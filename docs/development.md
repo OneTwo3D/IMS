@@ -68,8 +68,9 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
 DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit` — refuse to start,
-before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets PROOF FROM THE
-SERVER that the database was created to be destroyed. All of these must hold:
+before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets a set of FACTS
+from the server that together make an accidental run against a real database hard. None of them is
+proof the database is disposable (see "WHAT A MARKER PROVES" below). All of these must hold:
 
 * the database is STAMPED FOR ITS OWN NAME — a database comment applied by `npm run db:stamp-scratch`
   that contains the database's name, so a rename or a `pg_dump -C` restore under another name
@@ -79,8 +80,10 @@ SERVER that the database was created to be destroyed. All of these must hold:
 * the server says it is not a replica (`pg_is_in_recovery()`), not a template, and not the target of a
   logical-replication subscription it can see (an unreadable `pg_subscription` does not refuse here;
   the stamper, which issues the capability, does refuse on it); AND
-* it has not been set up as an installed application — no row in `users`, `organisations` or
-  `currencies` in the application's schema; AND
+* it has not been set up as an installed application — no row in any table named `users`,
+  `organisations` or `currencies`, in any schema; AND
+* it has no foreign tables at all (partitions included) — they are listed before any table is probed,
+  because probing a local parent would read a foreign child or partition on another server; AND
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
@@ -89,7 +92,8 @@ deliberately wrote this exact sentence naming this exact database — not that t
 that the database was empty. The guard compares one string, the text is a constant in this repository,
 and one `COMMENT ON DATABASE` statement written by hand is indistinguishable from the stamper's. The
 stamper's checks below make an ACCIDENTAL stamp hard; they are not properties the guard can verify
-afterwards.
+afterwards. Writing the marker by hand and exporting the declaration is TWO deliberate acts and skips
+the stamper's data check entirely; the guard's own checks above still apply to that database.
 
 **A NAME IS NOT EVIDENCE, and neither is ownership.** This product's tenant databases are `ims_<slug>`
 (`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory` (`.env.example`),
@@ -118,9 +122,10 @@ RESIDUALS, so nobody has to discover them:
 * **the data check runs when the stamp is ISSUED, not every time it is used.** A database stamped while
   empty keeps the capability however full it later becomes, unless it acquires the marks of an
   installed application (rows in `users`, `organisations` or `currencies`), which the guard does
-  check. It cannot check more: one run of this tier itself fills 23 tables (products, warehouses,
+  check. It does not check more, because one run of this tier itself fills 23 tables (products, warehouses,
   stock, ASNs — measured), so rows there are not evidence of anything. For a stamped database that has
-  merely gained such rows, the declaration is the only remaining barrier.
+  merely gained such rows no data check refuses it; what remains is the declaration and the name and
+  server-state rules.
 * **a database with no rows outside the three seeded tables looks fresh.** That population is narrower
   than it sounds: an `install.sh`-provisioned tenant is NOT in it, because `prisma/seed.ts` writes
   organisations, warehouses, currencies and tax rates and the bootstrap writes a user — it is only

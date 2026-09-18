@@ -1,101 +1,146 @@
 /**
- * STAMP A DATABASE AS DISPOSABLE, so the concurrency tier's guard will use it.
+ * MARK A DATABASE AS DISPOSABLE, so the concurrency tier's guard will use it.
  *
  *   npm run db:stamp-scratch   -- <database-name>     # stamp it
  *   npm run db:unstamp-scratch -- <database-name>     # take the stamp off again
  *
- * The guard (tests/concurrency/scratch-database-guard.ts) asks the SERVER for proof that a
- * database was created to be destroyed before it seeds anything into it, because two rounds
- * of name rules both admitted databases the product actually ships — tenant databases are
- * `ims_<slug>` (scripts/provision-ims-tenant.sh) and the canonical one is `onetwoinventory`
- * (.env.example). The proof is this stamp: `COMMENT ON DATABASE <db> IS '<marker naming that
- * database>'`, which lives outside every schema (so the schema-drift gate cannot see it) and
- * survives `prisma migrate deploy`.
+ * The guard (tests/concurrency/scratch-database-guard.ts) refuses to seed anything into a database
+ * unless, among other facts it asks the server for, the database carries this stamp:
+ * `COMMENT ON DATABASE <db> IS '<marker naming that database>'`. The stamp lives outside every
+ * schema (so the schema-drift gate cannot see it) and survives `prisma migrate deploy`.
  *
- * ══════════════════════════════════════════════════════════════════════════════════════
- * WHY IT TAKES THE NAME AS AN ARGUMENT, AND REFUSES A DATABASE HOLDING DATA (o3d-zzgp r7)
- * ══════════════════════════════════════════════════════════════════════════════════════
+ * WHAT THE STAMP IS, AND IS NOT (o3d-zzgp r9, review MEDIUM-4, agreeing with the guard's r8 M-2
+ * correction). It is a SENTENCE an owner of the database wrote, naming the database. It is not
+ * proof that this script ran, nor that the database was empty: the marker text is a constant in
+ * this repository and one hand-written `COMMENT ON DATABASE` produces the same sentence without any
+ * of the checks below. What this script adds is that the ACCIDENTAL path — a wrong DATABASE_URL, a
+ * tenant host, an inherited `.env.local` — does not produce a stamp: it must be given the name, and
+ * it refuses a database that holds application data, is a replica, a template, a subscriber, wired
+ * to another server, or named in the belt.
  *
- * Round 6 argued that stamping plus declaring were "two deliberate acts naming the
- * database". The independent review disproved it end to end: round 6's stamper read
- * `DATABASE_URL`, took no argument, asked nothing, never looked at what the database held,
- * and PRINTED the export line to paste — so it stamped a live tenant-shaped database full of
- * rows, and the guard then accepted it. Both "acts" came from one wrong URL.
+ * WHY IT TAKES THE NAME AS AN ARGUMENT (r7). Round 6's stamper read DATABASE_URL, took no argument,
+ * never looked at what the database held, and printed the export line to paste — so it stamped a
+ * live tenant-shaped database full of rows and the guard then accepted it. The argument must equal
+ * `current_database()`, which a copy-pasted URL does not supply.
  *
- * So the second act now genuinely names the database: the argument must equal
- * `current_database()`, which a copy-pasted URL does not supply. And a database that holds
- * application data is refused outright — a live database is exactly the thing this must never
- * mark disposable, and "it has rows in it" is the cheapest honest evidence of one.
+ * NOT OWNERSHIP. provision-ims-tenant.sh hands every tenant database to the role in its own
+ * DATABASE_URL, so "only an owner can set it" excludes nobody who can read a `.env`.
  *
- * NOT OWNERSHIP. Round 6 claimed ownership of the database was a meaningful barrier. It is
- * not: provision-ims-tenant.sh hands every tenant database to the role in its own
- * DATABASE_URL, and on the development server one role owns every `ims_*`. The barriers are
- * the argument, the data check, and the belt below.
+ * HOW IT TALKS TO THE SERVER (r9):
+ *   · every fact is read on a connection that defaults to read-only, with
+ *     `standard_conforming_strings` pinned on, through the data probe's own rules (no catalogue
+ *     text in string literals; one statement per call, extended protocol only). The read-only
+ *     default is a second layer, not the barrier: review MEDIUM-1 reproduced a write THROUGH it
+ *     with `COMMIT; BEGIN READ WRITE; …` smuggled in a catalogue name;
+ *   · the single COMMENT runs on a second connection, inside a transaction that FIRST re-checks
+ *     it reached the same SERVER and the same DATABASE the facts came from (oid, postmaster start
+ *     time, server address and port — review MEDIUM-3), and then RE-RUNS the data and installation
+ *     checks immediately before writing (review L7). That re-check is not a lock: rows another
+ *     session commits between it and COMMIT are not seen.
+ *   · `--unstamp` reads only the name, the server identity and the comment. It never runs the data
+ *     probe (review L6).
  */
 
 import { pathToFileURL } from 'node:url'
 
 import {
   ALWAYS_REFUSED_DATABASE,
-  SCRATCH_DATABASE_MARKER_PREFIX,
   expectedScratchDatabaseMarker,
 } from '../tests/concurrency/scratch-database-guard'
-import { readDataFacts } from '../tests/concurrency/scratch-database-data-probe'
+import {
+  readDataFacts,
+  readInstallationEvidence,
+  type ExtendedQueryClient,
+} from '../tests/concurrency/scratch-database-data-probe'
 
-// The "does it hold application data?" question — including which tables a fresh migration seeds
-// and why those three are exempt only in the application's own schema — lives in
-// tests/concurrency/scratch-database-data-probe.ts, shared with the guard (o3d-zzgp r8).
+/**
+ * The two marker forms this script has ever written — `ims-scratch-database(<name>): …` since r7 and
+ * `ims-scratch-database: …` in r6 — matched EXACTLY on their opening, not by a bare prefix (review
+ * L8), so `--unstamp` cannot remove some other comment that merely starts with the same word.
+ */
+const MARKER_OPENINGS = ['ims-scratch-database(', 'ims-scratch-database:'] as const
+
+type PgClient = ExtendedQueryClient & { connect: () => Promise<void>; end: () => Promise<void> }
+
+/**
+ * Who answered: the database by name AND oid, and the server by postmaster start time, address and
+ * port — the same identity lib/db/database-url-schema.mjs pins a lock connection to (review M3).
+ * A DATABASE_URL that resolves differently the second time (DNS, a pooler, a failover) changes at
+ * least one of these.
+ */
+type Identity = {
+  name: string
+  oid: string
+  postmasterStart: string
+  serverAddr: string
+  serverPort: string
+  comment: string | null
+}
+
+const IDENTITY_SQL = `
+  SELECT pg_catalog.current_database() AS name,
+         d.oid::text AS oid,
+         pg_catalog.pg_postmaster_start_time()::text AS postmaster_start,
+         COALESCE(pg_catalog.inet_server_addr()::text, 'local-socket') AS server_addr,
+         COALESCE(pg_catalog.inet_server_port()::text, 'local-socket') AS server_port,
+         pg_catalog.shobj_description(d.oid, 'pg_database') AS comment
+    FROM pg_catalog.pg_database d
+   WHERE d.datname = pg_catalog.current_database()`
+
+async function ask<T>(client: ExtendedQueryClient, text: string): Promise<T[]> {
+  const { rows } = await client.query({ text, values: [], queryMode: 'extended' })
+  return rows as T[]
+}
+
+async function readIdentity(client: ExtendedQueryClient): Promise<Identity> {
+  const [row] = await ask<{
+    name: string; oid: string; postmaster_start: string; server_addr: string; server_port: string; comment: string | null
+  }>(client, IDENTITY_SQL)
+  if (!row) throw new Error('the server returned no row for the connected database')
+  return {
+    name: String(row.name ?? ''),
+    oid: row.oid,
+    postmasterStart: row.postmaster_start,
+    serverAddr: row.server_addr,
+    serverPort: row.server_port,
+    comment: row.comment ?? null,
+  }
+}
+
+export function sameServerAndDatabase(a: Identity, b: Identity): boolean {
+  return a.name === b.name && a.oid === b.oid && a.postmasterStart === b.postmasterStart
+    && a.serverAddr === b.serverAddr && a.serverPort === b.serverPort
+}
 
 type Facts = {
-  database: string
-  comment: string | null
+  identity: Identity
   inRecovery: boolean
   isTemplate: boolean
   /** null when the catalogue could not be read — a REFUSAL here, see `refuseToStamp`. */
   subscriptionCount: number | null
-  /** Non-exempt relations holding at least one row (see scratch-database-data-probe.ts). */
   populatedTables: string[]
-  /** Foreign tables present — never read, refused on sight. */
   foreignTables: string[]
 }
 
-type PgClient = {
-  query: <T>(sql: string) => Promise<{ rows: T[] }>
-  end: () => Promise<void>
-}
-
-async function readFacts(client: PgClient, appSchema: string): Promise<Facts> {
-  const { rows } = await client.query<{
-    name: string
-    comment: string | null
-    in_recovery: boolean
-    is_template: boolean
-  }>(`SELECT pg_catalog.current_database() AS name,
-             pg_catalog.shobj_description(
-               (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
-               'pg_database') AS comment,
-             pg_catalog.pg_is_in_recovery() AS in_recovery,
-             (SELECT datistemplate FROM pg_catalog.pg_database
-               WHERE datname = pg_catalog.current_database()) AS is_template`)
-
+async function readStampFacts(client: ExtendedQueryClient, appSchema: string): Promise<Facts> {
+  const identity = await readIdentity(client)
+  const [state] = await ask<{ in_recovery: boolean; is_template: boolean }>(client, `
+    SELECT pg_catalog.pg_is_in_recovery() AS in_recovery, d.datistemplate AS is_template
+      FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()`)
   let subscriptionCount: number | null = null
   try {
-    const subscriptions = await client.query<{ count: string }>(
-      `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
-        WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
-                          WHERE datname = pg_catalog.current_database())`,
-    )
-    subscriptionCount = Number(subscriptions.rows[0]!.count)
+    const [row] = await ask<{ count: string }>(client, `
+      SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
+       WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())`)
+    subscriptionCount = Number(row!.count)
   } catch {
     subscriptionCount = null
   }
-
   const data = await readDataFacts(client, appSchema)
   return {
-    database: String(rows[0]!.name ?? ''),
-    comment: rows[0]!.comment ?? null,
-    inRecovery: rows[0]!.in_recovery === true,
-    isTemplate: rows[0]!.is_template === true,
+    identity,
+    inRecovery: state?.in_recovery === true,
+    isTemplate: state?.is_template === true,
     subscriptionCount,
     populatedTables: data.populated,
     foreignTables: data.foreign,
@@ -104,8 +149,7 @@ async function readFacts(client: PgClient, appSchema: string): Promise<Facts> {
 
 /**
  * The reasons a stamp must never be APPLIED, whoever asks (removing one, `--unstamp`, is deliberately
- * not gated by these — see main()). Pure, so the unit table can cover
- * every one without a server.
+ * not gated by these — see main()). Pure, so the unit table can cover every one without a server.
  */
 export function refuseToStamp(input: {
   database: string
@@ -165,6 +209,11 @@ function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`
 }
 
+/** Both connections: sanitised URL, conforming strings pinned; the reader is also read-only. */
+function connectionOptions(readOnly: boolean): string {
+  return `${readOnly ? '-c default_transaction_read_only=on ' : ''}-c standard_conforming_strings=on`
+}
+
 async function main(argv: string[]): Promise<number> {
   const unstamp = argv.includes('--unstamp')
   const requestedName = argv.find((arg) => !arg.startsWith('--'))
@@ -181,109 +230,138 @@ async function main(argv: string[]): Promise<number> {
     return 2
   }
   // The schema the APPLICATION resolves from this URL — the only schema in which the three
-  // migration-seeded tables are exempt from the data check (review L-1).
+  // migration-seeded tables are exempt from the data check.
   const appSchema = databaseUrlSchema(databaseUrl) ?? 'public'
 
   const { default: pg } = await import('pg')
-  // EVERY FACT IS GATHERED READ-ONLY (review L-8). Only the single COMMENT below needs to write,
-  // and it opens its own connection for that one statement.
-  const reader = new pg.Client({
-    connectionString,
-    options: '-c default_transaction_read_only=on',
-    application_name: 'o3d-stamp-scratch-database',
-  })
-  await reader.connect()
+  const open = async (readOnly: boolean): Promise<PgClient> => {
+    const client = new pg.Client({
+      connectionString,
+      options: connectionOptions(readOnly),
+      application_name: 'o3d-stamp-scratch-database',
+    }) as unknown as PgClient
+    await client.connect()
+    return client
+  }
+
+  // ---------------------------------------------------------------- --unstamp (review L6)
+  // Reads the name, the identity and the comment — nothing else, never the data probe. It is
+  // deliberately NOT behind the refusal table: removing a marker only makes the guard stricter,
+  // and gating it would block the clean-up that matters most (a hand-written marker on a real
+  // database). It still requires the exact name.
+  if (unstamp) {
+    const reader = await open(true)
+    let identity: Identity
+    try {
+      identity = await readIdentity(reader)
+    } finally {
+      await reader.end().catch(() => {})
+    }
+    if (requestedName !== identity.name) {
+      console.error('REFUSING to unstamp: the name given is not the database this DATABASE_URL reaches')
+      return 1
+    }
+    if (identity.comment === null) {
+      console.log(`"${identity.name}" carries no database comment; nothing to remove.`)
+      return 0
+    }
+    if (!MARKER_OPENINGS.some((opening) => identity.comment!.startsWith(opening))) {
+      console.error(`REFUSING to unstamp "${identity.name}": its comment is not a scratch marker, and this script `
+        + 'will not remove a comment it did not write')
+      return 1
+    }
+    const writer = await open(false)
+    try {
+      await ask(writer, 'BEGIN')
+      if (!sameServerAndDatabase(identity, await readIdentity(writer))) {
+        await ask(writer, 'ROLLBACK')
+        console.error('REFUSING to unstamp: the writing connection reached a different server or database')
+        return 1
+      }
+      await ask(writer, `COMMENT ON DATABASE ${quoteIdentifier(identity.name)} IS NULL`)
+      await ask(writer, 'COMMIT')
+    } finally {
+      await writer.end().catch(() => {})
+    }
+    console.log(`Removed the scratch marker from "${identity.name}".`)
+    return 0
+  }
+
+  // ---------------------------------------------------------------- stamp
+  const reader = await open(true)
   let facts: Facts
   try {
-    facts = await readFacts(reader as unknown as PgClient, appSchema)
+    facts = await readStampFacts(reader, appSchema)
   } finally {
     await reader.end().catch(() => {})
   }
 
-  const writeOne = async (sql: string) => {
-    const writer = new pg.Client({ connectionString, application_name: 'o3d-stamp-scratch-database' })
-    await writer.connect()
-    try {
-      // The writer must be talking to the database the facts were read from; a DATABASE_URL that
-      // resolves differently a second time (DNS, a pooler) would otherwise stamp a stranger.
-      const { rows } = await writer.query<{ name: string }>('SELECT pg_catalog.current_database() AS name')
-      if (rows[0]!.name !== facts.database) throw new Error('the second connection reached a different database')
-      await writer.query(sql)
-    } finally {
-      await writer.end().catch(() => {})
-    }
+  const refusal = refuseToStamp({
+    database: facts.identity.name,
+    requestedName,
+    inRecovery: facts.inRecovery,
+    isTemplate: facts.isTemplate,
+    subscriptionCount: facts.subscriptionCount,
+    populatedTables: facts.populatedTables,
+    foreignTables: facts.foreignTables,
+  })
+  if (refusal) {
+    console.error(`REFUSING to stamp "${facts.identity.name || '<unknown>'}": ${refusal}`)
+    return 1
   }
 
-  {
-    // --unstamp IS DELIBERATELY NOT BEHIND THE REFUSAL TABLE (review L-6). Everything it can do is
-    // remove a scratch marker, which only ever makes the guard STRICTER. Putting it behind the belt
-    // would stop exactly the clean-up that matters most: a marker written by hand onto a real
-    // database (review M-2 showed that takes one statement) could then never be removed by the
-    // tool built to remove it. It still requires the exact name, so it too is a decision about one
-    // database rather than a consequence of a URL.
-    if (unstamp) {
-      if (requestedName !== facts.database) {
-        console.error('REFUSING to unstamp: the name given is not the database this DATABASE_URL reaches')
-        return 1
-      }
-      if (facts.comment === null) {
-        console.log(`"${facts.database}" carries no database comment; nothing to remove.`)
-        return 0
-      }
-      // Any form this script has ever written: the round-7+ `ims-scratch-database(<name>): …` AND
-      // the round-6 `ims-scratch-database: …`, which the narrower check could not remove while
-      // claiming it "did not write" it (review L-7).
-      if (!facts.comment.startsWith(SCRATCH_DATABASE_MARKER_PREFIX)) {
-        console.error(`REFUSING to unstamp "${facts.database}": its comment is not a scratch marker, and this script `
-          + 'will not remove a comment it did not write')
-        return 1
-      }
-      await writeOne(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS NULL`)
-      console.log(`Removed the scratch marker from "${facts.database}".`)
-      return 0
-    }
+  const marker = expectedScratchDatabaseMarker(facts.identity.name)
+  if (facts.identity.comment === marker) {
+    console.log(`"${facts.identity.name}" is already stamped disposable.`)
+    return 0
+  }
+  if (facts.identity.comment !== null) {
+    console.error(
+      `REFUSING to stamp "${facts.identity.name}": it already carries a different database comment `
+      + `("${facts.identity.comment}"), which a database created for a test run does not have`,
+    )
+    return 1
+  }
 
-    const refusal = refuseToStamp({
-      database: facts.database,
+  const writer = await open(false)
+  try {
+    await ask(writer, 'BEGIN')
+    // SAME SERVER, SAME DATABASE (review M3) — not just the same name.
+    if (!sameServerAndDatabase(facts.identity, await readIdentity(writer))) {
+      await ask(writer, 'ROLLBACK')
+      console.error('REFUSING to stamp: the writing connection reached a different server or database than the checks')
+      return 1
+    }
+    // RE-CHECKED ON THE WRITER, IN THIS TRANSACTION, IMMEDIATELY BEFORE THE COMMENT (review L7).
+    // Not a lock: a row another session commits after this read and before COMMIT is not seen.
+    const data = await readDataFacts(writer, appSchema)
+    const installation = await readInstallationEvidence(writer)
+    const late = refuseToStamp({
+      database: facts.identity.name,
       requestedName,
       inRecovery: facts.inRecovery,
       isTemplate: facts.isTemplate,
       subscriptionCount: facts.subscriptionCount,
-      populatedTables: facts.populatedTables,
-      foreignTables: facts.foreignTables,
+      populatedTables: [...data.populated, ...installation.evidence],
+      foreignTables: data.foreign,
     })
-    if (refusal) {
-      console.error(`REFUSING to stamp "${facts.database || '<unknown>'}": ${refusal}`)
+    if (late) {
+      await ask(writer, 'ROLLBACK')
+      console.error(`REFUSING to stamp "${facts.identity.name}" at the last moment: ${late}`)
       return 1
     }
-
-    const marker = expectedScratchDatabaseMarker(facts.database)
-    if (facts.comment === marker) {
-      console.log(`"${facts.database}" is already stamped disposable.`)
-      return 0
-    }
-    if (facts.comment !== null) {
-      console.error(
-        `REFUSING to stamp "${facts.database}": it already carries a different database comment `
-        + `("${facts.comment}"), which a database created for a test run does not have`,
-      )
-      return 1
-    }
-
-    // Neither the identifier nor the comment can be a bind parameter in DDL. The name comes
-    // from the server's own current_database() and the marker is derived from it; both quoted.
-    await writeOne(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS ${quoteLiteral(marker)}`)
-    // DELIBERATELY NOT A PASTE-READY EXPORT LINE (review LOW-3): round 6 printed the exact
-    // declaration to set, which composed with the guard's refusal into a walkthrough for
-    // pointing the suite at whatever database the URL reached.
-    console.log(`Stamped "${facts.database}" disposable. docs/development.md, "Database-backed tiers", `
-      + 'has the rest of the setup.')
-    return 0
+    await ask(writer, `COMMENT ON DATABASE ${quoteIdentifier(facts.identity.name)} IS ${quoteLiteral(marker)}`)
+    await ask(writer, 'COMMIT')
+  } finally {
+    await writer.end().catch(() => {})
   }
+  // DELIBERATELY NOT A PASTE-READY EXPORT LINE (review r7 LOW-3).
+  console.log(`Stamped "${facts.identity.name}" disposable. docs/development.md, "Database-backed tiers", `
+    + 'has the rest of the setup.')
+  return 0
 }
 
-// Only when RUN, never when imported: the unit table imports `refuseToStamp` from here, and a
-// module that connects to a database on import would make importing it a side effect.
+// Only when RUN, never when imported: the unit table imports `refuseToStamp` from here.
 const invokedDirectly = process.argv[1] !== undefined
   && import.meta.url === pathToFileURL(process.argv[1]).href
 

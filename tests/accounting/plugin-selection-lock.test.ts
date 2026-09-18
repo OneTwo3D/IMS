@@ -902,8 +902,10 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 //      SQL, not that the SQL is safe; the plugin-key assertion below is what covers that, and it
 //      only covers migrations that live in this repo.
 //   5. STANDALONE CLIENTS IN `e2e/`. `CONSTRUCTS_A_DATABASE_CLIENT` is applied to `app`, `lib`,
-//      `prisma` and — since o3d-zzgp r7 — `scripts`, whose fifteen self-built clients are now
-//      classified one by one below. `e2e/` is still NOT a client-construction root: its harness
+//      `prisma` and — since o3d-zzgp r7 — `scripts`, whose self-built clients are classified one
+//      by one in DATABASE_EXECUTION_PATHS below. The count is deliberately not written here: r8 said
+//      "fifteen" beside sixteen entries (review L10), and a number in a comment is a claim nothing
+//      checks — the map, which the test pins in both directions, is the count. `e2e/` is still NOT a client-construction root: its harness
 //      files that build their own client are found only if they also shell a database tool. What
 //      covers them is the lexical plugin-key writer scan above, whose roots include `e2e` — so an
 //      unfenced plugin write there fails that test instead of this one. The two scans are

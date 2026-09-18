@@ -23,7 +23,11 @@
  * live tenant database and installed a trigger in it. Two rounds of guessing which names
  * are safe produced two wrong lists; a third guess is not the answer.
  *
- * SO THE SERVER IS ASKED FOR PROOF INSTEAD, and all of these must hold:
+ * SO THE SERVER IS ASKED FOR FACTS INSTEAD, and all of these must hold. None of them is PROOF
+ * that the database is disposable (o3d-zzgp r9, review MEDIUM-4 — "proof" was the fourth claim
+ * on this branch stronger than the code): each is a fact the server reports, and together they
+ * make an ACCIDENTAL run against a real database hard. A deliberate one remains possible, as the
+ * paragraph "WHAT THIS STILL DOES NOT STOP" below says exactly.
  *
  *   1. DECLARED — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database EXACTLY.
  *      (Round 5 let a scratch-shaped NAME satisfy this on its own; that is restored to a
@@ -56,9 +60,13 @@
  *      is writable. If `pg_subscription` cannot be read at all, the guard does NOT refuse on
  *      that ground (review L-4 — it used to be stated as a condition that "must hold"); the
  *      stamper, which issues the capability, does refuse.
- *   3a. NOT AN INSTALLED APPLICATION — none of `users`, `organisations`, `currencies` in the
- *      application's schema holds a row (review M-1; see INSTALLATION_EVIDENCE_TABLE_NAMES in
- *      scratch-database-data-probe.ts for why these three and not "any table with data").
+ *   3a. NOT AN INSTALLED APPLICATION — no table named `users`, `organisations` or `currencies`,
+ *      in ANY schema (r9, review L5), holds a row (r8 review M-1; see
+ *      INSTALLATION_EVIDENCE_TABLE_NAMES in scratch-database-data-probe.ts for why these three and
+ *      not "any table with data").
+ *   3b. NO FOREIGN TABLES — none at all, partitions included, listed BEFORE any table is probed,
+ *      because probing a local parent reads a foreign child or partition on another server (r9,
+ *      review M-2, measured with postgres_fdw).
  *   4. NOT OBVIOUSLY REAL — `ALWAYS_REFUSED_DATABASE` does not match. This is the BELT,
  *      checked first so it outranks everything above: it cannot be the fix (it is a name
  *      rule, and name rules are what failed twice), but it means a stamp applied to an
@@ -69,31 +77,42 @@
  * gate that runs beside these tests — a marker TABLE would show up as drift and could fail
  * the very CI job this guard runs in. It survives `prisma migrate deploy` (measured across
  * all 262 migrations) and it does not propagate through `CREATE DATABASE … TEMPLATE`
- * (measured: the copy's comment is NULL). `scripts/stamp-scratch-database.ts` is the one
- * thing that sets it.
+ * (measured: the copy's comment is NULL). `scripts/stamp-scratch-database.ts` is the tool
+ * built to set it — not the only thing that CAN: any owner can write the same sentence with one
+ * `COMMENT ON DATABASE` (rule 2 above, r8 review M-2).
  *
  * WHAT THIS STILL DOES NOT STOP, and round 6's version of this paragraph was WRONG about it.
  * It claimed the stamp plus the declaration were "two deliberate acts naming that database".
  * They were not: round 6's stamper took no argument, asked nothing, and printed the exact
  * line to export, so both acts followed from ONE wrong `DATABASE_URL` — and the review
  * reproduced it end to end on a tenant-shaped database holding rows. Now the stamper must be
- * given the database NAME as an argument and refuses a database holding application data, so
- * the remaining path is: create/keep a live database with no application rows in it, run the
- * stamper naming it, and export the declaration. That is three deliberate acts, one of which
- * is a lie about the database. A `DATABASE_URL` alone still buys nothing.
+ * given the database NAME as an argument and refuses a database holding application data. So
+ * the paths that remain are, precisely:
+ *   · through the stamper: keep a real database with no rows outside the three migration-seeded
+ *     tables, run the stamper naming it, and export the declaration — three deliberate acts;
+ *   · around the stamper: write the marker by hand with one `COMMENT ON DATABASE` as an owner and
+ *     export the declaration — TWO deliberate acts, and this path SKIPS the stamper's data check
+ *     entirely (r9, review MEDIUM-4; round 8's "three acts" was true only of the first path). The
+ *     guard then still applies rules 3, 3a, 3b and 4 — so an installed application is refused
+ *     either way — but a database holding only non-installation rows is accepted.
+ * A `DATABASE_URL` alone buys none of this.
  *
  * AND ONCE ISSUED, A STAMP LASTS (review M-1, measured): a database stamped while empty keeps
  * the capability however full it later becomes, UNLESS it acquires the marks of an installed
  * application (rule 3a). A database that merely gained product or stock rows is not refused —
  * the concurrency tier writes exactly those rows itself (measured: 23 tables after one run), so
- * the guard cannot tell them apart — and for it the declaration is the only remaining barrier.
+ * the guard cannot tell them apart — so no data check refuses it, and what remains between it and
+ * the tier is the declaration (plus the name and server-state rules, which it passed when stamped).
  * Name-binding closes rename and restore-under-another-name; it does not close repurposing in
  * place under the same name, and renaming a database BACK to the name in its marker makes the
  * marker valid again (review L-11, measured).
  *
- * The check runs on its own connection with `default_transaction_read_only=on`, so the
- * guard itself cannot write even if it is wrong, and it asks the SERVER for every fact
- * rather than trusting the URL. Call it first in every test, before importing anything
+ * The check runs on its own connection with `default_transaction_read_only=on`, and every
+ * statement it sends is one fixed statement over the EXTENDED protocol. The read-only default
+ * alone would NOT stop a write — a session can open `BEGIN READ WRITE`, which is exactly how r9's
+ * reproduction escaped it through a multi-statement string — so it is the single-statement,
+ * no-interpolation discipline that keeps this connection from writing, with the default as a
+ * second layer. It asks the SERVER for every fact rather than trusting the URL. Call it first in every test, before importing anything
  * that opens the application pool.
  */
 
@@ -120,7 +139,7 @@ export function expectedScratchDatabaseMarker(databaseName: string): string {
 }
 
 /**
- * THE BELT, not the fix. Names that can never be a scratch database however they are
+ * THE BELT, not the fix. Names this guard refuses as a scratch database however they are
  * stamped or declared: the product's canonical database (`onetwoinventory`), this estate's
  * own (`onetwo3d…`), the server's (`postgres…`, `template…`, `pg_…`), and anything whose
  * name contains `prod` or `live` in ANY form — `ims-prod`, `imslive`, `ims-production`,
@@ -133,7 +152,7 @@ export function expectedScratchDatabaseMarker(databaseName: string): string {
  *
  * NOT IN THE LIST, on purpose: the tenant shape `ims_<slug>`. It is indistinguishable by
  * name from CI's own `ims_ci`, so a name rule cannot separate them — which is exactly why
- * rule 2 exists. `ims_acme` is refused for having no stamp, and the unit table proves it.
+ * rule 2 exists. `ims_acme` is refused for having no stamp, and the unit table asserts it.
  */
 export const ALWAYS_REFUSED_DATABASE = /^(postgres|template|pg_)|onetwo3d|onetwoinventory|prod|live/i
 
@@ -161,11 +180,15 @@ export type ScratchDatabaseFacts = {
    */
   subscriptionCount: number | null
   /**
-   * Installation-evidence tables (`users`, `organisations`, `currencies`) in the application's
-   * schema that hold a row. Empty for a database created for a test run, however much the tier
-   * has seeded into it.
+   * Installation-evidence tables (`users`, `organisations`, `currencies`), in ANY schema, that hold
+   * a row. Empty for a database created for a test run, however much the tier has seeded into it.
    */
   installationEvidence: string[]
+  /**
+   * Every foreign table in the database, partitions included. When non-empty, `installationEvidence`
+   * was NOT probed — probing would read another server (r9, review M-2).
+   */
+  foreignTables: string[]
 }
 
 /** The pure decision, exported so every refusal path can be tested without a server. */
@@ -193,6 +216,13 @@ export function scratchDatabaseVerdict(facts: ScratchDatabaseFacts): { ok: true 
       ok: false,
       reason: `connected database "${db}" is the target of ${facts.subscriptionCount} logical-replication subscription(s), `
         + 'so it is a copy of another database rather than one created for this run',
+    }
+  }
+  if (facts.foreignTables.length > 0) {
+    return {
+      ok: false,
+      reason: `connected database "${db}" has foreign tables (${facts.foreignTables.slice(0, 3).join(', ')}), so it is `
+        + 'wired to another server; a database created for a test run is self-contained',
     }
   }
   if (facts.installationEvidence.length > 0) {
@@ -238,8 +268,8 @@ let verified: Promise<string> | null = null
 
 /**
  * Resolve to the verified scratch database name, or throw before anything has been
- * written. Memoised per process: the URL cannot change underneath a test run, and the
- * application pool is created from the same environment afterwards.
+ * written. Memoised per process: DATABASE_URL is read once here, and the application pool is
+ * created from the same environment afterwards.
  */
 export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
   verified ??= (async () => {
@@ -253,7 +283,7 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
     // lib/db/database-url-schema.mjs documents the identical bug for the search-path pin, and
     // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
     // `options` and `schema` removed. Reused rather than re-implemented.
-    const { databaseUrlSchema, sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
+    const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
     const { readInstallationEvidence } = await import('./scratch-database-data-probe')
     const connectionString = sanitisedProbeConnectionString(databaseUrl)
     if (connectionString === null) {
@@ -265,45 +295,53 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
     const { default: pg } = await import('pg')
     const client = new pg.Client({
       connectionString,
-      options: '-c default_transaction_read_only=on',
+      // standard_conforming_strings pinned ON as a third, independent layer under the data
+      // probe's own rules (no catalogue text in literals; extended protocol only) — r9 review M-1.
+      options: '-c default_transaction_read_only=on -c standard_conforming_strings=on',
       application_name: 'o3d-scratch-database-guard',
     })
     await client.connect()
     let facts: ScratchDatabaseFacts
     try {
-      const { rows } = await client.query<{
-        name: string
-        comment: string | null
-        in_recovery: boolean
-        is_template: boolean
+      // @types/pg's QueryConfig does not declare `queryMode`, which node-pg 8.20 honours; the probe
+      // module's ExtendedQueryClient type is the one that does.
+      const ext = client as unknown as import('./scratch-database-data-probe').ExtendedQueryClient
+      const { rows: stateRows } = await ext.query({
         // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
         // `search_path` — which MEDIUM-1 above shows could reach this connection — an
         // unqualified `shobj_description` could be answered by a planted function.
-      }>(`SELECT pg_catalog.current_database() AS name,
+        // One fixed statement, over the extended protocol (r9) — like every statement this sends.
+        text: `SELECT pg_catalog.current_database() AS name,
                  pg_catalog.shobj_description(
                    (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
                    'pg_database') AS comment,
                  pg_catalog.pg_is_in_recovery() AS in_recovery,
                  (SELECT datistemplate FROM pg_catalog.pg_database
-                   WHERE datname = pg_catalog.current_database()) AS is_template`)
+                   WHERE datname = pg_catalog.current_database()) AS is_template`,
+        values: [],
+        queryMode: 'extended',
+      })
+      const rows = stateRows as Array<{ name: string; comment: string | null; in_recovery: boolean; is_template: boolean }>
       // Separate, and allowed to fail: pg_subscription is not readable to every role.
       let subscriptionCount: number | null = null
       try {
-        const subscriptions = await client.query<{ count: string }>(
-          `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
+        const subscriptions = await ext.query({
+          text: `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
             WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
                               WHERE datname = pg_catalog.current_database())`,
-        )
-        subscriptionCount = Number(subscriptions.rows[0]!.count)
+          values: [],
+          queryMode: 'extended',
+        })
+        subscriptionCount = Number((subscriptions.rows[0] as { count: string }).count)
       } catch {
         subscriptionCount = null
       }
-      const installationEvidence = await readInstallationEvidence(
+      const installation = await readInstallationEvidence(
         client as unknown as Parameters<typeof readInstallationEvidence>[0],
-        databaseUrlSchema(databaseUrl) ?? 'public',
       )
       facts = {
-        installationEvidence,
+        installationEvidence: installation.evidence,
+        foreignTables: installation.foreign,
         connectedDatabase: String(rows[0]!.name ?? ''),
         optIn: process.env[SCRATCH_DATABASE_OPT_IN_ENV],
         databaseComment: rows[0]!.comment ?? null,

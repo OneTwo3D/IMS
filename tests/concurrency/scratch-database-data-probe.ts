@@ -1,162 +1,218 @@
 /**
  * "DOES THIS DATABASE HOLD APPLICATION DATA?" — asked once, used by both the stamper and the guard
- * (o3d-zzgp r8).
+ * (o3d-zzgp r8, hardened r9).
  *
  * Round 7 wrote this query inside scripts/stamp-scratch-database.ts, so only the STAMPER could ask
- * it; the review then showed the guard — the thing that decides whether the tier seeds and installs
- * DDL — had no data term at all (M-1). One implementation, imported by both, is what keeps the two
- * from answering the question differently.
+ * it; the review then showed the guard had no data term at all (r8 M-1). One implementation,
+ * imported by both, keeps the two from answering the question differently.
  *
- * WHAT COUNTS. Every table-like relation that stores rows — ordinary and partitioned tables and
- * MATERIALIZED VIEWS (review L-2: a matview with rows is data as surely as a table is) — in every
- * schema but the server's own. Partitions are skipped because their parent is probed and sees
- * their rows. FOREIGN TABLES are not read at all: probing one is a query against ANOTHER server,
- * which this must never do on someone's behalf; their mere presence is reported instead, and both
- * callers refuse on it — a database wired to another server is not a self-contained scratch
- * database.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THREE RULES FOR EVERY STATEMENT THIS MODULE SENDS (o3d-zzgp r9, review MEDIUM-1 and MEDIUM-2)
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
- * WHAT DOES NOT COUNT: exactly three tables, IN THE APPLICATION'S OWN SCHEMA. A fresh
- * `prisma migrate deploy` seeds rows into them, measured 2026-09-17 on this branch (262
- * migrations, 109 tables): `_prisma_migrations` (262 rows), `settings` (2) and
- * `shopping_status_mappings` (7), and nothing else. Round 7 exempted those NAMES in ANY schema
- * (review L-1: `tenant.settings` holding a row was exempt), which lib/db/database-url-schema.mjs
- * makes a real gap — it documents `CREATE SCHEMA "ims"` as a per-tenant layout. The exemption is
- * now `<appSchema>.<name>`, where `appSchema` is the schema the application itself resolves from
- * DATABASE_URL (`public` unless the URL names another).
+ *  1. NO CATALOGUE-DERIVED TEXT IS EVER A STRING LITERAL. Round 8 labelled each probe with a
+ *     single-quoted `'schema.table'`. A literal's quoting depends on `standard_conforming_strings`,
+ *     which a database owner can set with `ALTER DATABASE … SET standard_conforming_strings = off`;
+ *     then a backslash escapes the closing quote. The reviewer used a schema named
+ *     `" z;COMMIT;BEGIN READ WRITE;CREATE TABLE pwned();COMMIT;--"` holding tables `\` and `zz`
+ *     and got `pwned` created THROUGH the stamper's read-only connection — reproduced here too.
+ *     Probes are now labelled by their INDEX in a JS array (an integer this code generated) and
+ *     mapped back in JS. Catalogue names appear only as DOUBLE-quoted identifiers, whose quoting
+ *     has no backslash escape under any setting; the one value that is not an identifier (the
+ *     table names searched for installation evidence) is a BIND PARAMETER.
+ *  2. EVERY STATEMENT GOES THROUGH THE EXTENDED PROTOCOL (`queryMode: 'extended'`), whose Parse
+ *     message accepts exactly one statement. A string that somehow still carried `;…` would be
+ *     rejected by the server rather than run. Callers also pin `-c standard_conforming_strings=on`
+ *     in their startup options; that is the third, independent layer, not the fix.
+ *  3. FOREIGN TABLES ARE ENUMERATED FIRST AND STOP EVERYTHING. Round 8 said foreign tables were
+ *     "refused on sight and never read"; that was false twice over. Its catalogue query filtered
+ *     `NOT relispartition`, which hid a foreign PARTITION of a local partitioned table — and
+ *     probing the parent then scanned it. And a foreign table that INHERITS a local table was
+ *     reported, but the local parent was probed first, which scans its children. Measured with
+ *     postgres_fdw: the remote tables' seq_scan went 0 → 1. Now every relkind 'f' relation is
+ *     listed, partitions included, BEFORE any probe is built, and if there is one no probe runs
+ *     at all — both callers refuse on the list.
+ *
+ * WHAT COUNTS as data: every row-storing relation — ordinary and partitioned tables and
+ * materialized views — in every schema but the server's own (partitions themselves are skipped
+ * because their parent sees their rows; with foreign tables excluded first, every partition is
+ * local).
+ *
+ * WHAT DOES NOT COUNT: exactly three tables, IN THE APPLICATION'S OWN SCHEMA, which a fresh
+ * `prisma migrate deploy` seeds (measured 2026-09-17: `_prisma_migrations` 262 rows, `settings` 2,
+ * `shopping_status_mappings` 7, and nothing else across 109 tables). `appSchema` is the schema the
+ * application resolves from DATABASE_URL (`public` unless the URL names another).
  */
 
 export const MIGRATION_SEEDED_TABLE_NAMES = ['_prisma_migrations', 'settings', 'shopping_status_mappings'] as const
 
-/** One row of the catalogue query below. */
+/**
+ * Tables every INSTALLED application populates and the concurrency tier does not write — the guard's
+ * data term (r8, review M-1).
+ *
+ * WHY NOT "ANY TABLE WITH DATA". Measured 2026-09-18: after ONE green `npm run test:concurrency`
+ * (132/132) on a freshly migrated, stamped database, 23 non-seeded tables held rows — products 47,
+ * warehouses 85, stock_transfers 41, wms_asn_maps 45 … — and `settings` grew from 2 to 12. Each tier
+ * file is its own process, so a guard that refused on those rows would refuse whichever guarded file
+ * started after another had seeded, and every re-run. A product row is therefore NOT evidence of
+ * repurposing; the tier writes them.
+ *
+ * WHY THESE THREE. `prisma/seed.ts` upserts an organisation and the currencies, and the install
+ * bootstrap creates a user; a fresh `prisma migrate deploy` leaves all three empty and a full tier
+ * run leaves all three empty (both measured), and no file in tests/concurrency writes them (grep, and
+ * the r8 reviewer independently searched for indirect writers and found none). `tax_rates` is NOT
+ * here because two refund race tests create one. Since r9 they are searched in EVERY schema (review
+ * L5), not only the application's.
+ *
+ * WHAT IT DOES NOT CATCH: a stamped database that gained application rows WITHOUT being set up as an
+ * installation — product rows, stock — is indistinguishable from one the tier seeded, so no data
+ * check refuses it; what remains is the declaration and the guard's name and server-state rules.
+ */
+export const INSTALLATION_EVIDENCE_TABLE_NAMES = ['users', 'organisations', 'currencies'] as const
+
+/** One relation as the catalogue reports it. */
 export type CatalogueRelation = { schema: string; name: string; kind: string }
 
-/** The catalogue query: every row-storing relation outside the server's own schemas. */
+/** EVERY foreign table, partitions included — nothing about it is filtered (review M-2). */
+export const FOREIGN_TABLES_SQL = `
+  SELECT n.nspname AS schema, c.relname AS name, 'f' AS kind
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind = 'f'
+   ORDER BY 1, 2`
+
+/** Every LOCAL row-storing relation outside the server's schemas. Foreign tables are listed above. */
 export const ROW_STORING_RELATIONS_SQL = `
   SELECT n.nspname AS schema, c.relname AS name, c.relkind::text AS kind
     FROM pg_catalog.pg_class c
     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-   WHERE c.relkind IN ('r', 'p', 'm', 'f')
+   WHERE c.relkind IN ('r', 'p', 'm')
      AND NOT c.relispartition
      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-     AND n.nspname NOT LIKE 'pg\\_toast%'
-     AND n.nspname NOT LIKE 'pg\\_temp%'
+     AND n.nspname !~ '^pg_(toast|temp)'
    ORDER BY 1, 2`
 
-function quoteIdentifier(value: string): string {
+/** Installation-evidence tables in ANY schema; the names are a bind parameter, never interpolated. */
+export const INSTALLATION_EVIDENCE_RELATIONS_SQL = `
+  SELECT n.nspname AS schema, c.relname AS name, c.relkind::text AS kind
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+   WHERE c.relkind IN ('r', 'p')
+     AND NOT c.relispartition
+     AND c.relname = ANY($1::text[])
+     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   ORDER BY 1, 2`
+
+/** A double-quoted identifier. Its quoting has no backslash escape under any server setting. */
+export function quoteIdentifier(value: string): string {
+  if (value.includes('\u0000')) throw new Error('an identifier cannot contain NUL')
   return `"${value.replace(/"/g, '""')}"`
 }
 
-function quoteLiteral(value: string): string {
-  return `'${value.replace(/'/g, "''")}'`
-}
-
-export type PopulatedTableProbe = {
+export type RelationProbe = {
   /** One statement answering "which of these hold a row?", or null when there is nothing to ask. */
   sql: string | null
-  /** `schema.name` of every relation the statement probes, in order — for tests and messages. */
+  /** `schema.name` of every relation probed; a result row's `i` indexes into this array. */
   probed: string[]
-  /** `schema.name` of the migration-seeded tables that were exempted, and nothing else. */
+  /** `schema.name` of the relations deliberately left out. */
   exempted: string[]
-  /** `schema.name` of foreign tables, which are never read. */
-  foreign: string[]
 }
 
 /**
- * PURE: build the probe from the catalogue's answer. Exported so the exemption rule, the relkind
- * handling and the quoting are tested directly (review M-5: round 7's unit table injected the
- * populated-table array, so it proved the refusal branches, not that this statement is right).
+ * PURE: one EXISTS per relation, UNION ALLed, each labelled by its array index. The statement
+ * contains no string literal at all — every catalogue name is inside a double-quoted identifier —
+ * which is what the unit tests assert.
  */
-export function buildPopulatedTableProbe(relations: ReadonlyArray<CatalogueRelation>, appSchema: string): PopulatedTableProbe {
-  const exemptQualified = new Set(MIGRATION_SEEDED_TABLE_NAMES.map((name) => `${appSchema}.${name}`))
+export function buildRelationProbe(
+  relations: ReadonlyArray<CatalogueRelation>,
+  exempt: (qualifiedName: string) => boolean = () => false,
+): RelationProbe {
   const probed: string[] = []
   const exempted: string[] = []
-  const foreign: string[] = []
-  const probes: string[] = []
+  const members: string[] = []
   for (const relation of relations) {
-    const qualifiedName = `${relation.schema}.${relation.name}`
     if (relation.kind === 'f') {
-      foreign.push(qualifiedName)
-      continue
+      // Unreachable through readDataFacts, which stops on foreign tables before building anything;
+      // refused here too so no future caller can hand one in.
+      throw new Error(`refusing to probe foreign table ${relation.schema}.${relation.name}: it would read another server`)
     }
-    if (exemptQualified.has(qualifiedName)) {
+    const qualifiedName = `${relation.schema}.${relation.name}`
+    if (exempt(qualifiedName)) {
       exempted.push(qualifiedName)
       continue
     }
-    probed.push(qualifiedName)
-    probes.push(
-      `SELECT ${quoteLiteral(qualifiedName)} AS t `
-      + `WHERE EXISTS (SELECT 1 FROM ${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)})`,
+    members.push(
+      `SELECT ${probed.length}::int AS i WHERE EXISTS (SELECT 1 FROM ${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)})`,
     )
+    probed.push(qualifiedName)
   }
-  return { sql: probes.length > 0 ? probes.join(' UNION ALL ') : null, probed, exempted, foreign }
+  return { sql: members.length > 0 ? members.join(' UNION ALL ') : null, probed, exempted }
+}
+
+/** The data check's probe: everything except the three migration-seeded tables in `appSchema`. */
+export function buildPopulatedTableProbe(relations: ReadonlyArray<CatalogueRelation>, appSchema: string): RelationProbe {
+  const seeded = new Set(MIGRATION_SEEDED_TABLE_NAMES.map((name) => `${appSchema}.${name}`))
+  return buildRelationProbe(relations, (qualifiedName) => seeded.has(qualifiedName))
+}
+
+/** The minimum a client must offer: a query config, always sent through the extended protocol. */
+export type ExtendedQueryClient = {
+  query: (config: { text: string; values: unknown[]; queryMode: 'extended' }) => Promise<{ rows: unknown[] }>
+}
+
+async function ask<T>(client: ExtendedQueryClient, text: string, values: unknown[] = []): Promise<T[]> {
+  const { rows } = await client.query({ text, values, queryMode: 'extended' })
+  return rows as T[]
+}
+
+async function runProbe(client: ExtendedQueryClient, probe: RelationProbe): Promise<string[]> {
+  if (probe.sql === null) return []
+  const rows = await ask<{ i: number }>(client, probe.sql)
+  return rows.map((row) => {
+    const name = probe.probed[Number(row.i)]
+    if (name === undefined) throw new Error(`probe returned an index it did not issue: ${String(row.i)}`)
+    return name
+  })
+}
+
+/** `schema.name` of every foreign table present — asked FIRST by both callers. */
+export async function readForeignTables(client: ExtendedQueryClient): Promise<string[]> {
+  const rows = await ask<CatalogueRelation>(client, FOREIGN_TABLES_SQL)
+  return rows.map((row) => `${row.schema}.${row.name}`)
 }
 
 export type DataFacts = {
+  /** `schema.name` of every foreign table. When non-empty, NOTHING was probed. */
+  foreign: string[]
   /** `schema.name` of every non-exempt relation holding at least one row. */
   populated: string[]
-  /** `schema.name` of every foreign table present. */
+  /** Whether the row probe ran at all — false whenever `foreign` is non-empty. */
+  probed: boolean
+}
+
+/** The stamper's data check. Foreign tables first; if there are any, stop before building a probe. */
+export async function readDataFacts(client: ExtendedQueryClient, appSchema: string): Promise<DataFacts> {
+  const foreign = await readForeignTables(client)
+  if (foreign.length > 0) return { foreign, populated: [], probed: false }
+  const relations = await ask<CatalogueRelation>(client, ROW_STORING_RELATIONS_SQL)
+  const populated = await runProbe(client, buildPopulatedTableProbe(relations, appSchema))
+  return { foreign, populated, probed: true }
+}
+
+export type InstallationFacts = {
   foreign: string[]
+  /** `schema.name` of every installation-evidence table, in ANY schema, holding a row. */
+  evidence: string[]
+  probed: boolean
 }
 
-type QueryClient = { query: <T>(sql: string) => Promise<{ rows: T[] }> }
-
-/** Ask the server. Two round trips: the catalogue, then one UNION ALL of EXISTS probes. */
-export async function readDataFacts(client: QueryClient, appSchema: string): Promise<DataFacts> {
-  const { rows: relations } = await client.query<CatalogueRelation>(ROW_STORING_RELATIONS_SQL)
-  const probe = buildPopulatedTableProbe(relations, appSchema)
-  if (probe.sql === null) return { populated: [], foreign: probe.foreign }
-  const { rows } = await client.query<{ t: string }>(probe.sql)
-  return { populated: rows.map((row) => row.t), foreign: probe.foreign }
-}
-
-// ---------------------------------------------------------------------------------------------
-// THE GUARD'S DATA TERM (o3d-zzgp r8, review M-1) — narrower than the stamper's, and why
-// ---------------------------------------------------------------------------------------------
-
-/**
- * Tables every INSTALLED application populates and the concurrency tier never touches, so a row in
- * any of them means "this database has been set up as a real IMS" — and the guard refuses it even
- * when it carries a valid marker.
- *
- * WHY NOT THE STAMPER'S WHOLE CHECK. The review asked the guard to refuse "when a non-seeded table
- * has rows". MEASURED 2026-09-18, that would break the tier it protects: after ONE green
- * `npm run test:concurrency` (132/132) on a freshly migrated, stamped database, 23 non-seeded tables
- * held rows — products 47, warehouses 85, stock_transfers 41, wms_asn_maps 45 … — and `settings` had
- * grown from 2 to 12. Each tier file is its own process, started as the test runner schedules it,
- * so a guard that refused on those rows would refuse whichever guarded file started after another
- * file had seeded — and every re-run of the tier against the same database.
- * A product row is therefore NOT evidence that a database was repurposed; the tier writes them.
- *
- * WHAT IS EVIDENCE: the three tables below. `prisma/seed.ts` upserts an organisation and the
- * currencies, and the install bootstrap creates a user, so no installed IMS has them empty; a fresh
- * `prisma migrate deploy` leaves all three empty (measured), a full tier run leaves all three empty
- * (measured), and no file in tests/concurrency writes any of them (checked by grep; `tax_rates` was
- * a candidate and is NOT here because two refund race tests create and remove one mid-run). If a
- * future concurrency test does write one, the guard refuses in CI and names the table — loud, and
- * in the safe direction.
- *
- * WHAT IT STILL DOES NOT CATCH, said here and in the guard: a stamped database that has gained
- * application rows WITHOUT being set up as an installation — product rows, stock — is
- * indistinguishable from one the tier itself has seeded. For that database the declaration is the
- * only remaining barrier.
- */
-export const INSTALLATION_EVIDENCE_TABLE_NAMES = ['users', 'organisations', 'currencies'] as const
-
-/** Which installation-evidence tables, in the application's schema, hold a row. */
-export async function readInstallationEvidence(client: QueryClient, appSchema: string): Promise<string[]> {
-  const { rows: present } = await client.query<{ name: string }>(
-    `SELECT c.relname AS name
-       FROM pg_catalog.pg_class c
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE n.nspname = ${quoteLiteral(appSchema)}
-        AND c.relkind IN ('r', 'p')
-        AND c.relname IN (${INSTALLATION_EVIDENCE_TABLE_NAMES.map(quoteLiteral).join(', ')})`,
-  )
-  if (present.length === 0) return []
-  const sql = present
-    .map((row) => `SELECT ${quoteLiteral(`${appSchema}.${row.name}`)} AS t `
-      + `WHERE EXISTS (SELECT 1 FROM ${quoteIdentifier(appSchema)}.${quoteIdentifier(row.name)})`)
-    .join(' UNION ALL ')
-  const { rows } = await client.query<{ t: string }>(sql)
-  return rows.map((row) => row.t)
+/** The guard's data term. Foreign tables first here too; then users/organisations/currencies anywhere. */
+export async function readInstallationEvidence(client: ExtendedQueryClient): Promise<InstallationFacts> {
+  const foreign = await readForeignTables(client)
+  if (foreign.length > 0) return { foreign, evidence: [], probed: false }
+  const relations = await ask<CatalogueRelation>(client, INSTALLATION_EVIDENCE_RELATIONS_SQL, [
+    [...INSTALLATION_EVIDENCE_TABLE_NAMES],
+  ])
+  const evidence = await runProbe(client, buildRelationProbe(relations))
+  return { foreign, evidence, probed: true }
 }

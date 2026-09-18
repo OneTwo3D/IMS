@@ -8,11 +8,13 @@ import {
   scratchDatabaseVerdict,
   type ScratchDatabaseFacts,
 } from './concurrency/scratch-database-guard'
-import { refuseToStamp } from '../scripts/stamp-scratch-database'
+import { refuseToStamp, sameServerAndDatabase } from '../scripts/stamp-scratch-database'
 import {
   INSTALLATION_EVIDENCE_TABLE_NAMES,
   MIGRATION_SEEDED_TABLE_NAMES,
   buildPopulatedTableProbe,
+  readDataFacts,
+  readInstallationEvidence,
 } from './concurrency/scratch-database-data-probe'
 
 /**
@@ -49,6 +51,7 @@ function facts(overrides: Partial<ScratchDatabaseFacts> & { connectedDatabase: s
     isTemplate: false,
     subscriptionCount: 0,
     installationEvidence: [],
+    foreignTables: [],
     ...overrides,
   }
 }
@@ -216,7 +219,7 @@ test('the guard refuses a stamped, declared database that has been set up as an 
 })
 
 test('the data probe exempts the migration-seeded tables ONLY in the application schema', () => {
-  // Review L-1, and M-5: this tests the statement the server is sent, not an injected array.
+  // r8 review L-1: tests the statement the server is sent, not an injected array.
   const relations = [
     { schema: 'public', name: '_prisma_migrations', kind: 'r' },
     { schema: 'public', name: 'settings', kind: 'r' },
@@ -225,28 +228,152 @@ test('the data probe exempts the migration-seeded tables ONLY in the application
     { schema: 'tenant', name: 'settings', kind: 'r' },
     { schema: 'tenant', name: 'products', kind: 'p' },
     { schema: 'public', name: 'report_cache', kind: 'm' },
-    { schema: 'public', name: 'remote_orders', kind: 'f' },
-    { schema: 'we"ird', name: "o'dd", kind: 'r' },
   ]
   const probe = buildPopulatedTableProbe(relations, 'public')
   assert.deepEqual(probe.exempted, ['public._prisma_migrations', 'public.settings', 'public.shopping_status_mappings'])
-  // `tenant.settings` is PROBED — round 7 exempted the bare name in every schema.
-  assert.deepEqual(probe.probed, ['public.products', 'tenant.settings', 'tenant.products', 'public.report_cache', `we"ird.o'dd`])
-  // A foreign table is reported, never read.
-  assert.deepEqual(probe.foreign, ['public.remote_orders'])
-  assert.doesNotMatch(String(probe.sql), /remote_orders/)
-  // Identifiers and labels are quoted.
-  assert.match(String(probe.sql), /FROM "we""ird"\."o'dd"/)
-  assert.match(String(probe.sql), /'we"ird\.o''dd'/)
-
-  // Under a non-public application schema the exemption moves with it.
+  assert.deepEqual(probe.probed, ['public.products', 'tenant.settings', 'tenant.products', 'public.report_cache'])
   const ims = buildPopulatedTableProbe(
     [{ schema: 'ims', name: 'settings', kind: 'r' }, { schema: 'public', name: 'settings', kind: 'r' }],
     'ims',
   )
   assert.deepEqual(ims.exempted, ['ims.settings'])
   assert.deepEqual(ims.probed, ['public.settings'])
-
-  // Nothing to probe → no statement.
   assert.equal(buildPopulatedTableProbe([], 'public').sql, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-zzgp r9, review MEDIUM-1: SQL injection through catalogue names. The reviewer created
+// `pwned` through round 8's READ-ONLY reader using this schema name with tables `\` and `zz`,
+// after `ALTER DATABASE … SET standard_conforming_strings = off`. Reproduced live before the fix.
+// ---------------------------------------------------------------------------------------------
+const ATTACK_SCHEMA = ' z;COMMIT;BEGIN READ WRITE;CREATE TABLE pwned();COMMIT;--'
+
+/** Remove every double-quoted identifier from a statement, so what is left is what the server PARSES. */
+function withoutIdentifiers(sql: string): string {
+  return sql.replace(/"(?:[^"]|"")*"/g, 'IDENT')
+}
+
+test('the probe carries catalogue names ONLY inside double-quoted identifiers — never in a string literal', () => {
+  const probe = buildPopulatedTableProbe([
+    { schema: ATTACK_SCHEMA, name: '\\', kind: 'r' },
+    { schema: ATTACK_SCHEMA, name: 'zz', kind: 'r' },
+    { schema: 'we"ird', name: "o'dd", kind: 'r' },
+  ], 'public')
+  const sql = String(probe.sql)
+  // THE ROOT OF THE FINDING: round 8 labelled each probe with a single-quoted `'schema.table'`,
+  // whose quoting a backslash can break under standard_conforming_strings=off. No literal at all:
+  // (A quote INSIDE a double-quoted identifier — `"o'dd"` — is part of the name, not a literal.)
+  const parsed = withoutIdentifiers(sql)
+  assert.equal(parsed.includes("'"), false, `the probe must contain no string literal: ${parsed}`)
+  // And once every identifier is removed, nothing of any catalogue name is left for the parser.
+  for (const fragment of ['COMMIT', 'pwned', 'CREATE', 'READ WRITE', 'o\'dd', 'we']) {
+    assert.equal(parsed.includes(fragment), false, `"${fragment}" reached the parser outside an identifier: ${parsed}`)
+  }
+  // Labels are the integers this code generated, mapped back to names in JS.
+  assert.match(sql, /SELECT 0::int AS i WHERE EXISTS/)
+  assert.match(sql, /SELECT 2::int AS i WHERE EXISTS/)
+  assert.deepEqual(probe.probed, [`${ATTACK_SCHEMA}.\\`, `${ATTACK_SCHEMA}.zz`, `we"ird.o'dd`])
+})
+
+type Sent = { text: string; values: unknown; queryMode: unknown }
+
+/** A client that answers the catalogue queries it recognises and records everything it is sent. */
+function recordingClient(catalogue: { foreign: object[]; relations: object[] }) {
+  const sent: Sent[] = []
+  const client = {
+    query: async (config: unknown) => {
+      const text = typeof config === 'string' ? config : String((config as { text: string }).text)
+      sent.push({
+        text,
+        values: typeof config === 'string' ? undefined : (config as { values?: unknown }).values,
+        queryMode: typeof config === 'string' ? undefined : (config as { queryMode?: unknown }).queryMode,
+      })
+      if (/relkind\s*=\s*'f'/.test(text)) return { rows: catalogue.foreign }
+      if (/relkind IN/.test(text)) return { rows: [...catalogue.relations, ...catalogue.foreign] }
+      return { rows: [] }
+    },
+  }
+  return { client, sent }
+}
+
+test('every statement the probe sends goes through the EXTENDED protocol', async () => {
+  // The extended protocol's Parse accepts exactly ONE statement, so a `;…` tail is rejected by the
+  // server rather than run. Round 8 sent plain strings over the simple protocol.
+  const { client, sent } = recordingClient({ foreign: [], relations: [{ schema: 'public', name: 'products', kind: 'r' }] })
+  await readDataFacts(client as never, 'public')
+  assert.ok(sent.length >= 2, `precondition: statements were sent (${sent.length})`)
+  for (const statement of sent) {
+    assert.equal(statement.queryMode, 'extended', `sent over the simple protocol: ${statement.text.slice(0, 60)}`)
+  }
+  const evidence = recordingClient({ foreign: [], relations: [{ schema: 'public', name: 'users', kind: 'r' }] })
+  await readInstallationEvidence(evidence.client as never)
+  for (const statement of evidence.sent) {
+    assert.equal(statement.queryMode, 'extended', `sent over the simple protocol: ${statement.text.slice(0, 60)}`)
+  }
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-zzgp r9, review MEDIUM-2: "foreign tables are never read" was false. A foreign PARTITION
+// was hidden by `NOT relispartition`, and a foreign CHILD was listed but its local parent probed
+// first. Measured live with postgres_fdw before the fix: the remote tables' seq_scan went 0 → 1.
+// ---------------------------------------------------------------------------------------------
+test('a foreign table stops the data probe BEFORE any table is probed — partitions and children included', async () => {
+  const catalogue = {
+    // A foreign PARTITION of local `lp`, and a foreign CHILD inheriting local `lt`.
+    foreign: [
+      { schema: 'public', name: 'lp_remote', kind: 'f' },
+      { schema: 'public', name: 'lt_remote', kind: 'f' },
+    ],
+    relations: [
+      { schema: 'public', name: 'lp', kind: 'p' },
+      { schema: 'public', name: 'lt', kind: 'r' },
+    ],
+  }
+  const data = recordingClient(catalogue)
+  const facts = await readDataFacts(data.client as never, 'public')
+  // THE SUBSTANTIVE CHECK FIRST: nothing that could read the foreign tables was sent.
+  assert.equal(data.sent.some((statement) => /EXISTS/.test(statement.text)), false,
+    `no row probe may be sent while a foreign table exists: ${data.sent.map((statement) => statement.text.slice(0, 40)).join(' | ')}`)
+  assert.deepEqual(facts.foreign, ['public.lp_remote', 'public.lt_remote'], 'the foreign PARTITION is listed too')
+  assert.equal(facts.probed, false)
+
+  const evidence = recordingClient(catalogue)
+  const installation = await readInstallationEvidence(evidence.client as never)
+  assert.equal(installation.probed, false)
+  assert.equal(evidence.sent.some((statement) => /EXISTS/.test(statement.text)), false, 'the guard\'s probe stops too')
+
+  // And both callers refuse on the list.
+  assert.match(String(refuseToStamp({
+    database: 'ims_ci', requestedName: 'ims_ci', inRecovery: false, isTemplate: false,
+    subscriptionCount: 0, populatedTables: [], foreignTables: facts.foreign,
+  })), /foreign tables/)
+  assert.match(
+    (scratchDatabaseVerdict({ ...stamped('ims_ci'), foreignTables: installation.foreign }) as { reason: string }).reason,
+    /foreign tables/,
+  )
+})
+
+test('installation evidence is searched in EVERY schema, with the table names as a bind parameter', async () => {
+  // Review L5: round 8 looked only in the URL's schema.
+  const { client, sent } = recordingClient({
+    foreign: [],
+    relations: [{ schema: 'tenant', name: 'users', kind: 'r' }, { schema: 'public', name: 'organisations', kind: 'r' }],
+  })
+  await readInstallationEvidence(client as never)
+  const catalogueQuery = sent.find((statement) => /relname = ANY/.test(statement.text))
+  assert.ok(catalogueQuery, 'the evidence catalogue query was sent')
+  assert.doesNotMatch(catalogueQuery!.text, /nspname = /, 'not restricted to one schema')
+  assert.deepEqual(catalogueQuery!.values, [[...INSTALLATION_EVIDENCE_TABLE_NAMES]])
+  const probe = sent.find((statement) => /EXISTS/.test(statement.text))
+  assert.match(String(probe?.text), /"tenant"\."users"/)
+})
+
+test('the writer must reach the same SERVER and DATABASE, not merely the same name', () => {
+  // Review M3: round 8 compared current_database() only.
+  const reader = { name: 'ims_ci', oid: '16384', postmasterStart: '2026-09-18 07:00:00+00', serverAddr: '10.0.0.5/32', serverPort: '5432', comment: null }
+  assert.equal(sameServerAndDatabase(reader, { ...reader }), true)
+  assert.equal(sameServerAndDatabase(reader, { ...reader, oid: '16999' }), false, 'same name, recreated database')
+  assert.equal(sameServerAndDatabase(reader, { ...reader, postmasterStart: '2026-09-18 08:00:00+00' }), false, 'another server')
+  assert.equal(sameServerAndDatabase(reader, { ...reader, serverAddr: '10.0.0.6/32' }), false, 'another host')
+  assert.equal(sameServerAndDatabase(reader, { ...reader, serverPort: '6432' }), false, 'a pooler or another port')
 })

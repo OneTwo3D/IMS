@@ -23,8 +23,9 @@ if [ -n "${IMS_CONCURRENCY_SCRATCH_DB:-}" ]; then
 else
   echo
   echo "SKIPPED: npm run test:concurrency"
-  echo "  It seeds rows and installs DDL, so it runs only against a database created for the run"
-  echo "  and marked disposable -- never against the database DATABASE_URL points at by default."
+  echo "  It seeds rows and installs DDL, so its guard refuses any database that is not marked"
+  echo "  disposable for its own name AND declared in IMS_CONCURRENCY_SCRATCH_DB -- which your"
+  echo "  ordinary local database is not."
   echo "  The setup (create, migrate, mark it by NAME, declare it) is in docs/development.md,"
   echo "  'Database-backed tiers'. CI runs this tier on every PR that touches it regardless."
   # o3d-zzgp r8 (review M-3): this used to print `DATABASE_URL=<scratch url> npm run
