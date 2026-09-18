@@ -3677,9 +3677,17 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
       + 'Nothing needs reversing or credit-noting.',
   },
   INVOICE_EMAIL: {
-    effect: 'SENT the invoice email to the customer',
-    remedy: 'NO ledger document was created, and the email CANNOT be recalled. If the invoice should not have been '
-      + 'sent, contact the customer; there is nothing in Xero to reverse or credit-note for this row.',
+    // NOT "SENT" (round 36, Codex round 35 MEDIUM — the same disproven rationale as the call-site
+    // comment above, read from one worker's side). The effect is a QUEUE write: `queueEmail` inserts an
+    // EmailOutbox row and the email-outbox drain sends it later, and when a copy is already queued and
+    // undelivered `email_outbox_undelivered_reference_uq` refuses the insert and this attempt wrote
+    // NOTHING AT ALL. So the operator is told what IMS actually knows and where to look, instead of
+    // being told a mail went that may still be PENDING or may never have been written.
+    effect: 'QUEUED the invoice email to the customer, or found one already queued and undelivered and wrote nothing',
+    remedy: 'NO ledger document was created. Check this order\'s email outbox: a queued copy is sent by the '
+      + 'email-outbox drain and CANNOT be recalled once it goes, and an attempt that found one already queued '
+      + 'wrote nothing. If a copy has been sent and should not have been, contact the customer; there is nothing '
+      + 'in Xero to reverse or credit-note for this row.',
   },
   WC_INVOICE_NOTE: {
     effect: 'ADDED an invoice note to the WooCommerce order',
@@ -6098,7 +6106,17 @@ async function processClaimedEntry(
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
       const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
-      // Not a Xero call, but an external side effect all the same: a second worker here means the customer receives the invoice twice.
+      // Not a Xero call, but an external side effect all the same — though a reclaiming worker here
+      // does NOT by itself mail a further copy (Codex round 35, MEDIUM; this comment used to read
+      // "a second worker here means the customer receives the invoice twice", which o3d-alnk's fence
+      // branch made false). `sendAccountingInvoiceEmailInternal` enqueues through `queueEmail`, and
+      // `email_outbox_undelivered_reference_uq` refuses a row while the first is still PENDING or
+      // PROCESSING; that refusal arrives back as `already_queued`, this handler answers success, and
+      // no extra row exists. The duplicate therefore needs A's copy to have left that partial index —
+      // a drain settled it to SENT — before B enqueues, so it arrives only when the replay crosses a
+      // drain. The fence is still taken, for the reason it always was: this is a QUEUE write with no
+      // `createDispatchWrite`, so nothing downstream can couple the effect to this completion, and a
+      // copy that HAS gone cannot be recalled.
       const fence = await lease.fenceBeforeRemoteWrite('invoice-email')
       if (!fence.ok) return fence.result
       const emailResult = await sendAccountingInvoiceEmailInternal(orderId)
