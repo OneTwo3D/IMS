@@ -25,6 +25,7 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission } fro
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsnsForDuplicateRecovery,
+  findRecoverableMintsoftAsn,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   MINTSOFT_AUTH_TOKEN_KEY,
@@ -2750,21 +2751,6 @@ export async function createMintsoftPurchaseOrderAsn(
     return `${pendingAsnPrefix}${Date.now()}`
   }
 
-  function getMintsoftAsnRawString(raw: Record<string, unknown> | null, keys: string[]): string | null {
-    if (!raw) return null
-    for (const key of keys) {
-      const value = raw[key]
-      if (typeof value === 'string' && value.trim()) return value.trim()
-      if (typeof value === 'number' && Number.isFinite(value)) return String(value)
-    }
-    return null
-  }
-
-  function quantitiesMatch(left: number | null | undefined, right: number | null | undefined): boolean {
-    if (left == null || right == null) return false
-    return Math.abs(left - right) < 0.0001
-  }
-
   function buildCorrelatedAsnCallbackUrl(baseCallbackUrl: string | null, asnMapId: string): string | null {
     if (!baseCallbackUrl) return null
 
@@ -3216,44 +3202,17 @@ export async function createMintsoftPurchaseOrderAsn(
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
     // o3d-bhvu: the COMPLETE list or a throw (which the catch below turns into a failed attempt that
-    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate.
-    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery(reservation.externalWarehouseId)
-    const correlatedCallbackUrl = buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId)
-    const expectedLineCount = reservation.lines.length
-
-    if (correlatedCallbackUrl) {
-      const correlatedMatch = remoteAsns.find((asn) => (
-        getMintsoftAsnRawString(asn.raw, ['CallbackUrl', 'callbackUrl']) === correlatedCallbackUrl
-      ))
-      if (correlatedMatch) {
-        return correlatedMatch
-      }
-    }
-
-    const matches = remoteAsns.filter((asn) => {
-      // Mintsoft stores the reference as POReference (o3d-bhvu); `Reference` is not in its ASN model.
-      if (getMintsoftAsnRawString(asn.raw, ['POReference', 'Reference', 'reference']) !== reservation.reference) {
-        return false
-      }
-
-      if (asn.lines.length !== expectedLineCount) {
-        return false
-      }
-
-      const lineBySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
-      return reservation.lines.every((line) => {
-        const matchedLine = lineBySourceId.get(line.sourceLineId)
-        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.expectedQty)
-      })
+    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate. Read
+    // across the whole tenant (review M3): an ASN an earlier attempt created while the binding pointed at
+    // another warehouse must still be found; findRecoverableMintsoftAsn then refuses it by name rather than
+    // adopting it or creating a second one.
+    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery()
+    return findRecoverableMintsoftAsn(remoteAsns, {
+      reference: reservation.reference,
+      externalWarehouseId: reservation.externalWarehouseId,
+      correlatedCallbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
+      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.expectedQty })),
     })
-
-    matches.sort((left, right) => {
-      const leftCreatedAt = Date.parse(getMintsoftAsnRawString(left.raw, ['CreatedAt', 'createdAt']) ?? '')
-      const rightCreatedAt = Date.parse(getMintsoftAsnRawString(right.raw, ['CreatedAt', 'createdAt']) ?? '')
-      return (Number.isFinite(rightCreatedAt) ? rightCreatedAt : 0) - (Number.isFinite(leftCreatedAt) ? leftCreatedAt : 0)
-    })
-
-    return matches[0] ?? null
   }
 
   async function claimPendingAsnCreation(asnMapId: string): Promise<boolean> {
@@ -3691,21 +3650,6 @@ export async function createMintsoftTransferAsn(
    */
   function buildPendingExternalAsnId(): string {
     return `${pendingAsnPrefix}${Date.now()}-${randomUUID().slice(0, 8)}`
-  }
-
-  function getMintsoftAsnRawString(raw: Record<string, unknown> | null, keys: string[]): string | null {
-    if (!raw) return null
-    for (const key of keys) {
-      const value = raw[key]
-      if (typeof value === 'string' && value.trim()) return value.trim()
-      if (typeof value === 'number' && Number.isFinite(value)) return String(value)
-    }
-    return null
-  }
-
-  function quantitiesMatch(left: number | null | undefined, right: number | null | undefined): boolean {
-    if (left == null || right == null) return false
-    return Math.abs(left - right) < 0.0001
   }
 
   function buildCorrelatedAsnCallbackUrl(baseCallbackUrl: string | null, asnMapId: string): string | null {
@@ -4321,45 +4265,19 @@ export async function createMintsoftTransferAsn(
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
     // o3d-bhvu: the COMPLETE list or a throw (which the catch below turns into a failed attempt that
-    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate.
-    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery(reservation.externalWarehouseId)
-    const correlatedCallbackUrl = buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId)
-    const expectedLineCount = reservation.lines.length
-
-    if (correlatedCallbackUrl) {
-      const correlatedMatch = remoteAsns.find((asn) => (
-        getMintsoftAsnRawString(asn.raw, ['CallbackUrl', 'callbackUrl']) === correlatedCallbackUrl
-      ))
-      if (correlatedMatch) {
-        return correlatedMatch
-      }
-    }
-
-    const matches = remoteAsns.filter((asn) => {
-      // Mintsoft stores the reference as POReference (o3d-bhvu); `Reference` is not in its ASN model.
-      if (getMintsoftAsnRawString(asn.raw, ['POReference', 'Reference', 'reference']) !== reservation.reference) {
-        return false
-      }
-
-      if (asn.lines.length !== expectedLineCount) {
-        return false
-      }
-
-      const lineBySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
-      return reservation.lines.every((line) => {
-        const matchedLine = lineBySourceId.get(line.sourceLineId)
-        // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation.
-        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.outstanding.qtyNumber)
-      })
+    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate. Read
+    // across the whole tenant (review M3): an ASN an earlier attempt created while the binding pointed at
+    // another warehouse must still be found; findRecoverableMintsoftAsn then refuses it by name rather than
+    // adopting it or creating a second one.
+    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery()
+    return findRecoverableMintsoftAsn(remoteAsns, {
+      reference: reservation.reference,
+      externalWarehouseId: reservation.externalWarehouseId,
+      correlatedCallbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
+      // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-zzgp: the branded
+      // outstanding reading becomes a plain number here, and only here).
+      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
     })
-
-    matches.sort((left, right) => {
-      const leftCreatedAt = Date.parse(getMintsoftAsnRawString(left.raw, ['CreatedAt', 'createdAt']) ?? '')
-      const rightCreatedAt = Date.parse(getMintsoftAsnRawString(right.raw, ['CreatedAt', 'createdAt']) ?? '')
-      return (Number.isFinite(rightCreatedAt) ? rightCreatedAt : 0) - (Number.isFinite(leftCreatedAt) ? leftCreatedAt : 0)
-    })
-
-    return matches[0] ?? null
   }
 
   async function claimPendingAsnCreation(asnMapId: string): Promise<boolean> {

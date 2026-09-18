@@ -3,6 +3,7 @@ import test, { mock } from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import * as realMintsoftNs from '@/lib/connectors/mintsoft'
+import * as realConnectorFetchNs from '@/lib/security/connector-fetch'
 import {
   loadTransferLineLandedQty,
   loadTransferLineOutstandingQty,
@@ -100,6 +101,8 @@ let transferLines: TransferLineSeed[] = []
 let nextId = 0
 let transactionRollbacks = 0
 const createAsnCalls: Array<{ lines: Array<{ sourceLineId: string; sku: string; quantity: number }> }> = []
+/** Duplicate-recovery listings the creator made — proof the stub, not the real reader, answered them. */
+let recoveryListings = 0
 const landedLookups: Array<Record<string, unknown>> = []
 
 function seed(lines: TransferLineSeed[], options: { withPendingReservation?: boolean } = {}) {
@@ -107,6 +110,7 @@ function seed(lines: TransferLineSeed[], options: { withPendingReservation?: boo
   nextId = 0
   transactionRollbacks = 0
   createAsnCalls.length = 0
+  recoveryListings = 0
   landedLookups.length = 0
   asnMaps = []
   asnLines = []
@@ -417,6 +421,18 @@ const db: Record<string, unknown> = {
   },
 }
 
+// o3d-bhvu round 2: THE HTTP BOUNDARY ITSELF IS STUBBED TOO. This test drives the ASN creators, and the
+// review found that after a rename its connector-namespace stub no longer covered the listing the creators
+// call, so the real reader ran. Any request that gets past the namespace stubs lands here and fails; the
+// suite-wide trap (tests/no-outbound-network.ts) would also refuse the connection.
+mock.module('@/lib/security/connector-fetch', {
+  namedExports: {
+    ...(realConnectorFetchNs as unknown as Record<string, unknown>),
+    connectorFetch: async (input: string | URL) => {
+      throw new Error(`o3d-bhvu: an HTTP request reached the connector boundary from a unit test (${String(input)}); Mintsoft is LIVE`)
+    },
+  },
+})
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/auth/server', {
@@ -455,7 +471,13 @@ mock.module('@/lib/jobs/wms/process-mintsoft-booked-in-event', {
 mock.module('@/lib/connectors/mintsoft', {
   namedExports: {
     ...(realMintsoftNs as unknown as Record<string, unknown>),
-    fetchMintsoftAsns: async () => [],
+    // o3d-bhvu: the creators' duplicate recovery lists through fetchMintsoftAsnsForDuplicateRecovery; it is
+    // stubbed here and counted, and the old name throws so a creator that lists through it again is loud.
+    fetchMintsoftAsnsForDuplicateRecovery: async () => {
+      recoveryListings += 1
+      return []
+    },
+    fetchMintsoftAsns: async () => { throw new Error('o3d-bhvu: fetchMintsoftAsns is not the creators\u2019 listing; nothing here may reach Mintsoft') },
     getMintsoftSettings: async () => ({ mintsoft_webhook_secret: 'whsec' }),
   },
 })
@@ -567,6 +589,7 @@ test('o3d-zzgp: a retried transfer ASN is sized for the units still coming, not 
   const result = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
 
   assert.equal(result.success, true, `create failed: ${result.error ?? ''}`)
+  assert.equal(recoveryListings, 1, 'o3d-bhvu: duplicate recovery listed once, through the stub — not the real Mintsoft reader')
   // THE WIRE VALUE FIRST. WAS 10: Mintsoft told to expect ten units, six of which were
   // on its own shelves.
   assert.equal(createAsnCalls.length, 1, 'exactly one ASN create should reach the WMS')

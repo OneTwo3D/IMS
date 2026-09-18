@@ -56,6 +56,16 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
+**No test may reach the network (o3d-bhvu).** `test:unit` and `test:concurrency` both load
+`tests/no-outbound-network.ts` with `--import`. It wraps `net.Socket.prototype.connect` and refuses any
+connection to a non-loopback address — a routable IP literal, or a name that resolves to one — with
+`OutboundNetworkBlockedError`, before anything is sent. Loopback and unix sockets (the local Postgres, a
+test's own `http.createServer`) are allowed. Names are resolved through the caller's own `lookup` first,
+so `connectorFetch`'s SSRF refusals still surface as themselves. A test that drives a connector must mock
+`@/lib/security/connector-fetch` (or the connector's API functions) rather than rely on the trap, which is
+the backstop against a missing stub hitting a LIVE API such as Mintsoft. A focused run started with plain
+`npx tsx --test` does NOT load the trap; add `--import ./tests/no-outbound-network.ts` to get it.
+
 ### Database-backed tiers
 
 Two tiers want a real, migrated PostgreSQL, and these are the invocations that give them one:

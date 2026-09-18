@@ -214,10 +214,14 @@ function loadModules() {
       namedExports: {
         ...(realMintsoft as unknown as Record<string, unknown>),
         getMintsoftSettings: async () => ({ mintsoft_webhook_secret: '' }),
-        fetchMintsoftAsns: async () => {
+        // o3d-bhvu: the creators' duplicate-recovery listing is fetchMintsoftAsnsForDuplicateRecovery.
+        // The gate stays AT the listing step (between reservation and revalidation), and the old name
+        // throws, so a creator that ever lists through it again fails here instead of skipping the gate.
+        fetchMintsoftAsnsForDuplicateRecovery: async () => {
           if (listingGate.current) await listingGate.current.arrive()
           return []
         },
+        fetchMintsoftAsns: async () => { throw new Error(LIVE_WMS) },
       },
     })
     const realRegistry = await import('@/lib/connectors/wms/registry')
@@ -539,7 +543,15 @@ test(
       // (1) Reserve, and pause at the WMS listing call between reservation and revalidation.
       const gate = armListingGate()
       const createPromise = createMintsoftTransferAsn(world.transfer.id, { autoCallback: false })
-      await gate.reached
+      // o3d-bhvu round 2: the gate being reached is ASSERTED, not assumed. If the action finished without
+      // ever calling the gated listing (a rename, a stub on the wrong name), the race below would be run
+      // against no window at all; this fails first instead of hanging or passing vacuously.
+      await Promise.race([
+        gate.reached,
+        createPromise.then((result) => {
+          throw new Error(`the ASN action finished without reaching the gated listing step: ${JSON.stringify(result)}`)
+        }),
+      ])
 
       const reserved = await db.wmsAsnMap.findMany({
         where: { sourceType: 'STOCK_TRANSFER', sourceId: world.transfer.id },

@@ -102,6 +102,8 @@ function loadModules() {
         ...(realMintsoft as unknown as Record<string, unknown>),
         getMintsoftSettings: async () => ({ mintsoft_webhook_secret: '' }),
         fetchMintsoftAsns: async () => { throw new Error(LIVE_WMS) },
+        // o3d-bhvu: the name the creators actually call for duplicate recovery. LIVE_WMS, like the rest.
+        fetchMintsoftAsnsForDuplicateRecovery: async () => { throw new Error(LIVE_WMS) },
       },
     })
     const realRegistry = await import('@/lib/connectors/wms/registry')

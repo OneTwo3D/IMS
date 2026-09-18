@@ -459,8 +459,9 @@ export async function fetchMintsoftBundle(externalProductId: string): Promise<Wm
  *   - There is NO filter by our reference (the parameters are ASNStatusId, ClientId, PageNo, Limit,
  *     WarehouseId, SinceLastUpdated, BookedIn*Interval, IncludeASNItems), and an unparseable
  *     SinceLastUpdated is silently IGNORED rather than rejected — so no filter here may be trusted
- *     to narrow correctly, and none is relied on except WarehouseId, which does narrow (live: 16 rows
- *     for warehouse 6, and 100+ for warehouse 5).
+ *     to narrow correctly. WarehouseId does narrow (live: 16 rows for warehouse 6, 100+ for 5) and is
+ *     offered to callers, but duplicate recovery deliberately does not use it (review M3, see
+ *     fetchMintsoftAsnsForDuplicateRecovery).
  *
  * SO THIS EITHER RETURNS THE WHOLE LIST OR THROWS. It pages to exhaustion (a short page ends it),
  * refuses a page larger than it asked for, refuses to go past `MINTSOFT_ASN_LIST_MAX_PAGES`, and —
@@ -584,8 +585,13 @@ export async function fetchMintsoftAsns(options: MintsoftAsnListOptions = {}): P
  * row without them is one this caller cannot rule out as its own, and skipping it would be the partial
  * scan this function exists to prevent.
  */
-export async function fetchMintsoftAsnsForDuplicateRecovery(externalWarehouseId: string | null, options: Omit<MintsoftAsnListOptions, 'warehouseId'> = {}): Promise<WmsAsnRef[]> {
-  const rows = await fetchMintsoftAsnListRows({ ...options, warehouseId: externalWarehouseId })
+export async function fetchMintsoftAsnsForDuplicateRecovery(options: Omit<MintsoftAsnListOptions, 'warehouseId'> = {}): Promise<WmsAsnRef[]> {
+  // TENANT-WIDE, NOT SCOPED TO THE RESERVATION'S WAREHOUSE (review of o3d-bhvu, M3). A push whose
+  // response was lost, then a rebind of the warehouse, then a retry: a scan scoped to the NEW warehouse
+  // cannot see the ASN the first attempt created at the old one, so the retry creates a second.
+  // Unscoped, the earlier ASN is found and findRecoverableMintsoftAsn refuses the mismatch by name.
+  // Cost today: 220 ASNs = 3 pages x 2 consistent scans = 6 GETs per creation attempt.
+  const rows = await fetchMintsoftAsnListRows({ ...options, warehouseId: null })
   return rows.map((row) => normalizeMintsoftAsnListRowForRecovery(row))
 }
 
