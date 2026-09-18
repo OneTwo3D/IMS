@@ -12,7 +12,7 @@ export default async function MarginAnalyticsPage({ searchParams }: { searchPara
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
   const report = await loadMarginAnalyticsReportForPage(filters)
-  // o3d-kyey: `≤` = at most the true figure; `?` = a bound exists but its direction is not
+  // o3d-kyey: `≤` = the true figure is at most the one shown; `?` = a bound exists but its direction is not
   // established (a ratio moves its numerator and denominator together). See derived-figure-bound.ts.
   const bound = (value: string | undefined) => boundSuffix((value ?? 'exact') as DerivedFigureBound)
   const columns: Array<SalesAnalyticsColumn<MarginReportRow>> = [
