@@ -84,7 +84,7 @@ MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. E
 | --- | --- | ---: | ---: |
 | `shopping-webhook-retention-evidence` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 2 |
 | `reconciliation-void-mirror-contradictions` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 16 |
-| `reconciliation-unmirrored-sync-logs` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 6 |
+| `reconciliation-unmirrored-sync-logs` | `RUN_DB_RETENTION_TESTS` — the whole file | 0 | 8 |
 | `connection-schema-pinning` | `DATABASE_URL` present — its live tests only | 33 | 14 |
 | `session-lock-affinity` | `DATABASE_URL` present — its live tests only | 26 | 4 |
 | `guarded-pool-routing` | `DATABASE_URL` present — its live test only | 7 | 1 |
@@ -93,9 +93,9 @@ MEASURED CENSUS OF `tests/db/**` — counted by running it, not by reading it. E
 | `post-remote-persist` | nothing | 12 | 0 |
 | `prisma-unique-violation` | nothing | 9 | 0 |
 | `pool-acquisition-bound` | nothing | 2 | 0 |
-| **total** | | **101** | **44** |
+| **total** | | **101** | **46** |
 
-101 of the tier's 145 tests therefore execute inside an ordinary `npm run test:unit`. What
+101 of the tier's 147 tests therefore execute inside an ordinary `npm run test:unit`. What
 `npm run test:db` adds is the database: the four `DATABASE_URL` files switch their live probes on,
 and the three `RUN_DB_*` files stop skipping entirely.
 
@@ -108,10 +108,11 @@ must be, whenever it is quoted. The two corrections made on 2026-09-17 were meas
 file under the variables named above: `reconciliation-void-mirror-contradictions` at 0/16, and
 `connection-schema-pinning`'s skips at 14 rather than 13 (its total is 47, which is what took the
 tier to 139). `reconciliation-unmirrored-sync-logs` (o3d-bnp6) was measured the same way when it
-landed, at 0/6, and every other row was re-measured beside it and had not moved: 145 tests.
+landed, at 0/6, and every other row was re-measured beside it and had not moved: 145 tests. Its
+review follow-up added two tests (0/8), re-measured the same way with every other row unmoved: 147.
 
 What is worth carrying instead of a number is the property the number was there to illustrate: both
-tiers are COLLECTED by `test:unit`, so every one of these 44 skips, and every skip in
+tiers are COLLECTED by `test:unit`, so every one of these 46 skips, and every skip in
 `tests/concurrency/**`, is reported as `# SKIP` inside a run that still exits 0.
 
 Two qualifications on the row for `startup-option-verdict-across-bundles`, both read out of the file
@@ -165,7 +166,7 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
   or RENAME the pair — the second is bit for bit the defect this pair was invented to repair — and
   every test in all three files reports `# SKIP` in a green CI job, with no error anywhere. Reading an
   unset pair as merely "an ordinary local run" is therefore the understatement to avoid: it is also
-  what a `package.json` edit leaves behind, and in the `db-backed-regressions` job it means 24
+  what a `package.json` edit leaves behind, and in the `db-backed-regressions` job it means 26
   unexecuted tests and a green tick. o3d-dzsd carries the runtime census that would close it.
 * **NOT ENFORCED: that a NEW gate cannot hide.** The census above is prose in two files and nothing
   reads it. A file added to `tests/db/` that gates itself on a variable `npm run test:db` does not set
