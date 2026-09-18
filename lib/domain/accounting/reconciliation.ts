@@ -111,7 +111,19 @@ export const ECMASCRIPT_BLANK_PATTERN = `^(?:${ECMASCRIPT_TRIM_CHARACTERS.join('
  *
  * `"C"` IS ALWAYS AVAILABLE, whatever the encoding: it is a built-in collation with no encoding of
  * its own, so this one statement is accepted on the estate's SQL_ASCII databases and on a UTF8 one
- * alike, and both are exercised by the DB suite. Under `"C"`, `lower()` folds `A`-`Z` and touches
+ * alike, and both are exercised by the DB suite.
+ *
+ * o3d-11rf r13 — AND THE INDEPENDENCE IS MEASURED, ON FOUR DATABASES, NOT ARGUED. Every one of the
+ * 1,112,063 code points, in all four positions a key part can hold one, this normalisation against
+ * `buildAccountingEventIdempotencyKey`: SQL_ASCII with libc C/C, UTF8 with libc `C.utf8`, UTF8 with
+ * the PostgreSQL 17 `builtin` `C.UTF-8` provider, and UTF8 with ICU `en-US` — ZERO divergences on all
+ * four, and `lower(x COLLATE "C")` returns U+212A and U+0130 unchanged on all four. That is the
+ * property the pin is for: the case mapping follows the collation named on the ARGUMENT, not the
+ * ctype the database was created with. It matters because `install.sh` creates the application
+ * database with a bare `CREATE DATABASE`, which inherits `template1` — SQL_ASCII/C here, UTF8 with a
+ * UTF-8 ctype on a stock Debian `initdb`, which is what GitHub's `postgres:16` service gives CI. The
+ * DB suite's own premises had encoded the estate's answer and went red in CI for it; they now use a
+ * rival that fails identically on every ctype. Under `"C"`, `lower()` folds `A`-`Z` and touches
  * nothing else — which is precisely the ASCII-only fold ASCII_FOLD_EXCEPTIONS below was written
  * against. The pin does not change what this estate computes today; it makes the estate's ctype stop
  * being load-bearing, so ASCII_FOLD_EXCEPTIONS' exhaustive walk is a statement about the STATEMENT

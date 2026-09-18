@@ -1225,20 +1225,42 @@ test('o3d-11rf r10: PostgreSQL agrees with JavaScript trim() on every character,
  * DIFFERENT — `a-b` instead of `akb` — and quietly pairs with nothing while its sibling row key still
  * pairs, which is the form that leaves the report looking healthy.
  *
- * IT ASSERTS ITS OWN PRECONDITIONS, in the database, before it concludes anything: that PostgreSQL's
- * fold and JavaScript's really do disagree about these characters, and that the derivation as it was
- * SPELLED BEFORE THE FIX really does produce a different key — or no key at all — for these exact
- * tokens. Without those, a fixture like this one can pass while reaching nothing.
+ * IT ASSERTS ITS OWN PRECONDITIONS, in the database, before it concludes anything: that the fold the
+ * statement performs leaves these characters alone, and that the spelling WITHOUT the substitutions
+ * really does produce a different key — or no key at all — for these exact tokens. Without those, a
+ * fixture like this one can pass while reaching nothing.
  *
- * THE PRECONDITIONS ARE ABOUT THIS ESTATE; THE CONCLUSION IS NOT, and the difference was MEASURED
- * rather than reasoned. Run against a PostgreSQL 17 database created with `LOCALE_PROVIDER builtin
- * BUILTIN_LOCALE 'C.UTF-8'`, whose `lower()` folds U+212A to `k` on its own and U+0130 to a bare `i`,
- * the two preconditions below FAIL — correctly, because on such a database the pre-r11 spelling had
- * no Kelvin defect to measure — while the closing assertion, that the production statement reports
- * every event the TypeScript builder's keys name, still PASSES. The substitution puts both characters
- * beyond `lower()` before it runs, so the statement derives the same keys whatever the ctype does;
- * the fixture's ability to DEMONSTRATE the old defect is what depends on the ctype. A failure in a
- * precondition here therefore means the premise moved, not that the query regressed.
+ * o3d-11rf r13 — AND THE PRECONDITION MUST BE CHOSEN SO THAT IT IS NOT ABOUT THIS ESTATE.
+ *
+ * An earlier version of this test took its premise from the UNPINNED `lower()` — the pre-r11 spelling
+ * — and asserted it leaves U+212A exactly as it found it. That is a fact about the DATABASE'S ctype,
+ * not about the statement, and CI proved it: on GitHub's stock `postgres:16` (UTF8, a UTF-8 ctype)
+ * unpinned `lower()` folds U+212A to `k` on its own, the premise is false, and the suite went RED for
+ * a reason that has nothing to do with the query. `install.sh` creates the application database with
+ * a bare `CREATE DATABASE`, so it inherits `template1` — SQL_ASCII/C on this estate, UTF8 with a
+ * UTF-8 ctype on a stock Debian initdb — which means the old premise was a coin toss on the host.
+ *
+ * WHAT WAS MEASURED, four scratch databases, every one of the 1,112,063 code points, in all four
+ * positions, PRODUCTION spelling against the TypeScript builder:
+ *
+ *   SQL_ASCII, libc C/C                  0 divergences
+ *   UTF8, libc C.utf8/C.utf8             0 divergences
+ *   UTF8, builtin C.UTF-8                0 divergences
+ *   UTF8, ICU en-US                      0 divergences
+ *
+ * So the CONCLUSION is ctype-independent, and `lower(x COLLATE "C")` returned both of these
+ * characters unchanged on all four — the pin really does decide the case mapping and not merely the
+ * comparison. What varies is only which RIVAL spelling can still demonstrate the old defect:
+ *
+ *   pre-r11, UNPINNED        SQL_ASCII/C: both characters · UTF8 libc or builtin: U+0130 only ·
+ *                            ICU: NEITHER (its `lower()` matches JavaScript on both)
+ *   pinned, UNSUBSTITUTED    EXACTLY these two characters on ALL FOUR databases
+ *
+ * The preconditions below therefore use the second: the production fold with the pin kept and the
+ * substitutions removed. That rival fails identically whatever the ctype is, so the fixture's
+ * non-vacuity stops depending on the host — and the pre-r11 spelling is still measured, but as a
+ * REPORT with a subset assertion, announced loudly when this database cannot demonstrate it, rather
+ * than as a premise that can turn a green query red.
  */
 const CASE_FOLD_CHARACTERS = [
   { suffix: 'kelvin', character: 'K', label: 'U+212A KELVIN SIGN' },
@@ -1258,6 +1280,72 @@ const COLLAPSE_EXPRESSION = (value: string) =>
 
 /** The normalisation the statement performed BEFORE r11 — restated so the defect can be measured. */
 const UNSUBSTITUTED_NORMALISATION = (value: string) => COLLAPSE_EXPRESSION(`lower(${value})`)
+
+/**
+ * o3d-11rf r13 — THE RIVAL WHOSE FAILURE IS THE SAME ON EVERY DATABASE.
+ *
+ * The production fold with the PIN KEPT and the two substitutions REMOVED. Derived from
+ * FOLD_EXPRESSION by deleting its `replace()` pair rather than typed out, and both halves of that
+ * deletion are asserted, so a fold whose shape has moved fails here instead of measuring a spelling
+ * the statement never had.
+ *
+ * WHY THIS ONE. Under the pin, `lower()` folds `A`-`Z` and nothing else on ANY encoding, collation
+ * provider or ctype — measured on four databases, see the block above CASE_FOLD_CHARACTERS. So this
+ * rival gets EXACTLY the two substituted characters wrong everywhere, which makes it a premise about
+ * the statement rather than about the host the database was created on.
+ */
+const PINNED_UNSUBSTITUTED_FOLD = (value: string) => {
+  const stripped = FOLD_EXPRESSION(value).replace(`replace(replace(${value}, $2, $3), $4, $5)`, value)
+  assert.ok(!stripped.includes('replace('),
+    `the substitutions really were stripped from the fold, leaving: ${stripped}`)
+  assert.ok(stripped.includes(COLLATION_PIN),
+    `and the collation pin really was kept, leaving: ${stripped}`)
+  return stripped
+}
+const PINNED_UNSUBSTITUTED_NORMALISATION = (value: string) =>
+  COLLAPSE_EXPRESSION(PINNED_UNSUBSTITUTED_FOLD(value))
+
+/** How this database was created, for the messages that report which branch of the fold ran. */
+async function caseMappingContext(tx: Tx) {
+  const rows = await tx.$queryRaw`
+    SELECT pg_encoding_to_char(encoding) AS "encoding",
+           datcollate                    AS "collate",
+           datctype                      AS "ctype",
+           datlocprovider::text          AS "provider"
+    FROM pg_database WHERE datname = current_database()
+  ` as Array<{ encoding: string; collate: string; ctype: string; provider: string }>
+  const row = rows[0]
+  assert.ok(row, 'the database describes its own encoding and ctype')
+  return `${row.encoding}, collate ${row.collate}, ctype ${row.ctype}, provider ${row.provider}`
+}
+
+/**
+ * o3d-11rf r13 — AN UNDEMONSTRABLE HISTORICAL DEFECT IS ANNOUNCED, NOT SKIPPED AND NOT FAILED.
+ *
+ * On an ICU database the pre-r11 spelling agrees with JavaScript on both characters, so there is no
+ * old defect left to measure there. That must not fail (the query is fine and is proved fine by the
+ * pinned-unsubstituted rival above) and it must not pass in silence either, because a reader of a
+ * green log would otherwise believe the historical evidence was collected. Same three channels as
+ * `skipUnprovenLocaleHalf`, without the skip: the test goes on to prove the property that does hold.
+ */
+function announceUndemonstrable(what: string, context: string) {
+  const message = `${what} cannot be demonstrated on this database (${context}): its own lower() `
+    + 'already agrees with JavaScript on those characters. The pinned-but-unsubstituted rival was '
+    + 'used instead, which fails identically on every ctype, so the property IS proved here — only '
+    + 'the historical measurement is unavailable.'
+  process.stderr.write(`\n!! NOT MEASURED HERE: ${message}\n`)
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    process.stdout.write(`::warning title=o3d-11rf r11 historical rival not demonstrable::${message}\n`)
+  }
+  const summary = process.env.GITHUB_STEP_SUMMARY
+  if (summary) {
+    try {
+      appendFileSync(summary, `- **NOT MEASURED HERE (o3d-11rf r11 historical rival):** ${message}\n`)
+    } catch {
+      // A summary file that cannot be written must not fail the suite; stderr above already said it.
+    }
+  }
+}
 
 /**
  * o3d-11rf r12 — THE FOLD AS IT WAS SPELLED BEFORE THE COLLATION PIN, and the pin PUT IN THE WRONG
@@ -1361,19 +1449,28 @@ test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in
 
   const expected = fixtures.flatMap((f) => f.keys.map((_, k) => `${f.rowId}-e${k}`))
 
-  const { findings, folds, derivations } = await withRollback(async (tx) => {
-    // PRECONDITION 1 — THE TWO FOLDS DISAGREE, and PostgreSQL is asked rather than assumed.
-    const folds = await tx.$queryRaw`
-      SELECT v, lower(v) AS "sqlFold"
-      FROM unnest(${CASE_FOLD_CHARACTERS.map((c) => c.character)}::text[]) AS v
-    ` as Array<{ v: string; sqlFold: string }>
+  const { findings, folds, derivations, context } = await withRollback(async (tx) => {
+    const context = await caseMappingContext(tx)
 
-    // PRECONDITION 2 — AND IT REACHES THE KEY. The pre-r11 spelling is run against each fixture's own
-    // token, so the difference is measured on the strings this test actually uses.
+    // PRECONDITION 1 — THE FOLD THE STATEMENT PERFORMS LEAVES THESE CHARACTERS ALONE, which is why
+    // they have to be substituted before it runs. Asked of PostgreSQL, in the statement's own pinned
+    // spelling, so the answer is about the query and not about the ctype this database was made with.
+    // `lower(v)` beside it is the pre-r11 spelling, measured for the report below, asserted nowhere.
+    const folds = await tx.$queryRawUnsafe(
+      `SELECT v, lower(v ${COLLATION_PIN}) AS "pinnedFold", lower(v) AS "unpinnedFold"
+         FROM unnest($1::text[]) AS v`,
+      CASE_FOLD_CHARACTERS.map((c) => c.character),
+    ) as Array<{ v: string; pinnedFold: string; unpinnedFold: string }>
+
+    // PRECONDITION 2 — AND IT REACHES THE KEY. Both rivals are run against each fixture's own token,
+    // so the difference is measured on the strings this test actually uses: the pinned-unsubstituted
+    // spelling (which fails on every ctype) and the pre-r11 unpinned one (which may not).
     const derivations = await tx.$queryRawUnsafe(
-      `SELECT v, ${UNSUBSTITUTED_NORMALISATION('v')} AS "before" FROM unnest($1::text[]) AS v`,
+      `SELECT v, ${PINNED_UNSUBSTITUTED_NORMALISATION('v')} AS "unsubstituted",
+                 ${UNSUBSTITUTED_NORMALISATION('v')} AS "before"
+         FROM unnest($1::text[]) AS v`,
       fixtures.map((f) => f.token),
-    ) as Array<{ v: string; before: string | null }>
+    ) as Array<{ v: string; unsubstituted: string | null; before: string | null }>
 
     for (const fixture of fixtures) {
       await makeSyncLog(tx, {
@@ -1387,33 +1484,60 @@ test('o3d-11rf r11: a KELVIN SIGN and a DOTTED CAPITAL I derive the SAME keys in
       }
     }
 
-    return { findings: (await reportFindings(tx)).findings, folds, derivations }
+    return { findings: (await reportFindings(tx)).findings, folds, derivations, context }
   })
 
   for (const { character, label } of CASE_FOLD_CHARACTERS) {
     const observed = folds.find((row) => row.v === character)
     assert.ok(observed, `${label} survived the round trip`)
-    assert.equal(observed.sqlFold, character,
-      `${label} — PostgreSQL lower() leaves it exactly as it found it. Every database in this estate `
-      + 'is SQL_ASCII with a C ctype; see the note above for what a failure here means')
+    assert.equal(observed.pinnedFold, character,
+      `${label} — the fold this statement performs, lower(x ${COLLATION_PIN}), leaves it exactly as it `
+      + `found it on ${context}, which is why it has to be substituted BEFORE the fold runs`)
     assert.notEqual(character.toLowerCase(), character,
       `${label} — JavaScript toLowerCase() does not. THAT is the disagreement, stated before it is used`)
   }
 
-  // And the disagreement changes the KEY, not merely the character: the pre-r11 derivation produces
-  // something OTHER than what TypeScript produces for every one of these four tokens.
+  // And the disagreement changes the KEY, not merely the character: WITHOUT the substitutions the
+  // statement's own pinned fold produces something OTHER than TypeScript for every one of these four
+  // tokens. This holds on every encoding and ctype (see the block above), so it is asserted.
   for (const fixture of fixtures) {
-    const before = derivations.find((row) => row.v === fixture.token)
-    assert.ok(before, `${fixture.label} — the pre-r11 derivation was measured`)
+    const measured = derivations.find((row) => row.v === fixture.token)
+    assert.ok(measured, `${fixture.label} — the unsubstituted derivation was measured`)
     const typescriptPart = fixture.token.trim().toLowerCase()
       .replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
-    assert.notEqual(before.before, typescriptPart,
-      `${fixture.label} — the derivation this replaced gives ${JSON.stringify(before.before)} where `
-      + `TypeScript gives ${JSON.stringify(typescriptPart)}`)
+    assert.notEqual(measured.unsubstituted, typescriptPart,
+      `${fixture.label} — the same fold without the substitutions gives `
+      + `${JSON.stringify(measured.unsubstituted)} where TypeScript gives `
+      + `${JSON.stringify(typescriptPart)} (${context})`)
   }
-  assert.ok(derivations.some((row) => row.before === null || row.before === ''),
-    'and for a standalone one it gave NO PART AT ALL, which is how the whole key went NULL — the '
+  assert.ok(derivations.some((row) => row.unsubstituted === null || row.unsubstituted === ''),
+    'and for a standalone one it gives NO PART AT ALL, which is how the whole key went NULL — the '
     + 'shape of the false negative, measured rather than described')
+
+  // THE PRE-r11 SPELLING, REPORTED RATHER THAN REQUIRED. Whether the UNPINNED fold can still show the
+  // defect depends on this database's ctype: on SQL_ASCII/C it misses both characters, on a UTF-8
+  // ctype only U+0130, and on ICU neither. So what is asserted is the CLOSURE — it can never be wrong
+  // about anything outside the substituted table — and the announcement carries the rest.
+  const historicallyWrong = fixtures.filter((fixture) => {
+    const measured = derivations.find((row) => row.v === fixture.token)
+    const typescriptPart = fixture.token.trim().toLowerCase()
+      .replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+    return measured?.before !== typescriptPart
+  })
+  for (const { character, label } of CASE_FOLD_CHARACTERS) {
+    const observed = folds.find((row) => row.v === character)
+    assert.ok(observed && typeof observed.unpinnedFold === 'string',
+      `${label} — what the unpinned fold does here was measured`)
+  }
+  if (historicallyWrong.length === 0) {
+    announceUndemonstrable('the pre-r11 unpinned fold defect', context)
+  } else {
+    for (const fixture of historicallyWrong) {
+      assert.ok(CASE_FOLD_CHARACTERS.some((c) => fixture.token.includes(c.character)),
+        `the pre-r11 spelling is wrong here only about the substituted characters, not ${fixture.label} `
+        + `(${context})`)
+    }
+  }
 
   assert.deepEqual(
     findings.filter((f) => f.code === CONTRADICTION).map((f) => f.accountingEventId).sort(),
@@ -1538,24 +1662,54 @@ async function sweepEveryCodePoint(
 test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on every code point', { skip }, async () => {
   const { substitutions } = await pinnedNormalisation()
 
-  const { disagreements, rivalCharacters } = await withRollback(
-    async (tx) => sweepEveryCodePoint(
-      (sql, params) => tx.$queryRawUnsafe(sql, ...params) as ReturnType<SweepRunner>,
-      substitutions,
-      UNSUBSTITUTED_NORMALISATION,
-    ),
+  const { disagreements, unsubstituted, historical, context, swept } = await withRollback(
+    async (tx) => {
+      const run: SweepRunner = (sql, params) => tx.$queryRawUnsafe(sql, ...params) as ReturnType<SweepRunner>
+      // THE RIVAL THAT FAILS THE SAME WAY EVERYWHERE (r13): the statement's own pinned fold with the
+      // substitutions removed. This is the sweep the non-vacuity claim rests on.
+      const unsubstituted = await sweepEveryCodePoint(run, substitutions, PINNED_UNSUBSTITUTED_NORMALISATION)
+      // AND THE PRE-r11 SPELLING, swept for the report rather than for a premise.
+      const historical = await sweepEveryCodePoint(run, substitutions, UNSUBSTITUTED_NORMALISATION)
+      return {
+        disagreements: unsubstituted.disagreements,
+        unsubstituted,
+        historical,
+        context: await caseMappingContext(tx),
+        swept: unsubstituted.swept,
+      }
+    },
     1_800_000,
   )
 
   assert.deepEqual(disagreements.slice(0, 20), [],
     'the statement derives the same part TypeScript does, for every character, in both positions')
+  assert.ok(swept > 1_000_000, 'every code point, not a sample')
 
-  // NOT VACUOUS. The sweep must reach characters the PRE-r11 spelling got wrong, and it must reach
-  // the two this statement substitutes — otherwise it would pass against a normaliser that never
-  // fixed anything.
-  assert.deepEqual(rivalCharacters, [...CASE_FOLD_CHARACTERS.map((c) => JSON.stringify(c.character))].sort(),
-    'the spelling this replaced disagrees on exactly the substituted characters and no others — '
-    + 'the whole set, and the sweep reaches every one')
+  // NOT VACUOUS, AND THE CLAIM IS NOW CTYPE-INDEPENDENT (r13). Drop the substitutions from the fold
+  // the statement actually performs and it is wrong about EXACTLY the two substituted characters —
+  // measured as such on SQL_ASCII/C, UTF8 libc C.utf8, UTF8 builtin C.UTF-8 and UTF8 ICU alike,
+  // because under the pin `lower()` is an ASCII operation on every one of them.
+  assert.deepEqual(
+    unsubstituted.rivalCharacters,
+    [...CASE_FOLD_CHARACTERS.map((c) => JSON.stringify(c.character))].sort(),
+    'the fold without its substitutions disagrees on exactly the substituted characters and no others '
+    + `— the whole set, and the sweep reaches every one (${context}): `
+    + `${unsubstituted.rivalWrong.slice(0, 8).join(', ')}`,
+  )
+  assert.equal(unsubstituted.rivalWrong.length, CASE_FOLD_CHARACTERS.length * FORMS.length,
+    'in every one of the four positions — alone, embedded, doubled and against the strip')
+
+  // THE PRE-r11 SPELLING: a CLOSURE assertion, not an equality. Which of the two it still gets wrong
+  // depends on this database's ctype (SQL_ASCII/C both, a UTF-8 ctype only U+0130, ICU neither), and
+  // that is exactly why it cannot be a premise — CI's stock postgres:16 is the UTF-8 case.
+  const substituted = CASE_FOLD_CHARACTERS.map((c) => JSON.stringify(c.character))
+  for (const character of historical.rivalCharacters) {
+    assert.ok(substituted.includes(character),
+      `the pre-r11 spelling is wrong only about the substituted characters, never about ${character} `
+      + `(${context})`)
+  }
+  if (historical.rivalCharacters.length === 0) announceUndemonstrable('the pre-r11 unpinned fold defect', context)
+
   for (const { character, label } of CASE_FOLD_CHARACTERS) {
     const [alone] = await Promise.resolve([typescriptPart(character)])
     assert.ok(alone, `${label} builds a part in TypeScript — which is what the old spelling lost`)
@@ -1568,8 +1722,9 @@ test('o3d-11rf r11: the SQL per-part normalisation IS the TypeScript one, on eve
  * r11 walked all 1,114,111 code points and proved the SQL per-part normalisation IS the TypeScript
  * one. It walked them on THIS estate's database. `lower()` resolves the COLLATION of its argument,
  * which for a bare column is whatever the database was created with, so the proof was conditional on
- * a property of the installation that nothing in IMS enforced — and the r11 tests above SAY so, in
- * the sentence "every database in this estate is SQL_ASCII with a C ctype".
+ * a property of the installation that nothing in IMS enforced — and the r11 tests above used to SAY
+ * so, until r13 replaced their premise with one that holds on any ctype (see the block above
+ * CASE_FOLD_CHARACTERS, and the four-database measurement in it).
  *
  * WHAT THAT COSTS ON A DATABASE THAT IS NOT THIS ESTATE'S. On PostgreSQL created
  * `LOCALE_PROVIDER icu ICU_LOCALE 'tr-TR'`, `lower('I')` is `ı` U+0131 DOTLESS I. `ı` is outside
