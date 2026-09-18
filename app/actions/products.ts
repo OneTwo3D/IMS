@@ -26,6 +26,18 @@ import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+// o3d-zzgp: every incoming-stock badge below asks "how much of this transfer line is
+// still coming", and the answer is `qty − LANDED`, not `qty − qtyReceived`. The WMS
+// stock-sync alignment lands units by crediting
+// `wms_asn_line_maps.qtyAccountedViaSnapshot` and never writes `qtyReceived`, so the
+// old expression showed units that were already on the shelf as still in transit.
+import {
+  aggregateTransferLineOutstandingQty,
+  hasOutstandingQty,
+  loadTransferLineOutstandingQty,
+  requireOutstandingQty,
+  transferOutstandingTotalEntries,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
   ComponentGraphInFlightSalesError,
   bumpFulfillmentGraphVersions,
@@ -224,10 +236,11 @@ export async function listProducts(params: {
 
   // Batch query incoming stock (transfers + POs) grouped by product
   const [incomingTransfers, incomingPOs] = await Promise.all([
-    db.stockTransferLine.groupBy({
-      by: ['productId'],
+    // Not a groupBy: the landed quantity is a per-LINE fact (it needs each line's own
+    // ASN rows), so an aggregate over the two columns cannot express it (o3d-zzgp).
+    db.stockTransferLine.findMany({
       where: { productId: { in: allProductIds }, transfer: { status: 'IN_TRANSIT' } },
-      _sum: { qty: true, qtyReceived: true },
+      select: { id: true, productId: true, qty: true, qtyReceived: true },
     }),
     db.purchaseOrderLine.groupBy({
       by: ['productId'],
@@ -239,10 +252,19 @@ export async function listProducts(params: {
     }),
   ])
 
+  const incomingTransferOutstanding = await loadTransferLineOutstandingQty(db, incomingTransfers)
   const incomingByProduct = new Map<string, number>()
-  for (const t of incomingTransfers) {
-    const remaining = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
-    if (remaining > 0) incomingByProduct.set(t.productId, (incomingByProduct.get(t.productId) ?? 0) + remaining)
+  // o3d-zzgp round 2 (Codex MEDIUM): the per-product total is accumulated as BRANDED
+  // values and read out once, below. A `Map<string, number>` accumulator takes
+  // `Number(t.qty) - Number(t.qtyReceived)` just as happily as it takes a reading from
+  // the landed-quantity module, which is how the brand died on this line in round 1.
+  // `aggregateTransferLineOutstandingQty` accepts nothing but the branded value, and by
+  // the time the numbers come back out the transfer line is no longer in scope.
+  const incomingTransferTotals = aggregateTransferLineOutstandingQty(
+    incomingTransfers.map((t) => [t.productId, requireOutstandingQty(incomingTransferOutstanding, t.id)] as const),
+  )
+  for (const [productId, remaining] of transferOutstandingTotalEntries(incomingTransferTotals)) {
+    incomingByProduct.set(productId, (incomingByProduct.get(productId) ?? 0) + remaining)
   }
   for (const po of incomingPOs) {
     const remaining = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
@@ -372,7 +394,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     // Incoming via stock transfers (in-transit, arriving at destination warehouse)
     db.stockTransferLine.findMany({
       where: { productId: id, transfer: { status: 'IN_TRANSIT' } },
-      select: { qty: true, qtyReceived: true, transfer: { select: { toWarehouseId: true, toWarehouse: { select: { id: true, code: true, name: true } } } } },
+      select: { id: true, qty: true, qtyReceived: true, transfer: { select: { toWarehouseId: true, toWarehouse: { select: { id: true, code: true, name: true } } } } },
     }),
     // Incoming from open POs (grouped by destination warehouse)
     db.purchaseOrderLine.findMany({
@@ -396,16 +418,23 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     allocatedByWarehouse.set(wid, (allocatedByWarehouse.get(wid) ?? 0) + Number(line.qty))
   }
 
-  const incomingTransferByWarehouse = new Map<string, number>()
+  const inTransferOutstanding = await loadTransferLineOutstandingQty(db, inTransferLines)
   const warehouseInfoMap = new Map<string, { id: string; code: string; name: string }>()
+  // Keyed by destination warehouse, and branded all the way through, for the same
+  // reason as in `listProducts` above (o3d-zzgp round 2, Codex MEDIUM).
+  const incomingTransferTotalsByWarehouse = aggregateTransferLineOutstandingQty(
+    inTransferLines.map((line) => [
+      line.transfer.toWarehouseId,
+      requireOutstandingQty(inTransferOutstanding, line.id),
+    ] as const),
+  )
   for (const line of inTransferLines) {
-    const wid = line.transfer.toWarehouseId
-    const remaining = Number(line.qty) - Number(line.qtyReceived)
-    if (remaining > 0) {
-      incomingTransferByWarehouse.set(wid, (incomingTransferByWarehouse.get(wid) ?? 0) + remaining)
-      if (line.transfer.toWarehouse) warehouseInfoMap.set(wid, line.transfer.toWarehouse)
-    }
+    if (!hasOutstandingQty(requireOutstandingQty(inTransferOutstanding, line.id))) continue
+    if (line.transfer.toWarehouse) warehouseInfoMap.set(line.transfer.toWarehouseId, line.transfer.toWarehouse)
   }
+  const incomingTransferByWarehouse = new Map<string, number>(
+    transferOutstandingTotalEntries(incomingTransferTotalsByWarehouse),
+  )
 
   // PO incoming grouped by destination warehouse (null = unassigned)
   const incomingPoByWarehouse = new Map<string, number>()
@@ -432,10 +461,10 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   const variantIncomingMap = new Map<string, number>()
   if (variantIds.length > 0) {
     const [vTransfers, vPOs] = await Promise.all([
-      db.stockTransferLine.groupBy({
-        by: ['productId'],
+      // Per-line, not an aggregate, for the same reason as in `listProducts` above.
+      db.stockTransferLine.findMany({
         where: { productId: { in: variantIds }, transfer: { status: 'IN_TRANSIT' } },
-        _sum: { qty: true, qtyReceived: true },
+        select: { id: true, productId: true, qty: true, qtyReceived: true },
       }),
       db.purchaseOrderLine.groupBy({
         by: ['productId'],
@@ -446,9 +475,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         _sum: { qty: true, qtyReceived: true },
       }),
     ])
-    for (const t of vTransfers) {
-      const rem = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
-      if (rem > 0) variantIncomingMap.set(t.productId, (variantIncomingMap.get(t.productId) ?? 0) + rem)
+    const vTransferOutstanding = await loadTransferLineOutstandingQty(db, vTransfers)
+    const vTransferTotals = aggregateTransferLineOutstandingQty(
+      vTransfers.map((t) => [t.productId, requireOutstandingQty(vTransferOutstanding, t.id)] as const),
+    )
+    for (const [productId, rem] of transferOutstandingTotalEntries(vTransferTotals)) {
+      variantIncomingMap.set(productId, (variantIncomingMap.get(productId) ?? 0) + rem)
     }
     for (const po of vPOs) {
       const rem = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
@@ -2107,6 +2139,7 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
         },
       },
       select: {
+        id: true,
         qty: true,
         qtyReceived: true,
         transfer: { select: { id: true, reference: true, status: true } },
@@ -2130,9 +2163,16 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
     }
   }
 
+  const transferOutstanding = await loadTransferLineOutstandingQty(db, transferLines)
   for (const line of transferLines) {
-    const remaining = Number(line.qty) - Number(line.qtyReceived)
-    if (remaining > 0) {
+    // A per-LINE display row, so there is no aggregate to hold the brand in and the
+    // field on the serialised row has to be a number. `hasOutstandingQty` and
+    // `.qtyNumber` are the output boundary here; the behavioural regression test in
+    // tests/products-incoming-landed-quantity.ts is the guard for this one reader
+    // (o3d-zzgp round 2, Codex MEDIUM — stated as a limit, not claimed as prevention).
+    const outstanding = requireOutstandingQty(transferOutstanding, line.id)
+    const remaining = outstanding.qtyNumber
+    if (hasOutstandingQty(outstanding)) {
       results.push({
         type: 'transfer',
         id: line.transfer.id,
