@@ -22,7 +22,7 @@ import {
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
-  fetchMintsoftAsns,
+  fetchMintsoftAsnsForDuplicateRecovery,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   MINTSOFT_AUTH_TOKEN_KEY,
@@ -3190,7 +3190,9 @@ export async function createMintsoftPurchaseOrderAsn(
   }
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
-    const remoteAsns = await fetchMintsoftAsns()
+    // o3d-bhvu: the COMPLETE list or a throw (which the catch below turns into a failed attempt that
+    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate.
+    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery(reservation.externalWarehouseId)
     const correlatedCallbackUrl = buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId)
     const expectedLineCount = reservation.lines.length
 
@@ -3204,7 +3206,8 @@ export async function createMintsoftPurchaseOrderAsn(
     }
 
     const matches = remoteAsns.filter((asn) => {
-      if (getMintsoftAsnRawString(asn.raw, ['Reference', 'reference']) !== reservation.reference) {
+      // Mintsoft stores the reference as POReference (o3d-bhvu); `Reference` is not in its ASN model.
+      if (getMintsoftAsnRawString(asn.raw, ['POReference', 'Reference', 'reference']) !== reservation.reference) {
         return false
       }
 
@@ -4118,7 +4121,9 @@ export async function createMintsoftTransferAsn(
   }
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
-    const remoteAsns = await fetchMintsoftAsns()
+    // o3d-bhvu: the COMPLETE list or a throw (which the catch below turns into a failed attempt that
+    // creates nothing) — never a partial list read as "no such ASN", which would create a duplicate.
+    const remoteAsns = await fetchMintsoftAsnsForDuplicateRecovery(reservation.externalWarehouseId)
     const correlatedCallbackUrl = buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId)
     const expectedLineCount = reservation.lines.length
 
@@ -4132,7 +4137,8 @@ export async function createMintsoftTransferAsn(
     }
 
     const matches = remoteAsns.filter((asn) => {
-      if (getMintsoftAsnRawString(asn.raw, ['Reference', 'reference']) !== reservation.reference) {
+      // Mintsoft stores the reference as POReference (o3d-bhvu); `Reference` is not in its ASN model.
+      if (getMintsoftAsnRawString(asn.raw, ['POReference', 'Reference', 'reference']) !== reservation.reference) {
         return false
       }
 

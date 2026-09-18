@@ -443,15 +443,174 @@ export async function fetchMintsoftBundle(externalProductId: string): Promise<Wm
   }
 }
 
-export async function fetchMintsoftAsns(): Promise<WmsAsnRef[]> {
-  const result = await mintsoftRequest<unknown>('/api/ASN')
-  if (result.error) {
-    throw new Error(result.error)
-  }
+/**
+ * THE MINTSOFT ASN LIST, AS THE LIVE API ACTUALLY SERVES IT (o3d-bhvu).
+ *
+ * Established with read-only GETs against the live tenant (ClientId 89) on 2026-09-18, and against
+ * the published contract at GET /swagger/docs/v1:
+ *   - `GET /api/ASN` is 405. `/api/ASN` carries only PUT (create) in the swagger; the list is
+ *     `GET /api/ASN/List`. This function used to GET `/api/ASN`, so it threw on every call.
+ *   - `/api/ASN/List` PAGES. Unparameterised it returned exactly 100 rows of 220; `PageNo=1,2,3`
+ *     with `Limit=100` returned 100, 100 and 20. `Limit=101` and `Limit=500` are HTTP 400, so the
+ *     page size is CLAMPED here, never configured (the Order/List lesson: a larger value fails
+ *     silently into a fallback). `PageNo=0` is a 500 and a page past the end is `[]`.
+ *   - Rows are ordered neither by ID nor by LastUpdated, so a page boundary is not a stable cursor.
+ *   - `Items` is `null` unless `IncludeASNItems=true`.
+ *   - There is NO filter by our reference (the parameters are ASNStatusId, ClientId, PageNo, Limit,
+ *     WarehouseId, SinceLastUpdated, BookedIn*Interval, IncludeASNItems), and an unparseable
+ *     SinceLastUpdated is silently IGNORED rather than rejected — so no filter here may be trusted
+ *     to narrow correctly, and none is relied on except WarehouseId, which does narrow (live: 16 rows
+ *     for warehouse 6, and 100+ for warehouse 5).
+ *
+ * SO THIS EITHER RETURNS THE WHOLE LIST OR THROWS. It pages to exhaustion (a short page ends it),
+ * refuses a page larger than it asked for, refuses to go past `MINTSOFT_ASN_LIST_MAX_PAGES`, and —
+ * because the order is unstable, so a row can move across a page boundary while the scan runs and be
+ * skipped — accepts a scan only when two consecutive scans return exactly the same set of ASN IDs with
+ * no ID seen twice within either. A caller deciding "no such ASN exists, so create one" must be able
+ * to rely on the absence meaning absence; a partial list would make it create a DUPLICATE at a live
+ * warehouse.
+ */
+export const MINTSOFT_ASN_LIST_PAGE_LIMIT = 100
+/** 50 pages of 100 = 5,000 ASNs per scan. Past that the scan refuses rather than truncates. */
+export const MINTSOFT_ASN_LIST_MAX_PAGES = 50
+/** Scans attempted to get two consecutive identical ones before giving up. */
+export const MINTSOFT_ASN_LIST_SCAN_ATTEMPTS = 3
 
-  return extractMintsoftArrayPayload(result.data)
+/** Thrown when the ASN list cannot be established as complete. Callers must treat it as "unknown", never "empty". */
+export class MintsoftAsnListIncompleteError extends Error {
+  constructor(message: string) {
+    super(`Cannot establish the complete Mintsoft ASN list: ${message}`)
+    this.name = 'MintsoftAsnListIncompleteError'
+  }
+}
+
+export type MintsoftAsnListOptions = {
+  /** Mintsoft's numeric warehouse ID. Anything else is ignored and the whole tenant is scanned. */
+  warehouseId?: string | null
+  /** The HTTP boundary; tests substitute it. */
+  request?: (path: string) => Promise<MintsoftRequestResult<unknown>>
+}
+
+export function buildMintsoftAsnListRequest(pageNo: number, options?: { warehouseId?: string | null }): {
+  path: string
+  method: 'GET'
+} {
+  if (!Number.isInteger(pageNo) || pageNo < 1) throw new Error(`Mintsoft ASN List pages start at 1, got ${pageNo}`)
+  const query = new URLSearchParams({
+    PageNo: String(pageNo),
+    Limit: String(MINTSOFT_ASN_LIST_PAGE_LIMIT),
+    IncludeASNItems: 'true',
+  })
+  const warehouseId = options?.warehouseId?.trim()
+  if (warehouseId && /^\d+$/.test(warehouseId)) query.set('WarehouseId', warehouseId)
+  return { path: `/api/ASN/List?${query.toString()}`, method: 'GET' }
+}
+
+function mintsoftAsnListRowId(row: unknown): string {
+  const record = row && typeof row === 'object' && !Array.isArray(row) ? row as Record<string, unknown> : null
+  const id = record?.ID
+  if (typeof id === 'number' && Number.isInteger(id)) return String(id)
+  if (typeof id === 'string' && /^\d+$/.test(id.trim())) return id.trim()
+  throw new MintsoftAsnListIncompleteError('a row has no ASN ID, so it cannot be told apart from the others')
+}
+
+async function scanMintsoftAsnList(options: MintsoftAsnListOptions): Promise<{ rows: Array<Record<string, unknown>>; ids: string[]; repeated: boolean }> {
+  const request = options.request ?? ((path: string) => mintsoftRequest<unknown>(path))
+  const rows: Array<Record<string, unknown>> = []
+  const ids: string[] = []
+  const seen = new Set<string>()
+  let repeated = false
+  for (let pageNo = 1; pageNo <= MINTSOFT_ASN_LIST_MAX_PAGES; pageNo += 1) {
+    const result = await request(buildMintsoftAsnListRequest(pageNo, options).path)
+    if (result.error) throw new MintsoftAsnListIncompleteError(`page ${pageNo} failed (${result.status}): ${result.error}`)
+    if (!Array.isArray(result.data)) throw new MintsoftAsnListIncompleteError(`page ${pageNo} was not an array`)
+    const page = result.data
+    if (page.length > MINTSOFT_ASN_LIST_PAGE_LIMIT) {
+      throw new MintsoftAsnListIncompleteError(`page ${pageNo} returned ${page.length} rows for a limit of ${MINTSOFT_ASN_LIST_PAGE_LIMIT}`)
+    }
+    for (const row of page) {
+      const id = mintsoftAsnListRowId(row)
+      if (seen.has(id)) repeated = true
+      seen.add(id)
+      ids.push(id)
+      rows.push(row as Record<string, unknown>)
+    }
+    if (page.length < MINTSOFT_ASN_LIST_PAGE_LIMIT) return { rows, ids, repeated }
+  }
+  throw new MintsoftAsnListIncompleteError(
+    `more than ${MINTSOFT_ASN_LIST_MAX_PAGES} pages of ${MINTSOFT_ASN_LIST_PAGE_LIMIT}; refusing to treat a truncated list as complete`,
+  )
+}
+
+/** Every ASN row the list serves (with Items), or a MintsoftAsnListIncompleteError. Never a partial list. */
+export async function fetchMintsoftAsnListRows(options: MintsoftAsnListOptions = {}): Promise<Array<Record<string, unknown>>> {
+  let previous: { rows: Array<Record<string, unknown>>; ids: string[]; repeated: boolean } | null = null
+  for (let attempt = 1; attempt <= MINTSOFT_ASN_LIST_SCAN_ATTEMPTS; attempt += 1) {
+    const scan = await scanMintsoftAsnList(options)
+    if (previous && !previous.repeated && !scan.repeated && sameIdSet(previous.ids, scan.ids)) return scan.rows
+    previous = scan
+  }
+  throw new MintsoftAsnListIncompleteError(
+    `the list changed between ${MINTSOFT_ASN_LIST_SCAN_ATTEMPTS} consecutive scans, so no scan can be shown to be complete`,
+  )
+}
+
+function sameIdSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false
+  const a = [...left].sort()
+  const b = [...right].sort()
+  return a.every((value, index) => value === b[index])
+}
+
+/**
+ * The ASN list normalized as the booked-in path reads an ASN (`normalizeMintsoftAsn`, the same normalizer
+ * as `GET /api/ASN/{id}`). The MINTSOFT_USE_BULK_ASN_LOOKUP rollback path of the booked-in processor.
+ */
+export async function fetchMintsoftAsns(options: MintsoftAsnListOptions = {}): Promise<WmsAsnRef[]> {
+  return (await fetchMintsoftAsnListRows(options))
     .map((item) => normalizeMintsoftAsn(item))
     .filter((item): item is WmsAsnRef => Boolean(item))
+}
+
+/**
+ * THE ASNs A CREATOR MUST CHECK BEFORE IT CREATES ONE — duplicate recovery (o3d-bhvu).
+ *
+ * Each row carries what the creators match on: `raw.POReference` (Mintsoft stores the reference there;
+ * there is no `Reference` field in its ASN model) and one line per item with its `SourceLineId` and its
+ * EXPECTED quantity (`QuantityExpected`). The expected quantity is deliberately not `normalizeMintsoftAsn`'s
+ * `quantity`, which the booked-in path reads as RECEIVED.
+ *
+ * A row whose `Items` is not an array is REFUSED rather than skipped: the list was asked for items, so a
+ * row without them is one this caller cannot rule out as its own, and skipping it would be the partial
+ * scan this function exists to prevent.
+ */
+export async function fetchMintsoftAsnsForDuplicateRecovery(externalWarehouseId: string | null, options: Omit<MintsoftAsnListOptions, 'warehouseId'> = {}): Promise<WmsAsnRef[]> {
+  const rows = await fetchMintsoftAsnListRows({ ...options, warehouseId: externalWarehouseId })
+  return rows.map((row) => normalizeMintsoftAsnListRowForRecovery(row))
+}
+
+export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unknown>): WmsAsnRef {
+  const externalAsnId = mintsoftAsnListRowId(row)
+  if (!Array.isArray(row.Items)) {
+    throw new MintsoftAsnListIncompleteError(`ASN ${externalAsnId} came back without its items`)
+  }
+  const lines = (row.Items as unknown[]).flatMap((item) => {
+    const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
+    if (!record) return []
+    const sourceLineId = typeof record.SourceLineId === 'string' && record.SourceLineId.trim() ? record.SourceLineId.trim() : null
+    const externalLineId = record.ID == null ? null : String(record.ID)
+    if (!sourceLineId || !externalLineId) return []
+    const expected = typeof record.QuantityExpected === 'number' ? record.QuantityExpected : null
+    return [{
+      externalLineId,
+      sourceLineId,
+      externalProductId: record.ProductId == null ? null : String(record.ProductId),
+      sku: typeof record.SKU === 'string' ? record.SKU : null,
+      quantity: expected,
+      raw: record,
+    }]
+  })
+  return { externalAsnId, status: null, lines, raw: row }
 }
 
 export async function fetchMintsoftAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {

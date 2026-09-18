@@ -305,6 +305,43 @@ function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
   }
 }
 
+/**
+ * `GET /api/ASN/List`, shaped like the live rows (o3d-bhvu): `ID`, `POReference`, `WarehouseId`, and
+ * `Items` of `{ ID, SourceLineId, ProductId, SKU, QuantityExpected }` when IncludeASNItems=true, else
+ * `null`. Exported so the paging contract can be unit-tested without the e2e harness.
+ */
+export function fakeMintsoftAsnListResponse(asns: FakeMintsoftAsn[], params: URLSearchParams): NextResponse {
+  const pageNo = Number.parseInt(params.get('PageNo') ?? '1', 10)
+  const limitRaw = params.get('Limit')
+  const limit = limitRaw == null ? 100 : Number.parseInt(limitRaw, 10)
+  if (!Number.isInteger(pageNo) || pageNo < 1) {
+    return NextResponse.json({ Message: 'An error has occurred.' }, { status: 500 })
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return NextResponse.json({ Message: 'The request is invalid.' }, { status: 400 })
+  }
+  const warehouseId = params.get('WarehouseId')
+  const includeItems = params.get('IncludeASNItems') === 'true'
+  const scoped = warehouseId ? asns.filter((asn) => asn.warehouseId === warehouseId) : asns
+  const page = scoped.slice((pageNo - 1) * limit, pageNo * limit)
+  return NextResponse.json(page.map((asn) => ({
+    ID: /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id,
+    POReference: asn.reference,
+    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
+    ASNStatus: { Name: asn.status },
+    LastUpdated: asn.createdAt,
+    Items: includeItems
+      ? asn.lines.map((line) => ({
+          ID: line.id,
+          SourceLineId: line.sourceLineId,
+          ProductId: line.productId && /^\d+$/.test(line.productId) ? Number(line.productId) : line.productId,
+          SKU: line.sku,
+          QuantityExpected: line.quantity,
+        }))
+      : null,
+  })))
+}
+
 export function parseFakeMintsoftDirectAsnPath(path: string): string | null {
   if (!path.startsWith('api/ASN/')) return null
   return decodeURIComponent(path.slice('api/ASN/'.length))
@@ -470,12 +507,19 @@ export async function GET(
     )
   }
 
+  // o3d-bhvu: the fake follows the LIVE contract on the read side. Live Mintsoft answers `GET /api/ASN`
+  // with 405 (the path is the create route) and serves the list at `GET /api/ASN/List`, paged by
+  // PageNo/Limit with Limit capped at 100 (400 above it), `[]` past the end, and Items only with
+  // IncludeASNItems=true. Serving the list at `GET /api/ASN` here is how the broken client passed e2e.
   if (path === 'api/ASN') {
+    return NextResponse.json({ Message: "The requested resource does not support http method 'GET'." }, { status: 405 })
+  }
+
+  if (path === 'api/ASN/List') {
     if (!isAuthorized(request, state)) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
-
-    return NextResponse.json(state.asns.map(mapMintsoftAsnResponse))
+    return fakeMintsoftAsnListResponse(state.asns, request.nextUrl.searchParams)
   }
 
   const directAsnId = parseFakeMintsoftDirectAsnPath(path)
