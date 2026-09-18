@@ -4,16 +4,26 @@ import test from 'node:test'
 
 import {
   DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
+  ECMASCRIPT_BLANK_PATTERN,
+  ASCII_FOLD_EXCEPTION_PARAMETERS,
+  COLLATION_PIN,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
+  MAX_VOID_MIRROR_CONTRADICTIONS,
+  RECONCILIATION_ROW_CAP_REACHED,
+  VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+  readReconciliationCompleteness,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
   reconciliationLookbackDate,
   updateAccountingReconciliationFindingStatus,
+  type AccountingReconciliationFinding,
   type AccountingReconciliationReport,
   type AccountingReconciliationRows,
+  type AccountingReconciliationTruncation,
 } from '@/lib/domain/accounting/reconciliation'
+import { MIRRORED_ACCOUNTING_SYNC_TYPES } from '@/lib/domain/accounting/mirrored-sync-types'
 
 const A1_DATE = new Date('2026-04-24T10:00:00.000Z')
 const A2_DATE = new Date('2026-04-24T11:00:00.000Z')
@@ -829,6 +839,9 @@ test('accounting reconciliation row collection selects required datasets', async
         return []
       },
     },
+    // o3d-11rf r4: required by the client type, so every double has to answer it. See the
+    // contradiction-query tests below for what this statement is asserted to be.
+    async $queryRaw() { return [] },
   }
 
   await collectAccountingReconciliationRows(client)
@@ -1146,6 +1159,7 @@ test('o3d-cvj9 r7: the report reads the handovers made on an assumed order, boun
         return []
       },
     },
+    async $queryRaw() { return [] },
   }
 
   const toDate = new Date('2026-08-20T00:00:00.000Z')
@@ -1461,4 +1475,834 @@ test('[o3d-anu8] the identical row written back by the connector still silences 
   const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
 
   assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
+})
+
+// --- o3d-11rf r4: the VOID mirrors nobody can classify, ASKED FOR RATHER THAN SIFTED OUT ---
+
+/**
+ * o3d-11rf r4 (Codex r4, HIGH) — WHERE THIS RULE LIVES NOW, AND THEREFORE WHERE IT IS PROVED.
+ *
+ * Round 3 paired unclassified VOID mirrors against live sync rows IN THIS FILE, over the two general
+ * pages the report already loads. Both are `ORDER BY <date> DESC LIMIT 10,000` — a bound imposed on a
+ * broad load with the filter that decides relevance applied afterwards — so the OLDEST victims, which
+ * are the only kind this warning has, were dropped before the pairing that would have named them.
+ *
+ * The rule is now a JOIN. That moves the whole of it into PostgreSQL, and a rule that lives in SQL
+ * cannot honestly be proved by fixtures handed to a TypeScript function: a double could only show the
+ * shape of a string. So the shapes that must and must not be reported — the scope tuple, the live
+ * statuses, an explained void, a row that already carries a document id — are proved against a real
+ * database in tests/db/reconciliation-void-mirror-contradictions.test.ts, together with the over-cap
+ * case that is the point of the change.
+ *
+ * WHAT IS LEFT HERE IS THE TWO THINGS THAT ARE STILL THIS FILE'S: that the statement is ISSUED and is
+ * the fixed one (a report that never asks cannot find anything, however right the SQL is), and that
+ * what comes back is TURNED INTO FINDINGS honestly — including the truncation finding, without which
+ * a short list would silently mean the same thing as a complete one.
+ *
+ * The evaluator deliberately does NOT re-apply the rule to what the query returns. A second filter
+ * here would mask a widened predicate in the SQL — the mutation that kills nothing because an
+ * adjacent guard accounted for the case — and would leave two spellings of one rule to drift apart.
+ */
+
+function contradiction(overrides: Partial<VoidMirrorContradictionFixture> = {}): VoidMirrorContradictionFixture {
+  return {
+    accountingEventId: 'event-void',
+    connector: 'xero',
+    syncType: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+    syncLogIds: ['sync-live'],
+    syncLogStatuses: ['PENDING'],
+    ...overrides,
+  }
+}
+
+type VoidMirrorContradictionFixture = {
+  accountingEventId: string
+  connector: string | null
+  syncType: string
+  referenceType: string
+  referenceId: string
+  idempotencyKey: string
+  syncLogIds: string[]
+  syncLogStatuses: string[]
+}
+
+function voidMirrorFindings(contradictions: AccountingReconciliationRows['voidMirrorContradictions']) {
+  const rows = cleanRows()
+  rows.voidMirrorContradictions = contradictions
+  return evaluateAccountingReconciliationRows(rows)
+    .filter((finding) => finding.code.startsWith('void_mirror_basis_unknown'))
+}
+
+/** The collector double, capturing the one statement the contradiction query issues. */
+async function captureContradictionQuery(result: unknown[] = []) {
+  const captured: { strings?: TemplateStringsArray; values?: unknown[] } = {}
+  const client = {
+    salesOrder: { async findMany() { return [] } },
+    shipment: { async findMany() { return [] } },
+    salesOrderRefund: { async findMany() { return [] } },
+    accountingSyncLog: { async findMany() { return [] } },
+    accountingEvent: { async findMany() { return [] } },
+    accountingEventLog: { async findMany() { return [] } },
+    async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
+      captured.strings = strings
+      captured.values = values
+      return result
+    },
+  }
+
+  const rows = await collectAccountingReconciliationRows(client, {
+    lookbackDays: 30,
+    toDate: new Date('2026-08-20T00:00:00.000Z'),
+  })
+
+  assert.ok(captured.strings, 'the contradiction query is issued at all — a report that never asks finds nothing')
+  return { rows, sql: captured.strings.join('?'), values: captured.values ?? [] }
+}
+
+/**
+ * WHERE EACH PARAMETER SITS IN THE STATEMENT, named rather than counted at each use. The positions
+ * are the order the `${}` holes appear in the template, so inserting a parameter renumbers every one
+ * after it — which is how the three blank-test patterns arriving first (o3d-11rf r10) pushed the two
+ * list parameters along. `assertParameterPositions` below reads them back off a real capture, so a
+ * renumbering that these constants did not follow fails ONCE, here, instead of silently turning every
+ * assertion that uses them into an assertion about the wrong value.
+ */
+const PAYLOAD_KEY_BLANK_PARAMETER = 0
+const PAYLOAD_DATE_BLANK_PARAMETER = 1
+/** o3d-11rf r11: the four case-fold substitution parameters, `from`/`to` in table order. */
+const FOLD_EXCEPTION_PARAMETERS = [2, 3, 4, 5]
+const STATUSES_PARAMETER = 6
+const TYPES_PARAMETER = 7
+const EXTERNAL_ID_BLANK_PARAMETER = 8
+
+test('o3d-11rf r10: the statement’s parameters are where the assertions below say they are', async () => {
+  const { values } = await captureContradictionQuery()
+
+  assert.equal(values.length, 10,
+    'ten holes in the template: three blank patterns, four fold substitutions, two lists and the bound')
+  assert.equal(typeof values[PAYLOAD_KEY_BLANK_PARAMETER], 'string')
+  assert.equal(typeof values[PAYLOAD_DATE_BLANK_PARAMETER], 'string')
+  for (const at of FOLD_EXCEPTION_PARAMETERS) assert.equal(typeof values[at], 'string')
+  assert.ok(Array.isArray(values[STATUSES_PARAMETER]), 'the statuses are the first list')
+  assert.ok(Array.isArray(values[TYPES_PARAMETER]), 'the types are the second')
+  assert.equal(typeof values[EXTERNAL_ID_BLANK_PARAMETER], 'string')
+  assert.equal(typeof values.at(-1), 'number', 'and the bound is last')
+})
+
+test('o3d-11rf r4: the contradictions are ASKED FOR, by a statement with no date bound in it', async () => {
+  // THE FINDING, STATED AS AN ASSERTION. The subjects of this warning are older than any lookback by
+  // definition — a settlement made before the column existed, a row written by hand. A statement that
+  // carried a date bound, or that ordered a general page and filtered afterwards, would drop exactly
+  // them. So: the join is the filter, and nothing narrows it by time.
+  const { sql } = await captureContradictionQuery()
+
+  assert.match(sql, /FROM "accounting_events" e/, 'the events are one side')
+  assert.match(sql, /FROM "accounting_sync_logs" l/, 'and the live sync rows are the other')
+  assert.match(sql, /e\."status" = 'VOID'/)
+  assert.match(sql, /e\."voidBasis" IS NULL/, 'only the voids NO WRITER EXPLAINED')
+  assert.match(sql, /l\."externalTransactionId" IS NULL OR l\."externalTransactionId" COLLATE "C" ~ \?/,
+    'and only sync rows that hold no document id — a row that has one describes a document that exists')
+
+  assert.ok(!/businessDate|createdAt|syncedAt|fromDate/.test(sql),
+    'NO date bound anywhere in the statement: the oldest victim is the one this exists to find')
+})
+
+test('o3d-11rf r4: the scope joined on is the mirror scope, all four parts of it', async () => {
+  const { sql } = await captureContradictionQuery()
+
+  // Named individually rather than by counting join clauses: dropping any one of them widens the
+  // rule to name a document the operator has no reason to look at, next to one they do.
+  assert.match(sql, /l\."connector"\s+= e\."externalSystem"/)
+  assert.match(sql, /l\."type"\s+= e\."type"/)
+  assert.match(sql, /l\."referenceType" = e\."sourceEntityType"/)
+  assert.match(sql, /l\."referenceId"\s+= e\."sourceEntityId"/)
+})
+
+/**
+ * o3d-11rf r9 (Codex r9, HIGH) — AND THE SCOPE IS NOT THE IDENTITY.
+ *
+ * These are STATEMENT-shape assertions and they are the weaker half on purpose: what the join
+ * actually selects is proved against PostgreSQL in tests/db/reconciliation-void-mirror-contradictions,
+ * because only a database can answer which rows a join pairs. What is asserted here is that the
+ * ownership clause is IN the statement at all, and that the derivation spells the same three key
+ * forms `mirroredAccountingEventIdempotencyKeys` spells — a reader deleting the ownership clause to
+ * "simplify the join" has to argue with this first.
+ */
+test('o3d-11rf r9: and the ownership clause is joined on too, by the mirror key itself', async () => {
+  const { sql, values } = await captureContradictionQuery()
+
+  assert.match(sql, /e\."idempotencyKey" = ANY\(l\."mirrorKeys"\)/,
+    'the event must be the one THIS row derives, not one about the same document')
+
+  // The three key forms, by their literal prefixes and their part order.
+  assert.match(sql, /'accounting-sync:' \|\| n\."connector" \|\| ':' \|\| n\."type" \|\| ':' \|\| n\."payloadKey"/,
+    'the payload key form')
+  assert.match(sql, /'accounting-sync-log:' \|\| n\."connector" \|\| ':' \|\| n\."syncLogId"/,
+    'the sync-log id form')
+  assert.match(sql, /n\."referenceType"\s*\n?\s*\|\| ':' \|\| n\."referenceId" \|\| ':' \|\| n\."payloadDate"/,
+    'and the legacy date form, which is the one the recommendation named by hand')
+
+  // buildAccountingEventIdempotencyKey's normalisation, per part, with the blank-part guard.
+  assert.match(sql, /\[\^a-z0-9\._:-\]\+/, 'the allowed character class is the builder\'s')
+  assert.match(sql, /nullif\(regexp_replace/, 'and a part that normalises to blank makes its key NULL')
+
+  // A row whose type is not mirrored has no mirror, so it is not in the live set at all.
+  assert.match(sql, /l\."type"::text = ANY\(\?::text\[\]\)/, 'the mirrored types are a parameter')
+  assert.deepEqual(values[TYPES_PARAMETER], [...MIRRORED_ACCOUNTING_SYNC_TYPES],
+    'and it is the ONE list, not a copy that can fall behind it')
+})
+
+/**
+ * o3d-11rf r10 (Codex r10, HIGH) — THE BLANK TEST IS JAVASCRIPT'S, AND IT IS ENUMERATED HERE FROM THE
+ * ENGINE RATHER THAN TYPED OUT.
+ *
+ * The defect this replaces: the statement asked `btrim(text)`, which strips ORDINARY SPACES ONLY, for
+ * a question `stringValue` answers with `.trim()`. A `_idempotencyKey` of one TAB was therefore
+ * PRESENT to SQL and ABSENT to TypeScript, the two derivations took different branches, and the row
+ * ended with no mirror key at all.
+ *
+ * WHY THE SET IS DERIVED HERE. Spelling the 25 characters out in the test and comparing them with the
+ * 25 spelled out in the query would prove only that one person typed the same list twice. What has to
+ * be true is that the list IS `String.prototype.trim`'s, so it is taken from the running engine — and
+ * if a future JavaScript trims one more character, this goes red rather than the two spellings
+ * quietly parting company.
+ *
+ * WHAT IT CANNOT SHOW is what PostgreSQL does with the pattern. That is a fact about a database and
+ * it is proved against one in tests/db/reconciliation-void-mirror-contradictions, over every one of
+ * these characters and over the near-misses that separate this spelling from the plausible wrong ones.
+ */
+function everyCharacterJavaScriptTrims(): string[] {
+  const characters: string[] = []
+  for (let point = 0; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    const character = String.fromCodePoint(point)
+    if (character.trim() === '') characters.push(character)
+  }
+  return characters
+}
+
+test('o3d-11rf r10: the blank test the statement sends IS JavaScript trim(), character for character', async () => {
+  const trimmable = everyCharacterJavaScriptTrims()
+
+  // THE PREMISE, ASSERTED BEFORE ANYTHING IS CONCLUDED FROM IT: this set is not the ASCII one, which
+  // is the entire finding. A `btrim(text)` that handled it would make the rest of this test vacuous.
+  assert.ok(trimmable.includes('\t'), 'tab is trimmable — the character Codex named')
+  assert.ok(trimmable.includes('\u00a0') && trimmable.includes('\ufeff') && trimmable.includes('\u3000'),
+    'and so are NBSP, the BOM and an ideographic space — none of which btrim(text) touches')
+  assert.equal(trimmable.includes('\u0085'), false, 'NEL is NOT trimmable, whatever a ctype-driven class says')
+  assert.equal(trimmable.includes('\u200b'), false, 'nor is a zero-width space')
+
+  const { sql, values } = await captureContradictionQuery()
+
+  // The pattern is read back OUT of the statement's own parameters, so this is an assertion about
+  // what production sends and not about a constant that happens to sit beside it.
+  const sent = [values[PAYLOAD_KEY_BLANK_PARAMETER], values[PAYLOAD_DATE_BLANK_PARAMETER], values[EXTERNAL_ID_BLANK_PARAMETER]]
+  assert.deepEqual(sent, [ECMASCRIPT_BLANK_PATTERN, ECMASCRIPT_BLANK_PATTERN, ECMASCRIPT_BLANK_PATTERN],
+    'all three blank tests in the statement ask the same question, and it is the exported one')
+
+  // `[\s\S]` rather than `.` with the `s` flag: the alternation CONTAINS a newline and a CR, and the
+  // flag is not available at this tsconfig target.
+  const match = /^\^\(\?:([\s\S]*)\)\*\$$/.exec(ECMASCRIPT_BLANK_PATTERN)
+  assert.ok(match, 'the pattern is an anchored repetition of an alternation — anything else is a different rule')
+  const alternatives = match[1].split('|')
+  assert.equal(alternatives.length, trimmable.length,
+    'one alternative per trimmable character, no duplicates and none invented')
+  assert.deepEqual([...alternatives].sort(), [...trimmable].sort(),
+    'and they are exactly the characters the engine trims')
+
+  // AN ALTERNATION OF WHOLE CHARACTERS, NOT A CLASS. Every database in this estate is SQL_ASCII, where
+  // a bracket expression or a btrim character set is a set of BYTES: it would eat U+0085 and chew
+  // U+201A to nothing. Asserted on the spelling because the consequence is asserted in the DB suite.
+  assert.ok(!/\[\[:space:\]\]|\\s/.test(ECMASCRIPT_BLANK_PATTERN),
+    'no ctype-driven class: PostgreSQL disagrees with JavaScript about NBSP and about NEL')
+  // Over the EXECUTABLE statement with its `--` prose stripped out, because the prose beside the
+  // predicates names `btrim` in order to say why it is gone.
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/!~ \?/.test(executable), 'the comment stripper left the predicates behind — it is not eating the statement')
+  assert.ok(!/btrim/.test(executable), 'and no btrim left in the statement — that spelling is the defect')
+
+  assert.match(sql, /l\."payload" ->> '_idempotencyKey' !~ \?/, 'the payload token is tested with it')
+  assert.match(sql, /l\."payload" ->> 'date' !~ \?/, 'the legacy date is too')
+})
+
+/**
+ * o3d-11rf r11 (Codex r11, HIGH) — CASE, AND THE PROOF THAT THE SET OF EXCEPTIONS IS THE WHOLE SET.
+ *
+ * TypeScript lowercases with `toLowerCase()` (Unicode); the statement lowercases with PostgreSQL
+ * `lower()`, which on this estate's SQL_ASCII / C-ctype databases folds `A`-`Z` and touches nothing
+ * else. Rounds 9, 10 and 11 have now all been the same shape — a SQL derivation drifting from the
+ * TypeScript one — so this test does not patch the instance. It CLOSES the class for case, by
+ * walking every code point of the running engine and asserting that the set on which the two
+ * foldings can still produce different KEYS is exactly the table the statement substitutes.
+ *
+ * WHY A CLOSED SET EXISTS AT ALL, and it is the fact that makes this tractable. After folding, the
+ * normaliser collapses every run of characters outside `[a-z0-9._:-]` to one `-`. A folding
+ * difference can therefore only reach the key when one side produces a character INSIDE that
+ * alphabet and the other does not; case mappings never produce digits or punctuation, so that means
+ * an ASCII LETTER. The walk below finds the two characters for which that is true and asserts there
+ * is no third — so the next Unicode, or the next JavaScript, is caught HERE rather than in a review.
+ *
+ * WHAT IT CANNOT SHOW is that PostgreSQL's `lower()` really is the ASCII-only fold modelled here.
+ * That is a fact about a database and it is proved against one, over every character, in
+ * tests/db/reconciliation-void-mirror-contradictions.
+ */
+const ASCII_ONLY_FOLD = (value: string) => value.replace(/[A-Z]/g, (character) => character.toLowerCase())
+
+/** The normalisation `buildAccountingEventIdempotencyKey` applies to ONE part, with the fold swapped out. */
+function normalisePart(value: string, fold: (value: string) => string): string {
+  return fold(value.trim()).replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+test('o3d-11rf r11: the fold exceptions the statement substitutes are the WHOLE set, over every code point', async () => {
+  // EVERY CODE POINT, in the two positions that behave differently: standalone (where a difference can
+  // empty the part and kill the whole key) and embedded (where it merely produces a different key).
+  const disagreeing: Array<[string, string]> = []
+  for (let point = 1; point <= 0x10ffff; point++) {
+    if (point >= 0xd800 && point <= 0xdfff) continue
+    const character = String.fromCodePoint(point)
+    const differs = [character, `a${character}b`].some(
+      (token) => normalisePart(token, (v) => v.toLowerCase()) !== normalisePart(token, ASCII_ONLY_FOLD),
+    )
+    if (differs) disagreeing.push([character, character.toLowerCase()])
+  }
+
+  // THE CLOSURE. Not "the two we know about are in the set" — that the set has nothing else in it.
+  assert.deepEqual(disagreeing, [
+    ['İ', 'i̇'],
+    ['K', 'k'],
+  ], 'exactly two characters in all of Unicode can make these two foldings build different keys')
+
+  // AND THE STATEMENT SUBSTITUTES EXACTLY THOSE, read back OUT of the parameters production sends —
+  // not off the constant sitting beside them.
+  const { values } = await captureContradictionQuery()
+  const sent = FOLD_EXCEPTION_PARAMETERS.map((at) => values[at] as string)
+  assert.deepEqual(sent, ASCII_FOLD_EXCEPTION_PARAMETERS,
+    'the four substitution parameters are the exported table, flattened')
+  assert.deepEqual(
+    [[sent[0], sent[1]], [sent[2], sent[3]]].sort(),
+    [...disagreeing].sort(),
+    'and the exported table IS the set this walk just derived from the engine',
+  )
+
+  // NOT VACUOUS: each substitution must be the character's own JavaScript lowercase, or the statement
+  // would be replacing one wrong answer with another.
+  for (const [character, lowercase] of disagreeing) {
+    assert.equal(character.toLowerCase(), lowercase, 'the replacement is toLowerCase()’s own answer')
+    assert.notEqual(ASCII_ONLY_FOLD(character), lowercase,
+      'and an ASCII-only fold does NOT reach it — which is the entire finding')
+  }
+})
+
+test('o3d-11rf r11: the fold is applied to the SUBSTITUTED value, and no bare lower() survives', async () => {
+  const { sql } = await captureContradictionQuery()
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/lower\(/.test(executable), 'the comment stripper left the statement behind')
+
+  // ORDER IS THE WHOLE POINT: substitute, THEN fold. Folding first would hand `lower()` the very
+  // characters it gets wrong, and replacing afterwards would never find them.
+  assert.match(executable, /lower\(replace\(replace\(part\."?value"?,\s*\?,\s*\?\),\s*\?,\s*\?\) COLLATE "C"\)/,
+    'lower() is applied to a doubly-substituted part, with both replacements inside it')
+  assert.ok(!/lower\(part\.value\)/.test(executable),
+    'and no bare lower(part.value) is left anywhere — that spelling IS the defect')
+
+  // The collapse reads the FOLDED value, not the raw one: a substitution the normaliser never sees
+  // would be a fix that changes nothing.
+  assert.match(executable, /regexp_replace\(regexp_replace\(folded\.value COLLATE "C",/,
+    'the collapse consumes the folded value')
+})
+
+/**
+ * o3d-11rf r12 (Codex r12, HIGH) — THE PIN IS INSIDE THE CALL, AND THAT IS THE WHOLE FIX.
+ *
+ * `lower()` resolves the collation of its ARGUMENT. `lower(x COLLATE "C")` therefore folds ASCII on
+ * every installation; `lower(x) COLLATE "C"` labels the collation of the RESULT and folds with the
+ * database's locale exactly as before. Both parse, neither warns, and on a tr-TR database only one
+ * of them returns `i` for `I` — which is measured against a real Turkish database in
+ * tests/db/reconciliation-void-mirror-contradictions.
+ *
+ * WHAT THIS TEST CAN AND CANNOT SHOW. It is a spelling assertion: that the statement production
+ * issues carries the pin, and carries it in the position that works. What the pin DOES is a fact
+ * about PostgreSQL and is proved against one. Both halves are needed — a behavioural proof on one
+ * database cannot stop the next edit from moving the `COLLATE` two characters to the right.
+ */
+test('o3d-11rf r12: the collation pin is on the ARGUMENT of the fold, not on its result', async () => {
+  const { sql } = await captureContradictionQuery()
+  const executable = sql.replace(/--[^\n]*/g, '')
+  assert.ok(/lower\(/.test(executable), 'the comment stripper left the statement behind')
+
+  assert.equal(COLLATION_PIN, 'COLLATE "C"',
+    'the pin is the built-in C collation, which exists whatever the database encoding is')
+
+  // THE FOLD, WITH THE PIN INSIDE THE CLOSING PAREN OF lower(). The statement wraps across lines, so
+  // this reads over newlines deliberately — the property is the nesting, not the layout.
+  const fold = /lower\(replace\(replace\(part\."?value"?,[\s\S]*?\) COLLATE "C"\)/
+  assert.match(executable, fold, 'the fold pins its ARGUMENT — inside the call, where lower() reads it')
+
+  // THE MISPLACEMENT, NAMED AND REFUSED: the same expression with the pin one paren to the right.
+  // It parses, it warns about nothing, and it labels a fold that has already happened.
+  assert.ok(!/lower\(replace\(replace\(part\."?value"?,[\s\S]*?\)\)\s*COLLATE/.test(executable),
+    'and the pin is NOT outside lower(), where it would label the result of a locale-decided fold')
+
+  // The other collation-sensitive operations, named one at a time rather than counted, because
+  // dropping any single one of them re-opens the dependency on its own.
+  assert.match(executable, /regexp_replace\(folded\.value COLLATE "C"/, 'the collapse pins its input')
+  assert.match(executable, /l\."externalTransactionId" COLLATE "C" ~ \?/,
+    'and the one blank test whose operand is a COLUMN pins it too — a column carries the collation '
+    + 'it was declared with, and a nondeterministic one makes ~ throw rather than answer')
+
+  // AND THE TWO jsonb BLANK TESTS ARE DELIBERATELY UNPINNED. `->>` yields the database default
+  // collation, which PostgreSQL will not let be nondeterministic; and writing the pin here without
+  // parentheses would land it on the KEY NAME, because COLLATE binds tighter than `->>`.
+  assert.match(executable, /l\."payload" ->> '_idempotencyKey' !~ \?/, 'the payload token, unpinned')
+  assert.ok(!/->> '[^']*' COLLATE/.test(executable),
+    'and never `->> \'k\' COLLATE "C"`, which PostgreSQL parses as collating the key name')
+
+  // THREE PINS AND NO MORE — so a fourth appearing somewhere this test does not name cannot pass
+  // unnoticed, and so the count is a claim about the whole statement rather than three greps.
+  assert.equal((executable.match(/COLLATE "C"/g) ?? []).length, 3,
+    'the fold, the collapse, and the one blank test whose operand is a column — and nothing else')
+})
+
+test('o3d-11rf r4: the bound is applied AFTER the grouping, and it is the stated one', async () => {
+  const { sql, values } = await captureContradictionQuery()
+
+  // THE SHAPE OF THE DEFECT, PINNED. `LIMIT` before the filter is the bug; `LIMIT` after the grouped
+  // join is the fix. Both positions are asserted FOUND before they are compared — an unmatched
+  // indexOf returns -1, which is less than every real index and would make this pass for the exact
+  // reason it exists to catch.
+  const groupBy = sql.indexOf('GROUP BY')
+  const limit = sql.indexOf('LIMIT')
+  const where = sql.indexOf('WHERE')
+  assert.notEqual(where, -1, 'the statement filters')
+  assert.notEqual(groupBy, -1, 'and groups the pairs onto their event')
+  assert.notEqual(limit, -1, 'and is bounded')
+  assert.ok(where < groupBy && groupBy < limit,
+    'filter, then group, then bound — a bound reached before the filter is the defect this replaced')
+
+  // AND THE PAGE IS ORDERED BEFORE IT IS BOUNDED. Asserted on the STATEMENT, not on the rows that
+  // come back, and that is a repair rather than a preference: deleting this `ORDER BY` killed no
+  // database test, because the grouped plan happens to emit its rows in group-key order and would
+  // have gone on doing so until a row count or a version changed the plan. The rows can only ever
+  // show what one planner did once; what has to be true is that the statement ASKS. Without it the
+  // bound takes whatever the plan reached first, and an operator working a truncated list across
+  // runs would be handed a different 500 each time and never reach the end of it.
+  //
+  // MATCHED AGAINST THE OUTER SELECT BY NAME, not by looking for the first `ORDER BY` in the
+  // statement. The first one is inside `array_agg(... ORDER BY ...)`, which sits before the GROUP BY
+  // — so an index comparison against it was red whatever the query did, and the mutation that was
+  // supposed to prove this assertion was killed by a test that could not pass either way.
+  assert.match(sql, /FROM contradiction\s+ORDER BY "accountingEventId"\s+LIMIT/,
+    'the page taken off the grouped set is ordered by event id and only then bounded — the same 500 every run')
+
+  assert.equal(values.at(-1), MAX_VOID_MIRROR_CONTRADICTIONS,
+    'the bound is a parameter, and it is the one the truncation finding names')
+  assert.deepEqual(values[STATUSES_PARAMETER], ['PENDING', 'PROCESSING'],
+    'and the live statuses are parameters too, so the constant is the single spelling of that set')
+})
+
+test('o3d-11rf r4: the bound is DERIVED from what the run view shows, not a number someone picked', () => {
+  // A MUTATION SURVIVOR, REPAIRED. Widening this constant to 1,000 killed nothing: the over-cap test
+  // sizes its fixture from the constant, so the constant moved and the fixture moved with it. That
+  // test proves the BEHAVIOUR at the bound and cannot also prove the bound, because the argument for
+  // the bound is a RELATIONSHIP rather than a magnitude — past the number of findings a run will
+  // render, one more contradiction is a row written and never read, and the exact count in the
+  // truncation finding is the better thing to hand the operator. So the relationship is the assertion.
+  assert.equal(MAX_VOID_MIRROR_CONTRADICTIONS, MAX_RECONCILIATION_FINDINGS_PER_RUN,
+    'the bound is the number of findings the run view will display at all; a literal here has to argue with this')
+})
+
+test('o3d-11rf r4: the total comes from the same statement, and zero rows means zero', async () => {
+  const empty = await captureContradictionQuery([])
+  assert.deepEqual(empty.rows.voidMirrorContradictions, { rows: [], total: 0 },
+    'no rows is not "unknown": the window count only exists where a row does')
+
+  const one = await captureContradictionQuery([{ ...contradiction(), totalContradictions: 7 }])
+  assert.equal(one.rows.voidMirrorContradictions?.total, 7, 'the count is carried off the row')
+  assert.equal(one.rows.voidMirrorContradictions?.rows.length, 1)
+  assert.ok(!('totalContradictions' in (one.rows.voidMirrorContradictions?.rows[0] ?? {})),
+    'and stripped from the row, so a per-row count cannot be mistaken for this document’s sync rows')
+})
+
+test('o3d-11rf r4: a contradiction is reported with both sides named', () => {
+  const findings = voidMirrorFindings({ rows: [contradiction()], total: 1 })
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'void_mirror_basis_unknown_with_live_sync_row')
+  assert.equal(findings[0].severity, 'warning', 'unclassifiable is not the same as known-broken')
+  assert.equal(findings[0].accountingEventId, 'event-void', 'keyed to the row that must be repaired')
+  assert.deepEqual(findings[0].details, {
+    connector: 'xero',
+    syncType: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    syncLogIds: ['sync-live'],
+    syncLogStatuses: ['PENDING'],
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+  }, 'so the judgement can be made without opening the audit tables')
+})
+
+test('o3d-11rf r4: one finding per VOID mirror, naming every row whose work it blocks', () => {
+  const findings = voidMirrorFindings({
+    rows: [contradiction({ syncLogIds: ['sync-live', 'sync-live-2'], syncLogStatuses: ['PENDING', 'PROCESSING'] })],
+    total: 1,
+  })
+
+  assert.equal(findings.length, 1, 'one per mirror, not one per sync row')
+  assert.match(findings[0].message, /2 live sync row\(s\)/, 'and the count in the message is of those rows')
+  assert.deepEqual((findings[0].details as { syncLogIds: string[] }).syncLogIds, ['sync-live', 'sync-live-2'])
+  assert.deepEqual((findings[0].details as { syncLogStatuses: string[] }).syncLogStatuses, ['PENDING', 'PROCESSING'])
+})
+
+test('o3d-11rf r4: a truncated list SAYS SO, with the exact number that did not fit', () => {
+  // A silently short list is the original defect one level up: the operator reads three findings and
+  // has no way to know there are nine hundred. The count is exact because it was taken by the same
+  // statement over the same snapshot as the page.
+  const rows = [contradiction({ accountingEventId: 'event-a' }), contradiction({ accountingEventId: 'event-b' })]
+  const findings = voidMirrorFindings({ rows, total: 917 })
+
+  assert.equal(findings.length, 3, 'the two that fit, plus the fact that they are not all of them')
+  const truncated = findings.find((f) => f.code === 'void_mirror_basis_unknown_contradictions_truncated')
+  assert.ok(truncated, 'the truncation is a finding of its own, not a note inside another one')
+  assert.equal(truncated.severity, 'warning')
+  assert.deepEqual(truncated.details, { reported: 2, total: 917, limit: MAX_VOID_MIRROR_CONTRADICTIONS })
+  assert.match(truncated.message, /917/, 'the number is in the message, where an operator reads it')
+})
+
+test('o3d-11rf r4: a COMPLETE list carries no truncation finding — that is what makes it readable', () => {
+  // The fence in the other direction. Without it the truncation finding could be emitted always, and
+  // "the list is complete" would stop meaning anything.
+  const rows = [contradiction({ accountingEventId: 'event-a' }), contradiction({ accountingEventId: 'event-b' })]
+  const codes = voidMirrorFindings({ rows, total: 2 }).map((f) => f.code)
+  assert.deepEqual(codes, [
+    'void_mirror_basis_unknown_with_live_sync_row',
+    'void_mirror_basis_unknown_with_live_sync_row',
+  ])
+
+  assert.deepEqual(voidMirrorFindings({ rows: [], total: 0 }), [], 'and nothing to report reports nothing')
+})
+
+test('o3d-11rf r4: a dataset that was NOT READ reports nothing, rather than a clean bill', () => {
+  // `voidMirrorContradictions` absent means the collector never asked — a pure-evaluator fixture, or
+  // a caller that could not. Reporting zero contradictions there would be vouching for a check that
+  // never ran. It must also NOT fall back to pairing the general pages: that fallback is the defect.
+  const rows = cleanRows()
+  rows.accountingEvents = [{
+    id: 'event-void',
+    type: 'SALES_INVOICE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'order-1',
+    businessDate: A1_DATE,
+    status: 'VOID',
+    idempotencyKey: 'xero:SALES_INVOICE:SalesOrder:order-1',
+    externalSystem: 'xero',
+    externalId: null,
+    voidBasis: null,
+  }]
+  rows.syncLogs = [{
+    id: 'sync-live',
+    connector: 'xero',
+    type: 'SALES_INVOICE',
+    status: 'PENDING',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: null,
+    payload: null,
+    settlementBasis: null,
+  }]
+  assert.equal(rows.voidMirrorContradictions, undefined)
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+  assert.equal(codes.includes('void_mirror_basis_unknown_with_live_sync_row'), false,
+    'the in-memory pairing over the capped pages is gone, and nothing may quietly reinstate it')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-11rf r5 (Codex r4, HIGH) — THE ROW THAT SAYS THE LIST IS SHORT, DROPPED FOR BEING ONE ROW TOO MANY
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * WHAT CODEX FOUND, AND WHY THE r4 TESTS COULD NOT SEE IT. r3 bounded the contradiction query at the
+ * number of findings the run view renders, so that nothing is written that cannot be read — and then
+ * appended the truncation warning AFTER that loop. A truncating run therefore produces 501 findings
+ * for a 500-finding page, and the row most likely to be left out is the one whose entire content is
+ * "the list you are reading is incomplete". Every r4 test stopped at the evaluator's in-memory array,
+ * where all 501 are present; the loss happens later, in the reader.
+ *
+ * SO THESE TESTS GO THROUGH PERSISTENCE AND THE CAPPED READER, and assert the thing an operator can
+ * actually do: look at a run and tell whether what they are reading is all of it.
+ *
+ * The double pages by insertion order. PostgreSQL does not even do that — one `createMany` in one
+ * transaction gives every finding the same `createdAt`, so `ORDER BY "createdAt" ASC LIMIT 500`
+ * returns whichever 500 the plan emits, which is why the remedy could not be an ordering. That half
+ * is proved where it can be, against a real database, in
+ * tests/db/reconciliation-void-mirror-contradictions.test.ts.
+ */
+
+function reportOf(findings: AccountingReconciliationFinding[]): AccountingReconciliationReport {
+  return {
+    checkedAt: '2026-09-08T12:00:00.000Z',
+    fromDate: '2026-06-10T12:00:00.000Z',
+    toDate: '2026-09-08T12:00:00.000Z',
+    findings,
+    summary: {
+      total: findings.length,
+      warning: findings.filter((finding) => finding.severity === 'warning').length,
+      critical: findings.filter((finding) => finding.severity === 'critical').length,
+    },
+  }
+}
+
+async function persistAndReload(findings: AccountingReconciliationFinding[]) {
+  const { client } = persistenceClient()
+  await persistAccountingReconciliationReport(reportOf(findings), client as never)
+  const [withFindings] = await listAccountingReconciliationRuns(client as never, { limit: 10, includeFindings: true })
+  const [listedOnly] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+  return { withFindings, listedOnly }
+}
+
+test('o3d-11rf r5: over the cap the reader drops the truncation FINDING, and the run still says the list is short', async () => {
+  // THE PREMISE, ASSERTED RATHER THAN ASSUMED. A full contradiction page is exactly the display cap,
+  // so the warning about it is the 501st finding of a 500-finding page. If this stops being true the
+  // test below stops being about anything, so it is checked first.
+  const rows = cleanRows()
+  const dropped = 417
+  rows.voidMirrorContradictions = {
+    rows: Array.from({ length: MAX_VOID_MIRROR_CONTRADICTIONS }, (_unused, index) => contradiction({
+      accountingEventId: `event-${index}`,
+      referenceId: `order-${index}`,
+    })),
+    total: MAX_VOID_MIRROR_CONTRADICTIONS + dropped,
+  }
+  const findings = evaluateAccountingReconciliationRows(rows)
+  assert.equal(findings.length, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1,
+    'the run overflows the reader by exactly the truncation warning — that is the whole defect')
+
+  const { withFindings, listedOnly } = await persistAndReload(findings)
+
+  // THE LOSS, MADE VISIBLE. Every finding was written; the reader hands back a page one short, and
+  // the row it left behind is the one that was supposed to prove the page complete.
+  assert.equal(withFindings.findings?.length, MAX_RECONCILIATION_FINDINGS_PER_RUN, 'the page is capped')
+  assert.equal(withFindings._count?.findings, MAX_RECONCILIATION_FINDINGS_PER_RUN + 1, 'and one row did not fit in it')
+  assert.equal(
+    withFindings.findings?.some((finding) => finding.code === VOID_MIRROR_CONTRADICTIONS_TRUNCATED),
+    false,
+    'the warning is the row that fell off — a short list otherwise indistinguishable from a complete one',
+  )
+
+  // AND WHAT THE OPERATOR CAN STILL SEE. Recorded on the run, so no findings page can drop it.
+  const truncations = withFindings.truncations as AccountingReconciliationTruncation[]
+  assert.equal(truncations.length, 1, 'the run names the one thing that was truncated')
+  assert.equal(truncations[0].code, VOID_MIRROR_CONTRADICTIONS_TRUNCATED)
+  assert.deepEqual(truncations[0].details, {
+    reported: MAX_VOID_MIRROR_CONTRADICTIONS,
+    total: MAX_VOID_MIRROR_CONTRADICTIONS + dropped,
+    limit: MAX_VOID_MIRROR_CONTRADICTIONS,
+  }, 'with the exact count, not "there may be more"')
+  assert.match(truncations[0].message, new RegExp(String(MAX_VOID_MIRROR_CONTRADICTIONS + dropped)),
+    'and the number where an operator reads it, so the run row needs no finding to be legible')
+
+  // THE CHEAP LIST VIEW TOO — the one that asks for no findings at all, which a sentinel finding
+  // could never have reached however it was ordered or budgeted.
+  assert.equal(listedOnly.findings, undefined, 'this reader asks for no findings')
+  assert.deepEqual(listedOnly.truncations, withFindings.truncations, 'and is still told the report is incomplete')
+})
+
+test('o3d-11rf r5: the row-cap sentinel is lifted onto the run as well, not only the contradiction one', async () => {
+  // THE OTHER SENTINEL WITH THE SAME PROPERTY. `reconciliation_row_cap_reached` describes the
+  // completeness of the report and competes for the same 500 slots as the findings it qualifies. It
+  // is pushed before the loops rather than after, which saves it in an array — and saves it nowhere
+  // in PostgreSQL, where the findings of a run share one `createdAt` and the page is whatever the
+  // plan emits. Placed last here to model that page, since insertion order is all the double has.
+  const capReached: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+  const filler: AccountingReconciliationFinding[] = Array.from(
+    { length: MAX_RECONCILIATION_FINDINGS_PER_RUN },
+    (_unused, index) => ({
+      severity: 'warning' as const,
+      code: 'source_shipment_without_event',
+      message: `no mirrored event ${index}`,
+      details: { index },
+    }),
+  )
+
+  const { withFindings } = await persistAndReload([...filler, capReached])
+
+  assert.equal(
+    withFindings.findings?.some((finding) => finding.code === RECONCILIATION_ROW_CAP_REACHED),
+    false,
+    'the page dropped it, exactly as it drops the contradiction warning',
+  )
+  const truncations = withFindings.truncations as AccountingReconciliationTruncation[]
+  assert.deepEqual(truncations.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED],
+    'and the run carries it, so "10,000 rows were scanned and this is a partial answer" survives the cap')
+  assert.deepEqual(truncations[0].details, { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 })
+})
+
+test('o3d-11rf r5: a run with nothing truncated records [], which is not the same as recording nothing', async () => {
+  // THE FENCE IN THE OTHER DIRECTION, AND THE ONE THAT MAKES THE COLUMN WORTH READING. `[]` means
+  // asked and answered: this run was complete. NULL is reserved for a run written before the column
+  // existed, whose completeness nobody recorded — and a reader that treats those alike is back to
+  // the defect, believing a short list because nothing said otherwise.
+  const findings = evaluateAccountingReconciliationRows(cleanRows())
+  assert.deepEqual(findings, [], 'the clean fixture truncates nothing, so there is nothing to lift')
+
+  const { withFindings, listedOnly } = await persistAndReload(findings)
+
+  assert.deepEqual(withFindings.truncations, [], 'recorded, and empty')
+  assert.deepEqual(listedOnly.truncations, [], 'on the cheap list view too')
+  assert.notEqual(withFindings.truncations, null, 'never null: null is a run that never said')
+  assert.notEqual(withFindings.truncations, undefined)
+})
+
+test('o3d-11rf r5: only truncation sentinels are lifted — the run is not a second copy of the findings', async () => {
+  // Without this the column would fill with ordinary defects on any large run and stop being the
+  // short, exact statement about completeness that a reader can trust at a glance.
+  const findings = evaluateAccountingReconciliationRows(cleanRows())
+  const ordinary: AccountingReconciliationFinding = {
+    severity: 'critical',
+    code: 'posted_event_without_external_id',
+    message: 'a posted row with no document id',
+    details: { eventId: 'event-1' },
+  }
+  const { withFindings } = await persistAndReload([...findings, ordinary])
+
+  assert.deepEqual(withFindings.truncations, [],
+    'a defect in the DATA is not a statement about the completeness of the report')
+  assert.equal(withFindings._count?.findings, 1, 'and it is still persisted as a finding, where it belongs')
+})
+
+/**
+ * o3d-11rf r6 (Codex r5, HIGH) — THE READING ITSELF, ONCE, WHERE EVERY READER GETS IT FROM.
+ *
+ * The r5 column carries a three-way meaning and r5 left every reader to remember it. These tests are
+ * about the function that reading now goes through, so a reader that uses it cannot conflate NULL
+ * with `[]`, and a reader that does not use it is the only remaining way to get it wrong — which is
+ * a thing a grep can find.
+ */
+test('o3d-11rf r6: NULL is unknown completeness and [] is proven completeness, and they are not the same value', async () => {
+  const unrecorded = readReconciliationCompleteness(null)
+  assert.equal(unrecorded.state, 'unknown')
+  assert.equal(unrecorded.state === 'unknown' && unrecorded.reason, 'not-recorded')
+  assert.equal(unrecorded.truncations, null, 'there is no array to mistake for an empty one')
+
+  // A column Prisma was never asked for arrives as `undefined`, not `null`. Same claim, same answer.
+  assert.equal(readReconciliationCompleteness(undefined).state, 'unknown')
+
+  const recorded = readReconciliationCompleteness([])
+  assert.equal(recorded.state, 'complete',
+    'a run that recorded [] said something, and it is not the same thing as saying nothing')
+  assert.deepEqual(recorded.truncations, [])
+})
+
+test('o3d-11rf r6: a recorded truncation is read back with its code, message and details', async () => {
+  const completeness = readReconciliationCompleteness([
+    { code: RECONCILIATION_ROW_CAP_REACHED, message: '10000 rows scanned', details: { dataset: 'salesOrders' } },
+    { code: VOID_MIRROR_CONTRADICTIONS_TRUNCATED, message: '917 found, 500 reported', details: { total: 917 } },
+  ])
+
+  assert.equal(completeness.state, 'truncated',
+    'a truncated run is proven INCOMPLETE — also not a clean run')
+  assert.deepEqual(completeness.truncations?.map((entry) => entry.code),
+    [RECONCILIATION_ROW_CAP_REACHED, VOID_MIRROR_CONTRADICTIONS_TRUNCATED])
+  assert.deepEqual(completeness.truncations?.[1].details, { total: 917 })
+})
+
+test('o3d-11rf r6: a payload the reader cannot parse is unknown, and never complete', async () => {
+  // THE FAIL-CLOSED DIRECTION. The column is `Json?`, so a row can hold a shape this reader does not
+  // recognise — a future writer's format, or a corrupted value. None of these prove a run was
+  // complete, and the one answer that must never come back is `complete`.
+  for (const raw of [
+    {},                                        // an object rather than an array
+    { truncated: true },                       // something that LOOKS like a completeness claim
+    'none',                                    // a string
+    0,                                         // a number, where 0 might be read as "no truncations"
+    [null],                                    // an array with a hole in it
+    [[]],                                      // an array of arrays
+    [{ code: 'x' }],                           // an entry with no message
+    [{ message: 'x' }],                        // an entry with no code
+    [{ code: '', message: 'x' }],              // an entry whose code says nothing
+    [{ code: 1, message: 'x' }],               // an entry whose code is the wrong type
+    [{ code: 'a', message: 'a' }, 'not-an-entry'], // one good entry does not carry a bad one
+  ]) {
+    const completeness = readReconciliationCompleteness(raw)
+    assert.equal(completeness.state, 'unknown', `${JSON.stringify(raw)} proves nothing about completeness`)
+    assert.equal(completeness.state === 'unknown' && completeness.reason, 'unreadable',
+      'and is distinguishable from an honestly-silent predecessor row')
+  }
+})
+
+test('o3d-11rf r6: what a persisted run records is what the reader reads back', async () => {
+  // THE JOIN BETWEEN THE TWO HALVES. The writer lifts sentinels onto the run; the reader interprets
+  // the column. If either changes shape without the other, this fails — which is the only thing
+  // holding `reconciliationTruncations` and `readReconciliationCompleteness` to the same format.
+  const truncating: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+
+  const { withFindings } = await persistAndReload([truncating])
+  const completeness = readReconciliationCompleteness(withFindings.truncations)
+  assert.equal(completeness.state, 'truncated')
+  assert.deepEqual(completeness.truncations?.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED])
+
+  const { withFindings: clean } = await persistAndReload([])
+  assert.equal(readReconciliationCompleteness(clean.truncations).state, 'complete',
+    'and a run with nothing to report reads back as proven complete, not as unknown')
+})
+
+test('o3d-11rf r6: the list reader hands out the reading, so its callers cannot re-derive it wrongly', async () => {
+  // THE OTHER READER OF THE SAME COLUMN. /api/admin/accounting/reconciliation/runs serialises what
+  // this function returns straight to its caller. It drew no conclusion of its own, which made it
+  // correct and made it the next place the NULL-versus-[] rule could be missed. It now cannot be:
+  // the answer travels with the row.
+  const { client } = persistenceClient()
+  const capReached: AccountingReconciliationFinding = {
+    severity: 'warning',
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: 'Accounting reconciliation reached the 10000 row cap for salesOrders; report may be incomplete',
+    details: { dataset: 'salesOrders', scanned: 10_000, limit: 10_000 },
+  }
+  await persistAccountingReconciliationReport(reportOf([capReached]), client as never)
+  const [listed] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+
+  assert.equal(listed.completeness.state, 'truncated')
+  assert.deepEqual(listed.completeness.truncations?.map((entry) => entry.code), [RECONCILIATION_ROW_CAP_REACHED])
+  assert.deepEqual(listed.truncations, [{
+    code: RECONCILIATION_ROW_CAP_REACHED,
+    message: capReached.message,
+    details: capReached.details,
+  }], 'the raw column is still there, because the run view renders these messages')
+})
+
+test('o3d-11rf r6: a run row the list reader finds with no completeness recorded is unknown, not clean', async () => {
+  // A row written by the predecessor binary, reached through the reader an operator's run list uses.
+  const client = {
+    accountingReconciliationRun: {
+      create: async () => { throw new Error('not used') },
+      findMany: async () => [
+        { id: 'legacy-run', fromDate: null, toDate: null, status: 'COMPLETED', totalCount: 0,
+          warningCount: 0, criticalCount: 0, createdAt: new Date('2026-05-01T10:00:00.000Z'),
+          truncations: null, _count: { findings: 0 } },
+      ],
+    },
+    accountingReconciliationFinding: {
+      createMany: async () => ({ count: 0 }),
+      findUnique: async () => null,
+      update: async () => { throw new Error('not used') },
+    },
+  }
+
+  const [listed] = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+
+  assert.equal(listed.completeness.state, 'unknown',
+    'zero findings and a NULL column is a run nobody checked, not a run with nothing wrong')
 })
