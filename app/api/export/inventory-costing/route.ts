@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
 import { REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
+import { ExactFigure, ExactRatio, roundExact } from '@/lib/domain/math/exact-figure'
+import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import { db } from '@/lib/db'
 import {
   getCogsReport,
@@ -99,6 +101,10 @@ export async function getInventoryCostingExportResponse(
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((row) => row.productId))
+      // THE FILE ROUNDS EACH FIGURE ONCE, FROM ITS EXACT VALUE (o3d-rv4a r5, Codex round 5): money to
+      // six decimals, quantities to four, the ratio to two — the precisions this export has always
+      // published — each toward the bound in the column beside it. The producer hands over exact
+      // figures, so this is the only rounding a CSV value receives.
       const rows = report.rows.map((row) => ({
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
@@ -107,24 +113,24 @@ export async function getInventoryCostingExportResponse(
         warehouseCode: row.warehouseCode ?? '',
         customerName: row.customerName ?? '',
         channel: row.channel ?? '',
-        qty: row.qty,
-        cogsBase: row.cogsBase,
-        revenueBase: row.revenueBase ?? '',
+        qty: exportFigure(row.qty, CSV_QTY_PLACES, 'exact'),
+        cogsBase: exportFigure(row.cogsBase, CSV_MONEY_PLACES, 'exact'),
+        revenueBase: row.revenueBase ? exportFigure(row.revenueBase, CSV_MONEY_PLACES, row.revenueBaseBound ?? 'exact') : '',
         // o3d-rv4a: THE BOUND IS ITS OWN COLUMN, and a blank in it is the producer's `null` — no
         // published figure, so no relation. A CSV that dropped this would be the same defect in a
         // different skin: the page would mark revenue `≤` while the file an operator takes away shows
         // an exact-looking number with nothing beside it, and a file is read as the whole picture.
         revenueBaseBound: row.revenueBaseBound ?? '',
-        grossMarginBase: row.grossMarginBase ?? '',
+        grossMarginBase: row.grossMarginBase ? exportFigure(row.grossMarginBase, CSV_MONEY_PLACES, row.grossMarginBaseBound ?? 'exact') : '',
         grossMarginBaseBound: row.grossMarginBaseBound ?? '',
-        grossMarginPct: row.grossMarginPct ?? '',
+        grossMarginPct: row.grossMarginPct ? exportFigure(row.grossMarginPct, CSV_PCT_PLACES, row.grossMarginPctBound ?? 'exact') : '',
         // Separate from the two linear bounds: margin is a ratio, so this column can read
         // `indeterminate` on a row whose revenue and margin beside it are sound ceilings. A single
         // shared flag column could not say that, and a yes/no one could not say it at all.
         grossMarginPctBound: row.grossMarginPctBound ?? '',
-        refundsNetBasis: row.refundsNetBasis,
-        refundsGrossBasis: row.refundsGrossBasis,
-        refundsUnknownBasis: row.refundsUnknownBasis,
+        refundsNetBasis: exportFigure(row.refundsNetBasis, CSV_MONEY_PLACES, 'exact'),
+        refundsGrossBasis: exportFigure(row.refundsGrossBasis, CSV_MONEY_PLACES, 'exact'),
+        refundsUnknownBasis: exportFigure(row.refundsUnknownBasis, CSV_MONEY_PLACES, 'exact'),
         movementCount: row.movementCount,
         revenueCaptured: row.revenueCaptured,
       }))
@@ -151,7 +157,7 @@ export async function getInventoryCostingExportResponse(
           // them. The trailing-row channel itself (the keys above and the totals below) is the
           // repository-wide contract in docs/architecture.md and is filed as o3d-x5go rather than
           // changed for one report; this branch adds no further row to it.
-          ...Object.fromEntries(Object.entries(report.totals).map(([key, value]) => [`totals.${key}`, value])),
+          ...Object.fromEntries(Object.entries(report.totals).map(([key, value]) => [`totals.${key}`, exportTotal(key, value, report.totals)])),
         },
       )
     }
@@ -234,6 +240,29 @@ function searchParamsForFilters(searchParams: URLSearchParams): InventoryCosting
     else params[key] = [existing, value]
   }
   return params
+}
+
+const CSV_MONEY_PLACES = 6
+const CSV_QTY_PLACES = 4
+const CSV_PCT_PLACES = 2
+
+/** The CSV's one rounding of a figure: money and ratios keep their fixed shape, quantities are trimmed. */
+function exportFigure(value: ExactFigure | ExactRatio, places: number, bound: DerivedFigureBound): string {
+  return roundExact(value, places, bound, { trailingZeros: places === CSV_MONEY_PLACES })
+}
+
+const DERIVED_FIGURE_BOUNDS: ReadonlySet<string> = new Set(['exact', 'upper', 'lower', 'indeterminate'])
+
+/**
+ * A totals value for the metadata rows, rounded once. Still by ITERATION over the producer's whole map,
+ * so a totals key added tomorrow ships tomorrow; a figure is rounded toward the bound published beside
+ * it as `<key>Bound` where there is one, and to nearest where there is not.
+ */
+function exportTotal(key: string, value: unknown, totals: Record<string, unknown>): unknown {
+  if (!(value instanceof ExactFigure) && !(value instanceof ExactRatio)) return value
+  const bound = totals[`${key}Bound`]
+  const direction = typeof bound === 'string' && DERIVED_FIGURE_BOUNDS.has(bound) ? bound as DerivedFigureBound : 'exact'
+  return exportFigure(value, key === 'qty' ? CSV_QTY_PLACES : CSV_MONEY_PLACES, direction)
 }
 
 function exportTooLarge(rowCount: number): NextResponse | null {

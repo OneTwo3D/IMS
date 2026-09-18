@@ -16,9 +16,10 @@ import { assertSourceLimit, SourceScanTooLargeError } from '@/lib/security/sourc
 import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
 import { cache } from 'react'
 import { DISPLAY_ROUNDING_NOTICE_COGS, REFUND_BASIS_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
-import type { BoundedFigureString, DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { ExactFigure, ExactRatio, type ExactRoundable } from '@/lib/domain/math/exact-figure'
 import {
-  boundedFigureString,
+  creditPlacement,
   marginFigureBoundDecimal,
   netLinearFigureBoundDecimal,
 } from '@/lib/domain/sales/refund-basis-analytics'
@@ -146,24 +147,31 @@ export type CogsReportRow = {
   warehouseCode: string | null
   customerName: string | null
   channel: string | null
-  qty: string
-  cogsBase: string
+  /**
+   * EVERY FIGURE ON THIS ROW IS AN `ExactFigure`, UNROUNDED (o3d-rv4a r5, Codex round 5 HIGH). The page
+   * rounds each one once to the base currency's digits and the CSV rounds each one once to its own
+   * published precision; nothing between here and there rounds anything. Round 4 published six-decimal
+   * strings from here and the page rounded them again, which is two roundings — see exact-figure.ts.
+   */
+  qty: ExactFigure
+  cogsBase: ExactFigure
   /**
    * Ex-VAT sales-line revenue behind this group's dispatches, LESS the NET-basis credit against the
    * same lines (o3d-rv4a). `null` where the dispatch could not be matched to a sales line at all —
    * the null-not-zero discipline this report already had, now also covering the credit that
    * therefore had nothing to be subtracted from.
    */
-  revenueBase: BoundedFigureString | null
+  revenueBase: ExactFigure | null
   /**
    * WHAT THE FIGURE BESIDE IT IS, not a decoration on it. `null` travels with a `null` amount: a
    * withheld figure bears no relation to anything, and `'exact'` there would read as a measurement.
    * See lib/domain/sales/derived-figure-bound.ts for what each verdict claims.
    */
   revenueBaseBound: DerivedFigureBound | null
-  grossMarginBase: BoundedFigureString | null
+  grossMarginBase: ExactFigure | null
   grossMarginBaseBound: DerivedFigureBound | null
-  grossMarginPct: BoundedFigureString | null
+  /** `margin / revenue x 100` as an exact quotient, or an exact zero where revenue is not positive. */
+  grossMarginPct: ExactRoundable | null
   /**
    * Separate from the two linear bounds ON PURPOSE. Margin is a RATIO, so unsubtracted credit moves
    * the numerator and the denominator together and the direction is decided case by case — a row
@@ -171,9 +179,9 @@ export type CogsReportRow = {
    */
   grossMarginPctBound: DerivedFigureBound | null
   /** Credit against this group's lines, on the basis it was recorded on. Only `net` was subtracted. */
-  refundsNetBasis: string
-  refundsGrossBasis: string
-  refundsUnknownBasis: string
+  refundsNetBasis: ExactFigure
+  refundsGrossBasis: ExactFigure
+  refundsUnknownBasis: ExactFigure
   movementCount: number
   revenueCaptured: boolean
 }
@@ -186,21 +194,20 @@ export type CogsReport = {
   rows: CogsReportRow[]
   pageInfo: PageInfo
   totals: {
-    qty: string
-    cogsBase: string
+    qty: ExactFigure
+    cogsBase: ExactFigure
     /**
-     * THE THREE FIGURES ON THIS REPORT THAT CARRY A RELATION ARE TYPED SO THEY CANNOT BE ROUNDED THE
-     * WRONG WAY (o3d-rv4a r2). `BoundedFigureString` is mintable only by `boundedFigureString`, which
-     * demands the bound and rounds toward it; `moneyString` returns a plain `string` and no longer
-     * typechecks here. Round 1 published these through ROUND_HALF_UP under a `≤`.
+     * UNROUNDED, LIKE EVERY FIGURE HERE (o3d-rv4a r5). Round 2 typed these `BoundedFigureString` so they
+     * could not be rounded the wrong way; round 5 stops them being rounded here at all. The direction is
+     * still enforced where the one rounding happens: `roundExact` takes the bound beside the figure.
      */
-    revenueBase: BoundedFigureString
+    revenueBase: ExactFigure
     revenueBaseBound: DerivedFigureBound
-    grossMarginBase: BoundedFigureString
+    grossMarginBase: ExactFigure
     grossMarginBaseBound: DerivedFigureBound
-    refundsNetBasis: string
-    refundsGrossBasis: string
-    refundsUnknownBasis: string
+    refundsNetBasis: ExactFigure
+    refundsGrossBasis: ExactFigure
+    refundsUnknownBasis: ExactFigure
     /**
      * CREDIT THAT REACHED NO ROW, STATED ON ITS OWN BASIS AND NEVER AS ONE SUM. A net amount and a
      * gross amount added together are in no unit at all, and an operator reading that beside a NET
@@ -212,15 +219,15 @@ export type CogsReport = {
      * Either makes the period figures bounded even where the credit is the figure's own unit — it is
      * real credit that nothing subtracted.
      */
-    refundsUnattributedNetBasis: string
-    refundsUnattributedGrossBasis: string
-    refundsUnattributedUnknownBasis: string
-    refundsOutsideReportNetBasis: string
-    refundsOutsideReportGrossBasis: string
-    refundsOutsideReportUnknownBasis: string
+    refundsUnattributedNetBasis: ExactFigure
+    refundsUnattributedGrossBasis: ExactFigure
+    refundsUnattributedUnknownBasis: ExactFigure
+    refundsOutsideReportNetBasis: ExactFigure
+    refundsOutsideReportGrossBasis: ExactFigure
+    refundsOutsideReportUnknownBasis: ExactFigure
     revenueCapturedRows: number
-    glBalanceBase: string | null
-    glVarianceBase: string | null
+    glBalanceBase: ExactFigure | null
+    glVarianceBase: ExactFigure | null
   }
   notices: string[]
 }
@@ -510,30 +517,6 @@ function moneyString(value: DecimalInput): string {
   return roundQuantity(value, 6).toFixed(6)
 }
 
-/**
- * `moneyString` FOR A FIGURE THAT CARRIES A RELATION — same six decimals, rounded toward the bound
- * rather than to nearest (o3d-rv4a r2, Codex round 2 HIGH 3).
- *
- * The file this feeds publishes six decimals, so the defect bites at the seventh: a true revenue of
- * 100.0000003167 under a `≤` printed as `100.000000` is a ceiling below the truth, in a CSV column,
- * where the reader has no tooltip and no page to compare it against. A CSV column that rounds a bound
- * the wrong way is the same defect as the page's, in a different skin.
- */
-function boundedMoneyString(value: DecimalInput, bound: DerivedFigureBound): BoundedFigureString {
-  return boundedFigureString(value, bound, 6)
-}
-
-/**
- * The margin RATIO, at the two decimals this report has always published it to, rounded toward its
- * OWN bound — which is not always the bound on the amounts beside it (`marginFigureBoundDecimal`).
- *
- * `trailingZeros: false` keeps `decimalString`'s trimmed shape, so an exact 60% still reads `60` and
- * not `60.00`. The trimming is cosmetic; the direction above it is not.
- */
-function boundedPctString(value: DecimalInput, bound: DerivedFigureBound): BoundedFigureString {
-  return boundedFigureString(value, bound, 2, false)
-}
-
 function decimalZero(): Decimal {
   return toDecimal(0)
 }
@@ -637,7 +620,7 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, 
   }
 }
 
-async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: Decimal, filters: InventoryCostingFilters): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: ExactFigure, filters: InventoryCostingFilters): Promise<{ glBalanceBase: ExactFigure | null; glVarianceBase: ExactFigure | null; notices: string[] }> {
   if (!hasCogsGlScope(filters)) {
     return {
       glBalanceBase: null,
@@ -671,9 +654,14 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
   const notices = movement.movementBase.lt(0)
     ? ['GL COGS movement is negative. This can be caused by period-end reclassification, year-end close, or refunds; investigate before relying on the variance.']
     : []
+  // Exact, like the COGS total it is compared with (o3d-rv4a r5): IMS minus the ledger, the same
+  // orientation as `calculateAccountBalanceVarianceBase`, without a 20-significant-digit Decimal
+  // subtraction in between. `movementBase` is the ledger's own closing-minus-opening of two stored
+  // balances, which needs at most nineteen significant digits and is therefore exact already.
+  const ledger = ExactFigure.of(movement.movementBase)
   return {
-    glBalanceBase: movement.movementBase,
-    glVarianceBase: calculateAccountBalanceVarianceBase(cogsBase, movement.movementBase),
+    glBalanceBase: ledger,
+    glVarianceBase: cogsBase.sub(ledger),
     notices,
   }
 }
@@ -842,6 +830,64 @@ export type CogsCreditInput = {
   outsideReport: CreditBuckets
   /** Named nothing keyable: no sales line, no product, or no order behind it. */
   unattributed: CreditBuckets
+  /**
+   * THE SAME CREDIT, EXACTLY, FOR THE FIGURES (o3d-rv4a r5). The AMOUNTS a reader sees come from here,
+   * accumulated entry by entry through the same bucket rule `addCredit` uses. `CreditBuckets` holds
+   * Prisma.Decimal sums (and `scaleCredits` shares), which round at twenty significant digits, and is
+   * kept only for the VERDICT. Its zero and sign tests cannot be flipped by that rounding (a sum of
+   * same-signed entries keeps its sign), but `marginFigureBoundDecimal`'s case 3 compares revenue WITH
+   * the unplaced credit, and a Decimal-rounded credit can differ from the exact one in its twentieth
+   * significant digit. That comparison is therefore only as exact as the pre-existing verdict machinery;
+   * it is not claimed exact here.
+   */
+  exact: {
+    byRevenueKey: Map<string, ExactCredit>
+    outsideReport: ExactCredit
+    unattributed: ExactCredit
+  }
+}
+
+/** Credit on each recorded basis, held exactly. Only `net` is ever subtracted from this report's figures. */
+export type ExactCredit = { net: ExactFigure; gross: ExactFigure; unknown: ExactFigure }
+
+function emptyExactCredit(): ExactCredit {
+  return { net: ExactFigure.zero(), gross: ExactFigure.zero(), unknown: ExactFigure.zero() }
+}
+
+/** `addCredit`'s bucket rule, verbatim: `creditPlacement('NET', …).bucket`, so the two cannot disagree. */
+function addExactCredit(into: ExactCredit, totalsBasis: string | null, amount: DecimalInput): void {
+  const { bucket } = creditPlacement('NET', totalsBasis, amount)
+  into[bucket] = into[bucket].add(ExactFigure.of(amount))
+}
+
+function shareExactCredit(credit: ExactCredit, part: ExactFigure, whole: ExactFigure): ExactCredit {
+  return { net: credit.net.mulDiv(part, whole), gross: credit.gross.mulDiv(part, whole), unknown: credit.unknown.mulDiv(part, whole) }
+}
+
+function sumExactCredits(parts: ExactCredit[]): ExactCredit {
+  return {
+    net: ExactFigure.sum(parts.map((part) => part.net)),
+    gross: ExactFigure.sum(parts.map((part) => part.gross)),
+    unknown: ExactFigure.sum(parts.map((part) => part.unknown)),
+  }
+}
+
+/** The credit that is this report's figures' own unit — NET, as `COGS_FIGURE_BASIS` says. */
+function comparableExactCredit(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactFigure {
+  return basis === 'NET' ? credit.net : credit.gross
+}
+
+/**
+ * The figure a VERDICT compares, never one a reader sees: the exact value to sixty decimal places, with
+ * its exact sign kept even where it rounds to zero, so `marginFigureBoundDecimal`'s `revenue <= 0` case
+ * agrees with the page's own `revenue > 0` guard on the percentage.
+ */
+function verdictDecimal(figure: ExactFigure): Decimal {
+  const sign = figure.sign()
+  const projected = toDecimal(figure.roundTo(60, 'halfUp'))
+  if (sign === 0) return decimalZero()
+  if (projected.isZero()) return toDecimal(sign).mul(toDecimal('1e-61'))
+  return projected
 }
 
 /**
@@ -862,13 +908,20 @@ export type CogsCreditSummary = {
   unaccountedInterval: UnplacedCreditInterval
   /** False when ANY credit was left out of the period figures, for any reason. */
   basisComplete: boolean
+  /** The same three credit sets as exact amounts, for the published credit totals. */
+  exact: { attributed: ExactCredit; unattributed: ExactCredit; outsideReport: ExactCredit }
 }
 
 /** THIS REPORT'S REVENUE IS EX-VAT `SalesOrderLine.totalBase`, so a NET-basis credit is its unit. */
 const COGS_FIGURE_BASIS = 'NET' as const
 
 function emptyCogsCreditInput(): CogsCreditInput {
-  return { byRevenueKey: new Map(), outsideReport: emptyCredits(), unattributed: emptyCredits() }
+  return {
+    byRevenueKey: new Map(),
+    outsideReport: emptyCredits(),
+    unattributed: emptyCredits(),
+    exact: { byRevenueKey: new Map(), outsideReport: emptyExactCredit(), unattributed: emptyExactCredit() },
+  }
 }
 
 /**
@@ -894,17 +947,19 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
  * credit is 0.999916667. The published ceiling sat BELOW the truth — which is not a loose bound, it is
  * a false statement wearing a `≤`.
  *
- * So the aggregate travels as Decimal and is rounded exactly once, by the caller, toward its bound.
- * A consequence worth stating because it looks like a defect and is not: the rows no longer add up to
- * the total on screen. Each row is rounded toward its own ceiling and the total is rounded toward the
- * total's, so a column of ceilings can exceed the ceiling of the sum. Both figures are sound bounds;
- * the alternative — making them tally — is precisely the arithmetic that produced a false one.
+ * So the aggregate travels unrounded — as `ExactFigure`, since o3d-rv4a r5 found Prisma.Decimal's own
+ * twenty-significant-digit arithmetic to be a rounding too — and is rounded exactly once, by the page or
+ * the CSV, toward its bound.
+ * A consequence: the rows need not add up to the total on screen, because each is rounded on its own.
+ * That is what DISPLAY_ROUNDING_NOTICE_COGS tells the reader. (Round 3 also claimed that making them
+ * tally would falsify a figure; round 4 showed raising a ceiled total to the sum of ceiled rows is a
+ * looser ceiling, not a false one, so that claim is withdrawn.)
  */
 export type CogsUnroundedTotals = {
-  qty: Decimal
-  cogsBase: Decimal
-  revenueBase: Decimal
-  grossMarginBase: Decimal
+  qty: ExactFigure
+  cogsBase: ExactFigure
+  revenueBase: ExactFigure
+  grossMarginBase: ExactFigure
   revenueCapturedRows: number
 }
 
@@ -919,24 +974,33 @@ export function aggregateCogsReport(
   // the full line revenue in each group double-counts the report total
   // (cogs-audit scjz.50). Build per-line totals first, then allocate each line's
   // revenue across its groups in proportion to the qty fulfilled by that group.
-  const lineRevenueByKey = new Map<string, { revenue: Decimal; totalQty: Decimal }>()
+  // Each line carries its quantity both as a Decimal (the credit INTERVAL's share, for the verdict) and
+  // exactly (the published figures' share). The Decimal one is a sum of non-negative stored
+  // quantities, so its sign — the only thing `degenerate` below reads from it — is exact too.
+  const lineRevenueByKey = new Map<string, { totalQty: Decimal; exactRevenue: ExactFigure; exactTotalQty: ExactFigure }>()
   for (const input of inputs) {
     if (!input.revenueKey || input.revenueBase == null) continue
     const existing = lineRevenueByKey.get(input.revenueKey)
     if (existing) {
       existing.totalQty = existing.totalQty.add(toDecimal(input.qty))
+      existing.exactTotalQty = existing.exactTotalQty.add(ExactFigure.of(input.qty))
     } else {
-      lineRevenueByKey.set(input.revenueKey, { revenue: toDecimal(input.revenueBase), totalQty: toDecimal(input.qty) })
+      lineRevenueByKey.set(input.revenueKey, {
+        totalQty: toDecimal(input.qty),
+        exactRevenue: ExactFigure.of(input.revenueBase),
+        exactTotalQty: ExactFigure.of(input.qty),
+      })
     }
   }
 
   const groups = new Map<string, {
     first: CogsAggregationInput
-    qty: Decimal
-    cogsBase: Decimal
+    qty: ExactFigure
+    cogsBase: ExactFigure
     revenueCaptured: boolean
-    unkeyedRevenue: Decimal
+    unkeyedRevenue: ExactFigure
     qtyByRevenueKey: Map<string, Decimal>
+    exactQtyByRevenueKey: Map<string, ExactFigure>
     movementIds: Set<string>
   }>()
 
@@ -944,23 +1008,25 @@ export function aggregateCogsReport(
     const key = cogsGroupKey(input, groupBy)
     const existing = groups.get(key) ?? {
       first: input,
-      qty: decimalZero(),
-      cogsBase: decimalZero(),
+      qty: ExactFigure.zero(),
+      cogsBase: ExactFigure.zero(),
       revenueCaptured: true,
-      unkeyedRevenue: decimalZero(),
+      unkeyedRevenue: ExactFigure.zero(),
       qtyByRevenueKey: new Map<string, Decimal>(),
+      exactQtyByRevenueKey: new Map<string, ExactFigure>(),
       movementIds: new Set<string>(),
     }
-    existing.qty = existing.qty.add(toDecimal(input.qty))
-    existing.cogsBase = existing.cogsBase.add(toDecimal(input.cogsBase))
+    existing.qty = existing.qty.add(ExactFigure.of(input.qty))
+    existing.cogsBase = existing.cogsBase.add(ExactFigure.of(input.cogsBase))
     if (input.revenueBase == null) {
       existing.revenueCaptured = false
     } else if (input.revenueKey) {
       existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? decimalZero()).add(toDecimal(input.qty)))
+      existing.exactQtyByRevenueKey.set(input.revenueKey, (existing.exactQtyByRevenueKey.get(input.revenueKey) ?? ExactFigure.zero()).add(ExactFigure.of(input.qty)))
     } else {
       // Unkeyed revenue cannot be cross-group-deduped or qty-allocated; preserve
       // the prior per-row behaviour of summing it directly into the group.
-      existing.unkeyedRevenue = existing.unkeyedRevenue.add(toDecimal(input.revenueBase))
+      existing.unkeyedRevenue = existing.unkeyedRevenue.add(ExactFigure.of(input.revenueBase))
     }
     existing.movementIds.add(input.id)
     groups.set(key, existing)
@@ -968,16 +1034,14 @@ export function aggregateCogsReport(
 
   // o3d-rv4a: the credit that reached a row, and the interval of credit nothing subtracted.
   const attributed = emptyCredits()
+  const exactAttributed: ExactCredit[] = []
   const unaccounted: UnplacedCreditInterval[] = []
   // The period totals, accumulated from the UNROUNDED group figures as each row is built — never
   // reconstructed afterwards from the rows' published strings (Codex round 2 HIGH 2, above).
-  const totals: CogsUnroundedTotals = {
-    qty: decimalZero(),
-    cogsBase: decimalZero(),
-    revenueBase: decimalZero(),
-    grossMarginBase: decimalZero(),
-    revenueCapturedRows: 0,
-  }
+  // Collected as parts and summed ONCE at the end: ExactFigure addition copies its quotient terms, so a
+  // running total over thousands of groups would be quadratic in them.
+  const totalParts = { qty: [] as ExactFigure[], cogsBase: [] as ExactFigure[], revenueBase: [] as ExactFigure[], grossMarginBase: [] as ExactFigure[] }
+  let revenueCapturedRows = 0
   const rows = [...groups.entries()]
     .map(([key, group]) => {
       // Sum this group's qty-proportional share of each line's revenue. When a
@@ -989,23 +1053,31 @@ export function aggregateCogsReport(
       // quantity share while charging every group the whole credit would understate margin by the
       // credit once per extra group — the mirror of the double-count scjz.50 fixed for revenue.
       const groupCredits = emptyCredits()
-      const groupRevenue = [...group.qtyByRevenueKey.entries()].reduce((sum, [revKey, groupQty]) => {
+      const shares: ExactFigure[] = [group.unkeyedRevenue]
+      const creditShares: ExactCredit[] = []
+      for (const [revKey, groupQty] of group.qtyByRevenueKey) {
         const line = lineRevenueByKey.get(revKey)
-        if (!line) return sum
+        if (!line) continue
         const degenerate = !line.totalQty.gt(0)
-        const share = degenerate ? line.revenue : line.revenue.mul(groupQty).div(line.totalQty)
+        const exactGroupQty = group.exactQtyByRevenueKey.get(revKey) ?? ExactFigure.zero()
+        // THE SHARE STAYS A QUOTIENT (o3d-rv4a r5). Round 4 computed `revenue x q / Q` as a Decimal, which
+        // rounds it to twenty significant digits, and then published it at six decimals, rounding again.
+        shares.push(degenerate ? line.exactRevenue : line.exactRevenue.mulDiv(exactGroupQty, line.exactTotalQty))
         const credit = credits.byRevenueKey.get(revKey)
         if (credit) {
           mergeCredits(groupCredits, degenerate
             ? credit
             : scaleCredits(credit, groupQty, line.totalQty))
         }
-        return sum.add(share)
-      }, group.unkeyedRevenue)
+        const exactCredit = credits.exact.byRevenueKey.get(revKey)
+        if (exactCredit) creditShares.push(degenerate ? exactCredit : shareExactCredit(exactCredit, exactGroupQty, line.exactTotalQty))
+      }
+      const groupRevenue = ExactFigure.sum(shares)
+      const exactGroupCredits = sumExactCredits(creditShares)
       // Only the credit on this figure's OWN basis is the same unit as it, so only that is taken off.
       // Nothing is converted: on a mixed-rate order the rate behind a gross credit is not recoverable
       // from stored data (refund-basis-analytics.ts, o3d-w00's fail-closed conclusion).
-      const revenueBase = group.revenueCaptured ? groupRevenue.sub(comparableCredit(groupCredits, COGS_FIGURE_BASIS)) : null
+      const revenueBase = group.revenueCaptured ? groupRevenue.sub(comparableExactCredit(exactGroupCredits, COGS_FIGURE_BASIS)) : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
       // The ratio guard is `revenue > 0`, matching the Gross Margin report's `pctString` exactly
       // (o3d-kyey), so `marginFigureBoundDecimal`'s published case analysis is true OF THIS REPORT
@@ -1014,10 +1086,11 @@ export function aggregateCogsReport(
       // o3d-rv4a this report divided by a NEGATIVE revenue and published the sign-flipped quotient
       // (revenue -20 against 40 of cost printed +300%), which no case of that analysis covers — and
       // a negative revenue was unreachable then and is routine now that credit is subtracted.
-      const grossMarginPct = revenueBase == null
+      const grossMarginPct: ExactRoundable | null = revenueBase == null
         ? null
-        : revenueBase.gt(0) ? grossMarginBase!.div(revenueBase).mul(100) : decimalZero()
+        : revenueBase.sign() === 1 ? new ExactRatio(grossMarginBase!, revenueBase, 100) : ExactFigure.zero()
       mergeCredits(attributed, groupCredits)
+      exactAttributed.push(exactGroupCredits)
       const basisComplete = creditBasisComplete(groupCredits, COGS_FIGURE_BASIS)
       if (group.revenueCaptured) {
         unaccounted.push(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
@@ -1030,14 +1103,14 @@ export function aggregateCogsReport(
       const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
       const pctBound = grossMarginPct == null
         ? null
-        : marginFigureBoundDecimal({ netRevenue: revenueBase!, cogs: group.cogsBase, unplacedCredit: unplaced, basisComplete })
-      totals.qty = totals.qty.add(group.qty)
-      totals.cogsBase = totals.cogsBase.add(group.cogsBase)
+        : marginFigureBoundDecimal({ netRevenue: verdictDecimal(revenueBase!), cogs: verdictDecimal(group.cogsBase), unplacedCredit: unplaced, basisComplete })
+      totalParts.qty.push(group.qty)
+      totalParts.cogsBase.push(group.cogsBase)
       // A withheld figure contributes NOTHING, which is what its null has always meant to the totals —
       // and the credit that reached it is carried in `unaccounted` above, so it bounds them instead.
-      if (revenueBase) totals.revenueBase = totals.revenueBase.add(revenueBase)
-      if (grossMarginBase) totals.grossMarginBase = totals.grossMarginBase.add(grossMarginBase)
-      if (group.revenueCaptured) totals.revenueCapturedRows += 1
+      if (revenueBase) totalParts.revenueBase.push(revenueBase)
+      if (grossMarginBase) totalParts.grossMarginBase.push(grossMarginBase)
+      if (group.revenueCaptured) revenueCapturedRows += 1
       return {
         groupKey: key,
         groupLabel: cogsGroupLabel(group.first, groupBy),
@@ -1048,29 +1121,36 @@ export function aggregateCogsReport(
         warehouseCode: groupBy === 'warehouse' ? group.first.warehouseCode : null,
         customerName: groupBy === 'customer' ? group.first.customerName : null,
         channel: groupBy === 'channel' ? group.first.channel : null,
-        qty: decimalString(group.qty, 4),
-        cogsBase: moneyString(group.cogsBase),
-        // Each figure is rendered toward ITS OWN bound, and the ratio's bound is not the amounts'.
-        revenueBase: revenueBase ? boundedMoneyString(revenueBase, linearBound) : null,
+        qty: group.qty,
+        cogsBase: group.cogsBase,
+        // Unrounded. Each figure is rounded once, where it is shown, toward ITS OWN bound — and the
+        // ratio's bound is not the amounts'.
+        revenueBase,
         revenueBaseBound: revenueBase ? linearBound : null,
-        grossMarginBase: grossMarginBase ? boundedMoneyString(grossMarginBase, linearBound) : null,
+        grossMarginBase,
         grossMarginBaseBound: grossMarginBase ? linearBound : null,
-        grossMarginPct: grossMarginPct ? boundedPctString(grossMarginPct, pctBound!) : null,
+        grossMarginPct,
         grossMarginPctBound: pctBound,
-        refundsNetBasis: moneyString(groupCredits.net),
-        refundsGrossBasis: moneyString(groupCredits.gross),
-        refundsUnknownBasis: moneyString(groupCredits.unknown),
+        refundsNetBasis: exactGroupCredits.net,
+        refundsGrossBasis: exactGroupCredits.gross,
+        refundsUnknownBasis: exactGroupCredits.unknown,
         movementCount: group.movementIds.size,
         revenueCaptured: group.revenueCaptured,
       }
     })
     .sort((a, b) => {
-      const aCogs = toDecimal(a.cogsBase)
-      const bCogs = toDecimal(b.cogsBase)
-      if (aCogs.lt(bCogs)) return 1
-      if (aCogs.gt(bCogs)) return -1
+      // Highest COGS first, compared exactly.
+      const order = b.cogsBase.sub(a.cogsBase).sign()
+      if (order !== 0) return order
       return a.groupLabel.localeCompare(b.groupLabel)
     })
+  const totals: CogsUnroundedTotals = {
+    qty: ExactFigure.sum(totalParts.qty),
+    cogsBase: ExactFigure.sum(totalParts.cogsBase),
+    revenueBase: ExactFigure.sum(totalParts.revenueBase),
+    grossMarginBase: ExactFigure.sum(totalParts.grossMarginBase),
+    revenueCapturedRows,
+  }
   // Credit that reached no row at all bounds the period figures WHATEVER BASIS IT IS ON. A NET credit
   // is `placeable` — it is the figure's own unit — so a completeness flag read off the basis alone
   // would publish the period revenue as exact with a credit note missing from it. Existence is
@@ -1093,6 +1173,11 @@ export function aggregateCogsReport(
       // left out. Either one false makes the period figures bounded.
       basisComplete: creditBasisComplete(attributed, COGS_FIGURE_BASIS)
         && unaccountedInterval.lower.isZero() && unaccountedInterval.upper.isZero(),
+      exact: {
+        attributed: sumExactCredits(exactAttributed),
+        unattributed: credits.exact.unattributed,
+        outsideReport: credits.exact.outsideReport,
+      },
     },
   }
 }
@@ -1431,6 +1516,9 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
           lines: { select: { productId: true, totalBase: true } },
         },
       })
+  // Summed EXACTLY and handed on as a Decimal holding every digit (a Decimal constructor does not round;
+  // only Decimal arithmetic does). `.add` here would round a sum past twenty significant digits.
+  const exactRevenueByOrderProduct = new Map<string, ExactFigure>()
   const revenueByOrderProduct = new Map<string, Decimal>()
   const orderMetaById = new Map<string, { customerName: string | null; channel: string | null }>()
   for (const order of rows) {
@@ -1444,9 +1532,10 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
     for (const line of order.lines) {
       if (!line.productId) continue
       const key = revenueKey({ orderId: order.id, productId: line.productId })
-      revenueByOrderProduct.set(key, (revenueByOrderProduct.get(key) ?? decimalZero()).add(toDecimal(line.totalBase)))
+      exactRevenueByOrderProduct.set(key, (exactRevenueByOrderProduct.get(key) ?? ExactFigure.zero()).add(ExactFigure.of(line.totalBase)))
     }
   }
+  for (const [key, sum] of exactRevenueByOrderProduct) revenueByOrderProduct.set(key, toDecimal(sum.exactString()))
   return { revenueByOrderProduct, orderMetaById }
 }
 
@@ -1588,9 +1677,13 @@ export function resolveCogsRefundCreditKeys(
       const buckets = result.byRevenueKey.get(key) ?? emptyCredits()
       addCredit(buckets, line.refund.totalsBasis, line.totalBase)
       result.byRevenueKey.set(key, buckets)
+      const exact = result.exact.byRevenueKey.get(key) ?? emptyExactCredit()
+      addExactCredit(exact, line.refund.totalsBasis, line.totalBase)
+      result.exact.byRevenueKey.set(key, exact)
       continue
     }
     addCredit(lineKey || pairKey ? result.outsideReport : result.unattributed, line.refund.totalsBasis, line.totalBase)
+    addExactCredit(lineKey || pairKey ? result.exact.outsideReport : result.exact.unattributed, line.refund.totalsBasis, line.totalBase)
   }
   return result
 }
@@ -1806,10 +1899,9 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     basisComplete: creditSummary.basisComplete,
     unplacedCredit: unplacedCreditBound(creditSummary.unaccountedInterval),
   })
-  const reportCredits = emptyCredits()
-  mergeCredits(reportCredits, creditSummary.attributed)
-  mergeCredits(reportCredits, creditSummary.unattributed)
-  mergeCredits(reportCredits, creditSummary.outsideReport)
+  // The credit footers: every row's credit PLUS the credit that reached no row. That second part is
+  // why a credit footer can differ from its column by more than rounding (Codex r5 MEDIUM 1).
+  const reportCredits = sumExactCredits([creditSummary.exact.attributed, creditSummary.exact.unattributed, creditSummary.exact.outsideReport])
   const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
@@ -1820,30 +1912,34 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      qty: decimalString(totals.qty, 4),
-      cogsBase: moneyString(totals.cogsBase),
-      // Rounded ONCE, here, toward the relation the verdict beside it claims.
-      revenueBase: boundedMoneyString(totals.revenueBase, totalsBound),
+      // UNROUNDED (o3d-rv4a r5). Each is rounded once by the page or the CSV, toward the bound beside it.
+      qty: totals.qty,
+      cogsBase: totals.cogsBase,
+      revenueBase: totals.revenueBase,
       revenueBaseBound: totalsBound,
-      grossMarginBase: boundedMoneyString(totals.grossMarginBase, totalsBound),
+      grossMarginBase: totals.grossMarginBase,
       grossMarginBaseBound: totalsBound,
-      refundsNetBasis: moneyString(reportCredits.net),
-      refundsGrossBasis: moneyString(reportCredits.gross),
-      refundsUnknownBasis: moneyString(reportCredits.unknown),
-      refundsUnattributedNetBasis: moneyString(creditSummary.unattributed.net),
-      refundsUnattributedGrossBasis: moneyString(creditSummary.unattributed.gross),
-      refundsUnattributedUnknownBasis: moneyString(creditSummary.unattributed.unknown),
-      refundsOutsideReportNetBasis: moneyString(creditSummary.outsideReport.net),
-      refundsOutsideReportGrossBasis: moneyString(creditSummary.outsideReport.gross),
-      refundsOutsideReportUnknownBasis: moneyString(creditSummary.outsideReport.unknown),
+      refundsNetBasis: reportCredits.net,
+      refundsGrossBasis: reportCredits.gross,
+      refundsUnknownBasis: reportCredits.unknown,
+      refundsUnattributedNetBasis: creditSummary.exact.unattributed.net,
+      refundsUnattributedGrossBasis: creditSummary.exact.unattributed.gross,
+      refundsUnattributedUnknownBasis: creditSummary.exact.unattributed.unknown,
+      refundsOutsideReportNetBasis: creditSummary.exact.outsideReport.net,
+      refundsOutsideReportGrossBasis: creditSummary.exact.outsideReport.gross,
+      refundsOutsideReportUnknownBasis: creditSummary.exact.outsideReport.unknown,
       revenueCapturedRows: totals.revenueCapturedRows,
-      glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
-      glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
+      glBalanceBase: gl.glBalanceBase,
+      glVarianceBase: gl.glVarianceBase,
     },
     notices: [
       ...gl.notices,
       allRows.some((row) => !row.revenueCaptured)
-        ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product. Credit against an unmatched row has no revenue to come off and is reported in the off-report totals instead.'
+        // o3d-rv4a r5, Codex round 5 MEDIUM 2: what the report DOES with credit around an Unmatched row. A
+        // row is withheld if ANY of its movements cannot be matched; credit against a line it DID match is
+        // still attributed to the row (its credit columns), and only credit naming a line or product the
+        // report holds no revenue for goes to the off-report totals.
+        ? 'Revenue and margin are shown only where every COGS movement in a row can be matched to a sales order line for the same product; otherwise the row reads Unmatched. Credit against a line such a row did match still appears in that row\u2019s credit columns, with no revenue to come off; credit naming a line or product the report has no revenue for is shown in the off-report credit totals.'
         : '',
       // o3d-rv4a: this report is no longer refund-blind. Revenue is the dispatch's ex-VAT sales-line
       // revenue LESS the net-basis credit raised in the period; the gross-basis and unproven-basis

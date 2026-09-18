@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
+import { roundExact } from '@/lib/domain/math/exact-figure'
 import {
   aggregateCogsRows,
   aggregateInventoryTurnoverRows,
@@ -126,11 +127,12 @@ describe('inventory costing report aggregations', () => {
     const [row] = aggregateCogsRows(rows, 'product')
 
     assert.equal(row?.groupKey, 'product-a')
-    assert.equal(row?.qty, '3')
-    assert.equal(row?.cogsBase, '7.750000')
-    assert.equal(row?.revenueBase, '30.000000')
-    assert.equal(row?.grossMarginBase, '22.250000')
-    assert.equal(row?.grossMarginPct, '74.17')
+    assert.equal(row?.qty.exactString(), '3')
+    assert.equal(row?.cogsBase.exactString(), '7.75')
+    assert.equal(row?.revenueBase?.exactString(), '30')
+    assert.equal(row?.grossMarginBase?.exactString(), '22.25')
+    // Exact 22.25 / 30 x 100 = 74.1666…, rounded once to two decimals, as the page and the CSV print it.
+    assert.equal(row?.grossMarginPct == null ? null : roundExact(row.grossMarginPct, 2, row.grossMarginPctBound ?? 'exact'), '74.17')
     assert.equal(row?.revenueCaptured, true)
   })
 
@@ -172,9 +174,9 @@ describe('inventory costing report aggregations', () => {
 
     const [row] = aggregateCogsRows(rows, 'product')
 
-    assert.equal(row?.cogsBase, '7.000000')
-    assert.equal(row?.revenueBase, '10.000000')
-    assert.equal(row?.grossMarginBase, '3.000000')
+    assert.equal(row?.cogsBase.exactString(), '7')
+    assert.equal(row?.revenueBase?.exactString(), '10')
+    assert.equal(row?.grossMarginBase?.exactString(), '3')
     assert.equal(row?.revenueCaptured, true)
   })
 
@@ -219,15 +221,15 @@ describe('inventory costing report aggregations', () => {
 
     const rowsByGroup = aggregateCogsRows(rows, 'warehouse')
     const byCode = new Map(rowsByGroup.map((row) => [row.warehouseCode, row]))
-    assert.equal(byCode.get('WHA')?.revenueBase, '150.000000')
-    assert.equal(byCode.get('WHB')?.revenueBase, '150.000000')
+    assert.equal(byCode.get('WHA')?.revenueBase?.exactString(), '150')
+    assert.equal(byCode.get('WHB')?.revenueBase?.exactString(), '150')
     // Per-group revenue now sums to the true line revenue, not 2x.
-    const totalRevenue = rowsByGroup.reduce((sum, row) => sum + Number(row.revenueBase ?? 0), 0)
+    const totalRevenue = rowsByGroup.reduce((sum, row) => sum + Number(row.revenueBase?.exactString() ?? 0), 0)
     assert.equal(totalRevenue, 300)
 
     // Grouping that keeps the line in a single group still shows full revenue.
     const [productRow] = aggregateCogsRows(rows, 'product')
-    assert.equal(productRow?.revenueBase, '300.000000')
+    assert.equal(productRow?.revenueBase?.exactString(), '300')
   })
 
   it('still counts revenue for matched rows that carry no revenue key', () => {
@@ -252,8 +254,8 @@ describe('inventory costing report aggregations', () => {
 
     const [row] = aggregateCogsRows(rows, 'product')
 
-    assert.equal(row?.revenueBase, '10.000000')
-    assert.equal(row?.grossMarginBase, '6.000000')
+    assert.equal(row?.revenueBase?.exactString(), '10')
+    assert.equal(row?.grossMarginBase?.exactString(), '6')
     assert.equal(row?.revenueCaptured, true)
   })
 
@@ -332,7 +334,7 @@ describe('inventory costing report aggregations', () => {
 
     const [row] = aggregateCogsRows(rows, 'product')
 
-    assert.equal(row?.cogsBase, '7.000000')
+    assert.equal(row?.cogsBase.exactString(), '7')
     assert.equal(row?.revenueBase, null)
     assert.equal(row?.grossMarginBase, null)
     assert.equal(row?.revenueCaptured, false)
@@ -750,8 +752,8 @@ describe('resolveCogsRevenueKeys (scjz.67 line-granularity revenue)', () => {
       { id: 'm-b', warehouseId: 'wh-b', warehouseCode: 'WHB', ...base, ...resolved[1]! },
     ]
     const byCode = new Map(aggregateCogsRows(rows, 'warehouse').map((row) => [row.warehouseCode, row]))
-    assert.equal(byCode.get('WHA')?.revenueBase, '100.000000')
-    assert.equal(byCode.get('WHB')?.revenueBase, '200.000000')
+    assert.equal(byCode.get('WHA')?.revenueBase?.exactString(), '100')
+    assert.equal(byCode.get('WHB')?.revenueBase?.exactString(), '200')
   })
 
   it('falls back to the blended order:product key for the whole pair when any row is unlinked', () => {

@@ -4,6 +4,8 @@ import path from 'node:path'
 import test, { mock } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { parseCsv } from '@/lib/csv'
+import { ExactFigure, roundExact, type ExactRoundable } from '@/lib/domain/math/exact-figure'
+import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 /**
  * o3d-rv4a. THE ARITHMETIC IN EVERY ASSERTION IS WORKED OUT IN THE COMMENT ABOVE IT, FROM NAMED
@@ -235,6 +237,16 @@ function printedNumber(text: string): Prisma.Decimal {
   return D(cleaned)
 }
 
+/**
+ * The margin % a row publishes, rounded ONCE to the two decimals the page and the CSV print it at,
+ * toward its own bound. The producer hands over the exact quotient (o3d-rv4a r5); this is the same
+ * `roundExact` call the renderers make, so a test reading it reads what a reader sees.
+ */
+function pctText(row: { grossMarginPct: ExactRoundable | null; grossMarginPctBound: DerivedFigureBound | null } | undefined): string | null {
+  if (!row || row.grossMarginPct == null) return null
+  return roundExact(row.grossMarginPct, 2, row.grossMarginPctBound ?? 'exact', { trailingZeros: false })
+}
+
 async function csvRows(): Promise<{ rows: Record<string, string>[]; header: string[]; metadata: Map<string, string>; body: string }> {
   const { GET } = await import('@/app/api/export/inventory-costing/route')
   const { NextRequest } = await import('next/server')
@@ -259,14 +271,14 @@ test('NET credit: the fully credited line reads 0 revenue and MINUS 40 margin, e
   // is owed and the figures carry NO marker — `exact` is a claim, not a hedge.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '100', 'NET')])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '0.000000')
-  assert.equal(rows[0]!.grossMarginBase, '-40.000000')
-  assert.equal(rows[0]!.refundsNetBasis, '100.000000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '0')
+  assert.equal(rows[0]!.grossMarginBase!.exactString(), '-40')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '100')
   assert.equal(rows[0]!.revenueBaseBound, 'exact')
   assert.equal(rows[0]!.grossMarginBaseBound, 'exact')
   assert.equal(rows[0]!.grossMarginPctBound, 'exact')
-  assert.equal(totals.revenueBase, '0.000000')
-  assert.equal(totals.grossMarginBase, '-40.000000')
+  assert.equal(totals.revenueBase!.exactString(), '0')
+  assert.equal(totals.grossMarginBase!.exactString(), '-40')
   assert.equal(totals.revenueBaseBound, 'exact')
 
   const page = await pageCells()
@@ -288,11 +300,11 @@ test('GROSS credit: the same 100/60/60% print, but every one of them marked ≤ 
   // loose that is.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '120', 'GROSS')])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '100.000000')
-  assert.equal(rows[0]!.grossMarginBase, '60.000000')
-  assert.equal(rows[0]!.grossMarginPct, '60')
-  assert.equal(rows[0]!.refundsGrossBasis, '120.000000')
-  assert.equal(rows[0]!.refundsNetBasis, '0.000000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100')
+  assert.equal(rows[0]!.grossMarginBase!.exactString(), '60')
+  assert.equal(pctText(rows[0]!), '60')
+  assert.equal(rows[0]!.refundsGrossBasis.exactString(), '120')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '0')
   assert.equal(rows[0]!.revenueBaseBound, 'upper')
   assert.equal(rows[0]!.grossMarginBaseBound, 'upper')
   // Margin is a RATIO: published 60%, and placing the credit at any ex-VAT value in [0, 120] takes
@@ -300,7 +312,7 @@ test('GROSS credit: the same 100/60/60% print, but every one of them marked ≤ 
   // pins the worst reading to 0%. 0% is below 60%, so the published figure is a genuine ceiling here.
   assert.equal(rows[0]!.grossMarginPctBound, 'upper')
   assert.equal(totals.revenueBaseBound, 'upper')
-  assert.equal(totals.refundsGrossBasis, '120.000000')
+  assert.equal(totals.refundsGrossBasis.exactString(), '120')
 
   const page = await pageCells()
   assert.equal(page.cell('revenue'), '£100.00 ≤')
@@ -318,11 +330,11 @@ test('unproven basis: not converted, not guessed, and not reported as zero credi
   // unproven column rather than being quietly treated as net.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '100', null)])
   const { rows } = await report()
-  assert.equal(rows[0]!.revenueBase, '100.000000')
-  assert.equal(rows[0]!.grossMarginBase, '60.000000')
-  assert.equal(rows[0]!.refundsUnknownBasis, '100.000000')
-  assert.equal(rows[0]!.refundsNetBasis, '0.000000')
-  assert.equal(rows[0]!.refundsGrossBasis, '0.000000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100')
+  assert.equal(rows[0]!.grossMarginBase!.exactString(), '60')
+  assert.equal(rows[0]!.refundsUnknownBasis.exactString(), '100')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '0')
+  assert.equal(rows[0]!.refundsGrossBasis.exactString(), '0')
   assert.equal(rows[0]!.revenueBaseBound, 'upper')
   assert.equal(rows[0]!.grossMarginBaseBound, 'upper')
   assert.equal(rows[0]!.grossMarginPctBound, 'upper')
@@ -339,11 +351,11 @@ test('an UNSTAMPED basis is not read as NET even when the amounts would agree (o
   const asNet = await report()
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '100', 'MYSTERY')])
   const asUnrecognised = await report()
-  assert.equal(asNet.rows[0]!.revenueBase, '0.000000')
-  assert.equal(asUnrecognised.rows[0]!.revenueBase, '100.000000')
+  assert.equal(asNet.rows[0]!.revenueBase!.exactString(), '0')
+  assert.equal(asUnrecognised.rows[0]!.revenueBase!.exactString(), '100')
   // An unrecognised marker is UNKNOWN, never NET. Guessing is the mislabelling the backfill exists
   // to avoid, and a future writer's new value must not silently become a subtraction.
-  assert.equal(asUnrecognised.rows[0]!.refundsUnknownBasis, '100.000000')
+  assert.equal(asUnrecognised.rows[0]!.refundsUnknownBasis.exactString(), '100')
   assert.equal(asUnrecognised.rows[0]!.revenueBaseBound, 'upper')
 })
 
@@ -352,9 +364,9 @@ test('no credit at all: exact, unmarked, and the credit columns are zero (o3d-rv
   // gross-basis credit added. Blindness looked exactly like this, which is why the control matters.
   workedExample([])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '100.000000')
-  assert.equal(rows[0]!.grossMarginBase, '60.000000')
-  assert.equal(rows[0]!.grossMarginPct, '60')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100')
+  assert.equal(rows[0]!.grossMarginBase!.exactString(), '60')
+  assert.equal(pctText(rows[0]!), '60')
   assert.equal(rows[0]!.revenueBaseBound, 'exact')
   assert.equal(rows[0]!.grossMarginPctBound, 'exact')
   assert.equal(totals.revenueBaseBound, 'exact')
@@ -374,8 +386,8 @@ test('the ratio verdict can differ from the two linear ones on one row (o3d-iigc
   // genuine ceilings; the ratio is not, and marking it ≤ would be a false claim.
   workedExample([creditAgainstLine('L1', 'O1', 'p1', '120', 'GROSS')], '150')
   const { rows } = await report()
-  assert.equal(rows[0]!.grossMarginBase, '-50.000000')
-  assert.equal(rows[0]!.grossMarginPct, '-50')
+  assert.equal(rows[0]!.grossMarginBase!.exactString(), '-50')
+  assert.equal(pctText(rows[0]!), '-50')
   assert.equal(rows[0]!.revenueBaseBound, 'upper')
   assert.equal(rows[0]!.grossMarginBaseBound, 'upper')
   assert.equal(rows[0]!.grossMarginPctBound, 'indeterminate')
@@ -395,8 +407,8 @@ test('two opposite same-basis credits do not cancel behind the bound (o3d-la3n)'
     creditAgainstLine('L1', 'O1', 'p1', '-120', 'GROSS'),
   ])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.refundsGrossBasis, '0.000000', 'the published bucket really is a zero')
-  assert.equal(rows[0]!.revenueBase, '100.000000')
+  assert.equal(rows[0]!.refundsGrossBasis.exactString(), '0', 'the published bucket really is a zero')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100')
   assert.equal(rows[0]!.revenueBaseBound, 'indeterminate')
   assert.equal(rows[0]!.grossMarginBaseBound, 'indeterminate')
   assert.equal(totals.revenueBaseBound, 'indeterminate')
@@ -415,10 +427,10 @@ test('a NET credit that reached no row still bounds the totals (o3d-kyey)', asyn
   // period totals are not.
   workedExample([creditAgainstLine('L9', 'O1', 'p9', '10', 'NET')])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '100.000000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100')
   assert.equal(rows[0]!.revenueBaseBound, 'exact', 'no credit reached this row')
-  assert.equal(totals.refundsOutsideReportNetBasis, '10.000000')
-  assert.equal(totals.refundsUnattributedNetBasis, '0.000000')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '10')
+  assert.equal(totals.refundsUnattributedNetBasis.exactString(), '0')
   assert.equal(totals.revenueBaseBound, 'upper')
   assert.equal(totals.grossMarginBaseBound, 'upper')
   const page = await pageCells()
@@ -435,10 +447,10 @@ test('a credit line naming nothing keyable is separated from one naming a row we
     creditAgainstLine('L9', 'O1', 'p9', '3', null),
   ])
   const { totals } = await report()
-  assert.equal(totals.refundsUnattributedGrossBasis, '7.000000')
-  assert.equal(totals.refundsOutsideReportUnknownBasis, '3.000000')
-  assert.equal(totals.refundsGrossBasis, '7.000000', 'the report-wide credit total includes both')
-  assert.equal(totals.refundsUnknownBasis, '3.000000')
+  assert.equal(totals.refundsUnattributedGrossBasis.exactString(), '7')
+  assert.equal(totals.refundsOutsideReportUnknownBasis.exactString(), '3')
+  assert.equal(totals.refundsGrossBasis.exactString(), '7', 'the report-wide credit total includes both')
+  assert.equal(totals.refundsUnknownBasis.exactString(), '3')
   assert.equal(totals.revenueBaseBound, 'upper')
 })
 
@@ -456,7 +468,7 @@ test('a row whose revenue is Unmatched publishes no relation, and its credit is 
   assert.equal(rows[0]!.revenueBase, null)
   assert.equal(rows[0]!.revenueBaseBound, null, 'a withheld figure carries no relation, not `exact`')
   assert.equal(rows[0]!.grossMarginPctBound, null)
-  assert.equal(totals.refundsOutsideReportNetBasis, '50.000000')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '50')
   assert.equal(totals.revenueBaseBound, 'upper')
   const page = await pageCells()
   assert.equal(page.cell('revenue'), 'Unmatched')
@@ -488,16 +500,16 @@ test('credit that DID reach a row whose figure is withheld still bounds the tota
   assert.equal(rows[0]!.revenueBase, null)
   assert.equal(rows[0]!.revenueBaseBound, null)
   // The credit reached the row and is published on it — it is not off-report and it is not lost.
-  assert.equal(rows[0]!.refundsNetBasis, '100.000000')
-  assert.equal(totals.refundsNetBasis, '100.000000')
-  assert.equal(totals.refundsOutsideReportNetBasis, '0.000000')
-  assert.equal(totals.refundsUnattributedNetBasis, '0.000000')
+  assert.equal(rows[0]!.refundsNetBasis.exactString(), '100')
+  assert.equal(totals.refundsNetBasis.exactString(), '100')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '0')
+  assert.equal(totals.refundsUnattributedNetBasis.exactString(), '0')
   // The withheld row contributes neither revenue nor margin to the period totals (that is what the
   // null means, and the totals have always summed it as nothing), so both are zero against 55 of
   // posted cost — and both are BOUNDED, because 100 of real credit sits outside them.
-  assert.equal(totals.cogsBase, '55.000000')
-  assert.equal(totals.revenueBase, '0.000000')
-  assert.equal(totals.grossMarginBase, '0.000000')
+  assert.equal(totals.cogsBase.exactString(), '55')
+  assert.equal(totals.revenueBase!.exactString(), '0')
+  assert.equal(totals.grossMarginBase!.exactString(), '0')
   assert.equal(totals.revenueBaseBound, 'upper')
   assert.equal(totals.grossMarginBaseBound, 'upper')
   const page = await pageCells()
@@ -517,9 +529,9 @@ test('credit follows the BLENDED order:product key where revenue does (o3d-rv4a)
   ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
   CREDIT_LINES = [{ totalBase: D('100'), productId: 'p1', salesOrderLine: null, refund: { orderId: 'O1', totalsBasis: 'NET' } }]
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '0.000000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '0')
   assert.equal(rows[0]!.revenueBaseBound, 'exact')
-  assert.equal(totals.refundsOutsideReportNetBasis, '0.000000')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '0')
 })
 
 test('a line split across two warehouses shares its credit by the same qty proportion (scjz.50)', async () => {
@@ -543,12 +555,12 @@ test('a line split across two warehouses shares its credit by the same qty propo
   const { getCogsReport } = await import('@/lib/domain/inventory/inventory-costing-reports')
   const { rows, totals } = await getCogsReport({ ...FILTERS, groupBy: 'warehouse' }, { paginate: false })
   const byCode = new Map(rows.map((row) => [row.warehouseCode, row]))
-  assert.equal(byCode.get('WHA')!.refundsNetBasis, '75.000000')
-  assert.equal(byCode.get('WHB')!.refundsNetBasis, '225.000000')
-  assert.equal(byCode.get('WHA')!.revenueBase, '0.000000')
-  assert.equal(byCode.get('WHB')!.revenueBase, '0.000000')
-  assert.equal(totals.revenueBase, '0.000000')
-  assert.equal(totals.refundsNetBasis, '300.000000')
+  assert.equal(byCode.get('WHA')!.refundsNetBasis.exactString(), '75')
+  assert.equal(byCode.get('WHB')!.refundsNetBasis.exactString(), '225')
+  assert.equal(byCode.get('WHA')!.revenueBase!.exactString(), '0')
+  assert.equal(byCode.get('WHB')!.revenueBase!.exactString(), '0')
+  assert.equal(totals.revenueBase!.exactString(), '0')
+  assert.equal(totals.refundsNetBasis.exactString(), '300')
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -599,9 +611,9 @@ test('an in-period credit against an EARLIER period’s order is loaded, not dro
   // the query asked only for O1.
   workedExample([creditAgainstLine('L0', 'O0', 'p1', '30', 'NET')])
   const { rows, totals } = await report()
-  assert.equal(rows[0]!.revenueBase, '100.000000', 'June’s own dispatch is not reduced by May’s credit')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '100', 'June’s own dispatch is not reduced by May’s credit')
   assert.equal(rows[0]!.revenueBaseBound, 'exact', 'and no credit reached this row')
-  assert.equal(totals.refundsOutsideReportNetBasis, '30.000000', 'the credit is LOADED and published')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '30', 'the credit is LOADED and published')
   assert.equal(totals.revenueBaseBound, 'upper', 'so the period figures are bounded, not exact')
   assert.equal(totals.grossMarginBaseBound, 'upper')
 })
@@ -624,10 +636,10 @@ test('a filtered-out sibling product’s credit does not pollute the filtered to
   // future edit cannot satisfy this test by resolving an empty scope that admits nothing.
   assert.ok(PRODUCT_WHERE, 'the report never asked which products its filter admits')
   assert.deepEqual(PRODUCT_WHERE, { OR: [{ sku: { contains: 'Widget', mode: 'insensitive' } }, { name: { contains: 'Widget', mode: 'insensitive' } }] })
-  assert.equal(totals.refundsOutsideReportNetBasis, '0.000000', 'p2 is outside the FILTER, not outside the report')
-  assert.equal(totals.refundsUnattributedNetBasis, '0.000000')
-  assert.equal(totals.refundsNetBasis, '0.000000')
-  assert.equal(totals.revenueBase, '100.000000')
+  assert.equal(totals.refundsOutsideReportNetBasis.exactString(), '0', 'p2 is outside the FILTER, not outside the report')
+  assert.equal(totals.refundsUnattributedNetBasis.exactString(), '0')
+  assert.equal(totals.refundsNetBasis.exactString(), '0')
+  assert.equal(totals.revenueBase!.exactString(), '100')
   assert.equal(totals.revenueBaseBound, 'exact', 'nothing this view publishes is missing a credit')
   assert.equal(totals.grossMarginBaseBound, 'exact')
 })
@@ -644,7 +656,7 @@ test('a credit naming NO product is kept under a product filter — fail closed 
   ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
   CREDIT_LINES = [creditNamingNothing('O1', '7', 'GROSS')]
   const { totals } = await report()
-  assert.equal(totals.refundsUnattributedGrossBasis, '7.000000', 'an unkeyable credit is never filtered away')
+  assert.equal(totals.refundsUnattributedGrossBasis.exactString(), '7', 'an unkeyable credit is never filtered away')
   assert.equal(totals.revenueBaseBound, 'upper')
 })
 
@@ -728,13 +740,13 @@ test('the period total is summed UNROUNDED, so its upper bound is not below the 
   // rounded it back the wrong way by the same amount in both places.
   const trueTotal = D('1').sub(D('0.0001').div(D('1.2')))
   assert.equal(trueTotal.toFixed(9), '0.999916667', 'the reviewer\u2019s own figure for the truth')
-  assert.ok(
-    D(totals.revenueBase).gte(trueTotal),
-    `published upper bound ${totals.revenueBase} is BELOW the truth ${trueTotal.toFixed(12)}`,
-  )
-  assert.equal(totals.revenueBase, '1.000000')
+  // o3d-rv4a r5: the producer now publishes the EXACT sum — three hundred shares of £1 are £1 — and the
+  // page and the CSV each round it once. So the property is asserted on the exact value and on both.
+  assert.equal(totals.revenueBase!.exactString(), '1', 'three hundred shares of \u00a31, summed exactly')
+  assert.ok(D(totals.revenueBase!.exactString()).gte(trueTotal), 'the exact figure is at or above the truth')
+  assert.ok(D(totals.revenueBase.roundTo(6, 'ceil')).gte(trueTotal), 'and so is its six-decimal ceiling')
   // Margin is revenue less zero cost here, so the same claim rides on the same sum.
-  assert.ok(D(totals.grossMarginBase).gte(trueTotal), `published margin ceiling ${totals.grossMarginBase} is below the truth`)
+  assert.ok(D(totals.grossMarginBase!.exactString()).gte(trueTotal), `published margin ${totals.grossMarginBase!.exactString()} is below the truth`)
 })
 
 test('a displayed upper bound rounds UP, so the printed figure is not below the truth (Codex r2 HIGH 3)', async () => {
@@ -840,15 +852,15 @@ test('a displayed upper bound survives the FLOAT BOUNDARY, not only the formatte
   const { rows } = await report()
   // THE REVIEWER'S EXACT SCHEMA-VALID STRING has to be the thing the producer published, or this test
   // is about a different number than the finding was.
-  assert.equal(rows[0]!.revenueBase, '90071992547409.990000')
+  assert.equal(rows[0]!.revenueBase!.exactString(), '90071992547409.99')
   assert.equal(rows[0]!.revenueBaseBound, 'upper')
 
   const trueRevenue = D('90071992547409.99').sub(D('0.0001').div(D('1.2')))
   assert.equal(trueRevenue.toFixed(6), '90071992547409.989917', 'the reviewer’s own figure for the truth')
   // THE CONVERSION THE PAGE USED TO MAKE, NAMED. Without this the test would not say what it defends
   // against, and a reader could not tell the example still bites on today's floating point.
-  assert.equal(Number(rows[0]!.revenueBase), 90071992547409.984375, 'float64 still loses the ninth digit')
-  assert.ok(D(Number(rows[0]!.revenueBase)).lt(trueRevenue), 'and what it loses is the bound itself')
+  assert.equal(Number(rows[0]!.revenueBase!.exactString()), 90071992547409.984375, 'float64 still loses the ninth digit')
+  assert.ok(D(Number(rows[0]!.revenueBase!.exactString())).lt(trueRevenue), 'and what it loses is the bound itself')
 
   const page = await pageCells()
   const printed = page.cell('revenue')
@@ -881,7 +893,7 @@ test('the float boundary on a NEGATIVE ceiling and on a floor, the two signs ROU
   // A CEILING OVER A NEGATIVE FIGURE. The truth is at or below the published -90071992547409.995, so
   // the printed figure must be at or above it; toward +infinity at two decimals that is -…409.99.
   assert.equal(Number('-90071992547409.995000'), -90071992547410, 'float64 moves it the wrong way')
-  const printedCeiling = page.cellOf('margin', { grossMarginBase: '-90071992547409.995000', grossMarginBaseBound: 'upper' })
+  const printedCeiling = page.cellOf('margin', { grossMarginBase: ExactFigure.of('-90071992547409.995000'), grossMarginBaseBound: 'upper' })
   assert.match(printedCeiling, / ≤$/)
   assert.ok(
     printedNumber(printedCeiling).gte(D('-90071992547409.995')),
@@ -892,7 +904,7 @@ test('the float boundary on a NEGATIVE ceiling and on a floor, the two signs ROU
   // THE MIRROR: a floor, where the truth is at or ABOVE the published figure and the printed number
   // must therefore be at or below it. Toward -infinity that is …409.99, never …410.00.
   assert.equal(Number('90071992547409.995000'), 90071992547410, 'float64 moves it the wrong way')
-  const printedFloor = page.cellOf('margin', { grossMarginBase: '90071992547409.995000', grossMarginBaseBound: 'lower' })
+  const printedFloor = page.cellOf('margin', { grossMarginBase: ExactFigure.of('90071992547409.995000'), grossMarginBaseBound: 'lower' })
   assert.match(printedFloor, / ≥$/)
   assert.ok(
     printedNumber(printedFloor).lte(D('90071992547409.995')),
@@ -939,7 +951,7 @@ test('a bound is rounded to the digits the BASE CURRENCY prints, and printed wit
       BASE_CURRENCY = currency
       workedExample([])
       const page = await pageCells()
-      const printed = page.cellOf('revenue', { revenueBase: published, revenueBaseBound: bound })
+      const printed = page.cellOf('revenue', { revenueBase: ExactFigure.of(published), revenueBaseBound: bound })
       const amount = printedNumber(printed)
       const printedDigits = amount.toFixed().split('.')[1]?.length ?? 0
       const shown = printed.replace(/[^\d.]/g, '').split('.')[1]?.length ?? 0
@@ -985,7 +997,7 @@ test('a yen report rounds the footer, the summary, the plain money columns and n
     assert.equal(page.cell('margin'), '¥60 ≤')
     assert.equal(page.cell('cogs'), '¥41')
     assert.equal(page.footer('cogs'), '¥41')
-    assert.equal(page.cell('marginPct'), `${rows[0]!.grossMarginPct}% ≤`)
+    assert.equal(page.cell('marginPct'), `${pctText(rows[0])}% ≤`)
     assert.match(page.cell('marginPct'), /^\d+\.\d{2}% ≤$/, 'the ratio keeps its own two decimals')
   } finally {
     BASE_CURRENCY = 'GBP'
@@ -1125,6 +1137,201 @@ test('round 3’s false rounding claims are gone from every surface that made th
   }
   assert.ok(scanned > 3000, `only ${scanned} lines scanned`)
   assert.deepEqual(offenders, [])
+})
+
+/**
+ * Build a groupBy-warehouse fixture: one sales line of `lineTotal`, dispatched from several warehouses
+ * in the given quantities, each warehouse its own group. Optional credit against the line.
+ */
+function splitLineFixture(lineTotal: string, splits: Array<{ qty: string; cost: string }>, credit: unknown[] = []) {
+  const line = { id: 'L1', productId: 'p1', totalBase: lineTotal }
+  COGS_ROWS = splits.map((split, index) => {
+    const entry = cogsEntry({ id: `c${index}`, orderId: 'O1', productId: 'p1', qty: split.qty, cost: split.cost, line })
+    return { ...entry, movement: { ...entry.movement, fromWarehouseId: `wh-${index}`, fromWarehouse: { id: `wh-${index}`, code: `W${index}`, name: `Warehouse ${index}` } } }
+  })
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: lineTotal }])]
+  CREDIT_LINES = credit
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+}
+
+/** The page, grouped by warehouse, in `currency`. Restores GBP whatever happens. */
+async function warehousePage(currency = 'GBP') {
+  const previous = { ...FILTERS }
+  try {
+    BASE_CURRENCY = currency
+    ;(FILTERS as Record<string, unknown>).groupBy = 'warehouse'
+    return await pageCells()
+  } finally {
+    delete (FILTERS as Record<string, unknown>).groupBy
+    Object.assign(FILTERS, previous)
+    BASE_CURRENCY = 'GBP'
+  }
+}
+
+async function warehouseCsv() {
+  try {
+    ;(FILTERS as Record<string, unknown>).groupBy = 'warehouse'
+    return await csvRows()
+  } finally {
+    delete (FILTERS as Record<string, unknown>).groupBy
+  }
+}
+
+/**
+ * THE ORACLE. Round `numerator / denominator` to `places` decimals, from the exact fraction, with plain
+ * bigint arithmetic written here and nowhere else — deliberately NOT the implementation's rounder, so
+ * a test of "rounded once" is not the rounder agreeing with itself.
+ */
+function oracleRound(numerator: bigint, denominator: bigint, places: number, mode: 'ceil' | 'floor' | 'halfUp'): string {
+  const zero = BigInt(0)
+  const one = BigInt(1)
+  let n = numerator
+  let d = denominator
+  if (d < zero) { n = -n; d = -d }
+  const scaled = n * BigInt(10) ** BigInt(places)
+  let q = scaled / d
+  if (scaled % d !== zero && scaled < zero) q -= one // floor
+  const r = scaled - q * d
+  if (mode === 'ceil' && r !== zero) q += one
+  if (mode === 'halfUp' && (r * BigInt(2) > d || (r * BigInt(2) === d && n > zero))) q += one
+  const negative = q < zero
+  const digits = (negative ? -q : q).toString().padStart(places + 1, '0')
+  const body = places === 0 ? digits : `${digits.slice(0, -places)}.${digits.slice(-places)}`
+  return negative && /[1-9]/.test(body) ? `-${body}` : body
+}
+
+test('a figure is rounded ONCE, from its exact value — the reviewer’s £1.0050 (Codex r5 HIGH)', async () => {
+  // Codex round 5, verbatim: "`aggregateCogsReport` first rounds derived figures to six decimals, then
+  // `markFigure` rounds that string again to the currency precision. For a £1.0050 line allocated by
+  // quantities 2.499999/2.5, the exact group revenue is 1.004999598, the producer emits 1.005000, and
+  // the page displays £1.01 instead of the correct £1.00."
+  //
+  // WORKED: warehouse A ships 2.499999 of the line's 2.5 units, so its revenue is exactly
+  // 1.005 x 2.499999 / 2.5 = 1.004999598. Rounded once to the penny: 1.00. Rounded to six decimals
+  // first (1.005000) and then to the penny: 1.01. No credit, so the figure is exact and rounds to nearest.
+  splitLineFixture('1.005', [{ qty: '2.499999', cost: '2' }, { qty: '0.000001', cost: '1' }])
+  const page = await warehousePage()
+  assert.equal(page.rows.length, 2)
+  const warehouseA = page.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.ok(warehouseA, 'warehouse W0 is a row')
+  assert.equal(oracleRound(BigInt(1004999598), BigInt(1000000000), 2, 'halfUp'), '1.00', 'the oracle agrees with the worked value')
+  assert.equal(page.cellOf('revenue', warehouseA), '£1.00')
+  // And the file, which rounds once too — to six decimals, from the same exact value.
+  const { rows } = await warehouseCsv()
+  const fileA = rows.find((row) => row.warehouseCode === 'W0')
+  assert.equal(fileA?.revenueBase, oracleRound(BigInt(1004999598), BigInt(1000000000), 6, 'halfUp'))
+})
+
+test('rounded once in a zero-decimal currency too: 100.499999598 is ¥100, not ¥101 (Codex r5 HIGH)', async () => {
+  // 100.5 x 249.999999 / 250 = 100.499999598. Six decimals first gives 100.500000, which rounds to 101.
+  // Once, to yen: 100.
+  splitLineFixture('100.5', [{ qty: '249.999999', cost: '2' }, { qty: '0.000001', cost: '1' }])
+  const page = await warehousePage('JPY')
+  const warehouseA = page.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.ok(warehouseA)
+  assert.equal(oracleRound(BigInt(100499999598), BigInt(1000000000), 0, 'halfUp'), '100')
+  assert.equal(page.cellOf('revenue', warehouseA), '¥100')
+})
+
+test('a \u2264 row is the ceiling of its EXACT figure, not of a 20-digit Decimal sum (Codex r5 HIGH)', async () => {
+  // REWORKED ON RESUME. The parked version summed thirds of \u00a32 and PASSED on the unfixed head: Decimal
+  // rounds 2/3 + 2/3 + 2/3 straight back to exactly 2, so it never exercised a second rounding. For a
+  // directed rounding, rounding to six decimals first cannot change the answer (ceil6 then ceil2 is
+  // ceil2); what does is Decimal's own twenty-significant-digit arithmetic, which ABSORBS a small part of
+  // a large figure — and a ceiling taken after that is below the figure it bounds.
+  //
+  // WORKED, schema-valid (money is Decimal(18, 4), movement quantities Decimal(14, 6)): warehouse W0 ships
+  // all of line L1 (\u00a312,345,678,901,234, with a 0.0001 GROSS credit against it so W0's figures are \u2264)
+  // and 0.000001 of line L2's 1 unit (\u00a30.0001). W0's revenue is exactly
+  //   12345678901234 + 0.0001 x 0.000001 / 1 = 12345678901234.0000000001
+  // Its ceiling at the penny is 12,345,678,901,234.01; in yen 12,345,678,901,235; in the six-decimal file
+  // 12345678901234.000001. Decimal's add returns 12345678901234.000000, whose ceiling is .00 — a \u2264
+  // printed BELOW the exact figure, on the page and in the file.
+  COGS_ROWS = [
+    cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '0', line: { id: 'L1', productId: 'p1', totalBase: '12345678901234' } }),
+    cogsEntry({ id: 'c2', orderId: 'O1', productId: 'p2', qty: '0.000001', cost: '0', line: { id: 'L2', productId: 'p2', totalBase: '0.0001' } }),
+    cogsEntry({ id: 'c3', orderId: 'O1', productId: 'p2', qty: '0.999999', cost: '0', line: { id: 'L2', productId: 'p2', totalBase: '0.0001' } }),
+  ].map((entry, index) => {
+    const warehouse = index === 2 ? { id: 'wh-1', code: 'W1', name: 'Warehouse 1' } : { id: 'wh-0', code: 'W0', name: 'Warehouse 0' }
+    return { ...entry, movement: { ...entry.movement, fromWarehouseId: warehouse.id, fromWarehouse: warehouse } }
+  })
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '12345678901234' }, { productId: 'p2', totalBase: '0.0001' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+
+  // THE PRECONDITION: Decimal really does absorb it, so this fixture can tell once from twice.
+  assert.equal(D('12345678901234').add(D('0.0001').mul('0.000001').div('1')).toFixed(), '12345678901234')
+
+  const gbp = await warehousePage('GBP')
+  const w0 = gbp.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.ok(w0, 'warehouse W0 is a row')
+  assert.equal((w0 as { revenueBaseBound: string }).revenueBaseBound, 'upper', 'a ceiling is claimed, so it has to hold')
+  const exact = BigInt('123456789012340000000001')
+  const scale = BigInt('10000000000')
+  assert.equal(oracleRound(exact, scale, 2, 'ceil'), '12345678901234.01')
+  assert.equal(gbp.cellOf('revenue', w0), '\u00a312,345,678,901,234.01 \u2264')
+  assert.ok(printedNumber(gbp.cellOf('revenue', w0)).gte(D('12345678901234.0000000001')), 'the printed ceiling is at or above the exact figure')
+  const jpy = await warehousePage('JPY')
+  const w0y = jpy.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0')
+  assert.equal(jpy.cellOf('revenue', w0y), `\u00a5${Number(oracleRound(exact, scale, 0, 'ceil')).toLocaleString('en-GB')} \u2264`)
+  const { rows } = await warehouseCsv()
+  const fileW0 = rows.find((row) => row.warehouseCode === 'W0')
+  assert.equal(fileW0?.revenueBaseBound, 'upper')
+  assert.equal(fileW0?.revenueBase, oracleRound(exact, scale, 6, 'ceil'))
+})
+
+test('the credit footer can differ from the rows for a reason other than rounding, and the notice says so (Codex r5 MEDIUM 1)', async () => {
+  // Codex round 5, verbatim: "On a one-page report with an outside-report refund, every rendered credit
+  // row can be zero while the credit-column footer is non-zero because `reportCredits` includes
+  // unattributed and outside-report buckets."
+  //
+  // Round 4 claimed rounding and pagination were the only two causes. Read off how each footer is built:
+  // qty, COGS, revenue and margin footers are sums of the same group figures the rows show (withheld rows
+  // print Unmatched and are left out of both); the three credit footers are the rows' credit PLUS the
+  // credit that reached no row. So there are three causes, and the third applies to the credit columns.
+  //
+  // WORKED: one row, no credit against it, and a NET credit of 10 against a line this window has no
+  // revenue for. Every credit cell is 0.00; the net credit footer is 10.00.
+  workedExample([creditAgainstLine('L9', 'O1', 'p9', '10', 'NET')])
+  const page = await pageCells()
+  assert.equal(page.rows.length, 1)
+  assert.equal(page.cell('creditNet'), '£0.00')
+  assert.equal(page.footer('creditNet'), '£10.00')
+  const { DISPLAY_ROUNDING_NOTICE_COGS } = await import('@/lib/analytics/refund-figure-surfaces')
+  assert.ok(page.notices.includes(DISPLAY_ROUNDING_NOTICE_COGS))
+  assert.match(DISPLAY_ROUNDING_NOTICE_COGS, /credit totals[^.]*credit that reached no row/i, DISPLAY_ROUNDING_NOTICE_COGS)
+})
+
+test('an Unmatched row keeps the credit against its matched line in its own credit columns, and the notice says so (Codex r5 MEDIUM 2)', async () => {
+  // Codex round 5, verbatim: "A group containing one matched movement and one unmatched movement is
+  // rendered `Unmatched`, but credit keyed to its matched movement remains in that row's
+  // `refunds*Basis` fields and leaves both off-report summaries at zero. The notice nevertheless says
+  // credit against an unmatched row is reported in the off-report totals."
+  //
+  // WORKED: product p1 has two dispatches. One is linked to sales line L1 on order O1 (revenue 100); the
+  // other references order O2, which has no loaded lines, so it cannot be matched and the whole row reads
+  // Unmatched. A NET credit of 10 against L1 is attributed to the row: its net credit column reads 10.00,
+  // and both off-report lines stay at zero.
+  const matched = cogsEntry({ id: 'c1', orderId: 'O1', productId: 'p1', qty: '1', cost: '40', line: { id: 'L1', productId: 'p1', totalBase: '100' } })
+  const unmatched = cogsEntry({ id: 'c2', orderId: 'O2', productId: 'p1', qty: '1', cost: '40' })
+  COGS_ROWS = [matched, unmatched]
+  ORDERS = [order('O1', [{ productId: 'p1', totalBase: '100' }])]
+  CREDIT_LINES = [creditAgainstLine('L1', 'O1', 'p1', '10', 'NET')]
+  FILTER_PRODUCT_IDS = [...ALL_FIXTURE_PRODUCTS]
+  const page = await pageCells()
+  assert.equal(page.rows.length, 1, 'one product, one row')
+  assert.equal(page.cell('revenue'), 'Unmatched', 'the row is withheld, so it states no relation of its own')
+  assert.equal(page.cell('creditNet'), '£10.00', 'the credit against the matched line is in the row')
+  // And it still marks the period figures, as help-docs/analytics.md says: nothing subtracted it.
+  assert.match(page.footer('revenue'), / ≤$/, `the revenue footer is ${page.footer('revenue')}`)
+  assert.equal(page.summary.get('Credit off-report — nothing to attribute to (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
+  assert.equal(page.summary.get('Credit off-report — no revenue row here (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
+  const notice = page.notices.find((line) => /Unmatched|matched to a sales order line/.test(line))
+  assert.ok(notice, `no unmatched-row notice; notices were ${JSON.stringify(page.notices)}`)
+  // The false claim, as an absence, and the true one, as substance.
+  assert.doesNotMatch(notice!, /credit against an unmatched row[^.]*off-report totals/i, notice)
+  assert.match(notice!, /credit columns/i, notice)
+  assert.match(notice!, /off-report/i, notice)
 })
 
 // ---------------------------------------------------------------------------------------------
