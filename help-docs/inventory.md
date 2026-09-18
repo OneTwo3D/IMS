@@ -32,7 +32,11 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
 - **Stock** — total on-hand quantity (visible by default)
 - **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0)
 - **Available** — on hand minus allocated (red when negative)
-- **Incoming** — quantity expected from open purchase orders, in-transit transfers, manufacturing outputs, or WMS ASN evidence (blue)
+- **Incoming** — quantity expected from open purchase orders, in-transit transfers, manufacturing outputs, or WMS ASN evidence (blue).
+  An in-transit transfer line is counted once, at what has **not** arrived yet — and "arrived"
+  includes units the WMS stock-sync alignment brought in, which raise stock and lay cost layers
+  without recording a receipt against the transfer line. A transfer the WMS has fully accounted
+  for therefore shows nothing incoming, and its own ASN is not added a second time on top.
 - **COGS Value** — total inventory value from FIFO cost layers
 - **Variants**, **Created**, **Updated** — additional metadata columns
 
@@ -197,7 +201,9 @@ Each product displays four stock figures per warehouse:
 - **On Hand** -- Total physical stock in the warehouse.
 - **Allocated** -- Quantity reserved by confirmed sales orders. Click the figure to see which orders hold the allocation.
 - **Available** -- On Hand minus Allocated.
-- **Incoming** -- Quantity on open purchase orders or inbound transfers. Click the figure to see the source POs or transfers.
+- **Incoming** -- Quantity on open purchase orders or inbound transfers, net of everything that has
+  already arrived by any route (a manual receipt, a WMS book-in, or a WMS stock-sync alignment).
+  Click the figure to see the source POs or transfers.
 
 
 ## FIFO Cost Layers

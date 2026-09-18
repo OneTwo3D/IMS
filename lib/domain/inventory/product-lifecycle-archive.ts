@@ -3,6 +3,11 @@ import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 
 import { db } from '@/lib/db'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import {
+  loadTransferLineOutstandingQty,
+  requireOutstandingQty,
+  sumTransferLineOutstandingQty,
+} from '@/lib/domain/inventory/transfer-landed-quantity'
 
 const OPEN_PO_STATUSES = INCOMING_PO_STATUSES
 const OPEN_PRODUCTION_STATUSES = ['DRAFT', 'IN_PROGRESS'] as const
@@ -66,7 +71,8 @@ export async function getProductIncomingStock(
         productId,
         transfer: { status: 'IN_TRANSIT' },
       },
-      select: { qty: true, qtyReceived: true },
+      // `id` so the landed quantity can be loaded for these exact lines (o3d-zzgp).
+      select: { id: true, qty: true, qtyReceived: true },
     }),
     client.productionOrder.findMany({
       where: {
@@ -80,7 +86,16 @@ export async function getProductIncomingStock(
         productId,
         asn: { status: { in: [...OPEN_WMS_ASN_STATUSES] } },
       },
-      select: { expectedQty: true, qtyAccountedViaSnapshot: true, qtyAccountedViaReceipt: true },
+      // `sourceType`/`sourceLineId` so an ASN row that MIRRORS a transfer line this
+      // function is already counting can be told apart from one that stands alone
+      // (o3d-zzgp).
+      select: {
+        sourceType: true,
+        sourceLineId: true,
+        expectedQty: true,
+        qtyAccountedViaSnapshot: true,
+        qtyAccountedViaReceipt: true,
+      },
     }),
   ])
 
@@ -88,21 +103,60 @@ export async function getProductIncomingStock(
     (sum, line) => sum.add(Prisma.Decimal.max(0, toDecimal(line.qty).minus(line.qtyReceived))),
     new Prisma.Decimal(0),
   )
-  const stockTransfers = transferLines.reduce(
-    (sum, line) => sum.add(Prisma.Decimal.max(0, toDecimal(line.qty).minus(line.qtyReceived))),
-    new Prisma.Decimal(0),
+  // o3d-zzgp. TWO defects in one expression, and fixing either alone leaves a wrong
+  // number:
+  //
+  //  (a) `qty − qtyReceived` is not "outstanding". The WMS stock-sync alignment
+  //      brings units in and lays their cost layers by crediting
+  //      `wms_asn_line_maps.qtyAccountedViaSnapshot`; it never touches `qtyReceived`.
+  //      A line landed entirely that way read as fully outstanding.
+  //  (b) an in-transit transfer line with an open ASN was counted TWICE — once here
+  //      and again in the `wmsAsn` arm below, which sums the SAME ASN rows.
+  //
+  // Fixing (a) alone would have halved the over-statement and left the double-count;
+  // fixing (b) alone would have left a fully-aligned line reading as 100% incoming.
+  // Both together give: the transfer line is the authority for every line whose
+  // parent transfer is IN_TRANSIT, and its ASN rows are that line's mirror.
+  const outstandingByTransferLineId = await loadTransferLineOutstandingQty(client, transferLines)
+  const stockTransfers = sumTransferLineOutstandingQty(
+    transferLines.map((line) => requireOutstandingQty(outstandingByTransferLineId, line.id)),
   )
   const productionOrders = productionRows.reduce(
     (sum, order) => sum.add(Prisma.Decimal.max(0, toDecimal(order.qtyPlanned).minus(order.qtyProduced))),
     new Prisma.Decimal(0),
   )
+  // The ASN arm covers only what the arms above do NOT already speak for. An ASN row
+  // whose source transfer line is in `transferLines` is a mirror of a quantity the
+  // `stockTransfers` arm has just counted, so counting it again is the (b) above.
+  //
+  // The exclusion is keyed on the LINE BEING PRESENT, not on its outstanding quantity
+  // being positive: a line that has fully landed while its sibling keeps the transfer
+  // IN_TRANSIT contributes zero here AND zero there, which is right — its units have
+  // arrived. Keying it on "outstanding > 0" would let the mirror row re-assert them.
+  //
+  // A row whose parent transfer is NOT in-transit (received, or cancelled with the
+  // ASN left open) is not excluded, because no arm above counted it and it is then
+  // the only evidence that something is still due in.
+  //
+  // DELIBERATELY NOT EXTENDED TO PURCHASE-ORDER ASN ROWS. The same double-count
+  // exists between the `purchaseOrders` arm and PO-sourced ASN rows, and the same
+  // alignment path credits `qtyAccountedViaSnapshot` without writing
+  // `purchase_order_lines.qtyReceived` — but a PO line has no landed-quantity
+  // definition to read yet, so correcting it needs its own module. Tracked separately
+  // (o3d-zzgp follow-up); the asymmetry here is a scope boundary, not an oversight.
+  const transferLineIdsCountedAbove = new Set(transferLines.map((line) => line.id))
   const wmsAsn = asnLines.reduce(
-    (sum, line) => sum.add(Prisma.Decimal.max(
-      0,
-      toDecimal(line.expectedQty)
-        .minus(line.qtyAccountedViaSnapshot)
-        .minus(line.qtyAccountedViaReceipt),
-    )),
+    (sum, line) => {
+      if (line.sourceType === 'STOCK_TRANSFER_LINE' && transferLineIdsCountedAbove.has(line.sourceLineId)) {
+        return sum
+      }
+      return sum.add(Prisma.Decimal.max(
+        0,
+        toDecimal(line.expectedQty)
+          .minus(line.qtyAccountedViaSnapshot)
+          .minus(line.qtyAccountedViaReceipt),
+      ))
+    },
     new Prisma.Decimal(0),
   )
   const total = purchaseOrders.add(stockTransfers).add(productionOrders).add(wmsAsn)

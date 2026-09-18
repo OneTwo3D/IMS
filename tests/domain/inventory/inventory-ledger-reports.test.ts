@@ -185,8 +185,8 @@ test('getStockAdjustmentReport reason summary covers all filtered adjustments wh
 
 test('getStockTransferReport totals use the full filtered transfer set, not the display page', async () => {
   const transfers = [
-    { id: 't1', reference: 'TRF-1', status: 'IN_TRANSIT', fromWarehouse: { code: 'A', name: 'A' }, toWarehouse: { code: 'B', name: 'B' }, fromWarehouseId: 'a', toWarehouseId: 'b', dispatchedAt: new Date('2026-01-01T00:00:00Z'), completedAt: null, createdAt: new Date('2026-01-01T00:00:00Z'), lines: [{ qty: new Prisma.Decimal(10), qtyReceived: new Prisma.Decimal(0), sku: 'A', productName: 'A' }] },
-    { id: 't2', reference: 'TRF-2', status: 'RECEIVED', fromWarehouse: { code: 'A', name: 'A' }, toWarehouse: { code: 'B', name: 'B' }, fromWarehouseId: 'a', toWarehouseId: 'b', dispatchedAt: new Date('2026-01-02T00:00:00Z'), completedAt: new Date('2026-01-03T00:00:00Z'), createdAt: new Date('2026-01-02T00:00:00Z'), lines: [{ qty: new Prisma.Decimal(20), qtyReceived: new Prisma.Decimal(20), sku: 'B', productName: 'B' }] },
+    { id: 't1', reference: 'TRF-1', status: 'IN_TRANSIT', fromWarehouse: { code: 'A', name: 'A' }, toWarehouse: { code: 'B', name: 'B' }, fromWarehouseId: 'a', toWarehouseId: 'b', dispatchedAt: new Date('2026-01-01T00:00:00Z'), completedAt: null, createdAt: new Date('2026-01-01T00:00:00Z'), lines: [{ id: 'tl-1', qty: new Prisma.Decimal(10), qtyReceived: new Prisma.Decimal(0), sku: 'A', productName: 'A' }] },
+    { id: 't2', reference: 'TRF-2', status: 'RECEIVED', fromWarehouse: { code: 'A', name: 'A' }, toWarehouse: { code: 'B', name: 'B' }, fromWarehouseId: 'a', toWarehouseId: 'b', dispatchedAt: new Date('2026-01-02T00:00:00Z'), completedAt: new Date('2026-01-03T00:00:00Z'), createdAt: new Date('2026-01-02T00:00:00Z'), lines: [{ id: 'tl-2', qty: new Prisma.Decimal(20), qtyReceived: new Prisma.Decimal(20), sku: 'B', productName: 'B' }] },
   ]
   const client = {
     stockTransfer: {
@@ -200,6 +200,12 @@ test('getStockTransferReport totals use the full filtered transfer set, not the 
       async findMany() { return transfers.flatMap((transfer) => transfer.lines) },
     },
     stockMovement: {
+      async findMany() { return [] },
+    },
+    // o3d-zzgp: received is now a LANDED quantity, so the report asks for each line's
+    // WMS ASN rows. None of these lines has any, which is what keeps the figures below
+    // the same as before that change.
+    wmsAsnLineMap: {
       async findMany() { return [] },
     },
   } as never

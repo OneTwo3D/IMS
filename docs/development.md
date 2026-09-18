@@ -65,13 +65,117 @@ npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                         
 npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
 
+**Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
+concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
+DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit`, plus
+`stamp-scratch-database`, which creates and drops sibling databases to exercise the stamper — refuse to start,
+before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets a set of FACTS
+from the server that together make an accidental run against a real database hard. None of them is
+proof the database is disposable (see "WHAT A MARKER PROVES" below). All of these must hold:
+
+* the database is STAMPED FOR ITS OWN NAME — a database comment applied by `npm run db:stamp-scratch`
+  that contains the database's name, so a rename or a `pg_dump -C` restore under another name
+  invalidates it (and renaming it BACK makes it valid again). The comment lives outside every schema,
+  so it is not schema drift, and it survives `prisma migrate deploy`; AND
+* the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly; AND
+* the server says it is not a replica (`pg_is_in_recovery()`), not a template, and not the target of a
+  logical-replication subscription it can see (an unreadable `pg_subscription` does not refuse here;
+  the stamper, which issues the capability, does refuse on it); AND
+* it has not been set up as an installed application — no row in any table named `users`,
+  `organisations` or `currencies`, in any schema; AND
+* it has no foreign tables at all (partitions included) — they are listed before any table is probed,
+  because probing a local parent would read a foreign child or partition on another server; AND
+* no table it probes has a row-level-security policy that applies to the connecting role — the check
+  connects with `row_security=off`, so the server refuses such a probe instead of evaluating the policy
+  (a policy is arbitrary code, and `USING (false)` would otherwise HIDE a `users` row). A superuser, or
+  a role with BYPASSRLS, sees every row and never evaluates a policy, so it is not exposed to THAT — but
+  it IS the worst case for the next bullet; AND
+* every operator, cast and function in the check's SQL resolves in `pg_catalog` and nowhere else — the
+  connections pin `search_path=pg_catalog` (which outranks `ALTER DATABASE/ROLE … SET search_path`) and
+  the check asserts the pin before its first statement, and every operator/cast is written
+  `OPERATOR(pg_catalog.=)` / `::pg_catalog.text` besides. Without this a database owner can plant a
+  `=`/`!~` operator that the check would resolve to their own function (CVE-2018-1058); a SUPERUSER
+  stamper is the worst case, because such a function runs with its privileges (e.g. `COPY … TO
+  PROGRAM`). This is why the stamper should be run as the database's owning non-superuser role; AND
+* the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
+  anything containing `prod`/`live`, are refused however they are stamped and declared.
+
+**WHAT A MARKER PROVES, AND NOTHING MORE:** a marker is evidence that someone who owns the database
+deliberately wrote this exact sentence naming this exact database — not that the stamper ran, and not
+that the database was empty. The guard compares one string, the text is a constant in this repository,
+and one `COMMENT ON DATABASE` statement written by hand is indistinguishable from the stamper's. The
+stamper's checks below make an ACCIDENTAL stamp hard; they are not properties the guard can verify
+afterwards. Writing the marker by hand and exporting the declaration is TWO deliberate acts and skips
+the stamper's data check entirely; the guard's own checks above still apply to that database.
+
+**A NAME IS NOT EVIDENCE, and neither is ownership.** This product's tenant databases are `ims_<slug>`
+(`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory` (`.env.example`),
+so no naming convention separates a live database from a scratch one — and `provision-ims-tenant.sh`
+hands each tenant database to the role in its own `DATABASE_URL`, so "only the owner can stamp it"
+excludes nobody who can read a `.env`. What the stamp costs instead is that `npm run db:stamp-scratch`
+**must be given the database name as an argument**, which must equal `current_database()`, and it
+**refuses a database that holds application data** — rows in any table (or materialized view) other
+than the three a fresh `prisma migrate deploy` seeds, and only in the application's own schema
+(`<schema>._prisma_migrations`, `.settings`, `.shopping_status_mappings`, measured 2026-09-17) — or that
+has foreign tables at all, or a table whose row-level-security policy applies to the stamper's role, or
+a session whose `search_path` is not pinned. A wrong `DATABASE_URL` supplies none of that. Both of its
+connections pin `row_security=off` and `search_path=pg_catalog` and assert both before any statement,
+and the writer re-reads the identity AND re-runs the data check inside a savepoint made read-only, so
+NO catalog read runs read-write and the only read-write statements are `BEGIN`/`SAVEPOINT`/`SET
+LOCAL`/`ROLLBACK`/`RELEASE` and the `COMMENT` (o3d-zzgp r10, r11).
+
+**CI HAS NO EXECUTION COVERAGE OF THE SUPERUSER-SKIP CASES** (o3d-zzgp r11, review LOW-4). The
+row-level-security cases and the search-path superuser variant (`COPY … TO PROGRAM`, a table written
+by a planted operator on a superuser writer) can only be demonstrated by a role that is SUBJECT to
+row-level security or is a superuser; `fresh-db-drift` connects as `postgres` (a superuser), so those
+integration cases skip there, exactly as they say when they skip. What CI DOES cover indirectly:
+`assertProbeSessionSafe` fails closed for any role — including a superuser — whenever `row_security`
+is not off or `search_path` is not `pg_catalog`, and the unit tests assert both the option string and
+that the assertion is the first statement every read path sends, so removing either the option or the
+assertion turns a unit test red without a database. The non-superuser search-path cases (a/c/d) run in
+full under a developer's ordinary role. The out-of-band reproduction lives in `mut/r11/attacks.sh`.
+
+```bash
+createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above
+export DATABASE_URL=postgresql://…@localhost:5432/ims_scratch_<suffix>
+npx prisma migrate deploy
+npm run db:stamp-scratch -- ims_scratch_<suffix>        # names the database; refuses one holding data
+export IMS_CONCURRENCY_SCRATCH_DB=ims_scratch_<suffix>  # declare it, by exact name
+npm run test:concurrency
+npm run db:unstamp-scratch -- ims_scratch_<suffix>      # if you keep the database around
+dropdb ims_scratch_<suffix>
+```
+
+RESIDUALS, so nobody has to discover them:
+
+* **the data check runs when the stamp is ISSUED, not every time it is used.** A database stamped while
+  empty keeps the capability however full it later becomes, unless it acquires the marks of an
+  installed application (rows in `users`, `organisations` or `currencies`), which the guard does
+  check. It does not check more, because one run of this tier itself fills 23 tables (products, warehouses,
+  stock, ASNs — measured), so rows there are not evidence of anything. For a stamped database that has
+  merely gained such rows no data check refuses it; what remains is the declaration and the name and
+  server-state rules.
+* **a database with no rows outside the three seeded tables looks fresh.** That population is narrower
+  than it sounds: an `install.sh`-provisioned tenant is NOT in it, because `prisma/seed.ts` writes
+  organisations, warehouses, currencies and tax rates and the bootstrap writes a user — it is only
+  databases that were migrated and never seeded or bootstrapped.
+
+`npm run validate:db` runs this tier only when `IMS_CONCURRENCY_SCRATCH_DB` is set, and prints a
+SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
+declares its own per-run `ims_ci` service database, so the tier is gated on every PR that touches it.
+
+Of the other 32 files (counted 2026-09-18 on the merged tree), one — `email-outbox-claim-fence` — runs against a database it
+creates itself through `tests/helpers/throwaway-database.ts`; the remaining 31 have no guard yet and seed
+whatever `DATABASE_URL` reaches before checking anything (tracked as o3d-yvn8).
+
 **Neither tier is absent from `npm run test:unit`, and only one of the two is gated end to end.**
 `test:unit`'s glob is `tests/**/*.test.ts`, so it collects `tests/concurrency/**` and `tests/db/**`
 along with everything else. What they then DO under it differs, and the difference is what you need
 in order to read a green `test:unit` log correctly:
 
-* `tests/concurrency/**` — all 31 files gate every test on `RUN_DB_CONCURRENCY_TESTS`, so under
-  `test:unit` the tier is collected, reports `# SKIP`, and executes nothing.
+* `tests/concurrency/**` — all 35 files (re-counted 2026-09-18 on the tree merged with #689) gate
+  every test on `RUN_DB_CONCURRENCY_TESTS`, so under `test:unit` the tier is collected, reports
+  `# SKIP`, and executes nothing.
 * `tests/db/**` — exactly THREE of the eleven files are gated on a `RUN_DB_*` variable, and it is the
   same variable for all three. The other eight run under `test:unit`, four of them in full and four of
   them minus their live probes.
