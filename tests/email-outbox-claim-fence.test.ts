@@ -1028,7 +1028,7 @@ const FENCE_MIGRATION_SQL = normaliseForByteComparison(readFileSync(
 ))
 
 /**
- * THE REGION BEFORE `BEGIN` IS PINNED BYTE FOR BYTE, AND THERE IS NO PARSER (r40).
+ * THE WHOLE MIGRATION IS PINNED BYTE FOR BYTE, AND THERE IS NO PARSER (r40, widened in r42).
  *
  * THREE CONSECUTIVE ROUNDS WERE LOST INSIDE ONE FUNCTION (r41 LOW 3 — r40 said four and listed three;
  * r40 is the round that REMOVED it, not a fourth loss), EVERY ONE OF THEM A PARSE-EQUIVALENCE ERROR
@@ -1082,14 +1082,37 @@ const FENCE_MIGRATION_SQL = normaliseForByteComparison(readFileSync(
  * handling, no quote handling — those are the passes that produced the three findings above.
  *
  * WHAT THIS DOES NOT ESTABLISH. It says nothing about whether the refusal's SQL is CORRECT — only that
- * it is unchanged. The rest of the FILE is covered separately and, since r41, exhaustively by position:
- * the statements INSIDE the transaction are asserted by name below (and driven against a real database
- * by tests/concurrency), and everything AFTER the final `COMMIT;` must be empty — a partition this
- * paragraph used to describe as "before" and "inside" only, which read as complete while an appended
- * `CREATE TABLE` after the terminator passed every test in this file (r41 MEDIUM 1, executed).
+ * it is unchanged. The rest of the FILE is covered separately: the statements INSIDE the transaction are
+ * asserted by name below (and driven against a real database by tests/concurrency), and everything after
+ * the line that CLOSES the transaction must be empty — a partition this paragraph once described as
+ * "before" and "inside" only, which read as complete while an appended `CREATE TABLE` after the
+ * terminator passed every test in this file (r41 MEDIUM 1, executed).
+ *
+ * AND "EXHAUSTIVELY BY POSITION" WAS THE WRONG CLAIM (r42 MEDIUM 1). The three slices do partition every
+ * byte of the file, and r41 offered that as completeness. It is not: partitioning says nothing about
+ * whether `[begin, commit)` is ONE transaction. A line reading `END;` inside it closes the transaction —
+ * `END` IS `COMMIT` to PostgreSQL, measured: `BEGIN; CREATE a; END; CREATE b; COMMIT;` as one simple
+ * query commits BOTH, the second on its own — and `COMMIT ;`, `COMMIT WORK;` and lowercase `end;` do the
+ * same. Every one of those passed r41.
+ *
+ * SO THE PIN WAS WIDENED TO THE WHOLE FILE RATHER THAN THE SCAN BEING SHARPENED (r42). The first fix
+ * written for this was a line-anchored regex — "exactly one line closes a transaction" — and it was
+ * measured before it was trusted. It fails on a closer that is not at the start of its line:
+ * `UPDATE ...; COMMIT; CREATE TABLE evil;` on ONE line is invisible to it, the payload commits on its
+ * own, the tail is still empty and the prefix pin is untouched. That is the same defect in its fourth
+ * spelling, and it is what a regex over this file will keep being. The region before `BEGIN;` was
+ * already pinned; pinning the REST of the file costs the same kind of friction and removes the last
+ * parse decision: there is no longer any statement in this file whose boundaries this test has to find.
+ *
+ * WHAT THE SCAN BELOW IS FOR, NOW THAT IT CARRIES NOTHING. The terminator and opener counts are kept as
+ * a SECOND, weaker check that names the specific hazard in its failure message. They are not what makes
+ * the property hold — the byte pin is — and their false-failure modes are known and measured: a
+ * `COMMIT;`-shaped line inside a block comment, inside a multi-line string literal, or inside a
+ * dollar-quoted body is COUNTED (all three go red; a false failure is the safe direction and the price
+ * of not parsing), while a `-- COMMIT;` line is ignored, as it is by the server.
  */
-const PRE_TRANSACTION_FIXTURE = fileURLToPath(
-  new URL('./fixtures/email-outbox-claim-fence-pre-transaction.sql', import.meta.url),
+const MIGRATION_FIXTURE = fileURLToPath(
+  new URL('./fixtures/email-outbox-claim-fence-migration.sql', import.meta.url),
 )
 
 /** Line endings and a BOM, and nothing else — see the block above for why nothing else. */
@@ -1097,12 +1120,75 @@ function normaliseForByteComparison(text: string): string {
   return text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n')
 }
 
+/**
+ * THE SAME NORMALISATION, ON RAW BYTES (r42 MEDIUM 3). r41 claimed to compare "the encoded buffers"
+ * while both sides had already been DECODED by `readFileSync(…, 'utf8')`: invalid sequences collapse to
+ * U+FFFD at the read, and re-encoding a decoded string cannot recover them, so `Buffer.from(a).equals(
+ * Buffer.from(b))` was exactly `a === b` for well-formed text and strictly WEAKER for lone surrogates.
+ * The claim was a no-op. Rather than withdraw it, the comparison now reads both files as BUFFERS and
+ * normalises on bytes, so two files that differ on disk cannot compare equal. `EF BB BF` (a BOM) is
+ * dropped at the start; `0D 0A` and a lone `0D` become `0A`.
+ */
+function normaliseBytes(raw: Buffer): Buffer {
+  const withoutBom = raw.length >= 3 && raw[0] === 0xef && raw[1] === 0xbb && raw[2] === 0xbf
+    ? raw.subarray(3)
+    : raw
+  const out = Buffer.alloc(withoutBom.length)
+  let length = 0
+  for (let at = 0; at < withoutBom.length; at += 1) {
+    if (withoutBom[at] === 0x0d) {
+      out[length] = 0x0a
+      length += 1
+      if (withoutBom[at + 1] === 0x0a) at += 1
+      continue
+    }
+    out[length] = withoutBom[at]
+    length += 1
+  }
+  return out.subarray(0, length)
+}
+
+const FENCE_MIGRATION_BYTES = normaliseBytes(readFileSync(
+  fileURLToPath(new URL('../prisma/migrations/20260910120000_email_outbox_claim_fence/migration.sql', import.meta.url)),
+))
+
 
 test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)', () => {
   const begin = FENCE_MIGRATION_SQL.indexOf('\nBEGIN;')
   assert.ok(begin > 0, 'the migration no longer has an explicit BEGIN')
-  const commit = FENCE_MIGRATION_SQL.indexOf('\nCOMMIT;')
-  assert.ok(commit > begin, 'the migration no longer has a COMMIT after its BEGIN')
+
+  // THE TERMINATOR IS FOUND BY WHAT IT DOES, NOT BY ONE SPELLING (r42 MEDIUM 1, measured by the review).
+  // r41 located it with `indexOf('\nCOMMIT;')`, so a line reading `END;` — which ENDS THE TRANSACTION
+  // exactly as COMMIT does — left `commit` pointing at the real terminator further down: the payload
+  // after `END;` sat INSIDE `[begin, commit)`, the tail was still empty, and the pin was untouched.
+  //
+  // THIS SCAN IS NOT WHAT CLOSES THAT HOLE — THE WHOLE-FILE PIN IS. Measured, this line-anchored regex
+  // misses a closer that is not at the start of its line (`UPDATE ...; COMMIT; CREATE TABLE evil;`), and
+  // it counts a `COMMIT;`-shaped line inside a block comment, a multi-line literal or a dollar-quoted
+  // body (all false failures — the safe direction). It is kept because when the pin fails it is useful
+  // to be told WHICH hazard is present; it is not kept as evidence of anything. Comment lines are
+  // excluded by their leading `--`, and nothing else here is interpreted.
+  //
+  // AND THE RESIDUAL IS STATED RATHER THAN PAPERED OVER, because it was measured: an author who plants
+  // `UPDATE ...; COMMIT; CREATE TABLE evil;` on one line AND resyncs the pin in the same commit passes
+  // both this scan and the pin. That is the X8 residual the review has already accepted in its general
+  // form — no in-repo test can tell an authorised edit of this file from an unauthorised one in the same
+  // commit — and the answer to it is the diff a reviewer reads, not another assertion here. The
+  // line-anchored forms (`END;`, `COMMIT ;`, `COMMIT WORK;`, `end;`) ARE still caught even when the pin
+  // is resynced, which is why the scan stays.
+  const TRANSACTION_TERMINATOR = /^[ \t]*(?:COMMIT|END)\b[^\n]*;[ \t]*$/gim
+  const terminators = [...FENCE_MIGRATION_SQL.slice(begin).matchAll(TRANSACTION_TERMINATOR)]
+    .filter((match) => !match[0].trimStart().startsWith('--'))
+  assert.equal(
+    terminators.length,
+    1,
+    `the transaction region closes ${terminators.length} times, not once. COMMIT and END are the SAME `
+    + 'statement to PostgreSQL, so a second one — in any spelling, any case — ends the transaction early '
+    + 'and everything after it commits on its own, outside the all-or-nothing block this migration '
+    + `depends on: ${JSON.stringify(terminators.map((match) => match[0]))}`,
+  )
+  const commit = begin + terminators[0].index
+  assert.ok(commit > begin, 'the migration no longer closes its transaction after opening it')
 
   // THE ONLY STATEMENT OUT THERE IS THE READ-ONLY REFUSAL, and it is out there so that
   // `migrate deploy` can print its message at all (see the migration's own comment).
@@ -1113,41 +1199,55 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
   // carried an EXECUTE, and an escape-string divergence that swallowed a `CREATE TABLE` outright. There
   // is no version of that idea worth defending here, because the region is a FIXED FILE: it cannot vary
   // legitimately, so the honest assertion is that it is UNCHANGED, byte for byte, and the diff below is
-  // what a reviewer reads when it is not. See the block over `PRE_TRANSACTION_FIXTURE` for the full
+  // what a reviewer reads when it is not. See the block over `MIGRATION_FIXTURE` for the full
   // history and for what this costs.
-  const beforeTransaction = FENCE_MIGRATION_SQL.slice(0, begin)
-  const pinned = normaliseForByteComparison(readFileSync(PRE_TRANSACTION_FIXTURE, 'utf8'))
+  const beforeTransaction = FENCE_MIGRATION_SQL
+  const pinned = normaliseForByteComparison(readFileSync(MIGRATION_FIXTURE, 'utf8'))
+  // …and the same file as RAW BYTES, which is what the comparison below actually uses.
+  const beforeTransactionBytes = FENCE_MIGRATION_BYTES
+  const pinnedBytes = normaliseBytes(readFileSync(MIGRATION_FIXTURE))
 
   // A pin that had been emptied, truncated to the comment preamble, or reduced to the DO block alone
   // would still "match" a region edited to match it, so the pin's own shape is asserted first.
   assert.ok(
-    pinned.length > 10_000,
-    `the pinned pre-transaction text is ${pinned.length} characters, which is not this region — a short `
-    + 'or emptied pin would certify whatever the migration happens to say',
+    pinned.length > 15_000,
+    `the pinned migration text is ${pinned.length} characters, which is not this file — a short or `
+    + 'emptied pin would certify whatever the migration happens to say',
   )
-  // AND IT STILL ENDS MID-LINE (r41 LOW 4). The region stops at the `\n` before `BEGIN;`, so the pin has
-  // no trailing newline; an editor or tool that appends one would otherwise fail this test with a diff
-  // whose last line looks identical. Said here, and in the README beside the fixture.
-  assert.ok(
-    !pinned.endsWith('\n'),
-    'the pinned pre-transaction text has gained a trailing newline. The region it pins ends mid-line, at '
-    + 'the newline before BEGIN; — strip the final newline rather than adding one to the migration',
+  // AND IT ENDS THE WAY THE REGION ENDS (r41 LOW 4; DERIVED in r42 LOW 3). The region normally stops at
+  // the `\n` before `BEGIN;`, so the pin normally has no trailing newline, and an editor that appends one
+  // would otherwise fail with a diff whose last line looks identical. r41 asserted that ABSOLUTELY, which
+  // made the two assertions jointly unsatisfiable the moment a blank line sat before `BEGIN;`: the region
+  // then legitimately ends with `\n`, this fired, and doing what it said broke the byte comparison. It is
+  // derived from the region instead.
+  assert.equal(
+    pinned.endsWith('\n'),
+    beforeTransaction.endsWith('\n'),
+    beforeTransaction.endsWith('\n')
+      ? 'the migration ends with a newline and the pinned copy does not — append one to '
+        + 'tests/fixtures/email-outbox-claim-fence-migration.sql'
+      : 'the pinned copy has gained a trailing newline that the migration does not have. The migration '
+        + 'ends mid-line, at its final COMMIT;, so strip the final newline from '
+        + 'tests/fixtures/email-outbox-claim-fence-migration.sql (the README beside it says so)',
   )
   for (const landmark of ['-- o3d-alnk-sql-block: refuse-ambiguous-processing', 'RAISE EXCEPTION',
-    'USING DETAIL =', 'HINT =', 'END\n$$;', '-- o3d-alnk-sql-block-end']) {
+    'USING DETAIL =', 'HINT =', 'END\n$$;', '-- o3d-alnk-sql-block-end', '\nBEGIN;',
+    'ALTER TABLE "email_outbox" ADD COLUMN "lockedBy" TEXT;',
+    'CREATE UNIQUE INDEX "email_outbox_undelivered_reference_uq"', '\nCOMMIT;']) {
     assert.ok(
       pinned.includes(landmark),
-      `the pinned pre-transaction text does not contain ${JSON.stringify(landmark)}, so it is not a copy `
-      + 'of the region this test is about',
+      `the pinned migration text does not contain ${JSON.stringify(landmark)}, so it is not a copy of the `
+      + 'file this test is about',
     )
   }
 
-  // COMPARED AS BYTES, NOT AS DECODED STRINGS (r41 LOW 1). Both sides are read as UTF-8, and invalid
-  // sequences decode to U+FFFD — so two DIFFERENT byte sequences can compare equal as strings. Not
-  // exploitable (PostgreSQL rejects invalid UTF-8 in a UTF8 database, and executable ASCII round-trips),
-  // but "byte for byte" should mean it: the equality below is on the encoded buffers.
-  const sameBytes = Buffer.from(beforeTransaction, 'utf8').equals(Buffer.from(pinned, 'utf8'))
-  if (!sameBytes) {
+  // COMPARED AS BYTES THAT WERE READ AS BYTES (r42 MEDIUM 3). r41 wrote this as
+  // `Buffer.from(decodedString)` on both sides, which is a no-op: `readFileSync(…, 'utf8')` has already
+  // collapsed any invalid sequence to U+FFFD, and re-encoding cannot recover it — measured by the review,
+  // on-disk `41 FF 42` and `41 FE 42` compared EQUAL. Both files are now read as buffers and normalised
+  // on bytes, so two files that differ on disk cannot compare equal here. The decoded strings above are
+  // kept only for the human-readable diff.
+  if (!beforeTransactionBytes.equals(pinnedBytes)) {
     // A 13 000-character `assert.equal` prints an unreadable diff, so the first differing LINE is
     // located and shown with its neighbours. The assertion itself is still the byte comparison.
     const actualLines = beforeTransaction.split('\n')
@@ -1157,11 +1257,12 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
     const context = (lines: string[]) => lines.slice(Math.max(0, at - 2), at + 3)
       .map((line, index) => `${Math.max(1, at - 1) + index}: ${line}`).join('\n')
     assert.fail(
-      'WHAT RUNS BEFORE THIS MIGRATION OPENS ITS TRANSACTION HAS CHANGED. Everything in this region runs '
-      + 'OUTSIDE the all-or-nothing transaction, so a statement added here can half-apply the migration '
-      + 'and can execute even when the refusal fires. If the change is deliberate, read it as a reviewer '
-      + 'would and copy the region into tests/fixtures/email-outbox-claim-fence-pre-transaction.sql in '
-      + `the same commit.\n\nFirst difference at line ${at + 1}.\n\n--- pinned\n${context(pinnedLines)}`
+      'THIS MIGRATION HAS CHANGED. What runs before its transaction opens runs OUTSIDE the all-or-nothing '
+      + 'block, and a transaction closed early (COMMIT or END, in any spelling, anywhere on a line) makes '
+      + 'everything after it commit on its own — so the whole file is pinned rather than parsed. If the '
+      + 'change is deliberate, read it as a reviewer would and copy the file into '
+      + 'tests/fixtures/email-outbox-claim-fence-migration.sql in the same commit.'
+      + `\n\nFirst difference at line ${at + 1}.\n\n--- pinned\n${context(pinnedLines)}`
       + `\n\n+++ migration\n${context(actualLines)}`,
     )
   }
@@ -1175,23 +1276,31 @@ test('the migration changes NOTHING before its transaction begins (o3d-alnk r6)'
   // statement that changes anything is inside this transaction"). The region after the terminator must
   // therefore be EMPTY apart from whitespace, which also refuses a second `BEGIN;`/`COMMIT;` pair
   // appended after it.
-  const afterTransaction = FENCE_MIGRATION_SQL.slice(commit + '\nCOMMIT;'.length)
+  const afterTransaction = FENCE_MIGRATION_SQL.slice(commit + terminators[0][0].length)
   assert.equal(
     afterTransaction.trim(),
     '',
-    'there are statements AFTER the migration\'s final COMMIT;. Everything there runs OUTSIDE the '
-    + 'all-or-nothing transaction — an explicit COMMIT ends the implicit transaction a multi-statement '
-    + 'simple query runs in, so a statement after it commits on its own even when the refusal fires. '
-    + `What follows the terminator: ${JSON.stringify(afterTransaction)}`,
+    // r42 LOW 4: this refuses ANY non-whitespace after the terminator — a trailing comment or a stray
+    // `;` as well as a statement — so it says what it checked rather than diagnosing what it found.
+    'there is text after the line that closes the migration\'s transaction, and this test refuses all of '
+    + 'it: an explicit COMMIT (or END) ends the implicit transaction a multi-statement simple query runs '
+    + 'in, so anything after it commits on its own even when the refusal fires. If what follows is only a '
+    + 'comment, move it above the terminator. '
+    + `What follows: ${JSON.stringify(afterTransaction)}`,
   )
-  // …and exactly one transaction is opened and closed, so the pair cannot be moved rather than added.
+  // …and exactly one transaction is OPENED, so the pair cannot be moved rather than added. (r42: r41
+  // said "opened and closed" and counted `^COMMIT;$`, which is what `END;` walked past. Closing is
+  // counted above, by the spelling-insensitive scan.)
+  //
+  // r42 LOW 6: counted over the WHOLE file, comment lines excluded by their leading `--` and nothing
+  // else interpreted. A future comment that puts `BEGIN;` alone on a line fails this — closed, with a
+  // message that names the lines it counted rather than asserting what they mean.
+  const opens = [...FENCE_MIGRATION_SQL.matchAll(/^[ \t]*BEGIN\b[^\n]*;[ \t]*$/gim)]
+    .filter((match) => !match[0].trimStart().startsWith('--'))
   assert.equal(
-    [...FENCE_MIGRATION_SQL.matchAll(/^BEGIN;$/gm)].length, 1,
-    'the migration no longer opens exactly one transaction',
-  )
-  assert.equal(
-    [...FENCE_MIGRATION_SQL.matchAll(/^COMMIT;$/gm)].length, 1,
-    'the migration no longer closes exactly one transaction',
+    opens.length, 1,
+    `the migration opens a transaction ${opens.length} times, not once: `
+    + `${JSON.stringify(opens.map((match) => match[0]))}`,
   )
 
   // NON-VACUITY: the statements that DO change things are inside, and the one the review named is
@@ -1256,8 +1365,10 @@ test('r37/r38: the refusal gives all five recovery steps in order, and its one k
   // author who resyncs the pin and rewrites the HINT as `E'…'`, `U&'…'` or `$h$…$h$`, or puts a
   // backslash in it, would get a `remedy` that is NOT the text the server prints while all five step
   // checks below certify it. Rather than grow the model into another lexer (the mistake of r37-r39),
-  // the FORM is refused outright: the HINT opens with a plain quote, and carries no backslash and no
-  // dollar sign.
+  // the literal's OPENING is restricted to a plain quote — four prefixes refused by name — and, since
+  // r42, its CLOSE is required to be the end of the whole value. The prefix list is an ENUMERATION and
+  // is described as one: it refuses four ways of opening a different kind of literal, and it said nothing
+  // about a SECOND literal concatenated after the first until the rule below was added (r42 MEDIUM 2).
   const refusal = FENCE_MIGRATION_SQL.slice(0, begin)
   for (const rejected of ["HINT = E'", "HINT = e'", "HINT = U&'", "HINT = u&'", 'HINT = $']) {
     assert.ok(
@@ -1267,22 +1378,52 @@ test('r37/r38: the refusal gives all five recovery steps in order, and its one k
       + 'text it checks would not be the text the server prints. Keep the HINT a plain \'…\' literal',
     )
   }
+  // r42 LOW 5: this used to assert `=== 1` with a message that read "more than once", so a HINT written
+  // `HINT =\n'…'` or `HINT  = '…'` (count 0) was reported as the opposite of what happened.
+  const hintOpenings = [...refusal.matchAll(/HINT\s*=\s*/g)].length
   assert.equal(
-    [...refusal.matchAll(/HINT = /g)].length, 1,
-    'the refusal names HINT more than once before BEGIN, so the reader below may capture the wrong one',
+    hintOpenings,
+    1,
+    hintOpenings === 0
+      ? 'the refusal before BEGIN no longer assigns a HINT in a form this reader can find (`HINT = ` with '
+        + 'single spaces). Keep the spelling, or the remedy below is read from nothing'
+      : `the refusal assigns HINT ${hintOpenings} times before BEGIN, so the reader below may capture the `
+        + 'wrong one',
   )
   const hint = /HINT = '((?:[^']|'')*)'/.exec(refusal)
   assert.ok(hint, 'the refusal before BEGIN no longer carries a HINT at all')
   const remedy = hint[1]
   assert.ok(remedy.length > 600, `the HINT is ${remedy.length} characters, which is not the remedy this reads`)
-  for (const rejected of ['\\', '$']) {
-    assert.ok(
-      !remedy.includes(rejected),
-      `the HINT contains ${JSON.stringify(rejected)}, which the plain-literal model above does not `
-      + 'account for — a backslash changes where the string ends when standard_conforming_strings is '
-      + 'off, and a dollar sign is how a dollar-quoted body would start',
-    )
-  }
+
+  // AND THE LITERAL IS THE WHOLE VALUE — NO CONTINUATION, NO CONCATENATION (r42 MEDIUM 2, measured by
+  // the review). The prefix list above refuses four ways of OPENING a different kind of literal; it says
+  // nothing about a SECOND literal after the first. Adjacent-literal continuation (`'…'` newline `'…'`),
+  // `|| '…'` and `|| $d$…$d$` all leave `HINT = ` occurring once and this regex capturing only the FIRST
+  // literal — so `remedy` stayed byte-identical while the server printed something else. The review
+  // appended " AND IF THAT IS TOO SLOW, JUST LET THE DRAIN SETTLE THEM." that way and every step check
+  // below certified it green: the exact instruction round 37 exists to forbid.
+  //
+  // ONE RULE INSTEAD OF A LIST OF FORMS: the literal's closing quote must be IMMEDIATELY followed by `;`.
+  // That refuses every continuation and every concatenation at once, whatever it is spelled with.
+  const afterLiteral = refusal.slice(hint.index + hint[0].length)
+  assert.ok(
+    afterLiteral.startsWith(';'),
+    'the HINT literal is not the whole of the HINT: its closing quote is followed by '
+    + `${JSON.stringify(afterLiteral.slice(0, 40))} rather than \';\'. A second adjacent literal, a `
+    + '`|| \'…\'` or a `|| $d$…$d$` is concatenated by the server but INVISIBLE to the reader below, which '
+    + 'captures only the first literal — so every step check would certify text the operator never sees '
+    + '(r42 MEDIUM 2). Keep the remedy one literal ending `\';`',
+  )
+
+  // r42 LOW 7: the backslash ban stays — with standard_conforming_strings off it decides where the
+  // literal ENDS, which is the round-39 defect in one character. The `$` ban is GONE: it was there to
+  // refuse a dollar-quoted body, which the `HINT = $` prefix above already refuses at the opening, and
+  // it cost legitimate operator prose (`(cost: $0)` in the HINT was red).
+  assert.ok(
+    !remedy.includes('\\'),
+    'the HINT contains a backslash, which the plain-literal model above does not account for: with '
+    + 'standard_conforming_strings off it escapes the next byte and moves where the literal ends',
+  )
 
   // (1) THE DANGEROUS INSTRUCTION IS NOT GIVEN. Written as a COUNT and not as an absence, because the
   // HINT now names the old advice in order to forbid it: "do not let the drain settle them". A bare
