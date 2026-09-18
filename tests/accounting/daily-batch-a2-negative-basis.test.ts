@@ -67,9 +67,16 @@ const tx = {
     },
   },
   salesOrder: {
-    findMany: async (args?: { select?: Record<string, unknown> }) => (
-      args?.select?.allocations ? orders : orders.map((order) => ({ id: order.id }))
-    ),
+    // Honours the three things the A2 window asks of it: `id in` (the re-read under the lock),
+    // `id notIn` (o3d-sidy r2: a later pass looking past refused orders) and `take` (the window).
+    findMany: async (args?: { select?: Record<string, unknown>; where?: { id?: { in?: string[]; notIn?: string[] } }; take?: number }) => {
+      let rows = orders
+      const id = args?.where?.id
+      if (id?.in) rows = rows.filter((order) => id.in!.includes(order.id))
+      if (id?.notIn) rows = rows.filter((order) => !id.notIn!.includes(order.id))
+      if (typeof args?.take === 'number') rows = rows.slice(0, args.take)
+      return args?.select?.allocations ? rows : rows.map((order) => ({ id: order.id }))
+    },
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       orderUpdates.push({ id: where.id, data })
       return { id: where.id }
@@ -293,4 +300,78 @@ test('o3d-sidy H1: a ZERO basis is not refused', async () => {
   assert.deepEqual(result.errors.filter((error) => /negative/i.test(error)), [], 'no refusal')
   assert.deepEqual(orderUpdates.map((u) => u.id).sort(), ['order-H', 'order-Z'], 'both orders reclassified')
   assert.equal((a2Journal()?.payload.lines as Array<{ debit?: number }>)[0].debit, 20)
+})
+
+test('o3d-sidy r2 (LOW 3): EVERY refused order hands its layers back, not only the first', async () => {
+  // D1 and D2 each want 2 units off [£10, -6, then £20]; E wants 1. Both D orders reach the -6 layer
+  // and are refused. If only the FIRST refusal handed back, D2 would keep the £10 and -6 layers and E
+  // would pin the £20 layer instead.
+  reset(
+    [allocatedOrder('D1', 'prod-P', 2), allocatedOrder('D2', 'prod-P', 2), allocatedOrder('E', 'prod-P', 1)],
+    [
+      { id: 'layer-P1', productId: 'prod-P', warehouseId: 'wh-1', remainingQty: 1, unitCostBase: 10, receivedAt: 1 },
+      { id: 'layer-P2', productId: 'prod-P', warehouseId: 'wh-1', remainingQty: 1, unitCostBase: -6, receivedAt: 2 },
+      { id: 'layer-P3', productId: 'prod-P', warehouseId: 'wh-1', remainingQty: 5, unitCostBase: 20, receivedAt: 3 },
+    ],
+  )
+
+  const result = await run()
+
+  assert.equal(a2Refusals(result.errors, 'SO-D1').length, 1)
+  assert.equal(a2Refusals(result.errors, 'SO-D2').length, 1)
+  assert.equal((a2Journal()?.payload.lines as Array<{ debit?: number }>)[0].debit, 10,
+    'E pins the FIFO-oldest £10 layer both refused orders handed back')
+  const eRecord = allocationUpdates.find((u) => u.id === 'alloc-E')?.data.costLayerSnapshot as Array<{ costLayerId: string }>
+  assert.deepEqual(eRecord?.map((entry) => entry.costLayerId), ['layer-P1'])
+})
+
+test('o3d-sidy r2 (MEDIUM): refused orders filling the window do not starve the healthy order behind them', async () => {
+  // The window holds two orders. Both refused orders sit at its front; the healthy one is third.
+  const previous = process.env.XERO_DAILY_BATCH_LIMIT
+  process.env.XERO_DAILY_BATCH_LIMIT = '2'
+  try {
+    reset(
+      [allocatedOrder('R1', 'prod-N', 1), allocatedOrder('R2', 'prod-N', 1), allocatedOrder('H', 'prod-H', 1)],
+      [
+        { id: 'layer-N', productId: 'prod-N', warehouseId: 'wh-1', remainingQty: 2, unitCostBase: -6, receivedAt: 1 },
+        { id: 'layer-H', productId: 'prod-H', warehouseId: 'wh-1', remainingQty: 1, unitCostBase: 20, receivedAt: 1 },
+      ],
+    )
+
+    const result = await run()
+
+    assert.equal(result.batchLimit, 2, 'PRECONDITION: the window really is two orders wide')
+    assert.equal(a2Refusals(result.errors, 'SO-R1').length, 1, 'R1 refused once — not again by a later pass')
+    assert.equal(a2Refusals(result.errors, 'SO-R2').length, 1, 'R2 refused once')
+    assert.deepEqual(orderUpdates.map((u) => u.id), ['order-H'], 'H is reclassified in the SAME run')
+    const journals = created.filter((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.equal(journals.length, 1, 'by one journal, for H alone')
+    assert.equal((journals[0].payload.lines as Array<{ debit?: number }>)[0].debit, 20)
+    assert.equal(result.groupA2, 1)
+    assert.equal(activity.filter((entry) => entry.action === 'daily_batch_negative_cost_basis_refused').length, 2,
+      'one activity entry per refused order, however many passes the run took')
+  } finally {
+    if (previous === undefined) delete process.env.XERO_DAILY_BATCH_LIMIT
+    else process.env.XERO_DAILY_BATCH_LIMIT = previous
+  }
+})
+
+test('o3d-sidy r2 (LOW 2): a pass that ABORTS reports its abort, not the refusals it made before aborting', async () => {
+  // R is refused first; X then throws the whole A2 transaction ("Missing FIFO snapshot": dispatched,
+  // with no snapshot on the shipped line). Nothing in that pass committed, so R's refusal must not be
+  // published as though the rest of the pass had gone through.
+  const x = dispatchedOrder('X', '5.000000')
+  x.shipments[0].lines[0].costLayerSnapshot = null
+  reset(
+    [allocatedOrder('R', 'prod-N', 1), x],
+    [{ id: 'layer-N', productId: 'prod-N', warehouseId: 'wh-1', remainingQty: 1, unitCostBase: -6, receivedAt: 1 }],
+  )
+
+  const result = await run()
+
+  assert.ok(result.errors.some((error) => error.startsWith('Group A2 error:') && /Missing FIFO snapshot/.test(error)),
+    `PRECONDITION: the pass really aborted: ${JSON.stringify(result.errors)}`)
+  assert.deepEqual(a2Refusals(result.errors, 'SO-R'), [], 'the refusal from the aborted pass is not reported')
+  assert.deepEqual(activity.filter((entry) => entry.action === 'daily_batch_negative_cost_basis_refused'), [])
+  assert.deepEqual(orderUpdates, [], 'and nothing was stamped')
 })

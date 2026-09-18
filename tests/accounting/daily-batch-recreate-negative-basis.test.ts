@@ -17,7 +17,7 @@ type SyncLogRow = { connector: string; type: string; referenceId: string; status
 let shipmentRows: unknown[] = []
 const created: Array<{ type: string; referenceId: string; payload: Record<string, unknown> }> = []
 const cogsMovements: Array<{ sourceRef: string; baseDelta: unknown }> = []
-const syncLogs: SyncLogRow[] = []
+let syncLogs: SyncLogRow[] = []
 
 const tx = {
   accountingSyncLog: {
@@ -37,7 +37,14 @@ mock.module('@/lib/db', {
       accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       salesOrder: { findMany: async () => [] },
       shipment: { findMany: async () => shipmentRows },
-      accountingSyncLog: { count: async () => 0, findMany: async () => syncLogs },
+      accountingSyncLog: {
+        count: async () => syncLogs.length,
+        // The Xero verdict READS the rows and judges them (o3d-o97 r6); these are the fields it reads.
+        findMany: async () => syncLogs.map((row, index) => ({
+          id: `live-${index}`, referenceId: row.referenceId, status: row.status,
+          externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null,
+        })),
+      },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
     },
   },
@@ -68,8 +75,9 @@ const SETTINGS = {
 const STAMP = new Date('2026-07-20T09:00:00.000Z')
 const REF = 'B-2026-07-20-1a2b3c4d'
 
-function reset(rows: unknown[]) {
+function reset(rows: unknown[], logs: SyncLogRow[] = []) {
   shipmentRows = rows
+  syncLogs = logs
   created.length = 0
   cogsMovements.length = 0
 }
@@ -120,4 +128,32 @@ test('o3d-sidy M2: a healthy lost batch is still rebuilt exactly as before', asy
   const lines = created[0].payload.lines as Array<{ accountCode: string; debit?: number }>
   assert.equal(lines.find((line) => line.accountCode === '310')?.debit, 40, 'with its COGS pair')
   assert.deepEqual(cogsMovements, [{ sourceRef: 'ship-ok', baseDelta: 40 }])
+})
+
+test('o3d-sidy r2 (HIGH): a LIVE Group B batch beside a revalued-negative shipment is left alone — no refusal, no error, no activity', async () => {
+  // The review's scenario JB: the batch journaled a healthy £4 shipment and its log is live; a credit
+  // freight line then revalued the shipment's cogsBatchAmount to -6 (lib/cost-layers.ts rewrites it
+  // on journaled shipments too). There is nothing to rebuild. Judging the sign BEFORE the verdict
+  // refused it every run and told the operator a posted journal was lost.
+  reset(
+    [{ id: 'ship-neg', shipmentJournalDate: STAMP, shipmentJournalBatchRef: REF, revenueRecognizedAmount: 10, cogsBatchAmount: -6 }],
+    [{ connector: 'xero', type: 'DAILY_BATCH_GROUP_B', referenceId: REF, status: 'PENDING' }],
+  )
+
+  const { refusals, collected } = await sweep()
+
+  assert.deepEqual(created, [], 'PRECONDITION the verdict ran: a live batch is never rebuilt')
+  assert.deepEqual(refusals, [], 'and nothing is reported about it — least of all that it is lost')
+  assert.deepEqual(collected, [], 'so no ERROR activity entry is written for it either')
+})
+
+test('o3d-sidy r2: a LOST batch whose ONLY content is a negative COGS is still refused, not skipped as empty', async () => {
+  reset([{ id: 'ship-neg', shipmentJournalDate: STAMP, shipmentJournalBatchRef: REF, revenueRecognizedAmount: 0, cogsBatchAmount: -6 }])
+
+  const { refusals, collected } = await sweep()
+
+  assert.deepEqual(created, [])
+  assert.equal(refusals.filter((refusal) => refusal.includes(REF) && /negative cost basis/.test(refusal)).length, 1,
+    `refused by name: ${JSON.stringify(refusals)}`)
+  assert.equal(collected.length, 1)
 })
