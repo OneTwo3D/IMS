@@ -9,6 +9,11 @@ import {
   type ScratchDatabaseFacts,
 } from './concurrency/scratch-database-guard'
 import { refuseToStamp } from '../scripts/stamp-scratch-database'
+import {
+  INSTALLATION_EVIDENCE_TABLE_NAMES,
+  MIGRATION_SEEDED_TABLE_NAMES,
+  buildPopulatedTableProbe,
+} from './concurrency/scratch-database-data-probe'
 
 /**
  * o3d-zzgp rounds 4-6. The guard accepts a database only on PROOF FROM THE SERVER that it
@@ -43,6 +48,7 @@ function facts(overrides: Partial<ScratchDatabaseFacts> & { connectedDatabase: s
     inRecovery: false,
     isTemplate: false,
     subscriptionCount: 0,
+    installationEvidence: [],
     ...overrides,
   }
 }
@@ -174,7 +180,13 @@ test('the stamper refuses every database a stamp must never be applied to — in
 
   // The name must be GIVEN, and must be the database this URL reaches.
   assert.match(String(refuseToStamp({ ...ok, requestedName: undefined })), /no database name was given/)
-  assert.match(String(refuseToStamp({ ...ok, requestedName: 'ims_other' })), /is not the database this DATABASE_URL reaches/)
+  const wrongName = String(refuseToStamp({ ...ok, requestedName: 'ims_other' }))
+  assert.match(wrongName, /is not the database this DATABASE_URL reaches/)
+  // Review L-5: it must not name the database the URL actually reached — that made the argument
+  // one guided retry away.
+  assert.doesNotMatch(wrongName, /ims_ci/)
+  // A database wired to another server is refused on sight, never read.
+  assert.match(String(refuseToStamp({ ...ok, foreignTables: ['public.remote_orders'] })), /foreign tables/)
 
   // Server state, with the subscription catalogue failing CLOSED here (review LOW-4).
   assert.notEqual(refuseToStamp({ ...ok, inRecovery: true }), null)
@@ -183,4 +195,58 @@ test('the stamper refuses every database a stamp must never be applied to — in
   assert.match(String(refuseToStamp({ ...ok, subscriptionCount: null })), /could not be read/)
   assert.notEqual(refuseToStamp({ ...ok, database: '', requestedName: '' }), null)
   assert.equal(SCRATCH_DATABASE_OPT_IN_ENV, 'IMS_CONCURRENCY_SCRATCH_DB')
+})
+
+test('the guard refuses a stamped, declared database that has been set up as an installed application', () => {
+  // Review M-1: the stamp is checked for data only when it is ISSUED. The guard now refuses a
+  // stamped database that has since acquired the marks of an installation — and ONLY those, because
+  // the tier itself fills products/stock/warehouses (measured: 23 tables after one run), so those
+  // rows cannot be evidence of anything.
+  for (const table of INSTALLATION_EVIDENCE_TABLE_NAMES) {
+    const verdict = scratchDatabaseVerdict({ ...stamped('ims_ci'), installationEvidence: [`public.${table}`] })
+    assert.equal(verdict.ok, false, table)
+    assert.match(verdict.ok === false ? verdict.reason : '', /set up as an installed application/, table)
+  }
+  // The positive control: the same stamped database with none of them is accepted.
+  assert.deepEqual(scratchDatabaseVerdict(stamped('ims_ci')), { ok: true })
+  // And the evidence set is disjoint from what migrations seed, or a fresh database would fail.
+  for (const table of INSTALLATION_EVIDENCE_TABLE_NAMES) {
+    assert.equal((MIGRATION_SEEDED_TABLE_NAMES as readonly string[]).includes(table), false, table)
+  }
+})
+
+test('the data probe exempts the migration-seeded tables ONLY in the application schema', () => {
+  // Review L-1, and M-5: this tests the statement the server is sent, not an injected array.
+  const relations = [
+    { schema: 'public', name: '_prisma_migrations', kind: 'r' },
+    { schema: 'public', name: 'settings', kind: 'r' },
+    { schema: 'public', name: 'shopping_status_mappings', kind: 'r' },
+    { schema: 'public', name: 'products', kind: 'r' },
+    { schema: 'tenant', name: 'settings', kind: 'r' },
+    { schema: 'tenant', name: 'products', kind: 'p' },
+    { schema: 'public', name: 'report_cache', kind: 'm' },
+    { schema: 'public', name: 'remote_orders', kind: 'f' },
+    { schema: 'we"ird', name: "o'dd", kind: 'r' },
+  ]
+  const probe = buildPopulatedTableProbe(relations, 'public')
+  assert.deepEqual(probe.exempted, ['public._prisma_migrations', 'public.settings', 'public.shopping_status_mappings'])
+  // `tenant.settings` is PROBED — round 7 exempted the bare name in every schema.
+  assert.deepEqual(probe.probed, ['public.products', 'tenant.settings', 'tenant.products', 'public.report_cache', `we"ird.o'dd`])
+  // A foreign table is reported, never read.
+  assert.deepEqual(probe.foreign, ['public.remote_orders'])
+  assert.doesNotMatch(String(probe.sql), /remote_orders/)
+  // Identifiers and labels are quoted.
+  assert.match(String(probe.sql), /FROM "we""ird"\."o'dd"/)
+  assert.match(String(probe.sql), /'we"ird\.o''dd'/)
+
+  // Under a non-public application schema the exemption moves with it.
+  const ims = buildPopulatedTableProbe(
+    [{ schema: 'ims', name: 'settings', kind: 'r' }, { schema: 'public', name: 'settings', kind: 'r' }],
+    'ims',
+  )
+  assert.deepEqual(ims.exempted, ['ims.settings'])
+  assert.deepEqual(ims.probed, ['public.settings'])
+
+  // Nothing to probe → no statement.
+  assert.equal(buildPopulatedTableProbe([], 'public').sql, null)
 })

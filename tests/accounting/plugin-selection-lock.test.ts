@@ -901,12 +901,15 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 //   4. WHAT a classified path actually executes. `migration-runner` says a file applies migration
 //      SQL, not that the SQL is safe; the plugin-key assertion below is what covers that, and it
 //      only covers migrations that live in this repo.
-//   5. STANDALONE CLIENTS OUTSIDE `app`/`lib`/`prisma`. `CONSTRUCTS_A_DATABASE_CLIENT` is applied
-//      to those three roots only: `scripts/` and `e2e/` contain roughly two dozen fixture and
-//      harness files that each build their own client, and classifying them one by one would be
-//      churn without a guarantee. What covers THEM is the lexical plugin-key writer scan above,
-//      whose roots include both — so an unfenced plugin write there fails that test instead of this
-//      one. The two scans are complementary, and neither is complete alone.
+//   5. STANDALONE CLIENTS IN `e2e/`. `CONSTRUCTS_A_DATABASE_CLIENT` is applied to `app`, `lib`,
+//      `prisma` and — since o3d-zzgp r7 — `scripts`, whose fifteen self-built clients are now
+//      classified one by one below. `e2e/` is still NOT a client-construction root: its harness
+//      files that build their own client are found only if they also shell a database tool. What
+//      covers them is the lexical plugin-key writer scan above, whose roots include `e2e` — so an
+//      unfenced plugin write there fails that test instead of this one. The two scans are
+//      complementary, and neither is complete alone. (Until r8 this item still said `scripts/`
+//      was excluded as "churn without a guarantee", while the code below classified it — a stale
+//      limitation beside its own correction, review M-4.)
 //
 // These are limits of a source scan, not gaps to be closed by a better regex. The list below is a
 // floor — "at least these" — never a ceiling.
@@ -1032,10 +1035,15 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             of them write to XERO, over HTTP; none writes a row here.)
  *   'rolled-back-constraint-probe'
  *                           — scripts/check-stock-quantity-constraints.mjs, run by
- *                             `npm run validate:db`. It INSERTs deliberately invalid rows to prove
- *                             the database's own CHECK constraints reject them, inside
- *                             BEGIN/SAVEPOINT with ROLLBACK, so nothing it writes survives the
- *                             statement that wrote it.
+ *                             `npm run validate:db`. It opens ONE transaction, inserts a valid
+ *                             products row and a valid warehouses row as fixtures, then tries
+ *                             deliberately invalid rows inside savepoints to prove the database's
+ *                             own CHECK constraints reject them. Everything it writes lives only
+ *                             inside that transaction: the final ROLLBACK discards it, and on the
+ *                             assertion-failure path that ROLLBACK never runs — the backend then
+ *                             aborts the open transaction when the connection closes, which also
+ *                             discards it. So nothing it writes is ever DURABLE; it is not true
+ *                             that nothing survives the statement that wrote it (review L-9).
  *   'scratch-database-stamp'— connects to a database that is NOT this application's and writes ONE
  *                             DATABASE-LEVEL comment (`COMMENT ON DATABASE … IS '<marker>'`), which
  *                             is how the DB-backed concurrency tier is told a database was created

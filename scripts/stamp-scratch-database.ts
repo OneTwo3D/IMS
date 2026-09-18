@@ -40,25 +40,11 @@ import {
   SCRATCH_DATABASE_MARKER_PREFIX,
   expectedScratchDatabaseMarker,
 } from '../tests/concurrency/scratch-database-guard'
+import { readDataFacts } from '../tests/concurrency/scratch-database-data-probe'
 
-/**
- * Tables a FRESHLY MIGRATED database has rows in, so their rows are not evidence that a
- * database is in use. MEASURED on 2026-09-17, not assumed: `createdb` + `prisma migrate
- * deploy` (262 migrations) then a row count over all 109 user tables gave exactly
- * `_prisma_migrations` (262), `settings` (2) and `shopping_status_mappings` (7) — everything
- * else empty. Re-measure with:
- *
- *   for t in $(psql -At -c "SELECT n.nspname||'.'||c.relname FROM pg_class c
- *       JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ('r','p')
- *       AND n.nspname NOT IN ('pg_catalog','information_schema') AND NOT c.relispartition");
- *     do echo "$t $(psql -At -c "select count(*) from $t")"; done
- *
- * A future migration that seeds a fourth table makes this script REFUSE a freshly migrated
- * database and CI goes red naming the table — loud, and in the safe direction. The residual
- * is stated in docs/development.md: a live database whose ONLY rows are in these three is not
- * distinguished by this check.
- */
-const MIGRATION_SEEDED_TABLES = ['_prisma_migrations', 'settings', 'shopping_status_mappings']
+// The "does it hold application data?" question — including which tables a fresh migration seeds
+// and why those three are exempt only in the application's own schema — lives in
+// tests/concurrency/scratch-database-data-probe.ts, shared with the guard (o3d-zzgp r8).
 
 type Facts = {
   database: string
@@ -67,8 +53,10 @@ type Facts = {
   isTemplate: boolean
   /** null when the catalogue could not be read — a REFUSAL here, see `refuseToStamp`. */
   subscriptionCount: number | null
-  /** Tables outside `MIGRATION_SEEDED_TABLES` that hold at least one row. */
+  /** Non-exempt relations holding at least one row (see scratch-database-data-probe.ts). */
   populatedTables: string[]
+  /** Foreign tables present — never read, refused on sight. */
+  foreignTables: string[]
 }
 
 type PgClient = {
@@ -76,7 +64,7 @@ type PgClient = {
   end: () => Promise<void>
 }
 
-async function readFacts(client: PgClient): Promise<Facts> {
+async function readFacts(client: PgClient, appSchema: string): Promise<Facts> {
   const { rows } = await client.query<{
     name: string
     comment: string | null
@@ -102,47 +90,21 @@ async function readFacts(client: PgClient): Promise<Facts> {
     subscriptionCount = null
   }
 
+  const data = await readDataFacts(client, appSchema)
   return {
     database: String(rows[0]!.name ?? ''),
     comment: rows[0]!.comment ?? null,
     inRecovery: rows[0]!.in_recovery === true,
     isTemplate: rows[0]!.is_template === true,
     subscriptionCount,
-    populatedTables: await findPopulatedTables(client),
+    populatedTables: data.populated,
+    foreignTables: data.foreign,
   }
 }
 
 /**
- * Every ordinary table outside the migration-seeded set that holds at least one row, as ONE
- * statement: the catalogue names the tables, and an `EXISTS` per table is UNION ALLed so the
- * server answers in a single round trip and stops at the first row of each.
- */
-async function findPopulatedTables(client: PgClient): Promise<string[]> {
-  const { rows: tables } = await client.query<{ schema: string; table: string }>(
-    `SELECT n.nspname AS schema, c.relname AS table
-       FROM pg_catalog.pg_class c
-       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-      WHERE c.relkind IN ('r', 'p')
-        AND NOT c.relispartition
-        AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-        AND n.nspname NOT LIKE 'pg_toast%'
-        AND n.nspname NOT LIKE 'pg_temp%'
-      ORDER BY 1, 2`,
-  )
-  const candidates = tables.filter((row) => !MIGRATION_SEEDED_TABLES.includes(row.table))
-  if (candidates.length === 0) return []
-
-  const probes = candidates.map((row) => {
-    const qualified = `"${row.schema.replace(/"/g, '""')}"."${row.table.replace(/"/g, '""')}"`
-    const label = quoteLiteral(`${row.schema}.${row.table}`)
-    return `SELECT ${label} AS t WHERE EXISTS (SELECT 1 FROM ${qualified})`
-  })
-  const { rows } = await client.query<{ t: string }>(probes.join(' UNION ALL '))
-  return rows.map((row) => row.t)
-}
-
-/**
- * The reasons a stamp must never be applied, whoever asks. Pure, so the unit table can cover
+ * The reasons a stamp must never be APPLIED, whoever asks (removing one, `--unstamp`, is deliberately
+ * not gated by these — see main()). Pure, so the unit table can cover
  * every one without a server.
  */
 export function refuseToStamp(input: {
@@ -152,6 +114,7 @@ export function refuseToStamp(input: {
   isTemplate: boolean
   subscriptionCount: number | null
   populatedTables: string[]
+  foreignTables?: string[]
 }): string | null {
   if (!input.database) return 'the server reported no database name'
   if (input.requestedName === undefined) {
@@ -160,8 +123,10 @@ export function refuseToStamp(input: {
       + 'database rather than a consequence of whatever DATABASE_URL happens to be set to'
   }
   if (input.requestedName !== input.database) {
-    return `the name given ("${input.requestedName}") is not the database this DATABASE_URL reaches `
-      + `("${input.database}")`
+    // DOES NOT NAME THE DATABASE THE URL REACHED (review L-5): echoing current_database() here
+    // made the argument one guided retry away — the refusal would tell the operator exactly what
+    // to type next. Whoever set DATABASE_URL knows what it points at; the refusal need not.
+    return `the name given ("${input.requestedName}") is not the database this DATABASE_URL reaches`
   }
   if (ALWAYS_REFUSED_DATABASE.test(input.database)) {
     return `the name matches ${ALWAYS_REFUSED_DATABASE}, which is a real or server-owned database`
@@ -178,6 +143,10 @@ export function refuseToStamp(input: {
   }
   if (input.subscriptionCount > 0) {
     return `it is the target of ${input.subscriptionCount} logical-replication subscription(s), so it is a copy of another database`
+  }
+  if ((input.foreignTables ?? []).length > 0) {
+    return `it has foreign tables (${input.foreignTables!.slice(0, 3).join(', ')}), so it is wired to another `
+      + 'server; a database created for a test run is self-contained'
   }
   if (input.populatedTables.length > 0) {
     const shown = input.populatedTables.slice(0, 5).join(', ')
@@ -205,34 +174,71 @@ async function main(argv: string[]): Promise<number> {
     console.error('DATABASE_URL is not set; point it at the database you created for this test run')
     return 2
   }
-  const { sanitisedProbeConnectionString } = await import('../lib/db/database-url-schema.mjs')
+  const { databaseUrlSchema, sanitisedProbeConnectionString } = await import('../lib/db/database-url-schema.mjs')
   const connectionString = sanitisedProbeConnectionString(databaseUrl)
   if (connectionString === null) {
     console.error('DATABASE_URL is not a URL, so its connection parameters cannot be sanitised')
     return 2
   }
+  // The schema the APPLICATION resolves from this URL — the only schema in which the three
+  // migration-seeded tables are exempt from the data check (review L-1).
+  const appSchema = databaseUrlSchema(databaseUrl) ?? 'public'
 
   const { default: pg } = await import('pg')
-  const client = new pg.Client({ connectionString, application_name: 'o3d-stamp-scratch-database' })
-  await client.connect()
+  // EVERY FACT IS GATHERED READ-ONLY (review L-8). Only the single COMMENT below needs to write,
+  // and it opens its own connection for that one statement.
+  const reader = new pg.Client({
+    connectionString,
+    options: '-c default_transaction_read_only=on',
+    application_name: 'o3d-stamp-scratch-database',
+  })
+  await reader.connect()
+  let facts: Facts
   try {
-    const facts = await readFacts(client as unknown as PgClient)
+    facts = await readFacts(reader as unknown as PgClient, appSchema)
+  } finally {
+    await reader.end().catch(() => {})
+  }
 
+  const writeOne = async (sql: string) => {
+    const writer = new pg.Client({ connectionString, application_name: 'o3d-stamp-scratch-database' })
+    await writer.connect()
+    try {
+      // The writer must be talking to the database the facts were read from; a DATABASE_URL that
+      // resolves differently a second time (DNS, a pooler) would otherwise stamp a stranger.
+      const { rows } = await writer.query<{ name: string }>('SELECT pg_catalog.current_database() AS name')
+      if (rows[0]!.name !== facts.database) throw new Error('the second connection reached a different database')
+      await writer.query(sql)
+    } finally {
+      await writer.end().catch(() => {})
+    }
+  }
+
+  {
+    // --unstamp IS DELIBERATELY NOT BEHIND THE REFUSAL TABLE (review L-6). Everything it can do is
+    // remove a scratch marker, which only ever makes the guard STRICTER. Putting it behind the belt
+    // would stop exactly the clean-up that matters most: a marker written by hand onto a real
+    // database (review M-2 showed that takes one statement) could then never be removed by the
+    // tool built to remove it. It still requires the exact name, so it too is a decision about one
+    // database rather than a consequence of a URL.
     if (unstamp) {
       if (requestedName !== facts.database) {
-        console.error(`REFUSING to unstamp: name the database this DATABASE_URL reaches ("${facts.database}")`)
+        console.error('REFUSING to unstamp: the name given is not the database this DATABASE_URL reaches')
         return 1
       }
       if (facts.comment === null) {
         console.log(`"${facts.database}" carries no database comment; nothing to remove.`)
         return 0
       }
-      if (!facts.comment.startsWith(`${SCRATCH_DATABASE_MARKER_PREFIX}(`)) {
+      // Any form this script has ever written: the round-7+ `ims-scratch-database(<name>): …` AND
+      // the round-6 `ims-scratch-database: …`, which the narrower check could not remove while
+      // claiming it "did not write" it (review L-7).
+      if (!facts.comment.startsWith(SCRATCH_DATABASE_MARKER_PREFIX)) {
         console.error(`REFUSING to unstamp "${facts.database}": its comment is not a scratch marker, and this script `
           + 'will not remove a comment it did not write')
         return 1
       }
-      await client.query(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS NULL`)
+      await writeOne(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS NULL`)
       console.log(`Removed the scratch marker from "${facts.database}".`)
       return 0
     }
@@ -244,6 +250,7 @@ async function main(argv: string[]): Promise<number> {
       isTemplate: facts.isTemplate,
       subscriptionCount: facts.subscriptionCount,
       populatedTables: facts.populatedTables,
+      foreignTables: facts.foreignTables,
     })
     if (refusal) {
       console.error(`REFUSING to stamp "${facts.database || '<unknown>'}": ${refusal}`)
@@ -265,15 +272,13 @@ async function main(argv: string[]): Promise<number> {
 
     // Neither the identifier nor the comment can be a bind parameter in DDL. The name comes
     // from the server's own current_database() and the marker is derived from it; both quoted.
-    await client.query(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS ${quoteLiteral(marker)}`)
+    await writeOne(`COMMENT ON DATABASE ${quoteIdentifier(facts.database)} IS ${quoteLiteral(marker)}`)
     // DELIBERATELY NOT A PASTE-READY EXPORT LINE (review LOW-3): round 6 printed the exact
     // declaration to set, which composed with the guard's refusal into a walkthrough for
     // pointing the suite at whatever database the URL reached.
     console.log(`Stamped "${facts.database}" disposable. docs/development.md, "Database-backed tiers", `
       + 'has the rest of the setup.')
     return 0
-  } finally {
-    await client.end().catch(() => {})
   }
 }
 

@@ -40,12 +40,25 @@
  *      `ALTER DATABASE … OWNER TO "$DB_USER"`, so a tenant's LIVE database is owned by the
  *      very role in its own DATABASE_URL — and on the development server `imsdev` owns
  *      every `ims_*`. Ownership excludes nobody who can read a `.env` (review MEDIUM-2).
- *      What the stamp costs is that `scripts/stamp-scratch-database.ts` must be run
- *      DELIBERATELY, NAMING the database as an argument, against a database that holds no
- *      application data — none of which a wrong `DATABASE_URL` supplies on its own.
+ *
+ *      WHAT A MARKER PROVES, AND NOTHING MORE (o3d-zzgp r8, review M-2): a marker is evidence
+ *      that someone who owns the database deliberately wrote this exact sentence naming this
+ *      exact database — not that the stamper ran, and not that the database was empty. The
+ *      guard compares one string; it cannot tell a stamp the stamper issued from the same
+ *      text written by hand, and the review did exactly that with ONE statement, as an
+ *      ordinary login role owning a database holding a `products` row the stamper had just
+ *      refused — and the guard accepted it. The marker text is a constant in this repository.
+ *      The stamper's argument and data checks make an ACCIDENTAL stamp hard; they are not
+ *      properties the guard can verify afterwards.
  *   3. NOT A REPLICA, NOT A TEMPLATE — `pg_is_in_recovery()` is false, `datistemplate` is
- *      false, and no logical-replication subscription targets it. A replica of production
- *      is invisible to every name rule, and a logical one is writable.
+ *      false, and no logical-replication subscription that the server LETS THIS ROLE SEE
+ *      targets it. A replica of production is invisible to every name rule, and a logical one
+ *      is writable. If `pg_subscription` cannot be read at all, the guard does NOT refuse on
+ *      that ground (review L-4 — it used to be stated as a condition that "must hold"); the
+ *      stamper, which issues the capability, does refuse.
+ *   3a. NOT AN INSTALLED APPLICATION — none of `users`, `organisations`, `currencies` in the
+ *      application's schema holds a row (review M-1; see INSTALLATION_EVIDENCE_TABLE_NAMES in
+ *      scratch-database-data-probe.ts for why these three and not "any table with data").
  *   4. NOT OBVIOUSLY REAL — `ALWAYS_REFUSED_DATABASE` does not match. This is the BELT,
  *      checked first so it outranks everything above: it cannot be the fix (it is a name
  *      rule, and name rules are what failed twice), but it means a stamp applied to an
@@ -68,6 +81,15 @@
  * the remaining path is: create/keep a live database with no application rows in it, run the
  * stamper naming it, and export the declaration. That is three deliberate acts, one of which
  * is a lie about the database. A `DATABASE_URL` alone still buys nothing.
+ *
+ * AND ONCE ISSUED, A STAMP LASTS (review M-1, measured): a database stamped while empty keeps
+ * the capability however full it later becomes, UNLESS it acquires the marks of an installed
+ * application (rule 3a). A database that merely gained product or stock rows is not refused —
+ * the concurrency tier writes exactly those rows itself (measured: 23 tables after one run), so
+ * the guard cannot tell them apart — and for it the declaration is the only remaining barrier.
+ * Name-binding closes rename and restore-under-another-name; it does not close repurposing in
+ * place under the same name, and renaming a database BACK to the name in its marker makes the
+ * marker valid again (review L-11, measured).
  *
  * The check runs on its own connection with `default_transaction_read_only=on`, so the
  * guard itself cannot write even if it is wrong, and it asks the SERVER for every fact
@@ -138,6 +160,12 @@ export type ScratchDatabaseFacts = {
    * refuse every ordinary scratch database on a locked-down server.
    */
   subscriptionCount: number | null
+  /**
+   * Installation-evidence tables (`users`, `organisations`, `currencies`) in the application's
+   * schema that hold a row. Empty for a database created for a test run, however much the tier
+   * has seeded into it.
+   */
+  installationEvidence: string[]
 }
 
 /** The pure decision, exported so every refusal path can be tested without a server. */
@@ -165,6 +193,14 @@ export function scratchDatabaseVerdict(facts: ScratchDatabaseFacts): { ok: true 
       ok: false,
       reason: `connected database "${db}" is the target of ${facts.subscriptionCount} logical-replication subscription(s), `
         + 'so it is a copy of another database rather than one created for this run',
+    }
+  }
+  if (facts.installationEvidence.length > 0) {
+    return {
+      ok: false,
+      reason: `connected database "${db}" has been set up as an installed application — rows in `
+        + `${facts.installationEvidence.join(', ')} — which no database created for a test run has, `
+        + 'whatever its marker says',
     }
   }
   if (facts.optIn !== db) {
@@ -217,7 +253,8 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
     // lib/db/database-url-schema.mjs documents the identical bug for the search-path pin, and
     // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
     // `options` and `schema` removed. Reused rather than re-implemented.
-    const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
+    const { databaseUrlSchema, sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
+    const { readInstallationEvidence } = await import('./scratch-database-data-probe')
     const connectionString = sanitisedProbeConnectionString(databaseUrl)
     if (connectionString === null) {
       throw new NotAScratchDatabaseError(
@@ -261,7 +298,12 @@ export function assertScratchDatabaseBeforeAnyWrite(): Promise<string> {
       } catch {
         subscriptionCount = null
       }
+      const installationEvidence = await readInstallationEvidence(
+        client as unknown as Parameters<typeof readInstallationEvidence>[0],
+        databaseUrlSchema(databaseUrl) ?? 'public',
+      )
       facts = {
+        installationEvidence,
         connectedDatabase: String(rows[0]!.name ?? ''),
         optIn: process.env[SCRATCH_DATABASE_OPT_IN_ENV],
         databaseComment: rows[0]!.comment ?? null,

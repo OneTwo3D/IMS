@@ -101,8 +101,9 @@ For GitHub Actions trigger or gating changes, validate both the static workflow 
 
 Run `npm run validate:db` when a local `DATABASE_URL` is configured and the database is reachable. Its
 last step, the DB-backed concurrency tier, runs only when `IMS_CONCURRENCY_SCRATCH_DB` names a scratch
-database stamped with `npm run db:stamp-scratch`; without one it prints a SKIPPED notice instead of
-seeding your ordinary local database, which its guard refuses outright. CI runs that tier on every PR
+database that was marked disposable with `npm run db:stamp-scratch -- <database-name>` (the name is
+required, and the stamper refuses a database holding application data); without one it prints a
+SKIPPED notice instead of seeding your ordinary local database, which its guard refuses outright. CI runs that tier on every PR
 that touches it. See docs/development.md, "Database-backed tiers".
 
 ## Documentation Updates

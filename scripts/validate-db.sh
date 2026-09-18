@@ -23,9 +23,13 @@ if [ -n "${IMS_CONCURRENCY_SCRATCH_DB:-}" ]; then
 else
   echo
   echo "SKIPPED: npm run test:concurrency"
-  echo "  It seeds rows and installs DDL, so it runs only against a scratch database."
-  echo "  To run it here: create one, migrate it, then"
-  echo "      DATABASE_URL=<scratch url> npm run db:stamp-scratch"
-  echo "      export IMS_CONCURRENCY_SCRATCH_DB=<scratch database name>"
-  echo "  See docs/development.md, 'Database-backed tiers'. CI runs it on every PR regardless."
+  echo "  It seeds rows and installs DDL, so it runs only against a database created for the run"
+  echo "  and marked disposable -- never against the database DATABASE_URL points at by default."
+  echo "  The setup (create, migrate, mark it by NAME, declare it) is in docs/development.md,"
+  echo "  'Database-backed tiers'. CI runs this tier on every PR that touches it regardless."
+  # o3d-zzgp r8 (review M-3): this used to print `DATABASE_URL=<scratch url> npm run
+  # db:stamp-scratch`, the pre-r7 form, which the stamper now always refuses ("no database name
+  # was given") -- and it taught exactly the "point the URL at it and stamp" shape r7 removed.
+  # The remedy is deliberately a pointer, not a paste-ready command: the steps have to name a
+  # database the operator created, which this script cannot know.
 fi

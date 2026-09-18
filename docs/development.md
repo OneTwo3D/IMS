@@ -73,13 +73,23 @@ SERVER that the database was created to be destroyed. All of these must hold:
 
 * the database is STAMPED FOR ITS OWN NAME — a database comment applied by `npm run db:stamp-scratch`
   that contains the database's name, so a rename or a `pg_dump -C` restore under another name
-  invalidates it. The comment lives outside every schema, so it is not schema drift, and it survives
-  `prisma migrate deploy`; AND
+  invalidates it (and renaming it BACK makes it valid again). The comment lives outside every schema,
+  so it is not schema drift, and it survives `prisma migrate deploy`; AND
 * the run DECLARES it — `IMS_CONCURRENCY_SCRATCH_DB` names the connected database exactly; AND
 * the server says it is not a replica (`pg_is_in_recovery()`), not a template, and not the target of a
-  logical-replication subscription; AND
+  logical-replication subscription it can see (an unreadable `pg_subscription` does not refuse here;
+  the stamper, which issues the capability, does refuse on it); AND
+* it has not been set up as an installed application — no row in `users`, `organisations` or
+  `currencies` in the application's schema; AND
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
+
+**WHAT A MARKER PROVES, AND NOTHING MORE:** a marker is evidence that someone who owns the database
+deliberately wrote this exact sentence naming this exact database — not that the stamper ran, and not
+that the database was empty. The guard compares one string, the text is a constant in this repository,
+and one `COMMENT ON DATABASE` statement written by hand is indistinguishable from the stamper's. The
+stamper's checks below make an ACCIDENTAL stamp hard; they are not properties the guard can verify
+afterwards.
 
 **A NAME IS NOT EVIDENCE, and neither is ownership.** This product's tenant databases are `ims_<slug>`
 (`scripts/provision-ims-tenant.sh`) and its canonical database is `onetwoinventory` (`.env.example`),
@@ -87,9 +97,10 @@ so no naming convention separates a live database from a scratch one — and `pr
 hands each tenant database to the role in its own `DATABASE_URL`, so "only the owner can stamp it"
 excludes nobody who can read a `.env`. What the stamp costs instead is that `npm run db:stamp-scratch`
 **must be given the database name as an argument**, which must equal `current_database()`, and it
-**refuses a database that holds application data** — rows in any table other than the three a fresh
-`prisma migrate deploy` seeds (`_prisma_migrations`, `settings`, `shopping_status_mappings`, measured
-2026-09-17). A wrong `DATABASE_URL` supplies none of that.
+**refuses a database that holds application data** — rows in any table (or materialized view) other
+than the three a fresh `prisma migrate deploy` seeds, and only in the application's own schema
+(`<schema>._prisma_migrations`, `.settings`, `.shopping_status_mappings`, measured 2026-09-17) — or that
+has foreign tables at all. A wrong `DATABASE_URL` supplies none of that.
 
 ```bash
 createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above
@@ -102,10 +113,18 @@ npm run db:unstamp-scratch -- ims_scratch_<suffix>      # if you keep the databa
 dropdb ims_scratch_<suffix>
 ```
 
-RESIDUAL, so nobody has to discover it: a database that holds no rows outside those three seeded
-tables is not distinguished from a fresh one by the data check. Stamping such a database still takes a
-deliberate command naming it, and the belt and the declaration still apply — but the check is evidence
-of use, not proof of absence.
+RESIDUALS, so nobody has to discover them:
+
+* **the data check runs when the stamp is ISSUED, not every time it is used.** A database stamped while
+  empty keeps the capability however full it later becomes, unless it acquires the marks of an
+  installed application (rows in `users`, `organisations` or `currencies`), which the guard does
+  check. It cannot check more: one run of this tier itself fills 23 tables (products, warehouses,
+  stock, ASNs — measured), so rows there are not evidence of anything. For a stamped database that has
+  merely gained such rows, the declaration is the only remaining barrier.
+* **a database with no rows outside the three seeded tables looks fresh.** That population is narrower
+  than it sounds: an `install.sh`-provisioned tenant is NOT in it, because `prisma/seed.ts` writes
+  organisations, warehouses, currencies and tax rates and the bootstrap writes a user — it is only
+  databases that were migrated and never seeded or bootstrapped.
 
 `npm run validate:db` runs this tier only when `IMS_CONCURRENCY_SCRATCH_DB` is set, and prints a
 SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
