@@ -20,25 +20,10 @@ import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound
 import { ExactFigure, ExactRatio, type ExactRoundable } from '@/lib/domain/math/exact-figure'
 import {
   creditPlacement,
-  marginFigureBoundDecimal,
-  netLinearFigureBoundDecimal,
+  marginFigureBoundExact,
+  netLinearFigureBoundExact,
 } from '@/lib/domain/sales/refund-basis-analytics'
-import {
-  addCredit,
-  addUnplacedIntervals,
-  comparableCredit,
-  creditBasisComplete,
-  emptyCredits,
-  mergeCredits,
-  offRowCreditSummary,
-  refundLinesRaisedInPeriodWhere,
-  scaleCredits,
-  unabsorbedCreditInterval,
-  unplacedCreditBound,
-  unplacedCreditInterval,
-  type CreditBuckets,
-  type UnplacedCreditInterval,
-} from '@/lib/domain/sales/refund-credit-buckets'
+import { refundLinesRaisedInPeriodWhere } from '@/lib/domain/sales/refund-credit-buckets'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -825,43 +810,67 @@ export function inventoryCostingFiltersForUi(filters: InventoryCostingFilters): 
  * across groups by the same quantity share. The other two hold what could not be keyed at all.
  */
 export type CogsCreditInput = {
-  byRevenueKey: Map<string, CreditBuckets>
+  byRevenueKey: Map<string, ExactCredit>
   /** Named a sales line or product this report holds no revenue key for. */
-  outsideReport: CreditBuckets
+  outsideReport: ExactCredit
   /** Named nothing keyable: no sales line, no product, or no order behind it. */
-  unattributed: CreditBuckets
-  /**
-   * THE SAME CREDIT, EXACTLY, FOR THE FIGURES (o3d-rv4a r5). The AMOUNTS a reader sees come from here,
-   * accumulated entry by entry through the same bucket rule `addCredit` uses. `CreditBuckets` holds
-   * Prisma.Decimal sums (and `scaleCredits` shares), which round at twenty significant digits, and is
-   * kept only for the VERDICT. Its zero and sign tests cannot be flipped by that rounding (a sum of
-   * same-signed entries keeps its sign), but `marginFigureBoundDecimal`'s case 3 compares revenue WITH
-   * the unplaced credit, and a Decimal-rounded credit can differ from the exact one in its twentieth
-   * significant digit. That comparison is therefore only as exact as the pre-existing verdict machinery;
-   * it is not claimed exact here.
-   */
-  exact: {
-    byRevenueKey: Map<string, ExactCredit>
-    outsideReport: ExactCredit
-    unattributed: ExactCredit
-  }
+  unattributed: ExactCredit
 }
 
-/** Credit on each recorded basis, held exactly. Only `net` is ever subtracted from this report's figures. */
-export type ExactCredit = { net: ExactFigure; gross: ExactFigure; unknown: ExactFigure }
+/**
+ * CREDIT ON EACH RECORDED BASIS, HELD EXACTLY — THE AMOUNTS AND EVERY VERDICT INPUT (o3d-rv4a r5).
+ *
+ * Round 5 first kept a second, Prisma.Decimal copy of this credit (`CreditBuckets`, shared by quantity
+ * through `scaleCredits`) for the verdict, and the independent review found the two disagreeing where it
+ * matters (H1): a credit share that equals the revenue share EXACTLY came out a nineteenth-digit sliver
+ * smaller in Decimal, and the margin-% verdict's case 3 fired on it. So there is one copy, exact, and the
+ * verdicts read it: `positive` is `Σ max(entry, 0)` per bucket, carried beside the signed total because a
+ * signed total cannot bound anything on its own (o3d-la3n) — the same fields `CreditBuckets` carries,
+ * with the same meaning, built by the same placement rule.
+ */
+export type ExactCredit = {
+  net: ExactFigure
+  gross: ExactFigure
+  unknown: ExactFigure
+  netPositive: ExactFigure
+  grossPositive: ExactFigure
+  unknownPositive: ExactFigure
+  /** False when any entry could not be placed on a NET figure's basis (`creditPlacement`). */
+  netBasisComplete: boolean
+  grossBasisComplete: boolean
+}
 
 function emptyExactCredit(): ExactCredit {
-  return { net: ExactFigure.zero(), gross: ExactFigure.zero(), unknown: ExactFigure.zero() }
+  const zero = ExactFigure.zero()
+  return { net: zero, gross: zero, unknown: zero, netPositive: zero, grossPositive: zero, unknownPositive: zero, netBasisComplete: true, grossBasisComplete: true }
 }
 
-/** `addCredit`'s bucket rule, verbatim: `creditPlacement('NET', …).bucket`, so the two cannot disagree. */
+/** `addCredit` (refund-credit-buckets.ts), entry for entry, over exact figures. */
 function addExactCredit(into: ExactCredit, totalsBasis: string | null, amount: DecimalInput): void {
-  const { bucket } = creditPlacement('NET', totalsBasis, amount)
-  into[bucket] = into[bucket].add(ExactFigure.of(amount))
+  const onNet = creditPlacement('NET', totalsBasis, amount)
+  const onGross = creditPlacement('GROSS', totalsBasis, amount)
+  const value = ExactFigure.of(amount)
+  const positive = value.sign() > 0 ? value : ExactFigure.zero()
+  const bucket = onNet.bucket
+  into[bucket] = into[bucket].add(value)
+  const positiveKey = `${bucket}Positive` as 'netPositive' | 'grossPositive' | 'unknownPositive'
+  into[positiveKey] = into[positiveKey].add(positive)
+  if (!onNet.placeable) into.netBasisComplete = false
+  if (!onGross.placeable) into.grossBasisComplete = false
 }
 
+/** A quantity share of the credit — every bucket and every positive part scaled by the same exact q/Q. */
 function shareExactCredit(credit: ExactCredit, part: ExactFigure, whole: ExactFigure): ExactCredit {
-  return { net: credit.net.mulDiv(part, whole), gross: credit.gross.mulDiv(part, whole), unknown: credit.unknown.mulDiv(part, whole) }
+  return {
+    net: credit.net.mulDiv(part, whole),
+    gross: credit.gross.mulDiv(part, whole),
+    unknown: credit.unknown.mulDiv(part, whole),
+    netPositive: credit.netPositive.mulDiv(part, whole),
+    grossPositive: credit.grossPositive.mulDiv(part, whole),
+    unknownPositive: credit.unknownPositive.mulDiv(part, whole),
+    netBasisComplete: credit.netBasisComplete,
+    grossBasisComplete: credit.grossBasisComplete,
+  }
 }
 
 function sumExactCredits(parts: ExactCredit[]): ExactCredit {
@@ -869,6 +878,11 @@ function sumExactCredits(parts: ExactCredit[]): ExactCredit {
     net: ExactFigure.sum(parts.map((part) => part.net)),
     gross: ExactFigure.sum(parts.map((part) => part.gross)),
     unknown: ExactFigure.sum(parts.map((part) => part.unknown)),
+    netPositive: ExactFigure.sum(parts.map((part) => part.netPositive)),
+    grossPositive: ExactFigure.sum(parts.map((part) => part.grossPositive)),
+    unknownPositive: ExactFigure.sum(parts.map((part) => part.unknownPositive)),
+    netBasisComplete: parts.every((part) => part.netBasisComplete),
+    grossBasisComplete: parts.every((part) => part.grossBasisComplete),
   }
 }
 
@@ -877,17 +891,36 @@ function comparableExactCredit(credit: ExactCredit, basis: 'NET' | 'GROSS'): Exa
   return basis === 'NET' ? credit.net : credit.gross
 }
 
+function exactBasisComplete(credit: ExactCredit, basis: 'NET' | 'GROSS'): boolean {
+  return basis === 'NET' ? credit.netBasisComplete : credit.grossBasisComplete
+}
+
+/** `[lower, upper]`, in the figure's unit, of credit left unsubtracted. Exact at both ends. */
+export type ExactCreditInterval = { lower: ExactFigure; upper: ExactFigure }
+
 /**
- * The figure a VERDICT compares, never one a reader sees: the exact value to sixty decimal places, with
- * its exact sign kept even where it rounds to zero, so `marginFigureBoundDecimal`'s `revenue <= 0` case
- * agrees with the page's own `revenue > 0` guard on the percentage.
+ * `unplacedCreditInterval` over exact figures: the buckets that are NOT the figure's unit, each worth
+ * somewhere in `[Σ min(e, 0), Σ max(e, 0)]` — `total - positive` and `positive`.
  */
-function verdictDecimal(figure: ExactFigure): Decimal {
-  const sign = figure.sign()
-  const projected = toDecimal(figure.roundTo(60, 'halfUp'))
-  if (sign === 0) return decimalZero()
-  if (projected.isZero()) return toDecimal(sign).mul(toDecimal('1e-61'))
-  return projected
+function exactUnplacedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
+  const parts: Array<[ExactFigure, ExactFigure]> = basis === 'NET'
+    ? [[credit.gross, credit.grossPositive], [credit.unknown, credit.unknownPositive]]
+    : [[credit.net, credit.netPositive], [credit.unknown, credit.unknownPositive]]
+  return {
+    lower: ExactFigure.sum(parts.map(([total, positive]) => total.sub(positive))),
+    upper: ExactFigure.sum(parts.map(([, positive]) => positive)),
+  }
+}
+
+/** `unabsorbedCreditInterval` over exact figures: nothing was subtracted, so the same-basis credit is unplaced too. */
+function exactUnabsorbedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
+  const comparable = comparableExactCredit(credit, basis)
+  const rest = exactUnplacedInterval(credit, basis)
+  return { lower: comparable.add(rest.lower), upper: comparable.add(rest.upper) }
+}
+
+function sumExactIntervals(parts: ExactCreditInterval[]): ExactCreditInterval {
+  return { lower: ExactFigure.sum(parts.map((part) => part.lower)), upper: ExactFigure.sum(parts.map((part) => part.upper)) }
 }
 
 /**
@@ -901,27 +934,20 @@ function verdictDecimal(figure: ExactFigure): Decimal {
  */
 export type CogsCreditSummary = {
   /** Every row's credit, attributed. */
-  attributed: CreditBuckets
-  unattributed: CreditBuckets
-  outsideReport: CreditBuckets
-  /** The interval, in NET terms, of credit missing from the period revenue/margin. */
-  unaccountedInterval: UnplacedCreditInterval
+  attributed: ExactCredit
+  unattributed: ExactCredit
+  outsideReport: ExactCredit
+  /** The interval, in NET terms, of credit missing from the period revenue/margin. Exact. */
+  unaccountedInterval: ExactCreditInterval
   /** False when ANY credit was left out of the period figures, for any reason. */
   basisComplete: boolean
-  /** The same three credit sets as exact amounts, for the published credit totals. */
-  exact: { attributed: ExactCredit; unattributed: ExactCredit; outsideReport: ExactCredit }
 }
 
 /** THIS REPORT'S REVENUE IS EX-VAT `SalesOrderLine.totalBase`, so a NET-basis credit is its unit. */
 const COGS_FIGURE_BASIS = 'NET' as const
 
 function emptyCogsCreditInput(): CogsCreditInput {
-  return {
-    byRevenueKey: new Map(),
-    outsideReport: emptyCredits(),
-    unattributed: emptyCredits(),
-    exact: { byRevenueKey: new Map(), outsideReport: emptyExactCredit(), unattributed: emptyExactCredit() },
-  }
+  return { byRevenueKey: new Map(), outsideReport: emptyExactCredit(), unattributed: emptyExactCredit() }
 }
 
 /**
@@ -974,22 +1000,15 @@ export function aggregateCogsReport(
   // the full line revenue in each group double-counts the report total
   // (cogs-audit scjz.50). Build per-line totals first, then allocate each line's
   // revenue across its groups in proportion to the qty fulfilled by that group.
-  // Each line carries its quantity both as a Decimal (the credit INTERVAL's share, for the verdict) and
-  // exactly (the published figures' share). The Decimal one is a sum of non-negative stored
-  // quantities, so its sign — the only thing `degenerate` below reads from it — is exact too.
-  const lineRevenueByKey = new Map<string, { totalQty: Decimal; exactRevenue: ExactFigure; exactTotalQty: ExactFigure }>()
+  // Revenue and quantity held exactly: the share `revenue x q / Q` is kept as a quotient (o3d-rv4a r5).
+  const lineRevenueByKey = new Map<string, { revenue: ExactFigure; totalQty: ExactFigure }>()
   for (const input of inputs) {
     if (!input.revenueKey || input.revenueBase == null) continue
     const existing = lineRevenueByKey.get(input.revenueKey)
     if (existing) {
-      existing.totalQty = existing.totalQty.add(toDecimal(input.qty))
-      existing.exactTotalQty = existing.exactTotalQty.add(ExactFigure.of(input.qty))
+      existing.totalQty = existing.totalQty.add(ExactFigure.of(input.qty))
     } else {
-      lineRevenueByKey.set(input.revenueKey, {
-        totalQty: toDecimal(input.qty),
-        exactRevenue: ExactFigure.of(input.revenueBase),
-        exactTotalQty: ExactFigure.of(input.qty),
-      })
+      lineRevenueByKey.set(input.revenueKey, { revenue: ExactFigure.of(input.revenueBase), totalQty: ExactFigure.of(input.qty) })
     }
   }
 
@@ -999,8 +1018,7 @@ export function aggregateCogsReport(
     cogsBase: ExactFigure
     revenueCaptured: boolean
     unkeyedRevenue: ExactFigure
-    qtyByRevenueKey: Map<string, Decimal>
-    exactQtyByRevenueKey: Map<string, ExactFigure>
+    qtyByRevenueKey: Map<string, ExactFigure>
     movementIds: Set<string>
   }>()
 
@@ -1012,8 +1030,7 @@ export function aggregateCogsReport(
       cogsBase: ExactFigure.zero(),
       revenueCaptured: true,
       unkeyedRevenue: ExactFigure.zero(),
-      qtyByRevenueKey: new Map<string, Decimal>(),
-      exactQtyByRevenueKey: new Map<string, ExactFigure>(),
+      qtyByRevenueKey: new Map<string, ExactFigure>(),
       movementIds: new Set<string>(),
     }
     existing.qty = existing.qty.add(ExactFigure.of(input.qty))
@@ -1021,8 +1038,7 @@ export function aggregateCogsReport(
     if (input.revenueBase == null) {
       existing.revenueCaptured = false
     } else if (input.revenueKey) {
-      existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? decimalZero()).add(toDecimal(input.qty)))
-      existing.exactQtyByRevenueKey.set(input.revenueKey, (existing.exactQtyByRevenueKey.get(input.revenueKey) ?? ExactFigure.zero()).add(ExactFigure.of(input.qty)))
+      existing.qtyByRevenueKey.set(input.revenueKey, (existing.qtyByRevenueKey.get(input.revenueKey) ?? ExactFigure.zero()).add(ExactFigure.of(input.qty)))
     } else {
       // Unkeyed revenue cannot be cross-group-deduped or qty-allocated; preserve
       // the prior per-row behaviour of summing it directly into the group.
@@ -1033,9 +1049,8 @@ export function aggregateCogsReport(
   }
 
   // o3d-rv4a: the credit that reached a row, and the interval of credit nothing subtracted.
-  const attributed = emptyCredits()
-  const exactAttributed: ExactCredit[] = []
-  const unaccounted: UnplacedCreditInterval[] = []
+  const attributed: ExactCredit[] = []
+  const unaccounted: ExactCreditInterval[] = []
   // The period totals, accumulated from the UNROUNDED group figures as each row is built — never
   // reconstructed afterwards from the rows' published strings (Codex round 2 HIGH 2, above).
   // Collected as parts and summed ONCE at the end: ExactFigure addition copies its quotient terms, so a
@@ -1052,25 +1067,19 @@ export function aggregateCogsReport(
       // fallback. Two halves of one subtraction have to be on one denominator: allocating revenue by
       // quantity share while charging every group the whole credit would understate margin by the
       // credit once per extra group — the mirror of the double-count scjz.50 fixed for revenue.
-      const groupCredits = emptyCredits()
       const shares: ExactFigure[] = [group.unkeyedRevenue]
       const creditShares: ExactCredit[] = []
       for (const [revKey, groupQty] of group.qtyByRevenueKey) {
         const line = lineRevenueByKey.get(revKey)
         if (!line) continue
-        const degenerate = !line.totalQty.gt(0)
-        const exactGroupQty = group.exactQtyByRevenueKey.get(revKey) ?? ExactFigure.zero()
+        const degenerate = line.totalQty.sign() <= 0
         // THE SHARE STAYS A QUOTIENT (o3d-rv4a r5). Round 4 computed `revenue x q / Q` as a Decimal, which
         // rounds it to twenty significant digits, and then published it at six decimals, rounding again.
-        shares.push(degenerate ? line.exactRevenue : line.exactRevenue.mulDiv(exactGroupQty, line.exactTotalQty))
+        shares.push(degenerate ? line.revenue : line.revenue.mulDiv(groupQty, line.totalQty))
+        // The credit against the line is shared by the SAME exact q/Q (review H1: a Decimal share of it
+        // made an exactly-equal credit and revenue unequal in the nineteenth digit).
         const credit = credits.byRevenueKey.get(revKey)
-        if (credit) {
-          mergeCredits(groupCredits, degenerate
-            ? credit
-            : scaleCredits(credit, groupQty, line.totalQty))
-        }
-        const exactCredit = credits.exact.byRevenueKey.get(revKey)
-        if (exactCredit) creditShares.push(degenerate ? exactCredit : shareExactCredit(exactCredit, exactGroupQty, line.exactTotalQty))
+        if (credit) creditShares.push(degenerate ? credit : shareExactCredit(credit, groupQty, line.totalQty))
       }
       const groupRevenue = ExactFigure.sum(shares)
       const exactGroupCredits = sumExactCredits(creditShares)
@@ -1089,21 +1098,17 @@ export function aggregateCogsReport(
       const grossMarginPct: ExactRoundable | null = revenueBase == null
         ? null
         : revenueBase.sign() === 1 ? new ExactRatio(grossMarginBase!, revenueBase, 100) : ExactFigure.zero()
-      mergeCredits(attributed, groupCredits)
-      exactAttributed.push(exactGroupCredits)
-      const basisComplete = creditBasisComplete(groupCredits, COGS_FIGURE_BASIS)
-      if (group.revenueCaptured) {
-        unaccounted.push(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
-      } else {
-        // There is no figure on this row to subtract from, so even the same-basis credit is missing
-        // from the period totals. `Unmatched` is the honest cell; a bounded zero would not be.
-        unaccounted.push(unabsorbedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
-      }
-      const unplaced = unplacedCreditBound(unplacedCreditInterval(groupCredits, COGS_FIGURE_BASIS))
-      const linearBound = netLinearFigureBoundDecimal({ basisComplete, unplacedCredit: unplaced })
+      attributed.push(exactGroupCredits)
+      const basisComplete = exactBasisComplete(exactGroupCredits, COGS_FIGURE_BASIS)
+      const unplaced = exactUnplacedInterval(exactGroupCredits, COGS_FIGURE_BASIS)
+      // There is no figure on an Unmatched row to subtract from, so even the same-basis credit is missing
+      // from the period totals. `Unmatched` is the honest cell; a bounded zero would not be.
+      unaccounted.push(group.revenueCaptured ? unplaced : exactUnabsorbedInterval(exactGroupCredits, COGS_FIGURE_BASIS))
+      // EVERY VERDICT INPUT IS EXACT (review H1): revenue, COGS and both ends of the credit interval.
+      const linearBound = netLinearFigureBoundExact({ basisComplete, unplacedLower: unplaced.lower })
       const pctBound = grossMarginPct == null
         ? null
-        : marginFigureBoundDecimal({ netRevenue: verdictDecimal(revenueBase!), cogs: verdictDecimal(group.cogsBase), unplacedCredit: unplaced, basisComplete })
+        : marginFigureBoundExact({ netRevenue: revenueBase!, cogs: group.cogsBase, unplacedLower: unplaced.lower, unplacedUpper: unplaced.upper, basisComplete })
       totalParts.qty.push(group.qty)
       totalParts.cogsBase.push(group.cogsBase)
       // A withheld figure contributes NOTHING, which is what its null has always meant to the totals —
@@ -1156,14 +1161,15 @@ export function aggregateCogsReport(
   // would publish the period revenue as exact with a credit note missing from it. Existence is
   // decided from the INTERVAL, never a sum: +100 NET against -100 GROSS cancels across bases, and
   // +120 GROSS against -120 GROSS cancels within one while their ex-VAT values need not.
-  const offRow = offRowCreditSummary(credits.unattributed, credits.outsideReport)
-  const unaccountedInterval = [...unaccounted, offRow.interval]
-    .reduce(addUnplacedIntervals, { lower: decimalZero(), upper: decimalZero() })
+  // `offRowCreditSummary`'s interval, exactly: none of it was subtracted, so it is unabsorbed.
+  const offRow = exactUnabsorbedInterval(sumExactCredits([credits.unattributed, credits.outsideReport]), COGS_FIGURE_BASIS)
+  const unaccountedInterval = sumExactIntervals([...unaccounted, offRow])
+  const attributedCredit = sumExactCredits(attributed)
   return {
     rows,
     totals,
     credits: {
-      attributed,
+      attributed: attributedCredit,
       unattributed: credits.unattributed,
       outsideReport: credits.outsideReport,
       unaccountedInterval,
@@ -1171,13 +1177,8 @@ export function aggregateCogsReport(
       // cannot reproduce — a +5 and a -5 of unplaceable credit sum to zero while neither was
       // placeable) AND an all-zero interval, which is the only statement that nothing at all was
       // left out. Either one false makes the period figures bounded.
-      basisComplete: creditBasisComplete(attributed, COGS_FIGURE_BASIS)
-        && unaccountedInterval.lower.isZero() && unaccountedInterval.upper.isZero(),
-      exact: {
-        attributed: sumExactCredits(exactAttributed),
-        unattributed: credits.exact.unattributed,
-        outsideReport: credits.exact.outsideReport,
-      },
+      basisComplete: exactBasisComplete(attributedCredit, COGS_FIGURE_BASIS)
+        && unaccountedInterval.lower.sign() === 0 && unaccountedInterval.upper.sign() === 0,
     },
   }
 }
@@ -1674,16 +1675,12 @@ export function resolveCogsRefundCreditKeys(
       ? lineKey
       : pairKey && reportKeys.has(pairKey) ? pairKey : null
     if (key) {
-      const buckets = result.byRevenueKey.get(key) ?? emptyCredits()
-      addCredit(buckets, line.refund.totalsBasis, line.totalBase)
-      result.byRevenueKey.set(key, buckets)
-      const exact = result.exact.byRevenueKey.get(key) ?? emptyExactCredit()
-      addExactCredit(exact, line.refund.totalsBasis, line.totalBase)
-      result.exact.byRevenueKey.set(key, exact)
+      const credit = result.byRevenueKey.get(key) ?? emptyExactCredit()
+      addExactCredit(credit, line.refund.totalsBasis, line.totalBase)
+      result.byRevenueKey.set(key, credit)
       continue
     }
-    addCredit(lineKey || pairKey ? result.outsideReport : result.unattributed, line.refund.totalsBasis, line.totalBase)
-    addExactCredit(lineKey || pairKey ? result.exact.outsideReport : result.exact.unattributed, line.refund.totalsBasis, line.totalBase)
+    addExactCredit(lineKey || pairKey ? result.outsideReport : result.unattributed, line.refund.totalsBasis, line.totalBase)
   }
   return result
 }
@@ -1895,13 +1892,13 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   // The verdict is derived HERE, once, from the interval the rows carried up unrounded — not folded
   // from the rows' own verdicts and not rebuilt from their published (signed, rounded) credit
   // columns. That is o3d-la3n's whole finding: endpoints add, magnitudes matter, classify last.
-  const totalsBound = netLinearFigureBoundDecimal({
+  const totalsBound = netLinearFigureBoundExact({
     basisComplete: creditSummary.basisComplete,
-    unplacedCredit: unplacedCreditBound(creditSummary.unaccountedInterval),
+    unplacedLower: creditSummary.unaccountedInterval.lower,
   })
   // The credit footers: every row's credit PLUS the credit that reached no row. That second part is
   // why a credit footer can differ from its column by more than rounding (Codex r5 MEDIUM 1).
-  const reportCredits = sumExactCredits([creditSummary.exact.attributed, creditSummary.exact.unattributed, creditSummary.exact.outsideReport])
+  const reportCredits = sumExactCredits([creditSummary.attributed, creditSummary.unattributed, creditSummary.outsideReport])
   const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
@@ -1922,12 +1919,12 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       refundsNetBasis: reportCredits.net,
       refundsGrossBasis: reportCredits.gross,
       refundsUnknownBasis: reportCredits.unknown,
-      refundsUnattributedNetBasis: creditSummary.exact.unattributed.net,
-      refundsUnattributedGrossBasis: creditSummary.exact.unattributed.gross,
-      refundsUnattributedUnknownBasis: creditSummary.exact.unattributed.unknown,
-      refundsOutsideReportNetBasis: creditSummary.exact.outsideReport.net,
-      refundsOutsideReportGrossBasis: creditSummary.exact.outsideReport.gross,
-      refundsOutsideReportUnknownBasis: creditSummary.exact.outsideReport.unknown,
+      refundsUnattributedNetBasis: creditSummary.unattributed.net,
+      refundsUnattributedGrossBasis: creditSummary.unattributed.gross,
+      refundsUnattributedUnknownBasis: creditSummary.unattributed.unknown,
+      refundsOutsideReportNetBasis: creditSummary.outsideReport.net,
+      refundsOutsideReportGrossBasis: creditSummary.outsideReport.gross,
+      refundsOutsideReportUnknownBasis: creditSummary.outsideReport.unknown,
       revenueCapturedRows: totals.revenueCapturedRows,
       glBalanceBase: gl.glBalanceBase,
       glVarianceBase: gl.glVarianceBase,

@@ -246,7 +246,10 @@ const CSV_MONEY_PLACES = 6
 const CSV_QTY_PLACES = 4
 const CSV_PCT_PLACES = 2
 
-/** The CSV's one rounding of a figure: money and ratios keep their fixed shape, quantities are trimmed. */
+/**
+ * The CSV's one rounding of a figure. Money keeps its fixed six-decimal shape; quantities and the margin
+ * % are trimmed of trailing zeros (so an exact 60% reads `60`, as this export has always published it).
+ */
 function exportFigure(value: ExactFigure | ExactRatio, places: number, bound: DerivedFigureBound): string {
   return roundExact(value, places, bound, { trailingZeros: places === CSV_MONEY_PLACES })
 }

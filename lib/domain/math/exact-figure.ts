@@ -18,10 +18,12 @@ import type { DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound
  * and so is an `add` whose result needs more than twenty digits. A quantity share `revenue × q / Q`
  * rarely terminates, so "carry the Decimal unrounded" is not something Decimal can do.
  *
- * WHY NOT A PLAIN RATIONAL. Exactly right, and measured too slow: a group's revenue is a sum of shares
- * over many lines, each with its own line quantity, and the common denominator of a sum of fractions is
- * the lcm of theirs. One warehouse group of 1,000 split lines with distinct quantities took 8 s to sum
- * as a bigint rational and 2,000 took 81 s.
+ * WHY NOT A PLAIN RATIONAL (the design this one replaced). Exactly right, and too slow: a group's
+ * revenue is a sum of shares over many lines, each with its own line quantity, and the common
+ * denominator of a sum of fractions is the lcm of theirs. A prototype of THAT design — summing everything
+ * into one bigint rational — took 8 s for one warehouse group of 1,000 split lines with distinct
+ * quantities, and 81 s for 2,000. Those figures describe the rejected design, not this one; this one
+ * keeps the terms apart and only falls back to a rational for a near-tie (see below).
  *
  * WHAT IT IS. An exact whole part plus one quotient term per distinct denominator, every number held as
  * an integer scaled by a power of ten, so building and adding figures never rounds anything. Rounding

@@ -239,6 +239,7 @@ function round2(value: ReturnType<typeof toDecimal>): number {
  *                    would be a FALSE CLAIM, which is worse than publishing no claim at all.
  */
 export { boundSuffix, netLinearFigureBound, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import type { ExactFigure } from '@/lib/domain/math/exact-figure'
 import { collapseUnplacedCredit, type CollapsedUnplacedCredit, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 
@@ -378,6 +379,44 @@ export function collapseUnplacedCreditDecimal(
   interval: { lower: Decimal; upper: Decimal },
 ): CollapsedUnplacedCreditDecimal {
   return (interval.lower.lt(0) ? interval.lower : interval.upper) as CollapsedUnplacedCreditDecimal
+}
+
+/**
+ * `netLinearFigureBoundDecimal`, OVER EXACT FIGURES, from BOTH ends of the unplaced-credit interval
+ * (o3d-rv4a r5, review H1). The collapse `lower < 0 ? lower : upper` is `lower < 0` for the sign test,
+ * so the interval's lower end decides; nothing here rounds, so nothing can flip it.
+ */
+export function netLinearFigureBoundExact(params: {
+  basisComplete: boolean
+  unplacedLower: ExactFigure
+}): DerivedFigureBound {
+  if (params.basisComplete) return 'exact'
+  return params.unplacedLower.sign() < 0 ? 'indeterminate' : 'upper'
+}
+
+/**
+ * `marginFigureBoundDecimal`, OVER EXACT FIGURES — the same five branches in the same order, each a
+ * `sign()` of an exact difference (o3d-rv4a r5, review H1).
+ *
+ * WHY IT EXISTS. Round 5 fed the Decimal version an exact revenue and a credit share scaled in
+ * Prisma.Decimal at twenty significant digits. Case 3 compares the two, and for a line credited in full
+ * and shared by thirds the exact difference is ZERO while the mixed one was not — so it answered `upper`
+ * about a margin whose direction is not established (`-20% ≤` where `-20% ?` is owed). Every input here
+ * is exact: revenue, COGS and both ends of the unplaced-credit interval.
+ */
+export function marginFigureBoundExact(params: {
+  netRevenue: ExactFigure
+  cogs: ExactFigure
+  unplacedLower: ExactFigure
+  unplacedUpper: ExactFigure
+  basisComplete: boolean
+}): DerivedFigureBound {
+  if (params.basisComplete) return 'exact'
+  if (params.unplacedLower.sign() < 0) return 'indeterminate' // the collapsed credit is negative
+  if (params.cogs.sign() < 0) return 'indeterminate' // case 1
+  if (params.netRevenue.sign() <= 0) return 'exact' // case 2
+  if (params.netRevenue.sub(params.unplacedUpper).sign() > 0) return 'upper' // case 3
+  return params.netRevenue.sub(params.cogs).sign() >= 0 ? 'upper' : 'indeterminate' // case 4
 }
 
 /** `marginFigureBound`'s case analysis, over Decimal. Same five branches, in the same order. */

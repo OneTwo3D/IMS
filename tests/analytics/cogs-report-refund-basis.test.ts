@@ -1334,6 +1334,131 @@ test('an Unmatched row keeps the credit against its matched line in its own cred
   assert.match(notice!, /off-report/i, notice)
 })
 
+test('the margin-% verdict is decided from EXACT figures on both sides of case 3 (review of r5, H1)', async () => {
+  // Independent review of 0da72dec, H1: marginFigureBoundDecimal's case 3 (`revenue - unplaced credit > 0`)
+  // was fed an exact revenue and a credit share computed in Prisma.Decimal at twenty significant digits,
+  // so two quantities that are EQUAL came out unequal in the nineteenth digit and case 3 fired on a
+  // difference that is exactly zero.
+  //
+  // WORKED: one £100 ex-VAT line shipped 1 unit from W0 (COGS 40) and 2 from W1 (COGS 10), with a £100
+  // credit against it on a basis this figure cannot use. Warehouse W0 gets exactly a third of each:
+  // revenue 100/3, and up to 100/3 of unplaced credit. Its true revenue can therefore be as low as
+  // exactly 0, so case 3 (revenue minus the credit still positive) must FAIL, and case 4 decides:
+  // revenue 33.33 < COGS 40, so the direction is not established — `?`. The published margin is
+  // (100/3 - 40)/(100/3) = -20%; if the credit were net, the report's own `revenue > 0` guard would
+  // print 0%, which is ABOVE -20%, so `≤` would be a false claim.
+  for (const basis of ['GROSS', null] as const) {
+    splitLineFixture('100', [{ qty: '1', cost: '40' }, { qty: '2', cost: '10' }], [creditAgainstLine('L1', 'O1', 'p1', '100', basis)])
+    const page = await warehousePage()
+    const w0 = page.rows.find((row) => (row as { warehouseCode: string }).warehouseCode === 'W0') as { grossMarginPctBound: string; revenueBaseBound: string } | undefined
+    assert.ok(w0, 'warehouse W0 is a row')
+    assert.equal(w0.revenueBaseBound, 'upper', `${basis}: revenue itself is still a ceiling`)
+    assert.equal(w0.grossMarginPctBound, 'indeterminate', `${basis}: case 3 must not fire on an exactly-zero difference`)
+    assert.equal(page.cellOf('marginPct', w0), '-20% ?', `${basis}: the printed margin`)
+  }
+})
+
+test('a negative ≤ margin in the CSV rounds toward +infinity at its seventh decimal (review of r5, M1)', async () => {
+  // The review's mutation H — exportFigure sending a NEGATIVE `upper` figure toward -infinity — survived
+  // the whole suite: no CSV fixture had a negative ceiling with anything past its sixth decimal. This one
+  // does. Warehouse W0's margin is 100/3 - 40 = -20/3 = -6.6666666…, published `≤` (a GROSS credit is
+  // unplaced). Its ceiling at six decimals is -6.666666; toward -infinity it would be -6.666667, a
+  // "ceiling" below the figure it bounds.
+  splitLineFixture('100', [{ qty: '1', cost: '40' }, { qty: '2', cost: '10' }], [creditAgainstLine('L1', 'O1', 'p1', '0.0001', 'GROSS')])
+  const { rows } = await warehouseCsv()
+  const w0 = rows.find((row) => row.warehouseCode === 'W0')
+  assert.equal(w0?.grossMarginBaseBound, 'upper')
+  assert.equal(w0?.grossMarginBase, oracleRound(BigInt(-20), BigInt(3), 6, 'ceil'))
+  assert.equal(w0?.grossMarginBase, '-6.666666')
+})
+
+test('the row verdicts equal an exact-rational reference over non-terminating shares (review of r5, H1 property)', async () => {
+  // A seeded fuzz through the real `resolveCogsRefundCreditKeys` + `aggregateCogsReport`, with every
+  // verdict recomputed here from bigint rationals by the case analysis written out in
+  // refund-basis-analytics.ts (netLinearFigureBound* and marginFigureBound*). Quantities are drawn so
+  // shares rarely terminate, and one case in three credits the line in FULL on an unplaced basis, which
+  // makes the revenue-minus-credit difference in case 3 exactly zero — the situation review H1 found.
+  const { aggregateCogsReport, resolveCogsRefundCreditKeys } = await import('@/lib/domain/inventory/inventory-costing-reports')
+  type Q = { n: bigint; d: bigint }
+  const Z = BigInt(0)
+  const O = BigInt(1)
+  const TEN = BigInt(10)
+  const g = (a: bigint, b: bigint): bigint => { let x = a < Z ? -a : a; let y = b < Z ? -b : b; while (y) [x, y] = [y, x % y]; return x || O }
+  const q = (n: bigint, d = O): Q => { if (d < Z) { n = -n; d = -d } const k = g(n, d); return { n: n / k, d: d / k } }
+  const dec = (text: string): Q => { const neg = text.startsWith('-'); const [i, f = ''] = (neg ? text.slice(1) : text).split('.'); return q(BigInt(`${neg ? '-' : ''}${i}${f}`), TEN ** BigInt(f.length)) }
+  const add = (a: Q, b: Q) => q(a.n * b.d + b.n * a.d, a.d * b.d)
+  const sub = (a: Q, b: Q) => add(a, q(-b.n, b.d))
+  const mul = (a: Q, b: Q) => q(a.n * b.n, a.d * b.d)
+  const div = (a: Q, b: Q) => q(a.n * b.d, a.d * b.n)
+  const sgn = (a: Q) => (a.n > Z ? 1 : a.n < Z ? -1 : 0)
+  let seed = 20260918
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 }
+  const pick = <T,>(items: readonly T[]) => items[Math.floor(rand() * items.length)]!
+  const money = () => (Math.floor(rand() * 2000000) / 10000).toFixed(4)
+  const qty = () => (1 + Math.floor(rand() * 9) + Math.floor(rand() * 999999) / 1000000).toFixed(6)
+  let checked = 0
+  let caseThreeZero = 0
+  const seen = new Set<string>()
+  for (let round = 0; round < 150; round += 1) {
+    const revenue = money()
+    const splits = Array.from({ length: 2 + Math.floor(rand() * 3) }, () => ({ qty: qty(), cost: money() }))
+    const credits = Array.from({ length: 1 + Math.floor(rand() * 2) }, () => ({
+      amount: round % 3 === 0 ? revenue : (rand() < 0.2 ? '-' : '') + money(),
+      basis: pick(['GROSS', null, 'NET', 'GROSS'] as const),
+    }))
+    if (round % 3 === 0) { credits.length = 1; credits[0]!.basis = pick(['GROSS', null] as const) }
+    const inputs = splits.map((split, index) => ({
+      id: `m${index}`, qty: split.qty, cogsBase: split.cost, productId: 'p1', sku: 'P1', productName: 'P1', categoryName: null,
+      warehouseId: `w${index}`, warehouseCode: `W${index}`, warehouseName: `W${index}`, customerName: null, channel: null,
+      revenueKey: 'L:l1', revenueBase: revenue,
+    }))
+    const creditInput = resolveCogsRefundCreditKeys(
+      credits.map((credit) => ({ totalBase: credit.amount, productId: 'p1', salesOrderLine: { id: 'l1', orderId: 'o1', productId: 'p1' }, refund: { orderId: 'o1', totalsBasis: credit.basis } })),
+      new Set(['L:l1']),
+      null,
+    )
+    const { rows } = aggregateCogsReport(inputs, 'warehouse', creditInput)
+    const totalQty = splits.reduce((sum, split) => add(sum, dec(split.qty)), q(Z))
+    for (const [index, split] of splits.entries()) {
+      const share = div(dec(split.qty), totalQty)
+      const bucket = { net: q(Z), gross: q(Z), unknown: q(Z), grossPos: q(Z), unknownPos: q(Z) }
+      let complete = true
+      for (const credit of credits) {
+        const value = mul(dec(credit.amount), share)
+        const positive = sgn(value) > 0 ? value : q(Z)
+        if (credit.basis === 'NET') bucket.net = add(bucket.net, value)
+        else if (credit.basis === 'GROSS') { bucket.gross = add(bucket.gross, value); bucket.grossPos = add(bucket.grossPos, positive) } else { bucket.unknown = add(bucket.unknown, value); bucket.unknownPos = add(bucket.unknownPos, positive) }
+        if (credit.basis !== 'NET' && sgn(dec(credit.amount)) !== 0) complete = false
+      }
+      const netRevenue = sub(mul(dec(revenue), share), bucket.net)
+      const cogs = dec(split.cost)
+      const lower = add(sub(bucket.gross, bucket.grossPos), sub(bucket.unknown, bucket.unknownPos))
+      const upper = add(bucket.grossPos, bucket.unknownPos)
+      const linear = complete ? 'exact' : sgn(lower) < 0 ? 'indeterminate' : 'upper'
+      let margin: string
+      if (complete) margin = 'exact'
+      else if (sgn(lower) < 0) margin = 'indeterminate'
+      else if (sgn(cogs) < 0) margin = 'indeterminate'
+      else if (sgn(netRevenue) <= 0) margin = 'exact'
+      else if (sgn(sub(netRevenue, upper)) > 0) margin = 'upper'
+      else margin = sgn(sub(netRevenue, cogs)) >= 0 ? 'upper' : 'indeterminate'
+      if (!complete && sgn(lower) >= 0 && sgn(netRevenue) > 0 && sgn(sub(netRevenue, upper)) === 0) caseThreeZero += 1
+      const row = rows.find((candidate) => candidate.warehouseCode === `W${index}`)!
+      const where = `round ${round} W${index}: revenue ${revenue} credits ${JSON.stringify(credits)} splits ${JSON.stringify(splits)}`
+      const published = row.revenueBase!.toRational()
+      assert.ok(published.n === netRevenue.n && published.d === netRevenue.d, `revenue ${published.n}/${published.d}, want ${netRevenue.n}/${netRevenue.d}, ${where}`)
+      assert.equal(row.revenueBaseBound, linear, `linear verdict, ${where}`)
+      assert.equal(row.grossMarginPctBound, margin, `margin verdict, ${where}`)
+      seen.add(margin)
+      checked += 1
+    }
+  }
+  // The rig reached what it is for: the exactly-zero case-3 difference, and every margin verdict.
+  assert.ok(caseThreeZero >= 20, `case 3 with an exactly-zero difference reached ${caseThreeZero} times`)
+  assert.deepEqual([...seen].sort(), ['exact', 'indeterminate', 'upper'])
+  assert.ok(checked >= 300, `${checked} rows checked`)
+})
+
 // ---------------------------------------------------------------------------------------------
 // The CSV — a file reader has no tooltip
 // ---------------------------------------------------------------------------------------------
