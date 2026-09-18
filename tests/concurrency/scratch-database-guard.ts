@@ -305,7 +305,7 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
   // its `sanitisedProbeConnectionString()` is the fix it already ships: the same URL with
   // `options` and `schema` removed. Reused rather than re-implemented.
   const { sanitisedProbeConnectionString } = await import('@/lib/db/database-url-schema.mjs')
-  const { readInstallationEvidence, PROBE_SESSION_OPTIONS, RowSecurityPolicyPresent } = await import(
+  const { readInstallationEvidence, assertProbeSessionSafe, PROBE_SESSION_OPTIONS, UnsafeProbeSession } = await import(
     './scratch-database-data-probe'
   )
   const connectionString = sanitisedProbeConnectionString(databaseUrl)
@@ -329,6 +329,17 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
     // @types/pg's QueryConfig does not declare `queryMode`, which node-pg 8.20 honours; the probe
     // module's ExtendedQueryClient type is the one that does.
     const ext = client as unknown as import('./scratch-database-data-probe').ExtendedQueryClient
+    // FIRST statement on this connection: prove row_security=off AND search_path=pg_catalog, so the
+    // state query below — and every operator in it — cannot be answered through a hostile schema
+    // (r11 review HIGH-1). A missing pin is a refusal, not a crash.
+    try {
+      await assertProbeSessionSafe(ext)
+    } catch (error) {
+      if (error instanceof UnsafeProbeSession) {
+        throw new NotAScratchDatabaseError(`REFUSING before any write: ${error.message}`)
+      }
+      throw error
+    }
     const { rows: stateRows } = await ext.query({
       // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
       // `search_path` — which MEDIUM-1 above shows could reach this connection — an
@@ -337,11 +348,11 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
       // is fixed: the installation probe is catalogue-built (identifier-only, single-statement).
       text: `SELECT pg_catalog.current_database() AS name,
                pg_catalog.shobj_description(
-                 (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database()),
+                 (SELECT oid FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()),
                  'pg_database') AS comment,
                pg_catalog.pg_is_in_recovery() AS in_recovery,
                (SELECT datistemplate FROM pg_catalog.pg_database
-                 WHERE datname = pg_catalog.current_database()) AS is_template`,
+                 WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) AS is_template`,
       values: [],
       queryMode: 'extended',
     })
@@ -350,9 +361,9 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
     let subscriptionCount: number | null = null
     try {
       const subscriptions = await ext.query({
-        text: `SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
-          WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database
-                            WHERE datname = pg_catalog.current_database())`,
+        text: `SELECT pg_catalog.count(*)::pg_catalog.text AS count FROM pg_catalog.pg_subscription
+          WHERE subdbid OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_database
+                            WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database())`,
         values: [],
         queryMode: 'extended',
       })
@@ -366,8 +377,9 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
         client as unknown as Parameters<typeof readInstallationEvidence>[0],
       )
     } catch (error) {
-      // A policy the probe was not allowed to evaluate is a refusal, not a crash (r10 MEDIUM-1).
-      if (error instanceof RowSecurityPolicyPresent) {
+      // A session the probe cannot run safely on — a policy it may not evaluate (r10 MEDIUM-1),
+      // or an unpinned search_path (r11 HIGH-1) — is a refusal, not a crash.
+      if (error instanceof UnsafeProbeSession) {
         throw new NotAScratchDatabaseError(`REFUSING before any write: ${error.message}`)
       }
       throw error

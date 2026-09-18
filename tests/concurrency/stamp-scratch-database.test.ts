@@ -238,3 +238,66 @@ test('MEDIUM-1: the guard refuses a users row hidden by a USING (false) policy',
     )
   })
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-zzgp r11, review HIGH-1 (CVE-2018-1058). A database owner sets the DB search_path and plants
+// operators; without the search_path pin they resolve to the owner's functions. All three run as
+// the ordinary (non-superuser) role the suite already uses, which is the tenant-owner case; the
+// COPY-TO-PROGRAM / superuser-escalation variant needs a superuser connection this suite does not
+// have, and is proved out of band (mut/r11/attacks.sh) — see docs/development.md "Database-backed
+// tiers". Each sets ALTER DATABASE search_path so a missing pin would be exploited; the fix pins
+// search_path=pg_catalog in the startup options, which outranks ALTER DATABASE.
+
+/** Point the sibling DB's default search_path at a hostile schema, as an owner may. */
+async function setHostileSearchPath(name: string): Promise<void> {
+  await sql(process.env.DATABASE_URL!, `ALTER DATABASE "${name}" SET search_path = s, pg_catalog`)
+}
+
+test('HIGH-1(a): a planted operator that neutralises the data filter does not get a DB with rows stamped', { skip }, async () => {
+  await withSiblingDatabase(async (name, url) => {
+    await setHostileSearchPath(name)
+    await sql(url, `
+      CREATE SCHEMA s;
+      CREATE FUNCTION s.evil_nmatch(name, name) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT false $$;
+      CREATE OPERATOR s.!~ (LEFTARG = name, RIGHTARG = name, FUNCTION = s.evil_nmatch);
+      CREATE TABLE s.products (x int); INSERT INTO s.products VALUES (1)`)
+    const code = await runStamper(url, [name])
+    assert.equal(code, 1, `must refuse a DB holding s.products, not stamp it: ${lastOutput}`)
+    assert.equal(await commentOn(url), null, 'a DB holding rows must not be stamped')
+  })
+})
+
+test('HIGH-1(c): a planted = operator cannot run read-write on the stamper writer', { skip }, async () => {
+  await withSiblingDatabase(async (name, url) => {
+    await setHostileSearchPath(name)
+    await sql(url, `
+      CREATE SCHEMA s;
+      CREATE FUNCTION s.evil_eq(name, name) RETURNS boolean LANGUAGE plpgsql AS $$
+      BEGIN
+        IF current_setting('transaction_read_only') = 'off' THEN
+          EXECUTE 'CREATE TABLE IF NOT EXISTS s.pwned_rw_marker ()';
+        END IF;
+        RETURN $1 OPERATOR(pg_catalog.=) $2;
+      END $$;
+      CREATE OPERATOR s.= (LEFTARG = name, RIGHTARG = name, FUNCTION = s.evil_eq)`)
+    await runStamper(url, [name])
+    const [pwned] = await sql(url, `SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM pg_catalog.pg_class WHERE relname OPERATOR(pg_catalog.=) 'pwned_rw_marker'`)
+    assert.equal(pwned?.n, 0, 'the planted = operator must never run, still less create a table read-write')
+  })
+})
+
+test('HIGH-1(d): the guard refuses a users row hidden by a planted = operator', { skip }, async () => {
+  await withSiblingDatabase(async (name, url) => {
+    await setHostileSearchPath(name)
+    await sql(url, `
+      CREATE SCHEMA s;
+      CREATE FUNCTION s.evil_eqt(name, text) RETURNS boolean LANGUAGE sql IMMUTABLE AS $$ SELECT false $$;
+      CREATE OPERATOR s.= (LEFTARG = name, RIGHTARG = text, FUNCTION = s.evil_eqt);
+      CREATE TABLE s.users (id text); INSERT INTO s.users VALUES ('real-user');
+      COMMENT ON DATABASE "${name}" IS '${expectedScratchDatabaseMarker(name)}'`)
+    await assert.rejects(
+      checkScratchDatabase(url, name),
+      (error: unknown) => error instanceof NotAScratchDatabaseError && /installed application|users/.test(error.message),
+    )
+  })
+})

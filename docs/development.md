@@ -88,7 +88,15 @@ proof the database is disposable (see "WHAT A MARKER PROVES" below). All of thes
 * no table it probes has a row-level-security policy that applies to the connecting role — the check
   connects with `row_security=off`, so the server refuses such a probe instead of evaluating the policy
   (a policy is arbitrary code, and `USING (false)` would otherwise HIDE a `users` row). A superuser, or
-  a role with BYPASSRLS, sees every row and never evaluates a policy; AND
+  a role with BYPASSRLS, sees every row and never evaluates a policy, so it is not exposed to THAT — but
+  it IS the worst case for the next bullet; AND
+* every operator, cast and function in the check's SQL resolves in `pg_catalog` and nowhere else — the
+  connections pin `search_path=pg_catalog` (which outranks `ALTER DATABASE/ROLE … SET search_path`) and
+  the check asserts the pin before its first statement, and every operator/cast is written
+  `OPERATOR(pg_catalog.=)` / `::pg_catalog.text` besides. Without this a database owner can plant a
+  `=`/`!~` operator that the check would resolve to their own function (CVE-2018-1058); a SUPERUSER
+  stamper is the worst case, because such a function runs with its privileges (e.g. `COPY … TO
+  PROGRAM`). This is why the stamper should be run as the database's owning non-superuser role; AND
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
@@ -109,10 +117,23 @@ excludes nobody who can read a `.env`. What the stamp costs instead is that `npm
 **refuses a database that holds application data** — rows in any table (or materialized view) other
 than the three a fresh `prisma migrate deploy` seeds, and only in the application's own schema
 (`<schema>._prisma_migrations`, `.settings`, `.shopping_status_mappings`, measured 2026-09-17) — or that
-has foreign tables at all, or a table whose row-level-security policy applies to the stamper's role. A
-wrong `DATABASE_URL` supplies none of that. Both of its connections run with `row_security=off`, and the
-writer re-runs the data check inside a savepoint made read-only, so the COMMENT is the only statement
-that runs read-write (o3d-zzgp r10).
+has foreign tables at all, or a table whose row-level-security policy applies to the stamper's role, or
+a session whose `search_path` is not pinned. A wrong `DATABASE_URL` supplies none of that. Both of its
+connections pin `row_security=off` and `search_path=pg_catalog` and assert both before any statement,
+and the writer re-reads the identity AND re-runs the data check inside a savepoint made read-only, so
+NO catalog read runs read-write and the only read-write statements are `BEGIN`/`SAVEPOINT`/`SET
+LOCAL`/`ROLLBACK`/`RELEASE` and the `COMMENT` (o3d-zzgp r10, r11).
+
+**CI HAS NO EXECUTION COVERAGE OF THE SUPERUSER-SKIP CASES** (o3d-zzgp r11, review LOW-4). The
+row-level-security cases and the search-path superuser variant (`COPY … TO PROGRAM`, a table written
+by a planted operator on a superuser writer) can only be demonstrated by a role that is SUBJECT to
+row-level security or is a superuser; `fresh-db-drift` connects as `postgres` (a superuser), so those
+integration cases skip there, exactly as they say when they skip. What CI DOES cover indirectly:
+`assertProbeSessionSafe` fails closed for any role — including a superuser — whenever `row_security`
+is not off or `search_path` is not `pg_catalog`, and the unit tests assert both the option string and
+that the assertion is the first statement every read path sends, so removing either the option or the
+assertion turns a unit test red without a database. The non-superuser search-path cases (a/c/d) run in
+full under a developer's ordinary role. The out-of-band reproduction lives in `mut/r11/attacks.sh`.
 
 ```bash
 createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above

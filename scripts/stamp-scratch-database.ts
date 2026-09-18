@@ -26,26 +26,36 @@
  * NOT OWNERSHIP. provision-ims-tenant.sh hands every tenant database to the role in its own
  * DATABASE_URL, so "only an owner can set it" excludes nobody who can read a `.env`.
  *
- * HOW IT TALKS TO THE SERVER (r9, corrected r10):
- *   · BOTH connections start with the data probe's PROBE_SESSION_OPTIONS — `row_security=off`
- *     and `standard_conforming_strings=on` — and send one statement per call over the extended
- *     protocol. The reader also defaults to read-only. The probe's rules 1–3 keep catalogue TEXT
- *     from becoming SQL (review r9 MEDIUM-1 reproduced a write through the read-only default with
- *     `COMMIT; BEGIN READ WRITE; …` smuggled in a catalogue name, so the default is a second layer).
- *     Rule 4, `row_security=off`, is what keeps a table's POLICY from running: r10's review planted
- *     a policy calling a function that creates a table whenever the transaction is read-write, and
- *     r9's writer, re-running the probe in the transaction that commits, executed it.
- *   · the single COMMENT runs on a second connection, inside a transaction that FIRST re-checks
- *     it reached the same SERVER and the same DATABASE the facts came from (oid, postmaster start
- *     time, server address and port — review MEDIUM-3) and that the comment it is about to replace
- *     is still the one the reader saw (r10 LOW-4), then RE-RUNS the data and installation checks
- *     (review L7) inside a SAVEPOINT made read-only with `SET LOCAL transaction_read_only = on` and
- *     rolled back before the COMMENT (r10 MEDIUM-1) — so the re-check runs under read-only
- *     transaction semantics even on the writing connection, and the COMMENT is the only statement
- *     that runs read-write. The re-check is not a lock: rows another session commits between it
- *     and COMMIT are not seen.
+ * HOW IT TALKS TO THE SERVER (r9, corrected r10 and r11):
+ *   · BOTH connections start with the data probe's PROBE_SESSION_OPTIONS — `row_security=off`,
+ *     `standard_conforming_strings=on` and `search_path=pg_catalog` — and, before any catalog
+ *     statement, call `assertProbeSessionSafe`, which refuses (UnsafeProbeSession) if row_security
+ *     is not off or search_path is not exactly `pg_catalog`. Each statement is one call over the
+ *     extended protocol, every FUNCTION, OPERATOR and CAST it names is pg_catalog-qualified, and the
+ *     reader also defaults to read-only. Rules 1–3 keep catalogue TEXT from becoming SQL (r9 M-1);
+ *     rule 4 (`row_security=off`) keeps a table POLICY from running (r10 M-1); rule 5 (the pin plus
+ *     the qualified operators) keeps a planted OPERATOR/CAST from being resolved (r11 HIGH-1,
+ *     CVE-2018-1058 — reproduced four ways, incl. `COPY … TO PROGRAM` under a superuser stamper).
+ *   · the single COMMENT runs on a second connection. It FIRST opens a SAVEPOINT, makes it
+ *     read-only with `SET LOCAL transaction_read_only = on`, and — INSIDE that read-only savepoint —
+ *     re-reads the identity, re-runs the data check and re-runs the installation check (r11 M-2
+ *     moved the identity re-read in here too, so NO catalog read runs read-write). It then rolls the
+ *     savepoint back, restoring read-write for the COMMENT alone, and only then compares that it
+ *     reached the same SERVER and DATABASE the facts came from (oid, postmaster start time, address,
+ *     port — M-3) and that the comment it will replace is still the one the reader saw (r10 LOW-4).
+ *     The read-write statements are therefore exactly BEGIN, SAVEPOINT, SET LOCAL, ROLLBACK/RELEASE
+ *     and the COMMENT — none of which resolves a search_path name. Not a lock: rows another session
+ *     commits between the re-check and COMMIT are not seen.
  *   · `--unstamp` reads only the name, the server identity and the comment. It never runs the data
- *     probe (review L6), and it decides on the comment the WRITER re-reads (r10 LOW-4).
+ *     probe (review L6), pins the session on both connections, and decides on the comment the WRITER
+ *     re-reads (r10 LOW-4).
+ *
+ * SUPERUSER (r11, review LOW-4 item 4). The stamper does NOT hard-refuse to run as a superuser: CI
+ * stamps `ims_ci` as `postgres`, and a refusal would break it. A superuser is the WORST case for
+ * catalog-resolution attacks (it can use any planted operator, and COPY TO PROGRAM is code on the
+ * host), so run it as the OWNING NON-SUPERUSER role wherever possible; the search_path pin plus the
+ * qualified operators are what make the superuser run safe, and the stamper prints a warning when it
+ * is a superuser so the operator sees the recommendation.
  */
 
 import { pathToFileURL } from 'node:url'
@@ -55,10 +65,11 @@ import {
   expectedScratchDatabaseMarker,
 } from '../tests/concurrency/scratch-database-guard'
 import {
+  assertProbeSessionSafe,
   PROBE_SESSION_OPTIONS,
   readDataFacts,
   readInstallationEvidence,
-  RowSecurityPolicyPresent,
+  UnsafeProbeSession,
   type ExtendedQueryClient,
 } from '../tests/concurrency/scratch-database-data-probe'
 
@@ -96,17 +107,37 @@ type Identity = {
 
 const IDENTITY_SQL = `
   SELECT pg_catalog.current_database() AS name,
-         d.oid::text AS oid,
-         pg_catalog.pg_postmaster_start_time()::text AS postmaster_start,
-         COALESCE(pg_catalog.inet_server_addr()::text, 'local-socket') AS server_addr,
-         COALESCE(pg_catalog.inet_server_port()::text, 'local-socket') AS server_port,
+         d.oid::pg_catalog.text AS oid,
+         pg_catalog.pg_postmaster_start_time()::pg_catalog.text AS postmaster_start,
+         COALESCE(pg_catalog.inet_server_addr()::pg_catalog.text, 'local-socket') AS server_addr,
+         COALESCE(pg_catalog.inet_server_port()::pg_catalog.text, 'local-socket') AS server_port,
          pg_catalog.shobj_description(d.oid, 'pg_database') AS comment
     FROM pg_catalog.pg_database d
-   WHERE d.datname = pg_catalog.current_database()`
+   WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()`
 
 async function ask<T>(client: ExtendedQueryClient, text: string): Promise<T[]> {
   const { rows } = await client.query({ text, values: [], queryMode: 'extended' })
   return rows as T[]
+}
+
+/**
+ * Print the recommendation, once, when this run connects as a superuser (r11 review LOW-4 item 4).
+ * Not a refusal: CI stamps as `postgres`. A superuser is the worst case for catalog-resolution
+ * attacks, so the operator should prefer the owning non-superuser role.
+ */
+async function warnIfSuperuser(client: ExtendedQueryClient): Promise<void> {
+  try {
+    const [row] = await ask<{ is_superuser: string }>(
+      client, `SELECT pg_catalog.current_setting('is_superuser') AS is_superuser`,
+    )
+    if (row?.is_superuser === 'on') {
+      console.warn('NOTE: stamping as a SUPERUSER. The search_path pin and qualified operators keep this '
+        + 'safe, but a superuser is the worst case for catalog-resolution attacks — prefer running as the '
+        + 'database\'s owning non-superuser role.')
+    }
+  } catch {
+    // A warning must never fail the run.
+  }
 }
 
 async function readIdentity(client: ExtendedQueryClient): Promise<Identity> {
@@ -140,15 +171,19 @@ type Facts = {
 }
 
 async function readStampFacts(client: ExtendedQueryClient, appSchema: string): Promise<Facts> {
+  // FIRST statement on the reader: row_security=off AND search_path=pg_catalog, before IDENTITY_SQL
+  // (whose `=` would otherwise resolve through a hostile search_path) runs (r11 review HIGH-1).
+  await assertProbeSessionSafe(client)
+  await warnIfSuperuser(client)
   const identity = await readIdentity(client)
   const [state] = await ask<{ in_recovery: boolean; is_template: boolean }>(client, `
     SELECT pg_catalog.pg_is_in_recovery() AS in_recovery, d.datistemplate AS is_template
-      FROM pg_catalog.pg_database d WHERE d.datname = pg_catalog.current_database()`)
+      FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()`)
   let subscriptionCount: number | null = null
   try {
     const [row] = await ask<{ count: string }>(client, `
-      SELECT pg_catalog.count(*)::text AS count FROM pg_catalog.pg_subscription
-       WHERE subdbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database())`)
+      SELECT pg_catalog.count(*)::pg_catalog.text AS count FROM pg_catalog.pg_subscription
+       WHERE subdbid OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database())`)
     subscriptionCount = Number(row!.count)
   } catch {
     subscriptionCount = null
@@ -293,6 +328,10 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
     const reader = await open(true)
     let identity: Identity
     try {
+      // Pin proof first, even though --unstamp runs no data probe: IDENTITY_SQL's `=` still
+      // resolves through search_path, so it must be pinned before that statement (r11 HIGH-1).
+      await assertProbeSessionSafe(reader)
+      await warnIfSuperuser(reader)
       identity = await readIdentity(reader)
     } finally {
       await reader.end().catch(() => {})
@@ -314,6 +353,18 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
     const writer = await open(false)
     try {
       await ask(writer, 'BEGIN')
+      // Pin proof on the writer too. IDENTITY_SQL's operators are all pg_catalog-qualified, so this
+      // read is safe read-write; the assertion is the belt for a session that lost its options.
+      try {
+        await assertProbeSessionSafe(writer)
+      } catch (error) {
+        await ask(writer, 'ROLLBACK').catch(() => {})
+        if (error instanceof UnsafeProbeSession) {
+          console.error(`REFUSING to unstamp "${identity.name}": ${error.message}`)
+          return 1
+        }
+        throw error
+      }
       const seen = await readIdentity(writer)
       if (!sameServerAndDatabase(identity, seen)) {
         await ask(writer, 'ROLLBACK')
@@ -341,7 +392,7 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
   try {
     facts = await readStampFacts(reader, appSchema)
   } catch (error) {
-    if (error instanceof RowSecurityPolicyPresent) {
+    if (error instanceof UnsafeProbeSession) {
       console.error(`REFUSING to stamp: ${error.message}`)
       return 1
     }
@@ -381,7 +432,36 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
   const writer = await open(false)
   try {
     await ask(writer, 'BEGIN')
-    const seen = await readIdentity(writer)
+    // EVERY CATALOG READ ON THE WRITER RUNS INSIDE A READ-ONLY SAVEPOINT (r10 MEDIUM-1, extended in
+    // r11 MEDIUM-2). The savepoint is opened and made read-only FIRST, then the identity re-read,
+    // the data check and the installation check all run under `transaction_read_only = on`; the
+    // rollback to the savepoint restores read-write for the COMMENT alone. So — with search_path
+    // pinned and every operator qualified (r11 HIGH-1) — the only statements that run read-write are
+    // BEGIN, SAVEPOINT, SET LOCAL, ROLLBACK/RELEASE and the COMMENT, none of which resolves a
+    // search_path operator. r10's version read the identity BEFORE the savepoint, so its `=` ran
+    // read-write, which review MEDIUM-2 showed a planted operator could exploit. Not a lock: a row
+    // another session commits between this read and COMMIT is not seen.
+    let seen: Identity
+    let data: Awaited<ReturnType<typeof readDataFacts>>
+    let installation: Awaited<ReturnType<typeof readInstallationEvidence>>
+    try {
+      await ask(writer, 'SAVEPOINT stamp_recheck')
+      await ask(writer, 'SET LOCAL transaction_read_only = on')
+      // FIRST read inside the savepoint: prove the session is still pinned (r11).
+      await assertProbeSessionSafe(writer)
+      seen = await readIdentity(writer)
+      data = await readDataFacts(writer, appSchema)
+      installation = await readInstallationEvidence(writer)
+      await ask(writer, 'ROLLBACK TO SAVEPOINT stamp_recheck')
+      await ask(writer, 'RELEASE SAVEPOINT stamp_recheck')
+    } catch (error) {
+      await ask(writer, 'ROLLBACK').catch(() => {})
+      if (error instanceof UnsafeProbeSession) {
+        console.error(`REFUSING to stamp "${facts.identity.name}" at the last moment: ${error.message}`)
+        return 1
+      }
+      throw error
+    }
     // SAME SERVER, SAME DATABASE (review M3) — not just the same name.
     if (!sameServerAndDatabase(facts.identity, seen)) {
       await ask(writer, 'ROLLBACK')
@@ -393,32 +473,6 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
       await ask(writer, 'ROLLBACK')
       console.error(`REFUSING to stamp "${facts.identity.name}": its database comment changed after it was read`)
       return 1
-    }
-    // RE-CHECKED ON THE WRITER, IN THIS TRANSACTION, IMMEDIATELY BEFORE THE COMMENT (review L7),
-    // under READ-ONLY transaction semantics (r10 MEDIUM-1): the savepoint is made read-only and
-    // rolled back, which restores read-write for the COMMENT alone. row_security=off (startup
-    // options) is what stops a policy running at all; the savepoint is the layer under it, twice
-    // over — anything the re-check did run could not write, and a transactional write that got
-    // through would be discarded by the rollback to the savepoint (measured by mutation: with
-    // row_security on and the read-only line removed, the policy's table was still gone; with the
-    // whole savepoint removed — r9's shape — it survived). Not a lock: a row another session
-    // commits after this read and before COMMIT is not seen.
-    let data: Awaited<ReturnType<typeof readDataFacts>>
-    let installation: Awaited<ReturnType<typeof readInstallationEvidence>>
-    try {
-      await ask(writer, 'SAVEPOINT stamp_recheck')
-      await ask(writer, 'SET LOCAL transaction_read_only = on')
-      data = await readDataFacts(writer, appSchema)
-      installation = await readInstallationEvidence(writer)
-      await ask(writer, 'ROLLBACK TO SAVEPOINT stamp_recheck')
-      await ask(writer, 'RELEASE SAVEPOINT stamp_recheck')
-    } catch (error) {
-      await ask(writer, 'ROLLBACK').catch(() => {})
-      if (error instanceof RowSecurityPolicyPresent) {
-        console.error(`REFUSING to stamp "${facts.identity.name}" at the last moment: ${error.message}`)
-        return 1
-      }
-      throw error
     }
     const late = refuseToStamp({
       database: facts.identity.name,

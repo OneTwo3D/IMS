@@ -14,6 +14,7 @@ import {
   MIGRATION_SEEDED_TABLE_NAMES,
   PROBE_SESSION_OPTIONS,
   RowSecurityPolicyPresent,
+  SearchPathNotPinned,
   buildPopulatedTableProbe,
   readDataFacts,
   readInstallationEvidence,
@@ -272,8 +273,8 @@ test('the probe carries catalogue names ONLY inside double-quoted identifiers �
     assert.equal(parsed.includes(fragment), false, `"${fragment}" reached the parser outside an identifier: ${parsed}`)
   }
   // Labels are the integers this code generated, mapped back to names in JS.
-  assert.match(sql, /SELECT 0::int AS i WHERE EXISTS/)
-  assert.match(sql, /SELECT 2::int AS i WHERE EXISTS/)
+  assert.match(sql, /SELECT 0::pg_catalog\.int4 AS i WHERE EXISTS/)
+  assert.match(sql, /SELECT 2::pg_catalog\.int4 AS i WHERE EXISTS/)
   assert.deepEqual(probe.probed, [`${ATTACK_SCHEMA}.\\`, `${ATTACK_SCHEMA}.zz`, `we"ird.o'dd`])
 })
 
@@ -282,7 +283,7 @@ type Sent = { text: string; values: unknown; queryMode: unknown }
 /** A client that answers the catalogue queries it recognises and records everything it is sent. */
 function recordingClient(
   catalogue: { foreign: object[]; relations: object[] },
-  server: { rowSecurity?: string; probeError?: { code: string; message: string } } = {},
+  server: { rowSecurity?: string; searchPath?: string; probeError?: { code: string; message: string } } = {},
 ) {
   const sent: Sent[] = []
   const client = {
@@ -293,10 +294,10 @@ function recordingClient(
         values: typeof config === 'string' ? undefined : (config as { values?: unknown }).values,
         queryMode: typeof config === 'string' ? undefined : (config as { queryMode?: unknown }).queryMode,
       })
-      if (/current_setting\('row_security'\)/.test(text)) return { rows: [{ row_security: server.rowSecurity ?? 'off' }] }
+      if (/current_setting\('row_security'\)/.test(text)) return { rows: [{ row_security: server.rowSecurity ?? 'off', search_path: server.searchPath ?? 'pg_catalog' }] }
       if (server.probeError && /EXISTS/.test(text)) throw Object.assign(new Error(server.probeError.message), server.probeError)
-      if (/relkind\s*=\s*'f'/.test(text)) return { rows: catalogue.foreign }
-      if (/relkind IN/.test(text)) return { rows: [...catalogue.relations, ...catalogue.foreign] }
+      if (/relkind OPERATOR\(pg_catalog\.=\) 'f'/.test(text)) return { rows: catalogue.foreign }
+      if (/relkind OPERATOR\(pg_catalog\.=\) ANY/.test(text)) return { rows: [...catalogue.relations, ...catalogue.foreign] }
       return { rows: [] }
     },
   }
@@ -367,9 +368,9 @@ test('installation evidence is searched in EVERY schema, with the table names as
     relations: [{ schema: 'tenant', name: 'users', kind: 'r' }, { schema: 'public', name: 'organisations', kind: 'r' }],
   })
   await readInstallationEvidence(client as never)
-  const catalogueQuery = sent.find((statement) => /relname = ANY/.test(statement.text))
+  const catalogueQuery = sent.find((statement) => /relname::pg_catalog\.text OPERATOR\(pg_catalog\.=\) ANY/.test(statement.text))
   assert.ok(catalogueQuery, 'the evidence catalogue query was sent')
-  assert.doesNotMatch(catalogueQuery!.text, /nspname = /, 'not restricted to one schema')
+  assert.doesNotMatch(catalogueQuery!.text, /nspname OPERATOR\(pg_catalog\.=\)/, 'not restricted to one schema')
   assert.deepEqual(catalogueQuery!.values, [[...INSTALLATION_EVIDENCE_TABLE_NAMES]])
   const probe = sent.find((statement) => /EXISTS/.test(statement.text))
   assert.match(String(probe?.text), /"tenant"\."users"/)
@@ -392,9 +393,12 @@ test('the writer must reach the same SERVER and DATABASE, not merely the same na
 // row_security=off (the server then refuses, without evaluating the policy), the probe module
 // checks that setting itself, and reports the refusal as RowSecurityPolicyPresent.
 // ---------------------------------------------------------------------------------------------
-test('every connection that runs a probe starts with row_security=off', () => {
+test('PROBE_SESSION_OPTIONS pins row_security=off, standard_conforming_strings=on AND search_path=pg_catalog', () => {
+  // review LOW-4: this must fail if the reviewer's surviving mutation — dropping BOTH the option and
+  // the assertion — is reintroduced by dropping the option here.
   assert.match(PROBE_SESSION_OPTIONS, /(^| )-c row_security=off( |$)/)
   assert.match(PROBE_SESSION_OPTIONS, /(^| )-c standard_conforming_strings=on( |$)/)
+  assert.match(PROBE_SESSION_OPTIONS, /(^| )-c search_path=pg_catalog( |$)/)
   for (const readOnly of [true, false]) {
     assert.ok(connectionOptions(readOnly).includes(PROBE_SESSION_OPTIONS),
       `the stamper's ${readOnly ? 'reader' : 'writer'} must carry PROBE_SESSION_OPTIONS: ${connectionOptions(readOnly)}`)
@@ -425,4 +429,117 @@ test('a policy the server would not evaluate is reported as RowSecurityPolicyPre
     { probeError: { code: '42501', message: 'permission denied for table t' } })
   await assert.rejects(readDataFacts(denied.client as never, 'public'),
     (error: unknown) => !(error instanceof RowSecurityPolicyPresent) && /permission denied/.test((error as Error).message))
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-zzgp r11, review HIGH-1: operator/cast resolution through an unpinned search_path
+// (CVE-2018-1058). Every SQL string these three modules send must schema-qualify not only its
+// FUNCTIONS but its OPERATORS and CASTS, and every probe connection must pin search_path=pg_catalog
+// and assert it. These are lexical checks — able to fail — over the SQL literals themselves.
+// ---------------------------------------------------------------------------------------------
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const MODULE_FILES = [
+  'concurrency/scratch-database-data-probe.ts',
+  'concurrency/scratch-database-guard.ts',
+  '../scripts/stamp-scratch-database.ts',
+].map((rel) => fileURLToPath(new URL(rel, import.meta.url)))
+
+/** Every backtick or single-quoted chunk that looks like it carries SQL (has a SQL keyword). */
+function sqlLiterals(source: string): string[] {
+  // Strip block and line COMMENTS first: a docblock quotes example SQL in backticks (including old,
+  // deliberately-unqualified forms), and only the SQL the modules actually SEND must pass these
+  // checks. What remains are code template literals; keep those that are a real query.
+  const code = source.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ')
+  const out: string[] = []
+  for (const m of code.matchAll(/`([^`]*)`/g)) {
+    const body = m[1]
+    if (/\b(SELECT|COMMENT ON DATABASE)\b/.test(body)) out.push(body)
+  }
+  return out
+}
+
+test('every operator in the modules\' SQL is schema-qualified (r11 HIGH-1, CVE-2018-1058)', () => {
+  // A bare operator between two references resolves through search_path. Strip OPERATOR(pg_catalog.…)
+  // and single-quoted string LITERALS first, then any surviving =, <>, !~ is unqualified. Asserts a
+  // present property; the mutation proof removes a qualification to turn it red.
+  let checked = 0
+  for (const file of MODULE_FILES) {
+    for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
+      checked += 1
+      const bare = sql
+        .replace(/OPERATOR\(pg_catalog\.[^)]+\)/g, ' Q ')
+        .replace(/'[^']*'/g, " '' ")
+        .replace(/[<>!:]=/g, ' NE ')     // spare >=, <=, !=, :=
+      assert.ok(!/(^|[^A-Za-z_])!~([^A-Za-z_]|$)/.test(bare),
+        `unqualified !~ in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+      assert.ok(!/(^|[^A-Za-z_])<>([^A-Za-z_]|$)/.test(bare),
+        `unqualified <> in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+      assert.ok(!/\s=\s/.test(bare),
+        `unqualified = in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+    }
+  }
+  assert.ok(checked >= 6, `precondition: SQL literals were found and checked (${checked})`)
+})
+
+test('every cast in the modules\' SQL names a pg_catalog type (r11 HIGH-1)', () => {
+  let checked = 0
+  for (const file of MODULE_FILES) {
+    for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
+      checked += 1
+      const bare = sql.replace(/'[^']*'/g, " '' ")
+      for (const m of bare.matchAll(/::\s*([A-Za-z_][A-Za-z0-9_."\[\]]*)/g)) {
+        assert.ok(/^pg_catalog\./.test(m[1]),
+          `unqualified cast ::${m[1]} in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+      }
+    }
+  }
+  assert.ok(checked >= 6, `precondition: SQL literals were checked (${checked})`)
+})
+
+test('every catalog/function name in the modules\' SQL is pg_catalog-qualified (r11)', () => {
+  // pg_* references outside string literals must be written pg_catalog.<name>.
+  let checked = 0
+  for (const file of MODULE_FILES) {
+    for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
+      checked += 1
+      const bare = sql.replace(/'[^']*'/g, " '' ")
+      for (const m of bare.matchAll(/(?<![A-Za-z0-9_.])(pg_[A-Za-z0-9_]+)/g)) {
+        if (m[1] === 'pg_catalog') continue
+        const idx = m.index ?? 0
+        assert.ok(bare.slice(Math.max(0, idx - 11), idx).endsWith('pg_catalog.'),
+          `unqualified catalog name ${m[1]} in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+      }
+    }
+  }
+  assert.ok(checked >= 6, `precondition: SQL literals were checked (${checked})`)
+})
+
+test('the probe refuses when search_path is not pinned to pg_catalog (r11 HIGH-1)', async () => {
+  const catalogue = { foreign: [], relations: [{ schema: 'public', name: 'products', kind: 'r' }] }
+  for (const read of [
+    (client: never) => readDataFacts(client, 'public'),
+    (client: never) => readInstallationEvidence(client),
+  ]) {
+    const { client, sent } = recordingClient(catalogue, { searchPath: 's, pg_catalog' })
+    await assert.rejects(read(client as never), SearchPathNotPinned)
+    assert.equal(sent.some((statement) => /EXISTS/.test(statement.text)), false,
+      'no probe may run when search_path is not pinned')
+  }
+})
+
+test('assertProbeSessionSafe is the FIRST statement every reader path sends (r11 LOW-4)', async () => {
+  // If the assertion were removed from a read path, the first statement it sends would be a probe,
+  // not the row_security/search_path query. This pins that the settings query comes first.
+  for (const read of [
+    (client: never) => readDataFacts(client, 'public'),
+    (client: never) => readInstallationEvidence(client),
+  ]) {
+    const { client, sent } = recordingClient({ foreign: [], relations: [{ schema: 'public', name: 'products', kind: 'r' }] })
+    await read(client as never)
+    assert.ok(sent.length > 0, 'precondition: statements were sent')
+    assert.match(sent[0]!.text, /current_setting\('row_security'\)[\s\S]*current_setting\('search_path'\)/,
+      `the first statement must be the session-safety check, was: ${sent[0]!.text.slice(0, 80)}`)
+  }
 })

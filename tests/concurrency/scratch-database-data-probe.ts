@@ -7,7 +7,7 @@
  * imported by both, keeps the two from answering the question differently.
  *
  * ══════════════════════════════════════════════════════════════════════════════════════════════
- * FOUR RULES FOR EVERY STATEMENT THIS MODULE SENDS (o3d-zzgp r9 MEDIUM-1/-2, r10 MEDIUM-1)
+ * FIVE RULES FOR EVERY STATEMENT THIS MODULE SENDS (o3d-zzgp r9 MEDIUM-1/-2, r10 MEDIUM-1, r11 HIGH-1)
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  *
  *  1. NO CATALOGUE-DERIVED TEXT IS EVER A STRING LITERAL. Round 8 labelled each probe with a
@@ -19,7 +19,9 @@
  *     Probes are now labelled by their INDEX in a JS array (an integer this code generated) and
  *     mapped back in JS. Catalogue names appear only as DOUBLE-quoted identifiers, whose quoting
  *     has no backslash escape under any setting; the one value that is not an identifier (the
- *     table names searched for installation evidence) is a BIND PARAMETER.
+ *     table names searched for installation evidence) is a BIND PARAMETER. Every OPERATOR and CAST
+ *     is schema-qualified too (rule 5) — `OPERATOR(pg_catalog.=)`, `::pg_catalog.text` — so none
+ *     resolves through search_path.
  *  2. EVERY STATEMENT GOES THROUGH THE EXTENDED PROTOCOL (`queryMode: 'extended'`), whose Parse
  *     message accepts exactly one statement. A string that somehow still carried `;…` would be
  *     rejected by the server rather than run. Callers also pin `-c standard_conforming_strings=on`
@@ -48,7 +50,19 @@
  *     (`assertRowSecurityOff`) and reports the server's refusal as `RowSecurityPolicyPresent`,
  *     which both callers turn into a refusal to stamp or seed. A role that BYPASSES row-level
  *     security (a superuser, or BYPASSRLS) sees every row and evaluates no policy, so it is not
- *     exposed to either half of this.
+ *     exposed to either half of THAT — but a superuser is the WORST case for rule 5.
+ *  5. THE search_path IS PINNED TO pg_catalog, AND EVERY OPERATOR/CAST IS QUALIFIED (o3d-zzgp r11,
+ *     review HIGH-1 — CVE-2018-1058 shape). Round 10 qualified every FUNCTION with `pg_catalog.`
+ *     but left OPERATORS (`=`, `<>`, `!~`, `= ANY`) and CASTS (`::text`, `::int`) to resolve
+ *     through search_path. A database owner set `ALTER DATABASE … SET search_path = s, pg_catalog`
+ *     (ordinary for a tenant DB) and planted `s.=(name,name)`/`public.!~(name,name)`; the operator,
+ *     resolved before pg_catalog, ran a function they wrote. Reproduced on PG 17.11 four ways: it
+ *     neutralised the data filter so a DB holding rows stamped; it hid a `users` row so the guard
+ *     accepted; on the writer's read-write IDENTITY it created a table owned by a SUPERUSER stamper;
+ *     and as a superuser it ran `COPY … TO PROGRAM` (arbitrary code on the server host). The fix is
+ *     both: `-c search_path=pg_catalog` in PROBE_SESSION_OPTIONS (the barrier), and every operator
+ *     and cast written `OPERATOR(pg_catalog.…)` / `::pg_catalog.…` (the belt). `assertProbeSessionSafe`
+ *     refuses (SearchPathNotPinned) if the pin is missing, exactly as it refuses row_security on.
  *
  * WHAT COUNTS as data: every row-storing relation — ordinary and partitioned tables and
  * materialized views — in every schema but the server's own (partitions themselves are skipped
@@ -94,30 +108,30 @@ export type CatalogueRelation = { schema: string; name: string; kind: string }
 export const FOREIGN_TABLES_SQL = `
   SELECT n.nspname AS schema, c.relname AS name, 'f' AS kind
     FROM pg_catalog.pg_class c
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-   WHERE c.relkind = 'f'
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+   WHERE c.relkind OPERATOR(pg_catalog.=) 'f'
    ORDER BY 1, 2`
 
 /** Every LOCAL row-storing relation outside the server's schemas. Foreign tables are listed above. */
 export const ROW_STORING_RELATIONS_SQL = `
-  SELECT n.nspname AS schema, c.relname AS name, c.relkind::text AS kind
+  SELECT n.nspname AS schema, c.relname AS name, c.relkind::pg_catalog.text AS kind
     FROM pg_catalog.pg_class c
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-   WHERE c.relkind IN ('r', 'p', 'm')
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+   WHERE c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p', 'm']::pg_catalog."char"[])
      AND NOT c.relispartition
-     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-     AND n.nspname !~ '^pg_(toast|temp)'
+     AND n.nspname OPERATOR(pg_catalog.<>) ALL (ARRAY['pg_catalog', 'information_schema']::pg_catalog.name[])
+     AND n.nspname OPERATOR(pg_catalog.!~) '^pg_(toast|temp)'
    ORDER BY 1, 2`
 
 /** Installation-evidence tables in ANY schema; the names are a bind parameter, never interpolated. */
 export const INSTALLATION_EVIDENCE_RELATIONS_SQL = `
-  SELECT n.nspname AS schema, c.relname AS name, c.relkind::text AS kind
+  SELECT n.nspname AS schema, c.relname AS name, c.relkind::pg_catalog.text AS kind
     FROM pg_catalog.pg_class c
-    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-   WHERE c.relkind IN ('r', 'p')
+    JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+   WHERE c.relkind OPERATOR(pg_catalog.=) ANY (ARRAY['r', 'p']::pg_catalog."char"[])
      AND NOT c.relispartition
-     AND c.relname = ANY($1::text[])
-     AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+     AND c.relname::pg_catalog.text OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])
+     AND n.nspname OPERATOR(pg_catalog.<>) ALL (ARRAY['pg_catalog', 'information_schema']::pg_catalog.name[])
    ORDER BY 1, 2`
 
 /** A double-quoted identifier. Its quoting has no backslash escape under any server setting. */
@@ -159,7 +173,7 @@ export function buildRelationProbe(
       continue
     }
     members.push(
-      `SELECT ${probed.length}::int AS i WHERE EXISTS (SELECT 1 FROM ${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)})`,
+      `SELECT ${probed.length}::pg_catalog.int4 AS i WHERE EXISTS (SELECT 1 FROM ${quoteIdentifier(relation.schema)}.${quoteIdentifier(relation.name)})`,
     )
     probed.push(qualifiedName)
   }
@@ -189,20 +203,44 @@ async function ask<T>(client: ExtendedQueryClient, text: string, values: unknown
  * URL's own `options=` (sanitisedProbeConnectionString), so nothing in the database or the URL can
  * put these back.
  */
-export const PROBE_SESSION_OPTIONS = '-c row_security=off -c standard_conforming_strings=on'
+export const PROBE_SESSION_OPTIONS = '-c row_security=off -c standard_conforming_strings=on -c search_path=pg_catalog'
+
+/**
+ * The probe cannot run safely on this connection. Base class so both callers refuse on either
+ * reason with one `catch` (o3d-zzgp r11): the session is not pinned the way PROBE_SESSION_OPTIONS
+ * pins it, or a statement met code the session was supposed to keep from running.
+ */
+export class UnsafeProbeSession extends Error {
+  override readonly name: string = 'UnsafeProbeSession'
+}
 
 /** A probe met a table with a row-level-security policy that applies to this role (rule 4). */
-export class RowSecurityPolicyPresent extends Error {
+export class RowSecurityPolicyPresent extends UnsafeProbeSession {
   override readonly name = 'RowSecurityPolicyPresent'
 }
 
 /**
- * Rule 4, checked rather than assumed: a caller that forgot PROBE_SESSION_OPTIONS gets an error
- * here, before any probe, instead of a probe that runs a policy.
+ * The connection's search_path is not pinned to pg_catalog (r11, review HIGH-1). An unpinned
+ * search_path lets a database owner resolve this module's UNQUALIFIED operators — `=`, `<>`, `!~`,
+ * the `= ANY` element comparison — to functions they planted (CVE-2018-1058), which run as the
+ * connecting role, read-only or not. Every operator IS now schema-qualified as a second layer, but
+ * the pin is the barrier, and this is what refuses when it is missing.
  */
-export async function assertRowSecurityOff(client: ExtendedQueryClient): Promise<void> {
-  const [row] = await ask<{ row_security: string }>(
-    client, `SELECT pg_catalog.current_setting('row_security') AS row_security`,
+export class SearchPathNotPinned extends UnsafeProbeSession {
+  override readonly name = 'SearchPathNotPinned'
+}
+
+/**
+ * Rule 4 and the search_path pin, CHECKED rather than assumed (r11): a caller that forgot
+ * PROBE_SESSION_OPTIONS, or a startup option somehow overridden, gets an error here — before any
+ * probe — instead of a probe that runs a policy or resolves an operator through a hostile schema.
+ * One statement, over the extended protocol, every name pg_catalog-qualified.
+ */
+export async function assertProbeSessionSafe(client: ExtendedQueryClient): Promise<void> {
+  const [row] = await ask<{ row_security: string; search_path: string }>(
+    client,
+    `SELECT pg_catalog.current_setting('row_security') AS row_security,
+            pg_catalog.current_setting('search_path') AS search_path`,
   )
   if (row?.row_security !== 'off') {
     throw new RowSecurityPolicyPresent(
@@ -210,6 +248,18 @@ export async function assertRowSecurityOff(client: ExtendedQueryClient): Promise
       + 'EVALUATED by the data probe; connect with PROBE_SESSION_OPTIONS (row_security=off)',
     )
   }
+  if (row?.search_path !== 'pg_catalog') {
+    throw new SearchPathNotPinned(
+      `this connection's search_path is "${String(row?.search_path)}", not "pg_catalog", so an owner could `
+      + 'resolve this probe\'s operators to functions they planted (CVE-2018-1058); connect with '
+      + 'PROBE_SESSION_OPTIONS (search_path=pg_catalog)',
+    )
+  }
+}
+
+/** @deprecated Retained name; use assertProbeSessionSafe. */
+export async function assertRowSecurityOff(client: ExtendedQueryClient): Promise<void> {
+  await assertProbeSessionSafe(client)
 }
 
 async function runProbe(client: ExtendedQueryClient, probe: RelationProbe): Promise<string[]> {
@@ -253,7 +303,7 @@ export type DataFacts = {
 
 /** The stamper's data check. Foreign tables first; if there are any, stop before building a probe. */
 export async function readDataFacts(client: ExtendedQueryClient, appSchema: string): Promise<DataFacts> {
-  await assertRowSecurityOff(client)
+  await assertProbeSessionSafe(client)
   const foreign = await readForeignTables(client)
   if (foreign.length > 0) return { foreign, populated: [], probed: false }
   const relations = await ask<CatalogueRelation>(client, ROW_STORING_RELATIONS_SQL)
@@ -270,7 +320,7 @@ export type InstallationFacts = {
 
 /** The guard's data term. Foreign tables first here too; then users/organisations/currencies anywhere. */
 export async function readInstallationEvidence(client: ExtendedQueryClient): Promise<InstallationFacts> {
-  await assertRowSecurityOff(client)
+  await assertProbeSessionSafe(client)
   const foreign = await readForeignTables(client)
   if (foreign.length > 0) return { foreign, evidence: [], probed: false }
   const relations = await ask<CatalogueRelation>(client, INSTALLATION_EVIDENCE_RELATIONS_SQL, [
