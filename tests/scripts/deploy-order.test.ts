@@ -8367,6 +8367,11 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
     // ENV_VAR_SOURCE_REASON, BUS_STRINGS, BUS_ENV_IGNORE_FLAGS and DB_IDENTITY_REQUIRE_SNAPSHOT,
     // which update.sh expands with no default — so leaving it out reports them as unsupplied.
     ...readFileSync(join(process.cwd(), 'scripts/lib/unit-environment.sh'), 'utf8').split(/\r?\n/),
+    // …and the privileged-helper publication, sourced by all three since o3d-kyqa. It assigns
+    // IMS_DRIVER_HELPER_DIR, IMS_DRIVER_PROGRAM_DIR, IMS_DRIVER_DEPLOY_META, IMS_DRIVER_REASON and
+    // IMS_DRIVER_PUBLISHED_DIGEST, which update.sh expands with no default in its refusals and its
+    // driver-refresh report — so leaving it out reports five names as unsupplied.
+    ...readFileSync(join(process.cwd(), 'scripts/lib/privileged-helpers.sh'), 'utf8').split(/\r?\n/),
   ]
   const label = 'update.sh'
   const code = [...UPDATE_LINES, ...LIBRARY_LINES].filter((line) => !/^\s*#/.test(line))
@@ -8439,7 +8444,10 @@ test('every entrypoint defines what the shared fence library reads', () => {
   // BOTH shared libraries, for the same reason (o3d-p9dq added the second): each is sourced by
   // all three entrypoints and each expands names the entrypoint must supply — DB_FENCE_SCRIPT for
   // the fence, APP_USER for the crontab lock's refusal messages.
-  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/unit-environment.sh']
+  // …and the privileged-helper publication (o3d-kyqa), which expands ${IMS_SCRIPT_LIB_DIR} — the
+  // one thing it must not decide for itself, exactly as the fence library must not decide
+  // ${DB_FENCE_SCRIPT}.
+  const libCode = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/unit-environment.sh', 'scripts/lib/privileged-helpers.sh']
     .flatMap((rel) => readFileSync(join(process.cwd(), rel), 'utf8').split(/\r?\n/))
     .filter((line) => !/^\s*#/.test(line))
 
@@ -8458,6 +8466,9 @@ test('every entrypoint defines what the shared fence library reads', () => {
     // `\$NAME` is a literal dollar in an operator message, not an expansion — see the scan above.
     for (const match of line.matchAll(/(?<!\\)\$\{([A-Z][A-Z0-9_]*)\}|(?<!\\)\$([A-Z][A-Z0-9_]*)\b/g)) {
       const name = match[1] ?? match[2]
+      // Variables BASH itself sets (o3d-z5be r12: the run-time refusals read BASHPID to tell a subshell
+      // from the top-level shell). No entrypoint can or should assign them.
+      if (['BASHPID', 'BASH_SUBSHELL', 'EUID', 'UID', 'PPID'].includes(name)) continue
       if (!libAssigned.has(name)) needed.add(name)
     }
   }
@@ -8472,11 +8483,24 @@ test('every entrypoint defines what the shared fence library reads', () => {
     // `readonly` is a declaration prefix here too since o3d-secops.
     const missing = [...needed].filter((name) => !new RegExp(`(^|\\n)\\s*((export|readonly)\\s+)?${name}=`).test(source))
     assert.deepEqual(missing, [], `${label} sources the fence library but never assigns what it reads`)
-    // AND IT REALLY SOURCES IT, from its own directory rather than from an application path.
+    // AND IT REALLY SOURCES IT, from its own directory rather than from an application path — and from
+    // the PHYSICAL directory the running inode is in rather than through the pointer, which is what
+    // o3d-z5be r4 changed (Codex HIGH 1): plain `pwd` kept the symbolic link in the path, so every
+    // `source` re-traversed it and a concurrent publication could hand root another release's libraries.
     assert.match(
       source,
-      /IMS_SCRIPT_LIB_DIR="\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)" && pwd\)\/lib"/,
+      /IMS_SCRIPT_LIB_DIR="\$\(dirname -- "\$\{IMS_ENTRYPOINT_SELF\}"\)\/lib"/,
       `${label} must resolve the library beside itself, not under an application-writable directory`,
+    )
+    assert.match(
+      source,
+      /link="\$\(readlink -- "\/proc\/\$\$\/fd\/255" 2>\/dev\/null\)" \|\| link=""/,
+      `${label} must pin itself to the descriptor bash is reading it from`,
+    )
+    assert.doesNotMatch(
+      source,
+      /IMS_SCRIPT_LIB_DIR="\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)" && pwd\)\/lib"/,
+      `${label} must not resolve its library through the pointer on every source (o3d-z5be r4)`,
     )
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/db-fence-protected\.sh"/, `${label} must source it`)
     assert.match(source, /source "\$\{IMS_SCRIPT_LIB_DIR\}\/crontab-lock\.sh"/,
@@ -10602,7 +10626,14 @@ test('r34: an unpinned bootstrap out of an application-writable checkout is REFU
     assert.match(boot.output, /published WITH THE RELEASE/, 'where a first-ever install gets it')
     assert.match(boot.output, /--dry-run/, 'how the release host produces it')
     assert.match(boot.output, /fence_artefact_sha256=/, 'and where a host that already has it keeps it')
-    assert.match(boot.output, /bootstrap from a source only this account can write/, 'and the way out that needs no digest at all')
+    assert.match(boot.output, /bootstrap from a source nobody but root has ever written/, 'and the way out that needs no digest at all')
+    // o3d-z5be r6 (Codex HIGH 1): and that way out is fresh inodes, never a relabel of an existing tree.
+    // CASE-INSENSITIVE since r7 (review MEDIUM 1): one capital defeated the same check elsewhere.
+    assert.doesNotMatch(boot.output, /take group and other write off/i, 'the way out must not be a chown/chmod relabel')
+    // AND NOT VACUOUS (o3d-z5be r8, review LOW 8): the refusal really does carry a remedy in this output,
+    // so the absence above is about the WORDING of that remedy and not about an output that has none.
+    assert.match(boot.output, /fetch the release as root into a directory root has just created/,
+      `the refusal must still name the fresh-inode bootstrap:\n${boot.output}`)
 
     // THE CONTROL: the substitution is live, so what was refused was a real theft and not a
     // hypothetical one.
