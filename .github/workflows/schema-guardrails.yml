@@ -29,6 +29,15 @@ on:
       # them a change to the predicate could not reach the only job that runs that evidence.
       - "lib/connectors/shopping-webhook-retention.ts"
       - "lib/connectors/shopping-webhook-inbox.ts"
+      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
+      # account: the SQL that asks the database for the contradictions, and the two builders whose
+      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
+      # them a change to either side of that equality could not reach the only job that runs it.
+      - "lib/domain/accounting/reconciliation.ts"
+      - "lib/domain/accounting/accounting-event-builder.ts"
+      - "lib/domain/accounting/accounting-event-mirror.ts"
+      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      - "lib/domain/accounting/mirrored-sync-types.ts"
   push:
     branches:
       - main
@@ -59,6 +68,15 @@ on:
       # them a change to the predicate could not reach the only job that runs that evidence.
       - "lib/connectors/shopping-webhook-retention.ts"
       - "lib/connectors/shopping-webhook-inbox.ts"
+      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
+      # account: the SQL that asks the database for the contradictions, and the two builders whose
+      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
+      # them a change to either side of that equality could not reach the only job that runs it.
+      - "lib/domain/accounting/reconciliation.ts"
+      - "lib/domain/accounting/accounting-event-builder.ts"
+      - "lib/domain/accounting/accounting-event-mirror.ts"
+      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      - "lib/domain/accounting/mirrored-sync-types.ts"
 
 jobs:
   migration-scope:
@@ -182,7 +200,10 @@ jobs:
   # THE REST OF tests/db/, COUNTED RATHER THAN ASSERTED, because an earlier attempt at this comment
   # described the directory wrongly and the wrong sentence hid the defect it sat next to:
   #
-  #   * ONE file gates on a `RUN_DB_*` variable — the retention evidence above. It is set below now.
+  #   * TWO files gate on a `RUN_DB_*` variable, and it is the same one, set below: the retention
+  #     evidence above, and `reconciliation-void-mirror-contradictions`, which was written against a
+  #     `RUN_DB_MIGRATION_TESTS` pair that never reached development and was re-gated onto this pair
+  #     when it landed, so that it runs here instead of skipping green.
   #   * FOUR open a real connection whenever DATABASE_URL is set and skip only those tests when it
   #     is not (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
   #     `startup-option-verdict-across-bundles`). Their live probes run here, against this job's
@@ -190,8 +211,8 @@ jobs:
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
   #
-  # So this tier is NOT held back from `test:unit` as a block: 101 of its 122 tests execute there,
-  # and 21 skip. docs/development.md carries the same census per file, with the counts.
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 139 tests execute there,
+  # and 38 skip. docs/development.md carries the same census per file, with the counts.
   #
   # The lesson is not "count the files again": a prose census goes stale silently, and this one is
   # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
@@ -243,9 +264,9 @@ jobs:
   # nothing here reads that variable, and the live tests construct both of their endpoints themselves.
   #
   # SUPERUSER ON PURPOSE. The service's `POSTGRES_USER: postgres` is a superuser, which gives the
-  # connecting role CREATEDB and a route to the `postgres` maintenance database. Nothing in the tier
-  # needs that today; it is the shape a suite creating a scratch database will need, and taking it
-  # from the image costs nothing.
+  # connecting role CREATEDB and a route to the `postgres` maintenance database. The tier now needs
+  # both: the four locale tests in `tests/db/reconciliation-void-mirror-contradictions.test.ts`
+  # connect to `postgres`, CREATE an ICU `tr-TR` scratch database, migrate it and drop it.
   db-backed-regressions:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -291,8 +312,8 @@ jobs:
           fi
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
-      # tripwire for this job: if an edit ever drops the first, the suite refuses to load instead of
-      # skipping itself into a green run again. That covers THIS pair only. Nothing stops the NEXT
+      # tripwire for this job: if an edit ever drops the first, both suites gated on it refuse to
+      # load instead of skipping themselves into a green run again. That covers THIS pair only. Nothing stops the NEXT
       # gate arriving without either half — see the comment above the job, and o3d-dzsd.
       - name: Run the DB-backed regression suites
         env:

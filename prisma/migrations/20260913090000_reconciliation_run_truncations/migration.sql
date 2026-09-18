@@ -1,0 +1,34 @@
+-- o3d-11rf r5 (Codex r4, HIGH) — WHERE "THIS REPORT IS INCOMPLETE" IS ALLOWED TO LIVE.
+--
+-- THE DEFECT THIS CLOSES. Reconciliation reports incompleteness as a FINDING: a row-cap sentinel, and
+-- the void-mirror truncation warning that says how many contradictions did not fit. The run reader
+-- returns at most 500 findings per run. A run that truncates therefore emits 500 document findings
+-- and THEN the warning about them — 501 rows for a 500-row page — so the one row whose whole content
+-- is "the list you are reading is short" is the row most likely to be the one left out. What an
+-- operator then sees is a short list that is indistinguishable from a complete one.
+--
+-- WHY A COLUMN AND NOT AN ORDERING. The findings of a run are written by ONE `createMany`, inside one
+-- transaction, and `createdAt` defaults to CURRENT_TIMESTAMP — which in PostgreSQL is transaction
+-- start time. Every finding of a run therefore carries the SAME `createdAt`, and the reader's
+-- `ORDER BY "createdAt" ASC LIMIT 500` has nothing to order by: which 500 come back is whatever the
+-- plan emits. Prioritising the sentinel by ordering is not available without a priority column and an
+-- ORDER BY on it — a migration either way. So the fact is recorded on the RUN, where it is returned
+-- with the run row itself, to `includeFindings` readers and to the cheap list view that asks for no
+-- findings at all. A sentinel finding could never reach the second of those.
+--
+-- NULLABLE WITH NO DEFAULT, AND NULL IS "UNKNOWN", NOT "COMPLETE". Rows written before this column
+-- existed, and rows a predecessor binary writes while it is still serving across this deploy, are
+-- NULL — and NULL must not be read as "nothing was truncated", because nobody recorded that. A run
+-- whose completeness WAS recorded and had nothing to say carries `[]`. The distinction is the whole
+-- point of the column, so it is stated here and asserted in the suite.
+--
+-- AND THAT IS WHY THIS MIGRATION OWES NO verify.sql, unlike the migrations named in
+-- prisma/migrations/verification-required.txt. Those ask, after the fact, how many rows a deploy
+-- window could have left UNDECIDABLE — a predecessor binary writing NULL into them destroys a fact
+-- nothing can recover. Here a NULL is not a damaged row: it is an unreadable COMPLETENESS VERDICT
+-- about one reconciliation run, and the remedy needs no archaeology, because running reconciliation
+-- again on this build produces a run that records its own. Counting the NULLs a cutover left would
+-- therefore measure nothing that has to be repaired. (Same argument as this column's sibling,
+-- 20260912090000_accounting_event_void_basis, which says it for a column that can only ever grant a
+-- permission.)
+ALTER TABLE "accounting_reconciliation_runs" ADD COLUMN "truncations" JSONB;
