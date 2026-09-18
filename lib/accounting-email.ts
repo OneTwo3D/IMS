@@ -17,7 +17,12 @@ export async function sendAccountingInvoiceEmailInternal(orderId: string): Promi
     const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { id: true } })
     if (!so) return { success: false, error: 'Order not found' }
     const queued = await getAccountingInvoiceQueueData(orderId)
-    await queueEmail({
+    // o3d-alnk / o3d-8td2: this is the INVOICE_EMAIL effect of xero/accounting.post, which
+    // multiplexes every AccountingSyncType and is `unsafe-to-replay` partly BECAUSE this
+    // enqueue had no uniqueness of any kind — a replayed outbox row simply inserted a second
+    // invoice email. `email_outbox_undelivered_reference_uq` now refuses the second row while
+    // the first is still undelivered, and that refusal arrives here as `already_queued`.
+    const outcome = await queueEmail({
       kind: 'ACCOUNTING_INVOICE',
       to: queued.to,
       subject: queued.subject,
@@ -28,7 +33,9 @@ export async function sendAccountingInvoiceEmailInternal(orderId: string): Promi
 
     await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_email_queued', tag: 'sales', level: 'INFO',
-      description: `Queued invoice ${queued.reference}`,
+      description: outcome.queued
+        ? `Queued invoice ${queued.reference}`
+        : `Invoice ${queued.reference} was already queued and undelivered — not duplicated`,
       resolveUser: false,
     })
 
