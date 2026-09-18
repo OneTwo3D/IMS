@@ -6,7 +6,6 @@ import {
   accountingDocumentRevisionFamily,
   ASSUMED_REVISION_ORDER_TAKEOVER_ACTION,
   isDocumentRevisionAccountingSyncType,
-  isMirrorableAccountingSyncType,
 } from './accounting-event-mirror'
 // Read from the LEAF module rather than from accounting-event-mirror's re-export, for the reason
 // that module's own header gives: a great many suites replace accounting-event-mirror wholesale with
@@ -28,6 +27,14 @@ import { isOperatorAssertedSettlement } from './sync-row-settlement'
  * answers to different questions that happen to overlap.
  */
 const MIRROR_CONTRADICTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
+/**
+ * o3d-bnp6 — THE SYNC-LOG POPULATION RECONCILIATION READS, spelled once. Work still owed is read at ANY
+ * age, because a row stuck since before the lookback is exactly the one worth finding; finished work
+ * (SYNCED/FAILED) is read inside the lookback only. Both the general page and the dedicated
+ * unmirrored-row question take their statuses from here, so the two cannot come to mean different rows.
+ */
+const SYNC_LOG_WORK_OWED_STATUSES = ['PENDING', 'PROCESSING'] as const
+const SYNC_LOG_WINDOWED_STATUSES = ['SYNCED', 'FAILED'] as const
 
 /**
  * o3d-11rf r10 (Codex r10, HIGH) — EVERY CHARACTER `String.prototype.trim` STRIPS, AND ONLY THOSE.
@@ -382,6 +389,31 @@ export type VoidMirrorContradictions = {
   total: number
 }
 
+/**
+ * o3d-bnp6 — ONE SYNC ROW OF A MIRRORED TYPE THAT NO ACCOUNTING EVENT MIRRORS, as the database found it.
+ *
+ * "Mirrors" is the existence test `old_sync_log_without_mirrored_event` always used: an event of any
+ * status whose (externalSystem, type, sourceEntityType, sourceEntityId) is this row's (connector,
+ * type, referenceType, referenceId). It is now asked of the whole `accounting_events` table rather
+ * than of a 10,000-row page of it.
+ */
+type UnmirroredSyncLogRow = {
+  syncLogId: string
+  connector: string
+  type: string
+  status: string
+  referenceType: string
+  referenceId: string
+  createdAt: Date | string
+}
+
+export type UnmirroredSyncLogs = {
+  /** The bounded page — at most `MAX_UNMIRRORED_SYNC_LOGS` rows, OLDEST first. */
+  rows: UnmirroredSyncLogRow[]
+  /** How many such rows EXIST, counted by the same statement over the same snapshot. */
+  total: number
+}
+
 export type AccountingReconciliationRows = {
   salesOrders: SourceOrderRow[]
   shipments: SourceShipmentRow[]
@@ -405,16 +437,29 @@ export type AccountingReconciliationRows = {
    * contradictions, and `collectAccountingReconciliationRows` always provides it.
    */
   voidMirrorContradictions?: VoidMirrorContradictions
+  /**
+   * o3d-bnp6 — the sync rows no accounting event mirrors, ALREADY FILTERED BY THE DATABASE over the
+   * whole of both tables. Not something for this file to work out from `syncLogs` and
+   * `accountingEvents`: those are 10,000-row pages, and the sync-log page is newest-first, so the old
+   * rows this check exists for were the first to fall off it. See `collectUnmirroredSyncLogs`.
+   *
+   * Optional for the same reason as `voidMirrorContradictions`, and absent means NOT READ: the
+   * evaluator then reports nothing for this check rather than re-deriving it from the pages, because
+   * a fallback to the pages would be the defect this replaced, silently back for any caller that
+   * forgot the dataset.
+   */
+  unmirroredSyncLogs?: UnmirroredSyncLogs
 }
 
 type AccountingReconciliationClient = {
   /**
    * o3d-11rf r4 (Codex r4, HIGH) — REQUIRED, not optional, and deliberately so.
    *
-   * The unclassified-VOID contradictions are the one dataset here that CANNOT be assembled from the
-   * capped per-table pages below (see `collectVoidMirrorContradictions` for why). A client that did
-   * not offer this would silently produce a report with that check missing, which is the same defect
-   * one level up. Making it required means a caller has to say out loud that it cannot answer.
+   * The unclassified-VOID contradictions, and since o3d-bnp6 the sync rows no event mirrors, are the
+   * datasets here that CANNOT be assembled from the capped per-table pages below (see
+   * `collectVoidMirrorContradictions` and `collectUnmirroredSyncLogs` for why). A client that did
+   * not offer this would silently produce a report with those checks missing, which is the same
+   * defect one level up. Making it required means a caller has to say out loud that it cannot answer.
    */
   $queryRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<unknown[]>
   salesOrder: {
@@ -506,17 +551,20 @@ export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
  * migration either way, the honest place for the fact is the RUN — where it is returned with the run
  * row, including to the cheap list view that asks for no findings at all.
  *
- * A REGISTRY, AND THE PRODUCERS SPELL THEIR CODE FROM IT. Both `addRowCapFindings` and
- * `addUnclassifiedVoidMirrorFindings` take their `code` from these constants, so the string at the
- * push site IS the entry here and the two cannot drift apart. A NEW sentinel still has to be added
+ * A REGISTRY, AND THE PRODUCERS SPELL THEIR CODE FROM IT. `addRowCapFindings`,
+ * `addUnclassifiedVoidMirrorFindings` and `addUnmirroredSyncLogFindings` take their `code` from these
+ * constants, so the string at the push site IS the entry here and the two cannot drift apart. A NEW sentinel still has to be added
  * by hand — no mechanism enforces that — which is why this note names the property to look for:
  * a finding that describes the completeness of the report rather than a defect in the data.
  */
 export const RECONCILIATION_ROW_CAP_REACHED = 'reconciliation_row_cap_reached'
 export const VOID_MIRROR_CONTRADICTIONS_TRUNCATED = 'void_mirror_basis_unknown_contradictions_truncated'
+/** o3d-bnp6: more sync rows without a mirrored event exist than the report lists. See addUnmirroredSyncLogFindings. */
+export const UNMIRRORED_SYNC_LOGS_TRUNCATED = 'old_sync_log_without_mirrored_event_truncated'
 export const RECONCILIATION_TRUNCATION_FINDING_CODES: ReadonlySet<string> = new Set([
   RECONCILIATION_ROW_CAP_REACHED,
   VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+  UNMIRRORED_SYNC_LOGS_TRUNCATED,
 ])
 
 /** One truncation sentinel, lifted onto the run row. Carries the message so it needs no re-rendering. */
@@ -620,6 +668,14 @@ const MAX_RECONCILIATION_ROWS = 10_000
  * ever post is a decision about whatever is producing unrecorded voids, not 500 individual judgements.
  */
 export const MAX_VOID_MIRROR_CONTRADICTIONS = MAX_RECONCILIATION_FINDINGS_PER_RUN
+/**
+ * o3d-bnp6 — THE BOUND ON THE UNMIRRORED-SYNC-ROW QUESTION, for the reason MAX_VOID_MIRROR_CONTRADICTIONS
+ * gives: it bounds a set that is ALREADY only findings, so the question is how many a person can be
+ * shown, and past the number the run view renders at all an extra row is written and never read. What
+ * lies beyond it is reported as an exact COUNT (`UNMIRRORED_SYNC_LOGS_TRUNCATED`), and lifted onto the
+ * run's `truncations` so a short list cannot read as a complete one.
+ */
+export const MAX_UNMIRRORED_SYNC_LOGS = MAX_RECONCILIATION_FINDINGS_PER_RUN
 // Refunded orders are picked up by the refundStatus OR-branch in the source query;
 // this set is now purely terminal lifecycle statuses.
 const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
@@ -1213,28 +1269,10 @@ export function evaluateAccountingReconciliationRows(
     if (log.type === 'COGS_REVERSAL' && log.referenceType === 'Shipment') {
       sourceKeys.add(sourceKey(log.type, log.referenceType, log.referenceId))
     }
-    if (!isMirrorableAccountingSyncType(log.type)) continue
-    if (hasAccountingEvent(rows.accountingEvents, {
-      externalSystem: log.connector,
-      type: log.type,
-      sourceEntityType: log.referenceType,
-      sourceEntityId: log.referenceId,
-    })) continue
-
-    findings.push({
-      severity: 'warning',
-      code: 'old_sync_log_without_mirrored_event',
-      syncLogId: log.id,
-      message: `Accounting sync log ${log.id} has no mirrored accounting event`,
-      details: {
-        connector: log.connector,
-        type: log.type,
-        status: log.status,
-        referenceType: log.referenceType,
-        referenceId: log.referenceId,
-      },
-    })
   }
+  // o3d-bnp6: `old_sync_log_without_mirrored_event` is no longer worked out here from the two pages.
+  // It is asked of the database; see addUnmirroredSyncLogFindings and collectUnmirroredSyncLogs.
+  addUnmirroredSyncLogFindings(findings, rows)
 
   for (const event of rows.accountingEvents) {
     if (event.status === 'POSTED' && !event.externalId?.trim()) {
@@ -1360,6 +1398,69 @@ export function evaluateAccountingReconciliationRows(
   addUnclassifiedVoidMirrorFindings(findings, rows)
 
   return findings
+}
+
+/**
+ * o3d-bnp6 (P1) — `old_sync_log_without_mirrored_event`, FROM A QUESTION RATHER THAN A PAGE.
+ *
+ * WHAT WAS WRONG, and it is o3d-11rf r4's defect one check over. This loop used to walk `rows.syncLogs`
+ * and look each row up in `rows.accountingEvents`. Both are 10,000-row pages taken BEFORE the
+ * question: the sync-log page is `createdAt DESC`, and it reads PENDING/PROCESSING rows at ANY age
+ * precisely so that work owed from before the lookback is still checked — so on a busy tenant those
+ * old rows were the first to fall off, and the check named for OLD rows discarded them first. The
+ * event page failed the other way: a row whose mirrored event had fallen off THAT page (a POSTED
+ * event from before the lookback, or one of more than 10,000 recent events) was reported as having
+ * no event at all. Measured on a scratch database before the fix: with 10,001 mirrored recent rows
+ * and one 200-day-old PENDING row, the old code reported a recent row that HAS its event and did not
+ * report the old one. `reconciliation_row_cap_reached` said "syncLogs" and named neither.
+ *
+ * WHAT IT DOES NOW. `collectUnmirroredSyncLogs` asks PostgreSQL for the rows over both whole tables,
+ * filters first, and bounds afterwards, oldest first. Nothing here re-applies the rule to what comes
+ * back — a second filter would hide a predicate that had widened in the statement — so the rule is
+ * proved where it lives, in tests/db/reconciliation-unmirrored-sync-logs.test.ts.
+ *
+ * ABSENT MEANS NOT READ. A fixture or caller that does not supply the dataset gets no finding for
+ * this check, never one worked out from the pages.
+ */
+function addUnmirroredSyncLogFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  const unmirrored = rows.unmirroredSyncLogs
+  if (!unmirrored) return
+
+  for (const log of unmirrored.rows) {
+    findings.push({
+      severity: 'warning',
+      code: 'old_sync_log_without_mirrored_event',
+      syncLogId: log.syncLogId,
+      message: `Accounting sync log ${log.syncLogId} has no mirrored accounting event`,
+      details: {
+        connector: log.connector,
+        type: log.type,
+        status: log.status,
+        referenceType: log.referenceType,
+        referenceId: log.referenceId,
+      },
+    })
+  }
+
+  // THE BOUND, SAID OUT LOUD, with the exact count the same statement took. The copy that no
+  // findings page can drop is the one `reconciliationTruncations` lifts onto the run.
+  if (unmirrored.total > unmirrored.rows.length) {
+    findings.push({
+      severity: 'warning',
+      code: UNMIRRORED_SYNC_LOGS_TRUNCATED,
+      message:
+        `${unmirrored.total} accounting sync logs have no mirrored accounting event; only the oldest `
+        + `${unmirrored.rows.length} are listed. The rest are not in this report`,
+      details: {
+        reported: unmirrored.rows.length,
+        total: unmirrored.total,
+        limit: MAX_UNMIRRORED_SYNC_LOGS,
+      },
+    })
+  }
 }
 
 /**
@@ -1769,6 +1870,96 @@ async function collectVoidMirrorContradictions(
   }
 }
 
+/**
+ * o3d-bnp6 (P1) — THE SYNC ROWS NO ACCOUNTING EVENT MIRRORS, ASKED FOR RATHER THAN SIFTED OUT.
+ *
+ * THE POPULATION is the general sync-log page's, exactly: work owed (PENDING/PROCESSING) at any age,
+ * finished work (SYNCED/FAILED) inside the lookback — both status sets from the constants that page
+ * uses too — narrowed to MIRRORED_ACCOUNTING_SYNC_TYPES, the only types that have a mirror to miss.
+ *
+ * THE QUESTION is the existence test the check always asked, over the WHOLE events table: is there an
+ * event, in ANY status, whose (externalSystem, type, sourceEntityType, sourceEntityId) is this row's
+ * (connector, type, referenceType, referenceId)? An event with a NULL or different externalSystem
+ * does not count, as it did not before. `NOT EXISTS` is probed through
+ * accounting_events(sourceEntityType, sourceEntityId), so each candidate row is an index lookup.
+ *
+ * MEASURED, not assumed (PostgreSQL 17, EXPLAIN ANALYZE on a scratch database). The plan is a
+ * sequential scan of the candidate sync rows feeding a Nested Loop Anti Join that probes that index
+ * once per candidate: 42 ms at 22,200 sync rows / 20,000 events, 202 ms at 222,000 / 200,000, and
+ * 1.23 s at 1,110,000 / 1,000,000 (1,010,000 index probes). Linear, once per reconciliation run, and
+ * it has to be: the question is asked of every candidate row, which is the point. No index is added.
+ *
+ * FILTER, THEN ORDER, THEN BOUND. The bound is applied only to rows that are already findings, so no
+ * volume of healthy rows can push a finding out. The page it keeps is the OLDEST: those are the rows
+ * the old newest-first page threw away first, and the rows most likely to be work nobody will ever
+ * do. `id` breaks ties so the same 500 come back every run.
+ *
+ * THE COUNT IS FROM THE SAME STATEMENT, as in collectVoidMirrorContradictions: `count(*) OVER ()` is
+ * taken over the filtered set before LIMIT, so the total the truncation finding names is exact and is
+ * a fact about the same snapshot as the page.
+ *
+ * THE LOOKBACK IS PASSED AS TEXT AND CONVERTED HERE, because `createdAt` is a `timestamp` holding UTC
+ * wall-clock time (Prisma's DateTime convention) and the parameter must mean the same instant the
+ * page's own `createdAt >= fromDate` means. An ISO string ending in `Z` is unambiguous as a
+ * `timestamptz`, and `AT TIME ZONE 'UTC'` turns it into that wall-clock time whatever the session's
+ * TimeZone is. The DB suite pins this against the page's own selection at the boundary.
+ */
+async function collectUnmirroredSyncLogs(
+  client: AccountingReconciliationClient,
+  fromDate: Date,
+): Promise<UnmirroredSyncLogs> {
+  const rows = (await client.$queryRaw`
+    WITH unmirrored AS (
+      SELECT
+        l."id"            AS "syncLogId",
+        l."connector"     AS "connector",
+        l."type"::text    AS "type",
+        l."status"::text  AS "status",
+        l."referenceType" AS "referenceType",
+        l."referenceId"   AS "referenceId",
+        l."createdAt"     AS "createdAt"
+      FROM "accounting_sync_logs" l
+      WHERE l."type"::text = ANY(${[...MIRRORED_ACCOUNTING_SYNC_TYPES]}::text[])
+        AND (
+          l."status"::text = ANY(${[...SYNC_LOG_WORK_OWED_STATUSES]}::text[])
+          OR (
+            l."status"::text = ANY(${[...SYNC_LOG_WINDOWED_STATUSES]}::text[])
+            AND l."createdAt" >= (${fromDate.toISOString()}::timestamptz AT TIME ZONE 'UTC')
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "accounting_events" e
+          WHERE e."sourceEntityType" = l."referenceType"
+            AND e."sourceEntityId"   = l."referenceId"
+            AND e."type"             = l."type"::text
+            AND e."externalSystem"   = l."connector"
+        )
+    )
+    SELECT
+      "syncLogId", "connector", "type", "status", "referenceType", "referenceId", "createdAt",
+      (count(*) OVER ())::int AS "totalUnmirrored"
+    FROM unmirrored
+    ORDER BY "createdAt" ASC, "syncLogId" ASC
+    LIMIT ${MAX_UNMIRRORED_SYNC_LOGS}
+  `) as Array<UnmirroredSyncLogRow & { totalUnmirrored: number }>
+
+  return {
+    // Named field by field so the window count cannot ride into a finding's details.
+    rows: rows.map((row) => ({
+      syncLogId: row.syncLogId,
+      connector: row.connector,
+      type: row.type,
+      status: row.status,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      createdAt: row.createdAt,
+    })),
+    // Zero rows means zero unmirrored rows: the window count only exists where a row does.
+    total: rows[0]?.totalUnmirrored ?? 0,
+  }
+}
+
 export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
   options: { lookbackDays?: number; toDate?: Date } = {},
@@ -1778,7 +1969,8 @@ export async function collectAccountingReconciliationRows(
     options.toDate,
   )
   const [
-    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, unmirroredSyncLogs,
+    voidMirrorContradictions,
   ] = await Promise.all([
     client.salesOrder.findMany({
       where: {
@@ -1838,9 +2030,10 @@ export async function collectAccountingReconciliationRows(
     }),
     client.accountingSyncLog.findMany({
       where: {
+        // o3d-bnp6: the same two sets collectUnmirroredSyncLogs reads, spelled once.
         OR: [
-          { status: { in: ['PENDING', 'PROCESSING'] } },
-          { status: { in: ['SYNCED', 'FAILED'] }, createdAt: { gte: fromDate } },
+          { status: { in: [...SYNC_LOG_WORK_OWED_STATUSES] } },
+          { status: { in: [...SYNC_LOG_WINDOWED_STATUSES] }, createdAt: { gte: fromDate } },
         ],
       },
       orderBy: { createdAt: 'desc' },
@@ -1909,14 +2102,18 @@ export async function collectAccountingReconciliationRows(
         createdAt: true,
       },
     }),
-    // o3d-11rf r4: the ONE dataset here that is not a capped page of a table. It is asked as the
-    // question it answers — see collectVoidMirrorContradictions — because a page taken before the
-    // filter drops exactly the rows this check exists to find.
+    // o3d-bnp6: asked as the question it answers, like the void mirrors below, because the two pages
+    // above drop exactly the rows it exists to find. See collectUnmirroredSyncLogs.
+    collectUnmirroredSyncLogs(client, fromDate),
+    // o3d-11rf r4: not a capped page of a table either. It is asked as the question it answers — see
+    // collectVoidMirrorContradictions — because a page taken before the filter drops exactly the rows
+    // this check exists to find.
     collectVoidMirrorContradictions(client),
   ])
 
   return {
-    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, voidMirrorContradictions,
+    salesOrders, shipments, refunds, syncLogs, accountingEvents, revisionClaimLogs, unmirroredSyncLogs,
+    voidMirrorContradictions,
   }
 }
 

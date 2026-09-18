@@ -1372,9 +1372,14 @@ async function captureStatement() {
     accountingSyncLog: { async findMany() { return [] } },
     accountingEvent: { async findMany() { return [] } },
     accountingEventLog: { async findMany() { return [] } },
+    // o3d-bnp6: the report issues more than one raw statement now, so this keeps the one that
+    // DEFINES the contradiction CTE rather than whichever happened to be called last.
     async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
-      captured.strings = strings
-      captured.values = values
+      if (/\bcontradiction AS \(/.test(strings.join('?'))) {
+        assert.equal(captured.strings, undefined, 'the contradiction query is issued once')
+        captured.strings = strings
+        captured.values = values
+      }
       return []
     },
   }
