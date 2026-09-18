@@ -50,6 +50,9 @@ const REPO = process.cwd()
 const LIB_REL = 'scripts/lib/privileged-helpers.sh'
 const LIB_SOURCE = readFileSync(join(REPO, LIB_REL), 'utf8')
 const FENCE_LIB_REL = 'scripts/lib/db-fence-protected.sh'
+/** Every library the three entrypoints `source`. Asserted against their text, so a new one is a decision. */
+const SOURCED_LIBS = ['scripts/lib/db-fence-protected.sh', 'scripts/lib/crontab-lock.sh', 'scripts/lib/cutover-namespace.sh',
+  'scripts/lib/unit-environment.sh', 'scripts/lib/privileged-helpers.sh']
 
 const ENTRYPOINTS = ['scripts/install.sh', 'scripts/update.sh', 'scripts/deploy.sh'] as const
 const ENTRYPOINT_SOURCE = new Map<string, string>(
@@ -2497,31 +2500,115 @@ function shellCommands(line: string): string[][] {
     // `runuser -u imsapp -- npm ci` passed because NOTHING was read — an adjacent property in the very
     // test that claims payloads are read. The options are skipped and the rest is the payload.
     if (name === 'su' || name === 'sudo' || name === 'runuser') {
-      let k = 0
-      let separated = false
-      let named = false
-      while (k < args.length) {
-        const a = args[k]
-        if (a === '--') { k += 1; separated = true; break }
-        if (a === '-') { k += 1; continue }
-        if (/^--[A-Za-z-]+=/.test(a)) { k += 1; continue }
-        if (/^-[A-Za-z-]/.test(a)) {
-          const takesValue = ['-u', '-g', '-G', '-s', '--user', '--group', '--shell'].includes(a)
-          if (takesValue && ['-u', '--user'].includes(a)) named = true
-          k += takesValue ? 2 : 1
-          continue
-        }
-        break
-      }
-      let payload = args.slice(k)
-      // `su`/`runuser` take the account as an operand unless `-u` named it; `sudo` does not.
-      if (!separated && !named && (name === 'su' || name === 'runuser')) payload = payload.slice(1)
-      if (payload[0] === '--') payload = payload.slice(1)
+      const payload = runnerPayload(name, args)
       // `su imsapp -c …` is handled above; `su imsapp` alone runs a login shell, which is not a payload.
       if (payload.length > 1 || (payload.length === 1 && /[/]/.test(payload[0]))) commands.push(payload)
     }
   }
   return commands
+}
+
+/** What `su`/`sudo`/`runuser` run, with their own options (and the account operand) skipped. Empty
+ *  means a shell reading standard input. Redirection words are not operands. */
+function runnerPayload(name: string, rawArgs: string[]): string[] {
+  const args = rawArgs.filter((a) => !/^[0-9]*[<>]/.test(a))
+  let k = 0
+  let separated = false
+  let named = false
+  while (k < args.length) {
+    const a = args[k]
+    if (a === '--') { k += 1; separated = true; break }
+    if (a === '-') { k += 1; continue }
+    if (/^--[A-Za-z-]+=/.test(a)) { k += 1; continue }
+    if (/^-[A-Za-z-]/.test(a)) {
+      const takesValue = ['-u', '-g', '-G', '-s', '--user', '--group', '--shell'].includes(a)
+      if (takesValue && ['-u', '--user'].includes(a)) named = true
+      k += takesValue ? 2 : 1
+      continue
+    }
+    break
+  }
+  let payload = args.slice(k)
+  // `su`/`runuser` take the account as an operand unless `-u` named it; `sudo` does not.
+  if (!separated && !named && (name === 'su' || name === 'runuser')) payload = payload.slice(1)
+  if (payload[0] === '--') payload = payload.slice(1)
+  return payload
+}
+
+/**
+ * The here-documents a logical line opens, IN ORDER, found by SCANNING rather than by a regex (o3d-z5be
+ * r10, review M2). r9's regex found `<<WORD` anywhere, so `warn "… bash install.sh <<EOF"` (a message),
+ * `$(( 1 << BITS ))` (arithmetic), `<<<'text'` (a here-string) and `<<END-OF` (a delimiter with a dash,
+ * read as `END`) each swallowed every line up to the next matching one — a chown hidden for 58 lines was
+ * demonstrated. Quotes, backslashes, comments, `(( … ))` and `<<<` are skipped; the delimiter word
+ * follows bash: quoting and backslashes are removed from it (`<<'EOF'`, `<<"EOF"`, `<<\EOF`), and it
+ * ends at a blank or an operator character.
+ */
+function heredocDelimiters(line: string): Array<{ word: string; strip: boolean }> {
+  const out: Array<{ word: string; strip: boolean }> = []
+  let i = 0
+  while (i < line.length) {
+    const c = line[i]
+    if (c === '\\') { i += 2; continue }
+    if (c === "'") { const close = line.indexOf("'", i + 1); i = close === -1 ? line.length : close + 1; continue }
+    if (c === '"') {
+      i += 1
+      while (i < line.length && line[i] !== '"') i += line[i] === '\\' ? 2 : 1
+      i += 1
+      continue
+    }
+    if (c === '#' && (i === 0 || /[\s;&|(]/.test(line[i - 1]))) break
+    if (c === '(' && line[i + 1] === '(') {
+      let depth = 0
+      while (i < line.length) {
+        if (line[i] === '(') depth += 1
+        else if (line[i] === ')') { depth -= 1; if (depth === 0) { i += 1; break } }
+        i += 1
+      }
+      continue
+    }
+    if (c === '<' && line[i + 1] === '<') {
+      if (line[i + 2] === '<') { i += 3; continue }
+      i += 2
+      let strip = false
+      if (line[i] === '-') { strip = true; i += 1 }
+      while (line[i] === ' ' || line[i] === '\t') i += 1
+      let word = ''
+      while (i < line.length && !/[\s;|&<>()]/.test(line[i])) {
+        if (line[i] === '\\') { word += line[i + 1] ?? ''; i += 2; continue }
+        if (line[i] === "'" || line[i] === '"') {
+          const q = line[i]
+          const close = line.indexOf(q, i + 1)
+          word += line.slice(i + 1, close === -1 ? line.length : close)
+          i = close === -1 ? line.length : close + 1
+          continue
+        }
+        word += line[i]; i += 1
+      }
+      if (word) out.push({ word, strip })
+      continue
+    }
+    i += 1
+  }
+  return out
+}
+
+/** Is a here-document on this line FED TO A SHELL, so that its body is code (review M1)? `bash <<'EOF'`,
+ *  `bash -s -- a b <<EOF`, `runuser -u root -- bash <<EOF`, `su root <<EOF` (a login shell reading its
+ *  standard input), `source /dev/stdin <<EOF`. It over-approximates toward CODE: a false yes costs a
+ *  census row that must be explained, a false no hides a statement. */
+const SHELLS = new Set(['sh', 'bash', 'dash', 'ksh', 'zsh', 'busybox'])
+function feedsShell(text: string): boolean {
+  const readsStdin = (words: string[]): boolean => {
+    const { name, args } = commandName(words.filter((w) => !/^[0-9]*[<>]/.test(w)))
+    if (SHELLS.has(name) && !args.some((a) => /^-[A-Za-z]*c[A-Za-z]*$/.test(a))) return true
+    if (name === 'su' || name === 'sudo' || name === 'runuser') {
+      const payload = runnerPayload(name, args)
+      return payload.length === 0 || readsStdin(payload)
+    }
+    return (name === 'source' || name === '.') && args.some((a) => /^\/dev\/(stdin|fd\/0)$/.test(a))
+  }
+  return shellCommands(text).some(readsStdin)
 }
 
 /** The span starting at `line[at]` — a double-quoted string, a backtick, or `$( … )` — with its nested
@@ -2605,13 +2692,26 @@ const SHELL_RUNNERS = new Set(['sh', 'bash', 'ksh', 'zsh', 'dash', 'su', 'sudo',
  *             these files today. It is counted, so a new one has to be accounted for, but it does not
  *             make its enclosing function tree-wide: moving one file is not a tree operation.
  */
-function treeWide(words: string[], extra: ReadonlySet<string>, aliases: ReadonlyMap<string, string> = new Map()):
+function treeWide(words: string[], extra: ReadonlySet<string>, aliases: ReadonlyMap<string, string> = new Map(),
+  wrappers: ReadonlyMap<string, Wrapper> = new Map(), depth = 0):
   { name: string; kind: 'certain' | 'possible' } | null {
   const { name: raw, args } = commandName(words)
   if (!raw) return null
   const alias = aliases.get(raw.replace(/^[$]\{?/, '').replace(/\}$/, ''))
   const name = /^[$]/.test(raw) && alias ? alias : raw
   if (extra.has(name)) return { name: `${name} (a function in this file that does one)`, kind: 'certain' }
+  const wrapper = wrappers.get(name)
+  if (wrapper && depth < 4) {
+    const passed = args.slice(wrapper.skip).map((w) => `'${w.replace(/'/g, "'\\''")}'`).join(' ')
+    const expanded = wrapper.body.replace(/"\$\{?@\}?"/g, () => passed)
+    for (const line of logicalLines(expanded)) {
+      for (const inner of shellCommands(line.text)) {
+        const hit = treeWide(inner, extra, aliases, wrappers, depth + 1)
+        if (hit) return { name: `${name} → ${hit.name}`, kind: hit.kind }
+      }
+    }
+    return null
+  }
   const certain = (n: string) => ({ name: n, kind: 'certain' as const })
   switch (name) {
     case 'chown': case 'chmod': case 'chgrp':
@@ -2678,12 +2778,12 @@ function functionBody(text: string): string {
  *  `NAME {` is NOT one (it runs a command called NAME with an argument `{`), so it is not accepted. */
 const DEFINITION_HEAD = String.raw`\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?|([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\))`
 
-/** Physical lines joined on backslash-continuations, keeping the number of the FIRST line: a matcher
- *  that reads one physical line at a time cannot see `chown \` + `  -R …` (review MEDIUM 1). HEREDOC
- *  BODIES ARE SKIPPED (review LOW 7): they are data, and r8 tokenised them as code, so a document that
- *  quoted a `chown -R` produced a census row for a statement that does not exist. */
-function logicalLines(source: string): Array<{ n: number; text: string }> {
-  const out: Array<{ n: number; text: string }> = []
+/** Physical lines joined on backslash-continuations, keeping the number of the FIRST line (`n`) and the
+ *  LAST (`last`): a matcher that reads one physical line at a time cannot see `chown \` + `  -R …`
+ *  (review MEDIUM 1). A HERE-DOCUMENT BODY is skipped when it is data (r9, LOW 7) and READ AS CODE when
+ *  it is fed to a shell (r10, review M1 — r9 skipped both, so `bash <<'EOF'` hid its whole body). */
+function logicalLines(source: string): Array<{ n: number; last: number; text: string }> {
+  const out: Array<{ n: number; last: number; text: string }> = []
   const lines = source.split('\n')
   for (let i = 0; i < lines.length; i += 1) {
     if (/^\s*#/.test(lines[i]) || lines[i].trim() === '') continue
@@ -2693,11 +2793,12 @@ function logicalLines(source: string): Array<{ n: number; text: string }> {
       i += 1
       text = `${text.replace(/\\$/, ' ')}${lines[i]}`
     }
-    out.push({ n, text })
-    const heredoc = /<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?/.exec(text)
-    if (heredoc) {
-      const terminator = new RegExp(`^\\s*${heredoc[1]}\\s*$`)
-      while (i + 1 < lines.length && !terminator.test(lines[i + 1])) i += 1
+    out.push({ n, last: i + 1, text })
+    const documents = heredocDelimiters(text)
+    if (documents.length === 0 || feedsShell(text)) continue
+    for (const doc of documents) {
+      const ends = (line: string) => (doc.strip ? line.replace(/^\t+/, '') : line) === doc.word
+      while (i + 1 < lines.length && !ends(lines[i + 1])) i += 1
       i += 1
     }
   }
@@ -2706,7 +2807,7 @@ function logicalLines(source: string): Array<{ n: number; text: string }> {
 
 /** Functions defined in this file whose body runs a tree-wide command, to a fixpoint, so that a call to
  *  a local helper that chowns is itself tree-wide (review MEDIUM 4's `fix_ownership`). */
-function treeWideFunctions(source: string): Set<string> {
+function functionBodies(source: string): Map<string, string[]> {
   const lines = source.split('\n')
   const bodies = new Map<string, string[]>()
   let current: string | null = null
@@ -2737,6 +2838,41 @@ function treeWideFunctions(source: string): Set<string> {
       if (/^\}/.test(raw)) { depth -= 1; if (depth === 0) current = null }
     }
   }
+  return bodies
+}
+
+/**
+ * PASS-THROUGH WRAPPERS (o3d-z5be r10, review H1): same-file functions that EXECUTE their arguments —
+ * `run() { … "$@"; }` (update.sh 12 call sites, deploy.sh 5), `capture VAR cmd …`, `run_as_user USER
+ * cmd …`, `as_app_user cmd …`. `run chown -R …` was invisible because the command name is `run`. A
+ * wrapper is a function whose body mentions `"$@"`/`"${@}"`; the operands it `shift`s away first are
+ * its fixed leading operands; a call is read by substituting the rest of its words for `"$@"` in the
+ * body and reading THAT as shell — so `run_as_user root chown …` reaches `runuser -u root -- chown …`.
+ */
+type Wrapper = { skip: number; body: string }
+function passThroughWrappers(source: string): Map<string, Wrapper> {
+  const wrappers = new Map<string, Wrapper>()
+  for (const [name, body] of functionBodies(source)) {
+    const at = body.findIndex((line) => !/^\s*#/.test(line) && /"\$\{?@\}?"/.test(line))
+    if (at === -1) continue
+    let skip = 0
+    for (const line of body.slice(0, at)) {
+      if (/^\s*#/.test(line)) continue
+      for (const m of line.matchAll(/(?:^|[\s;])shift(?:\s+([0-9]+))?(?=\s|;|$)/g)) skip += Number(m[1] ?? 1)
+    }
+    wrappers.set(name, { skip, body: body.join('\n') })
+  }
+  return wrappers
+}
+
+/** Everything the classifier needs to know about one file. */
+function censusContext(source: string) {
+  const wrappers = passThroughWrappers(source)
+  return { wrappers, functions: treeWideFunctions(source, wrappers), aliases: commandAliases(source) }
+}
+
+function treeWideFunctions(source: string, wrappers: ReadonlyMap<string, Wrapper> = new Map()): Set<string> {
+  const bodies = functionBodies(source)
   const found = new Set<string>()
   for (let pass = 0; pass < 5; pass += 1) {
     const before = found.size
@@ -2744,7 +2880,7 @@ function treeWideFunctions(source: string): Set<string> {
       if (found.has(name)) continue
       const text = body.filter((l) => !/^\s*#/.test(l)).join('\n')
       for (const line of logicalLines(text)) {
-        if (shellCommands(line.text).some((words) => treeWide(words, found)?.kind === 'certain')) { found.add(name); break }
+        if (shellCommands(line.text).some((words) => treeWide(words, found, new Map(), wrappers)?.kind === 'certain')) { found.add(name); break }
       }
     }
     if (found.size === before) break
@@ -2752,19 +2888,76 @@ function treeWideFunctions(source: string): Set<string> {
   return found
 }
 
-test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or delete the entrypoints make is accounted for, guarded, and its refusal ends the run', () => {
-  // WHAT THIS IS AND IS NOT (o3d-z5be r8, review HIGH 1/2). It is a REGRESSION NET over the shapes the
-  // tokeniser above can classify. WHAT CARRIES THE PROPERTY is the guard made immediately before each
-  // such statement, in all three entrypoints; this test is what keeps those guards in place and fails on
-  // a new statement until somebody decides which row it is.
+/**
+ * THE LEXICAL BACKSTOP (o3d-z5be r10). Nine rounds each found a shape the tokeniser could not read, so the
+ * census is no longer asked to be complete. This asks a question syntax cannot evade: does a line SPELL a
+ * privileged command word at all? Every physical line of the entrypoints and the libraries they source —
+ * heredoc bodies, strings and continuation lines included; only lines whose first non-blank character is
+ * `#` are exempt — that does must be part of a census row or an EXACT entry in the reviewed allowlist.
+ *
+ * The words are whole words: `.` and `_` join a word on either side and `-` joins one on the RIGHT (so
+ * `install.sh`, `rm_tree` and `install-root` are not hits) but not on the left, so `${CH:-chown}` and
+ * `--chown` are. They are matched after deleting every backslash and quote character — bash removes
+ * those, so `ch\own`, `c"h"own` and `'chown'` are the word `chown`. A backslash-continuation is also read
+ * joined WITHOUT a space, so `ch\` + `own` is seen. What is NOT seen is a name that is never spelled out
+ * in these files: assembled at run time from expansions or substitutions (`${c}own`, `ch$()own`,
+ * `$'\x63hown'`, `printf -v c '%s' ch; ${c}own`), or written in another file (`. /etc/os-release`).
+ */
+const BACKSTOP_WORDS = ['chown', 'chgrp', 'chmod', 'setfacl', 'rsync', 'rm', 'cp', 'mv', 'install', 'tar', 'ln', 'find',
+  'xargs', 'cpio', 'unzip', 'useradd', 'usermod', 'chown_state_tree', 'copy_tree_into_new_dir']
+const BACKSTOP_WORD = new RegExp(`(?<![A-Za-z0-9_.])(${BACKSTOP_WORDS.join('|')})(?![A-Za-z0-9_.-])`, 'g')
+const BACKSTOP_GIT = /(?<![A-Za-z0-9_.-])git(?![A-Za-z0-9_.-])/
+const BACKSTOP_GIT_WRITE = /(?<![A-Za-z0-9_.-])(clean|checkout|reset|restore|switch)(?![A-Za-z0-9_.-])|(?<![A-Za-z0-9_-])(-f|--force)(?![A-Za-z0-9_-])/
+function privilegedWords(line: string): string[] {
+  const bare = line.replace(/[\\'"]/g, '')
+  const found = new Set([...bare.matchAll(BACKSTOP_WORD)].map((m) => m[1]))
+  if (BACKSTOP_GIT.test(bare) && BACKSTOP_GIT_WRITE.test(bare)) found.add('git')
+  return [...found].sort()
+}
+/** Every STATEMENT in `source` that spells a privileged word. A statement is one physical line, or a
+ *  whole backslash-continuation group — so the key of `find … \` + `  -delete` is both lines, and an
+ *  action added on a continuation line changes the key and fails the allowlist. The group is also read
+ *  joined WITHOUT a space, so `ch\` + `own` is seen. Keyed by the exact text: each physical line trimmed,
+ *  joined with a newline. `#`-first lines are exempt; nothing else is (heredoc bodies and strings are in). */
+function backstopHits(source: string): Array<{ n: number; last: number; line: string; words: string[] }> {
+  const lines = source.split('\n')
+  const hits: Array<{ n: number; last: number; line: string; words: string[] }> = []
+  for (let i = 0; i < lines.length; i += 1) {
+    if (/^\s*#/.test(lines[i])) continue
+    let j = i
+    while (/\\$/.test(lines[j]) && j + 1 < lines.length) j += 1
+    const group = lines.slice(i, j + 1)
+    const words = new Set(group.flatMap((l) => privilegedWords(l)))
+    if (j > i) for (const w of privilegedWords(group.map((l) => l.replace(/\\$/, '')).join(''))) words.add(w)
+    if (words.size) hits.push({ n: i + 1, last: j + 1, line: group.map((l) => l.trim()).join('\n'), words: [...words].sort() })
+    i = j
+  }
+  return hits
+}
+
+/** The statements the census classifies as tree-wide in one file, as logical lines with their index. A
+ *  DEFINITION LINE IS NOT SKIPPED, only a bare definition head is (review r9 HIGH 1). */
+function censusOps(source: string) {
+  const { functions, aliases, wrappers } = censusContext(source)
+  return logicalLines(source).map((line, index) => ({ ...line, index }))
+    .filter((line) => shellCommands(functionBody(line.text)).some((words) => treeWide(words, functions, aliases, wrappers)))
+}
+
+test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are each accounted for, guarded, and end the run on refusal', () => {
+  // WHAT THIS IS AND IS NOT (o3d-z5be r8–r10). It is a CLASSIFIER OVER THE SHAPES ITS TOKENISER CAN
+  // PARSE, backed by the LEXICAL BACKSTOP test below. WHAT CARRIES THE PROPERTY is the guard made
+  // immediately before a tree-wide statement; this test keeps those guards in place and fails on a new
+  // statement it classifies until somebody decides which row it is. It is not complete — nine review
+  // rounds each found a shape it could not parse, the ninth being this codebase's own `run chown -R …` —
+  // which is why the backstop, and not this, answers "is anything spelled out that nobody accounted for".
+  // What neither sees is a privileged command whose name is computed at run time or lives outside these
+  // files.
   //
-  // WHAT IT CANNOT SEE, MEASURED RATHER THAN IMAGINED (r9, review MEDIUM 6). Each of these was injected
-  // into a copy of the real install.sh and left the count at 25: a command name computed at run time
-  // (`c=ch; ${c}own -R …`), a name held in an ARRAY (`CMD=(chown -R); "${CMD[@]}"`), a default expansion
-  // (`${CH:-chown}`), and a helper defined in ANOTHER FILE. r8's concession named only the first and the
-  // last while FIVE more shapes were invisible — a one-line function definition and every call to it, a
-  // `case` arm body, a `sudo`/`runuser`/`su` payload without `-c`, a process substitution and a `trap`
-  // handler — all of which the positive list below now asserts, each verified to move the count.
+  // KNOWN GAPS OF THIS CLASSIFIER, LEFT TO THE BACKSTOP (review of c60997d8, L5/L6): a function whose name
+  // has `-`, `:` or non-ASCII characters, or whose body is `( … )`, is read at its definition but calls to
+  // it are not followed — the definition line spells the command, so it is still a census row or an
+  // allowlist entry; and `git … clean -ffdx` / `checkout -f` are not classified as tree-wide here, while
+  // the backstop's `git` rule makes any such statement an explicit decision.
   //
   // r7's version STRIPPED double-quoted spans before matching, with a regex that is not nesting-aware:
   // on `out="$(chown -R … )"` the opening quote paired with the first quote inside the substitution and
@@ -2806,13 +2999,8 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
   ]
   for (const rel of ENTRYPOINTS) {
     const source = ENTRYPOINT_SOURCE.get(rel)!
-    const functions = treeWideFunctions(source)
-    const aliases = commandAliases(source)
     const lines = logicalLines(source)
-    // A DEFINITION LINE IS NOT SKIPPED, ITS WRAPPER IS STRIPPED (review HIGH 1). r8 dropped any line
-    // starting a function definition, which threw away the BODY of a one-line definition with it.
-    const ops = lines.map((line, index) => ({ ...line, index, statement: functionBody(line.text) }))
-      .filter((line) => shellCommands(line.statement).some((words) => treeWide(words, functions, aliases)))
+    const ops = censusOps(source)
     const expected = table.filter((entry) => entry.file === rel)
     assert.equal(ops.length, expected.length,
       `${rel}: the census must account for every classified statement, found ${ops.length} and the table has ${expected.length}:\n${ops.map((op) => `${op.n}: ${op.text.trim().slice(0, 110)}`).join('\n')}`)
@@ -2857,6 +3045,30 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
       assert.ok(refusalEndsRun(previous.text),
         `${rel}:${previous.n}: the guard's refusal must end the run (|| die …), and the line is: ${previous.text.trim()}`)
     }
+  }
+
+  // AND `die` ITSELF ENDS THE RUN (r10, review L1). refusalEndsRun() accepts `|| die "…"` on the
+  // strength of the NAME; redefining `die() { error "$*"; }` kept this test green while every refusal
+  // continued. So each entrypoint must define `die` exactly once — nowhere in the libraries it sources,
+  // with no line starting `unset -f die` or `alias die=` — before its first guard, with a body whose last
+  // command is `exit` non-zero.
+  for (const rel of ENTRYPOINTS) {
+    const source = ENTRYPOINT_SOURCE.get(rel)!
+    const texts: Array<[string, string]> = [[rel, source], ...SOURCED_LIBS.map((lib) => [lib, readFileSync(join(REPO, lib), 'utf8')] as [string, string])]
+    const definitions = texts.flatMap(([where, text]) => logicalLines(text)
+      .filter((line) => new RegExp(`^${DEFINITION_HEAD}`).exec(line.text)?.slice(1, 3).includes('die'))
+      .map((line) => ({ where, ...line })))
+    assert.equal(definitions.length, 1, `${rel}: die must be defined exactly once across the entrypoint and its libraries: ${definitions.map((d) => `${d.where}:${d.n}`).join(', ')}`)
+    assert.equal(definitions[0].where, rel, `${rel}: and in the entrypoint itself`)
+    const body = /\{(.*)\}\s*$/.exec(definitions[0].text)?.[1] ?? ''
+    const commands = shellCommands(body)
+    const last = commands[commands.length - 1] ?? []
+    assert.ok(last[0] === 'exit' && /^[1-9][0-9]*$/.test(last[1] ?? ''), `${rel}:${definitions[0].n}: die's last command must be a non-zero exit: ${definitions[0].text.trim()}`)
+    for (const [where, text] of texts) {
+      assert.ok(!/^\s*(unset\s+-f\s+die|alias\s+die=)/m.test(text), `${where}: must not unset or alias die`)
+    }
+    const firstGuard = logicalLines(source).find((line) => /^\s*privileged_spare_running_tree /.test(line.text))
+    if (firstGuard) assert.ok(definitions[0].n < firstGuard.n, `${rel}: die must be defined before the first guard`)
   }
 
   // THE FORMS THE NET MUST SEE, asserted on the tokeniser itself — an injection into a shipped file
@@ -2932,7 +3144,7 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     assert.ok(shellCommands('fix_own').some((w) => treeWide(w, functions, new Map())),
       `and see a call to it: ${definition}`)
   }
-  // AND A DEFINITION IS NOT A CALL OF ITSELF: body + call = exactly two rows in every form, the way the
+  // AND A DEFINITION IS NOT A CALL OF ITSELF: body + call = exactly two rows in each form below, the way the
   // census counts them (functionBody, then the tokeniser). Without functionBody three of these are 3.
   for (const definition of [
     'fix_own() {\n  chown -R "${APP_USER}" "${APP_DIR}"\n}',
@@ -2948,6 +3160,65 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
   }
   // A ONE-LINE HELPER THAT IS NOT TREE-WIDE stays unregistered, or every `die` call would be a row.
   assert.ok(!treeWideFunctions('die() { error "$*"; exit 1; }\ndie x\n').has('die'), 'die() is not tree-wide')
+
+  // THE HOUSE PASS-THROUGH WRAPPERS, READ (r10, review H1). The wrapper definitions below are the
+  // shipped ones' shapes: `run` (update.sh/deploy.sh), `capture VAR` and `run_as_user USER` (install.sh),
+  // and a wrapper calling a wrapper. Each call is counted as a census row; without the wrapper reading,
+  // `run chown -R …` was measured by the reviewer to leave the real test green.
+  const wrapperFile = [
+    'run() {', '  if $DRY_RUN; then', '    echo "would run: $*"', '    return 0', '  fi', '  "$@"', '}',
+    'capture() {', '  local __capture_name="$1"', '  shift', '  __capture_raw="$(', '    "$@"', '  )" || true', '}',
+    'run_as_user() {', '  local user="$1"', '  shift', '  runuser -u "$user" -- "$@"', '}',
+    'run_git_as_user() {', '  local user="$1"', '  shift', '  run_as_user "${user}" env "GIT_SSH_COMMAND=ssh" "$@"', '}',
+  ].join('\n')
+  for (const call of [
+    'run chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"',
+    'capture out chown -R "${APP_USER}" "${APP_DIR}"',
+    'run_as_user root chown -R "${APP_USER}" "${APP_DIR}"',
+    'run_git_as_user root rm -rf "${APP_DIR}"',
+    'if ! run rsync -a "${SRC}/" "${APP_DIR}/"; then die x; fi',
+  ]) {
+    const rows = censusOps(`${wrapperFile}\n${call}\n`)
+    assert.deepEqual(rows.map((row) => row.text), [call], `the census must read the wrapper call: ${call}`)
+  }
+  for (const quiet of ['run npm ci', 'capture out git rev-parse HEAD', 'run_as_user imsapp npm ci', 'run rm -f "$tmp"']) {
+    assert.deepEqual(censusOps(`${wrapperFile}\n${quiet}\n`).map((row) => row.text), [], `and must stay quiet on: ${quiet}`)
+  }
+  // The shipped files really define these as wrappers, with the fixed operands measured from their bodies.
+  for (const [rel, name, skip] of [
+    ['scripts/update.sh', 'run', 0], ['scripts/deploy.sh', 'run', 0], ['scripts/install.sh', 'capture', 1],
+    ['scripts/install.sh', 'run_as_user', 1], ['scripts/update.sh', 'run_as_user', 1], ['scripts/deploy.sh', 'as_app_user', 0],
+  ] as const) {
+    assert.equal(passThroughWrappers(ENTRYPOINT_SOURCE.get(rel)!).get(name)?.skip, skip, `${rel}: ${name} must be a wrapper skipping ${skip}`)
+  }
+
+  // HERE-DOCUMENTS (r10, review M1/M2): a body fed to a shell is CODE, a body fed to anything else is
+  // data, and what opens one is found by scanning, not by a regex over the raw line.
+  for (const fed of [
+    "bash <<'EOF'\nchown -R imsapp \"${APP_DIR}\"\nEOF",
+    'bash -s -- a b <<EOF\nchown -R imsapp "${APP_DIR}"\nEOF',
+    'runuser -u root -- bash <<EOF\nchown -R imsapp "${APP_DIR}"\nEOF',
+    'su root <<EOF\nchown -R imsapp "${APP_DIR}"\nEOF',
+    'sudo bash <<\\EOF\nchown -R imsapp "${APP_DIR}"\nEOF',
+  ]) assert.equal(censusOps(fed).length, 1, `a here-document fed to a shell is code: ${fed}`)
+  for (const data of [
+    "cat <<'EOF'\nchown -R imsapp x\nEOF",
+    'cat > f <<-EOF\n\tchown -R imsapp x\n\tEOF',
+    'cat <<\\EOF\nchown -R imsapp x\nEOF',
+    'cat <<END-OF\nchown -R imsapp x\nEND-OF',
+  ]) assert.equal(censusOps(data).length, 0, `a here-document fed to cat is data: ${data}`)
+  // …and NOT opened by a message, arithmetic, a here-string or a trailing comment: the chown after each
+  // must still be counted (r9's regex swallowed it up to a line reading `EOF`).
+  for (const opener of [
+    'warn "run: bash install.sh <<EOF"',
+    'x=$(( 1 << BITS ))',
+    "grep -q x <<<'text'",
+    'true # see <<EOF',
+    "echo '<<EOF'",
+  ]) {
+    const source = `${opener}\nchown -R imsapp "\${APP_DIR}"\nEOF\n`
+    assert.equal(censusOps(source).length, 1, `nothing on this line opens a here-document: ${opener}`)
+  }
 
   // An alias needs both lines, so it is asserted over a two-line source (review LOW 12: r8 resolved
   // only a bare `NAME=value`, while `declare -x`/`readonly` are assignments of a command name too).
@@ -2996,6 +3267,138 @@ test('[o3d-z5be] REGRESSION NET: every tree-wide ownership change, copy, move or
     `${GUARD_CALL} | cat || die "stop"`,
     `${GUARD_CALL}`,
   ]) assert.ok(!refusalEndsRun(continues), `this refusal does NOT end the run: ${continues}`)
+})
+
+type AllowEntry = { file: string; line: string; count: number; class: string; reason: string }
+const ALLOWLIST_REL = 'tests/scripts/privileged-word-allowlist.json'
+const ALLOW_CLASSES = new Set(['text', 'single-inode', 'read-only', 'code-owned-tree', 'census-helper', 'definition', 'app-user'])
+/** The allowlist matches a WHOLE statement EXACTLY. A substring or prefix match would let
+ *  `<an allowlisted line> ; chown imsapp "${APP_DIR}"/*` through on the strength of its first half. */
+function allowlisted(entries: readonly AllowEntry[], file: string, line: string): AllowEntry | undefined {
+  return entries.find((entry) => entry.file === file && entry.line === line)
+}
+
+test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they source, a statement that spells a privileged command word is a census row or an exact, reviewed allowlist entry', () => {
+  // WHY THIS EXISTS (o3d-z5be r10). Nine review rounds each found a shape the census tokeniser could not
+  // read — the ninth was the house's own `run chown -R …`. The census is a classifier over the shapes it
+  // can parse; THIS is what does not depend on parsing. A line that spells `chown` — in a heredoc, after
+  // a redirect, behind `flock`, `doas`, `bash -ec`, an alias or a wrapper nobody taught the tokeniser —
+  // is found because the word is there, and fails the test until somebody decides what it is. A false
+  // positive fails loudly, which is the right way for this to fail. The one thing it cannot see is a
+  // command whose NAME is never spelled out in these files; see backstopHits() for the exact list.
+  const allow: AllowEntry[] = JSON.parse(readFileSync(join(REPO, ALLOWLIST_REL), 'utf8')).entries
+  for (const entry of allow) {
+    assert.ok(ALLOW_CLASSES.has(entry.class), `${entry.file}: unknown class ${entry.class} for: ${entry.line}`)
+    assert.ok(entry.reason.trim().length >= 20, `${entry.file}: each entry needs a written reason: ${entry.line}`)
+    assert.ok(Number.isInteger(entry.count) && entry.count >= 1, `${entry.file}: count must be a positive integer: ${entry.line}`)
+  }
+  assert.equal(new Set(allow.map((e) => `${e.file}\n${e.line}`)).size, allow.length, 'each statement is listed once, with its count')
+
+  // THE FILES: the three entrypoints and EVERY library they source — asserted against their text, so a
+  // new `source` is a decision here. The one other file read, `. /etc/os-release`, is the host's.
+  for (const rel of ENTRYPOINTS) {
+    const text = ENTRYPOINT_SOURCE.get(rel)!
+    const sourced = [...text.matchAll(/^\s*(?:source|\.)\s+"\$\{IMS_SCRIPT_LIB_DIR\}\/([A-Za-z0-9_-]+\.sh)"/gm)].map((m) => `scripts/lib/${m[1]}`)
+    assert.deepEqual([...sourced].sort(), [...SOURCED_LIBS].sort(), `${rel} must source exactly the libraries this backstop reads`)
+    const others = [...text.matchAll(/^\s*(?:source|\.)\s+(\S+)/gm)].map((m) => m[1]).filter((f) => !f.startsWith('"${IMS_SCRIPT_LIB_DIR}/'))
+    assert.ok(others.every((f) => f === '/etc/os-release'), `${rel}: an unexpected sourced file: ${others.join(', ')}`)
+  }
+  const files = [...ENTRYPOINTS, ...SOURCED_LIBS]
+  const unaccounted: string[] = []
+  const occurrences = new Map<string, number>()
+  let statements = 0
+  let censusRows = 0
+  for (const rel of files) {
+    const source = readFileSync(join(REPO, rel), 'utf8')
+    const covered = new Set<number>()
+    if ((ENTRYPOINTS as readonly string[]).includes(rel)) {
+      for (const op of censusOps(source)) for (let k = op.n; k <= op.last; k += 1) covered.add(k)
+    }
+    for (const hit of backstopHits(source)) {
+      statements += 1
+      if (covered.has(hit.n)) { censusRows += 1; continue }
+      const entry = allowlisted(allow, rel, hit.line)
+      if (!entry) { unaccounted.push(`${rel}:${hit.n} [${hit.words.join(',')}] ${hit.line}`); continue }
+      const key = `${entry.file}\n${entry.line}`
+      occurrences.set(key, (occurrences.get(key) ?? 0) + 1)
+    }
+  }
+  assert.deepEqual(unaccounted, [], `these statements spell a privileged command word and are neither a census row nor an exact allowlist entry (${ALLOWLIST_REL}):\n${unaccounted.join('\n')}`)
+  // A COPY OF AN ALLOWLISTED LINE IS A NEW STATEMENT: the counts must match, and an entry that matches
+  // nothing any more is stale and fails too.
+  for (const entry of allow) {
+    assert.equal(occurrences.get(`${entry.file}\n${entry.line}`) ?? 0, entry.count, `${entry.file}: expected ${entry.count} occurrence(s) of: ${entry.line}`)
+  }
+  // docs/installation.md says deploy.sh's own text makes no tree-wide change: that is enforced here.
+  assert.deepEqual([...new Set(allow.filter((e) => e.file === 'scripts/deploy.sh').map((e) => e.class))].sort(), ['read-only', 'single-inode', 'text'],
+    'deploy.sh may carry only single-inode, read-only and text entries')
+  // NON-VACUITY: it read the files, and the census rows it credited are the census's.
+  assert.ok(statements > 300, `precondition: the backstop found ${statements} statements`)
+  assert.ok(censusRows >= 30, `precondition: ${censusRows} of them are census rows`)
+
+  // THE MATCH IS EXACT (mutation (c)): the first half of a line being allowlisted is not enough.
+  const sample = allow.find((e) => e.line === 'rm -f "${CRON_BACKUP}"')!
+  assert.ok(sample, 'precondition: the sample entry exists')
+  assert.ok(allowlisted(allow, sample.file, sample.line), 'the entry matches its own line')
+  for (const extended of [`${sample.line} ; chown imsapp "\${APP_DIR}"/*`, ` ${sample.line}x`, sample.line.slice(0, -1)]) {
+    assert.equal(allowlisted(allow, sample.file, extended), undefined, `a line that merely CONTAINS an allowlisted one is not allowlisted: ${extended}`)
+  }
+
+  // WHAT IT SEES THAT THE CENSUS DOES NOT (review of c60997d8: H1, M1, M3, M4): the shapes the reviewer
+  // injected in which the word is spelled out, as listed in that review. The census does not classify
+  // most of them; the backstop needs only the word.
+  for (const shape of [
+    'run chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"',
+    'capture out chown -R "${APP_USER}" "${APP_DIR}"',
+    'bash -ec \'chown -R imsapp "${APP_DIR}"\'',
+    'sh -euc "chown -R imsapp ${APP_DIR}"',
+    'su --command="chown -R imsapp ${APP_DIR}" root',
+    'flock /run/x chown -R imsapp "${APP_DIR}"',
+    'systemd-run chown -R imsapp "${APP_DIR}"',
+    'doas chown -R imsapp "${APP_DIR}"',
+    'timeout -s KILL 30 chown -R imsapp "${APP_DIR}"',
+    'env -u HOME chown -R imsapp "${APP_DIR}"',
+    '2>/dev/null chown -R imsapp "${APP_DIR}"',
+    'alias co=chown',
+    'find "${APP_DIR}" | while read -r f; do chown -h imsapp "$f"; done',
+    'for f in "${APP_DIR}"/*; do chown -h imsapp "$f"; done',
+    'chown imsapp "${APP_DIR}"/*',
+    'CH=${CH:-chown}',
+    'printf -v c \'%s\' chown',
+    'ch\\own -R imsapp "${APP_DIR}"',
+    'c"h"own -R imsapp "${APP_DIR}"',
+    'git -C "${APP_DIR}" clean -ffdx',
+    'git -C "${APP_DIR}" checkout -f main',
+    'bash -xc "chown -R imsapp ${APP_DIR}"',
+    'su --command "chown -R imsapp ${APP_DIR}" root',
+    'nsenter -t 1 -m chown -R imsapp "${APP_DIR}"',
+    'unshare -m chown -R imsapp "${APP_DIR}"',
+    'chroot / chown -R imsapp "${APP_DIR}"',
+    'setpriv --reuid=0 chown -R imsapp "${APP_DIR}"',
+    'busybox chown -R imsapp "${APP_DIR}"',
+    'parallel chown -R imsapp ::: "${APP_DIR}"',
+    'watch -n1 chown -R imsapp "${APP_DIR}"',
+    'coproc chown -R imsapp "${APP_DIR}"',
+    'time -p chown -R imsapp "${APP_DIR}"',
+    'exec -a x chown -R imsapp "${APP_DIR}"',
+    'sudo -s chown -R imsapp "${APP_DIR}"',
+    'timeout 1.5 chown -R imsapp "${APP_DIR}"',
+    'sudo -C 3 -D / -r role -t type chown -R imsapp "${APP_DIR}"',
+    'shopt -s expand_aliases; alias co="chown -R"; co imsapp "${APP_DIR}"',
+    'source ./fix.sh && chown -R imsapp "${APP_DIR}"',
+    'x="$(echo \')\'; chown -R imsapp "${APP_DIR}")"',
+    'x="$(case a in a) chown -R imsapp "${APP_DIR}";; esac)"',
+    'shopt -s globstar; chown imsapp "${APP_DIR}"/**',
+    'as_app_user bash -c "chown -R imsapp ${APP_DIR}"',
+    'run_as_user root chown -R imsapp "${APP_DIR}"',
+  ]) assert.ok(privilegedWords(shape).length > 0, `the backstop must see: ${shape}`)
+  // A here-document fed to a shell is seen line by line, because its body lines are physical lines.
+  assert.deepEqual(backstopHits("bash <<'EOF'\nchown -R imsapp x\nEOF\n").map((h) => h.words), [['chown']], 'a here-document body is read')
+  assert.deepEqual(backstopHits('ch\\\nown -R imsapp "${APP_DIR}"\n').map((h) => h.words), [['chown']], 'a name split across a continuation is seen')
+  // AND WHAT IT CANNOT: a name never spelled out. These are the concession, asserted so it stays exact.
+  for (const unseen of ['c=ch; ${c}own -R imsapp "${APP_DIR}"', 'ch$()own -R imsapp "${APP_DIR}"', "$'\\x63hown' -R imsapp x", 'CMD=(ch own); "${CMD[0]}${CMD[1]}" -R x']) {
+    assert.deepEqual(privilegedWords(unseen), [], `stated as NOT seen — update the concession if this changes: ${unseen}`)
+  }
 })
 
 test('[o3d-z5be] install.sh asks the same question at configuration time, before any package is installed and before the account exists', () => {

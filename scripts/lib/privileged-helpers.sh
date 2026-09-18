@@ -1564,16 +1564,17 @@ privileged_trees_disjoint() {
           privileged_walk_reaches "${ra}" "${privileged_kind_ids}" || privileged_kind_hit=$?
         fi
         rm -f "${privileged_kind_ids}"
-        # AND THE NAME GOES WITH THE FILE (o3d-z5be r9, review LOW 10): leaving the variable set made the
-        # second block's `[[ -n … ]]` true, so the intended fresh mktemp was never reached and
-        # privileged_tree_inode_list re-created the now-unowned name with `: > "${out}"` AS ROOT.
+        # AND THE NAME GOES WITH THE FILE (o3d-z5be r9, review LOW 10): a set variable once made the
+        # second block reuse this removed name, and privileged_tree_inode_list re-created it AS ROOT.
         privileged_kind_ids=""
       fi
       # AND CONTAINMENT IS ASKED IN BOTH DIRECTIONS BEFORE CALLING IT A LINK (o3d-z5be r8). A target that
       # lies INSIDE the running tree also holds files whose inodes are in the set, and reporting that as
       # a hard link would be as wrong as the sentence this discrimination exists to avoid.
       privileged_kind_rev=2
-      if [[ -n "${privileged_kind_ids}" ]] || privileged_kind_ids="$(mktemp 2>/dev/null)"; then
+      # Its own fresh file, always (r10, review L6: the `[[ -n … ]] ||` arm this line used to carry could
+      # no longer be true after the line above, so it was dead code).
+      if privileged_kind_ids="$(mktemp 2>/dev/null)"; then
         if privileged_tree_inode_list "${ra}" "${privileged_kind_ids}"; then
           privileged_kind_rev=0
           privileged_walk_reaches "${rb}" "${privileged_kind_ids}" || privileged_kind_rev=$?
@@ -1611,16 +1612,17 @@ privileged_trees_disjoint() {
   return 0
 }
 
-# THE CALL THAT CARRIES THE PROPERTY, MADE IMMEDIATELY BEFORE EACH TREE-WIDE OWNERSHIP CHANGE, COPY,
-# MOVE OR DELETE THE CENSUS KNOWS ABOUT — with three listed exceptions: the deletes of the clone
-# directory a run has itself just made with `mktemp -d -t`, which the census carries by line with that
-# reason (o3d-z5be r9, review MEDIUM 4). It refuses when "$1" overlaps the directory this run is
-# executing from. THE SCOPE IS THE CENSUS'S (o3d-z5be r8, review HIGH 1/2): the regression net in
-# tests/scripts/privileged-helper-set.test.ts enumerates the SHAPES of such a statement, requires each
-# hit to be one of the two shipped `|| die` forms immediately before it, and fails on a new one — so it
-# keeps these guards in place and cannot promise that a shape nobody encoded is guarded. The shapes it
-# does NOT see are measured (r9): a command name computed at run time, a helper defined in another file,
-# a name held in an array, and a default expansion `${CH:-chown}`. install.sh additionally
+# THE CALL THAT CARRIES THE PROPERTY, made immediately before a tree-wide ownership change, copy, move
+# or delete in the entrypoints: it refuses when "$1" overlaps the directory this run is executing from.
+# The operations that run without it are listed by line, with reasons, in
+# tests/scripts/privileged-helper-set.test.ts — eleven deletes of the run's own `mktemp -d -t` clone
+# (three after a copy, eight in a guard's own failure branch) and single-file renames (o3d-z5be r10,
+# review L2). That test keeps these calls in place in two layers: a CENSUS, which is a classifier over
+# the shapes its tokeniser can parse and requires one of the two shipped `|| die` forms immediately
+# before each tree-wide statement it classifies; and a LEXICAL BACKSTOP, which requires every statement
+# in the entrypoints and the libraries they source (comment lines aside) that spells a privileged
+# command word to be a census row or an exact, reviewed allowlist entry. Neither sees a privileged command whose name is computed at
+# run time or lives outside these files. install.sh additionally
 # asks the same question of ${APP_DIR}, ${DATA_DIR} and ${LOG_DIR} at configuration time, which is an
 # EARLY REFUSAL and not the thing the property rests on: on a first install those directories do not
 # exist yet, so that call can only compare against their nearest existing ancestor — and update.sh and

@@ -1,0 +1,2077 @@
+{
+ "_about": "THE LEXICAL BACKSTOP ALLOWLIST (o3d-z5be r10). Each entry is one EXACT line (trimmed) of a script that spells a privileged command word and is not a census row, how many times that exact line occurs in that file, what it is, and why it is not a guarded tree operation. Reviewed by hand; tests/scripts/privileged-helper-set.test.ts fails on any line not listed, on a changed count, and on an entry that matches nothing.",
+ "entries": [
+  {
+   "file": "scripts/install.sh",
+   "line": "out=\"$(find \"${entry}\" \"${dir}\" \"${dir}/lib\" -maxdepth 0 \\( ! -uid \"${trusted}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "out=\"$(find \"${dir}/lib\" -mindepth 1 \\( ! -uid \"${trusted}\" -o -perm /022 -o \\( ! -type f ! -type d \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "out=\"$(find \"${above[@]}\" -maxdepth 0 \\( \\( ! -uid \"${trusted}\" -a ! -uid 0 \\) -o \\( -perm /022 -a ! -perm -1000 \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "ims_startup_refuse \"REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- \"${IMS_ENTRYPOINT_SELF}\"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with.\" || exit 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (basename, ims_startup_refuse, exit)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${tmp}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"${file} exists but is not a regular file, so the secrets a previous install committed to cannot be read. Refusing to continue: minting new ones over a live database makes every encrypted setting permanently undecryptable. Fix or move that path and run the installer again.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"${file} exists but is not readable by this process (run the installer as root), so the secrets a previous install committed to cannot be read. Refusing to continue rather than minting new ones over a live database.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"${file} could not be read to the end, so the secrets a previous install committed to are unknown. Refusing to continue rather than minting new ones over a live database.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "warn \"IMS_INSTALL_REMINT_SECRETS=yes: minting a fresh AUTH_SECRET, SETTINGS_ENCRYPTION_KEY and CRON_SECRET even though ${APP_DIR}/.env is ABSENT on a host that is not a first install. Every encrypted setting written under the previous SETTINGS_ENCRYPTION_KEY becomes permanently undecryptable, and every existing session is invalidated. Why this run is not a first install: ${witnesses[*]}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (warn)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"${APP_DIR}/.env is ABSENT, and this run cannot show that this is a first install, so it refuses to mint AUTH_SECRET, SETTINGS_ENCRYPTION_KEY and CRON_SECRET. A new SETTINGS_ENCRYPTION_KEY makes every encrypted setting already in the database PERMANENTLY undecryptable, a new AUTH_SECRET invalidates every session, and a new CRON_SECRET makes the crontab this script wrote unauthorised. ${APP_DIR} belongs to ${APP_USER}, so an absent .env is a state that account can produce by deleting a file it owns — it is not evidence of a fresh host. What this run found instead: ${witnesses[*]}. Restore .env from your backup, or from the running service's environment (systemctl show -p Environment ${APP_NAME}.service), and run this again. If this really is a fresh start and the existing data is expendable, say so deliberately: IMS_INSTALL_REMINT_SECRETS=yes. NOTHING HAS BEEN STOPPED AND NOTHING HAS BEEN MIGRATED.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${response_file}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "echo \"WARNING: this install continues. Until a vouched-for driver stands there, the documented update command has nothing to run — and running update.sh as root out of a tree another account can write is refused and not supported (o3d-z5be r5). Re-run install.sh from a release fetched as root into a newly created directory (see *The supported bootstrap* in docs/installation.md) to publish one.\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo, 2)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "write_app_env_file || die \"The password of '${DB_USER}' HAS BEEN ROTATED on the server, and ${APP_DIR}/.env could not be replaced. That file is complete and unchanged — it is published by rename, so it is not truncated — but it names the OLD password, which no longer works. The service is STOPPED and the connection fence is UP. DO NOT hand-edit that file: re-run this installer and it will reconcile from the journal at ${DB_ROLE_ROTATION_JOURNAL}, which records both candidates; it will ask the server which one is live, find the new one, and publish an environment file naming it. NOTHING HAS BEEN MIGRATED.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (write_app_env_file, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "FIRST_INSTALL_PIN_CONTRACT=\"On a first install, IMS_FENCE_ARTEFACT_SHA256 is the ONLY input that publishes the protected fence artefact. IMS_FENCE_SCRIPT_SHA256 alone is REFUSED here: it authenticates the entry file, while the artefact also vendors that helper's dependency closure out of the application-owned checkout. Supply IMS_FENCE_ARTEFACT_SHA256 -- IMS_FENCE_SCRIPT_SHA256 may accompany it and is then also enforced -- or supply neither, in which case this install fences nothing, publishes nothing, and the first upgrade asks for the digest instead.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "echo \"This run is a FIRST INSTALL — no service, no crontab and no other launcher was found, and the database was created by this run — so it performs NO credentialed fence execution: there is no writer to drain and nothing to hold closed. Something on this path asked for the fence helper anyway, and it will not be handed DEPLOY_ADMIN_DATABASE_URL: the tree it would run is assembled out of an application-owned checkout, and a first install is exactly the run with no standing artefact to authenticate it against. Nothing has been migrated.\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo, 2)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "first_install_exemption_available || die \\\n\"This run was about to take the first-install exemption from the cutover fence and it has not earned it. ${FIRST_INSTALL_EXEMPTION_REFUSAL} NOTHING HAS BEEN MIGRATED and nothing has been started.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (first_install_exemption_available, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "info \"First install: nothing is serving, no crontab is live and this run created the database,\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (info)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "info \"A first install fences nothing, so this publishes rather than executes: the artefact is\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (info)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "publish_fence_script_copy || die \\\n\"The protected fence artefact could not be published under the digest this invocation supplied: ${DB_FENCE_ROTATION_NOTE:-no reason was recorded}. A pin names the bytes you expect, so this is a refusal and not a warning. NOTHING HAS BEEN MIGRATED and nothing has been started; re-run with a digest that matches this release, or with neither pin, in which case this install fences nothing, publishes nothing and the first upgrade asks for the digest instead.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (publish_fence_script_copy, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"this run cannot tell an in-place upgrade from a first install: ${CRONTAB_COMMAND_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "read_crontab_for \"${APP_USER}\" || die \\\n\"the ${APP_USER} crontab could not be read, so this run cannot tell an in-place upgrade from a first install: ${CRONTAB_READ_REASON}. Both answers act destructively on the wrong host — one migrates a live installation, the other stops and fences a box that has nothing on it — so NOTHING HAS BEEN CHANGED. Settle the read (crontab -u ${APP_USER} -l) and run this again.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (read_crontab_for, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown -h \"$self\" \"${PUBLISH_STAGE_DIRNAME}\" 2>/dev/null || exit 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! chmod \"$mode\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if [[ -n \"$owner\" ]] && ! chown \"$owner\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown_state_tree() {",
+   "count": 1,
+   "class": "definition",
+   "reason": "the definition of a helper the census classifies; its calls are census rows"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "error \"A 'TRUSTED CERTIFICATE' block in ${source} did not survive re-encoding as one — this openssl dropped the X509_AUX trust and reject settings that block carries. Publishing it would install a trust anchor WIDER than the one you supplied, vouching for purposes your CA file excludes, so nothing has been published.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (error)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown \"${DB_CA_PUBLISH_OWNER}\" \"${DB_CA_PUBLISH_DIR}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 755 \"${DB_CA_PUBLISH_DIR}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 600 \"${candidate}\" 2>/dev/null || { rm -f \"${candidate}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "normalize_db_ca_pem \"${source}\" \"${candidate}\" || { rm -f \"${candidate}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ \"${digest}\" =~ ^[0-9a-f]{64}$ ]] || { rm -f \"${candidate}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${candidate}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${file}\" 2>/dev/null && info \"Removed superseded database CA generation ${file}.\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "done < <(find \"${DB_CA_PUBLISH_DIR}\" -maxdepth 1 -type f \\\n-name \"${DB_CA_GENERATION_PREFIX}*${DB_CA_GENERATION_SUFFIX}\" \\\n-printf '%T@ %p\\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 700 \"${DB_ENV_SNAPSHOT_DIR}\" 2>/dev/null || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "printf '# between those two points; the next install run reconciles it by asking the server\\n'",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (printf)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${DB_ROLE_ROTATION_JOURNAL}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"A database credential rotation for ${identity} was interrupted and this run could not find a single endpoint that both checks POSTGRESQL'S OWN role credential for '${DB_USER}' and can tell one password from another, so nothing it asked the server is evidence about which credential is live. A trust rule makes every candidate succeed; a revoked CONNECT makes every candidate fail; and an ldap, pam, radius or bsd rule answers confidently about a password held somewhere ALTER ROLE cannot reach — this run refuses on any of them rather than adopting a credential the probe cannot speak for. It may also be that NEITHER of the two passwords it recorded was accepted anywhere it could ask, which is what you see when somebody has rotated the role OUT OF BAND or the server is not reachable from here — and nothing this script can ask tells those apart, which is why it stops. ${DB_ROLE_ROTATION_JOURNAL} is LEFT IN PLACE so the two candidates are not lost. Give '${DB_USER}' a password-checked route to an UNFENCED database — GRANT CONNECT ON DATABASE postgres TO that role, with a scram-sha-256 or md5 rule for ${DB_HOST} in pg_hba.conf, is the whole of it — or establish the role's password by hand and remove that file. NOTHING HAS BEEN INSTALLED and nothing has been stopped. What this run asked, and what each endpoint did:${DB_PROBE_REPORT}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! chmod 644 \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 700 \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${FENCE_DROPIN_FILE}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${FENCE_FILE}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "error \"No systemd unit is named for the application, so there is nothing to install the route guarantee on.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (error)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! mkdir -p \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chown root:root \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chmod 700 \"$DB_ENV_SNAPSHOT_DIR\"; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown root:root \"$DB_ENV_SNAPSHOT_FILE\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${DB_ENV_SNAPSHOT_DROPIN_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"$DB_ENV_SNAPSHOT_FILE\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\" \\\n|| warn \"${LEGACY_STATE_DIR_FENCE_FILE} could not be removed; it is inert now that the fence names ${FENCE_FILE}, but remove it by hand.\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ -z \"${LEGACY_STATE_DIR_FENCE_FILE:-}\" ]] || rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! printf '%s\\n' \"${content}\" > \"${tmp}\" 2>/dev/null; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! chmod 600 \"${tmp}\" 2>/dev/null; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "readback=\"$(cat \"${tmp}\" 2>/dev/null)\" || { rm -f \"${tmp}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if [[ \"${readback}\" != \"${content}\" ]]; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "mode=\"$(stat -c '%a' \"${tmp}\" 2>/dev/null)\" || { rm -f \"${tmp}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if [[ \"${mode}\" != \"600\" ]]; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! fsync_path \"${tmp}\"; then rm -f \"${tmp}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if ! fsync_path \"$(dirname \"${CRON_BACKUP}\")\"; then rm -f \"${CRON_BACKUP}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${CRON_BACKUP}\"",
+   "count": 5,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "CRON_FENCE_REASON=\"the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ \"${rc}\" -ne \"${CRONTAB_UNFENCE_DIVERGED}\" ]] || die \\\n\"The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (${rc}, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"${FENCE_FILE} could not be removed, so this host would still refuse to start ${APP_NAME}.service on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "warn \"an install or upgrade interrupted, audit the ACL before trusting it:\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (warn)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ -z \"$owner\" ]] || chown \"${owner}:${owner}\" \"$canonical\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"$legacy\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "error \"${FENCE_FILE} is still there and would refuse the next boot. Remove it: rm -f ${FENCE_FILE}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (error)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "warn \"                Remove it once you are happy: rm -f ${FENCE_FILE}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (warn)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "error \"                start it again on its next boot. The re-install below says\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (error)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "install_reboot_fence \"install failed at ${CUTOVER_STEP}\" >/dev/null 2>&1 \\\n|| error \"THE REBOOT FENCE IS NOT IN PLACE. This host may start the old version against a migrated schema on its next boot. Stop it by hand.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (install_reboot_fence, 1, error)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "write_cutover_marker \"install failed at ${CUTOVER_STEP}\" \"${status}\" || true",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (write_cutover_marker, true)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "prompt SSH_AUTHORIZED_KEY \"Authorized SSH public key for root login (leave blank to skip key install)\" \"\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (prompt)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y -qq \\\ncurl wget gnupg2 ca-certificates lsb-release \\\ngit build-essential \\\njq openssh-client \\\nrsync \\\nnginx \\\nfail2ban \\\nunattended-upgrades apt-listchanges \\\nopenssl \\\nlogrotate \\\nutil-linux",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y nodejs",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y -qq postgresql postgresql-contrib",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y -qq openssh-server",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 700 /root/.ssh",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chmod 600 /root/.ssh/authorized_keys",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y -qq redis-server",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "if [[ -d \"${src}\" ]] && [[ -n \"$(find \"${src}\" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]]; then",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "[[ \"${DEPLOY_SSH_DIR_MODE}\" == \"700\" ]] || die \\\n\"${DEPLOY_SSH_DIR} is mode ${DEPLOY_SSH_DIR_MODE:-unreadable}, not 700. It holds the deploy private key, and ssh itself refuses a key in a group- or world-accessible directory. This run will not chmod it: chmod has no --no-dereference on Linux, so correcting a path inside a directory '${APP_USER}' owns is the same escalation with a different verb. Set it to 700 by hand and run the installer again.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (${DEPLOY_SSH_DIR_MODE}, die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown -h \"${APP_USER}:${APP_USER}\" \"${DEPLOY_SSH_DIR}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "run_git_as_user \"${APP_USER}\" git -C \"${APP_DIR}\" reset --hard \"origin/${GIT_BRANCH}\"",
+   "count": 1,
+   "class": "app-user",
+   "reason": "git reset --hard runs AS ${APP_USER} inside its own checkout, not as root"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "elif [[ -d \"${APP_DIR}\" ]] && [[ -n \"$(find \"${APP_DIR}\" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)\" ]]; then",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "info \"App directory exists but is not a git checkout — syncing fresh code into place...\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (info)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "chown \"${APP_USER}:${APP_USER}\" \"${TMP_CLONE_DIR}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${APP_DIR}/.env.local\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "die \"A password different from the installed one was supplied for '${DB_USER}', but this run has taken the first-install exemption: it created database '${DB_NAME}' itself and there is no existing installation to stop and no migration window to fence. The role '${DB_USER}' was ALREADY on this server, so rotating it would take the credential away from whatever else uses it, with nothing held closed. Re-run with the password that role already has, or rotate it deliberately on the server first. NOTHING HAS BEEN MIGRATED and the role's password is UNCHANGED.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "LISTENER_PROOF_REASON=\"\\`ss\\` is not available, so this run cannot find out which process holds the listening socket on :${APP_PORT}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "ln -sf \"${NGINX_CONF}\" \"/etc/nginx/sites-enabled/${APP_NAME}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive ln -sf on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "apt-get install -y -qq certbot python3-certbot-nginx",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: package names and the apt-get subcommand `install`"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "trap 'rm -f \"${CRON_BLOCK_FILE}\"' EXIT",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/install.sh",
+   "line": "rm -f \"${CRON_BLOCK_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "out=\"$(find \"${entry}\" \"${dir}\" \"${dir}/lib\" -maxdepth 0 \\( ! -uid \"${trusted}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "out=\"$(find \"${dir}/lib\" -mindepth 1 \\( ! -uid \"${trusted}\" -o -perm /022 -o \\( ! -type f ! -type d \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "out=\"$(find \"${above[@]}\" -maxdepth 0 \\( \\( ! -uid \"${trusted}\" -a ! -uid 0 \\) -o \\( -perm /022 -a ! -perm -1000 \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "ims_startup_refuse \"REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- \"${IMS_ENTRYPOINT_SELF}\"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with.\" || exit 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (basename, ims_startup_refuse, exit)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "case \"$query\" in *%*) DB_IDENTITY_REASON=\"DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate\"; return 1 ;; esac",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument ($query, return)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown -h \"$self\" \"${PUBLISH_STAGE_DIRNAME}\" 2>/dev/null || exit 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! chmod \"$mode\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if [[ -n \"$owner\" ]] && ! chown \"$owner\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! chmod 644 \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; return 1; fi",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chmod 700 \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"${FENCE_DROPIN_FILE}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"${FENCE_FILE}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\" \\\n|| warn \"${LEGACY_STATE_DIR_FENCE_FILE} could not be removed; it is inert now that the fence names ${FENCE_FILE}, but remove it by hand.\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "[[ -z \"${LEGACY_STATE_DIR_FENCE_FILE:-}\" ]] || rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! mkdir -p \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chown root:root \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chmod 700 \"$DB_ENV_SNAPSHOT_DIR\"; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; chmod on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown root:root \"$DB_ENV_SNAPSHOT_FILE\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"${DB_ENV_SNAPSHOT_DROPIN_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"$DB_ENV_SNAPSHOT_FILE\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown root:root \"${DB_FENCE_RECOVERY_DIR}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chmod 755 \"${DB_FENCE_RECOVERY_DIR}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown root:root \"${DB_FENCE_IDENTITY_FILE}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chmod 644 \"${DB_FENCE_IDENTITY_FILE}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"${CRON_BACKUP}\"",
+   "count": 5,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "error \"${FENCE_FILE} is still there and would refuse the next boot. Remove it: rm -f ${FENCE_FILE}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (error)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "echo -e \"                Remove it once you are happy: rm -f ${FENCE_FILE}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "echo -e \"                install below and says whether it worked.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! printf '%s\\n' \"$content\" > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! chmod 600 \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "readback=\"$(cat \"$tmp\" 2>/dev/null)\" || { rm -f \"$tmp\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if [[ \"${readback}\" != \"$content\" ]]; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "mode=\"$(stat -c '%a' \"$tmp\" 2>/dev/null)\" || { rm -f \"$tmp\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if [[ \"${mode}\" != \"600\" ]]; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "if ! fsync_path \"$(dirname \"${CRON_BACKUP}\")\"; then rm -f \"${CRON_BACKUP}\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "CRON_FENCE_REASON=\"the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "[[ \"$rc\" -ne \"$CRONTAB_UNFENCE_DIVERGED\" ]] || die \\\n\"The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument ($rc, die)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "die \"${FENCE_FILE} could not be removed, so this host would still refuse to start ${SERVICE_UNIT} on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "[[ -z \"$owner\" ]] || chown \"${owner}:${owner}\" \"$canonical\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "rm -f \"$legacy\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "run run_git_as_user \"${APP_USER}\" git -C \"${APP_DIR}\" reset --hard \"origin/${CURRENT_BRANCH}\"",
+   "count": 1,
+   "class": "app-user",
+   "reason": "git reset --hard runs AS ${APP_USER} inside its own checkout, not as root"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "[[ -n \"${GIT_REPO_URL:-}\" ]] || die \"No git checkout and no GIT_REPO_URL in ${DEPLOY_META_SOURCE:-${IMS_DRIVER_DEPLOY_META} or ${DEPLOY_META_FILE}}. Use --no-git to skip.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (-n, die)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "chown \"${APP_USER}:${APP_USER}\" \"${TMP_CLONE_DIR}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "VERIFY_COUNT=$(find \"${APP_DIR}/prisma/migrations\" -mindepth 2 -maxdepth 2 -name 'verify.sql' -type f 2>/dev/null | wc -l)",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "pg_dump \"${MIGRATION_DATABASE_URL}\" | gzip > \"${BACKUP_PARTIAL}\" || { backup_rc=$?; rm -f \"${BACKUP_PARTIAL}\"; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "run rm -f \"${FENCE_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f of the one fence file, through the `run` wrapper"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "out=\"$(find \"${entry}\" \"${dir}\" \"${dir}/lib\" -maxdepth 0 \\( ! -uid \"${trusted}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "out=\"$(find \"${dir}/lib\" -mindepth 1 \\( ! -uid \"${trusted}\" -o -perm /022 -o \\( ! -type f ! -type d \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "out=\"$(find \"${above[@]}\" -maxdepth 0 \\( \\( ! -uid \"${trusted}\" -a ! -uid 0 \\) -o \\( -perm /022 -a ! -perm -1000 \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "ims_startup_refuse \"REFUSING TO RUN AS ROOT OUT OF A TREE ANOTHER ACCOUNT CAN WRITE. ${IMS_STARTUP_OFFENDER} is owned by an account other than root, is writable by group or other, or is not a regular file or directory, so the code this run would execute as root — this file and the libraries beside it — could have been chosen by that account. Running root code from such a tree is not supported. Run the root-owned driver instead: sudo bash /etc/ims-cutover-driver/driver/$(basename -- \"${IMS_ENTRYPOINT_SELF}\"). On a host that has no driver yet, fetch the release AS ROOT INTO A NEWLY CREATED DIRECTORY (git clone or tar -x as root into mktemp -d /root/ims-release.XXXXXX) and run install.sh from there; it publishes one. Do NOT chown or chmod an existing tree to get past this: that does not revoke write descriptors another account already holds, and this check cannot tell a relabelled tree from a fresh one. See *The supported bootstrap* in docs/installation.md. This check is best-effort (see docs/installation.md): it cannot defend a tree that was already tampered with.\" || exit 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (basename, ims_startup_refuse, exit)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "case \"$query\" in *%*) DB_IDENTITY_REASON=\"DATABASE_URL percent-escapes something in its query string, and this will not decode it to find out whether the escape spells host, port, user or dbname — node-postgres decodes query KEYS, so ?ho%73t= reaches the driver as host= and moves the connection off the address the URL states. Write the query plainly, or run with --skip-migrate\"; return 1 ;; esac",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument ($query, return)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "chown -h \"$self\" \"${PUBLISH_STAGE_DIRNAME}\" 2>/dev/null || exit 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! chmod \"$mode\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if [[ -n \"$owner\" ]] && ! chown \"$owner\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; exit 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! chmod 644 \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! fsync_path \"$tmp\"; then rm -f \"$tmp\"; return 1; fi",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "chmod 700 \"${dir}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"$dropin\"",
+   "count": 3,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"$FENCE_FILE\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "echo -e \"${RED}[ERROR]${RESET} No systemd unit serves ${APP_DIR_REAL}, so there is NO reboot fence to install:\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo, 2)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\" \\\n|| warn \"${LEGACY_STATE_DIR_FENCE_FILE} could not be removed; it is inert now that the fence names ${FENCE_FILE}, but remove it by hand.\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "[[ -z \"${LEGACY_STATE_DIR_FENCE_FILE:-}\" ]] || rm -f \"${LEGACY_STATE_DIR_FENCE_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! mkdir -p \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chown root:root \"$DB_ENV_SNAPSHOT_DIR\" \\\n|| ! chmod 700 \"$DB_ENV_SNAPSHOT_DIR\"; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown; chmod on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "chown root:root \"$DB_ENV_SNAPSHOT_FILE\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"$DB_ENV_SNAPSHOT_FILE\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! printf '%s\\n' \"$content\" > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! chmod 600 \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "readback=\"$(cat \"$tmp\" 2>/dev/null)\" || { rm -f \"$tmp\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if [[ \"${readback}\" != \"$content\" ]]; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "mode=\"$(stat -c '%a' \"$tmp\" 2>/dev/null)\" || { rm -f \"$tmp\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if [[ \"${mode}\" != \"600\" ]]; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "if ! fsync_path \"$(dirname \"$CRON_BACKUP\")\"; then rm -f \"$CRON_BACKUP\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"$CRON_BACKUP\"",
+   "count": 5,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "CRON_FENCE_REASON=\"the fence projection of the ${APP_USER} crontab could not be computed, so there is nothing this run is willing to install in its place\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "[[ \"$rc\" -ne \"$CRONTAB_UNFENCE_DIVERGED\" ]] || die \\\n\"The ${APP_USER} crontab is still FENCED (every line commented out) and this run will not decide what belongs in it: ${CRON_UNFENCE_REASON}. Neither candidate is safe to install without a human — the backup at ${CRON_BACKUP} would discard whatever rewrote the crontab, and undoing the fence in place would discard the lines listed above. Compare the two (crontab -u ${APP_USER} -l, against ${CRON_BACKUP}) and install the union by hand.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument ($rc, die)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "die \"${FENCE_FILE} could not be removed, so this host would still refuse to start ${SERVICE_UNITS[0]:-the service} on its next boot. Remove it by hand (rm -f ${FENCE_FILE}) and re-run. Nothing has been stopped.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "echo -e \"${RED}[ERROR]${RESET} Remove it by hand:  rm -f ${FENCE_FILE}\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo, 2)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "echo -e \"                Remove it once you are happy: rm -f ${FENCE_FILE}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "echo -e \"                start the predecessor again. This run re-attempts the install\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo)"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "[[ -z \"$owner\" ]] || chown \"${owner}:${owner}\" \"$canonical\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "rm -f \"$legacy\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "done < <(find \"${APP_DIR_REAL}/prisma/migrations\" -mindepth 2 -maxdepth 2 -name 'verify.sql' -type f 2>/dev/null | sort)",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/deploy.sh",
+   "line": "run rm -f \"$FENCE_FILE\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f of the one fence file, through the `run` wrapper"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "readonly DB_FENCE_ARTEFACT_RECIPE=\"find . -type f -printf '%P\\\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "readonly DB_FENCE_ARTEFACT_SOURCE_TEXT=\"WHERE THAT VALUE COMES FROM, ON A FIRST-EVER INSTALL AS MUCH AS ON ANY OTHER: it is published WITH THE RELEASE. The release is built on a host that is not this one — a clean checkout of the tag, 'npm ci', then 'bash scripts/update.sh --print-fence-digest', which assembles exactly this tree, prints the line 'THE FENCE ARTEFACT THIS CHECKOUT WOULD PUBLISH HASHES TO <digest>', and neither writes nor executes any part of it. That mode exists BECAUSE the build host has no installation: it resolves the tree from the checkout the command was typed out of, needs no application directory, no .env, no port, no database and no root, and it runs before every gate the update path would otherwise refuse at — and that digest is published with the release checksums. A host that has ALREADY published this release will also report it: grep '^fence_artefact_sha256=' ${DB_FENCE_ARTEFACT_FILE} there. Running either that mode or --dry-run on THIS box prints the same kind of line, but assembled from the checkout under question, so it can CONFIRM the release's value and never stand in for it. The other way out needs no digest at all: bootstrap from a source nobody but root has ever written — fetch the release as root into a directory root has just created (git clone or tar -x as root into mktemp -d) — and the provenance question answers itself. Relabelling an existing tree with chown/chmod does NOT qualify: it revokes no write descriptor another account already holds.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! chmod \"$mode\" \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! _fence_fsync_path \"$tmp\"; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! mv -f \"$tmp\" \"$target\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "_fence_publish_file renames ONE mktemp file (made two lines up) onto its target"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "out=\"$(cd \"$root\" 2>/dev/null && find . -type f -printf '%P\\0' 2>/dev/null | LC_ALL=C sort -z | xargs -0 -r sha256sum --)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find | xargs with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find \"$root\" \\( ! -type d -a ! -type f \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find \"$root\" \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${DB_FENCE_RECOVERY_DIR}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod 755 \"${DB_FENCE_RECOVERY_DIR}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod 600 \"${program}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${program}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find \"${_FENCE_SRC_STRICT[@]}\" -maxdepth 0 \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find \"${_FENCE_SRC_PACKAGES[@]}\" \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find \"${_FENCE_SRC_PARENTS[@]}\" -maxdepth 0 \\\n\\( \\( ! -uid \"${uid}\" -a ! -uid 0 \\) -o \\( -perm /022 -a ! -perm -1000 \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "find \"${_FENCE_SRC_STRICT[@]}\" \"${_FENCE_SRC_PACKAGES[@]}\" \"${_FENCE_SRC_PARENTS[@]}\" \\\n-maxdepth 0 -printf '%p %D %i %U %m\\n' 2>/dev/null | LC_ALL=C sort",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${list}\"",
+   "count": 5,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "_fence_vendor_closure \"${app_dir}\" \"${staged}\" \"${list}\" \"${DB_FENCE_VENDOR_ROOTS[@]}\" || { rm -f \"${list}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "cp -R --no-dereference -- \"${app_dir}/${relative}\" \"${staged}/${relative}\" || { rc=1; break; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "copies FROM the app tree INTO the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; the app tree is only read"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "[[ \"${rc}\" -eq 0 ]] || { rm -f \"${list}\"; return 1; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "count=\"$(find \"${staged}\" -type f 2>/dev/null | wc -l)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\" || return 1",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1",
+   "count": 2,
+   "class": "code-owned-tree",
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory on a failure path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"",
+   "count": 6,
+   "class": "code-owned-tree",
+   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown -R root:root \"${DB_FENCE_STAGED_APP_DIR}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "gives the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory to root: the direction that removes write access"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod -R u=rwX,go=rX \"${DB_FENCE_STAGED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "takes group/other write off the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "manifest=\"$(_fence_tree_manifest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "artefact_digest=\"$(_fence_tree_digest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\" || return 1",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "mv -f \"${DB_FENCE_PROTECTED_APP_DIR}\" \"${DB_FENCE_RETIRED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "rotates the fence's own copies inside the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! mv -f \"${DB_FENCE_STAGED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\"; then",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "rotates the fence's own copies inside the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "[[ -e \"${DB_FENCE_RETIRED_APP_DIR}\" ]] && mv -f \"${DB_FENCE_RETIRED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\" 2>/dev/null",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "restores the fence's own retired copy inside the root-only recovery directory"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\"",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${DB_FENCE_ARTEFACT_FILE}\" \"${DB_FENCE_MANIFEST_FILE}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "DB_FENCE_ROTATION_NOTE=\"${DB_FENCE_SCRIPT} (${candidate}) differs from the protected copy at ${DB_FENCE_SCRIPT_COPY} (${existing}) and was NOT promoted: the checkout is application-owned and cannot authenticate itself. To adopt it deliberately, re-run with BOTH IMS_FENCE_SCRIPT_SHA256=<digest of the release's entry file> and IMS_FENCE_ARTEFACT_SHA256=<digest of the whole artefact tree>, taken from the release and not from this box — the entry-file digest alone does not cover the dependency closure this would also republish out of the checkout, and is refused on its own here. Or discard the artefact and let the next run bootstrap: ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${DB_FENCE_IDENTITY_FILE}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod 644 \"${DB_FENCE_IDENTITY_FILE}\" || return 1",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "echo \"There is no complete artefact record at ${DB_FENCE_ARTEFACT_FILE}, so nothing says what ${DB_FENCE_PROTECTED_APP_DIR} is supposed to hash to and the tree cannot be authenticated. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256.\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (echo, 2)"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${destination}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "actual=\"$(cd \"${protected_dir}\" 2>/dev/null && find . -type f -printf '%P\\0' | LC_ALL=C sort -z | xargs -0 -r sha256sum -- | sha256sum)\"",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find | xargs with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod 600 \"${cutover_lock}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${state_file}\" 2>/dev/null || true",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${target}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "mkdir -p \"${dir}/scripts\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the probe directory this function made with `mktemp -d` two lines up"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "cat < \"${DB_FENCE_SCRIPT}\" > \"${dir}/scripts/fence-db-connections.mjs\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the probe directory this function made with `mktemp -d`"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "_fence_vendor_into \"${app_dir}\" \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the probe directory this function made with `mktemp -d`"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod -R u=rwX,go=rX \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "seals, or deletes, the probe directory this function made with `mktemp -d`"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "_fence_tree_is_sealed \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the probe directory this function made with `mktemp -d`"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "digest=\"$(_fence_tree_digest \"${dir}\")\" || { rm -rf \"${dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes the probe directory this function made with `mktemp -d`"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "[[ -z \"${_fence_probe_dir}\" ]] || rm -rf \"${_fence_probe_dir}\"",
+   "count": 4,
+   "class": "code-owned-tree",
+   "reason": "deletes the `mktemp -d` probe directory _fence_probe_assemble made for this call"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "chown -h root:root \"${CRONTAB_LOCK_DIR}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "chown -h root:root \"${CRONTAB_LOCK_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "rm -f \"${err_file}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "CRONTAB_WRITE_REASON=\"\\`crontab\\` is not installed on this host, so nothing can install a schedule for ${user} — and its absence does not mean there is no schedule to displace, because the spool file and the running daemon both outlive the client binary\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "CRONTAB_WRITE_REASON=\"\\`crontab -u ${user} -\\` exited ${rc} and did NOT install the schedule it was given — it said: ${err:-nothing at all}. A rejected write leaves the crontab exactly as it was, which is not what the caller asked for and is not what the caller's next line assumes\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "CRON_COMPUTE_REASON=\"${what} exited 0 but returned ${got} line(s) for an input of ${want}. A line-for-line projection that changes the line count did not run to completion, whatever it exited with, and its output is not a crontab this run is willing to install\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (a string)"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "rm -f \"${cand_file}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "rm -f \"${cand_file}\" \"${back_file}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chmod \"${mode}\" . || { cd \"${saved}\" >/dev/null 2>&1 || true; die \"${path} could not be set to mode ${mode}. Nothing has been changed.\"; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chown \"${owner}:${owner}\" . 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "copy_tree_into_new_dir() {",
+   "count": 1,
+   "class": "definition",
+   "reason": "the definition of a helper the census classifies; its calls are census rows"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "rm -rf \"${dest}\"",
+   "count": 1,
+   "class": "census-helper",
+   "reason": "the body of copy_tree_into_new_dir: every call site is a census row with its own guard"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "cp -a \"${src}/.\" . 2>/dev/null || exit 1",
+   "count": 1,
+   "class": "census-helper",
+   "reason": "the body of copy_tree_into_new_dir, copying into the directory it just created and verified"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chown -h \"$(id -u):$(id -g)\" \"${path}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chmod 600 \"/proc/self/fd/${fd}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "rm -f \"${temporary}\" 2>/dev/null || true",
+   "count": 4,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chown -h \"$(id -u):$(id -g)\" \"${temporary}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "if ! mv -f \"${temporary}\" \"${path}\" 2>/dev/null; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "rotate_cutover_lock_inode renames ONE temporary lock file onto its path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "if ! chmod 711 . || ! chown \"$(id -u):$(id -g)\" .; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; chown on one named path"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "rotate_cutover_lock_inode \"$LOCK_FILE\" || die \\\n\"${LOCK_FILE} was inherited at mode ${inherited_lock_mode:-unreadable} — openable, and therefore lockable, by accounts other than this one — and this run could not replace it with a fresh 0600 inode it holds. Narrowing it in place would not help: \\`chmod\\` cannot reach a descriptor ${APP_USER} opened while the file was wide, and that descriptor can block every future deploy, update and install on this box. Refusing to run a cutover behind an exclusion this run cannot show it owns. Nothing has been stopped.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (rotate_cutover_lock_inode, die)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "driver_refuse \"${dir} has mode ${mode} — writable by group or other, and $( (( parent == 1 )) && printf 'it is the immediate parent, where the sticky bit would still let another account create that name first' || printf 'it is not sticky, so another account can rename it' ) — so an account other than this one can replace ${IMS_DRIVER_ROOT} and everything root runs out of it. Take the group and other WRITE BIT off that DIRECTORY (chmod g-w,o-w ${dir}) and re-run. That closes it, and it is not the relabel docs/installation.md refuses as a bootstrap: permission to create, rename or remove an entry IN a directory is checked on every operation, so a mode change there takes effect at once — where a FILE's mode change revokes no descriptor another account already opened for writing. Nothing has been published\" || return 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (parent, printf, driver_refuse)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "if ! chmod 755 . || ! chown \"$(id -u):$(id -g)\" .; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chmod; chown on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "driver_refuse \"${IMS_DRIVER_ROOT} is ${kind:-unreadable}, owned by uid ${owner:-unknown}, mode ${mode:-unknown}: it is not a directory this run owns outright, and it is REFUSED rather than corrected — a second chmod would be the same unasked question\" || return 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (driver_refuse, return)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "offender=\"$(find \"${src}\" -mindepth 1 -maxdepth 1 ! -type f -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "done < <(cd \"${src}\" 2>/dev/null && find . -mindepth 1 -maxdepth 1 -type f -printf '%P\\0' 2>/dev/null | LC_ALL=C sort -z)",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "offender=\"$(find \"${_DRIVER_SRC_DIRS[@]}\" \"${_DRIVER_SRC_FILES[@]}\" -maxdepth 0 \\\n\\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "offender=\"$(find \"${_DRIVER_SRC_TREES[@]}\" \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "offender=\"$(find \"${_DRIVER_SRC_PARENTS[@]}\" -maxdepth 0 \\\n\\( \\( ! -uid \"${uid}\" -a ! -uid 0 \\) -o \\( -perm /022 -a ! -perm -1000 \\) \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "find \"${_DRIVER_SRC_DIRS[@]}\" \"${_DRIVER_SRC_FILES[@]}\" \"${_DRIVER_SRC_PARENTS[@]}\" \\\n-maxdepth 0 -printf '%p %D %i %U %m\\n' 2>/dev/null",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "find \"${_DRIVER_SRC_TREES[@]}\" -printf '%p %D %i %U %m\\n' 2>/dev/null",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\\n' 2>/dev/null || true",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "mv -T \"${entry}\" \"${target}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "legacy migration: renames a publication directory this library made back to its pointer name when nothing stands there"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -rf \"${entry}\" || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "the sweep: deletes a superseded publication directory under the root-only IMS_DRIVER_ROOT that no process has open (o3d-u460)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "mv -T \"${retire_dir}\" \"${target}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "rollback: puts this publication's own retired directory back"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -rf \"${version_dir}\" \"${retire_dir}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "rollback: deletes this publication's own version and retire directories"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -f \"${pointer_tmp}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "mkdir -p \"${staged}\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -rf \"${run_dir}\"",
+   "count": 8,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own `mktemp -d` run directory under IMS_DRIVER_ROOT"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chown -R \"$(id -u):$(id -g)\" \"${staged}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "root takes ownership of its own staging copy inside the `mktemp -d` run directory"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chmod -R u=rwX,go=rX \"${staged}\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "takes group/other write off its own staging copy inside the `mktemp -d` run directory"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${run_dir}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chmod 755 \"${run_dir}\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "tree_manifest=\"$(_fence_tree_manifest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "digest=\"$(_fence_tree_digest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own `mktemp -d` run directory on failure"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${run_dir}/${record_name}\" \"${run_dir}/${manifest_name}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "if ! mv -T \"${run_dir}\" \"${version_dir}\"; then",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "renames this publication's own run directory to its version name"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "if ! mv -T \"${target}\" \"${retire_dir}\"; then",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "retires a legacy publication directory under the root-only IMS_DRIVER_ROOT"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "if ! ln -s -- \"${version_name}/${tree_name}\" \"${pointer_tmp}\"; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive ln -s -- on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "if ! mv -T \"${pointer_tmp}\" \"${target}\"; then",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "the atomic pointer flip: renames ONE symlink onto the pointer name"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -rf \"${retire_dir}\" 2>/dev/null || true",
+   "count": 2,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own retire directory after the flip"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "driver_refuse \"NOTHING VOUCHES FOR THE BYTES IN ${scripts_dir}, so NOTHING was published to ${IMS_DRIVER_PROGRAM_DIR} and the copy standing there is unchanged. ${IMS_DRIVER_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one, which means that account could have replaced what is in that tree AFTER every check this run has made — and what is published there is what the NEXT privileged run executes AS ROOT, on the documented update command. Publishing it would postpone a privilege escalation by one release rather than close it. TWO WAYS OUT, and both put the answer outside that account: re-run supplying IMS_DRIVER_SHA256=<digest of the driver tree of the release you intend to install>, which must come from the release and not from this box — a digest computed here is what the tree under question says about itself and can CONFIRM the release's value, never stand in for it; or fetch the release as root into a directory root has just created (git clone or tar -x as root into mktemp -d) and publish from there, in which case nothing needs to vouch for it because nobody else has ever had those files open. Relabelling an existing tree with chown/chmod does NOT qualify: it revokes no write descriptor another account already holds. The digest is taken over the tree that WOULD be published — the three entrypoints and lib/ — with: ${DB_FENCE_ARTEFACT_RECIPE}\" || true",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (driver_refuse, true)"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "chown \"$(id -u):$(id -g)\" \"${IMS_DRIVER_DEPLOY_META}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "hits=\"$(mktemp 2>/dev/null)\" || { rm -f \"${errors}\"; return 2; }",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "find \"${from}\" -printf '%D:%i\\n' 2>\"${errors}\" | grep -m1 -x -F -f \"${idfile}\" > \"${hits}\"",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -f \"${errors}\" \"${hits}\"",
+   "count": 3,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "find \"${extra}\" -printf '%D:%i\\n' >> \"${out}\" 2>/dev/null || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -f \"${privileged_trees_disjoint_ids}\"",
+   "count": 4,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "rm -f \"${privileged_kind_ids}\"",
+   "count": 2,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on one named path"
+  }
+ ]
+}

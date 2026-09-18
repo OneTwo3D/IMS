@@ -7503,9 +7503,9 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
 else
   prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwoinventory"
 fi
-# THE SOURCE, THE TARGETS AND THE RUNNING TREE MUST BE DISJOINT. THAT IS ASKED AT EACH OPERATION BELOW,
-# WHICH IS WHAT CARRIES THE PROPERTY, AND — EARLY, SO NOTHING HAS BEEN CHANGED WHEN AN OPERATOR HEARS
-# ABOUT IT — HERE (o3d-z5be r6/r9, Codex HIGH 2, review LOW 4). Section 9 copies
+# THE SOURCE, THE TARGETS AND THE RUNNING TREE MUST BE DISJOINT. THAT IS ASKED AT THE GUARDED OPERATIONS
+# BELOW, WHICH IS WHAT CARRIES THE PROPERTY, AND — EARLY, SO NOTHING HAS BEEN CHANGED WHEN AN OPERATOR
+# HEARS ABOUT IT — HERE (o3d-z5be r6/r9/r10, Codex HIGH 2, review LOW 4). Section 9 copies
 # LOCAL_SOURCE_DIR into ${APP_DIR} and then `chown -R`s ${APP_DIR} to ${APP_USER}; sections 8 and 9
 # recursively change the ownership of ${DATA_DIR} and ${LOG_DIR} too. Nothing prevented the release
 # being executed from already being ${APP_DIR}, and then that `chown` handed this script's own inode to
