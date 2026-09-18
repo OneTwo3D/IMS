@@ -2188,6 +2188,17 @@ The daily batch intentionally processes A1 revenue deferral, A2 inventory alloca
 
 Retry behavior is marker-driven. If the process stops after A1, the next run skips A1-marked orders and continues with A2. If it stops after A2, the next run continues with Group B. If Group B partially fails, unmarked shipments remain eligible for the next run. Do not manually clear these dates unless finance has also reversed any exported journals.
 
+**A shipment valued at a negative cost is refused, not posted.** If a shipment's cost-layer
+snapshot carries a negative unit cost — which happens when a landed-cost recalculation applies a
+credit freight cost line larger than the goods it is spread over — Group B does not journal that
+order. The daily batch run is marked failed with a message naming the order, the shipment and the
+cost layer, and the order's shipments stay unjournaled. Nothing needs clearing: correct the cost
+basis (usually by removing or correcting the credit freight cost line on the purchase order, which
+re-runs the landed-cost recalculation) and the next batch posts the shipment with its COGS. Before
+this, such a shipment was journaled with its revenue only and its COGS line silently left out.
+IMS does not post a negative cost basis at all; whether it ever should is an open decision
+(o3d-gd2f).
+
 ### Which batch a row belongs to
 
 Each staged row also records the exact journal reference it went into, alongside its marker date: `revenueDeferredBatchRef` (A1) and `inventoryAllocatedBatchRef` (A2) on the order, `shipmentJournalBatchRef` (Group B) on the shipment. That is what the order delete guard, the recreate sweep, the accounting invariants and reconciliation match on.

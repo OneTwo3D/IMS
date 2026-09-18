@@ -1086,6 +1086,54 @@ export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType
   return refusals
 }
 
+/**
+ * o3d-sidy (P1) — GROUP B REFUSES A NEGATIVE COST BASIS BY NAME, INSTEAD OF DROPPING ITS COGS LINE.
+ *
+ * WHAT HAPPENED WITHOUT THIS, proved end to end on a scratch database (o3d-sidy): a landed-cost
+ * recalc applying a CREDIT freight cost line drove a cost layer negative, and
+ * `updateSnapshotsForCostLayerChange` rewrote an ALREADY-SHIPPED, not-yet-journaled line's snapshot
+ * to that negative unit cost in place — with no movement builder in the path, so neither
+ * negative-basis refusal (#683, transfer re-layering) saw it. Group B read the snapshot directly, the
+ * batch COGS came out negative, and the COGS pair below is gated on `totalCogsNumber > 0`: the
+ * journal went out with its revenue pair only (its own narration said "COGS £-6.00"), the shipment
+ * was stamped journaled, the COGS subledger recorded a dispatch the ledger never received, and
+ * nothing failed. Beside a healthy shipment the same negative was NETTED into the batch total
+ * instead, understating COGS just as silently.
+ *
+ * WHY REFUSE RATHER THAN POST THE PAIR REVERSED. A reversed pair is how a signed COGS would be
+ * represented, and whether IMS represents a negative basis at all is the deferred o3d-gd2f decision
+ * (docs/todo/negative-basis-cost-layers-decision.md lists this very gate as its item (d)). Until it
+ * is taken, the established answer everywhere else is to refuse where an operator can see it (#683,
+ * transfer-cost-layer-recreation.ts). So the order is refused the way this loop already refuses a
+ * shipment with incomplete or mismatched snapshots: the throw lands in the per-order catch, the
+ * order's shipments stay UN-journaled (so a corrected basis flows through the next batch on its
+ * own), and the reason is a named entry in `result.errors`, which fails the cron run with it.
+ *
+ * WHY NOT A FAILED SYNC ROW. `resetFailedDailyBatchLogs` returns every FAILED daily-batch row to
+ * PENDING at the start of the next run, so a FAILED row would be re-queued for posting — the opposite
+ * of a refusal — and there is no journal to attach one to in the first place.
+ *
+ * PER ENTRY, NOT PER TOTAL. `parseCostLayerSnapshot` drops non-positive quantities, so an entry
+ * values below zero exactly when its unit cost does; a shipment that nets positive still carries a
+ * negative basis, which is the thing not represented. A ZERO basis is not refused: free goods have
+ * zero COGS, and the `> 0` gate dropping a zero pair drops nothing.
+ */
+function refuseNegativeBasisShipmentCogs(shipmentId: string, entries: CostLayerSnapshotEntry[]): void {
+  const negative = entries.filter((entry) => toDecimal(entry.unitCostBase).lt(0))
+  if (negative.length === 0) return
+  const cogs = roundQuantity(sumCostLayerSnapshot(entries), 2)
+  const layers = negative
+    .map((entry) => `${entry.costLayerId} (${entry.qty} @ ${entry.unitCostBase})`)
+    .join(', ')
+  throw new Error(
+    `Negative cost basis on shipment ${shipmentId}: cost layer(s) ${layers} carry a NEGATIVE unit cost, `
+    + `so its COGS would be ${cogs.toFixed(2)}. IMS does not post a negative cost basis (o3d-gd2f), so this `
+    + 'order is not journaled and stays queued for the next batch. Correct the basis - usually a credit '
+    + 'freight cost line a landed-cost recalculation applied to the purchase order - and the next batch '
+    + 'posts it (o3d-sidy).',
+  )
+}
+
 export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   const batchLimit = resolveXeroDailyBatchLimit()
   const result: XeroDailyBatchResult = {
@@ -1987,6 +2035,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               )
             : toDecimal(shipment.cogsBatchAmount ?? 0)
           const precomputedCogsNumber = precomputedCogs.toNumber()
+          // o3d-sidy: before anything is accumulated, so a refusal leaves nothing behind.
+          if (hasPrecomputedSnapshots) refuseNegativeBasisShipmentCogs(shipment.id, shipmentSnapshotsForLines.flat())
           if (hasPrecomputedSnapshots) {
             const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
               Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
@@ -2036,6 +2086,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
               }
             }
+
+            // o3d-sidy: the allocation snapshots are rewritten in place by the same revaluation.
+            refuseNegativeBasisShipmentCogs(shipment.id, shipmentCostSnapshot)
 
             for (const entry of shipmentCostSnapshot) {
               orderLayerDecrements.set(
