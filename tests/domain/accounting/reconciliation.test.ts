@@ -9,8 +9,12 @@ import {
   COLLATION_PIN,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   MAX_VOID_MIRROR_CONTRADICTIONS,
+  MAX_UNMIRRORED_SYNC_LOGS,
   RECONCILIATION_ROW_CAP_REACHED,
+  RECONCILIATION_TRUNCATION_FINDING_CODES,
+  UNMIRRORED_SYNC_LOGS_TRUNCATED,
   VOID_MIRROR_CONTRADICTIONS_TRUNCATED,
+  reconciliationTruncations,
   readReconciliationCompleteness,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
@@ -473,16 +477,80 @@ test('sources with accounting state report missing mirrored events', () => {
   assert.ok(codes.includes('source_refund_without_event'))
 })
 
-test('old mirrorable sync logs report missing accounting events', () => {
-  const rows = cleanRows()
-  rows.accountingEvents = rows.accountingEvents.filter((event) => event.type !== 'COGS_REVERSAL')
+// o3d-bnp6: `old_sync_log_without_mirrored_event` is asked of the database now (see
+// collectUnmirroredSyncLogs, proved in tests/db/reconciliation-unmirrored-sync-logs.test.ts). What the
+// evaluator does is REPORT what the statement found, bounded, with the exact count of the rest — and
+// NEVER work the answer out from the two capped pages, which is the defect this replaced.
+function unmirroredRow(syncLogId: string) {
+  return {
+    syncLogId,
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'PENDING',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    createdAt: new Date('2026-01-01T00:00:00.000Z'),
+  }
+}
 
-  const finding = evaluateAccountingReconciliationRows(rows).find((entry) => (
-    entry.code === 'old_sync_log_without_mirrored_event' &&
-    entry.syncLogId === 'sync-refund-cogs'
+test('o3d-bnp6: a sync log the statement found without a mirrored event is reported, fields intact', () => {
+  const rows = cleanRows()
+  rows.unmirroredSyncLogs = { rows: [unmirroredRow('sync-refund-cogs')], total: 1 }
+
+  const found = evaluateAccountingReconciliationRows(rows).filter((entry) => (
+    entry.code === 'old_sync_log_without_mirrored_event'
   ))
 
-  assert.ok(finding)
+  assert.equal(found.length, 1)
+  assert.equal(found[0].syncLogId, 'sync-refund-cogs')
+  assert.equal(found[0].severity, 'warning')
+  assert.deepEqual(found[0].details, {
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'PENDING',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+  }, 'the finding carries the same details the page-derived check did, so nothing downstream changes')
+  assert.ok(!evaluateAccountingReconciliationRows(rows).some((f) => f.code === UNMIRRORED_SYNC_LOGS_TRUNCATED),
+    'and a page that is the whole set says nothing about truncation')
+})
+
+test('o3d-bnp6: with the dataset ABSENT, nothing is worked out from the two pages instead', () => {
+  // The state the OLD check reported from: a mirrorable sync row on the page, its event gone from the
+  // event page. A fallback to the pages here would bring the defect back for any caller that forgot
+  // the dataset, so absent must mean "not read" and report nothing for this check.
+  const rows = cleanRows()
+  rows.accountingEvents = rows.accountingEvents.filter((event) => event.type !== 'COGS_REVERSAL')
+  assert.ok(rows.syncLogs.some((log) => log.id === 'sync-refund-cogs' && log.type === 'COGS_REVERSAL'),
+    'PRECONDITION: the page holds a mirrorable row whose event is not on the event page')
+  assert.equal(rows.unmirroredSyncLogs, undefined, 'PRECONDITION: the dataset was not supplied')
+
+  assert.deepEqual(
+    evaluateAccountingReconciliationRows(rows).filter((f) => f.code === 'old_sync_log_without_mirrored_event'),
+    [], 'no finding is derived from the pages')
+})
+
+test('o3d-bnp6: over the bound, the truncation finding carries the exact count and reaches the run', () => {
+  const rows = cleanRows()
+  const listed = Array.from({ length: 3 }, (_, i) => unmirroredRow(`sync-${i}`))
+  rows.unmirroredSyncLogs = { rows: listed, total: 1_234 }
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const truncation = findings.filter((f) => f.code === UNMIRRORED_SYNC_LOGS_TRUNCATED)
+
+  assert.equal(findings.filter((f) => f.code === 'old_sync_log_without_mirrored_event').length, 3)
+  assert.equal(truncation.length, 1)
+  assert.deepEqual(truncation[0].details, { reported: 3, total: 1_234, limit: MAX_UNMIRRORED_SYNC_LOGS })
+  assert.match(truncation[0].message, /^1234 accounting sync logs have no mirrored accounting event; only the oldest 3 /)
+  assert.ok(RECONCILIATION_TRUNCATION_FINDING_CODES.has(UNMIRRORED_SYNC_LOGS_TRUNCATED),
+    'the code is a registered run-level sentinel')
+  assert.deepEqual(reconciliationTruncations(findings).map((t) => t.code), [UNMIRRORED_SYNC_LOGS_TRUNCATED],
+    'so the run records it and a short list cannot read as complete')
+})
+
+test('o3d-bnp6: the bound is DERIVED from what the run view shows', () => {
+  assert.equal(MAX_UNMIRRORED_SYNC_LOGS, MAX_RECONCILIATION_FINDINGS_PER_RUN,
+    'the bound is the number of findings the run view will display at all')
 })
 
 test('shipment COGS revaluation sync logs count as source state for mirrored events', () => {
@@ -1537,8 +1605,21 @@ function voidMirrorFindings(contradictions: AccountingReconciliationRows['voidMi
 }
 
 /** The collector double, capturing the one statement the contradiction query issues. */
-async function captureContradictionQuery(result: unknown[] = []) {
-  const captured: { strings?: TemplateStringsArray; values?: unknown[] } = {}
+/**
+ * o3d-bnp6: the report now issues TWO raw statements — the void-mirror contradictions and the
+ * unmirrored sync rows — so a capture that kept "the last one" and answered every call with the same
+ * canned rows would depend on the order `Promise.all` happens to call them in, and would hand one
+ * statement's rows to the other. Each statement is recognised by the CTE it defines and answered
+ * with its own rows; an unrecognised statement fails loudly rather than being answered at all.
+ */
+const RAW_STATEMENT_MARKERS = {
+  contradiction: /\bcontradiction AS \(/,
+  unmirrored: /\bunmirrored AS \(/,
+} as const
+type RawStatement = keyof typeof RAW_STATEMENT_MARKERS
+
+async function captureRawStatements(results: Partial<Record<RawStatement, unknown[]>> = {}) {
+  const captured = new Map<RawStatement, { sql: string; values: unknown[] }>()
   const client = {
     salesOrder: { async findMany() { return [] } },
     shipment: { async findMany() { return [] } },
@@ -1547,9 +1628,13 @@ async function captureContradictionQuery(result: unknown[] = []) {
     accountingEvent: { async findMany() { return [] } },
     accountingEventLog: { async findMany() { return [] } },
     async $queryRaw(strings: TemplateStringsArray, ...values: unknown[]) {
-      captured.strings = strings
-      captured.values = values
-      return result
+      const sql = strings.join('?')
+      const matched = (Object.keys(RAW_STATEMENT_MARKERS) as RawStatement[])
+        .filter((name) => RAW_STATEMENT_MARKERS[name].test(sql))
+      assert.equal(matched.length, 1, `every raw statement the report issues is one this capture knows: ${sql.slice(0, 120)}`)
+      assert.ok(!captured.has(matched[0]), `and each is issued once: ${matched[0]}`)
+      captured.set(matched[0], { sql, values })
+      return results[matched[0]] ?? []
     },
   }
 
@@ -1557,10 +1642,53 @@ async function captureContradictionQuery(result: unknown[] = []) {
     lookbackDays: 30,
     toDate: new Date('2026-08-20T00:00:00.000Z'),
   })
-
-  assert.ok(captured.strings, 'the contradiction query is issued at all — a report that never asks finds nothing')
-  return { rows, sql: captured.strings.join('?'), values: captured.values ?? [] }
+  return { rows, captured }
 }
+
+async function captureContradictionQuery(result: unknown[] = []) {
+  const { rows, captured } = await captureRawStatements({ contradiction: result })
+  const statement = captured.get('contradiction')
+  assert.ok(statement, 'the contradiction query is issued at all — a report that never asks finds nothing')
+  return { rows, sql: statement.sql, values: statement.values }
+}
+
+async function captureUnmirroredQuery(result: unknown[] = []) {
+  const { rows, captured } = await captureRawStatements({ unmirrored: result })
+  const statement = captured.get('unmirrored')
+  assert.ok(statement, 'the unmirrored-sync-row query is issued at all — a report that never asks finds nothing')
+  return { rows, sql: statement.sql, values: statement.values }
+}
+
+test('o3d-bnp6: the unmirrored-row statement filters, then orders OLDEST first, then bounds', async () => {
+  const { sql, values } = await captureUnmirroredQuery()
+  const where = sql.indexOf('NOT EXISTS')
+  const order = sql.search(/FROM unmirrored\s+ORDER BY "createdAt" ASC, "syncLogId" ASC\s+LIMIT/)
+  assert.notEqual(where, -1, 'the statement asks whether an event exists')
+  assert.notEqual(order, -1, 'the page is ordered oldest first, ties on id, and only then bounded')
+  assert.ok(where < order, 'filter first, bound afterwards — a bound reached before the filter is the defect this replaced')
+  assert.match(sql, /\(count\(\*\) OVER \(\)\)::int AS "totalUnmirrored"/, 'the total is counted by the same statement')
+
+  // Every list the statement filters on is a parameter taken from the constant that means it.
+  assert.deepEqual(values[0], [...MIRRORED_ACCOUNTING_SYNC_TYPES], 'mirrored types only')
+  assert.deepEqual(values[1], ['PENDING', 'PROCESSING'], 'work owed, at any age')
+  assert.deepEqual(values[2], ['SYNCED', 'FAILED'], 'finished work, inside the lookback')
+  assert.equal(values[3], reconciliationLookbackDate(30, new Date('2026-08-20T00:00:00.000Z')).toISOString(),
+    'the lookback is the report\'s own, sent as an unambiguous UTC instant')
+  assert.equal(values.at(-1), MAX_UNMIRRORED_SYNC_LOGS, 'and the bound is the one the truncation finding names')
+  assert.equal(values.length, 5, 'and there is nothing else in it to reason about')
+})
+
+test('o3d-bnp6: the unmirrored total comes from the same statement, and zero rows means zero', async () => {
+  const empty = await captureUnmirroredQuery([])
+  assert.deepEqual(empty.rows.unmirroredSyncLogs, { rows: [], total: 0 })
+
+  const row = { ...unmirroredRow('sync-9'), totalUnmirrored: 9 }
+  const one = await captureUnmirroredQuery([row])
+  assert.equal(one.rows.unmirroredSyncLogs?.total, 9, 'the count is carried off the row')
+  assert.equal(one.rows.unmirroredSyncLogs?.rows.length, 1)
+  assert.ok(!('totalUnmirrored' in (one.rows.unmirroredSyncLogs?.rows[0] ?? {})),
+    'and stripped from the row, so it cannot ride into a finding as a fact about that sync log')
+})
 
 /**
  * WHERE EACH PARAMETER SITS IN THE STATEMENT, named rather than counted at each use. The positions

@@ -33,10 +33,13 @@ on:
       # account: the SQL that asks the database for the contradictions, and the two builders whose
       # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
       # them a change to either side of that equality could not reach the only job that runs it.
+      # reconciliation.ts also holds the unmirrored-sync-row statement that
+      # tests/db/reconciliation-unmirrored-sync-logs.test.ts proves (o3d-bnp6).
       - "lib/domain/accounting/reconciliation.ts"
       - "lib/domain/accounting/accounting-event-builder.ts"
       - "lib/domain/accounting/accounting-event-mirror.ts"
-      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
+      # and the unmirrored-sync-row question.
       - "lib/domain/accounting/mirrored-sync-types.ts"
   push:
     branches:
@@ -72,10 +75,13 @@ on:
       # account: the SQL that asks the database for the contradictions, and the two builders whose
       # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
       # them a change to either side of that equality could not reach the only job that runs it.
+      # reconciliation.ts also holds the unmirrored-sync-row statement that
+      # tests/db/reconciliation-unmirrored-sync-logs.test.ts proves (o3d-bnp6).
       - "lib/domain/accounting/reconciliation.ts"
       - "lib/domain/accounting/accounting-event-builder.ts"
       - "lib/domain/accounting/accounting-event-mirror.ts"
-      # The list the contradiction join itself filters on (`type = ANY(...)`, reconciliation.ts:1692).
+      # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
+      # and the unmirrored-sync-row question.
       - "lib/domain/accounting/mirrored-sync-types.ts"
 
 jobs:
@@ -217,10 +223,11 @@ jobs:
   # THE REST OF tests/db/, COUNTED RATHER THAN ASSERTED, because an earlier attempt at this comment
   # described the directory wrongly and the wrong sentence hid the defect it sat next to:
   #
-  #   * TWO files gate on a `RUN_DB_*` variable, and it is the same one, set below: the retention
-  #     evidence above, and `reconciliation-void-mirror-contradictions`, which was written against a
+  #   * THREE files gate on a `RUN_DB_*` variable, and it is the same one, set below: the retention
+  #     evidence above; `reconciliation-void-mirror-contradictions`, which was written against a
   #     `RUN_DB_MIGRATION_TESTS` pair that never reached development and was re-gated onto this pair
-  #     when it landed, so that it runs here instead of skipping green.
+  #     when it landed, so that it runs here instead of skipping green; and
+  #     `reconciliation-unmirrored-sync-logs` (o3d-bnp6), gated on this pair from the start.
   #   * FOUR open a real connection whenever DATABASE_URL is set and skip only those tests when it
   #     is not (`connection-schema-pinning`, `guarded-pool-routing`, `session-lock-affinity`,
   #     `startup-option-verdict-across-bundles`). Their live probes run here, against this job's
@@ -228,8 +235,8 @@ jobs:
   #   * FOUR never open one (`advisory-lock-keys`, `pool-acquisition-bound`, `post-remote-persist`,
   #     `prisma-unique-violation`) and run identically under `test:unit`.
   #
-  # So this tier is NOT held back from `test:unit` as a block: 101 of its 139 tests execute there,
-  # and 38 skip. docs/development.md carries the same census per file, with the counts.
+  # So this tier is NOT held back from `test:unit` as a block: 101 of its 145 tests execute there,
+  # and 44 skip. docs/development.md carries the same census per file, with the counts.
   #
   # The lesson is not "count the files again": a prose census goes stale silently, and this one is
   # prose. NOTHING MECHANICAL ENFORCES IT. A programmatic census was built on o3d-n3yt and
@@ -329,8 +336,8 @@ jobs:
           fi
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
       # `test:db` sets RUN_DB_RETENTION_TESTS=1 *and* REQUIRE_DB_RETENTION_TESTS=1. The second is the
-      # tripwire for this job: if an edit ever drops the first, both suites gated on it refuse to
-      # load instead of skipping themselves into a green run again. That covers THIS pair only. Nothing stops the NEXT
+      # tripwire for this job: if an edit ever drops the first, every suite gated on it refuses to
+      # load instead of skipping into a green run again. That covers THIS pair only. Nothing stops the NEXT
       # gate arriving without either half — see the comment above the job, and o3d-dzsd.
       - name: Run the DB-backed regression suites
         env:
