@@ -4,8 +4,9 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
+import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
@@ -1267,12 +1268,19 @@ async function releaseHeldWcSalesInvoice(
     // imported, with no operator present: the hold stays PENDING and the only record was a log line
     // nobody reads. The refusal is now outstanding work in the exception inbox, and the release that
     // eventually queues the invoice clears it (the facade clears on a queued enqueue).
-    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+    // The key comes from the SAME params the enqueue above was given, so it is the key the facade's clear uses.
+    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, enqueueOutcome.outcome?.posting ?? accountingPostingKey({
       type: 'SALES_INVOICE',
       referenceType: 'SalesOrder',
       referenceId: orderId,
+      idempotencyKey,
+    }), {
       chartConnector: heldChartConnector,
-      activeConnector: enqueueOutcome.outcome?.connector ?? null,
+      // o3d-j625 r5 (review M-4): the ACTIVE connector, read as such. r4 wrote the CHART's connector into
+      // this column (via the enqueue's reported connector, which on a refusal is the chart's) and, because
+      // this write lands after the facade's own, CLOBBERED the correct pair the facade had just recorded.
+      // The enqueue's own report of it first; read at report time only when the enqueue reported none.
+      activeConnector: enqueueOutcome.outcome?.activeConnector ?? await activeAccountingConnectorForReport(),
       reason: enqueueOutcome.outcome?.reason === 'refused' ? 'retired_chart' : 'held_release_not_queued',
       committed: `WooCommerce order ${wcOrder.externalOrderNumber} is imported and holds invoice number ${invoiceNumber}`,
       remedy:
@@ -1280,7 +1288,10 @@ async function releaseHeldWcSalesInvoice(
         + 'connector selection and let the WooCommerce reconcile sweep retry, or queue the sales invoice '
         + 'from the order.',
       detail: { invoiceNumber, idempotencyKey, shoppingSyncLogId: row.id },
-    })
+    },
+    // review M-5: when the facade already recorded this refusal with its specific reason, this write only
+    // adds what the release knows — it must not count the same refusal twice.
+    { mergeOnly: enqueueOutcome.outcome?.refusalRecorded === true })
     if (logFailure) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -2521,8 +2532,6 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             entityType: 'SALES_ORDER',
             entityId: so.id,
             action: 'sales_invoice_not_queued',
-            // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-            postingRef: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: so.id },
             posting: `the sales invoice for imported WooCommerce order ${orderNumber}`,
             committed: 'the order is imported and marked synced in IMS',
             remedy:

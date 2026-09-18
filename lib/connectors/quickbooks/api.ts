@@ -314,25 +314,30 @@ export function escapeQboQueryValue(value: string): string {
 
 /**
  * Resolve an account code or ID to a QBO AccountRef { value: id }.
- * Looks up AccountingAccount by code first, then by externalAccountId.
+ * Looks up AccountingAccount by externalAccountId first, then by code (o3d-j625 r5 HIGH 6).
  * Returns null if not found.
  */
 export async function resolveAccountRef(codeOrId: string): Promise<{ value: string } | null> {
   if (!codeOrId) return null
 
-  // Try by code (AcctNum) first
-  const byCode = await db.accountingAccount.findFirst({
-    where: { connector: QBO_CONNECTOR, code: codeOrId, active: true },
-    select: { externalAccountId: true },
-  })
-  if (byCode) return { value: byCode.externalAccountId }
-
-  // Try by externalAccountId directly (already a QBO ID)
+  // o3d-j625 r5 (review HIGH 6) — THE ID IS TRIED FIRST, AND THAT ORDERING IS THE POINT.
+  //
+  // This resolved by `AcctNum` first and both forms are short numeric strings in QuickBooks, so a value
+  // IMS had confirmed as an account Id — "35" — could be re-resolved here to whatever happens to carry
+  // AcctNum 35, and the payment would post to a different account. Round 3's finding was closed on the
+  // claim that the poster sends the confirmed id verbatim; this is what makes that claim true. A value
+  // that is genuinely a code still resolves, one lookup later.
   const byId = await db.accountingAccount.findFirst({
     where: { connector: QBO_CONNECTOR, externalAccountId: codeOrId, active: true },
     select: { externalAccountId: true },
   })
   if (byId) return { value: byId.externalAccountId }
+
+  const byCode = await db.accountingAccount.findFirst({
+    where: { connector: QBO_CONNECTOR, code: codeOrId, active: true },
+    select: { externalAccountId: true },
+  })
+  if (byCode) return { value: byCode.externalAccountId }
 
   return null
 }

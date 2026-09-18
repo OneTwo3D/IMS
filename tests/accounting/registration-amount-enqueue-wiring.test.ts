@@ -101,7 +101,7 @@ mock.module('@/lib/accounting', {
     isAccountingSyncTypeEnabled: async () => true,
     isAccountingSyncTypeEnabledFor: async () => true,
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero' }),
-    getPaymentAccountMap: async () => ({ default: 'BANK-1' }),
+    getPaymentAccountMap: async () => JSON.stringify({ 'card:GBP': 'BANK-1' }), // o3d-j625 r5: production returns the setting's JSON STRING
     lookupPaymentAccount: () => 'BANK-1',
     // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
     // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.

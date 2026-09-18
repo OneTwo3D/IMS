@@ -200,3 +200,46 @@ export function ownProperty(objectText: string, key: string): string | null {
   }
   return null
 }
+
+/**
+ * o3d-j625 r5 (review M-9) — AN ALIAS IS THE SAME CALL.
+ *
+ * `app/actions/sales.ts` already writes `const { queueAccountingSync: queueUpdate } = await import(…)`, so
+ * a census that matches only the declared names is one rename away from seeing nothing. Aliases are read
+ * out of the file's own destructures, imports and `const` re-bindings and counted as their target.
+ * (A higher-order WRAPPER is not an alias and is not recognised; see the census that uses this.)
+ */
+export function aliasesOf(code: string, callee: string): string[] {
+  const out: string[] = []
+  const patterns = [
+    new RegExp(`\\b${callee}\\s*:\\s*([A-Za-z_$][\\w$]*)`, 'g'),   // { queueAccountingSync: queueUpdate }
+    new RegExp(`\\b${callee}\\s+as\\s+([A-Za-z_$][\\w$]*)`, 'g'),  // import { x as y }
+    // const enqueue = queueAccountingSync / = deps.queueAccountingSync — a re-binding, not a call.
+    new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:[\\w$]+\\.)*${callee}(?![\\w$])(?!\\s*(?:\\?\\.\\s*)?\\()`, 'g'),
+  ]
+  for (const pattern of patterns) {
+    for (let m = pattern.exec(code); m; m = pattern.exec(code)) {
+      const alias = m[1]!
+      // `{ queueAccountingSync: async () => … }` in a double declares a PROPERTY, not an alias.
+      if (alias !== callee && !/^(async|function|await|typeof)$/.test(alias)) out.push(alias)
+    }
+  }
+  return [...new Set(out)]
+}
+
+/**
+ * o3d-j625 r5 (review M-9) — EVERY CALL OF `names`, IN EVERY SPELLING THE LANGUAGE ALLOWS FOR A DIRECT CALL.
+ *
+ * Whole identifier only, then optional whitespace, an optional `?.` (an optional member call — the
+ * injected enqueues in lib/cost-layers.ts are declared optional), and the `(`. Returns the identifier's
+ * index and the index of its open paren. `code` must already be `blankNonCode`d.
+ */
+export function callOpens(code: string, names: readonly string[]): Array<{ at: number; open: number; name: string }> {
+  const out: Array<{ at: number; open: number; name: string }> = []
+  for (const name of names) {
+    const escaped = name.replace(/\$/g, '\\$')
+    const re = new RegExp(`(?<![\\w$])${escaped}\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+    for (let m = re.exec(code); m; m = re.exec(code)) out.push({ at: m.index, open: m.index + m[0].length - 1, name })
+  }
+  return out.sort((a, b) => a.at - b.at)
+}

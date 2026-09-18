@@ -60,7 +60,7 @@ function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string,
   return true
 }
 
-const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown> } = {}
+const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number } = {}
 
 const emptyModel = {
   findMany: async () => [],
@@ -81,8 +81,10 @@ const db = new Proxy({
       seen.countWhere = where
       return allRows.filter((row) => matchesRefusalWhere(row, where)).length
     },
-    findMany: async ({ where }: { where: Record<string, unknown> }) => {
+    findMany: async ({ where, orderBy, take }: { where: Record<string, unknown>; orderBy?: unknown; take?: number }) => {
       seen.listWhere = where
+      seen.listOrderBy = orderBy
+      seen.listTake = take
       return allRows.filter((row) => matchesRefusalWhere(row, where))
     },
   },
@@ -124,13 +126,24 @@ test('[o3d-j625 r4] the exception inbox LISTS refused postings, counts them in i
   assert.equal(row.firstRefusedAt, '2026-09-10T08:00:00.000Z', 'serialised for the client')
 })
 
-test('[o3d-j625 r4] only OUTSTANDING refusals are selected — a resolved one is not work', async () => {
+test('[o3d-j625 r4/r5] only OUTSTANDING refusals are selected — a resolved one is not work', async () => {
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  // o3d-j625 r5 (review M-16) — ASSERTED AS BEHAVIOUR, NOT AS A LITERAL SHAPE. r4 deep-equalled the
+  // predicate object, so a semantically identical rewrite (`{ resolvedAt: { equals: null } }`) failed while a
+  // predicate that stopped excluding resolved rows would have to be spelt exactly wrong to be caught. What
+  // matters is which rows come back.
+  assert.equal(data.summary.accountingPostingRefusals, 1, 'the resolved row is not counted')
+  assert.deepEqual(data.accountingPostingRefusals.map((row) => row.id), ['refusal-1'], 'nor listed')
+  assert.ok(seen.countWhere && seen.listWhere, 'and both queries were made')
+})
+
+test('[o3d-j625 r5 M-16] the section is OLDEST DEBT FIRST and capped, as its own copy claims', async () => {
   const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
   await getExceptionInboxData()
-  assert.deepEqual(
-    [seen.countWhere, seen.listWhere],
-    [{ resolvedAt: null }, { resolvedAt: null }],
-    'BOTH the count and the list select on the column the posting-being-made clears, so nothing has to '
-    + 'be acknowledged — and a resolved refusal is not work',
-  )
+  assert.deepEqual(seen.listOrderBy, { firstRefusedAt: 'asc' },
+    'the list claims oldest first: a refusal repeating for a week is the one to look at, not the one that '
+    + 'last happened to run')
+  assert.equal(typeof seen.listTake, 'number', 'and it is capped like every other section')
+  assert.ok((seen.listTake ?? 0) > 0)
 })

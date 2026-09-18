@@ -1,6 +1,7 @@
 'use client'
 
 import { Fragment, useState, useTransition } from 'react'
+import { ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL } from '@/lib/domain/accounting/posting-refusal-copy'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
@@ -902,12 +903,13 @@ export function ExceptionsClient({ data }: Props) {
           <SectionHeading
             title={`Accounting postings IMS refused to queue (${data.summary.accountingPostingRefusals})`}
             /*
-             * o3d-j625 r4. Every sentence a refusal shows below is the REFUSING SITE's own — the reason,
-             * what stands in IMS, and the remedy are columns on the row, so this page cannot drift into a
-             * second account of the same event. What is written here is only what is true of every row in
-             * the section: nothing re-drives these, and they clear when the posting is made.
+             * o3d-j625 r4/r5. Every sentence a refusal shows below is the REFUSING SITE's own — the reason,
+             * what stands in IMS and the remedy are columns on the row, so this page cannot drift into a
+             * second account of the same event. What is true of EVERY row in the section is the one exported
+             * string below (review M-6: r4 wrote it as a literal here, which is the shape the sibling
+             * section's guard bans, and for the same reason).
              */
-            detail="IMS would have written these postings into books whose chart of accounts does not describe them — the accounting connector changed while the document was being built, or the document id it names cannot be shown to belong to the connector it would post to. Nothing was sent and nothing retries on its own. Each row says what still stands in IMS and what to do; a row disappears from this list when the posting is actually queued, not when it is acknowledged."
+            detail={ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL}
             shown={data.accountingPostingRefusals.length}
             total={data.summary.accountingPostingRefusals}
           />

@@ -165,7 +165,7 @@ mock.module('@/lib/accounting', {
     // o3d-ekn8 r2: the explicit-connector form, which is what a pinned hand-off must ask.
     isAccountingSyncTypeEnabledFor: async (connector: string) => live.typeEnabledFor(connector),
     getActiveAccountingConnectorInfo: async () => ({ id: live.activeConnector }),
-    getPaymentAccountMap: async () => ({ default: 'QBO-BANK-1' }),
+    getPaymentAccountMap: async () => JSON.stringify({ 'card:GBP': 'QBO-BANK-1' }), // o3d-j625 r5: production returns the setting's JSON STRING
     lookupPaymentAccount: () => 'QBO-BANK-1',
     // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
     // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.

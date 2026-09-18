@@ -540,7 +540,7 @@ export async function updateManufacturingOrderStatus(
     // o3d-j625 r3 (Codex HIGH 1 family): the enqueue's answer, out of the transaction the same way the
     // skip reason is. A HOLDER, not a `let`: a `let` assigned only inside the callback is narrowed to
     // `never` by TypeScript, which makes every later read of it unable to observe anything at all.
-    const manufacturingJournalOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    const manufacturingJournalOutcome: { outcome?: EnqueueOutcomeLike; chartConnector?: string | null } = {}
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
     // audit-wght: the quantity actually booked into stock at completion — the
     // ASSEMBLY actual (yield loss) when supplied, else the planned quantity.
@@ -914,6 +914,8 @@ export async function updateManufacturingOrderStatus(
           // the same channel a declined enqueue uses, never a silent skip.
           const settings = await getAccountingSettings()
           const journalVerdict = await accountingPostingVerdictForChart(settings.connector, 'MANUFACTURING_JOURNAL')
+          // review M-2: carried out of the transaction, so the post-commit report names the chart.
+          manufacturingJournalOutcome.chartConnector = settings.connector
           if (journalVerdict.verdict === 'chart-retired') {
             manufacturingJournalOutcome.outcome = { queued: false, reason: 'refused', connector: journalVerdict.chartConnector }
           }
@@ -1011,8 +1013,6 @@ export async function updateManufacturingOrderStatus(
           entityType: 'STOCK_ADJUSTMENT',
           entityId: id,
           action: 'manufacturing_journal_not_queued',
-          // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-          postingRef: { type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id },
           posting: `the manufacturing overhead journal for ${orderPreview.reference}`,
           committed: 'the production order is COMPLETE in IMS and its overhead is capitalised into the output cost',
           remedy:
@@ -1020,6 +1020,9 @@ export async function updateManufacturingOrderStatus(
             + 'have not been relieved. Post the journal by hand, or re-run the daily reconcile once the '
             + 'accounting connector selection has settled.',
           outcome: manufacturingJournalOutcome.outcome,
+          // review M-2: the chart WAS in scope here; r4 left it out and the inbox rendered "none",
+          // which reads as "no connector was on" rather than "nobody wrote it down".
+          metadata: { chartConnector: manufacturingJournalOutcome.chartConnector ?? null, productionOrderId: id },
         })
       }
 
@@ -1672,7 +1675,7 @@ export async function updateManufacturingCostLines(
     let cleanedForWrite = cleaned
 
     // o3d-j625 r3 (Codex HIGH 1 family): see the holder note above.
-    const reclassOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    const reclassOutcome: { outcome?: EnqueueOutcomeLike; chartConnector?: string | null } = {}
     await db.$transaction(async (tx) => {
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM production_orders WHERE id = ${productionOrderId} FOR UPDATE`,
@@ -1691,6 +1694,8 @@ export async function updateManufacturingCostLines(
       const reclassVerdict = reclassChart
         ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
         : null
+      // review M-2: same — the chart, out to the report.
+      reclassOutcome.chartConnector = reclassChart?.connector ?? null
       if (reclassVerdict?.verdict === 'chart-retired') {
         reclassOutcome.outcome = { queued: false, reason: 'refused', connector: reclassVerdict.chartConnector }
       }
@@ -1836,8 +1841,6 @@ export async function updateManufacturingCostLines(
         entityType: 'STOCK_ADJUSTMENT',
         entityId: productionOrderId,
         action: 'manufacturing_reclass_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'MANUFACTURING_RECLASS', referenceType: 'ProductionOrder', referenceId: productionOrderId },
         posting: `the manufacturing reclass journal for production order ${productionOrderId}`,
         committed: 'the retrospective manufacturing-cost change is saved in IMS',
         remedy:
@@ -1845,6 +1848,8 @@ export async function updateManufacturingCostLines(
           + 'old cost. Post it by hand, or re-save the cost lines once the accounting connector selection '
           + 'has settled.',
         outcome: reclassOutcome.outcome,
+        // review M-2: the reclass chart was in scope (`reclassChart`), and was not recorded.
+        metadata: { chartConnector: reclassOutcome.chartConnector ?? null, productionOrderId },
       })
     }
 

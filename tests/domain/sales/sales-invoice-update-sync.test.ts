@@ -19,7 +19,7 @@ function makeDeps(options: {
 }) {
   const queued: unknown[] = []
   const activity: unknown[] = []
-  const outstanding: Array<{ reason: string; chartConnector: string | null; activeConnector: string | null; remedy: string }> = []
+  const outstanding: Array<{ posting: { type: string; referenceId: string; scope: string }; reason: string; chartConnector: string | null; activeConnector: string | null; remedy: string }> = []
   const deps: QueueSalesInvoiceUpdateDeps = {
     async getActiveAccountingConnectorInfo() {
       return options.connector
@@ -54,6 +54,8 @@ const baseParams = {
   chartConnector: 'xero' as const,
   // o3d-j625 r3: whose INVOICE the update is posted against.
   documentConnector: 'xero' as const,
+  // o3d-j625 r5: the key the caller derives from these same params and the facade will match on.
+  posting: { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-1', scope: '' },
 }
 
 test('queueSalesInvoiceUpdateForExistingAccountingInvoice queues Xero update with idempotency key', async () => {
@@ -261,6 +263,7 @@ test('[o3d-j625 r4] every refusal on this path records an outstanding posting ca
     await queueSalesInvoiceUpdateForExistingAccountingInvoice(params, deps)
     assert.equal(outstanding.length, 1, `${reason}: exactly one outstanding row`)
     assert.equal(outstanding[0].reason, reason)
+    assert.deepEqual(outstanding[0].posting, baseParams.posting, 'keyed on the posting the enqueue itself would clear')
     assert.equal(outstanding[0].activeConnector, 'xero', 'the ACTIVE connector — the half round 2 omitted')
     assert.equal(outstanding[0].chartConnector, params.chartConnector)
     assert.ok(outstanding[0].remedy.length > 0, 'and what the operator must do')

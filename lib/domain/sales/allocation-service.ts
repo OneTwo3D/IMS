@@ -1318,6 +1318,11 @@ export async function reverseOrphanedAllocationPosting(
       ],
     },
     reportOutcome: (outcome) => { reversalOutcome.outcome = outcome },
+    // o3d-j625 r5 (review M-1, the second HIGH 4 site) — THE TRIM COMMITS WHATEVER THIS ANSWERS. r4 wrote
+    // an ERROR activity row here and nothing outstanding, so a refused allocation reversal — pounds left
+    // standing in Allocated Inventory — was recorded only on the Activity page. Written inside THIS
+    // transaction, so it commits with the trim that made the debt real.
+    recordRefusalAsOutstanding: true,
   })
 
   const wasQueued = await assertAllocationReversalQueued(tx, orderId, reversalToken, amount, orphaned, proof.provedOnConnector, reversalOutcome.outcome ?? null)

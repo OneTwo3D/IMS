@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { balancedFrom, blankNonCode, ownProperty, productionSources } from './paid-provenance-scan'
+import { balancedFrom, blankNonCode, ownProperty, productionSources, aliasesOf } from './paid-provenance-scan'
 
 /**
  * o3d-j625 r3 (Codex HIGH 1, MEDIUM) — NO PRODUCTION ACCOUNTING ENQUEUE MAY DISCARD ITS ANSWER.
@@ -48,7 +48,10 @@ import { balancedFrom, blankNonCode, ownProperty, productionSources } from './pa
  *   enqueueFollowUpSyncLog                each connector's follow-up enqueuer (payments, PDFs, attachments,
  *                                         credit-note allocations)
  *
- * DELIBERATELY NOT COVERED: the two daily-batch `createPendingSyncLog`s. They cannot decline — they return
+ * DELIBERATELY NOT COVERED, and this is the full list of what inserts an accounting sync row (review L-5).
+ * The SEVENTH inserter is the facade's own `create` inside `queueAccountingSyncTx` (lib/accounting.ts) —
+ * not a call site at all but the write the whole census is about, reached only through the two enqueues
+ * above. The other two are the daily-batch `createPendingSyncLog`s. They cannot decline — they return
  * the new row's id or throw — so there is no refusal for a caller to discard, and "the id was not read"
  * is not this defect. Stated here so their absence is a decision, not an oversight.
  */
@@ -65,11 +68,13 @@ type Verdict = 'assigned-and-read' | 'argument' | 'returned' | 'reportOutcome' |
 
 type Site = { file: string; line: number; callee: string; verdict: Verdict; detail?: string }
 
+
 export function enqueueSites(file: string, source: string): Site[] {
   const code = blankNonCode(source)
   const sites: Site[] = []
   const seen = new Set<number>()
-  for (const callee of CALLEES) {
+  const names = CALLEES.flatMap((callee) => [callee, ...aliasesOf(code, callee)])
+  for (const callee of names) {
     let from = 0
     for (;;) {
       const at = code.indexOf(callee, from)
@@ -81,6 +86,9 @@ export function enqueueSites(file: string, source: string): Site[] {
       if (seen.has(at)) continue
       let open = at + callee.length
       while (/\s/.test(code[open] ?? '')) open++
+      // review M-9: the OPTIONAL call form. `lib/cost-layers.ts` already declares its injected enqueues
+      // optional, so `deps.queueAccountingSyncTx?.(…)` is a call this census must see.
+      if (code[open] === '?' && code[open + 1] === '.') { open += 2; while (/\s/.test(code[open] ?? '')) open++ }
       // The parenthesised injected callee: `(options.queueAccountingSync ?? queueAccountingSyncTx)(tx, …)`.
       let calleeStart = at
       if (code[open] === ')') {
@@ -123,8 +131,41 @@ export function enqueueSites(file: string, source: string): Site[] {
   return sites.sort((a, b) => a.line - b.line)
 }
 
+/**
+ * Where the scope of the binding `root` ends in `after`: the close of the block its DECLARATION sits in.
+ *
+ * `const outcome = await …` declares it here, so the scope is the enclosing block. `holder.outcome = await …`
+ * inside a `try {` writes to a binding declared further out — its reads after the `try` closes are real
+ * reads — so the scope is found from the nearest preceding `const|let|var root`, `extra` braces deeper
+ * than the assignment. No declaration found (a parameter, or module level): the rest of the file.
+ */
+function bindingScopeEnd(prefix: string, after: string, root: string): number {
+  const escaped = root.replace(/\$/g, '\\$')
+  const declarations = [...prefix.matchAll(new RegExp(`(?:^|[^\\w$])(?:const|let|var)\\s+${escaped}(?![\\w$])`, 'g'))]
+  const declaredAt = declarations.length === 0 ? -1 : declarations[declarations.length - 1]!.index!
+  if (declaredAt === -1) return after.length
+  // How many blocks the assignment is nested INSIDE the declaration's block.
+  let extra = 0
+  for (const ch of prefix.slice(declaredAt)) {
+    if (ch === '{') extra++
+    else if (ch === '}') extra--
+  }
+  let depth = Math.max(0, extra)
+  for (let i = 0; i < after.length; i++) {
+    if (after[i] === '{') depth++
+    else if (after[i] === '}') { depth--; if (depth < 0) return i }
+  }
+  return after.length
+}
+
 function classify(prefix: string, after: string, hasReportOutcome: boolean, startsLine = false): { verdict: Verdict; detail?: string } {
   if (hasReportOutcome) return { verdict: 'reportOutcome' }
+  // review M-9: an arrow handed to `.map(`/`.forEach(`/`.flatMap(` RETURNS the promise to the iterator, and
+  // what the iterator does with it (an awaited Promise.all, or nothing — `forEach` drops it) is outside what
+  // this census reads. Fail closed rather than score the `=>` as consumed.
+  if (/\.(?:map|forEach|flatMap)\(\s*(?:async\s*)?(?:\([^()]*\)|[\w$]+)\s*=>$/.test(prefix)) {
+    return { verdict: 'UNCLASSIFIED', detail: prefix.slice(-30) }
+  }
   // `return` must be on the SAME line to be returning THIS call: `if (…) return` on the line above is a
   // different statement, and reading it as a return classified a discarded enqueue as consumed.
   if ((!startsLine && /(?:^|[^\w$])return$/.test(prefix)) || /=>$/.test(prefix)) return { verdict: 'returned' }
@@ -135,9 +176,19 @@ function classify(prefix: string, after: string, hasReportOutcome: boolean, star
   const assigned = prefix.match(/([\w$][\w$.]*)\s*=$/)
   if (assigned && !/[=!<>]=$/.test(prefix)) {
     const root = assigned[1].split('.')[0]
-    const readLater = new RegExp(`(?:^|[^\\w$.])${root.replace(/\$/g, '\\$')}(?![\\w$])`).test(after)
+    // review M-10: an occurrence is not a READ. `x = …` later in the file satisfied the old check, as did
+    // the identifier appearing in a comment-free string or as another object's property name. What counts
+    // is an occurrence that is not itself an assignment target.
+    // …and a READ OF THIS BINDING: the search is bounded by the block the assignment sits in. The whole rest
+    // of the file let `const outcome = …` in function A, never read, pass because function B further down
+    // reads a variable of its own that is also called `outcome`.
+    const escaped = root.replace(/\$/g, '\\$')
+    const readLater = new RegExp(`(?:^|[^\\w$.])${escaped}(?![\\w$])\\s*(?![=][^=])`).test(after.slice(0, bindingScopeEnd(prefix, after, root)))
     return readLater ? { verdict: 'assigned-and-read' } : { verdict: 'STORED-UNREAD', detail: root }
   }
+  // review M-9: a promise handed to `.map(`/`.forEach(` is not consumed by anything the census can see —
+  // the array of promises may be awaited, or dropped. Fail closed rather than score it either way.
+  if (/\.(map|forEach|flatMap)\($/.test(prefix)) return { verdict: 'UNCLASSIFIED', detail: prefix.slice(-20) }
   // A statement position: the answer goes nowhere.
   // …and a line-start after anything that cannot CONTINUE an expression (an operator, `?`, `:`, `.`,
   // `[` would continue it, and are left to fail closed).
@@ -278,4 +329,45 @@ test('[o3d-j625 r4] ACCEPTS the facade’s own spread delegation to a connector 
   assert.deepEqual(verdicts(`
     return { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
   `), ['argument'])
+})
+
+test('[o3d-j625 r5 M-10] a stored answer is READ only if it is read in ITS OWN block, not by a namesake further down', () => {
+  assert.deepEqual(verdicts(`
+    async function a() {
+      const outcome = await queueAccountingSync({ type: 'A', payload, chartConnector })
+      return 'done'
+    }
+    async function b(outcome) {
+      if (outcome.queued) return
+    }
+  `), ['STORED-UNREAD'])
+  // CONTROL: the same answer read in its own block is consumed — and so is a holder declared OUTSIDE the
+  // block it is assigned in and read after that block closes (the held WooCommerce release's shape).
+  assert.deepEqual(verdicts(`
+    async function release() {
+      const holder = {}
+      try {
+        holder.outcome = await queueAccountingSync({ type: 'A', payload, chartConnector })
+      } catch (error) {
+        return
+      }
+      if (postingIsOwed(holder.outcome)) report()
+    }
+  `), ['assigned-and-read'])
+  assert.deepEqual(verdicts(`
+    async function a() {
+      const outcome = await queueAccountingSync({ type: 'A', payload, chartConnector })
+      if (postingIsOwed(outcome)) report()
+    }
+  `), ['assigned-and-read'])
+})
+
+test('[o3d-j625 r5 M-9] aliases, a spaced call and an optional call are all SITES, and are classified', () => {
+  assert.deepEqual(verdicts(`
+    const { queueAccountingSync: enqueue } = await import('@/lib/accounting')
+    await enqueue({ type: 'A', payload, chartConnector })
+    await deps.queueAccountingSyncTx?.(tx, { type: 'B', payload, chartConnector })
+    await queueAccountingSync ({ type: 'C', payload, chartConnector })
+    rows.forEach((r) => queueAccountingSync({ type: 'D', payload, chartConnector }))
+  `), ['DISCARDED', 'DISCARDED', 'DISCARDED', 'UNCLASSIFIED'])
 })

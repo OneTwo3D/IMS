@@ -21,6 +21,7 @@ import {
   queueAccountingSyncTxWithOutcome,
 } from '@/lib/accounting'
 import { asRoutableAccountingConnector } from '@/lib/accounting/connector-provenance'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
@@ -1183,6 +1184,17 @@ export function deferredReceiptsFailedDescription(params: { connector: string; e
     + invoicePaymentRemedyNote({ redrive: 'deferred', connector: params.connector })
 }
 
+/**
+ * o3d-j625 r5 (review M-12) — WHICH CONNECTOR THIS REGISTRATION WAS FOR.
+ *
+ * Returned so `addPayment` can read the realised-FX chart FOR it instead of resolving the active connector
+ * again. r4 deferred that as "routed by its own chart, so internally consistent" — which is a proof of an
+ * adjacent property: consistent with itself is not "in the same books as the settlement it is about", and
+ * the symmetric case (markBillPaid) was fixed this round. `null` when nothing was resolved or nothing was
+ * registered.
+ */
+export type InvoicePaymentRegistrationConnector = 'xero' | 'quickbooks' | null
+
 export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
   orderReference: string
@@ -1212,7 +1224,7 @@ export async function registerInvoicePaymentWithLedger(params: {
    * An ADDITION, not a substitution.
    */
   postedUnder?: PostedInvoiceEvidence
-}): Promise<void> {
+}): Promise<InvoicePaymentRegistrationConnector> {
   const warn = async (action: string, description: string, metadata: Record<string, unknown>) => {
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -1234,6 +1246,9 @@ export async function registerInvoicePaymentWithLedger(params: {
    */
   const amountNumber = params.amount.toNumber()
 
+  // o3d-j625 r5 (review M-12): the connector this registration was FOR, handed back so the caller's
+  // realised-FX journal is read for the same books rather than from a second resolution.
+  const registeredFor: { connector: InvoicePaymentRegistrationConnector } = { connector: null }
   // WHICH live obligation names the remedy when more than one connector holds one — filled in below
   // once the active connector is resolved. It never decides WHETHER one exists (o3d-0bfh r14).
   let preferredConnector: string | null = pinned?.connector ?? null
@@ -1287,7 +1302,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           refusal: 'AMOUNT_NOT_REPRESENTABLE',
           asNumber: amountNumber,
         })
-      return
+      return registeredFor.connector
     }
 
     // o3d-j625 r4 (SWEEP 1) — THE CONNECTOR IS READ ONCE, AND THE POSTING VERDICT IS ASKED OF THAT READ.
@@ -1322,9 +1337,10 @@ export async function registerInvoicePaymentWithLedger(params: {
         },
       }),
     ])
-    if (!so) return
+    if (!so) return registeredFor.connector
 
     const connectorId: PostedInvoiceEvidence['connector'] | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
+    registeredFor.connector = (connectorId === 'xero' || connectorId === 'quickbooks') ? connectorId : null
     // Only a tie-break for the remedy's wording — see `deferredRecovery`.
     preferredConnector = connectorId
 
@@ -1350,7 +1366,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           postedInvoiceId: pinned.accountingInvoiceId, currentInvoiceId: so.accountingInvoiceId,
           connector: pinned.connector,
         })
-      return
+      return registeredFor.connector
     }
     const accountingInvoiceId = pinned ? pinned.accountingInvoiceId : so.accountingInvoiceId
 
@@ -1429,6 +1445,20 @@ export async function registerInvoicePaymentWithLedger(params: {
     const documentConnector = connectorId === null
       ? null
       : asRoutableAccountingConnector(so.accountingInvoiceConnector)
+    /**
+     * o3d-j625 r5 (review HIGH 3) — THE KEY OF THIS RECEIPT'S POSTING, not of the order's.
+     *
+     * An INVOICE_PAYMENT is one RECEIPT against one document (invoice-payment-capacity.ts). r4 keyed the
+     * inbox row on the ORDER, so a refused deposit's row was resolved by a later balance succeeding: the
+     * ledger short by the deposit, the inbox empty. Derived by the same function the enqueue uses, from the
+     * payload the enqueue is given, so the row this refusal writes is the row that enqueue's clear matches.
+     */
+    const receiptPostingKey = () => accountingPostingKey({
+      type: 'INVOICE_PAYMENT',
+      referenceType: 'SalesOrder',
+      referenceId: params.orderId,
+      payload: { paymentId: params.paymentId },
+    })
     const documentProvenanceRefused = Boolean(accountingInvoiceId)
       && paymentSyncEnabled
       && connectorId !== null
@@ -1500,10 +1530,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     if (documentProvenanceRefused) {
       // o3d-j625 r4: and it is OUTSTANDING work, not only a warning — the receipt stands in IMS while
       // the ledger shows the invoice unpaid, and nothing re-drives this on its own.
-      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
-        type: 'INVOICE_PAYMENT',
-        referenceType: 'SalesOrder',
-        referenceId: params.orderId,
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, receiptPostingKey(), {
         chartConnector: connectorId,
         activeConnector: activeConnector?.id ?? connectorId,
         reason: 'document_provenance_unproven',
@@ -1525,13 +1552,10 @@ export async function registerInvoicePaymentWithLedger(params: {
           ? 'the invoice link predates the column that records which connector holds it'
           : `the invoice is recorded as ${so.accountingInvoiceConnector}'s and this payment would post to ${connectorId}`,
       })
-      return
+      return registeredFor.connector
     }
     if (mappedBankAccountId !== null && !bankAccountIsThisLedgers) {
-      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
-        type: 'INVOICE_PAYMENT',
-        referenceType: 'SalesOrder',
-        referenceId: params.orderId,
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, receiptPostingKey(), {
         chartConnector: connectorId,
         activeConnector: activeConnector?.id ?? connectorId,
         reason: 'payment_account_not_in_ledger',
@@ -1547,12 +1571,12 @@ export async function registerInvoicePaymentWithLedger(params: {
         refusal: 'PAYMENT_ACCOUNT_NOT_IN_LEDGER',
         detail: `mapped account ${mappedBankAccountId} is not an active bank account of ${connectorId ?? 'no connector'}`,
       })
-      return
+      return registeredFor.connector
     }
 
     if (!decision.register) {
       await reportRefusal(decision)
-      return
+      return registeredFor.connector
     }
     // Unreachable — `decideInvoicePaymentRegistration` refuses DOCUMENT_NOT_POSTED before anything
     // else can say `register: true`. Asserted rather than cast away, because the idempotency key
@@ -1560,7 +1584,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     // every unanchored receipt into one slot, which is the blindness this round is closing.
     if (!accountingInvoiceId) {
       await reportRefusal({ register: false, refusal: 'DOCUMENT_NOT_POSTED' })
-      return
+      return registeredFor.connector
     }
 
     // ENQUEUE UNDER THE ORDER LOCK, and only if the receipt is still there. The Payment row committed
@@ -1618,6 +1642,13 @@ export async function registerInvoicePaymentWithLedger(params: {
       })
       if (!underLock.register) return { refused: underLock } as const
       const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
+        // o3d-j625 r5 (review HIGH 4) — THE RECEIPT IS ALREADY COMMITTED, so a refusal here leaves money
+        // recorded in IMS and the invoice unpaid in the ledger. r4 wrote no row on this path at all (its
+        // reasoning, "an in-transaction refusal frequently rolls the local work back", is false here), and
+        // `'context-changed'` below is reached by `refuseUnattributableChart`'s refusals too — so the only
+        // record was a WARNING activity line, which is the surface the owner's decision ruled insufficient.
+        // Written inside THIS transaction, so the row commits with the registration attempt it is about.
+        recordRefusalAsOutstanding: true,
         type: 'INVOICE_PAYMENT',
         referenceType: 'SalesOrder',
         referenceId: params.orderId,
@@ -1699,7 +1730,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           // Whether the throw actually undid a write, or found the work already queued elsewhere.
           rolledBack: !moved.alreadyQueued,
         })
-      return
+      return registeredFor.connector
     }
 
     // queueAccountingSyncTx RE-READS the posting context and returns false when it has since changed —
@@ -1711,7 +1742,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     // — the operator sees one message naming the reason, not a silent no-op.
     if (typeof outcome === 'object' && 'refused' in outcome) {
       await reportRefusal(outcome.refused)
-      return
+      return registeredFor.connector
     }
     if (outcome === 'document-moved') {
       await warn('invoice_payment_not_registered',
@@ -1729,7 +1760,7 @@ export async function registerInvoicePaymentWithLedger(params: {
           amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_MOVED',
           postedInvoiceId: pinned?.accountingInvoiceId ?? null,
         })
-      return
+      return registeredFor.connector
     }
     if (outcome === 'context-changed') {
       await warn('invoice_payment_not_registered',
@@ -1766,6 +1797,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       },
     }).catch(() => { /* logging must never block the receipt either */ })
   }
+  return registeredFor.connector
 }
 /**
  * REGISTER RECEIPTS THAT WERE RECORDED BEFORE THE INVOICE EXISTED (o3d-ekn8).

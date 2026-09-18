@@ -140,12 +140,17 @@ mock.module('@/lib/accounting', {
     isAccountingSyncTypeEnabledFor: async () => true,
     getActiveAccountingConnectorInfo: async () => ({ id: 'quickbooks' }),
     // THE VARIABLE UNDER TEST, asked as a real question of a real map.
-    getPaymentAccountMap: async () => paymentMap,
+    // o3d-j625 r5 (review L-9): the REAL `getPaymentAccountMap` returns the setting's JSON STRING. This
+    // fixture handed back an object, which is why the processors' "no map configured at all" arm — asked as
+    // `Object.keys(mapJson)` — was dead in production and alive here. Modelled as production produces it.
+    getPaymentAccountMap: async () => (paymentMap === null ? '{}' : JSON.stringify(paymentMap)),
     // KEYED THE WAY THE REAL ONE IS (o3d-batch-ret r11): `method:currency`, then the `method:*`
     // wildcard. A currency-blind stub would have made every assertion about WHICH account the money
     // reached vacuous — which is the whole of this round's finding.
-    lookupPaymentAccount: (map: Record<string, string> | null, method: string, currency: string) =>
-      map?.[`${method}:${currency}`] ?? map?.[`${method}:*`] ?? null,
+    lookupPaymentAccount: (mapJson: string, method: string, currency: string) => {
+      const map = ((): Record<string, string> => { try { return JSON.parse(mapJson) as Record<string, string> } catch { return {} } })()
+      return map[`${method}:${currency}`] ?? map[`${method}:*`] ?? null
+    },
     queueAccountingSyncTxWithOutcome: async () => ({ queued: true, connector: 'quickbooks' }),
   },
 })

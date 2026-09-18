@@ -2976,6 +2976,12 @@ model AccountingPostingRefusal {
   type            String
   referenceType   String
   referenceId     String
+  /// o3d-j625 r5 (review HIGH 3) — THE OBLIGATION WITHIN THE DOCUMENT, or `''` when the document IS the
+  /// obligation. An INVOICE_PAYMENT is one RECEIPT against one document, a stock receipt is one receipt of
+  /// a purchase order, a landed-cost journal is one adjustment run: keyed on the document alone, a refused
+  /// deposit's row was resolved by a later balance succeeding. Derived by `accountingPostingKey` from the
+  /// ENQUEUE's own params, never re-typed beside them.
+  scope           String    @default("")
   /// Whose chart of accounts the refused payload was built from. NULL = nothing was switched on.
   chartConnector  String?
   /// The connector that was active when the refusal happened — the half round 2 omitted.
@@ -2993,8 +2999,8 @@ model AccountingPostingRefusal {
   /// Stamped when a posting for the same document is actually queued. NULL = still outstanding.
   resolvedAt      DateTime?
 
-  @@unique([type, referenceType, referenceId])
-  @@index([resolvedAt, lastRefusedAt])
+  @@unique([type, referenceType, referenceId, scope])
+  @@index([resolvedAt, firstRefusedAt])
   @@map("accounting_posting_refusals")
 }
 

@@ -49,6 +49,20 @@ export type EnqueueOutcomeLike = {
   queued: boolean
   reason?: 'not-configured' | 'refused' | 'already-queued'
   connector?: string | null
+  /**
+   * o3d-j625 r5 (review HIGH 1/2/3) — THE POSTING KEY, FROM THE ENQUEUE'S OWN PARAMS.
+   *
+   * r4 had every reporting site hand-write this beside the enqueue, and three of fourteen disagreed with
+   * what the CLEAR matches: one row could never clear, one shared a key with a different posting (so a
+   * successful cancellation resolved a reversal that was never written), and payments were keyed per
+   * document where the obligation is per receipt. The enqueue now reports the key it derived, so a
+   * reporting site cannot key its row on anything else.
+   */
+  posting?: { type: string; referenceType: string; referenceId: string; scope: string }
+  /** The active connector as the refusal saw it (review L-7), not as a later report re-reads it. */
+  activeConnector?: string | null
+  /** True when the enqueue already wrote the outstanding row — this report then MERGES (review M-5). */
+  refusalRecorded?: boolean
 }
 
 /**
@@ -85,14 +99,6 @@ export function postingIsOwed(outcome: EnqueueOutcomeLike): boolean {
  * warned, so there is nothing for the stronger signal to change.
  */
 export async function reportPostingNotQueued(params: {
-  /**
-   * o3d-j625 r4 — THE POSTING THIS IS ABOUT, so the report also lands in the exception inbox.
-   *
-   * Every caller of this function keeps its local change and tells the operator the ledger did not get
-   * the posting. An Activity-log line is not a surface anybody is watching, so the same facts are
-   * upserted as an OUTSTANDING row (see posting-refusal-inbox.ts) that clears when the posting is made.
-   */
-  postingRef: { type: string; referenceType: string; referenceId: string }
   entityType: ActivityEntityType
   entityId?: string | null
   /** The activity-log action, e.g. `manufacturing_journal_not_queued`. */
@@ -125,22 +131,51 @@ export async function reportPostingNotQueued(params: {
     },
   }).catch(() => { /* a report that cannot be written must not become the site's exception */ })
   // o3d-j625 r4: and the same thing, durably, where an operator will find it without going looking.
+  //
+  // o3d-j625 r5 — THE KEY IS THE ENQUEUE'S OWN (review HIGH 1/2/3). An outcome that carries no key came
+  // from a double or from a path that never reached an enqueue; there is nothing honest to key a row on, so
+  // none is written and the omission is reported rather than guessed at.
+  const posting = params.outcome.posting
+  if (!posting) {
+    await logActivity({
+      entityType: params.entityType,
+      entityId: params.entityId ?? null,
+      action: 'accounting_posting_refusal_not_recorded',
+      tag: 'accounting',
+      level: 'ERROR',
+      description:
+        `The ${params.posting} was not queued and could not be recorded as outstanding work: the enqueue `
+        + 'reported no posting key, so the exception inbox will not list it.',
+      metadata: { ...params.metadata },
+    }).catch(() => { /* nothing else to try */ })
+    return
+  }
   const { db } = await import('@/lib/db')
-  await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
-    type: params.postingRef.type,
-    referenceType: params.postingRef.referenceType,
-    referenceId: params.postingRef.referenceId,
-    chartConnector: (params.metadata?.chartConnector as string | undefined) ?? null,
-    activeConnector: await activeAccountingConnectorForReport(),
-    reason: params.outcome.reason ?? 'refused',
-    committed: params.committed,
-    remedy: params.remedy,
-    detail: { posting: params.postingRef, enqueueConnector: params.outcome.connector ?? null, ...params.metadata },
-  })
+  await recordAccountingPostingRefusal(
+    db as unknown as PostingRefusalClient,
+    posting,
+    {
+      chartConnector: (params.metadata?.chartConnector as string | undefined) ?? null,
+      // review L-7: the connector the REFUSAL saw, where the enqueue reported it. A read taken now would be
+      // a different moment's answer.
+      activeConnector: params.outcome.activeConnector ?? await activeAccountingConnectorForReport(),
+      reason: params.outcome.reason ?? 'refused',
+      committed: params.committed,
+      remedy: params.remedy,
+      detail: { enqueueConnector: params.outcome.connector ?? null, ...params.metadata },
+    },
+    // review M-5: the facade already wrote this row with the SPECIFIC reason. Merging adds what only this
+    // site knows (what stands in IMS, the remedy) without counting the refusal twice or degrading its reason.
+    { mergeOnly: params.outcome.refusalRecorded === true },
+  )
 }
 
-/** The connector active at the moment of the report — the half round 2's warning omitted. */
-async function activeAccountingConnectorForReport(): Promise<string | null> {
+/**
+ * The connector active at the moment of the report — used only when the enqueue reported none.
+ * Display-only (the inbox row's "active" column); never a routing input. Never throws, including when a
+ * test double of `@/lib/accounting` does not provide the resolver.
+ */
+export async function activeAccountingConnectorForReport(): Promise<string | null> {
   try {
     const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
     return (await getActiveAccountingConnectorInfo())?.id ?? null

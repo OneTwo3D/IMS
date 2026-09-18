@@ -37,6 +37,8 @@ const state = {
   queued: [] as { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }[],
   /** The connector being off: queueAccountingSync returns silently and writes nothing. */
   enqueueNoOps: false,
+  // o3d-j625 r5: the facade's own refusal — it records the row (specific reason, both connectors) and says so.
+  enqueueRefusesAndRecords: false,
   activity: [] as { action: string; description: string }[],
 }
 
@@ -118,16 +120,23 @@ mock.module('@/lib/db', {
       // assertion below is that a refusal is SELECTABLE as outstanding work, which is a property of the
       // stored row, not of a call having been made.
       accountingPostingRefusal: {
-        upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId: { type: string; referenceType: string; referenceId: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
-          const key = where.type_referenceType_referenceId
-          const existing = state.refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId)
+        // o3d-j625 r5: the r5 key — four columns, `scope` included — and `updateMany` honouring the
+        // `resolvedAt` predicate it is given. r4's double matched `resolvedAt === null` whatever it was asked,
+        // so the episode reset (`resolvedAt: { not: null }`) zeroed an OPEN row's count on every attempt.
+        upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId_scope: { type: string; referenceType: string; referenceId: string; scope: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+          const key = where.type_referenceType_referenceId_scope
+          const existing = state.refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId && ((r as { scope?: string }).scope ?? '') === key.scope)
           if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
           const row = { refusedCount: 1, ...create, resolvedAt: null } as Record<string, unknown>
           state.refusals.push(row as never)
           return row
         },
         updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
-          const hits = state.refusals.filter((r) => r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId && r.resolvedAt === null)
+          const wantResolved = where.resolvedAt !== null && typeof where.resolvedAt === 'object'
+          const hits = state.refusals.filter((r) =>
+            r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId
+            && ((r as { scope?: string }).scope ?? '') === (where.scope ?? '')
+            && (wantResolved ? r.resolvedAt !== null : r.resolvedAt === null))
           for (const hit of hits) Object.assign(hit, data)
           return { count: hits.length }
         },
@@ -155,6 +164,13 @@ mock.module('@/lib/accounting', {
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
       if (state.enqueueNoOps) return
+      if (state.enqueueRefusesAndRecords) {
+        const posting = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: params.referenceId, scope: '' }
+        const existing = state.refusals.find((r) => r.referenceId === params.referenceId && r.resolvedAt === null)
+        if (existing) existing.refusedCount = Number(existing.refusedCount) + 1
+        else state.refusals.push({ ...posting, chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'chart_retired', refusedCount: 1, resolvedAt: null })
+        return { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks', refusalRecorded: true, posting }
+      }
       state.queued.push({ referenceId: params.referenceId, idempotencyKey: params.idempotencyKey, payload: params.payload })
     },
   },
@@ -178,6 +194,7 @@ function reset() {
   state.orders = []
   state.queued = []
   state.enqueueNoOps = false
+  state.enqueueRefusesAndRecords = false
   state.activity = []
 }
 
@@ -397,4 +414,20 @@ test('[o3d-j625 r4] CONTROL: a release that DOES queue records nothing outstandi
 
   assert.equal(state.queued.length, 1, 'PRECONDITION: the invoice was queued')
   assert.deepEqual(outstanding(), [], 'nothing is owed, so nothing is outstanding')
+})
+
+test('[o3d-j625 r5 M-4/M-5] a refusal the FACADE already recorded is merged by the release — not recounted, not re-reasoned', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueRefusesAndRecords = true
+
+  await sweep()
+
+  const rows = outstanding()
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].refusedCount, 1, 'one refusal is one attempt, however many writers describe it')
+  assert.equal(rows[0].reason, 'chart_retired', 'the facade\'s SPECIFIC reason survives the release\'s generic one')
+  assert.equal(rows[0].activeConnector, 'quickbooks', 'and the ACTIVE connector is not overwritten with the chart\'s')
+  assert.ok(String(rows[0].committed).includes('imported'), 'while what only the release knows is added')
 })

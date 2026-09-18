@@ -215,13 +215,35 @@ mock.module('@/lib/domain/accounting/followup-scope-lock', {
 /** Rows the IN-TRANSACTION enqueue inserted, with the connector each was written under. */
 const insertedInTx: Array<{ connector: string; type: string; salesAccount: unknown }> = []
 
+/** The refusal table as seen through a TRANSACTION client: a failing statement aborts the transaction
+ *  unless a savepoint is open around it (see txModel). */
+function txRefusalTable() {
+  const failing = (): never => {
+    if (txModel.savepointDepth === 0) txModel.aborted = true
+    throw new Error('relation "AccountingPostingRefusal" does not exist (code deployed ahead of migrate deploy)')
+  }
+  return {
+    upsert: async (args: Parameters<typeof postingRefusalTable.upsert>[0]) => {
+      if (txModel.failRefusalWrites) failing()
+      txModel.txRefusalWrites += 1
+      return postingRefusalTable.upsert(args)
+    },
+    updateMany: async (args: Parameters<typeof postingRefusalTable.updateMany>[0]) => {
+      if (txModel.failRefusalWrites) failing()
+      return postingRefusalTable.updateMany(args)
+    },
+  }
+}
+
 function transactionDouble() {
   return {
     $executeRaw: async () => 1,
     $queryRaw: async () => [],
+    accountingPostingRefusal: txRefusalTable(),
     accountingSyncLog: {
       findMany: async () => [],
       create: async ({ data }: { data: { connector: string; type: string; payload: Record<string, unknown> } }) => {
+        if (txModel.aborted) throw new Error('25P02: current transaction is aborted')
         const lines = data.payload.lines as Array<{ accountCode?: unknown }> | undefined
         insertedInTx.push({ connector: data.connector, type: data.type, salesAccount: lines?.[0]?.accountCode })
         return { id: `log-${insertedInTx.length}`, ...data }
@@ -251,11 +273,24 @@ const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string,
   }
 }
 
+type StoredAccount = { connector: string; code: string | null; externalAccountId: string; active: boolean; type: string }
+const storedAccounts: StoredAccount[] = []
+function accountMatches(a: StoredAccount, where: Record<string, unknown>): boolean {
+  for (const [key, value] of Object.entries(where)) {
+    if (key === 'OR') {
+      if (!(value as Array<Record<string, unknown>>).some((alt) => accountMatches(a, alt))) return false
+    } else if ((a as Record<string, unknown>)[key] !== value) {
+      return false
+    }
+  }
+  return true
+}
+
 const refusals: Array<Record<string, unknown>> = []
 const postingRefusalTable = {
-  upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId: { type: string; referenceType: string; referenceId: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
-    const key = where.type_referenceType_referenceId
-    const existing = refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId)
+  upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId_scope: { type: string; referenceType: string; referenceId: string; scope: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+    const key = where.type_referenceType_referenceId_scope
+    const existing = refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId && r.scope === key.scope)
     if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
     const row = { refusedCount: 1, ...create, resolvedAt: null }
     refusals.push(row)
@@ -263,7 +298,8 @@ const postingRefusalTable = {
   },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = refusals.filter((r) => r.type === where.type && r.referenceType === where.referenceType
-      && r.referenceId === where.referenceId && r.resolvedAt === null)
+      && r.referenceId === where.referenceId && r.scope === where.scope
+      && (where.resolvedAt === null ? r.resolvedAt === null : r.resolvedAt !== null))
     for (const hit of hits) Object.assign(hit, data)
     return { count: hits.length }
   },
@@ -281,18 +317,49 @@ mock.module('@/lib/db', {
       setting: { findUnique: async () => null },
       accountingSyncLog: { findMany: async () => [] },
       accountingToken: { findFirst: async () => null },
-      accountingPostingRefusal: postingRefusalTable,
+      // o3d-j625 r5 (review HIGH 5): the stored chart, with a where-clause EVALUATOR rather than a canned
+      // answer — the property under test is which rows the confirmation's predicate admits.
+      accountingAccount: { findFirst: async ({ where }: { where: Record<string, unknown> }) => storedAccounts.find((a) => accountMatches(a, where)) ?? null },
+      // The POOLED client's view of the same table, counted separately: "recorded inside the caller's
+      // transaction" is only observable if a write through the pool is distinguishable from one through tx.
+      accountingPostingRefusal: {
+        upsert: async (args: Parameters<typeof postingRefusalTable.upsert>[0]) => { txModel.pooledRefusalWrites += 1; return postingRefusalTable.upsert(args) },
+        updateMany: postingRefusalTable.updateMany,
+      },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(transactionDouble()),
     },
   },
 })
 
+/**
+ * o3d-j625 r5 (review M-14) — POSTGRES' ABORTED-TRANSACTION RULE, MODELLED.
+ *
+ * A statement that fails inside a transaction aborts it (25P02): every later statement fails and the commit
+ * rolls back, whatever the client did with the exception. Only a savepoint contains the failure. The double
+ * below applies that rule, so "the refusal write failed and the caller's transaction is still committable"
+ * is a property the tests can observe rather than a claim about a try/catch.
+ */
+const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, txRefusalWrites: 0, pooledRefusalWrites: 0 }
 mock.module('@/lib/db/savepoint', {
-  namedExports: { withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => fn() },
+  namedExports: {
+    withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => {
+      txModel.savepointDepth += 1
+      try {
+        return await fn() // a throw here is ROLLBACK TO SAVEPOINT: the transaction stays usable
+      } finally {
+        txModel.savepointDepth -= 1
+      }
+    },
+  },
 })
 
 function reset(selection: string[]): void {
   refusals.length = 0
+  txModel.savepointDepth = 0
+  txModel.aborted = false
+  txModel.failRefusalWrites = false
+  txModel.txRefusalWrites = 0
+  txModel.pooledRefusalWrites = 0
   enabledPlugins = selection
   selectionReads = 0
   flipToQuickBooksAfterReads = null
@@ -531,4 +598,154 @@ test('[o3d-j625 r4] the posting being QUEUED clears the outstanding row — noth
   assert.deepEqual(outstandingRefusals(), [], 'the row clears when the posting is MADE')
   assert.equal(refusals.length, 1, 'and the record that the gap existed is kept, resolved')
   assert.ok(refusals[0].resolvedAt, 'stamped with when it was resolved')
+})
+
+
+/** The in-transaction request shape, as chart-connector-routing.test.ts uses it. */
+const TX_REQUEST = {
+  type: 'INVENTORY_ADJUSTMENT' as const,
+  referenceType: 'StockMovement',
+  referenceId: 'movement-1',
+  unlockedOrderScopeReason: 'test harness: the order guard is doubled to a non-order scope',
+}
+
+test('[o3d-j625 r5 HIGH 4] the IN-TRANSACTION enqueue records its refusal when the caller asks, inside the caller’s transaction', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+    // What the invoice-payment registration and the allocation trim now pass: their local state COMMITS
+    // whatever this answers, so the debt is real and must be recorded — r4 recorded nothing on this path.
+    recordRefusalAsOutstanding: true,
+  })
+
+  assert.equal(queued, false, 'PRECONDITION: the retired chart refused')
+  assert.deepEqual(insertedInTx, [], 'and wrote no sync row')
+  const rows = outstandingRefusals()
+  assert.equal(rows.length, 1, `the refusal is outstanding. Rows: ${JSON.stringify(refusals)}`)
+  assert.equal(rows[0].type, TX_REQUEST.type)
+  assert.equal(rows[0].referenceId, TX_REQUEST.referenceId)
+  assert.equal(rows[0].chartConnector, 'xero')
+  assert.equal(rows[0].activeConnector, 'quickbooks', 'both connectors, as the refusal saw them')
+  assert.equal(txModel.txRefusalWrites, 1, 'written through the CALLER\'S TRANSACTION, so it commits with the state that made the debt real')
+  assert.equal(txModel.pooledRefusalWrites, 0, 'and not through the pool, where it would survive the caller rolling back')
+})
+
+test('[o3d-j625 r5] the in-transaction enqueue records NOTHING when the caller does not ask — its work rolls back', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+
+  await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+  })
+
+  assert.deepEqual(outstandingRefusals(), [],
+    'the bill payment and the supplier credit note ROLL BACK on a refusal, so an outstanding row there '
+    + 'would be a debt nobody owes')
+})
+
+test('[o3d-j625 r5 M-13] a posting refused, made, then refused again reports the NEW gap — not the first one', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+
+  enabledPlugins = ['quickbooks']
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  const firstEpisode = refusals[0]!
+  assert.equal(firstEpisode.refusedCount, 2, 'PRECONDITION: two attempts in the first episode')
+  const firstOpenedAt = firstEpisode.firstRefusedAt
+
+  // The posting is made: the gap closes.
+  enabledPlugins = ['xero']
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  assert.deepEqual(outstandingRefusals(), [])
+
+  // And a LATER switch opens a NEW gap. r4 carried the first episode's timestamp and count forward, so the
+  // inbox aged a fresh debt from a gap that had already been closed — falsifying the column's own contract.
+  enabledPlugins = ['quickbooks']
+  await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+
+  const reopened = outstandingRefusals()
+  assert.equal(reopened.length, 1)
+  assert.equal(reopened[0].refusedCount, 1, 'this episode has had one attempt')
+  assert.notEqual(reopened[0].firstRefusedAt, firstOpenedAt, 'and it is aged from when THIS gap opened')
+})
+
+test('[o3d-j625 r5 M-14] a refusal row that cannot be WRITTEN does not abort the caller’s transaction', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  enabledPlugins = ['quickbooks']
+  txModel.failRefusalWrites = true
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+    recordRefusalAsOutstanding: true,
+  })
+
+  assert.equal(queued, false, 'PRECONDITION: refused')
+  assert.equal(txModel.aborted, false,
+    'the failed refusal write was contained by a savepoint — without one the goods receipt, bill or MO '
+    + 'completion that called this rolls back with an opaque 25P02')
+})
+
+test('[o3d-j625 r5 M-14] a CLEAR that cannot be written does not abort the transaction the posting is queued in', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  txModel.failRefusalWrites = true
+  insertedInTx.length = 0
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    chartConnector: settings.connector,
+  })
+
+  assert.equal(queued, true, 'PRECONDITION: queued, so the clear ran')
+  assert.equal(insertedInTx.length, 1, 'PRECONDITION: the sync row was written in the transaction')
+  assert.equal(txModel.aborted, false, 'and the transaction that holds it is still committable')
+})
+
+test('[o3d-j625 r5 HIGH 5] the payment-account confirmation admits what the POSTER admits — id OR code, any type, archived too', async () => {
+  const { accountingBankAccountBelongsTo } = await import('@/lib/accounting')
+  storedAccounts.length = 0
+  // What the settings UI can store: a synced id, a Xero account CODE typed into the free-text field, and a
+  // non-BANK clearing account offered because the chart held no BANK-type account.
+  storedAccounts.push(
+    { connector: 'xero', code: '090', externalAccountId: 'xero-uuid-bank', active: true, type: 'BANK' },
+    { connector: 'xero', code: '810', externalAccountId: 'xero-uuid-clearing', active: true, type: 'CURRLIAB' },
+    { connector: 'xero', code: '091', externalAccountId: 'xero-uuid-archived', active: false, type: 'BANK' },
+  )
+
+  assert.equal(await accountingBankAccountBelongsTo('xero', 'xero-uuid-bank'), true, 'the synced id')
+  assert.equal(await accountingBankAccountBelongsTo('xero', '090'), true,
+    'a CODE — r4 matched the id only, so every payment mapped by code was refused for ever as unmapped')
+  assert.equal(await accountingBankAccountBelongsTo('xero', 'xero-uuid-clearing'), true,
+    'a non-BANK account — the poster does not filter on type, so neither may the confirmation')
+  assert.equal(await accountingBankAccountBelongsTo('xero', '091'), true,
+    'an archived account — rejected by the ledger, loudly, at post time; not silently refused here')
+})
+
+test('[o3d-j625 r5 HIGH 5] CONTROL: the confirmation still refuses a value that is not in THIS connector\'s chart', async () => {
+  const { accountingBankAccountBelongsTo } = await import('@/lib/accounting')
+  storedAccounts.length = 0
+  storedAccounts.push({ connector: 'xero', code: '090', externalAccountId: 'xero-uuid-bank', active: true, type: 'BANK' })
+
+  assert.equal(await accountingBankAccountBelongsTo('quickbooks', '090'), false, 'another connector\'s code')
+  assert.equal(await accountingBankAccountBelongsTo('quickbooks', 'xero-uuid-bank'), false, 'another connector\'s id')
+  assert.equal(await accountingBankAccountBelongsTo('xero', 'nope'), false, 'a value in no chart at all')
+  assert.equal(await accountingBankAccountBelongsTo('xero', ''), false, 'nothing mapped')
 })

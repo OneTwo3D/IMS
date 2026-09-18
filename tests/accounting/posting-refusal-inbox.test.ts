@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { balancedFrom, blankNonCode, ownProperty, productionSources } from './paid-provenance-scan'
+import { balancedFrom, blankNonCode, ownProperty, productionSources, topLevelProperty } from './paid-provenance-scan'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
 /**
  * o3d-j625 r4 — A REFUSED POSTING IS OUTSTANDING WORK IN THE EXCEPTION INBOX, NOT AN ACTIVITY LINE.
@@ -25,16 +26,19 @@ import { balancedFrom, blankNonCode, ownProperty, productionSources } from './pa
  */
 
 const rows: Array<Record<string, unknown>> = []
+/** The UPDATE branch of each upsert — what a second write would do to an existing row (review M-5). */
+const updates: Array<Record<string, unknown>> = []
 const activity: Array<{ action: string; level?: string }> = []
-let enqueueAnswer: { queued: boolean; reason?: string; connector: string | null } = { queued: true, connector: 'xero' }
+let enqueueAnswer: { queued: boolean; reason?: string; connector: string | null; activeConnector?: string | null; refusalRecorded?: boolean } = { queued: true, connector: 'xero' }
 let activeConnector: string | null = 'quickbooks'
 
 mock.module('@/lib/db', {
   namedExports: {
     db: {
       accountingPostingRefusal: {
-        upsert: async ({ create }: { create: Record<string, unknown> }) => {
+        upsert: async ({ create, update }: { create: Record<string, unknown>; update: Record<string, unknown> }) => {
           rows.push({ ...create, resolvedAt: null })
+          updates.push(update)
           return create
         },
         updateMany: async () => ({ count: 0 }),
@@ -52,7 +56,13 @@ mock.module('@/lib/accounting', {
   namedExports: {
     getActiveAccountingConnectorInfo: async () => (activeConnector ? { id: activeConnector, name: activeConnector } : null),
     isAccountingSyncTypeEnabledFor: async () => true,
-    queueAccountingSync: async () => enqueueAnswer,
+    // o3d-j625 r5: the facade reports the POSTING KEY it derived, and the report keys its row on that. The
+    // REAL key function is used here — the contract under test is that the site forwards it, not that a
+    // fixture can invent one.
+    queueAccountingSync: async (params: { type: string; referenceType: string; referenceId: string; idempotencyKey?: string; payload?: Record<string, unknown> }) => ({
+      ...enqueueAnswer,
+      posting: accountingPostingKey(params),
+    }),
   },
 })
 
@@ -70,13 +80,19 @@ async function pushTaxRate() {
 
 test.beforeEach(() => {
   rows.length = 0
+  updates.length = 0
   activity.length = 0
   enqueueAnswer = { queued: true, connector: 'xero' }
   activeConnector = 'xero'
 })
 
 test('[o3d-j625 r4] a site that keeps its local change and reports an ERROR also records OUTSTANDING work', async () => {
-  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero' }
+  // review M-4: the columns can only pass by carrying their own facts. The chart the payload was built from
+  // is xero (the site resolves it — the active connector at its top, which this double answers 'xero'); the
+  // connector active when the enqueue REFUSED is quickbooks, which the facade reports. A report-time read
+  // would say 'xero' again. r4 had every value equal to 'xero', so writing the chart into
+  // `activeConnector` passed.
+  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks' }
 
   await pushTaxRate()
 
@@ -86,7 +102,10 @@ test('[o3d-j625 r4] a site that keeps its local change and reports an ERROR also
   assert.equal(rows[0].type, 'TAX_RATE_SYNC')
   assert.equal(rows[0].referenceType, 'TaxRate')
   assert.equal(rows[0].referenceId, 'rate-1')
-  assert.equal(rows[0].activeConnector, 'xero', 'the ACTIVE connector is on the row — round 2 omitted it')
+  assert.equal(rows[0].activeConnector, 'quickbooks',
+    'the ACTIVE connector is on the row — round 2 omitted it — and it is the one the REFUSAL saw (review L-7), '
+    + 'not the chart\'s and not a report-time read (both of which are xero here)')
+  assert.equal(rows[0].chartConnector, 'xero', 'and the chart the payload was built from, as its own column')
   assert.equal(rows[0].reason, 'refused')
   assert.ok(String(rows[0].committed).length > 0, 'what stands in IMS')
   assert.ok(String(rows[0].remedy).length > 0, 'and what the operator must do')
@@ -106,9 +125,12 @@ test('[o3d-j625 r4] CONTROL: a queued posting records nothing outstanding, and a
 // EVERY reporting site names the posting the row is keyed on
 // ---------------------------------------------------------------------------------------------------
 
-test('[o3d-j625 r4] every reportPostingNotQueued call site names the posting, so every ERROR is also an inbox row', () => {
+test('[o3d-j625 r5] no reporting site invents an outcome — every one forwards what an enqueue answered', () => {
+  // r4 asserted that each site NAMED its posting; r5 took that property away from the sites (it is the
+  // enqueue's answer now), so the thing to assert is that no site hands this function an outcome it made up.
+  // An invented outcome is exactly how a hand-written key would come back.
   const NEEDLE = 'reportPostingNotQueued('
-  const sites: Array<{ file: string; line: number; namesPosting: boolean }> = []
+  const sites: Array<{ file: string; line: number; outcome: string }> = []
   for (const [file, source] of productionSources()) {
     const code = blankNonCode(source)
     let from = 0
@@ -120,19 +142,109 @@ test('[o3d-j625 r4] every reportPostingNotQueued call site names the posting, so
       const argument = balancedFrom(code, at + NEEDLE.length - 1)
       const objectAt = argument.indexOf('{')
       const request = objectAt === -1 ? null : balancedFrom(argument, objectAt)
-      sites.push({
-        file,
-        line: source.slice(0, at).split('\n').length,
-        // FAIL CLOSED on an argument this cannot read: an unparsed call is a hole in the census.
-        namesPosting: request !== null && ownProperty(request, 'postingRef') !== null,
-      })
+      const outcome = request === null ? '<unreadable>' : (ownPropertyText(request, 'outcome') ?? '<missing>')
+      sites.push({ file, line: source.slice(0, at).split('\n').length, outcome })
     }
   }
-  console.log(`[o3d-j625 r4] reportPostingNotQueued call sites examined: ${sites.length}`)
+  console.log(`[o3d-j625 r5] reportPostingNotQueued call sites examined: ${sites.length}`)
   assert.ok(sites.length >= 14, `expected the fourteen reporting sites, found ${sites.length}`)
+  const invented = sites.filter((site) => site.outcome.startsWith('{') || site.outcome === '<missing>' || site.outcome === '<unreadable>')
   assert.deepEqual(
-    sites.filter((site) => !site.namesPosting).map((site) => `${site.file}:${site.line}`),
+    invented.map((site) => `${site.file}:${site.line} ${site.outcome.slice(0, 40)}`),
     [],
-    'these sites report an ERROR without naming the posting, so nothing lands in the exception inbox for them',
+    'these sites report an outcome they built themselves. It must be the answer an enqueue gave, because the '
+    + 'inbox row is keyed on the posting THAT enqueue reported — see the r5 review, HIGH 1/2/3.',
   )
+})
+
+/** The text of an own top-level property of an object literal, or null. */
+function ownPropertyText(objectText: string, key: string): string | null {
+  const re = new RegExp(`(?:^|[^\\w$.])${key}\\s*:`)
+  const m = re.exec(objectText)
+  if (!m) return null
+  let i = m.index + m[0].length
+  while (i < objectText.length && /\s/.test(objectText[i]!)) i++
+  if ('({['.includes(objectText[i]!)) return balancedFrom(objectText, i)
+  let k = i
+  let depth = 0
+  while (k < objectText.length) {
+    const c = objectText[k]!
+    if ('({['.includes(c)) depth++
+    else if (')}]'.includes(c)) { if (depth === 0) break; depth-- }
+    else if (c === ',' && depth === 0) break
+    k++
+  }
+  return objectText.slice(i, k).trim()
+}
+
+test('[o3d-j625 r5 M-5] a refusal the enqueue already recorded is MERGED, not counted again or re-reasoned', async () => {
+  // Every facade-path refusal is written twice: by the enqueue, which knows the specific reason, and by the
+  // site reporting it, which knows what stands in IMS and the remedy. r4 let the second write increment the
+  // attempt count and overwrite `retired_chart` with a generic `refused`.
+  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero', refusalRecorded: true } as typeof enqueueAnswer
+  await pushTaxRate()
+
+  assert.equal(updates.length, 1, 'PRECONDITION: a row was upserted')
+  assert.equal('refusedCount' in updates[0]!, false, 'the second write must not count the refusal again')
+  assert.equal('reason' in updates[0]!, false, 'nor replace the enqueue’s specific reason with a generic one')
+  assert.ok('remedy' in updates[0]! && 'committed' in updates[0]!, 'it adds what only the site knows')
+})
+
+test('[o3d-j625 r5 M-5] CONTROL: a refusal nobody else recorded is a full write, counted', async () => {
+  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero' }
+  await pushTaxRate()
+  assert.equal(updates.length, 1)
+  assert.ok('refusedCount' in updates[0]!, 'a site-only refusal counts its attempts')
+  assert.ok('reason' in updates[0]!)
+})
+
+// o3d-j625 r5 (review L-1) — THE ONE CASE WHERE THE INBOX ROW IS MISSING MUST NOT ALSO BE THE CASE NOBODY
+// IS TOLD ABOUT. r4 swallowed a failed write silently.
+test('[o3d-j625 r5 L-1] a refusal that cannot be recorded is itself reported, and never thrown at the caller', async () => {
+  activity.length = 0
+  const { recordAccountingPostingRefusal, clearAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const broken = {
+    accountingPostingRefusal: {
+      upsert: async () => { throw new Error('relation "AccountingPostingRefusal" does not exist') },
+      updateMany: async () => { throw new Error('relation "AccountingPostingRefusal" does not exist') },
+    },
+  }
+  const key = accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-9' })
+
+  await recordAccountingPostingRefusal(broken, key, {
+    chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+  })
+  await clearAccountingPostingRefusal(broken, key)
+
+  const reported = activity.filter((a) => a.action === 'accounting_posting_refusal_not_recorded')
+  assert.equal(reported.length, 2, 'both the failed record and the failed clear are reported')
+  assert.ok(reported.every((a) => a.level === 'ERROR'))
+})
+
+// o3d-j625 r5 (review M-2) — THE CHART IS AN INPUT THE REPORTER CANNOT INFER.
+//
+// `reportPostingNotQueued` reads the chart's connector out of `metadata.chartConnector`, and three of r4's
+// sites passed no metadata although the chart was in scope, so the inbox rendered "none → xero": an
+// inference from an absence, and the schema says NULL means "nothing was switched on". Every reporting
+// site must name it — `null` is allowed, but only when written, so an absence is a decision someone made.
+test('[o3d-j625 r5 M-2] every reporting site names the chart it reports about', () => {
+  const NEEDLE = 'reportPostingNotQueued('
+  const sites: Array<{ at: string; named: boolean }> = []
+  for (const [file, source] of productionSources()) {
+    if (file === 'lib/domain/accounting/enqueue-outcome.ts') continue // the declaration
+    const code = blankNonCode(source)
+    for (let at = code.indexOf(NEEDLE); at !== -1; at = code.indexOf(NEEDLE, at + NEEDLE.length)) {
+      if (/(?:^|[^\w$])function\s+$/.test(code.slice(0, at))) continue
+      const argument = balancedFrom(code, at + NEEDLE.length - 1)
+      const objectAt = argument.indexOf('{')
+      const request = objectAt === -1 ? '' : balancedFrom(argument, objectAt)
+      const metadata = request === '' ? null : topLevelProperty(request, 'metadata')
+      const named = metadata !== null && metadata.startsWith('{') && ownProperty(metadata, 'chartConnector') !== null
+      sites.push({ at: `${file}:${source.slice(0, at).split('\n').length}`, named })
+    }
+  }
+  console.log(`[o3d-j625 r5] reporting sites examined: ${sites.length}`)
+  assert.ok(sites.length >= 14, `PRECONDITION: the reporting sites were found (found ${sites.length})`)
+  assert.deepEqual(sites.filter((site) => !site.named).map((site) => site.at), [],
+    'these report a refused posting without naming its chart, and the inbox would show "none"')
 })

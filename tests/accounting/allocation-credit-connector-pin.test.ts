@@ -257,7 +257,9 @@ test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the acti
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
-  let reported: { queued: boolean; reason?: string; connector: string | null } | null = null
+  // o3d-j625 r5: a HOLDER — TypeScript narrows a `let` assigned only inside a callback to `never`, which
+  // silently makes every assertion about it unable to observe anything.
+  const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } | null } = {}
   const wrote = await queueAccountingSyncTx(
     fenceOnlyTx() as never,
     {
@@ -266,16 +268,16 @@ test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the acti
       // o3d-j625 r2: same ledger as the pin — see the facade arm above for why the refusal is now the
       // chart check's and why the contract is unchanged.
       chartConnector: 'xero',
-      reportOutcome: (outcome) => { reported = outcome },
+      reportOutcome: (outcome) => { answered.outcome = outcome },
     },
   )
 
   assert.equal(wrote, false, 'nothing was written')
-  assert.deepEqual(
-    reported,
-    { queued: false, reason: 'refused', connector: 'xero' },
-    'and the answer names the pinned ledger and reports the posting as still OWED',
-  )
+  // o3d-j625 r5: the answer now also carries the POSTING KEY it is about (and, on a refusal, the active
+  // connector) — asserted as a superset so the three facts under test stay the three facts under test.
+  assert.equal(answered.outcome?.queued, false)
+  assert.equal(answered.outcome?.reason, 'refused')
+  assert.equal(answered.outcome?.connector, 'xero', 'the answer names the pinned ledger and reports the posting as still OWED')
 })
 
 test('o3d-i0o6 r7: THE CONTROL — an ACTIVE pin passes the guard and reaches the posting context', async () => {
@@ -288,7 +290,9 @@ test('o3d-i0o6 r7: THE CONTROL — an ACTIVE pin passes the guard and reaches th
   xeroSyncEnabled = 'false'
 
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
-  let reported: { queued: boolean; reason?: string; connector: string | null } | null = null
+  // o3d-j625 r5: a HOLDER — TypeScript narrows a `let` assigned only inside a callback to `never`, which
+  // silently makes every assertion about it unable to observe anything.
+  const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } | null } = {}
   const wrote = await queueAccountingSyncTx(
     fenceOnlyTx() as never,
     {
@@ -297,14 +301,30 @@ test('o3d-i0o6 r7: THE CONTROL — an ACTIVE pin passes the guard and reaches th
       // o3d-j625 r2: chart = pin = ACTIVE, so this control still reaches the posting context — which is
       // the whole point of it: `not-configured` here can only have come from BELOW both guards.
       chartConnector: 'xero',
-      reportOutcome: (outcome) => { reported = outcome },
+      reportOutcome: (outcome) => { answered.outcome = outcome },
     },
   )
 
   assert.equal(wrote, false)
-  assert.deepEqual(
-    reported,
-    { queued: false, reason: 'not-configured', connector: 'xero' },
-    'the pin guard let it through; what declined it was the pinned connector\'s OWN posting verdict',
-  )
+  // o3d-j625 r5: a superset — the answer now also carries the posting key it is about.
+  assert.equal(answered.outcome?.queued, false)
+  assert.equal(answered.outcome?.reason, 'not-configured',
+    'the pin guard let it through; what declined it was the pinned connector\'s OWN posting verdict')
+  assert.equal(answered.outcome?.connector, 'xero')
+})
+
+// o3d-j625 r5 (review M-1, the second HIGH 4 site) — THE TRIM COMMITS WHATEVER THE ENQUEUE ANSWERS, so a
+// refused reversal is a real debt and the enqueue must be ASKED to record it inside the trim's transaction.
+// The allocation service's own fixture doubles the enqueue, so the request is pinned here against the
+// source: the enqueue call that carries `type: 'ALLOCATION_REVERSAL'` must pass the flag. The block is cut
+// at the call's own closing `})`, so a flag belonging to a neighbouring call cannot satisfy it.
+test('[o3d-j625 r5 M-1] the orphan allocation reversal ASKS its in-transaction enqueue to record a refusal', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync(`${process.cwd()}/lib/domain/sales/allocation-service.ts`, 'utf8')
+  const calls = [...src.matchAll(/await queueAccountingSyncTx\(tx, \{\n([\s\S]*?)\n {2}\}\)\n/g)]
+    .map((m) => m[1])
+    .filter((body) => /^\s*type: 'ALLOCATION_REVERSAL',$/m.test(body))
+  assert.equal(calls.length, 1, `PRECONDITION: exactly one ALLOCATION_REVERSAL enqueue located (found ${calls.length})`)
+  assert.match(calls[0], /^\s*recordRefusalAsOutstanding: true,$/m,
+    'without it a refused reversal leaves pounds in Allocated Inventory recorded only on the Activity page')
 })

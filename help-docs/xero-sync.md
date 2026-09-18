@@ -2263,11 +2263,17 @@ owed (and how many attempts), what still stands in IMS, and what to do about it.
 
 Two things about those rows:
 
-* **They clear when the posting is actually made**, not when anyone acknowledges them. Re-queue the
-  posting from its source document and the row disappears on the enqueue that writes the sync row; the
-  resolved record is kept.
-* **One row per posting.** A sweep that refuses the same work every few minutes updates the row and counts
-  the attempts rather than filling the page.
+* **They clear when the posting is actually made**, not when anyone acknowledges them — there is no
+  acknowledge action, because acknowledging one would not post it. Re-queue the posting from its source
+  document and the row leaves the list on the enqueue that records the posting as durable. That includes an
+  enqueue that finds the work **already queued** by an earlier attempt: a row for the posting exists either
+  way, which is what the debt was about. The resolved record is kept in the table (nothing reads or prunes
+  it today — it is a record, not a report).
+* **One row per posting**, and a posting means the thing that is owed rather than the document it belongs
+  to: a customer payment is one **receipt** against one invoice, a stock receipt is one delivery against a
+  purchase order, a landed-cost journal is one recalculation. A sweep that refuses the same work every few
+  minutes updates that row and counts the attempts rather than filling the page; if the posting is made and
+  later refused again, the row reopens and its age is the age of the NEW gap.
 
 This is what makes the WooCommerce **held invoice release** safe to leave to the sweep: it can refuse for
 days with nobody watching, and the debt is on the exceptions page the whole time.

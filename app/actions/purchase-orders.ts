@@ -5,7 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, accountingPostingKey, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
@@ -2136,8 +2136,6 @@ export async function receivePurchaseOrder(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'stock_receipt_journal_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'STOCK_RECEIPT', referenceType: 'PurchaseOrder', referenceId: id },
         posting: `the stock receipt journal for PO ${po.reference}`,
         committed: 'the stock was received into inventory in IMS',
         remedy:
@@ -2670,8 +2668,6 @@ export async function returnPurchaseOrder(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'supplier_return_journal_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', referenceId: id },
         posting: `the supplier return journal for PO ${po.reference}`,
         committed: 'the return is booked and the stock reduced in IMS',
         remedy:
@@ -3160,8 +3156,6 @@ export async function createInvoice(
         entityType: 'PURCHASE_ORDER',
         entityId: poId,
         action: 'purchase_invoice_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: poId },
         posting: `the purchase bill for PO ${po.reference}`,
         committed: 'the bill is recorded in IMS',
         remedy:
@@ -3617,10 +3611,14 @@ export async function updateInvoice(
         },
       }).catch(() => { /* the save already happened; logging must not turn it into a failure */ })
       // o3d-j625 r4: the ledger holds the PREVIOUS version of this bill and nothing retries — outstanding.
-      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, {
+      await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, accountingPostingKey({
+        // o3d-j625 r5: the key `maybeQueuePurchaseInvoiceUpdate`'s own enqueue uses — PURCHASE_INVOICE_UPDATE
+        // is DOCUMENT-scoped, because its idempotency key is a content hash that changes with every edit and
+        // would strand the previous attempt's row for ever.
         type: 'PURCHASE_INVOICE_UPDATE',
         referenceType: 'PurchaseOrder',
         referenceId: invoice.poId,
+      }), {
         chartConnector: accountingSettings.connector,
         activeConnector: (await getActiveAccountingConnectorInfo().catch(() => null))?.id ?? null,
         reason: billUpdateSync.outcome === 'refused-chart-retired' ? 'retired_chart' : 'enqueue_refused',
@@ -4049,8 +4047,6 @@ export async function markBillPaid(
               entityType: 'PURCHASE_ORDER',
               entityId: invoice.poId,
               action: 'realised_fx_journal_not_queued',
-              // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-              postingRef: { type: 'REALISED_FX_JOURNAL', referenceType: 'PurchaseInvoice', referenceId: invoice.id },
               posting: `the realised FX journal for the payment on bill ${invoice.invoiceNumber ?? invoice.po.reference}`,
               committed: 'the bill is marked paid in IMS',
               remedy:
@@ -4301,6 +4297,30 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     }
     const shouldQueueXero =
       settings.connector === 'xero' && settings.syncEnabled && creditNotePosting.verdict === 'post'
+    // o3d-j625 r5 (review M-8) — AND THE ONE CASE THAT POSTS LOCALLY WITH NOTHING RECORDED IS RECORDED.
+    //
+    // PURCHASE_CREDIT_NOTE is absent from QUICKBOOKS_SYNC_TYPE_SETTING, so under QuickBooks the verdict is
+    // `post` (the type falls through to the default posting mode) while `shouldQueueXero` is false — the
+    // credit note commits DRAFT→POSTED and NOTHING is queued and nothing said. That is pre-existing and the
+    // new verdict function did not close it. It is not an outstanding DEBT — there is no ACCPAYCREDIT
+    // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
+    // says plainly what the ledger will not receive.
+    const postsLocallyOnly = creditNotePosting.verdict === 'post' && !shouldQueueXero && settings.syncEnabled
+    if (postsLocallyOnly) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: cn.poId,
+        action: 'supplier_credit_note_not_pushed_unsupported_connector',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} is recorded as POSTED in `
+          + `IMS but was NOT sent to ${settings.connector ?? 'the accounting connector'}: IMS has no supplier `
+          + 'credit-note poster for it. Payables in the ledger do NOT reflect this credit — enter it there by '
+          + 'hand if the ledger should show it.',
+        metadata: { creditNoteId: cn.id, reference: cn.po.reference, chartConnector: settings.connector },
+      }).catch(() => { /* the post itself is unaffected */ })
+    }
 
     // CRITICAL (Codex review): claim DRAFT->POSTED and enqueue the sync in ONE
     // transaction. If the queue insert fails, the whole tx rolls back and the row

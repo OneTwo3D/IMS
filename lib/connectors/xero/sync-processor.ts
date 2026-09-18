@@ -32,7 +32,9 @@ import {
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
-import { accountingBankAccountBelongsTo, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { accountingBankAccountBelongsTo, accountingPostingKey, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
@@ -6957,6 +6959,27 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
             billConnector,
           },
         }).catch(() => { /* a report that cannot be written must not stop the sweep */ })
+        // o3d-j625 r5 (review M-15): the message says the allocation is still OUTSTANDING, so it goes where
+        // outstanding work is listed. Keyed exactly as the allocation's own enqueue is, so the follow-up
+        // that eventually queues it clears this row.
+        await recordAccountingPostingRefusal(
+          db as unknown as PostingRefusalClient,
+          accountingPostingKey({
+            type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+            referenceType: 'SupplierCreditNote',
+            referenceId: item.supplierCreditNoteId,
+          }),
+          {
+            chartConnector: creditNoteConnector,
+            activeConnector: XERO_CONNECTOR,
+            reason: 'unattributable_document_id',
+            committed: `the supplier credit note ${item.creditNoteId} is posted in the ledger`,
+            remedy:
+              'Allocate the credit to the bill in the accounting system that holds both documents, or re-post '
+              + 'them from IMS so the connector that issued each is recorded.',
+            detail: { creditNoteId: item.creditNoteId, accountingInvoiceId: item.accountingInvoiceId, billConnector },
+          },
+        )
         continue
       }
       const origin = selectIssuingPostOriginRecord(
@@ -7339,7 +7362,11 @@ async function decideInvoicePaymentFollowUp(
     onInvalid: refuseUnreadable,
     onAmount: async ({ amount, method, currency, paymentDate }) => {
       const paymentMap = await getPaymentAccountMap()
-      if (!paymentMap || Object.keys(paymentMap).length === 0) {
+      // o3d-j625 r5 (review L-9): `getPaymentAccountMap` returns the setting's JSON STRING, so
+      // `Object.keys(...)` on it counted CHARACTERS and the "nothing is configured" arm was dead for any
+      // non-empty string — including `'{}'`. Asked of the parsed map, which is what `lookupPaymentAccount`
+      // reads anyway.
+      if (!paymentMap || Object.keys(parsePaymentAccountMap(paymentMap)).length === 0) {
         return await refuse(
           { method, currency },
           'no payment account map is configured',

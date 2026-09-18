@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { balancedFrom, blankNonCode, ownProperty, productionSources } from './paid-provenance-scan'
+import { balancedFrom, blankNonCode, ownProperty, productionSources, aliasesOf, callOpens } from './paid-provenance-scan'
 
 /**
  * o3d-j625 — EVERY FACADE ACCOUNTING ENQUEUE SAYS WHOSE CHART ITS ACCOUNT CODES CAME FROM.
@@ -81,21 +81,28 @@ type Site = {
 function facadeCallSites(file: string, source: string): Site[] {
   const code = blankNonCode(source)
   const sites: Site[] = []
-  let from = 0
-  for (;;) {
-    const at = code.indexOf(FACADE_CALL, from)
-    if (at === -1) break
-    from = at + FACADE_CALL.length
-    // `options.queueAccountingSync(...)` is the INJECTED in-transaction enqueue in lib/cost-layers.ts,
-    // not this facade; and `queueAccountingSyncTx(` does not match this needle at all because the
-    // needle ends in the open paren.
-    if (at > 0 && /[\w$.]/.test(code[at - 1])) continue
+  // o3d-j625 r5 (review M-9): every spelling of a direct call — `queueAccountingSync (`, `?.(` — and every
+  // alias the file binds (`{ queueAccountingSync: queueUpdate }`, `import { … as … }`, `const x = …`).
+  const facadeName = FACADE_CALL.slice(0, -1)
+  for (const { at, open } of callOpens(code, [facadeName, ...aliasesOf(code, facadeName)])) {
+    // `options.queueAccountingSync(...)` in lib/cost-layers.ts is the INJECTED IN-TRANSACTION enqueue
+    // typed `typeof queueAccountingSyncTx`, not this facade, and the transactional census below sweeps it.
+    // `queueAccountingSyncTx(` does not match this needle at all, because the needle ends in the open paren.
+    //
+    // o3d-j625 r5 (review M-11) — BUT AN INJECTED FACADE IS STILL A FACADE CALL. `deps.queueAccountingSync(`
+    // in lib/domain/sales/sales-invoice-update-sync.ts was examined by NEITHER census: this one skipped
+    // every member access, and the transactional one only knows the `Tx` names. A member call is now swept
+    // unless its receiver is the cost-layers option bag that holds the in-transaction enqueue.
+    if (at > 0 && /[\w$]/.test(code[at - 1])) continue
+    if (at > 0 && code[at - 1] === '.') {
+      const receiver = code.slice(Math.max(0, at - 40), at - 1)
+      if (/(?:^|[^\w$])options$/.test(receiver)) continue
+    }
     // The facade's own DECLARATION in lib/accounting.ts — `export async function queueAccountingSync(`
     // — is not a call site. Recognised by the `function` keyword before the name rather than by
     // excluding the file, so lib/accounting.ts is still swept for any call it makes itself.
     if (/(?:^|[^\w$])function\s+$/.test(code.slice(0, at))) continue
     const line = source.slice(0, at).split('\n').length
-    const open = at + FACADE_CALL.length - 1
     const argument = balancedFrom(code, open)
     // The detector reads an OBJECT LITERAL argument. Anything else — a variable, a spread of a
     // pre-built request — is a hole, and it is reported as one.
@@ -119,6 +126,9 @@ function allFacadeCallSites(): Site[] {
 }
 
 test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the chart its account codes came from (or pins the ledger)', () => {
+  // o3d-j625 r5 (review L-13): the counts are PRINTED, so a floor that stops tracking reality is visible in
+  // the log rather than inferred from a passing assertion.
+  console.log(`[o3d-j625] facade enqueue call sites: ${allFacadeCallSites().length}; in-transaction: ${allTxCallSites().length}`)
   const sites = allFacadeCallSites()
 
   // THE PRECONDITION, ASSERTED. If the walk or the needle ever stops finding these calls, the
@@ -126,7 +136,7 @@ test('[o3d-j625] every facade accounting enqueue in app/ and lib/ names the char
   // o3d-j625 sweep enumerated; it is a floor and not an equality so that adding an enqueue does not
   // fail this test for the wrong reason.
   assert.ok(
-    sites.length >= 11,
+    sites.length >= 12,
     `expected to find at least the 11 facade enqueue call sites the o3d-j625 sweep enumerated, found `
     + `${sites.length}. The detector is not examining the source it claims to.`,
   )
@@ -439,19 +449,24 @@ export function secondArgument(argumentList: string): string | null {
 function txCallSites(file: string, source: string): Site[] {
   const code = blankNonCode(source)
   const sites: Site[] = []
-  for (const needle of TX_CALLS) {
-    let from = 0
-    for (;;) {
-      const at = code.indexOf(needle, from)
-      if (at === -1) break
-      from = at + needle.length
+  // o3d-j625 r5 (review M-9): the identifier needles go through the shared call finder (whitespace, `?.(`,
+  // aliases); the parenthesised-callee needle is a literal and is still found as one.
+  const identifierNames = TX_CALLS.filter((needle) => /^[\w$]+\($/.test(needle)).map((needle) => needle.slice(0, -1))
+  const names = identifierNames.flatMap((name) => [name, ...aliasesOf(code, name)])
+  const parenthesised: Array<{ at: number; open: number }> = []
+  for (const needle of TX_CALLS.filter((n) => !/^[\w$]+\($/.test(n))) {
+    for (let at = code.indexOf(needle); at !== -1; at = code.indexOf(needle, at + needle.length)) {
+      parenthesised.push({ at, open: at + needle.length - 1 })
+    }
+  }
+  {
+    for (const { at, open } of [...callOpens(code, names), ...parenthesised].sort((a, b) => a.at - b.at)) {
       // `queueAccountingSyncTxWithOutcome(` starts with neither of the other needles' text followed by
       // `(`, so the three cannot double-count one call. A qualified callee (`deps.`, `params.deps.`) IS
       // counted — that is the real enqueue in production — but the DECLARATIONS in lib/accounting.ts are
       // not calls, and are recognised by the `function` keyword rather than by excluding the file.
       if (/(?:^|[^\w$])function\s+$/.test(code.slice(0, at))) continue
       const line = source.slice(0, at).split('\n').length
-      const open = at + needle.length - 1
       const argumentList = balancedFrom(code, open)
       const objectText = secondArgument(argumentList)
       sites.push({
@@ -516,9 +531,11 @@ test('[o3d-j625 r2] the whole census — facade plus transactional — is at lea
   // The number r1's scoping decision turned into "11 fixed, 16 filed". It is asserted as ONE total so
   // that shrinking either half is visible even if the other half grows.
   const total = allFacadeCallSites().length + allTxCallSites().length
+  // o3d-j625 r5 (review L-13): re-derived. 12 facade sites (the injected `deps.queueAccountingSync` in
+  // sales-invoice-update-sync joined them when this census stopped skipping member calls) + 16 in-transaction.
   assert.ok(
-    total >= 27,
-    `the o3d-j625 sweep covers 27 accounting enqueue call sites (11 facade + 16 in-transaction); the `
+    total >= 28,
+    `the o3d-j625 sweep covers 28 accounting enqueue call sites (12 facade + 16 in-transaction); the `
     + `census now sees ${total}. A census that stops seeing its subjects proves nothing about them.`,
   )
 })
@@ -714,4 +731,25 @@ test('[o3d-j625 r2] the required-declaration check can fire', () => {
     /chartConnector\s*\?\s*:/.test("  chartConnector: AccountingConnectorInfo['id'] | null"),
     false,
   )
+})
+
+test('[o3d-j625 r5 M-9] the chart censuses SEE a spaced call, an optional call and every alias the file binds', () => {
+  const fixture = `
+    const { queueAccountingSync: enqueue } = await import('@/lib/accounting')
+    const again = queueAccountingSync
+    await enqueue({ type: 'A', payload })
+    await again({ type: 'B', payload })
+    await queueAccountingSync ({ type: 'C', payload })
+    await deps.queueAccountingSync?.({ type: 'D', payload, chartConnector })
+    await options.queueAccountingSync(tx, { type: 'E', payload })
+    await deps.queueAccountingSyncTx?.(tx, { type: 'F', payload })
+    const { queueAccountingSyncTx: enqueueTx } = await import('@/lib/accounting')
+    await enqueueTx(tx, { type: 'G', payload, chartConnector })
+  `
+  const facade = facadeCallSites('fixture.ts', fixture)
+  assert.equal(facade.length, 4, 'A (destructured alias), B (const alias), C (spaced), D (optional) — and not E, the cost-layers option bag')
+  assert.deepEqual(facade.map((site) => site.namesChart), [false, false, false, true])
+  const tx = txCallSites('fixture.ts', fixture)
+  assert.equal(tx.length, 2, 'F (optional) and G (aliased)')
+  assert.deepEqual(tx.map((site) => site.namesChart), [false, true])
 })

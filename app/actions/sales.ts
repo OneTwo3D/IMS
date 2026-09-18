@@ -53,11 +53,13 @@ import {
   queueAccountingSync,
   queueAccountingSyncTxWithOutcome,
   getAccountingSettings,
+  getAccountingSettingsFor,
   getActiveAccountingConnectorInfo,
   isAccountingSyncTypeEnabledFor,
   type AccountingEnqueueOutcome,
   type AccountingSettings,
   asRoutableAccountingConnector,
+  accountingPostingKey,
 } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -1483,12 +1485,20 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       // o3d-j625 r3 (Codex HIGH 2): and whose invoice `so.accountingInvoiceId` — the document this update
       // is posted AGAINST — actually is. The chart cannot answer that: the id survives a switch.
       documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
+      // o3d-j625 r5: the key the facade will derive for this very posting, built from the same params.
+      posting: accountingPostingKey({
+        type: 'SALES_INVOICE_UPDATE',
+        referenceType: 'SalesOrder',
+        referenceId: so.id,
+        idempotencyKey,
+        payload: updatePayload,
+      }),
     }, {
       getActiveAccountingConnectorInfo,
       queueAccountingSync: queueUpdate,
       logActivity,
       // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
-      recordPostingRefusal: (record) => recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, record),
+      recordPostingRefusal: ({ posting, ...record }) => recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record),
     })
     return
   }
@@ -1523,8 +1533,6 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'sales_invoice_not_queued',
-      // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-      postingRef: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: so.id },
       posting: `the sales invoice for ${orderNumber}`,
       committed: 'the order is invoiced in IMS',
       remedy:
@@ -3786,8 +3794,10 @@ export async function addPayment(input: {
       metadata: { orderNumber: getSalesOrderReference(txResult.so), amount: input.amount, currency: input.currency, method: input.method },
     })
 
+    // o3d-j625 r5 (review M-12): which books the receipt was registered in, for the FX journal below.
+    const registeredFor: { connector: 'xero' | 'quickbooks' | null } = { connector: null }
     if (!input.refundId) {
-      await registerInvoicePaymentWithLedger({
+      registeredFor.connector = await registerInvoicePaymentWithLedger({
         orderId: input.orderId,
         orderReference: getSalesOrderReference(txResult.so),
         paymentId: txResult.paymentId,
@@ -3804,7 +3814,15 @@ export async function addPayment(input: {
 
     if (!input.refundId) {
       try {
-        const accountingSettings = await getAccountingSettings()
+
+        // o3d-j625 r5 (review M-12): FOR THE CONNECTOR THE PAYMENT WAS REGISTERED UNDER, not a second
+        // resolution. r4 deferred this as "routed by its own chart, so internally consistent" — a proof of
+        // an adjacent property: internally consistent is not "in the same books as the settlement it is
+        // about", and the symmetric case (markBillPaid) was fixed in r4. `null` = nothing was registered,
+        // and the FX journal then follows the active connector exactly as before.
+        const accountingSettings = registeredFor.connector
+          ? await getAccountingSettingsFor(registeredFor.connector)
+          : await getAccountingSettings()
         const accounts = getRealisedFxAccounts(accountingSettings, 'receivable')
         if (accountingSettings.syncEnabled && accounts && txResult.so.currency !== txResult.baseCurrency) {
           const realised = computeRealisedFx({
@@ -3863,8 +3881,6 @@ export async function addPayment(input: {
                 entityType: 'SALES_ORDER',
                 entityId: input.orderId,
                 action: 'realised_fx_journal_not_queued',
-                // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-                postingRef: { type: 'REALISED_FX_JOURNAL', referenceType: 'Payment', referenceId: txResult.paymentId },
                 posting: `the realised FX journal for the payment on ${getSalesOrderReference(txResult.so)}`,
                 committed: 'the payment is recorded in IMS',
                 remedy:

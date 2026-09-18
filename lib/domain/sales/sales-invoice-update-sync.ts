@@ -38,6 +38,12 @@ export type SalesInvoiceUpdateQueueParams = {
    * never resolved to the active connector.
    */
   documentConnector: 'xero' | 'quickbooks' | null
+  /**
+   * o3d-j625 r5 (review HIGH 1/2/3) — the key of the posting this update IS, derived by
+   * `accountingPostingKey` from the very params the caller hands the facade. Passed in rather than rebuilt
+   * here so the refusal row and the clear cannot disagree.
+   */
+  posting: { type: string; referenceType: string; referenceId: string; scope: string }
 }
 
 /**
@@ -89,9 +95,11 @@ export type QueueSalesInvoiceUpdateDeps = {
    * operator has to already be reading. Injected like everything else this module uses.
    */
   recordPostingRefusal: (record: {
-    type: 'SALES_INVOICE_UPDATE'
-    referenceType: 'SalesOrder'
-    referenceId: string
+    /**
+     * o3d-j625 r5: the key is the one THIS module's enqueue uses — `accountingPostingKey` over the same
+     * params — supplied by the caller's wiring so this seam cannot re-type it.
+     */
+    posting: { type: string; referenceType: string; referenceId: string; scope: string }
     chartConnector: string | null
     activeConnector: string | null
     reason: string
@@ -131,9 +139,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      type: 'SALES_INVOICE_UPDATE',
-      referenceType: 'SalesOrder',
-      referenceId: params.salesOrderId,
+      posting: params.posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'retired_chart',
@@ -177,9 +183,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      type: 'SALES_INVOICE_UPDATE',
-      referenceType: 'SalesOrder',
-      referenceId: params.salesOrderId,
+      posting: params.posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'unattributable_document_id',
@@ -251,9 +255,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       },
     })
     await deps.recordPostingRefusal({
-      type: 'SALES_INVOICE_UPDATE',
-      referenceType: 'SalesOrder',
-      referenceId: params.salesOrderId,
+      posting: params.posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
       reason: 'enqueue_refused',

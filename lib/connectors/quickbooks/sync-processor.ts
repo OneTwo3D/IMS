@@ -19,6 +19,7 @@ import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} from './api'
 import { accountingBankAccountBelongsTo, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import {
   liveRowOccupiesFollowUpSlot,
@@ -2288,7 +2289,11 @@ async function decideInvoicePaymentFollowUp(
     onInvalid: refuseUnreadable,
     onAmount: async ({ amount, method, currency, paymentDate }) => {
       const paymentMap = await getPaymentAccountMap()
-      if (!paymentMap || Object.keys(paymentMap).length === 0) {
+      // o3d-j625 r5 (review L-9): `getPaymentAccountMap` returns the setting's JSON STRING, so
+      // `Object.keys(...)` on it counted CHARACTERS and the "nothing is configured" arm was dead for any
+      // non-empty string — including `'{}'`. Asked of the parsed map, which is what `lookupPaymentAccount`
+      // reads anyway.
+      if (!paymentMap || Object.keys(parsePaymentAccountMap(paymentMap)).length === 0) {
         return await refuse(
           { method, currency },
           'no payment account map is configured',

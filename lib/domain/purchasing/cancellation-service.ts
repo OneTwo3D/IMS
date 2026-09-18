@@ -114,6 +114,9 @@ export async function cancelPurchaseOrderService(
     // assignments it can see, and this one is assigned inside a callback it cannot, which collapses the
     // variable to `never` and silently makes every later read of it unable to observe anything.
     const reversalPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    // review M-3: carried out of the transaction so the report can name the chart the journal was built
+    // from, rather than leaving the inbox to render an absence as "none".
+    const cancellationChartConnector: { connector: string | null } = { connector: null }
     const cancellation = await deps.transaction(async (tx) => {
       // audit-g5u2.4 (Codex review): lock the PO before reading the invoice/credit
       // gate state so a concurrent bill create/credit-note post can't change the
@@ -189,6 +192,10 @@ export async function cancelPurchaseOrderService(
 
       if (reversal.totalReversalValueBase.gt(0.000001)) {
         const accountingSettings = await deps.getAccountingSettings()
+        // review M-3: carried out of the transaction so the post-commit report can NAME the chart this
+        // journal was built from. r4 reported `chartConnector: null` and the inbox rendered "none", which
+        // reads as "no connector was on" — an inference from an absence.
+        cancellationChartConnector.connector = accountingSettings.connector
         const amount = roundQuantity(reversal.totalReversalValueBase, 2).toNumber()
         if (accountingSettings.syncEnabled) {
           const payload = {
@@ -251,8 +258,6 @@ export async function cancelPurchaseOrderService(
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'purchase_order_cancel_journal_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', referenceId: id },
         posting: `the cost-layer reversal journal for cancelled purchase order ${id}`,
         committed: 'the PO is cancelled and its remaining cost layers are reversed in IMS',
         remedy:
@@ -260,6 +265,8 @@ export async function cancelPurchaseOrderService(
           + 'goods-in-transit are overstated there. Post the reversal by hand, or re-run the daily '
           + 'reconcile once the accounting connector selection has settled.',
         outcome: reversalPostingOutcome.outcome,
+        // review M-3: `accountingSettings` was read in this very transaction and was not recorded.
+        metadata: { chartConnector: cancellationChartConnector.connector, purchaseOrderId: id },
       })
     }
 

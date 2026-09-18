@@ -855,8 +855,6 @@ export async function queueLandedCostAdjustmentJournals(
         entityType: 'PURCHASE_ORDER',
         entityId: adj.primaryPoId,
         action: 'landed_cost_reclass_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'STOCK_IN_TRANSIT', referenceType: 'PurchaseOrder', referenceId: adj.primaryPoId },
         posting: `the landed-cost inventory/transit reclass for ${adj.primaryPoRef}`,
         committed: 'the landed cost is applied to the stock on hand in IMS',
         remedy:
@@ -947,8 +945,6 @@ export async function queueLandedCostAdjustmentJournals(
         entityType: 'PURCHASE_ORDER',
         entityId: adj.primaryPoId,
         action: 'landed_cost_cogs_journal_not_queued',
-        // o3d-j625 r4: WHICH posting this is, so the report is also an OUTSTANDING inbox row.
-        postingRef: { type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', referenceId: adj.primaryPoId },
         posting: `the retrospective COGS adjustment for ${adj.primaryPoRef}`,
         committed: 'the landed-cost change is applied to the sold units in IMS',
         remedy:

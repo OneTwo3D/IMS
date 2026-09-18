@@ -13,7 +13,7 @@ import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domai
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
-import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots } from '@/lib/accounting'
+import { getAccountingSettings, getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
 import { cache } from 'react'
 import { REFUND_BLIND_NOTICE_COGS_MARGIN } from '@/lib/analytics/refund-figure-surfaces'
 
@@ -471,7 +471,14 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
 }
 
 const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | 'quickbooks' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
-  const [baseCurrency, settings, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getAccountingSettings(), getActiveAccountingConnectorInfo()])
+  // o3d-j625 r5 (review M-7) — ONE RESOLUTION, NOT TWO RUN IN PARALLEL.
+  //
+  // This is the same pair deleted elsewhere this round, and it is not read-only: the connector this context
+  // reports is handed to `syncAccountingAccountBalanceSnapshots`, which PERSISTS snapshots. Resolved once
+  // and the chart read FOR it, so the account codes and the connector the snapshots are written under
+  // cannot be two different connectors' after a switch between the two reads.
+  const [baseCurrency, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getActiveAccountingConnectorInfo()])
+  const settings = await getAccountingSettingsFor(connectorInfo?.id ?? null)
   return {
     connector: connectorInfo?.id ?? null,
     baseCurrency,
