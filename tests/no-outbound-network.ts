@@ -111,7 +111,7 @@ if (!registry[TRAP]) {
       return original.apply(this, args as Parameters<typeof original>)
     }
     const callback = args.find((arg) => typeof arg === 'function')
-    return original.apply(this, (callback ? [options, callback] : [options]) as Parameters<typeof original>)
+    return original.apply(this, (callback ? [options, callback] : [options]) as unknown as Parameters<typeof original>)
   } as typeof net.Socket.prototype.connect
   registry[TRAP] = true
 }
