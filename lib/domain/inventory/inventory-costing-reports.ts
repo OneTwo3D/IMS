@@ -821,7 +821,7 @@ export type CogsCreditInput = {
  * CREDIT ON EACH RECORDED BASIS, HELD EXACTLY — THE AMOUNTS AND EVERY VERDICT INPUT (o3d-rv4a r5).
  *
  * Round 5 first kept a second, Prisma.Decimal copy of this credit (`CreditBuckets`, shared by quantity
- * through `scaleCredits`) for the verdict, and the independent review found the two disagreeing where it
+ * through a Decimal scaling helper since deleted) for the verdict, and the independent review found the two disagreeing where it
  * matters (H1): a credit share that equals the revenue share EXACTLY came out a nineteenth-digit sliver
  * smaller in Decimal, and the margin-% verdict's case 3 fired on it. So there is one copy, exact, and the
  * verdicts read it: `positive` is `Σ max(entry, 0)` per bucket, carried beside the signed total because a
@@ -840,13 +840,15 @@ export type ExactCredit = {
   grossBasisComplete: boolean
 }
 
-function emptyExactCredit(): ExactCredit {
+// The helpers below are exported for tests/analytics/cogs-exact-credit-parity.test.ts, which ties them to
+// their Decimal originals in refund-credit-buckets.ts; nothing else should need them.
+export function emptyExactCredit(): ExactCredit {
   const zero = ExactFigure.zero()
   return { net: zero, gross: zero, unknown: zero, netPositive: zero, grossPositive: zero, unknownPositive: zero, netBasisComplete: true, grossBasisComplete: true }
 }
 
 /** `addCredit` (refund-credit-buckets.ts), entry for entry, over exact figures. */
-function addExactCredit(into: ExactCredit, totalsBasis: string | null, amount: DecimalInput): void {
+export function addExactCredit(into: ExactCredit, totalsBasis: string | null, amount: DecimalInput): void {
   const onNet = creditPlacement('NET', totalsBasis, amount)
   const onGross = creditPlacement('GROSS', totalsBasis, amount)
   const value = ExactFigure.of(amount)
@@ -873,7 +875,7 @@ function shareExactCredit(credit: ExactCredit, part: ExactFigure, whole: ExactFi
   }
 }
 
-function sumExactCredits(parts: ExactCredit[]): ExactCredit {
+export function sumExactCredits(parts: ExactCredit[]): ExactCredit {
   return {
     net: ExactFigure.sum(parts.map((part) => part.net)),
     gross: ExactFigure.sum(parts.map((part) => part.gross)),
@@ -902,7 +904,7 @@ export type ExactCreditInterval = { lower: ExactFigure; upper: ExactFigure }
  * `unplacedCreditInterval` over exact figures: the buckets that are NOT the figure's unit, each worth
  * somewhere in `[Σ min(e, 0), Σ max(e, 0)]` — `total - positive` and `positive`.
  */
-function exactUnplacedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
+export function exactUnplacedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
   const parts: Array<[ExactFigure, ExactFigure]> = basis === 'NET'
     ? [[credit.gross, credit.grossPositive], [credit.unknown, credit.unknownPositive]]
     : [[credit.net, credit.netPositive], [credit.unknown, credit.unknownPositive]]
@@ -912,8 +914,12 @@ function exactUnplacedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): Exa
   }
 }
 
-/** `unabsorbedCreditInterval` over exact figures: nothing was subtracted, so the same-basis credit is unplaced too. */
-function exactUnabsorbedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
+/**
+ * The credit a row could not absorb at all, because it publishes no figure (an `Unmatched` row) or because
+ * the credit reached no row: even the same-basis part is missing, so it is added at BOTH endpoints.
+ * (`offRowCreditSummary`'s interval in refund-credit-buckets.ts is the same formula.)
+ */
+export function exactUnabsorbedInterval(credit: ExactCredit, basis: 'NET' | 'GROSS'): ExactCreditInterval {
   const comparable = comparableExactCredit(credit, basis)
   const rest = exactUnplacedInterval(credit, basis)
   return { lower: comparable.add(rest.lower), upper: comparable.add(rest.upper) }
@@ -1089,7 +1095,7 @@ export function aggregateCogsReport(
       const revenueBase = group.revenueCaptured ? groupRevenue.sub(comparableExactCredit(exactGroupCredits, COGS_FIGURE_BASIS)) : null
       const grossMarginBase = revenueBase ? revenueBase.sub(group.cogsBase) : null
       // The ratio guard is `revenue > 0`, matching the Gross Margin report's `pctString` exactly
-      // (o3d-kyey), so `marginFigureBoundDecimal`'s published case analysis is true OF THIS REPORT
+      // (o3d-kyey), so `marginFigureBoundExact`'s published case analysis is true OF THIS REPORT
       // and not merely of a report shaped like it. Its case 2 reasons that a non-positive revenue
       // pins published and true margin both to zero, which is a claim about that guard. Before
       // o3d-rv4a this report divided by a NEGATIVE revenue and published the sign-flipped quotient
