@@ -423,3 +423,4 @@ test('a bounded amount rounds in the direction its relation allows (o3d-la3n r2)
   assert.equal(roundBoundedAmountForDisplay(-0.145, 'lower'), -0.15)
   assert.equal(roundBoundedAmountForDisplay(100, 'upper'), 100, 'an exact-cent figure is not nudged')
 })
+
