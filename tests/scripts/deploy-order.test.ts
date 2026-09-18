@@ -8466,6 +8466,9 @@ test('every entrypoint defines what the shared fence library reads', () => {
     // `\$NAME` is a literal dollar in an operator message, not an expansion — see the scan above.
     for (const match of line.matchAll(/(?<!\\)\$\{([A-Z][A-Z0-9_]*)\}|(?<!\\)\$([A-Z][A-Z0-9_]*)\b/g)) {
       const name = match[1] ?? match[2]
+      // Variables BASH itself sets (o3d-z5be r12: the run-time refusals read BASHPID to tell a subshell
+      // from the top-level shell). No entrypoint can or should assign them.
+      if (['BASHPID', 'BASH_SUBSHELL', 'EUID', 'UID', 'PPID'].includes(name)) continue
       if (!libAssigned.has(name)) needed.add(name)
     }
   }

@@ -2261,7 +2261,7 @@ test('[o3d-z5be] a commit that could not be made durable is reported as a refusa
 
 /** Source the shipped fence and privileged-helpers libraries (with the real root literal — these tests
  *  publish nothing) and run `program` with IMS_SCRIPT_LIB_DIR pinned at `runningLib`. */
-function withGuardLibrary(runningLib: string, program: string) {
+function withGuardLibrary(runningLib: string, program: string, env: Record<string, string> = {}) {
   const out = spawnSync('bash', ['-c', [
     // `-e` LIKE PRODUCTION (o3d-z5be r9, review LOW 13): all three entrypoints run `set -euo pipefail`,
     // and a rig without `-e` measures a shell that differs from them in exactly the option this project
@@ -2271,7 +2271,7 @@ function withGuardLibrary(runningLib: string, program: string) {
     `source ${JSON.stringify(join(REPO, LIB_REL))}`,
     `IMS_SCRIPT_LIB_DIR=${JSON.stringify(runningLib)}`,
     program,
-  ].join('\n')], { encoding: 'utf8' })
+  ].join('\n')], { encoding: 'utf8', env: { ...process.env, ...env } })
   return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
 }
 
@@ -2442,6 +2442,25 @@ test('[o3d-z5be] update.sh refuses to copy into or chown an APP_DIR that holds t
  * simple command comes back as a list of WORDS with their quoting removed, so `chown "-R" …` and
  * `/bin/chown -R …` are the same command as `chown -R …` to the classifier below.
  */
+/** The end of an ANSI-C quoted string `$'…'` that starts at `at` (the `$`), honouring its backslash
+ *  escapes — `$'\''` is ONE quote character, not a closed string followed by a stray quote (o3d-z5be r12,
+ *  review M3: reading it as closed desynchronised every reader after it). Returns the index after the
+ *  closing quote and the decoded text (escapes other than \' and \\ are kept as written). */
+function ansiCSpan(line: string, at: number): { text: string; next: number } {
+  let i = at + 2
+  let text = ''
+  while (i < line.length && line[i] !== "'") {
+    if (line[i] === '\\') {
+      const n = line[i + 1] ?? ''
+      text += n === "'" || n === '\\' ? n : `\\${n}`
+      i += 2
+      continue
+    }
+    text += line[i]; i += 1
+  }
+  return { text, next: Math.min(line.length, i + 1) }
+}
+
 function shellCommands(line: string): string[][] {
   const commands: string[][] = []
   let words: string[] = []
@@ -2453,6 +2472,11 @@ function shellCommands(line: string): string[][] {
   while (i < line.length) {
     const c = line[i]
     if (c === '\\') { word += line[i + 1] ?? ''; hasWord = true; i += 2; continue }
+    if (c === '$' && line[i + 1] === "'") {
+      const { text, next } = ansiCSpan(line, i)
+      word += text; hasWord = true; i = next
+      continue
+    }
     if (c === "'") {
       const close = line.indexOf("'", i + 1)
       word += line.slice(i + 1, close === -1 ? line.length : close); hasWord = true
@@ -2551,6 +2575,7 @@ function heredocDelimiters(line: string): Array<{ word: string; strip: boolean }
   while (i < line.length) {
     const c = line[i]
     if (c === '\\') { i += 2; continue }
+    if (c === '$' && line[i + 1] === "'") { i = ansiCSpan(line, i).next; continue }
     if (c === "'") { const close = line.indexOf("'", i + 1); i = close === -1 ? line.length : close + 1; continue }
     if (c === '"') {
       i += 1
@@ -2794,7 +2819,7 @@ const DEFINITION_HEAD = String.raw`\s*(?:function\s+([A-Za-z_][A-Za-z0-9_]*)\s*(
 function commentLines(source: string, strict = false): Set<number> {
   const lines = source.split('\n')
   const out = new Set<number>()
-  type Frame = { kind: 'code' | 'sub' | 'dq' | 'sq' | 'bt'; depth: number }
+  type Frame = { kind: 'code' | 'sub' | 'dq' | 'sq' | 'bt' | 'ansi'; depth: number }
   const stack: Frame[] = [{ kind: 'code', depth: 0 }]
   let i = 0
   while (i < lines.length) {
@@ -2810,6 +2835,8 @@ function commentLines(source: string, strict = false): Set<number> {
       const top = stack[stack.length - 1]
       const c = line[j]
       if (top.kind === 'sq') { if (c === "'") stack.pop(); j += 1; continue }
+      // ANSI-C `$'…'`: a backslash escapes the next character, INCLUDING a quote (r12, review M3).
+      if (top.kind === 'ansi') { if (c === '\\') { j += 2; continue } if (c === "'") stack.pop(); j += 1; continue }
       if (top.kind === 'dq') {
         if (c === '\\') { j += 2; continue }
         if (c === '"') { stack.pop(); j += 1; continue }
@@ -2826,6 +2853,7 @@ function commentLines(source: string, strict = false): Set<number> {
       }
       if (c === '\\') { j += 2; continue }
       if (c === '#' && (j === 0 || /[\s;&|(]/.test(line[j - 1]))) break
+      if (c === '$' && line[j + 1] === "'") { stack.push({ kind: 'ansi', depth: 0 }); j += 2; continue }
       if (c === "'") { stack.push({ kind: 'sq', depth: 0 }); j += 1; continue }
       if (c === '"') { stack.push({ kind: 'dq', depth: 0 }); j += 1; continue }
       if (c === '`') { stack.push({ kind: 'bt', depth: 0 }); j += 1; continue }
@@ -2876,6 +2904,10 @@ function statementsOf(line: string): string[] {
   while (i < line.length) {
     const c = line[i]
     if (c === '\\') { current += c + (line[i + 1] ?? ''); i += 2; continue }
+    if (c === '$' && line[i + 1] === "'") {
+      const { next } = ansiCSpan(line, i)
+      current += line.slice(i, next); i = next; continue
+    }
     if (c === "'") {
       const close = line.indexOf("'", i + 1)
       const end = close === -1 ? line.length : close + 1
@@ -3476,7 +3508,8 @@ test('[o3d-z5be] RUN-TIME GUARD driver_require_owned_path: driver_publish_unwind
   for (const [label, first] of [
     ['${APP_DIR}', app],
     ['/', '/'],
-    ['a symlink under the root that points into ${APP_DIR}', `${root}/link-into-app`],
+    ['a path THROUGH a symlink under the root that points into ${APP_DIR}', `${root}/link-into-app/keep.txt`],
+    ['the root itself', root],
     ['a `..` escape', `${root}/../escape`],
     ['a relative path', 'relative/x'],
   ] as const) {
@@ -3491,6 +3524,13 @@ test('[o3d-z5be] RUN-TIME GUARD driver_require_owned_path: driver_publish_unwind
   ]) {
     assertRefusedAndEnded(run(dirs, `driver_publish_unwind ${args}\necho AFTER`), `driver_publish_unwind ${args}`, victim)
   }
+  // THE LINK ITSELF IS ACCEPTED (r12, review L2): unwind's operations act on NAMES (`rm -rf NAME`,
+  // `mv -T NAME …` unlink or rename a final symlink, they do not follow it), so a pointer under the root
+  // whose target lies elsewhere is removed, and what it pointed at is untouched.
+  const linkRun = run(dirs, `driver_publish_unwind "${root}/link-into-app" ${tail}\necho AFTER`)
+  assert.equal(linkRun.status, 0, `a link under the root must be removable:\n${linkRun.stderr}`)
+  assert.equal(lstatSync(join(root, 'link-into-app'), { throwIfNoEntry: false }), undefined, 'the link is gone')
+  assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', 'and what it pointed at is untouched')
   // AND A LEGITIMATE CALL PROCEEDS: the version directory it names is removed, and the run continues.
   mkdirSync(join(root, '.version-x'))
   writeFileSync(join(root, '.version-x', 'f'), 'x\n')
@@ -3502,7 +3542,7 @@ test('[o3d-z5be] RUN-TIME GUARD driver_require_owned_path: driver_publish_unwind
 
 /** The shipped fence library, its recovery root aimed at `recovery` (and, optionally, one more line
  *  replaced), sourced, then `program`. */
-function withFenceLibrary(t: TestContext, recovery: string, program: string, replace?: [string, string]): Run {
+function withFenceLibrary(t: TestContext, recovery: string, program: string, replace?: [string, string], env: Record<string, string> = {}): Run {
   let text = protectedLibraryTextAt(recovery)
   if (replace) {
     assert.equal(text.split(replace[0]).length, 2, `the fence library must contain exactly one ${replace[0]}`)
@@ -3511,7 +3551,7 @@ function withFenceLibrary(t: TestContext, recovery: string, program: string, rep
   const work = createTempDirSync('runtime-guard-fence-', t)
   const lib = join(work, 'db-fence-protected.sh')
   writeFileSync(lib, text)
-  const out = spawnSync('bash', ['-c', ['set -uo pipefail', `source ${JSON.stringify(lib)}`, program].join('\n')], { encoding: 'utf8' })
+  const out = spawnSync('bash', ['-c', ['set -uo pipefail', `source ${JSON.stringify(lib)}`, program].join('\n')], { encoding: 'utf8', env: { ...process.env, ...env } })
   return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
 }
 
@@ -3543,16 +3583,24 @@ test('[o3d-z5be] RUN-TIME GUARD _fence_require_owned_tree: the fence copies into
     ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`])
   assertRefusedAndEnded(retargeted, 'a staging name re-aimed at ${APP_DIR}', victim)
 
-  // THE PROBE DIRECTORY: the one `mktemp -d` directory it may use outside the root, and only while it
-  // is a real directory — a recorded name replaced by a symlink is refused.
-  const probe = createTempDirSync('runtime-guard-probe-', t)
-  const probeOk = withFenceLibrary(t, recovery, `_FENCE_OWNED_TMP=${JSON.stringify(probe)}\n_fence_require_owned_tree ${JSON.stringify(join(probe, 'scripts'))} probe\necho AFTER`)
+  // THE PROBE DIRECTORY (r12, review H1): accepted only when the CALLER PASSES it as "$3" and it is what
+  // `mktemp -d` makes — a real directory owned by this uid, named `tmp.` + ten characters, directly in
+  // ${TMPDIR:-/tmp}. No global is read: r11's _FENCE_OWNED_TMP let an inherited value widen the check.
+  const tmpdir = createTempDirSync('runtime-guard-tmpdir-', t)
+  const probe = execFileSync('mktemp', ['-d'], { encoding: 'utf8', env: { ...process.env, TMPDIR: tmpdir } }).trim()
+  const inProbe = join(probe, 'scripts')
+  const probeOk = withFenceLibrary(t, recovery, `_fence_require_owned_tree ${JSON.stringify(inProbe)} probe ${JSON.stringify(probe)}\necho AFTER`, undefined, { TMPDIR: tmpdir })
   assert.equal(probeOk.status, 0, probeOk.stderr)
   assert.match(probeOk.stdout, /^AFTER$/m)
-  const linked = join(createTempDirSync('runtime-guard-probe-link-', t), 'probe')
+  // the same path, not offered as the probe, is refused
+  assertRefusedAndEnded(withFenceLibrary(t, recovery, `_fence_require_owned_tree ${JSON.stringify(inProbe)} probe\necho AFTER`, undefined, { TMPDIR: tmpdir }), 'a probe path without the probe named')
+  // a directory that is not a mktemp directory, offered as the probe, is refused — ${APP_DIR} above all
+  assertRefusedAndEnded(withFenceLibrary(t, recovery, `_fence_require_owned_tree ${JSON.stringify(app)} probe ${JSON.stringify(app)}\necho AFTER`, undefined, { TMPDIR: join(app, '..') }),
+    '${APP_DIR} offered as the probe', victim)
+  const linked = join(tmpdir, 'tmp.AAAAAAAAAA')
   symlinkSync(app, linked)
-  assertRefusedAndEnded(withFenceLibrary(t, recovery, `_FENCE_OWNED_TMP=${JSON.stringify(linked)}\n_fence_require_owned_tree ${JSON.stringify(linked)} probe\necho AFTER`),
-    'a recorded probe name that is a symlink into ${APP_DIR}', victim)
+  assertRefusedAndEnded(withFenceLibrary(t, recovery, `_fence_require_owned_tree ${JSON.stringify(linked)} probe ${JSON.stringify(linked)}\necho AFTER`, undefined, { TMPDIR: tmpdir }),
+    'a probe name that is a symlink into ${APP_DIR}', victim)
 })
 
 test('[o3d-z5be] RUN-TIME GUARD in copy_tree_into_new_dir: it refuses, and ends the run on, a destination that overlaps the running tree', (t) => {
@@ -3645,6 +3693,133 @@ test('[o3d-z5be] RUN-TIME GUARD in chown-tree.mjs: the walk refuses a directory 
   assert.equal(ok.status, 0, `a vetted state directory must be walked:\n${ok.stderr}`)
 })
 
+test('[o3d-z5be] RUN-TIME GUARDS end the RUN from a subshell, a command substitution, a pipeline or a background job (r12, review M1)', (t) => {
+  // `exit` in any of those leaves only the subshell, and every fence publication runs inside `$( … )`
+  // (resolve_fence_script → db_fence_script_in_use), where update.sh's `resolve_fence_script || true`
+  // then carried on. Each context below must end the whole program: AFTER never printed, the target
+  // untouched, the status non-zero (SIGTERM to the top-level shell, whose EXIT trap runs).
+  const dirs = scratch(t)
+  const { app, victim } = appTree(t)
+  const root = dirs.root
+  const unwind = `driver_publish_unwind ${JSON.stringify(app)} "${root}/.p" "${root}/.r" "${root}/helpers" 0`
+  const recovery = join(createTempDirSync('runtime-guard-ctx-', t), 'recovery')
+  mkdirSync(recovery)
+  const reaim: [string, string] = ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`]
+  const contexts = (cmd: string) => [
+    ['a command substitution', `: "$(${cmd})"`],
+    ['the update.sh shape: x="$(f)" || true', `f() { ${cmd}; }; x="$(f)" || true`],
+    ['a subshell', `( ${cmd} ) || true`],
+    ['a pipeline', `${cmd} | cat || true`],
+    ['a background job', `${cmd} & wait || true`],
+  ] as const
+  for (const [label, program] of contexts(unwind)) {
+    const out = run(dirs, `trap 'echo EXIT-TRAP' EXIT\n${program}\necho AFTER`)
+    assert.notEqual(out.status, 0, `driver guard in ${label}: the run must end:\n${out.stdout}${out.stderr}`)
+    assert.doesNotMatch(out.stdout, /^AFTER$/m, `driver guard in ${label}: nothing after it may run:\n${out.stdout}`)
+    assert.match(out.stdout, /^EXIT-TRAP$/m, `driver guard in ${label}: and the top-level EXIT trap runs, as for an operator's kill`)
+    assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', `driver guard in ${label}: target untouched`)
+  }
+  for (const [label, program] of contexts('_fence_stage_and_publish')) {
+    const out = withFenceLibrary(t, recovery, `trap 'echo EXIT-TRAP' EXIT\n${program}\necho AFTER`, reaim)
+    assert.notEqual(out.status, 0, `fence guard in ${label}: the run must end:\n${out.stdout}${out.stderr}`)
+    assert.doesNotMatch(out.stdout, /^AFTER$/m, `fence guard in ${label}: nothing after it may run:\n${out.stdout}`)
+    assert.match(out.stdout, /^EXIT-TRAP$/m, `fence guard in ${label}: and the EXIT trap runs`)
+    assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', `fence guard in ${label}: target untouched`)
+  }
+})
+
+/** Every global a run-time guard consults, or that feeds a guarded path (r12, review H1). Each is
+ *  readonly at load (IMS_DRIVER_*, DB_FENCE_*), cleared at load (_FENCE_OWNED_TMP,
+ *  IMS_DRIVER_OVERLAP_EXTRA_IDS), set by the caller on the same line (IMS_CHOWN_TREE_ROOT), or bounded by
+ *  the check itself (TMPDIR only locates a `tmp.XXXXXXXXXX` probe directory). */
+const HOSTILE_GLOBALS = ['_FENCE_OWNED_TMP', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_STAGED_APP_DIR', 'DB_FENCE_RETIRED_APP_DIR',
+  'DB_FENCE_PROTECTED_APP_DIR', 'IMS_DRIVER_ROOT', 'IMS_DRIVER_HELPER_DIR', 'IMS_DRIVER_PROGRAM_DIR', 'IMS_DRIVER_OVERLAP_EXTRA_IDS',
+  'IMS_CHOWN_TREE_ROOT', 'TMPDIR']
+
+test('[o3d-z5be] RUN-TIME GUARDS hold with every global they consult pre-set in the environment to a hostile value (r12, review H1)', (t) => {
+  // r11's fence guard read _FENCE_OWNED_TMP, which nothing initialised: `_FENCE_OWNED_TMP=<the app's
+  // parent>` widened it to the application tree and the re-aimed `rm -rf` RAN. The hostile value here
+  // is exactly that: the parent of the stand-in ${APP_DIR}, a real directory owned by this uid.
+  const { app, victim } = appTree(t)
+  const hostile = join(app, '..')
+  const dirs = scratch(t)
+  const recovery = join(createTempDirSync('runtime-guard-env-', t), 'recovery')
+  mkdirSync(recovery)
+  const release = join(createTempDirSync('runtime-guard-env-rel-', t), 'release')
+  const runningLib = join(release, 'scripts', 'lib')
+  mkdirSync(runningLib, { recursive: true })
+  const fn = shellFunction(INSTALL_SOURCE, 'chown_state_tree', 'scripts/install.sh')
+  const reaim: [string, string] = ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`]
+  let cases = 0
+  for (const name of HOSTILE_GLOBALS) {
+    const env = { [name]: hostile }
+    const results: Array<[string, Run]> = [
+      ['driver_publish_unwind ${APP_DIR}', run(dirs, `driver_publish_unwind ${JSON.stringify(app)} "${dirs.root}/.p" "${dirs.root}/.r" "${dirs.root}/helpers" 0\necho AFTER`, env)],
+      ['_fence_vendor_into ${APP_DIR}', withFenceLibrary(t, recovery, `_fence_vendor_into ${JSON.stringify(app)} ${JSON.stringify(app)}\necho AFTER`, undefined, env)],
+      ['_fence_vendor_into ${APP_DIR} with it offered as the probe', withFenceLibrary(t, recovery, `_fence_vendor_into ${JSON.stringify(app)} ${JSON.stringify(app)} ${JSON.stringify(app)}\necho AFTER`, undefined, env)],
+      ['_fence_stage_and_publish re-aimed at ${APP_DIR}', withFenceLibrary(t, recovery, '_fence_stage_and_publish\necho AFTER', reaim, env)],
+      ['copy_tree_into_new_dir onto the running release', withGuardLibrary(runningLib, ['die() { echo "DIE: $*" >&2; exit 1; }', `source ${JSON.stringify(join(REPO, 'scripts/lib/cutover-namespace.sh'))}`, `copy_tree_into_new_dir ${JSON.stringify(app)} ${JSON.stringify(release)}`, 'echo AFTER'].join('\n'), env)],
+      ['chown_state_tree ${APP_DIR}', withGuardLibrary(runningLib, ['die() { echo "DIE: $*" >&2; exit 1; }', `DATA_DIR=${JSON.stringify(join(release, '..', 'data'))}`, fn, `chown_state_tree ${JSON.stringify(app)} "$(id -un)" locks "the state directory"`, 'echo AFTER'].join('\n'), env)],
+    ]
+    const walk = spawnSync('node', [join(REPO, 'scripts/lib/chown-tree.mjs'), '.', String(process.getuid!()), String(process.getgid!()), 'locks'],
+      { cwd: app, encoding: 'utf8', env: { ...process.env, IMS_CHOWN_TREE_ROOT: '', ...env } })
+    results.push(['chown-tree.mjs in ${APP_DIR}', { status: walk.status ?? -1, stdout: walk.stdout ?? '', stderr: walk.stderr ?? '' }])
+    for (const [label, out] of results) {
+      assert.notEqual(out.status, 0, `${name}=${hostile}: ${label} must still be refused:\n${out.stdout}${out.stderr}`)
+      assert.doesNotMatch(out.stdout, /^AFTER$/m, `${name}=${hostile}: ${label}: nothing after the refusal may run`)
+      assert.equal(readFileSync(victim, 'utf8'), 'the application tree\n', `${name}=${hostile}: ${label}: the target must be untouched`)
+      cases += 1
+    }
+  }
+  assert.equal(cases, HOSTILE_GLOBALS.length * 7, 'precondition: every case ran for every name')
+  // And each library does clear or fix the names at load, so the list above is not merely what happened
+  // to be tried: a name the guards read must be one of these forms.
+  assert.match(readFileSync(join(REPO, FENCE_LIB_REL), 'utf8'), /^unset -v _FENCE_OWNED_TMP$/m, 'the fence library clears the name r11 read')
+  assert.match(LIB_SOURCE, /^IMS_DRIVER_OVERLAP_EXTRA_IDS=""$/m, 'privileged-helpers clears its one non-readonly input')
+})
+
+test('[o3d-z5be] the comment lexer agrees with BASH about which lines are comments (r12, review M3)', (t) => {
+  // r11's lexer read `$'\''` as a closed single quote and fell out of step with bash for the rest of the
+  // file, so a `#` line inside a `bash -c '…'` payload was exempted while bash executed it. ANSI-C quoting
+  // is handled now, and this checks the whole lexer against bash itself: every line it calls a comment is
+  // replaced by a marker comment, and `bash --pretty-print` (which drops comments and keeps strings and
+  // here-documents) must print none of the markers — and must still parse the file. A marker that
+  // survives, or a parse that breaks, is a line the lexer called a comment and bash did not.
+  const probe = spawnSync('bash', ['--pretty-print', '/dev/null'], { encoding: 'utf8' })
+  assert.equal(probe.status, 0, 'bash --pretty-print (bash 5.2+) is required for this check')
+  const work = createTempDirSync('lexer-vs-bash-', t)
+  const check = (label: string, src: string, strict: boolean) => {
+    const set = commentLines(src, strict)
+    const marked = src.split('\n').map((l, k) => (set.has(k + 1) ? `${(/^(\s*)/.exec(l) ?? ['', ''])[1]}# IMS_LEXER_COMMENT_${k + 1}` : l)).join('\n')
+    const file = join(work, 'marked.sh')
+    writeFileSync(file, marked)
+    const out = spawnSync('bash', ['--pretty-print', file], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    return { set, status: out.status, leaked: [...(out.stdout ?? '').matchAll(/IMS_LEXER_COMMENT_(\d+)/g)].map((m) => Number(m[1])), label }
+  }
+  for (const rel of [...ENTRYPOINTS, ...SOURCED_LIBS]) {
+    const src = readFileSync(join(REPO, rel), 'utf8')
+    for (const strict of [false, true]) {
+      const r = check(rel, src, strict)
+      assert.ok(r.set.size > 20, `precondition: ${rel} has ${r.set.size} comment lines`)
+      assert.equal(r.status, 0, `${rel}: replacing the lexer's comment lines changed how bash parses the file`)
+      assert.deepEqual(r.leaked, [], `${rel}: the lexer called these lines comments and bash keeps them: ${r.leaked.join(', ')}`)
+    }
+  }
+  // THE REVIEWER'S SHAPE, and a control proving this check can fail: the same file with the line marked
+  // as a comment BY HAND leaks the marker.
+  const shape = ": $'\\'\"'\nbash -c 'x=\"\n#\"; chown -R imsapp /data'\n"
+  assert.ok(!commentLines(shape).has(3) && !commentLines(shape, true).has(3), 'the executing line after $\'\\\'\' is not a comment')
+  assert.deepEqual(backstopHits(shape).map((h) => h.n), [3], 'and the backstop reads it')
+  // CONTROLS, proving both failure signals of this check can fire: a data line inside a string marked as
+  // a comment by hand LEAKS the marker; the reviewer's executing line marked by hand BREAKS the parse.
+  writeFileSync(join(work, 'leak.sh'), 'msg="a\n# IMS_LEXER_COMMENT_2\n"\n')
+  const leak = spawnSync('bash', ['--pretty-print', join(work, 'leak.sh')], { encoding: 'utf8' })
+  assert.match(leak.stdout ?? '', /IMS_LEXER_COMMENT_2/, 'control: a line wrongly called a comment leaks through bash')
+  writeFileSync(join(work, 'forced.sh'), shape.split('\n').map((l, k) => (k === 2 ? '# IMS_LEXER_COMMENT_3' : l)).join('\n'))
+  const forced = spawnSync('bash', ['--pretty-print', join(work, 'forced.sh')], { encoding: 'utf8' })
+  assert.ok(forced.status !== 0 || /IMS_LEXER_COMMENT_3/.test(forced.stdout ?? ''), 'control: the reviewer\'s line marked as a comment is detected')
+})
+
 type AllowEntry = { file: string; line: string; count: number; class: string; reason: string; guard?: string }
 const ALLOWLIST_REL = 'tests/scripts/privileged-word-allowlist.json'
 const ALLOW_CLASSES = new Set(['text', 'comment', 'single-inode', 'read-only', 'code-owned-tree', 'census-helper', 'definition', 'app-user'])
@@ -3657,17 +3832,15 @@ function firstVariable(word: string): string | null {
   const m = /\$\{([A-Za-z_][A-Za-z0-9_]*)|\$([A-Za-z_][A-Za-z0-9_]*)/.exec(word)
   return m ? (m[1] ?? m[2]) : null
 }
-/** The variables naming what a tree-changing statement ACTS ON: every operand of rm and mv, the last
+/** The operand WORDS naming what a tree-changing statement ACTS ON: every operand of rm and mv, the last
  *  operand of cp, rsync, chown, chmod, chgrp. Flags and a leading mode/owner are not operands. */
-function operandVariables(statement: string): string[] {
+function operandWords(statement: string): string[] {
   const out: string[] = []
   for (const words of shellCommands(statement)) {
     const { name, args } = commandName(words.filter((w) => !/^[0-9]*[<>]/.test(w)))
     const operands = args.filter((a) => !/^-/.test(a))
-    let targets: string[] = []
-    if (name === 'rm' || name === 'mv') targets = operands
-    else if (['cp', 'rsync', 'chown', 'chmod', 'chgrp'].includes(name)) targets = operands.slice(-1)
-    for (const t of targets) { const v = firstVariable(t); if (v) out.push(v) }
+    if (name === 'rm' || name === 'mv') out.push(...operands)
+    else if (['cp', 'rsync', 'chown', 'chmod', 'chgrp'].includes(name)) out.push(...operands.slice(-1))
   }
   return out
 }
@@ -3774,23 +3947,53 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
     for (const hit of backstopHits(source).filter((h) => h.line === entry.line)) {
       const fn = enclosingFunction(source, hit.n)
       assert.ok(fn, `${entry.file}:${hit.n}: a guarded operation must be inside a function: ${entry.line}`)
-      // THE GUARD MUST CHECK *THIS* OPERATION'S OPERAND (r11 mutation R15): "a call somewhere earlier in
-      // the function" was satisfied by a guard on the same NAME in an earlier loop, after which the
-      // variable was reassigned. So for each variable the operation acts on, there must be a guard call
-      // on that variable, earlier in the function (or earlier on the same line), with no reassignment of
-      // it in between.
+      // THE GUARD MUST CHECK *THIS* OPERATION'S OPERAND, AND BE A CALL THAT REALLY HAPPENS FIRST. This is a
+      // TEXTUAL rule (r11 R15; tightened in r12 after review M2's X1–X7, each of which passed r11's form):
+      //   1. the guard is a PLAIN statement: its line starts with the guard's name — not `( guard …)`, not
+      //      `: "$(guard …)"`, not `if … guard`, not `x || guard` — and is not backgrounded with `&`;
+      //      or it opens the same `{ guard …; op; }` group as the operation on the same line;
+      //   2. it is in the same block as the operation or an enclosing one: its indentation is no deeper
+      //      than the operation's, and no line between them is shallower than the guard (a closed `if`,
+      //      an `else`, a `done`) — the house style indents every block;
+      //   3. its argument is exactly `${NAME}`, and the operation's operand is exactly `${NAME}` or
+      //      `${NAME}/…`: any parameter operator on the name (`${NAME%/*}` is the PARENT) fails;
+      //   4. NAME is not reassigned between them: `NAME=`, `NAME+=`, `printf -v NAME`, `read … NAME`,
+      //      `mapfile/readarray NAME`, `local/declare/typeset/readonly/export … NAME`, `for NAME in`,
+      //      `unset NAME`.
+      // The run-time check is the guarantee; this keeps the calls to it where they do their job.
+      const indent = (n: number) => (/^( *)/.exec(lines[n - 1]) ?? ['', ''])[1].length
       const region = logicalLines(lines.slice(fn!.start, hit.n).join('\n'))
-        .flatMap((l) => statementsOf(l.text).map((statement) => ({ n: fn!.start + l.n, statement })))
-      const opIndex = region.map((r, k) => ({ ...r, k })).filter((r) => r.n === hit.n && privilegedWords(r.statement).length > 0)
-      const guardCalls = region.map((r, k) => ({ ...r, k })).filter((r) => shellCommands(r.statement).some((w) => commandName(w).name === entry.guard))
-      assert.ok(guardCalls.length > 0, `${entry.file}:${hit.n}: ${fn!.name} must call ${entry.guard} before: ${entry.line}`)
+        .flatMap((l) => statementsOf(l.text).map((statement) => ({ n: fn!.start + l.n, statement, line: l.text })))
+        .map((r, k) => ({ ...r, k }))
+      const opIndex = region.filter((r) => r.n === hit.n && privilegedWords(r.statement).length > 0)
+      const plainGuard = (r: { n: number; statement: string; line: string }) => {
+        const words = shellCommands(r.statement)[0] ?? []
+        if (commandName(words).name !== entry.guard || words[0] !== entry.guard) return false
+        const text = r.line.trim()
+        if (/&\s*$/.test(text) || /[^&>|]&[^&>]/.test(text.replace(/"[^"]*"/g, '""'))) return false
+        return text.startsWith(`${entry.guard} `) ? 'start' : new RegExp(`\\{ ${entry.guard} `).test(text) ? 'group' : false
+      }
+      const guardCalls = region.map((r) => ({ ...r, form: plainGuard(r) })).filter((r) => r.form)
+      assert.ok(guardCalls.length > 0, `${entry.file}:${hit.n}: ${fn!.name} must call ${entry.guard}, as a plain statement, before: ${entry.line}`)
       for (const op of opIndex) {
-        for (const operand of operandVariables(op.statement)) {
-          const checks = guardCalls.filter((g) => g.k < op.k && firstVariable(commandName(shellCommands(g.statement)[0] ?? []).args[0] ?? '') === operand)
-          assert.ok(checks.length > 0, `${entry.file}:${hit.n}: ${entry.guard} must be called on \${${operand}} before: ${op.statement}`)
+        for (const operand of operandWords(op.statement)) {
+          const name = firstVariable(operand)
+          if (!name) continue
+          assert.match(operand, new RegExp(`^\\$(?:\\{${name}\\}|${name})(?:/.*)?$`),
+            `${entry.file}:${hit.n}: the operand ${operand} applies an operator to \${${name}}, so no check of \${${name}} covers it: ${op.statement}`)
+          // A `{ guard …; op; }` group counts only for the operation on its own line.
+          const checks = guardCalls.filter((g) => g.k < op.k && (g.form === 'start' || g.n === op.n)
+            && new RegExp(`^\\$(?:\\{${name}\\}|${name})$`).test(commandName(shellCommands(g.statement)[0] ?? []).args[0] ?? ''))
+          assert.ok(checks.length > 0, `${entry.file}:${hit.n}: ${entry.guard} must be called on exactly \${${name}} before: ${op.statement}`)
           const last = checks[checks.length - 1]
-          const reassigned = region.slice(last.k + 1, op.k).find((r) => new RegExp(`(^|[\\s;(])(local\\s+[^;]*)?${operand}=|\\bfor\\s+${operand}\\s+in\\b|\\bread\\b[^;]*\\b${operand}\\b`).test(r.statement))
-          assert.equal(reassigned, undefined, `${entry.file}:${hit.n}: \${${operand}} is reassigned (${reassigned?.statement}) after its check and before: ${op.statement}`)
+          if (last.n !== op.n) {
+            assert.ok(indent(last.n) <= indent(op.n), `${entry.file}:${last.n}: the check of \${${name}} is in a deeper block than the operation at ${op.n}`)
+            const closed = region.find((r) => r.k > last.k && r.k < op.k && r.n !== last.n && indent(r.n) < indent(last.n))
+            assert.equal(closed, undefined, `${entry.file}:${hit.n}: the block holding the check of \${${name}} (line ${last.n}) ends before the operation, at line ${closed?.n}`)
+          }
+          const reassign = new RegExp(`(^|[\\s;(])${name}\\+?=|\\bprintf\\s+(?:-[A-Za-z]+\\s+)*-v\\s+${name}\\b|\\bread\\b[^;]*\\b${name}\\b|\\b(?:mapfile|readarray)\\b[^;]*\\b${name}\\b|\\b(?:local|declare|typeset|readonly|export)\\b[^;]*\\b${name}\\b|\\bfor\\s+${name}\\s+in\\b|\\bunset\\b[^;]*\\b${name}\\b`)
+          const reassigned = region.slice(last.k + 1, op.k).find((r) => reassign.test(r.statement))
+          assert.equal(reassigned, undefined, `${entry.file}:${hit.n}: \${${name}} is reassigned (${reassigned?.statement}) after its check and before: ${op.statement}`)
           operandChecks += 1
         }
       }

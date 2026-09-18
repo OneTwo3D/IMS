@@ -479,10 +479,10 @@
   },
   {
    "file": "scripts/install.sh",
-   "line": "[[ \"${root}\" == \"${DATA_DIR}\" ]] || die \\\n\"chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed.\"",
+   "line": "privileged_end_run \"chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed.\" \\\n|| die \"chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed.\"",
    "count": 1,
    "class": "text",
-   "reason": "not run: the word is text or an argument (${root}, die)"
+   "reason": "not run: the word is text or an argument (privileged_end_run, die)"
   },
   {
    "file": "scripts/install.sh",
@@ -2342,6 +2342,13 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# directory root owns, and with a re-aimed readonly the `rm -rf` ran. The name is also cleared below,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
    "line": "if ! cat > \"$tmp\" 2>/dev/null; then rm -f \"$tmp\"; return 1; fi",
    "count": 1,
    "class": "single-inode",
@@ -2728,7 +2735,7 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "_fence_vendor_into \"${app_dir}\" \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
+   "line": "_fence_vendor_into \"${app_dir}\" \"${dir}\" \"${dir}\" || { rm -rf \"${dir}\"; return 1; }",
    "count": 1,
    "class": "code-owned-tree",
    "reason": "deletes the probe directory this function made with `mktemp -d`; enforced at run time by _fence_require_owned_tree in _fence_probe_assemble",
@@ -2760,7 +2767,7 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "[[ -z \"${_fence_probe_dir}\" ]] || { _fence_require_owned_tree \"${_fence_probe_dir}\" \"the fence probe directory\"; rm -rf \"${_fence_probe_dir}\"; }",
+   "line": "[[ -z \"${_fence_probe_dir}\" ]] || { _fence_require_owned_tree \"${_fence_probe_dir}\" \"the fence probe directory\" \"${_fence_probe_dir}\"; rm -rf \"${_fence_probe_dir}\"; }",
    "count": 4,
    "class": "code-owned-tree",
    "reason": "deletes the `mktemp -d` probe directory _fence_probe_assemble made for this call; enforced at run time by _fence_require_owned_tree in db_fence_preflight, db_fence_probe_digests, db_fence_report_candidate_digest",
@@ -3006,10 +3013,10 @@
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
-   "line": "privileged_spare_running_tree \"${dest}\" \"the directory copy_tree_into_new_dir would replace\" || die \"${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}\"",
+   "line": "privileged_spare_running_tree \"${dest}\" \"the directory copy_tree_into_new_dir would replace\" \\\n|| privileged_end_run \"${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}\" \\\n|| die \"${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}\"",
    "count": 1,
    "class": "text",
-   "reason": "not run: the word is text or an argument (privileged_spare_running_tree, die)"
+   "reason": "not run: the word is text or an argument (privileged_spare_running_tree, privileged_end_run, die)"
   },
   {
    "file": "scripts/lib/cutover-namespace.sh",
@@ -3191,6 +3198,20 @@
   {
    "file": "scripts/lib/privileged-helpers.sh",
    "line": "#                                  first. A unique destination is the point: `mv src dst` with `dst`",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#   * mode `tree` (the default) — for an operation that FOLLOWS the path (chown -R, chmod -R, a copy",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/privileged-helpers.sh",
+   "line": "#   * mode `link` — for an operation on the NAME itself (`rm -rf NAME`, `mv -T NAME …`, which unlink or",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"

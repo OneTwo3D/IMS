@@ -4048,9 +4048,11 @@ chown_state_tree() {
   # WHAT IT MAY RE-OWN, CHECKED AT RUN TIME (o3d-z5be r11, review H4): the state directory and nothing
   # else, and never a tree that overlaps the one this run is executing from. Its one call site is also
   # guarded; this is the check that does not depend on the call site.
-  [[ "${root}" == "${DATA_DIR}" ]] || die \
-    "chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed."
-  privileged_spare_running_tree "${root}" "${what}" || die "${IMS_DRIVER_OVERLAP_REASON}"
+  if [[ "${root}" != "${DATA_DIR}" ]]; then
+    privileged_end_run "chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed." \
+      || die "chown_state_tree re-owns ${DATA_DIR} and nothing else, and was asked for ${root}. This is a bug in these scripts. Nothing has been changed."
+  fi
+  privileged_spare_running_tree "${root}" "${what}" || privileged_end_run "${IMS_DRIVER_OVERLAP_REASON}" || die "${IMS_DRIVER_OVERLAP_REASON}"
   # NUMERIC IDS, RESOLVED ONCE AND CHECKED. `chown` takes a name and resolves it itself; `fchown`
   # takes numbers, so the resolution happens here — and a name that resolves to nothing must end
   # the run rather than reach the helper as an empty string.

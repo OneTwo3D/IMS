@@ -75,15 +75,29 @@ Two mechanisms carry the guarantee at **run time**, and a static test keeps them
   entrypoint or a library inside the target cannot make two overlapping trees look separate. A walk that
   cannot be completed is a refusal, and a refusal ends the run.
 - **The helpers' own refusals.** The library helpers that delete, rename, re-own or copy into a tree
-  they are *handed* check, when they run, that the path they were given is their own, and **exit** if not:
-  `driver_publish_unwind`, the driver sweep and the driver publication accept only paths that
-  canonicalise strictly inside `/etc/ims-cutover-driver`; the fence's `_fence_vendor_into` and
-  `_fence_stage_and_publish` accept only paths strictly inside `/etc/ims-cutover-recovery` (or the one
-  `mktemp -d` directory the probe just made), so re-aiming one of the fence's `readonly` names at the
-  application tree ends the run; `copy_tree_into_new_dir` runs the running-tree check on its own
-  destination; `chown_state_tree` re-owns `${DATA_DIR}` and nothing else, after the same check; and
-  `scripts/lib/chown-tree.mjs` refuses a directory its caller did not name, `/` or any top-level
-  directory, and its own tree. Canonical means every symbolic link resolved and no `..` component.
+  they are *handed* check the path when they run, each against its own rule:
+  - `driver_publish_unwind`, the driver sweep and the driver publication accept only paths inside
+    `/etc/ims-cutover-driver`: for an operation that follows the path (a recursive chown or chmod, a
+    copy into it) the whole path must canonicalise strictly inside it; for an operation on the name
+    itself (`rm -rf NAME`, `mv -T NAME`, which remove or rename a final symlink without following it)
+    the name's own location must be inside it.
+  - the fence's `_fence_vendor_into` and `_fence_stage_and_publish` accept only paths strictly inside
+    `/etc/ims-cutover-recovery`, or a probe directory the caller passes explicitly that is what
+    `mktemp -d` makes (named `tmp.` + ten characters, directly in `${TMPDIR:-/tmp}`, owned by this
+    account). So re-aiming one of the fence's `readonly` names at the application tree is refused. No
+    global variable widens either check: the names they read are readonly or cleared when the library
+    loads.
+  - `copy_tree_into_new_dir` checks only that its destination does not overlap the tree the run is
+    executing from; the destination itself is the caller's choice, checked at the guarded call site.
+  - `chown_state_tree` re-owns `${DATA_DIR}` and nothing else, after the same overlap check.
+  - `scripts/lib/chown-tree.mjs` refuses to run anywhere but the directory its caller named, and refuses
+    `/`, a top-level directory and its own tree; which directory is named is `chown_state_tree`'s
+    decision.
+
+  Canonical means every symbolic link resolved and no `.` or `..` component. **A refusal means the
+  operation never runs, and it ends the run from any context**: in the top-level shell it exits; in a
+  command substitution, subshell, pipeline or background job — where every fence publication runs — it
+  also sends SIGTERM to the top-level shell, whose EXIT trap runs as it would for an operator's kill.
 
 The operations that run **without** a per-operation check in the entrypoints are listed by line, each
 with its reason, in the test described below: eleven deletes of the clone directory the same run has
@@ -109,11 +123,18 @@ a classifier over the shapes it can parse**; it is not a proof about what the sc
   and the house program `chown-tree` — must be wholly census rows or an entry in
   `tests/scripts/privileged-word-allowlist.json` whose text matches exactly and whose count agrees.
   Here-document bodies and strings are read; a `#` line is skipped only when it is a comment in code,
-  and never when it carries `$(` or a backtick.
+  and never when it carries `$(` or a backtick. Which lines are comments is decided by a lexer (quotes,
+  ANSI-C `$'…'` escapes, substitutions, here-documents), and the test checks that lexer against bash
+  itself (`bash --pretty-print`, which drops comments and keeps strings) on every file it reads.
 - The allowlist binds **text, not values or context**. Moving an allowlisted line, or changing a
   variable it uses, does not fail it. That is why every entry that changes a tree (`code-owned-tree`,
-  `census-helper`) names the run-time guard that checks its path, and the test requires that guard to be
-  called before each occurrence.
+  `census-helper`) names the run-time guard that checks its path, and the test binds each occurrence to
+  a call of that guard — also by text: the call is a plain statement (not in a subshell, a
+  substitution, a background job or a condition), in the same block as the operation or an enclosing
+  one, on exactly `${NAME}` where the operation acts on exactly `${NAME}` or `${NAME}/…` (no parameter
+  operator such as `${NAME%/*}`), with no reassignment of NAME in between (`=`, `+=`, `printf -v`,
+  `read`, `mapfile`, `local`/`declare`, `for … in`, `unset`). The run-time check is the guarantee; the
+  binding keeps the calls where they do their job.
 
 What this does **not** see: a privileged command whose name is computed at run time — assembled from
 variables (`c=ch; ${c}own`), an escape (`$'\x63hown'`), array elements (`"${CMD[0]}${CMD[1]}"`) or brace
