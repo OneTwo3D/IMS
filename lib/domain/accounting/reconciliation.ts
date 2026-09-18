@@ -392,10 +392,11 @@ export type VoidMirrorContradictions = {
 /**
  * o3d-bnp6 — ONE SYNC ROW OF A MIRRORED TYPE THAT NO ACCOUNTING EVENT MIRRORS, as the database found it.
  *
- * "Mirrors" is the existence test `old_sync_log_without_mirrored_event` always used: an event of any
- * status whose (externalSystem, type, sourceEntityType, sourceEntityId) is this row's (connector,
- * type, referenceType, referenceId). It is now asked of the whole `accounting_events` table rather
- * than of a 10,000-row page of it.
+ * "Mirrors" means: an event of any status whose (externalSystem, type, sourceEntityType,
+ * sourceEntityId) EQUALS this row's (connector, type, referenceType, referenceId), column by column,
+ * exactly. It is asked of the whole `accounting_events` table rather than of a 10,000-row page of it.
+ * That is the test `old_sync_log_without_mirrored_event` meant, but not quite the one it ran; see
+ * collectUnmirroredSyncLogs for the three places the two differ and why none of them is reachable.
  */
 type UnmirroredSyncLogRow = {
   syncLogId: string
@@ -1877,11 +1878,29 @@ async function collectVoidMirrorContradictions(
  * finished work (SYNCED/FAILED) inside the lookback — both status sets from the constants that page
  * uses too — narrowed to MIRRORED_ACCOUNTING_SYNC_TYPES, the only types that have a mirror to miss.
  *
- * THE QUESTION is the existence test the check always asked, over the WHOLE events table: is there an
- * event, in ANY status, whose (externalSystem, type, sourceEntityType, sourceEntityId) is this row's
- * (connector, type, referenceType, referenceId)? An event with a NULL or different externalSystem
- * does not count, as it did not before. `NOT EXISTS` is probed through
- * accounting_events(sourceEntityType, sourceEntityId), so each candidate row is an index lookup.
+ * THE QUESTION, over the WHOLE events table: is there an event, in ANY status, whose (externalSystem,
+ * type, sourceEntityType, sourceEntityId) equals this row's (connector, type, referenceType,
+ * referenceId) — four exact, case-sensitive equalities? An event with a NULL or different
+ * externalSystem does not count. `NOT EXISTS` is probed through accounting_events(sourceEntityType,
+ * sourceEntityId), so each candidate row is an index lookup.
+ *
+ * WHERE THIS IS NOT THE OLD IN-MEMORY TEST, stated exactly (o3d-bnp6 review L1). The old check built
+ * string keys with `eventKey`/`sourceKey` and compared those. That differed from four equalities in
+ * three ways, and this statement takes the four equalities:
+ *
+ *   • An EMPTY connector skipped the system comparison altogether (`params.externalSystem ? ... :
+ *     sourceKey(...)`), so any event on the same (type, reference) counted, whatever its system.
+ *   • A NULL externalSystem was spelled `'*'` in the key, so an event whose system was literally the
+ *     string `*` would have matched a NULL one.
+ *   • The parts were joined with `|`, so ('SalesOrder', 'x|y') and ('SalesOrder|x', 'y') built the
+ *     same key and matched each other.
+ *
+ * None of the three is reachable from rows IMS writes: `accounting_sync_logs.connector` is NOT NULL
+ * DEFAULT 'xero', and the create/upsert sites in the tree set 'xero', 'quickbooks', XERO_CONNECTOR,
+ * QBO_CONNECTOR or a caller's connector, or leave the default — never an empty string; no system is
+ * named `*`; and a reference type containing `|` is not one IMS uses. Where they could differ, the
+ * equalities are the correct answer: each of the three made an unrelated event count as this row's
+ * mirror, i.e. a false NEGATIVE in a detector.
  *
  * MEASURED, not assumed (PostgreSQL 17, EXPLAIN ANALYZE on a scratch database). The plan is a
  * sequential scan of the candidate sync rows feeding a Nested Loop Anti Join that probes that index

@@ -9,16 +9,19 @@ import {
 /**
  * THE CREDIT-BUCKET SUBSTRATE THE BASIS-AWARE REPORTS SHARE.
  *
- * Lifted out of `sales-fulfillment-analytics.ts` by o3d-rv4a WITHOUT a change of behaviour, because
- * the COGS report (`lib/domain/inventory/inventory-costing-reports.ts`) had to answer the identical
- * question and the alternative was a second copy of it. A second copy is the specific failure this
- * whole line of work keeps finding: two reports answering one question differently is its own
- * defect, and o3d-la3n's `combineNetLinearFigureBounds` was deleted for exactly that reason — the
- * operation that could not be both sound and tight was given no name to call.
+ * Lifted out of `sales-fulfillment-analytics.ts` by o3d-rv4a WITHOUT a change of behaviour. The Decimal
+ * reports (Sales Analytics, Customer Mix, Gross Margin) use it.
  *
- * Everything below is the o3d-kyey text verbatim; the only additions are `scaleCredits`, which the
- * COGS report needs because its revenue is allocated across groups by quantity share, and the
- * exports.
+ * THE COGS REPORT DOES NOT, AND THAT IS A DELIBERATE SECOND COPY (o3d-rv4a r5). The COGS report splits a
+ * line's credit across groups by quantity share, and a Decimal share rounds at twenty significant
+ * digits; the independent review of r5 found that rounding flipping a verdict (a credit share exactly
+ * equal to a revenue share came out unequal). So `inventory-costing-reports.ts` holds the same buckets
+ * EXACTLY (`ExactCredit`, `addExactCredit`, `exactUnplacedInterval`, `exactUnabsorbedInterval`). A second
+ * copy is the failure this line of work keeps finding, so the two are tied together by a parity test
+ * over shared fixtures (tests/analytics/cogs-exact-credit-parity.test.ts): same buckets, same positive
+ * parts, same placement flags, same intervals, entry for entry.
+ *
+ * Everything below is the o3d-kyey text verbatim plus the exports.
  */
 
 /**
@@ -238,58 +241,4 @@ export function offRowCreditSummary(...sets: CreditBuckets[]): OffRowCreditSumma
     upper: merged.net.add(convertible.upper),
   }
   return { present: !(interval.lower.isZero() && interval.upper.isZero()), interval }
-}
-
-/**
- * A FRACTION OF A BUCKET SET — for a report that splits one sales line's figures across several rows.
- *
- * The COGS report allocates each sales line's revenue across the groups that fulfilled it in
- * proportion to the quantity each group shipped (a split-warehouse dispatch produces two COGS
- * movements against one line, and counting the whole line revenue in both double-counts the report
- * total — cogs-audit scjz.50). The credit against that line has to follow the SAME allocation or the
- * two halves of the subtraction are on different denominators.
- *
- * SCALING BY A NON-NEGATIVE FACTOR IS THE ONLY KIND THAT PRESERVES THE ENDPOINTS, and that is why
- * the share is asserted rather than documented. `Σ max(k·e, 0) = k · Σ max(e, 0)` holds for `k >= 0`
- * and FAILS for `k < 0`, which would silently swap the interval's ends and turn a ceiling into a
- * claim the figure cannot support. The completeness flags are carried through unchanged: a credit
- * that could not be placed on a figure's basis is no more placeable for having been shared out, and
- * an exactly-zero share of an unplaceable credit still came from one (the amount rounds away, the
- * blindness does not — the same "dust is still value" rule `creditPlacement` applies).
- */
-export function scaleCredits(buckets: CreditBuckets, numerator: Prisma.Decimal, denominator: Prisma.Decimal): CreditBuckets {
-  if (numerator.lt(0) || denominator.lte(0)) {
-    throw new Error(`scaleCredits requires a non-negative share, got ${numerator.toString()}/${denominator.toString()}`)
-  }
-  // MULTIPLY THEN DIVIDE, in that order, because the caller's revenue allocation does. Decimal
-  // division is exact only to a finite precision, so `credit.mul(q).div(total)` and
-  // `credit.mul(q.div(total))` differ in the last digits whenever `q/total` does not terminate — and
-  // three groups sharing a line by thirds would leave the credit summing to slightly less than the
-  // revenue it is subtracted from. Same expression shape, same residual, no drift between the halves.
-  const share = (value: Prisma.Decimal) => value.mul(numerator).div(denominator)
-  return {
-    net: share(buckets.net),
-    gross: share(buckets.gross),
-    unknown: share(buckets.unknown),
-    netPositive: share(buckets.netPositive),
-    grossPositive: share(buckets.grossPositive),
-    unknownPositive: share(buckets.unknownPositive),
-    netBasisComplete: buckets.netBasisComplete,
-    grossBasisComplete: buckets.grossBasisComplete,
-  }
-}
-
-/**
- * THE CREDIT A ROW COULD NOT ABSORB AT ALL — because the row publishes no figure to absorb it.
- *
- * `offRowCreditSummary` in the same shape, but for credit that DID reach a row whose figure is
- * withheld (the COGS report prints `Unmatched` where a dispatch could not be tied to a sales line,
- * and there is no revenue there to subtract from). Even the same-basis part of that credit is
- * missing from the period figure, so it is added at BOTH endpoints; the parts on another basis
- * contribute their per-entry interval, exactly as everywhere else.
- */
-export function unabsorbedCreditInterval(buckets: CreditBuckets, basis: 'NET' | 'GROSS'): UnplacedCreditInterval {
-  const comparable = comparableCredit(buckets, basis)
-  const rest = unplacedCreditInterval(buckets, basis)
-  return { lower: comparable.add(rest.lower), upper: comparable.add(rest.upper) }
 }

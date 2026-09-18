@@ -12,6 +12,7 @@ import {
   evaluateAccountingReconciliationRows,
   listAccountingReconciliationRuns,
   persistAccountingReconciliationReport,
+  reconciliationLookbackDate,
   reconciliationTruncations,
   type AccountingReconciliationFinding,
   type AccountingReconciliationTruncation,
@@ -85,12 +86,37 @@ async function withRollback<T>(fn: (tx: Tx) => Promise<T>, timeout = 300_000): P
   return captured as T
 }
 
-async function report(tx: Tx) {
+async function report(tx: Tx, options: Parameters<typeof collectAccountingReconciliationRows>[1] = {}) {
   const rows = await collectAccountingReconciliationRows(
     tx as unknown as Parameters<typeof collectAccountingReconciliationRows>[0],
+    options,
   )
   return { rows, findings: evaluateAccountingReconciliationRows(rows) }
 }
+
+/**
+ * o3d-bnp6 review L4 — A PRECONDITION EVERY TEST HERE RESTS ON, STATED RATHER THAN ASSUMED.
+ *
+ * The statement lists at most MAX_UNMIRRORED_SYNC_LOGS rows, OLDEST first. On a database already
+ * holding that many unmirrored rows older than a test's own, the test's rows are simply not in the
+ * list — and then "X is reported" fails for the wrong reason, and "X is NOT reported" PASSES for the
+ * wrong reason, which is the dangerous one. So each test first establishes that the list it is about
+ * to read is the WHOLE set, and refuses to conclude anything otherwise. Assertions are also scoped to
+ * the test's own row ids, so rows another suite or a real tenant left behind cannot enter them.
+ */
+function assertListIsWhole(rows: Awaited<ReturnType<typeof report>>['rows'], what: string) {
+  const unmirrored = rows.unmirroredSyncLogs
+  assert.ok(unmirrored, `PRECONDITION (${what}): the unmirrored-sync-row dataset was read`)
+  assert.equal(unmirrored.rows.length, unmirrored.total,
+    `PRECONDITION (${what}): every unmirrored row in this database is listed (${unmirrored.total} of `
+    + `them, bound ${MAX_UNMIRRORED_SYNC_LOGS}). On a database holding more than the bound, what is `
+    + 'absent from the list proves nothing, so this test refuses to conclude rather than pass.')
+}
+
+/** This test's own findings, by the run-specific prefix its row ids carry. */
+const ownIds = (findings: AccountingReconciliationFinding[], marker: string) =>
+  findings.filter((f) => f.code === 'old_sync_log_without_mirrored_event' && f.syncLogId?.includes(marker))
+    .map((f) => f.syncLogId).sort()
 
 /**
  * `count` SYNCED sync rows created NOW, each WITH the mirrored event the check looks for, so none of
@@ -155,12 +181,14 @@ test('o3d-bnp6: an OLD pending row with no mirrored event is reported past 10,00
     await insertMirroredRecentRows(tx, `bnp6-r-${run}-`, PREVIOUS_SYNC_LOG_PAGE_CAP + 1)
     await insertUnmirroredRow(tx, victim, { status: 'PENDING', ageDays: 200 })
     const { rows, findings } = await report(tx)
+    assertListIsWhole(rows, 'the central case')
     return {
       pageSize: rows.syncLogs.length,
       victimOnPage: rows.syncLogs.some((log) => log.id === victim),
       syncLogCapReported: findings.some((f) => f.code === ROW_CAP
         && (f.details as { dataset?: string } | undefined)?.dataset === 'syncLogs'),
-      unmirrored: unmirroredIds(findings),
+      // Scoped to THIS run's rows (review L4): the recent rows and the victim both carry `run`.
+      unmirrored: ownIds(findings, run),
     }
   })
 
@@ -176,7 +204,7 @@ test('o3d-bnp6: an OLD pending row with no mirrored event is reported past 10,00
   // recent rows has its mirrored event, so a finding for any of them would be a false positive — the
   // shape the old code produced whenever the matching event fell off the EVENT page.
   assert.deepEqual(observed.unmirrored, [victim],
-    'the old pending row with no mirrored event is reported, and nothing else is')
+    'the old pending row with no mirrored event is reported, and none of the 10,001 mirrored rows is')
 })
 
 /** An event mirroring `referenceId` with the given shape. */
@@ -186,6 +214,7 @@ async function insertEvent(
   shape: {
     referenceId: string
     type?: string
+    sourceEntityType?: string
     externalSystem?: string | null
     status?: string
     businessDateAgeDays?: number
@@ -195,10 +224,11 @@ async function insertEvent(
     `INSERT INTO "accounting_events" (
        "id", "type", "sourceEntityType", "sourceEntityId", "businessDate", "status",
        "idempotencyKey", "linesJson", "currency", "externalSystem", "createdAt", "updatedAt"
-     ) VALUES ($1, $2, 'SalesOrder', $3, (now() AT TIME ZONE 'UTC') - ($4 || ' days')::interval, $5,
+     ) VALUES ($1, $2, $7, $3, (now() AT TIME ZONE 'UTC') - ($4 || ' days')::interval, $5,
                $1 || '-key', '[]'::jsonb, 'GBP', $6, now(), now())`,
     id, shape.type ?? 'SALES_INVOICE', shape.referenceId, String(shape.businessDateAgeDays ?? 0),
     shape.status ?? 'POSTED', shape.externalSystem === undefined ? 'xero' : shape.externalSystem,
+    shape.sourceEntityType ?? 'SalesOrder',
   )
 }
 
@@ -206,6 +236,13 @@ test('o3d-bnp6: over the bound, the OLDEST are listed and the exact count of the
   const run = randomUUID().slice(0, 8)
   const over = MAX_UNMIRRORED_SYNC_LOGS + 7
   const observed = await withRollback(async (tx) => {
+    // PRECONDITION (review L4): this test asserts WHICH 500 are listed, so it needs the list to be
+    // made of its own rows. That holds only on a database with no unmirrored rows of its own, which is
+    // checked here rather than assumed — inside the same transaction as everything below.
+    const baseline = await report(tx)
+    assert.equal(baseline.rows.unmirroredSyncLogs?.total, 0,
+      'PRECONDITION: the database holds no unmirrored sync rows before this test adds its own; on one '
+      + 'that does, "the oldest 500 are these" cannot be asserted, so the test refuses to conclude')
     // `over` unmirrored PENDING rows, row i created i days ago, so age order is id order reversed.
     await tx.$executeRawUnsafe(
       `INSERT INTO "accounting_sync_logs" (
@@ -275,6 +312,8 @@ test('o3d-bnp6: a row whose POSTED event fell off the EVENT page is not reported
     await insertUnmirroredRow(tx, row, { status: 'SYNCED', ageDays: 3, referenceId: `${row}-ref` })
     await insertEvent(tx, `${row}-e`, { referenceId: `${row}-ref`, status: 'POSTED', businessDateAgeDays: 200 })
     const { rows, findings } = await report(tx)
+    // An ABSENCE is asserted below, so the list it is absent from must be the whole set (review L4).
+    assertListIsWhole(rows, 'the event-page false positive')
     return {
       eventOnPage: rows.accountingEvents.some((event) => event.id === `${row}-e`),
       rowOnPage: rows.syncLogs.some((log) => log.id === row),
@@ -286,7 +325,7 @@ test('o3d-bnp6: a row whose POSTED event fell off the EVENT page is not reported
   assert.ok(!observed.unmirrored.includes(row), 'and the row is not reported as having no event')
 })
 
-test('o3d-bnp6: the population and the existence test are the ones the check always used', { skip }, async () => {
+test('o3d-bnp6: the population is the page\'s, and an event of another connector, none, or another type is not a mirror', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
   const id = (name: string) => `bnp6-pop-${run}-${name}`
   const outsideWindow = DEFAULT_RECONCILIATION_LOOKBACK_DAYS + 10
@@ -309,8 +348,9 @@ test('o3d-bnp6: the population and the existence test are the ones the check alw
     // And one that DOES, in a status other than POSTED: the test is existence, in any status.
     await insertUnmirroredRow(tx, id('void-mirrored'), { status: 'PENDING', ageDays: 2, referenceId: id('vm-ref') })
     await insertEvent(tx, id('vm-e'), { referenceId: id('vm-ref'), status: 'VOID' })
-    const { findings } = await report(tx)
-    return unmirroredIds(findings).filter((found) => found?.startsWith(`bnp6-pop-${run}-`))
+    const { rows, findings } = await report(tx)
+    assertListIsWhole(rows, 'the population')
+    return ownIds(findings, `bnp6-pop-${run}-`)
   })
 
   assert.deepEqual(observed, [
@@ -342,6 +382,7 @@ test('o3d-bnp6: the lookback boundary is the page\'s own, whatever the session t
     // were converted in the SESSION's zone would move the cutoff by fourteen hours and flip `outside`.
     await tx.$executeRawUnsafe(`SET LOCAL TimeZone = 'Pacific/Kiritimati'`)
     const { rows, findings } = await report(tx)
+    assertListIsWhole(rows, 'the lookback boundary')
     return {
       page: rows.syncLogs.filter((log) => log.id === inside || log.id === outside).map((log) => log.id).sort(),
       reported: unmirroredIds(findings).filter((found) => found === inside || found === outside),
@@ -349,6 +390,99 @@ test('o3d-bnp6: the lookback boundary is the page\'s own, whatever the session t
   })
   assert.deepEqual(observed.page, [inside], 'PRECONDITION: the page itself takes exactly the inside row')
   assert.deepEqual(observed.reported, observed.page, 'and the question selects exactly what the page selects')
+})
+
+/**
+ * o3d-bnp6 review M1 + L2 — AN EVENT MIRRORS A ROW ONLY ON FOUR EXACT EQUALITIES.
+ *
+ * The population test above covers a different connector, no connector and a different type. It did
+ * not cover the other two columns, and the review showed that mattered: replacing the
+ * `sourceEntityType` clause with TRUE left every test green, because no fixture had an event that
+ * differed from its row ONLY there. The same was true of `sourceEntityId` except through test 1's
+ * volume, and nothing pinned CASE or WHITESPACE: `lower(a) = lower(b)` on the connector and
+ * `btrim(a) = btrim(b)` on the reference both survived. Each fixture below is a row whose would-be
+ * event differs from it in exactly one column, in exactly one way, so each clause is the only thing
+ * standing between that row and a false "mirrored" — plus a control whose event matches on all four,
+ * which must NOT be reported, so the test cannot pass by reporting everything.
+ */
+test('o3d-bnp6: an event mirrors a row only when all four columns are EXACTLY equal', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const id = (name: string) => `bnp6-exact-${run}-${name}`
+  const observed = await withRollback(async (tx) => {
+    // Differs ONLY in sourceEntityType (review M1).
+    await insertUnmirroredRow(tx, id('entity-type'), { ageDays: 2, referenceId: id('et-ref') })
+    await insertEvent(tx, id('et-e'), { referenceId: id('et-ref'), sourceEntityType: 'OtherEntity' })
+    // Differs ONLY in sourceEntityId — stated explicitly rather than left to test 1's volume.
+    await insertUnmirroredRow(tx, id('entity-id'), { ageDays: 2, referenceId: id('ei-ref') })
+    await insertEvent(tx, id('ei-e'), { referenceId: id('ei-ref-other') })
+    // Differs ONLY in the CASE of the connector (review L2): 'Xero' is not 'xero'.
+    await insertUnmirroredRow(tx, id('connector-case'), { ageDays: 2, connector: 'Xero', referenceId: id('cc-ref') })
+    await insertEvent(tx, id('cc-e'), { referenceId: id('cc-ref'), externalSystem: 'xero' })
+    // Differs ONLY in trailing WHITESPACE on the reference (review L2): 'R ' is not 'R'.
+    await insertUnmirroredRow(tx, id('reference-space'), { ageDays: 2, referenceId: `${id('ws-ref')} ` })
+    await insertEvent(tx, id('ws-e'), { referenceId: id('ws-ref') })
+    // CONTROL: equal on all four, so it IS mirrored and must not be reported.
+    await insertUnmirroredRow(tx, id('control'), { ageDays: 2, referenceId: id('ctl-ref') })
+    await insertEvent(tx, id('ctl-e'), { referenceId: id('ctl-ref') })
+    const { rows, findings } = await report(tx)
+    assertListIsWhole(rows, 'exact matching')
+    return ownIds(findings, `bnp6-exact-${run}-`)
+  })
+
+  assert.deepEqual(observed, [
+    id('connector-case'),
+    id('entity-id'),
+    id('entity-type'),
+    id('reference-space'),
+  ].sort(), 'each row whose event differs in one column, by case or whitespace included, is reported; '
+    + 'the control whose event matches on all four is not')
+})
+
+/**
+ * o3d-bnp6 review L3 — THE CUTOFF INSTANT ITSELF.
+ *
+ * The boundary test above stands ten minutes either side of the lookback, so `>=` weakened to `>`
+ * survived it. The page is `createdAt >= fromDate` (Prisma `gte`); a SYNCED row created AT fromDate,
+ * to the millisecond, is on the page and must be asked about. `toDate` is fixed and fromDate is
+ * derived from it with the report's own function, so the row can be placed on the instant exactly
+ * rather than approximately — `createdAt` is timestamp(3), the same millisecond resolution as a Date.
+ */
+test('o3d-bnp6: a finished row created exactly AT the lookback cutoff is included, as the page includes it', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const atCutoff = `bnp6-cut-${run}-at`
+  const justBefore = `bnp6-cut-${run}-before`
+  const toDate = new Date(Math.floor(Date.now() / 1000) * 1000)
+  const fromDate = reconciliationLookbackDate(DEFAULT_RECONCILIATION_LOOKBACK_DAYS, toDate)
+  const observed = await withRollback(async (tx) => {
+    for (const [rowId, at] of [[atCutoff, fromDate], [justBefore, new Date(fromDate.getTime() - 1)]] as const) {
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "accounting_sync_logs" (
+           "id", "connector", "type", "status", "referenceType", "referenceId", "createdAt"
+         ) VALUES ($1, 'xero', 'SALES_INVOICE'::"AccountingSyncType", 'SYNCED'::"AccountingSyncStatus",
+                   'SalesOrder', $1 || '-ref', ($2::timestamptz AT TIME ZONE 'UTC'))`,
+        rowId, at.toISOString(),
+      )
+    }
+    const stored = await tx.$queryRawUnsafe(
+      `SELECT "id", to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "at"
+         FROM "accounting_sync_logs" WHERE "id" = ANY($1::text[]) ORDER BY "id"`,
+      [atCutoff, justBefore],
+    ) as Array<{ id: string; at: string }>
+    const { rows, findings } = await report(tx, { toDate })
+    assertListIsWhole(rows, 'the cutoff instant')
+    return {
+      stored,
+      page: rows.syncLogs.filter((log) => log.id === atCutoff || log.id === justBefore).map((log) => log.id).sort(),
+      reported: ownIds(findings, `bnp6-cut-${run}-`),
+    }
+  })
+
+  assert.deepEqual(observed.stored, [
+    { id: atCutoff, at: fromDate.toISOString() },
+    { id: justBefore, at: new Date(fromDate.getTime() - 1).toISOString() },
+  ], 'PRECONDITION: the two rows sit exactly on the cutoff and one millisecond before it')
+  assert.deepEqual(observed.page, [atCutoff], 'PRECONDITION: the page takes the row AT the cutoff and not the one before')
+  assert.deepEqual(observed.reported, observed.page, 'and the question is inclusive exactly where the page is')
 })
 
 test('o3d-bnp6: the probes left the database as they found it', { skip }, async () => {

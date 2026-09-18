@@ -403,9 +403,10 @@ function marginCogsBucket(row: CogsEntryRow): { productId: string; product: Marg
 }
 
 // o3d-rv4a: the credit-bucket substrate that used to live here is now
-// `@/lib/domain/sales/refund-credit-buckets`, imported above. It moved because the COGS report had
-// to ask the identical question and a second copy of it would have been the defect, not the fix.
-// Nothing about it changed in the move.
+// `@/lib/domain/sales/refund-credit-buckets`, imported above; nothing about it changed in the move.
+// The COGS report ended up keeping an EXACT copy of it (it shares credit by quantity, and a Decimal
+// share flipped a verdict — review of o3d-rv4a r5); the two are tied by a parity test,
+// tests/analytics/cogs-exact-credit-parity.test.ts. See refund-credit-buckets.ts.
 
 /** An order's whole credit, as Sales Analytics and Customer Mix attribute it: by order id. */
 type OrderRefundRow = {
