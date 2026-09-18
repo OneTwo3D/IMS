@@ -1006,6 +1006,26 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             cannot read a row, let alone write one. It is discovered here because
  *                             its prose names `psql` while explaining which connection it has to
  *                             match. o3d-2sm1.5 r41.
+ *   'lane-email-outbox-client'
+ *                           — builds a Prisma client for ONE connection string and hands its
+ *                             delegates to `processPendingEmailOutbox` as a harness client
+ *                             (o3d-alnk r24). It is discovered here because it constructs a client;
+ *                             what it constructs it for is a TEST LANE's own database. It exists
+ *                             because the previous shape let a caller pair a claim about the
+ *                             destination with PRODUCTION delegates, so the delegates are now built
+ *                             from the same string that was named, in one call, with no second
+ *                             argument to get wrong.
+ *                             WHAT KEEPS IT OFF THIS DATABASE IS TWO THINGS, and only the second is
+ *                             a guarantee (r26): it refuses a URL that resolves to the database
+ *                             `DATABASE_URL` configures, and — the real one — its only caller is
+ *                             `tests/helpers/throwaway-database.ts`, which hands out only a database
+ *                             this process watched its own CREATE complete for. Rounds 22-24 had a
+ *                             server-side attestation here instead; r25 showed it did not bind the
+ *                             pool that followed and was bypassable through the in-memory arm, and
+ *                             it was withdrawn.
+ *                             No application code path calls it (its imports are dynamic and its
+ *                             only callers are under tests/), it writes only what
+ *                             `processPendingEmailOutbox` writes, and it holds no plugin key.
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1028,6 +1048,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'deploy-connection-fence'
   | 'protocol-handshake-only'
   | 'compatibility-probe'
+  | 'lane-email-outbox-client'
   | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
@@ -1144,6 +1165,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  'lib/email-outbox.ts': 'lane-email-outbox-client',
   'prisma/seed.ts': 'seed',
 }
 

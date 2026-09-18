@@ -312,6 +312,16 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
     // literally `mintsoft`?". It belongs HERE, in the connector's own registration: this is the one
     // file whose job is to spell the id, so a second connector is added by writing an entry rather
     // than by editing the ASN facade, the product-sync dispatcher and the sweep.
+    //
+    // WHAT STOPS AN ENTRY HERE SILENTLY LOSING A HOOK (o3d-j8yq). The seam suites deliberately
+    // REPLACE this module — their Mintsoft declares no hooks at all — so they cannot see a hook
+    // going missing from the connector this build ships, and for three of the hooks below deleting
+    // them left every suite in the repo green. The tests that now fail are
+    // tests/wms-dispatch-hook-wiring.test.ts (`dispatchPrecondition`, `deltaScopeLock`),
+    // tests/wms-booked-in-recheck-wiring.test.ts (`bookedInRecheck`) — both driving the PRODUCTION
+    // entrypoints over this unmocked registry — and tests/wms-shipped-connector-hook-inventory.test.ts,
+    // which derives the hook names from `WmsConnectorHooks`'s own parse tree and is the (weaker,
+    // declaration-only) backstop for the other four. See docs/wms-connector-boundary.md.
     hooks: {
       asn: async () => {
         const m = await import('@/app/actions/mintsoft-sync')

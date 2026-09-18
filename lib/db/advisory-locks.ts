@@ -262,6 +262,26 @@ export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
  */
 export const SESSION_LOCK_SPACE_PROBE_NAMESPACE = SESSION_LOCK_SPACE_PROBE_NAMESPACE_FROM_URL_SCHEMA
 
+/**
+ * THERE IS NO THROWAWAY-TEST-DATABASE LOCK IN THIS REGISTRY ANY MORE (o3d-alnk r10).
+ *
+ * r9 put one here — `THROWAWAY_DATABASE_PROVISION_LOCK_NAMESPACE = 411_220_873` — so that
+ * `tests/helpers/throwaway-database.ts` could hold a minted database name across its existence
+ * probe, its `CREATE DATABASE` and a cleanup that decided whether to reclaim what it found. r10
+ * DELETED that cleanup: the helper now drops only a name whose `CREATE` it watched complete, and
+ * leaks anything ambiguous rather than inferring ownership from what is on the server. With
+ * nothing left to decide, the lock excluded nobody worth excluding — two lanes mint 64 bits of
+ * fresh randomness each and never contend for a name — while its id, a 31-bit hash of that name,
+ * could make two UNRELATED lanes wait on each other. It was removed rather than kept as an
+ * optimisation of a contention that does not occur.
+ *
+ * 411_220_873 is deliberately NOT reused for anything else, for the same reason 918_274_234 is
+ * not: an operator reading an old `pg_locks` capture, or an old build still running, must not
+ * find that number meaning something new.
+ */
+
+
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,

@@ -14,6 +14,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
 
 export const DISPATCH_EMAIL_SETTING_KEY = 'dispatch_email_enabled'
 export const DISPATCH_EMAIL_KIND = 'SHIPMENT_DISPATCHED'
@@ -112,6 +113,14 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
     })
     return { queued: true }
   } catch (error) {
+    // o3d-alnk: `email_outbox_undelivered_reference_uq` refuses a second undelivered row for
+    // this (kind, SalesOrder, orderId). The findFirst above already covers the same-order case
+    // because it runs under the order row lock, so reaching here means a writer this lock does
+    // not serialise — which is exactly what the index exists to catch. Caught OUT HERE and not
+    // inside the transaction on purpose: a P2002 swallowed inside an interactive transaction
+    // leaves it aborted (Postgres 25P02, see lib/db/prisma-unique-violation.ts), so the
+    // transaction must be allowed to roll back first.
+    if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }
     console.error(`Failed to queue dispatch email for order ${orderId}`, error)
     return { queued: false, reason: String(error) }
   }
