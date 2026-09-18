@@ -208,29 +208,107 @@ test('the three sales-analytics reports say WHICH credit was deducted, where the
   }
 })
 
-test('the reports that ARE still refund-blind keep saying so (o3d-iigc r5)', async () => {
-  // The COGS/inventory-turnover report was not in o3d-kyey's scope and is still blind. Its notice
-  // must survive: making three siblings basis-aware must not quietly take the disclosure off the one
-  // that still needs it.
-  const { REFUND_BLIND_NOTICE_COGS_MARGIN } = await import('@/lib/analytics/refund-figure-surfaces')
-  assert.match(REFUND_BLIND_NOTICE_COGS_MARGIN, /Refunds are NOT deducted/)
+test('the COGS report says WHICH credit was deducted, where it is read (o3d-rv4a)', async () => {
+  // o3d-iigc round 5 asserted the opposite of this — that this report carried "Refunds are NOT
+  // deducted" — and o3d-kyey's three siblings had the same assertion flipped when they were fixed.
+  // The COGS report is now basis-aware too, so what this pins is the property that replaced
+  // blindness: the notice must NAME the basis of the credit it took off, and must not still be
+  // claiming that none was taken off.
+  const { REFUND_BASIS_NOTICE_COGS_MARGIN } = await import('@/lib/analytics/refund-figure-surfaces')
+  assert.match(REFUND_BASIS_NOTICE_COGS_MARGIN, /net-basis credit/)
+  assert.doesNotMatch(REFUND_BASIS_NOTICE_COGS_MARGIN, /Refunds are NOT deducted/)
   const costing = readFileSync(path.join(process.cwd(), 'lib/domain/inventory/inventory-costing-reports.ts'), 'utf8')
-  assert.ok(costing.split('REFUND_BLIND_NOTICE_COGS_MARGIN').length - 1 >= 2)
+  // Twice — imported AND used. An import alone reaches nobody. See the same rule above.
+  assert.ok(costing.split('REFUND_BASIS_NOTICE_COGS_MARGIN').length - 1 >= 2)
 })
 
-test('and the pages that publish them actually RENDER the notices (o3d-iigc r5)', () => {
-  // The producers carry the disclosure; the pages carry it to the reader. A page that quietly
-  // stopped passing `notices` would leave a refund-blind Revenue column with nothing beside it, and
-  // the producer-side assertion above would still be green. Both halves, or neither.
-  for (const page of [
-    'app/(dashboard)/analytics/sales/page.tsx',
-    'app/(dashboard)/analytics/customers/page.tsx',
-    'app/(dashboard)/analytics/margin/page.tsx',
-    'app/(dashboard)/analytics/returns/page.tsx',
-    'app/(dashboard)/analytics/cogs/page.tsx',
-  ]) {
-    const source = readFileSync(path.join(process.cwd(), page), 'utf8')
-    assert.match(source, /notices=\{report\.notices\}/, `${page} must render its report's notices`)
+/**
+ * THE STALE ROUND-5 DISCLOSURE IS GONE, AS A UNIVERSAL CLAIM OVER THE TREE.
+ *
+ * A whole-file `includes` of the NEW text is EXISTENTIAL and therefore blind to the one failure that
+ * actually happens: the correction lands, the superseded sentence stays where it was, and both are on
+ * screen at once. Only an ABSENCE check is universal, so only an absence check can say the old claim
+ * is not standing beside the new one.
+ *
+ * Swept over source AND the operator documentation, because a disclosure the docs still make is a
+ * disclosure the reader still gets.
+ */
+const STALE_COGS_REFUND_CLAIMS: ReadonlyArray<{ pattern: RegExp; what: string }> = [
+  { pattern: /REFUND_BLIND_NOTICE_COGS_MARGIN/, what: 'the renamed round-5 constant' },
+  { pattern: /refunds are not deducted/i, what: 'the round-5 refund-blind sentence' },
+  { pattern: /keeps its full revenue and margin/i, what: "round 5's worked consequence of the blindness" },
+  { pattern: /remains? refund-blind/i, what: 'a prose claim that this report is still blind' },
+  { pattern: /refund-aware net revenue/i, what: "round 5's redirect to another report for a net figure" },
+]
+
+/** Every file that could carry the claim about THIS report. Listed, so the walk is checkable. */
+const COGS_DISCLOSURE_FILES = [
+  'lib/domain/inventory/inventory-costing-reports.ts',
+  'lib/analytics/refund-figure-surfaces.ts',
+  'app/(dashboard)/analytics/cogs/page.tsx',
+  'app/api/export/inventory-costing/route.ts',
+  'help-docs/analytics.md',
+]
+
+/** The two pinned entries that named this report, and the page/route that publish it. */
+const COGS_SURFACE_FILES = [
+  'lib/domain/inventory/inventory-costing-reports.ts',
+  'app/(dashboard)/analytics/cogs/page.tsx',
+  'app/api/export/inventory-costing/route.ts',
+]
+
+test('no stale refund-blind claim about the COGS report survives anywhere (o3d-rv4a)', () => {
+  const read = new Map<string, string>()
+  for (const file of COGS_DISCLOSURE_FILES) {
+    read.set(file, readFileSync(path.join(process.cwd(), file), 'utf8'))
+  }
+  // THE PRECONDITION, ASSERTED RATHER THAN ASSUMED. A rig that read nothing would report no stale
+  // claims and be a placebo. Prove the walk reached real content, and prove the MATCHERS CAN FIRE by
+  // running them against the round-5 sentence itself — if the rig cannot find the thing it is looking
+  // for when it is present, its silence establishes nothing.
+  assert.equal(read.size, COGS_DISCLOSURE_FILES.length, 'every listed file must have been read')
+  for (const [file, source] of read) {
+    assert.ok(source.length > 500, `${file} was read as ${source.length} bytes — the walk did not reach it`)
+  }
+  const roundFiveNotice =
+    'Refunds are NOT deducted: revenue and gross margin are attributed from the original sales line '
+    + 'behind each dispatch, so a returned sale keeps its full revenue and margin in this report. '
+    + 'Use Sales Statistics for a refund-aware net revenue.'
+  const firing = STALE_COGS_REFUND_CLAIMS.filter(({ pattern }) => pattern.test(roundFiveNotice)).map(({ what }) => what)
+  assert.equal(firing.length, 3, `matchers firing on the round-5 notice: ${firing.join('; ') || '(none)'}`)
+  assert.ok(STALE_COGS_REFUND_CLAIMS.some(({ pattern }) => pattern.test('REFUND_BLIND_NOTICE_COGS_MARGIN')))
+  assert.ok(STALE_COGS_REFUND_CLAIMS.some(({ pattern }) => pattern.test('The COGS Report remains refund-blind (see above).')))
+
+  const offenders: string[] = []
+  let linesScanned = 0
+  for (const [file, source] of read) {
+    const lines = source.split('\n')
+    linesScanned += lines.length
+    for (const [index, line] of lines.entries()) {
+      for (const { pattern, what } of STALE_COGS_REFUND_CLAIMS) {
+        if (pattern.test(line)) offenders.push(`${file}:${index + 1} ${what} — ${line.trim().slice(0, 160)}`)
+      }
+    }
+  }
+  assert.ok(linesScanned > 2000, `only ${linesScanned} lines were scanned`)
+  assert.deepEqual(offenders, [], [
+    `o3d-rv4a made the COGS report refund-aware (${linesScanned} lines scanned).`,
+    'A superseded disclosure left standing beside the correction tells the reader the opposite of what',
+    'the report now does, and it is invisible to any check that merely looks for the new text. Delete',
+    'the line, or if a COGS figure really did go back to being refund-blind, change',
+    'REFUND_FIGURE_SURFACES and this list together.',
+  ].join(' '))
+})
+
+test('the pinned COGS entries are no longer refund-blind and carry no disclosure (o3d-rv4a)', () => {
+  // The text sweep above cannot say this: `refund-blind` is a legitimate treatment elsewhere in the
+  // inventory, so a per-line grep of that file would either miss this or fire on other surfaces. The
+  // pin is DATA, so assert on the data.
+  for (const file of COGS_SURFACE_FILES) {
+    const surface = refundFigureSurface(file)
+    assert.ok(surface, `${file} must still be pinned`)
+    assert.equal(surface.treatment, 'basis-aware', `${file} is pinned ${surface.treatment}`)
+    assert.equal(surface.disclosure, undefined, `${file} still carries a refund-blind disclosure`)
   }
 })
 

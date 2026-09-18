@@ -106,9 +106,35 @@ export const REFUND_BASIS_NOTICE_CUSTOMER_MIX =
 export const REFUND_BASIS_NOTICE_GROSS_MARGIN =
   'Revenue is dispatched ex-VAT sales-line revenue LESS the net-basis credit raised in the period, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but not deducted, and marks revenue and gross profit as at most (≤) the true figures; margin and contribution are ratios whose numerator and denominator both move, so they are marked (?) instead — a bound exists but its direction is not established.'
 
-/** COGS / inventory-turnover: revenue attributed back to the original sales line. */
-export const REFUND_BLIND_NOTICE_COGS_MARGIN =
-  'Refunds are NOT deducted: revenue and gross margin are attributed from the original sales line behind each dispatch, so a returned sale keeps its full revenue and margin in this report. Use Sales Statistics for a refund-aware net revenue.'
+/**
+ * COGS report: ex-VAT sales-line revenue behind each dispatch, net of the net-basis credit (o3d-rv4a).
+ *
+ * THE NAME CHANGED WITH THE BEHAVIOUR, ON PURPOSE. While this said `REFUND_BLIND_NOTICE_…` any stale
+ * reference to it compiled, and the round-5 disclosure would have gone on standing beside the
+ * correction — which is the one failure mode a whole-file `includes` check cannot see. Renaming makes
+ * every such site a compile error instead. (Same device as o3d-la3n r3's `show` -> `showAmount`.)
+ */
+export const REFUND_BASIS_NOTICE_COGS_MARGIN =
+  'Revenue is the ex-VAT sales-line revenue behind each dispatch LESS the net-basis credit raised in the period against those same orders, so a fully credited sale no longer shows its original revenue and margin. Gross-basis and unproven-basis credit is reported but NOT deducted — no stored rate converts one basis into the other — and marks revenue and gross margin as at most (≤) the true figures; margin % is a ratio whose numerator and denominator both move, so where its direction is not established it is marked (?) instead. Credit that reached no row is stated separately on its own basis and bounds the totals even where it is the figure’s own unit. Inventory Turnover is COGS over average inventory value and no refund moves either input.'
+
+/**
+ * COGS report: WHY A FOOTER MAY NOT EQUAL THE SUM OF THE ROWS ABOVE IT (o3d-rv4a r3; rewritten r4 and r5,
+ * Codex round 4 MEDIUM 1 and round 5 MEDIUM 1).
+ *
+ * THE CAUSES, READ OFF HOW EACH FOOTER IS BUILT (getCogsReport / aggregateCogsReport), not assumed:
+ *   - Qty and COGS footers: the sum of every group's figure, all pages.
+ *   - Revenue and margin footers: the sum of every group's figure where revenue was matched, all pages. A
+ *     withheld row prints `Unmatched` and contributes to neither the column nor the footer.
+ *   - The three credit footers: every group's credit, all pages, PLUS the credit that reached no row
+ *     (`unattributed` and `outsideReport`), which no row shows. Round 4 said rounding and pagination were
+ *     the only causes; on a one-page report with an outside-report refund every credit cell reads zero
+ *     while the footer does not.
+ * So every footer can differ from its visible column by display rounding (each row and each total is
+ * rounded once, on its own) and by pagination; the credit footers can also differ by off-report credit.
+ * The sentence states exactly those three and nothing about bounds, currencies or pennies (round 4).
+ */
+export const DISPLAY_ROUNDING_NOTICE_COGS =
+  'Each row and each total is rounded independently for display, so the rows may not add up exactly to the total, which also covers every page of the report rather than just the rows shown. The credit totals also include credit that reached no row, listed under the off-report credit lines.'
 
 /** What the Returns report prints where a period's credit is not on one basis. */
 export const RETURNS_MIXED_BASIS_MARKER = 'Mixed basis'
@@ -138,10 +164,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/cogs/page.tsx',
-    figures: ['grossMarginBase', 'grossMarginPct', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueCapturedRows'],
-    treatment: 'refund-blind',
+    figures: ['grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueCapturedRows'],
+    treatment: 'basis-aware',
     reason:
-      'Renders getCogsReport revenue/gross margin. Refund-blind by the producer; the disclosure is carried in report.notices, which this page renders.',
+      'Renders getCogsReport revenue net of the net-basis credit, gross margin, margin % and the per-basis credit columns, each figure with the producer\u2019s own bound marker appended AFTER the amount renderer (o3d-la3n r3: the mark is a fact about the interval and the Unmatched branch must not be able to suppress it). Every figure arrives UNROUNDED as an ExactFigure/ExactRatio and markFigure\u2019s roundExact is its only rounding: once, toward the bound beside it, to moneyCodeFractionDigits(baseCurrency) for money (the digits the formatter prints: 0 for yen, 3 for dinars), two decimals for margin %, four for qty; formatMoneyCodeExact then pins those digits and throws rather than round again. Each piece closes a double rounding found in review: Intl rounding a \u2264 to nearest (r2), Number() before the ceiling (r3), two decimals then the currency\u2019s own (r4), and the producer\u2019s six-decimal strings plus Prisma.Decimal\u2019s twenty-digit arithmetic (r5).',
   },
   {
     file: 'app/(dashboard)/analytics/customers/page.tsx',
@@ -334,11 +360,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/api/export/inventory-costing/route.ts',
-    figures: ['getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginPct', 'revenueBase', 'revenueCaptured', 'turnoverRatio'],
-    treatment: 'refund-blind',
+    figures: ['getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'revenueBase', 'revenueBaseBound', 'revenueCaptured', 'turnoverRatio'],
+    treatment: 'basis-aware',
     reason:
-      'COGS/turnover CSV. Carries the disclosure as export metadata comment rows, which is this repo’s CSV-side equivalent of a notice.',
-    disclosure: REFUND_BLIND_NOTICE_COGS_MARGIN,
+      'COGS/turnover CSV. Every bounded figure carries its OWN bound column immediately right of it and the per-basis credit columns beside them, and the producer’s whole totals map travels as export metadata comment rows — a file reader has no tooltip, and a bound that exists only on the page is a disclosure the file reader never sees. o3d-rv4a r2: every bounded figure is rounded toward its bound, because a CSV column that rounds a bound the wrong way is the same defect as the page’s in a different skin. o3d-rv4a r5: the producer hands this route EXACT figures and exportFigure / exportTotal round each one once here, from full precision, to the file’s six decimals (money), four (qty) or two (margin %), toward the bound published beside it.',
   },
   {
     file: 'app/api/export/sales-analytics/route.ts',
@@ -482,11 +507,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/inventory/inventory-costing-reports.ts',
-    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'emptyInventoryTurnoverReportForSourceLimit', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginPct', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'qtyByRevenueKey', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
-    treatment: 'refund-blind',
+    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'byRevenueKey', 'emptyInventoryTurnoverReportForSourceLimit', 'exactRevenueByOrderProduct', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'netRevenue', 'qtyByRevenueKey', 'reportRevenueKeys', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
+    treatment: 'basis-aware',
     reason:
-      'COGS report revenue/gross margin and the turnover report. Revenue is the ORIGINAL ex-VAT sales-line total attributed through the dispatch; no refund line is loaded, so a credited sale still shows its full revenue and margin. Declared and disclosed rather than fixed — the fix needs refund lines attributed through the same order/product and line-linked keys, which is filed.',
-    disclosure: REFUND_BLIND_NOTICE_COGS_MARGIN,
+      'COGS report revenue/gross margin and the turnover report. o3d-rv4a: refund lines are loaded with their parent refund’s totalsBasis and attributed through the SAME line-linked and order:product keys the revenue uses, split across groups by the same quantity share; only the NET bucket is subtracted, the gross and unproven buckets are published beside the figures, and the totals classify from the unrounded credit INTERVAL carried up from the rows rather than from their published signed, rounded columns (o3d-la3n). o3d-rv4a r2 fixed the scope and the arithmetic of that bound: EVERY refund raised in the period is loaded through the shared refundLinesRaisedInPeriodWhere (round 1 restricted it to the window’s own order ids and so published exact revenue over a period with a credit note missing from it), the report’s product filter is applied separately by cogsRefundLineInProductScope so a filtered-out sibling product cannot pollute the totals, the period AMOUNTS are summed unrounded (round 1 rebuilt them from the rows’ six-decimal strings, putting the advertised ceiling below the truth). o3d-rv4a r5 (Codex round 5 HIGH): nothing is rounded here at all. Quantity shares stay quotients and every published figure is an ExactFigure, rounded once by the page or the CSV; revenueByOrderProduct and the credit amounts (exactRevenue, exactRevenueByOrderProduct, ExactCredit) are summed exactly, because Prisma.Decimal arithmetic rounds at twenty significant digits. The credit is held exactly too (ExactCredit, with the per-bucket positive parts), and every verdict — each row’s linear and margin-% bound and the totals’ bound — is decided from exact figures by netLinearFigureBoundExact / marginFigureBoundExact (independent review of r5, H1: a Decimal-scaled credit made an exactly-zero case-3 difference non-zero). Turnover is COGS over average inventory value and no refund line moves either input.',
   },
   {
     file: 'lib/domain/inventory/inventory-health-reports.ts',
@@ -511,7 +535,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-basis-analytics.ts',
-    figures: ['margin', 'marginFigureBound', 'marginFigureBoundDecimal', 'netRevenue', 'netTotal'],
+    figures: ['margin', 'marginFigureBound', 'marginFigureBoundDecimal', 'marginFigureBoundExact', 'netRevenue', 'netTotal'],
     treatment: 'basis-aware',
     reason:
       'The classifier every basis-aware surface reads. Establishes the basis and the bound; converts nothing.',
