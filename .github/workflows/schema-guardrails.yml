@@ -41,6 +41,10 @@ on:
       # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
       # and the unmirrored-sync-row question.
       - "lib/domain/accounting/mirrored-sync-types.ts"
+      # o3d-6e4v: the rollout-readiness history reader, whose SQL tests/db/rollout-readiness-reconciliation-proof.test.ts
+      # executes against a real Postgres (the jsonb predicates cannot be proven by a double).
+      - "lib/ops/rollout-readiness.ts"
+      - "lib/ops/reconciliation-proof.ts"
   push:
     branches:
       - main
@@ -83,6 +87,10 @@ on:
       # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
       # and the unmirrored-sync-row question.
       - "lib/domain/accounting/mirrored-sync-types.ts"
+      # o3d-6e4v: the rollout-readiness history reader, whose SQL tests/db/rollout-readiness-reconciliation-proof.test.ts
+      # executes against a real Postgres (the jsonb predicates cannot be proven by a double).
+      - "lib/ops/rollout-readiness.ts"
+      - "lib/ops/reconciliation-proof.ts"
 
 jobs:
   migration-scope:

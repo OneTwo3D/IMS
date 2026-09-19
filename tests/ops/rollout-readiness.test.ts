@@ -9,6 +9,7 @@ import {
   type LatestAccountingReconciliationRun,
   type RolloutReadinessAdapters,
 } from '../../lib/ops/rollout-readiness.ts'
+import type { ReconciliationHistory } from '../../lib/ops/reconciliation-proof.ts'
 import {
   type AdminHealthResponse,
   type HealthLevel,
@@ -327,6 +328,7 @@ function createAdapters(overrides: {
   preflight?: PreflightResult
   adminHealth?: AdminHealthResponse
   latestAccountingReconciliationRun?: LatestAccountingReconciliationRun | null
+  history?: ReconciliationHistory | (() => Promise<ReconciliationHistory>)
 } = {}): RolloutReadinessAdapters {
   return {
     now: () => FIXED_DATE,
@@ -336,6 +338,10 @@ function createAdapters(overrides: {
       overrides.latestAccountingReconciliationRun === undefined
         ? createReconciliationRun()
         : overrides.latestAccountingReconciliationRun,
+    accountingReconciliationHistory: async () =>
+      typeof overrides.history === 'function'
+        ? overrides.history()
+        : overrides.history ?? { runs: [], overflow: false, recordedBeforeNewest: false },
   }
 }
 
@@ -348,7 +354,7 @@ function createPreflight(checks: PreflightCheck[] = [
   }
 }
 
-function createReconciliationRun(): LatestAccountingReconciliationRun {
+function createReconciliationRun(overrides: Partial<LatestAccountingReconciliationRun> = {}): LatestAccountingReconciliationRun {
   return {
     id: 'recon-1',
     status: 'COMPLETED',
@@ -356,6 +362,11 @@ function createReconciliationRun(): LatestAccountingReconciliationRun {
     warningCount: 0,
     criticalCount: 0,
     createdAt: FIXED_DATE.toISOString(),
+    // o3d-6e4v: a clean run RECORDS that it was complete — `[]`, never NULL — over its 90-day window.
+    fromDate: '2026-01-31T10:00:00.000Z',
+    toDate: FIXED_DATE.toISOString(),
+    truncations: [],
+    ...overrides,
   }
 }
 
