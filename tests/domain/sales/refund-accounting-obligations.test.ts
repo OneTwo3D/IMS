@@ -379,16 +379,13 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
   const queuedAnswers = [...body.matchAll(/return answer\(\{ queued: true[^}]*\}, ([^)]*)\)/g)]
   assert.equal(
     queuedAnswers.length,
-    5,
+    4,
     'the idempotency hit, the create, the unique-key collision and (o3d-j625 r7) a posting marked handled '
-    + 'by hand — found before the enqueue, or by the row-creating primitive under its lock — are the five queued exits',
+    + 'by hand, found by the row-creating primitive under its lock, are the four queued exits',
   )
   // o3d-j625 r7: the handled-by-hand exit writes nothing either, and says so.
-  assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'handled-by-hand'")).length, 2)
+  assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'handled-by-hand'")).length, 1)
   for (const answer of queuedAnswers) {
-    // o3d-j625 r7: the ONE queued exit reached before any connector is resolved — a posting marked handled
-    // by hand, found up front — writes nothing and names the connector the caller pinned or built for.
-    if (answer[0].includes("reason: 'handled-by-hand'") && answer[1] === 'params.connector ?? params.chartConnector ?? null') continue
     assert.equal(
       answer[1],
       'context.connector',

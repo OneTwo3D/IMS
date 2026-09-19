@@ -582,7 +582,7 @@ test('[o3d-j625 r4] a refused posting becomes an OUTSTANDING inbox row naming BO
   assert.equal(rows[0].chartConnector, 'xero', 'the chart the codes came from')
   assert.equal(rows[0].activeConnector, 'quickbooks', 'AND what is active now — the half round 2 omitted')
   assert.equal(rows[0].reason, 'retired_chart')
-  assert.match(String(rows[0].remedy), /switch back to xero|raise it again/)
+  assert.match(String(rows[0].remedy), /back to xero/)
 })
 
 test('[o3d-j625 r4] the SAME posting refused again updates one row rather than filling the inbox', async () => {
@@ -931,7 +931,7 @@ test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT
   enabledPlugins = ['quickbooks']
   insertedInTx.length = 0
   assert.equal(await queueAccountingSyncTx(transactionDouble() as never, journal()), false, 'PRECONDITION: refused')
-  await recordAccountingPostingRefusal(postingRefusalTable as never, accountingPostingKey(journal()), {
+  await recordAccountingPostingRefusal({ accountingPostingRefusal: postingRefusalTable } as never, accountingPostingKey(journal()), {
     kind: 'landed_cost_cogs_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r',
   })
   const row = outstandingRefusals()[0]!

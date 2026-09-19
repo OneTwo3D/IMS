@@ -142,12 +142,12 @@ test('[o3d-j625 r6 H4] every posting an enqueue can record a refusal for has a k
     + 'itself or is marked handled. Add it to lib/domain/accounting/posting-refusal-kinds.ts.')
 })
 
-test('[o3d-j625 r6 H4] the enqueue\'s own default never makes a row AUTO where a site could be MANUAL', () => {
+test('[o3d-j625 r6/r7 H4] the enqueue\'s own default never makes a row AUTO where a site could offer the button', () => {
   for (const [kind, spec] of Object.entries(POSTING_REFUSAL_KINDS) as Array<[PostingRefusalKind, (typeof POSTING_REFUSAL_KINDS)[PostingRefusalKind]]>) {
     const byDefault = defaultPostingRefusalKind(spec.type, spec.referenceType)
     const siblings = Object.values(POSTING_REFUSAL_KINDS).filter((s) => s.type === spec.type && s.referenceType === spec.referenceType)
-    if (siblings.some((s) => s.clearing === 'manual') && byDefault !== null) {
-      assert.equal(postingRefusalClearing(byDefault), 'manual', `${kind}: a posting with a MANUAL site defaults to a MANUAL kind`)
+    if (siblings.some((s) => s.clearing !== 'auto') && byDefault !== null) {
+      assert.notEqual(postingRefusalClearing(byDefault), 'auto', `${kind}: a posting with a markable site never defaults to an AUTO kind`)
     }
   }
 })
@@ -200,8 +200,8 @@ function refusalWriteKinds(files: Array<[string, string]>): Array<{ at: string; 
 test('[o3d-j625 r6 H4] every refusal write names a LITERAL kind from the closed set', () => {
   const writes = refusalWriteKinds(productionSources())
   console.log(`[o3d-j625 r6] refusal writes naming a kind: ${writes.length}`)
-  // 22 sites; the two landed-cost reporters each name two kinds (outbox or direct): 24 kinds read. The count.
-  assert.ok(writes.length >= 24, `PRECONDITION: the reporting and recording sites were found (${writes.length})`)
+  // 22 sites, one literal kind each (r7: the landed-cost reporters no longer choose between two). The count.
+  assert.ok(writes.length >= 22, `PRECONDITION: the reporting and recording sites were found (${writes.length})`)
   assert.deepEqual(writes.filter((w) => w.kind === null || !(w.kind in POSTING_REFUSAL_KINDS)).map((w) => w.at), [])
 })
 

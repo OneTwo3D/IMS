@@ -1225,15 +1225,10 @@ export async function queueAccountingSyncTx(
     }
     return outcome.queued
   }
-  // o3d-j625 r7 — A POSTING MARKED HANDLED IS NEVER POSTED OR RE-REFUSED (see the facade). Asked through the
-  // caller's transaction, under a savepoint, before anything that could refuse it.
-  {
-    const suppression = await readPostingSuppression(tx as unknown as PostingSuppressionClient, posting)
-    if (suppression.suppressed) {
-      await reportSuppressedPosting(posting, suppression)
-      return answer({ queued: true, reason: 'handled-by-hand' }, params.connector ?? params.chartConnector ?? null)
-    }
-  }
+  // o3d-j625 r7: NO early suppression read here, unlike the facade. Nothing may touch `tx` before the pinned-
+  // ledger fence (o3d-i0o6 r8), and a second, pooled connection inside the caller's transaction is not a
+  // price worth paying for an answer the row-creating primitive gives anyway, under the lock: a posting
+  // marked handled is refused there, and a refusal of it is not recorded (recordAccountingPostingRefusal).
   // o3d-3zgy: this is the enqueue path that writes inside a CALLER's transaction, so — unlike
   // queueXeroSync / queueQuickBooksSync, which open their own — it cannot take the sales-order row
   // lock itself. Taking it here would take it LATE, inside a transaction that may already hold
