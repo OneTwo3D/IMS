@@ -193,6 +193,15 @@ If a freight PO is added or updated after goods have already been received, the 
 - Existing FIFO cost layers from the affected receipts are revalued with the new unit costs.
 - If any of those layers have already been consumed by sales shipments, a COGS revaluation journal is queued for Xero — it reverses the old COGS amount and posts the new one.
 - All cost-layer snapshot changes are recorded in the activity log so finance can trace what changed and why.
+- **A credit that would push an already-journaled shipment's cost below zero is refused.** This happens when a
+  credit cost line (a negative amount) is larger than the value of the goods it is spread over, and some of those goods
+  have already shipped and been journaled. IMS cannot post a negative COGS, so it changes nothing: no cost layer,
+  shipment or journal is touched. It writes an **ERROR** entry to the activity log
+  (`landed_cost_revaluation_refused_journaled_shipment`) naming the shipment, its old and new COGS, and the credit line
+  to correct.
+  - When you save a **freight PO**, the save itself fails with that reason, and your edit is not kept.
+  - When you edit **additional costs on a goods PO**, the cost lines are saved but the recalculation is refused, as with
+    any failed recalculation there. Correct or remove the credit line and save again.
 
 Each landed-cost adjustment carries the `freightPoId` of the triggering freight PO. This means adjustments from different freight POs against the same primary PO are kept as separate journals — finance can attribute deltas to the right invoice source.
 

@@ -1567,7 +1567,11 @@ async function recalculateManufacturingCostLayers(
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
-    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, { recalcRunId })
+    const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
+      recalcRunId,
+      // o3d-c08y: named in a refusal, if this recompute would take a journaled shipment below zero.
+      revaluationContext: { source: 'manufacturing_recompute', productionOrderId },
+    })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass
     // journal's COGS leg to avoid double-posting COGS for sold units.
