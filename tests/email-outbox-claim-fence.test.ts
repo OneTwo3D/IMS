@@ -75,6 +75,9 @@ function matchesClause(value: unknown, clause: unknown): boolean {
         if (!(left !== null && right !== null && (left as number) < (right as number))) return false
       } else if (operator === 'lte') {
         if (!(left !== null && right !== null && (left as number) <= (right as number))) return false
+      } else if (operator === 'gte') {
+        // o3d-hpeg: the park's `staleReclaimCount >= cap`.
+        if (!(left !== null && right !== null && (left as number) >= (right as number))) return false
       } else {
         throw new Error(`test double does not implement operator ${operator}`)
       }
@@ -82,6 +85,25 @@ function matchesClause(value: unknown, clause: unknown): boolean {
     return true
   }
   return sameInstant(value, clause)
+}
+
+/**
+ * Apply an updateMany's `data` the way Prisma does, for the one non-literal it uses: o3d-hpeg's
+ * `staleReclaimCount: { increment: 1 }`. Any other object-valued field is a literal (a Date).
+ */
+function applyData(row: EmailOutboxRow, data: Record<string, unknown>): void {
+  for (const [field, value] of Object.entries(data)) {
+    if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+      const operators = Object.keys(value as Record<string, unknown>)
+      if (operators.length !== 1 || operators[0] !== 'increment') {
+        throw new Error(`test double does not implement data operator(s) ${operators.join(', ')}`)
+      }
+      const record = row as unknown as Record<string, number>
+      record[field] = (record[field] ?? 0) + ((value as { increment: number }).increment)
+      continue
+    }
+    (row as unknown as Record<string, unknown>)[field] = value
+  }
 }
 
 function matchesWhere(row: EmailOutboxRow, where: Where): boolean {
@@ -171,6 +193,13 @@ type MakeClientOptions = {
    * is built into the delegate the mint proved rather than bolted onto the client afterwards.
    */
   createThrows?: () => never
+  /**
+   * o3d-hpeg — PAUSE INSIDE THE FIRST RECLAIM ATTEMPT, before it is applied: an `updateMany` taking a
+   * PROCESSING row to PROCESSING. That is the one window in which a reclaimer has already SWEPT the
+   * row (and so holds a copy of its `staleReclaimCount`) but has not yet written; another worker's
+   * reclaim landing there is what a cap checked on the swept copy would miss.
+   */
+  pauseBeforeFirstReclaim?: () => Promise<void>
 }
 
 async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {}): Promise<{
@@ -194,6 +223,7 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
   let suppressionUpsertFailed = false
   let suppressionLookupPaused = false
   let suppressionLookupFailed = false
+  let reclaimPaused = false
   /**
    * THE MINT'S PROBE IS NOT A DRAIN, so no interleaving hook may fire inside it. The proof reads
    * `findUnique` three times (empty store, sentinel, sentinel removed), and a pause that fired there
@@ -222,7 +252,7 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
           let committed = 0
           for (const row of store) {
             if (!matchesWhere(row, where)) continue
-            Object.assign(row, data)
+            applyData(row, data)
             committed += 1
           }
           updateManyCalls.push({ where, data, count: committed })
@@ -234,13 +264,18 @@ async function makeClient(rows: EmailOutboxRow[], options: MakeClientOptions = {
           options.throwOnFirstTerminalWrite()
           throw new Error('the settlement write could not reach the database')
         }
+        if (options.pauseBeforeFirstReclaim && !minting && !reclaimPaused
+          && where.status === 'PROCESSING' && data.status === 'PROCESSING') {
+          reclaimPaused = true
+          await options.pauseBeforeFirstReclaim()
+        }
         const effectiveWhere: Where = options.legacyUnfencedTerminalWrites && 'lockedBy' in where
           ? { id: where.id }
           : where
         let count = 0
         for (const row of store) {
           if (!matchesWhere(row, effectiveWhere)) continue
-          Object.assign(row, data)
+          applyData(row, data)
           count += 1
         }
         updateManyCalls.push({ where, data, count })
@@ -357,6 +392,7 @@ function makeRow(overrides: Partial<EmailOutboxRow> = {}): EmailOutboxRow {
     availableAt: new Date('2026-09-10T09:00:00.000Z'),
     processingStartedAt: null,
     lockedBy: null,
+    staleReclaimCount: 0,
     ...overrides,
   }
 }
@@ -514,44 +550,34 @@ test('REAL: the reclaimed worker is refused its terminal write, so SENT stands a
 })
 
 // ---------------------------------------------------------------------------
-// r37 (Codex r36 HIGH 2) — THE RECLAIM'S OWN COST IS NOT "AT MOST ONE DUPLICATE", AND THE FENCE DOES
-// NOT MAKE IT SO.
+// r37 (Codex r36 HIGH 2) found that successive reclaims were UNBOUNDED: each reclaim resets the row's
+// window, so the reclaimer is itself reclaimable one window later. This file used to PROVE that with
+// three workers each stalled inside the next one's run, and three copies delivered from one row.
 //
-// Every round of this branch before this one rested on a sentence at the top of `lib/email-outbox.ts`
-// saying an elapsed-time reclaim "costs at most one duplicate send". IT DOES NOT. A reclaim RESETS the
-// row: `processingStartedAt` becomes the reclaimer's instant and `lockedBy` its own token, so the
-// reclaimer is itself reclaimable one window later. Nothing caps the chain.
-//
-// THIS IS THE PROOF, AND IT RUNS AGAINST THE SHIPPED FENCE — no `legacyUnfencedTerminalWrites`, no
-// re-arm anywhere in it. Three workers, each stalled inside the next one's whole run:
+// o3d-hpeg CAPS IT, and the same three-worker chain is now the proof of the cap:
 //
 //   t0      A claims, enters the sender, does not return
-//   t0+16m  B finds the row stale, reclaims, enters the sender, does not return
-//   t0+32m  C finds the row stale AGAIN (B's own claim is now the stale one), reclaims, and delivers
+//   t0+16m  B finds the row stale, RECLAIMS it (staleReclaimCount 0 -> 1), enters the sender
+//   t0+32m  C finds the row stale AGAIN — and is REFUSED: the reclaim's own WHERE requires the count
+//           to be below EMAIL_MAX_STALE_RECLAIMS. C PARKS the row instead, and never enters the sender.
 //
-// THREE copies of one email leave the building, and the fence is working perfectly throughout: A's
-// and B's terminal writes are both ISSUED AND REFUSED, C's SENT stands, the row is never re-armed and
-// a fourth tick delivers nothing. That is the whole point — the fence closes the RE-ARM, which needed
-// no further stale window, and closes nothing about the count. o3d-hpeg scopes the lease change that
-// would bound it; the honest interim claim is stated at the top of `lib/email-outbox.ts`.
-//
-// WHY THREE AND NOT TWO IS THE WHOLE ASSERTION: two deliveries are what "at most one duplicate"
-// predicts, and every other arm in this file produces exactly two. A third is the counterexample, and
-// the chain extends by one for each further window a holder outlives.
+// TWO copies, not three: the holder and one reclaimer. On current development this test is RED — C
+// reclaims and delivers a third copy — which is the whole of o3d-hpeg.
 // ---------------------------------------------------------------------------
 
-/** A second stale window past B's own claim, so C's reclaim is granted on elapsed time too. */
+/** A second stale window past B's own claim — the point at which C would have reclaimed. */
 const T_RECLAIM_2 = new Date('2026-09-10T10:32:00.000Z')
-/** Well past any backoff a re-armed row would carry, so a re-arm would show up as a delivery here. */
-const T_FOURTH_TICK = new Date('2026-09-10T10:40:00.000Z')
+/** Far past any window or backoff: a parked row that were retried would be delivered here. */
+const T_FOURTH_TICK = new Date('2026-09-10T12:00:00.000Z')
 
-test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fence, and three copies delivered', async () => {
+test('o3d-hpeg: successive reclaims are CAPPED — the third worker is refused, the row PARKED, two copies at most', async () => {
   const deliveries: string[] = []
+  const logged: Array<Record<string, unknown>> = []
   const { client, rows, updateManyCalls } = await makeClient([makeRow()])
   let bReclaimed = false
-  let cReclaimed = false
   let workerB: Awaited<ReturnType<typeof drain>> | undefined
   let workerC: Awaited<ReturnType<typeof drain>> | undefined
+  let countWhenCArrived: number | undefined
 
   const workerA = await drain({
     client,
@@ -560,7 +586,6 @@ test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fenc
     logActivity: noLog,
     async sendEmail() {
       deliveries.push('worker-A')
-      // B's ENTIRE run happens inside A's stalled send, a stale window later.
       workerB = await drain({
         client,
         now: () => T_RECLAIM,
@@ -568,19 +593,19 @@ test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fenc
         logActivity: noLog,
         async sendEmail() {
           deliveries.push('worker-B')
-          // ...and C's entire run happens inside B's stalled send, ANOTHER stale window later. B's
-          // own claim is what has gone stale by now, which is the step "at most one duplicate" denies.
+          countWhenCArrived = rows[0].staleReclaimCount
+          // C's ENTIRE run happens inside B's stalled send, a second stale window later — exactly
+          // where r37's C reclaimed and delivered a third copy.
           workerC = await drain({
             client,
             now: () => T_RECLAIM_2,
             prepareQueuedEmail: noPrepare,
-            logActivity: noLog,
+            logActivity: async (entry: Record<string, unknown>) => { logged.push(entry) },
             async sendEmail() {
               deliveries.push('worker-C')
               return { success: true }
             },
-          })
-          cReclaimed = workerC.processed === 1 && workerC.sent === 1
+          } as unknown as EmailOutboxHarness)
           return { success: false, error: 'SMTP read timeout' }
         },
       })
@@ -589,45 +614,37 @@ test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fenc
     },
   })
 
-  // NON-VACUITY, BOTH STEPS. A green below would mean nothing if either reclaim had been refused:
-  // the chain has to have been WALKED for three deliveries to be evidence of anything.
+  // NON-VACUITY: the chain was walked to exactly the step the cap exists for.
   assert.equal(bReclaimed, true, "worker B never reclaimed A's row, so the chain was not entered at all")
-  assert.equal(
-    cReclaimed,
-    true,
-    "worker C never reclaimed B's row — the SECOND reclaim is the step this test exists for, and without "
-    + 'it this is just the two-worker arm again',
-  )
+  assert.equal(countWhenCArrived, 1, "B's reclaim was counted, IN the claim — so C met a row at the cap")
 
-  // THE FINDING. Three sends, from one row, with the fence shipped and working.
-  assert.deepEqual(
-    deliveries,
-    ['worker-A', 'worker-B', 'worker-C'],
-    'THREE copies of one email were not delivered, so this test is no longer the counterexample to "an '
-    + 'elapsed-time reclaim costs at most one duplicate send" (r37, Codex r36 HIGH 2). Each reclaim resets '
-    + '`processingStartedAt` and mints a new `lockedBy`, so the reclaimer is itself reclaimable one window '
-    + 'later and the chain extends by one send per window a holder outlives (o3d-hpeg)',
-  )
+  // THE BOUND. The holder and one reclaimer; C never entered the sender.
+  assert.deepEqual(deliveries, ['worker-A', 'worker-B'],
+    'a third copy was delivered: the second reclaim was granted, so the chain is still unbounded (o3d-hpeg)')
+  assert.equal(workerC?.processed, 0, 'C claimed nothing')
+  assert.equal(workerC?.parked, 1, 'C parked the row instead of reclaiming it')
 
-  // AND THE FENCE DID ITS JOB THROUGHOUT — this is not a regression in the fence, it is the fence's
-  // scope. Both losers were REFUSED, the winner's settlement stands, and nothing was re-armed.
-  assert.equal(workerA.conflicted, 1, "worker A's refused terminal write was not recorded as a reclaim")
-  assert.equal(workerB?.conflicted, 1, "worker B's refused terminal write was not recorded as a reclaim")
-  assert.equal(workerC?.sent, 1, 'worker C did not settle the row it delivered')
-  assert.equal(rows[0].status, 'SENT', "the row does not carry worker C's SENT")
-  assert.equal(rows[0].lockedBy, null, 'the settled row still carries a claim')
-  const refused = updateManyCalls.filter(
-    (call) => 'lockedBy' in call.where && call.data.status !== 'PROCESSING' && call.count === 0,
-  )
-  assert.equal(
-    refused.length,
-    2,
-    `${refused.length} fenced terminal writes were refused, not 2 — both losers must have ISSUED a write `
-    + 'and had it matched against zero rows, or the three deliveries below are not the fence working',
-  )
+  // THE ROW IS PARKED, and says why, and the losers' settlements were refused.
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
+  assert.equal(rows[0].lockedBy, null, 'the parked row carries no claim, so no stale holder can settle it')
+  assert.equal(rows[0].staleReclaimCount, 1, 'counted once, and the refusal did not count')
+  assert.match(String((rows[0] as unknown as { lastError?: string }).lastError), /send cap/)
+  assert.equal(workerA.sent + (workerB?.sent ?? 0), 0, 'neither stale holder could settle the parked row')
 
-  // A FOURTH TICK DELIVERS NOTHING. The count is unbounded in the number of OVER-RUNNING WORKERS, not
-  // in the number of drain ticks: with no fourth worker stalled on the socket, the row stays SENT.
+  // AN OPERATOR IS TOLD, BY NAME.
+  const parkedEntries = logged.filter((entry) => entry.action === 'email_outbox_parked_send_cap')
+  assert.equal(parkedEntries.length, 1)
+  assert.equal(parkedEntries[0].level, 'ERROR')
+  assert.equal(parkedEntries[0].entityId, 'email-1')
+  assert.match(String(parkedEntries[0].description), /email-outbox-parked\.ts --row email-1/)
+
+  // THE CLAIMS: one first claim that did not count, one reclaim that did, and C's reclaim REFUSED.
+  const reclaims = updateManyCalls.filter((call) => call.where.status === 'PROCESSING' && call.data.status === 'PROCESSING')
+  assert.deepEqual(reclaims.map((call) => call.count), [1, 0], 'B\'s reclaim matched; C\'s was refused by its WHERE')
+  assert.deepEqual(reclaims.map((call) => (call.where as { staleReclaimCount?: unknown }).staleReclaimCount),
+    [{ lt: 1 }, { lt: 1 }], 'and the cap is IN each reclaim statement')
+
+  // AND A PARKED ROW IS NEVER RETRIED AUTOMATICALLY — however far the clock goes.
   await drain({
     client,
     now: () => T_FOURTH_TICK,
@@ -638,11 +655,97 @@ test('r37: successive reclaims are UNBOUNDED — three workers, the shipped fenc
       return { success: true }
     },
   })
-  assert.deepEqual(
-    deliveries,
-    ['worker-A', 'worker-B', 'worker-C'],
-    'a fourth copy went out with no fourth worker involved, which would be the RE-ARM this fence removes',
+  assert.deepEqual(deliveries, ['worker-A', 'worker-B'], 'a parked row was picked up again by a later drain')
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
+})
+
+test('o3d-hpeg: a first claim does not count, and neither does an ordinary retry of a PENDING row', async () => {
+  const deliveries: string[] = []
+  const { client, rows } = await makeClient([makeRow()])
+  const first = await drain({
+    client,
+    now: () => T0,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('first')
+      return { success: false, error: 'SMTP 451 try later' }
+    },
+  })
+  assert.equal(first.failed, 1, 'PRECONDITION: the first attempt failed retryably')
+  assert.equal(rows[0].status, 'PENDING')
+  assert.equal(rows[0].staleReclaimCount, 0, 'a first claim is not a reclaim')
+
+  const retry = await drain({
+    client,
+    now: () => T_THIRD_TICK,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('retry')
+      return { success: true }
+    },
+  })
+  assert.equal(retry.sent, 1)
+  assert.deepEqual(deliveries, ['first', 'retry'])
+  assert.equal(rows[0].staleReclaimCount, 0, 'a retry after a settled failure is a claim of a PENDING row, not a reclaim')
+  assert.equal(rows[0].status, 'SENT')
+})
+
+test('o3d-hpeg: the cap is checked by the RECLAIM STATEMENT, not on the swept copy — a reclaim landing in between refuses the sweeper', async () => {
+  // B sweeps the stale row while its count is 0, then pauses before writing. In that gap C reclaims
+  // (0 -> 1) and enters the sender, and C's claim is itself stale by B's clock. A cap checked on B's
+  // swept copy (count 0) would let B reclaim a SECOND time and enter the sender a third; the cap in
+  // B's own WHERE sees the row as it stands, refuses, and B parks it instead.
+  const deliveries: string[] = []
+  const T_C = new Date('2026-09-10T10:16:00.000Z')
+  const T_B = new Date('2026-09-10T10:40:00.000Z')
+  let cInSender: () => void = () => undefined
+  const cEnteredSender = new Promise<void>((resolve) => { cInSender = resolve })
+  let releaseC: () => void = () => undefined
+  const cMayReturn = new Promise<void>((resolve) => { releaseC = resolve })
+  let workerC: Promise<Awaited<ReturnType<typeof drain>>> | undefined
+
+  const { client, rows } = await makeClient(
+    [makeRow({ status: 'PROCESSING', processingStartedAt: T0, lockedBy: 'holder-A' })],
+    {
+      async pauseBeforeFirstReclaim() {
+        workerC = drain({
+          client,
+          now: () => T_C,
+          prepareQueuedEmail: noPrepare,
+          logActivity: noLog,
+          async sendEmail() {
+            deliveries.push('worker-C')
+            cInSender()
+            await cMayReturn
+            return { success: true }
+          },
+        })
+        await cEnteredSender
+      },
+    },
   )
+
+  const workerB = await drain({
+    client,
+    now: () => T_B,
+    prepareQueuedEmail: noPrepare,
+    logActivity: noLog,
+    async sendEmail() {
+      deliveries.push('worker-B')
+      return { success: true }
+    },
+  })
+  releaseC()
+  await workerC
+
+  assert.ok(workerC, 'PRECONDITION: C ran inside B\'s pause')
+  assert.deepEqual(deliveries, ['worker-C'], 'B entered the sender after C\'s reclaim: the cap was read off a stale copy')
+  assert.equal(workerB.processed, 0)
+  assert.equal(workerB.parked, 1, 'B found the row at the cap and parked it')
+  assert.equal(rows[0].staleReclaimCount, 1, 'one reclaim, ever')
+  assert.equal(rows[0].status, 'PARKED_SEND_CAP')
 })
 
 test('REAL: the fenced-out terminal write is ISSUED AND REFUSED, not skipped', async () => {
@@ -783,6 +886,7 @@ test('REAL: a worker that still holds its claim settles normally', async () => {
     processed: 1,
     sent: 1,
     failed: 0,
+    parked: 0,
     conflicted: 0,
     conflictedWithoutSend: 0,
     unresolvedAfterSend: 0,
@@ -838,6 +942,7 @@ test('the suppression write is fenced too, and no longer fires before the claim'
     processed: 1,
     sent: 0,
     failed: 1,
+    parked: 0,
     conflicted: 0,
     conflictedWithoutSend: 0,
     unresolvedAfterSend: 0,
@@ -2085,6 +2190,7 @@ test('r30: a suppression lookup that FAILS settles its own row and the batch car
     processed: 2,
     sent: 1,
     failed: 1,
+    parked: 0,
     conflicted: 0,
     conflictedWithoutSend: 0,
     unresolvedAfterSend: 0,
