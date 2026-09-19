@@ -1834,6 +1834,16 @@ model SalesOrder {
   // back to deriving from the stamp.
   revenueDeferredBatchRef    String?            @map("accounting_revenue_deferred_batch_ref")
   inventoryAllocatedBatchRef String?            @map("accounting_inventory_allocated_batch_ref")
+  /// o3d-1xmo / o3d-2guf — WHICH LEDGER GROUP A1 DEFERRED THIS ORDER'S REVENUE INTO.
+  ///
+  /// Written by the A1 writer of the connector that ran it (`xero` / `quickbooks`), in the SAME
+  /// UPDATE as `revenueDeferredDate` and `revenueDeferredBatchRef`, and cleared with them. A batch
+  /// reference names a group and a date and NO ledger, so without this a connector switch left
+  /// every reader to assume the active connector: the other connector's recreate sweep rebuilt the
+  /// deferral into its own books, and a refund debited Unearned Revenue in books that never
+  /// credited it. Plain TEXT, like `AccountingSyncLog.connector`. NULL on rows staged before the
+  /// column existed; readers then resolve the ledger from the batch's own sync log when they can.
+  revenueDeferredConnector   String?            @map("accounting_revenue_deferred_connector")
   // o3d-o97 r3 — WHAT A2 ACTUALLY RAISED, AND WHERE.
   //
   // `allocationBatchAmount` above says how many pounds A2 VALUED this order at. It does NOT say a
@@ -2031,6 +2041,13 @@ model SalesOrderRefund {
   // reporting the order — and this string says, on a row that outlives the order's stamps, which
   // record was missing and how many pounds are still sitting in Allocated Inventory.
   allocationBasisUnresolved String? @map("accounting_allocation_basis_unresolved")
+  /// o3d-2guf — why this refund did NOT reverse the order's Group A1 unearned revenue, or null
+  /// when it did (or owed none). Set when the deferral was raised in a DIFFERENT ledger from the
+  /// one this refund posts to: debiting Unearned Revenue there would reverse a liability those
+  /// books never recorded, while the real one stood untouched in the other. The A1 stamps on the
+  /// order are then kept, and the standing invariant `sales_order_refund_unearned_reversal_unresolved`
+  /// reports the refund until somebody reverses it in the right books and clears this.
+  unearnedReversalUnresolved String? @map("accounting_unearned_reversal_unresolved")
   accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   // scjz.70: revenue-only chargeback — credit note reverses recognised revenue
   // against AR, but COGS reversal + inventory restock are suppressed (cost kept as
@@ -4117,6 +4134,11 @@ model Shipment {
   // o3d-0qoo: exact Group B batch referenceId this shipment was staged into. See the same
   // pair of columns on SalesOrder for why identity is persisted rather than re-derived.
   shipmentJournalBatchRef String?                @map("accounting_shipment_journal_batch_ref")
+  /// o3d-1xmo — WHICH LEDGER GROUP B JOURNALED THIS SHIPMENT INTO, written by the Group B writer in
+  /// the same UPDATE as `shipmentJournalDate`. See `SalesOrder.revenueDeferredConnector`: the batch
+  /// reference names no ledger, so the recreate sweep needs this to rebuild a lost batch only into
+  /// the books it belonged to. NULL on shipments journaled before the column existed.
+  shipmentJournalConnector String?               @map("accounting_shipment_journal_connector")
   // o3d-o97 r3: THE CR ALLOCATED INVENTORY THIS SHIPMENT'S GROUP B JOURNAL RAISED, written in the
   // same UPDATE as `shipmentJournalDate`. Group B posts DR COGS / CR Allocated for exactly this
   // shipment's dispatch COGS, so this is the relief the allocated contra received.
