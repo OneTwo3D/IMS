@@ -109,6 +109,8 @@ mock.module('@/lib/connectors/xero/settings', {
       xero_sync_inventory_adjustment: 'submitted',
       // o3d-j625 r6: posts, so the receipt-scoped cases (M2, M4) reach the idempotency check.
       xero_sync_stock_receipt: 'submitted',
+      // o3d-j625 r7: the landed-cost COGS journal posts, so the H-B double-post case reaches the create.
+      xero_sync_cogs_journal: 'submitted',
       xero_sales_account: 'X-SALES',
       xero_shipping_account: 'X-SHIP',
       xero_discount_account: 'X-DISC',
@@ -234,6 +236,7 @@ function txRefusalTable() {
       if (txModel.failRefusalWrites) failing()
       return postingRefusalTable.updateMany(args)
     },
+    findUnique: postingRefusalTable.findUnique,
   }
 }
 
@@ -245,6 +248,7 @@ function transactionDouble() {
     accountingSyncLog: {
       // o3d-j625 r6: a prior attempt the in-transaction enqueue's idempotency check can find (M2's case).
       findMany: async () => txModel.priorAttempts,
+      updateMany: async () => ({ count: 0 }),
       create: async ({ data }: { data: { connector: string; type: string; payload: Record<string, unknown> } }) => {
         if (txModel.aborted) throw new Error('25P02: current transaction is aborted')
         const lines = data.payload.lines as Array<{ accountCode?: unknown }> | undefined
@@ -295,16 +299,26 @@ const postingRefusalTable = {
     const key = where.type_referenceType_referenceId_scope
     const existing = refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId && r.scope === key.scope)
     if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
-    const row = { refusedCount: 1, ...create, resolvedAt: null }
+    const row = { id: `ref-${refusals.length + 1}`, refusedCount: 1, suppressedAt: null, ...create, resolvedAt: null }
     refusals.push(row)
     return row
   },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
-    const hits = refusals.filter((r) => r.type === where.type && r.referenceType === where.referenceType
-      && r.referenceId === where.referenceId && r.scope === where.scope
+    // o3d-j625 r7: the mark's own write names the ROW (id) and the kinds it may close.
+    const kinds = (where.kind as { in?: unknown[] } | undefined)?.in
+    const hits = refusals.filter((r) => (where.id !== undefined
+      ? r.id === where.id && (!kinds || kinds.includes(r.kind))
+      : r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId && r.scope === where.scope)
       && (where.resolvedAt === null ? r.resolvedAt === null : r.resolvedAt !== null))
     for (const hit of hits) Object.assign(hit, data)
     return { count: hits.length }
+  },
+  // o3d-j625 r7: read by the suppression check (by key) and by the mark (by id).
+  findUnique: async ({ where }: { where: { id?: string; type_referenceType_referenceId_scope?: Record<string, unknown> } }) => {
+    const key = where.type_referenceType_referenceId_scope
+    return refusals.find((r) => (where.id !== undefined
+      ? r.id === where.id
+      : r.type === key!.type && r.referenceType === key!.referenceType && r.referenceId === key!.referenceId && r.scope === key!.scope)) ?? null
   },
 }
 
@@ -884,4 +898,84 @@ test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector an
   assert.equal(reported.outcome?.reason, 'refused', 'PRECONDITION')
   assert.equal(reported.outcome?.activeConnector, 'quickbooks')
   assert.equal(reported.outcome?.refusalRecorded, true)
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r7 (review H-B) — THE DOUBLE POST THE REVIEW FOUND, DRIVEN.
+//
+// r6 classified a landed-cost journal refused by a direct caller as manual-only, while the landed-cost
+// outbox retries the SAME posting (same idempotency key) ~90s later. So: refused → an operator posts it by
+// hand and marks it handled → the connector selection settles → the outbox drains → the journal is posted
+// AGAIN. The outbox reaches the ledger through queueAccountingSyncTx and the row-creating primitive, which
+// is what is driven here, with the params queueLandedCostAdjustmentJournals passes.
+// ---------------------------------------------------------------------------------------------------
+test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT posted, and the activity says so', async () => {
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const { landedCostAdjustmentIdempotencyKey } = await import('@/lib/domain/purchasing/landed-cost-service')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const { markPostingHandled } = await import('@/lib/domain/accounting/posting-mark-handled')
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const settings = await getAccountingSettings()
+  const adjustment = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'recalc-1', totalDelta: 12.5 }
+  const journal = () => ({
+    type: 'COGS_JOURNAL' as const,
+    referenceType: 'PurchaseOrder',
+    referenceId: 'po-1',
+    idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adjustment as never),
+    payload: { lines: [{ accountCode: settings.cogsAccount, debit: 12.5 }] },
+    chartConnector: settings.connector,
+  })
+
+  // 1. Refused: the connector moved under the recalculation. The reporting site records the row.
+  enabledPlugins = ['quickbooks']
+  insertedInTx.length = 0
+  assert.equal(await queueAccountingSyncTx(transactionDouble() as never, journal()), false, 'PRECONDITION: refused')
+  await recordAccountingPostingRefusal(postingRefusalTable as never, accountingPostingKey(journal()), {
+    kind: 'landed_cost_cogs_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r',
+  })
+  const row = outstandingRefusals()[0]!
+  assert.equal(row.kind, 'landed_cost_cogs_journal', 'PRECONDITION: recorded as outstanding')
+
+  // 2. Posted by hand, and marked handled.
+  const marked = await markPostingHandled(transactionDouble() as never, { id: String(row.id), userId: 'user-1', note: 'MJ-77' })
+  assert.equal(marked.ok, true, `PRECONDITION: the mark succeeded (${JSON.stringify(marked)})`)
+
+  // 3. The cause clears and the outbox drains the same recalculation.
+  enabledPlugins = ['xero']
+  activity.length = 0
+  const answered: { outcome?: { queued: boolean; reason?: string } } = {}
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, { ...journal(), reportOutcome: (o) => { answered.outcome = o } })
+
+  assert.deepEqual(insertedInTx, [], 'NOTHING was written: the journal is in the ledger once, by hand')
+  assert.equal(queued, true, 'and the outbox is told the counterpart exists, so it stops retrying')
+  assert.equal(answered.outcome?.reason, 'handled-by-hand')
+  assert.ok(activity.some((a) => a.action === 'accounting_posting_suppressed_handled_by_hand'),
+    `and the refusal to post it is visible. Activity: ${JSON.stringify(activity.map((a) => a.action))}`)
+})
+
+test('[o3d-j625 r7 H-B] the primitive itself refuses a suppressed key, under the lock — no enqueue path can post around it', async () => {
+  reset(['xero'])
+  const { createAccountingSyncLogRow } = await import('@/lib/domain/accounting/sync-log-row')
+  refusals.push({ id: 'ref-x', type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', referenceId: 'po-9', scope: 'k-9', kind: 'landed_cost_cogs_journal', resolvedAt: new Date(), suppressedAt: new Date(), refusedCount: 1 })
+  const locks: string[] = []
+  const created: unknown[] = []
+  const client = {
+    $executeRaw: async (strings: TemplateStringsArray) => { locks.push(strings.join('?')); return 1 },
+    accountingPostingRefusal: postingRefusalTable,
+    accountingSyncLog: { create: async (args: unknown) => { created.push(args); return { id: 'row-1' } } },
+  }
+  const row = await createAccountingSyncLogRow(client as never, {
+    connector: 'xero', type: 'COGS_JOURNAL', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: 'po-9',
+    payload: { _idempotencyKey: 'k-9' },
+  } as never)
+  assert.equal(row, null)
+  assert.deepEqual(created, [], 'no row')
+  assert.equal(locks.length, 1, 'the per-key lock was taken before the suppression was read')
+  // CONTROL: a different posting on the same PO is written.
+  const other = await createAccountingSyncLogRow(client as never, {
+    connector: 'xero', type: 'COGS_JOURNAL', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: 'po-9',
+    payload: { _idempotencyKey: 'k-10' },
+  } as never)
+  assert.deepEqual(other, { id: 'row-1' })
 })

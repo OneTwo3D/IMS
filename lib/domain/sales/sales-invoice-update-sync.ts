@@ -64,7 +64,7 @@ type QueueAccountingSync = (params: {
   idempotencyKey: string
   chartConnector: 'xero' | 'quickbooks' | null
   documentConnector: 'xero' | 'quickbooks' | null
-}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued'; connector: string | null }>
+}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'; connector: string | null }>
 
 type LogActivity = (params: {
   entityType: 'SALES_ORDER'
@@ -154,7 +154,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
         'Re-save the order once the accounting connector selection has settled, or correct the invoice by hand '
-        + 'in the books its account codes belong to.',
+        + 'in the books its account codes belong to and mark this row handled — that stops IMS updating it too.',
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -198,8 +198,9 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       reason: 'unattributable_document_id',
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
-        'Re-post the invoice from this order so the document and the connector that issued it are recorded '
-        + 'together, then re-save the order.',
+        // o3d-j625 r7 (review H-A): r5 said "re-post the invoice from this order", which IMS does not offer.
+        'IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
+        + 'invoice by hand in the ledger that holds it, then mark this row handled — that stops IMS updating it too.',
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -268,7 +269,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
         'Re-save the order once the cause is resolved (see the accounting activity log), or correct the '
-        + 'invoice by hand in the ledger.',
+        + 'invoice by hand in the ledger and mark this row handled — that stops IMS updating it too.',
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector, enqueueReason: enqueued.reason ?? null },
     })
     return

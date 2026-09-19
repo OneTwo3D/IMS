@@ -22,20 +22,22 @@ export const ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL =
   + 'accounting connector changed while the document was being built, or a document id the posting names '
   + 'cannot be shown to belong to the connector it would post to. Nothing was sent. Each row says which posting '
   + 'is owed, which books it was built for, which connector is active now, what still stands in IMS, and what '
-  + 'to do. Rows marked "clears itself" have a path in IMS that raises the same posting again (a sweep, a '
-  + 're-save, a retry) and leave this list when it is queued; they cannot be dismissed. Rows marked "post it by '
-  + 'hand" have no such path: post it in the ledger, then mark the row handled.'
+  + 'to do. A row marked "clears itself" leaves this list when IMS queues the posting. Any other row can be marked '
+  + 'handled once you have posted it by hand: that records who did it, and IMS will then never post that posting '
+  + 'itself — its own retry is cancelled — so it cannot be posted twice.'
 
-/** o3d-j625 r6 (review H4): the prefix of the "How it clears" cell, per classification. */
+/** o3d-j625 r6/r7: the prefix of the "How it clears" cell, per classification. */
 export const ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL = {
   auto: 'Clears itself. ',
-  manual: 'Post it by hand, then mark it handled. ',
+  retried: 'IMS retries this, but the retry can get stuck. ',
+  manual: 'Nothing in IMS will post this. ',
 } as const
 
-/** o3d-j625 r6 (review H4): what the Mark-as-handled dialog tells the operator before they confirm. */
+/** o3d-j625 r6/r7: what the Mark-as-handled dialog tells the operator before they confirm. */
 export const ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING =
-  'Only once you have posted it by hand in the ledger. IMS will not raise this posting again, so this is how '
-  + 'the row leaves the list. If the same posting is refused again later it comes back as new work.'
+  'Mark this handled ONLY if you have posted it by hand in the ledger. Marking it means: "I posted this by hand; '
+  + 'IMS will not post it." IMS cancels its own retry of this posting and will refuse to post it from then on, so '
+  + 'it cannot reach the ledger twice. If IMS may already have posted it, you will be told, and nothing is changed.'
 
 /** o3d-j625 r6 (review H4): the heading detail of the recently-resolved list. */
 export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =

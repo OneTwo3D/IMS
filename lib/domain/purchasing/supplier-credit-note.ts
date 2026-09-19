@@ -292,7 +292,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
 export class SupplierCreditNoteEnqueueDeclined extends Error {
   constructor(
     readonly creditNoteId: string,
-    readonly reason: 'not-configured' | 'refused' | 'already-queued' | null = null,
+    readonly reason: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | null = null,
   ) {
     super(`The accounting queue declined a PURCHASE_CREDIT_NOTE for supplier credit note ${creditNoteId} (${reason ?? 'no reason reported'})`)
     this.name = 'SupplierCreditNoteEnqueueDeclined'

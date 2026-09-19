@@ -247,6 +247,16 @@ export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_871
 export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
 
 /**
+ * Per-POSTING-KEY serialization of "mark handled" against every automatic enqueue of that posting
+ * (o3d-j625 r7). Transaction-scoped. Taken by createAccountingSyncLogRow before it reads the suppression
+ * and creates the row, and by the mark-handled action before it cancels unposted rows and sets the
+ * suppression — so a row cannot be created between the mark's cancellation and its commit, which is the
+ * window in which a hand-posted journal would be posted a second time. 411_220_873 is retired (see below)
+ * and deliberately skipped.
+ */
+export const ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE = 411_220_874
+
+/**
  * The namespace the SESSION-LOCK-SPACE PROBE takes its key in (o3d-2k5r r26).
  *
  * Declared in `lib/db/database-url-schema.mjs` and re-exported here rather than written down twice:
@@ -289,6 +299,7 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
   ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
   ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
+  ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE,
   XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

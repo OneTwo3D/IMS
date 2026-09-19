@@ -987,7 +987,7 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground space-y-1">
                     {/* o3d-j625 r6 (review H4): the action exists ONLY on MANUAL-ONLY rows; the server refuses it on any other. */}
                     <div>{row.clearing ? ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL[row.clearing] : ''}{row.clearingNote ?? 'Unclassified.'}</div>
-                    {row.clearing === 'manual' ? (
+                    {row.clearing === 'manual' || row.clearing === 'retried' ? (
                       <Button
                         type="button"
                         variant="outline"

@@ -1285,9 +1285,12 @@ async function releaseHeldWcSalesInvoice(
       reason: enqueueOutcome.outcome?.reason === 'refused' ? 'retired_chart' : 'held_release_not_queued',
       committed: `WooCommerce order ${wcOrder.externalOrderNumber} is imported and holds invoice number ${invoiceNumber}`,
       remedy:
-        'No sales invoice will post for this order until the hold is released. Settle the accounting '
-        + 'connector selection and let the WooCommerce reconcile sweep retry, or queue the sales invoice '
-        + 'from the order.',
+        // o3d-j625 r7 (review H-A): r5 offered "queue the sales invoice from the order", which does not exist,
+        // and the sweep retries for the connector the invoice was BUILT for, so it refuses for ever after a
+        // permanent switch.
+        'No sales invoice will post for this order until the hold is released. The WooCommerce reconcile '
+        + 'sweep retries it for the connector it was built for, so switching back releases it. Otherwise raise '
+        + 'the invoice by hand in the ledger and mark this row handled — that stops the sweep posting it too.',
       detail: { invoiceNumber, idempotencyKey, shoppingSyncLogId: row.id },
     },
     // review M-5: when the facade already recorded this refusal with its specific reason, this write only

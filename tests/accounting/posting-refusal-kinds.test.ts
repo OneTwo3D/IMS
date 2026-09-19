@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { aliasesOf, balancedFrom, blankNonCode, callOpens, ownProperty, productionSources } from './paid-provenance-scan'
+import { renderPostingRefusalKindsDoc, POSTING_REFUSAL_KINDS_DOC_BEGIN, POSTING_REFUSAL_KINDS_DOC_END } from '@/lib/domain/accounting/posting-refusal-kinds-doc'
 import {
   POSTING_REFUSAL_KINDS,
   defaultPostingRefusalKind,
@@ -32,7 +33,17 @@ import {
 // ---------------------------------------------------------------------------------------------------
 type EnqueueSite = { file: string; line: number; type: string; referenceType: string; recordsRefusal: boolean }
 
-const ENQUEUES = ['queueAccountingSync', 'queueAccountingSyncTx', 'queueAccountingSyncTxWithOutcome']
+/**
+ * o3d-j625 r7 (review MEDIUM 1): EVERY way a posting is raised, not only the facade and the in-transaction
+ * enqueue — the connector queues, the follow-up enqueues and the row-creating primitive too. r6 read only
+ * the first three, per FILE, so a second producer of a "manual" posting in a file already listed stayed
+ * green (the reviewer's X1).
+ */
+const OBJECT_ENQUEUES = [
+  'queueAccountingSync', 'queueAccountingSyncTx', 'queueAccountingSyncTxWithOutcome',
+  'queueXeroSync', 'queueQuickBooksSync', 'createAccountingSyncLogRow',
+]
+const POSITIONAL_ENQUEUES = ['enqueueFollowUpSyncLog']
 
 function literal(value: string | null): string | null {
   const m = value?.trim().match(/^'([^']*)'(?:\s+as\s+const)?$/)
@@ -52,18 +63,40 @@ function identityProperty(code: string, source: string, objectText: string, key:
   return null
 }
 
-function enqueueSites(): EnqueueSite[] {
+/** Split a balanced argument list `( … )` at its top-level commas, returning the SOURCE text of each. */
+function topLevelArgs(args: string, source: string, open: number): string[] {
+  const out: string[] = []
+  let depth = 0
+  let start = 1
+  for (let i = 1; i < args.length - 1; i++) {
+    const ch = args[i]!
+    if ('([{'.includes(ch)) depth++
+    else if (')]}'.includes(ch)) depth--
+    else if (ch === ',' && depth === 0) { out.push(source.slice(open + start, open + i).trim()); start = i + 1 }
+  }
+  out.push(source.slice(open + start, open + args.length - 1).trim())
+  return out.filter((a) => a !== '')
+}
+
+function enqueueSitesIn(files: Array<[string, string]>): EnqueueSite[] {
   const sites: EnqueueSite[] = []
-  for (const [file, source] of productionSources()) {
+  for (const [file, source] of files) {
+    if (file === 'lib/domain/accounting/sync-log-row.ts') continue // the primitive's own declaration
     const code = blankNonCode(source)
-    const names = ENQUEUES.flatMap((name) => [name, ...aliasesOf(code, name)])
-    for (const { at, open, name } of callOpens(code, names)) {
+    const objectNames = OBJECT_ENQUEUES.flatMap((name) => [name, ...aliasesOf(code, name)])
+    const positionalNames = POSITIONAL_ENQUEUES.flatMap((name) => [name, ...aliasesOf(code, name)])
+    for (const { at, open, name } of callOpens(code, [...objectNames, ...positionalNames])) {
       if (/(?:^|[^\w$])function\s+$/.test(code.slice(0, at))) continue
       const args = balancedFrom(code, open)
+      const line = source.slice(0, at).split('\n').length
+      if (positionalNames.includes(name)) {
+        const [type, referenceType] = topLevelArgs(args, source, open)
+        sites.push({ file, line, type: literal(type ?? null) ?? '(dynamic)', referenceType: literal(referenceType ?? null) ?? '(dynamic)', recordsRefusal: false })
+        continue
+      }
       const objectAt = args.indexOf('{')
       if (objectAt === -1) continue
       const blanked = balancedFrom(args, objectAt)
-      // Read literals from the SOURCE text of the same span (strings are blank in `code`).
       const start = open + objectAt
       const objectText = source.slice(start, start + blanked.length)
       const type = literal(identityProperty(code, source, objectText, 'type'))
@@ -73,16 +106,14 @@ function enqueueSites(): EnqueueSite[] {
       const injectedTx = /(?:^|[^\w$])options\.$/.test(code.slice(Math.max(0, at - 20), at))
       const isFacade = !injectedTx && (name === 'queueAccountingSync' || aliasesOf(code, 'queueAccountingSync').includes(name))
       const asks = /recordRefusalAsOutstanding:\s*true/.test(objectText)
-      sites.push({
-        file,
-        line: source.slice(0, at).split('\n').length,
-        type: type ?? '(dynamic)',
-        referenceType: referenceType ?? '(dynamic)',
-        recordsRefusal: isFacade || asks,
-      })
+      sites.push({ file, line, type: type ?? '(dynamic)', referenceType: referenceType ?? '(dynamic)', recordsRefusal: isFacade || asks })
     }
   }
   return sites
+}
+
+function enqueueSites(): EnqueueSite[] {
+  return enqueueSitesIn(productionSources())
 }
 
 /** The two facade sites whose posting is a runtime value, and what they can raise (read from their producers). */
@@ -191,35 +222,47 @@ test('[o3d-j625 r6 H4] the census FIRES on a computed or unknown kind', () => {
 // SAME posting (same key) is raised again; since r6 the row that path creates clears the refusal.
 // ---------------------------------------------------------------------------------------------------
 const AUTO_PROOFS: Record<string, Array<[string, string]>> = {
-  sales_invoice_held_release: [['tests/connectors/wc-held-release-sweep.test.ts', '[o3d-j625 r6 H4] a refused held release is raised again, under the SAME posting key, by the next sweep']],
-  sales_invoice_update: [['tests/domain/sales/sales-invoice-update-sync.test.ts', '[o3d-j625 r6 H4] re-saving the order raises the SAME posting']],
-  purchase_invoice_update: [['tests/domain/purchasing/purchase-invoice-update-sync.test.ts', '[o3d-j625 r6 H2/H3] bill B']],
   tax_rate_sync: [['tests/accounting/posting-refusal-inbox.test.ts', '[o3d-j625 r6 H4] saving the tax rate again raises the SAME posting']],
-  invoice_payment_receipt: [
-    ['tests/accounting/invoice-payment-document-provenance.test.ts', '[o3d-j625 r5 HIGH 3]'],
-    ['tests/accounting/deferred-receipt-redrive-wiring.test.ts', ''],
-  ],
-  credit_note_allocation: [['tests/connectors/xero-followup-origin-inheritance.test.ts', 'o3d-j625 r6 H3: a refused allocation leaves the inbox when a later sweep queues it']],
-  unrealised_fx_journal: [['tests/accounting/fx-revaluation-refusal-and-connector-scope.test.ts', '[o3d-j625 r6 H4] a refused revaluation is raised again, under the SAME posting key, by re-running the date']],
-  landed_cost_cogs_journal: [['tests/domain/purchasing/landed-cost-journal-outbox.test.ts', '[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings']],
-  landed_cost_transit_journal: [['tests/domain/purchasing/landed-cost-journal-outbox.test.ts', '[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings']],
-  refund_credit_note: [['tests/domain/sales/refund-service.test.ts', '[o3d-j625 r6 H4] Retry refund accounting raises the SAME refund postings']],
-  refund_cogs_reversal: [['tests/domain/sales/refund-service.test.ts', '[o3d-j625 r6 H4] Retry refund accounting raises the SAME refund postings']],
-  refund_unearned_reversal: [['tests/domain/sales/refund-service.test.ts', '[o3d-j625 r6 H4] Retry refund accounting raises the SAME refund postings']],
 }
 
 function testText(file: string): string {
   return readFileSync(join(process.cwd(), file), 'utf8')
 }
 
-test('[o3d-j625 r6 H4] every AUTO kind rests on a test that drives its re-queue path', () => {
+/**
+ * o3d-j625 r7 (review MEDIUM 1): a proof is a TEST, named by its full title and declared as one. r6 checked
+ * `includes(title)`, so an entry with a blank title matched every file and could not fail.
+ */
+function declaresTest(text: string, title: string): boolean {
+  if (title.trim() === '') return false
+  const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "\\\\?'")
+  return new RegExp(`(?:^|\\n)\\s*test\\(\\s*['\`]${escaped}`).test(text)
+}
+
+test('[o3d-j625 r6/r7 H4] every AUTO kind rests on a test that drives its re-queue path — named in full, declared as a test', () => {
   const autoKinds = (Object.keys(POSTING_REFUSAL_KINDS) as PostingRefusalKind[]).filter((k) => POSTING_REFUSAL_KINDS[k].clearing === 'auto')
   assert.deepEqual(autoKinds.filter((k) => !(k in AUTO_PROOFS)), [], 'AUTO kinds with no proof named')
   for (const [kind, proofs] of Object.entries(AUTO_PROOFS)) {
     assert.equal(POSTING_REFUSAL_KINDS[kind as PostingRefusalKind]?.clearing, 'auto', `${kind} is listed as AUTO here and is not`)
+    assert.ok(proofs.length > 0, `${kind}: no proof`)
     for (const [file, title] of proofs) {
-      assert.ok(testText(file).includes(title), `${kind}: the proof "${title}" is not in ${file}`)
+      assert.ok(declaresTest(testText(file), title), `${kind}: no test titled "${title}" in ${file}`)
     }
+  }
+})
+
+test('[o3d-j625 r7] the proof check FIRES on a blank title and on a title that is only mentioned, not declared', () => {
+  const text = "test('a real proof', () => {})\n// mentions 'another title' in a comment\n"
+  assert.equal(declaresTest(text, ''), false, 'blank')
+  assert.equal(declaresTest(text, '   '), false, 'whitespace')
+  assert.equal(declaresTest(text, 'another title'), false, 'mentioned, not declared')
+  assert.equal(declaresTest(text, 'a real proof'), true)
+})
+
+test('[o3d-j625 r7] every kind that is not AUTO is markable, and no AUTO kind is', async () => {
+  const { postingRefusalMarkable } = await import('@/lib/domain/accounting/posting-refusal-kinds')
+  for (const [kind, spec] of Object.entries(POSTING_REFUSAL_KINDS)) {
+    assert.equal(postingRefusalMarkable(kind), spec.clearing !== 'auto', kind)
   }
 })
 
@@ -227,35 +270,65 @@ test('[o3d-j625 r6 H4] every AUTO kind rests on a test that drives its re-queue 
 // MANUAL: nothing else raises the posting. Each kind names the files whose enqueues raise its
 // (type, referenceType); any other producer fails here until the kind is reconsidered.
 // ---------------------------------------------------------------------------------------------------
-const MANUAL_PRODUCERS: Record<string, string[]> = {
-  sales_invoice_order: ['app/actions/sales.ts', 'lib/connectors/woocommerce/sync/order-import.ts'],
-  sales_invoice_import: ['app/actions/sales.ts', 'lib/connectors/woocommerce/sync/order-import.ts'],
-  stock_adjustment_journal: ['lib/domain/inventory/stock-adjustment-apply.ts'],
-  purchase_order_cancellation_reversal: ['lib/domain/purchasing/cancellation-service.ts'],
-  supplier_return_reversal: ['app/actions/purchase-orders.ts'],
-  stock_receipt_journal: ['app/actions/purchase-orders.ts'],
-  purchase_invoice: ['app/actions/purchase-orders.ts'],
-  realised_fx_bill_payment: ['app/actions/purchase-orders.ts'],
-  realised_fx_receipt: ['app/actions/sales.ts'],
-  manufacturing_journal: ['app/actions/manufacturing.ts'],
-  manufacturing_reclass: ['app/actions/manufacturing.ts'],
-  allocation_reversal: ['lib/domain/sales/allocation-service.ts'],
-  landed_cost_cogs_journal_direct: ['lib/domain/purchasing/landed-cost-service.ts'],
-  landed_cost_transit_journal_direct: ['lib/domain/purchasing/landed-cost-service.ts'],
+/**
+ * Per CALL SITE (o3d-j625 r7, review MEDIUM 1): the number of producing call sites in each file, so a second
+ * producer in a file that is already listed changes the count and fails the test.
+ */
+const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
+  sales_invoice_order: { 'app/actions/sales.ts': 1, 'lib/connectors/woocommerce/sync/order-import.ts': 2, 'lib/domain/accounting/invoice-payment-enqueue.ts': 0 },
+  sales_invoice_import: { 'app/actions/sales.ts': 1, 'lib/connectors/woocommerce/sync/order-import.ts': 2 },
+  stock_adjustment_journal: { 'lib/domain/inventory/stock-adjustment-apply.ts': 1 },
+  purchase_order_cancellation_reversal: { 'lib/domain/purchasing/cancellation-service.ts': 1 },
+  supplier_return_reversal: { 'app/actions/purchase-orders.ts': 1 },
+  stock_receipt_journal: { 'app/actions/purchase-orders.ts': 1 },
+  purchase_invoice: { 'app/actions/purchase-orders.ts': 1 },
+  realised_fx_bill_payment: { 'app/actions/purchase-orders.ts': 1 },
+  realised_fx_receipt: { 'app/actions/sales.ts': 1 },
+  manufacturing_journal: { 'app/actions/manufacturing.ts': 1 },
+  manufacturing_reclass: { 'app/actions/manufacturing.ts': 1 },
+  allocation_reversal: { 'lib/domain/sales/allocation-service.ts': 1 },
 }
 
-test('[o3d-j625 r6 H4] every MANUAL kind\'s posting is raised only by the sites that refused it', () => {
+function producerCounts(sites: EnqueueSite[], type: string, referenceType: string): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const site of sites) {
+    if (site.type === type && site.referenceType === referenceType) counts[site.file] = (counts[site.file] ?? 0) + 1
+  }
+  return counts
+}
+
+const nonZero = (counts: Record<string, number>) => Object.fromEntries(Object.entries(counts).filter(([, n]) => n > 0).sort())
+
+test('[o3d-j625 r6/r7 H4] every MANUAL kind\'s posting is raised only by the call sites that refused it', () => {
   const sites = enqueueSites()
+  console.log(`[o3d-j625 r7] producing call sites read: ${sites.length}; dynamic: ${sites.filter((s) => s.type === '(dynamic)').length}`)
   const manualKinds = (Object.keys(POSTING_REFUSAL_KINDS) as PostingRefusalKind[]).filter((k) => POSTING_REFUSAL_KINDS[k].clearing === 'manual')
   assert.deepEqual(manualKinds.filter((k) => !(k in MANUAL_PRODUCERS)), [], 'MANUAL kinds with no producer list')
   for (const kind of manualKinds) {
     const spec = POSTING_REFUSAL_KINDS[kind]
-    const producers = [...new Set(sites.filter((s) => s.type === spec.type && s.referenceType === spec.referenceType).map((s) => s.file))].sort()
-    assert.ok(producers.length > 0, `${kind}: PRECONDITION — its producing enqueue was found`)
-    assert.deepEqual(producers, [...MANUAL_PRODUCERS[kind]!].sort(),
-      `${kind}: a new enqueue raises ${spec.type}/${spec.referenceType}. If it raises the SAME posting again, this `
-      + 'kind now clears itself and must become AUTO (with a proof); if it raises a different one, add its file here.')
+    const found = producerCounts(sites, spec.type, spec.referenceType)
+    assert.ok(Object.keys(found).length > 0, `${kind}: PRECONDITION — its producing call site was found`)
+    assert.deepEqual(nonZero(found), nonZero(MANUAL_PRODUCERS[kind]!),
+      `${kind}: the call sites raising ${spec.type}/${spec.referenceType} changed. If a new one raises the SAME `
+      + 'posting again, this kind is retried by IMS and must become `retried`; otherwise add it here.')
   }
+})
+
+test('[o3d-j625 r7] X1: a SECOND producer in a file that is already listed is caught', () => {
+  const file = 'app/actions/manufacturing.ts'
+  const one = enqueueSitesIn([[file, `
+    await queueAccountingSyncTx(tx, { type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id, payload, chartConnector })
+  `]])
+  const two = enqueueSitesIn([[file, `
+    await queueAccountingSyncTx(tx, { type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id, payload, chartConnector })
+    await enqueueFollowUpSyncLog('MANUFACTURING_JOURNAL', 'ProductionOrder', id, payload, origin)
+    await createAccountingSyncLogRow(tx, { connector: 'xero', type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id })
+    await queueXeroSync({ type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: id, payload })
+  `]])
+  assert.deepEqual(producerCounts(one, 'MANUFACTURING_JOURNAL', 'ProductionOrder'), { [file]: 1 })
+  assert.deepEqual(producerCounts(two, 'MANUFACTURING_JOURNAL', 'ProductionOrder'), { [file]: 4 },
+    'a follow-up, a primitive call and a direct connector queue each count as a producer')
+  assert.notDeepEqual(nonZero(producerCounts(two, 'MANUFACTURING_JOURNAL', 'ProductionOrder')), nonZero(MANUAL_PRODUCERS.manufacturing_journal!))
 })
 
 // The daily batches and follow-ups create rows too, but never record a refusal (they are not refusal
@@ -271,4 +344,13 @@ function walkTests(dir: string, out: string[] = []): string[] {
 test('[o3d-j625 r6 H4] PRECONDITION: the proofs named above are in files this suite runs', () => {
   const all = walkTests(join(process.cwd(), 'tests')).map((path) => path.slice(process.cwd().length + 1))
   for (const proofs of Object.values(AUTO_PROOFS)) for (const [file] of proofs) assert.ok(all.includes(file), file)
+})
+
+test('[o3d-j625 r7] help-docs/xero-sync.md carries exactly the classification the code enforces', () => {
+  const doc = readFileSync(join(process.cwd(), 'help-docs/xero-sync.md'), 'utf8')
+  const a = doc.indexOf(POSTING_REFUSAL_KINDS_DOC_BEGIN)
+  const b = doc.indexOf(POSTING_REFUSAL_KINDS_DOC_END)
+  assert.ok(a >= 0 && b > a, 'PRECONDITION: the generated block is in the doc')
+  assert.equal(doc.slice(a, b + POSTING_REFUSAL_KINDS_DOC_END.length), renderPostingRefusalKindsDoc(),
+    'the operator doc disagrees with posting-refusal-kinds.ts — regenerate it from renderPostingRefusalKindsDoc()')
 })

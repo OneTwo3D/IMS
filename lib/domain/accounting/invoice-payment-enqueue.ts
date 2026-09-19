@@ -936,8 +936,8 @@ export function describeInvoicePaymentRefusal(params: {
           + `An accounting invoice id is a document id in the accounting system's own database and it is `
           + `kept when the connector selection changes, so it must not be assumed to belong to whichever `
           + `connector is active now — paying against the wrong one either fails or settles an unrelated `
-          + `document. The payment was NOT registered. Re-post the invoice from this order so the document `
-          + `and its connector are recorded together. ${remedy}`,
+          + `document. The payment was NOT registered, and IMS will not register it while the invoice's connector `
+          + `is unknown. ${remedy}`,
         metadata: withLedger,
       }
     // o3d-0m56: an earlier attempt on this order is FAILED or CANCELLED and the ledger could not be
@@ -1541,9 +1541,10 @@ export async function registerInvoicePaymentWithLedger(params: {
           // either can double a payment already queued. What is stated is the CONFIGURATION to correct,
           // which is safe to repeat, and the receipt's own remedy comes from invoicePaymentRemedyNote in
           // the warning beside this row.
-          'IMS cannot establish which accounting connector holds the invoice this payment would settle. '
-          + 'Re-post the invoice from this order so the document and the connector that issued it are '
-          + 'recorded together.',
+          // o3d-j625 r7 (review H-A): r5 said "re-post the invoice from this order", which IMS does not offer.
+          'IMS cannot establish which accounting connector holds the invoice this payment would settle, so it '
+          + 'will not register the payment. Once it is recorded in the ledger that holds the invoice, mark this '
+          + 'row handled; that cancels IMS\'s own attempt at the payment.',
         detail: { paymentId: params.paymentId, accountingInvoiceConnector: so.accountingInvoiceConnector },
       })
       await reportRefusal({
@@ -1707,7 +1708,7 @@ export async function registerInvoicePaymentWithLedger(params: {
       // report it, because a payment queued to a ledger nobody reckoned it against is what this whole
       // path exists to prevent.
       if (pinned && enqueued.queued && enqueued.connector !== pinned.connector) {
-        throw new PinnedConnectorMoved(enqueued.connector, enqueued.reason === 'already-queued')
+        throw new PinnedConnectorMoved(enqueued.connector, enqueued.reason === 'already-queued' || enqueued.reason === 'handled-by-hand')
       }
       return enqueued.queued ? ('queued' as const) : ('context-changed' as const)
     }, STOCK_TX_OPTIONS)

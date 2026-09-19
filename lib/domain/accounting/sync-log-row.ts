@@ -2,6 +2,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { lockPostingKey, readPostingSuppression, reportSuppressedPosting, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 
 /**
  * o3d-j625 r6 (review H3) — THE ONE PLACE AN ACCOUNTING SYNC ROW IS CREATED, AND THEREFORE THE ONE PLACE A
@@ -28,6 +29,11 @@ export type SyncLogRowClient = {
   accountingSyncLog: { create(args: { data: Prisma.AccountingSyncLogUncheckedCreateInput }): Promise<{ id: string }> }
 }
 
+/**
+ * Returns the created row, or `null` when the posting was MARKED HANDLED — posted by hand — in which case
+ * nothing is written and the refusal is reported (o3d-j625 r7). The `null` is in the return type so that
+ * every caller has to decide what "already posted by hand" means for it; none can post around it.
+ */
 export async function createAccountingSyncLogRow<T extends { id: string }>(
   client: SyncLogRowClient,
   data: Prisma.AccountingSyncLogUncheckedCreateInput,
@@ -38,17 +44,25 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
      */
     createInSavepoint?: boolean
   },
-): Promise<T> {
+): Promise<T | null> {
+  const key = accountingPostingKeyForRow({
+    type: String(data.type),
+    referenceType: data.referenceType,
+    referenceId: data.referenceId,
+    payload: data.payload,
+  })
+  // o3d-j625 r7: the mark-handled suppression, read under the same per-key lock the mark takes.
+  await lockPostingKey(client as unknown as PostingSuppressionClient, key)
+  const suppression = await readPostingSuppression(client as unknown as PostingSuppressionClient, key)
+  if (suppression.suppressed) {
+    await reportSuppressedPosting(key, suppression)
+    return null
+  }
   const create = () => client.accountingSyncLog.create({ data }) as Promise<T>
   const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
   await clearAccountingPostingRefusal(
     client as unknown as PostingRefusalClient,
-    accountingPostingKeyForRow({
-      type: String(data.type),
-      referenceType: data.referenceType,
-      referenceId: data.referenceId,
-      payload: data.payload,
-    }),
+    key,
     { withSavepoint: <R,>(fn: () => Promise<R>) => withSavepoint(client, fn) },
   )
   return row

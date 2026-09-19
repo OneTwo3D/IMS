@@ -55,6 +55,11 @@ export type PostingRefusalClient = {
       update: Record<string, unknown>
     }): Promise<unknown>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
+    /** o3d-j625 r7: read to honour a suppression (a posting marked handled). Optional for older doubles. */
+    findUnique?(args: {
+      where: { type_referenceType_referenceId_scope: PostingRefusalKey }
+      select: { suppressedAt: true; resolvedBy: true }
+    }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null } | null>
   }
 }
 
@@ -138,6 +143,30 @@ export async function recordAccountingPostingRefusal(
 ): Promise<void> {
   const now = new Date()
   await guarded('recording', key, options, async () => {
+    // o3d-j625 r7 — A POSTING MARKED HANDLED STAYS HANDLED. Someone asserted they posted it by hand, and
+    // IMS will never post it (posting-suppression.ts), so a later refusal of the same key is not new
+    // debt: recording it would reopen a row whose only remedy has already been carried out. Reported, not
+    // recorded. (A mark committing between this read and the upsert below would leave the row reopened;
+    // the suppression column is not in the upsert, so it survives, and nothing can be posted twice.)
+    const existing = typeof client.accountingPostingRefusal.findUnique === 'function'
+      ? await client.accountingPostingRefusal.findUnique({
+        where: { type_referenceType_referenceId_scope: key },
+        select: { suppressedAt: true, resolvedBy: true },
+      })
+      : null
+    if (existing?.suppressedAt) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_posting_refused_after_handled_by_hand',
+        tag: 'accounting',
+        level: 'INFO',
+        description:
+          `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled — `
+          + `posted by hand — on ${existing.suppressedAt.toISOString()}. Nothing is owed and nothing was recorded.`,
+        metadata: { ...key, reason: record.reason },
+      }).catch(() => { /* nothing else to try */ })
+      return
+    }
     if (!options?.mergeOnly) {
       // review M-13: a resolved row being refused again is a NEW episode. Reset before the increment, so
       // `firstRefusedAt` is when THIS gap opened and the count is this episode's.
@@ -214,28 +243,4 @@ export async function clearAccountingPostingRefusal(
       data: { resolvedAt: new Date(), resolution: 'queued' },
     })
   })
-}
-
-/**
- * o3d-j625 r6 (review H4; owner decision 2026-09-18) — MARK A MANUAL-ONLY ROW HANDLED.
- *
- * ONE CONDITIONAL UPDATE, so the checks and the write cannot be separated: the row must still be
- * outstanding (`resolvedAt: null`) and of a MANUAL kind. A double-click or two operators at once therefore
- * resolve it once — the second update matches nothing and is told so — and an AUTO row, or a row with no
- * kind, can never be closed by hand however the request is made. Returns how many rows it resolved (0 or 1).
- */
-export async function markAccountingPostingRefusalHandled(
-  client: { accountingPostingRefusal: { updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }> } },
-  params: { id: string; manualKinds: readonly string[]; userId: string; note: string | null; now?: Date },
-): Promise<number> {
-  const result = await client.accountingPostingRefusal.updateMany({
-    where: { id: params.id, resolvedAt: null, kind: { in: [...params.manualKinds] } },
-    data: {
-      resolvedAt: params.now ?? new Date(),
-      resolution: 'handled_manually',
-      resolvedBy: params.userId,
-      resolutionNote: params.note,
-    },
-  })
-  return result.count
 }

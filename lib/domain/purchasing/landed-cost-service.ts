@@ -786,13 +786,6 @@ export type LandedCostJournalRunOutcome = { owed: number }
 
 export async function queueLandedCostAdjustmentJournals(
   adjustments: LandedCostRecalcResult,
-  /**
-   * o3d-j625 r6 (review H4) — WHO RETRIES AN OWED JOURNAL. The landed-cost journal OUTBOX re-runs a
-   * recalculation whose journals are still owed (it keeps the work item and retries), so its refusals clear
-   * themselves. The direct callers (a PO edit, a freight PO, a cancellation) run once and nothing re-runs
-   * them, so their refusals are posted by hand and marked handled. The two differ only in the caller.
-   */
-  options: { retriedByOutbox?: boolean } = {},
 ): Promise<LandedCostJournalRunOutcome> {
   const settings = await getAccountingSettings()
   let owed = 0
@@ -863,16 +856,17 @@ export async function queueLandedCostAdjustmentJournals(
         entityId: adj.primaryPoId,
         action: 'landed_cost_reclass_not_queued',
         // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
-        kind: options.retriedByOutbox ? 'landed_cost_transit_journal' : 'landed_cost_transit_journal_direct',
+        // o3d-j625 r7 (review H-B): ONE kind whoever raised it. The direct callers (a PO edit, a freight PO, a
+        // cancellation) schedule the landed-cost outbox too, and it retries this SAME posting — r6 called
+        // their refusals manual-only, so a hand-posted journal was then posted again by the outbox.
+        kind: 'landed_cost_transit_journal',
         posting: `the landed-cost inventory/transit reclass for ${adj.primaryPoRef}`,
         committed: 'the landed cost is applied to the stock on hand in IMS',
         // r6 (review H4): the outbox retries its own; posting that one by hand as well would post it twice.
-        remedy: options.retriedByOutbox
-          ? 'Inventory and goods-in-transit in the ledger no longer match IMS for this order until the '
-            + 'landed-cost journal outbox retries it, which it does once the accounting connector selection '
-            + 'has settled. Do not post it by hand.'
-          : 'Inventory and goods-in-transit in the ledger no longer match IMS for this order. Post the '
-            + 'reclass by hand.',
+        remedy:
+          'Inventory and goods-in-transit in the ledger no longer match IMS for this order. The landed-cost '
+          + 'journal outbox retries it once the accounting connector selection has settled; if it has given up, '
+          + 'post the reclass by hand and mark this row handled, which stops IMS posting it too.',
         outcome: postingOutcome.outcome,
         metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
       })
@@ -958,15 +952,14 @@ export async function queueLandedCostAdjustmentJournals(
         entityId: adj.primaryPoId,
         action: 'landed_cost_cogs_journal_not_queued',
         // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
-        kind: options.retriedByOutbox ? 'landed_cost_cogs_journal' : 'landed_cost_cogs_journal_direct',
+        kind: 'landed_cost_cogs_journal',
         posting: `the retrospective COGS adjustment for ${adj.primaryPoRef}`,
         committed: 'the landed-cost change is applied to the sold units in IMS',
-        remedy: options.retriedByOutbox
-          ? 'COGS in the ledger does not reflect this landed-cost change until the landed-cost journal '
-            + 'outbox retries it, which it does once the accounting connector selection has settled. Do not '
-            + 'post it by hand.'
-          : 'COGS in the ledger does not reflect this landed-cost change and the freight liability will '
-            + 'not drain out of goods-in-transit. Post the adjustment by hand.',
+        remedy:
+          'COGS in the ledger does not reflect this landed-cost change and the freight liability will not drain '
+          + 'out of goods-in-transit. The landed-cost journal outbox retries it once the accounting connector '
+          + 'selection has settled; if it has given up, post the adjustment by hand and mark this row handled, '
+          + 'which stops IMS posting it too.',
         outcome: cogsPostingOutcome.outcome,
         metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
       })
