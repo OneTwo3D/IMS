@@ -67,6 +67,25 @@ function loadEnv() {
 type Fixture = Awaited<ReturnType<typeof seed>>
 
 /**
+ * Every order this file seeded. They are deleted when the file ends, with their shipments: a journaled
+ * shipment with no mirrored accounting event is exactly what the reconciliation reports, and the
+ * database-backed tier that runs after this one on the same scratch database counts those findings.
+ */
+const seededOrderIds: string[] = []
+
+async function deleteSeededOrders() {
+  if (seededOrderIds.length === 0) return
+  const { db } = await import('@/lib/db')
+  const shipments = await db.shipment.findMany({ where: { orderId: { in: seededOrderIds } }, select: { id: true } })
+  const shipmentIds = shipments.map((shipment) => shipment.id)
+  await db.shipmentLine.deleteMany({ where: { shipmentId: { in: shipmentIds } } })
+  await db.shipment.deleteMany({ where: { id: { in: shipmentIds } } })
+  await db.salesOrderLine.deleteMany({ where: { orderId: { in: seededOrderIds } } })
+  const deleted = await db.salesOrder.deleteMany({ where: { id: { in: seededOrderIds } } })
+  assert.equal(deleted.count, seededOrderIds.length, 'the seeded orders were not all removed')
+}
+
+/**
  * One unit bought at 4.00, shipped AND journaled (Group B posted COGS 4.00), and a credit cost line
  * of `credit` — on a linked freight PO (`where: 'freight'`) or on the goods PO itself (`'direct'`).
  * Nothing is recalculated here.
@@ -120,6 +139,7 @@ async function seed(label: string, where: 'freight' | 'direct', credit: number) 
     },
     include: { lines: true },
   })
+  seededOrderIds.push(order.id)
   const shipment = await db.shipment.create({
     data: {
       orderId: order.id, warehouseId: warehouse.id, status: 'SHIPPED', shippedAt: now,
@@ -189,6 +209,7 @@ test('o3d-c08y: a revaluation that would take a journaled shipment below zero is
   loadEnv()
   await assertScratchDatabaseBeforeAnyWrite()
   const { JournaledShipmentRevaluationRefusedError } = await import('@/lib/cost-layers')
+  t.after(deleteSeededOrders)
 
   await t.test('POSITIVE CONTROL: a credit that leaves the basis positive revalues the journaled shipment', async () => {
     const fixture = await seed('ctl', 'freight', -2)
