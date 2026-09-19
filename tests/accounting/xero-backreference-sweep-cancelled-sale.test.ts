@@ -361,9 +361,9 @@ test('o3d-e2mz r8: the sale is read UNDER ITS ROW LOCK, after the probe and befo
     //     the back-reference write, which is the point: it guards the follow-up rows, not the sale.
     //   • the trailing probe — the shared sweep's own post-write verification (o3d-9kek).
     // What this pins is the PREFIX: nothing is written before the lock and the status read behind it.
-    //   • `posting-key-lock` — o3d-j625 r7: the row-creating primitive's lock on the posting key, taken
-    //     before it reads whether the posting was marked handled; after the scope lock, before the create.
-    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'scope-lock', 'posting-key-lock', 'probe:order-1'],
+    //   • `posting-key-lock` ×2 — o3d-j625 r7: the row-creating primitive's lock on the posting key, taken
+    //     before it reads whether the posting was marked handled — once per follow-up row it creates.
+    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'scope-lock', 'posting-key-lock', 'posting-key-lock', 'probe:order-1'],
     'probe, then LOCK, then the status read, and only then the first write',
   )
 })
