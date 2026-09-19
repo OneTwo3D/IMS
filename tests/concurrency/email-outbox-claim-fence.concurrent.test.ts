@@ -494,8 +494,8 @@ test(
           ['worker-A', 'worker-B'],
           'the reclaim itself costs a duplicate delivery, and no fence can prevent that one. NOT "at most '
           + 'one" (r37, Codex r36 HIGH 2): this interleaving has two workers, so two copies is what THIS '
-          + 'scenario costs. A reclaim resets the window, so a third worker can reclaim the second one a '
-          + 'window later (lib/email-outbox.ts, o3d-hpeg)',
+          + 'scenario costs. A reclaim resets the window, and since o3d-hpeg a third worker is REFUSED a '
+          + 'second reclaim and parks the row instead (lib/email-outbox.ts, EMAIL_MAX_STALE_RECLAIMS)',
         )
 
         assert.equal(workerA.conflicted, 1, "worker A's refusal is recorded rather than silent")
@@ -513,6 +513,172 @@ test(
         assert.equal(after.processingStartedAt, null)
         assert.equal(after.lockedBy, null, 'a settled row holds no claim')
         assert.equal(after.attempts, 0, "A's attempts+1 never landed either")
+      })
+
+      // -------------------------------------------------------------------------------------------
+      // o3d-hpeg — THE RECLAIM CAP, ENFORCED BY THE STATEMENT, AGAINST REAL POSTGRES.
+      //
+      // The in-memory arms in tests/email-outbox-claim-fence.test.ts show the drain's logic; these show
+      // what only Postgres can: that the cap in the reclaim's WHERE is re-evaluated against the row as
+      // it stands when the lock is granted, so no interleaving of reclaimers gets past it.
+      // -------------------------------------------------------------------------------------------
+      await t.test('o3d-hpeg: two reclaimers racing on a stale row — exactly one wins, and it is counted once', async () => {
+        // WHAT THIS DOES AND DOES NOT PROVE. Two drains race on the same stale row at count 0: one
+        // reclaim lands, the other is re-evaluated against the committed row and matches nothing.
+        // That refusal is carried by the STALENESS predicate as well as the cap (the winner's new
+        // claim instant is not stale), so moving the cap out of the statement does NOT turn this red
+        // — run and confirmed. What it pins is "one winner, counted once". The proof that the cap
+        // itself is enforced by the statement is the NEXT test, where the row the loser meets is
+        // stale again and only the cap can refuse it.
+        const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+        const t0 = new Date()
+        const deliveries: string[] = []
+        await lane.db.emailOutbox.deleteMany({})
+        const row = await lane.db.emailOutbox.create({
+          data: {
+            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'cap race probe', html: 'queued',
+            referenceType: 'SalesOrder', referenceId: `cap-race-${randomUUID().slice(0, 8)}`,
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+          },
+        })
+        const client = laneHarnessClient(lane)
+        const later = new Date(t0.getTime() + RECLAIM_AFTER_MS)
+        const worker = (name: string) => drainWith(processPendingEmailOutbox, {
+          client,
+          now: () => later,
+          prepareQueuedEmail: noPrepare,
+          logActivity: noLog,
+          async sendEmail() {
+            deliveries.push(name)
+            return { success: true }
+          },
+        })
+
+        const [b, c] = await Promise.all([worker('worker-B'), worker('worker-C')])
+
+        assert.equal(b.processed + c.processed, 1, 'exactly one of the two racing reclaimers took the row')
+        assert.equal(deliveries.length, 1, `exactly one entered the sender: ${JSON.stringify(deliveries)}`)
+        assert.equal(b.parked + c.parked, 0, 'the loser did not park a row that had just been legitimately reclaimed')
+        const after = await lane.db.emailOutbox.findUniqueOrThrow({ where: { id: row.id } })
+        assert.equal(after.staleReclaimCount, 1, 'the one reclaim was counted, once')
+        assert.equal(after.status, 'SENT')
+      })
+
+      await t.test('o3d-hpeg: a reclaim that landed after the sweep is SEEN by the statement — the sweeper is refused and parks the row', async () => {
+        // THE INTERLEAVING A CAP ON THE SWEPT COPY WOULD MISS. B sweeps the stale row while its count
+        // is 0 and then blocks on the row lock this test holds. Inside that lock, C's reclaim lands
+        // (count 0 -> 1, a new claim instant that is itself stale by B's clock) and commits. B's
+        // reclaim is then re-evaluated against the committed row: with the cap in its WHERE it matches
+        // nothing and B parks the row; with a cap checked on B's swept copy it would reclaim a second
+        // time and enter the sender.
+        const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+        const { default: pg } = await import('pg')
+        const t0 = new Date(Date.now() - 60 * 60_000)
+        const tC = new Date(t0.getTime() + RECLAIM_AFTER_MS)
+        const tB = new Date(t0.getTime() + 40 * 60_000)
+        const deliveries: string[] = []
+        await lane.db.emailOutbox.deleteMany({})
+        const row = await lane.db.emailOutbox.create({
+          data: {
+            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'cap stale-read probe', html: 'queued',
+            referenceType: 'SalesOrder', referenceId: `cap-stale-${randomUUID().slice(0, 8)}`,
+            status: 'PROCESSING', processingStartedAt: t0, lockedBy: 'holder-A', availableAt: new Date(t0.getTime() - 60_000),
+          },
+        })
+
+        const holder = new pg.Client({ connectionString: lane.database.url })
+        await holder.connect()
+        try {
+          await holder.query('BEGIN')
+          await holder.query('SELECT id FROM email_outbox WHERE id = $1 FOR UPDATE', [row.id])
+
+          const workerB = drainWith(processPendingEmailOutbox, {
+            client: laneHarnessClient(lane),
+            now: () => tB,
+            prepareQueuedEmail: noPrepare,
+            logActivity: noLog,
+            async sendEmail() {
+              deliveries.push('worker-B')
+              return { success: true }
+            },
+          })
+
+          // PRECONDITION: B really has swept the row and is WAITING on the lock — the window is open.
+          let waiting = 0
+          for (let tries = 0; tries < 200 && waiting === 0; tries++) {
+            await new Promise((resolve) => setTimeout(resolve, 50))
+            const probe = await lane.sql.query(
+              `SELECT count(*)::int AS n FROM pg_stat_activity
+                WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE '%email_outbox%'`,
+            )
+            waiting = (probe.rows[0] as { n: number }).n
+          }
+          assert.equal(waiting, 1, 'PRECONDITION: B never blocked on the row lock, so the window was not reached')
+
+          // C's reclaim, exactly as the drain writes it, inside the lock.
+          await holder.query(
+            `UPDATE email_outbox SET "processingStartedAt" = $2, "lockedBy" = 'worker-C',
+                    "staleReclaimCount" = "staleReclaimCount" + 1 WHERE id = $1`,
+            [row.id, tC],
+          )
+          await holder.query('COMMIT')
+
+          const outcome = await workerB
+          assert.deepEqual(deliveries, [], 'B entered the sender after C\'s reclaim: the cap was not checked by the statement')
+          assert.equal(outcome.processed, 0)
+          assert.equal(outcome.parked, 1, 'B found the row at the cap and parked it')
+        } finally {
+          await holder.query('ROLLBACK').catch(() => undefined)
+          await holder.end().catch(() => undefined)
+        }
+
+        const after = await lane.db.emailOutbox.findUniqueOrThrow({ where: { id: row.id } })
+        assert.equal(after.status, 'PARKED_SEND_CAP')
+        assert.equal(after.staleReclaimCount, 1, 'one reclaim, ever — B\'s refused attempt did not count')
+        assert.equal(after.lockedBy, null)
+      })
+
+      await t.test('o3d-hpeg: a first claim does not count, and a normal send is unaffected', async () => {
+        const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+        const t0 = new Date()
+        await lane.db.emailOutbox.deleteMany({})
+        const row = await lane.db.emailOutbox.create({
+          data: {
+            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'cap first-claim probe', html: 'queued',
+            referenceType: 'SalesOrder', referenceId: `cap-first-${randomUUID().slice(0, 8)}`,
+            status: 'PENDING', availableAt: new Date(t0.getTime() - 60_000),
+          },
+        })
+        const outcome = await drainWith(processPendingEmailOutbox, {
+          client: laneHarnessClient(lane),
+          now: () => t0,
+          prepareQueuedEmail: noPrepare,
+          logActivity: noLog,
+          async sendEmail() { return { success: true } },
+        })
+        assert.equal(outcome.sent, 1)
+        assert.equal(outcome.parked, 0)
+        const after = await lane.db.emailOutbox.findUniqueOrThrow({ where: { id: row.id } })
+        assert.equal(after.status, 'SENT')
+        assert.equal(after.staleReclaimCount, 0, 'a first claim is not a reclaim')
+      })
+
+      await t.test('o3d-hpeg: a PARKED row still holds its reference — a second row for it is refused', async () => {
+        const { queueEmail } = await import('@/lib/email-outbox')
+        const reference = `cap-slot-${randomUUID().slice(0, 8)}`
+        await lane.db.emailOutbox.deleteMany({})
+        await lane.db.emailOutbox.create({
+          data: {
+            kind: 'ACCOUNTING_INVOICE', toEmail: FIXTURE_RECIPIENT, subject: 'parked', html: 'queued',
+            referenceType: 'SalesOrder', referenceId: reference, status: 'PARKED_SEND_CAP', staleReclaimCount: 1,
+          },
+        })
+        const outcome = await queueEmail({
+          kind: 'ACCOUNTING_INVOICE', to: FIXTURE_RECIPIENT, subject: 'again', html: 'queued',
+          referenceType: 'SalesOrder', referenceId: reference,
+        }, { client: lane.db as unknown as EmailOutboxClient })
+        assert.deepEqual(outcome, { queued: false, reason: 'already_queued' }, 'a fresh row would send the parked email again')
+        assert.equal(await lane.db.emailOutbox.count({ where: { referenceId: reference } }), 1)
       })
 
       await t.test('Postgres refuses a second UNDELIVERED row, and allows a later re-send', async () => {
