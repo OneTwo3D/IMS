@@ -92,6 +92,15 @@ function rig(functions: string[], body: string, extra = ''): string {
     'error() { printf "ERROR: %s\\n" "$*" >&2; }',
     'die() { error "$*"; exit 1; }',
     'info() { printf "INFO: %s\\n" "$*"; }',
+    // THE OVERLAP GUARD IS A STUB HERE, AND SAYING SO IS THE POINT (o3d-z5be r7). Since r6 every
+    // recursive ownership change, copy, move or delete in the shipped scripts is preceded by
+    // privileged_spare_running_tree(), which lives in scripts/lib/privileged-helpers.sh — a library
+    // these rigs do not source, because they lift ONE function out of a 600 KB entrypoint. The stub
+    // approves, so these tests go on measuring what they are about (the migration, the backup, the
+    // publication) rather than the guard. What the guard does, and that every such statement carries
+    // one, is measured in tests/scripts/privileged-helper-set.test.ts — see its REGRESSION NET test.
+    'privileged_spare_running_tree() { return 0; }',
+    'IMS_DRIVER_OVERLAP_REASON=""',
     shellConstant(INSTALL_SH, 'PUBLISH_STAGE_DIRNAME'),
     ...functions.map((name) => { const { source, where } = shippedFrom(name); return shellFunction(source, name, where) }),
     extra,
@@ -4829,6 +4838,11 @@ test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutove
         'gzip() { cat; }',
         'success() { printf "SUCCESS: %s\\n" "$*"; }',
         'pin_migration_window() { :; }',
+        // The overlap guard is stubbed for the same reason as in rig() above (o3d-z5be r7): this block
+        // now carries one before its `xargs -r rm --`, and what this test is about is which PROGRAM the
+        // block runs, not the guard. The guard itself is measured in privileged-helper-set.test.ts.
+        'privileged_spare_running_tree() { return 0; }',
+        'IMS_DRIVER_OVERLAP_REASON=""',
         // THE WINDOW, opened at the call site the shipped block already makes.
         `info() { printf "INFO: %s\\n" "$*"; cat > ${q(helper)} <<'PLANTED'\n${planted}PLANTED\n}`,
         `BACKUP_DIR=${q(backupDir)}`,
@@ -4987,7 +5001,9 @@ function runWalk(data: string, pruneAtRoot: string, opts: { helper?: string, env
     'set -uo pipefail',
     `node ${q(opts.helper ?? CHOWN_TREE)} . "$(${REAL.id} -u)" "$(${REAL.id} -g)" ${q(pruneAtRoot)}`,
     'echo "rc=$?"',
-  ].join('\n'), { cwd: data, env: opts.env })
+    // THE DIRECTORY THE CALLER VETTED (o3d-z5be r11): chown_state_tree() names it, and the walker now
+    // refuses to run anywhere else. The walker's own refusals are measured in privileged-helper-set.
+  ].join('\n'), { cwd: data, env: { IMS_CHOWN_TREE_ROOT: data, ...(opts.env ?? {}) } })
 }
 
 /** THE SHIPPED WALKER WITH ITS STAGING PRUNE REMOVED, and nothing else changed — the mutation every

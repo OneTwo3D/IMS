@@ -58,6 +58,12 @@ function releaseCheckout(): string {
   // again: it is the only thing that asks systemd what composes the service's environment, and
   // update.sh refuses to start without it.
   cpSync(join(REPO, 'scripts/lib/unit-environment.sh'), join(checkout, 'scripts/lib/unit-environment.sh'))
+  // …and the privileged helper snapshot, sourced from the same directory since o3d-kyqa. Same reason
+  // the fourth: it is the only thing that publishes a root-owned copy of the helpers a privileged
+  // run executes, and update.sh refuses to start without it. It is also why this checkout is FIVE
+  // libraries and not four — the release image and the shipped `source` list are one statement, and
+  // a rig that copies a subset is measuring a release that would not boot.
+  cpSync(join(REPO, 'scripts/lib/privileged-helpers.sh'), join(checkout, 'scripts/lib/privileged-helpers.sh'))
   cpSync(join(REPO, 'scripts/fence-db-connections.mjs'), join(checkout, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(checkout)
   mkdirSync(join(root, 'tmp'), { recursive: true })
@@ -355,6 +361,8 @@ function firstInstallFixture(): { root: string; digest: string } {
   cpSync(join(REPO, 'scripts/lib/crontab-lock.sh'), join(release, 'scripts/lib/crontab-lock.sh'))
   cpSync(join(REPO, 'scripts/lib/cutover-namespace.sh'), join(release, 'scripts/lib/cutover-namespace.sh'))
   cpSync(join(REPO, 'scripts/lib/unit-environment.sh'), join(release, 'scripts/lib/unit-environment.sh'))
+  // …and the fifth, for the reason releaseCheckout() above gives (o3d-kyqa).
+  cpSync(join(REPO, 'scripts/lib/privileged-helpers.sh'), join(release, 'scripts/lib/privileged-helpers.sh'))
   cpSync(join(app, 'scripts/fence-db-connections.mjs'), join(release, 'scripts/fence-db-connections.mjs'))
   writeCheckoutPg(release)
   const printed = execFileSync('bash', ['scripts/update.sh', '--print-fence-digest'], {

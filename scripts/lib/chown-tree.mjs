@@ -140,7 +140,9 @@
  *        privileged-and-private prune above is not switchable: it is the security boundary, and an
  *        argument that could turn it off is an argument somebody will get wrong.
  */
-import { chownSync, closeSync, fchownSync, fstatSync, openSync, readdirSync, statSync } from 'node:fs'
+import { chownSync, closeSync, fchownSync, fstatSync, openSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { constants } from 'node:fs'
 
 /** Deeper than any state directory this application creates, and shallow enough that the recursion
@@ -158,6 +160,36 @@ if (argv.length !== 4) {
   die('usage: chown-tree.mjs <root> <uid> <gid> <prune-name-at-root>')
 }
 const [root, uidText, gidText, pruneAtRoot] = argv
+
+// WHAT THIS WALK MAY BE AIMED AT, CHECKED HERE AND NOT ONLY BY THE CALLER (o3d-z5be r11, review H4).
+// This is the house's own recursive ownership change, and a test that reads the scripts' text can
+// neither see every way it is invoked nor bind where it is invoked from. So the walk refuses, before it
+// opens anything:
+//   * a target the caller did not name in IMS_CHOWN_TREE_ROOT — chown_state_tree() sets it to the one
+//     directory it vetted (${DATA_DIR}, disjoint from the running tree), so this program cannot be
+//     pointed somewhere else by a changed working directory;
+//   * `/` and any top-level directory (`/var`, `/opt`, `/etc`): no state root this installer makes is
+//     that shallow;
+//   * a target that is, contains or lies inside the directory this program is running from — handing
+//     that over would hand the account the code root is about to run.
+// Each refusal exits non-zero before a single ownership change.
+{
+  let target
+  try { target = realpathSync(root) } catch { die(`the target ${JSON.stringify(root)} could not be resolved, so nothing was changed.`) }
+  const declared = process.env.IMS_CHOWN_TREE_ROOT ?? ''
+  let vetted = ''
+  try { vetted = declared === '' ? '' : realpathSync(declared) } catch { vetted = '' }
+  if (vetted === '' || vetted !== target) {
+    die(`REFUSING: this walk is at ${target}, and the caller named ${JSON.stringify(declared)} as the directory it vetted (IMS_CHOWN_TREE_ROOT). Nothing was changed.`)
+  }
+  if (target.split('/').filter(Boolean).length < 2) {
+    die(`REFUSING: ${target} is \`/\` or a top-level directory, and no state root this installer makes is that shallow. Nothing was changed.`)
+  }
+  const self = dirname(realpathSync(fileURLToPath(import.meta.url)))
+  if (target === self || target.startsWith(`${self}/`) || self.startsWith(`${target}/`)) {
+    die(`REFUSING: ${target} overlaps ${self}, the directory this program is running from; re-owning it would hand the account the code root is running. Nothing was changed.`)
+  }
+}
 
 const asId = (text, what) => {
   if (!/^(0|[1-9][0-9]*)$/.test(text)) {

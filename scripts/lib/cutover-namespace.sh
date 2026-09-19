@@ -350,6 +350,14 @@ own_service_subdir() {
 # thing that establishes what is installed.
 copy_tree_into_new_dir() {
   local src="$1" dest="$2" self meta parent
+  # THE DESTINATION IS CHECKED HERE AT RUN TIME, not only at the call sites (o3d-z5be r11, review H3):
+  # this deletes and replaces a PARAMETER, and a caller that is not guarded — or a library that grows
+  # one — must not be able to aim it at the tree this run is executing from.
+  # The refusal ends the run from any context (privileged_end_run); `|| die` is the fallback if that
+  # function is not loaded, so a missing library fails closed rather than open.
+  privileged_spare_running_tree "${dest}" "the directory copy_tree_into_new_dir would replace" \
+    || privileged_end_run "${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}" \
+    || die "${IMS_DRIVER_OVERLAP_REASON:-the running-tree check is not loaded, so ${dest} cannot be shown to be separate from it}"
   self="$(id -u)" || die "\`id -u\` failed, so this run cannot establish which uid it is and cannot prove that ${dest} is the directory it just created."
   parent="$(stat -c '%d:%i' "$(dirname "${dest}")" 2>/dev/null || true)"
   [[ -n "${parent}" ]] || die "$(dirname "${dest}") could not be identified, so this run cannot prove where ${dest} is. Nothing has been copied."
