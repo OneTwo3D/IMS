@@ -7685,6 +7685,24 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // AND IT IS CREATED ROOT-OWNED. 0755 rather than the snapshot directory's 0700 because the
   // fence runs AS THE APPLICATION USER and has to read both files; neither holds a secret.
   const publish = shellFunction(UPDATE_LINES.join('\n'), 'publish_fence_recovery_record')
+  // AND THE DIGEST IT BINDS COMES FROM THE RESOLUTION (o3d-xi3w r3), which hands back the entry file of
+  // the versioned publication THIS operation is pinned to for its whole length — never from
+  // ${DB_FENCE_SCRIPT_COPY}, which is a path through the pointer and therefore a statement about
+  // whatever another privileged run has aimed it at by the time it is hashed. That difference is the
+  // fence being RAISED by one release and RELEASED by another.
+  //
+  // IT IS A LEXICAL CHECK, and it is stated as one: the two paths name the same file on any box where
+  // nothing publishes in the window, so no fixture can tell them apart — what distinguishes them is
+  // which name is written down. The ABSENCE half is universal, so a line that hashes the documented name
+  // again ANYWHERE in the function fails it, correction or no correction beside it.
+  assert.ok(
+    !/file_sha256 "\$\{DB_FENCE_SCRIPT_COPY\}"/.test(publish),
+    `the record's digest must not be taken through the documented name:\n${publish}`,
+  )
+  assert.match(publish, /script="\$\(db_fence_script_in_use\)" \|\| return 1/,
+    'it must be taken from the publication this operation is pinned to, through the one resolution')
+  assert.match(publish, /digest="\$\(file_sha256 "\$\{script\}"\)" \|\| return 1/,
+    'and that path is what is hashed')
   assert.match(publish, /chown root:root "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'the recovery directory must be root-owned')
   assert.match(publish, /chmod 755 "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'and traversable by the account that runs the fence')
   // THE CREDENTIAL IS NOT IN IT. A record that carried DEPLOY_ADMIN_DATABASE_URL would be a

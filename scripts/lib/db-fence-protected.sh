@@ -1757,13 +1757,164 @@ fence_record_artefact_digest() {
   printf '%s' "${digest}"
 }
 
+# THE RECOVERY RECORD BINDS THE PUBLICATION THAT IS STANDING, AND IS WRITTEN ONLY WHILE THAT IS STILL
+# TRUE (o3d-xi3w r3, Codex HIGH).
+#
+# THE FINDING. Round 1 made the publication itself atomic — one rename of a pointer commits a whole
+# versioned tree together with its own record and its own manifest — and left ONE statement about the
+# artefact outside that rename: `fence_script_sha256` in ${DB_FENCE_IDENTITY_FILE}, which
+# publish_fence_script_copy() rewrote AFTER the flip, from a digest it had already read. Two publishers
+# therefore interleave: A commits A's version; B commits B's and binds B's entry digest; A, still holding
+# the digest it read before B's flip, binds A's. The pointer then names B while the record names A — and
+# db_fence_script_in_use(), which checks the entry file of the standing publication against the digest the
+# record binds, REFUSES EVERY LATER RUN. Measured before the fix, with both publications complete and
+# neither tree wrong: the resolution refused twice in a row and repaired nothing. The per-run publication
+# names round 1 introduced are what make that interleaving reachable, and reading the pointer back after
+# the flip — which round 1 does — does not protect a write that happens after the read.
+#
+# AND THAT REFUSAL IS THE WORST OUTCOME THIS FILE HAS. It is not a substitution: it is the fence mechanism
+# declining to run at all, on an installation where nothing is wrong with either tree. Every path goes
+# through this one resolution — preflight, raise, the migration URL, release, the exit trap's re-fence and
+# both operator wrappers — so a cutover can neither fence nor unfence, and the box is left needing an
+# operator who knows to supply IMS_FENCE_ARTEFACT_SHA256 by hand.
+#
+# A COMPARE-AND-SWAP AND NOT A ROTATION LOCK, chosen and not defaulted to. A lock held across the flip and
+# the record write would serialise publishers, and it would be a NEW way for this mechanism to stop
+# working: a holder killed while holding it blocks every future publication, so the lock needs a liveness
+# test to break it (/proc, as the r2 pin uses) — and that test is then load-bearing in both directions,
+# since breaking a live holder's lock reopens the race it was taken to close. A publication that REFUSES
+# because another is in flight is also an outage of the kind this round exists to remove. The swap adds no
+# state that can outlive a run, needs no unwinding, and cannot be held by anybody.
+#
+# WHAT IT SWAPS ON, WHICH IS THE WHOLE DESIGN. The record does not say what THIS run published; it says
+# what IS STANDING. So each attempt reads the pointer, takes the entry digest out of the VERSIONED
+# directory it names — an immutable path, so that value can never become a statement about some other
+# tree — writes it, and reads the pointer AGAIN. If it still names the same publication, the record just
+# written describes it. If it has moved, another publisher committed inside the window, this attempt's
+# value is stale, and the loop goes round with the new one. A run whose own publication was superseded
+# therefore ends by binding THE WINNER'S digest, which is the state the next run needs, and its caller
+# reports a lost race instead of a rotation.
+#
+# IT ONLY EVER ADOPTS A PUBLICATION THAT AUTHENTICATES ITSELF. A digest is taken from a tree only after
+# that tree is sealed and hashes to what its own record beside it binds — the same two questions
+# db_fence_script_in_use() asks before executing it. So this cannot launder a tree somebody modified in
+# place into the record: it refuses, and the execution path goes on refusing, exactly as it did before.
+#
+# AND THERE ARE FOUR WAYS OUT, none of which leaves the mechanism unusable:
+#   * `bound`     — the record now binds the entry file of the publication the pointer named after the
+#                   write, re-read to say so.
+#   * `unchanged` — it already did, which is every ordinary run.
+#   * `absent`    — there is no complete recovery record binding a script digest at all (a box that has
+#                   published but never raised a fence). Minting one is not this function's business:
+#                   the run that RAISES a fence writes the record, and nothing is bound until it does.
+#   * `refused`   — with the reason, either because nothing could be authenticated or because every
+#                   attempt lost to another publisher. The record then holds a digest that was standing
+#                   moments before, and THE NEXT RUN REPAIRS IT: _fence_repair_record() below calls this
+#                   on the paths that publish nothing, so an ordinary cutover fixes a record it finds
+#                   stale — whoever left it stale, including a publisher killed between its flip and its
+#                   record write, which is a state no locking scheme prevents either.
+#
+# ANSWERS ON STDOUT, `<outcome>|<digest or reason>`, and not in a script-scope name. Every caller reads it
+# through a command substitution, so a value assigned in here dies with the subshell; and the caller
+# BRANCHES on the outcome, which makes it a decision rather than a report — the round-1 lesson, and the
+# reason the declaration census would refuse a global here.
+_fence_bind_record_to_standing() {
+  local attempts=4 attempt=0 base after entry digest recorded bound_record bound_tree
+  while (( attempt < attempts )); do
+    attempt=$(( attempt + 1 ))
+    if ! base="$(_fence_resolve_version)"; then
+      printf 'refused|%s' "${base}"
+      return 1
+    fi
+    entry="${base}/scripts/${DB_FENCE_SCRIPT_COPY##*/}"
+    if ! digest="$(file_sha256 "${entry}")"; then
+      printf 'refused|the fence artefact standing at %s holds no entry file at %s, so there is nothing for the recovery record to bind' "${DB_FENCE_PROTECTED_APP_DIR}" "${entry}"
+      return 1
+    fi
+    recorded="$(fence_record_script_digest)" || recorded=""
+    if [[ -z "${recorded}" ]]; then
+      printf 'absent|%s' "${digest}"
+      return 0
+    fi
+    if [[ "${recorded}" == "${digest}" ]]; then
+      printf 'unchanged|%s' "${digest}"
+      return 0
+    fi
+    # NOTHING IS ADOPTED THAT DOES NOT AUTHENTICATE ITSELF, and this is asked only when the two disagree,
+    # so the ordinary run above pays for none of it.
+    if ! _fence_tree_is_sealed "${base}"; then
+      printf 'refused|the fence artefact standing at %s is not sealed, so the recovery record was NOT rebound to it: %s' "${DB_FENCE_PROTECTED_APP_DIR}" "${DB_FENCE_SEAL_REASON}"
+      return 1
+    fi
+    bound_record="$(fence_record_artefact_digest "${base}")" || bound_record=""
+    bound_tree="$(_fence_tree_digest "${base}")" || bound_tree=""
+    if [[ -z "${bound_record}" || "${bound_record}" != "${bound_tree}" ]]; then
+      printf 'refused|the fence artefact standing at %s is not the tree its own record binds (record: %s; tree: %s), so the recovery record was NOT rebound to it' "${DB_FENCE_PROTECTED_APP_DIR}" "${bound_record:-none}" "${bound_tree:-unreadable}"
+      return 1
+    fi
+    if ! _fence_rewrite_record_digest "${digest}"; then
+      printf 'refused|the recovery record at %s could not be rewritten to bind %s' "${DB_FENCE_IDENTITY_FILE}" "${digest}"
+      return 1
+    fi
+    # THE SWAP'S SECOND HALF. Anything but the publication this attempt read makes the write stale, and
+    # the next attempt writes what is standing NOW rather than reporting what was standing then.
+    if ! after="$(_fence_resolve_version)"; then
+      printf 'refused|%s' "${after}"
+      return 1
+    fi
+    if [[ "${after}" == "${base}" ]]; then
+      printf 'bound|%s' "${digest}"
+      return 0
+    fi
+  done
+  printf 'refused|%s was published over %d times while the recovery record at %s was being bound to it, so this run cannot say that the record describes what is standing. It binds a publication that was standing moments ago; the next privileged run repairs it before it decides anything else, and nothing has been published or replaced by this one' "${DB_FENCE_PROTECTED_APP_DIR}" "${attempts}" "${DB_FENCE_IDENTITY_FILE}"
+  return 1
+}
+
+# THE REPAIR, MADE BY A RUN THAT PUBLISHES NOTHING (o3d-xi3w r3), which is what makes "a publisher that
+# loses can leave a state a later run fixes by itself" true rather than hopeful. The states it fixes are
+# the two nothing else can: a publisher outraced between its flip and its record write, and a publisher
+# KILLED between them — measured, both leave the resolution refusing for ever, on an artefact root itself
+# published and that authenticates against its own record.
+#
+# IT IS NOT DONE WHILE A FENCE IS STANDING, and that is the same rule that refuses a rotation there: the
+# version that raised a fence is the version that must release it, so re-pointing the record at a
+# different publication under a standing fence would be this mechanism arranging exactly the substitution
+# it exists to prevent. That costs nothing real, because a rotation cannot happen under a standing fence
+# either — so the mismatch this repairs cannot be created there. The one residue, stated rather than
+# hidden: a publisher committing inside the window in which a raise writes its record would leave a
+# mismatch under a fence that is then standing, and that state needs the operator (the artefact is intact;
+# re-publishing it with IMS_FENCE_ARTEFACT_SHA256 after the release is what clears it).
+#
+# IT REPORTS ON STDERR AND NEVER IN ${DB_FENCE_ROTATION_NOTE}: the note is the caller's verdict on a
+# ROTATION, and every branch below this one sets it, so a repair written there would be silently
+# overwritten by the very next line. A repair is also never a refusal — it publishes nothing, replaces
+# nothing and can only make a later resolution possible — so it reports what it did and returns 0, and the
+# resolution that follows refuses on its own terms if the record still cannot be bound.
+_fence_repair_record() {
+  local bound
+  if [[ -n "${DB_FENCE_STATE:-}" && -f "${DB_FENCE_STATE:-}" ]]; then
+    return 0
+  fi
+  if ! bound="$(_fence_bind_record_to_standing)"; then
+    echo "The recovery record at ${DB_FENCE_IDENTITY_FILE} does not bind the fence artefact standing at ${DB_FENCE_PROTECTED_APP_DIR} and could not be repaired: ${bound#*|}. Nothing has been published and nothing has been replaced." >&2
+    return 0
+  fi
+  case "${bound%%|*}" in
+    bound)
+      echo "The recovery record at ${DB_FENCE_IDENTITY_FILE} did not bind the entry file of the fence artefact standing at ${DB_FENCE_PROTECTED_APP_DIR} — the state a publication outraced or killed between committing its pointer and writing that record leaves behind — and it now binds ${bound#*|}, taken out of that publication's own versioned directory after it was found sealed and equal to the digest its own record carries. Nothing was published and no bytes were replaced." >&2
+      ;;
+  esac
+  return 0
+}
+
 # THE ONLY WRITER of ${DB_FENCE_PROTECTED_APP_DIR}, and it refuses to overwrite one from the
 # checkout.
 #
 # Returns 0 when an artefact is standing afterwards — whether this call published it, rotated it,
 # or left the existing one alone — and 1 when there is none and none could be made.
 publish_fence_script_copy() {
-  local existing="" candidate=""
+  local existing="" candidate="" bound="" standing_digest="" standing_artefact="" superseded=0
   DB_FENCE_ROTATION_NOTE=""
 
   if [[ -n "${DB_FENCE_EXPECTED_SHA256}" ]] && ! fence_valid_sha256 "${DB_FENCE_EXPECTED_SHA256}"; then
@@ -1773,6 +1924,15 @@ publish_fence_script_copy() {
   if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] && ! fence_valid_sha256 "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}"; then
     DB_FENCE_ROTATION_NOTE="IMS_FENCE_ARTEFACT_SHA256='${DB_FENCE_EXPECTED_ARTEFACT_SHA256}' is not a sha256 digest (64 lowercase hex characters). Refusing to treat it as one."
     return 1
+  fi
+
+  # AND BEFORE ANY OF THE DECISIONS BELOW, A RECORD THAT DOES NOT DESCRIBE WHAT IS STANDING IS REPAIRED
+  # (o3d-xi3w r3). It is first because every branch under it reasons about the standing artefact, and
+  # because a run that publishes nothing is the ONLY thing that ever visits a box left in that state.
+  # There is nothing standing to repair against until the bootstrap below has run, so it is asked on the
+  # path where an artefact already exists and nowhere else.
+  if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
+    _fence_repair_record
   fi
 
   if [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
@@ -1823,12 +1983,44 @@ publish_fence_script_copy() {
   fi
 
   _fence_stage_and_publish || return 1
-  # THE RECORD'S DIGEST MOVES WITH THE FILE IT NAMES. Leaving it behind would make
-  # db_fence_script_in_use() refuse every subsequent run — a rotation that bricks the mechanism is
-  # not a rotation. Only the digest line is touched; the identity of the fence that record
-  # describes is not this run's to restate.
-  _fence_rewrite_record_digest "$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || return 1
-  DB_FENCE_ROTATION_NOTE="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} was rotated: the entry file is now $(file_sha256 "${DB_FENCE_SCRIPT_COPY}") and the whole tree hashes to $(fence_record_artefact_digest "${DB_FENCE_PROTECTED_APP_DIR}"), which are the digests this invocation authenticated."
+  # THE RECORD'S DIGEST MOVES WITH THE FILE IT NAMES, AND THE FILE IT NAMES IS WHAT IS STANDING
+  # (o3d-xi3w, and r3). Leaving it behind would make db_fence_script_in_use() refuse every subsequent
+  # run — a rotation that bricks the mechanism is not a rotation — and writing THIS run's digest
+  # unconditionally does the same thing whenever another publisher committed between the flip and here,
+  # which is the finding this round closes. Only the digest line is ever touched; the identity of the
+  # fence that record describes is not this run's to restate.
+  if ! bound="$(_fence_bind_record_to_standing)"; then
+    DB_FENCE_ROTATION_NOTE="the fence artefact was published, but the recovery record at ${DB_FENCE_IDENTITY_FILE} could not be bound to what is standing at ${DB_FENCE_PROTECTED_APP_DIR}: ${bound#*|}. A run that resolves the fence helper while the two disagree will refuse rather than execute it, so nothing is being reported as published; the next privileged run repairs the record before it decides anything else."
+    return 1
+  fi
+  standing_digest="${bound#*|}"
+  # AND A PUBLICATION THAT WAS SUPERSEDED AFTER IT COMMITTED SAYS SO (o3d-xi3w r3). The pointer read-back
+  # inside _fence_stage_and_publish() catches a run that lost the FLIP; this catches the other order —
+  # this run flipped, and another run flipped after it — which is exactly the interleaving that used to
+  # leave the record describing a tree nobody was running. The record binds the winner, so the mechanism
+  # is usable and no operator has to repair anything; what is refused is REPORTING this run's rotation,
+  # because the sentence below would otherwise say that the digests standing there are "the digests this
+  # invocation authenticated" about another operator's release.
+  #
+  # AND IT COMPARES AGAINST THE PINS, NEVER AGAINST THE CHECKOUT. Re-hashing ${DB_FENCE_SCRIPT} at this
+  # point would be reading an application-owned file again AFTER the publication, so a checkout that
+  # changed in between would make a publication that won report a race it never lost — the same mistake
+  # as authenticating a tree against the source it came from. ${DB_FENCE_EXPECTED_SHA256} and
+  # ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are `readonly`, they are precisely what this invocation
+  # authenticated, and this path cannot be reached without at least one of them: a run with neither
+  # returned above without publishing anything.
+  standing_artefact="$(fence_record_artefact_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing_artefact=""
+  if [[ -n "${DB_FENCE_EXPECTED_SHA256}" && "${standing_digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]; then
+    superseded=1
+  fi
+  if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && "${standing_artefact}" != "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    superseded=1
+  fi
+  if (( superseded == 1 )); then
+    DB_FENCE_ROTATION_NOTE="this run published the artefact this invocation authenticated, and what stands at ${DB_FENCE_PROTECTED_APP_DIR} is a different one — its entry file is ${standing_digest:-unreadable} and its tree hashes to ${standing_artefact:-unreadable}: another privileged run published at the same moment and its copy is the one standing there. The recovery record binds THAT copy, so the fence is executable and nothing needs repairing; nothing of this run's is being reported as published, and re-running this one will publish over it."
+    return 1
+  fi
+  DB_FENCE_ROTATION_NOTE="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} was rotated: the entry file is now ${standing_digest} and the whole tree hashes to ${standing_artefact:-a value this run could not obtain}, which are the digests this invocation authenticated, and the recovery record binds that entry file."
   return 0
 }
 
@@ -1880,7 +2072,11 @@ db_fence_script_in_use() {
   fi
   if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then echo "${DB_FENCE_ROTATION_NOTE}" >&2; fi
 
-  # Re-read: an authenticated rotation moves the record's digest with the file it names.
+  # Re-read: an authenticated rotation moves the record's digest with the file it names — and so does the
+  # repair that publication makes when it finds a record describing something other than what is standing
+  # (o3d-xi3w r3), which is the state a publisher outraced or killed between its pointer flip and its own
+  # record write leaves behind. Without this re-read the run that repaired it would go on to refuse on the
+  # value it read before.
   recorded="$(fence_record_script_digest)" || recorded=""
 
   if [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then

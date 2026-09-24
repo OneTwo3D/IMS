@@ -2633,6 +2633,32 @@ rotation also moves `fence_script_sha256` in the recovery record with the file i
 behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
 rotation.
 
+**And that record is bound to whatever is standing, by compare-and-swap** (o3d-xi3w r3). The flip commits
+a whole versioned tree in one `rename(2)`, but `fence_script_sha256` lives in
+`/etc/ims-cutover-recovery/db-fence-identity.env`, outside it — so it used to be written *after* the flip
+from a digest read *before* it, and two publishers interleaved: A commits A, B commits B and records B's
+digest, A then records the digest it was still holding. The pointer names one publication and the record
+names another, and `db_fence_script_in_use()` then refuses to execute the artefact that is standing — an
+outage of the fence itself, on a box where nothing is wrong with either tree. A publisher **killed**
+between its flip and that write leaves exactly the same state, with no concurrency at all. Both were
+measured before the fix, and two consecutive later runs repaired neither.
+
+What the record says now is *what is standing*, never *what this run published*: each attempt reads the
+pointer, takes the entry digest out of the **versioned directory** it names (an immutable path), writes
+it, and reads the pointer again — if it has moved, the write was stale and the attempt is made once more
+against the publication that is standing now. A run whose own publication was superseded therefore binds
+the **winner's** digest and reports a lost race instead of a rotation. Nothing is adopted that does not
+authenticate itself: the digest is taken only from a tree that is sealed and hashes to what its own
+record beside it binds. And a run that **publishes nothing** repairs a record it finds stale before it
+decides anything else, which is what makes the killed-publisher state recoverable without an operator —
+except while a fence is standing, where the repair is refused for the same reason a rotation is.
+
+And the record a **raise** writes carries the digest of the artefact **that operation is pinned to**, not
+of whatever `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` resolves to at the instant it
+is hashed: a cutover is bound to one publication at its first resolution and raises the fence with that
+one, so a record naming any other would mean a later run releasing that fence with a different release's
+helper.
+
 A rotation republishes **both halves together** — a new entry file and a freshly resolved closure —
 which is the only way the vendored packages ever move. The consequence, stated because it is a real
 one: upgrading `pg` in `APP_DIR/node_modules` does **not** change what the fence imports, and

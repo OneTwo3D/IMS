@@ -3119,7 +3119,7 @@ remove_db_identity_snapshot() {
 # matters, which is the run that is killed between the two. A fence raised with no record is
 # exactly the state r28 left un-adoptable.
 publish_fence_recovery_record() {
-  local digest
+  local digest script
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_FENCE_IDENTITY_FILE} and a root-owned copy of the fence script at ${DB_FENCE_SCRIPT_COPY}"
     return 0
@@ -3146,13 +3146,24 @@ publish_fence_recovery_record() {
   # is consistent with itself. publish_fence_script_copy() now bootstraps when there is no
   # protected copy and otherwise leaves the standing one alone; an upgrade is an authenticated
   # rotation (IMS_FENCE_SCRIPT_SHA256 on the root invocation) and never an implicit consequence of
-  # raising a fence. See scripts/lib/db-fence-protected.sh.
-  publish_fence_script_copy || return 1
+  # raising a fence. See scripts/lib/db-fence-protected.sh. That call is no longer made here on its
+  # own: db_fence_script_in_use() below makes it, first thing, and then resolves — so the ensuring
+  # and the digest are one answer about one publication instead of two about whatever each found.
   # THE DIGEST IS TAKEN FROM THE PUBLISHED COPY, not from the checkout, because the copy is what
   # will run. Binding the two closes the copy/use race r29 left: the file whose digest the record
   # names is the file the fence is raised with, and every later adoption, release and re-fence
   # checks that it still is.
-  digest="$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || return 1
+  #
+  # AND IT IS THE COPY THIS OPERATION IS PINNED TO, NOT WHATEVER THE DOCUMENTED NAME RESOLVES TO
+  # (o3d-xi3w r3). This used to publish and then hash ${DB_FENCE_SCRIPT_COPY}, a path THROUGH the
+  # pointer — so a privileged run publishing between those two lines made this record bind an entry
+  # file this run is not going to execute: the fence would be raised by the version this operation
+  # pinned and RELEASED, later, by the one the record named. db_fence_script_in_use() publishes
+  # exactly as the removed call did, and then hands back the entry file of the versioned
+  # publication this operation is bound to for its whole length — which is the file the fence is
+  # about to be raised with, and therefore the only digest this record may carry.
+  script="$(db_fence_script_in_use)" || return 1
+  digest="$(file_sha256 "${script}")" || return 1
   {
     printf 'db_app_host=%s\n' "${DB_IDENTITY_HOST}"
     printf 'db_app_port=%s\n' "${DB_IDENTITY_PORT}"
