@@ -692,9 +692,16 @@ test('no live module imports anything from archive/ — which is what makes the 
       if (!/\.(ts|tsx|js|jsx|mjs|cjs|mts)$/.test(entry)) continue
       scanned += 1
       const source = readFileSync(join(ROOT, rel), 'utf8')
-      // Any specifier that resolves into the archive, however it is spelled: '@/archive/…',
-      // '../archive/…', 'archive/…'.
-      if (/from\s+['"][^'"]*\barchive\/[^'"]*['"]|import\s*\(\s*['"][^'"]*\barchive\//.test(source)) {
+      // ANY specifier that resolves into the archive, however it is spelled — '@/archive/…',
+      // '../archive/…', 'archive/…' — and in ANY of the three import forms. The first draft of this
+      // check matched `from '…'` and `import('…')` only, and a MUTATION found the hole: a bare
+      // side-effect import (`import '@/archive/…/settings'`) has no `from` and no parentheses, pulls
+      // the module into the graph exactly the same way, and passed. `require('…')` is included for
+      // the same reason.
+      const reachesArchive = new RegExp(
+        String.raw`(?:from\s*|\bimport\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)['"][^'"]*\barchive/`,
+      )
+      if (reachesArchive.test(source)) {
         offenders.push(rel)
       }
     }
