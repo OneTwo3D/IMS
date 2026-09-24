@@ -1,6 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
-import { withSavepoint } from '@/lib/db/savepoint'
+import { isClientInsideTransaction, withSavepoint } from '@/lib/db/savepoint'
 import type { PostingRefusalKey } from '@/lib/domain/accounting/posting-refusal-inbox'
 
 /**
@@ -90,6 +90,17 @@ export type PrismaClientCanAlwaysReadTheSuppression = AssertTrue<
     accountingPostingRefusal: { findUnique: (args: never) => unknown }
   } ? true : false
 >
+/**
+ * o3d-j625 r9 — and the same proof for the contention probe. `runUnderPostingKeyLock` answers
+ * `{ held: false, reason: 'unlockable' }` when the client cannot run `pg_try_advisory_xact_lock`; this
+ * fires if a real transaction client ever stops being able to, so that answer stays a statement about
+ * TEST DOUBLES and never becomes a way for production to write the inbox unserialised.
+ */
+export type PrismaClientCanAlwaysTakeThePostingKeyLock = AssertTrue<
+  Prisma.TransactionClient extends {
+    $queryRaw: (query: TemplateStringsArray, ...values: never[]) => unknown
+  } ? true : false
+>
 
 /**
  * THROWN when the suppression state could not be read, so nothing may be posted (o3d-j625 r8, Codex HIGH).
@@ -146,6 +157,141 @@ export function postingKeyLockId(key: PostingRefusalKey): number {
 export async function lockPostingKey(client: PostingSuppressionClient, key: PostingRefusalKey): Promise<void> {
   if (typeof client.$executeRaw !== 'function') return
   await client.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE}, ${postingKeyLockId(key)})`
+}
+
+/**
+ * ── o3d-j625 r9 (Codex HIGH) — THE REFUSAL INBOX'S OWN WRITES TAKE THIS LOCK TOO ──
+ *
+ * r7 and r8 serialised the two paths that decide whether IMS may POST: the mark, and every creation of
+ * an accounting sync row. `recordAccountingPostingRefusal` was left outside, reading `suppressedAt`
+ * before its upsert and taking no lock at all. So a mark committing between that read and that upsert
+ * left the row REOPENED — outstanding again, `suppressedAt` intact — and the exception inbox then
+ * presented a posting an operator had already posted BY HAND as work still owed, with a remedy that
+ * asks them to post it. The same shape lands a refusal after a successful enqueue has cleared the row,
+ * leaving a debt that is not owed. Measured, both of them, in
+ * tests/concurrency/posting-refusal-record-race.concurrent.test.ts.
+ *
+ * So EVERY write to `accounting_posting_refusals` now happens while holding this key's lock: the mark
+ * (posting-mark-handled.ts), the clear (through the row-creating primitive, or through this helper),
+ * and the record. That makes the row's state a thing a writer can READ and act on, which is what the
+ * r7 read was pretending to be.
+ *
+ * ── HOW IT INTERACTS WITH THE CALLER'S TRANSACTION, AND WHY IT CANNOT DEADLOCK ──
+ *
+ * A refusal is recorded from two kinds of caller, and the two get different treatment BECAUSE the
+ * deadlock argument is different for each:
+ *
+ *  • THROUGH THE POOL (the facade's own refusal, the sweeps, the sites that report after their commit).
+ *    An advisory `xact` lock taken on an autocommit connection is released by the implicit commit of
+ *    the statement that took it, so it serialises NOTHING there. This helper therefore opens its own
+ *    short transaction and holds the lock for the read and the write. It may WAIT for the lock, and
+ *    waiting is safe here by construction: it holds nothing when it starts to wait — no advisory lock,
+ *    no row lock, no connection but its own — so it cannot be part of a wait cycle. `lock_timeout`
+ *    bounds the wait anyway, and a timeout degrades to the logged "could not record" below.
+ *
+ *  • INSIDE THE CALLER'S TRANSACTION (`withSavepoint` given: a goods receipt, a bill, an MO completion
+ *    reporting its own refusal). That transaction may already hold anything — stock-level locks, the
+ *    sales-order row lock, another posting key's lock — so WAITING here could close a cycle against a
+ *    transaction that wants one of those. It therefore NEVER waits: `pg_try_advisory_xact_lock` only.
+ *    A transaction that already holds this key's lock (it queued this same posting) is granted it
+ *    again — advisory locks are re-entrant within a transaction — so the ordinary case never fails.
+ *    A genuine failure to take it means ANOTHER transaction is settling this exact posting right now,
+ *    which is precisely when this refusal is not the newest word on it: nothing is recorded and the
+ *    activity log says so. That is the same fail-closed direction as r8's unreadable suppression.
+ *
+ * Either way a failure here is still contained: review M-14's savepoint is unchanged, so a failed
+ * record cannot abort the caller's transaction.
+ */
+export type PostingKeyLockClient = PostingSuppressionClient & {
+  $queryRaw?: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown>
+  $transaction?: (
+    fn: (client: never) => Promise<unknown>,
+    options?: { timeout?: number; maxWait?: number },
+  ) => Promise<unknown>
+}
+
+/**
+ * Whether the posting key's lock is held for the work about to run, and — when it is — whether it had
+ * to be WAITED for.
+ *
+ * `contended` is not bookkeeping. It is the only clock-free evidence available that ANOTHER transaction
+ * was settling this posting while this refusal was being decided, which is exactly what makes the
+ * refusal stale (see `recordAccountingPostingRefusal`).
+ */
+export type PostingKeyLock =
+  | { held: true; contended: boolean }
+  /** `busy`: another transaction holds it and this caller may not wait. `unlockable`: a test double. */
+  | { held: false; reason: 'busy' | 'unlockable' }
+
+/** How long a POOLED writer will wait for the key before giving up and reporting it (ms). */
+const POOLED_LOCK_TIMEOUT_MS = 10_000
+/** Generous enough that the wait above, not this, is what ends a contended pooled write. */
+const POOLED_TRANSACTION = { timeout: 20_000, maxWait: 15_000 }
+
+/**
+ * `true` taken, `false` another transaction holds it, `null` this client did not actually run the
+ * function — a structural test double. The THIRD answer matters: a double whose `$queryRaw` returns `[]`
+ * to everything would otherwise read as "another transaction holds the key", and every in-transaction
+ * refusal in the unit suite would silently stop being recorded. A real PostgreSQL connection always
+ * returns exactly one row with a boolean in it.
+ */
+async function tryLockPostingKey(client: PostingKeyLockClient, key: PostingRefusalKey): Promise<boolean | null> {
+  if (typeof client.$queryRaw !== 'function') return null
+  const rows = await client.$queryRaw`SELECT pg_try_advisory_xact_lock(${ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE}, ${postingKeyLockId(key)}) AS got` as Array<{ got?: unknown }> | undefined
+  const got = rows?.[0]?.got
+  return typeof got === 'boolean' ? got : null
+}
+
+/**
+ * Run `fn` holding the posting key's lock, opening a transaction for it when the client is not already
+ * in one. `fn` is told what it got: it must not treat `{ held: false }` as permission.
+ *
+ * `callerTransaction` is the CONTRACT half — a caller that passed `withSavepoint` has said it is inside
+ * its own transaction. It is not trusted alone: when it is not set the database is ASKED
+ * (`isClientInsideTransaction`), because Prisma's transaction client is not distinguishable from the
+ * pooled one by looking at it (lib/db/savepoint.ts), and calling `$transaction` on a transaction client
+ * would open a SECOND connection inside the first — a self-deadlock waiting to happen.
+ */
+export async function runUnderPostingKeyLock<T>(
+  client: PostingKeyLockClient,
+  key: PostingRefusalKey,
+  options: { callerTransaction: boolean },
+  fn: (client: PostingKeyLockClient, lock: PostingKeyLock) => Promise<T>,
+): Promise<T> {
+  // STATICALLY imported, so `tsc` is what guarantees the probe exists in production; the `typeof` check
+  // can only be false under a MODULE DOUBLE of lib/db/savepoint that supplies `withSavepoint` alone (four
+  // test files do), and such a double is treated exactly like a client with no raw escape hatch.
+  const probe: unknown = isClientInsideTransaction
+  const inTransaction = options.callerTransaction
+    ? true
+    : typeof probe === 'function' ? await isClientInsideTransaction(client) : null
+  // No raw escape hatch at all: a structural test double. It could never have been serialised and this
+  // is not the round that changes that — it is told `held: false`, and says so.
+  if (inTransaction === null) return fn(client, { held: false, reason: 'unlockable' })
+  if (inTransaction) {
+    const got = await tryLockPostingKey(client, key)
+    if (got === null) return fn(client, { held: false, reason: 'unlockable' })
+    return fn(client, got ? { held: true, contended: false } : { held: false, reason: 'busy' })
+  }
+  if (typeof client.$transaction !== 'function') return fn(client, { held: false, reason: 'unlockable' })
+  return await client.$transaction(async (raw) => {
+    const tx = raw as unknown as PostingKeyLockClient
+    // Bounds the wait below without touching the session or any other transaction: `set_config(…, true)`
+    // is SET LOCAL, undone by this transaction's own commit. Parameterised rather than assembled, so
+    // this module stays off the runtime-assembled-SQL inventory (tests/accounting/plugin-selection-lock).
+    if (typeof tx.$executeRaw === 'function') {
+      await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${POOLED_LOCK_TIMEOUT_MS}ms`}, true)`
+    }
+    const got = await tryLockPostingKey(tx, key)
+    if (got === null) return fn(tx, { held: false, reason: 'unlockable' })
+    if (got) return fn(tx, { held: true, contended: false })
+    // Contended. Safe to wait: this transaction holds nothing yet (see the header), and a timeout
+    // raises 55P03, which the caller reports rather than swallows.
+    // Called as a METHOD (Prisma binds its client methods); the assertion only erases the optionality
+    // the structural type carries for doubles, which `got === null` above has already ruled out.
+    await tx.$executeRaw!`SELECT pg_advisory_xact_lock(${ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE}, ${postingKeyLockId(key)})`
+    return fn(tx, { held: true, contended: true })
+  }, POOLED_TRANSACTION) as T
 }
 
 export type PostingSuppression = { suppressed: false } | { suppressed: true; at: Date; by: string | null }

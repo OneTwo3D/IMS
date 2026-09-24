@@ -178,8 +178,16 @@ export async function reportPostingNotQueued(params: {
       remedy: params.remedy,
       detail: { enqueueConnector: params.outcome.connector ?? null, ...params.metadata },
     },
-    // review M-5: the facade already wrote this row with the SPECIFIC reason. Merging adds what only this
-    // site knows (what stands in IMS, the remedy) without counting the refusal twice or degrading its reason.
+    // review M-5: where the facade already wrote this row, it wrote the SPECIFIC reason. Merging adds what
+    // only this site knows (what stands in IMS, the remedy) without counting the refusal twice or degrading
+    // its reason.
+    //
+    // o3d-j625 r9 — this flag is the enqueue's INTENT, not proof a row exists. Since the record may now
+    // decline (a suppressed key, or a contended one inside a caller's transaction), `refusalRecorded` can be
+    // true with no row to merge into. That is harmless and deliberately not threaded back: with no existing
+    // row `recordAccountingPostingRefusal` takes its upsert's CREATE branch, which writes the whole record
+    // regardless of `mergeOnly` — the merge shape only narrows an UPDATE. Nothing is lost, so the outcome is
+    // not plumbed through three layers to change nothing.
     { mergeOnly: params.outcome.refusalRecorded === true, withSavepoint: params.inTransaction?.withSavepoint },
   )
 }

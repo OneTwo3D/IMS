@@ -2338,6 +2338,14 @@ Three things about those rows:
 * **A posting marked handled stays handled.** If the same posting is refused again later it is logged
   (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
   IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
+* **And that holds when the two happen at the same moment.** Marking a posting handled, queueing it, and
+  recording a refusal of it all take the same lock on that one posting, so a refusal cannot land in the gap
+  between your *Mark as handled* and its save and put the row back on the list — which would have asked you
+  to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being
+  queued is logged (`accounting_posting_refused_after_queued`) and not listed, because the posting is in the
+  accounting sync log. A refusal raised from inside a piece of work that cannot wait for that lock is not
+  listed either; it is logged as a **WARNING** (`accounting_posting_refusal_not_recorded_contended`) naming
+  the posting, and the refusal itself is in the accounting activity log as always.
 * **If IMS cannot tell whether a posting was marked handled, it does not post it.** The check runs before
   every accounting entry is queued. When the check itself cannot be made — the database is unreachable, the
   query times out, the transaction is cancelled — IMS refuses the enqueue rather than reading "cannot tell"

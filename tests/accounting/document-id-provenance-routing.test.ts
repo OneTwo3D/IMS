@@ -320,8 +320,14 @@ const postingRefusalTable = {
     const hits = refusals.filter((r) => (where.id !== undefined
       ? r.id === where.id && (!kinds || kinds.includes(r.kind))
       : r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId && r.scope === where.scope)
-      && (where.resolvedAt === null ? r.resolvedAt === null : r.resolvedAt !== null))
-    for (const hit of hits) Object.assign(hit, data)
+      // o3d-j625 r9: an ABSENT predicate constrains nothing. This read `where.resolvedAt === undefined` as
+      // "resolved", which was invisible while every caller named it — and the record's own update does not.
+      && (where.resolvedAt === undefined ? true : where.resolvedAt === null ? r.resolvedAt === null : r.resolvedAt !== null)
+      // o3d-j625 r9: and the suppression predicate that update carries, which is what stops a refusal
+      // reopening a posting somebody already posted by hand.
+      && (where.suppressedAt === undefined ? true : (r.suppressedAt ?? null) === null))
+    // r9: through the same applier as the upsert, so the atomic increment is applied here too.
+    for (const hit of hits) applyRefusalUpdate(hit, data)
     return { count: hits.length }
   },
   // o3d-j625 r7: read by the suppression check (by key) and by the mark (by id).

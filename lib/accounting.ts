@@ -522,6 +522,8 @@ async function refuseUnattributableChart(params: {
    * M-14) so it shares the commit that made the debt real.
    */
   refusalClient?: { client: PostingRefusalClient; withSavepoint: <T>(fn: () => Promise<T>) => Promise<T> }
+  /** o3d-j625 r9 — the moment the enqueue that is refusing began; see RecordRefusalOptions.decidedAt. */
+  decidedAt?: Date
 }): Promise<AccountingEnqueueOutcome | null> {
   // AND IF SOMETHING GETS HERE NAMING NOTHING, IT IS REFUSED — NOT ACCOMMODATED.
   //
@@ -673,7 +675,7 @@ async function refuseUnattributableChart(params: {
  * of counting it twice (review M-5).
  */
 async function recordRefusalIfAsked(
-  params: { recordRefusalAsOutstanding?: boolean; posting?: AccountingPostingKey; refusalClient?: { client: PostingRefusalClient; withSavepoint: <T>(fn: () => Promise<T>) => Promise<T> } },
+  params: { recordRefusalAsOutstanding?: boolean; posting?: AccountingPostingKey; refusalClient?: { client: PostingRefusalClient; withSavepoint: <T>(fn: () => Promise<T>) => Promise<T> }; decidedAt?: Date },
   given: Omit<Parameters<typeof recordAccountingPostingRefusal>[2], 'kind'>,
 ): Promise<boolean> {
   if (!params.recordRefusalAsOutstanding || !params.posting) return false
@@ -683,11 +685,12 @@ async function recordRefusalIfAsked(
   if (params.refusalClient) {
     await recordAccountingPostingRefusal(params.refusalClient.client, params.posting, record, {
       withSavepoint: params.refusalClient.withSavepoint,
+      decidedAt: params.decidedAt,
     })
     return true
   }
   const { db } = await import('@/lib/db')
-  await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, params.posting, record)
+  await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, params.posting, record, { decidedAt: params.decidedAt })
   return true
 }
 
@@ -769,6 +772,10 @@ export async function queueAccountingSync(params: {
   // o3d-j625 r4: a refusal on THIS path is recorded as outstanding work — the caller is not inside a
   // transaction this refusal rolls back, so what it was for stands and the posting really is owed.
   // o3d-j625 r5: and the row is keyed on THIS enqueue's own params, which is also what the clear matches.
+  // o3d-j625 r9 — WHEN THIS REFUSAL WAS DECIDED. Handed to every refusal record so that a posting
+  // QUEUED by another transaction after this moment can be recognised as superseding the refusal,
+  // rather than reopening a row nobody owes (posting-refusal-inbox.ts).
+  const decidedAt = new Date()
   const posting = accountingPostingKey(params)
   // o3d-j625 r7 — A POSTING MARKED HANDLED IS NEVER POSTED OR RE-REFUSED. Asked FIRST, before any check
   // that could refuse it and record a refusal over a posting someone has already made by hand. The
@@ -786,7 +793,7 @@ export async function queueAccountingSync(params: {
       return { queued: true, reason: 'handled-by-hand', connector: params.connector ?? params.chartConnector ?? null, posting }
     }
   }
-  const unattributable = await refuseUnattributableChart({ ...params, recordRefusalAsOutstanding: true, posting })
+  const unattributable = await refuseUnattributableChart({ ...params, recordRefusalAsOutstanding: true, posting, decidedAt })
   if (unattributable) return { ...unattributable, posting }
   // o3d-j625 r2: AND THERE IS NO SECOND RESOLUTION LEFT HERE AT ALL.
   //
@@ -1163,6 +1170,10 @@ export async function queueAccountingSyncTx(
 ): Promise<boolean> {
   // o3d-j625 r5 (review HIGH 1/2/3): one key, derived from these params, used by the refusal record and by
   // the clear below — they cannot disagree.
+  // o3d-j625 r9 — WHEN THIS REFUSAL WAS DECIDED. Handed to every refusal record so that a posting
+  // QUEUED by another transaction after this moment can be recognised as superseding the refusal,
+  // rather than reopening a row nobody owes (posting-refusal-inbox.ts).
+  const decidedAt = new Date()
   const posting = accountingPostingKey(params)
   const refusalClient = params.recordRefusalAsOutstanding
     ? {
@@ -1192,7 +1203,7 @@ export async function queueAccountingSyncTx(
     let outcome = given
     if (!outcome.queued && outcome.reason === 'refused' && refusal && refusalClient && !outcome.refusalRecorded) {
       const activeNow = await getActiveAccountingConnectorId().catch(() => null)
-      const recorded = await recordRefusalIfAsked({ ...params, posting, refusalClient }, {
+      const recorded = await recordRefusalIfAsked({ ...params, posting, refusalClient, decidedAt }, {
         chartConnector: params.chartConnector,
         activeConnector: activeNow,
         reason: refusal.reason,
@@ -1296,7 +1307,7 @@ export async function queueAccountingSyncTx(
   // the thing that removes the second resolution, so nothing may resolve ahead of it. Reported through
   // `answer` so this path's out-channel names the same connector the refusal is about. Shared with the
   // facade rather than restated: see refuseUnattributableChart.
-  const unattributable = await refuseUnattributableChart({ ...params, posting, refusalClient })
+  const unattributable = await refuseUnattributableChart({ ...params, posting, refusalClient, decidedAt })
   if (unattributable) {
     // review L1: the WHOLE answer, so the caller sees the active connector and that the row was recorded.
     return answer(unattributable, unattributable.connector)

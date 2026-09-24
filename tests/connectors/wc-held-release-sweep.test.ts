@@ -134,12 +134,15 @@ mock.module('@/lib/db', {
           return row
         },
         updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          // o3d-j625 r9: three predicates now, and an ABSENT one constrains nothing — the record's own
+          // update names neither `resolvedAt` nor an id, and carries `suppressedAt: null`.
           const wantResolved = where.resolvedAt !== null && typeof where.resolvedAt === 'object'
           const hits = state.refusals.filter((r) =>
             r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId
             && ((r as { scope?: string }).scope ?? '') === (where.scope ?? '')
-            && (wantResolved ? r.resolvedAt !== null : r.resolvedAt === null))
-          for (const hit of hits) Object.assign(hit, data)
+            && (where.resolvedAt === undefined ? true : wantResolved ? r.resolvedAt !== null : r.resolvedAt === null)
+            && (where.suppressedAt === undefined ? true : ((r as { suppressedAt?: unknown }).suppressedAt ?? null) === null))
+          for (const hit of hits) applyRefusalUpdate(hit as unknown as Record<string, unknown>, data)
           return { count: hits.length }
         },
       },

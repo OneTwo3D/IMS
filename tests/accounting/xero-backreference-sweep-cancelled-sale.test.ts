@@ -134,7 +134,12 @@ const dbStub = {
     upsert: async () => ({}),
   },
   // lockSalesOrder issues `SELECT id FROM "sales_orders" WHERE id = $1 FOR UPDATE`.
-  $queryRaw: async (query: { values?: unknown[] }) => {
+  $queryRaw: async (query: { values?: unknown[]; sql?: string; text?: string; strings?: string[] }) => {
+    // o3d-j625 r9: the SALES-ORDER lock is this one statement. Other mechanisms run raw SELECTs on this
+    // client too (the posting-key lock's `pg_try_advisory_xact_lock`), and journalling those as a row
+    // lock would put entries in the ORDER this test pins that are not sales-order locks at all.
+    const text = query?.sql ?? query?.text ?? (query?.strings ?? (Array.isArray(query) ? query as string[] : [])).join('?')
+    if (!/FOR UPDATE/i.test(String(text))) return []
     journal.push(`lock:${String(query?.values?.[0] ?? '')}`)
     if (lockFailures > 0) {
       lockFailures -= 1

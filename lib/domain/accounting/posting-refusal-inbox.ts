@@ -1,6 +1,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
+import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
+import { runUnderPostingKeyLock, type PostingKeyLockClient } from '@/lib/domain/accounting/posting-suppression'
 
 /**
  * o3d-j625 r4/r5 — A REFUSED POSTING IS OUTSTANDING WORK, NOT A LOG LINE.
@@ -55,12 +57,37 @@ export type PostingRefusalClient = {
       update: Record<string, unknown>
     }): Promise<unknown>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
-    /** o3d-j625 r7: read to honour a suppression (a posting marked handled). Optional for older doubles. */
+    /**
+     * o3d-j625 r7: read to honour a suppression (a posting marked handled). Optional for older doubles.
+     *
+     * o3d-j625 r9: and the RESOLUTION, so a refusal that lost a race with the posting being queued can
+     * see that it did. Read under the posting key's lock; a real client can always read it
+     * (`PrismaClientCanAlwaysReadTheSuppression`, checked by tsc).
+     */
     findUnique?(args: {
       where: { type_referenceType_referenceId_scope: PostingRefusalKey }
-      select: { suppressedAt: true; resolvedBy: true }
-    }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null } | null>
+      select: { suppressedAt: true; resolvedBy: true; resolvedAt?: true; resolution?: true }
+    }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null; resolvedAt?: Date | null; resolution?: string | null } | null>
   }
+  /**
+   * o3d-j625 r9 — THE ACCOUNTING SYNC LOG, read only when the posting key was CONTENDED.
+   *
+   * A refusal racing the FIRST successful enqueue of a posting has no resolved row to learn from: the
+   * enqueue's clear matched nothing, because no refusal row existed yet. The evidence that the posting is
+   * nonetheless queued is the sync row itself. Optional, so a structural double is unchanged — and read
+   * only under contention, never as a blanket "a row exists, so nothing is owed" (see the header).
+   */
+  /**
+   * Typed `unknown` and narrowed at runtime on purpose: the clients passed here carry a dozen different
+   * shapes of this delegate (a create-only double, a full Prisma client, a narrowed transaction alias),
+   * and an all-optional structural type would reject every one of them under TypeScript's weak-type
+   * check. What the code needs is asked of the value, which is what it has to do anyway.
+   */
+  accountingSyncLog?: unknown
+}
+
+type SyncLogReader = {
+  findMany?(args: { where: Record<string, unknown>; select: { payload: true } }): Promise<Array<{ payload: unknown }>>
 }
 
 /** The key of the posting a row is about — produced by `accountingPostingKey` in lib/accounting.ts. */
@@ -99,9 +126,34 @@ export type RecordRefusalOptions = {
   /**
    * A savepoint wrapper, supplied when the client is a CALLER'S TRANSACTION. See point 3 above: without it
    * a failure here aborts the caller's transaction whatever this module does with the exception.
+   *
+   * o3d-j625 r9: it is also the CONTRACT that says this client is inside a transaction, which decides
+   * whether this module may WAIT for the posting key's lock. See `runUnderPostingKeyLock`.
    */
   withSavepoint?: <T>(fn: () => Promise<T>) => Promise<T>
+  /**
+   * o3d-j625 r9 — WHEN THE REFUSAL WAS DECIDED, not when it is being written.
+   *
+   * A refusal is decided from state read before this call, and the write can land arbitrarily later: after
+   * an await, after a report, after waiting for this posting's lock. If the posting was QUEUED inside that
+   * window the refusal is stale, and reopening the row would be a debt nobody owes. The enqueue funnels
+   * pass the moment the enqueue began; every other site gets the moment this call began, which is the
+   * shortest honest answer available where nothing carries one.
+   */
+  decidedAt?: Date
 }
+
+/**
+ * Why nothing was written. Every value is something the operator is TOLD, never a silent no-op.
+ *
+ * `contended` is a refusal to guess rather than a failure: another transaction is settling this exact
+ * posting, and this caller — inside its own transaction — may not wait for it (see the deadlock note in
+ * posting-suppression.ts).
+ */
+type RefusalRecordOutcome =
+  | { recorded: true }
+  | { recorded: false; because: 'suppressed' | 'queued'; at: Date }
+  | { recorded: false; because: 'contended' }
 
 async function guarded(
   what: string,
@@ -130,10 +182,80 @@ async function guarded(
 }
 
 /**
+ * Is there a live accounting sync row for EXACTLY this posting key?
+ *
+ * Scoped the same way the mark scopes its candidates (posting-mark-handled.ts): the indexed columns
+ * narrow it, and `accountingPostingKeyForRow` — the same function the row-creating primitive keys its
+ * clear on — decides whether a row belongs to this posting or to a different one sharing the document.
+ * `false` when the client cannot answer (a structural double), which records as before.
+ */
+async function postingIsInTheSyncLog(client: PostingRefusalClient, key: PostingRefusalKey): Promise<boolean> {
+  // The delegate is never bound to a local: tests/accounting/sync-log-row-primitive.test.ts reports any
+  // such binding, because a `.create` reached through one is invisible to it. Every use of it here is
+  // visible at the access site, and both of them are reads.
+  const reader = client as { accountingSyncLog?: SyncLogReader }
+  if (typeof reader.accountingSyncLog?.findMany !== 'function') return false
+  const rows = await reader.accountingSyncLog.findMany({
+    where: {
+      type: key.type,
+      referenceType: key.referenceType,
+      referenceId: key.referenceId,
+      status: { not: 'CANCELLED' },
+    },
+    select: { payload: true },
+  })
+  return rows.some((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
+}
+
+/**
  * Record a refused posting as outstanding.
  *
  * Re-refusing REOPENS the row rather than leaving a resolved one behind: the posting is owed again, and a
  * row that says otherwise because it was once cleared is the silence this table exists to end.
+ *
+ * ── o3d-j625 r9 (Codex HIGH) — AND IT IS SERIALISED WITH THE MARK AND WITH THE CLEAR ──
+ *
+ * r7 read `suppressedAt` here and took no lock, which made the read a guess with a window behind it:
+ *
+ *   read (not suppressed) → `markPostingHandled` commits → upsert
+ *
+ * left the row OUTSTANDING with `suppressedAt` still set, so the exception inbox listed a posting an
+ * operator had already posted BY HAND as work still owed — and its remedy asks them to post it. The same
+ * shape with a successful enqueue instead of a mark (`clearAccountingPostingRefusal` commits between the
+ * read and the upsert) leaves a debt that is not owed. r7's comment argued the second half was harmless
+ * "because the suppression column is not in the upsert"; that is true of the COLUMN and false of the
+ * INBOX, which keys off `resolvedAt`.
+ *
+ * So the read and the write happen under this posting key's lock, the one the mark and every sync-row
+ * creation already take (`runUnderPostingKeyLock`, which also explains why waiting for it is safe from
+ * the pool and forbidden inside a caller's transaction). Under it, three things are checked:
+ *
+ *   1. SUPPRESSED — a posting marked handled stays handled. Reported, never recorded, and the write
+ *      itself refuses suppressed rows (`suppressedAt: null` in its predicate), so this does not rest on
+ *      the read alone.
+ *   2. QUEUED WHILE THIS REFUSAL WAS IN FLIGHT — the row is resolved as `queued`, and either this call
+ *      had to WAIT for the key (so another transaction was settling the posting while it waited) or the
+ *      resolution is stamped at/after the moment the refusal was decided. Then the posting is queued and
+ *      the refusal is stale.
+ *   3. CONTENDED AND UNABLE TO WAIT — inside a caller's transaction, a key another transaction holds.
+ *      Nothing is recorded, because nothing can be read that will still be true.
+ *
+ * WHAT IS DELIBERATELY *NOT* CHECKED, and why (the "what would still pass it" question). Not "is there a
+ * live sync row for this key" on its own. Several types share one key across successive postings by
+ * design (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT — see lib/accounting/posting-key.ts):
+ * edit 1 queues and clears the row, edit 2 is refused, and the ledger now holds a stale document. That
+ * refusal is a REAL debt, and a blanket "a live row exists, so nothing is owed" would swallow it — the
+ * table's whole purpose, lost to a guard meant to protect it. Only a resolution CONCURRENT with this
+ * refusal is treated as superseding it.
+ *
+ * THE RESIDUAL WINDOW, stated rather than papered over: a refusal decided before a successful enqueue
+ * that both started and committed in the gap between the decision and this call — with this call then
+ * taking the key uncontended — is still recorded, and the inbox shows a posting that is in fact queued.
+ * Commit order is what would settle it and PostgreSQL does not expose it here (no
+ * `track_commit_timestamp`). The consequence is bounded: the row is visible, and it CANNOT lead to a
+ * second ledger post, because `markPostingHandled` refuses (`may_be_posted`) for as long as a live sync
+ * row for the key exists. Passing `decidedAt` from the enqueue funnels narrows the window to the enqueue
+ * itself.
  */
 export async function recordAccountingPostingRefusal(
   client: PostingRefusalClient,
@@ -142,87 +264,178 @@ export async function recordAccountingPostingRefusal(
   options?: RecordRefusalOptions,
 ): Promise<void> {
   const now = new Date()
+  const decidedAt = options?.decidedAt ?? now
+  // A holder rather than a plain `let`: the assignment happens inside a callback, and TypeScript would
+  // otherwise narrow the variable to the initializer and call every branch below unreachable.
+  const state: { outcome: RefusalRecordOutcome } = { outcome: { recorded: true } }
   await guarded('recording', key, options, async () => {
-    // o3d-j625 r7 — A POSTING MARKED HANDLED STAYS HANDLED. Someone asserted they posted it by hand, and
-    // IMS will never post it (posting-suppression.ts), so a later refusal of the same key is not new
-    // debt: recording it would reopen a row whose only remedy has already been carried out. Reported, not
-    // recorded. (A mark committing between this read and the upsert below would leave the row reopened;
-    // the suppression column is not in the upsert, so it survives, and nothing can be posted twice.)
-    const existing = typeof client.accountingPostingRefusal.findUnique === 'function'
-      ? await client.accountingPostingRefusal.findUnique({
-        where: { type_referenceType_referenceId_scope: key },
-        select: { suppressedAt: true, resolvedBy: true },
-      })
-      : null
-    if (existing?.suppressedAt) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_posting_refused_after_handled_by_hand',
-        tag: 'accounting',
-        level: 'INFO',
-        description:
-          `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled — `
-          + `posted by hand — on ${existing.suppressedAt.toISOString()}. Nothing is owed and nothing was recorded.`,
-        metadata: { ...key, reason: record.reason },
-      }).catch(() => { /* nothing else to try */ })
-      return
-    }
-    if (!options?.mergeOnly) {
-      // review M-13: a resolved row being refused again is a NEW episode. Reset before the increment, so
-      // `firstRefusedAt` is when THIS gap opened and the count is this episode's.
-      await client.accountingPostingRefusal.updateMany({
-        where: { ...key, resolvedAt: { not: null } },
-        // r6 (review H4): a row someone MARKED HANDLED reopens the same way — the same posting refused again
-        // is a new debt, whoever closed the last one. (How it was closed is cleared with `resolvedAt`, below.)
-        data: { firstRefusedAt: now, refusedCount: 0, detail: null },
-      })
-    }
-    await client.accountingPostingRefusal.upsert({
-      where: { type_referenceType_referenceId_scope: key },
-      create: {
-        ...key,
-        kind: record.kind,
-        chartConnector: record.chartConnector,
-        activeConnector: record.activeConnector,
-        reason: record.reason,
-        committed: record.committed,
-        remedy: record.remedy,
-        detail: (record.detail ?? undefined) as Prisma.InputJsonValue | undefined,
-        firstRefusedAt: now,
-        lastRefusedAt: now,
-      },
-      update: options?.mergeOnly
-        ? {
-            // What only the caller knows. The reason and the count belong to the enqueue's own write.
-            committed: record.committed,
-            remedy: record.remedy,
-            // review L-2: `detail` is REPLACED, never merged — a stale detail can describe a different
-            // refusal of the same posting.
-            detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
-            // The SITE names the kind; the enqueue's own write could only default it (posting-refusal-kinds.ts).
-            ...(record.kind ? { kind: record.kind } : {}),
-            resolvedAt: null,
-            resolution: null,
-            resolvedBy: null,
-            resolutionNote: null,
+    state.outcome = await runUnderPostingKeyLock(
+      client as unknown as PostingKeyLockClient,
+      key,
+      { callerTransaction: Boolean(options?.withSavepoint) },
+      async (locked, lock) => {
+        const table = (locked as unknown as PostingRefusalClient).accountingPostingRefusal
+        // Another transaction is settling this exact posting and this caller may not wait for it. Nothing
+        // read now would still be true when it was written, so nothing is written.
+        if (!lock.held && lock.reason === 'busy') return { recorded: false, because: 'contended' }
+        const existing = typeof table.findUnique === 'function'
+          ? await table.findUnique({
+            where: { type_referenceType_referenceId_scope: key },
+            select: { suppressedAt: true, resolvedBy: true, resolvedAt: true, resolution: true },
+          })
+          : null
+        // 1. A POSTING MARKED HANDLED STAYS HANDLED (r7). Someone asserted they posted it by hand and IMS
+        //    will never post it (posting-suppression.ts), so a later refusal of the same key is not new
+        //    debt: recording it would reopen a row whose only remedy has already been carried out.
+        if (existing?.suppressedAt) return { recorded: false, because: 'suppressed', at: existing.suppressedAt }
+        // 2. QUEUED WHILE THIS REFUSAL WAS IN FLIGHT (r9). See the header for why a live sync row on its
+        //    own is NOT this check.
+        //
+        //    STRICTLY LATER, not "at or after". These timestamps are milliseconds, and a refusal decided in
+        //    the SAME millisecond as the clear is the ordinary fast case, not a race — measured: the r5 M-13
+        //    test (refuse, queue, refuse again through in-memory doubles) runs all of it inside one
+        //    millisecond, and `>=` swallowed the third refusal, losing a real debt. A tie is therefore
+        //    recorded, and the CONTENDED case below — which needs no clock at all — is what covers a race
+        //    this comparison is too coarse to see.
+        //
+        //    `lock.contended` is deliberately NOT an alternative here. A mutation that removed it changed
+        //    nothing measurable (the contended check below caught the same case), and in one state it would
+        //    be WRONG: a row resolved as `queued` whose sync row was CANCELLED afterwards is owed again, and
+        //    the sync-log check below sees that where "it was once queued" cannot.
+        if (
+          existing?.resolvedAt
+          && existing.resolution === 'queued'
+          && existing.resolvedAt.getTime() > decidedAt.getTime()
+        ) {
+          return { recorded: false, because: 'queued', at: existing.resolvedAt }
+        }
+        // And the FIRST refusal of a posting that was queued concurrently has no resolved row to learn
+        // from — the enqueue's clear matched nothing because there was no row yet. Under contention, the
+        // sync log is the evidence. Only under contention: a live row for this key is NOT on its own a
+        // reason to swallow a refusal (see the header's SALES_INVOICE_UPDATE case).
+        if (lock.held && lock.contended && await postingIsInTheSyncLog(locked as unknown as PostingRefusalClient, key)) {
+          return { recorded: false, because: 'queued', at: existing?.resolvedAt ?? now }
+        }
+        if (!options?.mergeOnly) {
+          // review M-13: a resolved row being refused again is a NEW episode. Reset before the increment, so
+          // `firstRefusedAt` is when THIS gap opened and the count is this episode's.
+          await table.updateMany({
+            // r6 (review H4): a row someone MARKED HANDLED reopens the same way — the same posting refused again
+            // is a new debt, whoever closed the last one. (How it was closed is cleared with `resolvedAt`, below.)
+            // r9: EXCEPT a suppressed one, which is never reopened by anyone — asserted in the predicate and
+            // not only in the read above, so a client that cannot read the suppression still cannot clear it.
+            where: { ...key, resolvedAt: { not: null }, suppressedAt: null },
+            data: { firstRefusedAt: now, refusedCount: 0, detail: null },
+          })
+        }
+        const update = options?.mergeOnly
+          ? {
+              // What only the caller knows. The reason and the count belong to the enqueue's own write.
+              committed: record.committed,
+              remedy: record.remedy,
+              // review L-2: `detail` is REPLACED, never merged — a stale detail can describe a different
+              // refusal of the same posting.
+              detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
+              // The SITE names the kind; the enqueue's own write could only default it (posting-refusal-kinds.ts).
+              ...(record.kind ? { kind: record.kind } : {}),
+              resolvedAt: null,
+              resolution: null,
+              resolvedBy: null,
+              resolutionNote: null,
+            }
+          : {
+              chartConnector: record.chartConnector,
+              activeConnector: record.activeConnector,
+              reason: record.reason,
+              committed: record.committed,
+              remedy: record.remedy,
+              detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
+              lastRefusedAt: now,
+              ...(record.kind ? { kind: record.kind } : {}),
+              resolvedAt: null,
+              resolution: null,
+              resolvedBy: null,
+              resolutionNote: null,
+              refusedCount: { increment: 1 },
+            }
+        if (existing) {
+          // A row IS there, so this is an update — and it carries the suppression predicate, which is what
+          // makes "a suppressed row is never updated" a property of the STATEMENT. `upsert` cannot express
+          // it (its `where` must be the unique key), which is why the two cases are split.
+          const { count } = await table.updateMany({ where: { ...key, suppressedAt: null }, data: update })
+          if (count === 0) {
+            throw new Error(
+              `the row for ${key.type} ${key.referenceType} ${key.referenceId} was not reopened: under this `
+              + 'posting\'s lock it is marked handled (posted by hand), or it is no longer there',
+            )
           }
-        : {
-            chartConnector: record.chartConnector,
-            activeConnector: record.activeConnector,
-            reason: record.reason,
-            committed: record.committed,
-            remedy: record.remedy,
-            detail: (record.detail ?? null) as Prisma.InputJsonValue | null,
-            lastRefusedAt: now,
-            ...(record.kind ? { kind: record.kind } : {}),
-            resolvedAt: null,
-            resolution: null,
-            resolvedBy: null,
-            resolutionNote: null,
-            refusedCount: { increment: 1 },
-          },
-    })
+        } else {
+          // No row to fence. `upsert` rather than `create` so a client that cannot READ the row (a
+          // structural test double) still behaves as it did before this round.
+          await table.upsert({
+            where: { type_referenceType_referenceId_scope: key },
+            create: {
+              ...key,
+              kind: record.kind,
+              chartConnector: record.chartConnector,
+              activeConnector: record.activeConnector,
+              reason: record.reason,
+              committed: record.committed,
+              remedy: record.remedy,
+              detail: (record.detail ?? undefined) as Prisma.InputJsonValue | undefined,
+              firstRefusedAt: now,
+              lastRefusedAt: now,
+            },
+            update,
+          })
+        }
+        return { recorded: true }
+      },
+    )
   })
+  // Reported OUTSIDE the lock: a refusal that is not recorded must still be visible, and the activity
+  // write is on another connection — holding a posting key while waiting for it buys nothing.
+  const outcome = state.outcome
+  if (outcome.recorded) return
+  if (outcome.because === 'suppressed') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_posting_refused_after_handled_by_hand',
+      tag: 'accounting',
+      level: 'INFO',
+      description:
+        `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled — `
+        + `posted by hand — on ${outcome.at.toISOString()}. Nothing is owed and nothing was recorded.`,
+      metadata: { ...key, reason: record.reason },
+    }).catch(() => { /* nothing else to try */ })
+    return
+  }
+  if (outcome.because === 'queued') {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_posting_refused_after_queued',
+      tag: 'accounting',
+      level: 'INFO',
+      description:
+        `${key.type} for ${key.referenceType} ${key.referenceId} was refused, but the posting was queued at `
+        + `${outcome.at.toISOString()}, while this refusal was being decided. The posting is in the accounting `
+        + 'sync log, nothing is owed, and nothing was recorded as outstanding.',
+      metadata: { ...key, reason: record.reason, queuedAt: outcome.at.toISOString() },
+    }).catch(() => { /* nothing else to try */ })
+    return
+  }
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'accounting_posting_refusal_not_recorded_contended',
+    tag: 'accounting',
+    level: 'WARNING',
+    description:
+      `IMS refused ${key.type} for ${key.referenceType} ${key.referenceId} and did not record it as outstanding `
+      + 'work: another transaction is queueing, marking or refusing this same posting right now, and this one is '
+      + 'inside a transaction that must not wait for it. The refusal itself stands and is in the accounting '
+      + 'activity log. If the other transaction did not queue the posting, the next refusal of it records the row.',
+    metadata: { ...key, reason: record.reason },
+  }).catch(() => { /* nothing else to try */ })
 }
 
 /**
@@ -231,6 +444,14 @@ export async function recordAccountingPostingRefusal(
  * Called from BOTH enqueues' success paths with a key derived from the enqueue's own params, and on the
  * in-transaction path with the transaction client so the clear commits with the sync row it is about — a
  * clear that survived a rolled-back enqueue would mark the debt paid over a posting never written.
+ *
+ * o3d-j625 r9 — UNDER THE POSTING KEY'S LOCK, like every other write to this table. On the path that
+ * matters most (`createAccountingSyncLogRow`) the caller's transaction already holds the key, so this is
+ * re-entrant and costs nothing; on the facade's pooled clear it is a real acquisition, and it is what
+ * makes a concurrent `recordAccountingPostingRefusal` able to SEE that the posting was queued rather than
+ * read a row that is about to change. A clear that cannot take the key still runs: it is a monotone
+ * CAS — it only ever closes a row that is open — so the worst it can do is settle a debt the posting has
+ * in fact discharged, and skipping it would leave the false debt this round exists to remove.
  */
 export async function clearAccountingPostingRefusal(
   client: PostingRefusalClient,
@@ -238,9 +459,16 @@ export async function clearAccountingPostingRefusal(
   options?: RecordRefusalOptions,
 ): Promise<void> {
   await guarded('clearing', key, options, async () => {
-    await client.accountingPostingRefusal.updateMany({
-      where: { ...key, resolvedAt: null },
-      data: { resolvedAt: new Date(), resolution: 'queued' },
-    })
+    await runUnderPostingKeyLock(
+      client as unknown as PostingKeyLockClient,
+      key,
+      { callerTransaction: Boolean(options?.withSavepoint) },
+      async (locked) => {
+        await (locked as unknown as PostingRefusalClient).accountingPostingRefusal.updateMany({
+          where: { ...key, resolvedAt: null },
+          data: { resolvedAt: new Date(), resolution: 'queued' },
+        })
+      },
+    )
   })
 }

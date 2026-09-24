@@ -84,8 +84,17 @@ const postingRefusalTable = {
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = refusalRows.filter((row) => row.type === where.type && row.referenceType === where.referenceType
       && row.referenceId === where.referenceId && row.scope === where.scope
-      && (where.resolvedAt === null ? row.resolvedAt === null : row.resolvedAt !== null))
-    for (const hit of hits) Object.assign(hit, data)
+      // o3d-j625 r9: an absent predicate constrains nothing; a `suppressedAt: null` one does.
+      && (where.resolvedAt === undefined ? true : where.resolvedAt === null ? row.resolvedAt === null : row.resolvedAt !== null)
+      && (where.suppressedAt === undefined ? true : ((row as Record<string, unknown>).suppressedAt ?? null) === null))
+    for (const hit of hits) {
+      for (const [field, value] of Object.entries(data)) {
+        const row = hit as unknown as Record<string, unknown>
+        row[field] = value && typeof value === 'object' && 'increment' in (value as object)
+          ? Number(row[field] ?? 0) + Number((value as { increment: number }).increment)
+          : value
+      }
+    }
     return { count: hits.length }
   },
 }

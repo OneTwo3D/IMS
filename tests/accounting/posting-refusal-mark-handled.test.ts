@@ -44,7 +44,17 @@ const refusalTable = {
       : refusals.find((row) => matches(row as unknown as Record<string, unknown>, where.type_referenceType_referenceId_scope!))) ?? null,
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = refusals.filter((row) => matches(row as unknown as Record<string, unknown>, where))
-    for (const hit of hits) Object.assign(hit, data)
+    // o3d-j625 r9: Prisma's atomic increment, modelled — the refusal record now writes an EXISTING row
+    // through updateMany (so the write itself can carry `suppressedAt: null`), and a double that stored
+    // the operator object would make every attempt-count assertion meaningless.
+    for (const hit of hits) {
+      const row = hit as unknown as Record<string, unknown>
+      for (const [field, value] of Object.entries(data)) {
+        row[field] = value && typeof value === 'object' && 'increment' in (value as object)
+          ? Number(row[field] ?? 0) + Number((value as { increment: number }).increment)
+          : value
+      }
+    }
     return { count: hits.length }
   },
   upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId_scope: Record<string, unknown> }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
