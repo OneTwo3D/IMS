@@ -28,7 +28,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
@@ -918,7 +918,10 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
   const b = checkout(dirs, 'B', 'V2-RUN-B')
   assert.match(run(script(dirs, 'zero.sh', program(dirs, zero, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
     /^RC=0$/m, 'precondition: an artefact must be standing before the race')
-  writeIdentity(dirs.recovery, standingEntryDigest(dirs.recovery))
+  // THE RECORD BINDS THAT PUBLICATION BY DIGEST **AND BY VERSION**, which is what a raise writes. Bound by
+  // digest alone it is inconsistent with the pointer, and since r5 the repair compares both -- so the first
+  // counted write below would legitimately be the REPAIR's and not the stale one this test is about.
+  writeIdentityBound(dirs.recovery, standingEntryDigest(dirs.recovery), readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''))
 
   const flipped = join(dirs.base, 'a-flipped')
   const paused = join(dirs.base, 'a-paused')
@@ -1006,12 +1009,20 @@ test('[o3d-xi3w] a publication killed between its flip and its record write is r
   assert.match(run(script(dirs, 'zero.sh', program(dirs, zero, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
     /^RC=0$/m, 'precondition: an artefact must be standing')
   const stale = standingEntryDigest(dirs.recovery)
-  writeIdentity(dirs.recovery, stale)
 
   const killed = run(script(dirs, 'killed.sh', program(dirs, next, killedAfterFlip(),
     [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(next)))}`])))
   assert.equal(standingMarker(dirs.recovery), 'V1-KILLED', `precondition: the killed run must have committed its flip: ${killed.output}`)
-  assert.equal(identityDigest(dirs.recovery), stale, 'precondition: and must not have written the record')
+  // AND THE RECORD THE RAISE HAD WRITTEN: it binds the publication that WAS standing, and it carries NO
+  // VERSION, which is the shape a release older than r4 wrote and the shape whose resolution falls back to
+  // the pointer. It is written HERE, after the killed publication, rather than before it, because since r5
+  // the repair compares the version as well as the digest -- so a record present while that run published
+  // would have been rebound by that run's own repair, and the state this test is about would never have
+  // existed. What is measured below is the same state; only nothing else has touched it on the way.
+  writeIdentity(dirs.recovery, stale)
+  assert.doesNotMatch(readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8'), /^fence_script_version=/m,
+    'precondition: the record names no publication, so the resolution falls back to the pointer')
+  assert.equal(identityDigest(dirs.recovery), stale, 'precondition: and it binds the publication that was standing')
   assert.notEqual(identityDigest(dirs.recovery), standingEntryDigest(dirs.recovery),
     'precondition: so the record and the standing artefact disagree')
 
@@ -1476,4 +1487,453 @@ test('[o3d-xi3w] the repair adopts nothing that does not authenticate itself', (
   assert.equal(identityDigest(dirs.recovery), stale, 'and the record must be left alone')
   const resolved = run(script(dirs, 'resolve.sh', program(dirs, next, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'])))
   assert.match(resolved.output, /^RC=1$/m, `and the execution path must go on refusing: ${resolved.output}`)
+})
+
+/**
+ * A LEGACY INSTALLATION THAT AUTHENTICATES ITSELF: the tree at the documented name, and BESIDE it the
+ * record and manifest a pre-pointer release wrote — with the digest the tree really has, so the execution
+ * path gets as far as returning a path instead of refusing on the record. legacyInstallation() above makes
+ * the same shape for the PUBLICATION tests, which never read the record.
+ */
+function legacyInstallationAuthenticated(dirs: Scratch, marker: string): { tree: string; digest: string } {
+  const tree = join(dirs.recovery, 'app')
+  mkdirSync(join(tree, 'scripts'), { recursive: true })
+  writeFileSync(join(tree, 'scripts', 'fence-db-connections.mjs'), markedHelper(marker))
+  const recipe = /^readonly DB_FENCE_ARTEFACT_RECIPE="(.+)"$/m.exec(LIBRARY)![1].replace(/\\\\/g, '\\')
+  const manifest = spawnSync('bash', ['-c', recipe.replace(/ \| sha256sum.*$/, '')], { cwd: tree, encoding: 'utf8' }).stdout
+  const digest = spawnSync('bash', ['-c', recipe], { cwd: tree, encoding: 'utf8' }).stdout.split(' ')[0]
+  assert.match(digest, /^[0-9a-f]{64}$/, 'precondition: the legacy tree has a digest by the documented recipe')
+  writeFileSync(join(dirs.recovery, 'db-fence-artefact.manifest'), manifest)
+  writeFileSync(join(dirs.recovery, 'db-fence-artefact.sha256'),
+    `fence_artefact_sha256=${digest}\nfence_script_sha256=${sha256Of(join(tree, 'scripts', 'fence-db-connections.mjs'))}\nfence_artefact_recipe=x\nfence_artefact_complete=1\n`)
+  assert.ok(lstatSync(tree).isDirectory() && !lstatSync(tree).isSymbolicLink(),
+    'precondition: the documented name must be a real directory, which is what makes it mutable')
+  return { tree, digest }
+}
+
+test('[o3d-xi3w] a pre-pointer installation is adopted, so a concurrent migration cannot change which helper a resolved operation runs', (t) => {
+  // o3d-xi3w r5, Codex HIGH. THE ONE MUTABLE EXECUTION PATH ROUND 2 LEFT. On an installation that no
+  // pointer-era release has published to, the documented name is the TREE — a real directory at a
+  // well-known name. db_fence_script_in_use() authenticated it (seal, record beside the tree, tree digest,
+  // entry digest) and handed that path back, and the caller then ran it with the administrative
+  // credential. A second privileged run publishing in between performs the ONE MIGRATION: it moves the
+  // legacy directory aside, puts a pointer to its own version at that name, and DELETES what it moved. The
+  // same string then resolves to the other release's helper.
+  //
+  // THE INTERLEAVE IS THE EXACT POINT THE FINDING NAMES: between the resolution returning and `node`. Run
+  // A resolves, signals, and waits; run B publishes; run A then executes what it was handed.
+  //
+  // MUTATION ROUTE: make _fence_bind_version() return the documented name again on a legacy box (delete
+  // the `[[ "${text}" == "${tree}" ]]` adoption branch) and the executed-marker assertion goes red with
+  // V2-CONCURRENT.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const legacyIno = statSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')).ino
+  const other = checkout(dirs, 'B', 'V2-CONCURRENT')
+  const resolved = join(dirs.base, 'a-resolved')
+  const published = join(dirs.base, 'b-done')
+
+  const aScript = script(dirs, 'a.sh', program(dirs, other, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; : > ' + JSON.stringify(resolved) + '; exit 0; }',
+    'echo "RESOLVE_RC=0"',
+    'echo "RESOLVED=${script}"',
+    'echo "AUTHENTICATED=$(file_sha256 "${script}")"',
+    // The authentication is complete above this line; the execution is below it.
+    `: > ${JSON.stringify(resolved)}`,
+    `i=0; while [[ ! -e ${JSON.stringify(published)} ]]; do i=$((i+1)); (( i > 400 )) && break; sleep 0.05; done`,
+    'echo "EXECUTED=$(node "${script}" 2>&1)"',
+    'echo "EXEC_DIGEST=$(file_sha256 "${script}")"',
+    'again="$(db_fence_script_in_use 2>/dev/null)" && echo "AGAIN=${again}" || echo "AGAIN_RC=1"',
+  ]))
+  const bScript = script(dirs, 'b.sh', program(dirs, other, [
+    `i=0; while [[ ! -e ${JSON.stringify(resolved)} ]]; do i=$((i+1)); (( i > 400 )) && break; sleep 0.05; done`,
+    '_fence_stage_and_publish; echo "B_RC=$?"',
+    `: > ${JSON.stringify(published)}`,
+  ]))
+  run(script(dirs, 'driver.sh', [
+    'set -uo pipefail',
+    `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
+    'bpid=$!',
+    `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
+    'wait "${bpid}" 2>/dev/null || true',
+  ].join('\n')))
+  const aLog = readFileSync(join(dirs.base, 'a.log'), 'utf8')
+  const bLog = readFileSync(join(dirs.base, 'b.log'), 'utf8')
+
+  // THE PRECONDITIONS, so this cannot pass by never reaching the race: A resolved, B published, and the
+  // documented name really was migrated out from under A — the legacy directory is gone and its record
+  // with it, which is what used to make A execute somebody else's bytes.
+  assert.match(aLog, /^RESOLVE_RC=0$/m, `precondition: run A must resolve on a pre-pointer installation: ${aLog}`)
+  assert.match(bLog, /^B_RC=0$/m, `precondition: run B must publish: ${bLog}`)
+  assert.ok(lstatSync(join(dirs.recovery, 'app')).isSymbolicLink(),
+    'precondition: the documented name must have been migrated to a pointer while A was paused')
+  assert.equal(standingMarker(dirs.recovery), 'V2-CONCURRENT', 'precondition: and it must resolve to the OTHER release')
+  assert.ok(!existsSync(join(dirs.recovery, 'db-fence-artefact.sha256')),
+    'precondition: the migration removed the legacy record, so A cannot be reading it any more')
+
+  // THE CLAIM: A ran the bytes it authenticated, out of a path that is not the documented name.
+  const resolvedPath = /^RESOLVED=(.+)$/m.exec(aLog)![1]
+  assert.doesNotMatch(resolvedPath, new RegExp(`^${join(dirs.recovery, 'app')}/`),
+    `the resolution must not hand back a path through the documented name: ${resolvedPath}`)
+  assert.match(resolvedPath, /\/\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+\/app\/scripts\//,
+    `it must be one versioned directory of this root: ${resolvedPath}`)
+  assert.match(aLog, /^EXECUTED=V0-LEGACY$/m, `and the helper that ran must be the one that was authenticated: ${aLog}`)
+  assert.equal(/^AUTHENTICATED=([0-9a-f]{64})$/m.exec(aLog)![1], /^EXEC_DIGEST=([0-9a-f]{64})$/m.exec(aLog)![1],
+    `by digest as well as by marker: ${aLog}`)
+  // AND THE BYTES ARE THE LEGACY TREE'S OWN INODE, not a copy of it: the adoption is a second NAME.
+  assert.equal(statSync(resolvedPath).ino, legacyIno,
+    'the adopted tree must be the same inode the legacy tree had, so nothing was copied and nothing could differ')
+  // AND THE SAME OPERATION GOES ON RESOLVING, which it did not before: r4 could only refuse here.
+  assert.match(aLog, new RegExp(`^AGAIN=${resolvedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'),
+    `and every later resolution of the same operation gets that same directory: ${aLog}`)
+})
+
+test('[o3d-xi3w] the adoption takes a second name for the legacy bytes and writes nothing at the documented name', (t) => {
+  // WHAT WOULD STILL PASS THE TEST ABOVE: an adoption that MIGRATED the legacy installation — published
+  // its tree into a version and flipped a pointer in. That is the other answer, and it is rejected because
+  // rename(2) cannot put a symbolic link over a non-empty directory: migrating must MOVE the only artefact
+  // on the box, and a power cut in the interval where the documented name does not exist leaves a standing
+  // fence with no helper to release it by. So this asserts the negative — the documented name is still the
+  // same directory, byte for byte and inode for inode, after an operation has resolved through it.
+  const dirs = scratch(t)
+  const { digest } = legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const before = lstatSync(join(dirs.recovery, 'app'))
+  const entry = join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')
+  assert.equal(statSync(entry).nlink, 1, 'precondition: the legacy entry file has exactly one name')
+
+  const out = run(script(dirs, 'resolve.sh', program(dirs, checkout(dirs, 'A', 'V1-CHECKOUT'), [
+    'script="$(db_fence_script_in_use)" || { echo "RC=1"; exit 0; }',
+    'echo "RC=0"',
+    'echo "RESOLVED=${script}"',
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ])))
+  assert.match(out.output, /^RC=0$/m, `the resolution must succeed on a pre-pointer installation: ${out.output}`)
+  assert.match(out.output, /^RAN=V0-LEGACY$/m, `and run the artefact that is standing: ${out.output}`)
+
+  // THE DOCUMENTED NAME IS UNTOUCHED: still a directory, still the same inode, still holding the bytes.
+  const after = lstatSync(join(dirs.recovery, 'app'))
+  assert.ok(after.isDirectory() && !after.isSymbolicLink(), 'the documented name must still be the legacy directory')
+  assert.equal(after.ino, before.ino, 'the same directory inode, so nothing was moved or replaced')
+  assert.equal(readFileSync(entry, 'utf8'), markedHelper('V0-LEGACY'), 'and its bytes are unchanged')
+  assert.ok(existsSync(join(dirs.recovery, 'db-fence-artefact.sha256')),
+    'and the legacy record beside it is still there: nothing was published, so nothing superseded it')
+
+  // AND THE ADOPTED TREE IS THE SAME INODES, with the record and the manifest carried in beside it so that
+  // `<tree>/../<record>` reaches a record describing THAT tree.
+  const resolvedPath = /^RESOLVED=(.+)$/m.exec(out.output)![1]
+  const versionDir = resolvedPath.replace(/\/app\/scripts\/.*$/, '')
+  assert.equal(statSync(resolvedPath).ino, statSync(entry).ino, 'the adopted entry file is the legacy one, by inode')
+  assert.equal(statSync(entry).nlink, 2, 'so the legacy entry file now has two names and no second copy exists')
+  assert.match(readFileSync(join(versionDir, 'db-fence-artefact.sha256'), 'utf8'),
+    new RegExp(`^fence_artefact_sha256=${digest}$`, 'm'), 'and the record travelled with it')
+  assert.ok(existsSync(join(versionDir, 'db-fence-artefact.manifest')), 'and so did the manifest')
+})
+
+test('[o3d-xi3w] a pre-pointer artefact that is not sealed is not given a versioned name', (t) => {
+  // THE SEAL IS ASKED BEFORE ANYTHING IS LINKED, so the link farm cannot be talked into making a second
+  // name for a symlink — which would be executable surface the digest does not cover, inside a directory
+  // this mechanism then calls immutable. Without this gate the refusal would still come, from
+  // db_fence_script_in_use()'s own seal check of the adopted tree; asked here it decides what may be
+  // linked at all, and the message names the legacy tree rather than a versioned directory nobody asked for.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  symlinkSync('/etc/hostname', join(dirs.recovery, 'app', 'scripts', 'smuggled.mjs'))
+  const out = run(script(dirs, 'resolve.sh', program(dirs, checkout(dirs, 'A', 'V1-CHECKOUT'), [
+    'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+  ])))
+  assert.match(out.output, /^RC=1$/m, `it must be refused: ${out.output}`)
+  assert.match(out.output, /is not sealed, so it will not be given a versioned name/,
+    `and the refusal must be the adoption's own: ${out.output}`)
+  const versions = readdirSync(dirs.recovery).filter((name) => name.startsWith('.version-') || name.startsWith('.publish-'))
+  assert.deepEqual(versions, [], `and nothing may be left behind under the recovery root: ${versions.join(', ')}`)
+})
+
+test('[o3d-xi3w] a pin that names a bare tree rather than a publication is not followed', (t) => {
+  // THE PIN'S TEXT IS HELD TO ONE SHAPE, and since r5 that shape REQUIRES the version component: the
+  // adoption means no code path can produce a pin naming the documented tree itself, so a pin that does is
+  // either a leftover from a release that predates this one or a name root was talked into creating — and
+  // following it would put this operation back on the mutable path the adoption exists to leave. The
+  // discriminator is the TEXT ALONE: the same installation, the same bytes, resolved twice.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+
+  // 1. THE PIN NAMES THE BARE TREE, which is what round 4 wrote on such a box.
+  const forged = run(script(dirs, 'forged.sh', program(dirs, app, [
+    'pin="$(_fence_operation_pin)" || { echo "NO_PIN=1"; exit 0; }',
+    'ln -s app "${pin}"',
+    'echo "PIN_TEXT=$(readlink -- "${pin}")"',
+    'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+  ])))
+  assert.match(forged.output, /^PIN_TEXT=app$/m, `precondition: the pin must name the bare tree: ${forged.output}`)
+  assert.match(forged.output, /^RC=1$/m, `a pin with no publication component must not be followed: ${forged.output}`)
+  assert.match(forged.output, /is not one versioned publication and one app tree beneath/,
+    `and it must say why: ${forged.output}`)
+
+  // 2. THE CONTROL: with no forged pin, the very same installation resolves and runs.
+  const ok = run(script(dirs, 'ok.sh', program(dirs, app, [
+    'script="$(db_fence_script_in_use)" || { echo "RC=1"; exit 0; }',
+    'echo "RC=0"',
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ])))
+  assert.match(ok.output, /^RC=0$/m, `CONTROL: the same installation resolves when the pin is the adoption's own: ${ok.output}`)
+  assert.match(ok.output, /^RAN=V0-LEGACY$/m, `and runs the standing artefact: ${ok.output}`)
+})
+
+test('[o3d-xi3w] an adoption whose source is replaced while it is reading refuses and leaves nothing behind', (t) => {
+  // THE WALK IS NOT ONE OPERATION, so the tree it read can stop being the tree at the documented name
+  // while it is reading — a concurrent publication committing its pointer there is exactly that. The
+  // source is identified by device and inode before and after; device and inode survive a RENAME, so what
+  // this catches is the NAME holding a different object, which is the case that matters: the link farm
+  // would otherwise be a half-read tree whose provenance nothing states.
+  //
+  // THE INTERLEAVE IS INJECTED AROUND THE SHIPPED COPY, not inside the library: `cp` is shadowed, the
+  // real program is still what runs, and the replacement happens after it returns — so everything either
+  // side of the pause is the shipped code.
+  //
+  // MUTATION ROUTE: delete the `[[ "${ident_after}" != "${ident_before}" ]]` branch and this goes red on
+  // the refusal, because the adoption then hands back a directory read out of a name somebody else owns.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+  const raced = run(script(dirs, 'raced.sh', program(dirs, app, [
+    'cp() {',
+    '  command cp "$@"; local rc=$?',
+    // The concurrent publisher's commit, in the one instant this case is about: the documented name
+    // stops being the legacy directory.
+    '  if [[ " $* " == *" --link "* ]]; then',
+    '    command rm -rf -- "${DB_FENCE_PROTECTED_APP_DIR}"',
+    '    command ln -s .version-fence.1.someoneelse/app "${DB_FENCE_PROTECTED_APP_DIR}"',
+    '  fi',
+    '  return $rc',
+    '}',
+    'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+  ])))
+  assert.match(raced.output, /^RC=1$/m, `the adoption must refuse: ${raced.output}`)
+  assert.match(raced.output, /while this run was giving it a versioned name/,
+    `and say that its source was replaced under it: ${raced.output}`)
+  const residue = readdirSync(dirs.recovery).filter((name) => name.startsWith('.version-') || name.startsWith('.publish-'))
+  assert.deepEqual(residue, [], `and leave no half-read tree behind: ${residue.join(', ')}`)
+
+  // THE CONTROL: the very same installation, with nothing replacing the documented name, is adopted and
+  // runs — so the refusal above is about the replacement and not about the shadowed `cp`.
+  const control = scratch(t)
+  legacyInstallationAuthenticated(control, 'V0-LEGACY')
+  const ok = run(script(control, 'control.sh', program(control, checkout(control, 'A', 'V1-CHECKOUT'), [
+    'cp() { command cp "$@"; }',
+    'script="$(db_fence_script_in_use)" || { echo "RC=1"; exit 0; }',
+    'echo "RC=0"',
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ])))
+  assert.match(ok.output, /^RC=0$/m, `CONTROL: the same installation resolves when nothing replaces the name: ${ok.output}`)
+  assert.match(ok.output, /^RAN=V0-LEGACY$/m, `and runs the artefact that is standing: ${ok.output}`)
+})
+
+test('[o3d-xi3w] adoptions on a box that never publishes do not accumulate', (t) => {
+  // THE COST OF NOT TOUCHING THE DOCUMENTED NAME is residue: one adopted directory per fence OPERATION,
+  // for as long as the box stays pre-pointer. And the sweep that reaps residue runs at the start of a
+  // PUBLICATION — which on such a box never happens, because an authenticated rotation is what migrates it.
+  // So the adoption asks the sweep itself, with the publisher's own argument: its own directory is what may
+  // not be taken, and an adoption whose pid is alive or whose pin names it is kept by questions the sweep
+  // already asks.
+  //
+  // THREE OPERATIONS, EACH IN A PROCESS THAT EXITS, which is what a cutover is. MUTATION ROUTE: delete the
+  // `_fence_sweep_publications "${stage}"` call and this goes red with three directories instead of one.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+  for (const n of [1, 2, 3]) {
+    const out = run(script(dirs, `op${n}.sh`, program(dirs, app, [
+      'script="$(db_fence_script_in_use)" || { echo "RC=1"; exit 0; }',
+      'echo "RC=0"',
+      'echo "RAN=$(node "${script}" 2>&1)"',
+    ])))
+    assert.match(out.output, /^RC=0$/m, `precondition: operation ${n} must resolve: ${out.output}`)
+    assert.match(out.output, /^RAN=V0-LEGACY$/m, `and run the standing artefact: ${out.output}`)
+  }
+  const versions = readdirSync(dirs.recovery).filter((name) => name.startsWith('.version-fence.'))
+  assert.equal(versions.length, 1, `only the last operation's adoption may be left: ${versions.join(', ')}`)
+  const pins = readdirSync(dirs.recovery).filter((name) => name.startsWith('.inuse-fence.'))
+  assert.equal(pins.length, 1, `and only its pin: ${pins.join(', ')}`)
+  // AND THE DOCUMENTED NAME IS STILL THE LEGACY DIRECTORY: three operations resolved through it and none
+  // of them published, which is the whole premise of this residue existing.
+  assert.ok(lstatSync(join(dirs.recovery, 'app')).isDirectory() && !lstatSync(join(dirs.recovery, 'app')).isSymbolicLink(),
+    'the box must still be pre-pointer')
+})
+
+test('[o3d-xi3w] an adoption that cannot be made durable refuses before it takes a version name', (t) => {
+  // o3d-xi3w r5, Codex review of this round. The first draft of the adoption took no durability barrier,
+  // arguing that nothing outside the operation ever names the directory. That is wrong by one step: the
+  // RAISE writes the version into the recovery record, durably — so a power cut could leave a standing
+  // fence naming a version that exists with files MISSING, and every later resolution would find it, fail
+  // its digest check and refuse. (A version that does not exist at all degrades to the pointer and is
+  // harmless; one that half exists is not.)
+  //
+  // A POWER CUT CANNOT BE STAGED, so what is asserted is the two things that are checkable: the barrier is
+  // TAKEN, and it is taken BEFORE the rename that gives the tree a name a record can hold — so its failure
+  // costs a refusal and not a half-named version. `sync` is shadowed to fail for this tree only, and the
+  // fallback whole-system form is failed with it; every earlier barrier in the same program still works.
+  //
+  // MUTATION ROUTES: delete the `_fence_fsync_tree "${stage}"` call and the refusal assertion goes red;
+  // move it to AFTER `_fence_rename_owned` and the residue assertion goes red, because a version directory
+  // is then left behind under a name a record could already name.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+  const marker = join(dirs.base, 'sync-failed')
+  const out = run(script(dirs, 'nodurable.sh', program(dirs, app, [
+    'sync() {',
+    `  if [[ " $* " == *".publish-fence."* ]]; then : > ${JSON.stringify(marker)}; echo "sync: injected failure" >&2; return 1; fi`,
+    `  if [[ -e ${JSON.stringify(marker)} ]]; then return 1; fi`,
+    '  command sync "$@"',
+    '}',
+    'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+  ])))
+  // THE PRECONDITION WAS REACHED: the injected failure really was the adoption's barrier and not some
+  // earlier one, so this is not a test that passed by refusing for another reason.
+  assert.ok(existsSync(marker), `precondition: the adoption's own barrier must have been asked: ${out.output}`)
+  assert.match(out.output, /^RC=1$/m, `it must refuse: ${out.output}`)
+  assert.match(out.output, /could not be made durable, so this run will not let a fence be raised with a version a power cut could leave incomplete/,
+    `and say why: ${out.output}`)
+  const residue = readdirSync(dirs.recovery).filter((name) => name.startsWith('.version-fence.') || name.startsWith('.publish-fence.'))
+  assert.deepEqual(residue, [], `and nothing may be left at a name a recovery record could hold: ${residue.join(', ')}`)
+  assert.ok(lstatSync(join(dirs.recovery, 'app')).isDirectory() && !lstatSync(join(dirs.recovery, 'app')).isSymbolicLink(),
+    'and the artefact standing at the documented name is untouched')
+
+  // THE CONTROL: the same installation, the same shadowing shape, nothing failed.
+  const ok = run(script(dirs, 'durable.sh', program(dirs, app, [
+    'sync() { command sync "$@"; }',
+    'script="$(db_fence_script_in_use)" || { echo "RC=1"; exit 0; }',
+    'echo "RC=0"',
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ])))
+  assert.match(ok.output, /^RC=0$/m, `CONTROL: with the barrier working it resolves: ${ok.output}`)
+  assert.match(ok.output, /^RAN=V0-LEGACY$/m, `and runs the standing artefact: ${ok.output}`)
+})
+
+test('[o3d-xi3w] a tree flush that FAILS is not laundered into success by the weaker fallback', (t) => {
+  // o3d-xi3w r5, second review of this round. _fence_fsync_tree() was written as
+  // `sync --file-system "$t" && return 0; sync && return 0` — and those two are not the same statement:
+  // `--file-system` is syncfs(2), which REPORTS writeback errors, while bare `sync` is sync(2), which on
+  // Linux cannot. So an I/O error on the strong form fell through to a form that always succeeds, the
+  // barrier returned 0, and the adoption took a version name after its tree had failed to flush.
+  //
+  // THE DISCRIMINATOR IS WHICH FORM FAILS. `sync` is shadowed so that `--file-system` fails and every other
+  // form — the capability probe and the bare flush — succeeds, which is exactly the shape the old code
+  // laundered. MUTATION ROUTE: put the `|| sync` fallback back (or make the absent-option branch
+  // unconditional) and this goes red, because the adoption then succeeds.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+  const asked = join(dirs.base, 'syncfs-asked')
+  const out = run(script(dirs, 'weakflush.sh', program(dirs, app, [
+    'sync() {',
+    `  if [[ " $* " == *" --file-system "* ]]; then : > ${JSON.stringify(asked)}; return 1; fi`,
+    '  command sync "$@"',
+    '}',
+    'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+  ])))
+  // THE PRECONDITION: the strong form really was reached, so the capability probe passed and this is not a
+  // test about an old coreutils.
+  assert.ok(existsSync(asked), `precondition: the filesystem flush must have been attempted: ${out.output}`)
+  assert.match(out.output, /^RC=1$/m, `a failed tree flush must refuse: ${out.output}`)
+  assert.match(out.output, /could not be made durable/, `and say so: ${out.output}`)
+  const residue = readdirSync(dirs.recovery).filter((name) => name.startsWith('.version-fence.') || name.startsWith('.publish-fence.'))
+  assert.deepEqual(residue, [], `and leave nothing at a name a recovery record could hold: ${residue.join(', ')}`)
+})
+
+test('[o3d-xi3w] a stale version binding is repaired even when the entry digest has not changed', (t) => {
+  // o3d-xi3w r5, second review of this round. _fence_bind_record_locked() declared the record "unchanged"
+  // on an equal ENTRY DIGEST alone. On a pre-pointer box that is a state nothing could repair: the raise
+  // records its adopted version, the release removes the fence, and the record then names a version while
+  // the pointer names none — so clause (B) of THE INVARIANT was false there, permanently, because the entry
+  // file had not changed. The same hole admits a publication whose entry file is identical and whose
+  // dependency closure is not.
+  //
+  // THE DISCRIMINATOR IS THE VERSION LINE AND NOTHING ELSE: the record's digest is already the digest of
+  // the standing entry file, so a repair that compares digests has nothing to do.
+  // MUTATION ROUTE: drop `&& "${recorded_version}" == "${version}"` and the record keeps the stale line.
+  const dirs = scratch(t)
+  legacyInstallationAuthenticated(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-CHECKOUT')
+  const standingEntry = sha256Of(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))
+  writeIdentityBound(dirs.recovery, standingEntry, '.version-fence.1.gonenow')
+  assert.match(readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8'), /^fence_script_version=\.version-fence\.1\.gonenow$/m,
+    'precondition: the record names a publication the pointer does not')
+  assert.equal(identityDigest(dirs.recovery), standingEntry,
+    'precondition: and its entry digest is ALREADY the standing one, so only the version differs')
+
+  const out = run(script(dirs, 'repair.sh', program(dirs, app, ['publish_fence_script_copy; echo "RC=$?"'])))
+  assert.match(out.output, /^RC=0$/m, `the repair must not be a refusal: ${out.output}`)
+  const record = readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8')
+  assert.doesNotMatch(record, /^fence_script_version=/m,
+    `the stale version must be gone, because the pointer names none: ${record}`)
+  assert.equal(identityDigest(dirs.recovery), standingEntry, 'and the entry digest is untouched')
+  assert.match(record, /^fence_identity_complete=1$/m, 'and the record is still complete')
+})
+
+test('[o3d-xi3w] the raise binds the record to the publication IT is pinned to, not to whatever is standing', (t) => {
+  // CLAUSE (A) OF THE INVARIANT, measured at the one write that establishes it: the raise's own rewrite,
+  // inside the critical section. The INVARIANT test above drives the property end to end, but since r5 the
+  // REPAIR also binds the version — so on its scenario the record already names the raising publication
+  // before the raise runs, and deleting the raise's rewrite changes nothing there. (That was measured: the
+  // mutation went green, which is a finding about the test and not about the code.) This test is the
+  // discriminator, and what makes it one is that the record and the PIN name different publications.
+  //
+  // THE SETUP: the same checkout published TWICE, so the two publications have identical entry files and
+  // identical trees and differ only in their version NAMES — which is exactly the case that matters (an
+  // entry digest cannot tell them apart, and Codex named the identical-entry-file/different-closure shape).
+  // The pointer and the record both name the SECOND; this operation is pinned to the FIRST.
+  //
+  // MUTATION ROUTE: make _fence_raise_bind_and_run() skip _fence_rewrite_record_binding() and the record
+  // keeps naming the second publication, and the release resolves out of it.
+  const dirs = scratch(t)
+  const same = checkout(dirs, 'S', 'V-SAME')
+  assert.match(run(script(dirs, 'first.sh', program(dirs, same, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: a first publication must commit')
+  const first = readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+  assert.match(run(script(dirs, 'second.sh', program(dirs, same, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: and a second publication of the SAME checkout must commit over it')
+  const second = readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+  assert.notEqual(first, second, 'precondition: two different publications')
+  assert.ok(existsSync(join(dirs.recovery, first, 'app', 'scripts', 'fence-db-connections.mjs')),
+    'precondition: and the first one is still there for this operation to be pinned to')
+  const digest = standingEntryDigest(dirs.recovery)
+  // A RECORD THAT IS ALREADY CONSISTENT WITH THE POINTER, so the repair has nothing to do and the only
+  // thing that can change the version line is the raise.
+  writeIdentityBound(dirs.recovery, digest, second)
+
+  const raise = run(script(dirs, 'raise.sh', program(dirs, same, [
+    'rig_authority() { printf \'{}\\n\' > "${DB_FENCE_STATE}"; }',
+    // THE PIN, taken by hand because only a run that had resolved BEFORE the second publication would hold
+    // it — which is the whole situation. Only root can write this directory on a real box.
+    `ln -s ${JSON.stringify(`${first}/app`)} "$(_fence_operation_pin)"`,
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; exit 1; }',
+    'echo "RESOLVED=${script}"',
+    `echo "VERSION_BEFORE_RAISE=$(grep -m1 '^fence_script_version=' "\${DB_FENCE_IDENTITY_FILE}" || true)"`,
+    '_fence_raise_critical_section "${script}" "${DB_FENCE_STATE}" rig_authority',
+    'echo "RAISE_RC=$?"',
+  ])))
+  assert.match(raise.output, /^RAISE_RC=0$/m, `the raise must succeed: ${raise.output}`)
+  // THE PRECONDITIONS: the operation really was pinned to the FIRST publication, and the record really did
+  // name the SECOND at the instant the raise began.
+  assert.match(raise.output, new RegExp(`^RESOLVED=${join(dirs.recovery, first, 'app', 'scripts')}/`, 'm'),
+    `precondition: the resolution must be the pinned publication's: ${raise.output}`)
+  assert.match(raise.output, new RegExp(`^VERSION_BEFORE_RAISE=fence_script_version=${second.replace(/\./g, '\\.')}$`, 'm'),
+    `precondition: and the record must have named the OTHER publication: ${raise.output}`)
+
+  // THE CLAIM: the record now names the publication the fence was raised with, and a separate later run
+  // resolves out of THAT one while the pointer still names the other.
+  assert.equal(identityVersion(dirs.recovery), first,
+    `the raise must bind the record to the publication it is pinned to: ${raise.output}`)
+  assert.equal(readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''), second,
+    'and the pointer is untouched, so the two really do differ')
+  const release = run(script(dirs, 'release.sh', program(dirs, same, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; exit 0; }',
+    'echo "RESOLVE_RC=0"',
+    'echo "RESOLVED=${script}"',
+  ])))
+  assert.match(release.output, /^RESOLVE_RC=0$/m, `and a release can resolve the helper: ${release.output}`)
+  assert.match(release.output, new RegExp(`^RESOLVED=${join(dirs.recovery, first, 'app', 'scripts')}/`, 'm'),
+    `out of the raising publication and not the standing one: ${release.output}`)
 })

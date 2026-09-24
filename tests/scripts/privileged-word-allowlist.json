@@ -3730,6 +3730,22 @@
    "count": 1,
    "class": "text",
    "reason": "a printf FORMAT and its arguments: the word is one of the values substituted into the sentence an operator reads, so that the refusal carries the command that puts the preserved artefact back instead of a description of one. Nothing is executed by this statement -- printf writes to stdout, which _fence_stage_and_publish() captures into a local and puts in its refusal."
-  }
+  },
+ {
+  "file": "scripts/lib/db-fence-protected.sh",
+  "line": "if ! cp -R --no-dereference --link --preserve=mode,ownership,timestamps -- \"${legacy}/.\" \"${staged}/\"; then",
+  "count": 1,
+  "class": "code-owned-tree",
+  "reason": "the adoption of a pre-pointer installation (o3d-xi3w r5): HARD-LINKS the files of the artefact standing at the documented name into this operation's own `mktemp -d` directory under the root-only recovery directory, so that the operation has an immutable name for the bytes it authenticated. The source is only ever read, and --link means no second copy of it exists; enforced at run time by _fence_require_owned_tree on the staging directory AND on the tree inside it, in _fence_adopt_legacy",
+  "guard": "_fence_require_owned_tree"
+ },
+ {
+  "file": "scripts/lib/db-fence-protected.sh",
+  "line": "chown root:root \"${stage}/${record_name}\" \"${stage}/${manifest_name}\" 2>/dev/null || true",
+  "count": 1,
+  "class": "code-owned-tree",
+  "reason": "gives the record and manifest the adoption carried into its own `mktemp -d` directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_adopt_legacy",
+  "guard": "_fence_require_owned_tree"
+ }
  ]
 }

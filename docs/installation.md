@@ -2688,6 +2688,8 @@ closes, including on `SIGKILL` and on a power cut: there is no file for an opera
 liveness test to get wrong, and a bounded wait makes a wedged peer a refusal rather than a hang. Stated
 plainly: a record written by a release older than this one carries no version, and the resolution then
 falls back to the pointer **and the digest check**, which is exactly what those installations did before.
+A **pre-pointer installation** is no longer one of those cases: since r5 its fence operations execute out
+of an adopted versioned directory (below), so a fence raised there records a version like any other.
 
 And the record a **raise** writes carries the digest of the artefact **that operation is pinned to**, not
 of whatever `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` resolves to at the instant it
@@ -2735,6 +2737,55 @@ snapshot answers the same question a different way, by resolving its pointer onc
 descriptor it is already reading from. A pin cannot skip a check: it selects a candidate, and the seal, the record
 beside the tree, the tree's own digest, `IMS_FENCE_ARTEFACT_SHA256` and the entry digest the recovery
 record binds are then all checked against **that** tree.
+
+**And a pre-pointer installation is *adopted*, not followed** (o3d-xi3w r5). On a box no pointer-era
+release has published to, `/etc/ims-cutover-recovery/app` is not a pointer — it is the tree, a real
+directory at a well-known name, and a well-known name is a mutable object. Measured: a run authenticated
+that tree completely (seal, record beside the tree, tree digest, entry digest), returned the path, and
+then executed a *concurrent publisher's* helper with `DEPLOY_ADMIN_DATABASE_URL` beside it, because that
+publisher had performed the one migration in between and the same string now resolved through its pointer.
+The re-read after the pin cannot help; a replacement that lands after it is exactly the case.
+
+So the resolution never hands that name back. Before it pins anything it gives the operation its own
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` directory whose files are **hard links to the
+standing tree's own inodes**, with the legacy `db-fence-artefact.sha256` and `.manifest` copied in beside
+them, and everything after that is about a name no other run can hold. Three things this is *not*, each
+deliberate:
+
+* it is **not a migration**. `rename(2)` will not put a symbolic link over a non-empty directory, so
+  publishing a legacy tree into a version must *move* the only artefact on the box — and a power cut in
+  the interval where the documented name does not exist leaves a standing fence with no helper to release
+  it by, which is the worst state this mechanism has. The adoption moves nothing and deletes nothing
+  outside its own staging name, so it has no unwind and a kill at any instant leaves only residue the
+  sweep reaps. The one migration stays where it belongs: in the next **authenticated** publication.
+* it is **not a publication**. Nothing is written at the documented name, the legacy record beside it is
+  left alone, and the box stays pre-pointer until a real publication migrates it. Nothing therefore has to
+  be *authenticated* that this path cannot authenticate — a migration would put bytes at the documented
+  name that no invocation pinned, which the publication refuses to do by design.
+* it is **not a copy**. `--link` means the adopted tree is a second *name* for the same inodes, so there
+  are no second bytes to prove equal to the first. Only root can write the recovery root and no path in
+  the library ever writes *into* a standing tree — a publication renames it aside and then deletes it, and
+  a delete unlinks — so the concurrent publisher that used to substitute these bytes cannot reach them at
+  all. `db_fence_script_in_use()` still asks every question it asked before, of the adopted directory.
+
+It is **made durable before it takes its version name**, and that ordering is the point (found by the
+review of this round). The first draft took no barrier at all, on the argument that nothing outside the
+operation ever names the directory — which is wrong by one step: the **raise** writes the version into
+`db-fence-identity.env`, durably, so a power cut could leave a standing fence naming a version that exists
+with files missing, and every later resolution would find it, fail its digest check and refuse. A version
+that does not exist at all degrades to the pointer and is harmless; one that half exists is not. So the
+whole tree is flushed (`sync --file-system`, because `sync <dir>` flushes one directory entry and the tree
+has nested ones) *before* the rename that gives it a name a record could hold, a barrier that cannot be
+taken is a refusal with the staging tree removed, and the flush of the name *after* the rename is not a
+refusal — the directory is complete by then and declining to fence over it would be the worse trade. The
+publication's own tree barrier was widened the same way in the same change.
+
+The adopted directory is an ordinary `.version-fence.<pid>.<rand>`: the sweep keeps it while its pid is
+alive, while a pin names it and while a standing fence's record binds it, and reaps it afterwards. One
+consequence is the point — a fence **raised** on such a box now records a `fence_script_version`, so
+clause (A) of the invariant above holds there instead of falling back. `--dry-run` and
+`--print-fence-digest` are unaffected: they resolve without a pin, they never adopt, and they still write
+nothing.
 
 The operator wrappers are the deliberate exception and check the **documented** name against the digest
 this operation was pinned to. They are run by hand after the cutover process has exited, so a versioned
