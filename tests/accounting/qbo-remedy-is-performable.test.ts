@@ -257,7 +257,13 @@ test('STEP 1: the outbox has no state that means “deliberately not delivered�
 
   // The whole vocabulary. Read from the generated client rather than quoted from the schema, so a
   // value added later shows up here rather than in an operator's hands.
-  assert.deepEqual(values.sort(), ['FAILED', 'PENDING', 'PROCESSING', 'SENT'])
+  //
+  // o3d-hpeg ADDED ONE, AND IT IS NOT THAT STATE. PARKED_SEND_CAP holds a row whose sender has already
+  // been entered twice, for an operator to decide on; it says a copy MAY have gone out, which is the
+  // opposite of "deliberately not delivered". Its operator cancel (scripts/email-outbox-parked.ts)
+  // writes FAILED, and applies to a parked row only — never to a PENDING one, so a queued copy still
+  // cannot be cancelled.
+  assert.deepEqual(values.sort(), ['FAILED', 'PARKED_SEND_CAP', 'PENDING', 'PROCESSING', 'SENT'])
   assert.equal(
     values.some((value) => /CANCEL|ABANDON|DISCARD|SUPPRESS|HELD|VOID/i.test(value)),
     false,

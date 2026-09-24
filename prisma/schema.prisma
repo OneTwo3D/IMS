@@ -317,6 +317,9 @@ enum EmailOutboxStatus {
   PROCESSING
   SENT
   FAILED
+  /// o3d-hpeg: a stale PROCESSING row that had already been reclaimed EMAIL_MAX_STALE_RECLAIMS times.
+  /// The drain never selects it; only an operator releases or cancels it (scripts/email-outbox-parked.ts).
+  PARKED_SEND_CAP
 }
 
 enum TaxType {
@@ -4013,14 +4016,20 @@ model EmailOutbox {
   /// while it was on the SMTP socket matches zero rows and cannot re-arm the row.
   processingStartedAt DateTime?
   lockedBy            String?
+  /// o3d-hpeg: how many elapsed-time RECLAIMS this row has had, over its whole life. Incremented by the
+  /// drain in the same conditional UPDATE that takes the reclaim, which only matches below
+  /// EMAIL_MAX_STALE_RECLAIMS (lib/email-outbox.ts); a first claim of a PENDING row does not touch it. A
+  /// stale PROCESSING row at the cap is parked (PARKED_SEND_CAP) instead of reclaimed again.
+  staleReclaimCount   Int              @default(0)
   sentAt              DateTime?
   createdAt           DateTime         @default(now())
   updatedAt           DateTime         @updatedAt
 
   /// A DB-native PARTIAL UNIQUE INDEX `email_outbox_undelivered_reference_uq` on
-  /// (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING') also
-  /// guards this table. Prisma cannot express a filtered unique, so it lives only in
-  /// prisma/migrations/20260910120000_email_outbox_claim_fence/migration.sql.
+  /// (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING','PARKED_SEND_CAP')
+  /// also guards this table. Prisma cannot express a filtered unique, so it lives only in the
+  /// migrations: created by 20260910120000_email_outbox_claim_fence, and widened to hold a parked
+  /// row's slot by 20260918090100_email_outbox_parked_holds_reference (o3d-hpeg).
   @@index([status, availableAt])
   @@index([referenceType, referenceId])
   @@map("email_outbox")
