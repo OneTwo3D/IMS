@@ -3,9 +3,9 @@
  *
  * WHY EVERY DISPATCH IS STILL A `switch (connector)` WITH ONE ARM (o3d-remove-parked-connectors).
  * Shopify was archived (see archive/connectors/README.md and
- * docs/archive/shopify-connector-removal.md), so `ShoppingConnectorId` is a union of one and each
- * switch below has a single `case 'woocommerce'`. They are deliberately NOT inlined: this file is
- * the seam a second storefront is threaded through, and the switches are the list of ports it must
+ * docs/archive/shopify-connector-removal.md), so `ShoppingConnectorId` is a union of one and each of
+ * the fifteen switches below has a single `case 'woocommerce'`. They are deliberately NOT inlined:
+ * this file is the seam a second storefront is threaded through, and the switches are the list of ports it must
  * answer. Collapsing them to direct WooCommerce calls would delete that list, and re-deriving it
  * would mean re-reading every caller. Each switch is exhaustive over the union, so adding an id to
  * `SHOPPING_CONNECTORS` makes every port a `tsc` error until it is answered — which is the whole

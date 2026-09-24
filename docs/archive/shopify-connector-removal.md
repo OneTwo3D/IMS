@@ -46,7 +46,9 @@ product sync returned "not wired yet". **No order and no product ever entered IM
 - **The `shopping` exclusivity group is deleted, not shrunk.** WooCommerce's only partner was
   Shopify. A one-member group can never conflict, so leaving it would be a rule that reads as
   enforced and enforces nothing.
-- Thirteen `case 'shopify':` arms in `lib/shopping.ts`; the `shopify` element of the
+- Every `case 'shopify':` arm in `lib/shopping.ts` (fourteen of the file's fifteen `switch (connector)`
+  dispatches had one; measured with `grep -c "switch (connector)" lib/shopping.ts`, which is 15 —
+  `docs/archive/connector-removal-plan.md` said thirteen from an earlier survey); the `shopify` element of the
   `drainers` map in `lib/jobs/shopping/drain-inbox.ts`; `persistShopifyWebhookEvent` and the second
   member of `ShoppingWebhookEventConnector`; `shopify_invoice_pdf_secret` from the invoice-PDF secret
   map; the three `SHOPIFY_*` `SETTING_ENV_FALLBACKS` and `SENSITIVE_SETTING_KEYS` entries.
@@ -103,7 +105,7 @@ resolved defensively from `SHOPPING_CONNECTORS` with the raw id as a fallback.
 
 ## What was KEPT, and why
 
-- **The thirteen `switch (connector)` dispatches in `lib/shopping.ts`, each now with one arm.** They
+- **All fifteen `switch (connector)` dispatches in `lib/shopping.ts`, each now with one arm.** They
   read as pointless and they are not: they are the list of ports a second storefront has to answer,
   they are exhaustive over the id union, and so adding an id to `SHOPPING_CONNECTORS` turns every
   unanswered port into a `tsc` error. Collapsing them into direct WooCommerce calls would delete
@@ -138,7 +140,7 @@ test that used to distinguish "generic" from "WooCommerce with extra steps" can 
    multi-entry. With one entry, "the ingress is registry-driven" and "the ingress hardcodes
    WooCommerce" produce identical results. **Do not restore it with a fixture entry** — a registry
    the app does not ship is not the registry the ingress reads.
-2. **Nothing routes a second id through the thirteen dispatches.** The contract test still drives a
+2. **Nothing routes a second id through the fifteen dispatches.** The contract test still drives a
    fictitious `'newshop'` through the persist and process CORES (which take the connector as a
    parameter and would fail if either grew a `=== 'woocommerce'` branch), but no test can enter the
    facade with a second id, because no second id exists. The genericity of `lib/shopping.ts` is
