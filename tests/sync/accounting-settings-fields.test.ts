@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  ACCOUNTING_CONNECTOR_IDS,
   ACCOUNT_FIELDS,
   buildAccountingSettingsPayload,
   isFieldAvailableForConnector,
@@ -135,18 +136,42 @@ test('accounting mapping ignores surrounding whitespace when comparing accounts'
   assert.equal(errors.length, 1, 'whitespace must not smuggle a collision past the guard')
 })
 
-test('accounting mapping validates ANOTHER connector\'s key prefix too', () => {
+test('accounting mapping validates EVERY REGISTERED connector\'s key prefix, and only those', () => {
   // REGRESSION (found by Codex review of PR #488): the first cut took the connector from
   // saveAccountingSettings' getActiveAccountingConnector(), which resolves the ACTIVE connector and
   // ignores the ?connector= param the client builds its payload from. A second connector's save was
-  // therefore checked against xero_* keys, found nothing, and passed silently. The validator now
-  // checks whichever prefixes are present in the payload — which is why this case uses a prefix that
-  // is not `xero_` and is not one the build registers (o3d-remove-parked-connectors).
-  const errors = validateAccountingAccountMapping({
-    'other-ledger_transit_account': '632',
-    'other-ledger_allocated_inventory_account': '632',
-  })
-  assert.equal(errors.length, 1)
+  // therefore checked against xero_* keys, found nothing, and passed silently.
+  //
+  // o3d-remove-parked-connectors — WHAT THE FIX ACTUALLY DOES, now that it matters. The validator
+  // loops `ACCOUNTING_CONNECTOR_IDS` and checks each one's prefix; it does NOT parse the payload for
+  // arbitrary prefixes. While two connectors were registered, "it checks the other one too" and "it
+  // checks every registered one" were the same assertion. They are not the same now, and the true one
+  // is the second — so it is asserted by driving the REGISTRY rather than a literal, which is also
+  // what makes it keep working when a connector is added.
+  assert.ok(ACCOUNTING_CONNECTOR_IDS.length >= 1, 'the registry must not be empty, or this loop asserts nothing')
+  let checked = 0
+  for (const connectorId of ACCOUNTING_CONNECTOR_IDS) {
+    const errors = validateAccountingAccountMapping({
+      [settingKeyFor(connectorId, 'transit_account')]: '632',
+      [settingKeyFor(connectorId, 'allocated_inventory_account')]: '632',
+    })
+    assert.equal(errors.length, 1, `${connectorId}: the collision must be caught under its own prefix`)
+    checked += 1
+  }
+  assert.equal(checked, ACCOUNTING_CONNECTOR_IDS.length)
+
+  // AND ONLY THOSE. A prefix no registered connector owns is not checked — correctly: a save is
+  // always FOR a registered connector (the /sync route resolves `?connector=` through the registry and
+  // falls back to the first registered id), so an unknown prefix in a payload is not a mapping this
+  // installation can have. Asserted rather than assumed, because it is the boundary of the rule above.
+  assert.deepEqual(
+    validateAccountingAccountMapping({
+      'other-ledger_transit_account': '632',
+      'other-ledger_allocated_inventory_account': '632',
+    }),
+    [],
+    'an unregistered prefix is outside the rule — the loop is over registered ids, not over the payload',
+  )
 })
 
 
