@@ -21,6 +21,19 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
  * "yes, create one". Both consumers reach a decision only through those three, so a new permissive branch
  * cannot be written in a caller: it has to be written here, into an exhaustive switch, in the open.
  *
+ * WHAT A PROOF OF ABSENCE ACTUALLY NEEDS — TWO THINGS, AND THEY ARE DIFFERENT QUESTIONS (round 7).
+ *   (1) THIS REMOTE ASN IS A DIFFERENT CONSIGNMENT from the one about to be created. Only readable content
+ *       that DIFFERS can establish that: another `POReference`, or a set of source lines that shares none of
+ *       ours. Content that is IDENTICAL, INDISTINGUISHABLE (an int32 rounding of a fractional quantity) or
+ *       UNREADABLE establishes nothing.
+ *   (2) IT IS NOT THE ASN AN EARLIER ATTEMPT CREATED FOR THIS RESERVATION, i.e. not what a create whose
+ *       response IMS lost left behind. A LOST RESPONSE IS EXACTLY THE CASE WHERE IMS HAS NO `wms_asn_maps`
+ *       ROW FOR THE ASN — that is what "lost" means — so an ASN IMS has ALREADY MAPPED cannot be one, and an
+ *       UNMAPPED one can be. `readMintsoftAsnMapState` below is that question, and NOTHING ELSE answers it.
+ * For a different reference or a disjoint line set, (1) also gives (2): a lost create for THESE lines cannot
+ * have produced an ASN over none of them. For an OVERLAPPING line set or a differing quantity, (1) holds and
+ * (2) does not, and the map is the only thing that decides — which is why the table below takes it.
+ *
  * THE COMPARISON IS THE SAME COMPARISON FOR BOTH CALLERS, because it is the same question asked twice:
  * "is THIS remote ASN the one this reservation asked for?" Before the push it is asked of every ASN in the
  * tenant (a yes means adopt, a proven no for all of them means create); after the push it is asked of the
@@ -34,6 +47,45 @@ export type MintsoftAsnExpectation = {
   /** Mintsoft's warehouse ID the reservation is for. */
   externalWarehouseId: string
   lines: ReadonlyArray<{ sourceLineId: string; expectedQty: number }>
+}
+
+/**
+ * WHAT IMS ALREADY KNOWS ABOUT THE REMOTE ASN IDS IT IS LOOKING AT (o3d-54al, the mechanism round 7's fix
+ * needs). `wms_asn_maps` holds one row per ASN IMS has recorded, keyed `@@unique(connector, externalAsnId)`.
+ *
+ * WHY MAPPED-NESS IS THE RIGHT DISCRIMINATOR, AND NOT A PROXY FOR ONE. The failure this whole path exists to
+ * prevent is a create whose RESPONSE was lost: Mintsoft made the ASN and IMS never recorded it. "Never
+ * recorded it" IS "there is no `wms_asn_maps` row for that ASN id" — the two are the same fact, not
+ * correlated facts. So an ASN that HAS a row is, by definition, not what a lost create left behind: it is an
+ * ASN IMS wrote down (an earlier partial for this order, or one belonging to another source), and the
+ * creators' own reservation logic already accounts for it — `reserveAsn` returns the existing ASN outright
+ * when IMS holds an OPEN map row for this source, so the mapped rows that reach this comparison at all are
+ * ones IMS has already reconciled. An UNMAPPED ASN carrying our reference over our lines is the opposite: the
+ * one state a lost response produces.
+ *
+ * THIS IS WHY AN OVERLAP CAN BE REFUSED WITHOUT BREAKING MULTI-ASN ORDERS. A purchase order is delivered in
+ * parts, and every ASN for it carries the SAME `POReference` (it is the ORDER's reference), so "this row
+ * overlaps our lines" cannot on its own mean "duplicate" — round 6 said so and left the overlap permitted
+ * for that reason. Mapped-ness separates the two populations exactly: the legitimate earlier partials are
+ * the ones IMS mapped, and they stay proof of absence; only an unmapped overlap refuses.
+ *
+ * `unreadable` IS NOT `unmapped`. If the map could not be read, IMS does not know which of the two it is
+ * looking at, and the rule of this branch applies unchanged: unreadable is not permission.
+ */
+export type MintsoftAsnMapKnowledge =
+  | { kind: 'readable'; mappedExternalAsnIds: ReadonlySet<string> }
+  | { kind: 'unreadable'; detail: string }
+
+export type MintsoftAsnMapState = 'mapped' | 'unmapped' | 'unknown'
+
+/**
+ * PURE, like the rest of this file: the map is in the database, so the CALLER reads it (both creators, via
+ * one helper, before they decide) and passes what it found in. Nothing here touches a database, which is
+ * what keeps the one statement of the rule testable on rows.
+ */
+export function readMintsoftAsnMapState(asn: WmsAsnRef, knowledge: MintsoftAsnMapKnowledge): MintsoftAsnMapState {
+  if (knowledge.kind === 'unreadable') return 'unknown'
+  return knowledge.mappedExternalAsnIds.has(asn.externalAsnId) ? 'mapped' : 'unmapped'
 }
 
 /**
@@ -88,7 +140,14 @@ export type MintsoftAsnDifference =
   | { kind: 'same' }
   | { kind: 'reference'; remoteReference: string | null }
   | { kind: 'lineIdentityUnreadable' }
-  | { kind: 'lines'; missingSourceLineIds: string[]; remoteItemCount: number }
+  /** Readable, and it shares NO source line with the reservation: another consignment entirely. */
+  | { kind: 'linesUnrelated'; missingSourceLineIds: string[]; remoteItemCount: number }
+  /**
+   * Readable, and it covers SOME of the reservation's source lines but not exactly them — the ASN at the
+   * warehouse holds {a,b} while the reservation now covers {a,b,c}, or the other way round. Round 7's Codex
+   * HIGH: this used to be proof of absence, and a second inbound ASN went out for a and b.
+   */
+  | { kind: 'linesOverlap'; sharedSourceLineIds: string[]; missingSourceLineIds: string[]; remoteItemCount: number }
   | { kind: 'quantityUnreadable'; sourceLineId: string; expectedQty: number }
   | { kind: 'quantity'; sourceLineId: string; expectedQty: number; remoteQty: number }
   | { kind: 'quantityRounded'; sourceLineId: string; expectedQty: number; remoteQty: number }
@@ -99,7 +158,8 @@ export const MINTSOFT_ASN_DIFFERENCE_KINDS = [
   'same',
   'reference',
   'lineIdentityUnreadable',
-  'lines',
+  'linesUnrelated',
+  'linesOverlap',
   'quantityUnreadable',
   'quantity',
   'quantityRounded',
@@ -179,7 +239,14 @@ export function compareMintsoftAsnAgainstExpectation(
     .map((line) => line.sourceLineId)
     .filter((sourceLineId) => !bySourceLineId.has(sourceLineId))
   if (missingSourceLineIds.length > 0 || remoteItemCount !== expectation.lines.length) {
-    return { kind: 'lines', missingSourceLineIds, remoteItemCount }
+    // WHICH of our lines this row DOES cover is the whole question (round 7): sharing none of them is
+    // determinate evidence of another consignment, sharing some is the lost-response shape.
+    const sharedSourceLineIds = expectation.lines
+      .map((line) => line.sourceLineId)
+      .filter((sourceLineId) => bySourceLineId.has(sourceLineId))
+    return sharedSourceLineIds.length > 0
+      ? { kind: 'linesOverlap', sharedSourceLineIds, missingSourceLineIds, remoteItemCount }
+      : { kind: 'linesUnrelated', missingSourceLineIds, remoteItemCount }
   }
 
   let unreadable: MintsoftAsnDifference | null = null
@@ -213,61 +280,81 @@ export function compareMintsoftAsnAgainstExpectation(
  * FOR THIS RESERVATION — the ONLY things a proof of absence may be built from. Everything else is
  * unresolved and refuses. This table is the rule; adding a `true` to it is the only way to widen what may
  * be created, and it cannot be done anywhere else.
+ *
+ * IT TAKES THE MAP STATE because of the two conditions a proof of absence needs (see the file header): a
+ * difference in READABLE CONTENT can show this is a different consignment, but only `wms_asn_maps` can show
+ * it is not the ASN a lost create left behind. Exactly two kinds need the second answer — `linesOverlap` and
+ * `quantity` — and for them `mapped` is the whole of it. `unmapped` and `unknown` both refuse, for different
+ * reasons that the refusals name: one is the lost-response shape, the other is a map IMS could not read, and
+ * an unreadable map is not permission.
  */
-export function isProofThatMintsoftAsnIsNotThisOne(difference: MintsoftAsnDifference): boolean {
+export function isProofThatMintsoftAsnIsNotThisOne(
+  difference: MintsoftAsnDifference,
+  mapState: MintsoftAsnMapState,
+): boolean {
   switch (difference.kind) {
     case 'reference':
       // Mintsoft stores and returns `POReference` verbatim (proven live 2026-09-24), and it is the field
       // both creators put the reservation's reference in. Another reference is another purchase order or
-      // transfer: determinate, and the only reason the tenant-wide scan is affordable at all.
+      // transfer: determinate, and the only reason the tenant-wide scan is affordable at all. Needs no map:
+      // a create for THIS reference cannot have produced a row carrying another one.
       return true
-    case 'lines':
+    case 'linesUnrelated':
       // Every identity on the row was READABLE (that is checked first), so the item set is known exactly,
-      // and it is not this reservation's set. A source line id is an IMS primary key: it never changes
-      // under a reservation, and Mintsoft returns it verbatim, so an ASN over other lines is over other
-      // lines.
+      // and it shares NOTHING with this reservation's set. A source line id is an IMS primary key: it never
+      // changes under a reservation, and Mintsoft returns it verbatim, so an ASN over none of our lines is
+      // an ASN for other goods — a different consignment, and not one a lost create for THESE lines made.
       //
-      // THIS IS THE ONE PLACE WHERE "DIFFERENT" IS STILL READ AS "NOT OURS", AND THE RESIDUAL IS STATED
-      // RATHER THAN HIDDEN. What can change between a create whose response was lost and the retry is not
-      // a line's identity but WHICH lines a reservation covers: add a line to the purchase order and the
-      // retry's set is {a,b,c} where the ASN already at the warehouse holds {a,b}. That row carries our
-      // reference and OVERLAPS our lines, and this branch answers "create one" — a second inbound ASN for
-      // a and b. It is the exact shape of the quantity case above, and it is NOT refused here for one
-      // reason: a second ASN over a different set of the same order's lines is how a partial delivery is
-      // handled at all (the reference is the ORDER's reference, shared by every ASN for it), so refusing
-      // an overlap would mean no purchase order could ever have two ASNs without an operator. The
-      // discriminator that resolves both is o3d-54al: an ASN IMS has ALREADY MAPPED is accounted for and
-      // is not a candidate; only an unmapped one can be what a lost create left behind. Until that lands,
-      // a changed LINE SET across a lost response is a known duplicate risk, and a changed QUANTITY is
-      // not (it refuses).
+      // The one shape this leaves (bounded, and stated rather than hidden): if EVERY line of the purchase
+      // order were deleted and re-added between a lost create and the retry, the reservation's ids would all
+      // be new and the ASN the lost create made would share none of them. It needs an operator to replace
+      // every line of an order that already has an ASN in flight; o3d-54al records it.
       return true
+    case 'linesOverlap':
+      // ROUND 7, CODEX HIGH. This used to be `true` — one `lines` kind covered both, and "the sets differ"
+      // was read as "not ours". The reachable sequence: Mintsoft creates the ASN, IMS loses the response,
+      // the purchase order GAINS a line, and the retry's reservation (whose pending lines are refreshed from
+      // the order's current outstanding lines) covers {a,b,c} while the ASN at the warehouse holds {a,b}.
+      // Answering "create one" sends a second inbound ASN for a and b, and the warehouse expects the same
+      // goods twice.
+      //
+      // The map is what makes refusing it affordable. Every ASN for a purchase order carries the ORDER's
+      // reference, so a second ASN over a different set of the same order's lines is how a partial delivery
+      // works; refusing every overlap would mean no order could have two ASNs without an operator (which is
+      // why round 6 left this permitted). An ASN IMS has MAPPED is a partial IMS has already recorded — it
+      // cannot be what a lost create left behind, because "lost" means unrecorded — so it stays proof of
+      // absence. An UNMAPPED overlap is the lost-response shape itself, and refuses by name.
+      return mapState === 'mapped'
     case 'same':
       // The ASN we were looking for. Not absence: the caller adopts it (or, after a create, records it).
       return false
     case 'quantity':
       // ROUND 6, CODEX HIGH 2. This used to return "no match", i.e. "create another one". It is the same
       // ASN by reference and by every line identity, with a quantity that differs. Three states produce
-      // that, and NOTHING available here tells them apart: an ASN a lost create really did make, whose
-      // source quantity has changed since; an ASN an operator edited at the warehouse; and a later partial
-      // for the same lines. Answering "create" turns the first two into a second inbound ASN at a live
-      // warehouse for lines that are already expected, so it is refused by name instead and blocks
-      // creation for this reservation until an operator reconciles the ASN in Mintsoft. The third state is
-      // what o3d-54al is for: an ASN IMS has ALREADY MAPPED is accounted for and should stop being a
-      // candidate at all — until it does, a second partial ASN over the same lines needs an operator.
-      return false
+      // that: an ASN a lost create really did make, whose source quantity has changed since; an ASN an
+      // operator edited at the warehouse; and a later partial for the same lines. Answering "create" turns
+      // the first two into a second inbound ASN at a live warehouse for lines that are already expected.
+      // ROUND 7 supplies what round 6 said was missing and left to o3d-54al: the third state is the one IMS
+      // has MAPPED, and it is proof of absence again, so a legitimate later partial over the same lines no
+      // longer needs an operator. Unmapped — the first two states — still refuses by name.
+      return mapState === 'mapped'
     case 'quantityRounded':
       // `ASNItem.QuantityExpected` is int32, so a fractional expectation cannot survive the round trip
-      // (review L-b). Indistinguishable from our own ASN, therefore not proof of anything.
+      // (review L-b). INDISTINGUISHABLE from our own ASN, so the first condition a proof of absence needs
+      // is not met and the map cannot supply it: mapped or not, this row may be carrying our own quantity.
       return false
     case 'quantityUnreadable':
       // A quantity Mintsoft did not return says nothing at all (round 4, Codex HIGH 1).
       return false
     case 'lineIdentityUnreadable':
-      // An item we cannot key is a row we cannot EXCLUDE (round 5, Codex HIGH 2).
+      // An item we cannot key is a row we cannot EXCLUDE (round 5, Codex HIGH 2). Not even a map row makes
+      // it excludable: what this ASN covers is unknown, so whether creating another duplicates it is unknown.
       return false
     case 'warehouse':
-      // The rebind case (review M3): the same ASN, at the warehouse the binding pointed at before. Finding
-      // it elsewhere is not a licence to adopt it and not a licence to create a second one.
+      // The rebind case (review M3): the same ASN — our reference, our exact lines, our exact quantities —
+      // at the warehouse the binding pointed at before. Identical content, so it is not a different
+      // consignment at all, whether or not IMS has mapped it. Finding it elsewhere is not a licence to adopt
+      // it and not a licence to create a second one.
       return false
   }
 }
@@ -286,10 +373,16 @@ export function describeMintsoftAsnDifference(
     case 'lineIdentityUnreadable':
       return 'it carries an item whose SourceLineId cannot be read (absent, null or blank), so its lines '
         + 'cannot be told apart from the ones that were sent'
-    case 'lines':
+    case 'linesUnrelated':
       return (difference.missingSourceLineIds.length > 0
-        ? `it does not carry source line ${difference.missingSourceLineIds.join(', ')}`
+        ? `it carries none of the source lines that were sent (not ${difference.missingSourceLineIds.join(', ')})`
         : 'it carries an item that was not sent')
+        + ` (sent ${expectation.lines.length} item(s), it holds ${difference.remoteItemCount})`
+    case 'linesOverlap':
+      return `it already covers source line ${difference.sharedSourceLineIds.join(', ')}`
+        + (difference.missingSourceLineIds.length > 0
+          ? ` but not ${difference.missingSourceLineIds.join(', ')}`
+          : ', plus an item that was not sent')
         + ` (sent ${expectation.lines.length} item(s), it holds ${difference.remoteItemCount})`
     case 'quantityUnreadable':
       return `line ${difference.sourceLineId} came back with no readable QuantityExpected where `

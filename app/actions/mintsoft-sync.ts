@@ -26,6 +26,7 @@ import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsnsForDuplicateRecovery,
   findRecoverableMintsoftAsn,
+  type MintsoftAsnMapKnowledge,
   MintsoftAsnCreateVerificationError,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
@@ -86,7 +87,7 @@ import {
   type IntegrationConnectionTestState,
 } from '@/lib/integration-connection-test-gate'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
-import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
+import type { WmsAsnPackagingType, WmsAsnRef } from '@/lib/connectors/wms/types'
 import type {
   WmsAsnRow,
   WmsPurchaseOrderAsnStateCore,
@@ -2669,6 +2670,40 @@ async function recordUnverifiedMintsoftAsnCreate(
   })
 }
 
+/**
+ * WHICH OF THE REMOTE ASN IDS IMS HAS ALREADY RECORDED — the ASN map read the duplicate matcher's verdict
+ * needs (o3d-54al, landed for o3d-bhvu round 7's Codex HIGH), done ONCE here for both creators.
+ *
+ * WHY THE READ IS HERE AND THE DECISION IS NOT. `findRecoverableMintsoftAsn` is pure so that the
+ * recover-or-create verdict can be tested on rows; the map is in the database. So this reads the ids and
+ * hands them over, and what mapped-ness MEANS is stated once in `asn-creation-rule.ts`: an ASN IMS has
+ * recorded cannot be one a create whose response was lost left behind, because that is what "lost" means.
+ *
+ * FAIL-CLOSED, LIKE THE LIST READ BESIDE IT. If the map cannot be read, this returns `unreadable` rather than
+ * an empty set: an empty set is a POSITIVE claim that none of these ASNs is known to IMS, and the matcher
+ * would act on it. `unreadable` makes the matcher refuse the two verdicts that depend on the map, by name.
+ *
+ * THE RACE, AND WHICH WAY IT FAILS. This reads outside the creators' transaction, so another attempt could
+ * map an ASN between the read and the decision. Then this attempt sees that id as UNMAPPED, which REFUSES —
+ * the safe direction. The reverse (an id read as mapped that stops being mapped) needs a map row to be
+ * deleted, and the only rows deleted here are pending reservations, whose ids are `pending:*` and can never
+ * be a Mintsoft ASN id.
+ */
+async function readMintsoftAsnMapKnowledge(remoteAsns: readonly WmsAsnRef[]): Promise<MintsoftAsnMapKnowledge> {
+  try {
+    const mapped = await db.wmsAsnMap.findMany({
+      where: {
+        connector: 'mintsoft',
+        externalAsnId: { in: remoteAsns.map((asn) => asn.externalAsnId) },
+      },
+      select: { externalAsnId: true },
+    })
+    return { kind: 'readable', mappedExternalAsnIds: new Set(mapped.map((row) => row.externalAsnId)) }
+  } catch (error) {
+    return { kind: 'unreadable', detail: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export async function createMintsoftPurchaseOrderAsn(
   poId: unknown,
   input: unknown,
@@ -3239,6 +3274,9 @@ export async function createMintsoftPurchaseOrderAsn(
       reference: reservation.reference,
       externalWarehouseId: reservation.externalWarehouseId,
       lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.expectedQty })),
+      // o3d-bhvu round 7 / o3d-54al: an ASN IMS has ALREADY MAPPED is a partial it recorded, not what a lost
+      // create left behind, and that is the only thing that tells the two apart.
+      mapKnowledge: await readMintsoftAsnMapKnowledge(remoteAsns),
     })
   }
 
@@ -4306,6 +4344,9 @@ export async function createMintsoftTransferAsn(
       // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-zzgp: the branded
       // outstanding reading becomes a plain number here, and only here).
       lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
+      // o3d-bhvu round 7 / o3d-54al: an ASN IMS has ALREADY MAPPED is a partial it recorded, not what a lost
+      // create left behind, and that is the only thing that tells the two apart.
+      mapKnowledge: await readMintsoftAsnMapKnowledge(remoteAsns),
     })
   }
 

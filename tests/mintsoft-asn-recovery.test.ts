@@ -3,6 +3,8 @@ import test from 'node:test'
 import {
   findRecoverableMintsoftAsn,
   MintsoftAsnRecoveryAmbiguousMatchError,
+  MintsoftAsnRecoveryLineSetOverlapError,
+  MintsoftAsnRecoveryMapUnreadableError,
   MintsoftAsnRecoveryQuantityConflictError,
   MintsoftAsnRecoveryQuantityRoundedError,
   MintsoftAsnRecoveryLineIdentityUnreadableError,
@@ -47,10 +49,18 @@ function hasNoLineIdentityMatch(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCri
   return !criteria.lines.every((line) => bySourceId.has(line.sourceLineId))
 }
 
+/**
+ * ROUND 7: every case below states what IMS has already recorded, because the verdict now depends on it. The
+ * default is the state a lost create leaves: the remote ASN carries an id IMS has NO map row for.
+ */
+const NOTHING_MAPPED = { kind: 'readable', mappedExternalAsnIds: new Set<string>() } as const
+const mapped = (...externalAsnIds: string[]) => ({ kind: 'readable' as const, mappedExternalAsnIds: new Set(externalAsnIds) })
+
 const RESERVATION: MintsoftAsnRecoveryCriteria = {
   reference: 'PO-1',
   externalWarehouseId: '6',
   lines: [{ sourceLineId: 'line-a', expectedQty: 10 }, { sourceLineId: 'line-b', expectedQty: 2.5 }],
+  mapKnowledge: NOTHING_MAPPED,
 }
 const MATCHING_ITEMS: Item[] = [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 10 }, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 2.5 }]
 
@@ -71,15 +81,111 @@ test('surrounding whitespace on either side does not hide the match', () => {
   assert.equal(findRecoverableMintsoftAsn([row(521, 'PO-1', 6, MATCHING_ITEMS)], { ...RESERVATION, reference: ' PO-1  ' })?.externalAsnId, '521')
 })
 
-test('an ASN over DIFFERENT SOURCE LINES is not this one, and creating ours is right', () => {
-  // Determinate evidence, and the only kind duplicate recovery has: every identity on the row was readable,
-  // so its item set is known exactly, and it is not this reservation's set. A source line id is an IMS
-  // primary key — it does not change under a reservation, and Mintsoft returns it verbatim.
-  assert.equal(findRecoverableMintsoftAsn([row(530, 'PO-1', 6, MATCHING_ITEMS.slice(0, 1))], RESERVATION), null, 'fewer lines')
-  assert.equal(findRecoverableMintsoftAsn([row(531, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 3, SourceLineId: 'line-c', QuantityExpected: 1 }])], RESERVATION), null, 'more lines')
-  assert.equal(findRecoverableMintsoftAsn([row(532, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-z', QuantityExpected: 2.5 }])], RESERVATION), null, 'another source line')
+test('an ASN over UNRELATED SOURCE LINES is not this one, and creating ours is right', () => {
+  // Determinate evidence, and the strongest duplicate recovery has: every identity on the row was readable,
+  // so its item set is known exactly, and it shares NOTHING with this reservation's set. A source line id is
+  // an IMS primary key — it does not change under a reservation, and Mintsoft returns it verbatim — so an
+  // ASN over none of our lines is an ASN for other goods, whatever its reference says.
+  assert.equal(findRecoverableMintsoftAsn([row(530, 'PO-1', 6, [{ ID: 9, SourceLineId: 'line-y', QuantityExpected: 10 }, { ID: 8, SourceLineId: 'line-z', QuantityExpected: 1 }])], RESERVATION), null)
+  assert.equal(findRecoverableMintsoftAsn([row(531, 'PO-1', 6, [{ ID: 9, SourceLineId: 'line-y', QuantityExpected: 10 }])], RESERVATION), null, 'and with a different item count')
   // Inside the 0.0001 tolerance the quantity still matches: the reservation's figure is a decimal reading.
   assert.equal(findRecoverableMintsoftAsn([row(534, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 2.50005 }])], RESERVATION)?.externalAsnId, '534')
+})
+
+/**
+ * ROUND 7, CODEX HIGH: AN OVERLAPPING LINE SET IS NOT PROOF THAT THE PRIOR ASN IS UNRELATED.
+ *
+ * THE SEQUENCE, WHICH THE PURCHASE-ORDER PATH MAKES REACHABLE: Mintsoft creates the ASN, IMS loses the
+ * response, and before the retry a line is ADDED to the purchase order. `reserveAsn` refreshes the pending
+ * reservation's lines from the order's CURRENT outstanding lines, so the retry covers {a,b,c} while the ASN
+ * at the warehouse holds {a,b}. Until this round the differing line set was proof of absence, the matcher
+ * answered "create one", and the warehouse was sent a second inbound ASN for a and b — it expects the same
+ * goods twice.
+ *
+ * WHY THE FIX IS THE ASN MAP AND NOT "REFUSE EVERY OVERLAP". Every ASN for a purchase order carries the
+ * ORDER's reference, so a second ASN over a different set of its lines is how a partial delivery works;
+ * refusing every overlap would put an operator in front of every multi-ASN order (which is exactly why round
+ * 6 left this permitted). A create whose response was lost leaves an ASN IMS has NO map row for — that is
+ * what "lost" means — so mapped-ness separates the two populations exactly, and only the unmapped overlap
+ * refuses.
+ */
+test('a lost response plus a CHANGED LINE SET is refused, and a partial IMS has already mapped still creates (round 7, Codex HIGH)', () => {
+  const RETRY: MintsoftAsnRecoveryCriteria = {
+    ...RESERVATION,
+    lines: [...RESERVATION.lines, { sourceLineId: 'line-c', expectedQty: 4 }],
+  }
+  const atTheWarehouse = row(700, 'PO-1', 6, MATCHING_ITEMS)
+  // PRECONDITION, so the refusal is doing work: to a line-set comparison this row really does look like
+  // somebody else's ASN — which is the answer that sent the second ASN.
+  assert.equal(hasNoLineIdentityMatch(atTheWarehouse, RETRY), true, 'precondition: the line sets really do differ')
+  assert.throws(
+    () => findRecoverableMintsoftAsn([atTheWarehouse], RETRY),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineSetOverlapError
+      && /ASN 700/.test(error.message) && /PO-1/.test(error.message)
+      && /line-a, line-b/.test(error.message) && /NO ASN WILL BE CREATED/.test(error.message),
+    'an UNMAPPED ASN covering line-a and line-b blocks the create',
+  )
+  // The same row, once IMS has recorded it: a legitimate earlier partial, and the ASN for the added line
+  // goes out without an operator.
+  assert.equal(findRecoverableMintsoftAsn([atTheWarehouse], { ...RETRY, mapKnowledge: mapped('700') }), null)
+  // Being mapped is about THIS ASN, not about the map having anything in it at all.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([atTheWarehouse], { ...RETRY, mapKnowledge: mapped('4242', '4243') }),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineSetOverlapError,
+  )
+
+  // THE OTHER DIRECTION — a line REMOVED from the order, so the ASN at the warehouse holds MORE than the
+  // retry covers. Same shape, same answer.
+  const superset = row(701, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 3, SourceLineId: 'line-c', QuantityExpected: 4 }])
+  assert.equal(hasNoLineIdentityMatch(superset), true, 'precondition: the line sets really do differ')
+  assert.throws(
+    () => findRecoverableMintsoftAsn([superset], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineSetOverlapError && /ASN 701/.test(error.message),
+  )
+  assert.equal(findRecoverableMintsoftAsn([superset], { ...RESERVATION, mapKnowledge: mapped('701') }), null)
+
+  // AN UNREADABLE MAP IS NOT PERMISSION. If IMS cannot read its own ASN map it cannot tell a partial it
+  // recorded from the ASN a lost create left behind, so the create is refused rather than let through — the
+  // same rule this branch applies to an unreadable ASN list, an unreadable line identity and an unreadable
+  // quantity, applied for once to IMS's own state.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([atTheWarehouse], { ...RETRY, mapKnowledge: { kind: 'unreadable', detail: 'connection refused' } }),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryMapUnreadableError
+      && /ASN 700/.test(error.message) && /connection refused/.test(error.message)
+      && /NO ASN WILL BE CREATED/.test(error.message),
+  )
+  // …and it does not block what needs no map: a row for ANOTHER reference is ruled out by the reference
+  // alone, so an unreadable map still leaves an ordinary create able to proceed.
+  assert.equal(
+    findRecoverableMintsoftAsn([row(702, 'PO-2', 6, MATCHING_ITEMS)], { ...RETRY, mapKnowledge: { kind: 'unreadable', detail: 'connection refused' } }),
+    null,
+  )
+})
+
+test('a quantity conflict on an ASN IMS has ALREADY MAPPED is a legitimate later partial, not an operator’s problem (round 7 / o3d-54al)', () => {
+  // Round 6 refused every same-lines, different-quantity row, and said so: it blocked a second legitimate
+  // partial over the same lines until the already-mapped check landed. It has landed, so the mapped case
+  // creates again while the UNMAPPED one — an ASN a lost create made whose quantity has changed since, or an
+  // operator's edit at the warehouse — still refuses.
+  const partial = row(710, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 4 }, MATCHING_ITEMS[1]!])
+  assert.throws(
+    () => findRecoverableMintsoftAsn([partial], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError && /ASN 710/.test(error.message),
+    'unmapped: still the round-6 refusal',
+  )
+  assert.equal(findRecoverableMintsoftAsn([partial], { ...RESERVATION, mapKnowledge: mapped('710') }), null, 'mapped: a partial IMS recorded')
+  // With the map unreadable it is refused, by the name that says why.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([partial], { ...RESERVATION, mapKnowledge: { kind: 'unreadable', detail: 'pool timeout' } }),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryMapUnreadableError && /ASN 710/.test(error.message) && /pool timeout/.test(error.message),
+  )
+  // Being mapped does NOT make an ASN that matches exactly disappear: it is still adopted, never duplicated.
+  assert.equal(findRecoverableMintsoftAsn([row(711, 'PO-1', 6, MATCHING_ITEMS)], { ...RESERVATION, mapKnowledge: mapped('711') })?.externalAsnId, '711')
+  // …nor does it make an unreadable row readable: what that ASN covers is still unknown, so it still refuses.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([row(712, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, QuantityExpected: 2.5 }])], { ...RESERVATION, mapKnowledge: mapped('712') }),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineIdentityUnreadableError && /ASN 712/.test(error.message),
+  )
 })
 
 /**
@@ -127,7 +233,17 @@ test('an item Mintsoft returned but the normalizer could not read STILL COUNTS (
   const withForeignExtra = row(536, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 4, SourceLineId: 77, QuantityExpected: 1 }])
   assert.equal(withForeignExtra.lines.length, 2, 'precondition: the normalizer really does drop that item')
   assert.equal((withForeignExtra.raw?.Items as unknown[]).length, 3, 'precondition: and Mintsoft really did return three')
-  assert.equal(findRecoverableMintsoftAsn([withForeignExtra], RESERVATION), null, 'a numeric SourceLineId is another integration\u2019s')
+  // ROUND 7 tightens what happens next. The row carries our reference and BOTH our lines plus an item that
+  // is determinately another integration's, so its set is not ours — but it OVERLAPS ours completely, and an
+  // ASN IMS never recorded that already covers these lines is refused rather than answered with "create one".
+  assert.throws(
+    () => findRecoverableMintsoftAsn([withForeignExtra], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineSetOverlapError && /ASN 536/.test(error.message),
+    'an unmapped row covering our lines, whatever else it carries',
+  )
+  assert.equal(findRecoverableMintsoftAsn([withForeignExtra], { ...RESERVATION, mapKnowledge: mapped('536') }), null, 'once IMS has recorded it, a numeric SourceLineId is another integration\u2019s')
+  // A row over lines that are all determinately another integration's is unrelated, and still creates.
+  assert.equal(findRecoverableMintsoftAsn([row(537, 'PO-1', 6, [{ ID: 4, SourceLineId: 77, QuantityExpected: 1 }, { ID: 5, SourceLineId: 78, QuantityExpected: 1 }])], RESERVATION), null)
   // The same, on a row for ANOTHER reference: an unreadable item there is not our concern at all.
   assert.equal(findRecoverableMintsoftAsn([row(538, 'PO-9', 6, [...MATCHING_ITEMS, { ID: 5, QuantityExpected: 1 }])], RESERVATION), null)
 })

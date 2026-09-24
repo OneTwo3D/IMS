@@ -1,11 +1,14 @@
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import {
   compareMintsoftAsnAgainstExpectation,
+  describeMintsoftAsnDifference,
   isProofThatMintsoftAsnIsNotThisOne,
+  readMintsoftAsnMapState,
   requireMintsoftAsnCreationVerdict,
   type MintsoftAsnCreationVerdict,
   type MintsoftAsnDifference,
   type MintsoftAsnExpectation,
+  type MintsoftAsnMapKnowledge,
 } from './asn-creation-rule'
 
 /**
@@ -50,14 +53,33 @@ import {
  * changed — and the reservation checks validate the CURRENT LOCAL quantities, never whether that remote
  * ASN exists. So it is refused by name, like every other unresolved state here.
  *
- * WHAT IT STILL DOES NOT LOOK AT (o3d-54al): the ASN's status, and whether IMS has already mapped that
- * ASN id. The second is what would let a legitimate later partial over the same lines be told apart from a
- * lost create; until it lands, that case reaches an operator instead of creating a second ASN — and, in
- * the other direction, an ASN whose line SET merely overlaps the reservation's is still read as somebody
- * else's, which is the one remaining "different, therefore create" answer on this path. The comment on
- * `isProofThatMintsoftAsnIsNotThisOne`'s `lines` case states that residual and why it is not closed here.
+ * AN OVERLAPPING LINE SET IS NOT PROOF EITHER, UNLESS IMS HAS ALREADY MAPPED THAT ASN (round 7, Codex HIGH;
+ * this is o3d-54al's already-mapped check, landed here because it is the mechanism the fix needs). Rounds
+ * 2–6 answered a row carrying our reference over SOME of our lines with "somebody else's ASN, create one":
+ * Mintsoft creates the ASN, IMS loses the response, the purchase order gains a line, and the retry covers
+ * {a,b,c} where the ASN at the warehouse holds {a,b} — so a second inbound ASN went out for a and b. Round 6
+ * left it permitted because the reference belongs to the ORDER and a second ASN over a different set of its
+ * lines is how a partial delivery works. The map settles which of the two it is: a partial IMS has recorded
+ * has a `wms_asn_maps` row and stays proof of absence, while an UNMAPPED overlap is precisely what a lost
+ * response leaves behind and refuses by name. THE MATCHER STAYS PURE — the map lives in the database, so the
+ * CALLER reads it (one helper in app/actions/mintsoft-sync.ts, used by both creators) and passes the ids in
+ * as `criteria.mapKnowledge`; and if that read fails, `unreadable` is passed, which refuses rather than
+ * permits.
+ *
+ * WHAT IT STILL DOES NOT LOOK AT (o3d-54al keeps this): the ASN's STATUS. A COMPLETE, booked-in ASN carrying
+ * the same reference and exactly the same line ids and quantities is still ADOPTED as though it were this
+ * attempt's, which then waits for a booked-in callback that has already happened. Status is orthogonal to
+ * everything here and needs its own decision about which `ASNStatusId`s may be adopted at all.
  */
-export type MintsoftAsnRecoveryCriteria = MintsoftAsnExpectation
+export type MintsoftAsnRecoveryCriteria = MintsoftAsnExpectation & {
+  /**
+   * WHICH OF THE REMOTE ASN IDS IMS HAS ALREADY RECORDED, or the fact that it could not find out. Required,
+   * not optional: a caller that forgets it cannot compile, because defaulting it would default to either
+   * "nothing is mapped" (an operator for every legitimate second partial) or "everything is" (the duplicate
+   * this exists to prevent), and neither is a safe silent default.
+   */
+  mapKnowledge: MintsoftAsnMapKnowledge
+}
 
 export class MintsoftAsnRecoveryLineIdentityUnreadableError extends Error {
   constructor(externalAsnIds: readonly string[], reference: string) {
@@ -144,13 +166,70 @@ export class MintsoftAsnRecoveryQuantityConflictError extends Error {
   }
 }
 
+/**
+ * ROUND 7, CODEX HIGH. A row carrying our reference that already covers SOME of the lines this reservation is
+ * about to send, which IMS has NO map row for. That is what a create whose response was lost leaves behind,
+ * and answering it with "no such ASN exists" made the warehouse expect the same goods twice.
+ */
+export class MintsoftAsnRecoveryLineSetOverlapError extends Error {
+  constructor(externalAsnId: string, reference: string, sharedSourceLineIds: readonly string[], description: string) {
+    super(
+      `Mintsoft ASN ${externalAsnId} carries reference ${reference} and IMS has no ASN map row for it, and `
+      + `${description}. An ASN IMS never recorded is exactly what a create whose response was lost leaves `
+      + `behind, and this one already covers source line ${sharedSourceLineIds.join(', ')} — so answering "no `
+      + 'such ASN exists" would make the warehouse expect the same goods twice. Refusing both to adopt it (its '
+      + 'line set is not this reservation\'s) and to create a second one. NO ASN WILL BE CREATED for this '
+      + 'reservation until an operator reconciles that ASN in Mintsoft (book it in or delete it), then retry. An '
+      + 'ASN IMS has ALREADY MAPPED does not block anything: a legitimate second partial for this order still '
+      + 'goes through.',
+    )
+    this.name = 'MintsoftAsnRecoveryLineSetOverlapError'
+  }
+}
+
+/**
+ * ROUND 7. The decision needed the ASN map — is this row a partial IMS has recorded, or the ASN a lost create
+ * left behind? — and the map could not be read. The rule of this branch, applied to IMS's own state for once:
+ * unreadable is not permission.
+ */
+export class MintsoftAsnRecoveryMapUnreadableError extends Error {
+  constructor(externalAsnId: string, reference: string, description: string, detail: string) {
+    super(
+      `Mintsoft ASN ${externalAsnId} carries reference ${reference} and ${description}, and IMS could not read its `
+      + `own ASN map to tell whether it has already recorded that ASN (${detail}). Whether this row is a partial `
+      + 'IMS knows about or the ASN an earlier attempt created and IMS never recorded is exactly what the map '
+      + 'answers, so nothing here can prove this ASN is not the one that attempt created. Nothing was created and '
+      + 'NO ASN WILL BE CREATED for this reservation until the ASN map reads back, then retry.',
+    )
+    this.name = 'MintsoftAsnRecoveryMapUnreadableError'
+  }
+}
+
 /** The refusal for a candidate the rule leaves unresolved, named for what the difference actually is. */
 function refusalFor(
   asn: WmsAsnRef,
   difference: MintsoftAsnDifference,
   criteria: MintsoftAsnRecoveryCriteria,
 ): Error {
+  // ROUND 7: two kinds are unresolved ONLY because the map could not answer them (see
+  // `isProofThatMintsoftAsnIsNotThisOne`), so when that is why, the refusal says so rather than blaming the
+  // difference. It changes the NAME of the refusal, never whether one happens: both branches refuse.
+  if (criteria.mapKnowledge.kind === 'unreadable' && (difference.kind === 'linesOverlap' || difference.kind === 'quantity')) {
+    return new MintsoftAsnRecoveryMapUnreadableError(
+      asn.externalAsnId,
+      criteria.reference.trim(),
+      describeMintsoftAsnDifference(difference, criteria),
+      criteria.mapKnowledge.detail,
+    )
+  }
   switch (difference.kind) {
+    case 'linesOverlap':
+      return new MintsoftAsnRecoveryLineSetOverlapError(
+        asn.externalAsnId,
+        criteria.reference.trim(),
+        difference.sharedSourceLineIds,
+        describeMintsoftAsnDifference(difference, criteria),
+      )
     case 'quantityUnreadable':
       return new MintsoftAsnRecoveryQuantityUnreadableError(asn.externalAsnId, difference.sourceLineId, difference.expectedQty)
     case 'quantity':
@@ -163,7 +242,7 @@ function refusalFor(
       return new MintsoftAsnRecoveryLineIdentityUnreadableError([asn.externalAsnId], criteria.reference.trim())
     case 'same':
     case 'reference':
-    case 'lines':
+    case 'linesUnrelated':
       // Ruled out or adopted before this point. Refusing rather than falling through to "create" keeps the
       // rule true of a difference kind added later that nobody wired up here.
       return new Error(
@@ -184,8 +263,13 @@ export function decideMintsoftAsnCreation(
 ): MintsoftAsnCreationVerdict {
   const reference = criteria.reference.trim()
   const unresolved = asns
-    .map((asn) => ({ asn, difference: compareMintsoftAsnAgainstExpectation(asn, criteria) }))
-    .filter(({ difference }) => !isProofThatMintsoftAsnIsNotThisOne(difference))
+    .map((asn) => ({
+      asn,
+      difference: compareMintsoftAsnAgainstExpectation(asn, criteria),
+      // ROUND 7: the ONLY thing IMS's own records contribute, read here and nowhere else in this file.
+      mapState: readMintsoftAsnMapState(asn, criteria.mapKnowledge),
+    }))
+    .filter(({ difference, mapState }) => !isProofThatMintsoftAsnIsNotThisOne(difference, mapState))
 
   // BEFORE anything else, because a row we cannot key is a row we cannot EXCLUDE (round 5, Codex HIGH 2),
   // and every such row is named, in SORTED order, so the refusal does not depend on the list's page order.

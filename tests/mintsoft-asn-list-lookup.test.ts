@@ -291,7 +291,10 @@ test('a rebind between a lost attempt and the retry still finds the earlier ASN,
   const { findRecoverableMintsoftAsn } = await import('@/lib/connectors/mintsoft/api/asn-recovery')
   const asns = await fetchMintsoftAsnsForDuplicateRecovery()
   assert.throws(
-    () => findRecoverableMintsoftAsn(asns, { reference: 'PO-TARGET', externalWarehouseId: '6', lines: [{ sourceLineId: 'line-9999', expectedQty: 4 }] }),
+    () => findRecoverableMintsoftAsn(asns, {
+      reference: 'PO-TARGET', externalWarehouseId: '6', lines: [{ sourceLineId: 'line-9999', expectedQty: 4 }],
+      mapKnowledge: { kind: 'readable', mappedExternalAsnIds: new Set() },
+    }),
     (error: unknown) => error instanceof Error && error.name === 'MintsoftAsnRecoveryWarehouseMismatchError' && /ASN 9999/.test(error.message),
   )
 })
@@ -306,4 +309,18 @@ test('both ASN creators decide recover-or-create through findRecoverableMintsoft
   assert.equal((source.match(/await fetchMintsoftAsnsForDuplicateRecovery\(\)/g) ?? []).length, 2, 'both read the tenant-wide list')
   assert.equal((source.match(/return findRecoverableMintsoftAsn\(remoteAsns, \{/g) ?? []).length, 2, 'both decide through the shared matcher')
   assert.equal((source.match(/POReference/g) ?? []).length, 0, 'no creator keeps its own reference matching')
+
+  // ROUND 7 (Codex HIGH), and o3d-54al's mechanism: the verdict needs to know which remote ASN ids IMS has
+  // already recorded, so BOTH creators read the map and pass it in — from ONE helper, so the two cannot drift.
+  assert.equal((source.match(/async function readMintsoftAsnMapKnowledge\(/g) ?? []).length, 1, 'one map read')
+  assert.equal((source.match(/mapKnowledge: await readMintsoftAsnMapKnowledge\(remoteAsns\),/g) ?? []).length, 2, 'both creators pass it')
+  // FAIL-CLOSED, as an absence check over the whole file: the ONLY place that can claim the map was readable
+  // is the helper's success path, and the only 'unreadable' is its catch. An empty set claimed after a failed
+  // read would be a POSITIVE claim that nothing is mapped, which the matcher would act on.
+  assert.equal((source.match(/kind: 'readable'/g) ?? []).length, 1, 'one claim that the map was read')
+  assert.equal((source.match(/kind: 'unreadable'/g) ?? []).length, 1, 'and one fail-closed answer when it was not')
+  const helper = source.slice(source.indexOf('async function readMintsoftAsnMapKnowledge('))
+  const body = helper.slice(0, helper.indexOf('\n}\n') + 2)
+  assert.match(body, /catch \(error\) \{\n\s+return \{ kind: 'unreadable'/, 'the catch fails closed rather than returning an empty set')
+  assert.equal((body.match(/mappedExternalAsnIds: new Set\(/g) ?? []).length, 1, 'and the set is only ever built from rows the database returned')
 })
