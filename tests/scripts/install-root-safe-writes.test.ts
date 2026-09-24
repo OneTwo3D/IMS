@@ -1823,6 +1823,13 @@ const PROTECTED_LIBRARY_CONSTANTS = [
   // the prefix and the pin is written and looked for somewhere else, which makes every invocation read
   // the mutable pointer again -- the finding -- and makes the sweep reclaim a tree that is being executed.
   'DB_FENCE_INUSE_PREFIX',
+  // o3d-xi3w r4: THE ONE LOCK, and the bound on waiting for it. The lock file is the object the raise's
+  // critical section opens and flocks so that binding the recovery record and publishing the authority
+  // cannot be interleaved with another run's write of the same lines: re-aim the path and two runs take
+  // two different locks and exclude nothing, which is the round-4 finding with a longer name. The wait
+  // decides whether a busy peer is waited for or refused, so a value another path could set is a way to
+  // turn every raise into a refusal (0) or a hang.
+  'DB_FENCE_RECORD_LOCK', 'DB_FENCE_RECORD_LOCK_WAIT',
   'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE',
   // o3d-xi3w: where a pre-pointer release left the record and the manifest. This run REMOVES them once
   // it has migrated such an installation, so they are paths the mechanism acts on.

@@ -3723,6 +3723,13 @@
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "printf ' AND %s IS NOW ABSENT: this run had to move the artefact that was there aside for the one migration a pre-pointer installation needs, could not put it back, and has PRESERVED it at %s rather than deleting it -- it is the only previously usable fence artefact on this box and nothing else has a copy of it. Put it back before the next cutover (as root: %s -T %s %s), or discard it deliberately and let the next privileged run bootstrap from the release.' \"${DB_FENCE_PROTECTED_APP_DIR}\" \"${preserved}\" \"mv\" \"${preserved}\" \"${DB_FENCE_PROTECTED_APP_DIR}\"",
+   "count": 1,
+   "class": "text",
+   "reason": "a printf FORMAT and its arguments: the word is one of the values substituted into the sentence an operator reads, so that the refusal carries the command that puts the preserved artefact back instead of a description of one. Nothing is executed by this statement -- printf writes to stdout, which _fence_stage_and_publish() captures into a local and puts in its refusal."
   }
  ]
 }

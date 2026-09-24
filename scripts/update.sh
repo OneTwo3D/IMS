@@ -3119,7 +3119,7 @@ remove_db_identity_snapshot() {
 # matters, which is the run that is killed between the two. A fence raised with no record is
 # exactly the state r28 left un-adoptable.
 publish_fence_recovery_record() {
-  local digest script
+  local digest script version=""
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_FENCE_IDENTITY_FILE} and a root-owned copy of the fence script at ${DB_FENCE_SCRIPT_COPY}"
     return 0
@@ -3162,8 +3162,16 @@ publish_fence_recovery_record() {
   # exactly as the removed call did, and then hands back the entry file of the versioned
   # publication this operation is bound to for its whole length — which is the file the fence is
   # about to be raised with, and therefore the only digest this record may carry.
+  #
+  # AND THE RECORD NAMES THE PUBLICATION AS WELL AS THE BYTES (o3d-xi3w r4). The digest says WHICH BYTES;
+  # the version says WHICH PUBLICATION they are in, and that is what a release needs once the documented
+  # pointer has moved on -- see THE INVARIANT in scripts/lib/db-fence-protected.sh. Both are taken from the
+  # entry file THIS operation is pinned to. It is written here as well as in the raise's critical section
+  # because this write happens BEFORE the revoke and the critical section happens after it: a run killed
+  # between the two leaves a record that already names the right publication.
   script="$(db_fence_script_in_use)" || return 1
   digest="$(file_sha256 "${script}")" || return 1
+  version="$(_fence_version_of_entry "${script}")" || version=""
   {
     printf 'db_app_host=%s\n' "${DB_IDENTITY_HOST}"
     printf 'db_app_port=%s\n' "${DB_IDENTITY_PORT}"
@@ -3171,6 +3179,7 @@ publish_fence_recovery_record() {
     printf 'db_app_database=%s\n' "${DB_IDENTITY_DATABASE}"
     printf 'db_connect_fence_state=%s\n' "${DB_FENCE_STATE}"
     printf 'fence_script_sha256=%s\n' "${digest}"
+    if [[ -n "${version}" ]]; then printf 'fence_script_version=%s\n' "${version}"; fi
     printf 'recorded_at=%s\n' "$(date -Iseconds)"
     # THE LAST LINE, AND IT IS THE POINT OF IT, exactly as marker_complete=1 is: a record that
     # does not end here was never published in one piece, and a HALF-READ IDENTITY IS A DIFFERENT

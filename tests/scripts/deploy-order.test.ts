@@ -7703,6 +7703,15 @@ test('the recovery record lives where the application user cannot rewrite it', (
     'it must be taken from the publication this operation is pinned to, through the one resolution')
   assert.match(publish, /digest="\$\(file_sha256 "\$\{script\}"\)" \|\| return 1/,
     'and that path is what is hashed')
+  // AND THE RECORD NAMES THE PUBLICATION AS WELL AS THE BYTES (o3d-xi3w r4). The raise's critical section
+  // rewrites both lines again immediately before it publishes the authority, so this earlier write is what
+  // covers the one state that section cannot: a run KILLED between this record and that authority. Lexical
+  // for the same reason the digest check above is -- no fixture can distinguish "written here" from
+  // "written there" on a box where nothing intervenes.
+  assert.match(publish, /version="\$\(_fence_version_of_entry "\$\{script\}"\)" \|\| version=""/,
+    'the publication this operation is pinned to must be taken from the same resolution')
+  assert.match(publish, /printf 'fence_script_version=%s\\n' "\$\{version\}"/,
+    'and written into the record, so a release resolves the raising publication and not whatever the pointer names')
   assert.match(publish, /chown root:root "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'the recovery directory must be root-owned')
   assert.match(publish, /chmod 755 "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'and traversable by the account that runs the fence')
   // THE CREDENTIAL IS NOT IN IT. A record that carried DEPLOY_ADMIN_DATABASE_URL would be a
@@ -8949,7 +8958,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
   //     and case 2 fails: the protected copy becomes v2 with nothing authorising it.
   //   * drop the `[[ "${digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]` refusal from
   //     _fence_stage_and_publish() and case 3 fails: a wrong expected digest publishes anyway.
-  //   * delete the _fence_rewrite_record_digest() call and case 4 fails at the record assertion,
+  //   * delete the _fence_rewrite_record_binding() call and case 4 fails at the record assertion,
   //     and every later run would be refused by db_fence_script_in_use() — a rotation that bricks
   //     the mechanism is not a rotation.
   //   * delete the ${DB_FENCE_STATE} arm and case 5 rotates the helper out from under a standing

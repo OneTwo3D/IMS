@@ -2628,7 +2628,14 @@ src *inside* it and returns **success**, which left one publication's whole tree
 inside the other's with both runs reporting that they had published. Neither is reachable now: the
 documented name is a symbolic link that is replaced in one operation, and every rename this library makes
 passes `-T`, which refuses a directory destination outright. The full argument is above
-`_fence_publish_unwind()` in `scripts/lib/db-fence-protected.sh`. A
+`_fence_publish_unwind()` in `scripts/lib/db-fence-protected.sh`, and so is the rule that **a rollback
+never destroys the only usable artefact** (o3d-xi3w r4): the one migration moves a legacy directory to
+`/etc/ims-cutover-recovery/.retired-fence.<pid>.<rand>`, and if the pointer creation or the commit rename
+then fails, that name is deleted **only** when the artefact is back where it was — proved by the rename's
+own status — or when the documented name holds a committed replacement that is sealed and hashes to its
+own record. Otherwise it is **kept**, and the refusal names its path with the command that puts it back.
+It used to be deleted unconditionally, one line after a restore whose status was discarded, so a restore
+that failed left the documented name absent and the legacy artefact gone. A
 rotation also moves `fence_script_sha256` in the recovery record with the file it names; leaving it
 behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
 rotation.
@@ -2652,6 +2659,35 @@ authenticate itself: the digest is taken only from a tree that is sealed and has
 record beside it binds. And a run that **publishes nothing** repairs a record it finds stale before it
 decides anything else, which is what makes the killed-publisher state recoverable without an operator —
 except while a fence is standing, where the repair is refused for the same reason a rotation is.
+
+**And while a fence stands, the record names the publication that RAISED it — and the release resolves
+through that, not through the pointer** (o3d-xi3w r4). This is the invariant the whole mechanism is held
+to, stated once above `_fence_bind_record_to_standing()`:
+
+* **while a fence stands**, `/etc/ims-cutover-recovery/db-fence-identity.env` names the raising
+  publication by `fence_script_version` as well as by `fence_script_sha256`, and every run that resolves
+  the fence helper is bound to **that** publication;
+* **while no fence stands**, it names what the pointer names, and a run that finds otherwise rebinds it
+  itself.
+
+Three properties make the first clause true. The record carries the **version**, so a publication that
+commits after the raise cannot change which tree the release runs — before this it could, and did:
+measured, a publication landing between the raise's resolution and its authority made the release execute
+*another release's* entry file with this fence's grantee list, and when the two digests disagreed instead,
+the fence could not be released at all, because the repair is refused while a fence stands. The raise
+**binds that record and publishes the authority inside one critical section**, held on
+`/etc/ims-cutover-recovery/db-fence-record.lock`, and every other writer of those two lines takes the same
+lock and refuses under it while an authority is present — so a stale write either lands before the raise
+binds, and is overwritten by it, or does not land at all. And the **sweep keeps** the version a standing
+fence's record names, because the pointer has moved on, that publisher is long gone and nothing in the
+tree is open, so every other question the sweep asks says "take it".
+
+The lock is `flock(2)`, opened read-only on a root-owned `0600` file in the recovery root. It is
+admissible where r3 refused a lock because the **kernel** releases it when the holder's last descriptor
+closes, including on `SIGKILL` and on a power cut: there is no file for an operator to remove and no
+liveness test to get wrong, and a bounded wait makes a wedged peer a refusal rather than a hang. Stated
+plainly: a record written by a release older than this one carries no version, and the resolution then
+falls back to the pointer **and the digest check**, which is exactly what those installations did before.
 
 And the record a **raise** writes carries the digest of the artefact **that operation is pinned to**, not
 of whatever `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` resolves to at the instant it

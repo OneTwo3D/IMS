@@ -822,6 +822,7 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
   const flipped = join(dirs.base, 'a-flipped')
   const paused = join(dirs.base, 'a-paused')
   const bDone = join(dirs.base, 'b-done')
+  const bFlipped = join(dirs.base, 'b-flipped')
   const aScript = script(dirs, 'a.sh', program(dirs, a, [
     `eval "$(declare -f _fence_stage_and_publish | sed '1s/_fence_stage_and_publish/_rig_staged/')"`,
     '_fence_stage_and_publish() {',
@@ -834,7 +835,7 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
     '  _rig_recorded "$@"; local rc=$?',
     `  if [[ -e ${JSON.stringify(flipped)} ]] && [[ ! -e ${JSON.stringify(paused)} ]]; then`,
     `    : > ${JSON.stringify(paused)}`,
-    `    while [[ ! -e ${JSON.stringify(bDone)} ]]; do sleep 0.05; done`,
+    `    while [[ ! -e ${JSON.stringify(bFlipped)} ]]; do sleep 0.05; done`,
     '  fi',
     '  return $rc',
     '}',
@@ -843,6 +844,17 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(a)))}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
     `while [[ ! -e ${JSON.stringify(paused)} ]]; do sleep 0.05; done`,
+    // r4: B SIGNALS AT ITS FLIP, not at the end of its publication. A is held inside the round-4 critical
+    // section, which holds ${DB_FENCE_RECORD_LOCK} — and B's own record write takes that same lock, so
+    // waiting for B to FINISH would be waiting for a lock A has not let go of. The flip needs no lock (a
+    // publisher never takes one), so this is still exactly the interleave the round-3 finding is about:
+    // the pointer moves under A between the instant A read it and the instant A writes.
+    `eval "$(declare -f _fence_stage_and_publish | sed '1s/_fence_stage_and_publish/_rig_staged_b/')"`,
+    '_fence_stage_and_publish() {',
+    '  _rig_staged_b "$@"; local rc=$?',
+    `  [[ $rc -ne 0 ]] || : > ${JSON.stringify(bFlipped)}`,
+    '  return $rc',
+    '}',
     'publish_fence_script_copy; echo "RC=$?"',
     `: > ${JSON.stringify(bDone)}`,
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(b)))}`]))
@@ -857,10 +869,13 @@ test('[o3d-xi3w] a publisher outraced between its pointer flip and its record wr
   const bLog = readFileSync(join(dirs.base, 'b.log'), 'utf8')
 
   // THE PRECONDITIONS WERE REACHED: A committed its pointer, was then held inside its record write, and B
-  // published a WHOLE publication — flip and record — while it was held. Without these three this test
+  // COMMITTED ITS OWN FLIP while it was held — so the pointer moved under A between the instant A read it
+  // and the instant A wrote. (r4: B's own record write queues behind the lock A is holding, and lands
+  // after A's; the end state is the same and is what is asserted below.) Without these three this test
   // would pass on a run in which nothing interleaved at all.
   assert.ok(existsSync(flipped), `precondition: run A must have committed its flip: ${aLog}`)
   assert.ok(existsSync(paused), `precondition: run A must have been held inside its record write: ${aLog}`)
+  assert.ok(existsSync(bFlipped), `precondition: run B must have committed its flip while A was held: ${bLog}`)
   assert.match(bLog, /^RC=0$/m, `precondition: run B must have published while A was held: ${bLog}`)
   assert.equal(standingMarker(dirs.recovery), 'V2-RUN-B', `precondition: B's publication must be the one standing: ${bLog}`)
 
@@ -894,7 +909,7 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
   // half is what catches it: the pointer is read AGAIN after the write, and a pointer that has moved makes
   // the attempt go round with the publication that is standing NOW.
   //
-  // THE RETRY IS COUNTED, not inferred: _fence_rewrite_record_digest() is wrapped in A and every call
+  // THE RETRY IS COUNTED, not inferred: _fence_rewrite_record_binding() is wrapped in A and every call
   // recorded, so this test asserts that the second attempt HAPPENED. Deleting the re-read (returning
   // `bound` unconditionally after the write) leaves the count at 1 and the record bound to A.
   const dirs = scratch(t)
@@ -908,6 +923,7 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
   const flipped = join(dirs.base, 'a-flipped')
   const paused = join(dirs.base, 'a-paused')
   const bDone = join(dirs.base, 'b-done')
+  const bFlipped = join(dirs.base, 'b-flipped')
   const writes = join(dirs.base, 'a-writes')
   const aScript = script(dirs, 'a.sh', program(dirs, a, [
     `eval "$(declare -f _fence_stage_and_publish | sed '1s/_fence_stage_and_publish/_rig_staged/')"`,
@@ -922,12 +938,12 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
     '  _rig_resolve "$@"; local rc=$?',
     `  if [[ -e ${JSON.stringify(flipped)} ]] && [[ ! -e ${JSON.stringify(paused)} ]]; then`,
     `    : > ${JSON.stringify(paused)}`,
-    `    while [[ ! -e ${JSON.stringify(bDone)} ]]; do sleep 0.05; done`,
+    `    while [[ ! -e ${JSON.stringify(bFlipped)} ]]; do sleep 0.05; done`,
     '  fi',
     '  return $rc',
     '}',
-    `eval "$(declare -f _fence_rewrite_record_digest | sed '1s/_fence_rewrite_record_digest/_rig_rewrite/')"`,
-    '_fence_rewrite_record_digest() {',
+    `eval "$(declare -f _fence_rewrite_record_binding | sed '1s/_fence_rewrite_record_binding/_rig_rewrite/')"`,
+    '_fence_rewrite_record_binding() {',
     `  printf '%s\\n' "$1" >> ${JSON.stringify(writes)}`,
     '  _rig_rewrite "$@"',
     '}',
@@ -935,6 +951,17 @@ test('[o3d-xi3w] the record write is a compare-and-swap: a write that loses the 
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(a)))}`]))
   const bScript = script(dirs, 'b.sh', program(dirs, b, [
     `while [[ ! -e ${JSON.stringify(paused)} ]]; do sleep 0.05; done`,
+    // r4: B SIGNALS AT ITS FLIP, not at the end of its publication. A is held inside the round-4 critical
+    // section, which holds ${DB_FENCE_RECORD_LOCK} — and B's own record write takes that same lock, so
+    // waiting for B to FINISH would be waiting for a lock A has not let go of. The flip needs no lock (a
+    // publisher never takes one), so this is still exactly the interleave the round-3 finding is about:
+    // the pointer moves under A between the instant A read it and the instant A writes.
+    `eval "$(declare -f _fence_stage_and_publish | sed '1s/_fence_stage_and_publish/_rig_staged_b/')"`,
+    '_fence_stage_and_publish() {',
+    '  _rig_staged_b "$@"; local rc=$?',
+    `  [[ $rc -ne 0 ]] || : > ${JSON.stringify(bFlipped)}`,
+    '  return $rc',
+    '}',
     'publish_fence_script_copy; echo "RC=$?"',
     `: > ${JSON.stringify(bDone)}`,
   ], [`export IMS_FENCE_SCRIPT_SHA256=${JSON.stringify(sha256Of(checkoutHelper(b)))}`]))
@@ -1015,6 +1042,408 @@ test('[o3d-xi3w] a publication killed between its flip and its record write is r
   assert.match(resolved.output, /^RESOLVE_RC=0$/m, `and the artefact is executable again: ${resolved.output}`)
   const ran = spawnSync('node', [/^RESOLVED=(.+)$/m.exec(resolved.output)![1]], { encoding: 'utf8' })
   assert.match(ran.stdout, /V1-KILLED/, `running the publication that was standing all along: ${ran.stdout}${ran.stderr}`)
+})
+
+/** A complete recovery record that names a publication as well as an entry digest (o3d-xi3w r4). */
+function writeIdentityBound(recovery: string, digest: string, version: string): void {
+  writeFileSync(join(recovery, 'db-fence-identity.env'), [
+    'db_app_host=127.0.0.1',
+    'db_app_port=5432',
+    'db_app_user=imsapp',
+    'db_app_database=imsdb',
+    `fence_script_sha256=${digest}`,
+    ...(version === '' ? [] : [`fence_script_version=${version}`]),
+    'recorded_at=2026-01-01T00:00:00+00:00',
+    'fence_identity_complete=1',
+    '',
+  ].join('\n'))
+}
+
+/** The publication the recovery record binds the fence to, or '' when it binds none. */
+function identityVersion(recovery: string): string {
+  const file = join(recovery, 'db-fence-identity.env')
+  if (!existsSync(file)) return ''
+  return /^fence_script_version=(\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+)$/m.exec(readFileSync(file, 'utf8'))?.[1] ?? ''
+}
+
+/**
+ * A LEGACY INSTALLATION: the documented name is a real directory, which is the one state the publication
+ * has to migrate — and the only state in which it moves an existing artefact aside at all.
+ */
+function legacyInstallation(dirs: Scratch, marker: string): void {
+  const tree = join(dirs.recovery, 'app')
+  mkdirSync(join(tree, 'scripts'), { recursive: true })
+  writeFileSync(join(tree, 'scripts', 'fence-db-connections.mjs'), markedHelper(marker))
+  assert.ok(lstatSync(tree).isDirectory() && !lstatSync(tree).isSymbolicLink(),
+    'precondition: the documented name must be a real directory for a migration to happen at all')
+}
+
+/**
+ * MAKE ONE FILESYSTEM OPERATION FAIL, as a full or faulted device would, WITHOUT touching the library:
+ * a shell function of the same name shadows the command, refuses the operands the case is about, and
+ * hands everything else to the real program. `command` is how the real one is still reached.
+ */
+function failing(name: 'ln' | 'mv', when: string): string[] {
+  return [
+    `${name}() {`,
+    `  if ${when}; then echo "${name}: injected failure" >&2; return 1; fi`,
+    `  command ${name} "$@"`,
+    '}',
+  ]
+}
+/**
+ * WHICH rename, by DIRECTION as well as by name. `mv -T -- <src> <dst>` puts the documented name LAST on
+ * the restore and on the commit, and FIRST on the move-aside — so a predicate that only asked whether both
+ * words appeared would refuse the move-aside too, and the migration under test would never happen.
+ */
+const RESTORE_OPERANDS = '[[ "${@: -1}" == "${DB_FENCE_PROTECTED_APP_DIR}" && " $* " == *".retired-"* ]]'
+/** True for the arguments of the COMMIT: this publication's temporary pointer onto the documented name. */
+const COMMIT_OPERANDS = '[[ "${@: -1}" == "${DB_FENCE_PROTECTED_APP_DIR}" && " $* " == *".pointer-"* ]]'
+
+test('[o3d-xi3w] a rollback whose restore FAILS preserves the moved-aside artefact and names it (r4, Codex HIGH 2)', (t) => {
+  // THE FINDING. During the one migration the legacy artefact is moved to ${retire_dir}. If the pointer
+  // creation or the commit rename then fails, the unwind tried to put it back, DISCARDED the rename's
+  // status with `|| true`, and deleted ${retire_dir} on the next line regardless. Measured against the
+  // pre-r4 library, from both of those two failures: the documented name was left ABSENT, no retirement
+  // directory remained, the legacy bytes were nowhere under the recovery root, and the next resolution
+  // refused with nothing to fall back to — the one outcome this file calls worse than not publishing.
+  //
+  // WHAT IS ASSERTED, per failure path: the retirement name still holds the legacy tree, the refusal
+  // NAMES it, and the bytes are still on the box. Restoring the discarded status (`|| true` back on the
+  // rename inside _fence_publish_unwind, or deleting unconditionally) turns this red on the first of
+  // those three.
+  for (const [label, injected, expectedNote] of [
+    ['the pointer creation', failing('ln', '[[ " $* " == *" -s "* ]]'), /the pointer for the fence artefact could not be created/],
+    ['the commit rename', failing('mv', `${COMMIT_OPERANDS} || ${RESTORE_OPERANDS}`), /the fence artefact could not be published at/],
+  ] as const) {
+    const dirs = scratch(t)
+    legacyInstallation(dirs, 'V0-LEGACY')
+    const app = checkout(dirs, 'A', 'V1-NEW')
+    const out = run(script(dirs, 'migrate.sh', program(dirs, app, [
+      ...(label === 'the pointer creation' ? [...injected, ...failing('mv', RESTORE_OPERANDS)] : [...injected]),
+      '_fence_stage_and_publish; echo "RC=$?"',
+      'echo "NOTE=${DB_FENCE_ROTATION_NOTE}"',
+    ])))
+    assert.match(out.output, /^RC=1$/m, `${label}: the publication must refuse: ${out.output}`)
+    assert.match(out.output, expectedNote, `${label}: and refuse for the reason this case injected: ${out.output}`)
+    // THE PRECONDITION WAS REACHED: a migration happened at all, so the documented name really was moved
+    // aside and this is not a case that passed by never reaching the rollback.
+    assert.ok(!existsSync(join(dirs.recovery, 'app')) && !lstatSync(join(dirs.recovery, 'app'), { throwIfNoEntry: false }),
+      `${label}: precondition — the documented name is absent, which is what makes the retirement copy the only one: ${out.output}`)
+    const retired = readdirSync(dirs.recovery).filter((name) => name.startsWith('.retired-'))
+    assert.equal(retired.length, 1, `${label}: the moved-aside artefact must be PRESERVED, and ${retired.length} were: ${out.output}`)
+    assert.equal(readFileSync(join(dirs.recovery, retired[0], 'scripts', 'fence-db-connections.mjs'), 'utf8'),
+      markedHelper('V0-LEGACY'), `${label}: and it must still be the legacy artefact's own bytes`)
+    assert.ok(out.output.includes(join(dirs.recovery, retired[0])),
+      `${label}: and the refusal must NAME the path it preserved: ${out.output}`)
+    assert.match(out.output, /IS NOW ABSENT/, `${label}: and must not claim the old artefact is still standing: ${out.output}`)
+  }
+})
+
+test('[o3d-xi3w] the retirement name is deleted only for a committed replacement that authenticates itself (r4)', (t) => {
+  // THE OTHER HALF of the same rule, and the reason `-e` is not the question. Three cases, one per way the
+  // retirement name may be removed, and one that proves the negative is not vacuous:
+  //   * the restore SUCCEEDS   — nothing is left at the retirement name, because it is back where it was;
+  //   * a COMMITTED replacement stands at the documented name — the legacy copy is disposable;
+  //   * something merely EXISTS at the documented name that no run could execute — it is KEPT.
+  const dirs = scratch(t)
+
+  // 1. the ordinary rollback: the restore works, so there is nothing to preserve and nothing to report.
+  legacyInstallation(dirs, 'V0-LEGACY')
+  const app = checkout(dirs, 'A', 'V1-NEW')
+  const ok = run(script(dirs, 'restored.sh', program(dirs, app, [
+    ...failing('ln', '[[ " $* " == *" -s "* ]]'),
+    '_fence_stage_and_publish; echo "RC=$?"',
+    'echo "NOTE=${DB_FENCE_ROTATION_NOTE}"',
+  ])))
+  assert.match(ok.output, /^RC=1$/m, `the publication must refuse: ${ok.output}`)
+  assert.equal(readFileSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'), 'utf8'),
+    markedHelper('V0-LEGACY'), `and the legacy artefact must be back at the documented name: ${ok.output}`)
+  assert.deepEqual(readdirSync(dirs.recovery).filter((n) => n.startsWith('.retired-')), [],
+    'with nothing left at the retirement name')
+  assert.match(ok.output, /Whatever was standing at .* is unchanged\./,
+    `and the refusal says so rather than naming a preserved copy: ${ok.output}`)
+
+  // 2. a COMMITTED replacement: another publication owns the documented name, so the legacy copy goes.
+  const second = scratch(t)
+  legacyInstallation(second, 'V0-LEGACY')
+  const other = checkout(second, 'B', 'V2-COMMITTED')
+  const committed = run(script(second, 'committed.sh', program(second, other, [
+    // the restore is refused AND something has taken the documented name: a complete publication, made
+    // by the shipped primitive from a second checkout, put there while this one was failing.
+    ...failing('ln', '[[ " $* " == *" -s "* ]]'),
+    ...failing('mv', RESTORE_OPERANDS),
+    'eval "$(declare -f _fence_publish_unwind | sed \'1s/_fence_publish_unwind/_rig_unwind/\')"',
+    '_fence_publish_unwind() {',
+    `  ( unset -f ln mv; _fence_stage_and_publish >/dev/null 2>&1 )`,
+    '  _rig_unwind "$@"',
+    '}',
+    '_fence_stage_and_publish; echo "RC=$?"',
+  ])))
+  assert.match(committed.output, /^RC=1$/m, `the first publication must refuse: ${committed.output}`)
+  assert.equal(standingMarker(second.recovery), 'V2-COMMITTED',
+    `precondition: a committed replacement must be standing: ${committed.output}`)
+  assert.deepEqual(readdirSync(second.recovery).filter((n) => n.startsWith('.retired-')), [],
+    `and the legacy copy is then disposable: ${committed.output}`)
+
+  // 3. AND IT IS NOT MERELY `-e`: a dangling pointer at the documented name is something, and is nothing
+  // any run can execute, so the legacy copy is KEPT. Without this case the rule above would be satisfied
+  // by any occupied name, which is the defect with a narrower hole in it.
+  const third = scratch(t)
+  legacyInstallation(third, 'V0-LEGACY')
+  const spare = checkout(third, 'C', 'V3-NEW')
+  const dangling = run(script(third, 'dangling.sh', program(third, spare, [
+    ...failing('ln', '[[ " $* " == *" -s "* ]]'),
+    ...failing('mv', RESTORE_OPERANDS),
+    'eval "$(declare -f _fence_publish_unwind | sed \'1s/_fence_publish_unwind/_rig_unwind/\')"',
+    '_fence_publish_unwind() {',
+    `  ( unset -f ln mv; command ln -s .version-fence.1.gone/app ${JSON.stringify(join(third.recovery, 'app'))} )`,
+    '  _rig_unwind "$@"',
+    '}',
+    '_fence_stage_and_publish; echo "RC=$?"',
+  ])))
+  assert.match(dangling.output, /^RC=1$/m, `the publication must refuse: ${dangling.output}`)
+  assert.ok(lstatSync(join(third.recovery, 'app')).isSymbolicLink() && !existsSync(join(third.recovery, 'app')),
+    `precondition: a DANGLING pointer must be at the documented name: ${dangling.output}`)
+  assert.equal(readdirSync(third.recovery).filter((n) => n.startsWith('.retired-')).length, 1,
+    `and the legacy artefact must still be preserved: ${dangling.output}`)
+})
+
+test('[o3d-xi3w] THE INVARIANT: a standing fence is released with the publication it was raised with (r4, Codex HIGH 1)', (t) => {
+  // THE INVARIANT, stated once above _fence_bind_record_to_standing() and driven here from the shape three
+  // rounds of sequence-specific fixes kept re-opening: a publication that commits AFTER the raise has
+  // resolved. Before r4 that was a measured substitution — the release resolved the LATER publication and
+  // executed another release's entry file with this fence's grantee list — and, when the digests disagreed,
+  // a fence that could not be released at all with the repair gated off by its own standing.
+  //
+  // NO CONCURRENCY IS NEEDED for it. One raise, then one later publication.
+  const dirs = scratch(t)
+  const raised = checkout(dirs, 'R', 'V0-RAISED')
+  const later = checkout(dirs, 'L', 'V1-LATER')
+  assert.match(run(script(dirs, 'zero.sh', program(dirs, raised, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: an artefact must be standing')
+  const raisedVersion = readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+  const raisedDigest = standingEntryDigest(dirs.recovery)
+  writeIdentity(dirs.recovery, raisedDigest)
+
+  // THE RAISE: the shipped critical section binds the record to the entry file this operation is pinned
+  // to and publishes the authority without letting go of the lock in between.
+  // AND THE AUTHORITY IS PUBLISHED WITH THE LOCK STILL HELD AND THE RECORD ALREADY BOUND. The stand-in
+  // for db_fence_publish_authority() answers both questions from INSIDE the critical section: a second
+  // `flock -n` on the same file, taken in a child (so it is a different open file description and really
+  // does contend), must FAIL; and the record must already carry the binding. Without these two the test
+  // would pass on a critical section that took no lock and bound nothing until afterwards.
+  const raise = run(script(dirs, 'raise.sh', program(dirs, raised, [
+    'rig_authority() {',
+    `  if ( flock -n -x 8 ) 8< "\${DB_FENCE_RECORD_LOCK}" 2>/dev/null; then`,
+    '    echo "LOCK_FREE_DURING_AUTHORITY=yes"',
+    '  else',
+    '    echo "LOCK_FREE_DURING_AUTHORITY=no"',
+    '  fi',
+    `  echo "VERSION_LINES_BEFORE_AUTHORITY=$(grep -c '^fence_script_version=' "\${DB_FENCE_IDENTITY_FILE}" || true)"`,
+    '  printf \'{}\\n\' > "${DB_FENCE_STATE}"',
+    '}',
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; exit 1; }',
+    '_fence_raise_critical_section "${script}" "${DB_FENCE_STATE}" rig_authority',
+    'echo "RAISE_RC=$?"',
+  ])))
+  assert.match(raise.output, /^RAISE_RC=0$/m, `the raise must succeed: ${raise.output}`)
+  assert.match(raise.output, /^LOCK_FREE_DURING_AUTHORITY=no$/m,
+    `the record lock must still be HELD while the authority is published: ${raise.output}`)
+  assert.match(raise.output, /^VERSION_LINES_BEFORE_AUTHORITY=1$/m,
+    `and the record must already bind the publication before the authority exists: ${raise.output}`)
+  assert.ok(existsSync(join(dirs.base, 'state.json')), `precondition: a fence must now stand: ${raise.output}`)
+  assert.equal(identityVersion(dirs.recovery), raisedVersion,
+    `and the record must name the publication the fence was raised with: ${raise.output}`)
+
+  // THE LATER PUBLICATION, made by the shipped primitive exactly as a second entrypoint or an older
+  // release would make it. The rotation path refuses while a fence stands; this is the publication itself.
+  const late = run(script(dirs, 'late.sh', program(dirs, later, ['_fence_stage_and_publish; echo "RC=$?"'])))
+  assert.match(late.output, /^RC=0$/m, `precondition: the later publication must commit: ${late.output}`)
+  assert.notEqual(readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''), raisedVersion,
+    `precondition: and must have moved the pointer off the raising publication: ${late.output}`)
+
+  // THE CLAIM, in three parts.
+  assert.equal(identityVersion(dirs.recovery), raisedVersion, 'the record still names the raising publication')
+  assert.equal(identityDigest(dirs.recovery), raisedDigest, 'and still binds its entry file')
+  const resolved = run(script(dirs, 'release.sh', program(dirs, later, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; exit 0; }',
+    'echo "RESOLVE_RC=0"',
+    'echo "RESOLVED=${script}"',
+  ])))
+  assert.match(resolved.output, /^RESOLVE_RC=0$/m, `and the release can resolve the helper: ${resolved.output}`)
+  const ran = spawnSync('node', [/^RESOLVED=(.+)$/m.exec(resolved.output)![1]], { encoding: 'utf8' })
+  assert.match(ran.stdout, /V0-RAISED/, `and executes the publication the fence was raised with: ${ran.stdout}${ran.stderr}`)
+  assert.doesNotMatch(ran.stdout, /V1-LATER/, 'and never the one that was published afterwards')
+})
+
+test('[o3d-xi3w] while a fence stands nothing rebinds the record, and the gate is asked under the lock (r4)', (t) => {
+  // CLAUSE (A)'s enforcement, and the thing the r3 compare-and-swap could not do: the write at the end of
+  // _fence_bind_record_locked() happens under ${DB_FENCE_RECORD_LOCK} with the fence gate asked under the
+  // same lock, so a run that was authenticating a tree when a fence went up cannot land its write behind
+  // the raise. Writing the digest unconditionally — the r3 line — makes this red.
+  const dirs = scratch(t)
+  const zero = checkout(dirs, 'Z', 'V0-RAISED')
+  const next = checkout(dirs, 'N', 'V1-LATER')
+  assert.match(run(script(dirs, 'zero.sh', program(dirs, zero, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: an artefact must be standing')
+  const raisedVersion = readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+  const raisedDigest = standingEntryDigest(dirs.recovery)
+  writeIdentityBound(dirs.recovery, raisedDigest, raisedVersion)
+  assert.match(run(script(dirs, 'late.sh', program(dirs, next, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: a later publication must have moved the pointer')
+  writeFileSync(join(dirs.base, 'state.json'), '{}\n')
+
+  const bind = run(script(dirs, 'bind.sh', program(dirs, next, [
+    'out="$(_fence_bind_record_to_standing)"; echo "BIND_RC=$?"',
+    'echo "OUTCOME=${out%%|*}"',
+  ])))
+  assert.match(bind.output, /^BIND_RC=1$/m, `the bind must refuse while a fence stands: ${bind.output}`)
+  assert.match(bind.output, /^OUTCOME=standing$/m, `and say why, in one word the caller branches on: ${bind.output}`)
+  assert.equal(identityDigest(dirs.recovery), raisedDigest, 'and the record must be untouched')
+  assert.equal(identityVersion(dirs.recovery), raisedVersion, 'in both of its binding lines')
+
+  // AND A RUN THAT PUBLISHES NOTHING SAYS NOTHING ABOUT IT: reaching the gate is the ordinary state of
+  // every run made while a fence is up, so the repair is silent rather than noisy.
+  const quiet = run(script(dirs, 'quiet.sh', program(dirs, next, ['_fence_repair_record; echo "REPAIR_RC=$?"'])))
+  assert.match(quiet.output, /^REPAIR_RC=0$/m, `the repair must not fail: ${quiet.output}`)
+  assert.doesNotMatch(quiet.output, /could not be repaired/, `and must not report a failure: ${quiet.output}`)
+  assert.equal(identityDigest(dirs.recovery), raisedDigest, 'and still must not have written anything')
+
+  // THE LOCK EXCLUDES, AND THE KERNEL RELEASES IT. A holder taken in another process blocks the raise's
+  // critical section; when that holder is KILLED with SIGKILL — where nothing of its own can run — the
+  // lock goes with it and the next run proceeds. That is why a lock is admissible here at all.
+  unlinkSync(join(dirs.base, 'state.json'))
+  const lockFile = join(dirs.recovery, 'db-fence-record.lock')
+  assert.ok(existsSync(lockFile), 'precondition: the lock file must have been created by the runs above')
+  // THE HOLDER `exec`s into `sleep`, so the process that holds the descriptor IS the pid it wrote down
+  // and killing that pid really does close it. Nothing of its own runs afterwards, which is the point:
+  // SIGKILL gives a process no chance to release anything, so whatever releases this lock is the kernel.
+  const pidFile = join(dirs.base, 'holder.pid')
+  writeFileSync(join(dirs.base, 'holder.sh'), [
+    'set -u',
+    `exec 9<${JSON.stringify(lockFile)}`,
+    'flock -x 9 || exit 1',
+    `echo $$ > ${JSON.stringify(pidFile)}`,
+    'exec sleep 300',
+  ].join('\n'))
+  spawnSync('bash', ['-c', `setsid bash ${JSON.stringify(join(dirs.base, 'holder.sh'))} >/dev/null 2>&1 &`])
+  const probe = (name: string) => run(script(dirs, name, program(dirs, next, [
+    `exec 9<${JSON.stringify(lockFile)}`,
+    'flock -w 1 -x 9; echo "TOOK_LOCK_RC=$?"',
+  ])))
+  for (let i = 0; i < 100 && !existsSync(pidFile); i += 1) spawnSync('sleep', ['0.05'])
+  assert.ok(existsSync(pidFile), 'precondition: a second process must have taken the lock')
+  assert.match(probe('held.sh').output, /^TOOK_LOCK_RC=1$/m,
+    'while another process holds it the lock EXCLUDES — without this the release below proves nothing')
+  const pid = Number(readFileSync(pidFile, 'utf8').trim())
+  assert.ok(Number.isInteger(pid) && pid > 1, `precondition: the holder must have a pid: ${pid}`)
+  assert.equal(spawnSync('kill', ['-9', String(pid)]).status, 0, 'precondition: and it must be killable')
+  let freed = ''
+  for (let i = 0; i < 100; i += 1) {
+    freed = probe(`freed-${i}.sh`).output
+    if (/^TOOK_LOCK_RC=0$/m.test(freed)) break
+    spawnSync('sleep', ['0.05'])
+  }
+  assert.match(freed, /^TOOK_LOCK_RC=0$/m,
+    `and a holder killed with SIGKILL leaves it free, which is why a lock is admissible here: ${freed}`)
+})
+
+test('[o3d-xi3w] the sweep keeps the publication a standing fence will be released with (r4)', (t) => {
+  // THE FIFTH QUESTION, and none of the other four covers it: the pointer has moved on, the publisher is
+  // gone, nothing in the tree is open and no live operation is pinned to it — and it is still the only
+  // thing that can release the fence that is standing.
+  //
+  // THE CONTROL IS FIRST, and the claim is worthless without it: with NO fence standing, the very same
+  // later publication DOES reclaim that version. Without this half the test would pass on a sweep that
+  // reclaims nothing at all, which is exactly what it did while it was being written.
+  const control = scratch(t)
+  const controlRaised = checkout(control, 'R', 'V0-RAISED')
+  const controlLater = checkout(control, 'L', 'V1-LATER')
+  const controlVersion = standingFromAnExitedRun(control, controlRaised)
+  // TWO later publications, not one: the sweep runs at the START of a publication, so while the SECOND is
+  // being assembled the FIRST is still what the pointer names and is never touched. It is the third that
+  // can reclaim it, and the same two are made in the fenced case below so the two halves differ in
+  // nothing but the fence.
+  const controlSwept = run(script(control, 'sweep.sh', program(control, controlLater, [
+    '_fence_stage_and_publish; echo "RC1=$?"',
+    '_fence_stage_and_publish; echo "RC2=$?"',
+  ])))
+  assert.match(controlSwept.output, /^RC1=0$/m, `precondition: the later publication must commit and sweep: ${controlSwept.output}`)
+  assert.match(controlSwept.output, /^RC2=0$/m, `precondition: and so must the one after it: ${controlSwept.output}`)
+  assert.ok(!existsSync(join(control.recovery, controlVersion)),
+    `CONTROL: with no fence standing the sweep DOES reclaim the superseded publication: ${controlSwept.output}`)
+
+  // AND NOW THE SAME THING WITH A FENCE STANDING AND THE RECORD NAMING THAT VERSION.
+  const dirs = scratch(t)
+  const raised = checkout(dirs, 'R', 'V0-RAISED')
+  const later = checkout(dirs, 'L', 'V1-LATER')
+  const raisedVersion = standingFromAnExitedRun(dirs, raised)
+  const raisedDigest = standingEntryDigest(dirs.recovery)
+  writeIdentityBound(dirs.recovery, raisedDigest, raisedVersion)
+  writeFileSync(join(dirs.base, 'state.json'), '{}\n')
+
+  const swept = run(script(dirs, 'sweep.sh', program(dirs, later, [
+    '_fence_stage_and_publish; echo "RC1=$?"',
+    '_fence_stage_and_publish; echo "RC2=$?"',
+  ])))
+  assert.match(swept.output, /^RC1=0$/m, `precondition: the later publication must commit and sweep: ${swept.output}`)
+  assert.match(swept.output, /^RC2=0$/m, `precondition: and so must the one after it: ${swept.output}`)
+  assert.notEqual(readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''), raisedVersion,
+    'precondition: and the pointer must no longer name the raising publication')
+  assert.ok(existsSync(join(dirs.recovery, raisedVersion, 'app', 'scripts', 'fence-db-connections.mjs')),
+    `the publication the standing fence will be released with must NOT have been reclaimed: ${swept.output}`)
+})
+
+test('[o3d-xi3w] the publication the record names is held to one shape, and a name of any other is not followed (r4)', (t) => {
+  // THE RECORD IS A FILE, and what _fence_bind_version() builds out of it is a PATH it then executes out
+  // of, so `fence_script_version` is held to the same one-component `.version-fence.<pid>.<suffix>` shape
+  // the pointer's own text is. Only root can write that file, so this is not a defence against the
+  // application account; it is the rule that a value read out of a file cannot introduce a second
+  // directory level, a `..` or an absolute path — the same rule, and the same argument, as the pointer's.
+  //
+  // THE DISCRIMINATOR IS THE NAME AND NOTHING ELSE. A complete, sealed publication is put at a name of
+  // the WRONG SHAPE and the record is pointed at it with its own digest; then the SAME directory is
+  // renamed to a name of the RIGHT shape and the record is pointed at that. Everything else — the bytes,
+  // the record beside the tree, the digest in the recovery record, the standing fence — is identical.
+  const dirs = scratch(t)
+  const bound = checkout(dirs, 'B', 'V0-BOUND')
+  const standing = checkout(dirs, 'S', 'V1-STANDING')
+  const boundVersion = standingFromAnExitedRun(dirs, bound)
+  const boundDigest = standingEntryDigest(dirs.recovery)
+  assert.match(run(script(dirs, 'later.sh', program(dirs, standing, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: a SECOND publication must be standing, so the pointer and the record differ')
+  assert.notEqual(standingEntryDigest(dirs.recovery), boundDigest,
+    'precondition: and the two publications must have different entry files')
+  writeFileSync(join(dirs.base, 'state.json'), '{}\n')
+
+  const resolve = (name: string) => run(script(dirs, `${name}.sh`, program(dirs, standing, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=1"; exit 0; }',
+    'echo "RESOLVE_RC=0"',
+    'echo "RESOLVED=${script}"',
+  ])))
+
+  // 1. THE WRONG SHAPE. `sneaky` is a real directory, in this root, holding a complete publication.
+  const sneaky = join(dirs.recovery, 'sneaky')
+  spawnSync('mv', ['-T', join(dirs.recovery, boundVersion), sneaky])
+  writeIdentityBound(dirs.recovery, boundDigest, boundVersion)
+  writeFileSync(join(dirs.recovery, 'db-fence-identity.env'),
+    readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8').replace(`fence_script_version=${boundVersion}`, 'fence_script_version=sneaky'))
+  assert.match(readFileSync(join(dirs.recovery, 'db-fence-identity.env'), 'utf8'), /^fence_script_version=sneaky$/m,
+    'precondition: the record must name the badly-shaped directory')
+  const refused = resolve('sneaky')
+  assert.match(refused.output, /^RESOLVE_RC=1$/m,
+    `a version name that is not one publication of this root must not be followed: ${refused.output}`)
+  assert.doesNotMatch(refused.output, /sneaky/, `and nothing may be resolved out of it: ${refused.output}`)
+
+  // 2. THE CONTROL: the same directory, the same bytes, the same record — at a name of the right shape.
+  spawnSync('mv', ['-T', sneaky, join(dirs.recovery, boundVersion)])
+  writeIdentityBound(dirs.recovery, boundDigest, boundVersion)
+  const followed = resolve('shaped')
+  assert.match(followed.output, /^RESOLVE_RC=0$/m,
+    `CONTROL: at a well-formed name the very same publication IS followed: ${followed.output}`)
+  const ran = spawnSync('node', [/^RESOLVED=(.+)$/m.exec(followed.output)![1]], { encoding: 'utf8' })
+  assert.match(ran.stdout, /V0-BOUND/, `and it is the publication the record binds: ${ran.stdout}${ran.stderr}`)
 })
 
 test('[o3d-xi3w] the repair adopts nothing that does not authenticate itself', (t) => {
