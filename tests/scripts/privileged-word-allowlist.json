@@ -2532,7 +2532,7 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "echo \"There is no complete artefact record at ${DB_FENCE_ARTEFACT_FILE}, so nothing says what ${DB_FENCE_PROTECTED_APP_DIR} is supposed to hash to and the tree cannot be authenticated. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256.\" >&2",
+   "line": "echo \"There is no complete artefact record beside ${base}, so nothing says what it is supposed to hash to and the tree cannot be authenticated. Discard the artefact and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256.\" >&2",
    "count": 1,
    "class": "text",
    "reason": "not run: the word is text or an argument (echo, 2)"
@@ -3712,10 +3712,17 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "echo \"The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} will not be followed: ${DB_FENCE_STANDING_REASON}. Nothing will be executed out of it. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — and supply IMS_FENCE_ARTEFACT_SHA256 from the release.\" >&2",
+   "line": "echo \"The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} will not be followed: ${base:-no reason was recorded}. Nothing will be executed out of it. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — and supply IMS_FENCE_ARTEFACT_SHA256 from the release.\" >&2",
    "count": 1,
    "class": "text",
    "reason": "a message printed to the operator: it names the command THEY may type to discard the artefact, and runs nothing"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# that disappears after that makes `node` fail to find a file. Nothing can make it run other bytes.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   }
  ]
 }

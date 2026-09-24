@@ -387,8 +387,14 @@ test('[o3d-xi3w] the artefact is SEALED, DIGESTED and RESOLVED through the point
   // db_fence_script_in_use() publishes, validates the pointer, seals the tree, reads the record THROUGH
   // the pointer, compares it with what the tree hashes to, and hands back the path — which is then run.
   //
-  // IT IS HERE BECAUSE A CHANGE OF SHAPE BREAKS READERS SILENTLY. `find <dir>` with the documented name
-  // as its start point reports the POINTER itself as "neither a regular file nor a directory" and as
+  // AND THE PATH IT HANDS BACK IS THE VERSIONED ONE (r2, Codex HIGH): the documented name is a mutable
+  // object, so a path through it is a statement about whatever it resolves to when `node` dereferences
+  // it, and not about the tree that was just sealed and digested. The two tests after this one measure
+  // what that difference does; this one fixes the SHAPE, so that a change back to the documented name
+  // fails here as well as there.
+  //
+  // IT IS ALSO HERE BECAUSE A CHANGE OF SHAPE BREAKS READERS SILENTLY. `find <dir>` with the documented
+  // name as its start point reports the POINTER itself as "neither a regular file nor a directory" and as
   // group- and other-writable (every symlink is 0777), so without `-H` the seal refuses every standing
   // artefact and no cutover can fence anything. Dropping `-H` from _fence_tree_is_sealed() turns this
   // red; asserting the flag's TEXT alone would only establish that the flag is written down.
@@ -399,13 +405,33 @@ test('[o3d-xi3w] the artefact is SEALED, DIGESTED and RESOLVED through the point
     'echo "RESOLVED=${script}"',
   ])))
   const resolved = /^RESOLVED=(.+)$/m.exec(out.output)?.[1]
-  assert.equal(resolved, join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'),
-    `the resolution must hand back the protected copy: ${out.output}`)
+  const version = readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+  assert.match(version, /^\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+$/, `precondition: a versioned publication stands: ${out.output}`)
+  assert.equal(resolved, join(dirs.recovery, version, 'app', 'scripts', 'fence-db-connections.mjs'),
+    `the resolution must hand back the versioned copy, not the mutable documented name: ${out.output}`)
   assert.ok(lstatSync(join(dirs.recovery, 'app')).isSymbolicLink(), 'reached through the pointer a publication commits')
+  assert.ok(!lstatSync(join(dirs.recovery, version)).isSymbolicLink(), 'and the directory it names is a real one, which nothing writes into again')
   // AND THE BYTES IT HANDS BACK ARE THE ONES THAT RUN.
   const ran = spawnSync('node', [resolved!], { encoding: 'utf8' })
   assert.equal(ran.status, 0, `${ran.stdout}${ran.stderr}`)
   assert.match(ran.stdout, /V1-EXECUTED/, 'the protected copy is what executes')
+  // AND THE SEAL STILL ACCEPTS THE POINTER AS ITS OWN START POINT, which is what `find -H` is for.
+  // `find <pointer>` reports the LINK as "neither a regular file nor a directory" and as group- and
+  // other-writable (every symlink is 0777), so without `-H` the helper refuses every pointer it is handed.
+  // IT IS ASSERTED DIRECTLY, on the helper, because since r2 no resolution hands it one any more: every
+  // check is made against the versioned directory, which is a real directory, and dropping `-H` therefore
+  // stops failing anything measured through the resolution path. This is the helper's own contract, and
+  // the reason the flag is there; dropping `-H` from _fence_tree_is_sealed() turns this red.
+  const sealed = run(script(dirs, 'sealed.sh', program(dirs, app, [
+    '_fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}"; echo "SEALED=$?"',
+    'echo "SEAL_REASON=${DB_FENCE_SEAL_REASON}"',
+  ])))
+  assert.ok(lstatSync(join(dirs.recovery, 'app')).isSymbolicLink(),
+    'precondition: the start point handed to the seal really is a symbolic link')
+  assert.match(sealed.output, /^SEALED=0$/m,
+    `the seal must accept the documented name as a start point: ${sealed.output}`)
+  assert.match(sealed.output, /^SEAL_REASON=$/m, `and record no offender: ${sealed.output}`)
+
   // A SECOND RESOLUTION, with nothing to publish, still passes every check: the record reached through
   // the pointer describes the tree that is standing.
   const again = run(script(dirs, 'resolve2.sh', program(dirs, app, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'])))
@@ -487,4 +513,236 @@ test('[o3d-xi3w] an installation published before the pointer existed is migrate
   assert.ok(!existsSync(join(dirs.recovery, 'db-fence-artefact.manifest')), 'and so must its manifest')
   const retired = readdirSync(dirs.recovery).filter((name) => name.startsWith('.retired-'))
   assert.deepEqual(retired, [], `and the directory it moved aside must be gone: ${retired.join(', ')}`)
+})
+
+/**
+ * A publication whose run has EXITED, which is the ordinary state of the artefact on a box: it was
+ * published by some previous deploy weeks ago, so the pid in its versioned name is dead and the sweep's
+ * "is its publisher gone" question says yes about it.
+ */
+function standingFromAnExitedRun(dirs: Scratch, appRoot: string): string {
+  assert.match(run(script(dirs, `zero-${standingFromAnExitedRun.calls}.sh`, program(dirs, appRoot, ['_fence_stage_and_publish; echo "RC=$?"']))).output,
+    /^RC=0$/m, 'precondition: an artefact must be standing, published by a run that has since exited')
+  standingFromAnExitedRun.calls += 1
+  return readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, '')
+}
+standingFromAnExitedRun.calls = 0
+
+test('[o3d-xi3w] a publication landing between the resolution and the exec cannot change the bytes that run', (t) => {
+  // THE ROUND-2 FINDING (Codex HIGH). Round 1 made publication atomic and left the RESOLUTION naming a
+  // mutable object: db_fence_script_in_use() authenticated the standing artefact and handed back a path
+  // THROUGH the pointer, and the caller then gave that string to `node` with DEPLOY_ADMIN_DATABASE_URL
+  // beside it. Everything a caller does in between — refreshing the operator wrappers, printing banners,
+  // running `--plan`, having root validate it — is the window.
+  //
+  // MEASURED AGAINST THE PRE-FIX LIBRARY (head 3a0843d4, /var/tmp/ims-xi3w/rigs/rigN.sh): the invocation
+  // pinned IMS_FENCE_ARTEFACT_SHA256 to the standing artefact, MATCHED it, returned 0 — and then executed
+  // a different release's entry file. Pointing the resolution back at ${DB_FENCE_SCRIPT_COPY} turns this
+  // red on the RAN= assertion, and the pin in the harness is what makes the point: the digest check
+  // passed, so the pin was never a statement about the bytes that ran.
+  const dirs = scratch(t)
+  const a = checkout(dirs, 'A', 'V1-PINNED')
+  const b = checkout(dirs, 'B', 'V2-SWAPPED')
+  const version = standingFromAnExitedRun(dirs, a)
+  const pin = recordedDigest(dirs.recovery)
+  assert.match(pin, /^[0-9a-f]{64}$/, 'precondition: the standing artefact has a recorded digest to pin')
+
+  const resolved = join(dirs.base, 'a-resolved')
+  const published = join(dirs.base, 'b-published')
+  // A THIRD PUBLICATION, so that the version the resolution named is SUPERSEDED when a sweep next runs:
+  // no pointer names it, its publisher has exited, and nothing holds a file in it open. All three of the
+  // sweep's original questions therefore say "reclaim it", and only this operation's pin says otherwise.
+  const third = script(dirs, 'c.sh', program(dirs, b, ['_fence_stage_and_publish; echo "C_RC=$?"']))
+  const aScript = script(dirs, 'a.sh', program(dirs, a, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=$?"; exit 0; }',
+    'echo "RESOLVED=${script}"',
+    `: > ${JSON.stringify(resolved)}`,
+    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ], [`export IMS_FENCE_ARTEFACT_SHA256=${JSON.stringify(pin)}`]))
+  const bScript = script(dirs, 'b.sh', program(dirs, b, [
+    `while [[ ! -e ${JSON.stringify(resolved)} ]]; do sleep 0.05; done`,
+    '_fence_stage_and_publish; echo "B_RC=$?"',
+    `bash ${JSON.stringify(third)}`,
+    `: > ${JSON.stringify(published)}`,
+  ]))
+  const driver = script(dirs, 'driver.sh', [
+    'set -uo pipefail',
+    `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
+    'bpid=$!',
+    `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
+    'wait "${bpid}" 2>/dev/null || true',
+  ].join('\n'))
+  run(driver)
+  const aLog = readFileSync(join(dirs.base, 'a.log'), 'utf8')
+  const bLog = readFileSync(join(dirs.base, 'b.log'), 'utf8')
+
+  // THE PRECONDITIONS WERE REACHED: the resolution succeeded, and two further publications landed inside
+  // the window. A test in which nothing published while the path was held would prove nothing.
+  assert.match(aLog, /^RESOLVED=/m, `precondition: the resolution must succeed: ${aLog}`)
+  assert.match(bLog, /^B_RC=0$/m, `precondition: a second run must publish inside the window: ${bLog}`)
+  assert.match(bLog, /^C_RC=0$/m, `precondition: and a third, so the resolved version is superseded: ${bLog}`)
+  assert.notEqual(readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''), version,
+    'precondition: the pointer must have been flipped away from the version that was resolved')
+
+  // THE CLAIM: the bytes that ran are the bytes that were authenticated.
+  assert.match(aLog, /^RAN=V1-PINNED$/m, `the resolved tree's bytes must be the ones executed: ${aLog}`)
+  assert.equal(/^RESOLVED=(.+)$/m.exec(aLog)?.[1], join(dirs.recovery, version, 'app', 'scripts', 'fence-db-connections.mjs'),
+    'and the path handed back names the versioned publication, not the documented name')
+
+  // AND THE LIVENESS HALF: the sweep did not reclaim it, although all three of its original questions
+  // said it could. This is what the pin is for, and the next test proves it is what did it.
+  assert.ok(existsSync(join(dirs.recovery, version)), `the version a live operation is pinned to must survive the sweep: ${bLog}`)
+  const pins = readdirSync(dirs.recovery).filter((name) => name.startsWith('.inuse-'))
+  assert.equal(pins.length, 1, `exactly one pin, this operation's: ${pins.join(', ')}`)
+  assert.equal(readlinkSync(join(dirs.recovery, pins[0])), `${version}/app`, 'naming the publication it resolved')
+})
+
+test('[o3d-xi3w] CONTROL: without the pin, that same sweep does reclaim the version being executed', (t) => {
+  // WHAT WOULD STILL PASS THE TEST ABOVE if the pin were decorative: nothing, because the version would
+  // be gone. This is the proof of that — the identical sequence with the pin REMOVED after it was taken,
+  // which is what a sweep that does not consult it amounts to. Without this, "it survived" could be a
+  // property of the sweep never having looked at that directory at all.
+  const dirs = scratch(t)
+  const a = checkout(dirs, 'A', 'V1-PINNED')
+  const b = checkout(dirs, 'B', 'V2-SWAPPED')
+  const version = standingFromAnExitedRun(dirs, a)
+  const resolved = join(dirs.base, 'a-resolved')
+  const published = join(dirs.base, 'b-published')
+  const third = script(dirs, 'c.sh', program(dirs, b, ['_fence_stage_and_publish; echo "C_RC=$?"']))
+  const aScript = script(dirs, 'a.sh', program(dirs, a, [
+    'script="$(db_fence_script_in_use)" || { echo "RESOLVE_RC=$?"; exit 0; }',
+    'echo "RESOLVED=${script}"',
+    // The one line that differs from the test above.
+    `rm -f "\${DB_FENCE_RECOVERY_DIR}"/.inuse-fence.*`,
+    `: > ${JSON.stringify(resolved)}`,
+    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    'echo "RAN=$(node "${script}" 2>&1)"',
+  ]))
+  const bScript = script(dirs, 'b.sh', program(dirs, b, [
+    `while [[ ! -e ${JSON.stringify(resolved)} ]]; do sleep 0.05; done`,
+    '_fence_stage_and_publish; echo "B_RC=$?"',
+    `bash ${JSON.stringify(third)}`,
+    `: > ${JSON.stringify(published)}`,
+  ]))
+  const driver = script(dirs, 'driver.sh', [
+    'set -uo pipefail',
+    `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
+    'bpid=$!',
+    `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
+    'wait "${bpid}" 2>/dev/null || true',
+  ].join('\n'))
+  run(driver)
+  const aLog = readFileSync(join(dirs.base, 'a.log'), 'utf8')
+  const bLog = readFileSync(join(dirs.base, 'b.log'), 'utf8')
+  assert.match(aLog, /^RESOLVED=/m, `precondition: the resolution must succeed: ${aLog}`)
+  assert.match(bLog, /^C_RC=0$/m, `precondition: both later publications must land: ${bLog}`)
+  assert.equal(readdirSync(dirs.recovery).filter((name) => name.startsWith('.inuse-')).length, 0,
+    'precondition: the pin was removed, which is what a sweep that ignores it amounts to')
+  assert.ok(!existsSync(join(dirs.recovery, version)),
+    `the sweep really does reclaim a superseded version whose publisher has exited — so the pin in the test above is what kept it: ${bLog}`)
+})
+
+test('[o3d-xi3w] every helper invocation of ONE fence operation resolves to the same publication', (t) => {
+  // Raising a fence is not one invocation. Each entrypoint resolves the helper seven times across a
+  // cutover — the identity bind, the version check, the pin, the fence itself, the preflight, the release
+  // and the exit trap's re-fence — and each resolution used to read the pointer afresh.
+  //
+  // MEASURED AGAINST THE PRE-FIX LIBRARY: two invocations of one operation, with a publication between
+  // them, executed DIFFERENT releases ("V1-PINNED" then "V2-SWAPPED"). Dropping the per-operation pin —
+  // making _fence_bind_version() read the pointer every time instead of consulting
+  // ${DB_FENCE_RECOVERY_DIR}/.inuse-fence.<pid>.<start time> — turns this red on RUN2.
+  //
+  // THE PIN IS A FILE AND NOT A SHELL VARIABLE BECAUSE IT HAS TO BE: every caller resolves the helper as
+  // `script="$(resolve_fence_script)"`, in a command substitution, and a script-scope name assigned in
+  // there dies with the subshell. The two invocations below are in ONE process for that reason, which is
+  // also how a cutover reaches them.
+  const dirs = scratch(t)
+  const a = checkout(dirs, 'A', 'V1-PINNED')
+  const b = checkout(dirs, 'B', 'V2-SWAPPED')
+  const version = standingFromAnExitedRun(dirs, a)
+  const first = join(dirs.base, 'a-first')
+  const published = join(dirs.base, 'b-published')
+  const aScript = script(dirs, 'a.sh', program(dirs, a, [
+    's1="$(db_fence_script_in_use)"; echo "RC1=$?"',
+    'echo "PATH1=${s1}"',
+    'echo "RUN1=$(node "${s1}" 2>&1)"',
+    `: > ${JSON.stringify(first)}`,
+    `while [[ ! -e ${JSON.stringify(published)} ]]; do sleep 0.05; done`,
+    's2="$(db_fence_script_in_use)"; echo "RC2=$?"',
+    'echo "PATH2=${s2}"',
+    'echo "RUN2=$(node "${s2}" 2>&1)"',
+  ]))
+  const bScript = script(dirs, 'b.sh', program(dirs, b, [
+    `while [[ ! -e ${JSON.stringify(first)} ]]; do sleep 0.05; done`,
+    '_fence_stage_and_publish; echo "B_RC=$?"',
+    `: > ${JSON.stringify(published)}`,
+  ]))
+  const driver = script(dirs, 'driver.sh', [
+    'set -uo pipefail',
+    `bash ${JSON.stringify(bScript)} > ${JSON.stringify(join(dirs.base, 'b.log'))} 2>&1 &`,
+    'bpid=$!',
+    `bash ${JSON.stringify(aScript)} > ${JSON.stringify(join(dirs.base, 'a.log'))} 2>&1`,
+    'wait "${bpid}" 2>/dev/null || true',
+  ].join('\n'))
+  run(driver)
+  const aLog = readFileSync(join(dirs.base, 'a.log'), 'utf8')
+  const bLog = readFileSync(join(dirs.base, 'b.log'), 'utf8')
+
+  // THE PRECONDITION: a publication really did land between the two invocations, and it won.
+  assert.match(bLog, /^B_RC=0$/m, `precondition: the second run must publish between the two invocations: ${bLog}`)
+  assert.notEqual(readlinkSync(join(dirs.recovery, 'app')).replace(/\/.*$/, ''), version,
+    'precondition: and the documented name must now resolve to its publication')
+  assert.match(aLog, /^RC1=0$/m, `precondition: the first invocation must resolve: ${aLog}`)
+
+  // THE CLAIM: the second invocation is the first one's publication, and it is still executable.
+  assert.match(aLog, /^RC2=0$/m, `the second invocation must still resolve, not refuse: ${aLog}`)
+  const expected = join(dirs.recovery, version, 'app', 'scripts', 'fence-db-connections.mjs')
+  assert.equal(/^PATH1=(.+)$/m.exec(aLog)?.[1], expected, `the first invocation names its version: ${aLog}`)
+  assert.equal(/^PATH2=(.+)$/m.exec(aLog)?.[1], expected, `and so does the second: ${aLog}`)
+  assert.match(aLog, /^RUN1=V1-PINNED$/m, `the first invocation runs the release it authenticated: ${aLog}`)
+  assert.match(aLog, /^RUN2=V1-PINNED$/m, `and so does the second, in the same cutover: ${aLog}`)
+})
+
+test('[o3d-xi3w] a pin naming something other than one publication of this root is refused, not followed', (t) => {
+  // The pin is a symbolic link in a root-owned directory, so only root can have written one. If one
+  // appeared anyway it selects a CANDIDATE and nothing more: the text is held to the same shape the
+  // pointer's is, the object must still be a real directory inside the recovery root, and the seal, the
+  // record beside the tree, the tree's own digest and the recovery record's entry digest are then all
+  // checked against THAT tree. A pin cannot skip a check. These are the two ways it is refused outright.
+  const dirs = scratch(t)
+  const app = checkout(dirs, 'A', 'V1-STANDING')
+  const version = standingFromAnExitedRun(dirs, app)
+  const elsewhere = join(dirs.base, 'elsewhere')
+  mkdirSync(join(elsewhere, 'scripts'), { recursive: true })
+  writeFileSync(join(elsewhere, 'scripts', 'fence-db-connections.mjs'), markedHelper('V9-ELSEWHERE'))
+
+  let checked = 0
+  for (const [label, text, says] of [
+    ['a pin naming a path outside the recovery root', `../../${elsewhere.replace(/^\//, '')}/app`, /is not one versioned publication and one app tree beneath/],
+    ['a pin naming a publication that has been reclaimed', '.version-fence.1.GONE/app', /is no longer a directory it can execute out of/],
+    ['a pin naming a second directory level', `${version}/app/scripts`, /is not one versioned publication and one app tree beneath/],
+  ] as const) {
+    const out = run(script(dirs, `pinned-${checked}.sh`, program(dirs, app, [
+      // Only root can do this on a real box: put a pin of its own choosing in the recovery directory,
+      // under the name this process would compose for itself.
+      'stamp="$(_fence_process_start_time "$$")"',
+      'echo "STAMP=${stamp}"',
+      `ln -s ${JSON.stringify(text)} "\${DB_FENCE_RECOVERY_DIR}/.inuse-fence.$$.\${stamp}"`,
+      'db_fence_script_in_use >/dev/null; echo "RC=$?"',
+    ])))
+    assert.match(out.output, /^STAMP=[0-9]+$/m, `precondition: this process's own identity must be readable: ${out.output}`)
+    assert.match(out.output, /^RC=1$/m, `${label} must be refused: ${out.output}`)
+    // AND IT SAYS WHY. The reason travels on stdout because every caller reads this through a command
+    // substitution: a reason left in a script-scope name dies with the subshell, and the first draft of
+    // this fix printed "will not be followed: ." — a refusal with the explanation missing.
+    assert.match(out.output, says, `${label} must say why it was refused: ${out.output}`)
+    checked += 1
+  }
+  assert.equal(checked, 3, 'precondition: all three forged pins were tried')
+
+  // AND THE ORDINARY CASE STILL RESOLVES, so the three refusals above are about the pin's text and not
+  // about the mechanism having been broken.
+  const ok = run(script(dirs, 'ok.sh', program(dirs, app, ['db_fence_script_in_use >/dev/null; echo "RC=$?"'])))
+  assert.match(ok.output, /^RC=0$/m, `a standing artefact with no forged pin must resolve: ${ok.output}`)
 })

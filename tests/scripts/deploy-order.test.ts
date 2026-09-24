@@ -15,6 +15,7 @@ import {
   standingRecordPath,
   writeCheckoutPg,
   protectedPaths,
+  standingHelperPath,
   writeFenceCheckout,
 } from './fence-artefact-harness.ts'
 import { shellConstant, shellFunction, shellFunctionDefinitions } from './shell-symbol.ts'
@@ -7165,7 +7166,9 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
       `and aimed at the identity the record says that fence was raised against:\n${log}`,
     )
     assert.ok(
-      log.includes(join(recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
+      // THE VERSIONED PATH, which is what the resolution hands back since o3d-xi3w r2 — the documented
+      // name is a mutable object and a path through it names whatever it resolves to at exec time.
+      log.includes(standingHelperPath(recovery)),
       `and run from the root-owned copy, because the checkout's is gone:\n${log}`,
     )
     assert.ok(
@@ -7426,7 +7429,9 @@ test('a fence script replaced in the checkout is never the one that runs', () =>
       const log = readCalls(dirs.state)
 
       assert.ok(log.length > 0, `${scenario.label}: precondition — the fence helper was invoked at all:\n${result.output}`)
-      assert.ok(log.includes(protectedCopy), `${scenario.label}: must run the root-owned copy:\n${log}`)
+      // Read AFTER the run, and from the harness, because what is executed is the versioned publication
+      // the pointer names and not a path through the pointer (o3d-xi3w r2).
+      assert.ok(log.includes(standingHelperPath(dirs.recovery)), `${scenario.label}: must run the root-owned copy:\n${log}`)
       assert.ok(!log.includes(checkoutScript), `${scenario.label}: and never the path the application account rewrote:\n${log}`)
 
       // AND THE SUBSTITUTE NEVER BECOMES THE PROTECTED ONE. An adoption that republished the copy
@@ -8943,7 +8948,8 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     writeFileSync(helper, V1)
     const bootstrap = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo']))
     assert.equal(bootstrap.status, 0, `the bootstrap must succeed:\n${bootstrap.output}`)
-    assert.match(bootstrap.output, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and return the protected path')
+    assert.match(bootstrap.output, new RegExp(escapeRe(standingHelperPath(dirs.recovery))),
+      'and return the protected path — the versioned publication, not the mutable documented name (o3d-xi3w r2)')
     assert.equal(readFileSync(copy, 'utf8'), V1, 'and hold the checkout bytes')
     // The record a raised fence would have written, so the digest binding is live for the rest.
     writeFileSync(
@@ -9184,7 +9190,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
     assert.match(run.output, /^PREFLIGHT=0$/m, `and the preflight path with it:\n${run.output}`)
     assert.ok(existsSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
       'and the artefact really was published, which is what proves _fence_source_trust() ran')
-    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(standingHelperPath(dirs.recovery))}\\]$`, 'm'),
       `and something really was executed:\n${run.output}`)
 
     // THE CLAIM.
@@ -9296,7 +9302,7 @@ test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing art
       assert.match(exec, /\bDEPLOY_ADMIN_DATABASE_URL=\S+/,
         `${script}: including the credential the preflight needs: ${exec}`)
       assert.ok(
-        exec.endsWith(`node ${join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')} --preflight `),
+        exec.endsWith(`node ${standingHelperPath(dirs.recovery)} --preflight `),
         `${script}: and then the STANDING artefact, appended by the library: ${exec}`,
       )
     }
@@ -9370,7 +9376,8 @@ test('r32: a dependency substituted in the checkout is never the one the protect
     const resolved = runShell(artefactHarness(dir, ['script="$(db_fence_script_in_use)" || exit 1', 'echo "SCRIPT=${script}"']))
     assert.equal(resolved.status, 0, `the artefact must publish:\n${resolved.output}`)
     const script = /^SCRIPT=(.+)$/m.exec(resolved.output)?.[1]
-    assert.equal(script, protectedPaths(dir).helper, `and the resolved script is the protected one:\n${resolved.output}`)
+    assert.equal(script, standingHelperPath(protectedPaths(dir).recovery),
+      `and the resolved script is the protected one:\n${resolved.output}`)
 
     // THE SWAP. The account owns node_modules and does not need to delete anything — only to
     // supply something that works.
@@ -11439,7 +11446,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     // reporting the candidate does not mean running it. Observed as the argv the runner was given.
     assert.match(
       probe.output,
-      new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+      new RegExp(`^PROBE=\\[${escapeRe(standingHelperPath(dirs.recovery))}\\]$`, 'm'),
       `the standing artefact is what a preflight executes:\n${probe.output}`,
     )
     assert.match(probe.output, /^CONTENT=\[\/\/ v1\]$/m, 'the OLD bytes, because the artefact did not move')

@@ -2653,6 +2653,34 @@ Two more properties of the rotation:
   deliberately an act at the console rather than a flag. Do it only with no fence standing — with a
   record present and the copy gone, every run refuses by design.
 
+**What is executed is the versioned directory, and one fence operation executes exactly one of them.**
+Making the *publication* atomic left the *resolution* naming a mutable object: `db_fence_script_in_use()`
+authenticated the standing artefact and handed back a path **through** the pointer, and the caller then
+gave that string to `node` with `DEPLOY_ADMIN_DATABASE_URL` beside it. A concurrent publisher's flip lands
+between the two (measured: an invocation that pinned `IMS_FENCE_ARTEFACT_SHA256`, matched it and returned
+0 then executed a *different release's* entry file), and raising a fence is not one invocation — each
+entrypoint resolves the helper seven times across a cutover, and two of those ran different releases. So
+the resolution now seals, digests and authenticates the **versioned directory** and hands back
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/app/scripts/fence-db-connections.mjs`, which nothing
+writes into after its publication renamed it there; and it records which publication this operation is
+bound to in `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>`, so every later invocation of the
+same operation resolves to that one and not to a newer one. The pin is a file rather than a shell variable
+because it has to be: every caller resolves the helper inside a command substitution, and a value assigned
+there dies with the subshell. Its name carries the operation's pid **and** the start time `/proc` reports
+for that pid, so a marker left by a dead run whose pid has been reused is not mistaken for this one's; the
+sweep reaps it when its holder is gone, and never reclaims a version a live holder names. The deploy driver's own
+snapshot answers the same question a different way, by resolving its pointer once at entry and holding the
+descriptor it is already reading from. A pin cannot skip a check: it selects a candidate, and the seal, the record
+beside the tree, the tree's own digest, `IMS_FENCE_ARTEFACT_SHA256` and the entry digest the recovery
+record binds are then all checked against **that** tree.
+
+The operator wrappers are the deliberate exception and check the **documented** name against the digest
+this operation was pinned to. They are run by hand after the cutover process has exited, so a versioned
+path baked into one could name a publication the sweep has since reclaimed — a recovery route that
+evaporates — while the digest is what stops one release raising a fence and another releasing it: if
+anything published in between, the wrapper refuses and says the artefact has changed since the fence was
+raised.
+
 **One mechanism, three entrypoints.** The rule now lives in `scripts/lib/db-fence-protected.sh`,
 sourced by `install.sh`, `update.sh` and `deploy.sh`, and no entrypoint has fence-helper resolution
 of its own: `db_fence_script_in_use()` decides, and it never returns the checkout's path. Every
@@ -2721,7 +2749,8 @@ exactly, and it is **copied**, root-owned, into the mirror:
 | path | what it is |
 | --- | --- |
 | `/etc/ims-cutover-recovery/app` | a **symbolic link** to `.version-fence.<pid>.<rand>/app`, and the single mutable object of a publication (o3d-xi3w) |
-| `/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` | one publication, complete and immutable: the tree, its record and its manifest together |
+| `/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` | one publication, complete and immutable: the tree, its record and its manifest together. **This is what is executed**; the pointer is only how the first invocation of an operation finds it |
+| `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>` | one **fence operation's pin**: a symbolic link naming the publication that operation resolved. Every later invocation of that operation is bound to it, and the sweep will not reclaim a version a live holder names (o3d-xi3w) |
 | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` | the only file executed |
 | `/etc/ims-cutover-recovery/app/node_modules/pg/…` | a real root-owned directory, not a link |
 | `/etc/ims-cutover-recovery/app/node_modules/pg-protocol/…` etc. | …and the rest of the resolved closure (13 packages, ~140 files) |

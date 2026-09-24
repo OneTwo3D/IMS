@@ -1816,6 +1816,13 @@ const PROTECTED_LIBRARY_CONSTANTS = [
   // which names a publication may hold and which the sweep may reap.
   'DB_FENCE_PUBLISH_KIND', 'DB_FENCE_PUBLISH_PREFIX', 'DB_FENCE_VERSION_PREFIX',
   'DB_FENCE_POINTER_PREFIX', 'DB_FENCE_RETIRE_PREFIX',
+  // o3d-xi3w r2: the FIFTH prefix, and it is the one an EXECUTION writes rather than a publication.
+  // `.inuse-fence.<pid>.<that process's start time>` is one symbolic link per fence operation whose text
+  // is the publication that operation resolved: it is the PIN every later helper invocation of the
+  // operation is bound to, and the LIVENESS MARKER the sweep honours before reclaiming a version. Re-aim
+  // the prefix and the pin is written and looked for somewhere else, which makes every invocation read
+  // the mutable pointer again -- the finding -- and makes the sweep reclaim a tree that is being executed.
+  'DB_FENCE_INUSE_PREFIX',
   'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE',
   // o3d-xi3w: where a pre-pointer release left the record and the manifest. This run REMOVES them once
   // it has migrated such an installation, so they are paths the mechanism acts on.
