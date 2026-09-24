@@ -455,6 +455,9 @@ test('the e2e fake creates an ASN only from a NewASN body, and refuses everythin
 
   for (const [label, body] of [
     ['the body IMS used to send', { WarehouseId: 301, Reference: 'PO-2026-001', ETA: null, Lines: [{ SourceLineId: 'po-line-1' }] }],
+    // The old names with a VALID GoodsInType, so the refusal can only come from the names themselves:
+    // Mintsoft reads POReference and Items, and an ASN made from Reference/Lines would carry neither.
+    ['the old names with nothing else wrong', { WarehouseId: 301, Reference: 'PO-2026-001', GoodsInType: 'Carton', Quantity: 2, Lines: [{ SourceLineId: 'po-line-1', ProductId: 501, SKU: 'MS-SKU-1', Quantity: 10 }] }],
     ['a ClientId a client user may not send', { ...newAsn, ClientId: 89 }],
     ['no GoodsInType', { ...newAsn, GoodsInType: undefined }],
     ['a GoodsInType Mintsoft does not know', { ...newAsn, GoodsInType: 'Envelope' }],
