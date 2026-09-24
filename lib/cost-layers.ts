@@ -156,9 +156,11 @@ export class JournaledShipmentRevaluationRefusedError extends Error {
  * (`assertHelperCanRefuseEffectively`, transfer-cost-layer-recreation.ts, Codex round-6 HIGH-2) —
  * which this one's comments claimed to mirror before it actually did.
  *
- * All five real call chains (three in landed-cost-service, the manufacturing recompute, and the
- * freight-PO cancellation) run inside `db.$transaction` with no savepoint between, so nothing in the
- * application is refused by this; what it stops is a NEW call site that would be.
+ * Every real call site — three in landed-cost-service and one in the manufacturing recompute — is
+ * handed its `tx` by a `db.$transaction`, on all five entry paths (the two PO-cost actions, the
+ * freight-PO create, the freight-PO cancellation and the production-order recompute), with no
+ * `withSavepoint` between. So nothing in the application today is refused by this; what it stops is a
+ * NEW call site that would be, and a refusal that would have been reducible to a skip.
  */
 export class JournaledShipmentRevaluationContextError extends Error {
   override readonly name = 'JournaledShipmentRevaluationContextError'
@@ -174,8 +176,8 @@ export class JournaledShipmentRevaluationContextError extends Error {
  * Clients already shown to be inside a transaction. A Prisma transaction client cannot leave its
  * transaction and the base client never enters one, so a `true` answer is stable for the life of the
  * object — and this function is called once per revalued cost layer, which is many times per recalc.
- * Only the positive answer is cached: the other two outcomes throw. A WeakMap so a short-lived
- * transaction client is not kept alive.
+ * Only the positive answer is cached: the other two outcomes throw. Held weakly, so a short-lived
+ * transaction client is not kept alive by this set.
  */
 const CLIENTS_KNOWN_INSIDE_TRANSACTION = new WeakSet<object>()
 

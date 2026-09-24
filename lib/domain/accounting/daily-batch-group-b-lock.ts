@@ -67,7 +67,17 @@ export const DAILY_BATCH_GROUP_B_SHIPMENT_WHERE = {
   },
 } as const satisfies Prisma.ShipmentWhereInput
 
-/** Raised when the loaded data references a cost layer the lock did not cover. */
+/**
+ * Raised when the loaded data references a cost layer the lock did not cover.
+ *
+ * It fails the WHOLE WINDOW rather than one order, because it means the lock set itself was wrong and
+ * no order's figures in this run can be trusted; the Group B catch turns it into a named
+ * `result.errors` entry, nothing is stamped, and the next run's probe sees whatever appeared and locks
+ * it — so it cannot loop. It should be unreachable: the layer ids an entry names are stable under
+ * revaluation, the real read is restricted to the probed shipments, and the daily-batch advisory lock
+ * is shared with refund creation, so the four sources cannot grow underneath a run. It is here because
+ * "should be unreachable" is exactly the kind of claim this issue exists to stop trusting.
+ */
 export class UnlockedCostLayerError extends Error {
   override readonly name = 'UnlockedCostLayerError'
   readonly costLayerIds: string[]
