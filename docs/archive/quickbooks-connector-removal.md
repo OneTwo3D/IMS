@@ -31,6 +31,7 @@ expect rebase conflicts on any accounting branch that is still open — `lib/acc
 | `app/actions/quickbooks-sync.ts`, `app/actions/quickbooks-daily-batch.ts` | Its two server-action modules |
 | `tests/**/{quickbooks,qbo}-*.test.ts` (15 files) | Its own unit tests |
 | `tests/accounting/shared-reversal-classifier.test.ts` | 28 cases, 1,135 lines — see "What is no longer proven", item 1 |
+| `public/images/qb-logo-stacked.svg` | The card/panel logo |
 | `docs/todo/quickbooks-tax-parity-plan.md` | Its follow-up plan, now closed-not-done |
 
 ## What was removed from the generic layer
