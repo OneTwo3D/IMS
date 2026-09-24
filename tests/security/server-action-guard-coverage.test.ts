@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import {
@@ -623,7 +624,16 @@ export async function wipeEverything(id: string) {
  * roots must appear below with a reason, and a new one fails this test with its
  * own path in the message. Unrecognised fails; it does not pass.
  */
+const ARCHIVED_CONNECTOR_REASON =
+  'ARCHIVED, and unreachable by construction (o3d-remove-parked-connectors). Next mints a server '
+  + 'action when it COMPILES a module carrying the directive, and it compiles only what the module '
+  + 'graph rooted at app/ reaches. Nothing under app/, lib/, components/ or scripts/ imports anything '
+  + 'under archive/ — asserted below, by a walk, not by inspection — and archive/ is excluded from '
+  + 'tsconfig and eslint besides. See archive/connectors/README.md.'
+
 const USE_SERVER_OUTSIDE_SCAN_ROOTS: Record<string, string> = {
+  'archive/connectors/quickbooks/app/actions/quickbooks-daily-batch.ts': ARCHIVED_CONNECTOR_REASON,
+  'archive/connectors/quickbooks/app/actions/quickbooks-sync.ts': ARCHIVED_CONNECTOR_REASON,
   'scripts/check-server-action-auth-bypass.mjs':
     'a CHECKER, not an endpoint: it greps the tree for the directive. Ships nothing to Next.',
 }
@@ -647,4 +657,56 @@ test('every outside-the-roots exemption states a reason', () => {
   for (const [file, reason] of Object.entries(USE_SERVER_OUTSIDE_SCAN_ROOTS)) {
     assert.ok(reason.trim().length > 0, `${file} needs a stated reason`)
   }
+})
+
+/**
+ * THE ARCHIVE EXEMPTION'S OWN PRECONDITION (o3d-remove-parked-connectors).
+ *
+ * Two archived modules carry `'use server'`, and the reason they are exempt is that nothing compiles
+ * them — which is a claim about the IMPORT GRAPH, not about a directory name. A single import of an
+ * archived module from live code would pull it into Next's graph and mint its actions, with the
+ * exemption above still cheerfully saying it publishes nothing. So the claim is checked here, by
+ * walking the live roots for any specifier that reaches `archive/`.
+ *
+ * NOT VACUOUS: the walk asserts it read a non-trivial number of files before concluding.
+ */
+test('no live module imports anything from archive/ — which is what makes the exemption above true', () => {
+  const roots = ['app', 'lib', 'components', 'scripts', 'prisma', 'types']
+  const offenders: string[] = []
+  let scanned = 0
+
+  const walk = (dir: string): void => {
+    let entries: string[]
+    try {
+      entries = readdirSync(join(ROOT, dir))
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const rel = `${dir}/${entry}`
+      if (statSync(join(ROOT, rel)).isDirectory()) {
+        if (entry === 'node_modules' || entry === 'generated') continue
+        walk(rel)
+        continue
+      }
+      if (!/\.(ts|tsx|js|jsx|mjs|cjs|mts)$/.test(entry)) continue
+      scanned += 1
+      const source = readFileSync(join(ROOT, rel), 'utf8')
+      // Any specifier that resolves into the archive, however it is spelled: '@/archive/…',
+      // '../archive/…', 'archive/…'.
+      if (/from\s+['"][^'"]*\barchive\/[^'"]*['"]|import\s*\(\s*['"][^'"]*\barchive\//.test(source)) {
+        offenders.push(rel)
+      }
+    }
+  }
+  for (const root of roots) walk(root)
+
+  assert.ok(scanned > 200, `the walk must actually read the tree — it scanned ${scanned} files`)
+  assert.deepEqual(
+    offenders, [],
+    'A live module imports from archive/. That pulls an archived module into Next\'s compile graph, '
+    + 'which mints every `use server` export in it as a real endpoint — and the exemption list above '
+    + 'says those modules publish nothing. Either revive the connector properly (git mv it back) or '
+    + 'delete the import.',
+  )
 })

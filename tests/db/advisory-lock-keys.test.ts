@@ -170,7 +170,8 @@ test('[o3d-4ajo] a lost pinned lock refuses further protected work', async () =>
 test('[o3d-4ajo] both daily batches check the lock before every write phase', () => {
   // The primitive is only useful if it is CALLED. A phase added later without a
   // check would silently reintroduce the window.
-  for (const path of ['lib/connectors/xero/daily-sync.ts', 'lib/connectors/quickbooks/daily-sync.ts']) {
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+  for (const path of ['lib/connectors/xero/daily-sync.ts']) {
     const src = readFileSync(path, 'utf8')
     const phases = (src.match(/^ {2}\/\/ --- Group [AB]\d?/gm) ?? []).length
     const checks = (src.match(/batchLock\.assertHeld\(/g) ?? []).length

@@ -119,11 +119,11 @@ test('only the toggles a page actually needs are collected, and duplicates colla
  * module becomes unnecessary) or loses the toggle gate (in which case the toggle stops being
  * sufficient and adoption must be re-derived).
  */
-test('both manual Sync actions gate on the toggle ALONE — the premise, read off the actions', async () => {
+test('the manual Sync action gates on the toggle ALONE — the premise, read off the action', async () => {
   const read = async (rel: string) => await readFile(path.join(process.cwd(), rel), 'utf8')
 
+  // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
   for (const [file, fn, key] of [
-    ['app/actions/quickbooks-sync.ts', 'export async function triggerQuickBooksSync', 'quickbooks_sync_enabled'],
     ['app/actions/xero-sync.ts', 'export async function triggerXeroSync', 'xero_sync_enabled'],
   ] as const) {
     const src = await read(file)

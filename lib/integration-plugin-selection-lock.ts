@@ -38,6 +38,7 @@
  * row lock would be a real cost for no correctness gain.
  */
 
+import { ACCOUNTING_CONNECTORS, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
   INTEGRATION_PLUGIN_IDS,
@@ -105,18 +106,32 @@ export async function readLockedPluginSelection(
   ) as IntegrationPluginState
 }
 
-export type AccountingConnectorSelection = 'xero' | 'quickbooks' | null
+/**
+ * o3d-remove-parked-connectors: this was a THIRD hand-written spelling of the accounting id union
+ * (`accounting-registry.ts` has the canonical one, `app/actions/accounting-sync.ts` and
+ * `app/(dashboard)/sync/accounting-settings-fields.ts` had two more). Archiving QuickBooks was the
+ * moment to stop copying it: it is now `AccountingConnectorId | null`, so registering a connector
+ * widens this by construction instead of by somebody remembering this file.
+ */
+export type AccountingConnectorSelection = AccountingConnectorId | null
 
 /**
- * Xero-first, exactly like `getActiveConnector` — the same rule, applied to a locked read instead
- * of a pooled one. Kept as a pure function so the resolution rule has ONE definition and can be
- * asserted against the pooled path.
+ * First registered connector that is enabled, exactly like `getActiveConnector` — the same rule,
+ * applied to a locked read instead of a pooled one. Kept as a pure function so the resolution rule
+ * has ONE definition and can be asserted against the pooled path.
  */
 export function resolveActiveAccountingConnector(
-  state: Pick<IntegrationPluginState, 'xero' | 'quickbooks'>,
+  state: Pick<IntegrationPluginState, AccountingConnectorId>,
 ): AccountingConnectorSelection {
-  if (state.xero) return 'xero'
-  if (state.quickbooks) return 'quickbooks'
+  // REGISTRY ORDER, not a hand-written chain (o3d-remove-parked-connectors). This was
+  // `if (state.xero) … if (state.quickbooks) …`, i.e. Xero-first by virtue of being written first.
+  // It now walks ACCOUNTING_CONNECTORS in its declared order, so "the first enabled registered
+  // connector wins" is the rule and the registry's order is where the precedence lives — the same
+  // shape `resolveEnabledWmsConnector` uses. With one connector registered the two are
+  // indistinguishable; with two they are not, which is why it is worth writing down now.
+  for (const connector of ACCOUNTING_CONNECTORS) {
+    if (state[connector.id]) return connector.id
+  }
   return null
 }
 

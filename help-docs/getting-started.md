@@ -35,7 +35,7 @@ Go to **Settings > Inventory** and create at least one warehouse. Each warehouse
 
 ### 4. Connect Integrations (optional)
 
-If you use WooCommerce, Xero, QuickBooks, or Mintsoft, connect them now from **Integrations**. After entering credentials, you must **click "Test Connection"** before sync activates — this is the system's safety net against silently running with bad credentials. See the [Setup Wizard Walkthrough](onboarding-walkthrough.md) for connector-specific instructions.
+If you use WooCommerce, Xero, or Mintsoft, connect them now from **Integrations**. After entering credentials, you must **click "Test Connection"** before sync activates — this is the system's safety net against silently running with bad credentials. See the [Setup Wizard Walkthrough](onboarding-walkthrough.md) for connector-specific instructions.
 
 ### 5. Add Products
 

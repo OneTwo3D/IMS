@@ -140,10 +140,10 @@ test('the PROCESSING blocker does not tell an operator to wait for something tha
 })
 
 test('the recovery advice requires EXCLUSIVE activation, because dispatch is single-connector (o3d-sref)', async () => {
-  // getActiveAccountingConnectorId returns 'xero' if the Xero plugin is enabled and only then falls
-  // through to 'quickbooks' (lib/accounting.ts). The settings UI permits BOTH to be enabled, so
-  // "re-enable QuickBooks" is not a remedy while Xero is on: nothing ever dispatches to QuickBooks,
-  // the row stays PROCESSING, and the order stays blocked.
+  // `getActiveAccountingConnectorId` returns the FIRST registered accounting connector whose plugin is
+  // enabled (lib/accounting.ts). Re-enabling a connector is therefore not a remedy on its own while an
+  // earlier-registered one is on: nothing ever dispatches to it, the row stays PROCESSING, and the
+  // order stays blocked.
   //
   // Advice that works only under a condition it does not state is the same dead end as advice that
   // cannot work at all — the operator follows it, nothing happens, and there is no next step.
@@ -158,11 +158,17 @@ test('the recovery advice requires EXCLUSIVE activation, because dispatch is sin
   assert.match(message, /not enough/, 'and the both-enabled case is called out explicitly')
 
   // Pin the premise: if dispatch ever became multi-connector, this advice would need revisiting.
+  // o3d-remove-parked-connectors: this pinned the literal `if (await isIntegrationPluginEnabled('xero'))
+  // return 'xero'` chain. That chain is gone — the resolution now walks `ACCOUNTING_CONNECTORS` in its
+  // declared order — so the premise is pinned as the SHAPE instead: one connector is returned, from a
+  // walk that stops at the first enabled one. A resolver that returned a list would need this advice
+  // revisited, and that is what this catches.
   const accounting = readFileSync(join(process.cwd(), 'lib/accounting.ts'), 'utf8')
   assert.match(
     accounting,
-    /if \(await isIntegrationPluginEnabled\('xero'\)\) return 'xero'/,
-    'dispatch is still single-connector and xero-first — the reason exclusivity is required',
+    /for \(const connector of ACCOUNTING_CONNECTORS\) \{\s*\n\s*if \(await isIntegrationPluginEnabled\(connector\.id\)\) return connector\.id/,
+    'dispatch is still single-connector — first registered connector that is enabled wins, which is the '
+      + 'reason exclusivity is required',
   )
 })
 

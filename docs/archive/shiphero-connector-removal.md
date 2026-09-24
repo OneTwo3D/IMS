@@ -659,4 +659,4 @@ had asked about*.
 
 The Shopify and QuickBooks removals follow this pattern; the plan, including why
 QuickBooks should wait, is in
-[`../todo/connector-removal-plan.md`](../todo/connector-removal-plan.md).
+[`connector-removal-plan.md`](./connector-removal-plan.md).

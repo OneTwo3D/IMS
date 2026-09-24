@@ -1,9 +1,10 @@
 'use client'
 
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
-  BookOpen, Calculator, CalendarClock, Check, ExternalLink,
+  BookOpen, CalendarClock, Check, ExternalLink,
   Loader2, ShoppingCart,
 } from 'lucide-react'
 import Link from 'next/link'
@@ -25,7 +26,7 @@ import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { isIntegrationsStepReady } from '@/lib/domain/onboarding/integrations-step-readiness'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { ShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
-import type { AccountingConnectionStatus, AccountingConnectorId, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
+import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
 import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
@@ -95,11 +96,11 @@ export function IntegrationsStep({
 
 
   // Accounting credentials
-  const [acClientId, setAcClientId] = useState(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
+  const [acClientId, setAcClientId] = useState(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? '')
   const [acClientSecret, setAcClientSecret] = useState(
     initialAccountingSettings.secretMasked
       ? ''
-      : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? initialAccountingSettings.quickbooks_client_secret ?? ''),
+      : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? ''),
   )
   const [acSaved, setAcSaved] = useState(false)
   const [accountingMessage, setAccountingMessage] = useState('')
@@ -120,11 +121,11 @@ export function IntegrationsStep({
   }, [wmsConnection.configured])
 
   useEffect(() => {
-    setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
+    setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? '')
     setAcClientSecret(
       initialAccountingSettings.secretMasked
         ? ''
-        : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? initialAccountingSettings.quickbooks_client_secret ?? ''),
+        : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? ''),
     )
   }, [initialAccountingSettings])
 
@@ -172,8 +173,13 @@ export function IntegrationsStep({
 
   function buildNextPlugins(current: IntegrationPluginState, key: keyof IntegrationPluginState, value: boolean): IntegrationPluginState {
     const next = { ...current, [key]: value }
-    if (key === 'xero' && value) next.quickbooks = false
-    if (key === 'quickbooks' && value) next.xero = false
+    // o3d-remove-parked-connectors: the two lines that turned the OTHER accounting connector off
+    // when one was switched on are gone with QuickBooks. This is the OPTIMISTIC local copy only —
+    // the binding rule is `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS`, evaluated by both writers under
+    // the selection lock against the state the write RESULTS in. With one accounting connector
+    // registered there is no pair to mirror here; a second one restores a group entry, and this
+    // function then has to mirror it again or the screen will optimistically show a state the
+    // writer will refuse.
     return next
   }
 
@@ -269,8 +275,8 @@ export function IntegrationsStep({
 
   function handleSaveAccountingConnection() {
     if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
-    const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
-    const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
+    const selectedAccountingConnector = selectedAccountingDef.id
+    const selectedAccountingLabel = selectedAccountingDef.label
     setError('')
     setAcSaved(false)
     setAccountingMessage('')
@@ -296,8 +302,8 @@ export function IntegrationsStep({
 
   function handleConnectAccounting() {
     if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
-    const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
-    const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
+    const selectedAccountingConnector = selectedAccountingDef.id
+    const selectedAccountingLabel = selectedAccountingDef.label
     setError('')
     setConnectingAccounting(true)
     void (async () => {
@@ -326,9 +332,16 @@ export function IntegrationsStep({
   }
 
   const hasShoppingConnector = plugins.woocommerce
-  const hasAccountingConnector = plugins.xero || plugins.quickbooks
+  // DERIVED from the registry (o3d-remove-parked-connectors). `hasAccountingConnector` was
+  // `plugins.xero || plugins.quickbooks` and `accountingLabel` was `plugins.quickbooks ? … : 'Xero'`,
+  // so a third registered connector would have been invisible to the first and mislabelled by the
+  // second. `selectedAccountingDef` is the ONE value the two save handlers key off, so the connector
+  // they write to and the name they put in the operator's message cannot disagree.
+  const enabledAccountingDef = ACCOUNTING_CONNECTORS.find((connector) => plugins[connector.id])
+  const hasAccountingConnector = !!enabledAccountingDef
+  const selectedAccountingDef = enabledAccountingDef ?? ACCOUNTING_CONNECTORS[0]
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
-  const accountingLabel = plugins.quickbooks ? 'QuickBooks' : 'Xero'
+  const accountingLabel = selectedAccountingDef.label
   const hasPublicAppUrl = Boolean(publicAppUrlInfo.value)
   const hasSavedAccountingSecret = initialAccountingSettings.secretMasked
   const hasAccountingSecret = Boolean(acClientSecret.trim()) || hasSavedAccountingSecret
@@ -498,71 +511,6 @@ export function IntegrationsStep({
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Saving stores the OAuth app credentials only. Connect & Verify completes OAuth and records the connection-test gate; onboarding cannot continue until Xero is connected.
-                </p>
-              </>
-            )}
-            <p className="text-xs text-muted-foreground">
-              After connecting, you can complete account mapping and tax configuration in{' '}
-              <Link href="/sync" className="text-primary hover:underline inline-flex items-center gap-0.5">
-                Integrations <ExternalLink className="h-3 w-3" />
-              </Link>
-            </p>
-          </Card>
-        )}
-
-        <label className="flex items-start gap-3 cursor-pointer rounded-lg border p-3 hover:bg-muted/50 transition-colors">
-          <Switch checked={plugins.quickbooks} onCheckedChange={(v) => togglePlugin('quickbooks', v)} className="mt-0.5" disabled={busy} />
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <Calculator className="h-4 w-4 text-green-700" />
-              <span className="text-sm font-medium">QuickBooks Online</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-0.5">Post journal entries and sync invoices to QuickBooks</p>
-          </div>
-        </label>
-        {plugins.quickbooks && (
-          <Card className="p-4 space-y-4">
-            {accountingConnected ? (
-              <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800">
-                <Check className="h-4 w-4" />
-                Connected to <strong>{accountingConnectedLabel}</strong>
-              </div>
-            ) : (
-              <>
-                {!hasPublicAppUrl && (
-                  <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
-                    Set a Public App URL in the Company Details step before connecting to QuickBooks.
-                  </div>
-                )}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div className="space-y-1.5">
-                    <Label className="text-xs">Client ID</Label>
-                    <Input value={acClientId} onChange={(e) => setAcClientId(e.target.value)} className="h-9" />
-                  </div>
-                  <div className="space-y-1.5">
-                    <Label className="text-xs">Client Secret</Label>
-                    <Input
-                      type="password"
-                      value={acClientSecret}
-                      onChange={(e) => setAcClientSecret(e.target.value)}
-                      placeholder={initialAccountingSettings.secretMasked ? '••••••••' : ''}
-                      className="h-9"
-                    />
-                  </div>
-                </div>
-                <div className="flex flex-wrap items-center gap-3">
-                  <Button type="button" onClick={handleSaveAccountingConnection} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm">
-                    {savingAccountingConnection ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    {acSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save OAuth Settings'}
-                  </Button>
-                  <Button type="button" onClick={handleConnectAccounting} disabled={busy || !acClientId || !hasAccountingSecret || !hasPublicAppUrl} size="sm" variant="outline">
-                    {connectingAccounting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                    Connect & Verify QuickBooks
-                  </Button>
-                  {accountingMessage ? <span className="text-xs text-muted-foreground">{accountingMessage}</span> : null}
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Saving stores the OAuth app credentials only. Connect & Verify completes OAuth and records the connection-test gate; onboarding cannot continue until QuickBooks is connected.
                 </p>
               </>
             )}

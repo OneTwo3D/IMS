@@ -15,7 +15,7 @@ connectors from the active codebase (archive the code but remove it from active 
 the generic design of the ims so it is possible to add later on different connectors."* Active
 connectors are WooCommerce, Mintsoft and Xero (connector priority 2026-08).
 
-This removal follows the plan in `docs/todo/connector-removal-plan.md`, which surveyed it in detail.
+This removal follows the plan in [`connector-removal-plan.md`](./connector-removal-plan.md), which surveyed it in detail.
 
 ---
 

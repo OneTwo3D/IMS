@@ -1,5 +1,6 @@
 'use client'
 
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { useCallback, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
@@ -141,9 +142,15 @@ export function OnboardingClient({
   const wcConnected = integrationConnectedOverride.wc ?? (!!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked)
   const accountingConnected = integrationConnectedOverride.accounting ?? accountingStatus.connected
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
+  // DERIVED from the registry, like `wmsEnabled` (o3d-remove-parked-connectors). It was
+  // `plugins.xero || plugins.quickbooks`, and the label below was `plugins.quickbooks ? … : 'Xero'`,
+  // which named Xero for every connector that was not QuickBooks.
+  const enabledAccountingConnector = ACCOUNTING_CONNECTORS.find((connector) => plugins[connector.id])
+  const accountingEnabled = !!enabledAccountingConnector
+  const activeAccountingLabel = enabledAccountingConnector?.label ?? 'accounting'
   const wmsConnected = integrationConnectedOverride.wms ?? wmsConnection.configured
   const hasTaxRates = taxRates.some((rate) => rate.active)
-  const anyIntegrationsEnabled = plugins.woocommerce || plugins.xero || plugins.quickbooks || wmsEnabled
+  const anyIntegrationsEnabled = plugins.woocommerce || accountingEnabled || wmsEnabled
   const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {
@@ -155,7 +162,7 @@ export function OnboardingClient({
       if (integrationsReadyOverride != null) return integrationsReadyOverride
       if (!anyIntegrationsEnabled) return false
       if (plugins.woocommerce && !wcConnected) return false
-      if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
+      if (accountingEnabled && !accountingConnected) return false
       if (wmsEnabled && !wmsConnected) return false
       return true
     }
@@ -261,7 +268,6 @@ export function OnboardingClient({
   }
 
   const shoppingEnabled = plugins.woocommerce
-  const accountingEnabled = plugins.xero || plugins.quickbooks
 
   return (
     <div className="max-w-5xl mx-auto">
@@ -492,7 +498,7 @@ export function OnboardingClient({
                         <li className="flex items-start gap-2">
                           <ArrowRight className="h-3.5 w-3.5 mt-0.5 shrink-0" />
                           <span>
-                            Complete the {plugins.quickbooks ? 'QuickBooks' : 'Xero'} OAuth connection in{' '}
+                            Complete the {activeAccountingLabel} OAuth connection in{' '}
                             <Link href="/sync" className="font-medium hover:underline inline-flex items-center gap-0.5">
                               Integrations <ExternalLink className="h-3 w-3" />
                             </Link>

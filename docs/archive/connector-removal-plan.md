@@ -1,9 +1,25 @@
-# Connector removals: Shopify and QuickBooks
+# Connector removals: Shopify and QuickBooks — DONE (plan retained)
+
+> **BOTH REMOVALS ARE DONE (2026-09-24, branch `o3d-remove-parked-connectors`).** This file was the
+> PLAN; it is kept, moved from `docs/todo/` to `docs/archive/`, because its survey — the footprints,
+> the traps, the "what the ShipHero seam actually proves" lessons — is the reasoning the removals were
+> carried out on, and a reader of either removal note will want it. Where the plan and what shipped
+> disagree, the removal notes are authoritative:
+>
+> - [`shopify-connector-removal.md`](./shopify-connector-removal.md)
+> - [`quickbooks-connector-removal.md`](./quickbooks-connector-removal.md)
+>
+> **Two of its recommendations were NOT followed, and both are recorded in the QuickBooks note:**
+> QuickBooks was removed now rather than after the in-flight accounting branches merged (an explicit
+> instruction), and the proposed `AccountingConnectorDef` capability flags were not added, because
+> every stub they were meant to replace was a QuickBooks stub and went with it. What WAS followed is
+> its central recommendation — fix the abstraction on the way out rather than preserving it as it
+> stood; the QuickBooks note lists the seven places that happened.
 
 The owner's decision (2026-09) is that QuickBooks, Shopify and ShipHero are not
 in focus. **ShipHero is done** — see
-[`../archive/shiphero-connector-removal.md`](../archive/shiphero-connector-removal.md).
-This plans the other two. Production is not in use and will be reinstalled from
+[`shiphero-connector-removal.md`](./shiphero-connector-removal.md).
+This planned the other two. Production is not in use and will be reinstalled from
 scratch, so no retrospective data fixes are needed; all deployment is to the
 development system.
 
@@ -485,5 +501,5 @@ breakage, not a compile error.
 | # | Connector | When | Why |
 |---|---|---|---|
 | 1 | ShipHero | **done** | No live deployment, self-contained, established the pattern. |
-| 2 | Shopify | next | Self-contained, no schema change, no in-flight work, and it closes a security exemption and a maintenance-fence gap. |
-| 3 | QuickBooks | after the accounting branches merge | 5,000 LOC across a layer that five live branches are actively changing; nothing gains by doing it early. |
+| 2 | Shopify | **done** | Self-contained, no schema change, no in-flight work, and it closes a security exemption and a maintenance-fence gap. |
+| 3 | QuickBooks | **done** (not after the branches merged — an explicit instruction) | 5,000 LOC across a layer that five live branches are actively changing; nothing gains by doing it early. |

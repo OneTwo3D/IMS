@@ -1,5 +1,6 @@
 export const dynamic = 'force-dynamic'
 
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { redirect } from 'next/navigation'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
@@ -32,7 +33,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
         userEmail={session.user.email ?? ''}
         userPictureUrl={session.user.pictureUrl}
         shoppingIntegrationEnabled={pluginState.woocommerce}
-        accountingIntegrationEnabled={pluginState.xero || pluginState.quickbooks}
+        accountingIntegrationEnabled={ACCOUNTING_CONNECTORS.some((connector) => pluginState[connector.id])}
         wmsIntegrationEnabled={isIntegrationModuleVisible('wms', pluginState)}
       >
         {children}

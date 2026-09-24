@@ -373,7 +373,7 @@ test('every committing settings writer is discovered — an empty scan proves no
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
       'app/actions/onboarding.ts#setOnboardingStep',
-      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      // o3d-remove-parked-connectors: `autoLinkQuickBooksTaxRates` was a committing writer here.
       'app/actions/settings.ts#autoLinkXeroTaxRates',
       'app/actions/settings.ts#createAdjustmentReason',
       'app/actions/settings.ts#createPurchaseUnit',
@@ -426,7 +426,7 @@ test('...and the guard is actually being used, so the check above is not vacuous
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
       'app/actions/onboarding.ts#setOnboardingStep',
-      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      // o3d-remove-parked-connectors: `autoLinkQuickBooksTaxRates` was a committing writer here.
       'app/actions/settings.ts#autoLinkXeroTaxRates',
       'app/actions/settings.ts#createAdjustmentReason',
       'app/actions/settings.ts#createPurchaseUnit',

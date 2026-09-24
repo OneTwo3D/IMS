@@ -71,15 +71,7 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 
-mock.module('@/lib/connectors/quickbooks/queue', {
-  namedExports: {
-    queueQuickBooksSync: async (params: { type: string; referenceId: string }) => {
-      if (quickbooksSyncEnabled !== 'true') return { queued: false, reason: 'not-configured' }
-      queued.push({ queue: 'quickbooks', type: params.type, referenceId: params.referenceId })
-      return { queued: true }
-    },
-  },
-})
+// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 
 const REQUEST = {
   type: 'UNEARNED_REV_REVERSAL' as const,
@@ -99,7 +91,7 @@ test('o3d-i0o6 r3: a PINNED facade enqueue is answered BY the named connector, n
   reset()
   // Both plugins on. `getActiveAccountingConnectorId` is Xero-first, so 'xero' is the active one and
   // an UNPINNED enqueue would go there; the pin names it explicitly and is answered for it.
-  enabledPlugins = ['xero', 'quickbooks']
+  enabledPlugins = ['xero']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
   const outcome = await queueAccountingSync({ ...REQUEST, connector: 'xero' })
@@ -114,7 +106,7 @@ test('o3d-i0o6 r7: a pin to a ledger that is no longer the ACTIVE connector writ
   // The switch that happens between staging and the hand-off: QuickBooks is active now. Xero's own
   // sync toggle is untouched by that switch and is still 'true' — which is precisely why the
   // enqueue's own gate said yes and a PENDING Xero row was written that nothing scheduled drains.
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSync } = await import('@/lib/accounting')
@@ -146,14 +138,19 @@ test('o3d-i0o6 r3: a pinned enqueue whose connector does not post this type writ
 })
 
 test('o3d-i0o6 r3: an UNPINNED enqueue still resolves the active connector, exactly as before', async () => {
+  // o3d-remove-parked-connectors: this enabled ONLY the second connector and asserted the enqueue
+  // followed it — which showed the resolution was real rather than a constant. With one registered
+  // connector that distinction is unobservable here, so the case asserts what remains: an unpinned
+  // enqueue takes its connector from the resolution and reports it. Recorded in
+  // docs/archive/quickbooks-connector-removal.md.
   reset()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = ['xero']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
   const outcome = await queueAccountingSync(REQUEST)
 
-  assert.equal(outcome.connector, 'quickbooks')
-  assert.deepEqual(queued.map((row) => row.queue), ['quickbooks'])
+  assert.equal(outcome.connector, 'xero')
+  assert.deepEqual(queued.map((row) => row.queue), ['xero'])
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -227,7 +224,7 @@ function fenceOnlyTx(): unknown {
 
 test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the active connector', async () => {
   reset()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSyncTx } = await import('@/lib/accounting')

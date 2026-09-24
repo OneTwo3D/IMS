@@ -1,3 +1,4 @@
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
@@ -344,7 +345,7 @@ export type RefundAccountingSyncRequest = {
    * about a connector (the credit note, the COGS reversal): those keep the active-connector
    * resolution they have always had.
    */
-  connector?: 'xero' | 'quickbooks'
+  connector?: AccountingConnectorId
 }
 
 /**
@@ -1053,7 +1054,7 @@ async function stageRefundAccountingReversals(
      * switch org doesn't subtract reversals posted to a different ledger. Resolved by the
      * server-action layer (the unit-tested domain path passes none → no connector filter).
      */
-    activeConnector?: 'xero' | 'quickbooks'
+    activeConnector?: AccountingConnectorId
   },
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
@@ -2960,7 +2961,11 @@ function parseRefundAccountingRetrySyncs(
       // `undefined` — `{...}` and `{connector: undefined}` are the same request to every consumer
       // but not to a structural comparison, and one of those consumers is the persisted JSON this
       // very function round-trips.
-      ...(entry.connector === 'xero' || entry.connector === 'quickbooks'
+      // REGISTRY-CHECKED (o3d-remove-parked-connectors); it was the two literals this build happened
+      // to ship. A pin naming a connector this build cannot route is still not a pin — see the
+      // paragraph above — and checking the registry means a connector registered later is honoured
+      // without an edit here.
+      ...(isRegisteredAccountingConnector(entry.connector)
         ? { connector: entry.connector }
         : {}),
     }]
@@ -3020,7 +3025,7 @@ export async function createSalesOrderRefund(
      */
     chargeback?: boolean
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
-    activeAccountingConnector?: 'xero' | 'quickbooks'
+    activeAccountingConnector?: AccountingConnectorId
     /**
      * o3d-w00 (Codex r8 #6): will a CREDIT NOTE actually be posted for this refund? That — not "is an
      * accounting plugin enabled" — is what gates the posted-VAT fence below.
@@ -4608,7 +4613,7 @@ export async function retrySalesOrderRefundAccounting(
     refundId: string
     accountingSettings: AccountingSettings
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
-    activeAccountingConnector?: 'xero' | 'quickbooks'
+    activeAccountingConnector?: AccountingConnectorId
     /**
      * o3d-w00 (Codex r8 #4): whether a CREDIT NOTE will actually post, asked AGAIN here.
      *

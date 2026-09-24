@@ -1,3 +1,4 @@
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Metadata } from 'next'
 import Link from 'next/link'
 import { History } from 'lucide-react'
@@ -172,7 +173,7 @@ export default async function SyncPage() {
   // Plugins switches unreachable in precisely the state those switches caused, which is the same
   // shape as HIGH 2: a misconfiguration that removes its own remedy.
   const anyIntegrationPluginEnabled = !!(
-    pluginState.woocommerce || pluginState.xero || pluginState.quickbooks
+    pluginState.woocommerce || ACCOUNTING_CONNECTORS.some((connector) => pluginState[connector.id])
     || wmsResolution.kind !== 'none'
   )
 
@@ -292,7 +293,7 @@ export default async function SyncPage() {
 
   // Only hit the accounting Tax Rates API when an accounting connector is live —
   // otherwise the sync page would pay for a round-trip on every render.
-  const accountingTaxRates = dashboard && (pluginState.xero || pluginState.quickbooks) && dashboard.accountingStatus.connected
+  const accountingTaxRates = dashboard && ACCOUNTING_CONNECTORS.some((connector) => pluginState[connector.id]) && dashboard.accountingStatus.connected
     // o3d-r30: passive display read — the settings page rate list may be up to 4h stale; the explicit
     // "Refresh Xero tax rates" button and the authoritative auto-link both read live.
     ? (await panel('accounting tax rates', () => fetchAccountingTaxRates({ allowCache: true }))) ?? []

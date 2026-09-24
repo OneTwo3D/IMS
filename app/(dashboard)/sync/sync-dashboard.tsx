@@ -112,14 +112,6 @@ const NON_WMS_CONNECTORS: ConnectorDef[] = [
     category: 'accounting',
     available: true,
   },
-  {
-    id: 'quickbooks',
-    name: 'QuickBooks',
-    description: 'Sync invoices, COGS journals and purchase invoices',
-    logo: '/images/qb-logo-stacked.svg',
-    category: 'accounting',
-    available: true,
-  },
 ]
 
 /**
@@ -160,8 +152,6 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   ...Object.fromEntries(WMS_PANEL_ENTRIES.map((entry) => [entry.id, entry.logo])),
   // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
-  // eslint-disable-next-line @next/next/no-img-element
-  quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
 export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData, availableWmsConnectorIds, ambiguousWmsConnectorIds }: Props) {
@@ -172,8 +162,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     requestedConnector === 'woocommerce' && !pluginState.woocommerce
   ) || (
     requestedConnector === 'xero' && !pluginState.xero
-  ) || (
-    requestedConnector === 'quickbooks' && !pluginState.quickbooks
   ) || (
     // A connector this build does not OFFER has no panel to open, however the URL was arrived at
     // (round 12, Codex HIGH 2). `?connector=` is operator-supplied, and the grid is not the only
@@ -199,7 +187,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   const visibleConnectors = connectors.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
     if (connector.id === 'xero') return pluginState.xero
-    if (connector.id === 'quickbooks') return pluginState.quickbooks
     if (isWmsConnectorId(connector.id)) return pluginState[connector.id]
     return true
   })
@@ -420,7 +407,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {(c.id === 'xero' || c.id === 'quickbooks') && accountingConnected && (
+                {isAccountingConnectorUiId(c.id) && accountingConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

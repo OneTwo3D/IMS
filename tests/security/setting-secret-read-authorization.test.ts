@@ -261,17 +261,20 @@ const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
   // place that must import it, and the place that adds the set membership check.
   'lib/settings-store.ts': 'implements maskSettingSecret; adds the SENSITIVE_SETTING_KEYS check',
 
-  // OUT OF SCOPE by owner instruction (QuickBooks). It masks a key that IS in
-  // SENSITIVE_SETTING_KEYS today (quickbooks_client_secret), so nothing is currently
-  // drifting — but it is not routed through the gate, so nothing stops the next
-  // key it adds from drifting. Not a claim that it is correct; a record that it
-  // was looked at and left alone.
+  // o3d-remove-parked-connectors — BOTH WAIVERS ARE GONE, AND SO IS EVERYTHING THEY WAIVED.
   //
-  // o3d-remove-parked-connectors: `app/actions/shopping-sync.ts` was the other entry here, waived
-  // for the same reason. Shopify is archived and that file no longer masks anything, so the waiver
-  // is DELETED rather than left to pass vacuously — the deepEqual below is exhaustive, so a stale
-  // key fails it.
-  'app/actions/quickbooks-sync.ts': 'OUT OF SCOPE (QuickBooks) — masks quickbooks_client_secret, in the set today, but not via the gate',
+  // This map held two entries beside the one above: `app/actions/shopping-sync.ts` (Shopify) and
+  // `app/actions/quickbooks-sync.ts` (QuickBooks), each masking a key that WAS in
+  // SENSITIVE_SETTING_KEYS but not routed through `maskSettingSecret` — so nothing was drifting, and
+  // nothing stopped the next key they added from drifting. Both connectors are archived and neither
+  // file exists in the live tree any more, so the waivers are deleted rather than left to pass
+  // vacuously. The assertion below is exhaustive, so a stale entry fails it — which is how these were
+  // found.
+  //
+  // WHAT THAT MEANS FOR THIS FILE: it is now down to ONE justified call site, and that one is the
+  // implementation of `maskSettingSecret` itself. In other words, every remaining masker in the tree
+  // goes through the gate. That is a stronger state than the file has ever pinned, and the assertion
+  // that keeps it true is unchanged.
 }
 
 function filesReferencingRawMaskSecret(): string[] {

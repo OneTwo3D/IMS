@@ -9,12 +9,12 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 ### Released v2.0.0 follow-ups
 
 - [`xero-tax-rate-drift-detection-plan.md`](xero-tax-rate-drift-detection-plan.md) — daily cron that compares IMS `TaxRate` profiles to live Xero `TaxComponents` and alerts on drift without writeback. Completes the residual scope from PR #186. **Not yet started.**
-- [`quickbooks-tax-parity-plan.md`](quickbooks-tax-parity-plan.md) — brings QBO to feature parity with Xero for sales/purchase invoice updates and the reverse-charge tax-type swap; documents the gap on `TaxComponents` (no QBO API). **Partial: reverse-charge swap shipped; `SALES/PURCHASE_INVOICE_UPDATE` still unimplemented.**
 - [`reorder-row-selection-plan.md`](reorder-row-selection-plan.md) — per-row checkboxes on the Reorder Planning report so the operator can scope the Generate button to a subset of rows. Deferred from PR #190. **Not yet started.**
 
 ### Connector boundary + new connectors
 
 - ~~`shopify-connector-followup-plan.md`~~ — **CLOSED, not done.** The Shopify connector was archived (o3d-remove-parked-connectors); the plan moved to `archive/connectors/shopify/docs/todo/` with the code. See [`../archive/shopify-connector-removal.md`](../archive/shopify-connector-removal.md).
+- ~~`quickbooks-tax-parity-plan.md`~~ — **CLOSED, not done.** The QuickBooks connector was archived in the same change; the plan moved to `archive/connectors/quickbooks/docs/todo/`. See [`../archive/quickbooks-connector-removal.md`](../archive/quickbooks-connector-removal.md).
 - [`mintsoft-wms-connector-plan.md`](mintsoft-wms-connector-plan.md) — architectural design for the Mintsoft warehouse connector. **Partial: Phases 1–4 shipped; 2b/5/6/7 outstanding.**
 - [`mintsoft-wms-connector-implementation-plan.md`](mintsoft-wms-connector-implementation-plan.md) — concrete file-by-file build plan for the Mintsoft connector. **Partial: Phases 1–3 in prod; ALIGN_TO_WMS, ASN/booked-in, returns inbox outstanding.**
 - [`WC-followup-plan.md`](WC-followup-plan.md) — WooCommerce work remaining after the webhook-first shift. **Phases 1–4 closed; Phase 5 (sweep `wc_*` bindings behind generic selectors) open.**

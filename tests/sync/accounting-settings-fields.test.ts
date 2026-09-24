@@ -8,35 +8,44 @@ import {
   settingKeyFor,
   validateAccountingAccountMapping,
 } from '@/app/(dashboard)/sync/accounting-settings-fields'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 
-// iwrm: the accounting settings form is shared by Xero and QuickBooks. The save
-// payload must use the active connector's key prefix; previously it hardcoded
-// xero_* keys, so saveQuickBooksSettings' allowlist dropped every qbo_* mapping
-// and NO QuickBooks account was UI-configurable.
+// iwrm: the accounting settings form is connector-agnostic and the save payload must use the ACTIVE
+// connector's key prefix; it previously hardcoded xero_* keys, so the other connector's allowlist
+// dropped every one of its mappings and none of its accounts was UI-configurable.
+//
+// o3d-remove-parked-connectors — WHY THE SECOND-CONNECTOR CASES NOW USE AN UNREGISTERED ID.
+//
+// The defect this file exists for is a PREFIX defect: the payload builder must key off the connector
+// it was given, not off whichever connector is active. With one registered connector, every
+// `buildAccountingSettingsPayload('xero', …)` case passes equally well for a builder that ignores its
+// argument and hardcodes `xero_` — which is the exact bug. So the prefix cases drive an id the union
+// does not contain: what is asserted is that the ARGUMENT decides the prefix, which is the property,
+// and it cannot be satisfied by a hardcode. The Xero-only field gating is asserted the same way.
+const OTHER_CONNECTOR = 'other-ledger' as unknown as AccountingConnectorId
 
-test('QuickBooks payload uses quickbooks_ prefix and persists the rounding-difference account', () => {
+test('the payload prefix comes from the CONNECTOR ARGUMENT, not from a hardcoded xero_', () => {
   const state: Record<string, string> = {
-    quickbooks_sales_account: '4000',
-    quickbooks_cogs_account: '5000',
-    quickbooks_rounding_difference_account: '6900',
-    quickbooks_sync_enabled: 'true',
-    // A stray xero_* value must never leak into a QuickBooks save.
+    'other-ledger_sales_account': '4000',
+    'other-ledger_cogs_account': '5000',
+    'other-ledger_rounding_difference_account': '6900',
+    'other-ledger_sync_enabled': 'true',
+    // A stray xero_* value must never leak into another connector's save.
     xero_sales_account: 'LEAK',
   }
-  const payload = buildAccountingSettingsPayload('quickbooks', state)
+  const payload = buildAccountingSettingsPayload(OTHER_CONNECTOR, state)
 
-  assert.equal(payload.quickbooks_sales_account, '4000')
-  assert.equal(payload.quickbooks_cogs_account, '5000')
-  // scjz.60b parity: the QuickBooks rounding-difference account is now saveable.
-  assert.equal(payload.quickbooks_rounding_difference_account, '6900')
-  assert.equal(payload.quickbooks_sync_enabled, 'true')
+  assert.equal(payload['other-ledger_sales_account'], '4000')
+  assert.equal(payload['other-ledger_cogs_account'], '5000')
+  assert.equal(payload['other-ledger_rounding_difference_account'], '6900')
+  assert.equal(payload['other-ledger_sync_enabled'], 'true')
 
-  // Every persisted key is quickbooks_-prefixed — no xero_* leakage.
-  assert.ok(Object.keys(payload).every((k) => k.startsWith('quickbooks_')), 'all keys quickbooks_-prefixed')
+  // Every persisted key carries the argument's prefix — no xero_* leakage.
+  assert.ok(Object.keys(payload).every((k) => k.startsWith('other-ledger_')), 'all keys take the argument prefix')
   assert.equal('xero_sales_account' in payload, false)
 
-  // inventory_revaluation is Xero-only — it must not appear in a QuickBooks payload.
-  assert.equal('quickbooks_inventory_revaluation_account' in payload, false)
+  // inventory_revaluation is Xero-only — it must not appear in another connector's payload.
+  assert.equal('other-ledger_inventory_revaluation_account' in payload, false)
 })
 
 test('Xero payload uses xero_ prefix and includes both Xero-only account keys', () => {
@@ -54,9 +63,9 @@ test('Xero payload uses xero_ prefix and includes both Xero-only account keys', 
 })
 
 test('missing settings default to empty string (cleared mapping, not undefined)', () => {
-  const payload = buildAccountingSettingsPayload('quickbooks', {})
-  assert.equal(payload.quickbooks_sales_account, '')
-  assert.equal(payload.quickbooks_sync_enabled, '')
+  const payload = buildAccountingSettingsPayload(OTHER_CONNECTOR, {})
+  assert.equal(payload['other-ledger_sales_account'], '')
+  assert.equal(payload['other-ledger_sync_enabled'], '')
   assert.ok(Object.values(payload).every((v) => typeof v === 'string'))
 })
 
@@ -64,15 +73,16 @@ test('isFieldAvailableForConnector gates Xero-only fields', () => {
   const revaluation = ACCOUNT_FIELDS.find((f) => f.suffix === 'inventory_revaluation_account')!
   const sales = ACCOUNT_FIELDS.find((f) => f.suffix === 'sales_account')!
   assert.equal(isFieldAvailableForConnector(revaluation, 'xero'), true)
-  assert.equal(isFieldAvailableForConnector(revaluation, 'quickbooks'), false)
-  // A shared field is available on both connectors.
+  assert.equal(isFieldAvailableForConnector(revaluation, OTHER_CONNECTOR), false,
+    'a field restricted to xero is NOT offered to another connector — the restriction is real')
+  // A shared field (no `connectors` restriction) is available on every connector.
   assert.equal(isFieldAvailableForConnector(sales, 'xero'), true)
-  assert.equal(isFieldAvailableForConnector(sales, 'quickbooks'), true)
+  assert.equal(isFieldAvailableForConnector(sales, OTHER_CONNECTOR), true)
 })
 
 test('settingKeyFor composes the connector prefix', () => {
   assert.equal(settingKeyFor('xero', 'sales_account'), 'xero_sales_account')
-  assert.equal(settingKeyFor('quickbooks', 'sales_account'), 'quickbooks_sales_account')
+  assert.equal(settingKeyFor(OTHER_CONNECTOR, 'sales_account'), 'other-ledger_sales_account')
 })
 
 
@@ -125,15 +135,16 @@ test('accounting mapping ignores surrounding whitespace when comparing accounts'
   assert.equal(errors.length, 1, 'whitespace must not smuggle a collision past the guard')
 })
 
-test('accounting mapping validates the QuickBooks key prefix too', () => {
+test('accounting mapping validates ANOTHER connector\'s key prefix too', () => {
   // REGRESSION (found by Codex review of PR #488): the first cut took the connector from
-  // saveAccountingSettings' getActiveAccountingConnector(), which is xero-first and
-  // ignores the ?connector= param the client builds its payload from. A QuickBooks save
-  // was therefore checked against xero_* keys, found nothing, and passed silently. The
-  // validator now checks whichever prefixes are present in the payload.
+  // saveAccountingSettings' getActiveAccountingConnector(), which resolves the ACTIVE connector and
+  // ignores the ?connector= param the client builds its payload from. A second connector's save was
+  // therefore checked against xero_* keys, found nothing, and passed silently. The validator now
+  // checks whichever prefixes are present in the payload — which is why this case uses a prefix that
+  // is not `xero_` and is not one the build registers (o3d-remove-parked-connectors).
   const errors = validateAccountingAccountMapping({
-    quickbooks_transit_account: '632',
-    quickbooks_allocated_inventory_account: '632',
+    'other-ledger_transit_account': '632',
+    'other-ledger_allocated_inventory_account': '632',
   })
   assert.equal(errors.length, 1)
 })

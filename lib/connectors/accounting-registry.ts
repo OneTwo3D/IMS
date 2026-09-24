@@ -1,7 +1,19 @@
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import type { MissingTaxRatePreviewResult, MissingTaxRateGenerateResult } from '@/lib/tax/generate-missing-tax-rates'
 
-export type AccountingConnectorId = 'xero' | 'quickbooks'
+/**
+ * ONE ENTRY TODAY (o3d-remove-parked-connectors). QuickBooks was the second and is archived — see
+ * archive/connectors/README.md and docs/archive/quickbooks-connector-removal.md. The union, the
+ * definition list, the definition lookup and the factory below are all still driven by the registry
+ * rather than by a Xero literal, so a second connector is a registration plus a factory entry.
+ *
+ * WHAT A UNION OF ONE COSTS, stated rather than implied: nothing drives the accounting seam with a
+ * second id any more, because there is no second id. The genericity of everything keyed by
+ * `AccountingConnectorId` is type-checked, not tested. The removal note's "What is no longer proven"
+ * enumerates the specific losses; do not read a green suite as evidence that a second accounting
+ * connector would work.
+ */
+export type AccountingConnectorId = 'xero'
 
 export type AccountingAccountBalanceSnapshotResult = {
   fetched: number
@@ -143,12 +155,22 @@ export const ACCOUNTING_CONNECTORS: readonly AccountingConnectorDef[] = [
     label: 'Xero',
     available: true,
   },
-  {
-    id: 'quickbooks',
-    label: 'QuickBooks',
-    available: true,
-  },
 ] as const
+
+/**
+ * Whether a value — typically a `connector` string read back off a stored row — names a connector
+ * THIS BUILD registers (o3d-remove-parked-connectors).
+ *
+ * The `connector` columns on `AccountingSyncLog`, `AccountingToken`, `AccountingAccount` and
+ * `AccountingAccountBalanceSnapshot` are plain `String @default("xero")`, so a row can name a
+ * connector that has since been archived — development databases hold `quickbooks` rows right now.
+ * Several call sites used to test that with a literal pair (`=== 'xero' || === 'quickbooks'`), which
+ * both hard-codes the roster and, worse, would accept `quickbooks` after the code to service it was
+ * gone. One predicate, keyed off the registry, is the answer to both.
+ */
+export function isRegisteredAccountingConnector(value: unknown): value is AccountingConnectorId {
+  return typeof value === 'string' && ACCOUNTING_CONNECTORS.some((connector) => connector.id === value)
+}
 
 export function getAccountingConnectorDefinition(id: AccountingConnectorId): AccountingConnectorDef {
   const def = ACCOUNTING_CONNECTORS.find((connector) => connector.id === id)
@@ -156,103 +178,24 @@ export function getAccountingConnectorDefinition(id: AccountingConnectorId): Acc
   return def
 }
 
-export function getAccountingConnector(id: AccountingConnectorId): AccountingConnector {
-  const def = getAccountingConnectorDefinition(id)
-
-  if (id === 'quickbooks') {
-    return {
-      ...def,
-      async getSettingsMasked() {
-        const { getQuickBooksSettingsMasked } = await import('@/app/actions/quickbooks-sync')
-        return getQuickBooksSettingsMasked() as unknown as Promise<AccountingConnectorSettingsMasked>
-      },
-      async saveSettings(data) {
-        const { saveQuickBooksSettings } = await import('@/app/actions/quickbooks-sync')
-        return saveQuickBooksSettings(data)
-      },
-      async saveConnectionSettings(clientId, clientSecret) {
-        const { saveQuickBooksConnectionSettings } = await import('@/app/actions/quickbooks-sync')
-        return saveQuickBooksConnectionSettings(clientId, clientSecret)
-      },
-      async getConnectionStatus() {
-        const { getQuickBooksConnectionStatus } = await import('@/app/actions/quickbooks-sync')
-        return getQuickBooksConnectionStatus()
-      },
-      async getConnectionTestState() {
-        // QuickBooks does not yet run a fresh-secret connection-test gate.
-        return { status: 'never', testedAt: null, message: '', fingerprint: null }
-      },
-      async testConnection() {
-        return { success: false, error: 'QuickBooks connection testing is not available yet.' }
-      },
-      async connect(clientId, clientSecret, origin, returnPath) {
-        const { connectQuickBooks } = await import('@/app/actions/quickbooks-sync')
-        return connectQuickBooks(clientId, clientSecret, origin, returnPath)
-      },
-      async disconnect() {
-        const { disconnectQuickBooks } = await import('@/app/actions/quickbooks-sync')
-        return disconnectQuickBooks()
-      },
-      async syncAccounts() {
-        const { syncQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
-        return syncQuickBooksAccounts()
-      },
-      async syncAccountBalanceSnapshots() {
-        return { fetched: 0, persisted: 0, skipped: 0, errors: ['QuickBooks account-balance snapshot ingestion is not implemented yet.'] }
-      },
-      async getAccounts() {
-        const { getQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
-        return getQuickBooksAccounts()
-      },
-      async fetchTaxRates() {
-        // QuickBooks tax codes are not part of the Xero reference cache; the allowCache opt (present on
-        // the interface) is a no-op here, so the param is simply omitted.
-        const { fetchQuickBooksTaxCodes } = await import('@/app/actions/quickbooks-sync')
-        return fetchQuickBooksTaxCodes()
-      },
-      async autoLinkTaxRates() {
-        const { autoLinkQuickBooksTaxRates } = await import('@/app/actions/settings')
-        const result = await autoLinkQuickBooksTaxRates()
-        return {
-          success: result.success,
-          linked: result.linked,
-          alreadyLinked: result.alreadyLinked,
-          unmatched: result.unmatched,
-          externalRatesCount: result.quickBooksRatesCount,
-          error: result.error,
-        }
-      },
-      async previewMissingTaxRates() {
-        const { previewMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
-        return previewMissingQuickBooksTaxRates()
-      },
-      async generateMissingTaxRates(taxRateIds, reportTypeOverrides) {
-        const { generateMissingQuickBooksTaxRates } = await import('@/app/actions/settings')
-        return generateMissingQuickBooksTaxRates(taxRateIds, reportTypeOverrides)
-      },
-      async getSyncLogs(limit = 50) {
-        const { getQuickBooksSyncLogs } = await import('@/app/actions/quickbooks-sync')
-        return getQuickBooksSyncLogs(limit)
-      },
-      async triggerSync() {
-        const { triggerQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
-        return triggerQuickBooksSync()
-      },
-      async retryFailedSync(entryId) {
-        // o3d-e2mz: this connector's processor stamps no attempt revision, so there is no attempt to
-        // fence a per-row retry on and the parameter is deliberately ignored. Out of scope by owner
-        // instruction; the retry stays exactly as unfenced as it was.
-        const { retryFailedQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
-        return retryFailedQuickBooksSync(entryId)
-      },
-      async getSyncReadiness() {
-        const { getQuickBooksSyncReadiness } = await import('@/app/actions/quickbooks-sync')
-        return getQuickBooksSyncReadiness()
-      },
-    }
-  }
-
-  return {
+/**
+ * THE FACTORY, KEYED BY THE REGISTRY (o3d-remove-parked-connectors).
+ *
+ * This used to be `if (id === 'quickbooks') { ...45 methods... }` followed by a fall-through to
+ * Xero — not a map, not even a switch, and one edit away from being deleted as an `if` with one arm.
+ * Removing QuickBooks was the moment to take that back rather than leave a bare `return xero()`
+ * behind, because a bare return is what a second connector would have to reverse-engineer.
+ *
+ * The record is TOTAL over `AccountingConnectorId`, so adding an id to the union is a `tsc` error
+ * here until a builder is supplied, and the builder is typed per key (`(def) => AccountingConnector`
+ * built from that key's own definition) rather than over the whole union. `getAccountingConnector`
+ * resolves the definition first, so an unregistered id is refused by
+ * `getAccountingConnectorDefinition` before any builder runs.
+ */
+const ACCOUNTING_CONNECTOR_FACTORIES: {
+  [Id in AccountingConnectorId]: (def: AccountingConnectorDef & { id: Id }) => AccountingConnector
+} = {
+  xero: (def) => ({
     ...def,
     async getSettingsMasked() {
       const { getXeroSettingsMasked } = await import('@/app/actions/xero-sync')
@@ -359,5 +302,12 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       const { getXeroSyncReadiness } = await import('@/app/actions/xero-sync')
       return getXeroSyncReadiness()
     },
-  }
+  }),
+}
+
+export function getAccountingConnector(id: AccountingConnectorId): AccountingConnector {
+  const def = getAccountingConnectorDefinition(id)
+  const build = ACCOUNTING_CONNECTOR_FACTORIES[def.id]
+  if (!build) throw new Error(`No accounting connector factory registered for: ${id}`)
+  return build(def)
 }

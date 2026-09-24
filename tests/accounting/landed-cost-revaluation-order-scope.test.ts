@@ -117,7 +117,8 @@ test('o3d-zpa7: the chain that makes the race unreachable is pinned in both conn
   // These two where-clauses are the middle links. If either loses its condition, an order with no
   // accountingInvoiceId can reach a journaled shipment, the enqueue starts refusing work it used to
   // do, and THIS test says which link moved — instead of the change looking harmless.
-  for (const connector of ['xero', 'quickbooks']) {
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+for (const connector of ['xero']) {
     const src = readFileSync(join(process.cwd(), `lib/connectors/${connector}/daily-sync.ts`), 'utf8')
       .replace(/\s+/g, ' ')
 
@@ -164,7 +165,8 @@ test('o3d-zpa7: only Group B writes shipmentJournalDate, so the chain has no sid
 
   assert.deepEqual(
     [...writers].sort(),
-    ['lib/connectors/quickbooks/daily-sync.ts', 'lib/connectors/xero/daily-sync.ts'],
+    // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+    ['lib/connectors/xero/daily-sync.ts'],
     'a writer of shipmentJournalDate outside daily-batch Group B would bypass Group A1 and break the '
     + 'o3d-zpa7 unreachability argument — the landed-cost enqueue would then be racing a real hard delete',
   )

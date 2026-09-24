@@ -31,14 +31,15 @@
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from './connectors/wms/types'
 
 /**
- * The plugins that are not WMS connectors: one shopping connector and one accounting pair. These are
- * enumerated because there is no registry to derive them from — unlike the WMS connectors, which
- * have one.
+ * The plugins that are not WMS connectors: one shopping connector and one accounting connector.
+ * These are enumerated because there is no registry to derive them from — unlike the WMS
+ * connectors, which have one.
  *
- * o3d-remove-parked-connectors: `shopify` was here and is archived (see
- * docs/archive/shopify-connector-removal.md). Its exclusivity group went with it — see below.
+ * o3d-remove-parked-connectors: `shopify` and `quickbooks` were here and are archived (see
+ * docs/archive/shopify-connector-removal.md and docs/archive/quickbooks-connector-removal.md).
+ * Both exclusivity groups went with them — see below.
  */
-export const NON_WMS_INTEGRATION_PLUGIN_IDS = ['woocommerce', 'xero', 'quickbooks'] as const
+export const NON_WMS_INTEGRATION_PLUGIN_IDS = ['woocommerce', 'xero'] as const
 
 export type NonWmsIntegrationPluginId = (typeof NON_WMS_INTEGRATION_PLUGIN_IDS)[number]
 
@@ -62,12 +63,19 @@ export const INTEGRATION_PLUGIN_IDS: readonly IntegrationPluginId[] = [
  * `WMS_CONNECTOR_IDS.find(...)` — first enabled wins. The operator is told the thing they asked for
  * happened. It did not.
  *
- * WHY THE `shopping` GROUP IS GONE RATHER THAN LEFT WITH ONE MEMBER (o3d-remove-parked-connectors).
- * Shopify was WooCommerce's only partner in that group. A one-member group can never conflict, so it
- * reads as an enforced rule and enforces nothing — the same failure mode as a guard nobody has
- * watched fail. It is deleted; a second storefront restores it in the same commit that registers
- * itself. `findIntegrationPluginExclusivityConflict` is unchanged and total over whatever groups
- * exist, so restoring the entry is the whole edit.
+ * WHY THE `shopping` AND `accounting` GROUPS ARE GONE RATHER THAN LEFT WITH ONE MEMBER EACH
+ * (o3d-remove-parked-connectors). Shopify was WooCommerce's only partner, and QuickBooks was Xero's.
+ * A one-member group can never conflict, so it reads as an enforced rule and enforces nothing — the
+ * same failure mode as a guard nobody has watched fail. Both are deleted; a second storefront or a
+ * second ledger restores its entry in the same commit that registers itself.
+ * `findIntegrationPluginExclusivityConflict` is unchanged and total over whatever groups exist, so
+ * restoring an entry is the whole edit.
+ *
+ * ONE GROUP IS LEFT — `wms` — and it is the only one with more than a theoretical membership, since
+ * its ids are derived. So the exclusivity mechanism is still exercised by the WMS seam tests
+ * (tests/wms-single-connector-exclusivity.test.ts and the second-connector seam suite, which
+ * register a fictitious `acme-wms`); what is NOT exercised any more is a hand-written group. See
+ * both removal notes' "What is no longer proven".
  *
  * WHY A GROUP TABLE RATHER THAN A THIRD `if`. A third `if` is a rule about the two connectors
  * somebody remembered; this is a rule about the SHAPE of the id space. The WMS group is spread from
@@ -94,11 +102,6 @@ export const INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS: readonly {
   /** Shown to the operator when two members of this group are on at once. */
   readonly conflict: string
 }[] = [
-  {
-    label: 'accounting',
-    ids: ['xero', 'quickbooks'],
-    conflict: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.',
-  },
   {
     label: 'wms',
     // DERIVED. One entry ships today; the point is that the second one is covered the day it is

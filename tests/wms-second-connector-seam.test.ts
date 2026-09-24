@@ -482,7 +482,7 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   // to Mintsoft — the failure mode being a resolver that quietly reads Mintsoft's row for every
   // WMS and links a second warehouse's fulfilments to the wrong storefront.
   const asked: string[] = []
-  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'other-storefront' }
+  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'woocommerce' }
   const port = {
     findConnection: async (connector: string) => {
       asked.push(connector)
@@ -494,10 +494,19 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   assert.equal(await resolveWmsOrderLookupConnector(ACME_WMS_ID, port), 'woocommerce')
   assert.deepEqual(asked, [ACME_WMS_ID], 'the resolver must filter on the connector it was asked about')
 
-  // THE CONTRAST THAT MAKES IT A TEST OF THE FILTER. Two connectors, two different configured
-  // storefronts. A resolver pinned to Mintsoft's row would answer 'other-storefront' above — and would
-  // link the fictitious warehouse's fulfilments to a shop that did not sell the order.
-  assert.equal(await resolveWmsOrderLookupConnector('mintsoft', port), 'other-storefront')
+  // THE CONTRAST, AND WHAT IS LEFT OF IT (o3d-remove-parked-connectors).
+  //
+  // It used to give the two WMS connectors DIFFERENT configured storefronts — 'woocommerce' and
+  // 'shopify' — so a resolver pinned to Mintsoft's row would answer the wrong storefront above and
+  // link the fictitious warehouse's fulfilments to a shop that did not sell the order. Shopify is
+  // archived, so there is only one shopping id left and no two rows can differ by VALUE any more.
+  //
+  // What still distinguishes a parameterised query from a pinned one is the ARGUMENT, and that is
+  // asserted: `asked` records exactly which connector each call filtered on, in order. A resolver
+  // that read Mintsoft's row for every WMS would push 'mintsoft' twice and fail here. That is weaker
+  // than the value contrast — it proves the query is parameterised, not that the answer follows the
+  // parameter — and it is recorded in docs/archive/shopify-connector-removal.md.
+  assert.equal(await resolveWmsOrderLookupConnector('mintsoft', port), 'woocommerce')
   assert.deepEqual(asked, [ACME_WMS_ID, 'mintsoft'])
 })
 

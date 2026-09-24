@@ -134,8 +134,8 @@ Three daily batches the Xero sub-ledger posts each night:
 
 **Connector**
 A plugin that links the IMS to an external system. There are three categories:
-- **Shopping connectors** — WooCommerce. Order intake. (Shopify was removed in 2026-09; see the release notes.)
-- **Accounting connectors** — Xero, QuickBooks. Journal posting.
+- **Shopping connectors** — WooCommerce. Order intake. (Shopify was removed in 2026-09.)
+- **Accounting connectors** — Xero. Journal posting. (QuickBooks Online was removed in 2026-09.)
 - **WMS connectors** — Mintsoft. Outbound warehouse management.
 
 **Webhook**

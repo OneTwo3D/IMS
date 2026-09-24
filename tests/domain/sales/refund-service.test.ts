@@ -28,6 +28,21 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 // A hand-written row would prove the refund handles a shape; driving the rewrite proves the shape
 // is one an ordinary allocation edit actually leaves behind.
 import { resetAllocationAccountingIfStaged } from '@/lib/domain/sales/allocation-service'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+/**
+ * A LEDGER THIS BUILD NO LONGER SERVICES (o3d-remove-parked-connectors).
+ *
+ * Three cases below are about a refund raised while the books are on one ledger against a debit that
+ * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. They
+ * named 'quickbooks', the second REGISTERED connector; it is archived, so the id is no longer in the
+ * union. They are kept rather than deleted, driving the retired id, because that is not a hypothetical
+ * state: `AccountingSyncLog.connector` is a plain String column and development databases hold
+ * `quickbooks` rows right now, so "a debit standing in a ledger this build cannot post to" is exactly
+ * what an operator will meet. Weaker subject than two live ledgers, and recorded as such in
+ * docs/archive/quickbooks-connector-removal.md.
+ */
+const OTHER_LEDGER = 'quickbooks' as unknown as AccountingConnectorId
+
 
 type Order = {
   id: string
@@ -5764,7 +5779,7 @@ test('the A2 record names WHICH LEDGER it was raised against, and a reversal wil
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     accountingSettings,
-    activeAccountingConnector: 'quickbooks',
+    activeAccountingConnector: OTHER_LEDGER,
     ...monetaryFullRefund(),
   })
 
@@ -6112,13 +6127,13 @@ test("Group B's relief raised in ANOTHER LEDGER is not netted against this rever
   // Inventory on xero; this reversal would be raised on quickbooks. Netting them treats a credit in
   // one set of books as if it had happened in another.
   const state = a2StagedWithJournaledShipment()
-  withRecordedA2Journal(state, { status: 'SYNCED', connector: 'quickbooks' })
+  withRecordedA2Journal(state, { status: 'SYNCED', connector: OTHER_LEDGER })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED', connector: 'xero' })
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
     accountingSettings,
-    activeAccountingConnector: 'quickbooks',
+    activeAccountingConnector: OTHER_LEDGER,
     ...monetaryFullRefund(),
   })
 
@@ -8080,7 +8095,7 @@ test('o3d-i0o6 r6: a refund staged against the connector A2 did NOT post on stag
     reason: 'Goodwill full refund',
     creditNotePrefix: 'CN-',
     accountingSettings,
-    activeAccountingConnector: 'quickbooks',
+    activeAccountingConnector: OTHER_LEDGER,
   })
 
   assert.equal(result.success, true)

@@ -105,7 +105,7 @@ test('a row that vanished after the claim THROWS rather than posting the snapsho
  */
 const PROCESSORS = [
   { path: 'lib/connectors/xero/sync-processor.ts', claimSites: 2 },
-  { path: 'lib/connectors/quickbooks/sync-processor.ts', claimSites: 1 },
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
 ]
 
 for (const processor of PROCESSORS) {

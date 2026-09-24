@@ -1,3 +1,4 @@
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { LandedCostMethod, Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
@@ -537,7 +538,7 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
-const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | 'quickbooks' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: AccountingConnectorId | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
   const [baseCurrency, settings, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getAccountingSettings(), getActiveAccountingConnectorInfo()])
   return {
     connector: connectorInfo?.id ?? null,
