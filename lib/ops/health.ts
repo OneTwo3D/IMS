@@ -907,7 +907,7 @@ async function getLatestAccountingBatch(now: Date = new Date()): Promise<LatestO
 }
 
 // b8i6.4: report the latest shopping sync per CONFIGURED connector, not just
-// WooCommerce, so a Shopify-only or dual setup isn't blind. The slot is
+// WooCommerce, so a future second-storefront or dual setup isn't blind. The slot is
 // represented by the most stale configured connector (so a lagging connector
 // surfaces), with a per-connector breakdown in details. (Field/adapter name
 // kept as latestWooCommerceSync for back-compat with rollout-readiness + UI.)

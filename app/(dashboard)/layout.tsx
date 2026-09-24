@@ -31,7 +31,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
         userName={session.user.name ?? ''}
         userEmail={session.user.email ?? ''}
         userPictureUrl={session.user.pictureUrl}
-        shoppingIntegrationEnabled={pluginState.woocommerce || pluginState.shopify}
+        shoppingIntegrationEnabled={pluginState.woocommerce}
         accountingIntegrationEnabled={pluginState.xero || pluginState.quickbooks}
         wmsIntegrationEnabled={isIntegrationModuleVisible('wms', pluginState)}
       >

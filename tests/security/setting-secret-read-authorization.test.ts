@@ -261,13 +261,16 @@ const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
   // place that must import it, and the place that adds the set membership check.
   'lib/settings-store.ts': 'implements maskSettingSecret; adds the SENSITIVE_SETTING_KEYS check',
 
-  // OUT OF SCOPE by owner instruction (Shopify / QuickBooks). Both mask keys that
-  // ARE in SENSITIVE_SETTING_KEYS today (shopify_admin_api_access_token,
-  // shopify_webhook_secret, quickbooks_client_secret), so nothing is currently
-  // drifting — but neither is routed through the gate, so nothing stops the next
-  // key they add from drifting. Not a claim that they are correct; a record that
-  // they were looked at and left alone.
-  'app/actions/shopping-sync.ts': 'OUT OF SCOPE (Shopify) — masks shopify_admin_api_access_token + shopify_webhook_secret, both in the set today, but not via the gate',
+  // OUT OF SCOPE by owner instruction (QuickBooks). It masks a key that IS in
+  // SENSITIVE_SETTING_KEYS today (quickbooks_client_secret), so nothing is currently
+  // drifting — but it is not routed through the gate, so nothing stops the next
+  // key it adds from drifting. Not a claim that it is correct; a record that it
+  // was looked at and left alone.
+  //
+  // o3d-remove-parked-connectors: `app/actions/shopping-sync.ts` was the other entry here, waived
+  // for the same reason. Shopify is archived and that file no longer masks anything, so the waiver
+  // is DELETED rather than left to pass vacuously — the deepEqual below is exhaustive, so a stale
+  // key fails it.
   'app/actions/quickbooks-sync.ts': 'OUT OF SCOPE (QuickBooks) — masks quickbooks_client_secret, in the set today, but not via the gate',
 }
 

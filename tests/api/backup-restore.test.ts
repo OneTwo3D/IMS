@@ -2554,11 +2554,27 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
     'the accounting OAuth callback is the only remaining wholly unfenced inbound webhook',
   )
 
-  // The shopping route is the one that is fenced for ONE connector and not another. Pinned by
+  // The shopping route is fenced by the HANDLER it dispatches to, not by the route file. Pinned by
   // reading the dispatch, because that asymmetry is what the round-11 claim flattened.
+  //
+  // o3d-remove-parked-connectors: this used to assert both halves of the asymmetry — a WooCommerce
+  // arm reaching the fenced handler and a `shopify` arm reaching an unfenced one. Shopify is
+  // archived, so the unfenced half no longer exists and asserting it would just hard-fail. What is
+  // asserted instead is stronger about today's build and keeps the same alarm: the dispatcher has
+  // exactly ONE connector arm and it is the fenced one. A second arm added without its own fence
+  // fails this, which is precisely the condition the classification 'woocommerce-only' warns about.
   const shopping = await readFile(path.join(repo, 'lib', 'shopping.ts'), 'utf8')
-  assert.match(shopping, /case 'woocommerce':[\s\S]{0,200}handleWcWebhook/, 'woocommerce dispatches to the fenced handler')
-  assert.match(shopping, /case 'shopify':[\s\S]{0,200}handleWebhook/, 'shopify does not')
+  const dispatcher = shopping.slice(shopping.indexOf('export async function handleShoppingWebhook'))
+  assert.ok(dispatcher.length > 0, 'handleShoppingWebhook must be findable, or this passes vacuously')
+  assert.match(dispatcher, /case 'woocommerce':[\s\S]{0,200}handleWcWebhook/, 'woocommerce dispatches to the fenced handler')
+  const dispatchArms = [...dispatcher.slice(0, dispatcher.indexOf('isEmptyShoppingWebhookBodyAllowed')).matchAll(/case '([a-z0-9-]+)':/g)].map((m) => m[1])
+  assert.deepEqual(
+    dispatchArms,
+    ['woocommerce'],
+    'every connector arm of handleShoppingWebhook must reach a handler that consults the maintenance '
+      + 'flag; a new arm here means MAINTENANCE_MODE_REACH.inboundWebhooks is describing a route it '
+      + 'no longer fences for every connector it accepts',
+  )
   const wc = await readFile(path.join(repo, 'lib', 'connectors', 'woocommerce', 'webhooks.ts'), 'utf8')
   assert.match(wc, /getMaintenanceModeResponse\('webhook'\)/, 'and the WooCommerce fence is real')
 

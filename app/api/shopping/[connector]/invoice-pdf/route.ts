@@ -9,6 +9,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { readLimitedRequestBody } from '@/lib/security/read-limited-request-body'
 import {
   getShoppingConnector,
+  SHOPPING_CONNECTORS,
   type ShoppingConnectorId,
 } from '@/lib/connectors/shopping-registry'
 import {
@@ -66,8 +67,10 @@ const defaultDependencies: ShoppingInvoicePdfRouteDependencies = {
   checkRateLimit,
 }
 
+// DERIVED FROM THE REGISTRY (o3d-remove-parked-connectors): a second id union here would mean this
+// ingress accepts only the connectors somebody remembered to spell in this file.
 function isShoppingConnectorId(value: string): value is ShoppingConnectorId {
-  return value === 'woocommerce' || value === 'shopify'
+  return SHOPPING_CONNECTORS.some((connector) => connector.id === value)
 }
 
 function jsonNoStore(body: object, status: number): NextResponse {

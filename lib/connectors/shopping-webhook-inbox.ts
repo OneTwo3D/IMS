@@ -7,9 +7,17 @@ import { parsePositiveIntegerEnv } from '@/lib/env'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
 export const WOOCOMMERCE_CONNECTOR = 'woocommerce' as const
-const SHOPIFY_CONNECTOR = 'shopify' as const
 
-export type ShoppingWebhookEventConnector = typeof WOOCOMMERCE_CONNECTOR | typeof SHOPIFY_CONNECTOR
+/**
+ * ONE MEMBER TODAY (o3d-remove-parked-connectors). Shopify was the second and is archived (see
+ * docs/archive/shopify-connector-removal.md). The generic `persistShoppingWebhookEvent` below still
+ * takes the connector as a parameter rather than assuming WooCommerce, so a second connector adds a
+ * member here and a thin wrapper beside `persistWcWebhookEvent` — nothing in the persist path itself
+ * changes. Note that this union names the values stored in `shopping_webhook_events.connector`, and
+ * rows written by the archived connector may still exist in a development database; the column is a
+ * plain `String`, so nothing here refuses to READ them (see the note's "Data left behind").
+ */
+export type ShoppingWebhookEventConnector = typeof WOOCOMMERCE_CONNECTOR
 
 export const WC_WEBHOOK_EVENT_STATUS = {
   pending: 'PENDING',
@@ -355,17 +363,6 @@ export async function persistWcWebhookEvent(
   return persistShoppingWebhookEvent(repository, input, {
     ...options,
     connector: WOOCOMMERCE_CONNECTOR,
-  })
-}
-
-export async function persistShopifyWebhookEvent(
-  repository: ShoppingWebhookEventRepository,
-  input: PersistShoppingWebhookEventInput,
-  options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
-): Promise<PersistShoppingWebhookEventResult> {
-  return persistShoppingWebhookEvent(repository, input, {
-    ...options,
-    connector: SHOPIFY_CONNECTOR,
   })
 }
 

@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import {
   BookOpen, Calculator, CalendarClock, Check, ExternalLink,
-  Loader2, ShoppingCart, Store,
+  Loader2, ShoppingCart,
 } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
@@ -13,7 +13,7 @@ import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
-import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
+import { saveShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import { connectAccountingConnector, saveAccountingConnectionSettings } from '@/app/actions/accounting-sync'
 import { saveOnboardingPluginState } from '@/app/actions/onboarding'
 import {
@@ -24,7 +24,7 @@ import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { isIntegrationsStepReady } from '@/lib/domain/onboarding/integrations-step-readiness'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
-import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
+import type { ShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorId, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
 import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
@@ -32,7 +32,6 @@ import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 type Props = {
   pluginState: IntegrationPluginState
   wcCredentials: ShoppingConnectorCredentials
-  shopifyCredentials: ShopifyConnectorCredentials
   accountingSettings: AccountingConnectorSettingsMasked
   accountingStatus: AccountingConnectionStatus
   wmsConnection: WmsOnboardingConnectionData
@@ -40,7 +39,6 @@ type Props = {
   onPluginStateChange: (state: IntegrationPluginState) => void
   onConnectionStateChange: (state: {
     wc?: boolean
-    shopify?: boolean
     accounting?: boolean
     wms?: boolean
   }) => void
@@ -50,7 +48,6 @@ type Props = {
 export function IntegrationsStep({
   pluginState: initialPluginState,
   wcCredentials: initialWcCreds,
-  shopifyCredentials: initialShopifyCreds,
   accountingSettings: initialAccountingSettings,
   accountingStatus: initialAccountingStatus,
   wmsConnection,
@@ -84,7 +81,6 @@ export function IntegrationsStep({
   const [schedulerWarning, setSchedulerWarning] = useState('')
   const [savingPlugins, setSavingPlugins] = useState(false)
   const [savingWc, setSavingWc] = useState(false)
-  const [savingShopify, setSavingShopify] = useState(false)
   const [wmsBusy, setWmsBusy] = useState(false)
   const [wmsConnected, setWmsConnected] = useState(wmsConnection.configured)
   const [savingAccountingConnection, setSavingAccountingConnection] = useState(false)
@@ -97,12 +93,6 @@ export function IntegrationsStep({
   const [wcSaved, setWcSaved] = useState(false)
   const [wcMessage, setWcMessage] = useState('')
 
-  // Shopify credentials
-  const [shopifyDomain, setShopifyDomain] = useState(initialShopifyCreds.storeDomain)
-  const [shopifyToken, setShopifyToken] = useState(initialShopifyCreds.accessTokenMasked ? '' : initialShopifyCreds.adminApiAccessToken)
-  const [shopifyWebhookSecret, setShopifyWebhookSecret] = useState(initialShopifyCreds.webhookSecretMasked ? '' : initialShopifyCreds.webhookSecret)
-  const [shopifySaved, setShopifySaved] = useState(false)
-  const [shopifyMessage, setShopifyMessage] = useState('')
 
   // Accounting credentials
   const [acClientId, setAcClientId] = useState(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
@@ -124,12 +114,6 @@ export function IntegrationsStep({
     setWcKey(initialWcCreds.key)
     setWcSecret(initialWcCreds.secretMasked ? '' : initialWcCreds.secret)
   }, [initialWcCreds])
-
-  useEffect(() => {
-    setShopifyDomain(initialShopifyCreds.storeDomain)
-    setShopifyToken(initialShopifyCreds.accessTokenMasked ? '' : initialShopifyCreds.adminApiAccessToken)
-    setShopifyWebhookSecret(initialShopifyCreds.webhookSecretMasked ? '' : initialShopifyCreds.webhookSecret)
-  }, [initialShopifyCreds])
 
   useEffect(() => {
     setWmsConnected(wmsConnection.configured)
@@ -179,7 +163,6 @@ export function IntegrationsStep({
       setSavingAccountingConnection(false)
       setSavingPlugins(false)
       setSavingWc(false)
-      setSavingShopify(false)
       setWmsBusy(false)
     }
 
@@ -189,8 +172,6 @@ export function IntegrationsStep({
 
   function buildNextPlugins(current: IntegrationPluginState, key: keyof IntegrationPluginState, value: boolean): IntegrationPluginState {
     const next = { ...current, [key]: value }
-    if (key === 'woocommerce' && value) next.shopify = false
-    if (key === 'shopify' && value) next.woocommerce = false
     if (key === 'xero' && value) next.quickbooks = false
     if (key === 'quickbooks' && value) next.xero = false
     return next
@@ -228,7 +209,7 @@ export function IntegrationsStep({
   }
 
   function togglePlugin(key: keyof IntegrationPluginState, value: boolean) {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
     const previousPlugins = plugins
     const nextPlugins = buildNextPlugins(previousPlugins, key, value)
     setError('')
@@ -261,7 +242,7 @@ export function IntegrationsStep({
   }
 
   function handleSaveWcCredentials() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
     setError('')
     setWcSaved(false)
     setWcMessage('')
@@ -286,34 +267,8 @@ export function IntegrationsStep({
     })()
   }
 
-  function handleSaveShopifyCredentials() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
-    setError('')
-    setShopifySaved(false)
-    setShopifyMessage('')
-    setSavingShopify(true)
-    void (async () => {
-      try {
-        const result = await withStepUp(() => saveShopifyConnectorCredentials(shopifyDomain, shopifyToken, shopifyWebhookSecret))
-        if (!result.success) {
-          setError(result.error ?? 'Failed to save Shopify credentials')
-          return
-        }
-        setShopifySaved(true)
-        setShopifyMessage(result.message ?? 'Connection verified and saved.')
-        onConnectionStateChange({ shopify: true })
-        router.refresh()
-        setTimeout(() => setShopifySaved(false), 2000)
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to save Shopify credentials')
-      } finally {
-        setSavingShopify(false)
-      }
-    })()
-  }
-
   function handleSaveAccountingConnection() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
     const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
     const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
     setError('')
@@ -340,7 +295,7 @@ export function IntegrationsStep({
   }
 
   function handleConnectAccounting() {
-    if (savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting) return
+    if (savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting) return
     const selectedAccountingConnector: AccountingConnectorId = plugins.quickbooks ? 'quickbooks' : 'xero'
     const selectedAccountingLabel = selectedAccountingConnector === 'quickbooks' ? 'QuickBooks' : 'Xero'
     setError('')
@@ -370,23 +325,20 @@ export function IntegrationsStep({
     })()
   }
 
-  const hasShoppingConnector = plugins.woocommerce || plugins.shopify
+  const hasShoppingConnector = plugins.woocommerce
   const hasAccountingConnector = plugins.xero || plugins.quickbooks
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
   const accountingLabel = plugins.quickbooks ? 'QuickBooks' : 'Xero'
   const hasPublicAppUrl = Boolean(publicAppUrlInfo.value)
   const hasSavedAccountingSecret = initialAccountingSettings.secretMasked
   const hasAccountingSecret = Boolean(acClientSecret.trim()) || hasSavedAccountingSecret
-  const busy = savingPlugins || savingWc || savingShopify || wmsBusy || savingAccountingConnection || connectingAccounting
+  const busy = savingPlugins || savingWc || wmsBusy || savingAccountingConnection || connectingAccounting
   const availableWmsOrderLookupConnectors = [
     plugins.woocommerce ? 'woocommerce' : null,
-    plugins.shopify ? 'shopify' : null,
-  ].filter((value): value is 'woocommerce' | 'shopify' => value !== null)
+  ].filter((value): value is 'woocommerce' => value !== null)
   const wcConnected = wcSaved || (!!initialWcCreds.url && !!initialWcCreds.key && initialWcCreds.secretMasked)
-  const shopifyConnected = shopifySaved || (!!initialShopifyCreds.storeDomain && initialShopifyCreds.accessTokenMasked)
   const accountingConnected = accountingConnectedLocal || initialAccountingStatus.connected
   const wcConnectedLabel = wcUrl.trim() || initialWcCreds.url || 'WooCommerce store'
-  const shopifyConnectedLabel = shopifyDomain.trim() || initialShopifyCreds.storeDomain || 'Shopify store'
   const accountingConnectedLabel = initialAccountingStatus.tenantName || accountingLabel
 
   useEffect(() => {
@@ -396,7 +348,6 @@ export function IntegrationsStep({
     // into a wizard that could not be completed at all.
     onReadyChange(isIntegrationsStepReady(plugins, {
       woocommerce: wcConnected,
-      shopify: shopifyConnected,
       accounting: accountingConnected,
       wms: wmsConnected,
     }))
@@ -406,7 +357,6 @@ export function IntegrationsStep({
     wmsEnabled,
     onReadyChange,
     plugins,
-    shopifyConnected,
     wcConnected,
   ])
 
@@ -483,60 +433,6 @@ export function IntegrationsStep({
                 {wcSaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
               </Button>
               {wcMessage ? <span className="text-xs text-muted-foreground">{wcMessage}</span> : null}
-            </div>
-          </Card>
-        )}
-
-        <label className="flex items-start gap-3 cursor-pointer rounded-lg border p-3 hover:bg-muted/50 transition-colors">
-          <Switch checked={plugins.shopify} onCheckedChange={(v) => togglePlugin('shopify', v)} className="mt-0.5" disabled={busy} />
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <Store className="h-4 w-4 text-green-600" />
-              <span className="text-sm font-medium">Shopify</span>
-            </div>
-            <p className="text-xs text-muted-foreground mt-0.5">Sync orders and products from your Shopify store</p>
-          </div>
-        </label>
-        {plugins.shopify && (
-          <Card className="p-4 space-y-4">
-            {shopifyConnected ? (
-              <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 p-3 text-sm text-green-800">
-                <Check className="h-4 w-4" />
-                Connected to <strong>{shopifyConnectedLabel}</strong>
-              </div>
-            ) : null}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="space-y-1.5">
-                <Label className="text-xs">Store Domain</Label>
-                <Input value={shopifyDomain} onChange={(e) => setShopifyDomain(e.target.value)} placeholder="mystore.myshopify.com" className="h-9" />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs">Admin API Access Token</Label>
-                <Input
-                  type="password"
-                  value={shopifyToken}
-                  onChange={(e) => setShopifyToken(e.target.value)}
-                  placeholder={initialShopifyCreds.accessTokenMasked ? '••••••••' : 'shpat_...'}
-                  className="h-9"
-                />
-              </div>
-              <div className="space-y-1.5 sm:col-span-2">
-                <Label className="text-xs">Webhook Secret</Label>
-                <Input
-                  type="password"
-                  value={shopifyWebhookSecret}
-                  onChange={(e) => setShopifyWebhookSecret(e.target.value)}
-                  placeholder={initialShopifyCreds.webhookSecretMasked ? '••••••••' : 'whsec_...'}
-                  className="h-9"
-                />
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-3">
-              <Button type="button" onClick={handleSaveShopifyCredentials} disabled={busy} size="sm">
-                {savingShopify ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-                {shopifySaved ? <><Check className="h-4 w-4 mr-1" />Verified</> : 'Save & Test Connection'}
-              </Button>
-              {shopifyMessage ? <span className="text-xs text-muted-foreground">{shopifyMessage}</span> : null}
             </div>
           </Card>
         )}

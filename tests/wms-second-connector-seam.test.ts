@@ -482,7 +482,7 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   // to Mintsoft — the failure mode being a resolver that quietly reads Mintsoft's row for every
   // WMS and links a second warehouse's fulfilments to the wrong storefront.
   const asked: string[] = []
-  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'shopify' }
+  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'other-storefront' }
   const port = {
     findConnection: async (connector: string) => {
       asked.push(connector)
@@ -495,9 +495,9 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   assert.deepEqual(asked, [ACME_WMS_ID], 'the resolver must filter on the connector it was asked about')
 
   // THE CONTRAST THAT MAKES IT A TEST OF THE FILTER. Two connectors, two different configured
-  // storefronts. A resolver pinned to Mintsoft's row would answer 'shopify' above — and would
+  // storefronts. A resolver pinned to Mintsoft's row would answer 'other-storefront' above — and would
   // link the fictitious warehouse's fulfilments to a shop that did not sell the order.
-  assert.equal(await resolveWmsOrderLookupConnector('mintsoft', port), 'shopify')
+  assert.equal(await resolveWmsOrderLookupConnector('mintsoft', port), 'other-storefront')
   assert.deepEqual(asked, [ACME_WMS_ID, 'mintsoft'])
 })
 

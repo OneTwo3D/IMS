@@ -7,13 +7,21 @@
  * each connector's order import code read its own prefix keys in a uniform
  * way, without hardcoding WooCommerce assumptions.
  *
- * Add a new entry here when a new shopping connector lands (e.g. Shopify,
- * BigCommerce). No changes required to the Numbering UI — it reads this list.
+ * Add a new entry here when a new shopping connector lands (e.g. BigCommerce).
+ * No changes required to the Numbering UI — it reads this list.
+ *
+ * ONE ENTRY TODAY (o3d-remove-parked-connectors). Shopify was the second entry and was archived —
+ * see archive/connectors/README.md and docs/archive/shopify-connector-removal.md. The list, the id
+ * union, the parser and the prefix reader are all still driven by the list rather than by a
+ * WooCommerce literal, so a second entry needs no edit here beyond the entry itself. What a union of
+ * one costs is stated in that note: `tests/connectors/shopping-contract.test.ts` can still hand a
+ * fictitious id to the generic helpers, but nothing routes a second id through the thirteen
+ * dispatches in lib/shopping.ts, because no second id exists.
  */
 
 import { db } from '@/lib/db'
 
-export type ShoppingConnectorId = 'woocommerce' | 'shopify'
+export type ShoppingConnectorId = 'woocommerce'
 
 export type ShoppingConnectorDef = {
   id: ShoppingConnectorId
@@ -44,15 +52,6 @@ export const SHOPPING_CONNECTORS: readonly ShoppingConnectorDef[] = [
     available: true,
     legacyOrderKeys: ['wc_order_prefix', 'order_number_prefix'],
     legacyInvKeys: ['wc_inv_prefix', 'wc_invoice_prefix'],
-  },
-  {
-    id: 'shopify',
-    label: 'Shopify',
-    orderKey: 'shopify_order_prefix',
-    invKey: 'shopify_inv_prefix',
-    defaultOrder: '',
-    defaultInv: 'INSH-',
-    available: true,
   },
 ] as const
 

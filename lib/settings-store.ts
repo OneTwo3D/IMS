@@ -14,9 +14,6 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_password: 'MINTSOFT_PASSWORD',
   mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
-  shopify_admin_api_access_token: 'SHOPIFY_ADMIN_API_ACCESS_TOKEN',
-  shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
-  shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
@@ -89,9 +86,6 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'mintsoft_username',
   'mintsoft_webhook_secret',
   'quickbooks_client_secret',
-  'shopify_admin_api_access_token',
-  'shopify_invoice_pdf_secret',
-  'shopify_webhook_secret',
   'trackship_api_key',
   // o3d-512h: the WooCommerce consumer KEY, not only the secret. getWcCredentials
   // has always masked it before returning it to the client (app/actions/wc-sync.ts),

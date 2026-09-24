@@ -25,8 +25,6 @@ import type { IntegrationPluginState } from '@/lib/integration-plugin-keys'
 export type IntegrationsStepConnections = {
   /** The WooCommerce store's credentials are saved. */
   woocommerce: boolean
-  /** The Shopify store's credentials are saved. */
-  shopify: boolean
   /** The selected accounting connector has a live connection. */
   accounting: boolean
   /** The active WMS connector's connection is set up — `WmsOnboardingConnectionData.configured`. */
@@ -39,10 +37,9 @@ export function isIntegrationsStepReady(
 ): boolean {
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
   // At least one connector has to be chosen: an all-off step is not "ready", it is skipped.
-  const anyChosen = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled
+  const anyChosen = plugins.woocommerce || plugins.xero || plugins.quickbooks || wmsEnabled
   return anyChosen
     && (plugins.woocommerce ? connected.woocommerce : true)
-    && (plugins.shopify ? connected.shopify : true)
     && ((plugins.xero || plugins.quickbooks) ? connected.accounting : true)
     && (wmsEnabled ? connected.wms : true)
 }

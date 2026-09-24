@@ -31,11 +31,14 @@
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from './connectors/wms/types'
 
 /**
- * The plugins that are not WMS connectors: one shopping pair and one accounting pair, each
- * mutually exclusive. These are enumerated because there is no registry to derive them from —
- * unlike the WMS connectors, which have one.
+ * The plugins that are not WMS connectors: one shopping connector and one accounting pair. These are
+ * enumerated because there is no registry to derive them from — unlike the WMS connectors, which
+ * have one.
+ *
+ * o3d-remove-parked-connectors: `shopify` was here and is archived (see
+ * docs/archive/shopify-connector-removal.md). Its exclusivity group went with it — see below.
  */
-export const NON_WMS_INTEGRATION_PLUGIN_IDS = ['woocommerce', 'shopify', 'xero', 'quickbooks'] as const
+export const NON_WMS_INTEGRATION_PLUGIN_IDS = ['woocommerce', 'xero', 'quickbooks'] as const
 
 export type NonWmsIntegrationPluginId = (typeof NON_WMS_INTEGRATION_PLUGIN_IDS)[number]
 
@@ -58,6 +61,13 @@ export const INTEGRATION_PLUGIN_IDS: readonly IntegrationPluginId[] = [
  * keep going to Mintsoft, because production routing resolved the active connector with
  * `WMS_CONNECTOR_IDS.find(...)` — first enabled wins. The operator is told the thing they asked for
  * happened. It did not.
+ *
+ * WHY THE `shopping` GROUP IS GONE RATHER THAN LEFT WITH ONE MEMBER (o3d-remove-parked-connectors).
+ * Shopify was WooCommerce's only partner in that group. A one-member group can never conflict, so it
+ * reads as an enforced rule and enforces nothing — the same failure mode as a guard nobody has
+ * watched fail. It is deleted; a second storefront restores it in the same commit that registers
+ * itself. `findIntegrationPluginExclusivityConflict` is unchanged and total over whatever groups
+ * exist, so restoring the entry is the whole edit.
  *
  * WHY A GROUP TABLE RATHER THAN A THIRD `if`. A third `if` is a rule about the two connectors
  * somebody remembered; this is a rule about the SHAPE of the id space. The WMS group is spread from
@@ -84,11 +94,6 @@ export const INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS: readonly {
   /** Shown to the operator when two members of this group are on at once. */
   readonly conflict: string
 }[] = [
-  {
-    label: 'shopping',
-    ids: ['woocommerce', 'shopify'],
-    conflict: 'Enable either WooCommerce or Shopify, not both.',
-  },
   {
     label: 'accounting',
     ids: ['xero', 'quickbooks'],
@@ -143,10 +148,11 @@ export type IntegrationPluginState = Record<IntegrationPluginId, boolean>
 /**
  * Every plugin key, sorted — THE canonical order these rows are locked in.
  *
- * ALL of them, not just the two accounting ones. Exclusivity spans WooCommerce/Shopify as well as
- * Xero/QuickBooks, so locking only the accounting pair would leave the commerce pair with exactly
- * the race the lock exists to close. One order for one lock set is also what stops two callers
- * taking the same rows in opposite orders and deadlocking.
+ * ALL of them, not just the ones that are currently in an exclusivity group. The lock set is derived
+ * from the id list and not from the groups on purpose: a connector that joins a group later must
+ * already have been locked in the same order by every earlier caller, or the commit that adds the
+ * group introduces exactly the race the lock exists to close. One order for one lock set is also
+ * what stops two callers taking the same rows in opposite orders and deadlocking.
  */
 export const INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER: readonly string[] = INTEGRATION_PLUGIN_IDS
   .map((id) => INTEGRATION_PLUGIN_SETTING_KEYS[id])

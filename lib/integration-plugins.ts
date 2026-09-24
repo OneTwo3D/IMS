@@ -42,8 +42,8 @@ export function isIntegrationModuleVisible(
   if (module === 'accounting') return state.xero || state.quickbooks
   if (module === 'wms') return WMS_CONNECTOR_IDS.some((id) => state[id])
 
-  // A per-connector module string (e.g. 'woocommerce', 'shopify', or any WMS
-  // connector id such as 'mintsoft') maps to that plugin's own enabled flag.
+  // A per-connector module string (e.g. 'woocommerce', or any WMS connector id
+  // such as 'mintsoft') maps to that plugin's own enabled flag.
   if (module in state) return state[module as IntegrationPluginId]
 
   return true

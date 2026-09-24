@@ -26,7 +26,7 @@ import type { TaxRateRow } from '@/app/actions/settings'
 import type { WarehouseRow } from '@/app/actions/settings'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
-import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
+import type { ShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
 import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import type { EmailSettings } from '@/app/actions/company'
@@ -59,7 +59,6 @@ type Props = {
   pluginState: IntegrationPluginState
   productCount: number
   wcCredentials: ShoppingConnectorCredentials
-  shopifyCredentials: ShopifyConnectorCredentials
   accountingSettings: AccountingConnectorSettingsMasked
   accountingStatus: AccountingConnectionStatus
   wmsConnection: WmsOnboardingConnectionData
@@ -82,7 +81,6 @@ export function OnboardingClient({
   pluginState: initialPluginState,
   productCount,
   wcCredentials,
-  shopifyCredentials,
   accountingSettings,
   accountingStatus,
   wmsConnection,
@@ -108,12 +106,10 @@ export function OnboardingClient({
   const [integrationsReadyOverride, setIntegrationsReadyOverride] = useState<boolean | null>(null)
   const [integrationConnectedOverride, setIntegrationConnectedOverride] = useState<{
     wc: boolean | null
-    shopify: boolean | null
     accounting: boolean | null
     wms: boolean | null
   }>({
     wc: null,
-    shopify: null,
     accounting: null,
     wms: null,
   })
@@ -143,12 +139,11 @@ export function OnboardingClient({
   }
 
   const wcConnected = integrationConnectedOverride.wc ?? (!!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked)
-  const shopifyConnected = integrationConnectedOverride.shopify ?? (!!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked)
   const accountingConnected = integrationConnectedOverride.accounting ?? accountingStatus.connected
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
   const wmsConnected = integrationConnectedOverride.wms ?? wmsConnection.configured
   const hasTaxRates = taxRates.some((rate) => rate.active)
-  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled
+  const anyIntegrationsEnabled = plugins.woocommerce || plugins.xero || plugins.quickbooks || wmsEnabled
   const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {
@@ -160,7 +155,6 @@ export function OnboardingClient({
       if (integrationsReadyOverride != null) return integrationsReadyOverride
       if (!anyIntegrationsEnabled) return false
       if (plugins.woocommerce && !wcConnected) return false
-      if (plugins.shopify && !shopifyConnected) return false
       if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
       if (wmsEnabled && !wmsConnected) return false
       return true
@@ -229,13 +223,11 @@ export function OnboardingClient({
 
   const handleIntegrationConnectionStateChange = useCallback((updates: {
     wc?: boolean
-    shopify?: boolean
     accounting?: boolean
     wms?: boolean
   }) => {
     setIntegrationConnectedOverride((prev) => ({
       wc: updates.wc ?? prev.wc,
-      shopify: updates.shopify ?? prev.shopify,
       accounting: updates.accounting ?? prev.accounting,
       wms: updates.wms ?? prev.wms,
     }))
@@ -268,7 +260,7 @@ export function OnboardingClient({
     router.push('/dashboard')
   }
 
-  const shoppingEnabled = plugins.woocommerce || plugins.shopify
+  const shoppingEnabled = plugins.woocommerce
   const accountingEnabled = plugins.xero || plugins.quickbooks
 
   return (
@@ -371,7 +363,6 @@ export function OnboardingClient({
               <IntegrationsStep
                 pluginState={plugins}
                 wcCredentials={wcCredentials}
-                shopifyCredentials={shopifyCredentials}
                 accountingSettings={accountingSettings}
                 accountingStatus={accountingStatus}
                 wmsConnection={wmsConnection}
@@ -402,8 +393,6 @@ export function OnboardingClient({
                 shoppingConnectorEnabled={shoppingEnabled}
                 wcEnabled={plugins.woocommerce}
                 wcConnected={wcConnected}
-                shopifyEnabled={plugins.shopify}
-                shopifyConnected={shopifyConnected}
                 productCount={productCount}
                 onImported={() => setProductsImported(true)}
               />

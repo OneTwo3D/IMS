@@ -40,7 +40,6 @@ const ACME_SETTING_KEY = `plugin_${ACME_WMS_ID}_enabled`
 
 const SHIPPED_KEYS = [
   'plugin_woocommerce_enabled',
-  'plugin_shopify_enabled',
   'plugin_xero_enabled',
   'plugin_quickbooks_enabled',
   'plugin_mintsoft_enabled',
@@ -314,7 +313,7 @@ test('seam/plugin-state: toggling that switch and pressing Save SENDS the connec
   )
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ['acme-wms', 'mintsoft', 'quickbooks', 'shopify', 'woocommerce', 'xero'],
+    ['acme-wms', 'mintsoft', 'quickbooks', 'woocommerce', 'xero'],
     'the WHOLE selection is sent, over every registered plugin',
   )
 })

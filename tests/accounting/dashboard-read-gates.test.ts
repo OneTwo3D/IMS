@@ -102,11 +102,11 @@ mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => state.plugins[id] === true,
     getIntegrationPluginState: async () => ({
-      woocommerce: false, shopify: false, xero: false, quickbooks: false, mintsoft: false,
+      woocommerce: false, xero: false, quickbooks: false, mintsoft: false,
       ...state.plugins,
     }),
     INTEGRATION_PLUGIN_SETTING_KEYS: {
-      woocommerce: 'plugin_woocommerce_enabled', shopify: 'plugin_shopify_enabled',
+      woocommerce: 'plugin_woocommerce_enabled',
       xero: 'plugin_xero_enabled', quickbooks: 'plugin_quickbooks_enabled',
       mintsoft: 'plugin_mintsoft_enabled',
     },
@@ -144,9 +144,6 @@ async function dashboardReads(): Promise<Array<[string, () => Promise<unknown>]>
     ['getShoppingStatusMappings', () => shopping.getShoppingStatusMappings()],
     ['getShoppingSyncLogs', () => shopping.getShoppingSyncLogs(100)],
     ['getShoppingConnectorCredentials', () => shopping.getShoppingConnectorCredentials()],
-    ['getShopifySyncSettings', () => shopping.getShopifySyncSettings()],
-    ['getShopifyConnectorCredentials', () => shopping.getShopifyConnectorCredentials()],
-    ['getShopifySyncLogs', () => shopping.getShopifySyncLogs(100)],
     ['getTaxRates', () => settings.getTaxRates()],
     ['getAccountingSettingsMasked', () => accounting.getAccountingSettingsMasked()],
     ['getAccountingConnectionStatus', () => accounting.getAccountingConnectionStatus()],

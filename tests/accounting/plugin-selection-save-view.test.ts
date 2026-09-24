@@ -34,7 +34,6 @@ import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outco
 function pluginState(over: Partial<IntegrationPluginState> = {}): IntegrationPluginState {
   return {
     woocommerce: false,
-    shopify: false,
     xero: false,
     quickbooks: false,
     mintsoft: false,

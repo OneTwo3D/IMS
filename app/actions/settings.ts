@@ -1196,7 +1196,7 @@ export async function saveIntegrationPluginState(
   // requests then both observed both connectors disabled, one enabled Xero and the other
   // QuickBooks, their writes serialized, and the result was BOTH ENABLED — an invalid state that
   // no later validation ever revisits and that getActiveConnector silently resolves Xero-first, so
-  // nothing ever complains. WooCommerce/Shopify had the identical race.
+  // nothing ever complains. The shopping pair had the identical race before Shopify was archived.
   //
   // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
   // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state

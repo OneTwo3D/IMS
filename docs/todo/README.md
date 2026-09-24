@@ -14,7 +14,7 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 
 ### Connector boundary + new connectors
 
-- [`shopify-connector-followup-plan.md`](shopify-connector-followup-plan.md) — shared work after the connector-owned Shopify implementation. **Open: sync-job cron entrypoints, fulfillment creation, location mapping.**
+- ~~`shopify-connector-followup-plan.md`~~ — **CLOSED, not done.** The Shopify connector was archived (o3d-remove-parked-connectors); the plan moved to `archive/connectors/shopify/docs/todo/` with the code. See [`../archive/shopify-connector-removal.md`](../archive/shopify-connector-removal.md).
 - [`mintsoft-wms-connector-plan.md`](mintsoft-wms-connector-plan.md) — architectural design for the Mintsoft warehouse connector. **Partial: Phases 1–4 shipped; 2b/5/6/7 outstanding.**
 - [`mintsoft-wms-connector-implementation-plan.md`](mintsoft-wms-connector-implementation-plan.md) — concrete file-by-file build plan for the Mintsoft connector. **Partial: Phases 1–3 in prod; ALIGN_TO_WMS, ASN/booked-in, returns inbox outstanding.**
 - [`WC-followup-plan.md`](WC-followup-plan.md) — WooCommerce work remaining after the webhook-first shift. **Phases 1–4 closed; Phase 5 (sweep `wc_*` bindings behind generic selectors) open.**

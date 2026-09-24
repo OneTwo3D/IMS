@@ -54,7 +54,7 @@
 | `app/api/` | API Route Handlers — PDF generation, CSV export, cron endpoints, file uploads, webhooks |
 | `components/` | React components organised by module (auth, inventory, layout, profile, settings, ui) |
 | `lib/` | Shared utilities — database client, PDF generation, email templates, CSV handling, activity logging |
-| `lib/connectors/` | External system connectors behind connector-agnostic boundaries — shopping (WooCommerce, Shopify), accounting (Xero, QuickBooks), and WMS/3PL (Mintsoft). The WMS boundary is contract-enforced; see [`wms-connector-boundary.md`](./wms-connector-boundary.md) |
+| `lib/connectors/` | External system connectors behind connector-agnostic boundaries — shopping (WooCommerce), accounting (Xero, QuickBooks), and WMS/3PL (Mintsoft). The WMS boundary is contract-enforced; see [`wms-connector-boundary.md`](./wms-connector-boundary.md). Archived connectors live under `archive/connectors/` and are excluded from the build; see [`archive/connectors/README.md`](../archive/connectors/README.md) |
 | `lib/connectors/woocommerce/` | WooCommerce connector module — order import, status sync, refund sync, product sync, stock sync |
 | `lib/connectors/wms/` | Connector-agnostic WMS contract + registry; `lib/connectors/mintsoft/` is the first implementation (stock sync, ASN, returns, order dispatch push) |
 | `prisma/` | Database schema, migrations, and seed data |
@@ -474,6 +474,5 @@ The `/sync` page provides a unified view of all connectors:
 
 - **WooCommerce** — connection settings, order/product/stock sync config, tax mapping, status mapping, sync log
 - **Xero** — OAuth connection, account mapping, transaction type toggles, sub-ledger settings, payment method mapping, sync log
-- **Shopify** — tile shown (coming soon)
 - **QuickBooks** — tile shown (coming soon)
 - **REST API** — tile with endpoint documentation
