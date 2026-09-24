@@ -424,7 +424,7 @@ const db: Record<string, unknown> = {
 // o3d-bhvu round 2: THE HTTP BOUNDARY ITSELF IS STUBBED TOO. This test drives the ASN creators, and the
 // review found that after a rename its connector-namespace stub no longer covered the listing the creators
 // call, so the real reader ran. Any request that gets past the namespace stubs lands here and fails; the
-// suite-wide trap (tests/no-outbound-network.ts) would also refuse the connection.
+// suite-wide trap (tests/no-outbound-network.cjs) would also refuse the connection.
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
     ...(realConnectorFetchNs as unknown as Record<string, unknown>),

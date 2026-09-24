@@ -56,15 +56,27 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
-**No test may reach the network (o3d-bhvu).** `test:unit` and `test:concurrency` both load
-`tests/no-outbound-network.ts` with `--import`. It wraps `net.Socket.prototype.connect` and refuses any
-connection to a non-loopback address — a routable IP literal, or a name that resolves to one — with
-`OutboundNetworkBlockedError`, before anything is sent. Loopback and unix sockets (the local Postgres, a
-test's own `http.createServer`) are allowed. Names are resolved through the caller's own `lookup` first,
-so `connectorFetch`'s SSRF refusals still surface as themselves. A test that drives a connector must mock
+**No test may reach the network (o3d-bhvu).** `test:unit`, `test:concurrency` and `test:db` all load
+`tests/no-outbound-network.cjs` with `--import`. A test that drives a connector must mock
 `@/lib/security/connector-fetch` (or the connector's API functions) rather than rely on the trap, which is
 the backstop against a missing stub hitting a LIVE API such as Mintsoft. A focused run started with plain
-`npx tsx --test` does NOT load the trap; add `--import ./tests/no-outbound-network.ts` to get it.
+`npx tsx --test` does NOT load the trap; add `--import ./tests/no-outbound-network.cjs` to get it.
+
+The trap is a per-process patch, so what it covers is worth stating exactly rather than as "no test may
+reach the network" (round 3, review M-a — a worker thread, a spawned `node` and a spawned `curl` all
+reached a listener on this machine's own routable address while that sentence was in this file):
+
+| | |
+| --- | --- |
+| **this process** | `net.Socket.prototype.connect` is wrapped, which is where every TCP/TLS client in Node ends up — `http`/`https` (so `connectorFetch`), `fetch` (undici), `tls`, `http2`, WebSocket, database drivers. A non-loopback IP literal is refused with `OutboundNetworkBlockedError` before anything is sent; a NAME — including `localhost` and `*.localhost` — is resolved first, through the caller's own `lookup` where it has one so `connectorFetch`'s SSRF refusals still surface as themselves, and refused if it resolves to a non-loopback address. Loopback and unix sockets (the local Postgres, a test's own `http.createServer`) are allowed. |
+| **a Node child process** | covered. `--require <the trap>` is appended to `process.env.NODE_OPTIONS`, and `node:child_process` is wrapped so a child launched with a replacement environment (`{ PATH: … }`) or with `NODE_OPTIONS` cleared gets it back at the spawn boundary. |
+| **a worker thread** | covered, by `--require` in the worker's `execArgv`. A worker is a fresh realm with its own `net`; `--import` and `NODE_OPTIONS` install nothing there (measured on Node 22.23). This is why the trap is CommonJS: `--require` cannot load ESM before Node 22.12, and a `.ts` trap would need `tsx` resolvable in every child. |
+| **NOT covered: a worker started from a true-ESM module that destructures the constructor** | a `.mjs` doing `import { Worker } from 'node:worker_threads'` under `tsx`. A builtin's ESM facade snapshots its named exports when first imported, and `tsx` imports `node:worker_threads` for its own hook thread before any `--import` preload — so that snapshot is the unguarded constructor. Every test here is TypeScript transpiled to CommonJS, so the suite reads the patched module property (the worker test asserts that by marker), and `node:child_process` has no facade yet when the trap loads, so its named imports ARE patched (both measured). A `.mjs` that wants a guarded worker passes `execArgv: ['--require', './tests/no-outbound-network.cjs']` itself. |
+| **a child that is a known network client** | `curl`, `wget`, `nc`, `telnet`, `ssh`, `rsync` and similar, and `git fetch`/`pull`/`push`/`clone`/`ls-remote`, are refused at the spawn boundary — nothing can be installed inside a binary that is not Node. |
+| **NOT covered: any other non-Node child** | `psql -h <remote>`, `bash -c 'exec 3<>/dev/tcp/…'`, or a binary the denylist does not name. This is the honest residual. |
+| **NOT covered: an environment rebuilt outside `node:child_process`** | a shell that unsets `NODE_OPTIONS` and then execs Node. `tests/no-outbound-network.test.ts` does exactly that as its negative control, so the "the listener saw nothing" assertions in that file are known not to be vacuous. |
+| **NOT covered: UDP and raw `dgram`** | DNS lookups still resolve — a lookup sends a name, not our data. |
+| **Known wart** | a refused IP literal is destroyed on the next tick rather than synchronously (throwing would break every caller that handles `'error'`), so `http2.connect()` emits one spurious `'connect'` on the session before the error. Nothing is sent. |
 
 ### Database-backed tiers
 
