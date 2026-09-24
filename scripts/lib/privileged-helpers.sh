@@ -409,23 +409,23 @@ driver_refuse() {
   return 1
 }
 
-# IS THIS A PATH STRICTLY INSIDE ${IMS_DRIVER_ROOT}? IF NOT, THE OPERATION NEVER RUNS (o3d-z5be r11/r12).
+# IS THIS A PATH STRICTLY INSIDE ${IMS_DRIVER_ROOT}? IF NOT, THE OPERATION NEVER RUNS (o3d-z5be r11–r13).
 #
 # Every helper in this library that deletes, renames, chowns or chmods a tree takes the tree from a
 # variable — several from a PARAMETER — and the only thing that ever made those operations safe was
 # that the callers named paths under the root. This checks it where the operation is, at run time: the
-# path must be absolute and contain no `.` or `..` component, and then
-#   * mode `tree` (the default) — for an operation that FOLLOWS the path (chown -R, chmod -R, a copy
-#     into it): the path CANONICALISES, every symbolic link resolved including a final one, to something
-#     strictly below the canonical root. A symlink under the root that points at ${APP_DIR} is refused.
-#   * mode `link` — for an operation on the NAME itself (`rm -rf NAME`, `mv -T NAME …`, which unlink or
-#     rename a final symlink rather than follow it): the PARENT canonicalises strictly inside-or-at the
-#     root and the last component is a plain name, so the name's own location is inside the root. A
-#     pointer whose target has gone, or lies elsewhere, can then still be removed (r12, review L2), while
-#     a path THROUGH such a link (`link/x`) is still refused, because its parent resolves outside.
-# The refusal ends the run from any context: see privileged_end_run().
+# path must be absolute, contain no `.` or `..` component, and CANONICALISE — every symbolic link
+# resolved, a final one included — to something strictly below the canonical root. A symlink under the
+# root that points at ${APP_DIR} is refused. This is the check for an operation that FOLLOWS the path
+# (chown -R, chmod -R, a copy into it, `rm -rf NAME/`), and it takes exactly two arguments: r12 had a
+# third, `link`, and a caller could pass it and then operate THROUGH the link (review of 6ae8c48a,
+# MED-1). Operations on a NAME itself go through driver_unlink_owned / driver_rename_owned /
+# driver_link_owned below, which perform the operation themselves, on exactly the name they checked.
 driver_require_owned_path() {
-  local path="$1" what="$2" mode="${3:-tree}" root canon parent base
+  local path="$1" what="$2" root canon
+  if (( $# != 2 )); then
+    driver_owned_refuse "${what}" "${path}" "was checked with $# arguments; this check takes a path and a description and nothing else"
+  fi
   case "${path}" in
     /*) ;;
     *) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
@@ -434,21 +434,58 @@ driver_require_owned_path() {
     */../*|*/./*) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
   esac
   root="$(readlink -m -- "${IMS_DRIVER_ROOT}" 2>/dev/null)" || root=""
-  if [[ "${mode}" == "link" ]]; then
-    base="${path##*/}"
-    parent="$(readlink -m -- "${path%/*}/" 2>/dev/null)" || parent=""
-    if [[ -z "${base}" || -z "${parent}" ]]; then
-      canon=""
-    else
-      canon="${parent%/}/${base}"
-    fi
-  else
-    canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
-  fi
-  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* || "${canon#"${root}/"}" == */ ]]; then
+  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
+  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* ]]; then
     driver_owned_refuse "${what}" "${path}" "resolves to '${canon:-nothing}', which is not strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable})"
   fi
   return 0
+}
+
+# IS THIS NAME'S OWN LOCATION STRICTLY INSIDE ${IMS_DRIVER_ROOT}? (o3d-z5be r12 L2, r13 MED-1.) For an
+# operation on the NAME — unlink it, rename it, create a link at it — which does not follow a final
+# symlink: the parent canonicalises inside-or-at the root and the last component is a plain name, so
+# a pointer whose target has gone, or lies elsewhere, can be removed. PRIVATE: it is called only by the
+# three helpers below, each of which then performs its one operation on exactly the name it checked, so
+# no caller can check a name and then act THROUGH it (`rm -rf NAME/`, `NAME/*`, `chmod -R NAME`).
+_driver_owned_name() {
+  local path="$1" what="$2" root canon parent base
+  case "${path}" in
+    /*) ;;
+    *) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+  esac
+  case "/${path}/" in
+    */../*|*/./*) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  root="$(readlink -m -- "${IMS_DRIVER_ROOT}" 2>/dev/null)" || root=""
+  base="${path##*/}"
+  parent="$(readlink -m -- "${path%/*}/" 2>/dev/null)" || parent=""
+  canon=""
+  [[ -z "${base}" || -z "${parent}" ]] || canon="${parent%/}/${base}"
+  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* || "${canon#"${root}/"}" == */ ]]; then
+    driver_owned_refuse "${what}" "${path}" "is not a name strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable}); it resolves to '${canon:-nothing}'"
+  fi
+  return 0
+}
+
+# THE THREE OPERATIONS ON A NAME, each performed on exactly the name it has just checked. `quiet` as
+# the last argument discards the operation's own error output (never the refusal's).
+driver_unlink_owned() {
+  local name="$1" what="$2" quiet="${3:-}"
+  _driver_owned_name "${name}" "${what}"
+  if [[ "${quiet}" == "quiet" ]]; then rm -rf -- "${name}" 2>/dev/null; else rm -rf -- "${name}"; fi
+}
+
+driver_rename_owned() {
+  local from="$1" to="$2" what="$3" quiet="${4:-}"
+  _driver_owned_name "${from}" "${what} (the name being moved)"
+  _driver_owned_name "${to}" "${what} (the name it is moved to)"
+  if [[ "${quiet}" == "quiet" ]]; then mv -T -- "${from}" "${to}" 2>/dev/null; else mv -T -- "${from}" "${to}"; fi
+}
+
+driver_link_owned() {
+  local target="$1" name="$2" what="$3"
+  _driver_owned_name "${name}" "${what}"
+  ln -s -- "${target}" "${name}"
 }
 
 driver_owned_refuse() {
@@ -460,13 +497,31 @@ driver_owned_refuse() {
 # the fence's publications all run inside `$(…)`. So in a subshell this ALSO sends SIGTERM to the
 # top-level shell — `$$` is the top-level pid in every subshell — whose EXIT trap then runs exactly as it
 # would for an operator's kill (update.sh and deploy.sh turn TERM into `exit 143`; bash runs an EXIT trap
-# on an untrapped TERM too, as measured). In the top-level shell it simply exits 1.
+# on an untrapped TERM too, as measured). In the top-level shell it simply exits 1. NOT covered, and
+# stated in docs/installation.md: with TERM trapped, bash finishes the current simple command first, so
+# a refusal in a substitution used as an ARGUMENT lets that command complete (every real call site is an
+# assignment); TERM ignored lets the run continue; a separate `bash -c` process ends alone; and inside
+# an entrypoint's EXIT-trap handler only the subshell ends, so the handler can still report. In
+# each case the refused operation itself never runs.
 privileged_end_run() {
   echo "REFUSING: $*" >&2
-  if [[ "${BASHPID}" != "$$" ]]; then
+  if [[ "${BASHPID}" != "$$" ]] && ! privileged_in_exit_handler; then
     kill -TERM "$$" 2>/dev/null || true
   fi
   exit 1
+}
+
+# IS THIS REFUSAL BEING MADE FROM INSIDE AN ENTRYPOINT'S EXIT-TRAP HANDLER? (o3d-z5be r13, review LOW-1c)
+# on_exit / on_cutover_exit re-raise the fence through a command substitution; a refusal there that
+# signalled the top-level shell would end the handler before it reports. The answer is read from the
+# call stack — FUNCNAME, which a subshell inherits and the environment cannot set — not from a variable,
+# so there is nothing to inherit, clear or classify.
+privileged_in_exit_handler() {
+  local frame
+  for frame in "${FUNCNAME[@]}"; do
+    [[ "${frame}" == "on_exit" || "${frame}" == "on_cutover_exit" ]] && return 0
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -783,9 +838,7 @@ driver_sweep_orphans() {
     esac
     [[ ! -e "${target}" ]] || continue
     [[ ! -L "${target}" ]] || continue
-    driver_require_owned_path "${entry}" "the retired publication the sweep would restore" link
-    driver_require_owned_path "${target}" "the pointer name the sweep would restore it to" link
-    mv -T "${entry}" "${target}" 2>/dev/null || true
+    driver_rename_owned "${entry}" "${target}" "the retired publication the sweep restores" quiet || true
   done
 
   # WHAT IS STANDING, READ OFF THE POINTERS THEMSELVES rather than assumed from a name. Only the first
@@ -831,8 +884,7 @@ driver_sweep_orphans() {
     if [[ "${open_paths}" == *"${entry}"* ]]; then
       continue
     fi
-    driver_require_owned_path "${entry}" "the superseded publication the sweep would delete" link
-    rm -rf "${entry}" || true
+    driver_unlink_owned "${entry}" "the superseded publication the sweep deletes" || true
   done
   return 0
 }
@@ -893,20 +945,21 @@ driver_publish_unwind() {
   # EVERY PATH IT IS HANDED IS CHECKED AT RUN TIME (o3d-z5be r11, review H3): this function deletes and
   # renames what its CALLER names, and "today's callers only pass names under the root" is a claim
   # about callers that no test of the text can bind. A path outside the root ends the run.
-  driver_require_owned_path "${version_dir}" "the version directory driver_publish_unwind would delete" link
-  driver_require_owned_path "${pointer_tmp}" "the temporary pointer driver_publish_unwind would delete" link
-  driver_require_owned_path "${retire_dir}" "the retire directory driver_publish_unwind would delete or restore" link
-  driver_require_owned_path "${target}" "the pointer driver_publish_unwind would restore" link
+  _driver_owned_name "${version_dir}" "the version directory driver_publish_unwind would delete"
+  _driver_owned_name "${pointer_tmp}" "the temporary pointer driver_publish_unwind would delete"
+  _driver_owned_name "${retire_dir}" "the retire directory driver_publish_unwind would delete or restore"
+  _driver_owned_name "${target}" "the pointer driver_publish_unwind would restore"
   # `-d` ALONE WOULD NOT DO IT since r4 (Codex MEDIUM 1): what a failed migration moved aside can be
   # another publication's POINTER as well as a legacy directory, and a symbolic link that resolves to a
   # directory answers `-d` while one whose publication has been swept answers neither `-d` nor `-e`.
   # Whatever was moved is what goes back.
   if (( migrated == 1 )) && [[ ! -e "${target}" ]] && [[ ! -L "${target}" ]] \
      && { [[ -e "${retire_dir}" ]] || [[ -L "${retire_dir}" ]]; }; then
-    mv -T "${retire_dir}" "${target}" 2>/dev/null || true
+    driver_rename_owned "${retire_dir}" "${target}" "the moved-aside directory driver_publish_unwind restores" quiet || true
   fi
-  rm -rf "${version_dir}" "${retire_dir}" 2>/dev/null || true
-  rm -f "${pointer_tmp}" 2>/dev/null || true
+  driver_unlink_owned "${version_dir}" "the version directory driver_publish_unwind deletes" quiet || true
+  driver_unlink_owned "${retire_dir}" "the retire directory driver_publish_unwind deletes" quiet || true
+  driver_unlink_owned "${pointer_tmp}" "the temporary pointer driver_publish_unwind deletes" quiet || true
   return 0
 }
 
@@ -1028,10 +1081,10 @@ driver_publish_tree() {
   # One call per name, so that a test can bind each operation below to the check of ITS operand.
   driver_require_owned_path "${run_dir}" "the ${what} staging directory"
   driver_require_owned_path "${staged}" "the ${what} staged tree"
-  driver_require_owned_path "${version_dir}" "the ${what} version directory" link
-  driver_require_owned_path "${pointer_tmp}" "the ${what} temporary pointer" link
-  driver_require_owned_path "${retire_dir}" "the ${what} retire directory" link
-  driver_require_owned_path "${target}" "the ${what} pointer" link
+  _driver_owned_name "${version_dir}" "the ${what} version directory"
+  _driver_owned_name "${pointer_tmp}" "the ${what} temporary pointer"
+  _driver_owned_name "${retire_dir}" "the ${what} retire directory"
+  _driver_owned_name "${target}" "the ${what} pointer"
   mkdir -p "${staged}" || { rm -rf "${run_dir}"; return 1; }
 
   # THE FILLER'S STATUS IS CARRIED, NOT COLLAPSED. `|| filled=$?` rather than a bare call: under
@@ -1108,7 +1161,7 @@ driver_publish_tree() {
   # THE PUBLICATION BECOMES A VERSION. One rename, into a name nothing else can hold, after which the
   # directory is immutable: every later step only reads it. The staging name is retired by this rename
   # rather than copied out of, so there is no second copy to keep in step.
-  if ! mv -T "${run_dir}" "${version_dir}"; then
+  if ! driver_rename_owned "${run_dir}" "${version_dir}" "the ${what} staging directory, becoming its version"; then
     rm -rf "${run_dir}"
     driver_refuse "${what} could not be moved to ${version_dir}, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
   fi
@@ -1140,7 +1193,7 @@ driver_publish_tree() {
       driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" 0
       driver_refuse "${target} is ${legacy_ident:-something this run could not inspect} and no longer the directory it found there a moment ago, so another privileged run is committing at that name. NOTHING has been published and NOTHING has been moved aside; re-running this one will publish over whatever stands there" || return 1
     fi
-    if ! mv -T "${target}" "${retire_dir}"; then
+    if ! driver_rename_owned "${target}" "${retire_dir}" "the legacy ${what} directory, moved aside"; then
       driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" 0
       driver_refuse "${target} is a directory from a release that published trees directly and it could not be moved aside, so nothing was published and it is still there" || return 1
     fi
@@ -1155,7 +1208,7 @@ driver_publish_tree() {
   # THE POINTER, BUILT UNDER ITS OWN NAME AND THEN RENAMED. `ln -sf` would unlink the documented name
   # and create it again, and between the two it resolves to nothing at all — for a name root is
   # documented to run a program out of, that is a window this scheme exists to not have.
-  if ! ln -s -- "${version_name}/${tree_name}" "${pointer_tmp}"; then
+  if ! driver_link_owned "${version_name}/${tree_name}" "${pointer_tmp}" "the ${what} temporary pointer"; then
     driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" "${migrated}"
     driver_refuse "the pointer for ${what} could not be created under ${IMS_DRIVER_ROOT}, so nothing was published to ${target} and the copy standing there is unchanged" || return 1
   fi
@@ -1164,7 +1217,7 @@ driver_publish_tree() {
   # only reads. One `rename(2)`: the name resolves to the previous publication before it and to this
   # one after it, with no third state and no possibility of nesting, because the destination is a
   # symbolic link and not a directory.
-  if ! mv -T "${pointer_tmp}" "${target}"; then
+  if ! driver_rename_owned "${pointer_tmp}" "${target}" "the ${what} pointer flip"; then
     driver_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${target}" "${migrated}"
     driver_refuse "${what} could not be published at ${target}; the copy that was there is still there" || return 1
   fi
@@ -1188,10 +1241,10 @@ driver_publish_tree() {
   # one object, and what must not happen is this run claiming the outcome.
   link="$(readlink -- "${target}" 2>/dev/null)" || link=""
   if [[ "${link}" != "${version_name}/${tree_name}" ]]; then
-    rm -rf "${retire_dir}" 2>/dev/null || true
+    driver_unlink_owned "${retire_dir}" "the ${what} retire directory" quiet || true
     driver_refuse "${target} names ${link:-a tree this publication did not create} and this run published ${version_name}/${tree_name}: another privileged run published ${what} at the same moment and its copy is the one standing there. Nothing of this run's is being reported as published; that run's tree was vouched for by its own operator and is complete, and re-running this one will publish over it" || return 1
   fi
-  rm -rf "${retire_dir}" 2>/dev/null || true
+  driver_unlink_owned "${retire_dir}" "the ${what} retire directory" quiet || true
   IMS_DRIVER_PUBLISHED_DIGEST="${digest}"
   return 0
 }
