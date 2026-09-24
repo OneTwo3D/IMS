@@ -142,6 +142,34 @@ test('[o3d-j625 r6 H4] every posting an enqueue can record a refusal for has a k
     + 'itself or is marked handled. Add it to lib/domain/accounting/posting-refusal-kinds.ts.')
 })
 
+/**
+ * o3d-j625 r7 (mutation survivor H4-6): the check above is VACUOUS against the real map — no posting is
+ * raised from both an AUTO site and another kind of site, so `defaultPostingRefusalKind` never reaches its
+ * "never an AUTO kind" filter. Both halves are asserted here: that the map really is unambiguous that way
+ * (so the reader knows the check above proves nothing today), and that the filter DOES choose the markable
+ * kind when it is reached, driven over an injected map.
+ */
+test('[o3d-j625 r7] no posting mixes an AUTO site with another, and where one did the default would not be the AUTO kind', () => {
+  const clearingsByPosting = new Map<string, string[]>()
+  for (const spec of Object.values(POSTING_REFUSAL_KINDS)) {
+    const at = `${spec.type}|${spec.referenceType}`
+    clearingsByPosting.set(at, [...(clearingsByPosting.get(at) ?? []), spec.clearing])
+  }
+  assert.deepEqual(
+    [...clearingsByPosting].filter(([, clearings]) => clearings.includes('auto') && clearings.length > 1).map(([at]) => at),
+    [],
+    'a posting raised from an AUTO site AND another site would make the check above meaningful — and this one redundant',
+  )
+  const ambiguous = {
+    ambiguous_auto: { type: 'X_POSTING', referenceType: 'XRef', clearing: 'auto' as const, how: 'a sweep raises it' },
+    ambiguous_manual: { type: 'X_POSTING', referenceType: 'XRef', clearing: 'manual' as const, how: 'nothing raises it' },
+  }
+  assert.equal(Object.keys(ambiguous)[0], 'ambiguous_auto', 'PRECONDITION: the AUTO kind is first, so picking "the first match" would pick it')
+  assert.equal(defaultPostingRefusalKind('X_POSTING', 'XRef', ambiguous), 'ambiguous_manual' as never,
+    'the default is the kind that offers the button, never the AUTO one that would hide a row that can stick')
+  assert.equal(defaultPostingRefusalKind('X_POSTING', 'OtherRef', ambiguous), null, 'and an unknown posting still has no kind')
+})
+
 test('[o3d-j625 r6/r7 H4] the enqueue\'s own default never makes a row AUTO where a site could offer the button', () => {
   for (const [kind, spec] of Object.entries(POSTING_REFUSAL_KINDS) as Array<[PostingRefusalKind, (typeof POSTING_REFUSAL_KINDS)[PostingRefusalKind]]>) {
     const byDefault = defaultPostingRefusalKind(spec.type, spec.referenceType)

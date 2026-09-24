@@ -26,7 +26,7 @@
  */
 export type RefusalClearing = 'auto' | 'retried' | 'manual'
 
-type KindSpec = {
+export type KindSpec = {
   type: string
   referenceType: string
   clearing: RefusalClearing
@@ -145,8 +145,19 @@ export type PostingRefusalKind = keyof typeof POSTING_REFUSAL_KINDS
  * gets the first kind that offers the button — never an AUTO kind, which would hide a row that can stick —
  * and the site's own report or record then names the real one.
  */
-export function defaultPostingRefusalKind(type: string, referenceType: string): PostingRefusalKind | null {
-  const matches = (Object.entries(POSTING_REFUSAL_KINDS) as Array<[PostingRefusalKind, KindSpec]>)
+export function defaultPostingRefusalKind(
+  type: string,
+  referenceType: string,
+  /**
+   * o3d-j625 r7 (mutation survivor): the map to read. Injectable ONLY so a test can drive the ambiguous
+   * case — no (type, referenceType) in POSTING_REFUSAL_KINDS carries both an AUTO kind and another one, so
+   * against the real map the "never an AUTO kind" filter below cannot be reached. That is an invariant the
+   * kinds test asserts, and the filter is the fail-safe for the day a new kind breaks it; injecting the map
+   * is how the fail-safe is shown to work rather than merely to exist.
+   */
+  kinds: Readonly<Record<string, KindSpec>> = POSTING_REFUSAL_KINDS,
+): PostingRefusalKind | null {
+  const matches = (Object.entries(kinds) as Array<[PostingRefusalKind, KindSpec]>)
     .filter(([, spec]) => spec.type === type && spec.referenceType === referenceType)
   if (matches.length === 1) return matches[0]![0]
   // A posting refused from several kinds of site: one that offers the button (retried or manual), never an

@@ -69,10 +69,16 @@ const syncTable = {
     return { count: hits.length }
   },
 }
+/** o3d-j625 r7: fired when the per-key lock is taken — the moment another transaction's commit becomes visible. */
+let onLock: (() => void) | null = null
 const tx = {
   accountingPostingRefusal: refusalTable,
   accountingSyncLog: syncTable,
-  $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => { locks.push(`${strings.join('?')}:${values.join(',')}`); return 1 },
+  $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    locks.push(`${strings.join('?')}:${values.join(',')}`)
+    onLock?.()
+    return 1
+  },
 }
 mock.module('@/lib/db', {
   namedExports: {
@@ -129,6 +135,7 @@ test.beforeEach(() => {
   locks.length = 0
   mirrorWrites.length = 0
   denyFresh = false
+  onLock = null
 })
 
 async function mark(id: string, note = '') {
@@ -302,3 +309,45 @@ for (const [kind, type, referenceType, why] of [
     assert.ok(refusals[0]!.suppressedAt, 'and IMS will not post it')
   })
 }
+
+/**
+ * o3d-j625 r7 (mutation survivors H4-2 and H4-4) — the two conditions that no test reached.
+ *
+ * The mark reads the row BEFORE it takes the per-key lock, so everything it decided from that read is a
+ * live check, not a held one; the resolving write restates BOTH conditions (still outstanding, still a
+ * markable kind) so a row that moved under the lock is refused instead of resolved. `resolvedAt` was
+ * covered; the kind was not, because against the real map the earlier check already caught it.
+ */
+test('[o3d-j625 r7] the resolve restates the KIND too: a row that stops being markable under the lock is refused, not resolved', async () => {
+  refusals.push(refusal('r12', 'stock_receipt_journal'))
+  onLock = () => { refusals[0]!.kind = 'tax_rate_sync'; onLock = null }
+
+  const result = await mark('r12', 'posted by hand as MJ-12')
+
+  assert.equal(locks.length > 0, true, 'PRECONDITION: the lock was taken, so the row moved at the only moment it could')
+  assert.equal(refusals[0]!.kind, 'tax_rate_sync', 'PRECONDITION: the row is no longer of a markable kind')
+  assert.equal(ok(result), false, `it must not resolve: ${JSON.stringify(result)}`)
+  assert.match(errorOf(result), /changed while it was being marked/)
+  assert.equal(refusals[0]!.resolvedAt, null, 'nothing was resolved')
+  assert.equal(refusals[0]!.suppressedAt, null, 'and nothing was suppressed, so IMS still posts it')
+})
+
+test('[o3d-j625 r6 H4/r7] a row IMS cleared by QUEUEING the posting, refused again, reopens with the old resolution wiped', async () => {
+  refusals.push(refusal('r13', 'stock_receipt_journal', {
+    resolvedAt: new Date('2026-09-10T00:00:00Z'), resolution: 'queued', resolvedBy: 'user-9', resolutionNote: 'the old note',
+  }))
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+
+  await recordAccountingPostingRefusal(
+    { accountingPostingRefusal: refusalTable },
+    { type: 'STOCK_RECEIPT', referenceType: 'PurchaseOrder', referenceId: 'po-r13', scope: 'k-r13' },
+    { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' },
+  )
+
+  assert.equal(refusals[0]!.suppressedAt, null, 'PRECONDITION: this row was never marked handled, so it DOES reopen')
+  assert.equal(refusals[0]!.resolvedAt, null, 'PRECONDITION: it reopened')
+  assert.equal(refusals[0]!.resolution, null, 'and it no longer claims to have been resolved by queueing')
+  assert.equal(refusals[0]!.resolvedBy, null)
+  assert.equal(refusals[0]!.resolutionNote, null)
+  assert.equal(refusals[0]!.refusedCount, 1, 'and the count is this episode\'s')
+})
