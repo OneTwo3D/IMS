@@ -56,6 +56,28 @@ mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async () => undefined },
 })
 
+/**
+ * o3d-j625 r8 — AND THE SAME ARGUMENT NOW APPLIES TO THE DATABASE ITSELF.
+ *
+ * Before anything else, the facade asks whether this exact posting was already posted BY HAND
+ * (lib/domain/accounting/posting-suppression.ts). Until r8 a read that FAILED was answered "not
+ * suppressed", so this file's facade tests were reaching a real, unconfigured client, failing to
+ * connect, and being carried past it — passing for exactly the reason the note above guards against.
+ * r8 makes an unreadable suppression refuse the enqueue, so the read has to be a real answer, and this
+ * is that answer: nothing here was marked handled.
+ */
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      accountingPostingRefusal: {
+        findUnique: async () => null,
+        upsert: async () => ({ id: 'refusal-1' }),
+        updateMany: async () => ({ count: 0 }),
+      },
+    },
+  },
+})
+
 mock.module('@/lib/connectors/xero/queue', {
   namedExports: {
     queueXeroSync: async (params: { type: string; referenceId: string }) => {
