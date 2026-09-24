@@ -252,7 +252,8 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     //
     //   1. IT SAID `EmailOutbox` HAS "no idempotency key and no unique constraint of any kind".
     //      It now has `email_outbox_undelivered_reference_uq`, a PARTIAL unique index on
-    //      (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'). That refuses
+    //      (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING','PARKED_SEND_CAP')
+    //      (o3d-hpeg added the parked status, so a row held for an operator keeps its slot). That refuses
     //      a duplicate UNDELIVERED ROW — and a duplicate undelivered row is not the hazard.
     //      THE CADENCES IN THIS PARAGRAPH WERE THE WRONG WAY ROUND (Codex round 19, MEDIUM). Round 18
     //      corrected this same false premise in lib/domain/accounting/unrecorded-posted-document.ts

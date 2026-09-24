@@ -11,22 +11,40 @@
  * Every earlier version of this comment said the reclaim "costs at most one duplicate send" and that
  * the fence leaves only that behind. THE BOUND WAS FALSE, and it was load-bearing for many rounds. A
  * reclaim RESETS the row — `processingStartedAt` becomes the reclaimer's own instant and `lockedBy`
- * its own token — so the reclaimer is itself reclaimable one window later. A can outlive
- * `EMAIL_CLAIM_STALE_MS` and be reclaimed by B; B can outlive the NEXT window and be reclaimed by C;
- * all three enter the sender, and nothing in this module caps the chain.
+ * its own token — so the reclaimer is itself reclaimable one window later. A could outlive
+ * `EMAIL_CLAIM_STALE_MS` and be reclaimed by B; B could outlive the NEXT window and be reclaimed by C;
+ * all three entered the sender, and until o3d-hpeg nothing capped the chain.
  *
- * SO THE HONEST STATEMENT IS THIS, AND IT IS THE ONE THIS MODULE NOW MAKES EVERYWHERE: AN
- * ELAPSED-TIME RECLAIM ADMITS UNBOUNDEDLY MANY SUCCESSIVE SENDS, BOUNDED IN PRACTICE ONLY BY HOW
- * LONG A WORKER CAN OUTLIVE THE WINDOW — one further send per `EMAIL_CLAIM_STALE_MS` of over-run,
- * with no cap in this code — and no local write can retract any of them. This is MEASURED, not
- * argued: `tests/email-outbox-claim-fence.test.ts` drives the three-worker chain against the SHIPPED
- * fence and asserts that THREE copies are delivered from one row.
+ * o3d-hpeg — THE CHAIN IS NOW CAPPED, AND THIS IS THE BOUND, EXACTLY AS THE CODE ENFORCES IT.
+ * `email_outbox.staleReclaimCount` counts the elapsed-time RECLAIMS a row has had over its whole life.
+ * `claimEmailRow` takes a stale PROCESSING row only through ONE conditional UPDATE whose WHERE requires
+ * `staleReclaimCount < EMAIL_MAX_STALE_RECLAIMS` and whose SET increments it — the check and the
+ * increment are the same statement, so two reclaimers racing at the cap cannot both pass, and a
+ * reclaimer that read the row before another reclaim landed is refused by the database, not by a stale
+ * copy of the count. A first claim of a PENDING row does not touch the count. A stale PROCESSING row
+ * that is AT the cap is not reclaimed: it is moved to `PARKED_SEND_CAP`, which the sweep never
+ * selects, and it stays there until an operator releases or cancels it (scripts/email-outbox-parked.ts).
+ * With `EMAIL_MAX_STALE_RECLAIMS = 1`, the sender is entered for one row:
  *
- * A BOUND IS A DESIGN CHANGE, AND DELIBERATELY NOT THIS BRANCH'S. It needs either a lease the holder
- * RENEWS while it is on the socket (so a reclaim means the holder really stopped) or a per-row count
- * of SENDER ENTRIES with a cap that parks the row instead of reclaiming it again. Both change the
- * lease model and need their own migration. o3d-hpeg scopes both, weighs their cost, and records the
- * statement above as the INTERIM claim until one of them ships.
+ *   • once per claim of a PENDING row — the first claim, each retry after this drain settled a
+ *     delivery failure (bounded by EMAIL_MAX_ATTEMPTS), and each operator release; and
+ *   • at most ONCE more, EVER, by an elapsed-time reclaim.
+ *
+ * So a claim chain that never settles — the case above — enters the sender at most TWICE (the holder
+ * and one reclaimer), which is one extra send per holder that dies or stalls past the window, and then
+ * parks. The count is never reset automatically; an operator's release does not reset it either, so a
+ * released row that stalls again is parked rather than reclaimed. What the cap cannot do is un-send:
+ * the one permitted duplicate is still a duplicate, and the fence below is still what keeps a loser
+ * from re-arming the row. `tests/email-outbox-claim-fence.test.ts` drives the three-worker chain and
+ * asserts the third worker is REFUSED and the row PARKED; the concurrency lane proves the cap is
+ * enforced by the statement against real Postgres.
+ *
+ * WHY A COUNT AND NOT A RENEWED LEASE. A lease the holder heartbeats while it is on the socket would
+ * make a reclaim mean "the holder really stopped", but it needs a timer inside the send path — which is
+ * a single awaited `sendEmail` call with no loop or progress callback to hang one on — and a decision
+ * about what a failed heartbeat means. It is not built. The count is deterministic, needs no clock
+ * beyond the one the reclaim already reads, and gives a bound that can be stated and tested. Its cost
+ * is that a holder that was merely SLOW past the window, not dead, is counted exactly like a dead one.
  *
  * WHAT MADE THIS A P1 IS SOMETHING ELSE ENTIRELY. Every terminal write used to be
  * `update({ where: { id } })`, keyed on the id and nothing else, so:
@@ -51,20 +69,22 @@
  * front of the write, because a read-then-write check is itself racy and would put the guard
  * between the resume and the effect rather than making the effect's write conditional.
  *
- * WHAT THIS DOES NOT FIX, STATED PLAINLY. The duplicate SEND at t0+15m still happens. The
+ * WHAT THE FENCE DOES NOT FIX, STATED PLAINLY. The duplicate SEND at t0+15m still happens. The
  * fence sits between the reclaim and the ROW, and no local write can un-send an email
- * (o3d-ic9a property B). NOR DOES IT MAKE THE NUMBER OF SENDS FINITE: successive reclaims are
- * unbounded with this fence exactly as they were without it, because each reclaim resets the window
- * (see the correction at the top of this comment, and o3d-hpeg). What it removes is the RE-ARM — the
- * copies that needed no further stale window at all, from a row another worker had already settled —
- * and it makes the losing worker's outcome observable (`conflicted`) instead of silent.
+ * (o3d-ic9a property B). Nor does the fence make the number of sends finite — each reclaim resets the
+ * window — and that is what the reclaim cap above does (o3d-hpeg). What the fence removes is the
+ * RE-ARM — the copies that needed no further stale window at all, from a row another worker had
+ * already settled — and it makes the losing worker's outcome observable (`conflicted`) instead of
+ * silent.
  *
  * THE ENQUEUE SIDE IS GUARDED SEPARATELY, IN THE DATABASE. The fence protects one row from
  * being settled twice; it says nothing about two ROWS being created for one logical email.
  * A partial UNIQUE index — `email_outbox_undelivered_reference_uq` on
- * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING') — makes a
- * second UNDELIVERED row impossible rather than merely unlikely. See the migration
- * 20260910120000_email_outbox_claim_fence for why it is scoped to undelivered statuses.
+ * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING','PARKED_SEND_CAP') —
+ * makes a second UNDELIVERED row impossible rather than merely unlikely. See the migration
+ * 20260910120000_email_outbox_claim_fence for why it is scoped to undelivered statuses, and
+ * 20260918090100_email_outbox_parked_holds_reference for why a PARKED row still holds its slot: it may
+ * already have been sent twice, and a fresh row for the same reference would send it again.
  *
  * AND THE DRAIN'S DEPENDENCIES ARE ONE ALL-OR-NOTHING VALUE, NOT A BAG OF OPTIONAL FIELDS. This is
  * a SWEEP over the globally oldest eligible rows, so a caller who injects a fake sender WITHOUT
@@ -117,6 +137,17 @@ import { prepareQueuedEmail } from '@/lib/order-email'
 
 const EMAIL_MAX_ATTEMPTS = 5
 const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
+/**
+ * o3d-hpeg — how many elapsed-time RECLAIMS one row may have over its whole life. One: the holder plus
+ * one reclaimer may enter the sender for a claim that never settles, which is one extra send per
+ * holder that dies or stalls past the window — the cost `(a)` in o3d-hpeg would also have had, without
+ * the heartbeat. A named constant and not an environment setting, like every other limit in this
+ * module (EMAIL_MAX_ATTEMPTS, EMAIL_CLAIM_STALE_MS): it is part of the claim the module makes, and a
+ * per-install value would make that claim unknowable from the code.
+ */
+export const EMAIL_MAX_STALE_RECLAIMS = 1
+/** The status a row at the reclaim cap is moved to. The sweep never selects it. */
+export const EMAIL_OUTBOX_PARKED_STATUS = 'PARKED_SEND_CAP'
 const EMAIL_BACKOFF_BASE_MS = 60_000
 const EMAIL_BACKOFF_MAX_MS = 60 * 60 * 1000
 /**
@@ -149,9 +180,12 @@ type QueueEmailInput = {
 
 /**
  * `already_queued` is not a failure: A DELIVERY FOR THIS EXACT LOGICAL EMAIL IS ALREADY QUEUED — an
- * undelivered row (PENDING or PROCESSING) exists, which is what the partial unique index refused
- * the second of. Returned rather than thrown so a caller can say so instead of reporting an error
- * for a duplicate click or a replayed outbox row.
+ * undelivered row (PENDING or PROCESSING) exists, which is what the partial unique index refused the
+ * second of. Returned rather than thrown so a caller can say so instead of reporting an error for a
+ * duplicate click or a replayed outbox row. o3d-hpeg: the same answer comes back while the row is
+ * PARKED_SEND_CAP, which is NOT queued — it is held for an operator after its sender was entered twice
+ * — because a fresh row would send that email again; the index keeps a parked row's slot for that
+ * reason.
  *
  * IT IS NOT A PROMISE OF DELIVERY, and this contract used to read as one. All the row establishes
  * is that a delivery is QUEUED: a PROCESSING row may already be on the wire, and any undelivered
@@ -177,6 +211,8 @@ export type EmailOutboxRow = {
   availableAt: Date
   processingStartedAt: Date | null
   lockedBy: string | null
+  /** o3d-hpeg: elapsed-time reclaims this row has had. See EMAIL_MAX_STALE_RECLAIMS. */
+  staleReclaimCount: number
 }
 
 /**
@@ -475,6 +511,7 @@ const IN_MEMORY_PROOFS: readonly InMemoryProof[] = [
       availableAt: new Date(0),
       processingStartedAt: null,
       lockedBy: null,
+      staleReclaimCount: 0,
     }),
     emptyStoreReads: (sentinel) => [
       {
@@ -1269,6 +1306,12 @@ export type ProcessEmailOutboxResult = {
   sent: number
   failed: number
   /**
+   * o3d-hpeg: stale PROCESSING rows this run found AT the reclaim cap and moved to PARKED_SEND_CAP
+   * instead of reclaiming. Not claimed, not sent, not counted in `processed`; each one also writes an
+   * ERROR activity entry naming the row, because only an operator can move it on.
+   */
+  parked: number
+  /**
    * Rows this worker claimed, HANDED TO THE SENDER, and was then refused the terminal write for
    * WITH ANOTHER WORKER'S RECLAIM ESTABLISHED — the row read back holding someone else's token, or
    * holding no claim at all when every write this worker issued had answered. Non-zero means a
@@ -1282,7 +1325,8 @@ export type ProcessEmailOutboxResult = {
    * AND ONE DUPLICATE MAY NOT BE THE WHOLE OF IT (r37, Codex r36 HIGH 2). A reclaim resets the row's
    * window, so a worker that also outruns it may itself be reclaimed, and this counter may be non-zero
    * on several workers for the same row across successive windows. Read it as "a duplicate is
-   * possible", never as "at most one extra copy" — nothing in this module bounds that count (o3d-hpeg).
+   * possible", never as "at most one extra copy" per run. Over a row's LIFE the extra entries are capped
+   * by EMAIL_MAX_STALE_RECLAIMS (o3d-hpeg): one reclaim, ever, and then the row is parked.
    *
    * "ESTABLISHED", AND THAT IS THE WHOLE OF ROUND 33's MEDIUM. This counter used to be incremented
    * for every refused post-send terminal write, including the four diagnoses that establish NO
@@ -1838,6 +1882,79 @@ function refuseSweptRowsFromOutsideTheStore(swept: EmailOutboxRow[], rows: () =>
   }
 }
 
+/**
+ * o3d-hpeg — TAKE ONE ROW, OR PARK IT. Three conditional UPDATEs, each atomic on its own and each
+ * re-checking the row under its lock, tried in order:
+ *
+ *   1. A FIRST CLAIM of a PENDING row whose time has come. Does not touch `staleReclaimCount`.
+ *   2. An ELAPSED-TIME RECLAIM of a stale PROCESSING row, ONLY while `staleReclaimCount` is below
+ *      EMAIL_MAX_STALE_RECLAIMS, INCREMENTING it in the same statement. The cap check is in the WHERE
+ *      on purpose: a check made on the swept copy of the row would be a read-then-write, and a
+ *      reclaimer that swept the row before another reclaim landed — and that went stale in turn —
+ *      would pass it and enter the sender a third time. Postgres re-evaluates this WHERE against the
+ *      row as it stands when the lock is granted, so that reclaimer is refused.
+ *   3. A PARK of a stale PROCESSING row AT the cap: PARKED_SEND_CAP, the claim cleared (so the stale
+ *      holder's fenced settlement matches nothing), and the reason in `lastError`.
+ *
+ * Split into three rather than one OR because only the reclaim may count, and an UPDATE's SET cannot
+ * depend on which OR branch matched. Nothing is lost by the split: each statement names the state it
+ * takes the row FROM, so a row that moved between them simply fails to match the next one.
+ */
+async function claimEmailRow(
+  client: EmailOutboxClient,
+  id: string,
+  claim: { claimedAt: Date; staleCutoff: Date; token: string },
+): Promise<'claimed' | 'parked' | 'none'> {
+  const first = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { lt: EMAIL_MAX_ATTEMPTS },
+      status: 'PENDING',
+      availableAt: { lte: claim.claimedAt },
+    },
+    data: {
+      status: 'PROCESSING',
+      processingStartedAt: claim.claimedAt,
+      lockedBy: claim.token,
+    },
+  })
+  if (first.count > 0) return 'claimed'
+
+  const reclaim = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { lt: EMAIL_MAX_ATTEMPTS },
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      staleReclaimCount: { lt: EMAIL_MAX_STALE_RECLAIMS },
+    },
+    data: {
+      status: 'PROCESSING',
+      processingStartedAt: claim.claimedAt,
+      lockedBy: claim.token,
+      staleReclaimCount: { increment: 1 },
+    },
+  })
+  if (reclaim.count > 0) return 'claimed'
+
+  const parked = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      staleReclaimCount: { gte: EMAIL_MAX_STALE_RECLAIMS },
+    },
+    data: {
+      status: EMAIL_OUTBOX_PARKED_STATUS,
+      processingStartedAt: null,
+      lockedBy: null,
+      lastError: `Parked at the send cap: already reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s), and the holder `
+        + 'went stale again. Not retried automatically; an operator must release or cancel it (o3d-hpeg).',
+    },
+  })
+  return parked.count > 0 ? 'parked' : 'none'
+}
+
 export async function processPendingEmailOutbox(
   options: ProcessEmailOutboxOptions = {},
 ): Promise<ProcessEmailOutboxResult> {
@@ -1864,6 +1981,7 @@ export async function processPendingEmailOutbox(
     processed: 0,
     sent: 0,
     failed: 0,
+    parked: 0,
     conflicted: 0,
     conflictedWithoutSend: 0,
     unresolvedAfterSend: 0,
@@ -2259,28 +2377,39 @@ export async function processPendingEmailOutbox(
   for (const email of pending) {
     const claimedAt = now()
     const token = randomUUID()
-    const claimResult = await client.emailOutbox.updateMany({
-      where: {
-        id: email.id,
-        attempts: { lt: EMAIL_MAX_ATTEMPTS },
-        OR: [
-          {
-            status: 'PENDING',
-            availableAt: { lte: claimedAt },
-          },
-          {
-            status: 'PROCESSING',
-            processingStartedAt: { lt: staleCutoff },
-          },
-        ],
-      },
-      data: {
-        status: 'PROCESSING',
-        processingStartedAt: claimedAt,
-        lockedBy: token,
-      },
-    })
-    if (claimResult.count === 0) continue
+    const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token })
+    if (verdict === 'parked') {
+      // o3d-hpeg: this row had already been reclaimed EMAIL_MAX_STALE_RECLAIMS times and its latest
+      // holder has gone stale too. It is NOT reclaimed a further time; it is parked, and the drain
+      // never selects it again. Said loudly, because nothing will move it on but an operator.
+      result.parked++
+      const reference = email.referenceType && email.referenceId ? ` for ${email.referenceType} ${email.referenceId}` : ''
+      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED at the `
+        + `send cap: it had already been reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s) and its holder has gone stale `
+        + 'again, so the sender has been entered at least twice for it and a copy may already have reached the '
+        + 'customer. It will not be sent automatically. Check the mail server or provider log, then release it '
+        + `(tsx scripts/email-outbox-parked.ts --row ${email.id} --release --apply) or cancel it (--cancel --apply) (o3d-hpeg).`
+      console.error(`[email-outbox] ${message}`)
+      await log({
+        entityType: 'SYSTEM',
+        entityId: email.id,
+        action: 'email_outbox_parked_send_cap',
+        tag: 'system',
+        level: 'ERROR',
+        description: message,
+        metadata: {
+          emailOutboxId: email.id,
+          kind: email.kind,
+          referenceType: email.referenceType,
+          referenceId: email.referenceId,
+          staleReclaimCount: email.staleReclaimCount,
+          cap: EMAIL_MAX_STALE_RECLAIMS,
+        },
+        resolveUser: false,
+      })
+      continue
+    }
+    if (verdict === 'none') continue
 
     const claim: EmailClaim = { id: email.id, token, claimedAt }
     result.processed++
@@ -2392,8 +2521,8 @@ export async function processPendingEmailOutbox(
       }))
       // This is the write the issue was raised for: unfenced, it re-armed a row another worker had
       // already settled to SENT, so further copies went out on ordinary drain ticks with no further
-      // stale window needed. (The reclaim's OWN cost is not bounded either — see the correction at
-      // the top of this file and o3d-hpeg — but that part no fence can close.)
+      // stale window needed. (The reclaim's OWN cost is bounded separately, by the reclaim cap —
+      // see the top of this file and o3d-hpeg — because that part no fence can close.)
       if (settled) result.failed++
       else await recordConflict(claim, 'a failed send', smtp)
     } catch (error) {
@@ -2417,7 +2546,8 @@ export async function processPendingEmailOutbox(
     }
   }
 
-  if (result.processed > 0) {
+  // A run that only PARKED rows processed none of them, and still has something to say (o3d-hpeg).
+  if (result.processed > 0 || result.parked > 0) {
     await log({
       entityType: 'SYSTEM',
       action: 'email_outbox_processed',
@@ -2443,7 +2573,7 @@ export async function processPendingEmailOutbox(
       description: `Email outbox: ${result.sent} sent, ${result.failed} failed, `
         + `${result.conflicted} reclaimed after a send, ${result.conflictedWithoutSend} reclaimed before one, `
         + `${result.unresolvedAfterSend} unresolved after a send, ${result.unresolvedWithoutSend} unresolved before one, `
-        + `out of ${result.processed} processed`,
+        + `out of ${result.processed} processed, ${result.parked} parked at the send cap`,
       metadata: result,
       resolveUser: false,
     })
