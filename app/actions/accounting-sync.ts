@@ -6,7 +6,7 @@ import {
   ACCOUNTING_CONNECTORS,
   getAccountingConnector,
   getAccountingConnectorDefinition,
-  type AccountingConnectorId,
+  type AccountingConnectorId as RegistryAccountingConnectorId,
 } from '@/lib/connectors/accounting-registry'
 import { accountMappingRuleKeys, validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
@@ -114,10 +114,19 @@ export type AccountingConnectionStatus = {
   hasStoredToken?: boolean
 }
 
-// o3d-remove-parked-connectors: re-exported from the registry rather than re-declared. This was the
+// o3d-remove-parked-connectors: aliased from the registry rather than re-declared. This was the
 // second of five unlinked copies of the same union; this module's clients import it from here, so
 // the name stays and only its source changes.
-export type { AccountingConnectorId }
+//
+// It has to be a type ALIAS. Writing it as `export type { AccountingConnectorId }` — a re-export of
+// the binding imported above — made `next build` fail with "Export AccountingConnectorId doesn't
+// exist in target module" at all five pages that import this module, because this is a `'use server'`
+// module and the name reaches the generated server-action manifest as if it were a runtime export.
+// `tsc`, eslint, test:unit and check:all all passed on that version: the build is the ONLY gate that
+// catches it. The single-statement form IS fine (see `export type { XeroSettings } from ...` in
+// app/actions/xero-sync.ts, which builds) — it is specifically the split import-then-re-export shape
+// that breaks, so do not "tidy" this alias into one.
+export type AccountingConnectorId = RegistryAccountingConnectorId
 
 export type AccountingSyncReadiness = {
   ready: boolean
