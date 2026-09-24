@@ -202,9 +202,10 @@ const ALL_SEPARATORS_SCHEMA = BACKEND_SEPARATORS.map(([, separator], index) => `
  *
  * This is why the tests below ask the server its version instead of asserting one answer: the
  * first CI run of this whole tier ran against `postgres:16` and the flat six-character assertion
- * failed there (o3d-n3yt). The module has NOT been made version-aware — that is o3d-ik1j, a
- * product defect with its own branch — and the characterization test named for it below proves
- * what the module does on a server that keeps the character.
+ * failed there (o3d-n3yt). The module now trims only the five characters every major agrees on
+ * and REFUSES a vertical tab outside quotes, where the answer depends on the major (o3d-ik1j); the
+ * pure test `SCANNER_ISSPACE_BY_MAJOR` drives holds it to both majors' answers on any host, and the
+ * live test named for the issue measures whichever server this run reaches.
  */
 const VERTICAL_TAB = '\v'
 
@@ -434,7 +435,7 @@ function urlWithSearchPath(value: string): string {
   return url.toString()
 }
 
-test('o3d-2k5r r15: the six ASCII scanner whitespace characters are trimmed off a search path', () => {
+test('o3d-2k5r r15 / o3d-ik1j: the five version-independent scanner whitespace characters are trimmed off a search path; the vertical tab is refused', () => {
   // ROUTE: DATABASE_URL `?options=-c search_path=\<ws>tenant` -> splitLibpqOptions() (the escape is
   // why the character survives tokenizing) -> unescapeLibpq() -> singleSchemaOfSearchPath()'s trim
   // -> foldUnquotedIdentifier() -> the schema pinned and compared against `?schema=`. This is the
@@ -458,13 +459,172 @@ test('o3d-2k5r r15: the six ASCII scanner whitespace characters are trimmed off 
       ['trailing', `tenant${whitespace}`],
       ['both ends', `${whitespace}tenant${whitespace}`],
     ] as [string, string][]) {
+      if (whitespace === VERTICAL_TAB) {
+        // o3d-ik1j: PostgreSQL 17+ trims it and 16 and below keep it inside the name, so which
+        // schema this names depends on the server's major. Refused on every version, by name.
+        assert.throws(
+          () => resolveDatabaseUrlSchema(urlWithSearchPath(value)),
+          (error: unknown) => {
+            assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${label} ${position}: refused`)
+            assert.match((error as Error).message, /vertical tab/, `${label} ${position}: names the character`)
+            assert.match((error as Error).message, /o3d-ik1j/, `${label} ${position}: names the issue`)
+            return true
+          },
+        )
+        continue
+      }
       assert.deepEqual(
         resolveDatabaseUrlSchema(urlWithSearchPath(value)),
         { parsed: true, explicit: true, schema: 'tenant' },
-        `${label} ${position}: trimmed here because the server trims it there`,
+        `${label} ${position}: trimmed here because the server trims it there, on every major`,
       )
     }
   }
+})
+
+/**
+ * `scanner_isspace()` PER POSTGRESQL MAJOR, transcribed from src/backend/parser/scansup.c at each
+ * stable branch (read 2026-09-19): REL_14_STABLE and REL_16_STABLE list five characters,
+ * REL_17_STABLE adds the vertical tab (commit ae6d06f09684d8f8a7084514c9b35a274babca61). 15 is the
+ * same as 14 and 16. The live tests below measure whichever server this run reaches; this table is
+ * what lets the pure test below hold the module to BOTH answers on any host (o3d-ik1j).
+ */
+const SCANNER_ISSPACE_BY_MAJOR: [string, ReadonlySet<string>][] = [
+  ['PostgreSQL 14-16', new Set([' ', '\t', '\n', '\r', '\f'])],
+  ['PostgreSQL 17+', new Set([' ', '\t', '\n', '\r', '\v', '\f'])],
+]
+
+/**
+ * `SplitIdentifierString(value, ',', &list)` (src/backend/utils/adt/varlena.c) with
+ * `scanner_isspace()` as a parameter: the list of schema names a `search_path` value resolves
+ * through, or `null` where the server rejects the value as invalid list syntax. Unquoted names are
+ * folded A-Z -> a-z (`downcase_truncate_identifier()` for ASCII; the corpus below is ASCII).
+ */
+function splitIdentifierString(value: string, isSpace: ReadonlySet<string>): string[] | null {
+  const names: string[] = []
+  let at = 0
+  while (at < value.length && isSpace.has(value[at]!)) at += 1
+  if (at >= value.length) return names
+  for (;;) {
+    let name: string
+    if (value[at] === '"') {
+      name = ''
+      at += 1
+      for (;;) {
+        const close = value.indexOf('"', at)
+        if (close < 0) return null
+        name += value.slice(at, close)
+        if (value[close + 1] === '"') {
+          name += '"'
+          at = close + 2
+          continue
+        }
+        at = close + 1
+        break
+      }
+    } else {
+      const start = at
+      while (at < value.length && value[at] !== ',' && !isSpace.has(value[at]!)) at += 1
+      if (at === start) return null
+      name = value.slice(start, at).replace(/[A-Z]/g, (c) => c.toLowerCase())
+    }
+    while (at < value.length && isSpace.has(value[at]!)) at += 1
+    names.push(name)
+    if (at >= value.length) return names
+    if (value[at] !== ',') return null
+    at += 1
+    while (at < value.length && isSpace.has(value[at]!)) at += 1
+  }
+}
+
+test('o3d-ik1j: the pin is the schema EVERY PostgreSQL major resolves, or the URL is refused', (t) => {
+  // ROUTE: DATABASE_URL `?options=-c search_path=<value, escaped for pg_split_opts>` ->
+  // splitLibpqOptions() -> searchPathSchemaOf() -> the schema resolveDatabaseUrlSchema() reports,
+  // which pgConnectionConfig() pins QUOTED (so the server lands on exactly that string) and which
+  // is compared against `?schema=`.
+  //
+  // THE PROPERTY, per value and per major: if the module pins S, then that major's own
+  // SplitIdentifierString() resolves the value to exactly [S]. Where the majors disagree, the only
+  // correct answer is a refusal — any pin is wrong on one of them.
+  //
+  // MUTATION: put '\v' back into SCANNER_WHITESPACE (the pre-fix module). `<VT>tenant` then pins
+  // `tenant` while 14-16 resolve `<VT>tenant`, and this fails naming that value and that major.
+  // Deleting only the explicit refusal leaves the module fail-closed (an unquoted `<VT>tenant` is
+  // not a foldable identifier), so that mutation is caught by the message assertions in the test
+  // above rather than here.
+  const whitespace = [' ', '\t', '\n', '\r', '\f', '\v']
+  const values = new Set<string>(['tenant', 'TenantA', '"TenantA"', '"ten ant"', 'a,b'])
+  for (const w of whitespace) {
+    for (const base of ['tenant', 'TenantA']) {
+      values.add(`${w}${base}`)
+      values.add(`${base}${w}`)
+      values.add(`${w}${base}${w}`)
+      values.add(`${base.slice(0, 3)}${w}${base.slice(3)}`)
+    }
+    values.add(`"${w}tenant"`)
+    values.add(`"tenant${w}"`)
+    values.add(`"ten${w}ant"`)
+    values.add(`${w}"tenant"`)
+    values.add(`"tenant"${w}`)
+    values.add(`${w}"${w}tenant"${w}`)
+  }
+
+  let pinned = 0
+  let refused = 0
+  let majorsDisagree = 0
+  let pinnedWithVerticalTab = 0
+  for (const value of values) {
+    const answers = SCANNER_ISSPACE_BY_MAJOR.map(([major, set]) => [major, splitIdentifierString(value, set)] as const)
+    const disagree = new Set(answers.map(([, names]) => JSON.stringify(names))).size > 1
+    if (disagree) majorsDisagree += 1
+    let schema: string | null = null
+    try {
+      schema = resolveDatabaseUrlSchema(urlWithSearchPath(value)).schema
+    } catch (error) {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, `${JSON.stringify(value)}: a refusal, not a crash`)
+    }
+    if (schema === null) {
+      refused += 1
+      continue
+    }
+    pinned += 1
+    if (value.includes('\v')) pinnedWithVerticalTab += 1
+    assert.ok(!disagree, `${JSON.stringify(value)}: the majors disagree (${JSON.stringify(answers)}) and the module pinned ${JSON.stringify(schema)}`)
+    for (const [major, names] of answers) {
+      assert.deepEqual(names, [schema], `${JSON.stringify(value)}: pinned ${JSON.stringify(schema)}, and ${major} resolves the same`)
+    }
+    // AND THE CONFLICT GATE agrees with the server, not with a trim: `?schema=` naming what the
+    // server resolves is agreement on every major.
+    const both = new URL(urlWithSearchPath(value))
+    both.searchParams.set('schema', schema)
+    assert.equal(resolveDatabaseUrlSchema(both.toString()).schema, schema, `${JSON.stringify(value)}: ?schema= agrees`)
+  }
+
+  // THE VERSION-DEPENDENT VALUES CANNOT BE PINNED, AND ?schema= CANNOT BE MADE TO AGREE WITH THEM
+  // under either major's reading — the disarmed conflict gate from the issue.
+  for (const value of values) {
+    const answers = SCANNER_ISSPACE_BY_MAJOR.map(([, set]) => splitIdentifierString(value, set))
+    if (new Set(answers.map((names) => JSON.stringify(names))).size === 1) continue
+    for (const names of answers) {
+      if (names?.length !== 1) continue
+      const both = new URL(urlWithSearchPath(value))
+      both.searchParams.set('schema', names[0]!)
+      assert.throws(
+        () => resolveDatabaseUrlSchema(both.toString()),
+        DatabaseUrlSchemaConflictError,
+        `${JSON.stringify(value)} with ?schema=${JSON.stringify(names[0])}: one major reads two different schemas here`,
+      )
+    }
+  }
+
+  // NOT VACUOUS: the corpus reaches both outcomes, holds values the majors genuinely disagree on,
+  // and still pins a vertical tab where every major agrees (inside quotes) — so the fix is a
+  // refusal of the AMBIGUOUS character, not of the character.
+  t.diagnostic(`corpus ${values.size}: pinned ${pinned}, refused ${refused}, majors disagree on ${majorsDisagree}, pinned with a quoted vertical tab ${pinnedWithVerticalTab}`)
+  assert.ok(pinned >= 40, `the corpus pins real values (${pinned})`)
+  assert.ok(refused >= 20, `and refuses real values (${refused})`)
+  assert.ok(majorsDisagree >= 10, `and holds values the majors disagree on (${majorsDisagree})`)
+  assert.ok(pinnedWithVerticalTab >= 3, `and pins a vertical tab where every major agrees (${pinnedWithVerticalTab})`)
 })
 
 test('o3d-2k5r r18: an escaped non-ASCII character at either end of a search path is refused, not trimmed', () => {
@@ -1418,7 +1578,7 @@ test('o3d-2k5r r18 (live): the REAL server carries the escaped character, and it
   }
 })
 
-test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, and this module trims it on EVERY version', async (t) => {
+test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, so the module refuses it where the server would decide, and carries it where it is literal', async (t) => {
   const scratch = await openScratch(t)
   if (!scratch) return
   const quote = (name: string) => `"${name.replace(/"/g, '""')}"`
@@ -1448,25 +1608,43 @@ test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, and this modul
     )
     await scratch.admin.query("select set_config('search_path','public',false)")
 
-    // WHAT THE MODULE DOES WITH IT: the same thing on every version, which is the defect.
-    // `SCANNER_WHITESPACE` is a fixed six-character set, so `trimScannerWhitespace()` strips the
-    // vertical tab whether or not the server would, and `pgConnectionConfig()` then DELETES the
-    // URL's own `options` and pins the trimmed name.
+    // WHAT THE MODULE DOES WITH IT: REFUSES IT, on every version (o3d-ik1j). Before the fix it trimmed
+    // it on every version — right on 17 and above, and on 16 and below a silent cross-schema
+    // retargeting: the write through the module landed in `tenant` while the URL as written named
+    // the existing `<VT>tenant`, and `?schema=tenant` was accepted as agreeing with it.
     //
     // The vertical tab must be backslash-escaped to get here at all: unescaped it is a
     // `pg_split_opts()` separator on every version (libc `isspace()`), which ends the token and
     // routes the URL to the zero-length-name refusal instead.
+    //
+    // MUTATION: put '\v' back into SCANNER_WHITESPACE and delete the refusal in
+    // searchPathSchemaOf(). pgConnectionConfig() then returns `-c search_path="tenant"` again and
+    // the assert.throws below fails on every major.
+    const refusedAsAmbiguous = (error: unknown) => {
+      assert.ok(error instanceof DatabaseUrlSchemaConflictError, 'refused with the gate\'s own error')
+      assert.match((error as Error).message, /vertical tab/)
+      assert.match((error as Error).message, /o3d-ik1j/)
+      return true
+    }
     const url = new URL(scratch.url)
     url.searchParams.set('options', `-c search_path=\\${VERTICAL_TAB}tenant`)
-    const config = pgConnectionConfig(url.toString())
-    assert.equal(
-      config.options,
-      '-c search_path="tenant"',
-      'the module trims the vertical tab regardless of what the server does with it',
-    )
+    assert.throws(() => pgConnectionConfig(url.toString()), refusedAsAmbiguous, `PostgreSQL ${major}: leading VT refused`)
+    for (const value of [`tenant\\${VERTICAL_TAB}`, `"tenant"\\${VERTICAL_TAB}`, `\\${VERTICAL_TAB}"tenant"`]) {
+      const other = new URL(scratch.url)
+      other.searchParams.set('options', `-c search_path=${value}`)
+      assert.throws(() => pgConnectionConfig(other.toString()), refusedAsAmbiguous, `PostgreSQL ${major}: ${JSON.stringify(value)} refused`)
+    }
 
-    // AND WHERE EACH OF THEM PUTS A WRITE, measured rather than reasoned about: the operator's own
-    // URL sent verbatim, and the same URL through the module.
+    // AND THE CONFLICT GATE IS NO LONGER DISARMED: `?schema=tenant` beside the same options is a
+    // refusal, not "agreement" — on 16 and below those two halves name two different schemas.
+    const both = new URL(scratch.url)
+    both.searchParams.set('schema', 'tenant')
+    both.searchParams.set('options', `-c search_path=\\${VERTICAL_TAB}tenant`)
+    assert.throws(() => pgConnectionConfig(both.toString()), refusedAsAmbiguous, `PostgreSQL ${major}: the two-schema URL is refused`)
+
+    // WHAT THE REFUSAL COSTS, MEASURED: the operator's own URL, sent verbatim with the module
+    // bypassed, lands where THIS server's major says — which is exactly why the module cannot
+    // pick one answer for it.
     const write = async (client: pg.Client, key: string) => {
       await client.connect()
       try {
@@ -1475,7 +1653,10 @@ test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, and this modul
         await client.end().catch(() => undefined)
       }
     }
-    await write(new pg.Client({ ...config, connectionTimeoutMillis: 3_000 }), 'through-the-module')
+    const landed = async (name: string) =>
+      (await scratch.admin.query<{ k: string }>(`select key as k from ${quote(name)}.settings order by key`)).rows.map(
+        (row) => row.k,
+      )
     await write(
       new pg.Client({
         connectionString: scratch.url,
@@ -1484,60 +1665,25 @@ test('o3d-ik1j (live): PostgreSQL learned the vertical tab in 17, and this modul
       }),
       'as-the-url-is-written',
     )
-    const landed = async (name: string) =>
-      (await scratch.admin.query<{ k: string }>(`select key as k from ${quote(name)}.settings order by key`)).rows.map(
-        (row) => row.k,
-      )
-
-    if (serverStrips) {
-      // ON 17 AND ABOVE THE MODULE IS RIGHT, and this half is what must keep passing once o3d-ik1j
-      // is fixed: both routes name the same schema because the server itself trims the character.
-      assert.deepEqual(
-        await landed('tenant'),
-        ['as-the-url-is-written', 'through-the-module'],
-        `PostgreSQL ${major}: both routes resolve the same schema, so the trim matches the server`,
-      )
-      assert.deepEqual(await landed(VT_TENANT), [], `PostgreSQL ${major}: and nothing reaches the other schema`)
-    } else {
-      // ON 16 AND BELOW IT IS A SILENT CROSS-SCHEMA RETARGETING — the defect class
-      // `trimScannerWhitespace()` exists to prevent (o3d-2k5r r15, the U+00A0 finding), in the same
-      // direction, on an ASCII character round 18's non-ASCII refusal does not cover.
-      //
-      // THIS IS A CHARACTERIZATION OF A KNOWN, TRACKED DEFECT, NOT AN ACCEPTED BEHAVIOUR. It is
-      // asserted rather than skipped so that the tests/db tier reports it on every run against a
-      // pre-17 server (this repository's CI runs `postgres:16` and `postgres:14.13`), and so that
-      // it cannot widen unnoticed. When o3d-ik1j is fixed this branch FAILS — deliberately: the
-      // fix must delete it and leave the `serverStrips` half above, which by then holds on every
-      // version.
-      t.diagnostic(
-        `KNOWN DEFECT o3d-ik1j: on PostgreSQL ${major} the server KEEPS a vertical tab in a ` +
-          'search_path element, the module trims it, and the two routes below resolve DIFFERENT schemas',
-      )
-      assert.deepEqual(
-        await landed('tenant'),
-        ['through-the-module'],
-        `PostgreSQL ${major} (o3d-ik1j): the module retargets the write onto the trimmed name`,
-      )
-      assert.deepEqual(
-        await landed(VT_TENANT),
-        ['as-the-url-is-written'],
-        `PostgreSQL ${major} (o3d-ik1j): while the URL as written names a different, existing schema`,
-      )
-    }
-
-    // AND THE CONFLICT GATE IS DISARMED BY THE SAME TRIM, not merely made inaccurate. o3d-1izw
-    // refuses a URL naming two schemas; here the two halves compare EQUAL after the trim, so on a
-    // server that keeps the character a genuine two-schema URL is reported as agreement.
-    const both = new URL(scratch.url)
-    both.searchParams.set('schema', 'tenant')
-    both.searchParams.set('options', `-c search_path=\\${VERTICAL_TAB}tenant`)
-    assert.equal(
-      pgConnectionConfig(both.toString()).options,
-      '-c search_path="tenant"',
-      serverStrips
-        ? `PostgreSQL ${major}: the two halves really do name one schema, so agreement is correct`
-        : `PostgreSQL ${major} (o3d-ik1j): the two halves name DIFFERENT schemas and are accepted as agreement`,
+    assert.deepEqual(
+      await landed(serverStrips ? 'tenant' : VT_TENANT),
+      ['as-the-url-is-written'],
+      `PostgreSQL ${major}: the URL as written resolves ${serverStrips ? 'the trimmed name' : 'the name WITH the vertical tab'}`,
     )
+
+    // AND WHERE THE CHARACTER IS LITERAL ON EVERY VERSION — inside a quoted element — IT IS CARRIED,
+    // NOT REFUSED: the module pins `<VT>tenant` and this server lands on it, whatever its major.
+    // (Escaped for pg_split_opts, which splits on it inside quotes too.)
+    const quoted = new URL(scratch.url)
+    quoted.searchParams.set('options', `-c search_path="\\${VERTICAL_TAB}tenant"`)
+    const quotedConfig = pgConnectionConfig(quoted.toString())
+    await write(new pg.Client({ ...quotedConfig, connectionTimeoutMillis: 3_000 }), 'quoted-through-the-module')
+    assert.deepEqual(
+      await landed(VT_TENANT),
+      serverStrips ? ['quoted-through-the-module'] : ['as-the-url-is-written', 'quoted-through-the-module'],
+      `PostgreSQL ${major}: a quoted vertical tab is part of the name on every major, and the module pins it`,
+    )
+    assert.ok(!(await landed('tenant')).includes('quoted-through-the-module'), `PostgreSQL ${major}: and never lands on the trimmed name`)
   } finally {
     await scratch.drop()
   }
