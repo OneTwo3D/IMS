@@ -2962,14 +2962,67 @@ function parseRefundAccountingRetrySyncs(
       // but not to a structural comparison, and one of those consumers is the persisted JSON this
       // very function round-trips.
       // REGISTRY-CHECKED (o3d-remove-parked-connectors); it was the two literals this build happened
-      // to ship. A pin naming a connector this build cannot route is still not a pin — see the
-      // paragraph above — and checking the registry means a connector registered later is honoured
-      // without an edit here.
+      // to ship, so checking the registry means a connector registered later is honoured without an
+      // edit here.
+      //
+      // o3d-r5uk: DROPPING AN UNREGISTERED PIN IS NOT SAFE, and it is not what this line is for.
+      // `AccountingSyncLog`/`accountingRetrySyncs` still hold `quickbooks` pins — retiring the
+      // connector deleted no rows — and an ABSENT `connector` means "resolve the active connector"
+      // (see the field's own doc at RefundAccountingSyncRequest). So dropping the key here would
+      // re-queue a reversal that was proved against QuickBooks into XERO'S BOOKS, silently. Before
+      // the registry check the literal `=== 'quickbooks'` kept the pin, `pinnedLedgerIsServiced`
+      // found the active connector was not it, and the enqueue answered `refused` — the posting left
+      // owed and visible, which is the correct answer.
+      //
+      // The pin is therefore still only carried when this build can route it, AND
+      // `unserviceableRefundAccountingRetryPins` below refuses the whole retry when any entry names
+      // one it cannot. The two together are what keeps "drop the key" from meaning "post it
+      // somewhere else".
       ...(isRegisteredAccountingConnector(entry.connector)
         ? { connector: entry.connector }
         : {}),
     }]
   })
+}
+
+/**
+ * The connector pins in a persisted retry stage that THIS BUILD CANNOT ROUTE (o3d-r5uk).
+ *
+ * Read from the raw JSON rather than from the parsed requests, because the parser's job is to build
+ * a request this build can act on and it necessarily drops what it cannot — which is exactly the
+ * information needed here. Distinct, sorted, so the refusal names each ledger once.
+ *
+ * WHY NOT DROP THE ENTRY INSTEAD: an entry that parses to nothing makes `persistedSyncs` empty, and
+ * an empty persisted stage is a DIFFERENT event on the retry path — one whose success writes
+ * `accountingRetryRequired: false` and `accountingRetrySyncs: DbNull`, erasing the only durable mark
+ * that this refund's accounting was ever unfinished. Refusing keeps the mark, the affordance and the
+ * evidence; see the o3d-2sm1 note at the retry's `revenueDeferredDate` branch, which argues the same
+ * asymmetry for a different undecidable.
+ */
+export function unserviceableRefundAccountingRetryPins(
+  value: Prisma.JsonValue | null | undefined,
+): string[] {
+  if (!Array.isArray(value)) return []
+  const pins = new Set<string>()
+  for (const entry of value) {
+    if (!isRecord(entry)) continue
+    const pin = entry.connector
+    if (typeof pin !== 'string') continue
+    const trimmed = pin.trim()
+    if (trimmed.length === 0) continue
+    if (!isRegisteredAccountingConnector(trimmed)) pins.add(trimmed)
+  }
+  return [...pins].sort()
+}
+
+/** The refusal an unserviceable pin produces, named so an operator knows which ledger and why. */
+export function unserviceableRefundAccountingRetryError(pins: readonly string[]): string {
+  return 'This refund\'s staged accounting reversals are pinned to '
+    + `${pins.join(', ')}, which this build no longer ships. They are NOT re-queued: an unpinned `
+    + 'retry would post them to the active ledger instead, crediting one set of books for a '
+    + 'reversal that was proved against another. The refund keeps its retry flag and its staged '
+    + 'reversals, so nothing is lost — reconnect that ledger, or raise the reversals against it by '
+    + 'hand and clear the flag.'
 }
 
 /**
@@ -4731,6 +4784,13 @@ export async function retrySalesOrderRefundAccounting(
             input.accountingSettings.reverseChargeSalesTaxType,
           )
         : null
+
+      // o3d-r5uk: asked BEFORE the parse, because the parse is what makes an unroutable pin
+      // invisible. Refusing leaves `accountingRetryRequired` set and the staged syncs on the row.
+      const unserviceablePins = unserviceableRefundAccountingRetryPins(refund.accountingRetrySyncs)
+      if (unserviceablePins.length > 0) {
+        return { success: false, error: unserviceableRefundAccountingRetryError(unserviceablePins) }
+      }
 
       const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
       if (persistedSyncs.length > 0) {

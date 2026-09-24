@@ -4794,6 +4794,134 @@ test('retrySalesOrderRefundAccounting replays persisted syncs after full refund 
   assert.equal(state.movements.length, 0)
 })
 
+/**
+ * o3d-r5uk — A PIN NAMING A RETIRED LEDGER REFUSES THE RETRY; IT IS NOT DROPPED.
+ *
+ * `SalesOrderRefund.accountingRetrySyncs` is JSON and archiving QuickBooks deleted no rows, so a
+ * staged reversal can still carry `connector: 'quickbooks'`. An ABSENT `connector` means "resolve
+ * the active connector" (RefundAccountingSyncRequest's own doc), so narrowing the parser's pin check
+ * to the registry turned a stored QuickBooks pin into an UNPINNED request — and the retry would have
+ * re-queued a reversal proved against QuickBooks into Xero's books. Before the narrowing the literal
+ * check kept the pin, `pinnedLedgerIsServiced` found the active connector was not it, and the
+ * enqueue answered `refused`: the posting left owed and visible.
+ *
+ * The refusal has to happen HERE rather than by dropping the entry, because an entry that parses to
+ * nothing empties `persistedSyncs`, and an empty persisted stage takes a different branch whose
+ * success clears `accountingRetryRequired` and nulls `accountingRetrySyncs` — erasing the only
+ * durable mark that the accounting was unfinished.
+ */
+function quickbooksPinnedRetryFixture() {
+  const persistedSyncs = [{
+    type: 'COGS_REVERSAL' as const,
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal',
+    connector: 'quickbooks',
+    payload: {
+      date: '2026-01-03',
+      reference: 'COGS reversal: SO-1',
+      lines: [
+        { accountCode: '1200', description: 'COGS reversal: SO-1', debit: 20 },
+        { accountCode: '5000', description: 'COGS reversal: SO-1', credit: 20 },
+      ],
+    },
+  }]
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Full return',
+      totalForeign: 100,
+      totalBase: 100,
+      returnWarehouseId: null,
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting queueing failed',
+      accountingRetrySyncs: persistedSyncs,
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 2,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
+    }],
+  })
+  withRecordedA2Journal(state, { status: 'SYNCED' })
+  return { state, persistedSyncs }
+}
+
+test('a retry stage pinned to the RETIRED QuickBooks ledger is refused by name, not re-queued into Xero', async () => {
+  const { state, persistedSyncs } = quickbooksPinnedRetryFixture()
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, false, 'an unroutable pin must refuse — dropping it posts to Xero')
+  const error = result.success ? '' : String(result.error)
+  assert.match(error, /quickbooks/, 'the refusal must NAME the ledger that caused it')
+  assert.match(error, /no longer ships/)
+  // The staged reversals are still on the row and the flag is still set: nothing was consumed.
+  assert.deepEqual(state.refunds[0].accountingRetrySyncs, persistedSyncs)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
+  assert.equal(state.movements.length, 0)
+})
+
+test('the same fixture pinned to a SERVICED ledger still replays — the refusal is about the pin, not the shape', async () => {
+  // The control. Without it, "refused" above could be any of the retry's other refusals.
+  const { state, persistedSyncs } = quickbooksPinnedRetryFixture()
+  const xeroPinned = persistedSyncs.map((sync) => ({ ...sync, connector: 'xero' }))
+  state.refunds[0].accountingRetrySyncs = xeroPinned
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(result.success ? result.accountingSyncs : [], xeroPinned, 'the pin survives the round trip')
+})
+
+test('unserviceableRefundAccountingRetryPins reads the RAW stage, distinct and sorted', async () => {
+  const { unserviceableRefundAccountingRetryPins } = await import('../../../lib/domain/sales/refund-service.ts')
+  assert.deepEqual(unserviceableRefundAccountingRetryPins(null), [])
+  assert.deepEqual(unserviceableRefundAccountingRetryPins([]), [])
+  assert.deepEqual(unserviceableRefundAccountingRetryPins([{ connector: 'xero' }]), [])
+  assert.deepEqual(unserviceableRefundAccountingRetryPins([{ connector: '  ' }]), [], 'blank is not a pin')
+  assert.deepEqual(unserviceableRefundAccountingRetryPins([{}]), [], 'unpinned is not unserviceable')
+  assert.deepEqual(
+    unserviceableRefundAccountingRetryPins([
+      { connector: 'quickbooks' },
+      { connector: 'xero' },
+      { connector: 'quickbooks' },
+      { connector: 'sage' },
+    ]),
+    ['quickbooks', 'sage'],
+  )
+})
+
 test('applyReturnInboundStockTx returns existing movement rows without duplicating stock', async () => {
   const state = baseState({
     movements: [{
