@@ -47,8 +47,9 @@
  *     and the COMMENT — none of which resolves a search_path name. Not a lock: rows another session
  *     commits between the re-check and COMMIT are not seen.
  *   · `--unstamp` reads only the name, the server identity and the comment. It never runs the data
- *     probe (review L6), pins the session on both connections, and decides on the comment the WRITER
- *     re-reads (r10 LOW-4).
+ *     probe (review L6), pins the session on both connections, re-reads the identity on the writer
+ *     inside the same kind of read-only savepoint as the stamp path (follow-up LOW-5), and decides
+ *     on the comment the WRITER re-reads (r10 LOW-4).
  *
  * SUPERUSER (r11, review LOW-4 item 4). The stamper does NOT hard-refuse to run as a superuser: CI
  * stamps `ims_ci` as `postgres`, and a refusal would break it. A superuser is the WORST case for
@@ -115,7 +116,16 @@ const IDENTITY_SQL = `
     FROM pg_catalog.pg_database d
    WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()`
 
+/**
+ * TEST-ONLY observer of every statement this script sends, in order (follow-up review LOW-3). It lets
+ * a test assert the writer's statement ORDER — that the identity re-read and the data/installation
+ * checks run BETWEEN `SAVEPOINT` + `SET LOCAL transaction_read_only = on` and the rollback, so no
+ * catalog read runs read-write. It observes; it changes nothing.
+ */
+let statementObserver: ((sql: string) => void) | null = null
+
 async function ask<T>(client: ExtendedQueryClient, text: string): Promise<T[]> {
+  statementObserver?.(text)
   const { rows } = await client.query({ text, values: [], queryMode: 'extended' })
   return rows as T[]
 }
@@ -287,9 +297,18 @@ export function connectionOptions(readOnly: boolean): string {
  * show each check refusing. It widens nothing: whatever it does is done by the test's own
  * connection, and every check below still runs.
  */
-export type StampHooks = { betweenReadAndWrite?: () => Promise<void> }
+export type StampHooks = { betweenReadAndWrite?: () => Promise<void>; onStatement?: (sql: string) => void }
 
 export async function main(argv: string[], hooks: StampHooks = {}): Promise<number> {
+  statementObserver = hooks.onStatement ?? null
+  try {
+    return await runMain(argv, hooks)
+  } finally {
+    statementObserver = null
+  }
+}
+
+async function runMain(argv: string[], hooks: StampHooks): Promise<number> {
   const unstamp = argv.includes('--unstamp')
   const requestedName = argv.find((arg) => !arg.startsWith('--'))
 
@@ -353,10 +372,18 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
     const writer = await open(false)
     try {
       await ask(writer, 'BEGIN')
-      // Pin proof on the writer too. IDENTITY_SQL's operators are all pg_catalog-qualified, so this
-      // read is safe read-write; the assertion is the belt for a session that lost its options.
+      // THE SAME READ-ONLY SAVEPOINT AS THE STAMP PATH (o3d-zzgp follow-up, review LOW-5): the pin
+      // proof and the identity re-read run under `transaction_read_only = on`, and the rollback to the
+      // savepoint restores read-write for the COMMENT alone — so on --unstamp too, no catalog read
+      // runs read-write.
+      let seen: Identity
       try {
+        await ask(writer, 'SAVEPOINT unstamp_recheck')
+        await ask(writer, 'SET LOCAL transaction_read_only = on')
         await assertProbeSessionSafe(writer)
+        seen = await readIdentity(writer)
+        await ask(writer, 'ROLLBACK TO SAVEPOINT unstamp_recheck')
+        await ask(writer, 'RELEASE SAVEPOINT unstamp_recheck')
       } catch (error) {
         await ask(writer, 'ROLLBACK').catch(() => {})
         if (error instanceof UnsafeProbeSession) {
@@ -365,7 +392,6 @@ export async function main(argv: string[], hooks: StampHooks = {}): Promise<numb
         }
         throw error
       }
-      const seen = await readIdentity(writer)
       if (!sameServerAndDatabase(identity, seen)) {
         await ask(writer, 'ROLLBACK')
         console.error('REFUSING to unstamp: the writing connection reached a different server or database')

@@ -146,16 +146,26 @@ and the writer re-reads the identity AND re-runs the data check inside a savepoi
 NO catalog read runs read-write and the only read-write statements are `BEGIN`/`SAVEPOINT`/`SET
 LOCAL`/`ROLLBACK`/`RELEASE` and the `COMMENT` (o3d-zzgp r10, r11).
 
-**CI HAS NO EXECUTION COVERAGE OF THE SUPERUSER-SKIP CASES** (o3d-zzgp r11, review LOW-4). The
-row-level-security cases and the search-path superuser variant (`COPY … TO PROGRAM`, a table written
-by a planted operator on a superuser writer) can only be demonstrated by a role that is SUBJECT to
-row-level security or is a superuser; `fresh-db-drift` connects as `postgres` (a superuser), so those
-integration cases skip there, exactly as they say when they skip. What CI DOES cover indirectly:
-`assertProbeSessionSafe` fails closed for any role — including a superuser — whenever `row_security`
-is not off or `search_path` is not `pg_catalog`, and the unit tests assert both the option string and
-that the assertion is the first statement every read path sends, so removing either the option or the
-assertion turns a unit test red without a database. The non-superuser search-path cases (a/c/d) run in
-full under a developer's ordinary role. The out-of-band reproduction lives in `mut/r11/attacks.sh`.
+**WHAT CI EXECUTES, AND WHAT IT DOES NOT** (o3d-zzgp r11, corrected in the follow-up). CI's
+`fresh-db-drift` job connects as `postgres`, a superuser. In
+`tests/concurrency/stamp-scratch-database.test.ts`:
+
+* the two **row-level-security** cases SKIP there, and say why: a superuser (or a BYPASSRLS role) never
+  evaluates a policy, so there is nothing to show. They run under a developer's ordinary role.
+* the **search-path** cases — (a) a planted `!~` that would hide rows from the data check, (c) a
+  planted `=` that would write on the stamper's writer, (d) a planted `=` that would hide a `users`
+  row from the guard, and the case that shows the `search_path` pin holding ON ITS OWN against an
+  unqualified statement — do NOT skip: the planting role is the connecting role, so they run in CI as
+  `postgres` and locally as the developer's role.
+* no automated case covers the superuser-only CONSEQUENCE of that vector — a planted operator running
+  `COPY … TO PROGRAM` as the server's OS user. It was demonstrated by hand during review and is not
+  automated, because demonstrating it means executing a program on the database host.
+
+Indirect coverage that needs no database: `assertProbeSessionSafe` fails closed for any role whenever
+`row_security` is not off or `search_path` is not `pg_catalog`; unit tests pin the option string, that
+the assertion is the first statement each read path sends, the stamper's statement order (every
+catalog read on its writing connection happens inside the read-only savepoint), and that every
+operator, function, cast and relation in the SQL these modules send is `pg_catalog`-qualified.
 
 ```bash
 createdb -O "$PGUSER" ims_scratch_$(date +%s)          # any name that is not refused above

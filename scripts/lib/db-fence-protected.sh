@@ -426,7 +426,9 @@ _fence_fsync_path() {
 # THE REFUSAL ENDS THE RUN FROM ANY CONTEXT (r12, review M1). Every fence publication runs inside a
 # command substitution, where `exit` leaves only the substitution. So a refusal made in a subshell also
 # sends SIGTERM to the top-level shell ($$ is the top-level pid in every subshell), whose EXIT trap runs
-# as it would for an operator's kill; in the top-level shell it simply exits.
+# as it would for an operator's kill; in the top-level shell it simply exits. The limits are those of
+# privileged_end_run() (TERM trapped and a substitution in an argument; TERM ignored; `bash -c`; inside
+# an EXIT-trap handler): the refused operation never runs in any of them.
 _fence_require_owned_tree() {
   local path="$1" what="$2" probe="${3:-}" root canon owned base tmp
   case "${path}" in
@@ -457,7 +459,13 @@ _fence_require_owned_tree() {
 
 _fence_owned_refuse() {
   echo "REFUSING: ${1} (${2}) ${3}. The fence library only copies into, deletes or re-owns trees it created; reaching here is a bug in these scripts, and the run stops rather than touch it." >&2
-  if [[ "${BASHPID}" != "$$" ]]; then
+  local frame in_handler=0
+  for frame in "${FUNCNAME[@]}"; do
+    [[ "${frame}" == "on_exit" || "${frame}" == "on_cutover_exit" ]] && in_handler=1
+  done
+  # Not from inside an entrypoint's EXIT-trap handler (read from the call stack; see
+  # privileged_in_exit_handler): there the refusal ends only its subshell and the handler still reports.
+  if [[ "${BASHPID}" != "$$" ]] && (( in_handler == 0 )); then
     kill -TERM "$$" 2>/dev/null || true
   fi
   exit 1

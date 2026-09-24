@@ -77,16 +77,18 @@ Two mechanisms carry the guarantee at **run time**, and a static test keeps them
 - **The helpers' own refusals.** The library helpers that delete, rename, re-own or copy into a tree
   they are *handed* check the path when they run, each against its own rule:
   - `driver_publish_unwind`, the driver sweep and the driver publication accept only paths inside
-    `/etc/ims-cutover-driver`: for an operation that follows the path (a recursive chown or chmod, a
-    copy into it) the whole path must canonicalise strictly inside it; for an operation on the name
-    itself (`rm -rf NAME`, `mv -T NAME`, which remove or rename a final symlink without following it)
-    the name's own location must be inside it.
+    `/etc/ims-cutover-driver`. For an operation that follows the path (a recursive chown or chmod, a
+    copy into it) the whole path must canonicalise strictly inside it (`driver_require_owned_path`,
+    which takes no mode). An operation on a NAME itself — removing, renaming or creating a pointer — is
+    done by `driver_unlink_owned`, `driver_rename_owned` or `driver_link_owned`, which check that the
+    name's own location is inside the root and then perform that one operation on exactly that name,
+    so a pointer whose target lies elsewhere can be removed but nothing can be done *through* it.
   - the fence's `_fence_vendor_into` and `_fence_stage_and_publish` accept only paths strictly inside
     `/etc/ims-cutover-recovery`, or a probe directory the caller passes explicitly that is what
     `mktemp -d` makes (named `tmp.` + ten characters, directly in `${TMPDIR:-/tmp}`, owned by this
-    account). So re-aiming one of the fence's `readonly` names at the application tree is refused. No
-    global variable widens either check: the names they read are readonly or cleared when the library
-    loads.
+    account). So re-aiming one of the fence's `readonly` names at the application tree is refused.
+    What these checks read is readonly, cleared when the library loads, or — `TMPDIR` — able only to
+    narrow the probe rule (it says where a caller-passed probe must be), never to widen it.
   - `copy_tree_into_new_dir` checks only that its destination does not overlap the tree the run is
     executing from; the destination itself is the caller's choice, checked at the guarded call site.
   - `chown_state_tree` re-owns `${DATA_DIR}` and nothing else, after the same overlap check.
@@ -95,9 +97,20 @@ Two mechanisms carry the guarantee at **run time**, and a static test keeps them
     decision.
 
   Canonical means every symbolic link resolved and no `.` or `..` component. **A refusal means the
-  operation never runs, and it ends the run from any context**: in the top-level shell it exits; in a
-  command substitution, subshell, pipeline or background job — where every fence publication runs — it
-  also sends SIGTERM to the top-level shell, whose EXIT trap runs as it would for an operator's kill.
+  refused operation never runs.** It also ends the run: in the top-level shell it exits; in a command
+  substitution, subshell, pipeline or background job — where every fence publication runs — it also
+  sends SIGTERM to the top-level shell, whose EXIT trap runs as it would for an operator's kill. What
+  that does NOT cover, stated precisely:
+  - with TERM trapped (update.sh and deploy.sh: `exit 143`), bash runs the trap after the *current*
+    simple command finishes, so a refusal inside a substitution used as an ARGUMENT
+    (`rm -rf "v$(f)"`) lets that command complete. Every real call site is an assignment
+    (`x="$(resolve_fence_script)" || die`/`return`), which is why this is wording and not a defect;
+  - if TERM is ignored (`trap '' TERM`, or inherited as ignored), the run continues after the refusal;
+  - a guarded function run in a separate `bash -c` process ends only that process;
+  - inside the entrypoints' own EXIT-trap handlers the refusal deliberately ends only its subshell, so
+    the handler still reports (for example "the fence could not be re-established") and finishes.
+
+  In every one of these cases the refused operation itself still never runs.
 
 The operations that run **without** a per-operation check in the entrypoints are listed by line, each
 with its reason, in the test described below: eleven deletes of the clone directory the same run has
@@ -129,12 +142,19 @@ a classifier over the shapes it can parse**; it is not a proof about what the sc
 - The allowlist binds **text, not values or context**. Moving an allowlisted line, or changing a
   variable it uses, does not fail it. That is why every entry that changes a tree (`code-owned-tree`,
   `census-helper`) names the run-time guard that checks its path, and the test binds each occurrence to
-  a call of that guard — also by text: the call is a plain statement (not in a subshell, a
-  substitution, a background job or a condition), in the same block as the operation or an enclosing
-  one, on exactly `${NAME}` where the operation acts on exactly `${NAME}` or `${NAME}/…` (no parameter
-  operator such as `${NAME%/*}`), with no reassignment of NAME in between (`=`, `+=`, `printf -v`,
-  `read`, `mapfile`, `local`/`declare`, `for … in`, `unset`). The run-time check is the guarantee; the
-  binding keeps the calls where they do their job.
+  a call of that guard. That binding is **textual**, and exactly this: the call is a plain statement
+  (its line starts with the guard, or it opens the operation's own `{ guard; op; }` group — not in a
+  subshell, a substitution, a background job, or after `||`/`&&`); it sits in the function body or in a
+  block that encloses the operation, judged by the shell's block structure (`if`/`while`/`for`/`case`/
+  `{`/`(` … `fi`/`done`/`esac`/`}`/`)`, with `else`/`elif` starting a new block), not by indentation; it
+  is called with its own number of arguments; it is called on exactly `${NAME}`, and the operation acts
+  on exactly `${NAME}` — or `${NAME}/…` for a check that canonicalises the whole path, never for the
+  name check, which covers only `rm`, `mv` and `ln` of the name itself — with no parameter operator
+  such as `${NAME%/*}`; and NAME is not reassigned in between (`=`, `+=`, `NAME[…]=`, `printf -v`,
+  `read`, `mapfile`, `local`/`declare`/`typeset`/`readonly`/`export`, `for … in`, `unset`, or any
+  `eval`) nor aliased by a nameref declared anywhere in the function. A reader who wants to defeat a
+  textual rule can; **the run-time check is the guarantee**, and the binding keeps the calls where they
+  do their job.
 
 What this does **not** see: a privileged command whose name is computed at run time — assembled from
 variables (`c=ch; ${c}own`), an escape (`$'\x63hown'`), array elements (`"${CMD[0]}${CMD[1]}"`) or brace
@@ -1368,6 +1388,11 @@ privilege escalation by one release rather than close it, so the run **refuses**
 # what the tree under question says about itself.
 IMS_DRIVER_SHA256=<64 hex> sudo -E bash /etc/ims-cutover-driver/driver/update.sh
 ```
+
+`sudo -E` carries the whole environment. `update.sh` does not read `IMS_CHOWN_TREE_HELPER`, but
+`install.sh` does, and that variable SELECTS A PROGRAM RUN AS ROOT to re-own the state directory: it
+exists for the test suite, and must never be set — or passed through with `-E` — from an environment
+you do not control.
 
 The digest is taken over the tree that would be published — the three entrypoints and `lib/` — with:
 
