@@ -390,6 +390,85 @@ export function fakeMintsoftAsnListResponse(asns: FakeMintsoftAsn[], params: URL
   })))
 }
 
+/**
+ * `PUT /api/ASN` as live Mintsoft answers it (o3d-vcw8, three attempts on 2026-09-24). Exported so the
+ * create contract can be unit-tested without the e2e harness: the fake used to accept an invented
+ * `POST /api/ASN` with `Reference`/`Lines`, and a fake that agrees with a broken client is how a create
+ * that could never work passed every e2e run.
+ *
+ * EVERY rejection below is an HTTP 200 with `Success: false` and `ID: 0` — the verdict is in the body,
+ * never in the status code — and creates nothing.
+ */
+export function fakeMintsoftAsnCreateResult(
+  asns: FakeMintsoftAsn[],
+  body: Record<string, unknown> | null,
+): { response: NextResponse; created: FakeMintsoftAsn | null } {
+  if (body != null && Object.prototype.hasOwnProperty.call(body, 'ClientId')) {
+    // Our key is a client user: Mintsoft refuses a NewASN that names a ClientId, though the model has one.
+    return { response: fakeMintsoftToolkitResult(0, false, 'Client Users cannot specify a ClientId when creating an ASN!'), created: null }
+  }
+
+  const goodsInType = asString(body?.GoodsInType)
+  if (!goodsInType || !FAKE_MINTSOFT_GOODS_IN_TYPES.includes(goodsInType)) {
+    // GoodsInType is REQUIRED, though the swagger does not mark it so.
+    return { response: fakeMintsoftToolkitResult(0, false, 'Invalid GoodsInType:  See ASN/GoodsInTypes for valid types'), created: null }
+  }
+
+  const warehouseId = asString(body?.WarehouseId)
+  const reference = asString(body?.POReference)
+  const lines = asArray(body?.Items)
+    .map((line) => {
+      const recordLine = line && typeof line === 'object' && !Array.isArray(line)
+        ? line as Record<string, unknown>
+        : null
+      const sourceLineId = asString(recordLine?.SourceLineId)
+      if (!sourceLineId) return null
+
+      return {
+        id: '',
+        sourceLineId,
+        productId: asString(recordLine?.ProductId),
+        sku: asString(recordLine?.SKU),
+        quantity: asNumber(recordLine?.Quantity, 0),
+      } satisfies FakeMintsoftAsnLine
+    })
+    .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
+
+  if (!warehouseId || !reference || lines.length === 0) {
+    // The generic Success-false-with-HTTP-200 case: a body Mintsoft's validation rejects before any row is
+    // written (proven live: a rejected create leaves the tenant's ASN id set byte-identical).
+    return {
+      response: fakeMintsoftToolkitResult(0, false, 'ASN could not be created: WarehouseId, POReference and at least one item are required'),
+      created: null,
+    }
+  }
+
+  const asnId = buildNextNumericId(asns.map((asn) => asn.id))
+  const created: FakeMintsoftAsn = {
+    id: asnId,
+    warehouseId,
+    reference,
+    supplierNotes: asString(body?.SupplierNotes),
+    estimatedDelivery: asString(body?.EstimatedDelivery),
+    goodsInType,
+    quantity: asNumber(body?.Quantity, 1),
+    statusId: 1,
+    status: 'NEW',
+    createdAt: new Date().toISOString(),
+    lines: lines.map((line, index) => ({ ...line, id: `${asnId}-${index + 1}` })),
+  }
+
+  return {
+    response: fakeMintsoftToolkitResult(Number(asnId), true, 'ASN Successfully created. Please note the ID for future reference.'),
+    created,
+  }
+}
+
+/** `GET /api/ASN/{id}` in the live shape. Exported for the same reason as the create above. */
+export function fakeMintsoftAsnById(asn: FakeMintsoftAsn) {
+  return mapMintsoftAsnResponse(asn)
+}
+
 export function parseFakeMintsoftDirectAsnPath(path: string): string | null {
   if (!path.startsWith('api/ASN/')) return null
   return decodeURIComponent(path.slice('api/ASN/'.length))
@@ -690,62 +769,12 @@ export async function PUT(
     }
 
     const body = await request.json().catch(() => null) as Record<string, unknown> | null
-    if (body != null && Object.prototype.hasOwnProperty.call(body, 'ClientId')) {
-      return fakeMintsoftToolkitResult(0, false, 'Client Users cannot specify a ClientId when creating an ASN!')
+    const { response, created } = fakeMintsoftAsnCreateResult(state.asns, body)
+    if (created) {
+      state.asns.push(created)
+      await persistFakeMintsoftState(state)
     }
-
-    const goodsInType = asString(body?.GoodsInType)
-    if (!goodsInType || !FAKE_MINTSOFT_GOODS_IN_TYPES.includes(goodsInType)) {
-      return fakeMintsoftToolkitResult(0, false, 'Invalid GoodsInType:  See ASN/GoodsInTypes for valid types')
-    }
-
-    const warehouseId = asString(body?.WarehouseId)
-    const reference = asString(body?.POReference)
-    const lines = asArray(body?.Items)
-      .map((line, index) => {
-        const recordLine = line && typeof line === 'object' && !Array.isArray(line)
-          ? line as Record<string, unknown>
-          : null
-        const sourceLineId = asString(recordLine?.SourceLineId)
-        if (!sourceLineId) return null
-
-        return {
-          id: `${Date.now()}-${index + 1}`,
-          sourceLineId,
-          productId: asString(recordLine?.ProductId),
-          sku: asString(recordLine?.SKU),
-          quantity: asNumber(recordLine?.Quantity, 0),
-        } satisfies FakeMintsoftAsnLine
-      })
-      .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
-
-    if (!warehouseId || !reference || lines.length === 0) {
-      // The generic Success-false-with-HTTP-200 case: a body Mintsoft's validation rejects before any row
-      // is written (proven live: a rejected create leaves the tenant's ASN id set byte-identical).
-      return fakeMintsoftToolkitResult(0, false, 'ASN could not be created: WarehouseId, POReference and at least one item are required')
-    }
-
-    const asnId = buildNextNumericId(state.asns.map((asn) => asn.id))
-    const asn: FakeMintsoftAsn = {
-      id: asnId,
-      warehouseId,
-      reference,
-      supplierNotes: asString(body?.SupplierNotes),
-      estimatedDelivery: asString(body?.EstimatedDelivery),
-      goodsInType,
-      quantity: asNumber(body?.Quantity, 1),
-      statusId: 1,
-      status: 'NEW',
-      createdAt: new Date().toISOString(),
-      lines: lines.map((line, index) => ({
-        ...line,
-        id: `${asnId}-${index + 1}`,
-      })),
-    }
-
-    state.asns.push(asn)
-    await persistFakeMintsoftState(state)
-    return fakeMintsoftToolkitResult(Number(asnId), true, 'ASN Successfully created. Please note the ID for future reference.')
+    return response
   }
 
   if (path !== 'api/Product') {

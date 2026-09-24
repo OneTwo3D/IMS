@@ -432,3 +432,67 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
     null,
   )
 })
+
+/**
+ * THE E2E FAKE SPEAKS THE SAME CONTRACT (o3d-vcw8). It used to implement an invented `POST /api/ASN` with
+ * `Reference`/`Lines` and answer with an invented ASN shape — it agreed with the broken client, which is
+ * exactly why every e2e run passed while live creation could not work at all. These pin it to the contract
+ * the live probe established, so the fake can no longer bless a client that does not speak it.
+ */
+test('the e2e fake creates an ASN only from a NewASN body, and refuses everything else with HTTP 200', () => {
+  const newAsn = {
+    WarehouseId: 301,
+    POReference: 'PO-2026-001',
+    GoodsInType: 'Carton',
+    Quantity: 2,
+    Items: [{ SourceLineId: 'po-line-1', ProductId: 501, SKU: 'MS-SKU-1', Quantity: 10 }],
+  }
+
+  const ok = fakeMintsoftRoute.fakeMintsoftAsnCreateResult([], newAsn)
+  assert.equal(ok.response.status, 200)
+  assert.equal(ok.created?.reference, 'PO-2026-001')
+  assert.deepEqual(ok.created?.lines.map((line) => line.sourceLineId), ['po-line-1'])
+
+  for (const [label, body] of [
+    ['the body IMS used to send', { WarehouseId: 301, Reference: 'PO-2026-001', ETA: null, Lines: [{ SourceLineId: 'po-line-1' }] }],
+    ['a ClientId a client user may not send', { ...newAsn, ClientId: 89 }],
+    ['no GoodsInType', { ...newAsn, GoodsInType: undefined }],
+    ['a GoodsInType Mintsoft does not know', { ...newAsn, GoodsInType: 'Envelope' }],
+    ['no POReference', { ...newAsn, POReference: undefined }],
+    ['no items', { ...newAsn, Items: [] }],
+    ['nothing at all', null],
+  ] as const) {
+    const refused = fakeMintsoftRoute.fakeMintsoftAsnCreateResult([], body as Record<string, unknown> | null)
+    assert.equal(refused.response.status, 200, `${label}: a refusal is still an HTTP 200`)
+    assert.equal(refused.created, null, `${label}: and nothing is created`)
+  }
+})
+
+test('the e2e fake serves GET /api/ASN/{id} in the live ASN/ASNItem shape', () => {
+  const { created } = fakeMintsoftRoute.fakeMintsoftAsnCreateResult([], {
+    WarehouseId: 301,
+    POReference: 'PO-2026-001',
+    GoodsInType: 'Pallet',
+    Quantity: 2,
+    Items: [{ SourceLineId: 'po-line-1', ProductId: 501, SKU: 'MS-SKU-1', Quantity: 10 }],
+  })
+  assert.ok(created)
+  const body = fakeMintsoftRoute.fakeMintsoftAsnById(created) as Record<string, unknown>
+
+  assert.equal(body.POReference, 'PO-2026-001')
+  assert.equal(body.GoodsInType, 'Pallet')
+  assert.equal(body.Quantity, 2, 'the header quantity is the package count')
+  assert.deepEqual(body.ASNStatus, { Name: 'NEW', Colour: 'purple', TextColour: null, ID: 1 }, 'ASNStatus is an OBJECT')
+  assert.equal(body.ASNStatusId, 1)
+  assert.equal(Object.prototype.hasOwnProperty.call(body.ASNStatus as object, 'ExternalName'), false, 'ExternalName is order-only')
+  for (const absent of ['AsnId', 'Reference', 'Status', 'Lines', 'CallbackUrl', 'AutoCallback']) {
+    assert.equal(Object.prototype.hasOwnProperty.call(body, absent), false, `${absent} is not a live ASN field`)
+  }
+  const items = body.Items as Array<Record<string, unknown>>
+  assert.equal(items.length, 1)
+  assert.equal(items[0]!.SourceLineId, 'po-line-1')
+  assert.equal(items[0]!.QuantityExpected, 10)
+  for (const key of ['QuantityReceieved', 'QuantityBooked', 'OnOrder', 'ID', 'ASNId']) {
+    assert.equal(Object.prototype.hasOwnProperty.call(items[0]!, key), true, `an ASNItem carries ${key}`)
+  }
+})
