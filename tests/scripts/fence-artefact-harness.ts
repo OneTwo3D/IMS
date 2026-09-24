@@ -225,6 +225,21 @@ export function protectedLibraryLines(root: string): string[] {
   return protectedLibraryLinesAt(join(root, 'recovery'))
 }
 
+/**
+ * THE RECORD OR MANIFEST OF WHATEVER IS STANDING, named THROUGH the pointer exactly as the library names
+ * it (o3d-xi3w): `<recovery>/app/../db-fence-artefact.sha256`.
+ *
+ * path.join() MUST NOT BE USED for this: it collapses the `..` LEXICALLY and names
+ * `<recovery>/db-fence-artefact.sha256`, which is where a pre-pointer release left the record and not
+ * where the standing one lives. The whole device is that the KERNEL resolves `app` first — a symbolic
+ * link into the versioned directory that holds the tree, its record and its manifest together — so this
+ * path always reaches the record of the tree that is standing, and one rename commits both. On an
+ * installation no pointer-era publication has touched yet, the same string resolves to the old location.
+ */
+export function standingRecordPath(recovery: string, name = 'db-fence-artefact.sha256'): string {
+  return `${join(recovery, 'app')}/../${name}`
+}
+
 /** Where the published artefact and its record end up, for assertions. */
 export function protectedPaths(root: string): {
   recovery: string
@@ -243,8 +258,8 @@ export function protectedPaths(root: string): {
     app: join(recovery, 'app'),
     helper: join(recovery, 'app', 'scripts', 'fence-db-connections.mjs'),
     pgEntry: join(recovery, 'app', 'node_modules', 'pg', 'lib', 'index.js'),
-    artefactFile: join(recovery, 'db-fence-artefact.sha256'),
-    manifestFile: join(recovery, 'db-fence-artefact.manifest'),
+    artefactFile: standingRecordPath(recovery),
+    manifestFile: standingRecordPath(recovery, 'db-fence-artefact.manifest'),
     releaseWrapper: join(recovery, 'release-db-fence'),
     refenceWrapper: join(recovery, 'refence-db'),
     // o3d-secops r26: the third wrapper, which no cutover runs. It is the one-time operator way

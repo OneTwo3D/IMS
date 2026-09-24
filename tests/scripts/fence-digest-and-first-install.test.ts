@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { protectedLibraryLinesAt, writeCheckoutPg } from './fence-artefact-harness.ts'
+import { protectedLibraryLinesAt, standingRecordPath, writeCheckoutPg } from './fence-artefact-harness.ts'
 
 const REPO = process.cwd()
 
@@ -401,7 +401,7 @@ test('r35: a first install with no pin publishes nothing, and cannot execute the
     assert.match(policy.output, /POLICY_RC=0/, 'a first install with no pin is not a refusal')
     assert.match(policy.output, /NOT required here/, 'and it says so rather than leaving the operator to infer it')
     assert.ok(
-      !existsSync(join(root, 'recovery', 'db-fence-artefact.sha256')),
+      !existsSync(standingRecordPath(join(root, 'recovery'))),
       'nothing may be published: an unauthenticated artefact from an application-owned checkout is the whole thing this refuses',
     )
     assert.ok(!existsSync(join(root, 'recovery', 'app')), 'and no artefact tree either')
@@ -458,7 +458,7 @@ test('r35: a first install WITH the release pin publishes the artefact before it
     assert.match(run.output, /POLICY_RC=0/)
 
     assert.ok(existsSync(join(root, 'recovery')), 'the pinned path must reach a publication at all')
-    const record = readFileSync(join(root, 'recovery', 'db-fence-artefact.sha256'), 'utf8')
+    const record = readFileSync(standingRecordPath(join(root, 'recovery')), 'utf8')
     // PRECONDITION, ASSERTED RATHER THAN ASSUMED: the pin is what permitted this. The fixture's
     // checkout is application-writable, so an unpinned publication from it is refused outright —
     // clearing IMS_FENCE_ARTEFACT_SHA256 before the call turns this test red (mutation route 2).
@@ -508,7 +508,7 @@ test('r35: a first install with a pin that does not authenticate the checkout is
     assert.match(run.output, new RegExp(wrong), 'and the refusal must name the digest that did not match')
     assert.match(run.output, /NOTHING HAS BEEN MIGRATED/, 'and say what state the box is in')
     assert.ok(
-      !existsSync(join(root, 'recovery', 'db-fence-artefact.sha256')),
+      !existsSync(standingRecordPath(join(root, 'recovery'))),
       'a refused publication must publish nothing',
     )
   } finally {

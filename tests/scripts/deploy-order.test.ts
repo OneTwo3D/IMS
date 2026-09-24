@@ -12,6 +12,7 @@ import {
   protectedLibraryLines,
   protectedLibraryLinesAt,
   sealCheckoutModes,
+  standingRecordPath,
   writeCheckoutPg,
   protectedPaths,
   writeFenceCheckout,
@@ -7612,7 +7613,7 @@ test('the recovery record lives where the application user cannot rewrite it', (
     const reassign = lines.filter(
       (candidate) =>
         isCode(candidate) &&
-        /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|STAGED_APP_DIR|RETIRED_APP_DIR|ARTEFACT_FILE|MANIFEST_FILE|VENDOR_ROOTS)=/.test(candidate),
+        /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|PUBLISH_PREFIX|VERSION_PREFIX|POINTER_PREFIX|RETIRE_PREFIX|ARTEFACT_FILE|MANIFEST_FILE|VENDOR_ROOTS)=/.test(candidate),
     )
     assert.deepEqual(reassign, [], `${label} must not redefine the protected-helper paths the library owns`)
   }
@@ -7638,10 +7639,26 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // MUTATION ROUTE: add `ln -sfn "${app_modules}" "${DB_FENCE_PROTECTED_APP_DIR}/node_modules"`
   // back into _fence_stage_and_publish() and the first assertion fails by name.
   const libraryCode = LIBRARY_LINES.filter((candidate) => isCode(candidate)).join('\n')
-  assert.ok(
-    !/\bln -s/.test(libraryCode),
-    'the protected artefact may contain no symlink the library creates: a symlink is followed by node and is not covered by the artefact digest',
-  )
+  // THE ONE LINK THE LIBRARY CREATES IS THE PUBLICATION'S POINTER, and it is the documented name itself
+  // rather than anything inside the tree (o3d-xi3w). That is what makes a publication one `rename(2)`:
+  // the name resolves to the previous artefact before the flip and to the new one after it, with no
+  // instant in between, and `rename` over a symbolic link cannot nest one tree inside another the way it
+  // can over a directory. It is not covered by the artefact digest because it is not part of the
+  // artefact — what it NAMES is, and the name is validated against one shape before it is ever followed.
+  //
+  // MUTATION ROUTE: add `ln -sfn "${app_modules}" "${staged}/node_modules"` back into
+  // _fence_stage_and_publish() and this fails, naming the second link.
+  const links = LIBRARY_LINES.filter((candidate) => isCode(candidate) && /\bln -s/.test(candidate)).map((candidate) => candidate.trim())
+  assert.deepEqual(links, ['ln -s -- "${target}" "${name}"'],
+    `the only link the library may create is the publication pointer, in _fence_link_owned: ${links.join(' | ')}`)
+  assert.match(shellFunction(LIBRARY, '_fence_link_owned'), /_fence_owned_name "\$\{name\}" "\$\{what\}"/,
+    'and it must check the NAME it is about to create, so nothing can be linked outside the recovery root')
+  // AND NOTHING INSIDE THE PUBLISHED TREE MAY BE A LINK, which is where r32's property actually lives:
+  // a symlink inside the tree IS followed by node and is NOT hashed by the manifest.
+  assert.match(shellFunction(LIBRARY, '_fence_tree_is_sealed'), /! -type d -a ! -type f/,
+    'the seal must still refuse anything in the tree that is not a regular file or a directory')
+  assert.match(libraryCode, /_fence_link_owned "\$\{version_name\}\/\$\{tree_name\}" "\$\{pointer_tmp\}"/,
+    'and the pointer names one versioned directory and one tree, relatively, so it cannot leave the recovery root')
   assert.match(
     libraryCode,
     /cp -R --no-dereference -- "\$\{app_dir\}\/\$\{relative\}" "\$\{staged\}\/\$\{relative\}"/,
@@ -7652,7 +7669,11 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // silently, which is an escape the digest would then bless.
   assert.match(
     libraryCode,
-    /find "\$root" \\\( ! -type d -a ! -type f \\\) -print -quit/,
+    // `-H` dereferences the START POINT and nothing else (o3d-xi3w): the documented name is now a
+    // symbolic link into the versioned directory, and without it the start point itself would answer
+    // "neither a regular file nor a directory" and every sealing check of a standing artefact would
+    // refuse it. Links INSIDE the tree are still found, and still refused by name.
+    /find -H "\$root" \\\( ! -type d -a ! -type f \\\) -print -quit/,
     'and anything in the published tree that is not a regular file or a directory must be refused',
   )
 
@@ -9058,7 +9079,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     )
     assert.match(published.output, /^RC=0$/m, `the digest a dry run reports must authorise the publication:\n${published.output}`)
     assert.equal(
-      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(join(dirs.recovery, 'db-fence-artefact.sha256'), 'utf8'))?.[1],
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(standingRecordPath(dirs.recovery), 'utf8'))?.[1],
       candidate,
       'and be what the record ends up holding',
     )
@@ -11431,7 +11452,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     )
     assert.match(rotated.output, /^RC=0$/m, `the reported candidate must authorise the rotation:\n${rotated.output}`)
     assert.equal(
-      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(join(dirs.recovery, 'db-fence-artefact.sha256'), 'utf8'))?.[1],
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(standingRecordPath(dirs.recovery), 'utf8'))?.[1],
       candidate,
       'and be what the record then holds',
     )

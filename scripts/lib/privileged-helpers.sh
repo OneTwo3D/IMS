@@ -205,6 +205,26 @@
 # wrong instead of being published into.
 # -----------------------------------------------------------------------------
 
+# THE FUNCTIONS THIS FILE TAKES FROM lib/db-fence-protected.sh, CHECKED AT LOAD (o3d-xi3w). This
+# library has always called that one's publication primitives, and since o3d-xi3w it also takes the
+# ownership decision its run-time guards make and the /proc walk its sweep needs. All three
+# entrypoints source that file FIRST and a test asserts they source exactly these two libraries —
+# but "the caller sources them in the right order" is a claim about callers, and a missing function
+# in bash is a command that is simply not found: the guard would print an error, the `if` would take
+# its failure branch, and the operation would run UNCHECKED. So the order is enforced here, at load,
+# where the failure is one line an operator can act on rather than a refusal that silently became a
+# no-op. Every entrypoint's `source` line already ends with `|| { echo FATAL …; exit 1; }`.
+for _priv_required in _priv_path_inside_root _priv_name_inside_root _priv_open_paths \
+                      _fence_tree_is_sealed _fence_tree_manifest _fence_tree_digest \
+                      _fence_publish_file _fence_fsync_path; do
+  if ! declare -F "${_priv_required}" >/dev/null 2>&1; then
+    echo "FATAL: ${_priv_required}() is not defined, so scripts/lib/db-fence-protected.sh has not been sourced before scripts/lib/privileged-helpers.sh. This library's run-time ownership guards and its publication are built on that file's primitives, and a missing one would not refuse — it would be a command not found, and the operation it guards would run unchecked. Nothing has been changed." >&2
+    unset -v _priv_required
+    return 1 2>/dev/null || exit 1
+  fi
+done
+unset -v _priv_required
+
 # THE ONE LITERAL. Every path below is composed from it BY THIS FILE, so the harnesses can
 # substitute this single line in the shipped text before sourcing it and exercise the real
 # functions against a scratch root — the technique tests/scripts/fence-artefact-harness.ts already
@@ -421,24 +441,27 @@ driver_refuse() {
 # third, `link`, and a caller could pass it and then operate THROUGH the link (review of 6ae8c48a,
 # MED-1). Operations on a NAME itself go through driver_unlink_owned / driver_rename_owned /
 # driver_link_owned below, which perform the operation themselves, on exactly the name they checked.
+#
+# AND THE DECISION IT MAKES IS lib/db-fence-protected.sh's _priv_path_inside_root (o3d-xi3w): the fence
+# artefact's publication asks the same question of its own root, and the same question answered twice is
+# what o3d-xi3w was filed about. What stays here is the ARITY rule and the refusal — this library ends the
+# run through privileged_end_run(), and the sentence names ${IMS_DRIVER_ROOT}.
 driver_require_owned_path() {
-  local path="$1" what="$2" root canon
+  local path="$1" what="$2" answer canon root
   if (( $# != 2 )); then
     driver_owned_refuse "${what}" "${path}" "was checked with $# arguments; this check takes a path and a description and nothing else"
   fi
-  case "${path}" in
-    /*) ;;
-    *) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
-  esac
-  case "/${path}/" in
-    */../*|*/./*) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
-  esac
-  root="$(readlink -m -- "${IMS_DRIVER_ROOT}" 2>/dev/null)" || root=""
-  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
-  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* ]]; then
-    driver_owned_refuse "${what}" "${path}" "resolves to '${canon:-nothing}', which is not strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable})"
+  if answer="$(_priv_path_inside_root "${path}" "${IMS_DRIVER_ROOT}")"; then
+    return 0
   fi
-  return 0
+  canon="${answer#*|}"
+  canon="${canon%%|*}"
+  root="${answer##*|}"
+  case "${answer%%|*}" in
+    absolute) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+    dotdot) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  driver_owned_refuse "${what}" "${path}" "resolves to '${canon:-nothing}', which is not strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable})"
 }
 
 # IS THIS NAME'S OWN LOCATION STRICTLY INSIDE ${IMS_DRIVER_ROOT}? (o3d-z5be r12 L2, r13 MED-1.) For an
@@ -447,24 +470,22 @@ driver_require_owned_path() {
 # a pointer whose target has gone, or lies elsewhere, can be removed. PRIVATE: it is called only by the
 # three helpers below, each of which then performs its one operation on exactly the name it checked, so
 # no caller can check a name and then act THROUGH it (`rm -rf NAME/`, `NAME/*`, `chmod -R NAME`).
+#
+# THE DECISION IS SHARED with the fence artefact's publication — lib/db-fence-protected.sh's
+# _priv_name_inside_root, and _fence_owned_name is its counterpart there (o3d-xi3w).
 _driver_owned_name() {
-  local path="$1" what="$2" root canon parent base
-  case "${path}" in
-    /*) ;;
-    *) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
-  esac
-  case "/${path}/" in
-    */../*|*/./*) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
-  esac
-  root="$(readlink -m -- "${IMS_DRIVER_ROOT}" 2>/dev/null)" || root=""
-  base="${path##*/}"
-  parent="$(readlink -m -- "${path%/*}/" 2>/dev/null)" || parent=""
-  canon=""
-  [[ -z "${base}" || -z "${parent}" ]] || canon="${parent%/}/${base}"
-  if [[ -z "${root}" || "${root}" == "/" || -z "${canon}" || "${canon}" != "${root}/"?* || "${canon#"${root}/"}" == */ ]]; then
-    driver_owned_refuse "${what}" "${path}" "is not a name strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable}); it resolves to '${canon:-nothing}'"
+  local path="$1" what="$2" answer canon root
+  if answer="$(_priv_name_inside_root "${path}" "${IMS_DRIVER_ROOT}")"; then
+    return 0
   fi
-  return 0
+  canon="${answer#*|}"
+  canon="${canon%%|*}"
+  root="${answer##*|}"
+  case "${answer%%|*}" in
+    absolute) driver_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+    dotdot) driver_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  driver_owned_refuse "${what}" "${path}" "is not a name strictly inside ${IMS_DRIVER_ROOT} (${root:-unresolvable}); it resolves to '${canon:-nothing}'"
 }
 
 # THE THREE OPERATIONS ON A NAME, each performed on exactly the name it has just checked. `quiet` as
@@ -800,11 +821,11 @@ driver_source_ident() {
 # and only onto a name that is absent, so it can never displace a publication that has committed.
 driver_open_paths() {
   # EVERY OPEN FILE, CURRENT DIRECTORY AND EXECUTABLE THIS ACCOUNT CAN SEE, as physical paths, one per
-  # line. The globs name the per-process directories directly rather than walking /proc, which keeps
-  # this at a few milliseconds; `find` racing an exiting process is expected and its status is
-  # therefore not read — but the CALLER treats an EMPTY answer as "the question could not be asked"
-  # and deletes nothing, which is the conservative direction for a function that only ever deletes.
-  find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\n' 2>/dev/null || true
+  # line. The walk itself is lib/db-fence-protected.sh's _priv_open_paths, because the fence artefact's
+  # sweep asks the same question of the same /proc and two spellings of one walk is what o3d-xi3w was
+  # filed about. The CALLER treats an EMPTY answer as "the question could not be asked" and deletes
+  # nothing, which is the conservative direction for a function that only ever deletes.
+  _priv_open_paths
 }
 
 driver_sweep_orphans() {

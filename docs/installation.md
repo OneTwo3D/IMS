@@ -2466,7 +2466,7 @@ So the precedence is inverted, and it is one rule for every privileged artefact:
 | artefact | which source decides | `APP_DIR/.env` / the checkout |
 | --- | --- | --- |
 | the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
-| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
+| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** — since o3d-xi3w that name is a symbolic link into the versioned directory one publication commits | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
 | `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
 | the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
 | the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
@@ -2591,7 +2591,7 @@ deployment. There are three sources and they are not interchangeable:
    release checksums, and it is what the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every
    target that needs one.
 2. **A host that has already published this release.**
-   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256` there.
+   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` there.
 3. **`--print-fence-digest` or `--dry-run` on the target itself — for comparison only.** Either
    prints the same line, assembled
    from the checkout under question, so it can **confirm** the release's value and can never stand
@@ -2611,12 +2611,24 @@ run somewhere that is *not* the machine being deployed, or the checksum publishe
 Deriving it on the target would authenticate the checkout against itself, and nothing computed from
 `APP_DIR` can authenticate `APP_DIR`. (That command is given inline rather than as a copy-pasteable
 block on purpose: it is a step for a workstation, not for the machine mid-cutover.)
-The **whole artefact** — the entry file and the vendored dependency closure — is then assembled at
-`/etc/ims-cutover-recovery/.app.staged`, which only root can write; it is sealed (ownership and
-modes), checked (nothing but regular files and directories), digested **from that staged tree**,
-and only then renamed into place, with the previous tree moved aside rather than deleted so a
-failure between the two renames leaves the *old* artefact standing rather than none. The tree that
-was verified is the tree that is published, and the checkout is never read again after the copy. A
+The **whole artefact** — the entry file and the vendored dependency closure — is then assembled in a
+directory of that publication's own, `/etc/ims-cutover-recovery/.publish-fence.<pid>.<rand>`, which only
+root can write; it is sealed (ownership and modes), checked (nothing but regular files and directories),
+digested **from that staged tree**, given its digest record and manifest *inside* that directory, made
+durable, renamed to `.version-fence.<pid>.<rand>`, and committed by flipping one symbolic link —
+`/etc/ims-cutover-recovery/app` — onto it with a single `rename(2)`. The tree that was verified is the
+tree that is published, and the checkout is never read again after the copy. **One name per run and one
+rename to commit** is what closed o3d-xi3w: the staging and retirement names used to be one per *kind*, so
+a second privileged run could empty and refill the first run's staging tree between the instant it
+assembled it and the instant it hashed it (measured: a run that had matched `IMS_FENCE_SCRIPT_SHA256`
+against its own entry file published the other run's, and recorded the digest of the one it had checked);
+and the previous sequence moved the standing tree aside *before* renaming the new one in, so the
+documented name did not exist in between — and `mv src dst` with `dst` an existing **directory** moves
+src *inside* it and returns **success**, which left one publication's whole tree nested one level down
+inside the other's with both runs reporting that they had published. Neither is reachable now: the
+documented name is a symbolic link that is replaced in one operation, and every rename this library makes
+passes `-T`, which refuses a directory destination outright. The full argument is above
+`_fence_publish_unwind()` in `scripts/lib/db-fence-protected.sh`. A
 rotation also moves `fence_script_sha256` in the recovery record with the file it names; leaving it
 behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
 rotation.
@@ -2633,9 +2645,11 @@ Two more properties of the rotation:
 * it is **refused while a fence may be standing** (`db-connect-fence.json` exists). The helper that
   raised a fence is the helper that must release it, from a record the raise wrote; swapping
   versions across that pair is how a release stops meaning what the fence meant.
-* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (the whole
-  tree, since r32 — removing only the entry file leaves a vendored closure the next publication
-  would have to reconcile). Only root can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
+* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (since r32 the
+  whole artefact, not just the entry file — removing only the entry file leaves a vendored closure the
+  next publication would have to reconcile; since o3d-xi3w that name is a symbolic link, so this removes
+  the pointer and the versioned directory it named is reaped by the next publication's sweep). Only root
+  can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
   deliberately an act at the console rather than a flag. Do it only with no fence standing — with a
   record present and the copy gone, every run refuses by design.
 
@@ -2706,11 +2720,13 @@ exactly, and it is **copied**, root-owned, into the mirror:
 
 | path | what it is |
 | --- | --- |
+| `/etc/ims-cutover-recovery/app` | a **symbolic link** to `.version-fence.<pid>.<rand>/app`, and the single mutable object of a publication (o3d-xi3w) |
+| `/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` | one publication, complete and immutable: the tree, its record and its manifest together |
 | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` | the only file executed |
 | `/etc/ims-cutover-recovery/app/node_modules/pg/…` | a real root-owned directory, not a link |
 | `/etc/ims-cutover-recovery/app/node_modules/pg-protocol/…` etc. | …and the rest of the resolved closure (13 packages, ~140 files) |
-| `/etc/ims-cutover-recovery/db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to |
-| `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to. Named **through the pointer**, so it is always the record of the artefact that is standing: the kernel resolves `..` from the directory the link landed in, and one rename therefore commits the tree and its record together |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
 | `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
 | `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
 | `/etc/ims-cutover-recovery/resolve-legacy-db-fence` | the one-time operator resolution for an authority that carries no applied stamp (o3d-secops r26). No banner prints it and no cutover runs it — the validator's refusal is the only thing that names it |
@@ -2747,8 +2763,9 @@ cd /etc/ims-cutover-recovery/app && find . -type f -printf '%P\0' | LC_ALL=C sor
 That is the literal command the library computes with; a test asserts that the library, this page
 and the recorded value all agree, because a documented check that does not reproduce is a check an
 operator concludes is broken and stops running. Compare its output with `fence_artefact_sha256` in
-`/etc/ims-cutover-recovery/db-fence-artefact.sha256`. When they differ,
-`cd /etc/ims-cutover-recovery/app && sha256sum -c /etc/ims-cutover-recovery/db-fence-artefact.manifest`
+`/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` — the record of whatever is standing, reached
+through the pointer. When they differ,
+`cd /etc/ims-cutover-recovery/app && sha256sum -c ../db-fence-artefact.manifest`
 names **which** file moved, which "the digest changed" does not.
 
 The digest is **verified before every execution**, along with the seal (every file owned by root,

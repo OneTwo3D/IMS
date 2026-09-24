@@ -2391,20 +2391,6 @@
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
-   "line": "offender=\"$(find \"$root\" \\( ! -type d -a ! -type f \\) -print -quit 2>/dev/null)\" || return 1",
-   "count": 1,
-   "class": "read-only",
-   "reason": "read-only: find with no action that writes"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "offender=\"$(find \"$root\" \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
-   "count": 1,
-   "class": "read-only",
-   "reason": "read-only: find with no action that writes"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
    "line": "chown root:root \"${DB_FENCE_RECOVERY_DIR}\" 2>/dev/null || true",
    "count": 1,
    "class": "single-inode",
@@ -2522,109 +2508,6 @@
    "count": 1,
    "class": "read-only",
    "reason": "read-only: find with no action that writes"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\" || return 1",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1",
-   "count": 2,
-   "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"",
-   "count": 6,
-   "class": "code-owned-tree",
-   "reason": "deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "chown -R root:root \"${DB_FENCE_STAGED_APP_DIR}\" 2>/dev/null || true",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "gives the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "chmod -R u=rwX,go=rX \"${DB_FENCE_STAGED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "takes group/other write off the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "manifest=\"$(_fence_tree_manifest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "artefact_digest=\"$(_fence_tree_digest \"${DB_FENCE_STAGED_APP_DIR}\")\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "failure path deletes the fence's own staging copy ${DB_FENCE_RECOVERY_DIR}/.app.staged, under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\" || return 1",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "mv -f \"${DB_FENCE_PROTECTED_APP_DIR}\" \"${DB_FENCE_RETIRED_APP_DIR}\" || { rm -rf \"${DB_FENCE_STAGED_APP_DIR}\"; return 1; }",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "rotates the fence's own copies inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "if ! mv -f \"${DB_FENCE_STAGED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\"; then",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "rotates the fence's own copies inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "[[ -e \"${DB_FENCE_RETIRED_APP_DIR}\" ]] && mv -f \"${DB_FENCE_RETIRED_APP_DIR}\" \"${DB_FENCE_PROTECTED_APP_DIR}\" 2>/dev/null",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "restores the fence's own retired copy inside the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "rm -rf \"${DB_FENCE_RETIRED_APP_DIR}\"",
-   "count": 1,
-   "class": "code-owned-tree",
-   "reason": "deletes the fence's own retired copy ${DB_FENCE_RECOVERY_DIR}/.app.retired; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
-   "guard": "_fence_require_owned_tree"
-  },
-  {
-   "file": "scripts/lib/db-fence-protected.sh",
-   "line": "chown root:root \"${DB_FENCE_ARTEFACT_FILE}\" \"${DB_FENCE_MANIFEST_FILE}\" 2>/dev/null || true",
-   "count": 1,
-   "class": "single-inode",
-   "reason": "non-recursive chown on one named path"
   },
   {
    "file": "scripts/lib/db-fence-protected.sh",
@@ -3375,20 +3258,6 @@
   },
   {
    "file": "scripts/lib/privileged-helpers.sh",
-   "line": "# this at a few milliseconds; `find` racing an exiting process is expected and its status is",
-   "count": 1,
-   "class": "comment",
-   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
-  },
-  {
-   "file": "scripts/lib/privileged-helpers.sh",
-   "line": "find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\\n' 2>/dev/null || true",
-   "count": 1,
-   "class": "read-only",
-   "reason": "read-only: find with no action that writes"
-  },
-  {
-   "file": "scripts/lib/privileged-helpers.sh",
    "line": "# killed between `mv -T ${target} ${retire_dir}` and the pointer flip leaves the documented name",
    "count": 1,
    "class": "comment",
@@ -3652,6 +3521,201 @@
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# CANONICAL AND STRICTLY INSIDE ${2} — for an operation that FOLLOWS the path: a copy INTO it, `chown -R`,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# `chmod -R`, `rm -rf NAME/`. Absolute, no `.` or `..` component, and CANONICALISING — every symbolic",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# — while `rm -rf NAME/`, `NAME/*` and `chmod -R NAME`, which all follow it, are the other function's",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# `-T` ON EVERY RENAME, and it is not a tidiness flag (o3d-xi3w). `mv -f src dst` with `dst` an existing",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "#     tree there first -- and `mv src dst` with `dst` an existing DIRECTORY does not replace dst, it moves",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "#     the winner's, the loser's `mv` reported success, and the record then bound the loser's digest to a",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "# THE POINTER, BUILT UNDER ITS OWN NAME AND THEN RENAMED. A `ln -sfn` onto the documented name would",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\\n' 2>/dev/null || true",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if [[ \"${quiet}\" == \"quiet\" ]]; then rm -rf -- \"${name}\" 2>/dev/null; else rm -rf -- \"${name}\"; fi",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "removes one name inside the root-only recovery directory -- a version directory, a temporary pointer or a retire name this publication created; enforced at run time by _fence_owned_name, which this function calls on ${name} and which does not follow a final symbolic link",
+   "guard": "_fence_owned_name"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if [[ \"${quiet}\" == \"quiet\" ]]; then mv -T -- \"${from}\" \"${to}\" 2>/dev/null; else mv -T -- \"${from}\" \"${to}\"; fi",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "renames one name onto another inside the root-only recovery directory, `-T` so that a directory destination is refused rather than moved into; enforced at run time by _fence_owned_name, called on ${from} and on ${to}",
+   "guard": "_fence_owned_name"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "ln -s -- \"${target}\" \"${name}\"",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "creates the temporary pointer a publication commits, inside the root-only recovery directory; enforced at run time by _fence_owned_name, called on ${name}",
+   "guard": "_fence_owned_name"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find -H \"$root\" \\( ! -type d -a ! -type f \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "offender=\"$(find -H \"$root\" \\( ! -uid \"${uid}\" -o -perm /022 \\) -print -quit 2>/dev/null)\" || return 1",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: find with no action that writes"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "mkdir -p \"${staged}/scripts\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own staging directory, a `mktemp -d` this call made under the root-only recovery directory, on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${run_dir}\"; return 1",
+   "count": 2,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own staging directory, a `mktemp -d` this call made under the root-only recovery directory, on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -rf \"${run_dir}\"",
+   "count": 9,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own staging directory, a `mktemp -d` this call made under the root-only recovery directory, on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown -R root:root \"${staged}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "gives this publication's staged tree, inside its own `mktemp -d` staging directory under the root-only recovery directory, to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod -R u=rwX,go=rX \"${staged}\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "takes group and other write off this publication's staged tree, and on failure deletes this call's own staging directory; both are under the root-only recovery directory; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${run_dir}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "gives this call's own `mktemp -d` staging directory to root; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chmod 755 \"${run_dir}\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "makes this call's own staging directory readable, because the protected artefact is executed as the application user and `mktemp -d` leaves it 0700; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "manifest=\"$(_fence_tree_manifest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own staging directory, a `mktemp -d` this call made under the root-only recovery directory, on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "artefact_digest=\"$(_fence_tree_digest \"${staged}\")\" || { rm -rf \"${run_dir}\"; return 1; }",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "deletes this publication's own staging directory, a `mktemp -d` this call made under the root-only recovery directory, on a failure path; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${run_dir}/${record_name}\" \"${run_dir}/${manifest_name}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "gives the record and manifest this call wrote inside its own staging directory to root; enforced at run time by _fence_require_owned_tree in _fence_stage_and_publish",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${DB_FENCE_LEGACY_ARTEFACT_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "removes ONE file -- the artefact record a pre-pointer release left beside the tree, unreachable through the pointer once this run has migrated the installation. `rm -f` and not -r, on a readonly path composed from the recovery root"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "rm -f \"${DB_FENCE_LEGACY_MANIFEST_FILE}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "removes ONE file -- the per-file manifest a pre-pointer release left beside the tree, unreachable through the pointer once this run has migrated the installation. `rm -f` and not -r, on a readonly path composed from the recovery root"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "echo \"The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} will not be followed: ${DB_FENCE_STANDING_REASON}. Nothing will be executed out of it. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — and supply IMS_FENCE_ARTEFACT_SHA256 from the release.\" >&2",
+   "count": 1,
+   "class": "text",
+   "reason": "a message printed to the operator: it names the command THEY may type to discard the artefact, and runs nothing"
   }
  ]
 }
