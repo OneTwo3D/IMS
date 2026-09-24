@@ -207,6 +207,8 @@ export {
   fetchMintsoftAsnListRows,
   fetchMintsoftAsns,
   fetchMintsoftAsnsForDuplicateRecovery,
+  MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS,
+  mintsoftAsnListRecentWindowSince,
   MintsoftAsnListIncompleteError,
   fetchMintsoftBundle,
   fetchMintsoftProduct,
@@ -221,6 +223,7 @@ export {
   findRecoverableMintsoftAsn,
   MintsoftAsnRecoveryAmbiguousMatchError,
   MintsoftAsnRecoveryQuantityRoundedError,
+  MintsoftAsnRecoveryQuantityUnreadableError,
   MintsoftAsnRecoveryWarehouseMismatchError,
   type MintsoftAsnRecoveryCriteria,
 } from './api/asn-recovery'

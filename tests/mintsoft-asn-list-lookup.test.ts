@@ -13,6 +13,12 @@ import test, { mock } from 'node:test'
  * reaches a network.
  *
  * The first test is the defect as it stood: the old client GET `/api/ASN` and threw on every call.
+ *
+ * ROUND 4 (Codex HIGH 2) adds the two incompleteness shapes re-reading cannot see, because they REPEAT:
+ * a short page that is not the end of the list, and a full scan that omits the same ASN every time. The
+ * stub therefore also serves the independent `SinceLastUpdated` read; that read does not advance the
+ * `scanCounter` the per-scan fixtures are written against, so a fixture's `scan === 1` still means the
+ * first FULL scan, and the window read is served whatever scan 1 would serve.
  */
 
 type Row = { ID: number; POReference: string; WarehouseId: number; Items: Array<Record<string, unknown>> }
@@ -35,9 +41,13 @@ function liveLikeServer(url: URL): Response {
   const limit = Number.parseInt(url.searchParams.get('Limit') ?? '100', 10)
   if (pageNo < 1) return json({ Message: 'An error has occurred.' }, 500)
   if (limit > 100) return json({ Message: 'The request is invalid.' }, 400)
-  if (pageNo === 1) scanCounter += 1
+  // The recently-updated read is a scan of its own; live Mintsoft narrows it, and this stub does not (an
+  // unparseable SinceLastUpdated is IGNORED live, and a window read that returns MORE can only make the
+  // containment check stricter). It is served the first full scan's fixture and leaves scanCounter alone.
+  const recentWindow = url.searchParams.has('SinceLastUpdated')
+  if (pageNo === 1 && !recentWindow) scanCounter += 1
   const warehouse = url.searchParams.get('WarehouseId')
-  const all = rowsForScan(scanCounter).filter((row) => !warehouse || String(row.WarehouseId) === warehouse)
+  const all = rowsForScan(recentWindow ? 1 : scanCounter).filter((row) => !warehouse || String(row.WarehouseId) === warehouse)
   const page = all.slice((pageNo - 1) * limit, pageNo * limit)
   const includeItems = url.searchParams.get('IncludeASNItems') === 'true'
   return json(page.map((row) => ({ ...row, Items: includeItems ? row.Items : null })))
@@ -96,20 +106,32 @@ test('the ASN list is read from GET /api/ASN/List, not the 405 create route (o3d
   assert.ok(!requests.some((request) => request === '/api/ASN' || request.startsWith('/api/ASN?')), `never the create route: ${requests.join(' ')}`)
 })
 
-test('every page request is Limit=100, PageNo >= 1 and asks for items, and paging stops at the short page', async () => {
+test('every page request is Limit=100 and PageNo >= 1, the full scans ask for items, and the short page is PROVEN to be the end', async () => {
   reset(() => tenant())
-  const { fetchMintsoftAsns } = await client()
+  const { fetchMintsoftAsns, MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS, mintsoftAsnListRecentWindowSince } = await client()
   await fetchMintsoftAsns()
   assert.ok(requests.length > 0)
-  for (const request of requests) {
-    const url = new URL(request, 'https://mintsoft.test')
+  const urls = requests.map((request) => new URL(request, 'https://mintsoft.test'))
+  for (const url of urls) {
     assert.equal(url.pathname, '/api/ASN/List')
     assert.equal(url.searchParams.get('Limit'), '100')
     assert.ok(Number(url.searchParams.get('PageNo')) >= 1)
+  }
+  // Three scans of four requests: the independent recently-updated read FIRST, then the two full scans that
+  // must agree. 220 rows = pages of 100, 100, 20 — and then page 4, which must come back empty for page 3
+  // to be the end of the list rather than a truncation (round 4, Codex HIGH 2).
+  assert.deepEqual(urls.map((url) => url.searchParams.get('PageNo')), ['1', '2', '3', '4', '1', '2', '3', '4', '1', '2', '3', '4'])
+  const window = urls.slice(0, 4)
+  const fullScans = urls.slice(4)
+  assert.ok(MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS >= 1)
+  for (const url of window) {
+    assert.equal(url.searchParams.get('SinceLastUpdated'), mintsoftAsnListRecentWindowSince(), 'the window read is dated')
+    assert.equal(url.searchParams.has('IncludeASNItems'), false, 'and needs IDs only')
+  }
+  for (const url of fullScans) {
+    assert.equal(url.searchParams.has('SinceLastUpdated'), false, 'the full scan is not narrowed')
     assert.equal(url.searchParams.get('IncludeASNItems'), 'true')
   }
-  // 220 rows = pages of 100, 100, 20, read twice (two consecutive scans must agree).
-  assert.deepEqual(requests.map((request) => new URL(request, 'https://mintsoft.test').searchParams.get('PageNo')), ['1', '2', '3', '1', '2', '3'])
 })
 
 test('duplicate recovery reads the WHOLE tenant and finds its ASN on page 2, by POReference and expected quantity', async () => {
@@ -191,6 +213,73 @@ test('a scan that LOSES the target is never accepted until two consecutive scans
   const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
   await assert.rejects(fetchMintsoftAsnsForDuplicateRecovery(), (error: unknown) => error instanceof Error && /changed between 3 consecutive scans/.test(error.message))
   assert.equal(scanCounter, 3, 'three scans were made, none of them accepted')
+})
+
+test('a SHORT PAGE is not the end of the list until the next page comes back empty (round 4, Codex HIGH 2)', async () => {
+  // THE SHAPE RE-READING CANNOT SEE. Page 1 is cut short at 23 rows — the same 23 rows on every scan, so two
+  // consecutive scans agree, no ID repeats, and the old reader called that the complete tenant and let the
+  // creator push an ASN that already exists. Asking for page 2 settles it: it still serves rows.
+  reset(() => tenant())
+  pageHook = (url) => {
+    if (url.pathname !== '/api/ASN/List') return null
+    if (url.searchParams.get('PageNo') !== '1') return null
+    return json(tenant().slice(0, 23).map((row) => ({ ...row, Items: url.searchParams.get('IncludeASNItems') === 'true' ? row.Items : null })))
+  }
+  const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
+  await assert.rejects(
+    fetchMintsoftAsnsForDuplicateRecovery(),
+    (error: unknown) => error instanceof Error
+      && error.name === 'MintsoftAsnListIncompleteError'
+      && /page 1 returned 23 rows of 100/.test(error.message)
+      && /still served 100 rows/.test(error.message)
+      && /TRUNCATION/.test(error.message),
+  )
+  assert.deepEqual(
+    requests.map((request) => new URL(request, 'https://mintsoft.test').searchParams.get('PageNo')),
+    ['1', '2'],
+    'it refused on the very first scan, at the page that disproved the claim',
+  )
+})
+
+test('an ASN the full scan omits EVERY time is still found, by the independent recently-updated read (round 4, Codex HIGH 2)', async () => {
+  // The other shape re-reading cannot see: a deterministic omission. The full scan never serves ASN 9999 —
+  // its pages are internally consistent, no ID repeats, both scans agree, and page 4 is empty — so nothing
+  // about the scan itself betrays it. The `SinceLastUpdated` read is a different request whose rows fit in
+  // one page, so it has no boundary to lose the row at, and it puts 9999 on the record.
+  reset(() => tenant().filter((row) => row.ID !== 9999))
+  pageHook = (url) => {
+    if (url.pathname !== '/api/ASN/List' || !url.searchParams.has('SinceLastUpdated')) return null
+    if (url.searchParams.get('PageNo') !== '1') return json([])
+    return json([{ ID: 9999, POReference: 'PO-TARGET', WarehouseId: 6, Items: [] }])
+  }
+  const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
+  await assert.rejects(
+    fetchMintsoftAsnsForDuplicateRecovery(),
+    (error: unknown) => error instanceof Error
+      && error.name === 'MintsoftAsnListIncompleteError'
+      && /recently-updated read served ASN 9999/.test(error.message)
+      && /no ASN will be created/.test(error.message),
+  )
+  assert.equal(scanCounter, 2, 'precondition: two full scans ran and AGREED — the omission is invisible to them')
+  assert.ok(
+    requests.some((request) => {
+      const url = new URL(request, 'https://mintsoft.test')
+      return url.searchParams.has('SinceLastUpdated') && url.searchParams.get('PageNo') === '1'
+    }),
+    'and the window read really was made',
+  )
+})
+
+test('the recently-updated read can only ever REFUSE: what it misses does not widen the accepted list', async () => {
+  // It is evidence of presence, not of absence. An ASN outside the window (here: the window read serves
+  // nothing at all) leaves the full scan's verdict exactly as it was — otherwise a tenant whose ASNs are all
+  // older than the window could never create one.
+  reset(() => tenant())
+  pageHook = (url) => (url.pathname === '/api/ASN/List' && url.searchParams.has('SinceLastUpdated') ? json([]) : null)
+  const { fetchMintsoftAsnsForDuplicateRecovery } = await client()
+  const asns = await fetchMintsoftAsnsForDuplicateRecovery()
+  assert.equal(asns.length, 220)
+  assert.ok(asns.some((asn) => asn.externalAsnId === '9999'))
 })
 
 test('a rebind between a lost attempt and the retry still finds the earlier ASN, and refuses it by name (review M3)', async () => {

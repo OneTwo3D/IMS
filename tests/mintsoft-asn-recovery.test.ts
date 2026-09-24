@@ -4,6 +4,7 @@ import {
   findRecoverableMintsoftAsn,
   MintsoftAsnRecoveryAmbiguousMatchError,
   MintsoftAsnRecoveryQuantityRoundedError,
+  MintsoftAsnRecoveryQuantityUnreadableError,
   MintsoftAsnRecoveryWarehouseMismatchError,
   type MintsoftAsnRecoveryCriteria,
 } from '@/lib/connectors/mintsoft/api/asn-recovery'
@@ -25,7 +26,7 @@ import { normalizeMintsoftAsnListRowForRecovery } from '@/lib/connectors/mintsof
  * only shape a fractional expectation can come back in.
  */
 
-type Item = { ID: number; SourceLineId?: string | number; QuantityExpected: number }
+type Item = { ID?: number | string | null; SourceLineId?: string | number; QuantityExpected?: unknown }
 function row(id: number, poReference: string, warehouseId: number, items: Item[]) {
   return normalizeMintsoftAsnListRowForRecovery({ ID: id, POReference: poReference, WarehouseId: warehouseId, Items: items, QuantityReceieved: 0 })
 }
@@ -127,6 +128,66 @@ test('a FRACTIONAL expectation against Mintsoft’s whole-number store is refuse
   const whole: MintsoftAsnRecoveryCriteria = { ...RESERVATION, lines: [{ sourceLineId: 'line-a', expectedQty: 10 }] }
   assert.equal(findRecoverableMintsoftAsn([row(572, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 11 }])], whole), null)
   assert.equal(findRecoverableMintsoftAsn([row(573, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 10 }])], whole)?.externalAsnId, '573')
+})
+
+test('an expected quantity Mintsoft did not return is UNRESOLVED, never permission to create another ASN (round 4, Codex HIGH 1)', () => {
+  // A degraded row — the key absent, null, a string, a NaN — used to normalize to quantity null, which the
+  // matcher read as "a different quantity", which is "no such ASN exists, create one". For a row carrying
+  // OUR reference and OUR line ids that answer pushes a second ASN to a live warehouse. It is refused by
+  // name instead, exactly like the ambiguous-match and rounded-quantity refusals.
+  for (const [label, quantityExpected] of [
+    ['the key absent', undefined],
+    ['null', null],
+    ['a string', '2.5'],
+    ['NaN', Number.NaN],
+    ['Infinity', Number.POSITIVE_INFINITY],
+  ] as const) {
+    const asn = row(580, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: quantityExpected }])
+    assert.equal(asn.lines.length, 2, `precondition (${label}): the line is still matched by SourceLineId`)
+    assert.equal(asn.lines[1]!.quantity, null, `precondition (${label}): and its quantity is unreadable`)
+    assert.throws(
+      () => findRecoverableMintsoftAsn([asn], RESERVATION),
+      (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityUnreadableError
+        && /ASN 580/.test(error.message) && /line-b/.test(error.message) && /2\.5/.test(error.message)
+        && /NO ASN WILL BE CREATED/.test(error.message),
+      `remote quantity ${label}`,
+    )
+  }
+  // Unreadable OUTRANKS a readable difference on another line: while any line cannot be read, this ASN
+  // cannot be told apart from ours, so "not ours, create one" is not available.
+  assert.throws(
+    () => findRecoverableMintsoftAsn(
+      [row(581, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 12 }, { ID: 2, SourceLineId: 'line-b', QuantityExpected: null }])],
+      RESERVATION,
+    ),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityUnreadableError && /ASN 581/.test(error.message),
+    'a different quantity on line-a does not license creating another ASN while line-b is unreadable',
+  )
+  // And a readable quantity of zero is a quantity, not an unreadable one: it is a difference, and 0 !== 10
+  // still means some other ASN.
+  assert.equal(
+    findRecoverableMintsoftAsn([row(582, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 0 }, MATCHING_ITEMS[1]!])], { ...RESERVATION, lines: [{ sourceLineId: 'line-a', expectedQty: 10 }, { sourceLineId: 'line-b', expectedQty: 2.5 }] }),
+    null,
+  )
+})
+
+test('an item carrying OUR source line id but no item ID of its own is refused by the normalizer, not dropped (round 4)', () => {
+  // The same failure one step earlier. Dropping it left the row with one line against two items, so
+  // hasSameLineIdentity called the ASN somebody else's and the creator pushed a duplicate. The row is
+  // refused instead, with the ASN and the line named.
+  for (const [label, id] of [['null', null], ['absent', undefined], ['blank', '  ']] as const) {
+    assert.throws(
+      () => row(583, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: id, SourceLineId: 'line-b', QuantityExpected: 2.5 }]),
+      (error: unknown) => error instanceof Error
+        && error.name === 'MintsoftAsnListIncompleteError'
+        && /ASN 583/.test(error.message) && /line-b/.test(error.message) && /no item ID/.test(error.message),
+      `item ID ${label}`,
+    )
+  }
+  // An item with no SourceLineId at all is still DROPPED and still COUNTED (review L-a): it is not ours.
+  const notOurs = row(584, 'PO-1', 6, [...MATCHING_ITEMS, { QuantityExpected: 1 }])
+  assert.equal(notOurs.lines.length, 2)
+  assert.equal((notOurs.raw?.Items as unknown[]).length, 3)
 })
 
 test('a match at ANOTHER warehouse (a rebind between the lost attempt and the retry) is refused by name (review M3)', () => {

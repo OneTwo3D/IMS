@@ -41,6 +41,17 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
  * rounding cannot explain (a whole-number expectation against a different whole number) still means a
  * different ASN, and is not adopted.
  *
+ * A QUANTITY MINTSOFT DID NOT RETURN IS UNRESOLVED, NOT "A DIFFERENT ASN" (round 4, Codex HIGH 1). The
+ * list normalizer sets a line's quantity to null when the row carries no readable `QuantityExpected` —
+ * the key absent, null, a string, a NaN. Reading that as a quantity mismatch answered a DEGRADED response
+ * describing the very ASN an earlier attempt created with "no such ASN exists, create one", which is the
+ * duplicate at a live warehouse this whole path exists to prevent. So a row that carries this reference
+ * and exactly these `SourceLineId`s, with a quantity that cannot be read, is refused by name: not adopted
+ * (the expectation is unknown), not created again. It outranks a readable mismatch on another line,
+ * because until every line can be read the ASN cannot be told apart from ours. Operationally this BLOCKS
+ * creation for that reservation until someone looks at the ASN in Mintsoft — deliberately, because the
+ * alternative is a second inbound ASN nobody asked for.
+ *
  * AND THE WAREHOUSE IS CHECKED AFTER THE MATCH, NOT BEFORE IT (review M3). The list is read across the
  * whole tenant, so an ASN created by an earlier attempt while the product's binding pointed at another
  * warehouse is still found. Finding it there is not a licence to adopt it — the reservation is for the
@@ -93,6 +104,20 @@ export class MintsoftAsnRecoveryQuantityRoundedError extends Error {
   }
 }
 
+export class MintsoftAsnRecoveryQuantityUnreadableError extends Error {
+  constructor(externalAsnId: string, sourceLineId: string, expectedQty: number) {
+    super(
+      `Mintsoft ASN ${externalAsnId} carries this reference and these lines, but line ${sourceLineId} came `
+      + `back with no readable expected quantity where the reservation expects ${expectedQty}. An ASN whose `
+      + 'quantity cannot be read cannot be told apart from the one an earlier attempt created, so this is '
+      + 'refused rather than answered with "no such ASN exists". Nothing was created and NO ASN WILL BE '
+      + 'CREATED for this reservation until the ASN reads back completely: check it in Mintsoft (or re-run '
+      + 'once the list serves QuantityExpected again), then retry.',
+    )
+    this.name = 'MintsoftAsnRecoveryQuantityUnreadableError'
+  }
+}
+
 function rawString(raw: Record<string, unknown> | null | undefined, keys: readonly string[]): string | null {
   if (!raw) return null
   for (const key of keys) {
@@ -134,6 +159,7 @@ function roundingCouldExplain(expectedQty: number, remoteQty: number | null | un
 type LineVerdict =
   | { kind: 'match' }
   | { kind: 'different' }
+  | { kind: 'unreadable'; sourceLineId: string; expectedQty: number }
   | { kind: 'rounded'; sourceLineId: string; expectedQty: number; remoteQty: number }
 
 /** Same reference and same line identity — the quantities are judged separately. */
@@ -143,18 +169,34 @@ function hasSameLineIdentity(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCriter
   return criteria.lines.every((line) => bySourceId.has(line.sourceLineId))
 }
 
+/**
+ * Every line is judged before a verdict is reached — no early return — because an UNREADABLE quantity on
+ * one line must outrank a readable mismatch on another (Codex HIGH 1). Precedence: unreadable, then a
+ * difference rounding cannot explain, then one it can, then a match.
+ */
 function judgeQuantities(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCriteria): LineVerdict {
   const bySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
+  let unreadable: LineVerdict | null = null
+  let different = false
   let rounded: LineVerdict | null = null
   for (const line of criteria.lines) {
+    // null is "Mintsoft did not give us a number", never "zero" and never "some other quantity": the
+    // normalizer only produces it for an absent, null, non-numeric or non-finite QuantityExpected, and
+    // the line itself is present by SourceLineId (hasSameLineIdentity already required that).
     const remote = bySourceId.get(line.sourceLineId)?.quantity ?? null
-    if (quantitiesMatch(remote, line.expectedQty)) continue
-    if (roundingCouldExplain(line.expectedQty, remote)) {
-      rounded ??= { kind: 'rounded', sourceLineId: line.sourceLineId, expectedQty: line.expectedQty, remoteQty: remote as number }
+    if (remote == null) {
+      unreadable ??= { kind: 'unreadable', sourceLineId: line.sourceLineId, expectedQty: line.expectedQty }
       continue
     }
-    return { kind: 'different' }
+    if (quantitiesMatch(remote, line.expectedQty)) continue
+    if (roundingCouldExplain(line.expectedQty, remote)) {
+      rounded ??= { kind: 'rounded', sourceLineId: line.sourceLineId, expectedQty: line.expectedQty, remoteQty: remote }
+      continue
+    }
+    different = true
   }
+  if (unreadable) return unreadable
+  if (different) return { kind: 'different' }
   return rounded ?? { kind: 'match' }
 }
 
@@ -181,6 +223,9 @@ export function findRecoverableMintsoftAsn(asns: readonly WmsAsnRef[], criteria:
   )
   if (!match) return null
   const quantities = judgeQuantities(match, criteria)
+  if (quantities.kind === 'unreadable') {
+    throw new MintsoftAsnRecoveryQuantityUnreadableError(match.externalAsnId, quantities.sourceLineId, quantities.expectedQty)
+  }
   if (quantities.kind === 'different') return null
   if (quantities.kind === 'rounded') {
     throw new MintsoftAsnRecoveryQuantityRoundedError(match.externalAsnId, quantities.sourceLineId, quantities.expectedQty, quantities.remoteQty)

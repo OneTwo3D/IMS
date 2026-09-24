@@ -463,19 +463,52 @@ export async function fetchMintsoftBundle(externalProductId: string): Promise<Wm
  *     offered to callers, but duplicate recovery deliberately does not use it (review M3, see
  *     fetchMintsoftAsnsForDuplicateRecovery).
  *
- * SO THIS EITHER RETURNS THE WHOLE LIST OR THROWS. It pages to exhaustion (a short page ends it),
- * refuses a page larger than it asked for, refuses to go past `MINTSOFT_ASN_LIST_MAX_PAGES`, and —
- * because the order is unstable, so a row can move across a page boundary while the scan runs and be
- * skipped — accepts a scan only when two consecutive scans return exactly the same set of ASN IDs with
- * no ID seen twice within either. A caller deciding "no such ASN exists, so create one" must be able
- * to rely on the absence meaning absence; a partial list would make it create a DUPLICATE at a live
- * warehouse.
+ * SO THIS EITHER RETURNS THE WHOLE LIST OR THROWS. A caller deciding "no such ASN exists, so create one"
+ * must be able to rely on absence meaning absence; a partial list would make it create a DUPLICATE at a
+ * live warehouse. A scan is accepted only when ALL of these hold, and every other outcome is a refusal:
+ *
+ *   (1) every page before the terminating one returned EXACTLY `Limit` rows (more is refused outright);
+ *   (2) the terminating short page is PROVEN to be the end, by asking for the page after it and requiring
+ *       it to be empty (round 4, Codex HIGH 2). A short page used to be *assumed* to be the end. Any
+ *       truncation that is DETERMINISTIC — a server that answers page 1 with 23 rows every time — then
+ *       looks exactly like a complete list, and looks the same on every re-scan, so no amount of re-reading
+ *       can see it. Live Mintsoft answers a page past the end with `[]` (`PageNo=99999` → `200 []`), so the
+ *       question is cheap and its answer is unambiguous;
+ *   (3) no ASN ID appeared twice within the scan;
+ *   (4) two consecutive scans returned exactly the same set of ASN IDs;
+ *   (5) an INDEPENDENT read of the recently-updated window (`SinceLastUpdated`, taken BEFORE the full
+ *       scans) is contained in the accepted set. See `fetchMintsoftAsnListRows`.
+ *
+ * WHY (3) AND (4) TOGETHER EXCLUDE A ROW THAT MOVED ACROSS A PAGE BOUNDARY. Pages are windows over an
+ * ordering of the whole current set, so the collected count is `(pages−1)·Limit + |last page|`, which by
+ * (1) and (2) is the set size at the moment the last page was served. If the scan collected that many
+ * DISTINCT rows (3) and yet omitted one that existed, then by counting it must have collected some row that
+ * no longer existed then — i.e. an ASN deleted mid-scan. Mintsoft's delete is a hard delete with no ID
+ * reuse (proven live 2026-09-24: `DELETE /api/ASN/6117` then `GET /api/ASN/6117` → 404), so that deleted row
+ * cannot appear in the NEXT scan, and (4) would fail. Two agreeing, repeat-free, end-proven scans therefore
+ * omit nothing — GIVEN the paging model.
+ *
+ * WHAT IS STILL ASSUMED, PLAINLY. That model itself: that `PageNo`/`Limit` are a window over a permutation
+ * of the whole current set, and not, say, a keyset walk that can skip a row identically every time. No
+ * client-side check can establish it from this API — there is no total count, no cursor, no ordering
+ * parameter, and no filter by our own reference — which is why (5) exists (a read whose result fits in one
+ * page has no page boundary to be lost at) and why the real answer is post-create verification keyed on
+ * `POReference` + `Items[].SourceLineId`, both now proven to round-trip (o3d-vcw8). Until that lands, this
+ * reader FAILS CLOSED: every refusal here aborts the creation attempt, so no ASN is created — and, because
+ * the scan is tenant-wide, none can be created for any reservation — until the condition clears.
  */
 export const MINTSOFT_ASN_LIST_PAGE_LIMIT = 100
 /** 50 pages of 100 = 5,000 ASNs per scan. Past that the scan refuses rather than truncates. */
 export const MINTSOFT_ASN_LIST_MAX_PAGES = 50
 /** Scans attempted to get two consecutive identical ones before giving up. */
 export const MINTSOFT_ASN_LIST_SCAN_ATTEMPTS = 3
+/**
+ * How far back the independent `SinceLastUpdated` read looks. It exists to cover the rows duplicate
+ * recovery is actually hunting — an ASN a recent earlier attempt created — and live it is small (9 of 220
+ * ASNs were updated in the 17 days before 2026-09-18), so it is normally one page and therefore has no page
+ * boundary a row could be lost at.
+ */
+export const MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS = 30
 
 /** Thrown when the ASN list cannot be established as complete. Callers must treat it as "unknown", never "empty". */
 export class MintsoftAsnListIncompleteError extends Error {
@@ -492,7 +525,7 @@ export type MintsoftAsnListOptions = {
   request?: (path: string) => Promise<MintsoftRequestResult<unknown>>
 }
 
-export function buildMintsoftAsnListRequest(pageNo: number, options?: { warehouseId?: string | null }): {
+export function buildMintsoftAsnListRequest(pageNo: number, options?: MintsoftAsnListScanShape): {
   path: string
   method: 'GET'
 } {
@@ -500,11 +533,28 @@ export function buildMintsoftAsnListRequest(pageNo: number, options?: { warehous
   const query = new URLSearchParams({
     PageNo: String(pageNo),
     Limit: String(MINTSOFT_ASN_LIST_PAGE_LIMIT),
-    IncludeASNItems: 'true',
   })
+  // The window read needs IDs only, and every parameter it sends is one proven live in combination with
+  // PageNo/Limit; IncludeASNItems is left off it rather than assumed to combine.
+  if (options?.includeItems !== false) query.set('IncludeASNItems', 'true')
   const warehouseId = options?.warehouseId?.trim()
   if (warehouseId && /^\d+$/.test(warehouseId)) query.set('WarehouseId', warehouseId)
+  const sinceLastUpdated = options?.sinceLastUpdated?.trim()
+  if (sinceLastUpdated) query.set('SinceLastUpdated', sinceLastUpdated)
   return { path: `/api/ASN/List?${query.toString()}`, method: 'GET' }
+}
+
+/** Everything that shapes one scan's requests. `sinceLastUpdated` is a date Mintsoft parses, e.g. 2026-09-01. */
+type MintsoftAsnListScanShape = {
+  warehouseId?: string | null
+  sinceLastUpdated?: string | null
+  includeItems?: boolean
+}
+
+/** The start of the independent recently-updated window, in the `YYYY-MM-DD` form live Mintsoft accepts. */
+export function mintsoftAsnListRecentWindowSince(now: Date = new Date()): string {
+  const since = new Date(now.getTime() - MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+  return since.toISOString().slice(0, 10)
 }
 
 function mintsoftAsnListRowId(row: unknown): string {
@@ -515,7 +565,33 @@ function mintsoftAsnListRowId(row: unknown): string {
   throw new MintsoftAsnListIncompleteError('a row has no ASN ID, so it cannot be told apart from the others')
 }
 
-async function scanMintsoftAsnList(options: MintsoftAsnListOptions): Promise<{ rows: Array<Record<string, unknown>>; ids: string[]; repeated: boolean }> {
+type MintsoftAsnListScan = { rows: Array<Record<string, unknown>>; ids: string[]; repeated: boolean }
+
+/**
+ * A SHORT PAGE IS A CLAIM, AND THIS IS THE CHECK (round 4, Codex HIGH 2). Asking for the page after it and
+ * requiring `[]` is the only way from this client to tell "that was the end" from "that was cut short",
+ * and it is the only incompleteness that survives re-scanning, because a deterministic truncation repeats.
+ */
+async function requireEndOfMintsoftAsnList(
+  request: (path: string) => Promise<MintsoftRequestResult<unknown>>,
+  shortPageNo: number,
+  shortPageLength: number,
+  options: MintsoftAsnListOptions & MintsoftAsnListScanShape,
+): Promise<void> {
+  const nextPageNo = shortPageNo + 1
+  const preamble = `page ${shortPageNo} returned ${shortPageLength} rows of ${MINTSOFT_ASN_LIST_PAGE_LIMIT}, which is the end of the list only if page ${nextPageNo} is empty`
+  const result = await request(buildMintsoftAsnListRequest(nextPageNo, options).path)
+  if (result.error) throw new MintsoftAsnListIncompleteError(`${preamble} — and it failed (${result.status}): ${result.error}`)
+  if (!Array.isArray(result.data)) throw new MintsoftAsnListIncompleteError(`${preamble} — and it was not an array`)
+  if (result.data.length > 0) {
+    throw new MintsoftAsnListIncompleteError(
+      `${preamble} — and it still served ${result.data.length} rows, so the short page was a TRUNCATION, not the end. `
+      + 'Refusing to read this as the whole list: no ASN will be created until it reads back completely',
+    )
+  }
+}
+
+async function scanMintsoftAsnList(options: MintsoftAsnListOptions & MintsoftAsnListScanShape): Promise<MintsoftAsnListScan> {
   const request = options.request ?? ((path: string) => mintsoftRequest<unknown>(path))
   const rows: Array<Record<string, unknown>> = []
   const ids: string[] = []
@@ -536,7 +612,10 @@ async function scanMintsoftAsnList(options: MintsoftAsnListOptions): Promise<{ r
       ids.push(id)
       rows.push(row as Record<string, unknown>)
     }
-    if (page.length < MINTSOFT_ASN_LIST_PAGE_LIMIT) return { rows, ids, repeated }
+    if (page.length < MINTSOFT_ASN_LIST_PAGE_LIMIT) {
+      await requireEndOfMintsoftAsnList(request, pageNo, page.length, options)
+      return { rows, ids, repeated }
+    }
   }
   throw new MintsoftAsnListIncompleteError(
     `more than ${MINTSOFT_ASN_LIST_MAX_PAGES} pages of ${MINTSOFT_ASN_LIST_PAGE_LIMIT}; refusing to treat a truncated list as complete`,
@@ -545,14 +624,39 @@ async function scanMintsoftAsnList(options: MintsoftAsnListOptions): Promise<{ r
 
 /** Every ASN row the list serves (with Items), or a MintsoftAsnListIncompleteError. Never a partial list. */
 export async function fetchMintsoftAsnListRows(options: MintsoftAsnListOptions = {}): Promise<Array<Record<string, unknown>>> {
-  let previous: { rows: Array<Record<string, unknown>>; ids: string[]; repeated: boolean } | null = null
+  // THE INDEPENDENT READ, AND IT GOES FIRST (round 4, Codex HIGH 2). Re-reading the same paged request
+  // cannot see an omission that repeats; a DIFFERENTLY FILTERED request can, because the rows it returns
+  // normally fit in one page and a single page has no boundary to lose a row at. It is taken before the
+  // full scans so that an ASN created after it cannot make the check refuse a scan that is in fact whole;
+  // the same warehouse scope is used, so it can never contain a row the full scan correctly excludes.
+  const recent = await scanMintsoftAsnList({ ...options, sinceLastUpdated: mintsoftAsnListRecentWindowSince(), includeItems: false })
+  let previous: MintsoftAsnListScan | null = null
   for (let attempt = 1; attempt <= MINTSOFT_ASN_LIST_SCAN_ATTEMPTS; attempt += 1) {
     const scan = await scanMintsoftAsnList(options)
-    if (previous && !previous.repeated && !scan.repeated && sameIdSet(previous.ids, scan.ids)) return scan.rows
+    if (previous && !previous.repeated && !scan.repeated && sameIdSet(previous.ids, scan.ids)) {
+      requireRecentWindowIsCovered(recent.ids, scan.ids)
+      return scan.rows
+    }
     previous = scan
   }
   throw new MintsoftAsnListIncompleteError(
     `the list changed between ${MINTSOFT_ASN_LIST_SCAN_ATTEMPTS} consecutive scans, so no scan can be shown to be complete`,
+  )
+}
+
+/**
+ * The window read is evidence of PRESENCE only: an ASN it served exists, whatever the full scan did. A row
+ * it repeated or an ASN it missed says nothing (it is not the list this returns), so neither is a refusal —
+ * this check can only ever refuse, never widen what is accepted.
+ */
+function requireRecentWindowIsCovered(recentIds: readonly string[], acceptedIds: readonly string[]): void {
+  const accepted = new Set(acceptedIds)
+  const missing = [...new Set(recentIds)].filter((id) => !accepted.has(id))
+  if (missing.length === 0) return
+  throw new MintsoftAsnListIncompleteError(
+    `the recently-updated read served ASN ${missing.join(', ')}, which two agreeing full scans never did, so the `
+    + 'full scan is incomplete however consistent it looks. Refusing to read it as the whole list: an ASN it '
+    + 'cannot show is one an earlier attempt may have created, and no ASN will be created until the two reads agree',
   )
 }
 
@@ -604,9 +708,28 @@ export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unkno
     const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
     if (!record) return []
     const sourceLineId = typeof record.SourceLineId === 'string' && record.SourceLineId.trim() ? record.SourceLineId.trim() : null
-    const externalLineId = record.ID == null ? null : String(record.ID)
-    if (!sourceLineId || !externalLineId) return []
-    const expected = typeof record.QuantityExpected === 'number' ? record.QuantityExpected : null
+    // An item with no usable SourceLineId is NOT ours — most of this tenant's ASNs were made in the
+    // Mintsoft UI and carry none — so it is dropped here and counted by remoteItemCount instead (review L-a).
+    if (!sourceLineId) return []
+    const externalLineId = record.ID == null || String(record.ID).trim() === '' ? null : String(record.ID)
+    if (!externalLineId) {
+      // IT CARRIES OUR LINE ID, SO IT IS OURS (round 4, the shape of Codex HIGH 1). Dropping it would leave
+      // the row with fewer lines than items, hasSameLineIdentity would call the ASN somebody else's, and the
+      // creator would push a SECOND ASN for a line this one already covers. An item we cannot key is a read
+      // we cannot complete, not a row to skip.
+      throw new MintsoftAsnListIncompleteError(
+        `ASN ${externalAsnId} has an item carrying source line ${sourceLineId} but no item ID of its own, so `
+        + 'this ASN cannot be told apart from one an earlier attempt created. Nothing will be created for it '
+        + 'until the item reads back with its ID',
+      )
+    }
+    // UNREADABLE IS null, AND null IS NEVER A QUANTITY (round 4, Codex HIGH 1). NaN and Infinity are
+    // `typeof 'number'`, so they were reaching the matcher as quantities that match nothing — which the
+    // matcher then read as "a different ASN, go ahead and create one". findRecoverableMintsoftAsn refuses
+    // on null instead (MintsoftAsnRecoveryQuantityUnreadableError).
+    const expected = typeof record.QuantityExpected === 'number' && Number.isFinite(record.QuantityExpected)
+      ? record.QuantityExpected
+      : null
     return [{
       externalLineId,
       sourceLineId,
