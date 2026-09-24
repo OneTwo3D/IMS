@@ -51,7 +51,9 @@ product sync returned "not wired yet". **No order and no product ever entered IM
   `docs/archive/connector-removal-plan.md` said thirteen from an earlier survey); the `shopify` element of the
   `drainers` map in `lib/jobs/shopping/drain-inbox.ts`; `persistShopifyWebhookEvent` and the second
   member of `ShoppingWebhookEventConnector`; `shopify_invoice_pdf_secret` from the invoice-PDF secret
-  map; the three `SHOPIFY_*` `SETTING_ENV_FALLBACKS` and `SENSITIVE_SETTING_KEYS` entries.
+  map; the three `SHOPIFY_*` `SETTING_ENV_FALLBACKS` entries. **The three `SENSITIVE_SETTING_KEYS`
+  entries were removed too, and that was a security regression — reversed in round 2; see
+  "The credential keys stay" below.**
 - Server actions: `getShopifySyncSettings`, `saveShopifySyncSettings`,
   `get/saveShopifyConnectorCredentials`, `getShopifySyncLogs`, `triggerShopifyManualSync`.
 - UI: the `/sync` card, logo, deep link and panel; the onboarding Integrations-step switch, credential
@@ -167,6 +169,66 @@ test that used to distinguish "generic" from "WooCommerce with extra steps" can 
    compared two wrappers now shows only that one of them names its own connector. A core that
    hardcoded `'woocommerce'` would still pass it; the core is covered separately with `'newshop'`.
 
+## Round 2: two findings, both of the same shape
+
+Codex reviewed the branch at `7555ff97` and raised two HIGHs. Both are the rule that also caught
+`CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` during the removal itself:
+
+> **Removing a connector from the code does not remove its rows from the database, and every reader
+> of those rows has to keep coping with them.**
+
+### The credential keys stay (`lib/settings-store.ts`)
+
+`RETIRED_CREDENTIAL_SETTING_KEYS` now names every archived connector's credential keys and is spread
+into `SENSITIVE_SETTING_KEYS`, so a key's gate outlives its connector. It covers seven keys: the
+three `shopify_*` this branch removed, the three `shiphero_*` that **PR #680 removed the same way**
+(the same exposure had been live on `development` since that merge), and `quickbooks_client_secret`,
+which the QuickBooks removal correctly kept — that asymmetry is what showed the other two removals
+were the mistake rather than the policy.
+
+The rule: **a credential key stays for as long as a row for it may exist.** Removing one is a
+data-retention decision that needs the migration that deleted the rows, not a code cleanup.
+
+`SETTING_ENV_FALLBACKS` is deliberately NOT symmetrical and the `SHOPIFY_*` / `SHIPHERO_*` entries
+stay removed: that map decides which value WINS for code that reads the key, and there is no such
+code left. The sensitive set decides who may read the row and whether it is encrypted.
+
+`tests/security/setting-secret-read-authorization.test.ts` pins the list by its own literals, in
+both directions, and exercises each key against a SEEDED row for MANAGER/WAREHOUSE/READONLY with an
+ADMIN positive control. It has to pin literals: the pre-existing exhaustive case iterates
+`SENSITIVE_SETTING_KEYS`, so deleting a key deleted the case that covered it and the suite stayed
+green.
+
+### An archived storefront is refused, not inferred past (`lib/fulfillment/shopping-order-lookup.ts`)
+
+`WmsConnection.orderLookupConnector` can still say `shopify`. The narrowed `isShoppingConnectorId`
+rejected it, and the resolver then treated "unrecognised" exactly like "unconfigured" and inferred —
+answering `woocommerce` whenever WooCommerce links existed. The WMS order-status sweep would then
+query the 3PL by WooCommerce order numbers, store the result against those orders and push the status
+to WooCommerce.
+
+The resolver now returns a `ShoppingOrderLookupResolution` (`one` / `none` / `ambiguous` /
+`unsupported`), shaped after `WmsConnectorResolution` in
+`lib/connectors/wms/enabled-connector.ts` for the same stated reason: these states are not
+interchangeable and collapsing them into `null` loses the only thing an operator can act on. An
+explicit persisted value is honoured or refused **by name**; inference runs only when nothing was
+configured.
+
+The second half was not in the finding and is the same defect: the inference's own query filtered
+`connector IN ('woocommerce', 'shopify')`, so narrowing that list turned an installation holding both
+stores' links — which used to see two candidates and refuse as ambiguous — into one that sees a
+single candidate and answers WooCommerce. The observation query is unfiltered now, and an unsupported
+value in the answer is a refusal.
+
+### One "no longer proven" item is recovered
+
+Item 2 of the list above said the second-connector seam test had lost its VALUE contrast: with one
+shopping id left, no two `WmsConnection` rows could differ by value, so the test could only prove the
+query was parameterised, not that the answer followed the parameter. That is recoverable now, because
+an archived value **resolves differently** instead of being narrowed away:
+`tests/wms-second-connector-seam.test.ts` gives the fictitious warehouse `shopify` and Mintsoft
+`woocommerce` and asserts the two distinct resolutions. A resolver pinned to Mintsoft's row fails it.
+
 ## Data left behind (development databases only; production is unused and will be reinstalled)
 
 **No migration was authored and no database is altered by this branch.**
@@ -178,10 +240,20 @@ test that used to distinguish "generic" from "WooCommerce with extra steps" can 
   deleting rows to tidy up a dev database is a worse habit than leaving visibly stale ones. They age
   out under the ordinary webhook-event retention window.
 - `Setting` rows `shopify_*` and `plugin_shopify_enabled` become orphans. **Decision: leave them.**
-  Nothing reads them, `getIntegrationPluginState` is built over the id union so it cannot see
-  `plugin_shopify_enabled` at all, and a settings-row delete is not worth a migration on a database
-  that is about to be reinstalled. They are visible in Settings' raw setting list, which is the
-  correct amount of visibility for an orphan.
+  No *connector* code reads them, `getIntegrationPluginState` is built over the id union so it cannot
+  see `plugin_shopify_enabled` at all, and a settings-row delete is not worth a migration on a
+  database that is about to be reinstalled. They are visible in Settings' raw setting list, which is
+  the correct amount of visibility for an orphan.
+
+  **BUT "nothing reads them" WAS FALSE FOR THE CREDENTIALS, and it is the whole of round 2's first
+  finding.** `app/actions/settings.ts:getSetting` is a `'use server'` export that takes an
+  ARBITRARY key from any internal principal, and what decides whether it demands the `settings`
+  permission is membership of `SENSITIVE_SETTING_KEYS`. Dropping the three `shopify_*` credential
+  keys from that set therefore did not make the rows unreadable — it made them readable by
+  WAREHOUSE and READONLY, by name. Measured on the pre-fix head: a WAREHOUSE session got
+  `shopify_admin_api_access_token`, `shopify_webhook_secret` and `shopify_invoice_pdf_secret` back
+  in clear. The same set also drives encryption at rest, so a legacy plaintext row would have
+  stayed plaintext for good.
 - `ShoppingSyncLog` rows with `connector = 'shopify'` are unreachable from the UI (the reader is
   keyed by registered connector). **Decision: leave them**, same reasoning.
 
