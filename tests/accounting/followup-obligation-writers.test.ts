@@ -1568,12 +1568,20 @@ test('[o3d-0bfh r7] a FAILED row that never reached SYNCED is aged on createdAt,
   // `syncedAt`; without the createdAt branch it could never be listed at all, and FAILED is one of
   // the two statuses this backlog exists for.
   //
-  // o3d-remove-parked-connectors: this reset the world to the QuickBooks connector, which mattered
-  // only because that was the connector with no repair sweep. `inTheOperatorBacklog` is a pure
-  // predicate over a row, so the connector is immaterial to what is asserted.
+  // o3d-remove-parked-connectors — WHY THE ROW STILL NAMES AN ARCHIVED CONNECTOR.
+  //
+  // The backlog's population IS `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` — connectors whose retained
+  // markers nothing re-reads — so the connector is NOT immaterial here: a Xero row is deliberately
+  // excluded, because Xero's sweep comes back for it. QuickBooks was the only connector in that
+  // population and is archived, and its registry entry is KEPT for exactly this reason (see
+  // lib/domain/accounting/follow-up-obligation-registry.ts): development databases hold SYNCED and
+  // FAILED `quickbooks` rows with a non-null marker, and this backlog is the one screen that lists
+  // them. So the fixture names it directly rather than through `reset`, and this case is now about a
+  // HISTORICAL row — which is the only kind there will ever be.
   reset()
   const row: SyncRow = {
     ...blankRow(),
+    connector: 'quickbooks',
     status: 'FAILED',
     syncedAt: null,
     createdAt: new Date(Date.now() - 60 * 60_000),
