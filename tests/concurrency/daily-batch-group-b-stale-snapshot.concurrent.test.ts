@@ -9,8 +9,9 @@ import { assertScratchDatabaseBeforeAnyWrite } from './scratch-database-guard'
  * LANDED-COST REVALUATION. Needs real Postgres: the property is a lock wait and what is visible after
  * it.
  *
- * THE DEFECT, measured end to end before the fix (probe `.c08y2probe/race.ts`, own scratch database
- * `ims_scratch_c08y2p`, network trapped): with a revaluation held open, the real `runDailyBatchSync`
+ * THE DEFECT, measured end to end before the fix (probe kept outside the repository at
+ * /var/tmp/ims-session-park-20260913/c08y2-probe/race.ts; own throwaway scratch database, network
+ * trapped): with a revaluation held open, the real `runDailyBatchSync`
  * parked at `SELECT id FROM "cost_layers" … FOR UPDATE` — observed in `pg_stat_activity` — and then
  * posted DAILY_BATCH_GROUP_B COGS £4.00 from the window it had read BEFORE the lock, stamped
  * `shipmentJournalDate`, wrote `cogsBatchAmount` back to 4.00 over the committed -6.00 and recorded a

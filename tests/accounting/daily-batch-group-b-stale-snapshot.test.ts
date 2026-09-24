@@ -4,8 +4,9 @@ import test, { mock } from 'node:test'
 /**
  * o3d-c08y round 2, Codex HIGH — GROUP B POSTED FROM A SNAPSHOT IT READ BEFORE IT TOOK THE LOCK.
  *
- * MEASURED FIRST on a scratch database (probe `.c08y2probe/race.ts`, own database
- * `ims_scratch_c08y2p`, network trapped, zero outbound calls). One unit bought at 4.00, shipped and
+ * MEASURED FIRST on a scratch database (probe kept outside the repository at
+ * /var/tmp/ims-session-park-20260913/c08y2-probe/race.ts; own throwaway database, network trapped,
+ * zero outbound calls). One unit bought at 4.00, shipped and
  * NOT yet journaled — the case the o3d-c08y refusal deliberately permits to go negative, because the
  * daily batch was supposed to refuse it (o3d-sidy). A landed-cost revaluation applying a -10.00 credit
  * freight line was held open in its own transaction; the batch started, read the window, and parked at
@@ -228,9 +229,11 @@ mock.module('@/lib/domain/accounting/cogs-subledger-movement', {
   },
 })
 
+// Both connectors run the ordering and stale-value tests; what they do with the reloaded NEGATIVE
+// basis differs, so that is asserted per connector below rather than parameterised here.
 const CONNECTORS = [
-  { name: 'xero', load: () => import('@/lib/connectors/xero/daily-sync'), refuses: true },
-  { name: 'quickbooks', load: () => import('@/lib/connectors/quickbooks/daily-sync'), refuses: false },
+  { name: 'xero', load: () => import('@/lib/connectors/xero/daily-sync') },
+  { name: 'quickbooks', load: () => import('@/lib/connectors/quickbooks/daily-sync') },
 ] as const
 
 type JournalLine = { accountCode: string; debit?: number; credit?: number }

@@ -2,8 +2,9 @@
  * o3d-c08y round 2 (Codex HIGH) — GROUP B MUST NOT COMPUTE FROM A SNAPSHOT IT READ BEFORE IT TOOK
  * THE LOCK.
  *
- * THE DEFECT, measured on a scratch database before this module existed (probe `.c08y2probe/race.ts`,
- * network trapped, own database `ims_scratch_c08y2p`): both daily batches loaded the whole shipment
+ * THE DEFECT, measured on a scratch database before this module existed (probe kept at
+ * /var/tmp/ims-session-park-20260913/c08y2-probe/race.ts, outside the repository; network trapped, own
+ * throwaway database): both daily batches loaded the whole shipment
  * window — including `shipment_lines.costLayerSnapshot` and `cogsBatchAmount` — and only THEN locked
  * the cost layers those snapshots reference. A landed-cost revaluation holding those layer locks
  * parked the batch at
