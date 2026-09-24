@@ -107,9 +107,12 @@
  * place under the same name, and renaming a database BACK to the name in its marker makes the
  * marker valid again (review L-11, measured).
  *
- * HOW THE CHECK TALKS TO THE SERVER (corrected in r10, review MEDIUM-1 and LOW-6). It runs on
- * its own connection, started with `default_transaction_read_only=on` and PROBE_SESSION_OPTIONS
- * (`row_security=off`, `standard_conforming_strings=on`), and sends every statement singly over
+ * HOW THE CHECK TALKS TO THE SERVER (corrected in r10, review MEDIUM-1 and LOW-6; r11 HIGH-1). It
+ * runs on its own connection, started with `default_transaction_read_only=on` and
+ * PROBE_SESSION_OPTIONS (`row_security=off`, `standard_conforming_strings=on`,
+ * `search_path=pg_catalog`), asserts the row_security and search_path settings as its FIRST
+ * statement (`assertProbeSessionSafe`), writes every function, operator and cast it uses
+ * pg_catalog-qualified (the probe module's rule 5), and sends every statement singly over
  * the EXTENDED protocol. Its statements are NOT all fixed: the state and subscription queries are,
  * but the installation-evidence probe is BUILT from catalogue names — one statement, table names
  * only as double-quoted identifiers, labels as integers (the probe module's rules 1–3). Those rules
@@ -319,7 +322,8 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
   const client = new pg.Client({
     connectionString,
     // PROBE_SESSION_OPTIONS = row_security=off (r10 review MEDIUM-1: no table policy is ever
-    // evaluated by this check) + standard_conforming_strings=on (r9 review M-1).
+    // evaluated by this check) + standard_conforming_strings=on (r9 review M-1) +
+    // search_path=pg_catalog (r11 review HIGH-1: no planted operator or function is resolved).
     options: `-c default_transaction_read_only=on ${PROBE_SESSION_OPTIONS}`,
     application_name: 'o3d-scratch-database-guard',
   })
@@ -341,9 +345,11 @@ export async function checkScratchDatabase(databaseUrl: string, optIn: string | 
       throw error
     }
     const { rows: stateRows } = await ext.query({
-      // EVERY catalogue reference is schema-qualified (review LOW-6): with a URL-supplied
-      // `search_path` — which MEDIUM-1 above shows could reach this connection — an
-      // unqualified `shobj_description` could be answered by a planted function.
+      // EVERY function, operator and cast is schema-qualified (review LOW-6; r11 HIGH-1). The URL's
+      // own `options=`/`schema` are stripped (sanitisedProbeConnectionString) and search_path is
+      // pinned to pg_catalog by the startup options and asserted above, so a URL cannot reach this
+      // connection's search_path; the qualification is the second, independent layer against a
+      // planted function or operator.
       // One fixed statement, over the extended protocol (r9). Not every statement this check sends
       // is fixed: the installation probe is catalogue-built (identifier-only, single-statement).
       text: `SELECT pg_catalog.current_database() AS name,

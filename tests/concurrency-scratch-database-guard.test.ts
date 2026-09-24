@@ -460,60 +460,82 @@ function sqlLiterals(source: string): string[] {
   return out
 }
 
-test('every operator in the modules\' SQL is schema-qualified (r11 HIGH-1, CVE-2018-1058)', () => {
-  // A bare operator between two references resolves through search_path. Strip OPERATOR(pg_catalog.…)
-  // and single-quoted string LITERALS first, then any surviving =, <>, !~ is unqualified. Asserts a
-  // present property; the mutation proof removes a qualification to turn it red.
+/**
+ * Reduce a SQL string to its RESIDUAL: remove every construct that is safe BY CONSTRUCTION, so that
+ * anything left is a name/operator/cast/function that would be resolved through search_path. This is
+ * a genuine check, not a spot-check of a few operator spellings (follow-up MEDIUM-1): the removals
+ * are the exhaustive set of safe forms this code is allowed to use, and everything else is rejected.
+ * Removed, in order: string literals; `OPERATOR(pg_catalog.…)`; `::pg_catalog.<type>` casts;
+ * `pg_catalog.<name>` references (optionally an aggregate `(*)`); double-quoted identifiers (rule 1);
+ * `$n` bind parameters; numbers; alias-qualified column refs `x.y`; and the structural keywords and
+ * SQL-standard constructs that are NOT schema-resolved.
+ */
+// Keyword OPERATORS and casts that ARE search-path/grammar-sensitive and must never appear bare.
+const FORBIDDEN_KEYWORD = /\b(LIKE|ILIKE|SIMILAR|BETWEEN|OVERLAPS|CAST|COLLATE)\b/i
+const FORBIDDEN_KEYWORD_PHRASE = /\bIS\s+(NOT\s+)?DISTINCT\s+FROM\b|\bNOT\s+(LIKE|ILIKE|IN)\b|\bIN\s*\(/i
+
+function sqlResidual(sql: string): string {
+  return sql
+    .replace(/\$\{[^}]*\}/g, ' INTERP ')                    // JS template interpolations (quoted idents / ints)
+    .replace(/'(?:[^']|'')*'/g, ' ')                         // string literals
+    .replace(/OPERATOR\(pg_catalog\.[^)]+\)/g, ' ')           // qualified operators
+    .replace(/::\s*pg_catalog\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[\s*\])?/g, ' ') // qualified casts
+    .replace(/pg_catalog\.[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\*\s*\))?/g, ' FUNC ')        // qualified names/aggregates
+    .replace(/"(?:[^"]|"")*"/g, ' IDENT ')                    // double-quoted identifiers (rule 1)
+    .replace(/\$\d+/g, ' PARAM ')                             // bind parameters
+    .replace(/\b\d+\b/g, ' NUM ')                             // numbers
+    .replace(/\b[a-z][a-z0-9_]*\.[a-z_][a-z0-9_]*\b/gi, ' COL ') // alias.column
+    .replace(/[(),;.*]/g, ' ')                                // structural punctuation and aggregate star
+}
+
+test('the modules send only pg_catalog-qualified SQL — no operator, cast, function or catalog name resolves through search_path (follow-up MEDIUM-1)', () => {
   let checked = 0
+  const OP_CHARS = /[-+/<>=~!@#%^&|?]/          // arithmetic/comparison/regex operator characters
   for (const file of MODULE_FILES) {
     for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
       checked += 1
-      const bare = sql
-        .replace(/OPERATOR\(pg_catalog\.[^)]+\)/g, ' Q ')
-        .replace(/'[^']*'/g, " '' ")
-        .replace(/[<>!:]=/g, ' NE ')     // spare >=, <=, !=, :=
-      assert.ok(!/(^|[^A-Za-z_])!~([^A-Za-z_]|$)/.test(bare),
-        `unqualified !~ in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
-      assert.ok(!/(^|[^A-Za-z_])<>([^A-Za-z_]|$)/.test(bare),
-        `unqualified <> in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
-      assert.ok(!/\s=\s/.test(bare),
-        `unqualified = in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
+      const short = sql.replace(/\s+/g, ' ').slice(0, 110)
+      const sqlNoInterp = sql.replace(/\$\{[^}]*\}/g, ' INTERP ')
+      // 1. No search-path-sensitive KEYWORD operator or cast keyword survives.
+      assert.ok(!FORBIDDEN_KEYWORD.test(sqlNoInterp), `forbidden keyword operator/cast in ${file}: ${short}`)
+      assert.ok(!FORBIDDEN_KEYWORD_PHRASE.test(sqlNoInterp), `forbidden operator phrase (IS DISTINCT/NOT LIKE/IN (…)) in ${file}: ${short}`)
+      // 2. No unqualified cast: every `::` must be `::pg_catalog.…` (removed by the residual).
+      const residual = sqlResidual(sql)
+      assert.ok(!residual.includes('::'), `unqualified cast (::) survives in ${file}: ${short}`)
+      // 3. No operator CHARACTER survives — every real operator is OPERATOR(pg_catalog.…), removed above.
+      const opLeft = residual.match(OP_CHARS)
+      assert.equal(opLeft, null, `unqualified operator "${opLeft?.[0]}" survives in ${file}: residual="${residual.replace(/\s+/g,' ').trim().slice(0,90)}" sql=${short}`)
+      // 4. Every FUNCTION CALL is pg_catalog-qualified or a grammar construct. Remove the safe forms
+      //    from the raw SQL, then any `name(` left is an unqualified function whose name resolves
+      //    through search_path.
+      const deQualified = sql
+        .replace(/\$\{[^}]*\}/g, ' INTERP ')
+        .replace(/'(?:[^']|'')*'/g, ' ')
+        .replace(/OPERATOR\(pg_catalog\.[^)]+\)/g, ' %OP% ')  // non-word: a following subquery '(' is not a call
+        .replace(/::\s*pg_catalog\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\[\s*\])?/g, ' ')
+        .replace(/pg_catalog\.[A-Za-z_][A-Za-z0-9_]*/g, ' pg_catalog_ref ')  // keeps any following '('
+        .replace(/"(?:[^"]|"")*"/g, ' IDENT ')
+      const GRAMMAR_CALLS = new Set(['COALESCE', 'NULLIF', 'ARRAY', 'ANY', 'ALL', 'EXISTS'])
+      for (const m of deQualified.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+        const name = m[1]
+        if (name === 'pg_catalog_ref') continue
+        if (GRAMMAR_CALLS.has(name.toUpperCase())) continue
+        assert.fail(`unqualified function call "${name}(" in ${file}: ${short}`)
+      }
+      // 5. Every RELATION after FROM/JOIN is pg_catalog-qualified or a subquery.
+      for (const m of deQualified.matchAll(/\b(?:FROM|JOIN)\s+([^\s(]+)/gi)) {
+        const rel = m[1]
+        // pg_catalog_ref = a pg_catalog relation; INTERP/IDENT = a runtime double-quoted identifier
+        // (the user table being probed for rows — rule 1 covers its quoting).
+        if (rel === 'pg_catalog_ref' || rel.startsWith('INTERP') || rel.startsWith('IDENT')) continue
+        assert.fail(`unqualified relation after FROM/JOIN ("${rel}") in ${file}: ${short}`)
+      }
+      // 6. No bare pg_* token survives the residual (an unqualified catalog name used as a value).
+      const pgLeft = residual.match(/\bpg_[A-Za-z0-9_]+\b/)
+      assert.equal(pgLeft, null, `unqualified catalog name "${pgLeft?.[0]}" in ${file}: ${short}`)
     }
   }
   assert.ok(checked >= 6, `precondition: SQL literals were found and checked (${checked})`)
-})
-
-test('every cast in the modules\' SQL names a pg_catalog type (r11 HIGH-1)', () => {
-  let checked = 0
-  for (const file of MODULE_FILES) {
-    for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
-      checked += 1
-      const bare = sql.replace(/'[^']*'/g, " '' ")
-      for (const m of bare.matchAll(/::\s*([A-Za-z_][A-Za-z0-9_."\[\]]*)/g)) {
-        assert.ok(/^pg_catalog\./.test(m[1]),
-          `unqualified cast ::${m[1]} in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
-      }
-    }
-  }
-  assert.ok(checked >= 6, `precondition: SQL literals were checked (${checked})`)
-})
-
-test('every catalog/function name in the modules\' SQL is pg_catalog-qualified (r11)', () => {
-  // pg_* references outside string literals must be written pg_catalog.<name>.
-  let checked = 0
-  for (const file of MODULE_FILES) {
-    for (const sql of sqlLiterals(readFileSync(file, 'utf8'))) {
-      checked += 1
-      const bare = sql.replace(/'[^']*'/g, " '' ")
-      for (const m of bare.matchAll(/(?<![A-Za-z0-9_.])(pg_[A-Za-z0-9_]+)/g)) {
-        if (m[1] === 'pg_catalog') continue
-        const idx = m.index ?? 0
-        assert.ok(bare.slice(Math.max(0, idx - 11), idx).endsWith('pg_catalog.'),
-          `unqualified catalog name ${m[1]} in ${file}: ${sql.replace(/\s+/g, ' ').slice(0, 90)}`)
-      }
-    }
-  }
-  assert.ok(checked >= 6, `precondition: SQL literals were checked (${checked})`)
 })
 
 test('the probe refuses when search_path is not pinned to pg_catalog (r11 HIGH-1)', async () => {

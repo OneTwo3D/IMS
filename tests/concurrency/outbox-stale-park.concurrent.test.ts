@@ -566,7 +566,8 @@ test(
      * fails and the entry is due a re-read".
      *
      * Somebody did. o3d-alnk's `email_outbox_undelivered_reference_uq` is a PARTIAL unique index on
-     * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING'), and this is the
+     * (kind, referenceType, referenceId) WHERE status IN ('PENDING','PROCESSING') — widened by o3d-hpeg
+     * to 'PARKED_SEND_CAP' too, which changes nothing below — and this is the
      * re-read it asked for. THE VERDICT IS UNCHANGED, and it is important to be exact about why,
      * because the old reason is now false and a false reason is not a reason:
      *
