@@ -825,7 +825,7 @@ export class BillPaymentEnqueueDeclined extends Error {
    */
   constructor(
     readonly accountingInvoiceId: string,
-    readonly reason: 'not-configured' | 'refused' | 'already-queued' | null = null,
+    readonly reason: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | null = null,
   ) {
     super(`The accounting queue declined a BILL_PAYMENT for ledger invoice ${accountingInvoiceId} (${reason ?? 'no reason reported'})`)
     this.name = 'BillPaymentEnqueueDeclined'

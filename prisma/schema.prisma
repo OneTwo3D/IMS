@@ -3015,6 +3015,11 @@ model AccountingPostingRefusal {
   resolvedBy      String?
   /// The operator's note when marking it handled (e.g. the ledger journal number). Plain text, length-limited.
   resolutionNote  String?
+  /// o3d-j625 r7 (owner decision 2026-09-19, "Handled + stop retry"): when someone marked this posting
+  /// handled — i.e. asserted they posted it BY HAND. From then on IMS never posts this exact posting key:
+  /// every automatic enqueue of it is refused as already handled (createAccountingSyncLogRow). Never
+  /// cleared by any writer; a later refusal of the same key does not reopen the row. NULL = not suppressed.
+  suppressedAt    DateTime?
 
   /// o3d-j625 r6 (review H1): named explicitly. The default name is 68 characters; Postgres truncates it to
   /// 63 and Prisma truncates it DIFFERENTLY, so the migration's index and the schema's never matched and the

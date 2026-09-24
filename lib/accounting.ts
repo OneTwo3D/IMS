@@ -12,6 +12,7 @@ import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { notConfiguredUnderPinnedLedgerFence } from '@/lib/domain/accounting/pinned-enqueue-fence'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { readPostingSuppression, reportSuppressedPosting, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import {
   classifyPriorAttempts,
   describeUnresolvedPriorAttempt,
@@ -316,7 +317,12 @@ export type ConnectorEnqueueOutcome = {
    * still going to post, and rolling back an empty transaction while telling the operator "nothing
    * was sent" is the one message that guarantees nobody goes looking for it.
    */
-  reason?: 'not-configured' | 'refused' | 'already-queued'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'
+  /*
+   * `handled-by-hand` (o3d-j625 r7) — `queued: true` WITHOUT A WRITE, like `already-queued`: someone
+   * marked this exact posting handled after posting it BY HAND, so IMS did not post it and never will
+   * (posting-suppression.ts). A counterpart exists in the ledger; it is not owed; it was not IMS's.
+   */
 }
 
 export type AccountingEnqueueOutcome = ConnectorEnqueueOutcome & {
@@ -586,9 +592,13 @@ async function refuseUnattributableChart(params: {
       committed: 'the document it names stands in IMS',
       // review M-6: no hand-posting authorisation here. This refusal is reached by INVOICE_PAYMENT among
       // others, and a receipt entered by hand cannot be deduplicated against a queued row.
+      // o3d-j625 r7 (review H-A/LOW 6): r5 said "re-post the source document … raise this posting again", an
+      // action IMS does not offer for most documents. What is true: the document's connector is not recorded,
+      // and a retry of this posting (where one exists) refuses for the same reason until it is.
       remedy:
-        'Re-post the source document so its accounting document id and the connector that issued it are '
-        + 'recorded together, then raise this posting again from the source document.',
+        'IMS cannot show which accounting connector holds the document this posting names, so it will not post '
+        + 'it. Post it yourself in the ledger that holds that document, then mark this row handled — that '
+        + 'cancels IMS\'s own attempt at it, so it is not posted twice.',
       detail: {
         documentConnector: params.documentConnector ?? null,
         connectorNativePayloadKeys: nativeIdKeys,
@@ -617,9 +627,9 @@ async function refuseUnattributableChart(params: {
       `NOTHING WAS QUEUED. The ${params.type} for ${params.referenceType} ${params.referenceId} was `
       + `built from ${params.chartConnector}'s chart of accounts, and the active accounting connector `
       + `is now ${activeLabel}, so queueing it would write a row no scheduled sync `
-      + 'reads. This posting is still OUTSTANDING: re-queue it from the source document once the '
-      + `accounting connector selection has settled — either switch back to ${params.chartConnector}, `
-      + `or raise this posting again from ${activeLabel}'s own chart of accounts.`,
+      + 'reads. This posting is still OUTSTANDING: switching back to '
+      + `${params.chartConnector} lets IMS's own retry of it (where it has one) post it; otherwise post it by `
+      + 'hand in the ledger it belongs to and mark it handled in the exception inbox.',
     metadata: {
       chartConnector: params.chartConnector,
       // The other end of the switch. Without it this record says a posting was refused and cannot say
@@ -637,10 +647,13 @@ async function refuseUnattributableChart(params: {
     activeConnector,
     reason: 'retired_chart',
     committed: 'the document this posting is for stands in IMS',
+    // o3d-j625 r7 (review LOW 6): r5 named "re-queue from its source document", which most documents
+    // do not offer. What is true, for every posting: switching back lets a retry post it, and a hand
+    // posting is closed by marking the row handled (which stops IMS posting it too).
     remedy:
-      `Re-queue this posting from its source document once the accounting connector selection has `
-      + `settled — either switch back to ${params.chartConnector}, or raise it again from `
-      + `${activeLabel}'s own chart of accounts.`,
+      `Switch the accounting connector back to ${params.chartConnector} so IMS's own retry of this posting (where `
+      + 'it has one) can post it. Otherwise post it by hand in the ledger it belongs to and mark this row handled — '
+      + 'that cancels IMS\'s retry, so it is not posted twice.',
   })
   return {
     queued: false,
@@ -757,6 +770,17 @@ export async function queueAccountingSync(params: {
   // transaction this refusal rolls back, so what it was for stands and the posting really is owed.
   // o3d-j625 r5: and the row is keyed on THIS enqueue's own params, which is also what the clear matches.
   const posting = accountingPostingKey(params)
+  // o3d-j625 r7 — A POSTING MARKED HANDLED IS NEVER POSTED OR RE-REFUSED. Asked FIRST, before any check
+  // that could refuse it and record a refusal over a posting someone has already made by hand. The
+  // row-creating primitive asks again under the per-key lock, which is the check that cannot be raced.
+  {
+    const { db } = await import('@/lib/db')
+    const suppression = await readPostingSuppression(db as unknown as PostingSuppressionClient, posting)
+    if (suppression.suppressed) {
+      await reportSuppressedPosting(posting, suppression)
+      return { queued: true, reason: 'handled-by-hand', connector: params.connector ?? params.chartConnector ?? null, posting }
+    }
+  }
   const unattributable = await refuseUnattributableChart({ ...params, recordRefusalAsOutstanding: true, posting })
   if (unattributable) return { ...unattributable, posting }
   // o3d-j625 r2: AND THERE IS NO SECOND RESOLUTION LEFT HERE AT ALL.
@@ -1201,6 +1225,10 @@ export async function queueAccountingSyncTx(
     }
     return outcome.queued
   }
+  // o3d-j625 r7: NO early suppression read here, unlike the facade. Nothing may touch `tx` before the pinned-
+  // ledger fence (o3d-i0o6 r8), and a second, pooled connection inside the caller's transaction is not a
+  // price worth paying for an answer the row-creating primitive gives anyway, under the lock: a posting
+  // marked handled is refused there, and a refusal of it is not recorded (recordAccountingPostingRefusal).
   // o3d-3zgy: this is the enqueue path that writes inside a CALLER's transaction, so — unlike
   // queueXeroSync / queueQuickBooksSync, which open their own — it cannot take the sales-order row
   // lock itself. Taking it here would take it LATE, inside a transaction that may already hold
@@ -1402,7 +1430,7 @@ export async function queueAccountingSyncTx(
     // WRAPPED AROUND THE CREATE ALONE, not the whole block. The outbox schedule and the event mirror
     // that follow are ordinary work whose failure is NOT handled here — isolating them would only
     // hide it. The collision can come from nothing but this INSERT.
-    const log = await createAccountingSyncLogRow(tx, {
+    const created = await createAccountingSyncLogRow(tx, {
         connector: context.connector,
         type: params.type,
         status: 'PENDING',
@@ -1420,6 +1448,9 @@ export async function queueAccountingSyncTx(
         // money-attempt-provenance.ts. A row created without it is never recycled again.
         ...stampingCustodyOnCreate(),
       }, { createInSavepoint: true })
+    // o3d-j625 r7: marked handled — posted by hand. Nothing written; not owed.
+    if (!created) return answer({ queued: true, reason: 'handled-by-hand' }, context.connector)
+    const log = created
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
       await scheduleXeroAccountingOutbox(tx, {

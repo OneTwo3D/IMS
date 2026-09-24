@@ -36,7 +36,7 @@ import {
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { POSTING_REFUSAL_KINDS, POSTING_REFUSAL_NOTE_MAX_LENGTH, postingRefusalClearing, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
-import { markAccountingPostingRefusalHandled } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { markPostingHandled, MarkHandledRaceError, type MarkHandledClient, type MarkHandledResult } from '@/lib/domain/accounting/posting-mark-handled'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -470,7 +470,7 @@ export type AccountingPostingRefusalRow = {
   lastRefusedAt: string
   /** o3d-j625 r6 (review H4): the site kind, and from it whether the row may be marked handled. */
   kind: string | null
-  clearing: 'auto' | 'manual' | null
+  clearing: 'auto' | 'retried' | 'manual' | null
   /** What raises the posting again (auto), or why nothing does (manual) — from the kind, not the row. */
   clearingNote: string | null
 }
@@ -1398,17 +1398,14 @@ async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingR
 }
 
 /**
- * o3d-j625 r6 (review H4; owner decision 2026-09-18) — MARK A REFUSED POSTING HANDLED, after posting it by
- * hand in the ledger.
+ * o3d-j625 r6/r7 (owner decisions 2026-09-18 and 2026-09-19, "Handled + stop retry") — MARK A REFUSED
+ * POSTING HANDLED: the operator asserts they posted it BY HAND, and IMS will then never post it itself.
  *
- * ONLY FOR A MANUAL-ONLY KIND — decided here, server-side, from the row's stored kind and the closed
- * classification in posting-refusal-kinds.ts, never from what the page showed. A row IMS clears itself
- * (AUTO) is refused: dismissing it would hide a debt that is still real while IMS would have cleared it
- * on its own. A row with no kind (written before the column) is refused too — fail closed.
- *
- * The write is ONE conditional update on "still outstanding and manual" (see
- * markAccountingPostingRefusalHandled), so a double-click or two operators resolve it once. The same
- * posting refused again later reopens the row as a new episode (posting-refusal-inbox.ts).
+ * Offered only for kinds that are not `auto` (posting-refusal-kinds.ts), decided HERE from the stored kind,
+ * never from what the page showed. The work — refusing when IMS may already have posted it, cancelling
+ * any provably-unsent sync row for the key, resolving the row and setting the suppression that every
+ * row-creating path reads — is one transaction in lib/domain/accounting/posting-mark-handled.ts, under the
+ * per-key lock those paths take, so a retry cannot slip a row in between.
  */
 export async function markAccountingPostingRefusalHandledAction(id: string, note: string): Promise<MutationResult> {
   try {
@@ -1418,37 +1415,26 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
     if (trimmed.length > POSTING_REFUSAL_NOTE_MAX_LENGTH) {
       return { success: false, error: `The note is limited to ${POSTING_REFUSAL_NOTE_MAX_LENGTH} characters.` }
     }
-    const row = await db.accountingPostingRefusal.findUnique({
-      where: { id },
-      select: { id: true, type: true, referenceType: true, referenceId: true, kind: true, resolvedAt: true },
-    })
-    if (!row) return { success: false, error: 'This refused posting no longer exists.' }
-    if (row.resolvedAt) return { success: false, error: 'This refused posting is already resolved.' }
-    const clearing = postingRefusalClearing(row.kind)
-    if (clearing !== 'manual') {
-      return {
-        success: false,
-        error: clearing === 'auto'
-          ? 'IMS clears this row itself when the posting is queued, so it cannot be marked handled. '
-            + POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how
-          : 'This row does not say which kind of refusal it is, so it cannot be marked handled.',
-      }
+    let result: MarkHandledResult
+    try {
+      result = await db.$transaction(
+        (tx) => markPostingHandled(tx as unknown as MarkHandledClient, { id, userId: session.user.id, note: trimmed === '' ? null : trimmed }),
+        { maxWait: 5000, timeout: 20000 },
+      )
+    } catch (error) {
+      if (error instanceof MarkHandledRaceError) return { success: false, error: error.message }
+      throw error
     }
-    const manualKinds = (Object.keys(POSTING_REFUSAL_KINDS) as PostingRefusalKind[])
-      .filter((kind) => POSTING_REFUSAL_KINDS[kind].clearing === 'manual')
-    const resolved = await markAccountingPostingRefusalHandled(db, {
-      id, manualKinds, userId: session.user.id, note: trimmed === '' ? null : trimmed,
-    })
-    if (resolved === 0) return { success: false, error: 'This refused posting is already resolved.' }
+    if (!result.ok) return { success: false, error: result.message }
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'accounting',
       action: 'accounting_posting_refusal_marked_handled',
       level: 'INFO',
       description:
-        `Marked the refused ${row.type} for ${row.referenceType} ${row.referenceId} as handled — posted by hand `
-        + 'in the ledger.',
-      metadata: { refusalId: id, kind: row.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed },
+        `Marked a refused ${result.kind} posting as handled — posted by hand in the ledger. IMS will not post it`
+        + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.'),
+      metadata: { refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed, cancelledSyncRows: result.cancelledSyncRows },
       resolveUser: false,
     })
     revalidatePath('/sync/exceptions')

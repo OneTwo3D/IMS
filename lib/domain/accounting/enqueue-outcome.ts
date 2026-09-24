@@ -48,7 +48,7 @@ import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal
  */
 export type EnqueueOutcomeLike = {
   queued: boolean
-  reason?: 'not-configured' | 'refused' | 'already-queued'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'
   connector?: string | null
   /**
    * o3d-j625 r5 (review HIGH 1/2/3) — THE POSTING KEY, FROM THE ENQUEUE'S OWN PARAMS.

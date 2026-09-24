@@ -2279,39 +2279,65 @@ owed (and how many attempts), what still stands in IMS, and what to do about it.
 
 Three things about those rows:
 
-* **Some clear themselves, some are closed by you** — and the page says which on every row. Which kind a
-  row is depends on the place that refused it, not on its text:
+* **How a row is closed depends on the place that refused it**, not on its text, and the page says which on
+  every row. The classification, generated from the code:
 
-  | Clears itself when the posting is queued (no action offered) | What raises it again |
-  | --- | --- |
-  | A held WooCommerce invoice release | The WooCommerce reconcile sweep |
-  | A sales-invoice update, a bill update, a tax-rate push | Saving the order / bill / rate again |
-  | A customer receipt (INVOICE_PAYMENT) | The deferred-receipt recovery, once the cause is corrected |
-  | A supplier-credit-note allocation | The credit-note allocation sweep |
-  | An unrealised FX revaluation journal | Running the revaluation for that date again |
-  | A landed-cost COGS or transit journal raised by the landed-cost journal outbox | The outbox retries it |
-  | A refund's credit note, COGS reversal or unearned-revenue reversal | *Retry refund accounting* on the refund |
+<!-- posting-refusal-kinds:begin (generated from lib/domain/accounting/posting-refusal-kinds.ts; do not edit by hand) -->
 
-  | Marked handled by you, after posting it by hand | Why nothing in IMS raises it again |
-  | --- | --- |
-  | A sales invoice for a manual order, or for an imported WooCommerce order | It is queued once, at finalise / import |
-  | A stock adjustment journal | It is queued once, with the movement |
-  | A purchase-order cancellation reversal | A PO is cancelled once |
-  | A supplier-return reversal | Raising the return again would be a second return |
-  | A goods-receipt journal | Receiving again is a different receipt |
-  | A purchase bill | Creating it again would be a second bill |
-  | A realised FX gain/loss (bill payment or customer receipt) | The FX revaluation raises *unrealised* journals, not this one |
-  | A manufacturing completion journal or retrospective reclass | A completion happens once; a later cost change is a different reclass |
-  | A landed-cost COGS or transit journal raised directly by a purchase-order edit, freight PO or cancellation | That edit runs once; nothing re-runs it |
-  | An allocation reversal | Each belongs to one trim of the order's allocations |
+**Clears itself** — IMS queues the same posting again and nothing can make it refuse for ever. No action is offered.
 
-  **Mark as handled** is offered only on the second kind, asks for an optional note (for example the ledger
-  journal number), and records who marked it and when. IMS refuses it on any other row, whatever the page
-  showed. A row that clears itself leaves the list when the posting is queued — by any path: every accounting
-  sync row IMS writes goes through one function, and that function clears the matching row. Resolved rows
-  from the last 30 days are listed underneath with how each was closed.
-* **A resolved posting refused again comes back as new work** — whether IMS queued it or someone marked it
-  handled, its age is the age of the NEW gap.
+| Refused posting | Why |
+| --- | --- |
+| `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
+
+**IMS retries it, but the retry can get stuck** — *Mark as handled* is offered: post it by hand, then mark it; IMS cancels its own retry and will never post it.
+
+| Refused posting | Why |
+| --- | --- |
+| `sales_invoice_held_release` (SALES_INVOICE / SalesOrder) | The WooCommerce reconcile sweep retries the held invoice, but always for the connector it was built for — after a permanent connector switch it is refused on every run. |
+| `sales_invoice_update` (SALES_INVOICE_UPDATE / SalesOrder) | Re-saving the order queues the update again, but it is refused for as long as the invoice belongs to a connector that is no longer active. |
+| `purchase_invoice_update` (PURCHASE_INVOICE_UPDATE / PurchaseOrder) | Re-saving the bill queues the update again, but it is refused for as long as the bill belongs to a connector that is no longer active. |
+| `invoice_payment_receipt` (INVOICE_PAYMENT / SalesOrder) | The receipt is registered again only when the invoice's deferred-receipt recovery runs, which does not happen for every invoice. |
+| `credit_note_allocation` (PURCHASE_CREDIT_NOTE_ALLOCATION / SupplierCreditNote) | The credit-note allocation sweep retries it, but refuses on every run until both documents are recorded as belonging to the active connector. |
+| `unrealised_fx_journal` (UNREALISED_FX_JOURNAL / FxRevaluation) | The FX revaluation raises this journal only for the date it runs for; the daily run values today, so a refused journal for an earlier date is not raised again unless that date is re-run. |
+| `landed_cost_cogs_journal` (COGS_JOURNAL / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
+| `landed_cost_transit_journal` (STOCK_IN_TRANSIT / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
+| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+
+**Nothing in IMS posts it again** — post it by hand, then *Mark as handled* (which also stops IMS ever posting it).
+
+| Refused posting | Why |
+| --- | --- |
+| `sales_invoice_order` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the order is created or finalised, and nothing queues it again. |
+| `sales_invoice_import` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the WooCommerce order is imported, and nothing queues it again. |
+| `stock_adjustment_journal` (INVENTORY_ADJUSTMENT / StockMovement) | The journal is queued once, with the stock movement; nothing queues it again for that movement. |
+| `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | The reversal is queued once, when the purchase order is cancelled, which cannot happen twice. |
+| `supplier_return_reversal` (INVENTORY_ADJUSTMENT / PurchaseReturn) | The reversal is queued once, with the return; raising the return again would be a second return. |
+| `stock_receipt_journal` (STOCK_RECEIPT / PurchaseOrder) | The journal is queued once, with the receipt; receiving again is a different receipt. |
+| `purchase_invoice` (PURCHASE_INVOICE / PurchaseInvoice) | The bill is queued once, when it is created; creating it again would be a second bill. |
+| `realised_fx_bill_payment` (REALISED_FX_JOURNAL / PurchaseInvoice) | The realised gain/loss is queued once, when the bill is paid; the FX revaluation raises unrealised journals, not this one. |
+| `realised_fx_receipt` (REALISED_FX_JOURNAL / Payment) | The realised gain/loss is queued once, when the receipt settles; the FX revaluation raises unrealised journals, not this one. |
+| `manufacturing_journal` (MANUFACTURING_JOURNAL / ProductionOrder) | The journal is queued once, when the production order completes, which cannot happen twice. |
+| `manufacturing_reclass` (MANUFACTURING_RECLASS / ProductionOrder) | The reclass is queued once for this cost change; a later cost change is a different reclass. |
+| `allocation_reversal` (ALLOCATION_REVERSAL / SalesOrder) | Each reversal belongs to one trim of the order's allocations and is never raised again. |
+
+<!-- posting-refusal-kinds:end -->
+
+  **Mark as handled** means: *"I posted this by hand; IMS will not post it."* It asks for an optional note
+  (for example the ledger journal number) and records who marked it and when. In the same step IMS cancels
+  its own queued attempt at that exact posting and, from then on, refuses every automatic attempt to post it
+  (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is logged as
+  `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. If IMS may already
+  have posted it, or is posting it now (its accounting sync row is being processed, has failed, or carries a
+  document id), the mark is refused and nothing changes: check the ledger and settle that sync row first.
+  IMS refuses the mark on a row that clears itself, whatever the page showed. A row that clears itself leaves
+  the list when the posting is queued — by any path. Resolved rows from the last 30 days are listed underneath
+  with how each was closed.
+* **A posting marked handled stays handled.** If the same posting is refused again later it is logged
+  (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
+  IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
 * **One row per posting**, and a posting means the thing that is owed rather than the document it belongs
   to: a customer payment is one **receipt** against one invoice, a stock receipt is one delivery against a
   purchase order, a landed-cost journal is one recalculation, a bill update is one **bill** (a purchase

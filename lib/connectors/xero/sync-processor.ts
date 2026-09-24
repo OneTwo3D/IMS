@@ -1535,7 +1535,7 @@ export async function enqueueFollowUpSyncLog(
         })
         return 'done' as const
       }
-      const log = await createAccountingSyncLogRow(tx, {
+      const created = await createAccountingSyncLogRow(tx, {
           connector: XERO_CONNECTOR,
           type,
           status: 'PENDING',
@@ -1553,6 +1553,10 @@ export async function enqueueFollowUpSyncLog(
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
         })
+      // o3d-j625 r7: this follow-up was marked handled — posted by hand — so nothing is owed and nothing
+      // was written (the primitive reported it). Done, in the only sense that matters: IMS must not post it.
+      if (!created) return 'done' as const
+      const log = created
       // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
       // exist without the line that says so.
       await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
@@ -6997,8 +7001,10 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
             reason: 'unattributable_document_id',
             committed: `the supplier credit note ${item.creditNoteId} is posted in the ledger`,
             remedy:
-              'Allocate the credit to the bill in the accounting system that holds both documents, or re-post '
-              + 'them from IMS so the connector that issued each is recorded.',
+              // o3d-j625 r7 (review H-A): "re-post them from IMS" is not an action IMS offers; the sweep refuses
+              // on every run until both documents' connectors are recorded as the active one.
+              'Allocate the credit to the bill in the accounting system that holds both documents, then mark '
+              + 'this row handled — that stops the allocation sweep posting it too.',
             detail: { creditNoteId: item.creditNoteId, accountingInvoiceId: item.accountingInvoiceId, billConnector },
           },
         )

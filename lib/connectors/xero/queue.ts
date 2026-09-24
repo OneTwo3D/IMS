@@ -163,6 +163,8 @@ export async function queueXeroSync(params: {
     // Reported after the transaction, like the other two refusals, because the decision is taken
     // inside it and nothing may be written for it.
     let pinnedLedgerRetired = false
+    // o3d-j625 r7: the posting was marked handled — posted by hand — so nothing is written for it.
+    let handledByHand = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -223,7 +225,7 @@ export async function queueXeroSync(params: {
         if (staleDiscount) return
       }
 
-      const log = await createAccountingSyncLogRow(tx, {
+      const created = await createAccountingSyncLogRow(tx, {
           connector: 'xero',
           type: params.type,
           status: 'PENDING',
@@ -241,6 +243,11 @@ export async function queueXeroSync(params: {
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
         })
+      if (!created) {
+        handledByHand = true
+        return
+      }
+      const log = created
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
@@ -275,6 +282,9 @@ export async function queueXeroSync(params: {
     // one being serviced. The posting is still owed in every case — `refused`, never
     // `not-configured`, which is the one no-op allowed to settle an obligation.
     if (deletedOrder || staleDiscount || pinnedLedgerRetired) return { queued: false, reason: 'refused' }
+    // Not owed: the ledger has it, by hand. `queued: true` in the sense every caller reads — a counterpart
+    // exists — with the reason saying it was not IMS that put it there.
+    if (handledByHand) return { queued: true, reason: 'handled-by-hand' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.

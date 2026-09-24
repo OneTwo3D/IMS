@@ -379,9 +379,12 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
   const queuedAnswers = [...body.matchAll(/return answer\(\{ queued: true[^}]*\}, ([^)]*)\)/g)]
   assert.equal(
     queuedAnswers.length,
-    3,
-    'the idempotency hit, the create, and the unique-key collision are the three queued exits',
+    4,
+    'the idempotency hit, the create, the unique-key collision and (o3d-j625 r7) a posting marked handled '
+    + 'by hand, found by the row-creating primitive under its lock, are the four queued exits',
   )
+  // o3d-j625 r7: the handled-by-hand exit writes nothing either, and says so.
+  assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'handled-by-hand'")).length, 1)
   for (const answer of queuedAnswers) {
     assert.equal(
       answer[1],

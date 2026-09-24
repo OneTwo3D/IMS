@@ -139,8 +139,10 @@ test('scheduleLandedCostJournalOutbox is a no-op for a zero-delta recalc', async
   assert.equal(createCalls, 0)
 })
 
-// o3d-j625 r6 (review H4) — `landed_cost_*_journal` (the OUTBOX kinds) ARE AUTO because the outbox retry
-// re-runs the SAME recalculation result, and each journal's key is a function of the adjustment alone.
+// o3d-j625 r6/r7 — the outbox retry re-runs the SAME recalculation result, and each journal's key is a
+// function of the adjustment alone: so a journal refused by ANY caller (the direct ones schedule the outbox
+// too) is raised again by the outbox under the same key — which is why r7 made these `retried` kinds whose
+// mark-handled suppresses exactly that key (review H-B).
 test('[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings', async () => {
   const { landedCostAdjustmentIdempotencyKey } = await import('@/lib/domain/purchasing/landed-cost-service')
   const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
@@ -150,8 +152,4 @@ test('[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings', a
     const retry = accountingPostingKey({ type, referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: landedCostAdjustmentIdempotencyKey(kind, adj) })
     assert.deepEqual(retry, first, `${type}: a retry of the same adjustment is the same posting`)
   }
-  // And the outbox — the only caller that retries — says so, so its refusals get the AUTO kind.
-  const { readFileSync } = await import('node:fs')
-  const outbox = readFileSync(`${process.cwd()}/lib/domain/purchasing/landed-cost-journal-outbox.ts`, 'utf8')
-  assert.match(outbox, /queueLandedCostAdjustmentJournals\(result, \{ retriedByOutbox: true \}\)/)
 })

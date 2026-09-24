@@ -122,8 +122,7 @@ export type LandedCostOutboxDrainDeps = {
 const defaultDrainDeps = (): LandedCostOutboxDrainDeps => ({
   claimWork: claimIntegrationOutboxWork,
   // Lazy import to avoid a cycle (landed-cost-service imports this module).
-  // o3d-j625 r6 (review H4): this caller RETRIES owed journals, so its refusals are the self-clearing kind.
-  queueJournals: async (result) => (await import('./landed-cost-service')).queueLandedCostAdjustmentJournals(result, { retriedByOutbox: true }),
+  queueJournals: async (result) => (await import('./landed-cost-service')).queueLandedCostAdjustmentJournals(result),
   markSuccess: markIntegrationOutboxSuccess,
   markRetry: markIntegrationOutboxRetryableFailure,
 })
