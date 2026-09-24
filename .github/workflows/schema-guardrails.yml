@@ -186,7 +186,8 @@ jobs:
             exit 1
           fi
           echo "url=${DATABASE_URL/@127.0.0.1:5432/@${ip}:5432}" >> "$GITHUB_OUTPUT"
-      # The concurrency tier refuses to seed or install DDL into any database that is not
+      # Every file of the concurrency tier (o3d-yvn8: the --import preload in
+      # `npm run test:concurrency`) refuses to seed or install DDL into any database that is not
       # marked disposable: stamped with a database comment naming it, and named in
       # IMS_CONCURRENCY_SCRATCH_DB. A name rule is not enough -- this product's tenant
       # databases are `ims_<slug>` and its canonical one is `onetwoinventory`, so no naming

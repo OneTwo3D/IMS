@@ -58,6 +58,7 @@
  *     below as the fact it is. Whether the generation chain suffices is a design question about
  *     `saveWmsDeltaCursors`, not something this lock can answer.
  */
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
