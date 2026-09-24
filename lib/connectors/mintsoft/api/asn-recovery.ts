@@ -1,7 +1,15 @@
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
+import {
+  compareMintsoftAsnAgainstExpectation,
+  isProofThatMintsoftAsnIsNotThisOne,
+  requireMintsoftAsnCreationVerdict,
+  type MintsoftAsnCreationVerdict,
+  type MintsoftAsnDifference,
+  type MintsoftAsnExpectation,
+} from './asn-creation-rule'
 
 /**
- * WHICH REMOTE ASN, IF ANY, AN EARLIER ATTEMPT ALREADY CREATED (o3d-bhvu rounds 2 and 3).
+ * WHICH REMOTE ASN, IF ANY, AN EARLIER ATTEMPT ALREADY CREATED (o3d-bhvu rounds 2–6).
  *
  * Both Mintsoft ASN creators (app/actions/mintsoft-sync.ts: createMintsoftPurchaseOrderAsn and
  * createMintsoftTransferAsn) run this before they push. A push whose response was lost has created
@@ -9,104 +17,47 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
  * second. Pure, so the decision can be tested on rows rather than on source text — the two creators
  * used to carry a copy of it each as a closure.
  *
+ * THE DECISION IS NOT MADE HERE. What one remote ASN IS, relative to a reservation, and which differences
+ * are determinate evidence that it is not ours, live in `asn-creation-rule.ts` — the single statement of
+ * the rule that the post-create read-back in `client.ts` goes through as well (round 6). This file does
+ * only the part that is about a LIST rather than about one ASN: which rows are candidates at all, what two
+ * candidates mean, and which named refusal an unresolved candidate deserves.
+ *
  * THE MATCH: every ASN whose reference EQUALS the reservation's (trimmed; `POReference` is where Mintsoft
  * stores it — a prefix or a substring is not a match, so `PO-1` never claims `PO-10`), carrying EXACTLY as
- * many items as the reservation has lines, with each reservation line present by `SourceLineId`.
+ * many items as the reservation has lines, with each reservation line present by `SourceLineId` and each
+ * line's `QuantityExpected` equal to the reservation's.
  *
  * THERE IS NO CALLBACK-URL MATCH ANY MORE (round 5, o3d-vcw8). Rounds 2–4 tried the reservation's
  * correlated callback URL first, "the strongest evidence there is". It was never evidence of anything: the
  * string "Callback" appears ZERO times in the entire Mintsoft API document, so no ASN can carry a
  * CallbackUrl and that branch could only ever match nothing. It is removed rather than left inert, because
- * an inert first branch reads as a correlation channel this integration has, and it has none. `POReference`
- * plus `Items[].SourceLineId` IS the correlation — both proven to round-trip verbatim on 2026-09-24.
+ * an inert first branch reads as a correlation channel this integration has. `POReference` plus
+ * `Items[].SourceLineId` IS the correlation — both proven to round-trip verbatim on 2026-09-24.
  *
  * MORE THAN ONE CANDIDATE IS A REFUSAL, NOT A CHOICE (round 3, review M-b). Round 2 said "the most
  * recently created wins" and sorted on a `CreatedAt` that live ASN rows do not have (the swagger's ASN
  * model has `LastUpdated` only), so every row sorted equal and the LIST's order decided — and that order
  * is documented as unstable across pages. The same state could therefore adopt on one retry and refuse on
- * the next. There is no tie-break worth inventing here: two ASNs that both carry this reference and these
- * line ids mean the duplicate this whole path exists to prevent has already happened, so the attempt
+ * the next. There is no tie-break worth inventing here: two ASNs that carry this reference and cannot be
+ * ruled out mean the duplicate this whole path exists to prevent may already have happened, so the attempt
  * fails naming both ids and an operator decides. Nothing here depends on the order of `asns`.
  *
- * ITEMS ARE COUNTED AS MINTSOFT RETURNED THEM, not as we could read them (round 3, review L-a). The list
- * normalizer drops an item that carries no usable `SourceLineId` — most of this tenant's ASNs come from
- * another integration and have none — so counting the normalized lines would let an ASN with an EXTRA
- * item pass as "exactly our lines". The raw `Items` array is the count.
- *
- * A QUANTITY THAT ONLY ROUNDING COULD EXPLAIN IS ALSO A REFUSAL (round 3, review L-b). Mintsoft types
- * `ASNItem.QuantityExpected` as int32, so a fractional IMS quantity cannot survive the round trip: 2.5
- * comes back as 2 or as 3 depending on a rounding rule Mintsoft does not publish. Returning "no match"
- * there would create a SECOND ASN at a live warehouse for the same lines, which is the worst outcome
- * available; adopting it would record an expectation IMS never asked for. So when the reference and the
- * whole line set match and the only difference is one an integer rounding of a FRACTIONAL expectation
- * could account for, the attempt fails naming the ASN, the line and both quantities. A quantity that
- * rounding cannot explain (a whole-number expectation against a different whole number) still means a
- * different ASN, and is not adopted.
- *
- * A QUANTITY MINTSOFT DID NOT RETURN IS UNRESOLVED, NOT "A DIFFERENT ASN" (round 4, Codex HIGH 1). The
- * list normalizer sets a line's quantity to null when the row carries no readable `QuantityExpected` —
- * the key absent, null, a string, a NaN. Reading that as a quantity mismatch answered a DEGRADED response
- * describing the very ASN an earlier attempt created with "no such ASN exists, create one", which is the
- * duplicate at a live warehouse this whole path exists to prevent. So a row that carries this reference
- * and exactly these `SourceLineId`s, with a quantity that cannot be read, is refused by name: not adopted
- * (the expectation is unknown), not created again. It outranks a readable mismatch on another line,
- * because until every line can be read the ASN cannot be told apart from ours. Operationally this BLOCKS
- * creation for that reservation until someone looks at the ASN in Mintsoft — deliberately, because the
- * alternative is a second inbound ASN nobody asked for.
- *
- * A LINE IDENTITY THAT CANNOT BE READ IS ALSO UNRESOLVED, ON ANY ROW CARRYING OUR REFERENCE (round 5,
- * Codex HIGH 2). The list normalizer DROPS an item whose `SourceLineId` it cannot use. For a row that
- * carries the reservation's `POReference`, dropping is the same fail-open the quantity case was: our own
- * ASN comes back with one item's `SourceLineId` degraded, `hasSameLineIdentity` no longer finds that line,
- * the row is read as somebody else's, and the creator pushes a SECOND ASN for lines this one already
- * covers. So every row carrying our reference is checked BEFORE the line sets are compared, and an item
- * whose identity is unreadable — not an object, or `SourceLineId` absent, null or blank — makes the whole
- * decision UNRESOLVED: refused by name, nothing adopted and nothing created. A DETERMINATE identity that
- * simply is not ours (a number, where every IMS source line id is a cuid string Mintsoft returns verbatim)
- * is NOT unreadable: it is another integration's item, it is dropped and it still counts (review L-a).
- *
- * AND THE WAREHOUSE IS CHECKED AFTER THE MATCH, NOT BEFORE IT (review M3). The list is read across the
- * whole tenant, so an ASN created by an earlier attempt while the product's binding pointed at another
- * warehouse is still found. Finding it there is not a licence to adopt it — the reservation is for the
- * CURRENT warehouse — and not a licence to create a second one either. So a match at a different
- * warehouse is refused with an error naming both, and an operator decides.
+ * A QUANTITY THAT DIFFERS IS AN UNRESOLVED CONFLICT, NOT "A DIFFERENT ASN" (round 6, Codex HIGH 2). Rounds
+ * 3–5 refused an unreadable quantity and a rounding-explainable one but still answered a plainly different
+ * one with "no such ASN exists, create one". A reference and a whole line set that match, with a quantity
+ * that does not, is exactly what an ASN created by a lost attempt looks like after the source quantity has
+ * changed — and the reservation checks validate the CURRENT LOCAL quantities, never whether that remote
+ * ASN exists. So it is refused by name, like every other unresolved state here.
  *
  * WHAT IT STILL DOES NOT LOOK AT (o3d-54al): the ASN's status, and whether IMS has already mapped that
- * ASN id to another reservation.
+ * ASN id. The second is what would let a legitimate later partial over the same lines be told apart from a
+ * lost create; until it lands, that case reaches an operator instead of creating a second ASN — and, in
+ * the other direction, an ASN whose line SET merely overlaps the reservation's is still read as somebody
+ * else's, which is the one remaining "different, therefore create" answer on this path. The comment on
+ * `isProofThatMintsoftAsnIsNotThisOne`'s `lines` case states that residual and why it is not closed here.
  */
-export type MintsoftAsnRecoveryCriteria = {
-  reference: string
-  /** Mintsoft's warehouse ID the reservation is for. */
-  externalWarehouseId: string
-  lines: ReadonlyArray<{ sourceLineId: string; expectedQty: number }>
-}
-
-/**
- * WHAT ONE `ASNItem`'S LINE IDENTITY IS, AND WHETHER IT CAN BE READ AT ALL — the single rule, used BOTH by
- * the list normalizer (which keeps `identified` items and drops the rest) and by the refusal below (which
- * treats `unreadable` on a row carrying our reference as "cannot be told apart from ours"). One function on
- * purpose: two copies of this rule would drift, and the drift would make the refusal vacuous.
- *
- * `foreign` is a DETERMINATE identity that cannot be one of ours. Every IMS source line id is a cuid — a
- * non-numeric string — and Mintsoft returns `SourceLineId` verbatim (proven live 2026-09-24, ASN 6117), so
- * a numeric `SourceLineId` belongs to another integration and says so definitively. Everything that is not
- * a usable string and not a finite number says nothing at all, and is `unreadable`.
- */
-export type MintsoftAsnItemLineIdentity =
-  | { kind: 'identified'; sourceLineId: string }
-  | { kind: 'foreign' }
-  | { kind: 'unreadable' }
-
-export function readMintsoftAsnItemLineIdentity(item: unknown): MintsoftAsnItemLineIdentity {
-  const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
-  if (!record) return { kind: 'unreadable' }
-  const value = record.SourceLineId
-  if (typeof value === 'string') {
-    return value.trim() ? { kind: 'identified', sourceLineId: value.trim() } : { kind: 'unreadable' }
-  }
-  if (typeof value === 'number' && Number.isFinite(value)) return { kind: 'foreign' }
-  return { kind: 'unreadable' }
-}
+export type MintsoftAsnRecoveryCriteria = MintsoftAsnExpectation
 
 export class MintsoftAsnRecoveryLineIdentityUnreadableError extends Error {
   constructor(externalAsnIds: readonly string[], reference: string) {
@@ -136,9 +87,10 @@ export class MintsoftAsnRecoveryWarehouseMismatchError extends Error {
 export class MintsoftAsnRecoveryAmbiguousMatchError extends Error {
   constructor(externalAsnIds: readonly string[], reference: string) {
     super(
-      `Mintsoft ASNs ${externalAsnIds.join(', ')} all carry reference ${reference} and this reservation's lines. `
-      + 'Refusing both to adopt one of them arbitrarily — the list order decides which, and it is not stable — '
-      + 'and to create a third; resolve the duplicate in Mintsoft, then retry.',
+      `Mintsoft ASNs ${externalAsnIds.join(', ')} all carry reference ${reference} and cannot be ruled out as the `
+      + 'ASN an earlier attempt created for these lines. Refusing both to adopt one of them arbitrarily — the list '
+      + 'order decides which, and it is not stable — and to create a third; resolve the duplicate in Mintsoft, '
+      + 'then retry.',
     )
     this.name = 'MintsoftAsnRecoveryAmbiguousMatchError'
   }
@@ -171,141 +123,97 @@ export class MintsoftAsnRecoveryQuantityUnreadableError extends Error {
   }
 }
 
-function rawString(raw: Record<string, unknown> | null | undefined, keys: readonly string[]): string | null {
-  if (!raw) return null
-  for (const key of keys) {
-    const value = raw[key]
-    if (typeof value === 'string' && value.trim()) return value.trim()
-    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+/**
+ * ROUND 6, CODEX HIGH 2. The reference and every line identity match; a quantity does not. That is what an
+ * ASN created by an attempt whose response IMS lost looks like once the source quantity has changed, and
+ * it is also what an operator's edit at the warehouse looks like, and what a later partial over the same
+ * lines looks like. Answering it with "no such ASN exists" pushed a SECOND inbound ASN for lines the first
+ * already covers.
+ */
+export class MintsoftAsnRecoveryQuantityConflictError extends Error {
+  constructor(externalAsnId: string, sourceLineId: string, expectedQty: number, remoteQty: number) {
+    super(
+      `Mintsoft ASN ${externalAsnId} carries this reference and exactly these lines, but line ${sourceLineId} `
+      + `expects ${remoteQty} where the reservation expects ${expectedQty}. A quantity that differs is not `
+      + 'evidence of a different ASN: an ASN an earlier attempt created, whose quantity has changed since (in '
+      + 'IMS or at the warehouse), looks exactly like this. Refusing both to adopt it — the reservation is for '
+      + `${expectedQty} — and to create a second one. NO ASN WILL BE CREATED for this reservation until an `
+      + 'operator reconciles that ASN in Mintsoft (edit or delete it), then retry.',
+    )
+    this.name = 'MintsoftAsnRecoveryQuantityConflictError'
   }
-  return null
 }
 
-/**
- * How many items Mintsoft returned for this ASN, not how many of them we could read. Falls back to the
- * normalized lines only when the raw row carries no `Items` array at all, which the list reader already
- * refuses upstream (MintsoftAsnListIncompleteError).
- */
-function remoteItemCount(asn: WmsAsnRef): number {
-  const items = asn.raw?.Items
-  return Array.isArray(items) ? items.length : asn.lines.length
-}
-
-function quantitiesMatch(left: number | null | undefined, right: number | null | undefined): boolean {
-  if (left == null || right == null) return false
-  return Math.abs(left - right) < 0.0001
-}
-
-/**
- * Could an integer store of a fractional expectation have produced this remote quantity? True for any
- * rounding rule Mintsoft might use — nearest, floor, truncate or ceiling — which is the point: we do not
- * know which it uses, so anything within one whole unit of a fractional expectation is indistinguishable
- * from our own ASN and must not be answered with "create another one".
- */
-function roundingCouldExplain(expectedQty: number, remoteQty: number | null | undefined): boolean {
-  if (remoteQty == null) return false
-  if (Number.isInteger(expectedQty)) return false
-  if (!Number.isInteger(remoteQty)) return false
-  return Math.abs(remoteQty - expectedQty) < 1
-}
-
-type LineVerdict =
-  | { kind: 'match' }
-  | { kind: 'different' }
-  | { kind: 'unreadable'; sourceLineId: string; expectedQty: number }
-  | { kind: 'rounded'; sourceLineId: string; expectedQty: number; remoteQty: number }
-
-/** Same reference and same line identity — the quantities are judged separately. */
-function hasSameLineIdentity(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCriteria): boolean {
-  if (remoteItemCount(asn) !== criteria.lines.length) return false
-  const bySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
-  return criteria.lines.every((line) => bySourceId.has(line.sourceLineId))
-}
-
-/**
- * Every line is judged before a verdict is reached — no early return — because an UNREADABLE quantity on
- * one line must outrank a readable mismatch on another (Codex HIGH 1). Precedence: unreadable, then a
- * difference rounding cannot explain, then one it can, then a match.
- */
-function judgeQuantities(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCriteria): LineVerdict {
-  const bySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
-  let unreadable: LineVerdict | null = null
-  let different = false
-  let rounded: LineVerdict | null = null
-  for (const line of criteria.lines) {
-    // null is "Mintsoft did not give us a number", never "zero" and never "some other quantity": the
-    // normalizer only produces it for an absent, null, non-numeric or non-finite QuantityExpected, and
-    // the line itself is present by SourceLineId (hasSameLineIdentity already required that).
-    const remote = bySourceId.get(line.sourceLineId)?.quantity ?? null
-    if (remote == null) {
-      unreadable ??= { kind: 'unreadable', sourceLineId: line.sourceLineId, expectedQty: line.expectedQty }
-      continue
-    }
-    if (quantitiesMatch(remote, line.expectedQty)) continue
-    if (roundingCouldExplain(line.expectedQty, remote)) {
-      rounded ??= { kind: 'rounded', sourceLineId: line.sourceLineId, expectedQty: line.expectedQty, remoteQty: remote }
-      continue
-    }
-    different = true
+/** The refusal for a candidate the rule leaves unresolved, named for what the difference actually is. */
+function refusalFor(
+  asn: WmsAsnRef,
+  difference: MintsoftAsnDifference,
+  criteria: MintsoftAsnRecoveryCriteria,
+): Error {
+  switch (difference.kind) {
+    case 'quantityUnreadable':
+      return new MintsoftAsnRecoveryQuantityUnreadableError(asn.externalAsnId, difference.sourceLineId, difference.expectedQty)
+    case 'quantity':
+      return new MintsoftAsnRecoveryQuantityConflictError(asn.externalAsnId, difference.sourceLineId, difference.expectedQty, difference.remoteQty)
+    case 'quantityRounded':
+      return new MintsoftAsnRecoveryQuantityRoundedError(asn.externalAsnId, difference.sourceLineId, difference.expectedQty, difference.remoteQty)
+    case 'warehouse':
+      return new MintsoftAsnRecoveryWarehouseMismatchError(asn.externalAsnId, difference.remoteWarehouseId, criteria.externalWarehouseId)
+    case 'lineIdentityUnreadable':
+      return new MintsoftAsnRecoveryLineIdentityUnreadableError([asn.externalAsnId], criteria.reference.trim())
+    case 'same':
+    case 'reference':
+    case 'lines':
+      // Ruled out or adopted before this point. Refusing rather than falling through to "create" keeps the
+      // rule true of a difference kind added later that nobody wired up here.
+      return new Error(
+        `Mintsoft ASN ${asn.externalAsnId} carries reference ${criteria.reference.trim()} and this code cannot say `
+        + `what it is (${difference.kind}). Refusing to create another ASN for this reservation; check it in Mintsoft.`,
+      )
   }
-  if (unreadable) return unreadable
-  if (different) return { kind: 'different' }
-  return rounded ?? { kind: 'match' }
-}
-
-/** One candidate, or a refusal naming them all. Never "whichever the list happened to put first". */
-function theOnlyOne(candidates: readonly WmsAsnRef[], reference: string): WmsAsnRef | null {
-  if (candidates.length === 0) return null
-  if (candidates.length > 1) {
-    throw new MintsoftAsnRecoveryAmbiguousMatchError(candidates.map((asn) => asn.externalAsnId), reference)
-  }
-  return candidates[0] ?? null
 }
 
 /**
- * Every row carrying our reference whose items we cannot all key. Named in SORTED order, so which ASN the
- * refusal names does not depend on the list's order (which is not stable across pages — review M-b).
+ * THE RECOVER-OR-CREATE VERDICT. `absenceProven` is reached only when EVERY row in the list was ruled out
+ * by `isProofThatMintsoftAsnIsNotThisOne` — there is no other way out of this function that permits a
+ * create.
  */
-function unreadableLineIdentityAsnIds(sameReference: readonly WmsAsnRef[]): string[] {
-  return sameReference
-    .filter((asn) => {
-      const items = asn.raw?.Items
-      if (!Array.isArray(items)) return false
-      return items.some((item) => readMintsoftAsnItemLineIdentity(item).kind === 'unreadable')
-    })
-    .map((asn) => asn.externalAsnId)
-    .sort()
-}
-
-export function findRecoverableMintsoftAsn(asns: readonly WmsAsnRef[], criteria: MintsoftAsnRecoveryCriteria): WmsAsnRef | null {
+export function decideMintsoftAsnCreation(
+  asns: readonly WmsAsnRef[],
+  criteria: MintsoftAsnRecoveryCriteria,
+): MintsoftAsnCreationVerdict {
   const reference = criteria.reference.trim()
-  const sameReference = asns.filter((asn) => rawString(asn.raw, ['POReference', 'Reference', 'reference']) === reference)
-  // BEFORE the line sets are compared, because a row we cannot key is a row we cannot EXCLUDE (round 5,
-  // Codex HIGH 2). Comparing first would let the missing line read as "a different ASN" and create a second.
-  const unreadable = unreadableLineIdentityAsnIds(sameReference)
+  const unresolved = asns
+    .map((asn) => ({ asn, difference: compareMintsoftAsnAgainstExpectation(asn, criteria) }))
+    .filter(({ difference }) => !isProofThatMintsoftAsnIsNotThisOne(difference))
+
+  // BEFORE anything else, because a row we cannot key is a row we cannot EXCLUDE (round 5, Codex HIGH 2),
+  // and every such row is named, in SORTED order, so the refusal does not depend on the list's page order.
+  const unreadable = unresolved
+    .filter(({ difference }) => difference.kind === 'lineIdentityUnreadable')
+    .map(({ asn }) => asn.externalAsnId)
+    .sort()
   if (unreadable.length > 0) {
-    throw new MintsoftAsnRecoveryLineIdentityUnreadableError(unreadable, reference)
+    return { kind: 'refused', error: new MintsoftAsnRecoveryLineIdentityUnreadableError(unreadable, reference) }
   }
-  const match = theOnlyOne(
-    sameReference.filter((asn) => hasSameLineIdentity(asn, criteria)),
-    reference,
-  )
-  if (!match) return null
-  const quantities = judgeQuantities(match, criteria)
-  if (quantities.kind === 'unreadable') {
-    throw new MintsoftAsnRecoveryQuantityUnreadableError(match.externalAsnId, quantities.sourceLineId, quantities.expectedQty)
+
+  if (unresolved.length > 1) {
+    return {
+      kind: 'refused',
+      error: new MintsoftAsnRecoveryAmbiguousMatchError(unresolved.map(({ asn }) => asn.externalAsnId).sort(), reference),
+    }
   }
-  if (quantities.kind === 'different') return null
-  if (quantities.kind === 'rounded') {
-    throw new MintsoftAsnRecoveryQuantityRoundedError(match.externalAsnId, quantities.sourceLineId, quantities.expectedQty, quantities.remoteQty)
-  }
-  return atTheRightWarehouse(match, criteria)
+
+  const candidate = unresolved[0]
+  if (!candidate) return { kind: 'absenceProven' }
+  if (candidate.difference.kind === 'same') return { kind: 'existingAsn', asn: candidate.asn }
+  return { kind: 'refused', error: refusalFor(candidate.asn, candidate.difference, criteria) }
 }
 
-function atTheRightWarehouse(match: WmsAsnRef, criteria: MintsoftAsnRecoveryCriteria): WmsAsnRef {
-  const remoteWarehouseId = rawString(match.raw, ['WarehouseId', 'warehouseId'])
-  if (remoteWarehouseId !== criteria.externalWarehouseId.trim()) {
-    throw new MintsoftAsnRecoveryWarehouseMismatchError(match.externalAsnId, remoteWarehouseId, criteria.externalWarehouseId)
-  }
-  return match
+/** The ASN an earlier attempt created, or `null` meaning a create is permitted — through the one gate. */
+export function findRecoverableMintsoftAsn(
+  asns: readonly WmsAsnRef[],
+  criteria: MintsoftAsnRecoveryCriteria,
+): WmsAsnRef | null {
+  return requireMintsoftAsnCreationVerdict(decideMintsoftAsnCreation(asns, criteria))
 }

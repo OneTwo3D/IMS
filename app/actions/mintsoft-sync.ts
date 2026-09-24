@@ -26,6 +26,7 @@ import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsnsForDuplicateRecovery,
   findRecoverableMintsoftAsn,
+  MintsoftAsnCreateVerificationError,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   MINTSOFT_AUTH_TOKEN_KEY,
@@ -2637,6 +2638,37 @@ export async function recheckMintsoftAsnBookedIn(
   }
 }
 
+/**
+ * THE ASN NOBODY RECORDED (round 6, Codex HIGH 1). A create Mintsoft accepted, whose read-back did not
+ * confirm the warehouse, the item set or a quantity, leaves an inbound ASN AT THE LIVE WAREHOUSE with no
+ * `wms_asn_maps` row pointing at it — deliberately, because recording an ASN that is not what was asked for
+ * is what the refusal exists to prevent. The id is therefore retained here, on a WARNING activity entry and
+ * on the failed job's summary, so "which ASN do I have to go and look at?" can be answered by a query
+ * rather than by reading an error string out of a log. Nothing else acts on it: removing it is
+ * `DELETE /api/ASN/{id}` in Mintsoft, by a person.
+ */
+async function recordUnverifiedMintsoftAsnCreate(
+  jobId: string,
+  externalAsnId: string | null,
+  error: string,
+  source: { poId?: string; transferId?: string },
+): Promise<void> {
+  if (!externalAsnId) return
+  await logActivity({
+    entityType: 'SYNC',
+    entityId: jobId,
+    tag: 'sync',
+    action: 'mintsoft_asn_create_unverified',
+    level: 'WARNING',
+    description: `Mintsoft ASN ${externalAsnId} exists at the warehouse but does not match what was sent, so IMS recorded nothing for it`,
+    metadata: {
+      ...source,
+      externalAsnId,
+      error,
+    },
+  })
+}
+
 export async function createMintsoftPurchaseOrderAsn(
   poId: unknown,
   input: unknown,
@@ -3477,6 +3509,12 @@ export async function createMintsoftPurchaseOrderAsn(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to create Mintsoft ASN.'
+    // ROUND 6, CODEX HIGH 1: a create Mintsoft accepted but IMS could not verify leaves an ASN AT THE
+    // WAREHOUSE that nothing here recorded. Its id is the operator's only handle on it, so it is retained
+    // where it can be queried afterwards — the failed job's summary and an activity entry — rather than
+    // only inside an error string. Nothing is adopted or retried on it here: the matcher in the connector
+    // is what looks an existing ASN up, by the reference and the item source line ids.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError ? error.externalAsnId : null
 
     await db.wmsAsnMap.updateMany({
       where: {
@@ -3502,9 +3540,12 @@ export async function createMintsoftPurchaseOrderAsn(
         summary: {
           poId: parsedId.data,
           error: message,
+          ...(unrecordedExternalAsnId ? { unrecordedExternalAsnId } : {}),
         } satisfies Prisma.InputJsonObject,
       },
     })
+
+    await recordUnverifiedMintsoftAsnCreate(job.id, unrecordedExternalAsnId, message, { poId: parsedId.data })
 
     return {
       success: false,
@@ -4576,6 +4617,12 @@ export async function createMintsoftTransferAsn(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to create Mintsoft ASN.'
+    // ROUND 6, CODEX HIGH 1: a create Mintsoft accepted but IMS could not verify leaves an ASN AT THE
+    // WAREHOUSE that nothing here recorded. Its id is the operator's only handle on it, so it is retained
+    // where it can be queried afterwards — the failed job's summary and an activity entry — rather than
+    // only inside an error string. Nothing is adopted or retried on it here: the matcher in the connector
+    // is what looks an existing ASN up, by the reference and the item source line ids.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError ? error.externalAsnId : null
 
     await db.wmsAsnMap.updateMany({
       where: {
@@ -4601,9 +4648,12 @@ export async function createMintsoftTransferAsn(
         summary: {
           transferId: parsedId.data,
           error: message,
+          ...(unrecordedExternalAsnId ? { unrecordedExternalAsnId } : {}),
         } satisfies Prisma.InputJsonObject,
       },
     })
+
+    await recordUnverifiedMintsoftAsnCreate(job.id, unrecordedExternalAsnId, message, { transferId: parsedId.data })
 
     return {
       success: false,

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   findRecoverableMintsoftAsn,
   MintsoftAsnRecoveryAmbiguousMatchError,
+  MintsoftAsnRecoveryQuantityConflictError,
   MintsoftAsnRecoveryQuantityRoundedError,
   MintsoftAsnRecoveryLineIdentityUnreadableError,
   MintsoftAsnRecoveryQuantityUnreadableError,
@@ -38,12 +39,12 @@ function row(id: number, poReference: string, warehouseId: number, items: Item[]
  * Asserting it keeps the round-5 tests honest — each one first shows the row really does look foreign to a
  * line-identity comparison, so the refusal is doing work rather than restating a match that already held.
  */
-function hasNoLineIdentityMatch(asn: WmsAsnRef): boolean {
+function hasNoLineIdentityMatch(asn: WmsAsnRef, criteria: MintsoftAsnRecoveryCriteria = RESERVATION): boolean {
   const items = asn.raw?.Items
   const remoteItemCount = Array.isArray(items) ? items.length : asn.lines.length
-  if (remoteItemCount !== RESERVATION.lines.length) return true
+  if (remoteItemCount !== criteria.lines.length) return true
   const bySourceId = new Set(asn.lines.map((line) => line.sourceLineId))
-  return !RESERVATION.lines.every((line) => bySourceId.has(line.sourceLineId))
+  return !criteria.lines.every((line) => bySourceId.has(line.sourceLineId))
 }
 
 const RESERVATION: MintsoftAsnRecoveryCriteria = {
@@ -70,15 +71,50 @@ test('surrounding whitespace on either side does not hide the match', () => {
   assert.equal(findRecoverableMintsoftAsn([row(521, 'PO-1', 6, MATCHING_ITEMS)], { ...RESERVATION, reference: ' PO-1  ' })?.externalAsnId, '521')
 })
 
-test('a different line count, a missing SourceLineId or a quantity rounding cannot explain is not this ASN', () => {
+test('an ASN over DIFFERENT SOURCE LINES is not this one, and creating ours is right', () => {
+  // Determinate evidence, and the only kind duplicate recovery has: every identity on the row was readable,
+  // so its item set is known exactly, and it is not this reservation's set. A source line id is an IMS
+  // primary key — it does not change under a reservation, and Mintsoft returns it verbatim.
   assert.equal(findRecoverableMintsoftAsn([row(530, 'PO-1', 6, MATCHING_ITEMS.slice(0, 1))], RESERVATION), null, 'fewer lines')
   assert.equal(findRecoverableMintsoftAsn([row(531, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 3, SourceLineId: 'line-c', QuantityExpected: 1 }])], RESERVATION), null, 'more lines')
   assert.equal(findRecoverableMintsoftAsn([row(532, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-z', QuantityExpected: 2.5 }])], RESERVATION), null, 'another source line')
-  // A WHOLE-NUMBER expectation against a different whole number: rounding cannot produce that, so this is
-  // some other ASN and creating ours is right. (The fractional case is the test below, and is refused.)
-  assert.equal(findRecoverableMintsoftAsn([row(533, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 12 }, MATCHING_ITEMS[1]!])], RESERVATION), null, 'another quantity')
   // Inside the 0.0001 tolerance the quantity still matches: the reservation's figure is a decimal reading.
   assert.equal(findRecoverableMintsoftAsn([row(534, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 2.50005 }])], RESERVATION)?.externalAsnId, '534')
+})
+
+/**
+ * ROUND 6, CODEX HIGH 2: A QUANTITY THAT MERELY DIFFERS IS NOT PERMISSION TO CREATE A DUPLICATE.
+ *
+ * Until this round, a row carrying our reference and EXACTLY our line ids, whose quantity differed by more
+ * than rounding could explain, was answered with "no such ASN exists" — and the creator pushed a SECOND
+ * inbound ASN at a live warehouse for lines the first already covers. That is what an ASN a lost create
+ * really made looks like after the source quantity changed (the reservation checks validate the CURRENT
+ * LOCAL quantities, never whether the earlier remote ASN exists), and equally what an operator's edit at
+ * the warehouse looks like. It is refused by name instead, naming the ASN, the line and both figures.
+ */
+test('a same-reference, same-line-id ASN whose QUANTITY differs is an unresolved conflict, never a licence to create (round 6, Codex HIGH 2)', () => {
+  for (const [label, items, criteria, line, remote, expected] of [
+    ['a whole-number difference on one line', [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 12 }, MATCHING_ITEMS[1]!], RESERVATION, 'line-a', 12, 10],
+    ['a quantity of zero', [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 0 }, MATCHING_ITEMS[1]!], RESERVATION, 'line-a', 0, 10],
+    ['a whole unit away from a FRACTIONAL expectation, which rounding cannot explain', [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 4 }], RESERVATION, 'line-b', 4, 2.5],
+    ['a single-line reservation', [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 11 }], { ...RESERVATION, lines: [{ sourceLineId: 'line-a', expectedQty: 10 }] }, 'line-a', 11, 10],
+  ] as const) {
+    const asn = row(533, 'PO-1', 6, [...items] as Item[])
+    // PRECONDITION, so the refusal is doing work rather than restating a state that never arises: the row
+    // really does carry our reference and EXACTLY our line ids, and the quantity really is readable.
+    assert.equal(hasNoLineIdentityMatch(asn, criteria), false, `precondition (${label}): the line identity matches`)
+    assert.equal(asn.lines.find((entry) => entry.sourceLineId === line)?.quantity, remote, `precondition (${label}): and the remote quantity is readable`)
+    assert.throws(
+      () => findRecoverableMintsoftAsn([asn], criteria),
+      (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError
+        && /ASN 533/.test(error.message) && new RegExp(line).test(error.message)
+        && new RegExp(`expects ${remote} `).test(error.message) && new RegExp(`reservation expects ${expected}`).test(error.message)
+        && /NO ASN WILL BE CREATED/.test(error.message),
+      label,
+    )
+  }
+  // The ASN whose quantities DO match is still recovered, so the refusal has not swallowed the match.
+  assert.equal(findRecoverableMintsoftAsn([row(535, 'PO-1', 6, MATCHING_ITEMS)], RESERVATION)?.externalAsnId, '535')
 })
 
 test('an item Mintsoft returned but the normalizer could not read STILL COUNTS (review L-a)', () => {
@@ -185,12 +221,21 @@ test('a FRACTIONAL expectation against Mintsoft’s whole-number store is refuse
       `remote quantity ${remote}`,
     )
   }
-  // The refusal is only for a difference rounding could explain. A whole unit away from a FRACTIONAL
-  // expectation is not: 2.5 cannot be stored as 4.
-  assert.equal(findRecoverableMintsoftAsn([row(571, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 4 }])], RESERVATION), null)
-  // …and a reservation whose lines are all whole numbers is never refused this way: it round-trips.
+  // THIS refusal is only for a difference rounding could explain; a difference it cannot explain is the
+  // round-6 conflict above, not a licence to create. Either way nothing is created — what changes is which
+  // error names the state, because "Mintsoft rounded our 2.5" and "somebody changed the quantity" need
+  // different things done about them.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([row(571, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 4 }])], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError,
+    '2.5 cannot be stored as 4, so rounding is not the explanation — but it is still not a different ASN',
+  )
+  // …and a reservation whose lines are all whole numbers is never refused as a ROUNDING case: it round-trips.
   const whole: MintsoftAsnRecoveryCriteria = { ...RESERVATION, lines: [{ sourceLineId: 'line-a', expectedQty: 10 }] }
-  assert.equal(findRecoverableMintsoftAsn([row(572, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 11 }])], whole), null)
+  assert.throws(
+    () => findRecoverableMintsoftAsn([row(572, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 11 }])], whole),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError,
+  )
   assert.equal(findRecoverableMintsoftAsn([row(573, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 10 }])], whole)?.externalAsnId, '573')
 })
 
@@ -227,11 +272,12 @@ test('an expected quantity Mintsoft did not return is UNRESOLVED, never permissi
     (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityUnreadableError && /ASN 581/.test(error.message),
     'a different quantity on line-a does not license creating another ASN while line-b is unreadable',
   )
-  // And a readable quantity of zero is a quantity, not an unreadable one: it is a difference, and 0 !== 10
-  // still means some other ASN.
-  assert.equal(
-    findRecoverableMintsoftAsn([row(582, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 0 }, MATCHING_ITEMS[1]!])], { ...RESERVATION, lines: [{ sourceLineId: 'line-a', expectedQty: 10 }, { sourceLineId: 'line-b', expectedQty: 2.5 }] }),
-    null,
+  // And a readable quantity of zero is a quantity, not an unreadable one — so it is the round-6 CONFLICT
+  // refusal, by a different name, rather than the unreadable one. (Before round 6 it was "some other ASN,
+  // create another".)
+  assert.throws(
+    () => findRecoverableMintsoftAsn([row(582, 'PO-1', 6, [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 0 }, MATCHING_ITEMS[1]!])], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError && /ASN 582/.test(error.message),
   )
 })
 

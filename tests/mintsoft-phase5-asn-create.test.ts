@@ -124,55 +124,147 @@ test('a Mintsoft ASN create is only successful when Success is true AND ID > 0 (
 })
 
 /**
- * POST-CREATE VERIFICATION (o3d-vcw8). The ToolkitResult carries an id and nothing else, so the ASN is read
- * back and the read-back is CHECKED: the POReference and every SourceLineId sent must be there. Those two
- * are exactly what a retry finds the ASN by, so if they are not on it, the id does not describe what we
- * asked for and IMS records nothing.
+ * POST-CREATE VERIFICATION (o3d-vcw8, tightened in o3d-bhvu round 6 by Codex HIGH 1). The ToolkitResult
+ * carries an id and nothing else, so the ASN is read back and the read-back is CHECKED against the SAME
+ * rule the pre-create matcher uses (lib/connectors/mintsoft/api/asn-creation-rule.ts): the POReference, the
+ * EXACT item set, every QuantityExpected and the WarehouseId must be what was sent.
+ *
+ * ROUND 5 CHECKED THE REFERENCE AND THE PRESENCE OF EACH SourceLineId ONLY, so an ASN created at another
+ * warehouse, with an extra item, or expecting a different quantity — including Mintsoft's int32 store
+ * turning a fractional quantity into a whole one — was recorded as though it were what IMS asked for,
+ * together with the RESERVATION's own quantities, and the job was marked succeeded. The warehouse would
+ * have been expecting something else and nothing in IMS would have said so.
  */
-test('a created ASN is verified by POReference and every SourceLineId sent, not just parsed', () => {
-  const input = {
-    externalWarehouseId: '6',
-    reference: 'PO-1',
-    lines: [
-      { sourceLineId: 'line-a', externalProductId: '1', sku: 'S1', quantity: 1 },
-      { sourceLineId: 'line-b', externalProductId: '2', sku: 'S2', quantity: 2 },
-    ],
-  }
-  const line = (sourceLineId: string, externalLineId: string) => ({
-    externalLineId, sourceLineId, externalProductId: null, sku: null, quantity: null, raw: null,
-  })
-  const created = (poReference: unknown, sourceLineIds: string[]): WmsAsnRef => ({
+const VERIFY_INPUT = {
+  externalWarehouseId: '6',
+  reference: 'PO-1',
+  lines: [
+    { sourceLineId: 'line-a', externalProductId: '1', sku: 'S1', quantity: 1 },
+    { sourceLineId: 'line-b', externalProductId: '2', sku: 'S2', quantity: 2 },
+  ],
+}
+
+/** A read-back in the live ASN/ASNItem shape (o3d-vcw8, ASN 6117): items carry QuantityExpected. */
+function readBack(options: {
+  poReference?: unknown
+  warehouseId?: unknown
+  items?: Array<{ sourceLineId?: unknown; quantityExpected?: unknown }>
+}): WmsAsnRef {
+  const items = (options.items ?? [
+    { sourceLineId: 'line-a', quantityExpected: 1 },
+    { sourceLineId: 'line-b', quantityExpected: 2 },
+  ]).map((item, index) => ({
+    ID: 57457 + index,
+    ASNId: 6117,
+    SourceLineId: item.sourceLineId,
+    QuantityExpected: item.quantityExpected,
+    QuantityReceieved: 0,
+    QuantityBooked: 0,
+  }))
+  return {
     externalAsnId: '6117',
-    status: null,
-    lines: sourceLineIds.map((sourceLineId, index) => line(sourceLineId, String(index))),
-    raw: { POReference: poReference, ID: 6117 },
-  })
+    status: 'NEW',
+    lines: items.flatMap((item) => (typeof item.SourceLineId === 'string' && item.SourceLineId.trim()
+      ? [{
+          externalLineId: String(item.ID),
+          sourceLineId: item.SourceLineId,
+          externalProductId: null,
+          sku: null,
+          quantity: null,
+          raw: item as Record<string, unknown>,
+        }]
+      : [])),
+    raw: {
+      POReference: 'poReference' in options ? options.poReference : 'PO-1',
+      WarehouseId: 'warehouseId' in options ? options.warehouseId : 6,
+      ID: 6117,
+      Items: items,
+    },
+  }
+}
 
+test('a created ASN is verified by POReference, the exact item set, every QuantityExpected and the warehouse', () => {
   assert.equal(
-    client.requireCreatedMintsoftAsnMatchesRequest(created('PO-1', ['line-a', 'line-b']), input).externalAsnId,
+    client.requireCreatedMintsoftAsnMatchesRequest(readBack({}), VERIFY_INPUT).externalAsnId,
     '6117',
+    'what was asked for is what came back',
   )
   assert.equal(
-    client.requireCreatedMintsoftAsnMatchesRequest(created(' PO-1 ', ['line-a', 'line-b', 'line-c']), input).externalAsnId,
+    client.requireCreatedMintsoftAsnMatchesRequest(readBack({ poReference: ' PO-1 ' }), VERIFY_INPUT).externalAsnId,
     '6117',
-    'a surplus line is not a reason to refuse: every line we sent is there',
+    'surrounding whitespace on the reference is not a difference',
   )
 
-  for (const [label, asn] of [
-    ['another reference', created('PO-2', ['line-a', 'line-b'])],
-    ['no reference at all', created(null, ['line-a', 'line-b'])],
-    ['a missing source line', created('PO-1', ['line-a'])],
-    ['source lines Mintsoft altered', created('PO-1', ['line-a', 'line-b-truncated'])],
+  for (const [label, asn, expected] of [
+    ['another reference', readBack({ poReference: 'PO-2' }), /"PO-2"/],
+    ['no reference at all', readBack({ poReference: null }), /\(none\)/],
+    ['a missing source line', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }] }), /line-b/],
+    ['source lines Mintsoft altered', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: 'line-b-truncated', quantityExpected: 2 }] }), /line-b/],
+    // ROUND 6, CODEX HIGH 1 — each of these passed before, and each recorded an ASN the warehouse holds
+    // differently from what IMS then stored against it.
+    ['a SURPLUS item nobody asked for', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: 'line-b', quantityExpected: 2 }, { sourceLineId: 'line-c', quantityExpected: 9 }] }), /it holds 3/],
+    ['another warehouse', readBack({ warehouseId: 5 }), /warehouse 5 rather than warehouse 6/],
+    ['no warehouse at all', readBack({ warehouseId: null }), /warehouse \(none\)/],
+    ['a changed quantity', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: 'line-b', quantityExpected: 7 }] }), /line-b expects 7 where 2 was sent/],
+    ['a quantity Mintsoft did not return', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: 'line-b', quantityExpected: null }] }), /no readable QuantityExpected/],
+    ['an item whose SourceLineId cannot be read', readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: null, quantityExpected: 2 }] }), /SourceLineId cannot be read/],
   ] as const) {
     assert.throws(
-      () => client.requireCreatedMintsoftAsnMatchesRequest(asn, input),
+      () => client.requireCreatedMintsoftAsnMatchesRequest(asn, VERIFY_INPUT),
       (error: unknown) => error instanceof Error
         && error.name === 'MintsoftAsnCreateVerificationError'
         && /ASN 6117/.test(error.message)
+        && expected.test(error.message)
         && /DELETE \/api\/ASN\/6117/.test(error.message),
       label,
     )
   }
+
+  // And the case the pre-flight refusal below is the primary defence against: if a FRACTIONAL quantity ever
+  // did reach Mintsoft, its int32 store would round it, and the read-back names the rounding instead of
+  // recording our 2.5 against an ASN the warehouse holds as 3.
+  assert.throws(
+    () => client.requireCreatedMintsoftAsnMatchesRequest(
+      readBack({ items: [{ sourceLineId: 'line-a', quantityExpected: 1 }, { sourceLineId: 'line-b', quantityExpected: 3 }] }),
+      { ...VERIFY_INPUT, lines: [VERIFY_INPUT.lines[0]!, { ...VERIFY_INPUT.lines[1]!, quantity: 2.5 }] },
+    ),
+    (error: unknown) => error instanceof Error
+      && error.name === 'MintsoftAsnCreateVerificationError'
+      && /line-b expects 3 where 2.5 was sent/.test(error.message)
+      && /whole number/.test(error.message),
+  )
+})
+
+/**
+ * A QUANTITY MINTSOFT CANNOT STORE NEVER LEAVES THE BOX (round 6, Codex HIGH 1). NewASNItem.Quantity and
+ * ASNItem.QuantityExpected are int32 and IMS quantities can be fractional, so a fractional line would be
+ * created at the warehouse as some other number and only then refused by the read-back — with the ASN
+ * already there and only DELETE /api/ASN/{id} to remove it.
+ */
+test('a fractional line quantity is refused before the create request is built, not after the ASN exists', () => {
+  for (const [label, quantity] of [['a fraction', 2.5], ['a tiny fraction', 1.0001], ['NaN', Number.NaN], ['Infinity', Number.POSITIVE_INFINITY], ['beyond int32', 2147483648]] as const) {
+    assert.throws(
+      () => client.buildMintsoftAsnCreateRequest({
+        externalWarehouseId: '6',
+        reference: 'PO-1',
+        lines: [
+          { sourceLineId: 'line-a', externalProductId: '1', sku: 'S1', quantity: 1 },
+          { sourceLineId: 'line-b', externalProductId: '2', sku: 'S2', quantity },
+        ],
+      }),
+      (error: unknown) => error instanceof Error
+        && error.name === 'MintsoftAsnQuantityNotRepresentableError'
+        && /line-b/.test(error.message)
+        && /NOTHING WAS SENT/.test(error.message),
+      label,
+    )
+  }
+  // A whole number still builds, so the guard is not refusing everything.
+  assert.ok(client.buildMintsoftAsnCreateRequest({
+    externalWarehouseId: '6',
+    reference: 'PO-1',
+    lines: [{ sourceLineId: 'line-a', externalProductId: '1', sku: 'S1', quantity: 3 }],
+  }).body.includes('"Quantity":3'))
 })
 
 test('buildMintsoftAsnFetchByIdRequest targets the direct ASN endpoint', () => {

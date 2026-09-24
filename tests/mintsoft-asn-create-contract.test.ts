@@ -259,6 +259,80 @@ test('a read-back that does not carry what was sent is refused, and the ASN id i
   )
 })
 
+/**
+ * ROUND 6, CODEX HIGH 1: THE READ-BACK ACCEPTED A CHANGED WAREHOUSE OR A CHANGED QUANTITY.
+ *
+ * Round 5 checked the POReference and the PRESENCE of each SourceLineId only, so an ASN the warehouse holds
+ * differently from the request was recorded as though it were the request — with the RESERVATION's own
+ * expected quantities written against it and the job marked succeeded. The ASN id is named (and retained on
+ * the error) because the ASN EXISTS: only an operator can remove it.
+ */
+test('a read-back at another warehouse, with an extra item, or expecting a different quantity is refused (round 6, Codex HIGH 1)', async () => {
+  for (const [label, hook, expected] of [
+    [
+      'another warehouse',
+      (asn: Record<string, unknown>) => ({ ...asn, WarehouseId: 5 }),
+      /warehouse 5 rather than warehouse 6/,
+    ],
+    [
+      'a changed QuantityExpected',
+      (asn: Record<string, unknown>) => ({
+        ...asn,
+        Items: (asn.Items as Array<Record<string, unknown>>).map((item, index) => (index === 1 ? { ...item, QuantityExpected: 3 } : item)),
+      }),
+      /line cm1vcw8probel1ne0000zzt02 expects 3 where 4 was sent/,
+    ],
+    [
+      'a quantity rounded away to zero',
+      (asn: Record<string, unknown>) => ({
+        ...asn,
+        Items: (asn.Items as Array<Record<string, unknown>>).map((item, index) => (index === 1 ? { ...item, QuantityExpected: 0 } : item)),
+      }),
+      /expects 0 where 4 was sent/,
+    ],
+    [
+      'an extra item nobody asked for',
+      (asn: Record<string, unknown>) => ({
+        ...asn,
+        Items: [
+          ...(asn.Items as Array<Record<string, unknown>>),
+          { ...(asn.Items as Array<Record<string, unknown>>)[0]!, ID: 57459, SourceLineId: 'someone-elses-line', QuantityExpected: 9 },
+        ],
+      }),
+      /it holds 3/,
+    ],
+  ] as const) {
+    reset()
+    readBackHook = hook
+    await assert.rejects(
+      (await client()).createMintsoftAsn(INPUT),
+      (error: unknown) => error instanceof Error
+        && error.name === 'MintsoftAsnCreateVerificationError'
+        && /ASN 6117/.test(error.message)
+        && expected.test(error.message)
+        && /DELETE \/api\/ASN\/6117/.test(error.message),
+      label,
+    )
+    // PRECONDITION that the refusal is doing work: Mintsoft really did accept the create and really was
+    // read back, so this is exactly the state in which round 5 recorded the ASN and marked the job
+    // succeeded.
+    assert.deepEqual(requests, ['PUT /api/ASN', 'GET /api/ASN/6117'], label)
+    assert.equal(stored.length, 1, `${label}: the ASN EXISTS at the warehouse — the refusal is about what IMS records`)
+  }
+})
+
+test('a fractional quantity is refused before anything is sent, because Mintsoft stores whole numbers (round 6)', async () => {
+  reset()
+  await assert.rejects(
+    (await client()).createMintsoftAsn({ ...INPUT, lines: [{ ...INPUT.lines[0]!, quantity: 2.5 }] }),
+    (error: unknown) => error instanceof Error
+      && error.name === 'MintsoftAsnQuantityNotRepresentableError'
+      && /NOTHING WAS SENT/.test(error.message),
+  )
+  assert.deepEqual(requests, [], 'nothing reached the network, so no ASN exists to reconcile')
+  assert.equal(stored.length, 0)
+})
+
 test('an ASN Mintsoft reports created but will not serve back is refused, not recorded', async () => {
   reset()
   readBackHook = () => ({ POReference: 'PO-2026-001', ID: 6117, Items: [] })

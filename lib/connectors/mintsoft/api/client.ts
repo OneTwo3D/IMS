@@ -1,6 +1,11 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
-import { readMintsoftAsnItemLineIdentity } from './asn-recovery'
+import {
+  readMintsoftAsnItemExpectedQuantity,
+  readMintsoftAsnItemLineIdentity,
+  requireMintsoftAsnIsTheOneRequested,
+  type MintsoftAsnExpectation,
+} from './asn-creation-rule'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
@@ -311,6 +316,14 @@ export class MintsoftAsnCreateRejectedError extends Error {
 }
 
 export class MintsoftAsnCreateVerificationError extends Error {
+  /**
+   * THE ID IS RETAINED, NOT JUST PRINTED (round 6, Codex HIGH 1). The ASN exists at the live warehouse and
+   * IMS recorded nothing, so the id is the only handle an operator has. Both creators read it off this
+   * error and write it onto the failed sync job and an activity entry, where it can be queried later — a
+   * message in a log line is not a record.
+   */
+  readonly externalAsnId: string
+
   constructor(externalAsnId: string, detail: string) {
     super(
       `Mintsoft reported ASN ${externalAsnId} created, but reading it back does not confirm what was sent: `
@@ -319,6 +332,46 @@ export class MintsoftAsnCreateVerificationError extends Error {
       + `can remove it (DELETE /api/ASN/${externalAsnId} is Mintsoft's only removal — there is no cancel).`,
     )
     this.name = 'MintsoftAsnCreateVerificationError'
+    this.externalAsnId = externalAsnId
+  }
+}
+
+/**
+ * A QUANTITY MINTSOFT CANNOT STORE IS REFUSED BEFORE THE PUT, NOT AFTER IT (round 6, Codex HIGH 1).
+ * `NewASNItem.Quantity` and `ASNItem.QuantityExpected` are int32, and IMS quantities can be fractional. A
+ * fractional quantity sent to Mintsoft comes back rounded, which the read-back below refuses — correctly,
+ * but by then the ASN exists at the warehouse and only an operator can delete it. There is nothing to be
+ * gained by discovering that afterwards, so the create never leaves the box.
+ */
+export class MintsoftAsnQuantityNotRepresentableError extends Error {
+  constructor(sourceLineId: string, quantity: number) {
+    super(
+      `Mintsoft cannot store the quantity ${quantity} that line ${sourceLineId} expects: an ASN item quantity `
+      + 'is a whole number (int32) in Mintsoft, so this would be created at the warehouse as some other '
+      + 'quantity and could never be reconciled with the reservation. NOTHING WAS SENT and no ASN was '
+      + 'created: adjust the outstanding quantity to a whole number, then retry.',
+    )
+    this.name = 'MintsoftAsnQuantityNotRepresentableError'
+  }
+}
+
+const MINTSOFT_INT32_MAX = 2147483647
+
+/** Every `Items[].Quantity` Mintsoft could not store, refused before the request is built. */
+function requireMintsoftCanStoreAsnQuantities(input: WmsAsnInput): void {
+  for (const line of input.lines) {
+    if (!Number.isFinite(line.quantity) || !Number.isInteger(line.quantity) || Math.abs(line.quantity) > MINTSOFT_INT32_MAX) {
+      throw new MintsoftAsnQuantityNotRepresentableError(line.sourceLineId, line.quantity)
+    }
+  }
+}
+
+/** What the create asked for, in the form the shared rule compares a remote ASN against. */
+export function mintsoftAsnExpectationFromCreateInput(input: WmsAsnInput): MintsoftAsnExpectation {
+  return {
+    reference: input.reference,
+    externalWarehouseId: input.externalWarehouseId,
+    lines: input.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.quantity })),
   }
 }
 
@@ -341,27 +394,23 @@ export function readMintsoftAsnCreateResultId(data: unknown): number {
 /**
  * POST-CREATE VERIFICATION (o3d-vcw8; o3d-bhvu round 4 named this the real answer to duplicate recovery's
  * completeness residual). The `ToolkitResult` carries an id and nothing else, so the ASN is read back — and
- * the read-back is CHECKED, not just parsed: the `POReference` and every `SourceLineId` that was sent must
- * come back. Both round-trip verbatim (proven live 2026-09-24), so this is the pair a retry can find the ASN
- * by; if they are not there, the id we hold does not describe what we asked for and nothing is recorded.
+ * the read-back is CHECKED, not just parsed, against the SAME rule the pre-create matcher uses
+ * (`asn-creation-rule.ts`): the `POReference`, the EXACT item set, every `QuantityExpected` and the
+ * `WarehouseId` must be what was sent.
+ *
+ * ROUND 6, CODEX HIGH 1 — IT USED TO CHECK THE REFERENCE AND THE PRESENCE OF EACH `SourceLineId` ONLY. A
+ * read-back at another warehouse, with an extra item, or with a different `QuantityExpected` — including
+ * Mintsoft's int32 store turning a fractional quantity into a whole one — passed, and the caller then
+ * recorded the RESERVATION's own quantities against that ASN and marked the job succeeded. IMS would have
+ * shown an inbound delivery that the warehouse is not expecting, and nothing would ever have said so.
+ * A difference refuses instead, naming the ASN id (which the error retains) so it can be reconciled.
  */
 export function requireCreatedMintsoftAsnMatchesRequest(created: WmsAsnRef, input: WmsAsnInput): WmsAsnRef {
-  const remoteReference = typeof created.raw?.POReference === 'string' ? created.raw.POReference.trim() : null
-  if (remoteReference !== input.reference.trim()) {
-    throw new MintsoftAsnCreateVerificationError(
-      created.externalAsnId,
-      `it carries POReference ${remoteReference == null ? '(none)' : `"${remoteReference}"`} where "${input.reference.trim()}" was sent`,
-    )
-  }
-  const returned = new Set(created.lines.map((line) => line.sourceLineId))
-  const missing = input.lines.map((line) => line.sourceLineId).filter((sourceLineId) => !returned.has(sourceLineId))
-  if (missing.length > 0) {
-    throw new MintsoftAsnCreateVerificationError(
-      created.externalAsnId,
-      `it does not carry source line ${missing.join(', ')} (sent ${input.lines.length} item(s), read back ${returned.size})`,
-    )
-  }
-  return created
+  return requireMintsoftAsnIsTheOneRequested(
+    created,
+    mintsoftAsnExpectationFromCreateInput(input),
+    (detail) => new MintsoftAsnCreateVerificationError(created.externalAsnId, detail),
+  )
 }
 
 export function buildMintsoftProductUpsertRequest(
@@ -408,6 +457,7 @@ export function buildMintsoftAsnCreateRequest(
   method: 'PUT'
   body: string
 } {
+  requireMintsoftCanStoreAsnQuantities(input)
   return {
     path: '/api/ASN',
     method: 'PUT',
@@ -853,10 +903,9 @@ export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unkno
     // UNREADABLE IS null, AND null IS NEVER A QUANTITY (round 4, Codex HIGH 1). NaN and Infinity are
     // `typeof 'number'`, so they were reaching the matcher as quantities that match nothing — which the
     // matcher then read as "a different ASN, go ahead and create one". findRecoverableMintsoftAsn refuses
-    // on null instead (MintsoftAsnRecoveryQuantityUnreadableError).
-    const expected = typeof record.QuantityExpected === 'number' && Number.isFinite(record.QuantityExpected)
-      ? record.QuantityExpected
-      : null
+    // on null instead (MintsoftAsnRecoveryQuantityUnreadableError). ONE reader for it, shared with the
+    // rule the matcher and the post-create read-back both go through (round 6).
+    const expected = readMintsoftAsnItemExpectedQuantity(record)
     return [{
       externalLineId,
       sourceLineId,
