@@ -24,7 +24,37 @@ export const ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL =
   + 'is owed, which books it was built for, which connector is active now, what still stands in IMS, and what '
   + 'to do. A row marked "clears itself" leaves this list when IMS queues the posting. Any other row can be marked '
   + 'handled once you have posted it by hand: that records who did it, and IMS will then never post that posting '
-  + 'itself — its own retry is cancelled — so it cannot be posted twice.'
+  + 'itself — its own retry is cancelled — so it cannot be posted twice. A row marked "Unconfirmed" is not yet '
+  + 'one of these: IMS refused it while another job was settling the same posting, and the accounting sync run '
+  + 'is still establishing whether it is owed — do not post an unconfirmed row by hand.'
+
+/**
+ * o3d-j625 r10 (Codex round 9, HIGH) — WHAT AN UNRECONCILED PROVISIONAL CLAIM SAYS, AND WHAT IT MUST NOT.
+ *
+ * A refusal decided inside a business transaction that could not take the posting key is held as a
+ * provisional claim and settled by the accounting-sync tick (lib/domain/accounting/
+ * posting-refusal-provisional.ts). Until that happens IMS does not know whether the posting is owed —
+ * another transaction may have queued it — so the ONE thing this text must never do is ask the operator
+ * to post it by hand. That instruction, given while the posting may still be someone else's, is how a
+ * ledger gets the same journal twice. It says so in as many words, and the row carries no kind, so the
+ * Mark-as-handled affordance is not offered against it either.
+ */
+export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON = 'awaiting_reconciliation'
+
+export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY =
+  'Nothing yet — and do NOT post this in the ledger by hand. IMS refused this posting while another job was '
+  + 'settling the same one, so it does not yet know whether the posting is owed or was queued by that job. The '
+  + 'accounting sync run settles it automatically, usually within minutes: it then either disappears from this '
+  + 'list or becomes an ordinary refused posting with a remedy. If it is still here after an hour, the '
+  + 'accounting sync cron is not running — check that first.'
+
+export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_CLEARING_NOTE =
+  'Unconfirmed. Waiting for the accounting sync run to settle whether this posting is owed; it is not yet '
+  + 'something to post by hand, and it cannot be marked handled.'
+
+export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_COMMITTED =
+  'The work that produced this posting is committed in IMS. Whether the posting itself reached the ledger is '
+  + 'what has not been established yet.'
 
 /** o3d-j625 r6/r7: the prefix of the "How it clears" cell, per classification. */
 export const ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL = {

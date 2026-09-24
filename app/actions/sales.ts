@@ -1489,7 +1489,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       queueAccountingSync: queueUpdate,
       logActivity,
       // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
-      recordPostingRefusal: ({ posting, ...record }) => recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record),
+      // r10: the outcome is deliberately dropped here — this site reports the refusal and has nothing
+      // to retry with, unlike the reconciler, which is the caller the return value exists for.
+      recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
     })
     return
   }

@@ -36,6 +36,16 @@ import {
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { POSTING_REFUSAL_KINDS, POSTING_REFUSAL_NOTE_MAX_LENGTH, postingRefusalClearing, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
+import {
+  countUnreconciledProvisionalPostingRefusals,
+  listUnreconciledProvisionalPostingRefusals,
+} from '@/lib/domain/accounting/posting-refusal-provisional'
+import {
+  ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_CLEARING_NOTE,
+  ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_COMMITTED,
+  ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON,
+  ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY,
+} from '@/lib/domain/accounting/posting-refusal-copy'
 import { markPostingHandled, MarkHandledRaceError, type MarkHandledClient, type MarkHandledResult } from '@/lib/domain/accounting/posting-mark-handled'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
@@ -473,6 +483,17 @@ export type AccountingPostingRefusalRow = {
   clearing: 'auto' | 'retried' | 'manual' | null
   /** What raises the posting again (auto), or why nothing does (manual) — from the kind, not the row. */
   clearingNote: string | null
+  /**
+   * o3d-j625 r10 (Codex round 9, HIGH) — this is a PROVISIONAL CLAIM, not an established debt.
+   *
+   * The refusal was decided inside a business transaction that could not take the posting key, so it was
+   * persisted with that transaction and is waiting for the accounting-sync tick to settle — under the key
+   * — whether the posting is owed or was queued by the job that held it. Listed once it is past its grace
+   * so a reconciler that never runs is visible rather than silent, and listed with a remedy that tells the
+   * operator NOT to post it by hand yet: while it is unconfirmed the posting may still be someone else's.
+   * `kind` is null on these, so `clearing` is null and nothing offers Mark-as-handled.
+   */
+  unconfirmed: boolean
 }
 
 /** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
@@ -516,6 +537,12 @@ export type ExceptionInboxSummary = {
    * silent non-posting, and these clear only when the posting is actually made.
    */
   accountingPostingRefusals: number
+  /**
+   * o3d-j625 r10: how many of the number above are PROVISIONAL claims still waiting to be reconciled,
+   * rather than established debts. Included in `accountingPostingRefusals` (they are listed in the same
+   * section) and broken out so "the inbox total went up" can be told from "a posting is owed".
+   */
+  accountingPostingRefusalsUnconfirmed: number
   total: number
 }
 
@@ -779,7 +806,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, accountingPostingRefusals] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -803,6 +830,11 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // o3d-j625 r4: outstanding refusals. NOT scoped to the active connector, for the same reason the
     // follow-up obligations are not: a posting owed to the books you switched away from is still owed.
     db.accountingPostingRefusal.count({ where: { resolvedAt: null } }),
+    // o3d-j625 r10: and the provisional claims past their grace — a refusal a business transaction held
+    // because it could not take the posting key, which nothing has reconciled. Counted here rather than
+    // left to the integration-outbox section so that a reconciler which never runs is visible as what it
+    // is: a posting whose fate IMS has not established.
+    countUnreconciledProvisionalPostingRefusals({ client: db }),
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
@@ -819,10 +851,11 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
     accountingFollowUpObligations,
-    accountingPostingRefusals,
+    accountingPostingRefusals: outstandingPostingRefusals + unconfirmedPostingRefusals,
+    accountingPostingRefusalsUnconfirmed: unconfirmedPostingRefusals,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
       + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length
-      + accountingFollowUpObligations + accountingPostingRefusals,
+      + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
 
@@ -1341,16 +1374,22 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     }),
     // o3d-j625 r4: rendered from the columns the refusal itself wrote — the remedy an operator reads is
     // the one the refusing site stated, so the page and the accounting log cannot tell two stories.
-    accountingPostingRefusals: postingRefusalRows.map((row) => {
-      const clearing = postingRefusalClearing(row.kind)
-      return {
-        ...row,
-        firstRefusedAt: row.firstRefusedAt.toISOString(),
-        lastRefusedAt: row.lastRefusedAt.toISOString(),
-        clearing,
-        clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
-      }
-    }),
+    accountingPostingRefusals: [
+      ...postingRefusalRows.map((row) => {
+        const clearing = postingRefusalClearing(row.kind)
+        return {
+          ...row,
+          firstRefusedAt: row.firstRefusedAt.toISOString(),
+          lastRefusedAt: row.lastRefusedAt.toISOString(),
+          clearing,
+          clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
+          unconfirmed: false,
+        }
+      }),
+      // o3d-j625 r10 (Codex round 9, HIGH): the provisional claims, AFTER the established debts — they
+      // are the ones an operator can act on, and an unconfirmed claim is explicitly not yet actionable.
+      ...await loadUnconfirmedPostingRefusals(),
+    ],
     accountingPostingRefusalsResolved: await loadResolvedPostingRefusals(),
   }
 
@@ -1364,6 +1403,39 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
 }
 
 type MutationResult = { success: boolean; error?: string } | FreshAuthFailureResult
+
+/**
+ * o3d-j625 r10 (Codex round 9, HIGH) — the PROVISIONAL claims, rendered in the refusal section's own shape.
+ *
+ * Every visible field comes from the claim's stored payload — the same record the refusing site wrote —
+ * except the reason, the remedy and the "how it clears" note, which are this state's and live in
+ * posting-refusal-copy.ts beside every other operator sentence this section shows. `kind` is deliberately
+ * left null: it is what `postingRefusalClearing` reads, and a null kind is what keeps Mark-as-handled off
+ * a row IMS cannot yet say is owed.
+ */
+async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusalRow[]> {
+  const claims = await listUnreconciledProvisionalPostingRefusals({ client: db, limit: SECTION_LIMIT })
+  return claims.map((claim) => ({
+    id: claim.id,
+    type: claim.key.type,
+    referenceType: claim.key.referenceType,
+    referenceId: claim.key.referenceId,
+    chartConnector: claim.record.chartConnector,
+    activeConnector: claim.record.activeConnector,
+    reason: ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON,
+    committed: ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_COMMITTED,
+    remedy: ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY,
+    // The claim is one refusal, however many times the drain has failed to settle it; the attempts are
+    // the RECONCILIATION's, not the posting's, and calling them refusals would overstate the debt.
+    refusedCount: 1,
+    firstRefusedAt: claim.decidedAt.toISOString(),
+    lastRefusedAt: claim.decidedAt.toISOString(),
+    kind: null,
+    clearing: null,
+    clearingNote: ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_CLEARING_NOTE,
+    unconfirmed: true,
+  }))
+}
 
 /**
  * o3d-j625 r6 (review H4) — the refusals resolved in the last 30 days, newest first, with who resolved them

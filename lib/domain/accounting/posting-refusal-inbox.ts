@@ -1,8 +1,25 @@
+import { randomUUID } from 'node:crypto'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { runUnderPostingKeyLock, type PostingKeyLockClient } from '@/lib/domain/accounting/posting-suppression'
+import { enqueueProvisionalPostingRefusal } from '@/lib/domain/accounting/posting-refusal-provisional'
+import type { IntegrationOutboxClient } from '@/lib/domain/integrations/outbox'
+
+/**
+ * o3d-j625 r10 — THE DEFERRED PATH IS NOT A CAPABILITY A REAL CLIENT CAN LACK.
+ *
+ * `enqueueProvisionalPostingRefusal` is reached only from inside a caller's TRANSACTION (the contended
+ * branch is unreachable otherwise), and it writes through that same transaction client. This is the proof
+ * — checked by `tsc`, costing nothing at runtime — that such a client can always make that write, so the
+ * deferral can never quietly degrade back into r9's discard. It is the same shape as
+ * `PrismaClientCanAlwaysReadTheSuppression` in posting-suppression.ts, and for the same reason.
+ */
+type AssertTrue<T extends true> = T
+export type PrismaClientCanAlwaysHoldAProvisionalRefusal = AssertTrue<
+  Prisma.TransactionClient extends IntegrationOutboxClient ? true : false
+>
 
 /**
  * o3d-j625 r4/r5 — A REFUSED POSTING IS OUTSTANDING WORK, NOT A LOG LINE.
@@ -87,7 +104,10 @@ export type PostingRefusalClient = {
 }
 
 type SyncLogReader = {
-  findMany?(args: { where: Record<string, unknown>; select: { payload: true } }): Promise<Array<{ payload: unknown }>>
+  findMany?(args: {
+    where: Record<string, unknown>
+    select: { payload: true; createdAt: true }
+  }): Promise<Array<{ payload: unknown; createdAt: Date }>>
 }
 
 /** The key of the posting a row is about — produced by `accountingPostingKey` in lib/accounting.ts. */
@@ -141,6 +161,17 @@ export type RecordRefusalOptions = {
    * shortest honest answer available where nothing carries one.
    */
   decidedAt?: Date
+  /**
+   * o3d-j625 r10 — THE POSTING KEY WAS HELD BY ANOTHER TRANSACTION WHEN THIS REFUSAL WAS DECIDED.
+   *
+   * Set only by `reconcileProvisionalPostingRefusals`, replaying a refusal whose in-transaction call
+   * could not take the key. By the time the replay runs that transaction has ended and the key is free,
+   * so the replay looks UNCONTENDED and would not otherwise consult the accounting sync log — the one
+   * piece of evidence a FIRST refusal racing a FIRST enqueue can have. This carries the contention
+   * forward so the replay reaches the same answer the original call would have, had it been allowed to
+   * wait for the key.
+   */
+  contendedWhenDecided?: boolean
 }
 
 /**
@@ -148,12 +179,18 @@ export type RecordRefusalOptions = {
  *
  * `contended` is a refusal to guess rather than a failure: another transaction is settling this exact
  * posting, and this caller — inside its own transaction — may not wait for it (see the deadlock note in
- * posting-suppression.ts).
+ * posting-suppression.ts). Since r10 it is also not a LOSS: `deferred` says the refusal was persisted in
+ * the caller's transaction as a provisional claim for `reconcileProvisionalPostingRefusals` to replay.
+ *
+ * `failed` is the write that did not land at all (review L-1 reports it; M-14 contains it). It is
+ * returned rather than swallowed so a CALLER THAT CAN RETRY — the reconciler — can tell "nothing is owed"
+ * from "nothing was written", which are the same silence from the outside.
  */
-type RefusalRecordOutcome =
+export type RefusalRecordOutcome =
   | { recorded: true }
   | { recorded: false; because: 'suppressed' | 'queued'; at: Date }
-  | { recorded: false; because: 'contended' }
+  | { recorded: false; because: 'contended'; deferred: boolean }
+  | { recorded: false; because: 'failed' }
 
 async function guarded(
   what: string,
@@ -182,14 +219,43 @@ async function guarded(
 }
 
 /**
- * Is there a live accounting sync row for EXACTLY this posting key?
+ * Was this posting QUEUED after this refusal was decided — on the evidence of the accounting sync log
+ * rather than of the refusal row?
  *
  * Scoped the same way the mark scopes its candidates (posting-mark-handled.ts): the indexed columns
  * narrow it, and `accountingPostingKeyForRow` — the same function the row-creating primitive keys its
  * clear on — decides whether a row belongs to this posting or to a different one sharing the document.
  * `false` when the client cannot answer (a structural double), which records as before.
+ *
+ * A LIVE ROW IS NOT ON ITS OWN THE ANSWER, and this is the "what would still pass it" question the
+ * header asks. Several types share ONE key across successive postings by design (SALES_INVOICE_UPDATE,
+ * PURCHASE_INVOICE_UPDATE, BILL_PAYMENT — lib/accounting/posting-key.ts): edit 1 queues, its row stays
+ * live forever, edit 2 is refused, and the ledger now holds a stale document. That refusal is a REAL
+ * debt. So the row must post-date the refusal, in one of the two ways a row can:
+ *
+ *  • IT WAS CREATED AFTER THE REFUSAL WAS DECIDED (`createdAt` beats the decision). This is the
+ *    direct answer, and it is what closes r9's residual — a successful enqueue that both started and
+ *    committed in the gap between the decision and this call, taking the key uncontended, used to be
+ *    recorded as a debt that was already discharged.
+ *  • OR THE KEY WAS CONTENDED when the refusal was decided, which means another transaction was
+ *    settling this exact posting at that moment. Its row may have been created BEFORE the decision and
+ *    committed after — commit order is not a thing PostgreSQL exposes here (no `track_commit_timestamp`,
+ *    which must stay off), so contention is the only evidence there is, and it is exact evidence: this
+ *    call, or the in-transaction call this one is replaying, actually queued for that key.
+ *
+ * CLOCK DOMAINS, because the first arm crosses one. `decidedAt` is an application clock (`new Date()` in
+ * a Node process) and `accounting_sync_logs.createdAt` is a DATABASE clock (`@default(now())`), so
+ * comparing them directly would make a skew between the two into a rule about which debts are kept — and
+ * the dangerous direction (a database clock running ahead) is the one that SWALLOWS a real debt. The
+ * comparison is therefore made entirely in database time: the cutoff is the database's own clock minus
+ * the age of the decision as measured on the application clock, so only an INTERVAL crosses the boundary
+ * and the offset cancels.
  */
-async function postingIsInTheSyncLog(client: PostingRefusalClient, key: PostingRefusalKey): Promise<boolean> {
+async function postingQueuedAfterThisRefusal(
+  client: PostingRefusalClient,
+  key: PostingRefusalKey,
+  options: { decidedAt: Date; contended: boolean },
+): Promise<boolean> {
   // The delegate is never bound to a local: tests/accounting/sync-log-row-primitive.test.ts reports any
   // such binding, because a `.create` reached through one is invisible to it. Every use of it here is
   // visible at the access site, and both of them are reads.
@@ -202,9 +268,35 @@ async function postingIsInTheSyncLog(client: PostingRefusalClient, key: PostingR
       referenceId: key.referenceId,
       status: { not: 'CANCELLED' },
     },
-    select: { payload: true },
+    select: { payload: true, createdAt: true },
   })
-  return rows.some((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
+  const forThisPosting = rows.filter((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
+  if (forThisPosting.length === 0) return false
+  if (options.contended) return true
+  const cutoff = await databaseTimeOf(client, options.decidedAt)
+  if (!cutoff) return false
+  return forThisPosting.some((row) => row.createdAt instanceof Date && row.createdAt.getTime() > cutoff.getTime())
+}
+
+/**
+ * `at` expressed on the DATABASE's clock: the database's clock now, less however long ago `at` was here.
+ *
+ * `clock_timestamp()`, NEVER `now()`. `now()` is `transaction_timestamp()` — the moment THIS TRANSACTION
+ * began — and on the in-transaction path that transaction is the CALLER'S: a goods receipt or an MO
+ * completion that may have started minutes before this refusal was decided. The cutoff would then sit
+ * minutes in the past, and rows created well BEFORE the decision would count as having come after it,
+ * which is the direction that swallows a real debt.
+ *
+ * `null` when the client cannot be asked, which leaves the comparison unmade and the refusal RECORDED —
+ * the direction that keeps a debt rather than losing one.
+ */
+async function databaseTimeOf(client: PostingRefusalClient, at: Date): Promise<Date | null> {
+  const raw = client as { $queryRaw?: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown> }
+  if (typeof raw.$queryRaw !== 'function') return null
+  const rows = await raw.$queryRaw`SELECT clock_timestamp() AS at` as Array<{ at?: unknown }> | undefined
+  const databaseNow = rows?.[0]?.at
+  if (!(databaseNow instanceof Date)) return null
+  return new Date(databaseNow.getTime() - (Date.now() - at.getTime()))
 }
 
 /**
@@ -233,41 +325,53 @@ async function postingIsInTheSyncLog(client: PostingRefusalClient, key: PostingR
  *   1. SUPPRESSED — a posting marked handled stays handled. Reported, never recorded, and the write
  *      itself refuses suppressed rows (`suppressedAt: null` in its predicate), so this does not rest on
  *      the read alone.
- *   2. QUEUED WHILE THIS REFUSAL WAS IN FLIGHT — the row is resolved as `queued`, and either this call
- *      had to WAIT for the key (so another transaction was settling the posting while it waited) or the
- *      resolution is stamped at/after the moment the refusal was decided. Then the posting is queued and
- *      the refusal is stale.
+ *   2. QUEUED WHILE THIS REFUSAL WAS IN FLIGHT — the posting was queued after this refusal was decided,
+ *      on the evidence of the refusal row's own resolution or of the accounting sync log. Then the
+ *      refusal is stale. `postingQueuedAfterThisRefusal` states exactly what counts as that evidence.
  *   3. CONTENDED AND UNABLE TO WAIT — inside a caller's transaction, a key another transaction holds.
- *      Nothing is recorded, because nothing can be read that will still be true.
+ *      Nothing can be read that will still be true, so nothing is written HERE; since r10 the refusal is
+ *      instead persisted with the caller's own transaction and replayed under the key (see below).
  *
  * WHAT IS DELIBERATELY *NOT* CHECKED, and why (the "what would still pass it" question). Not "is there a
  * live sync row for this key" on its own. Several types share one key across successive postings by
  * design (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT — see lib/accounting/posting-key.ts):
  * edit 1 queues and clears the row, edit 2 is refused, and the ledger now holds a stale document. That
  * refusal is a REAL debt, and a blanket "a live row exists, so nothing is owed" would swallow it — the
- * table's whole purpose, lost to a guard meant to protect it. Only a resolution CONCURRENT with this
- * refusal is treated as superseding it.
+ * table's whole purpose, lost to a guard meant to protect it. Only a posting that can be shown to have
+ * been queued AFTER this refusal was decided supersedes it.
  *
- * THE RESIDUAL WINDOW, stated rather than papered over: a refusal decided before a successful enqueue
- * that both started and committed in the gap between the decision and this call — with this call then
- * taking the key uncontended — is still recorded, and the inbox shows a posting that is in fact queued.
- * Commit order is what would settle it and PostgreSQL does not expose it here (no
- * `track_commit_timestamp`). The consequence is bounded: the row is visible, and it CANNOT lead to a
- * second ledger post, because `markPostingHandled` refuses (`may_be_posted`) for as long as a live sync
- * row for the key exists. Passing `decidedAt` from the enqueue funnels narrows the window to the enqueue
- * itself.
+ * ── o3d-j625 r10 (Codex round 9, HIGH) — AND CONTENTION NO LONGER DISCARDS THE REFUSAL ──
+ *
+ * Case 3 above used to end there: nothing recorded, a WARNING in the activity log, and the caller's
+ * business transaction committing anyway. If the transaction holding the key then rolled back, or failed
+ * to queue its posting, the debt existed and nothing listed it. The refusal is now PERSISTED IN THE
+ * CALLER'S OWN TRANSACTION as a provisional claim and replayed from the pool, where waiting for the key
+ * is allowed — see posting-refusal-provisional.ts for the design, the reconciler, and what an
+ * unreconciled claim looks like in the inbox.
+ *
+ * r9's RESIDUAL WINDOW IS CLOSED BY THE SAME ROUND, and it had to be: a refusal decided before a
+ * successful enqueue that both started and committed in the gap before this call took the key
+ * UNCONTENDED used to be recorded as a debt that was in fact discharged. The reconciler runs minutes
+ * after the claim, uncontended by then, so leaving that window open would have turned it from a rare race
+ * into the ordinary path. `postingQueuedAfterThisRefusal` now compares the sync row's own creation
+ * against the moment this refusal was decided, in database time, which answers the case the contention
+ * probe could not see.
  */
 export async function recordAccountingPostingRefusal(
   client: PostingRefusalClient,
   key: PostingRefusalKey,
   record: AccountingPostingRefusalRecord,
   options?: RecordRefusalOptions,
-): Promise<void> {
+): Promise<RefusalRecordOutcome> {
   const now = new Date()
   const decidedAt = options?.decidedAt ?? now
   // A holder rather than a plain `let`: the assignment happens inside a callback, and TypeScript would
   // otherwise narrow the variable to the initializer and call every branch below unreachable.
-  const state: { outcome: RefusalRecordOutcome } = { outcome: { recorded: true } }
+  //
+  // r10: it starts at `failed`, not at `recorded: true`. `guarded` REPORTS a write that threw and does
+  // not rethrow it, so with an optimistic initial value this function returned "recorded" for a row that
+  // was never written — invisible to a caller that can retry, which the reconciler is.
+  const state: { outcome: RefusalRecordOutcome } = { outcome: { recorded: false, because: 'failed' } }
   await guarded('recording', key, options, async () => {
     state.outcome = await runUnderPostingKeyLock(
       client as unknown as PostingKeyLockClient,
@@ -275,9 +379,29 @@ export async function recordAccountingPostingRefusal(
       { callerTransaction: Boolean(options?.withSavepoint) },
       async (locked, lock) => {
         const table = (locked as unknown as PostingRefusalClient).accountingPostingRefusal
-        // Another transaction is settling this exact posting and this caller may not wait for it. Nothing
-        // read now would still be true when it was written, so nothing is written.
-        if (!lock.held && lock.reason === 'busy') return { recorded: false, because: 'contended' }
+        // ── o3d-j625 r10 (Codex round 9, HIGH) — CONTENDED IS DEFERRED, NOT DISCARDED ──
+        //
+        // Another transaction is settling this exact posting and this caller — inside its own
+        // transaction — may not wait for it. Nothing read now would still be true when it was written, so
+        // nothing is written HERE. But the caller's business transaction commits regardless (review
+        // M-14), and until r10 that meant a posting the other transaction then failed to queue, or rolled
+        // back entirely, was simply absent from the exception inbox behind an activity-log WARNING.
+        //
+        // So the refusal is persisted as a PROVISIONAL CLAIM in the caller's own transaction — one
+        // INSERT into a table nothing here holds a lock on — and replayed from the pool, where waiting
+        // for this key is allowed. See posting-refusal-provisional.ts for why an INSERT is the only
+        // durable write available on this path, and what the claim looks like until it is reconciled.
+        if (!lock.held && lock.reason === 'busy') {
+          await enqueueProvisionalPostingRefusal(
+            // The CALLER'S client, deliberately: the claim must commit with the business writes it
+            // describes and vanish with them if the caller rolls back.
+            locked as unknown as IntegrationOutboxClient,
+            key,
+            record,
+            { decidedAt, mergeOnly: options?.mergeOnly === true, nonce: randomUUID() },
+          )
+          return { recorded: false, because: 'contended', deferred: true }
+        }
         const existing = typeof table.findUnique === 'function'
           ? await table.findUnique({
             where: { type_referenceType_referenceId_scope: key },
@@ -310,10 +434,13 @@ export async function recordAccountingPostingRefusal(
           return { recorded: false, because: 'queued', at: existing.resolvedAt }
         }
         // And the FIRST refusal of a posting that was queued concurrently has no resolved row to learn
-        // from — the enqueue's clear matched nothing because there was no row yet. Under contention, the
-        // sync log is the evidence. Only under contention: a live row for this key is NOT on its own a
-        // reason to swallow a refusal (see the header's SALES_INVOICE_UPDATE case).
-        if (lock.held && lock.contended && await postingIsInTheSyncLog(locked as unknown as PostingRefusalClient, key)) {
+        // from — the enqueue's clear matched nothing because there was no row yet. The sync log is the
+        // evidence, and `postingQueuedAfterThisRefusal` states exactly what makes a live row count:
+        // it was created after this refusal was decided, or the key was contended when it was.
+        if (lock.held && await postingQueuedAfterThisRefusal(locked as unknown as PostingRefusalClient, key, {
+          decidedAt,
+          contended: lock.contended || options?.contendedWhenDecided === true,
+        })) {
           return { recorded: false, because: 'queued', at: existing?.resolvedAt ?? now }
         }
         if (!options?.mergeOnly) {
@@ -396,7 +523,11 @@ export async function recordAccountingPostingRefusal(
   // Reported OUTSIDE the lock: a refusal that is not recorded must still be visible, and the activity
   // write is on another connection — holding a posting key while waiting for it buys nothing.
   const outcome = state.outcome
-  if (outcome.recorded) return
+  if (outcome.recorded) return outcome
+  // A write that threw has already been reported by `guarded`, under its own action. Returning it
+  // unreported here is deliberate: reporting the same failure twice would make the activity log say the
+  // row was missing for two different reasons.
+  if (outcome.because === 'failed') return outcome
   if (outcome.because === 'suppressed') {
     await logActivity({
       entityType: 'SYSTEM',
@@ -408,7 +539,7 @@ export async function recordAccountingPostingRefusal(
         + `posted by hand — on ${outcome.at.toISOString()}. Nothing is owed and nothing was recorded.`,
       metadata: { ...key, reason: record.reason },
     }).catch(() => { /* nothing else to try */ })
-    return
+    return outcome
   }
   if (outcome.because === 'queued') {
     await logActivity({
@@ -422,20 +553,26 @@ export async function recordAccountingPostingRefusal(
         + 'sync log, nothing is owed, and nothing was recorded as outstanding.',
       metadata: { ...key, reason: record.reason, queuedAt: outcome.at.toISOString() },
     }).catch(() => { /* nothing else to try */ })
-    return
+    return outcome
   }
+  if (outcome.because !== 'contended') return outcome
   await logActivity({
     entityType: 'SYSTEM',
     action: 'accounting_posting_refusal_not_recorded_contended',
     tag: 'accounting',
-    level: 'WARNING',
+    // r10: INFO, not WARNING. Nothing is lost any more — the refusal is persisted in this caller's own
+    // transaction and reconciled under the key it could not take. It is recorded here because "which
+    // refusals took the deferred path" is a question the activity log should be able to answer.
+    level: 'INFO',
     description:
-      `IMS refused ${key.type} for ${key.referenceType} ${key.referenceId} and did not record it as outstanding `
-      + 'work: another transaction is queueing, marking or refusing this same posting right now, and this one is '
-      + 'inside a transaction that must not wait for it. The refusal itself stands and is in the accounting '
-      + 'activity log. If the other transaction did not queue the posting, the next refusal of it records the row.',
-    metadata: { ...key, reason: record.reason },
+      `IMS refused ${key.type} for ${key.referenceType} ${key.referenceId} while another transaction was `
+      + 'queueing, marking or refusing this same posting, and this one is inside a transaction that must not '
+      + 'wait for it. The refusal is held as a provisional claim that commits with this transaction, and the '
+      + 'accounting-sync tick settles it under this posting\'s lock: if the other transaction queued the '
+      + 'posting nothing is owed, and if it did not the refusal is listed in the exception inbox.',
+    metadata: { ...key, reason: record.reason, deferred: outcome.deferred },
   }).catch(() => { /* nothing else to try */ })
+  return outcome
 }
 
 /**

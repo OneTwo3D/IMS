@@ -406,7 +406,14 @@ test('STEP 4: the ONE lever the message names is the one that actually stops the
   // Off — which is what the message tells the operator to do.
   state.settings = new Map()
   const skipped = await (await GET(new Request('https://ims.test/api/cron/accounting-sync'))).json()
-  assert.deepEqual(skipped, { skipped: true, reason: 'QuickBooks sync disabled' })
+  // o3d-j625 r10: the tick ALSO settles held posting refusals, before any connector gate and therefore
+  // on a skipped run too — deliberately, because those refusals are largely raised by the very state
+  // this lever produces. It is not part of the sweep this test is about, so it is separated out rather
+  // than folded into the shape.
+  const { provisionalPostingRefusals, ...sweep } = skipped as Record<string, unknown>
+  assert.deepEqual(provisionalPostingRefusals, { claimed: 0, recorded: 0, settled: 0, failed: 0 },
+    'the reconciler ran on a skipped tick — and had nothing to do')
+  assert.deepEqual(sweep, { skipped: true, reason: 'QuickBooks sync disabled' })
   assert.equal(state.processorRan, false, 'the stale-claim sweep never reaches the row, so the effect stops repeating')
 
   // On — the control run, so the assertion above is about the toggle and not about the double.

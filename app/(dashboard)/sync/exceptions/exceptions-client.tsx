@@ -975,7 +975,12 @@ export function ExceptionsClient({ data }: Props) {
             <TableBody>
               {data.accountingPostingRefusals.map((row) => (
                 <TableRow key={row.id}>
-                  <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.reason})</span></TableCell>
+                  <TableCell className="text-xs">
+                    {row.type} <span className="text-muted-foreground">({row.reason})</span>
+                    {/* o3d-j625 r10: a provisional claim is not yet an established debt, and the row has to say so
+                        where the operator reads it, not only in the remedy column. */}
+                    {row.unconfirmed ? <div className="text-muted-foreground">Unconfirmed — not yet known to be owed</div> : null}
+                  </TableCell>
                   <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
                   <TableCell className="text-xs">{row.chartConnector ?? 'none'} → {row.activeConnector ?? 'none'}</TableCell>
                   <TableCell className="text-xs">

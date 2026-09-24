@@ -223,6 +223,40 @@ test('[o3d-j625 r5 L-1] a refusal that cannot be recorded is itself reported, an
   assert.ok(reported.every((a) => a.level === 'ERROR'))
 })
 
+// o3d-j625 r10 — AND IT SAYS SO IN ITS RETURN VALUE, not only in the activity log.
+//
+// The record REPORTS a write that threw and does not rethrow it, which is what keeps M-14 true. From the
+// outside that is indistinguishable from "nothing was owed" — and since r10 there is a caller that has to
+// tell those apart: `reconcileProvisionalPostingRefusals` completes a claim on the answer. An optimistic
+// answer here marks a claim SUCCEEDED over a debt that was never written, which is round 9's loss again.
+test('[o3d-j625 r10] a record whose write threw answers `failed`, so a caller that can retry knows to', async () => {
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const broken = {
+    accountingPostingRefusal: {
+      upsert: async () => { throw new Error('relation "AccountingPostingRefusal" does not exist') },
+      updateMany: async () => { throw new Error('relation "AccountingPostingRefusal" does not exist') },
+    },
+  }
+  const outcome = await recordAccountingPostingRefusal(broken, accountingPostingKey({
+    type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-10',
+  }), {
+    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+  })
+  assert.deepEqual(outcome, { recorded: false, because: 'failed' })
+
+  // CONTROL: the same call against a client that CAN write answers `recorded`, so the assertion above is
+  // about the failure and not about this function always saying `failed`.
+  const working = {
+    accountingPostingRefusal: { upsert: async () => ({}), updateMany: async () => ({ count: 1 }) },
+  }
+  assert.deepEqual(
+    await recordAccountingPostingRefusal(working, accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-11' }), {
+      kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+    }),
+    { recorded: true },
+  )
+})
+
 // o3d-j625 r5 (review M-2) — THE CHART IS AN INPUT THE REPORTER CANNOT INFER.
 //
 // `reportPostingNotQueued` reads the chart's connector out of `metadata.chartConnector`, and three of r4's

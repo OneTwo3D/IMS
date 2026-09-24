@@ -75,7 +75,24 @@ const emptyModel = {
   updateMany: async () => ({ count: 0 }),
 }
 
+/**
+ * o3d-j625 r10 (Codex round 9, HIGH) — the PROVISIONAL CLAIMS the inbox also lists.
+ *
+ * Refusals a business transaction had to hold because another job held the posting key. They live on
+ * `integration_outbox`, so the double answers only the provisional predicate and leaves every other read
+ * of that table (the outbox-failure section's) empty, which keeps each count attributable.
+ */
+const provisionalClaims: Array<Record<string, unknown>> = []
+
+const PROVISIONAL_OPERATION = 'posting-refusal.provisional'
+const isProvisionalRead = (where: Record<string, unknown> | undefined) => where?.operation === PROVISIONAL_OPERATION
+
 const db = new Proxy({
+  integrationOutbox: {
+    ...emptyModel,
+    count: async ({ where }: { where: Record<string, unknown> }) => (isProvisionalRead(where) ? provisionalClaims.length : 0),
+    findMany: async ({ where }: { where?: Record<string, unknown> } = {}) => (isProvisionalRead(where) ? provisionalClaims : []),
+  },
   accountingPostingRefusal: {
     ...emptyModel,
     // BOTH reads are recorded, because the count and the list are separate queries and a section that
@@ -155,4 +172,66 @@ test('[o3d-j625 r5 M-16] the section is OLDEST DEBT FIRST and capped, as its own
     + 'last happened to run')
   assert.equal(typeof seen.listTake, 'number', 'and it is capped like every other section')
   assert.ok((seen.listTake ?? 0) > 0)
+})
+
+/**
+ * o3d-j625 r10 (Codex round 9, HIGH) — AN UNRECONCILED CLAIM IS VISIBLE, AND VISIBLY NOT YET ACTIONABLE.
+ *
+ * A refusal that could not take its posting key is held with the caller's transaction and settled by the
+ * accounting-sync tick. If that tick is not running, the claim must not sit invisibly: the whole finding
+ * was that a refusal nothing lists is a silent non-posting. But it also must not read as an ordinary debt
+ * — while it is unconfirmed the posting may still belong to the job that held the key, so "post this by
+ * hand" is the one instruction that could put the journal in the ledger twice.
+ */
+test('[o3d-j625 r10] an unreconciled provisional claim is LISTED and counted, marked unconfirmed, with no way to mark it handled', async () => {
+  provisionalClaims.length = 0
+  provisionalClaims.push({
+    id: 'claim-7',
+    attempts: 0,
+    status: 'PENDING',
+    createdAt: new Date('2026-09-24T10:00:00.000Z'),
+    payloadJson: {
+      key: { type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', referenceId: 'po-7', scope: '' },
+      record: {
+        kind: 'manufacturing_journal',
+        chartConnector: 'xero',
+        activeConnector: 'quickbooks',
+        reason: 'retired_chart',
+        committed: 'the production order is completed in IMS',
+        remedy: 'Post the manufacturing journal by hand and mark this row handled.',
+      },
+      decidedAt: '2026-09-24T10:00:00.000Z',
+      mergeOnly: false,
+    },
+  })
+  const [{ getExceptionInboxData }, copy] = await Promise.all([
+    import('@/app/actions/sync-exceptions'),
+    import('@/lib/domain/accounting/posting-refusal-copy'),
+  ])
+
+  const data = await getExceptionInboxData()
+
+  assert.equal(data.summary.accountingPostingRefusalsUnconfirmed, 1, 'counted, and counted separately')
+  assert.equal(data.summary.accountingPostingRefusals, 2, 'and included in the section\'s own badge (1 debt + 1 claim)')
+  assert.equal(data.summary.total, 2, 'and in the inbox TOTAL — a claim nothing settles is work somebody must look at')
+
+  const claim = data.accountingPostingRefusals.find((row) => row.id === 'claim-7')
+  assert.ok(claim, 'the claim is listed in the refusal section, beside the established debts')
+  assert.equal(claim.unconfirmed, true, 'and marked as what it is')
+  assert.equal(claim.type, 'MANUFACTURING_JOURNAL', 'naming the posting, from the claim\'s own payload')
+  assert.equal(claim.referenceId, 'po-7')
+  assert.equal(claim.chartConnector, 'xero')
+  // THE PART THAT MATTERS. The claim's stored remedy asks for a hand posting; that instruction must NOT
+  // be what the page shows while IMS cannot yet say the posting is owed.
+  assert.equal(claim.remedy, copy.ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY)
+  assert.doesNotMatch(claim.remedy, /mark this row handled/i)
+  assert.equal(claim.kind, null, 'no kind, which is what withholds the Mark-as-handled affordance')
+  assert.equal(claim.clearing, null)
+
+  // And the established debt beside it is untouched by any of this.
+  const debt = data.accountingPostingRefusals.find((row) => row.id === 'refusal-1')
+  assert.ok(debt)
+  assert.equal(debt.unconfirmed, false)
+  assert.equal(debt.remedy, refusalRows[0].remedy)
+  provisionalClaims.length = 0
 })

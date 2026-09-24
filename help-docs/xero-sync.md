@@ -1840,7 +1840,7 @@ settles expire normally.
 
 | Endpoint | Schedule | Purpose |
 |---|---|---|
-| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then — for Xero only — run the back-reference repair sweep |
+| `/api/cron/accounting-sync` | Every 5 min | Settle any held ("unconfirmed") posting refusals — which happens on every run, whether or not an accounting connector is enabled — then process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then, for Xero only, run the back-reference repair sweep |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
@@ -2344,8 +2344,21 @@ Three things about those rows:
   to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being
   queued is logged (`accounting_posting_refused_after_queued`) and not listed, because the posting is in the
   accounting sync log. A refusal raised from inside a piece of work that cannot wait for that lock is not
-  listed either; it is logged as a **WARNING** (`accounting_posting_refusal_not_recorded_contended`) naming
-  the posting, and the refusal itself is in the accounting activity log as always.
+  lost either: it is held with that work — it commits or rolls back with it — and the next **accounting
+  sync** run settles it under the posting's lock, which is the wait the original job was not allowed to
+  make. If the job holding the lock queued the posting, nothing is owed and the claim disappears; if that
+  job rolled back or never queued it, the refusal becomes an ordinary row on this list. It is logged as
+  `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal itself is
+  in the accounting activity log as always.
+* **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not
+  settled one of those held refusals within about 15 minutes, it is listed in this section marked
+  **Unconfirmed — not yet known to be owed**, so a reconciler that has stopped running is visible instead
+  of silent. An unconfirmed row offers no *Mark as handled* action and **must not be posted by hand**:
+  until it is settled the posting may still belong to the job that held the lock, and posting it by hand
+  in that window is exactly how a journal reaches the ledger twice. The usual cause of a row sitting here
+  is that `/api/cron/accounting-sync` is not running — check that before anything else. A claim the run
+  keeps failing to settle eventually stops being retried and moves to the **integration outbox failures**
+  section instead, so it is in one place at a time.
 * **If IMS cannot tell whether a posting was marked handled, it does not post it.** The check runs before
   every accounting entry is queued. When the check itself cannot be made — the database is unreachable, the
   query times out, the transaction is cancelled — IMS refuses the enqueue rather than reading "cannot tell"

@@ -906,7 +906,7 @@ test('every registered outbox operation declares a known replay-safety answer an
   }
   // The walk itself is asserted, not just its verdict: a registry this loop failed to enumerate
   // would otherwise pass by examining nothing.
-  assert.ok(declared.length >= 6, `expected the registry walk to reach every operation, saw ${declared.length}`)
+  assert.ok(declared.length >= 7, `expected the registry walk to reach every operation, saw ${declared.length}`)
   for (const { key, replay, keyedBy } of declared) {
     assert.ok(
       (OUTBOX_REPLAY_SAFETY_VALUES as readonly string[]).includes(replay),
@@ -927,6 +927,11 @@ test('every registered outbox operation declares a known replay-safety answer an
     declared.map((entry) => entry.key).sort(),
     [
       'accounting/landed-cost.adjustment-journal',
+      // o3d-j625 r10: assessed on o3d-8td2's terms before it was added. The drain re-runs
+      // `recordAccountingPostingRefusal` on the pool; every write it makes happens while holding the
+      // posting key's advisory lock, and it re-reads the suppression and the resolution under that lock —
+      // a guard between the RESUME and the effect, not between the claim and the effect.
+      'accounting/posting-refusal.provisional',
       'mintsoft/inbound.booked-in',
       'sales/refund.reservation-release',
       'sales/refund.unmatched-warning',
@@ -937,7 +942,7 @@ test('every registered outbox operation declares a known replay-safety answer an
   )
 })
 
-test('the six verdicts are the round-3 corrected ones', () => {
+test('the seven verdicts are the round-3 corrected ones', () => {
   const verdicts = Object.fromEntries(
     Object.entries(INTEGRATION_OUTBOX_REGISTRY).flatMap(([connector, operations]) =>
       Object.entries(operations).map(([operation, entry]) => [`${connector}/${operation}`, entry.replay]),
@@ -958,6 +963,9 @@ test('the six verdicts are the round-3 corrected ones', () => {
     // unguarded ones, so a crash in the tail strands them BECAUSE the guard commits `processedAt`.
     'mintsoft/inbound.booked-in': 'unsafe-to-replay',
     'accounting/landed-cost.adjustment-journal': 'local-only-guarded',
+    // o3d-j625 r10 (Codex round 9, HIGH): local only — no connector call at all — and the named guard
+    // is the posting key's advisory lock, which the replay re-enters before it may write anything.
+    'accounting/posting-refusal.provisional': 'local-only-guarded',
     'sales/refund.reservation-release': 'local-only-guarded',
     'sales/refund.unmatched-warning': 'local-only-guarded',
   })
