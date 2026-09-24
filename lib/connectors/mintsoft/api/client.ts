@@ -1,5 +1,6 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
-import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnPackagingType, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import { readMintsoftAsnItemLineIdentity } from './asn-recovery'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
@@ -227,24 +228,140 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
   return payload
 }
 
+/**
+ * The seven names `GET /api/ASN/GoodsInTypes` serves (read live 2026-09-24). `NewASN.GoodsInType` is
+ * REQUIRED even though the swagger does not mark it so: a create without it comes back HTTP 200 with
+ * `Success: false, Message: "Invalid GoodsInType:  See ASN/GoodsInTypes for valid types"` (o3d-vcw8).
+ */
+export const MINTSOFT_GOODS_IN_TYPES = [
+  'TwentyFtContainer',
+  'FortyFtContainer',
+  'Pallet',
+  'Carton',
+  'FortyFtContainerHC',
+  'FortyFiveFtContainer',
+  'FortyFiveFtContainerHC',
+] as const
+
+export type MintsoftGoodsInType = typeof MINTSOFT_GOODS_IN_TYPES[number]
+
+/**
+ * IMS's packaging type as one of Mintsoft's goods-in types. Keyed by the whole union, so adding a packaging
+ * type is a type error here rather than a `Success: false` at the warehouse. `Carton` is the fallback for a
+ * reservation that names none: it is what 216 of this tenant's 223 ASNs use, and an ASN must carry one.
+ */
+const MINTSOFT_GOODS_IN_TYPE_BY_PACKAGING: Record<WmsAsnPackagingType, MintsoftGoodsInType> = {
+  PARCEL: 'Carton',
+  PALLET: 'Pallet',
+  CONTAINER: 'TwentyFtContainer',
+}
+
+export function mintsoftGoodsInType(packagingType: WmsAsnPackagingType | null | undefined): MintsoftGoodsInType {
+  return (packagingType ? MINTSOFT_GOODS_IN_TYPE_BY_PACKAGING[packagingType] : undefined) ?? 'Carton'
+}
+
+/**
+ * `NewASN`, THE BODY MINTSOFT ACTUALLY ACCEPTS (o3d-vcw8, proven live 2026-09-24 by one owner-sanctioned
+ * create — ASN 6117, read back and deleted). What IMS used to send — `Reference`, `Lines`, `ETA`, `Carrier`,
+ * `PackagingType`, `PackageCount`, `CallbackUrl`, `AutoCallback` — is not this model; none of those names
+ * exists on `NewASN`, so an accepted create would have stored an ASN with no reference and no items.
+ *
+ * `ClientId` IS NOT SENT, though `NewASN` declares it: our key is a client user and Mintsoft answers
+ * "Client Users cannot specify a ClientId when creating an ASN!". Mintsoft sets it on the created row.
+ *
+ * `Quantity` IS THE PACKAGE COUNT, NOT A QUANTITY OF GOODS. The header quantity equalled the item sum on
+ * only 3 of this tenant's 223 ASNs; on the ASN this contract was proven with, `Quantity: 1` with one item
+ * of `QuantityExpected: 1` and `GoodsInType: "Carton"` came back as one carton. Units live on `Items[]`.
+ *
+ * `Carrier` and `SupplierReference` have NO home on `NewASN`, so they are preserved as labelled
+ * `SupplierNotes` rather than dropped silently (the alternative o3d-vcw8 sanctions).
+ */
 function buildMintsoftAsnPayload(input: WmsAsnInput): Record<string, unknown> {
-  return {
+  const supplierNotes = [
+    input.supplierReference?.trim() ? `Supplier reference: ${input.supplierReference.trim()}` : null,
+    input.carrier?.trim() ? `Carrier: ${input.carrier.trim()}` : null,
+  ].filter((note): note is string => Boolean(note)).join('\n')
+
+  const payload: Record<string, unknown> = {
     WarehouseId: /^\d+$/.test(input.externalWarehouseId) ? Number.parseInt(input.externalWarehouseId, 10) : input.externalWarehouseId,
-    Reference: input.reference,
-    SupplierReference: input.supplierReference ?? null,
-    Carrier: input.carrier ?? null,
-    ETA: input.eta ?? null,
-    PackagingType: input.packagingType ?? null,
-    PackageCount: input.packageCount ?? null,
-    CallbackUrl: input.callbackUrl ?? null,
-    AutoCallback: input.autoCallback ?? true,
-    Lines: input.lines.map((line) => ({
+    POReference: input.reference,
+    GoodsInType: mintsoftGoodsInType(input.packagingType),
+    Quantity: Number.isInteger(input.packageCount) && (input.packageCount ?? 0) > 0 ? input.packageCount : 1,
+    Items: input.lines.map((line) => ({
       SourceLineId: line.sourceLineId,
       ProductId: /^\d+$/.test(line.externalProductId) ? Number.parseInt(line.externalProductId, 10) : line.externalProductId,
       SKU: line.sku,
       Quantity: line.quantity,
     })),
   }
+  if (supplierNotes) payload.SupplierNotes = supplierNotes
+  if (input.eta) payload.EstimatedDelivery = input.eta
+  return payload
+}
+
+export class MintsoftAsnCreateRejectedError extends Error {
+  constructor(message: string | null, raw: unknown) {
+    super(
+      `Mintsoft refused the ASN create: ${message?.trim() || 'it answered without Success or an ASN id'}. `
+      + 'Mintsoft answers a REFUSED create with HTTP 200 and Success: false, so nothing was created and no '
+      + `ASN id exists to record (it replied ${JSON.stringify(raw)?.slice(0, 400) ?? 'nothing'}).`,
+    )
+    this.name = 'MintsoftAsnCreateRejectedError'
+  }
+}
+
+export class MintsoftAsnCreateVerificationError extends Error {
+  constructor(externalAsnId: string, detail: string) {
+    super(
+      `Mintsoft reported ASN ${externalAsnId} created, but reading it back does not confirm what was sent: `
+      + `${detail}. The ASN EXISTS at the warehouse and IMS has not recorded it, so nothing is being retried `
+      + 'blindly: a retry looks it up by POReference and the item SourceLineIds first, and only an operator '
+      + `can remove it (DELETE /api/ASN/${externalAsnId} is Mintsoft's only removal — there is no cancel).`,
+    )
+    this.name = 'MintsoftAsnCreateVerificationError'
+  }
+}
+
+/**
+ * EVERY MINTSOFT ASN CREATE FAILURE IS AN HTTP 200 (o3d-vcw8, three live attempts: two `Success: false`
+ * with `ID: 0`, one `Success: true` with `ID: 6117`). The reply is a `ToolkitResult`, never an ASN, so
+ * trusting the status code recorded a phantom ASN id of 0 as if an inbound delivery had been booked.
+ * Success is `Success === true` AND `ID > 0`, and nothing else.
+ */
+export function readMintsoftAsnCreateResultId(data: unknown): number {
+  const record = data && typeof data === 'object' && !Array.isArray(data) ? data as Record<string, unknown> : null
+  const message = typeof record?.Message === 'string' ? record.Message : null
+  const id = typeof record?.ID === 'number' && Number.isFinite(record.ID) ? record.ID : null
+  if (record?.Success !== true || id == null || !Number.isInteger(id) || id <= 0) {
+    throw new MintsoftAsnCreateRejectedError(message, data)
+  }
+  return id
+}
+
+/**
+ * POST-CREATE VERIFICATION (o3d-vcw8; o3d-bhvu round 4 named this the real answer to duplicate recovery's
+ * completeness residual). The `ToolkitResult` carries an id and nothing else, so the ASN is read back — and
+ * the read-back is CHECKED, not just parsed: the `POReference` and every `SourceLineId` that was sent must
+ * come back. Both round-trip verbatim (proven live 2026-09-24), so this is the pair a retry can find the ASN
+ * by; if they are not there, the id we hold does not describe what we asked for and nothing is recorded.
+ */
+export function requireCreatedMintsoftAsnMatchesRequest(created: WmsAsnRef, input: WmsAsnInput): WmsAsnRef {
+  const remoteReference = typeof created.raw?.POReference === 'string' ? created.raw.POReference.trim() : null
+  if (remoteReference !== input.reference.trim()) {
+    throw new MintsoftAsnCreateVerificationError(
+      created.externalAsnId,
+      `it carries POReference ${remoteReference == null ? '(none)' : `"${remoteReference}"`} where "${input.reference.trim()}" was sent`,
+    )
+  }
+  const returned = new Set(created.lines.map((line) => line.sourceLineId))
+  const missing = input.lines.map((line) => line.sourceLineId).filter((sourceLineId) => !returned.has(sourceLineId))
+  if (missing.length > 0) {
+    throw new MintsoftAsnCreateVerificationError(
+      created.externalAsnId,
+      `it does not carry source line ${missing.join(', ')} (sent ${input.lines.length} item(s), read back ${returned.size})`,
+    )
+  }
+  return created
 }
 
 export function buildMintsoftProductUpsertRequest(
@@ -280,16 +397,20 @@ export function buildMintsoftProductUpsertRequest(
   }
 }
 
+/**
+ * `PUT /api/ASN` — there is no `POST /api/ASN` (the swagger defines the create as PUT and `POST /api/ASN/{id}`
+ * as the UPDATE route; live `GET /api/ASN` is 405, the path being write-only). o3d-vcw8.
+ */
 export function buildMintsoftAsnCreateRequest(
   input: WmsAsnInput,
 ): {
   path: string
-  method: 'POST'
+  method: 'PUT'
   body: string
 } {
   return {
     path: '/api/ASN',
-    method: 'POST',
+    method: 'PUT',
     body: JSON.stringify(buildMintsoftAsnPayload(input)),
   }
 }
@@ -349,12 +470,14 @@ export async function createMintsoftAsn(input: WmsAsnInput): Promise<WmsAsnRef> 
     throw new Error(result.error)
   }
 
-  const normalized = normalizeMintsoftAsn(result.data)
-  if (!normalized) {
-    throw new Error('Mintsoft ASN create succeeded but no line mapping was returned')
+  // NEVER `result.status`: a rejected create is an HTTP 200 (o3d-vcw8). The verdict is in the body.
+  const externalAsnId = String(readMintsoftAsnCreateResultId(result.data))
+  const created = await fetchMintsoftAsnById(externalAsnId)
+  if (!created) {
+    throw new MintsoftAsnCreateVerificationError(externalAsnId, 'reading it back returned nothing IMS can map to lines')
   }
 
-  return normalized
+  return requireCreatedMintsoftAsnMatchesRequest(created, input)
 }
 
 function buildMintsoftBundlePayload(input: WmsBundleDto): Record<string, unknown> {
@@ -707,10 +830,14 @@ export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unkno
   const lines = (row.Items as unknown[]).flatMap((item) => {
     const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
     if (!record) return []
-    const sourceLineId = typeof record.SourceLineId === 'string' && record.SourceLineId.trim() ? record.SourceLineId.trim() : null
-    // An item with no usable SourceLineId is NOT ours — most of this tenant's ASNs were made in the
-    // Mintsoft UI and carry none — so it is dropped here and counted by remoteItemCount instead (review L-a).
-    if (!sourceLineId) return []
+    // ONE rule for what an item's line identity is, shared with the matcher (round 5, Codex HIGH 2): an
+    // item we cannot key is dropped here exactly as before — and, for a row carrying the reservation's
+    // POReference, findRecoverableMintsoftAsn refuses the whole decision rather than reading the missing
+    // line as "somebody else's ASN". An item with a DETERMINATE identity that is not ours (a numeric
+    // SourceLineId, i.e. another integration's) is dropped and counted by remoteItemCount (review L-a).
+    const identity = readMintsoftAsnItemLineIdentity(record)
+    if (identity.kind !== 'identified') return []
+    const sourceLineId = identity.sourceLineId
     const externalLineId = record.ID == null || String(record.ID).trim() === '' ? null : String(record.ID)
     if (!externalLineId) {
       // IT CARRIES OUR LINE ID, SO IT IS OURS (round 4, the shape of Codex HIGH 1). Dropping it would leave

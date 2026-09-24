@@ -4,11 +4,13 @@ import {
   findRecoverableMintsoftAsn,
   MintsoftAsnRecoveryAmbiguousMatchError,
   MintsoftAsnRecoveryQuantityRoundedError,
+  MintsoftAsnRecoveryLineIdentityUnreadableError,
   MintsoftAsnRecoveryQuantityUnreadableError,
   MintsoftAsnRecoveryWarehouseMismatchError,
   type MintsoftAsnRecoveryCriteria,
 } from '@/lib/connectors/mintsoft/api/asn-recovery'
 import { normalizeMintsoftAsnListRowForRecovery } from '@/lib/connectors/mintsoft/api/client'
+import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 
 /**
  * o3d-bhvu round 2 (review M2) and round 3 (review M-b, L-a, L-b): THE RECOVER-OR-CREATE DECISION, ON ROWS.
@@ -31,10 +33,22 @@ function row(id: number, poReference: string, warehouseId: number, items: Item[]
   return normalizeMintsoftAsnListRowForRecovery({ ID: id, POReference: poReference, WarehouseId: warehouseId, Items: items, QuantityReceieved: 0 })
 }
 
+/**
+ * The verdict the code reached BEFORE round 5: "the line sets differ, so this is somebody else's ASN".
+ * Asserting it keeps the round-5 tests honest — each one first shows the row really does look foreign to a
+ * line-identity comparison, so the refusal is doing work rather than restating a match that already held.
+ */
+function hasNoLineIdentityMatch(asn: WmsAsnRef): boolean {
+  const items = asn.raw?.Items
+  const remoteItemCount = Array.isArray(items) ? items.length : asn.lines.length
+  if (remoteItemCount !== RESERVATION.lines.length) return true
+  const bySourceId = new Set(asn.lines.map((line) => line.sourceLineId))
+  return !RESERVATION.lines.every((line) => bySourceId.has(line.sourceLineId))
+}
+
 const RESERVATION: MintsoftAsnRecoveryCriteria = {
   reference: 'PO-1',
   externalWarehouseId: '6',
-  correlatedCallbackUrl: null,
   lines: [{ sourceLineId: 'line-a', expectedQty: 10 }, { sourceLineId: 'line-b', expectedQty: 2.5 }],
 }
 const MATCHING_ITEMS: Item[] = [{ ID: 1, SourceLineId: 'line-a', QuantityExpected: 10 }, { ID: 2, SourceLineId: 'line-b', QuantityExpected: 2.5 }]
@@ -68,16 +82,66 @@ test('a different line count, a missing SourceLineId or a quantity rounding cann
 })
 
 test('an item Mintsoft returned but the normalizer could not read STILL COUNTS (review L-a)', () => {
-  // normalizeMintsoftAsnListRowForRecovery drops an item without a usable string SourceLineId — most of
+  // normalizeMintsoftAsnListRowForRecovery drops an item whose SourceLineId cannot be one of ours — most of
   // this tenant's ASNs come from another integration and carry none — so counting the NORMALIZED lines
-  // made an ASN with an extra item look like "exactly our two lines" and adopted it. The raw Items array
-  // is the count, so an ASN carrying a third item is not ours, whatever shape that item is in.
-  const withUnreadableExtra = row(535, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 3, QuantityExpected: 1 }])
-  assert.equal(withUnreadableExtra.lines.length, 2, 'precondition: the normalizer really does drop that item')
-  assert.equal((withUnreadableExtra.raw?.Items as unknown[]).length, 3, 'precondition: and Mintsoft really did return three')
-  assert.equal(findRecoverableMintsoftAsn([withUnreadableExtra], RESERVATION), null, 'an item with no SourceLineId')
-  assert.equal(findRecoverableMintsoftAsn([row(536, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 4, SourceLineId: 77, QuantityExpected: 1 }])], RESERVATION), null, 'a numeric SourceLineId')
-  assert.equal(findRecoverableMintsoftAsn([row(537, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 5, SourceLineId: '   ', QuantityExpected: 1 }])], RESERVATION), null, 'a blank one')
+  // made an ASN with an extra item look like "exactly our two lines" and adopted it. The raw Items array is
+  // the count, so an ASN carrying a third item is not ours. ROUND 5 SPLITS THIS CASE (Codex HIGH 2): a
+  // DETERMINATE foreign identity (a numeric SourceLineId, which an IMS cuid can never be) still means "not
+  // ours"; one that cannot be READ at all is refused instead, by the test below.
+  const withForeignExtra = row(536, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 4, SourceLineId: 77, QuantityExpected: 1 }])
+  assert.equal(withForeignExtra.lines.length, 2, 'precondition: the normalizer really does drop that item')
+  assert.equal((withForeignExtra.raw?.Items as unknown[]).length, 3, 'precondition: and Mintsoft really did return three')
+  assert.equal(findRecoverableMintsoftAsn([withForeignExtra], RESERVATION), null, 'a numeric SourceLineId is another integration\u2019s')
+  // The same, on a row for ANOTHER reference: an unreadable item there is not our concern at all.
+  assert.equal(findRecoverableMintsoftAsn([row(538, 'PO-9', 6, [...MATCHING_ITEMS, { ID: 5, QuantityExpected: 1 }])], RESERVATION), null)
+})
+
+/**
+ * ROUND 5, CODEX HIGH 2: AN UNREADABLE LINE IDENTITY IS NOT PERMISSION TO CREATE A DUPLICATE.
+ *
+ * The shape that matters is the FIRST case: our own ASN, our reference, our two items, but one item's
+ * SourceLineId comes back degraded. The normalizer drops it, hasSameLineIdentity no longer finds line-b,
+ * the row reads as somebody else's, findRecoverableMintsoftAsn returns null — and the creator pushes a
+ * SECOND ASN at a live warehouse for lines the first one already covers. It is refused by name instead.
+ */
+test('a row carrying OUR reference whose line identity cannot be read is UNRESOLVED, never a licence to create (round 5, Codex HIGH 2)', () => {
+  for (const [label, degraded] of [
+    ['absent', { ID: 2, QuantityExpected: 2.5 }],
+    ['null', { ID: 2, SourceLineId: null, QuantityExpected: 2.5 }],
+    ['blank', { ID: 2, SourceLineId: '   ', QuantityExpected: 2.5 }],
+    ['not an object', 'line-b'],
+  ] as const) {
+    const ours = row(590, 'PO-1', 6, [MATCHING_ITEMS[0]!, degraded as never])
+    assert.equal(ours.lines.length, 1, `precondition (${label}): the degraded item really is dropped`)
+    assert.equal((ours.raw?.Items as unknown[]).length, 2, `precondition (${label}): Mintsoft still returned two`)
+    assert.equal(hasNoLineIdentityMatch(ours), true, `precondition (${label}): the old code called this somebody else's ASN`)
+    assert.throws(
+      () => findRecoverableMintsoftAsn([ours], RESERVATION),
+      (error: unknown) => error instanceof MintsoftAsnRecoveryLineIdentityUnreadableError
+        && /ASN 590/.test(error.message) && /PO-1/.test(error.message),
+      `a ${label} SourceLineId`,
+    )
+  }
+
+  // An EXTRA item we cannot read, on a row with our reference, is the same refusal: the row cannot be
+  // excluded, so it cannot be answered with "create another one" either.
+  assert.throws(
+    () => findRecoverableMintsoftAsn([row(591, 'PO-1', 6, [...MATCHING_ITEMS, { ID: 3, QuantityExpected: 1 }])], RESERVATION),
+    (error: unknown) => error instanceof MintsoftAsnRecoveryLineIdentityUnreadableError && /ASN 591/.test(error.message),
+  )
+
+  // Several such rows: all named, in sorted order, so which one the refusal blames does not depend on the
+  // list's order across pages (review M-b).
+  const rows = [row(593, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, QuantityExpected: 2.5 }]), row(592, 'PO-1', 6, [{ ID: 1, QuantityExpected: 10 }, MATCHING_ITEMS[1]!])]
+  for (const order of [rows, [...rows].reverse()]) {
+    assert.throws(
+      () => findRecoverableMintsoftAsn(order, RESERVATION),
+      (error: unknown) => error instanceof MintsoftAsnRecoveryLineIdentityUnreadableError && /ASNs 592, 593/.test(error.message),
+    )
+  }
+
+  // And it does not swallow the ordinary path: every item readable still recovers the ASN.
+  assert.equal(findRecoverableMintsoftAsn([row(594, 'PO-1', 6, MATCHING_ITEMS)], RESERVATION)?.externalAsnId, '594')
 })
 
 test('TWO ASNs that both match are refused, in EITHER order the list returns them (review M-b)', () => {
@@ -184,8 +248,9 @@ test('an item carrying OUR source line id but no item ID of its own is refused b
       `item ID ${label}`,
     )
   }
-  // An item with no SourceLineId at all is still DROPPED and still COUNTED (review L-a): it is not ours.
-  const notOurs = row(584, 'PO-1', 6, [...MATCHING_ITEMS, { QuantityExpected: 1 }])
+  // An item with a DETERMINATE foreign SourceLineId is still DROPPED and still COUNTED (review L-a): it is
+  // not ours, and it is not unreadable either. (One that cannot be read at all is refused — round 5.)
+  const notOurs = row(584, 'PO-1', 6, [...MATCHING_ITEMS, { SourceLineId: 4242, QuantityExpected: 1 }])
   assert.equal(notOurs.lines.length, 2)
   assert.equal((notOurs.raw?.Items as unknown[]).length, 3)
 })

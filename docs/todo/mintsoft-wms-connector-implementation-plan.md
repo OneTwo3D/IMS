@@ -754,7 +754,7 @@ Phases 0–2 are the near-term target; Phases 3–7 are already sketched in `doc
 - `GET /api/Warehouse` → warehouse list
 - `POST /api/Product` and `PUT /api/Product/{id}` → product upsert; **confirm whether Mintsoft accepts the full customs/dimensions/image payload in one call and confirm barcode field name (`EAN`, `Barcode`, or other)**.
 - `GET /api/Product/StockLevels?warehouseId=...` → stock feed
-- `POST /api/ASN` + callback registration
+- `PUT /api/ASN` (there is no `POST /api/ASN`) — and **no callback registration exists**: Mintsoft has no `CallbackUrl` field anywhere in its API (o3d-vcw8, settled 2026-09-24; see `docs/mintsoft.md`)
 - `GET /api/Returns` polling
 - outbound shipment / status payloads — **confirm which order identity Mintsoft emits back** (`externalOrderNumber`, storefront order number, IMS order number, or another stable field). This determines how `orderLookupConnector` is validated in Phase 1.
 - Bundle API (or confirm there is no public bundle CRUD — gates Phase 4 scope)

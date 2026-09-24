@@ -9,14 +9,16 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
  * second. Pure, so the decision can be tested on rows rather than on source text — the two creators
  * used to carry a copy of it each as a closure.
  *
- * THE MATCH, in the order it is decided:
- *   1. an ASN whose CallbackUrl is the reservation's correlated callback URL (the strongest evidence —
- *      Mintsoft's ASN model carries no CallbackUrl today, so this is inert until o3d-vcw8 settles how
- *      correlation travels);
- *   2. otherwise, every ASN whose reference EQUALS the reservation's (trimmed; `POReference` is where
- *      Mintsoft stores it — a prefix or a substring is not a match, so `PO-1` never claims `PO-10`),
- *      carrying EXACTLY as many items as the reservation has lines, with each reservation line present
- *      by `SourceLineId`.
+ * THE MATCH: every ASN whose reference EQUALS the reservation's (trimmed; `POReference` is where Mintsoft
+ * stores it — a prefix or a substring is not a match, so `PO-1` never claims `PO-10`), carrying EXACTLY as
+ * many items as the reservation has lines, with each reservation line present by `SourceLineId`.
+ *
+ * THERE IS NO CALLBACK-URL MATCH ANY MORE (round 5, o3d-vcw8). Rounds 2–4 tried the reservation's
+ * correlated callback URL first, "the strongest evidence there is". It was never evidence of anything: the
+ * string "Callback" appears ZERO times in the entire Mintsoft API document, so no ASN can carry a
+ * CallbackUrl and that branch could only ever match nothing. It is removed rather than left inert, because
+ * an inert first branch reads as a correlation channel this integration has, and it has none. `POReference`
+ * plus `Items[].SourceLineId` IS the correlation — both proven to round-trip verbatim on 2026-09-24.
  *
  * MORE THAN ONE CANDIDATE IS A REFUSAL, NOT A CHOICE (round 3, review M-b). Round 2 said "the most
  * recently created wins" and sorted on a `CreatedAt` that live ASN rows do not have (the swagger's ASN
@@ -52,6 +54,17 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
  * creation for that reservation until someone looks at the ASN in Mintsoft — deliberately, because the
  * alternative is a second inbound ASN nobody asked for.
  *
+ * A LINE IDENTITY THAT CANNOT BE READ IS ALSO UNRESOLVED, ON ANY ROW CARRYING OUR REFERENCE (round 5,
+ * Codex HIGH 2). The list normalizer DROPS an item whose `SourceLineId` it cannot use. For a row that
+ * carries the reservation's `POReference`, dropping is the same fail-open the quantity case was: our own
+ * ASN comes back with one item's `SourceLineId` degraded, `hasSameLineIdentity` no longer finds that line,
+ * the row is read as somebody else's, and the creator pushes a SECOND ASN for lines this one already
+ * covers. So every row carrying our reference is checked BEFORE the line sets are compared, and an item
+ * whose identity is unreadable — not an object, or `SourceLineId` absent, null or blank — makes the whole
+ * decision UNRESOLVED: refused by name, nothing adopted and nothing created. A DETERMINATE identity that
+ * simply is not ours (a number, where every IMS source line id is a cuid string Mintsoft returns verbatim)
+ * is NOT unreadable: it is another integration's item, it is dropped and it still counts (review L-a).
+ *
  * AND THE WAREHOUSE IS CHECKED AFTER THE MATCH, NOT BEFORE IT (review M3). The list is read across the
  * whole tenant, so an ASN created by an earlier attempt while the product's binding pointed at another
  * warehouse is still found. Finding it there is not a licence to adopt it — the reservation is for the
@@ -65,8 +78,48 @@ export type MintsoftAsnRecoveryCriteria = {
   reference: string
   /** Mintsoft's warehouse ID the reservation is for. */
   externalWarehouseId: string
-  correlatedCallbackUrl: string | null
   lines: ReadonlyArray<{ sourceLineId: string; expectedQty: number }>
+}
+
+/**
+ * WHAT ONE `ASNItem`'S LINE IDENTITY IS, AND WHETHER IT CAN BE READ AT ALL — the single rule, used BOTH by
+ * the list normalizer (which keeps `identified` items and drops the rest) and by the refusal below (which
+ * treats `unreadable` on a row carrying our reference as "cannot be told apart from ours"). One function on
+ * purpose: two copies of this rule would drift, and the drift would make the refusal vacuous.
+ *
+ * `foreign` is a DETERMINATE identity that cannot be one of ours. Every IMS source line id is a cuid — a
+ * non-numeric string — and Mintsoft returns `SourceLineId` verbatim (proven live 2026-09-24, ASN 6117), so
+ * a numeric `SourceLineId` belongs to another integration and says so definitively. Everything that is not
+ * a usable string and not a finite number says nothing at all, and is `unreadable`.
+ */
+export type MintsoftAsnItemLineIdentity =
+  | { kind: 'identified'; sourceLineId: string }
+  | { kind: 'foreign' }
+  | { kind: 'unreadable' }
+
+export function readMintsoftAsnItemLineIdentity(item: unknown): MintsoftAsnItemLineIdentity {
+  const record = item && typeof item === 'object' && !Array.isArray(item) ? item as Record<string, unknown> : null
+  if (!record) return { kind: 'unreadable' }
+  const value = record.SourceLineId
+  if (typeof value === 'string') {
+    return value.trim() ? { kind: 'identified', sourceLineId: value.trim() } : { kind: 'unreadable' }
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) return { kind: 'foreign' }
+  return { kind: 'unreadable' }
+}
+
+export class MintsoftAsnRecoveryLineIdentityUnreadableError extends Error {
+  constructor(externalAsnIds: readonly string[], reference: string) {
+    super(
+      `Mintsoft ASN${externalAsnIds.length > 1 ? 's' : ''} ${externalAsnIds.join(', ')} carr${externalAsnIds.length > 1 ? 'y' : 'ies'} `
+      + `reference ${reference}, but came back with an item whose SourceLineId cannot be read (absent, null or `
+      + 'blank). An ASN whose line identity cannot be read cannot be told apart from the one an earlier '
+      + 'attempt created for these lines, so this is refused rather than answered with "no such ASN exists". '
+      + 'Nothing was created and NO ASN WILL BE CREATED for this reservation until the items read back with '
+      + 'their SourceLineIds: check the ASN in Mintsoft, then retry.',
+    )
+    this.name = 'MintsoftAsnRecoveryLineIdentityUnreadableError'
+  }
 }
 
 export class MintsoftAsnRecoveryWarehouseMismatchError extends Error {
@@ -209,16 +262,32 @@ function theOnlyOne(candidates: readonly WmsAsnRef[], reference: string): WmsAsn
   return candidates[0] ?? null
 }
 
+/**
+ * Every row carrying our reference whose items we cannot all key. Named in SORTED order, so which ASN the
+ * refusal names does not depend on the list's order (which is not stable across pages — review M-b).
+ */
+function unreadableLineIdentityAsnIds(sameReference: readonly WmsAsnRef[]): string[] {
+  return sameReference
+    .filter((asn) => {
+      const items = asn.raw?.Items
+      if (!Array.isArray(items)) return false
+      return items.some((item) => readMintsoftAsnItemLineIdentity(item).kind === 'unreadable')
+    })
+    .map((asn) => asn.externalAsnId)
+    .sort()
+}
+
 export function findRecoverableMintsoftAsn(asns: readonly WmsAsnRef[], criteria: MintsoftAsnRecoveryCriteria): WmsAsnRef | null {
   const reference = criteria.reference.trim()
-  // The correlated callback URL is the strongest evidence there is — it is OURS, on that ASN — so it is
-  // adopted on its own terms, without re-judging lines it was never matched on.
-  const correlated = criteria.correlatedCallbackUrl
-    ? theOnlyOne(asns.filter((asn) => rawString(asn.raw, ['CallbackUrl', 'callbackUrl']) === criteria.correlatedCallbackUrl), reference)
-    : null
-  if (correlated) return atTheRightWarehouse(correlated, criteria)
+  const sameReference = asns.filter((asn) => rawString(asn.raw, ['POReference', 'Reference', 'reference']) === reference)
+  // BEFORE the line sets are compared, because a row we cannot key is a row we cannot EXCLUDE (round 5,
+  // Codex HIGH 2). Comparing first would let the missing line read as "a different ASN" and create a second.
+  const unreadable = unreadableLineIdentityAsnIds(sameReference)
+  if (unreadable.length > 0) {
+    throw new MintsoftAsnRecoveryLineIdentityUnreadableError(unreadable, reference)
+  }
   const match = theOnlyOne(
-    asns.filter((asn) => rawString(asn.raw, ['POReference', 'Reference', 'reference']) === reference && hasSameLineIdentity(asn, criteria)),
+    sameReference.filter((asn) => hasSameLineIdentity(asn, criteria)),
     reference,
   )
   if (!match) return null

@@ -2668,6 +2668,16 @@ export async function createMintsoftPurchaseOrderAsn(
     etaIso = parsedEta.toISOString()
   }
 
+  // THE CALLBACK URL IS NOT SENT ON THE ASN, AND NEVER WAS (o3d-vcw8, round 5). Mintsoft's API has no
+  // CallbackUrl or AutoCallback field anywhere — the string "Callback" occurs zero times in its whole
+  // document — so the booked-in callback is configured tenant-side in Mintsoft, not registered per ASN.
+  // What this flag still governs is real: the webhook route verifies an HMAC with mintsoft_webhook_secret
+  // and needs the public app URL to be reachable, so both must be set before an operator is told booked-in
+  // callbacks are on; and the URL is recorded on the activity entry so it can be pasted into Mintsoft.
+  // Correlation of a booked-in event is by externalAsnId in the payload, or by the ASN reference and the
+  // item source line ids, read back over the sweep — never by a per-ASN URL. (No reference matching lives
+  // in this action: it is all in findRecoverableMintsoftAsn, which the structural pin in
+  // tests/mintsoft-asn-list-lookup.test.ts checks by counting reference-field names that appear here.)
   const autoCallback = data.autoCallback ?? true
   const [publicAppUrl, settings] = await Promise.all([
     getPublicAppUrl(),
@@ -2730,8 +2740,6 @@ export async function createMintsoftPurchaseOrderAsn(
       eta: string | null
       packagingType: WmsAsnPackagingType | null
       packageCount: number | null
-      autoCallback: boolean
-      callbackUrl: string | null
       lines: ReservedAsnLine[]
     }
 
@@ -2749,14 +2757,6 @@ export async function createMintsoftPurchaseOrderAsn(
 
   function buildPendingExternalAsnId(): string {
     return `${pendingAsnPrefix}${Date.now()}`
-  }
-
-  function buildCorrelatedAsnCallbackUrl(baseCallbackUrl: string | null, asnMapId: string): string | null {
-    if (!baseCallbackUrl) return null
-
-    const url = new URL(baseCallbackUrl)
-    url.searchParams.set('imsAsnMapId', asnMapId)
-    return url.toString()
   }
 
   function mapCreatedMintsoftAsnLines(lines: ReservedAsnLine[], externalAsnId: string, createdAsn: {
@@ -3076,8 +3076,6 @@ export async function createMintsoftPurchaseOrderAsn(
           eta: etaIso,
           packagingType: data.packagingType ?? null,
           packageCount: data.packageCount ?? null,
-          autoCallback,
-          callbackUrl,
           lines: pendingLines,
         } satisfies AsnReservation
       }
@@ -3139,8 +3137,6 @@ export async function createMintsoftPurchaseOrderAsn(
         eta: etaIso,
         packagingType: data.packagingType ?? null,
         packageCount: data.packageCount ?? null,
-        autoCallback,
-        callbackUrl,
         lines: asnMap.lines.map((line, index) => ({
           asnLineMapId: line.id,
           sourceLineId: line.sourceLineId,
@@ -3210,7 +3206,6 @@ export async function createMintsoftPurchaseOrderAsn(
     return findRecoverableMintsoftAsn(remoteAsns, {
       reference: reservation.reference,
       externalWarehouseId: reservation.externalWarehouseId,
-      correlatedCallbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
       lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.expectedQty })),
     })
   }
@@ -3373,13 +3368,11 @@ export async function createMintsoftPurchaseOrderAsn(
         const createdAsn = await connector.createAsn({
           externalWarehouseId: reservation.externalWarehouseId,
           reference: reservation.reference,
-          callbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
           supplierReference: reservation.supplierReference,
           carrier: reservation.carrier,
           eta: reservation.eta,
           packagingType: reservation.packagingType,
           packageCount: reservation.packageCount,
-          autoCallback: reservation.autoCallback,
           lines: reservation.lines.map((line) => ({
             sourceLineId: line.sourceLineId,
             externalProductId: line.externalProductId,
@@ -3551,6 +3544,16 @@ export async function createMintsoftTransferAsn(
     etaIso = parsedEta.toISOString()
   }
 
+  // THE CALLBACK URL IS NOT SENT ON THE ASN, AND NEVER WAS (o3d-vcw8, round 5). Mintsoft's API has no
+  // CallbackUrl or AutoCallback field anywhere — the string "Callback" occurs zero times in its whole
+  // document — so the booked-in callback is configured tenant-side in Mintsoft, not registered per ASN.
+  // What this flag still governs is real: the webhook route verifies an HMAC with mintsoft_webhook_secret
+  // and needs the public app URL to be reachable, so both must be set before an operator is told booked-in
+  // callbacks are on; and the URL is recorded on the activity entry so it can be pasted into Mintsoft.
+  // Correlation of a booked-in event is by externalAsnId in the payload, or by the ASN reference and the
+  // item source line ids, read back over the sweep — never by a per-ASN URL. (No reference matching lives
+  // in this action: it is all in findRecoverableMintsoftAsn, which the structural pin in
+  // tests/mintsoft-asn-list-lookup.test.ts checks by counting reference-field names that appear here.)
   const autoCallback = data.autoCallback ?? true
   const [publicAppUrl, settings] = await Promise.all([
     getPublicAppUrl(),
@@ -3620,8 +3623,6 @@ export async function createMintsoftTransferAsn(
       eta: string | null
       packagingType: WmsAsnPackagingType | null
       packageCount: number | null
-      autoCallback: boolean
-      callbackUrl: string | null
       lines: ReservedAsnLine[]
     }
 
@@ -3650,14 +3651,6 @@ export async function createMintsoftTransferAsn(
    */
   function buildPendingExternalAsnId(): string {
     return `${pendingAsnPrefix}${Date.now()}-${randomUUID().slice(0, 8)}`
-  }
-
-  function buildCorrelatedAsnCallbackUrl(baseCallbackUrl: string | null, asnMapId: string): string | null {
-    if (!baseCallbackUrl) return null
-
-    const url = new URL(baseCallbackUrl)
-    url.searchParams.set('imsAsnMapId', asnMapId)
-    return url.toString()
   }
 
   function mapCreatedMintsoftAsnLines(lines: ReservedAsnLine[], externalAsnId: string, createdAsn: {
@@ -4116,8 +4109,6 @@ export async function createMintsoftTransferAsn(
           eta: etaIso,
           packagingType: data.packagingType ?? null,
           packageCount: data.packageCount ?? null,
-          autoCallback,
-          callbackUrl,
           lines: pendingLines,
         } satisfies AsnReservation
       }
@@ -4181,8 +4172,6 @@ export async function createMintsoftTransferAsn(
         eta: etaIso,
         packagingType: data.packagingType ?? null,
         packageCount: data.packageCount ?? null,
-        autoCallback,
-        callbackUrl,
         // Paired by `sourceLineId`, not by array index: the rows come back ordered by
         // cuid while the outstanding lines are in transfer-line order, so the index
         // pairing was only ever right by accident (o3d-zzgp round 2). The branded
@@ -4273,7 +4262,6 @@ export async function createMintsoftTransferAsn(
     return findRecoverableMintsoftAsn(remoteAsns, {
       reference: reservation.reference,
       externalWarehouseId: reservation.externalWarehouseId,
-      correlatedCallbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
       // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-zzgp: the branded
       // outstanding reading becomes a plain number here, and only here).
       lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
@@ -4478,13 +4466,11 @@ export async function createMintsoftTransferAsn(
         const createdAsn = await connector.createAsn({
           externalWarehouseId: reservation.externalWarehouseId,
           reference: reservation.reference,
-          callbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
           supplierReference: reservation.supplierReference,
           carrier: reservation.carrier,
           eta: reservation.eta,
           packagingType: reservation.packagingType,
           packageCount: reservation.packageCount,
-          autoCallback: reservation.autoCallback,
           lines: reservation.lines.map((line) => ({
             sourceLineId: line.sourceLineId,
             externalProductId: line.externalProductId,

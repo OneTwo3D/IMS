@@ -54,18 +54,47 @@ type FakeMintsoftAsnLine = {
   quantity: number
 }
 
+/**
+ * o3d-vcw8: the fake holds an ASN the way Mintsoft does — `POReference`, `GoodsInType`, a header `Quantity`
+ * that is a PACKAGE COUNT, `SupplierNotes`, and items keyed by `SourceLineId`. There is no callback field
+ * of any kind, because Mintsoft has none.
+ */
 type FakeMintsoftAsn = {
   id: string
   warehouseId: string | null
   reference: string | null
-  supplierReference: string | null
-  carrier: string | null
-  eta: string | null
-  callbackUrl: string | null
-  autoCallback: boolean
+  supplierNotes: string | null
+  estimatedDelivery: string | null
+  goodsInType: string
+  /** The header package count, NOT a quantity of goods. */
+  quantity: number
+  statusId: number
   status: string
   createdAt: string
   lines: FakeMintsoftAsnLine[]
+}
+
+/** `GET /api/ASN/GoodsInTypes`, read live 2026-09-24. `NewASN.GoodsInType` must be one of these. */
+const FAKE_MINTSOFT_GOODS_IN_TYPES = [
+  'TwentyFtContainer',
+  'FortyFtContainer',
+  'Pallet',
+  'Carton',
+  'FortyFtContainerHC',
+  'FortyFiveFtContainer',
+  'FortyFiveFtContainerHC',
+]
+
+/** Mintsoft answers EVERY create failure with HTTP 200 and a `ToolkitResult` carrying the verdict. */
+function fakeMintsoftToolkitResult(id: number, success: boolean, message: string): NextResponse {
+  return NextResponse.json({
+    ID: id,
+    Success: success,
+    SensitiveData: null,
+    Message: message,
+    WarningMessage: null,
+    AllocatedFromReplen: false,
+  })
 }
 
 type FakeMintsoftState = {
@@ -238,12 +267,12 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
         id,
         warehouseId: asString(asn?.warehouseId),
         reference: asString(asn?.reference),
-        supplierReference: asString(asn?.supplierReference),
-        carrier: asString(asn?.carrier),
-        eta: asString(asn?.eta),
-        callbackUrl: asString(asn?.callbackUrl),
-        autoCallback: asBoolean(asn?.autoCallback, true),
-        status: asString(asn?.status) ?? 'OPEN',
+        supplierNotes: asString(asn?.supplierNotes),
+        estimatedDelivery: asString(asn?.estimatedDelivery),
+        goodsInType: asString(asn?.goodsInType) ?? 'Carton',
+        quantity: asNumber(asn?.quantity, 1),
+        statusId: asNumber(asn?.statusId, 1),
+        status: asString(asn?.status) ?? 'NEW',
         createdAt: asString(asn?.createdAt) ?? new Date().toISOString(),
         lines,
       } satisfies FakeMintsoftAsn
@@ -283,25 +312,44 @@ function mapMintsoftProductResponse(product: FakeMintsoftProduct) {
   }
 }
 
+/**
+ * `GET /api/ASN/{id}`, in the LIVE `ASN`/`ASNItem` shape (o3d-vcw8, captured from ASN 6117 on 2026-09-24).
+ * It used to answer with an invented `AsnId`/`Reference`/`Status`/`Lines` shape that agreed with the
+ * equally invented client — which is precisely how a create contract that cannot work passed every e2e run.
+ * `ASNStatus` is an OBJECT and carries NO ExternalName (that trick is order-only), quantities are
+ * `QuantityExpected`/`QuantityReceieved` (Mintsoft's spelling)/`QuantityBooked`/`OnOrder`.
+ */
 function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
+  const asnId = /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id
   return {
-    AsnId: /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id,
-    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
-    Reference: asn.reference,
-    SupplierReference: asn.supplierReference,
-    Carrier: asn.carrier,
-    ETA: asn.eta,
-    CallbackUrl: asn.callbackUrl,
-    AutoCallback: asn.autoCallback,
-    Status: asn.status,
-    CreatedAt: asn.createdAt,
-    Lines: asn.lines.map((line) => ({
-      AsnLineId: line.id,
-      SourceLineId: line.sourceLineId,
+    CLIENTSHORTNAME: 'E2E Fake Client',
+    POReference: asn.reference,
+    Supplier: null,
+    SupplierNotes: asn.supplierNotes,
+    EstimatedDelivery: asn.estimatedDelivery,
+    Comments: null,
+    GoodsInType: asn.goodsInType,
+    Quantity: asn.quantity,
+    ASNStatus: { Name: asn.status, Colour: 'purple', TextColour: null, ID: asn.statusId },
+    ASNStatusId: asn.statusId,
+    Shipped: false,
+    Items: asn.lines.map((line) => ({
+      ASNId: asnId,
       ProductId: line.productId && /^\d+$/.test(line.productId) ? Number(line.productId) : line.productId,
+      QuantityExpected: line.quantity,
+      QuantityReceieved: 0,
+      QuantityBooked: 0,
+      OnOrder: 0,
+      SSCCNumber: null,
+      Complete: false,
+      SourceLineId: line.sourceLineId,
       SKU: line.sku,
-      Quantity: line.quantity,
+      ID: line.id,
     })),
+    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
+    ClientId: 89,
+    ID: asnId,
+    LastUpdated: asn.createdAt,
   }
 }
 
@@ -607,57 +655,11 @@ export async function POST(
     return NextResponse.json(mapMintsoftProductResponse(updated))
   }
 
+  // o3d-vcw8: there is NO `POST /api/ASN` in Mintsoft. The create is `PUT /api/ASN` (below) and
+  // `POST /api/ASN/{id}` is the UPDATE route. The fake used to implement this invented POST, which is how a
+  // client that could never create an ASN passed e2e; it answers the way a write-only path does instead.
   if (path === 'api/ASN') {
-    if (!isAuthorized(request, state)) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const body = await request.json().catch(() => null) as Record<string, unknown> | null
-    const warehouseId = asString(body?.WarehouseId ?? body?.warehouseId)
-    const reference = asString(body?.Reference ?? body?.reference)
-    const lines = asArray(body?.Lines ?? body?.lines)
-      .map((line, index) => {
-        const recordLine = line && typeof line === 'object' && !Array.isArray(line)
-          ? line as Record<string, unknown>
-          : null
-        const sourceLineId = asString(recordLine?.SourceLineId ?? recordLine?.sourceLineId)
-        if (!sourceLineId) return null
-
-        return {
-          id: `${Date.now()}-${index + 1}`,
-          sourceLineId,
-          productId: asString(recordLine?.ProductId ?? recordLine?.productId),
-          sku: asString(recordLine?.SKU ?? recordLine?.sku),
-          quantity: asNumber(recordLine?.Quantity ?? recordLine?.quantity, 0),
-        } satisfies FakeMintsoftAsnLine
-      })
-      .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
-
-    if (!warehouseId || !reference || lines.length === 0) {
-      return NextResponse.json({ error: 'WarehouseId, Reference, and at least one line are required' }, { status: 400 })
-    }
-
-    const asnId = buildNextNumericId(state.asns.map((asn) => asn.id))
-    const asn: FakeMintsoftAsn = {
-      id: asnId,
-      warehouseId,
-      reference,
-      supplierReference: asString(body?.SupplierReference ?? body?.supplierReference),
-      carrier: asString(body?.Carrier ?? body?.carrier),
-      eta: asString(body?.ETA ?? body?.eta),
-      callbackUrl: asString(body?.CallbackUrl ?? body?.callbackUrl),
-      autoCallback: asBoolean(body?.AutoCallback ?? body?.autoCallback, true),
-      status: 'OPEN',
-      createdAt: new Date().toISOString(),
-      lines: lines.map((line, index) => ({
-        ...line,
-        id: `${asnId}-${index + 1}`,
-      })),
-    }
-
-    state.asns.push(asn)
-    await persistFakeMintsoftState(state)
-    return NextResponse.json(mapMintsoftAsnResponse(asn))
+    return NextResponse.json({ Message: "The requested resource does not support http method 'POST'." }, { status: 405 })
   }
 
   return NextResponse.json({ error: 'Not found' }, { status: 404 })
@@ -677,6 +679,74 @@ export async function PUT(
 
   const { slug } = await context.params
   const path = slug.join('/')
+
+  // `PUT /api/ASN` IS THE ASN CREATE, and every failure of it is an HTTP 200 carrying a ToolkitResult with
+  // Success: false (o3d-vcw8, three live attempts on 2026-09-24). The fake reproduces that exactly —
+  // including the two rejections the live probe collected — so a client that trusts the status code, omits
+  // GoodsInType or sends ClientId fails here rather than at a live warehouse.
+  if (path === 'api/ASN') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null
+    if (body != null && Object.prototype.hasOwnProperty.call(body, 'ClientId')) {
+      return fakeMintsoftToolkitResult(0, false, 'Client Users cannot specify a ClientId when creating an ASN!')
+    }
+
+    const goodsInType = asString(body?.GoodsInType)
+    if (!goodsInType || !FAKE_MINTSOFT_GOODS_IN_TYPES.includes(goodsInType)) {
+      return fakeMintsoftToolkitResult(0, false, 'Invalid GoodsInType:  See ASN/GoodsInTypes for valid types')
+    }
+
+    const warehouseId = asString(body?.WarehouseId)
+    const reference = asString(body?.POReference)
+    const lines = asArray(body?.Items)
+      .map((line, index) => {
+        const recordLine = line && typeof line === 'object' && !Array.isArray(line)
+          ? line as Record<string, unknown>
+          : null
+        const sourceLineId = asString(recordLine?.SourceLineId)
+        if (!sourceLineId) return null
+
+        return {
+          id: `${Date.now()}-${index + 1}`,
+          sourceLineId,
+          productId: asString(recordLine?.ProductId),
+          sku: asString(recordLine?.SKU),
+          quantity: asNumber(recordLine?.Quantity, 0),
+        } satisfies FakeMintsoftAsnLine
+      })
+      .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
+
+    if (!warehouseId || !reference || lines.length === 0) {
+      // The generic Success-false-with-HTTP-200 case: a body Mintsoft's validation rejects before any row
+      // is written (proven live: a rejected create leaves the tenant's ASN id set byte-identical).
+      return fakeMintsoftToolkitResult(0, false, 'ASN could not be created: WarehouseId, POReference and at least one item are required')
+    }
+
+    const asnId = buildNextNumericId(state.asns.map((asn) => asn.id))
+    const asn: FakeMintsoftAsn = {
+      id: asnId,
+      warehouseId,
+      reference,
+      supplierNotes: asString(body?.SupplierNotes),
+      estimatedDelivery: asString(body?.EstimatedDelivery),
+      goodsInType,
+      quantity: asNumber(body?.Quantity, 1),
+      statusId: 1,
+      status: 'NEW',
+      createdAt: new Date().toISOString(),
+      lines: lines.map((line, index) => ({
+        ...line,
+        id: `${asnId}-${index + 1}`,
+      })),
+    }
+
+    state.asns.push(asn)
+    await persistFakeMintsoftState(state)
+    return fakeMintsoftToolkitResult(Number(asnId), true, 'ASN Successfully created. Please note the ID for future reference.')
+  }
 
   if (path !== 'api/Product') {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })

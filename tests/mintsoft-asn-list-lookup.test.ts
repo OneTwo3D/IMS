@@ -291,7 +291,7 @@ test('a rebind between a lost attempt and the retry still finds the earlier ASN,
   const { findRecoverableMintsoftAsn } = await import('@/lib/connectors/mintsoft/api/asn-recovery')
   const asns = await fetchMintsoftAsnsForDuplicateRecovery()
   assert.throws(
-    () => findRecoverableMintsoftAsn(asns, { reference: 'PO-TARGET', externalWarehouseId: '6', correlatedCallbackUrl: null, lines: [{ sourceLineId: 'line-9999', expectedQty: 4 }] }),
+    () => findRecoverableMintsoftAsn(asns, { reference: 'PO-TARGET', externalWarehouseId: '6', lines: [{ sourceLineId: 'line-9999', expectedQty: 4 }] }),
     (error: unknown) => error instanceof Error && error.name === 'MintsoftAsnRecoveryWarehouseMismatchError' && /ASN 9999/.test(error.message),
   )
 })
