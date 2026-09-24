@@ -202,6 +202,11 @@ If a freight PO is added or updated after goods have already been received, the 
   - When you save a **freight PO**, the save itself fails with that reason, and your edit is not kept.
   - When you edit **additional costs on a goods PO**, the cost lines are saved but the recalculation is refused, as with
     any failed recalculation there. Correct or remove the credit line and save again.
+  - When you **cancel a freight PO**, the cancellation fails and the PO stays active. Cancelling it takes its own
+    uplift off the cost layer while a credit on another PO stays behind, which is what pushes the cost below zero — so
+    the line to correct is on that *other* purchase order, and the message names it. Correct it, then cancel again.
+  - When you **recompute a production order**, the recompute fails. A production order cannot carry a negative cost
+    line, so the negative cost comes from a component's purchase order: correct the credit there, then recompute.
 
 Each landed-cost adjustment carries the `freightPoId` of the triggering freight PO. This means adjustments from different freight POs against the same primary PO are kept as separate journals — finance can attribute deltas to the right invoice source.
 

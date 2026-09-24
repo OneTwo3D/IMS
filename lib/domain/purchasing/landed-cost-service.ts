@@ -950,6 +950,10 @@ export async function recalculateLandedCosts(
         subtotalBase: true,
         directFreightBase: true,
         lines: {
+          // o3d-c08y r2: ordered for the same reason as the direct recalc — the refusal fires on the
+          // first layer that would take a journaled shipment negative, so the walk order is observable
+          // and must not be Postgres' choice.
+          orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
           select: {
             id: true,
             qty: true,
@@ -958,6 +962,7 @@ export async function recalculateLandedCosts(
             totalBase: true,
             product: { select: { weight: true } },
             costLayers: {
+              orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
               select: {
                 id: true,
                 unitCostBase: true,
@@ -997,6 +1002,10 @@ export async function recalculateLandedCosts(
     // o3d-c08y: what a refusal names as the thing to correct.
     const revaluationContext: ShipmentRevaluationContext = {
       source: 'landed_cost_recalc',
+      // o3d-c08y r2: a cancellation cannot be "saved again", and this freight PO's own cost lines are
+      // excluded from the figures above, so the remedy must name a different action and a different
+      // document. See buildRefusalRemedy.
+      operation: options.reason === 'freight_purchase_order_cancelled' ? 'cancel_freight_po' : 'save',
       primaryPoId,
       primaryPoReference: primaryPo.reference,
       freightPoId,
@@ -1333,6 +1342,14 @@ export async function recalculateDirectLandedCosts(
       status: true,
       subtotalBase: true,
       lines: {
+        // o3d-c08y r2: ORDERED, because the walk order is observable. The refusal below fires on the
+        // FIRST layer whose revaluation would take a journaled shipment negative, so on a PO whose
+        // lines net out (layer A to -6, layer B to +11, total +5) whether it refuses depends on which
+        // line is reached first — and an unordered Prisma read makes that Postgres' choice, so the same
+        // edit could be accepted on one run and refused on the next. Refusing is the conservative
+        // outcome either way (the per-layer COGS_REVERSAL for A would have had a negative side), but it
+        // must be REPRODUCIBLE. `sortOrder` is the order the operator sees on the PO; `id` breaks ties.
+        orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
         select: {
           id: true,
           qty: true,
@@ -1341,6 +1358,8 @@ export async function recalculateDirectLandedCosts(
           totalBase: true,
           product: { select: { weight: true } },
           costLayers: {
+            // FIFO order, for the same reason, with `id` breaking ties on a shared receivedAt.
+            orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
             select: {
               id: true,
               unitCostBase: true,
@@ -1375,6 +1394,7 @@ export async function recalculateDirectLandedCosts(
   // o3d-c08y: what a refusal names as the thing to correct.
   const revaluationContext: ShipmentRevaluationContext = {
     source: 'direct_landed_cost_recalc',
+    operation: 'save',
     primaryPoId: po.id,
     primaryPoReference: po.reference,
     creditCostLines: creditCostLinesOf([

@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   buildShipmentCogsRevaluationSyncPayload,
+  JournaledShipmentRevaluationContextError,
   JournaledShipmentRevaluationRefusedError,
   refreshShipmentCogsForCostLayerChange,
   type JournaledShipmentRevaluationRefusal,
@@ -26,12 +27,28 @@ import {
 
 type ShipmentRow = { id: string; cogsBatchAmount: string; journaled: boolean; unitCostBase: string }
 
-function doubleTx(shipments: ShipmentRow[]) {
+function doubleTx(shipments: ShipmentRow[], over: { savepointProbe?: 'accepts' | 'rejects-25P01' | 'absent' } = {}) {
   const updates: unknown[] = []
   const queued: unknown[] = []
   const rawStatements: string[] = []
+  const probeStatements: string[] = []
+  const reads: string[] = []
   const tx = {
-    $queryRawUnsafe: async () => shipments.map((shipment) => ({ id: shipment.id })),
+    $queryRawUnsafe: async (sql: string) => {
+      reads.push(sql)
+      return shipments.map((shipment) => ({ id: shipment.id }))
+    },
+    // o3d-c08y r2: the entry precondition asks Postgres whether this client is inside a transaction by
+    // ATTEMPTING a savepoint. A real transaction client accepts it; an autocommit one raises 25P01.
+    ...(over.savepointProbe === 'absent' ? {} : {
+      $executeRawUnsafe: async (sql: string) => {
+        probeStatements.push(sql)
+        if (over.savepointProbe === 'rejects-25P01' && sql.startsWith('SAVEPOINT')) {
+          throw new Error('ERROR: 25P01: there is no transaction in progress')
+        }
+        return 0
+      },
+    }),
     // The abort statement is REQUIRED to fail, as it does on Postgres.
     $executeRaw: async (strings: TemplateStringsArray) => {
       rawStatements.push(strings.join('?'))
@@ -56,7 +73,7 @@ function doubleTx(shipments: ShipmentRow[]) {
     },
     cogsSubledgerMovement: { upsert: async ({ create }: { create: unknown }) => create },
   }
-  return { tx, updates, queued, rawStatements }
+  return { tx, updates, queued, rawStatements, probeStatements, reads }
 }
 
 function options(queued: unknown[], logged: JournaledShipmentRevaluationRefusal[]) {
@@ -181,4 +198,178 @@ test('BACKSTOP: the revaluation journal builder refuses a negative side instead 
   assert.ok(buildShipmentCogsRevaluationSyncPayload({
     shipmentId: 'ship-J', costLayerId: 'layer-1', inventoryAccount: '630', cogsAccount: '500', oldCogsBase: '4.00', newCogsBase: '0.00',
   }))
+})
+
+// ---------------------------------------------------------------------------
+// o3d-c08y ROUND 2: THE ENTRY PRECONDITION.
+//
+// The refusal above works by poisoning the enclosing transaction. Round 1's comments said it used
+// "the same mechanism as the transfer re-layering refusal", but it did not check the two client
+// properties that make that mechanism inert — and where the transfer refusal THROWS on a client with
+// no raw access, this one SKIPPED the abort and threw a refusal a caller could swallow while still
+// committing a negative cost layer. These check the precondition itself, and that it is checked BEFORE
+// anything is read.
+// ---------------------------------------------------------------------------
+
+test('o3d-c08y r2: a client with NO raw access is refused at entry, before anything is read', async () => {
+  const { tx, reads, updates, queued } = doubleTx(
+    [{ id: 'ship-J', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '-6.000000' }],
+    { savepointProbe: 'absent' },
+  )
+  // Also drop $executeRaw: with neither, there is nothing to abort with at all.
+  delete (tx as { $executeRaw?: unknown }).$executeRaw
+
+  await assert.rejects(
+    () => refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', options(queued, [])),
+    (error: unknown) => {
+      assert.ok(error instanceof JournaledShipmentRevaluationContextError, `wrong error: ${String(error)}`)
+      assert.equal(error.reason, 'no_raw_access')
+      assert.match(error.message, /layer-1/)
+      return true
+    },
+  )
+  assert.deepEqual(reads, [], 'it refused before reading any shipment — the precondition is at ENTRY')
+  assert.deepEqual(updates, [])
+  assert.deepEqual(queued, [])
+})
+
+test('o3d-c08y r2: an AUTOCOMMIT client is refused at entry — its caller\'s layer write is already committed', async () => {
+  const { tx, reads, probeStatements, queued } = doubleTx(
+    // A POSITIVE revaluation: the refusal path is never reached, and it is still refused. The check is
+    // unconditional on purpose — a call site that cannot be refused effectively is a defect whether or
+    // not this particular revaluation happens to go negative.
+    [{ id: 'ship-ok', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '9.000000' }],
+    { savepointProbe: 'rejects-25P01' },
+  )
+
+  await assert.rejects(
+    () => refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', options(queued, [])),
+    (error: unknown) => {
+      assert.ok(error instanceof JournaledShipmentRevaluationContextError, `wrong error: ${String(error)}`)
+      assert.equal(error.reason, 'not_in_transaction')
+      return true
+    },
+  )
+  assert.ok(
+    probeStatements.some((statement) => statement.startsWith('SAVEPOINT')),
+    `PRECONDITION: the transaction probe was actually issued: ${JSON.stringify(probeStatements)}`,
+  )
+  assert.deepEqual(reads, [], 'and nothing was read')
+  assert.deepEqual(queued, [])
+})
+
+test('o3d-c08y r2: an OPEN SAVEPOINT is refused — rolling back to it would clear the abort', async () => {
+  const { withSavepoint } = await import('@/lib/db/savepoint')
+  const { tx, reads, queued } = doubleTx([
+    { id: 'ship-J', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '-6.000000' },
+  ])
+
+  await withSavepoint(tx, async () => {
+    await assert.rejects(
+      () => refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', options(queued, [])),
+      (error: unknown) => {
+        assert.ok(error instanceof JournaledShipmentRevaluationContextError, `wrong error: ${String(error)}`)
+        assert.equal(error.reason, 'open_savepoint')
+        assert.match(error.message, /1 savepoint is open/)
+        return true
+      },
+    )
+  })
+  assert.deepEqual(reads, [], 'and nothing was read')
+  assert.deepEqual(queued, [])
+})
+
+test('o3d-c08y r2: POSITIVE CONTROL — the same client OUTSIDE a savepoint revalues normally', async () => {
+  // Without this, the three refusals above are indistinguishable from a function that now refuses
+  // everything.
+  const { tx, updates, queued, probeStatements } = doubleTx([
+    { id: 'ship-ok', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '9.000000' },
+  ])
+  const result = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', options(queued, []))
+
+  assert.equal(result.shipmentsUpdated, 1)
+  assert.deepEqual(updates, [{ where: { id: 'ship-ok' }, data: { cogsBatchAmount: 9 } }])
+  assert.equal(queued.length, 1, 'and the revaluation posted as before')
+  assert.ok(probeStatements.some((statement) => statement.startsWith('SAVEPOINT')), 'the probe ran and accepted')
+})
+
+test('o3d-c08y r2: the refusal itself will not fall back to a SKIP when the abort cannot be issued', async () => {
+  // The second lock on the same door: the entry precondition refuses a raw-less client, and if one ever
+  // reached the refusal anyway it must not quietly skip the abort — which is what round 1 did.
+  const { tx, queued } = doubleTx([
+    { id: 'ship-J', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '-6.000000' },
+  ])
+  const logged: JournaledShipmentRevaluationRefusal[] = []
+  // Pass the precondition, then take $executeRaw away between the probe and the refusal.
+  const guarded = {
+    ...tx,
+    shipmentLine: {
+      findMany: async (args: { where: { shipmentId: string } }) => {
+        delete (guarded as { $executeRaw?: unknown }).$executeRaw
+        return tx.shipmentLine.findMany(args)
+      },
+    },
+  }
+
+  await assert.rejects(
+    () => refreshShipmentCogsForCostLayerChange(guarded as never, 'layer-1', options(queued, logged)),
+    (error: unknown) => {
+      assert.ok(error instanceof JournaledShipmentRevaluationContextError, `wrong error: ${String(error)}`)
+      assert.equal(error.reason, 'no_raw_access')
+      assert.match(error.message, /REFUSED/, 'and it still reports the refusal it was making')
+      return true
+    },
+  )
+  assert.equal(logged.length, 1, 'the ERROR entry is still written — the operator still learns of the credit line')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-c08y ROUND 2: THE REMEDY MUST NAME AN ACTION THE OPERATOR CAN ACTUALLY TAKE.
+// Round 1 said "save again" for every operation that can reach the refusal.
+// ---------------------------------------------------------------------------
+
+async function refusalMessageFor(context: Record<string, unknown>): Promise<string> {
+  const { tx, queued } = doubleTx([{ id: 'ship-J', cogsBatchAmount: '4.00', journaled: true, unitCostBase: '-6.000000' }])
+  const logged: JournaledShipmentRevaluationRefusal[] = []
+  await assert.rejects(() => refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    ...options(queued, logged),
+    revaluationContext: context as never,
+  }))
+  assert.equal(logged.length, 1, 'PRECONDITION: the refusal was reached and reported')
+  return logged[0].message
+}
+
+test('o3d-c08y r2: a SAVE is told to correct the credit line and save again', async () => {
+  const message = await refusalMessageFor({
+    source: 'landed_cost_recalc', operation: 'save', primaryPoReference: 'PO-1', freightPoId: 'fpo-1',
+    creditCostLines: [{ freightCostLineId: 'fcl-1', purchaseOrderId: 'fpo-1', purchaseOrderReference: 'PO-F-1', amountBase: '-10.00' }],
+  })
+  assert.match(message, /line fcl-1 on PO-F-1 \(-10\.00\)/, 'naming the credit line')
+  assert.match(message, /and save again\./)
+})
+
+test('o3d-c08y r2: a freight-PO CANCELLATION is not told to "save again" — it is told to cancel again once the credit elsewhere is corrected', async () => {
+  // The cancelled PO is excluded from the recalc, so the credit named here is on ANOTHER document and
+  // there is no save of this one to repeat.
+  const message = await refusalMessageFor({
+    source: 'landed_cost_recalc', operation: 'cancel_freight_po', primaryPoReference: 'PO-1', freightPoId: 'fpo-cancel',
+    creditCostLines: [{ freightCostLineId: 'fcl-other', purchaseOrderId: 'fpo-2', purchaseOrderReference: 'PO-F-2', amountBase: '-10.00' }],
+  })
+  assert.match(message, /This CANCELLATION is refused/)
+  assert.match(message, /cancel this freight PO again/)
+  assert.match(message, /line fcl-other on PO-F-2/, 'and names the credit that is still there')
+  assert.doesNotMatch(message, /save again/, 'there is no save of a cancellation to repeat')
+})
+
+test('o3d-c08y r2: a PRODUCTION-ORDER recompute is pointed at the component purchase order, not at a freight line of its own', async () => {
+  // Manufacturing rejects negative cost lines, so "correct the negative freight or additional cost"
+  // named nothing the operator could find on the production order.
+  const message = await refusalMessageFor({
+    source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId: 'po-prod-1',
+  })
+  assert.match(message, /production order po-prod-1/, 'the driver is named')
+  assert.match(message, /A production order cannot be recosted below zero/)
+  assert.match(message, /the purchase order that supplied it/)
+  assert.match(message, /recompute this production order/)
+  assert.doesNotMatch(message, /save again/)
 })

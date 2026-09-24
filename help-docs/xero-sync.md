@@ -2244,9 +2244,22 @@ the difference posted nowhere. Now the landed-cost recalculation refuses and cha
 shipment's recorded cost as it was, so none of the three batch checks above ever sees a negative
 cost from it (o3d-c08y).
 
+**The checks above read each shipment's cost *after* locking it, so a recalculation running at the
+same time cannot slip a stale value past them.** A landed-cost recalculation may change a shipment's
+recorded cost at any moment, including while a batch run is in progress. The batch used to read the
+whole window first and take its cost-layer locks afterwards, so a run that waited for a recalculation
+to finish then carried on with the figures it had read *before* the wait: it journalled the old,
+positive cost, and the negative one it should have refused was never seen. The batch now reads only
+the list of shipments first, locks their cost layers, and then reads the costs — so a recalculation
+either finished before the lock (the batch sees its result and refuses the order) or waits for the
+batch (and then meets the already-journaled refusal above). Nothing needs configuring (o3d-c08y).
+
 **What this does not cover.** Other places a negative cost can reach are catalogued in
 `docs/todo/negative-basis-cost-layers-decision.md`. Whether IMS should ever post a negative cost
-basis at all is an open decision (o3d-gd2f).
+basis at all is an open decision (o3d-gd2f). In particular the **QuickBooks** daily batch reads its
+costs under the lock in the same way, but it has none of the three refusals above: a negative cost
+that reaches it is still journalled with its COGS line dropped. The refusals were built for Xero
+(o3d-sidy); QuickBooks is tracked separately.
 
 ### Which batch a row belongs to
 
