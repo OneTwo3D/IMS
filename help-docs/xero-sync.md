@@ -2338,6 +2338,13 @@ Three things about those rows:
 * **A posting marked handled stays handled.** If the same posting is refused again later it is logged
   (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
   IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
+* **If IMS cannot tell whether a posting was marked handled, it does not post it.** The check runs before
+  every accounting entry is queued. When the check itself cannot be made — the database is unreachable, the
+  query times out, the transaction is cancelled — IMS refuses the enqueue rather than reading "cannot tell"
+  as "nothing was marked": **nothing is written**, the whole operation that would have queued it is rolled
+  back and retried (by a sweep, the outbox, or by you re-running it), and an **ERROR**
+  (`accounting_posting_suppression_unreadable`) names the posting and the cause. An unreadable state is
+  never permission to post.
 * **One row per posting**, and a posting means the thing that is owed rather than the document it belongs
   to: a customer payment is one **receipt** against one invoice, a stock receipt is one delivery against a
   purchase order, a landed-cost journal is one recalculation, a bill update is one **bill** (a purchase

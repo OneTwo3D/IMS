@@ -222,9 +222,9 @@ const insertedInTx: Array<{ connector: string; type: string; salesAccount: unkno
 /** The refusal table as seen through a TRANSACTION client: a failing statement aborts the transaction
  *  unless a savepoint is open around it (see txModel). */
 function txRefusalTable() {
-  const failing = (): never => {
+  const failing = (message = 'relation "AccountingPostingRefusal" does not exist (code deployed ahead of migrate deploy)'): never => {
     if (txModel.savepointDepth === 0) txModel.aborted = true
-    throw new Error('relation "AccountingPostingRefusal" does not exist (code deployed ahead of migrate deploy)')
+    throw new Error(message)
   }
   return {
     upsert: async (args: Parameters<typeof postingRefusalTable.upsert>[0]) => {
@@ -236,9 +236,20 @@ function txRefusalTable() {
       if (txModel.failRefusalWrites) failing()
       return postingRefusalTable.updateMany(args)
     },
-    findUnique: postingRefusalTable.findUnique,
+    findUnique: async (args: Parameters<typeof postingRefusalTable.findUnique>[0]) => {
+      // o3d-j625 r8 (Codex HIGH): the SUPPRESSION READ fails, and ONLY it — the writes above still work,
+      // and so does the sync-row insert, which is the whole shape of the finding. A statement timeout
+      // rather than a missing relation, deliberately: r7's defence of the degrade was that the only
+      // realistic failure is a schema that has not caught up, and this is the failure that defence does
+      // not cover.
+      if (txModel.failSuppressionRead) failing(SUPPRESSION_READ_FAILURE)
+      return postingRefusalTable.findUnique(args)
+    },
   }
 }
+
+/** What an UNREADABLE suppression looks like: the state is there, this session cannot see it. */
+const SUPPRESSION_READ_FAILURE = '57014: canceling statement due to statement timeout'
 
 function transactionDouble() {
   return {
@@ -342,6 +353,13 @@ mock.module('@/lib/db', {
       accountingPostingRefusal: {
         upsert: async (args: Parameters<typeof postingRefusalTable.upsert>[0]) => { txModel.pooledRefusalWrites += 1; return postingRefusalTable.upsert(args) },
         updateMany: postingRefusalTable.updateMany,
+        // o3d-j625 r7/r8: the FACADE's early suppression read goes through the pooled client. Without it
+        // here the read took posting-suppression.ts's "this client cannot read the table" short-circuit,
+        // so the facade's own suppression answer was never exercised in this file at all.
+        findUnique: async (args: Parameters<typeof postingRefusalTable.findUnique>[0]) => {
+          if (txModel.failSuppressionRead) throw new Error(SUPPRESSION_READ_FAILURE)
+          return postingRefusalTable.findUnique(args)
+        },
       },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(transactionDouble()),
     },
@@ -356,7 +374,7 @@ mock.module('@/lib/db', {
  * below applies that rule, so "the refusal write failed and the caller's transaction is still committable"
  * is a property the tests can observe rather than a claim about a try/catch.
  */
-const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, txRefusalWrites: 0, pooledRefusalWrites: 0, priorAttempts: [] as Array<{ id: string; status: string; externalTransactionId: string | null }> }
+const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, failSuppressionRead: false, txRefusalWrites: 0, pooledRefusalWrites: 0, priorAttempts: [] as Array<{ id: string; status: string; externalTransactionId: string | null }> }
 mock.module('@/lib/db/savepoint', {
   namedExports: {
     withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => {
@@ -375,6 +393,7 @@ function reset(selection: string[]): void {
   txModel.savepointDepth = 0
   txModel.aborted = false
   txModel.failRefusalWrites = false
+  txModel.failSuppressionRead = false
   txModel.txRefusalWrites = 0
   txModel.pooledRefusalWrites = 0
   txModel.priorAttempts = []
@@ -978,4 +997,97 @@ test('[o3d-j625 r7 H-B] the primitive itself refuses a suppressed key, under the
     payload: { _idempotencyKey: 'k-10' },
   } as never)
   assert.deepEqual(other, { id: 'row-1' })
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r8 (Codex HIGH) — AN UNREADABLE SUPPRESSION IS NOT PERMISSION TO POST.
+//
+// r7's `readPostingSuppression` logged a failed lookup and returned `{ suppressed: false }`, and the
+// primitive then created a PENDING sync row. So a lookup that failed AFTER an operator marked the posting
+// handled queued, durably, the very posting the "Handled + stop retry" decision exists to stop IMS
+// posting — and the connector posts it a second time. Measured before the fix against a real Postgres
+// transaction with the failure injected on that one query: one PENDING row, committed.
+//
+// The two tests below pin the two answers an unreadable state must never give: a written row, and
+// `handled-by-hand`, which tells `postingIsOwed()` and the landed-cost outbox that the ledger has it.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r8 HIGH] the primitive REFUSES when the suppression cannot be READ — it does not write the row', async () => {
+  reset(['xero'])
+  const { createAccountingSyncLogRow } = await import('@/lib/domain/accounting/sync-log-row')
+  const { PostingSuppressionUnreadableError } = await import('@/lib/domain/accounting/posting-suppression')
+  refusals.push({
+    id: 'ref-r8', type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', referenceId: 'po-r8', scope: 'k-r8',
+    kind: 'landed_cost_cogs_journal', resolvedAt: new Date(), resolution: 'handled_manually', suppressedAt: new Date(), refusedCount: 1,
+  })
+  const tx = transactionDouble()
+  const journalRow = (idempotencyKey: string) => ({
+    connector: 'xero', type: 'COGS_JOURNAL', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: 'po-r8',
+    payload: { _idempotencyKey: idempotencyKey, lines: [{ accountCode: 'X-COGS', debit: 12.5 }] },
+  })
+
+  // PRECONDITION: with the read WORKING, this exact posting is refused and nothing is written.
+  assert.equal(await createAccountingSyncLogRow(tx as never, journalRow('k-r8') as never), null,
+    'PRECONDITION: a READABLE suppression refuses')
+  assert.deepEqual(insertedInTx, [], 'PRECONDITION: and writes nothing')
+
+  // PRECONDITION / CONTROL: the insert this test claims does NOT happen is reachable through this same
+  // double. Without this, "nothing was written" could be passing because nothing can ever be written.
+  assert.ok(await createAccountingSyncLogRow(tx as never, journalRow('k-r8-unsuppressed') as never),
+    'PRECONDITION: an unsuppressed posting IS created')
+  assert.equal(insertedInTx.length, 1, 'PRECONDITION: the create double really inserts')
+  insertedInTx.length = 0
+  activity.length = 0
+
+  // THE DEFECT: the suppression read, and only it, fails.
+  txModel.failSuppressionRead = true
+  await assert.rejects(
+    () => createAccountingSyncLogRow(tx as never, journalRow('k-r8') as never),
+    (error: unknown) => error instanceof PostingSuppressionUnreadableError
+      && /COGS_JOURNAL for PurchaseOrder po-r8/.test((error as Error).message)
+      && (error as { retryable?: unknown }).retryable === true,
+    'an unreadable suppression must REFUSE the enqueue, not fall through to the insert',
+  )
+  assert.deepEqual(insertedInTx, [],
+    'NOTHING was written. r7 wrote a PENDING row here, for a posting already in the ledger by hand')
+  assert.equal(txModel.aborted, false,
+    'and the refusal is a DECISION, not a poisoned transaction: the savepoint contained the failure, which is '
+    + 'exactly why r7 was able to carry on past it and insert')
+  assert.ok(activity.some((a) => a.action === 'accounting_posting_suppression_unreadable'),
+    `the refusal is reported. Activity: ${JSON.stringify(activity.map((a) => a.action))}`)
+  const report = activity.find((a) => a.action === 'accounting_posting_suppression_unreadable')!
+  assert.match(report.description, /did NOT queue it/, 'and the report says what was DONE about it, not just what failed')
+  assert.match(report.description, /57014/, 'and names the cause')
+})
+
+test("[o3d-j625 r8 HIGH] the facade refuses a suppression it cannot read, and never answers 'handled-by-hand' for one", async () => {
+  reset(['xero'])
+  const { accountingPostingKey, getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
+  const { PostingSuppressionUnreadableError } = await import('@/lib/domain/accounting/posting-suppression')
+  const settings = await getAccountingSettings()
+  const request = () => ({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
+  const key = accountingPostingKey(request())
+  refusals.push({
+    id: 'ref-r8f', ...key, kind: 'sales_invoice_held_release', resolvedAt: new Date(), resolution: 'handled_manually',
+    suppressedAt: new Date(), refusedCount: 1,
+  })
+
+  // PRECONDITION: with the read working the facade gives the answer that STOPS every retry.
+  const handled = await queueAccountingSync(request())
+  assert.equal(handled.queued, true, 'PRECONDITION: a readable suppression answers queued')
+  assert.equal(handled.reason, 'handled-by-hand', 'PRECONDITION: …as handled-by-hand')
+  assert.equal(routed.length, 0, 'PRECONDITION: and writes nothing')
+
+  // THE DEFECT: that answer means "a counterpart exists in the ledger and nothing is owed" —
+  // postingIsOwed() reads it as settled and the landed-cost outbox stops re-driving. A state nobody could
+  // read may not produce it.
+  txModel.failSuppressionRead = true
+  await assert.rejects(
+    () => queueAccountingSync(request()),
+    (error: unknown) => error instanceof PostingSuppressionUnreadableError,
+    'an unreadable suppression must not be answered at all, least of all as handled-by-hand',
+  )
+  assert.equal(routed.length, 0, 'and nothing was written')
+  assert.deepEqual(outstandingRefusals(), [],
+    'and no refusal was recorded over a posting that may already be in the ledger by hand')
 })

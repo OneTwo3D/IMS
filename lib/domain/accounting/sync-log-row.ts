@@ -33,6 +33,10 @@ export type SyncLogRowClient = {
  * Returns the created row, or `null` when the posting was MARKED HANDLED — posted by hand — in which case
  * nothing is written and the refusal is reported (o3d-j625 r7). The `null` is in the return type so that
  * every caller has to decide what "already posted by hand" means for it; none can post around it.
+ *
+ * THROWS `PostingSuppressionUnreadableError` when whether it was marked handled cannot be READ (o3d-j625
+ * r8). That is a third answer, not a `null`: `null` asserts a counterpart exists in the ledger, and an
+ * unreadable state asserts nothing at all. Nothing is written, so the caller may retry.
  */
 export async function createAccountingSyncLogRow<T extends { id: string }>(
   client: SyncLogRowClient,
@@ -52,6 +56,12 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     payload: data.payload,
   })
   // o3d-j625 r7: the mark-handled suppression, read under the same per-key lock the mark takes.
+  //
+  // o3d-j625 r8 (Codex HIGH): and a read that CANNOT be made throws out of here, before the create —
+  // deliberately not caught. r7 let an unreadable suppression mean "not suppressed", so a lookup that
+  // failed after the posting was marked handled wrote a PENDING row for it and the connector posted it a
+  // second time. The caller's transaction rolls back and the operation is retried; see the reasoning in
+  // posting-suppression.ts, including why refusing just this enqueue was the worse of the two answers.
   await lockPostingKey(client as unknown as PostingSuppressionClient, key)
   const suppression = await readPostingSuppression(client as unknown as PostingSuppressionClient, key)
   if (suppression.suppressed) {

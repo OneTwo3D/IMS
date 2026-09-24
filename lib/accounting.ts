@@ -773,6 +773,11 @@ export async function queueAccountingSync(params: {
   // o3d-j625 r7 — A POSTING MARKED HANDLED IS NEVER POSTED OR RE-REFUSED. Asked FIRST, before any check
   // that could refuse it and record a refusal over a posting someone has already made by hand. The
   // row-creating primitive asks again under the per-key lock, which is the check that cannot be raced.
+  //
+  // o3d-j625 r8 (Codex HIGH): if it cannot be read, this THROWS — before any write, and before any
+  // refusal is recorded — rather than proceeding as "not suppressed". `handled-by-hand` below is the
+  // answer that tells every caller a counterpart exists in the ledger and nothing is owed
+  // (`postingIsOwed`, the landed-cost outbox); an unreadable state must never be able to produce it.
   {
     const { db } = await import('@/lib/db')
     const suppression = await readPostingSuppression(db as unknown as PostingSuppressionClient, posting)
