@@ -243,7 +243,7 @@ test('a NODE CHILD PROCESS inherits the trap and cannot reach the listener (revi
     // 2. A REPLACEMENT environment, which is how several harnesses here launch children, and a CLEARED
     //    NODE_OPTIONS, which is how four of them launch guard scripts. Neither can lose the trap: it is
     //    put back at the spawn boundary.
-    const replaced = await runToCompletion(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH ?? '' } })
+    const replaced = await runToCompletion(process.execPath, ['-e', probe], { env: { PATH: process.env.PATH ?? '' } as unknown as NodeJS.ProcessEnv })
     assert.equal(replaced, 'REFUSED:OutboundNetworkBlockedError', `a replacement-environment child: ${replaced}`)
     const cleared = await runToCompletion(process.execPath, ['-e', probe], { env: { ...process.env, NODE_OPTIONS: '' } })
     assert.equal(cleared, 'REFUSED:OutboundNetworkBlockedError', `a child with NODE_OPTIONS cleared: ${cleared}`)
