@@ -61,6 +61,19 @@ registry, `IntegrationPluginId` + `plugin_shiphero_enabled`, the
 settings-store secrets, the route-auth and public-route security policy entries,
 and the ShipHero paths in the WMS connector-boundary allowlist.
 
+> **CORRECTION (o3d-r5uk, 2026-09).** Taking the three `shiphero_*` keys out of
+> `SENSITIVE_SETTING_KEYS` was wrong, and the exposure it opened was live on
+> `development` from this merge until it was found while reviewing the Shopify
+> removal for the same mistake. No migration deleted the rows, and membership of
+> that set is what gates `app/actions/settings.ts:getSetting` — a `'use server'`
+> export that takes an arbitrary key — on the `settings` permission. So the three
+> stored credentials became readable in clear by any WAREHOUSE or READONLY
+> session, and stopped being encrypted at rest. They are back, in
+> `RETIRED_CREDENTIAL_SETTING_KEYS`, together with Shopify's three and
+> `quickbooks_client_secret`. **A credential key stays in that set for as long as
+> a row for it may exist.** See `docs/archive/shopify-connector-removal.md`,
+> "Round 2".
+
 **Dead-on-removal generic code, also deleted:**
 `lib/domain/wms/stock-sync-helpers.ts` lost everything except
 `classifyUnresolvedWmsSku`. That module was created as a "connector-agnostic"

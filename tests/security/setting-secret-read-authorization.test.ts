@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test, { before, mock } from 'node:test'
 
 import { createRepoGraph } from './module-graph'
-import { createRecordingDb } from './recording-db'
+import { createRecordingDb, type QueryContext } from './recording-db'
 
 /**
  * o3d-512h — action-level control on the generic settings read.
@@ -43,7 +43,27 @@ mock.module('@/lib/auth', {
 // A static import is hoisted, so it would evaluate settings-store — and with it
 // its own '@/lib/db' import — before mock.module registers, and the tests would
 // open a real Postgres connection.
-const recorder = createRecordingDb(null)
+/**
+ * SEEDED ROWS, so that "refused" is distinguishable from "there was nothing there" (o3d-r5uk).
+ *
+ * This recorder answered `null` to everything, which is a fine stand-in for an authorization test
+ * that only asks whether the guard threw — but it cannot show what the guard WITHHELD, and a test
+ * that cannot show that is one `getSetting` regression away from passing while a credential leaks.
+ * `seededSettingRows` lets a test put a value behind the key it is about and then assert, as a
+ * positive control, that an ADMIN really does get that value back. The default is empty, so every
+ * pre-existing assertion below still sees the `null` it was written against.
+ */
+const seededSettingRows = new Map<string, string>()
+const recorder = createRecordingDb((ctx: QueryContext) => {
+  if (ctx.model === 'setting' && ctx.op === 'findUnique') {
+    const key = (ctx.args[0] as { where?: { key?: unknown } } | undefined)?.where?.key
+    if (typeof key === 'string') {
+      const value = seededSettingRows.get(key)
+      if (value !== undefined) return { key, value }
+    }
+  }
+  return null
+})
 mock.module('@/lib/db', { namedExports: { db: recorder.db } })
 
 before(async () => {
@@ -310,5 +330,105 @@ test('the in-scope maskers were converted — wc-sync, xero-sync and mintsoft-sy
     'app/actions/mintsoft-sync.ts',
   ]) {
     assert.ok(!importers.has(file), `${file} must mask through maskSettingSecret, not raw maskSecret`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-r5uk — A RETIRED CONNECTOR KEEPS ITS CREDENTIAL GATE
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex round 2, HIGH 1. Archiving the Shopify connector deleted its three credential keys from
+ * SENSITIVE_SETTING_KEYS, and archiving ShipHero (2c2fd9fa, PR #680) had already deleted its three
+ * before that. Neither removal deleted a single `Setting` ROW — there is no migration in either
+ * change — so both converted a stored credential from admin-only into something any WAREHOUSE or
+ * READONLY session could fetch from `getSetting` by naming the key. Measured on the head this block
+ * was added to: all six came back in clear.
+ *
+ * WHY THE SUITE DID NOT CATCH IT. The exhaustive case above — "refuses a WAREHOUSE session for every
+ * sensitive key" — ITERATES SENSITIVE_SETTING_KEYS. Deleting a key from the set deletes the case
+ * that covered it, so the suite stayed green and got one assertion shorter. A set cannot be its own
+ * pin. The literals below are the pin, and they are exhaustive in BOTH directions: an addition that
+ * is not declared here fails just as an unexplained deletion does.
+ */
+const RETIRED_CONNECTOR_CREDENTIAL_KEYS = [
+  'quickbooks_client_secret',       // QuickBooks Online — archived on this branch
+  'shiphero_access_token',          // ShipHero — archived by 2c2fd9fa (PR #680)
+  'shiphero_refresh_token',
+  'shiphero_webhook_secret',
+  'shopify_admin_api_access_token', // Shopify — archived on this branch
+  'shopify_invoice_pdf_secret',
+  'shopify_webhook_secret',
+] as const
+
+test('RETIRED_CREDENTIAL_SETTING_KEYS lists exactly the retired connectors\' credentials', async () => {
+  const { RETIRED_CREDENTIAL_SETTING_KEYS } = await import('@/lib/settings-store')
+  assert.deepEqual(
+    [...RETIRED_CREDENTIAL_SETTING_KEYS].sort(),
+    [...RETIRED_CONNECTOR_CREDENTIAL_KEYS].sort(),
+    'Retiring a connector does not delete its Setting rows, so its credential keys must stay gated. '
+    + 'Removing a key here is a DATA-RETENTION decision (the rows are gone) and needs the migration '
+    + 'that deleted them; adding one needs a line saying which connector it belonged to.',
+  )
+})
+
+test('every retired-connector credential is still in SENSITIVE_SETTING_KEYS', async () => {
+  const { SENSITIVE_SETTING_KEYS } = await import('@/lib/settings-store')
+  for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+    assert.ok(
+      SENSITIVE_SETTING_KEYS.has(key),
+      `${key} belongs to a retired connector whose rows still exist: it must stay in `
+      + 'SENSITIVE_SETTING_KEYS so getSetting gates it and serializeSettingValue encrypts it at rest',
+    )
+  }
+})
+
+for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY'] as const) {
+  test(`getSetting refuses a ${role} session every retired-connector credential, against a SEEDED row`, async () => {
+    currentRole = role
+    const { getSetting } = await import('@/app/actions/settings')
+    let checked = 0
+    for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+      // The row is PRESENT and holds a value. Without this, a refusal and a miss look identical.
+      seededSettingRows.set(key, `seeded-secret-for-${key}`)
+      recorder.reset()
+      await assert.rejects(
+        () => getSetting(key),
+        (error: unknown) => {
+          assert.equal((error as { permission?: string }).permission, 'settings')
+          assert.match(String((error as Error).message), /Forbidden: missing permission settings/)
+          return true
+        },
+        `${role} must not be able to read the stored ${key}`,
+      )
+      recorder.assertNoReads(`${role} reading ${key}`)
+      seededSettingRows.delete(key)
+      checked += 1
+    }
+    assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
+    assert.ok(checked >= 7, `expected at least 7 retired credential keys, checked ${checked}`)
+  })
+}
+
+/**
+ * THE POSITIVE CONTROL FOR THE THREE CASES ABOVE. It is what makes them a statement about
+ * authorization rather than about an empty stub: the same seeded row, read by ADMIN, comes back with
+ * its value. So the refusals withheld something that was really there and really readable — which is
+ * exactly the exposure that was measured before the fix.
+ */
+test('the seeded retired-connector rows ARE readable — by ADMIN, and only by ADMIN', async () => {
+  currentRole = 'ADMIN'
+  const { getSetting } = await import('@/app/actions/settings')
+  for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+    seededSettingRows.set(key, `seeded-secret-for-${key}`)
+    recorder.reset()
+    assert.equal(
+      await getSetting(key),
+      `seeded-secret-for-${key}`,
+      `${key} must still be readable by a principal WITH the settings permission — `
+      + 'over-gating a retired credential would break the operator\'s only route to rotate or clear it',
+    )
+    recorder.assertCalls(['setting.findUnique'], `ADMIN reading ${key}`)
+    seededSettingRows.delete(key)
   }
 })
