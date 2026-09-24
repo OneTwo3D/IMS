@@ -66,10 +66,9 @@ npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS
 ```
 
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
-concurrency tier seeds fixture rows into whatever database the URL reaches. Files that also install
-DDL — currently `pending-asn-disposal-race` and `pending-asn-retirement-commit`, plus
-`stamp-scratch-database`, which creates and drops sibling databases to exercise the stamper — refuse to start,
-before any connection writes, unless `tests/concurrency/scratch-database-guard.ts` gets a set of FACTS
+concurrency tier seeds fixture rows — and several of its files install DDL or disable triggers — into
+whatever database the URL reaches. So EVERY file in the tier refuses to start (o3d-yvn8), before it is
+even loaded, unless `tests/concurrency/scratch-database-guard.ts` gets a set of FACTS
 from the server that together make an accidental run against a real database hard. None of them is
 proof the database is disposable (see "WHAT A MARKER PROVES" below). All of these must hold:
 
@@ -174,9 +173,26 @@ RESIDUALS, so nobody has to discover them:
 SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
 declares its own per-run `ims_ci` service database, so the tier is gated on every PR that touches it.
 
-Of the other 32 files (counted 2026-09-18 on the merged tree), one — `email-outbox-claim-fence` — runs against a database it
-creates itself through `tests/helpers/throwaway-database.ts`; the remaining 31 have no guard yet and seed
-whatever `DATABASE_URL` reaches before checking anything (tracked as o3d-yvn8).
+**HOW EVERY FILE IS COVERED (o3d-yvn8).** Until this change 31 of the tier's 35 files had no guard and
+seeded whatever `DATABASE_URL` reached — measured before the fix on an unstamped, undeclared database:
+1,678 row writes and 142 passing tests. The barrier is now structural, in two pieces:
+
+* `npm run test:concurrency` loads `tests/concurrency/scratch-database-preload.mts` with `--import`. In
+  every test-file process it loads `.env.local`/`.env` exactly as the files do, runs the guard, and
+  only then lets Node load the file — a refusal fails the process before the file exists.
+* every file's FIRST import is `tests/concurrency/scratch-database-setup.ts`, which throws at import if
+  the tier is on (`RUN_DB_CONCURRENCY_TESTS=1`) but the preload did not verify the database in that
+  process. So `tsx --test tests/concurrency/<file>.test.ts` with the flag exported refuses too; to run
+  one file, pass `--import ./tests/concurrency/scratch-database-preload.mts` yourself.
+
+Measured after the fix on the same kind of database: 0 rows written, all 35 files refused, and a direct
+single-file run refused at import. `tests/concurrency-scratch-database-census.test.ts` (a `test:unit`
+test, no database) fails if a tier file does not import the setup first, if the npm script drops the
+preload, or if either piece stops refusing. Why not a call inside each file: this project compiles to
+CommonJS, where top-level `await` is rejected, and a `before()` hook is not a barrier — node:test ran a
+file's own root `before` while the guard hook was still awaiting, and ran it even when the guard
+refused (both measured). `email-outbox-claim-fence` additionally creates its own database through
+`tests/helpers/throwaway-database.ts`; the configured one must still pass the guard first.
 
 **Neither tier is absent from `npm run test:unit`, and only one of the two is gated end to end.**
 `test:unit`'s glob is `tests/**/*.test.ts`, so it collects `tests/concurrency/**` and `tests/db/**`
