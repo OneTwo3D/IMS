@@ -8,6 +8,7 @@ import {
   expectedScratchDatabaseMarker,
   NotAScratchDatabaseError,
 } from './scratch-database-guard'
+import { PROBE_SESSION_OPTIONS } from './scratch-database-data-probe'
 
 /**
  * o3d-zzgp r10 — THE STAMPER'S WRITER, END TO END (review LOW-5 and MEDIUM-1).
@@ -88,7 +89,12 @@ async function commentOn(url: string): Promise<string | null> {
 }
 
 /** Run the stamper's main() against `url`, output silenced; returns its exit code. */
-async function runStamper(url: string, argv: string[], betweenReadAndWrite?: () => Promise<void>): Promise<number> {
+async function runStamper(
+  url: string,
+  argv: string[],
+  betweenReadAndWrite?: () => Promise<void>,
+  onStatement?: (sql: string) => void,
+): Promise<number> {
   const { main } = await import('../../scripts/stamp-scratch-database')
   const saved = { url: process.env.DATABASE_URL, log: console.log, error: console.error }
   const said: string[] = []
@@ -96,7 +102,7 @@ async function runStamper(url: string, argv: string[], betweenReadAndWrite?: () 
   console.log = (...args: unknown[]) => { said.push(args.join(' ')) }
   console.error = (...args: unknown[]) => { said.push(args.join(' ')) }
   try {
-    const code = await main(argv, { betweenReadAndWrite })
+    const code = await main(argv, { betweenReadAndWrite, onStatement })
     lastOutput = said.join('\n')
     return code
   } finally {
@@ -104,6 +110,14 @@ async function runStamper(url: string, argv: string[], betweenReadAndWrite?: () 
     console.log = saved.log
     console.error = saved.error
   }
+}
+
+/** A pg.Client on `url` carrying explicit startup `options` (e.g. a search_path pin, or none). */
+async function connectWithOptions(url: string, options: string): Promise<Client> {
+  const { default: pg } = await import('pg')
+  const client = new pg.Client({ connectionString: url, options, application_name: 'o3d-zzgp-followup-pintest' })
+  await client.connect()
+  return client as unknown as Client
 }
 let lastOutput = ''
 
@@ -299,5 +313,71 @@ test('HIGH-1(d): the guard refuses a users row hidden by a planted = operator', 
       checkScratchDatabase(url, name),
       (error: unknown) => error instanceof NotAScratchDatabaseError && /installed application|users/.test(error.message),
     )
+  })
+})
+
+test('LOW-2: the search_path pin ALONE stops a planted operator on an unqualified statement', { skip }, async () => {
+  // The HIGH-1 integration tests pass even with the pin removed, because the qualified operators
+  // hold on their own. This isolates the OTHER layer: with operators DISABLED (an unqualified
+  // `name = name`), the pin alone must stop the planted operator resolving. Control: without the
+  // pin the same statement fires it.
+  await withSiblingDatabase(async (name, url) => {
+    await setHostileSearchPath(name)
+    await sql(url, `
+      CREATE SCHEMA s;
+      CREATE FUNCTION s.evil_eq(name, name) RETURNS boolean LANGUAGE plpgsql AS $$
+      BEGIN
+        IF current_setting('transaction_read_only') = 'off' THEN
+          EXECUTE 'CREATE TABLE IF NOT EXISTS s.pinproof ()';
+        END IF;
+        RETURN $1 OPERATOR(pg_catalog.=) $2;
+      END $$;
+      CREATE OPERATOR s.= (LEFTARG = name, RIGHTARG = name, FUNCTION = s.evil_eq)`)
+    // An UNQUALIFIED name = name comparison — this is the test's own probe, not the guard's.
+    const UNQUALIFIED = `SELECT 1 FROM pg_catalog.pg_database WHERE datname = current_database()`
+
+    const unpinned = await connectWithOptions(url, '-c standard_conforming_strings=on')
+    try { await unpinned.query(UNQUALIFIED) } finally { await unpinned.end() }
+    const [ctl] = await sql(url, `SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM pg_catalog.pg_class WHERE relname OPERATOR(pg_catalog.=) 'pinproof'`)
+    assert.equal(ctl?.n, 1, 'control: without the pin, the unqualified = resolves the planted operator and it writes')
+    await sql(url, 'DROP TABLE IF EXISTS s.pinproof')
+
+    // The SAME options the guard and the stamper connect with — so removing the pin there reds this.
+    const pinned = await connectWithOptions(url, PROBE_SESSION_OPTIONS)
+    try { await pinned.query(UNQUALIFIED) } finally { await pinned.end() }
+    const [res] = await sql(url, `SELECT pg_catalog.count(*)::pg_catalog.int4 AS n FROM pg_catalog.pg_class WHERE relname OPERATOR(pg_catalog.=) 'pinproof'`)
+    assert.equal(res?.n, 0, 'with search_path=pg_catalog the unqualified = resolves pg_catalog.= and the operator never runs')
+  })
+})
+
+test('LOW-3: the writer re-reads identity and re-checks INSIDE a read-only savepoint (statement order)', { skip }, async () => {
+  await withSiblingDatabase(async (name, url) => {
+    const stmts: string[] = []
+    const code = await runStamper(url, [name], undefined, (sql) => stmts.push(sql))
+    assert.equal(code, 0, lastOutput)
+    const iSavepoint = stmts.findIndex((q) => /^\s*SAVEPOINT stamp_recheck/.test(q))
+    const iReadOnly = stmts.findIndex((q) => /SET LOCAL transaction_read_only = on/.test(q))
+    // The WRITER's identity re-read — the first one AFTER the read-only savepoint opens (the reader's
+    // own identity read at the start of the run is deliberately not the one under test).
+    const iIdentity = stmts.findIndex((q, idx) => idx > iReadOnly && iReadOnly >= 0 && /pg_postmaster_start_time/.test(q))
+    const iRollback = stmts.findIndex((q) => /ROLLBACK TO SAVEPOINT stamp_recheck/.test(q))
+    const iComment = stmts.findIndex((q) => /COMMENT ON DATABASE/.test(q))
+    const order = `savepoint=${iSavepoint} readOnly=${iReadOnly} identity=${iIdentity} rollback=${iRollback} comment=${iComment}`
+    assert.ok(iSavepoint >= 0, `SAVEPOINT stamp_recheck must be sent — ${order}`)
+    assert.ok(iReadOnly > iSavepoint, `SET LOCAL read-only must follow the SAVEPOINT — ${order}`)
+    assert.ok(iIdentity > iReadOnly, `the identity re-read must run under the read-only savepoint — ${order}`)
+    assert.ok(iRollback > iIdentity, `the savepoint must be rolled back after the re-check — ${order}`)
+    assert.ok(iComment > iRollback, `the COMMENT must run only after the savepoint is rolled back — ${order}`)
+
+    // --unstamp (follow-up LOW-5): the same shape on its writer.
+    const un: string[] = []
+    assert.equal(await runStamper(url, [name, '--unstamp'], undefined, (sql) => un.push(sql)), 0, lastOutput)
+    const uSave = un.findIndex((q) => /^\s*SAVEPOINT unstamp_recheck/.test(q))
+    const uRo = un.findIndex((q, idx) => idx > uSave && uSave >= 0 && /SET LOCAL transaction_read_only = on/.test(q))
+    const uId = un.findIndex((q, idx) => idx > uRo && uRo >= 0 && /pg_postmaster_start_time/.test(q))
+    const uRb = un.findIndex((q) => /ROLLBACK TO SAVEPOINT unstamp_recheck/.test(q))
+    const uCom = un.findIndex((q) => /COMMENT ON DATABASE/.test(q))
+    const uOrder = `savepoint=${uSave} readOnly=${uRo} identity=${uId} rollback=${uRb} comment=${uCom}`
+    assert.ok(uSave >= 0 && uRo > uSave && uId > uRo && uRb > uId && uCom > uRb, `--unstamp writer order — ${uOrder}`)
   })
 })
