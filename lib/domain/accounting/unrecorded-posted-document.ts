@@ -667,7 +667,8 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
     // established: the query is a snapshot that can still grow, and it says so.
     // ROUND 16 (Codex MEDIUM): "ONE MORE PENDING ROW PER SWEEP" IS A COUNT o3d-alnk MADE FALSE.
     // `email_outbox_undelivered_reference_uq` refuses a second (kind, referenceType, referenceId)
-    // row while one is still PENDING or PROCESSING, and `queueEmail` swallows that P2002 and returns
+    // row while one is still PENDING or PROCESSING (or, since o3d-hpeg, PARKED_SEND_CAP — held for an
+    // operator, and so for longer than any sweep), and `queueEmail` swallows that P2002 and returns
     // `already_queued` — so a sweep landing inside that window queues NOTHING while still reporting
     // success. The repetition is real, but it is keyed to DELIVERY rather than to sweeps, and an
     // operator reading a per-sweep count would over-state what is outstanding. Said exactly.
@@ -700,10 +701,10 @@ export const QBO_OPERATIONS_WITHOUT_REQUEST_ID: Partial<Record<
       + 'PROCESSING queues nothing and reports success anyway. THE REPETITION IS PACED BY THE OUTBOX '
       + 'DRAIN, NOT BY THIS SWEEP: this sweep is scheduled every five minutes and the outbox drain is '
       + 'scheduled hourly, so MOST SWEEPS QUEUE NOTHING — around a dozen in a row meet the same '
-      + 'undelivered row — and the refusal lifts only when a drain settles that row to SENT or FAILED. '
+      + 'undelivered row — and the refusal lifts only when that row is settled to SENT or FAILED (by a drain, or by an operator resolving a row parked at the send cap). '
       + 'Count copies against the OUTBOX cadence, never one per sweep',
     check: 'this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. '
-      + 'EmailOutbox has four states — PENDING, PROCESSING, SENT, FAILED — none of which means '
+      + 'EmailOutbox has five states — PENDING, PROCESSING, SENT, FAILED, PARKED_SEND_CAP — none of which means '
       + '"deliberately not delivered", and no action, route or screen removes an unsent row, so there '
       + 'is nothing to press. '
       + renderLocalDirection(
@@ -1640,8 +1641,8 @@ export const NON_DOCUMENT_INCIDENT_WORDING: Readonly<Record<
       did: 'it QUEUED an invoice email to the customer, or found one already queued and undelivered '
         + 'and wrote no second row, and THIS RECORD DOES NOT SAY WHICH OF THE TWO. Either way it '
         + 'succeeds by QUEUEING, not by sending',
-      remedy: 'REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has four states (PENDING, '
-        + 'PROCESSING, SENT, FAILED), none of which means "deliberately not delivered", and no action, '
+      remedy: 'REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has five states (PENDING, '
+        + 'PROCESSING, SENT, FAILED, PARKED_SEND_CAP), none of which means "deliberately not delivered", and no action, '
         + 'route or screen removes an unsent row. '
         + renderLocalDirection(
           { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' },

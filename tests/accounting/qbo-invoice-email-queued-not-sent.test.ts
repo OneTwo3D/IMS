@@ -39,7 +39,8 @@ const state = {
 // `emailOutbox.create` here blindly appended every row, so this file "proved" three simultaneous
 // PENDING copies — a state that can no longer exist. o3d-alnk's `email_outbox_undelivered_reference_uq`
 // is a PARTIAL UNIQUE INDEX on (kind, referenceType, referenceId) WHERE status IN
-// ('PENDING','PROCESSING') AND referenceType IS NOT NULL AND referenceId IS NOT NULL, and `queueEmail`
+// ('PENDING','PROCESSING','PARKED_SEND_CAP') AND referenceType IS NOT NULL AND referenceId IS NOT NULL
+// (o3d-hpeg added the parked status: a row held for an operator after the send cap keeps its slot), and `queueEmail`
 // catches the P2002 it raises and answers `already_queued`. A double that accepts what the real table
 // refuses cannot prove anything about production, so it models the index instead.
 //
@@ -51,7 +52,7 @@ const state = {
 // ---------------------------------------------------------------------------
 
 const UNDELIVERED_UNIQUE_INDEX = 'email_outbox_undelivered_reference_uq'
-const UNDELIVERED_STATUSES = new Set(['PENDING', 'PROCESSING'])
+const UNDELIVERED_STATUSES = new Set(['PENDING', 'PROCESSING', 'PARKED_SEND_CAP'])
 
 /** The index's key for a row, or null when the row falls outside its partial predicate. */
 function undeliveredSlot(row: OutboxRow): string | null {
@@ -511,7 +512,7 @@ test('r18: the sentence\'s cadences match the cron config and the cron doc, and 
   // THE VERDICT IS UNCHANGED AND MUST STAY: what makes this unsafe to replay is repetition after
   // the row is settled, not the rate at which it repeats.
   assert.match(description, /ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER/)
-  assert.match(description, /the refusal lifts only when a drain settles that row to SENT or FAILED/)
+  assert.match(description, /the refusal lifts only when that row is settled to SENT or FAILED/)
 })
 
 // ---------------------------------------------------------------------------
