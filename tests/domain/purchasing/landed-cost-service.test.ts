@@ -1989,3 +1989,41 @@ test('WITHOUT the link the delta is silently stranded — the state the fix remo
   // Nothing records the omission either: no obligation is persisted anywhere, so
   // this is a permanent loss. That is why the link is now a helper postcondition.
 })
+
+test('o3d-c08y r2: both recalc paths read PO lines and cost layers in a DETERMINISTIC order', async () => {
+  // WHY THIS MATTERS. The journaled-shipment refusal (o3d-c08y) fires on the FIRST cost layer whose
+  // revaluation would take a journaled shipment below zero, and the walk is line-by-line then
+  // layer-by-layer. On a PO whose lines net out — layer A to -6.00, layer B to +11.00, total +5.00 —
+  // whether the edit is refused therefore depends on which line is reached first. With no `orderBy`
+  // that is Postgres' choice, so the same edit could be accepted on one run and refused on the next.
+  //
+  // Asserted on the QUERY the code sends, not on the order rows come back in: a double cannot choose a
+  // physical row order, and on a real database a small table usually comes back in insertion order
+  // anyway — so a behavioural test here would pass with the `orderBy` removed and prove nothing.
+  const captured: Array<Record<string, unknown>> = []
+  const tx = {
+    landedCostLink: { findMany: async () => [{ primaryPoId: 'po-1' }] },
+    purchaseOrder: {
+      findUnique: async (args: Record<string, unknown>) => {
+        captured.push(args)
+        return null // nothing further to do: the query itself is the subject
+      },
+    },
+  }
+
+  await recalculateLandedCosts(tx as never, 'freight-1', noopDeps(), TEST_AUDIT_OPTIONS)
+  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
+
+  assert.equal(captured.length, 2, 'PRECONDITION: both recalc paths issued their purchase-order read')
+  for (const [index, args] of captured.entries()) {
+    const lines = (args.select as { lines: { orderBy: unknown; select: { costLayers: { orderBy: unknown } } } }).lines
+    assert.deepEqual(
+      lines.orderBy, [{ sortOrder: 'asc' }, { id: 'asc' }],
+      `recalc path ${index} reads PO lines with no deterministic order, so the refusal outcome is not reproducible (o3d-c08y)`,
+    )
+    assert.deepEqual(
+      lines.select.costLayers.orderBy, [{ receivedAt: 'asc' }, { id: 'asc' }],
+      `recalc path ${index} reads cost layers with no deterministic order (o3d-c08y)`,
+    )
+  }
+})

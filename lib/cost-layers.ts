@@ -10,6 +10,7 @@
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
 import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
@@ -54,6 +55,177 @@ type ShipmentCogsRevaluationSyncOptions = {
    * WITHIN a run (same nonce) still dedups correctly (cogs-audit scjz.33).
    */
   recalcRunId?: string
+  /**
+   * o3d-c08y: what drove this revaluation, so a refusal can name the thing to correct (the credit
+   * freight cost line, or the production order). Optional: a refusal without it still names the
+   * shipment, the layer and both COGS figures.
+   */
+  revaluationContext?: ShipmentRevaluationContext
+  /**
+   * o3d-c08y: writes the ERROR activity entry for a refusal. It MUST commit independently of `tx`,
+   * because the refusal aborts `tx` and everything written through it is rolled back. Injectable for
+   * tests; the default is `logActivityPersisted`, which uses its own connection.
+   */
+  logRefusal?: (refusal: JournaledShipmentRevaluationRefusal) => Promise<boolean>
+}
+
+/** o3d-c08y: the operation that revalued a cost layer, as far as the caller knows it. */
+export type ShipmentRevaluationContext = {
+  source: 'landed_cost_recalc' | 'direct_landed_cost_recalc' | 'landed_cost_output_propagation' | 'manufacturing_recompute'
+  /**
+   * o3d-c08y r2: WHAT THE OPERATOR WAS DOING, which decides what the remedy can sensibly ask of them.
+   * Round 1 always said "save again", which is wrong for a CANCELLATION (there is no save to repeat,
+   * and the cancelled PO's own cost lines are excluded from the figures the refusal quotes) and wrong
+   * for a production-order recompute (manufacturing rejects negative cost lines, so the credit is on a
+   * component's purchase order, not here). Defaults to a save when the caller does not say.
+   */
+  operation?: 'save' | 'cancel_freight_po' | 'recompute_production_order'
+  primaryPoId?: string
+  primaryPoReference?: string
+  freightPoId?: string
+  productionOrderId?: string
+  /** Negative (credit) cost lines that contributed to this revaluation — the thing to correct. */
+  creditCostLines?: Array<{
+    freightCostLineId: string
+    purchaseOrderId: string
+    purchaseOrderReference: string | null
+    amountBase: string
+  }>
+}
+
+/** o3d-c08y: one already-journaled shipment a revaluation would have driven below zero. */
+export type RefusedJournaledShipment = {
+  shipmentId: string
+  oldCogsBase: string
+  newCogsBase: string
+}
+
+export type JournaledShipmentRevaluationRefusal = {
+  costLayerId: string
+  shipments: RefusedJournaledShipment[]
+  context: ShipmentRevaluationContext | null
+  message: string
+}
+
+/**
+ * o3d-c08y: A REVALUATION THAT WOULD TAKE AN ALREADY-JOURNALED SHIPMENT'S COGS BELOW ZERO IS REFUSED.
+ *
+ * Thrown by `refreshShipmentCogsForCostLayerChange` after it has aborted the enclosing transaction,
+ * so the whole revaluation — the layer's new cost, the rewritten snapshots, and anything else the
+ * caller wrote in the same transaction — is rolled back. Nothing reaches the ledger or the COGS
+ * subledger, so the two cannot disagree. `loggedToActivity` says whether the ERROR entry, written
+ * on its own connection, was persisted.
+ */
+export class JournaledShipmentRevaluationRefusedError extends Error {
+  override readonly name = 'JournaledShipmentRevaluationRefusedError'
+  readonly costLayerId: string
+  readonly shipments: RefusedJournaledShipment[]
+  readonly context: ShipmentRevaluationContext | null
+  readonly loggedToActivity: boolean
+
+  constructor(refusal: JournaledShipmentRevaluationRefusal, loggedToActivity: boolean) {
+    super(refusal.message)
+    this.costLayerId = refusal.costLayerId
+    this.shipments = refusal.shipments
+    this.context = refusal.context
+    this.loggedToActivity = loggedToActivity
+  }
+}
+
+/**
+ * o3d-c08y r2 — THROWN AT ENTRY when the client handed to
+ * `refreshShipmentCogsForCostLayerChange` is one whose refusal could not actually refuse.
+ *
+ * The refusal works by poisoning the enclosing transaction, so a caller that catches it still cannot
+ * commit the layer cost and snapshots it wrote just before calling. That mechanism has exactly three
+ * ways to be inert, and all three are properties of the CLIENT rather than of where the call site sits
+ * in the source — which is why they are asked of the client and of Postgres, not of a source scanner:
+ *
+ *  1. NO RAW ACCESS. Without `$executeRaw`/`$executeRawUnsafe` there is nothing to abort with, and the
+ *     previous code SKIPPED the abort in that case and threw anyway — a refusal reducible to a skip.
+ *  2. NOT IN A TRANSACTION. On an autocommit client the caller's `costLayer.update` has already
+ *     committed, so the abort poisons a transaction consisting of itself and a caught refusal leaves a
+ *     negative layer standing with the shipment snapshot rewritten to match.
+ *  3. UNDER AN OPEN SAVEPOINT. `ROLLBACK TO SAVEPOINT` clears the aborted state, so a `withSavepoint`
+ *     anywhere between the call and the transaction would let a caller undo the abort and carry on.
+ *
+ * Checked UNCONDITIONALLY, before anything is read or written, and not only on the refusal path: a
+ * call site that cannot be refused effectively is a defect whether or not this particular revaluation
+ * happens to go negative, and finding out only on the rare negative input is finding out in
+ * production. Same reasoning, and the same two runtime probes, as the transfer re-layering refusal
+ * (`assertHelperCanRefuseEffectively`, transfer-cost-layer-recreation.ts, Codex round-6 HIGH-2) —
+ * which this one's comments claimed to mirror before it actually did.
+ *
+ * Every real call site — three in landed-cost-service and one in the manufacturing recompute — is
+ * handed its `tx` by a `db.$transaction`, on all five entry paths (the two PO-cost actions, the
+ * freight-PO create, the freight-PO cancellation and the production-order recompute), with no
+ * `withSavepoint` between. So nothing in the application today is refused by this; what it stops is a
+ * NEW call site that would be, and a refusal that would have been reducible to a skip.
+ */
+export class JournaledShipmentRevaluationContextError extends Error {
+  override readonly name = 'JournaledShipmentRevaluationContextError'
+  readonly reason: 'no_raw_access' | 'not_in_transaction' | 'open_savepoint'
+
+  constructor(reason: 'no_raw_access' | 'not_in_transaction' | 'open_savepoint', message: string) {
+    super(message)
+    this.reason = reason
+  }
+}
+
+/**
+ * Clients already shown to be inside a transaction. A Prisma transaction client cannot leave its
+ * transaction and the base client never enters one, so a `true` answer is stable for the life of the
+ * object — and this function is called once per revalued cost layer, which is many times per recalc.
+ * Only the positive answer is cached: the other two outcomes throw. Held weakly, so a short-lived
+ * transaction client is not kept alive by this set.
+ */
+const CLIENTS_KNOWN_INSIDE_TRANSACTION = new WeakSet<object>()
+
+async function assertRevaluationRefusalCanRefuseEffectively(tx: TxClient, costLayerId: string): Promise<void> {
+  const where = `cost layer ${costLayerId}`
+  const depth = openSavepointDepth(tx)
+  if (depth > 0) {
+    throw new JournaledShipmentRevaluationContextError(
+      'open_savepoint',
+      `refreshShipmentCogsForCostLayerChange: refusing to run for ${where} because ${depth} savepoint`
+      + `${depth === 1 ? ' is' : 's are'} open on this client. Rolling back to a savepoint CLEARS the aborted-`
+      + 'transaction state a journaled-shipment refusal uses to stop its caller committing the revaluation it '
+      + 'has already written, so the refusal would be reducible to a skip. Call this directly on the '
+      + 'transaction client (o3d-c08y).',
+    )
+  }
+  if (CLIENTS_KNOWN_INSIDE_TRANSACTION.has(tx)) return
+
+  if (typeof (tx as { $executeRaw?: unknown }).$executeRaw !== 'function') {
+    throw new JournaledShipmentRevaluationContextError(
+      'no_raw_access',
+      `refreshShipmentCogsForCostLayerChange: refusing to run for ${where} because the client exposes no `
+      + '$executeRaw, so a journaled-shipment refusal could not abort the enclosing transaction and a caller '
+      + 'that caught it could commit a negative cost layer with the shipment snapshots rewritten to match '
+      + '(o3d-c08y).',
+    )
+  }
+  const inTransaction = await isClientInsideTransaction(tx)
+  if (inTransaction === true) {
+    CLIENTS_KNOWN_INSIDE_TRANSACTION.add(tx)
+    return
+  }
+  if (inTransaction === null) {
+    throw new JournaledShipmentRevaluationContextError(
+      'no_raw_access',
+      `refreshShipmentCogsForCostLayerChange: refusing to run for ${where} because the client exposes no raw `
+      + 'escape hatch to probe with, so it cannot be shown to be inside a transaction and a refusal could not '
+      + 'be shown to abort anything (o3d-c08y).',
+    )
+  }
+  throw new JournaledShipmentRevaluationContextError(
+    'not_in_transaction',
+    `refreshShipmentCogsForCostLayerChange: refusing to run for ${where} because the client is NOT inside a `
+    + 'transaction (Postgres 25P01 on a probe SAVEPOINT). Every caller has already written the layer\'s new '
+    + 'cost before calling, and on an autocommit client that write is already committed: a refusal would have '
+    + 'nothing to abort and a caller that caught it would leave a negative cost basis standing. Call this '
+    + 'inside db.$transaction (o3d-c08y).',
+  )
 }
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
@@ -66,6 +238,18 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
 }): Record<string, unknown> | null {
   const oldCogs = roundQuantity(input.oldCogsBase, 2)
   const newCogs = roundQuantity(input.newCogsBase, 2)
+  // o3d-c08y: EACH LEG BELOW IS GATED ON ITS OWN SIDE BEING POSITIVE, so a negative side used to be
+  // DROPPED: a shipment revalued from 4.00 to -6.00 posted only the 4.00 reversal, and 6.00 posted
+  // nowhere. A negative basis cannot be represented here (o3d-gd2f), and
+  // `refreshShipmentCogsForCostLayerChange` refuses the revaluation before it gets this far; this
+  // throw is the backstop that keeps the leg-drop from ever being silent again.
+  if (oldCogs.lt(0) || newCogs.lt(0)) {
+    throw new Error(
+      `buildShipmentCogsRevaluationSyncPayload: shipment ${input.shipmentId} would be revalued from `
+      + `${oldCogs.toFixed(2)} to ${newCogs.toFixed(2)} for cost layer ${input.costLayerId}. A negative shipment COGS `
+      + 'cannot be posted (o3d-gd2f), and building this journal would drop the negative leg silently (o3d-c08y).',
+    )
+  }
   if (oldCogs.sub(newCogs).abs().lt(0.01)) return null
 
   // Use a 4-line reverse + repost journal rather than a 2-line delta so the
@@ -1128,17 +1312,24 @@ export async function refreshShipmentCogsForCostLayerChange(
   costLayerId: string,
   options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<ShipmentCogsRefreshResult> {
+  // o3d-c08y r2: BEFORE anything is read or written — the refusal below only means something on a
+  // client whose transaction can actually be aborted. See JournaledShipmentRevaluationContextError.
+  await assertRevaluationRefusalCanRefuseEffectively(tx, costLayerId)
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const shipments = await tx.$queryRawUnsafe<Array<{ id: string }>>(
     `SELECT DISTINCT "shipmentId" AS id FROM "shipment_lines" WHERE "costLayerSnapshot" @> $1::jsonb`,
     containsCostLayer,
   )
 
-  let updated = 0
-  let cogsRevaluationDelta = toDecimal(0)
-  // Resolved lazily on the first un-journaled shipment, then reused, so a
-  // settings read happens at most once per call (audit-gbzh).
-  let dailyBatchPosts: boolean | null = null
+  // o3d-c08y: A WHOLE-SET PRE-PASS, READ-ONLY. Every shipment's new COGS is computed before any of
+  // them is written, so a refusal on the third shipment cannot follow two shipments' writes. (The
+  // transaction abort would undo those too; "nothing this function wrote" is simply the stronger and
+  // easier property to check.)
+  const planned: Array<{
+    id: string
+    current: { cogsBatchAmount: Prisma.Decimal | null; shipmentJournalDate: Date | null } | null
+    cogs: number
+  }> = []
   for (const shipment of shipments) {
     const currentShipment = await tx.shipment.findUnique({
       where: { id: shipment.id },
@@ -1152,7 +1343,49 @@ export async function refreshShipmentCogsForCostLayerChange(
       (sum, line) => addMoney(sum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))),
       toDecimal(0),
     )
-    const cogs = roundQuantity(cogsTotal, 2).toNumber()
+    planned.push({ id: shipment.id, current: currentShipment, cogs: roundQuantity(cogsTotal, 2).toNumber() })
+  }
+
+  // o3d-c08y: AN ALREADY-JOURNALED SHIPMENT MAY NOT BE REVALUED BELOW ZERO. Its revaluation posts as a
+  // reverse-old / post-new COGS_REVERSAL, each leg gated on its own side being positive, so the negative
+  // repost used to be dropped while this function still claimed the WHOLE delta as shipment-owned — and
+  // the caller subtracted it from its own COGS journal. The ledger moved by the reversal alone, the
+  // rest posted nowhere, and the COGS subledger recorded the full delta. A negative basis is o3d-gd2f's
+  // open decision and is not represented, so this REFUSES instead, before writing anything, and aborts
+  // the enclosing transaction so the layer's new cost and the rewritten snapshots roll back with it.
+  // A negative OLD side is refused too: that journal would drop the reversal leg the same way.
+  //
+  // An UN-journaled shipment is deliberately not refused here: nothing has been posted for it, its
+  // cogsBatchAmount is what the daily batch will post, and the batch refuses a negative Group B basis
+  // visibly on its own (o3d-sidy).
+  //
+  // THAT HANDOVER IS ONLY SOUND BECAUSE THE BATCH READS THE SNAPSHOT UNDER THE COST-LAYER LOCK
+  // (o3d-c08y r2, Codex HIGH). It did not: Group B loaded the shipment window
+  // first and locked afterwards, so a batch already parked on the lock resumed from its stale POSITIVE
+  // copy, posted the positive COGS journal and stamped shipmentJournalDate — reproduced end to end on
+  // a scratch database. Group B now probes ids, locks, and then reads the data under the lock, so an
+  // un-journaled shipment this function drives negative is refused by the batch on the committed value
+  // (per order, nothing stamped, in result.errors and an ERROR entry, retried next run) and a batch
+  // that got there first makes the shipment JOURNALED, which brings it back to the refusal above. See
+  // lib/domain/accounting/daily-batch-group-b-lock.ts and
+  // tests/concurrency/daily-batch-group-b-stale-snapshot.concurrent.test.ts.
+  const refused = planned.filter((plan) => plan.current?.shipmentJournalDate
+    && (toDecimal(plan.cogs).lt(0) || toDecimal(plan.current.cogsBatchAmount ?? 0).lt(0)))
+  if (refused.length > 0) {
+    await refuseJournaledShipmentRevaluation(tx, costLayerId, refused.map((plan) => ({
+      shipmentId: plan.id,
+      oldCogsBase: roundQuantity(plan.current?.cogsBatchAmount ?? 0, 2).toFixed(2),
+      newCogsBase: toDecimal(plan.cogs).toFixed(2),
+    })), options)
+  }
+
+  let updated = 0
+  let cogsRevaluationDelta = toDecimal(0)
+  // Resolved lazily on the first un-journaled shipment, then reused, so a
+  // settings read happens at most once per call (audit-gbzh).
+  let dailyBatchPosts: boolean | null = null
+  for (const { id: shipmentId, current: currentShipment, cogs } of planned) {
+    const shipment = { id: shipmentId }
     // (newCogs − oldCogs) is the layer-revaluation delta for this shipment (only
     // this layer's snapshot cost changed).
     const shipmentDelta = subtractMoney(toDecimal(cogs), toDecimal(currentShipment?.cogsBatchAmount ?? 0))
@@ -1186,6 +1419,145 @@ export async function refreshShipmentCogsForCostLayerChange(
   }
 
   return { shipmentsUpdated: updated, cogsRevaluationDelta }
+}
+
+/** Raised on purpose to put the enclosing transaction into aborted state (o3d-c08y). */
+const JOURNALED_REVALUATION_ABORT_SENTINEL = 'journaled_shipment_revaluation_refused'
+
+/**
+ * o3d-c08y r2 — WHAT THE OPERATOR SHOULD ACTUALLY DO, which is not the same sentence for all three
+ * operations that can reach this refusal.
+ *
+ *  - A SAVE (a freight PO's cost lines, a goods PO's additional costs): correct the credit and save
+ *    again. This was the only case round 1 wrote for.
+ *  - A FREIGHT-PO CANCELLATION: there is no save to repeat. The cancellation is what drives the layer
+ *    negative — it removes this PO's positive uplift while a credit on ANOTHER PO stays — and the
+ *    cancelled PO's own cost lines are excluded from the recalc (`freightPO: { status: { not:
+ *    'CANCELLED' } }`), so they are not among the lines named here either. Telling the operator to
+ *    "save again" points at the wrong document.
+ *  - A PRODUCTION-ORDER RECOMPUTE: manufacturing rejects negative cost lines outright, so the credit
+ *    is never on the production order. It is on the purchase order that supplied a component, and the
+ *    recompute merely carried the component layer's cost through to the finished goods.
+ */
+function buildRefusalRemedy(
+  context: ShipmentRevaluationContext | null,
+  creditLines: { count: number; named: string },
+): string {
+  const namedCreditLines = creditLines.named
+  const correct = creditLines.count > 0
+    ? `Correct the credit cost line${creditLines.count === 1 ? '' : 's'} that drove the layer negative — ${namedCreditLines}`
+    : 'Correct the credit cost line (a negative freight or additional cost) that drove the layer negative'
+
+  if (context?.operation === 'cancel_freight_po') {
+    return `This CANCELLATION is refused, so the freight PO is still active. Cancelling it removes its own uplift `
+      + 'from the cost layer while a credit elsewhere stays, which is what takes the shipment below zero; the '
+      + 'cancelled PO\'s own cost lines are excluded from the recalculation and so are not listed here. '
+      + `${correct} — on whichever purchase order still carries it — and then cancel this freight PO again.`
+  }
+  if (context?.operation === 'recompute_production_order' || context?.source === 'manufacturing_recompute') {
+    return 'A production order cannot be recosted below zero, and manufacturing does not accept negative cost '
+      + 'lines: the negative basis comes from a COMPONENT cost layer, i.e. a credit freight or additional cost on '
+      + `the purchase order that supplied it${namedCreditLines ? ` (${namedCreditLines})` : ''}. Correct that credit `
+      + 'on the purchase order, then recompute this production order.'
+  }
+  return `${correct} — and save again.`
+}
+
+/**
+ * o3d-c08y: report, abort, throw — in that order, and never return.
+ *
+ * REPORT FIRST, on its own connection: the abort below rolls back everything written through `tx`,
+ * so an entry written there would vanish with the revaluation it describes.
+ *
+ * ABORT SECOND: a caller that catches the error cannot then commit the layer's new cost and the
+ * rewritten snapshots, because Postgres refuses every further statement in an aborted transaction and
+ * turns its COMMIT into a ROLLBACK. Same mechanism as the transfer re-layering refusal
+ * (transfer-cost-layer-recreation.ts), including its entry precondition (o3d-c08y r2 — see
+ * JournaledShipmentRevaluationContextError), so a client that cannot be aborted is refused rather
+ * than silently skipping the abort.
+ */
+async function refuseJournaledShipmentRevaluation(
+  tx: TxClient,
+  costLayerId: string,
+  shipments: RefusedJournaledShipment[],
+  options: ShipmentCogsRevaluationSyncOptions,
+): Promise<never> {
+  const context = options.revaluationContext ?? null
+  const creditLines = context?.creditCostLines ?? []
+  const shipmentText = shipments
+    .map((shipment) => `${shipment.shipmentId} (COGS ${shipment.oldCogsBase} -> ${shipment.newCogsBase})`)
+    .join(', ')
+  const driver = context?.productionOrderId
+    ? `production order ${context.productionOrderId}`
+    : context?.primaryPoReference
+      ? `purchase order ${context.primaryPoReference}${context.freightPoId ? ` (freight PO ${context.freightPoId})` : ''}`
+      : 'the purchase order that owns this cost layer'
+  const namedCreditLines = creditLines
+    .map((line) => `line ${line.freightCostLineId} on ${line.purchaseOrderReference ?? line.purchaseOrderId} (${line.amountBase})`)
+    .join('; ')
+  const remedy = buildRefusalRemedy(context, { count: creditLines.length, named: namedCreditLines })
+  const message = `Landed-cost revaluation REFUSED for cost layer ${costLayerId} (${driver}): it would take `
+    + `already-journaled shipment${shipments.length === 1 ? '' : 's'} ${shipmentText} below zero. IMS cannot post a `
+    + 'negative shipment COGS (o3d-gd2f): the revaluation journal would reverse the old COGS and drop the negative '
+    + 'repost, so the difference would post nowhere. NOTHING WAS CHANGED: the cost layer, the shipment snapshots, '
+    + 'the shipment COGS and the accounting sync queue are as they were, and this transaction has been aborted. '
+    + `${remedy} (o3d-c08y)`
+  const refusal: JournaledShipmentRevaluationRefusal = { costLayerId, shipments, context, message }
+
+  let logged = false
+  try {
+    logged = await (options.logRefusal ?? defaultLogJournaledShipmentRevaluationRefusal)(refusal)
+  } catch (error) {
+    console.error('refuseJournaledShipmentRevaluation: the ERROR activity entry could not be written', error)
+  }
+  console.error(message)
+
+  // Checked OUTSIDE the try on purpose (as the transfer refusal does): inside it, a client with no
+  // $executeRaw would raise a TypeError the catch below would read as "the abort statement failed",
+  // i.e. as success — a hole precisely where this must have none. The entry precondition has already
+  // refused such a client; this is the second lock on the same door, because it is this line that
+  // would otherwise SKIP the abort and throw a refusal a caller could swallow.
+  if (typeof (tx as { $executeRaw?: unknown }).$executeRaw !== 'function') {
+    throw new JournaledShipmentRevaluationContextError(
+      'no_raw_access',
+      `${message} ALSO: this client exposes no $executeRaw, so the enclosing transaction could not be aborted `
+      + 'and a caller that caught the refusal could still commit the revaluation. Refusing without that '
+      + 'guarantee (o3d-c08y).',
+    )
+  }
+  let aborted = false
+  try {
+    await tx.$executeRaw`SELECT CAST(${JOURNALED_REVALUATION_ABORT_SENTINEL} AS int)`
+  } catch {
+    aborted = true // EXPECTED: this statement exists to fail.
+  }
+  if (!aborted) {
+    throw new Error(
+      `${message} ALSO: the deliberate abort statement SUCCEEDED, so the enclosing transaction may still be `
+      + 'writable. Refusing regardless.',
+    )
+  }
+  throw new JournaledShipmentRevaluationRefusedError(refusal, logged)
+}
+
+async function defaultLogJournaledShipmentRevaluationRefusal(
+  refusal: JournaledShipmentRevaluationRefusal,
+): Promise<boolean> {
+  const { logActivityPersisted } = await import('@/lib/activity-log')
+  return logActivityPersisted({
+    entityType: 'SYSTEM',
+    entityId: refusal.shipments[0]?.shipmentId ?? null,
+    action: 'landed_cost_revaluation_refused_journaled_shipment',
+    tag: 'accounting',
+    level: 'ERROR',
+    description: refusal.message,
+    metadata: {
+      costLayerId: refusal.costLayerId,
+      shipments: refusal.shipments,
+      context: refusal.context,
+    },
+    resolveUser: false,
+  })
 }
 
 export async function refreshSalesOrderLineCogs(
