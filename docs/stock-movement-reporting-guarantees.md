@@ -5,6 +5,18 @@ Migration `20260602103000_stock_movement_reporting_guarantees` installs DB-nativ
 - `stock_movements_reporting_value_consistent` requires `unitCostBase` and `totalValueBase` to be either both null or both populated, and requires populated totals to equal `ROUND(qty * unitCostBase, 6)`.
 - `stock_movements_reporting_evidence_guard` is a deferred constraint trigger. At commit time it requires inbound `PURCHASE_RECEIPT`, `PRODUCTION_IN`, and inbound `ADJUSTMENT` movements to have cost-layer evidence, and outbound `SALE_DISPATCH`, `PURCHASE_REVERSAL`, `PRODUCTION_OUT`, and outbound `ADJUSTMENT` movements to have COGS evidence.
 
+### The reference a guarded inbound movement must carry (o3d-gles)
+
+The cost-layer half of that guard is not satisfied by *any* matching layer: the movement has to **name the document that vouches for the units**, because that id is how the guard reaches the layer. The same rule is written three times — in this trigger, in `hasMatchingInboundCostLayer` and in the `stock_movement_missing_cost_layer` SQL collector (both `lib/domain/inventory/invariants.ts`) — so a writer that gets it wrong either fails at COMMIT or reports as a `critical` invariant finding for ever.
+
+| movement | `referenceType` / `referenceId` | the layer it must find |
+| --- | --- | --- |
+| `PURCHASE_RECEIPT` | `'PurchaseOrder'` / the purchase-order id | a `cost_layers` row for the same product + destination warehouse, `receivedQty` equal to the movement quantity, whose `poLineId` belongs to that purchase order |
+| `PRODUCTION_IN` | `'ProductionOrder'` / the production-order id | a layer with `production_order_id` equal to that id |
+| inbound `ADJUSTMENT` | anything | a layer with `adjustment_movement_id` equal to the movement's own id |
+
+Both purchase-receipt writers obey this: the manual receipt (`app/actions/purchase-orders.ts`) and the WMS webhook book-in (`lib/domain/wms/booked-in-service.ts`). The WMS one used to write `referenceType: 'WmsAsnMap'` instead, so every purchase-order-backed book-in with units to credit died at COMMIT with SQLSTATE 23514 and moved no stock (o3d-gles, pre-existing since PR #581). Its ASN linkage is carried by `idempotencyKey` (`PURCHASE_RECEIPT:wmsAsnLine:<asnLineMapId>:receipt:<receiptEventId>`) and by the external ASN id in `note`. `TRANSFER_IN` is not covered by the guard and still references the ASN map.
+
 ## Deploy Recovery
 
 The migration preflight blocks deploy only for value-field drift because those rows would fail CHECK validation:
