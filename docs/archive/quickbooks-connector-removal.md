@@ -116,11 +116,13 @@ Both are filed as follow-ups rather than guessed at.
   trigger. A retired key in an exclusion list costs nothing; removing it reopens the cycle.
 - **`quickbooks_client_secret` in `SENSITIVE_SETTING_KEYS`.** Same reasoning, and it fails safe: a
   stale sensitive key over-protects.
-- **`ACCOUNTING_FOLLOW_UP_RECOVERY['quickbooks']`, `sync-row-claimability`'s `quickbooks` entry,
-  `connector-orphans`, and the `CONNECTOR_LABELS` maps in the orphan and failed-sync banners.** These
-  are all keyed by the STORED connector string, and stored `quickbooks` rows exist. Removing them
-  would make an existing row render as an unlabelled id, or drop out of a summary that is the only
-  way an operator can see and cancel it. `connector-orphans` in particular is now UNREACHABLE by a
+- **`ACCOUNTING_FOLLOW_UP_RECOVERY['quickbooks']`, `connector-orphans`, and the `CONNECTOR_LABELS`
+  maps in the orphan and failed-sync banners.** These are all keyed by the STORED connector string,
+  and stored `quickbooks` rows exist. Removing them would make an existing row render as an unlabelled
+  id, or drop out of a summary that is the only way an operator can see and cancel it.
+  **`sync-row-claimability`'s `quickbooks` entry WAS IN THIS LIST AND SHOULD NOT HAVE BEEN** — see
+  "Round 2" below. It is gone: that map is not a label, it is a claim-path assertion, and keeping it
+  asserted a claim path that had been archived. `connector-orphans` in particular is now UNREACHABLE by a
   connector switch — there is no switch — and its only population is rows naming an archived
   connector, which is precisely the state a development database is in.
 - **The `quickbooks` branch in `effectiveTokenFor`** (`followup-retry-guard.ts`), unreachable and
@@ -204,15 +206,23 @@ Decisions, stated rather than left implicit:
 - **`AccountingSyncLog` rows with `connector = 'quickbooks'`: LEAVE THEM.** They are financial
   evidence — what IMS believes it posted, and where. Nothing claims them (each processor filters on
   its own connector), and `getCrossConnectorOrphanSummary` is exactly the surface that makes them
-  visible and bulk-cancellable. The settle-one-row action now refuses them explicitly ("that sync
-  entry no longer exists") rather than trying to read a ledger it cannot reach.
+  visible and bulk-cancellable. `reconcileSettledAccountingSyncRow` refuses them explicitly ("that
+  sync entry no longer exists") rather than trying to read a ledger it cannot reach — it exists to READ
+  the connector's ledger, and there is nothing to read it with. `settleAccountingSyncRow` gives the
+  OPPOSITE answer for the same row and both are right: it needs nothing to be able to CLAIM the row,
+  which is exactly what an archived connector guarantees, so such a row is adopted and settled rather
+  than refused. See "Round 2" below; the first cut of this branch refused it there too, which left the
+  row with no exit at all.
 - **`AccountingToken` / `AccountingAccount` / `AccountingAccountBalanceSnapshot` rows with
   `connector = 'quickbooks'`: LEAVE THEM.** A token row is a credential and deleting it is a remote
   side effect nobody asked for; the other two are a cache.
-- **`Setting` rows `quickbooks_*` and `plugin_quickbooks_enabled`: LEAVE THEM.** Nothing reads them —
-  `getIntegrationPluginState` is built over the id union, so it cannot see the plugin flag at all —
-  and `quickbooks_expected_realm_id` is still in the wholesale-delete exclusion list for the deadlock
-  reason above.
+- **`Setting` rows `quickbooks_*` and `plugin_quickbooks_enabled`: LEAVE THEM.** `plugin_quickbooks_enabled`
+  is unread: `getIntegrationPluginState` is built over the id union, so it cannot see the plugin flag
+  at all. `quickbooks_expected_realm_id` is still in the wholesale-delete exclusion list for the
+  deadlock reason above. **"Nothing reads them" was FALSE of `quickbooks_sync_enabled` when this
+  sentence was first written**, and that is the round-2 finding below: the stranded-row loader read it
+  by name and the claimability rule treated the value as proof a QuickBooks claim path was open.
+  Nothing reads it now.
 - **Provenance strings beginning `quickbooks:`** on `Product.accountingItemProvenance` and the two
   contact-provenance columns: LEAVE THEM. They are read as opaque namespaces, and a row from a
   namespace this build cannot issue is inert, which is what the provenance design is for.
@@ -235,3 +245,53 @@ is no path from any cron, any server action or any operator control to a QuickBo
 build. **The HIGH is moot on this branch's head.** It is not "fixed" — the refusal was never written —
 so if QuickBooks is ever revived from the archive, it comes back with that defect intact, and the
 revival note says so.
+
+## Round 2 (Codex MEDIUM): a retired toggle blocked settlement of stranded rows
+
+> [medium] Retired QuickBooks toggle blocks settlement of stranded rows
+> (`lib/domain/accounting/sync-row-claimability.ts:61-63`) — "The removal leaves existing
+> `quickbooks_sync_enabled=true` settings in place, but removes the QuickBooks processor and Sync
+> settings control. `isAccountingConnectorQuiesced` still treats that stored value as proof that
+> QuickBooks can claim a row."
+
+**The rule was asking the wrong question.** What adoption needs to know is *is there a deployed worker
+that could still claim this row?* The `<connector>_sync_enabled` toggle was a PROXY for that, and a
+good one while the connector existed: it is the one gate both claim paths — the cron branch and the
+manual Sync action — pass through. Archiving QuickBooks deleted the processor, the cron branch, the
+manual Sync action and the Sync-settings control, and deleted no `quickbooks_sync_enabled` row. The
+proxy then answered in the UNSAFE direction: it reported the row CLAIMABLE when nothing in the
+deployment could claim it. Both the stranded-rows banner and `settleAccountingSyncRow` therefore
+refused a revision-0 QuickBooks row, and the refusal named a checkbox the Sync page no longer renders.
+A financial row with no claim path, no exit, and instructions that cannot be followed.
+
+**The fix asks whether the connector is in the active codebase, using the one place that already
+answers it.** `isAccountingConnectorQuiesced` now begins at `isRegisteredAccountingConnector`
+(`lib/connectors/accounting-registry.ts`) — the same registry-keyed predicate the refund-retry pin,
+`reconcileSettledAccountingSyncRow` and the mapping validator read, so "retired" has one spelling and
+cannot disagree with the registry about who exists. An unregistered connector is quiesced
+unconditionally: every candidate and claim query in `lib/connectors/xero/sync-processor.ts` is scoped
+`connector: XERO_CONNECTOR`, so no processor in this build selects its rows. A REGISTERED connector is
+unchanged — its toggle is still the necessary condition, and the round-5/round-7 residual (the toggle
+is an admission check, not a fence; o3d-4b5p) still applies to it and only to it.
+
+Also changed:
+
+- `ACCOUNTING_SYNC_ENABLED_SETTING_KEYS` lost its `quickbooks` entry and is now typed
+  `Record<AccountingConnectorId, string>`, i.e. TOTAL over the registry. Registering a connector
+  without naming the toggle its claim paths gate on is a `tsc` error rather than a silent runtime
+  "cannot be shown to be quiesced".
+- The stranded-row loader issues no `settings` read at all for a page of archived-connector rows.
+- `describeStillClaimableStrandedRow` can only ever name a key drawn from the registered roster, so no
+  refusal can send an operator to a control that was archived with its connector. (Its unregistered
+  arm is now unreachable from both callers by construction, and names no lever.)
+
+**The premise that is a deployment fact rather than a code fact**, stated because the finding asked
+for it: "not in this build" equals "not in the deployment" only because IMS runs as ONE Next server.
+Both claim paths live inside it — the cron scheduler calls an HTTP route, it does not run a worker of
+its own — and there is no standalone accounting worker in the tree. A rolling deployment serving two
+binaries against one database would break the equivalence; IMS is not deployed that way, and a second
+accounting connector would be registered in both binaries anyway.
+
+**There was no instance to repair.** The development database holds ZERO `accounting_sync_logs` rows
+with `connector = 'quickbooks'` and no `quickbooks_sync_enabled` setting row at all; production is
+unused and will be reinstalled. The fix is code-only — no migration, no backfill.
