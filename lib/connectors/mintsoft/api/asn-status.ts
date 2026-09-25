@@ -173,6 +173,23 @@ const ASN_STATUS_NAME_KEYS = ['Status', 'status', 'AsnStatus', 'asnStatus', 'ASN
 const ASN_STATUS_ID_KEYS = ['ASNStatusId', 'AsnStatusId', 'asnStatusId', 'StatusId', 'statusId'] as const
 const NESTED_STATUS_ID_KEYS = ['ID', 'Id', 'id'] as const
 
+/**
+ * THE ONLY TWO STATUS FIELDS MINTSOFT'S CONTRACT NAMES: `ASNStatusId` (int32) and `ASNStatus.ID` inside the
+ * `ASNStatus` object (swagger read 2026-09-24 and confirmed on live ASN 6114 and created ASN 6117; bd
+ * o3d-vcw8). They are STRICT: present with a value that is not a safe integer is an unreadable signal, not
+ * a field to skip past — an `ASNStatusId` of `"3"` beside a name of `COMPLETE` would otherwise be a
+ * disagreement discarded silently, which is the exact shape of round 9's finding.
+ *
+ * The other spellings in the lists above are GUESSES inherited from the pre-round-8 reader; Mintsoft serves
+ * none of them. They stay LENIENT — a usable integer is a signal, anything else is ignored — because
+ * refusing on some response wrapper's unrelated `status` or `statusId` would block ASN creation
+ * tenant-wide over a field Mintsoft never sends. Narrowing the lists to the canonical two is tracked on
+ * bd o3d-nvy1.
+ */
+const CANONICAL_STATUS_ID_KEY = 'ASNStatusId'
+const CANONICAL_NESTED_STATUS_ID_KEY = 'ID'
+const CANONICAL_STATUS_OBJECT_KEY = 'ASNStatus'
+
 /** One thing the wire said about this ASN's status, and the status (if any) it resolves to. */
 type WireStatusSignal = {
   /** The wire field it came from, for the operator's message (e.g. `ASNStatus.Name`). */
@@ -200,6 +217,22 @@ function idSignal(source: string, value: number): WireStatusSignal {
   return { source, seen: String(value), fact: MINTSOFT_ASN_STATUSES.find((fact) => fact.id === value) ?? null }
 }
 
+/** A CANONICAL status-id field that is there but is not an id. `fact: null`, so the caller refuses. */
+function unusableSignal(source: string, value: unknown): WireStatusSignal {
+  return { source, seen: typeof value === 'string' ? value : JSON.stringify(value) ?? String(value), fact: null }
+}
+
+/**
+ * One status-id field, read at whichever strictness its spelling earns (see `CANONICAL_STATUS_ID_KEY`).
+ * `null`/`undefined` is ABSENT everywhere: a warehouse may legitimately say nothing here, and the other
+ * signals — or the absence of all of them, which also refuses — decide.
+ */
+function idSignalsFrom(source: string, value: unknown, canonical: boolean): WireStatusSignal[] {
+  if (value === null || value === undefined) return []
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return [idSignal(source, value)]
+  return canonical ? [unusableSignal(source, value)] : []
+}
+
 /**
  * EVERY STATUS SIGNAL THE ROW CARRIES — not the first one that reads, which is the precedence contest
  * round 9 removed. Live Mintsoft serves three of them on one ASN (`ASNStatus.Name`, `ASNStatus.ID` and
@@ -220,16 +253,16 @@ function collectWireStatusSignals(row: Record<string, unknown>): WireStatusSigna
     const nestedName = nested.Name ?? nested.name
     if (typeof nestedName === 'string' && nestedName.trim()) signals.push(nameSignal(`${key}.Name`, nestedName))
     for (const idKey of NESTED_STATUS_ID_KEYS) {
-      const nestedId = nested[idKey]
-      if (typeof nestedId === 'number' && Number.isInteger(nestedId)) {
-        signals.push(idSignal(`${key}.${idKey}`, nestedId))
-        break
-      }
+      if (!(idKey in nested)) continue
+      const canonical = key === CANONICAL_STATUS_OBJECT_KEY && idKey === CANONICAL_NESTED_STATUS_ID_KEY
+      const read = idSignalsFrom(`${key}.${idKey}`, nested[idKey], canonical)
+      signals.push(...read)
+      if (read.length > 0) break
     }
   }
   for (const key of ASN_STATUS_ID_KEYS) {
-    const value = row[key]
-    if (typeof value === 'number' && Number.isInteger(value)) signals.push(idSignal(key, value))
+    if (!(key in row)) continue
+    signals.push(...idSignalsFrom(key, row[key], key === CANONICAL_STATUS_ID_KEY))
   }
   return signals
 }

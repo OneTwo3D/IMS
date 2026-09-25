@@ -904,7 +904,17 @@ test('o3d-bhvu r9: readMintsoftAsnWireStatus distinguishes absent, unreadable an
     ['a NESTED id that disagrees with the name', { ASNStatus: { Name: 'COMPLETE', ID: 3 } }, 'unreadable'],
     ['a nested id that disagrees with ASNStatusId', { ASNStatus: { Name: 'COMPLETE', ID: 6 }, ASNStatusId: 3 }, 'unreadable'],
     ['an IMS name', { ASNStatus: { Name: 'OPEN' } }, 'unreadable'],
-    ['a non-integer id', { ASNStatusId: 3.5 }, 'absent'],
+    // THE CANONICAL FIELDS ARE STRICT: present but not an id is a wire-shape change, not a field to skip
+    // past. A discarded `ASNStatusId: '3'` beside a readable `COMPLETE` would be round 9's finding again.
+    ['a non-integer canonical id', { ASNStatusId: 3.5 }, 'unreadable'],
+    ['a numeric-STRING canonical id beside a readable name', { ASNStatus: { Name: 'COMPLETE' }, ASNStatusId: '3' }, 'unreadable'],
+    ['a canonical nested ID that is not an id', { ASNStatus: { Name: 'COMPLETE', ID: 'six' } }, 'unreadable'],
+    ['an explicit null canonical id is absent, not unreadable', { ASNStatusId: null }, 'absent'],
+    ['a null canonical id beside a readable name still resolves', { ASNStatus: { Name: 'COMPLETE' }, ASNStatusId: null }, 'resolved'],
+    // …and the SPECULATIVE spellings stay lenient, so a wrapper's unrelated `statusId` cannot refuse a
+    // tenant's ASNs over a field Mintsoft never sends (bd o3d-nvy1).
+    ['a speculative statusId that is not an id is ignored', { ASNStatus: { Name: 'COMPLETE' }, statusId: 'ok' }, 'resolved'],
+    ['a speculative statusId that IS a listed id still counts', { ASNStatus: { Name: 'COMPLETE' }, statusId: 3 }, 'unreadable'],
   ]
   let examined = 0
   for (const [label, row, expected] of cases) {
