@@ -829,8 +829,37 @@ export async function processBookedInEvent(
                     qty: receiptLine.stockQtyToAdd,
                     ...buildStockMovementValueFields({ qty: receiptLine.stockQtyToAdd, unitCostBase }),
                     note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-                    referenceType: 'WmsAsnMap',
-                    referenceId: asnMap.id,
+                    // o3d-gles. THIS USED TO BE `referenceType: 'WmsAsnMap'` / `referenceId:
+                    // asnMap.id`, and that made EVERY purchase-order-backed WMS book-in with units
+                    // to credit die at COMMIT on `stock_movements_reporting_evidence_guard`
+                    // (SQLSTATE 23514, "requires matching cost-layer evidence"): the guard accepts a
+                    // PURCHASE_RECEIPT only when the movement names the PURCHASE ORDER that vouches
+                    // for the units, because that is what it joins to `cost_layers` -> its
+                    // `poLineId` -> `purchase_order_lines.poId`. Pre-existing since 259e702f
+                    // (PR #581); it was masked while the live ASN-item quantity was unread
+                    // (o3d-btiw) and `stockQtyToAdd` was therefore always 0, so the insert was
+                    // never reached.
+                    //
+                    // THE PO, NOT THE ASN, IS THE EVIDENCE. The guard's question is "which purchase
+                    // order vouches for these units"; the ASN is the routing detail that says where
+                    // they physically turned up. The SAME rule is written in THREE places and all
+                    // three demand 'PurchaseOrder' — this trigger, the TypeScript invariant
+                    // (lib/domain/inventory/invariants.ts hasMatchingInboundCostLayer) and the SQL
+                    // invariant collector (same file, stock_movement_missing_cost_layer). Widening
+                    // them instead would have to widen all three, and a WMS receipt left out of any
+                    // one of them reports as a CRITICAL `stock_movement_missing_cost_layer` finding
+                    // for ever.
+                    //
+                    // THE ASN LINK IS NOT LOST. Nothing in the tree reads
+                    // `stock_movements.referenceType = 'WmsAsnMap'` (the only occurrences were this
+                    // write and the TRANSFER_IN one below), and the ASN line is still carried
+                    // line-granularly by `idempotencyKey` —
+                    // `PURCHASE_RECEIPT:wmsAsnLine:<asnLineMapId>:receipt:<receiptEventId>` — with
+                    // the external ASN id in `note`. That is the same latent-in-the-key shape
+                    // SALE_DISPATCH had before `shipmentLineId` was promoted to a column; promoting
+                    // this one is filed, not folded in, because no reader needs it yet.
+                    referenceType: 'PurchaseOrder',
+                    referenceId: poId,
                     idempotencyKey: wmsPurchaseReceiptMovementKey({
                       asnLineMapId: receiptLine.asnLineMapId,
                       receiptEventId: lockedEvent.id,
