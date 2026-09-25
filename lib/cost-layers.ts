@@ -1360,7 +1360,7 @@ export async function refreshShipmentCogsForCostLayerChange(
   // visibly on its own (o3d-sidy).
   //
   // THAT HANDOVER IS ONLY SOUND BECAUSE THE BATCH READS THE SNAPSHOT UNDER THE COST-LAYER LOCK
-  // (o3d-c08y r2, Codex HIGH). It did not: both Group B implementations loaded the shipment window
+  // (o3d-c08y r2, Codex HIGH). It did not: Group B loaded the shipment window
   // first and locked afterwards, so a batch already parked on the lock resumed from its stale POSITIVE
   // copy, posted the positive COGS journal and stamped shipmentJournalDate — reproduced end to end on
   // a scratch database. Group B now probes ids, locks, and then reads the data under the lock, so an
