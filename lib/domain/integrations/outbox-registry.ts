@@ -102,6 +102,21 @@ export const AccountingPostingRefusalProvisionalPayloadSchema = z.object({
   /** ISO-8601. Required, not defaulted: a claim with no decision moment cannot be aged or compared. */
   decidedAt: z.string().min(1),
   mergeOnly: z.boolean(),
+  /**
+   * o3d-j625 r11 (Codex round 10, HIGH 1) — THE POSTINGS ALREADY QUEUED WHEN THE REFUSAL WAS SHUT OUT OF
+   * ITS KEY: the accounting-sync-log row ids, and whether that list is the whole set.
+   *
+   * OPTIONAL AND NULLABLE, and the three states are three different facts, which is why neither a default
+   * nor a required field would do. `undefined` = a claim written before this field existed. `null` = the
+   * deferring call was shut out and could not make the observation. An object = the baseline. Only the
+   * third licenses the replay to conclude that the transaction which held the key queued this posting;
+   * the other two leave it with the decision-time comparison, which keeps a debt rather than losing one.
+   */
+  queuedWhenShutOut: z.object({
+    ids: z.array(nonEmptyString),
+    /** `false` = there were more live rows than a claim may carry, so `ids` is NOT the whole set. */
+    complete: z.boolean(),
+  }).nullable().optional(),
 })
 
 export const LandedCostJournalOutboxPayloadSchema = z.object({

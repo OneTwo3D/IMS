@@ -2347,7 +2347,10 @@ Three things about those rows:
   lost either: it is held with that work — it commits or rolls back with it — and the next **accounting
   sync** run settles it under the posting's lock, which is the wait the original job was not allowed to
   make. If the job holding the lock queued the posting, nothing is owed and the claim disappears; if that
-  job rolled back or never queued it, the refusal becomes an ordinary row on this list. It is logged as
+  job rolled back or never queued it, the refusal becomes an ordinary row on this list. "Queued" here means
+  a posting IMS can see was queued *while the refusal was waiting* — an **earlier** entry for the same
+  document (successive edits of one invoice, successive payments of one bill) does not settle it, because
+  the ledger would still be holding the earlier version. It is logged as
   `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal itself is
   in the accounting activity log as always.
 * **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not

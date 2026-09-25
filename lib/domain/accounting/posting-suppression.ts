@@ -214,14 +214,27 @@ export type PostingKeyLockClient = PostingSuppressionClient & {
  * Whether the posting key's lock is held for the work about to run, and — when it is — whether it had
  * to be WAITED for.
  *
- * `contended` is not bookkeeping. It is the only clock-free evidence available that ANOTHER transaction
- * was settling this posting while this refusal was being decided, which is exactly what makes the
- * refusal stale (see `recordAccountingPostingRefusal`).
+ * `contended` is not bookkeeping: it says another transaction was settling this posting at the moment
+ * this caller wanted the key.
+ *
+ * ── o3d-j625 r11 (Codex round 10, HIGH 1) — AND CONTENTION ALONE IS NOT EVIDENCE OF WHAT IT DID ──
+ *
+ * r10 treated it as evidence that the holder had QUEUED the posting, which it is not: a holder that
+ * rolls back, or that was marking or refusing rather than queueing, leaves contention behind and no
+ * posting. What distinguishes the two is what the holder WROTE, so whoever is shut out of the key must
+ * be able to say what was there BEFORE it. `observed` is that snapshot, taken by `observeWhenContended`
+ * at the one moment it can be taken — after the key has been refused, before the holder can commit —
+ * and it is the baseline the caller compares against once it does hold the key.
+ *
+ * `null` means no observation was made (no observer supplied, or the observation itself failed). It is
+ * NOT an empty observation: a caller must treat it as "I cannot tell", never as "nothing was there".
  */
-export type PostingKeyLock =
-  | { held: true; contended: boolean }
+export type PostingKeyLock<O = never> =
+  | { held: true; contended: false }
+  | { held: true; contended: true; observed: O | null }
   /** `busy`: another transaction holds it and this caller may not wait. `unlockable`: a test double. */
-  | { held: false; reason: 'busy' | 'unlockable' }
+  | { held: false; reason: 'busy'; observed: O | null }
+  | { held: false; reason: 'unlockable' }
 
 /** How long a POOLED writer will wait for the key before giving up and reporting it (ms). */
 const POOLED_LOCK_TIMEOUT_MS = 10_000
@@ -251,13 +264,31 @@ async function tryLockPostingKey(client: PostingKeyLockClient, key: PostingRefus
  * (`isClientInsideTransaction`), because Prisma's transaction client is not distinguishable from the
  * pooled one by looking at it (lib/db/savepoint.ts), and calling `$transaction` on a transaction client
  * would open a SECOND connection inside the first — a self-deadlock waiting to happen.
+ *
+ * `observeWhenContended` (o3d-j625 r11) is called ONLY on the two paths where this caller has just been
+ * refused the key — the in-transaction `busy` path and the pooled path that is about to wait — and it is
+ * called BEFORE the wait, so what it returns cannot already include the holder's own writes. It must be a
+ * READ: it runs inside the caller's transaction on the `busy` path, where a statement that raises would
+ * abort that transaction, so the observer is responsible for its own savepoint. A throw here is contained
+ * and reported as `observed: null` rather than failing the lock, because an observation is evidence the
+ * caller can do without and the lock is not.
  */
-export async function runUnderPostingKeyLock<T>(
+export async function runUnderPostingKeyLock<T, O = never>(
   client: PostingKeyLockClient,
   key: PostingRefusalKey,
-  options: { callerTransaction: boolean },
-  fn: (client: PostingKeyLockClient, lock: PostingKeyLock) => Promise<T>,
+  options: { callerTransaction: boolean; observeWhenContended?: (client: PostingKeyLockClient) => Promise<O | null> },
+  fn: (client: PostingKeyLockClient, lock: PostingKeyLock<O>) => Promise<T>,
 ): Promise<T> {
+  const observe = async (on: PostingKeyLockClient): Promise<O | null> => {
+    if (!options.observeWhenContended) return null
+    try {
+      return await options.observeWhenContended(on)
+    } catch {
+      // Deliberately silent HERE: the caller is told `observed: null`, which it must read as "I cannot
+      // tell". Reporting belongs to whoever decides what that costs, not to the lock.
+      return null
+    }
+  }
   // STATICALLY imported, so `tsc` is what guarantees the probe exists in production; the `typeof` check
   // can only be false under a MODULE DOUBLE of lib/db/savepoint that supplies `withSavepoint` alone (four
   // test files do), and such a double is treated exactly like a client with no raw escape hatch.
@@ -271,7 +302,8 @@ export async function runUnderPostingKeyLock<T>(
   if (inTransaction) {
     const got = await tryLockPostingKey(client, key)
     if (got === null) return fn(client, { held: false, reason: 'unlockable' })
-    return fn(client, got ? { held: true, contended: false } : { held: false, reason: 'busy' })
+    if (got) return fn(client, { held: true, contended: false })
+    return fn(client, { held: false, reason: 'busy', observed: await observe(client) })
   }
   if (typeof client.$transaction !== 'function') return fn(client, { held: false, reason: 'unlockable' })
   return await client.$transaction(async (raw) => {
@@ -285,12 +317,15 @@ export async function runUnderPostingKeyLock<T>(
     const got = await tryLockPostingKey(tx, key)
     if (got === null) return fn(tx, { held: false, reason: 'unlockable' })
     if (got) return fn(tx, { held: true, contended: false })
+    // o3d-j625 r11: what was there BEFORE the holder could commit — read now, because after the wait
+    // below the holder's writes are indistinguishable from everybody else's.
+    const observed = await observe(tx)
     // Contended. Safe to wait: this transaction holds nothing yet (see the header), and a timeout
     // raises 55P03, which the caller reports rather than swallows.
     // Called as a METHOD (Prisma binds its client methods); the assertion only erases the optionality
     // the structural type carries for doubles, which `got === null` above has already ruled out.
     await tx.$executeRaw!`SELECT pg_advisory_xact_lock(${ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE}, ${postingKeyLockId(key)})`
-    return fn(tx, { held: true, contended: true })
+    return fn(tx, { held: true, contended: true, observed })
   }, POOLED_TRANSACTION) as T
 }
 

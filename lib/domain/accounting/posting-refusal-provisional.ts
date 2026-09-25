@@ -9,7 +9,11 @@ import {
   type AccountingPostingRefusalProvisionalPayload,
 } from '@/lib/domain/integrations/outbox-registry'
 import { POSTING_REFUSAL_KINDS, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
-import type { AccountingPostingRefusalRecord, PostingRefusalKey } from '@/lib/domain/accounting/posting-refusal-inbox'
+import type {
+  AccountingPostingRefusalRecord,
+  PostingRefusalKey,
+  QueuedPostingEvidence,
+} from '@/lib/domain/accounting/posting-refusal-inbox'
 
 /**
  * o3d-j625 r10 (Codex round 9, HIGH) — A REFUSAL THE CALLER'S TRANSACTION COULD NOT RECORD IS STILL
@@ -119,7 +123,7 @@ function provisionalIdempotencyKey(key: PostingRefusalKey, decidedAt: Date, nonc
 export function buildProvisionalPostingRefusalPayload(
   key: PostingRefusalKey,
   record: AccountingPostingRefusalRecord,
-  options: { decidedAt: Date; mergeOnly: boolean },
+  options: { decidedAt: Date; mergeOnly: boolean; queuedWhenShutOut?: QueuedPostingEvidence | null },
 ): AccountingPostingRefusalProvisionalPayload {
   return {
     key: { type: key.type, referenceType: key.referenceType, referenceId: key.referenceId, scope: key.scope },
@@ -134,6 +138,20 @@ export function buildProvisionalPostingRefusalPayload(
     },
     decidedAt: options.decidedAt.toISOString(),
     mergeOnly: options.mergeOnly,
+    // o3d-j625 r11 (Codex round 10, HIGH 1) — WHAT WAS ALREADY QUEUED WHEN THE KEY WAS REFUSED.
+    //
+    // The replay's whole difficulty is that by the time it runs, the transaction that held the key has
+    // ended: a holder that queued the posting and a holder that rolled back look identical from there, and
+    // r10 resolved that by treating any live sync row as the holder's. For the types whose successive
+    // edits SHARE a posting key, edit 1's row then discharged every later refusal for ever. This is the
+    // baseline that makes the difference visible — a live row whose id is not in it was written by a
+    // transaction that committed after the refusal was shut out.
+    //
+    // `null` is a VALUE here, not an omission: "this call was shut out and could not look", which the
+    // replay must not read as "nothing was queued". An older claim, written before this field existed,
+    // parses as `undefined` and the replay falls back to the decision-time comparison alone — which keeps
+    // the debt rather than losing it.
+    queuedWhenShutOut: options.queuedWhenShutOut === undefined ? null : options.queuedWhenShutOut,
   }
 }
 
@@ -149,7 +167,7 @@ export async function enqueueProvisionalPostingRefusal(
   client: IntegrationOutboxClient,
   key: PostingRefusalKey,
   record: AccountingPostingRefusalRecord,
-  options: { decidedAt: Date; mergeOnly: boolean; nonce: string },
+  options: { decidedAt: Date; mergeOnly: boolean; nonce: string; queuedWhenShutOut: QueuedPostingEvidence | null },
 ): Promise<void> {
   await enqueueIntegrationOutbox(
     {
@@ -190,6 +208,12 @@ export type UnreconciledProvisionalPostingRefusal = {
   key: PostingRefusalKey
   record: AccountingPostingRefusalRecord
   decidedAt: Date
+  /**
+   * o3d-j625 r11 — the postings already queued when the refusal was shut out of its key. `null` = it could
+   * not be observed; `undefined` = a claim written before this field existed. Both leave the replay with
+   * the decision-time comparison alone, which keeps the debt.
+   */
+  queuedWhenShutOut?: QueuedPostingEvidence | null
   /** How many reconciliation attempts have already failed; 0 while it is simply waiting for the drain. */
   attempts: number
   status: string
@@ -260,6 +284,7 @@ export async function listUnreconciledProvisionalPostingRefusals(options: {
       key: parsed.data.key,
       record: provisionalPayloadToRecord(parsed.data),
       decidedAt: new Date(parsed.data.decidedAt),
+      ...(parsed.data.queuedWhenShutOut === undefined ? {} : { queuedWhenShutOut: parsed.data.queuedWhenShutOut }),
       attempts: row.attempts,
       status: row.status,
     })

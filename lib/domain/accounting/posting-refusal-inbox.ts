@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import { withSavepoint } from '@/lib/db/savepoint'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { runUnderPostingKeyLock, type PostingKeyLockClient } from '@/lib/domain/accounting/posting-suppression'
@@ -87,12 +88,16 @@ export type PostingRefusalClient = {
     }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null; resolvedAt?: Date | null; resolution?: string | null } | null>
   }
   /**
-   * o3d-j625 r9 — THE ACCOUNTING SYNC LOG, read only when the posting key was CONTENDED.
+   * o3d-j625 r9 — THE ACCOUNTING SYNC LOG, the only durable trace a FIRST enqueue of a posting leaves.
    *
    * A refusal racing the FIRST successful enqueue of a posting has no resolved row to learn from: the
    * enqueue's clear matched nothing, because no refusal row existed yet. The evidence that the posting is
-   * nonetheless queued is the sync row itself. Optional, so a structural double is unchanged — and read
-   * only under contention, never as a blanket "a row exists, so nothing is owed" (see the header).
+   * nonetheless queued is the sync row itself. Optional, so a structural double is unchanged — and never
+   * read as a blanket "a row exists, so nothing is owed" (see the header).
+   *
+   * o3d-j625 r11: read for the ROW IDS as much as for the rows. A sync row's id exists only if the
+   * transaction that inserted it committed, so a row id that was not there when this refusal was shut out
+   * of the posting key IS the enqueue saying, in its own writing, that it happened.
    */
   /**
    * Typed `unknown` and narrowed at runtime on purpose: the clients passed here carry a dozen different
@@ -106,8 +111,8 @@ export type PostingRefusalClient = {
 type SyncLogReader = {
   findMany?(args: {
     where: Record<string, unknown>
-    select: { payload: true; createdAt: true }
-  }): Promise<Array<{ payload: unknown; createdAt: Date }>>
+    select: { id: true; payload: true; createdAt: true }
+  }): Promise<Array<{ id: string; payload: unknown; createdAt: Date }>>
 }
 
 /** The key of the posting a row is about — produced by `accountingPostingKey` in lib/accounting.ts. */
@@ -162,16 +167,30 @@ export type RecordRefusalOptions = {
    */
   decidedAt?: Date
   /**
-   * o3d-j625 r10 — THE POSTING KEY WAS HELD BY ANOTHER TRANSACTION WHEN THIS REFUSAL WAS DECIDED.
+   * o3d-j625 r11 (Codex round 10, HIGH 1) — WHICH POSTINGS WERE ALREADY QUEUED WHEN THIS REFUSAL WAS SHUT
+   * OUT OF THE POSTING KEY. The baseline, not a flag.
    *
-   * Set only by `reconcileProvisionalPostingRefusals`, replaying a refusal whose in-transaction call
-   * could not take the key. By the time the replay runs that transaction has ended and the key is free,
-   * so the replay looks UNCONTENDED and would not otherwise consult the accounting sync log — the one
-   * piece of evidence a FIRST refusal racing a FIRST enqueue can have. This carries the contention
-   * forward so the replay reaches the same answer the original call would have, had it been allowed to
-   * wait for the key.
+   * Set only by `reconcileProvisionalPostingRefusals`, replaying a refusal whose in-transaction call could
+   * not take the key. By the time the replay runs that transaction has ended and the key is free, so the
+   * replay cannot observe the race it is recovering from; the claim carries the observation forward.
+   *
+   * r10 carried a BOOLEAN here (`contendedWhenDecided`), and under it the replay treated ANY live sync row
+   * for the key as proof that the contending transaction had queued the posting. Successive edits of one
+   * invoice share a posting key (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT), so edit 1's
+   * row — live for ever — discharged a refusal whose lock holder had ROLLED BACK and queued nothing. The
+   * debt then existed and nothing listed it. Contention says another transaction was settling this
+   * posting; it says nothing about WHAT it did, and only what it WROTE can.
+   *
+   * THREE VALUES, and the difference between the last two is the fix:
+   *   • `undefined` — this call was never shut out of the key, so there is no baseline and no claim.
+   *   • `null` — it was shut out and the observation could not be made. "I cannot tell", never "nothing
+   *     was there": the identity comparison is abstained from and the refusal is RECORDED, which keeps a
+   *     debt that may not be owed rather than losing one that is.
+   *   • an evidence object — the ids of the postings already queued at that moment. A live row that is
+   *     NOT among them was written by a transaction that committed after this refusal was shut out, which
+   *     is the enqueue's own evidence that it happened.
    */
-  contendedWhenDecided?: boolean
+  queuedWhenShutOut?: QueuedPostingEvidence | null
 }
 
 /**
@@ -219,48 +238,57 @@ async function guarded(
 }
 
 /**
- * Was this posting QUEUED after this refusal was decided — on the evidence of the accounting sync log
- * rather than of the refusal row?
+ * ── o3d-j625 r11 (Codex round 10, both HIGHs) — WHAT COUNTS AS EVIDENCE THAT A POSTING WAS QUEUED ──
+ *
+ * The two findings of round 10 pull in opposite directions — one discharged a debt that was owed, the
+ * other recorded one that was not — and they share a single defect: A TIMESTAMP COMPARISON WAS BEING USED
+ * AS EVIDENCE OF AN EVENT. So the question asked here is no longer "is there a row, and is its clock
+ * reading later than mine": it is "did an enqueue leave, in its own writing, something that was not there
+ * before". A sync row's ID is exactly that: it exists only if the transaction that inserted it committed,
+ * and a transaction that rolled back leaves none.
+ *
+ * A REFUSAL IS SUPERSEDED, THEN, IN EITHER OF TWO WAYS:
+ *
+ *  1. A POSTING WAS QUEUED WHILE THIS REFUSAL WAS SHUT OUT OF THE KEY — a live row whose id is not in the
+ *     baseline taken at the moment the key was refused ({@link RecordRefusalOptions.queuedWhenShutOut}).
+ *     This is an IDENTITY, not a clock: it answers "did the contending transaction enqueue THIS posting?"
+ *     with what that transaction wrote. r10 answered it with "the key was contended and some live row
+ *     exists", which edit 1 of a shared-key invoice satisfied for ever, so a holder that rolled back
+ *     discharged a real debt (HIGH 1).
+ *  2. OR A POSTING FOR THIS KEY WAS QUEUED AFTER THE REFUSAL WAS DECIDED — `createdAt` later than
+ *     `decidedAt`. This is the arm that closes r9's residual: an enqueue that both started and committed
+ *     in the gap before this call, taking the key uncontended, must not be recorded as a debt it has
+ *     already discharged.
+ *
+ * ON THE CLOCKS IN ARM 2, because r10 got this wrong in a way that happened not to bite. Its comment
+ * called `accounting_sync_logs.createdAt` "a DATABASE clock (`@default(now())`)" and converted
+ * `decidedAt` into database time to meet it. MEASURED, that is false: Prisma supplies `@default(now())`
+ * values ITSELF, in the client, at the moment of the INSERT — so `createdAt` is the enqueueing IMS
+ * process's own clock, and `decidedAt` is the refusing IMS process's. Both are application clocks, and
+ * r10's conversion therefore ADDED the database host's offset to a comparison that had none. It cancelled
+ * only because this deployment's database shares the application's host. The conversion is gone and the
+ * comparison is made where both values live. Two things keep that honest rather than incidental:
+ * the concurrency tier pins that `createdAt` is stamped at the INSERT and not at transaction start
+ * (which is what the column DEFAULT would give), and tests/accounting/sync-log-row-primitive.test.ts
+ * refuses raw SQL that writes a sync row at all — the only way that DEFAULT could ever apply. (That
+ * census matches its patterns against the SOURCE rather than the parsed code, because a raw statement
+ * lives inside a string, so it fires on PROSE too: this sentence deliberately does not spell the
+ * statement out. Measured — an earlier draft of it was reported as an offender.)
  *
  * Scoped the same way the mark scopes its candidates (posting-mark-handled.ts): the indexed columns
  * narrow it, and `accountingPostingKeyForRow` — the same function the row-creating primitive keys its
  * clear on — decides whether a row belongs to this posting or to a different one sharing the document.
- * `false` when the client cannot answer (a structural double), which records as before.
- *
- * A LIVE ROW IS NOT ON ITS OWN THE ANSWER, and this is the "what would still pass it" question the
- * header asks. Several types share ONE key across successive postings by design (SALES_INVOICE_UPDATE,
- * PURCHASE_INVOICE_UPDATE, BILL_PAYMENT — lib/accounting/posting-key.ts): edit 1 queues, its row stays
- * live forever, edit 2 is refused, and the ledger now holds a stale document. That refusal is a REAL
- * debt. So the row must post-date the refusal, in one of the two ways a row can:
- *
- *  • IT WAS CREATED AFTER THE REFUSAL WAS DECIDED (`createdAt` beats the decision). This is the
- *    direct answer, and it is what closes r9's residual — a successful enqueue that both started and
- *    committed in the gap between the decision and this call, taking the key uncontended, used to be
- *    recorded as a debt that was already discharged.
- *  • OR THE KEY WAS CONTENDED when the refusal was decided, which means another transaction was
- *    settling this exact posting at that moment. Its row may have been created BEFORE the decision and
- *    committed after — commit order is not a thing PostgreSQL exposes here (no `track_commit_timestamp`,
- *    which must stay off), so contention is the only evidence there is, and it is exact evidence: this
- *    call, or the in-transaction call this one is replaying, actually queued for that key.
- *
- * CLOCK DOMAINS, because the first arm crosses one. `decidedAt` is an application clock (`new Date()` in
- * a Node process) and `accounting_sync_logs.createdAt` is a DATABASE clock (`@default(now())`), so
- * comparing them directly would make a skew between the two into a rule about which debts are kept — and
- * the dangerous direction (a database clock running ahead) is the one that SWALLOWS a real debt. The
- * comparison is therefore made entirely in database time: the cutoff is the database's own clock minus
- * the age of the decision as measured on the application clock, so only an INTERVAL crosses the boundary
- * and the offset cancels.
+ * `null` when the client cannot answer (a structural double), which records as before.
  */
-async function postingQueuedAfterThisRefusal(
+async function readLiveQueuedPostings(
   client: PostingRefusalClient,
   key: PostingRefusalKey,
-  options: { decidedAt: Date; contended: boolean },
-): Promise<boolean> {
+): Promise<Array<{ id: string; createdAt: Date }> | null> {
   // The delegate is never bound to a local: tests/accounting/sync-log-row-primitive.test.ts reports any
   // such binding, because a `.create` reached through one is invisible to it. Every use of it here is
-  // visible at the access site, and both of them are reads.
+  // visible at the access site, and all of them are reads.
   const reader = client as { accountingSyncLog?: SyncLogReader }
-  if (typeof reader.accountingSyncLog?.findMany !== 'function') return false
+  if (typeof reader.accountingSyncLog?.findMany !== 'function') return null
   const rows = await reader.accountingSyncLog.findMany({
     where: {
       type: key.type,
@@ -268,35 +296,71 @@ async function postingQueuedAfterThisRefusal(
       referenceId: key.referenceId,
       status: { not: 'CANCELLED' },
     },
-    select: { payload: true, createdAt: true },
+    select: { id: true, payload: true, createdAt: true },
   })
-  const forThisPosting = rows.filter((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
-  if (forThisPosting.length === 0) return false
-  if (options.contended) return true
-  const cutoff = await databaseTimeOf(client, options.decidedAt)
-  if (!cutoff) return false
-  return forThisPosting.some((row) => row.createdAt instanceof Date && row.createdAt.getTime() > cutoff.getTime())
+  return rows
+    .filter((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
+    .filter((row): row is { id: string; payload: unknown; createdAt: Date } => typeof row.id === 'string' && row.createdAt instanceof Date)
+    .map((row) => ({ id: row.id, createdAt: row.createdAt }))
 }
 
 /**
- * `at` expressed on the DATABASE's clock: the database's clock now, less however long ago `at` was here.
+ * THE POSTINGS ALREADY QUEUED FOR ONE KEY, AS IDENTITIES — the baseline a refusal that was refused the
+ * posting key takes, so that later, holding the key, it can tell a NEW enqueue from an old one.
  *
- * `clock_timestamp()`, NEVER `now()`. `now()` is `transaction_timestamp()` — the moment THIS TRANSACTION
- * began — and on the in-transaction path that transaction is the CALLER'S: a goods receipt or an MO
- * completion that may have started minutes before this refusal was decided. The cutoff would then sit
- * minutes in the past, and rows created well BEFORE the decision would count as having come after it,
- * which is the direction that swallows a real debt.
- *
- * `null` when the client cannot be asked, which leaves the comparison unmade and the refusal RECORDED —
- * the direction that keeps a debt rather than losing one.
+ * `complete` is not decoration. The list is carried in a provisional claim's payload, so it is capped; a
+ * key with more live rows than the cap yields `complete: false` and the identity comparison ABSTAINS,
+ * which records the refusal — keeping a debt that may not be owed rather than losing one that is. Reading
+ * it as "nothing changed" would be the failure mode this round exists to remove, one cap away.
  */
-async function databaseTimeOf(client: PostingRefusalClient, at: Date): Promise<Date | null> {
-  const raw = client as { $queryRaw?: (query: TemplateStringsArray, ...values: unknown[]) => Promise<unknown> }
-  if (typeof raw.$queryRaw !== 'function') return null
-  const rows = await raw.$queryRaw`SELECT clock_timestamp() AS at` as Array<{ at?: unknown }> | undefined
-  const databaseNow = rows?.[0]?.at
-  if (!(databaseNow instanceof Date)) return null
-  return new Date(databaseNow.getTime() - (Date.now() - at.getTime()))
+export type QueuedPostingEvidence = {
+  /** Sorted, so two observations of the same state are equal however the rows came back. */
+  ids: string[]
+  complete: boolean
+}
+
+/**
+ * How many sync-row ids a baseline may carry. A document-scoped posting has one live row; the
+ * idempotency-keyed types have a handful. This is a bound on the CLAIM PAYLOAD, not an expectation.
+ */
+const QUEUED_POSTING_EVIDENCE_LIMIT = 200
+
+export function queuedPostingEvidenceOf(rows: Array<{ id: string }>): QueuedPostingEvidence {
+  const ids = rows.map((row) => row.id).sort()
+  return ids.length > QUEUED_POSTING_EVIDENCE_LIMIT
+    ? { ids: [], complete: false }
+    : { ids, complete: true }
+}
+
+/**
+ * Did an enqueue commit for this posting while this refusal was shut out of its key?
+ *
+ * UNIVERSAL, not existential: every live row must be one the baseline already knew about for the answer
+ * to be "no". An unreadable or over-long baseline answers "no" as well — see `complete` above — and the
+ * refusal is then recorded.
+ */
+function aPostingWasQueuedSinceTheBaseline(
+  baseline: QueuedPostingEvidence,
+  live: Array<{ id: string }>,
+): boolean {
+  if (!baseline.complete) return false
+  const known = new Set(baseline.ids)
+  return live.some((row) => !known.has(row.id))
+}
+
+async function postingSupersedesThisRefusal(
+  client: PostingRefusalClient,
+  key: PostingRefusalKey,
+  options: { decidedAt: Date; queuedWhenShutOut: QueuedPostingEvidence | null | undefined },
+): Promise<boolean> {
+  const live = await readLiveQueuedPostings(client, key)
+  if (live === null || live.length === 0) return false
+  // ARM 1 — identity. `undefined` means this refusal was never shut out of the key, so there is no
+  // baseline to compare against; `null` means it was and could not look, which is not "nothing was there".
+  if (options.queuedWhenShutOut && aPostingWasQueuedSinceTheBaseline(options.queuedWhenShutOut, live)) return true
+  // ARM 2 — queued after the decision. STRICTLY later: see the note at the call site on why a tie is a
+  // debt and not a race.
+  return live.some((row) => row.createdAt.getTime() > options.decidedAt.getTime())
 }
 
 /**
@@ -327,7 +391,8 @@ async function databaseTimeOf(client: PostingRefusalClient, at: Date): Promise<D
  *      the read alone.
  *   2. QUEUED WHILE THIS REFUSAL WAS IN FLIGHT — the posting was queued after this refusal was decided,
  *      on the evidence of the refusal row's own resolution or of the accounting sync log. Then the
- *      refusal is stale. `postingQueuedAfterThisRefusal` states exactly what counts as that evidence.
+ *      refusal is stale. `postingSupersedesThisRefusal` states exactly what counts as that evidence, and
+ *      since r11 the answer rests on an enqueue's own ROW ID wherever a clock cannot settle it.
  *   3. CONTENDED AND UNABLE TO WAIT — inside a caller's transaction, a key another transaction holds.
  *      Nothing can be read that will still be true, so nothing is written HERE; since r10 the refusal is
  *      instead persisted with the caller's own transaction and replayed under the key (see below).
@@ -353,9 +418,19 @@ async function databaseTimeOf(client: PostingRefusalClient, at: Date): Promise<D
  * successful enqueue that both started and committed in the gap before this call took the key
  * UNCONTENDED used to be recorded as a debt that was in fact discharged. The reconciler runs minutes
  * after the claim, uncontended by then, so leaving that window open would have turned it from a rare race
- * into the ordinary path. `postingQueuedAfterThisRefusal` now compares the sync row's own creation
- * against the moment this refusal was decided, in database time, which answers the case the contention
- * probe could not see.
+ * into the ordinary path. `postingSupersedesThisRefusal` compares the sync row's own creation against the
+ * moment this refusal was decided, which answers the case the contention probe could not see.
+ *
+ * ── o3d-j625 r11 (Codex round 10, HIGH 1) — AND THE DEFERRED PATH TAKES A BASELINE WITH IT ──
+ *
+ * The claim r10 persists is replayed under the key, and the replay has to answer a question the clock
+ * cannot: did the transaction that held the key QUEUE this posting, or did it roll back? r10 answered
+ * "there is a live row, so it queued it", and for the types whose successive edits share one posting key
+ * an ancient row answered for ever. So the deferring call now records WHAT WAS ALREADY QUEUED at the
+ * moment it was refused the key ({@link RecordRefusalOptions.queuedWhenShutOut}), and the replay looks for
+ * a row that was not in that set. That read is the observation `runUnderPostingKeyLock` takes for it,
+ * before it waits or gives up — the only moment at which the holder's writes are still distinguishable
+ * from everybody else's.
  */
 export async function recordAccountingPostingRefusal(
   client: PostingRefusalClient,
@@ -376,7 +451,27 @@ export async function recordAccountingPostingRefusal(
     state.outcome = await runUnderPostingKeyLock(
       client as unknown as PostingKeyLockClient,
       key,
-      { callerTransaction: Boolean(options?.withSavepoint) },
+      {
+        callerTransaction: Boolean(options?.withSavepoint),
+        // o3d-j625 r11 — THE BASELINE, taken at the only moment it means anything: the key has just been
+        // refused to this caller, so the transaction holding it has not committed and nothing it wrote is
+        // visible here yet. A live row that appears after this is that transaction's own evidence that it
+        // queued the posting; r10 had only "the key was contended", which an older edit's row satisfied.
+        //
+        // IT IS A READ, AND IT TAKES ITS OWN SAVEPOINT — on BOTH paths, not only the in-transaction one.
+        // A statement that raises aborts the whole PostgreSQL transaction (25P02), and on either path there
+        // is a transaction to abort: the CALLER'S when it was refused the key, and the one
+        // `runUnderPostingKeyLock` opened for itself when it is about to wait for it. Without the
+        // savepoint a failed observation would take the lock acquisition and the write down with it, so
+        // the deferred refusal would be reported as unwritable instead of simply unobserved. Wrapped, it
+        // comes back as `observed: null` — "I cannot tell", which records the refusal, never "nothing was
+        // queued". The module's own helper rather than `options.withSavepoint`, so the pooled path is
+        // covered too; on a client that is in no transaction at all it simply runs the read.
+        observeWhenContended: async (on) => withSavepoint(on, async () => {
+          const live = await readLiveQueuedPostings(on as unknown as PostingRefusalClient, key)
+          return live === null ? null : queuedPostingEvidenceOf(live)
+        }),
+      },
       async (locked, lock) => {
         const table = (locked as unknown as PostingRefusalClient).accountingPostingRefusal
         // ── o3d-j625 r10 (Codex round 9, HIGH) — CONTENDED IS DEFERRED, NOT DISCARDED ──
@@ -398,7 +493,14 @@ export async function recordAccountingPostingRefusal(
             locked as unknown as IntegrationOutboxClient,
             key,
             record,
-            { decidedAt, mergeOnly: options?.mergeOnly === true, nonce: randomUUID() },
+            {
+              decidedAt,
+              mergeOnly: options?.mergeOnly === true,
+              nonce: randomUUID(),
+              // What was already queued when the key was refused. `null` is carried as `null`: the replay
+              // must be able to tell "nothing was queued then" from "this call could not look".
+              queuedWhenShutOut: lock.observed,
+            },
           )
           return { recorded: false, because: 'contended', deferred: true }
         }
@@ -435,11 +537,20 @@ export async function recordAccountingPostingRefusal(
         }
         // And the FIRST refusal of a posting that was queued concurrently has no resolved row to learn
         // from — the enqueue's clear matched nothing because there was no row yet. The sync log is the
-        // evidence, and `postingQueuedAfterThisRefusal` states exactly what makes a live row count:
-        // it was created after this refusal was decided, or the key was contended when it was.
-        if (lock.held && await postingQueuedAfterThisRefusal(locked as unknown as PostingRefusalClient, key, {
+        // evidence, and `postingSupersedesThisRefusal` states exactly what makes a live row count: its id
+        // was not there when this refusal was shut out of the key, or it was created after the refusal was
+        // decided.
+        //
+        // WHICH BASELINE, when there could be two. A replay carries the ORIGINAL call's observation
+        // (`options.queuedWhenShutOut`) and may ALSO have waited for the key itself; the original is
+        // strictly earlier, so it is the one that answers "was this queued while the refusal was shut
+        // out". `undefined` — never shut out — leaves only the clock arm, which is correct: there was no
+        // window in which a commit could hide.
+        if (lock.held && await postingSupersedesThisRefusal(locked as unknown as PostingRefusalClient, key, {
           decidedAt,
-          contended: lock.contended || options?.contendedWhenDecided === true,
+          queuedWhenShutOut: options && 'queuedWhenShutOut' in options
+            ? options.queuedWhenShutOut
+            : lock.contended ? lock.observed : undefined,
         })) {
           return { recorded: false, because: 'queued', at: existing?.resolvedAt ?? now }
         }

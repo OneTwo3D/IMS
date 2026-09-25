@@ -28,18 +28,26 @@ import {
  * could not: under the key, is this posting suppressed (someone posted it by hand), was it queued while
  * this refusal was in flight, or is it genuinely still owed?
  *
- * `contendedWhenDecided` is the one piece of knowledge the claim carries forward. The original refusal
- * lost a race with a transaction that was settling this exact posting; by the time this replay runs that
- * transaction has ended and the key is free, so the replay would otherwise look UNCONTENDED and could not
- * see the race it is recovering from. The flag is what makes the replay consult the accounting sync log
- * for a live row of this exact posting — the same evidence the in-transaction call would have used had it
- * been allowed to wait.
+ * `queuedWhenShutOut` is the one piece of knowledge the claim carries forward, and since r11 it is a
+ * BASELINE rather than a flag. The original refusal lost a race with a transaction that was settling this
+ * exact posting; by the time this replay runs that transaction has ended and the key is free, so the
+ * replay cannot see the race it is recovering from. What it can see is a sync row that was NOT there when
+ * the original call was refused the key — which is that transaction's own evidence that it committed.
+ *
+ * r10 carried a boolean (`contendedWhenDecided`) and let any live row for the key stand for the holder's
+ * enqueue. Codex executed the consequence: successive edits of one invoice share a posting key, so edit
+ * 1's row — live for ever — settled a claim whose holder had ROLLED BACK, and the owed posting reached
+ * nothing. A pre-existing row can no longer satisfy the claim, because the claim knows which rows already
+ * existed.
  *
  * SO THE TWO OUTCOMES CODEX ASKED ABOUT ARE BOTH REACHED HERE:
- *   • the lock holder QUEUED the posting → a live sync row for the key → nothing is recorded, an INFO
- *     entry says the posting was queued while the refusal was being decided, and the claim SUCCEEDS.
- *   • the lock holder ROLLED BACK (or never queued) → no live row → the refusal is RECORDED and the
- *     posting is outstanding in the exception inbox, which is what r9 lost.
+ *   • the lock holder QUEUED the posting → a live sync row whose id was NOT in the claim's baseline →
+ *     nothing is recorded, an INFO entry says the posting was queued while the refusal was being decided,
+ *     and the claim SUCCEEDS.
+ *   • the lock holder ROLLED BACK (or never queued, or was marking rather than queueing) → every live row
+ *     is one the baseline already knew about → the refusal is RECORDED and the posting is outstanding in
+ *     the exception inbox, which is what r9 lost and what r10 gave back to any posting type whose
+ *     successive edits share a key.
  *
  * FAILURE IS NEVER SUCCESS. The replay RETURNS its outcome rather than throwing on a write that did not
  * land (`recordAccountingPostingRefusal` reports and contains its own failures, review L-1 / M-14), so a
@@ -116,7 +124,12 @@ async function reconcileOne(
         mergeOnly: payload.mergeOnly,
         // No `withSavepoint`: this is the POOL. That is also what tells `runUnderPostingKeyLock` it may
         // open its own transaction and WAIT for the key.
-        contendedWhenDecided: true,
+        //
+        // The baseline, verbatim. `undefined` on a claim written before r11 — and then the key is
+        // PASSED ANYWAY as undefined, which leaves the replay with the decision-time comparison alone:
+        // the direction that keeps a debt. Never rewritten to "nothing was queued", which would let any
+        // live row discharge it — r10's finding exactly.
+        queuedWhenShutOut: payload.queuedWhenShutOut,
       },
     )
     if (outcome.recorded) result.recorded++

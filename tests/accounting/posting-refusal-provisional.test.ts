@@ -47,11 +47,20 @@ type OutboxRow = { connector: string; operation: string; idempotencyKey: string;
  * transaction holds, and `withSavepoint` is the contract half that says this client is inside a
  * transaction — together they are the only way to reach the branch under test.
  */
-function contendedCallerTransaction() {
+function contendedCallerTransaction(liveSyncRows: Array<{ id: string; payload?: unknown; createdAt?: Date }> = []) {
   const refusalWrites: unknown[] = []
   const outbox: OutboxRow[] = []
+  const syncLogReads: unknown[] = []
   const client = {
     $queryRaw: async () => [{ got: false }],
+    // o3d-j625 r11: the BASELINE read — what was already queued when the key was refused. A double with no
+    // `findMany` cannot answer it, which is `null` ("I cannot tell"), so the rows are supplied explicitly.
+    accountingSyncLog: {
+      findMany: async (args: unknown) => {
+        syncLogReads.push(args)
+        return liveSyncRows.map((row) => ({ id: row.id, payload: row.payload ?? {}, createdAt: row.createdAt ?? new Date('2026-09-24T09:00:00.000Z') }))
+      },
+    },
     accountingPostingRefusal: {
       upsert: async (args: unknown) => { refusalWrites.push(args); return {} },
       updateMany: async (args: unknown) => { refusalWrites.push(args); return { count: 1 } },
@@ -63,7 +72,7 @@ function contendedCallerTransaction() {
       updateMany: async () => ({ count: 0 }),
     },
   }
-  return { client, refusalWrites, outbox }
+  return { client, refusalWrites, outbox, syncLogReads }
 }
 
 test('[o3d-j625 r10] a contended in-transaction refusal is PERSISTED as a provisional claim, not discarded', async () => {
@@ -163,12 +172,85 @@ test('[o3d-j625 r10] the reconciler replays the refusal with its ORIGINAL decisi
   const { replays } = await runReconciler({ recorded: true })
   assert.equal(replays.length, 1, 'PRECONDITION: the claim was replayed')
   assert.deepEqual(replays[0]!.key, KEY)
-  const options = replays[0]!.options as { decidedAt: Date; contendedWhenDecided?: boolean; withSavepoint?: unknown }
+  const options = replays[0]!.options as { decidedAt: Date; queuedWhenShutOut?: unknown; withSavepoint?: unknown }
   assert.equal(options.decidedAt.toISOString(), '2026-09-24T10:00:00.000Z',
     'replacing this with "now" would make every staleness check true and swallow the debt')
-  assert.equal(options.contendedWhenDecided, true,
-    'by replay time the key is free, so without this the replay cannot see the race it is recovering from')
+  assert.ok('queuedWhenShutOut' in options,
+    'by replay time the key is free, so without the baseline the replay cannot see the race it is recovering from')
   assert.equal(options.withSavepoint, undefined, 'the replay runs on the POOL, which is what lets it WAIT for the key')
+})
+
+/**
+ * o3d-j625 r11 (Codex round 10, HIGH 1) — THE BASELINE REACHES THE REPLAY VERBATIM.
+ *
+ * r10 passed a BOOLEAN, under which the replay treated any live sync row for the key as the holder's
+ * enqueue: edit 1 of a shared-key invoice discharged a refusal whose holder had rolled back. The replay
+ * now needs to know WHICH rows already existed, and this is the only place that can tell it.
+ */
+test('[o3d-j625 r11] the reconciler replays with the baseline of postings already queued, verbatim', async () => {
+  const { buildProvisionalPostingRefusalPayload } = await import('@/lib/domain/accounting/posting-refusal-provisional')
+  const payload = buildProvisionalPostingRefusalPayload(KEY, RECORD, {
+    decidedAt: new Date('2026-09-24T10:00:00.000Z'),
+    mergeOnly: false,
+    queuedWhenShutOut: { ids: ['sync-edit-1'], complete: true },
+  })
+  const { replays } = await runReconciler({ recorded: true }, payload)
+  const options = replays[0]!.options as { queuedWhenShutOut?: { ids: string[]; complete: boolean } | null }
+  assert.deepEqual(options.queuedWhenShutOut, { ids: ['sync-edit-1'], complete: true },
+    'the ids the original call saw — a live row that is NOT one of them is the holder\'s own evidence that it committed')
+})
+
+test('[o3d-j625 r11] a claim written BEFORE the baseline existed does not replay as "nothing was queued"', async () => {
+  // The dangerous rewrite. An absent baseline read as an EMPTY one would make every live row look new, so
+  // every legacy claim would be discharged by the oldest row for its key — r10's finding, restored.
+  const legacy = {
+    key: KEY,
+    record: { kind: RECORD.kind, chartConnector: RECORD.chartConnector, activeConnector: RECORD.activeConnector, reason: RECORD.reason, committed: RECORD.committed, remedy: RECORD.remedy },
+    decidedAt: '2026-09-24T10:00:00.000Z',
+    mergeOnly: false,
+  }
+  const { replays } = await runReconciler({ recorded: true }, legacy)
+  const options = replays[0]!.options as { queuedWhenShutOut?: { ids: string[]; complete: boolean } | null }
+  assert.equal(options.queuedWhenShutOut, undefined,
+    'no baseline is passed as no baseline. An empty one would assert that nothing was queued when the key '
+    + 'was refused, which is an assertion this claim never made')
+})
+
+test('[o3d-j625 r11] a deferred refusal carries the ids of the postings already queued for its key', async () => {
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const { AccountingPostingRefusalProvisionalPayloadSchema } = await import('@/lib/domain/integrations/outbox-registry')
+  const world = contendedCallerTransaction([{ id: 'sync-edit-1' }, { id: 'sync-edit-0' }])
+
+  const outcome = await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+    withSavepoint: async (fn) => fn(),
+    decidedAt: new Date('2026-09-24T10:00:00.000Z'),
+  })
+
+  assert.deepEqual(outcome, { recorded: false, because: 'contended', deferred: true },
+    'PRECONDITION: the deferred path was reached')
+  assert.equal(world.syncLogReads.length, 1,
+    'PRECONDITION: the baseline was actually READ — one query, taken while the key was still refused')
+  const payload = AccountingPostingRefusalProvisionalPayloadSchema.parse(world.outbox[0]!.payloadJson)
+  assert.deepEqual(payload.queuedWhenShutOut, { ids: ['sync-edit-0', 'sync-edit-1'], complete: true },
+    'sorted, so two observations of one state compare equal however the rows came back')
+})
+
+test('[o3d-j625 r11] a deferred refusal whose baseline CANNOT be read carries null, not an empty set', async () => {
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const { AccountingPostingRefusalProvisionalPayloadSchema } = await import('@/lib/domain/integrations/outbox-registry')
+  const world = contendedCallerTransaction()
+  // The double has a `findMany`, so remove it: this is a client that cannot answer the question at all.
+  delete (world.client as { accountingSyncLog?: unknown }).accountingSyncLog
+
+  await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+    withSavepoint: async (fn) => fn(),
+    decidedAt: new Date('2026-09-24T10:00:00.000Z'),
+  })
+
+  const payload = AccountingPostingRefusalProvisionalPayloadSchema.parse(world.outbox[0]!.payloadJson)
+  assert.equal(payload.queuedWhenShutOut, null,
+    '"I could not look" is not "nothing was there" — read as the latter, the oldest row for the key would '
+    + 'discharge the debt')
 })
 
 test('[o3d-j625 r10] a claim is completed when the replay RECORDS the debt, and counted as recorded', async () => {
@@ -299,4 +381,80 @@ test('[o3d-j625 r10] the accounting-sync cron reconciles claims BEFORE any conne
   assert.ok(reconcileAt < firstGateAt,
     'the reconciler must run on every tick: the refusals it settles are largely the ones raised because no '
     + 'connector is enabled, which is precisely when every branch below returns "skipped"')
+})
+
+/**
+ * o3d-j625 r11 — WHAT A BASELINE LICENSES, AND WHAT AN INCOMPLETE ONE MUST NOT.
+ *
+ * The replay's identity arm says "a live row that is not in the baseline was queued while this refusal was
+ * shut out of the key". The baseline is carried in a claim payload, so it is CAPPED — and a capped-out
+ * baseline is not a small baseline, it is no baseline: read as one, every live row would look new and the
+ * oldest row for the key would discharge the debt, which is the r10 finding with an extra step. These two
+ * tests differ in exactly one field.
+ */
+function grantedCallerTransaction(liveSyncRows: Array<{ id: string; createdAt: Date }>) {
+  const writes: unknown[] = []
+  const client = {
+    // `got: true` — the key was granted, so the arms that decide whether the refusal is stale run.
+    $queryRaw: async () => [{ got: true }],
+    accountingSyncLog: {
+      findMany: async () => liveSyncRows.map((row) => ({ id: row.id, payload: {}, createdAt: row.createdAt })),
+    },
+    accountingPostingRefusal: {
+      findUnique: async () => null,
+      upsert: async (args: unknown) => { writes.push(args); return {} },
+      updateMany: async (args: unknown) => { writes.push(args); return { count: 1 } },
+    },
+  }
+  return { client, writes }
+}
+
+const DECIDED_AT = new Date('2026-09-24T10:00:00.000Z')
+/** One live row for the key, queued BEFORE the refusal was decided: an EARLIER posting. */
+const EARLIER_ROW = [{ id: 'sync-edit-1', createdAt: new Date('2026-09-24T09:00:00.000Z') }]
+
+test('[o3d-j625 r11] a COMPLETE baseline that did not know this row discharges the refusal', async () => {
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const world = grantedCallerTransaction(EARLIER_ROW)
+  const outcome = await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+    withSavepoint: async (fn) => fn(),
+    decidedAt: DECIDED_AT,
+    queuedWhenShutOut: { ids: [], complete: true },
+  })
+  assert.equal(outcome.recorded, false, 'PRECONDITION: the arm under test decided this, not the write')
+  assert.equal(outcome.recorded === false ? outcome.because : null, 'queued',
+    'the row was not in the baseline, so it was queued while this refusal was shut out of the key')
+  assert.deepEqual(world.writes, [], 'and nothing is recorded as outstanding')
+})
+
+test('[o3d-j625 r11] an INCOMPLETE baseline discharges nothing — the debt is kept', async () => {
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const world = grantedCallerTransaction(EARLIER_ROW)
+  const outcome = await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+    withSavepoint: async (fn) => fn(),
+    decidedAt: DECIDED_AT,
+    // The ONLY difference from the test above.
+    queuedWhenShutOut: { ids: [], complete: false },
+  })
+  assert.deepEqual(outcome, { recorded: true },
+    'a baseline that could not carry every id proves nothing about which rows are new, so the refusal is '
+    + 'recorded — keeping a debt that may not be owed rather than losing one that is')
+  // TWO statements, and naming them is the point: the M-13 episode reset, then the row itself. A count of
+  // 0 would mean the arm above swallowed it; a count of 1 would mean one of the two stopped happening.
+  console.log(`[r11] writes examined: ${world.writes.length}`)
+  assert.equal(world.writes.length, 2, 'the episode reset and the upsert both ran')
+})
+
+test('[o3d-j625 r11] an EARLIER posting does not discharge a refusal that was never shut out of the key', async () => {
+  // The control for both of the above: with no baseline at all, only the decision-time comparison applies,
+  // and a row queued before the decision is an earlier posting. A guard that swallowed this would lose
+  // exactly the debt the table exists to show.
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const world = grantedCallerTransaction(EARLIER_ROW)
+  const outcome = await recordAccountingPostingRefusal(world.client as never, KEY, RECORD, {
+    withSavepoint: async (fn) => fn(),
+    decidedAt: DECIDED_AT,
+  })
+  assert.deepEqual(outcome, { recorded: true })
+  assert.equal(world.writes.length, 2, 'the episode reset and the upsert both ran')
 })
