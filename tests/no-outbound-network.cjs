@@ -60,6 +60,14 @@
  *   reads through the patched module object (the test asserts exactly that, by marker); `node:child_process`
  *   has no such facade yet when this loads, so its named imports ARE patched (also measured). A `.mjs`
  *   that wants a guarded worker must pass `execArgv: ['--require', <this file>]` itself.
+ * * THE DECLARED DATABASE ENDPOINT (round 10). The suite is CONFIGURED with a database, and in CI that
+ *   database is a service container on a Docker bridge address (172.18.0.2), not loopback. Round 9 wired
+ *   this trap into `test:db` and `test:concurrency` and thereby refused it: eight `o3d-bnp6` tests, two
+ *   `o3d-11rf` tests and a payment-write-lock concurrency test died with `OutboundNetworkBlockedError`
+ *   raised inside `pg-pool`, on two CI jobs that are green on development. The trap exists to stop calls
+ *   to THIRD-PARTY VENDORS; the database is a dependency this suite is handed, not an outbound call. So
+ *   the host and port of each DECLARED database URL in the environment is permitted, and nothing else is.
+ *   It is an exemption the operator DECLARES, not a widened net: see `databaseEndpointsFrom`.
  * * UDP and raw `dgram`. DNS lookups still resolve: a lookup sends a name, not our data.
  * * Any test run that does not load this file: `npm run test:unit`, `npm run test:concurrency` and
  *   `npm run test:db` do; a focused `npx tsx --test …` does not unless you add the `--import` yourself.
@@ -104,6 +112,104 @@ function isLoopbackHost(host) {
 
 function isIpLiteral(host) {
   return net.isIP(String(host).replace(/^\[|\]$/g, '')) !== 0
+}
+
+/**
+ * THE DATABASE THIS SUITE IS CONFIGURED WITH — the one exemption, and the shape of it matters.
+ * o3d-bhvu round 10 (PR #701: `db-backed-regressions` and `fresh-db-drift` red on the branch, green on
+ * development).
+ *
+ * WHAT WENT WRONG. Round 9 added this trap to `test:db` and `test:concurrency`, which until then did not
+ * load it. Locally `DATABASE_URL` is loopback, so every DB-backed test passed. In CI the postgres service
+ * container is reached at its Docker BRIDGE address — `db-backed-regressions` resolves it explicitly and
+ * re-points `DATABASE_URL` at `172.18.0.2:5432`, and the concurrency job does the same for
+ * `DATABASE_SESSION_LOCK_URL` — and the trap admits only loopback, so every one of those tests was
+ * refused inside `pg-pool` before a socket was opened. Two careful readers missed it because a local run
+ * cannot see it.
+ *
+ * WHY AN EXEMPTION IS RIGHT, AND NOT A WEAKENING. The trap's subject is a THIRD-PARTY VENDOR: Mintsoft
+ * fulfils what it is sent, Xero and QuickBooks record what they are told. The database is not that. It is
+ * a dependency the run is HANDED, in its own environment variables, by whoever started it — and a test
+ * that cannot reach it does not silently do something to somebody else's system, it fails.
+ *
+ * WHY IT IS DECLARED AND NOT INFERRED. Three shapes were available and two are wrong:
+ *   · `!isLoopback(host) && port === 5432` — a heuristic. Any vendor that happens to answer on 5432 is
+ *     then reachable, and the trap's guarantee becomes a guess about port numbers.
+ *   · hardcode `172.18.0.0/16` — the CI-of-today's bridge range. It grants a whole private network on
+ *     every machine, and says nothing about the endpoint this run was actually given.
+ *   · THIS: parse the database URLs the environment DECLARES, at load, and permit exactly the (host, port)
+ *     pairs they name. What is permitted is then a fact about this run's configuration, and it MOVES when
+ *     the configuration moves. tests/no-outbound-network.test.ts proves that by changing the configured
+ *     host and showing the permitted host change with it.
+ *
+ * AND AN ABSENT URL PERMITS NOTHING. `databaseEndpointsFrom({})` is empty and an empty set matches no
+ * host, so "no `DATABASE_URL`" can never become "allow everything" — the failure mode that would turn
+ * this exemption into the removal of the trap. Asserted directly, and proved in a child process with the
+ * variables stripped.
+ *
+ * ONLY `postgres:`/`postgresql:` URLs contribute, and only their TCP endpoint. A socket route
+ * (`postgresql:///ims?host=/var/run/postgresql`) names no host, so it adds nothing — it needs nothing,
+ * because a Unix socket never reaches this check at all.
+ */
+const DATABASE_URL_ENV_KEYS = [
+  // The data path, and the direct/admin routes the migration and fence scripts use.
+  'DATABASE_URL', 'DIRECT_URL', 'SHADOW_DATABASE_URL', 'DEPLOY_ADMIN_DATABASE_URL',
+  // The session-lock pool (lib/db/session-lock-pool.ts). This is the one the CONCURRENCY job re-points
+  // at the bridge address while DATABASE_URL stays on the published loopback port, so omitting it would
+  // leave that tier broken while test:db looked fixed.
+  'DATABASE_SESSION_LOCK_URL',
+  // A Unix-socket route (tests/db/connection-schema-pinning.test.ts). Normally contributes no TCP
+  // endpoint; listed so that a TCP one someone puts there is declared rather than refused.
+  'UNIX_SOCKET_DATABASE_URL',
+]
+
+/** Postgres' own default, used when a declared URL omits the port, as `postgresql://host/db` may. */
+const DEFAULT_POSTGRES_PORT = 5432
+
+function normalizeHost(host) {
+  return String(host).trim().toLowerCase().replace(/^\[|\]$/g, '')
+}
+
+/**
+ * The `host|port` keys the given environment DECLARES a database at. A pure function of the environment,
+ * exported so a test can vary the environment and watch the answer follow rather than trusting a comment.
+ */
+function databaseEndpointsFrom(env) {
+  const endpoints = new Set()
+  const source = env && typeof env === 'object' ? env : {}
+  for (const key of DATABASE_URL_ENV_KEYS) {
+    const raw = source[key]
+    if (typeof raw !== 'string' || raw.trim() === '') continue
+    let url
+    try {
+      url = new URL(raw.trim())
+    } catch {
+      continue // not a URL this can read is not an endpoint it may permit
+    }
+    if (url.protocol !== 'postgres:' && url.protocol !== 'postgresql:') continue
+    const host = normalizeHost(url.hostname)
+    if (host === '') continue // a socket route, or a URL with no host: nothing to permit
+    const port = url.port === '' ? DEFAULT_POSTGRES_PORT : Number(url.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) continue
+    endpoints.add(host + '|' + port)
+  }
+  return endpoints
+}
+
+/** Parsed ONCE, at load, from the environment this process was started with. */
+const DECLARED_DATABASE_ENDPOINTS = databaseEndpointsFrom(process.env)
+
+/**
+ * Is this exact (host, port) one the environment declared a database at? An EMPTY set of declared
+ * endpoints answers `false` for everything — that is the absent-URL case, and it is why this is a set
+ * membership test and not a predicate with a default.
+ */
+function isDeclaredDatabaseTarget(host, port) {
+  if (DECLARED_DATABASE_ENDPOINTS.size === 0) return false
+  if (host == null || host === '') return false
+  const value = Number(port)
+  if (!Number.isInteger(value)) return false
+  return DECLARED_DATABASE_ENDPOINTS.has(normalizeHost(host) + '|' + value)
 }
 
 function blockedError(host, port, resolved) {
@@ -157,7 +263,10 @@ function guardedLookup(original, host, port) {
     resolve(hostname, options, (error, address, family) => {
       if (error) return callback(error, address, family)
       const addresses = Array.isArray(address) ? address.map((entry) => entry.address) : [String(address)]
-      const remote = addresses.find((entry) => !isLoopbackHost(entry))
+      // ROUND 10: an address the environment DECLARED a database at is permitted here as well as above,
+      // so a name that resolves to it (a service alias, a `/etc/hosts` entry) reaches the same database
+      // the IP literal would. Everything else that is not loopback is refused exactly as before.
+      const remote = addresses.find((entry) => !isLoopbackHost(entry) && !isDeclaredDatabaseTarget(entry, port))
       if (remote) return callback(blockedError(host, port, remote))
       return callback(null, address, family)
     })
@@ -169,6 +278,11 @@ function installSocketTrap() {
   net.Socket.prototype.connect = function trappedConnect(...args) {
     const target = targetOf(args)
     if (target.path || target.host == null || target.host === '') {
+      return original.apply(this, args)
+    }
+    // ROUND 10: the database this run was CONFIGURED with, by exact host and port, whether that host is
+    // an IP literal (CI's bridge address) or a name (a service alias). Nothing else is exempt.
+    if (isDeclaredDatabaseTarget(target.host, target.port)) {
       return original.apply(this, args)
     }
     if (isIpLiteral(target.host)) {
@@ -336,6 +450,18 @@ function installWorkerTrap() {
 }
 
 // ---------------------------------------------------------------------------
+
+/**
+ * EXPORTED FOR tests/no-outbound-network.test.ts ONLY. `databaseEndpointsFrom` is pure, so the test can
+ * hand it an environment and assert the permitted endpoints follow it; `declaredDatabaseEndpoints` is what
+ * THIS process actually parsed, so the test can assert the two agree rather than testing a helper nothing
+ * uses. Nothing in the application reads this file.
+ */
+module.exports = {
+  databaseEndpointsFrom,
+  declaredDatabaseEndpoints: DECLARED_DATABASE_ENDPOINTS,
+  databaseUrlEnvKeys: DATABASE_URL_ENV_KEYS,
+}
 
 const registry = globalThis
 if (!registry[TRAP]) {

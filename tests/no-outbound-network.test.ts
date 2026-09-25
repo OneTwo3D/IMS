@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { exec, spawn, spawnSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
+import { createRequire } from 'node:module'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
@@ -327,4 +328,154 @@ test('all three test scripts load the trap', () => {
   for (const name of ['test:unit', 'test:concurrency', 'test:db']) {
     assert.match(scripts[name] ?? '', /--import\s+\.\/tests\/no-outbound-network\.cjs/, `${name} must --import the trap`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bhvu ROUND 10 — THE DECLARED DATABASE ENDPOINT IS PERMITTED, AND NOTHING ELSE IS.
+//
+// Round 9 wired this trap into `test:db` and `test:concurrency`, which had not loaded it before. Locally
+// DATABASE_URL is loopback so every DB-backed test passed; in CI the postgres service container is reached
+// at its Docker BRIDGE address (172.18.0.2), and the trap admitted only loopback — so eight o3d-bnp6
+// tests, two o3d-11rf tests and a payment-write-lock concurrency test died with OutboundNetworkBlockedError
+// raised inside pg-pool, on two jobs that are green on development.
+//
+// EVERY ASSERTION BELOW RUNS IN A CHILD PROCESS WITH A REPLACEMENT ENVIRONMENT, because the exemption is
+// parsed at trap load: the configured URL is the independent variable, so it has to be set before the trap
+// exists. The parent's child_process wrapper puts `--require <trap>` into that replacement environment, so
+// each child really is trapped — asserted, not assumed, by the refusals in cases B and D.
+//
+// THE MATRIX IS TWO PAIRS THAT DIFFER IN EXACTLY ONE THING:
+//   B vs C: the same probe target, allowed only when the URL names it  -> the exemption is DERIVED.
+//   A vs D: the same probe target, allowed only when a URL is declared -> absent URL permits NOTHING.
+// NOTHING IS AIMED AT A VENDOR. Both endpoints are listeners this test starts on this machine's own
+// routable address; the "not the database" one is simply a second port on it.
+// ---------------------------------------------------------------------------
+
+const trapModule = createRequire(__filename)('./no-outbound-network.cjs') as {
+  databaseEndpointsFrom: (env: Record<string, string | undefined>) => Set<string>
+  declaredDatabaseEndpoints: Set<string>
+  databaseUrlEnvKeys: string[]
+}
+
+/** A child that is trapped, given exactly this database configuration and nothing else. */
+function probeWithDatabaseEnv(env: Record<string, string>, host: string, port: number): Promise<string> {
+  return runToCompletion(process.execPath, ['-e', connectProbe(host, port)], {
+    // A REPLACEMENT environment, not the parent's: the declared URL is the independent variable, so the
+    // child must not inherit this run's DATABASE_URL. `NODE_ENV` is carried because this project's
+    // ProcessEnv type requires it; it has no bearing on the trap.
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', NODE_ENV: process.env.NODE_ENV ?? 'test', ...env },
+  })
+}
+
+test('o3d-bhvu r10: the permitted endpoint is DERIVED from the declared URL — change the host, the permission moves', () => {
+  const { databaseEndpointsFrom, declaredDatabaseEndpoints, databaseUrlEnvKeys } = trapModule
+
+  // DERIVATION, not a hardcoded range: the same shape of URL at three different hosts yields three
+  // different permissions, and each permits only its own.
+  const hosts = ['172.18.0.2', '10.44.0.7', 'db.internal.example']
+  let derived = 0
+  for (const host of hosts) {
+    const endpoints = databaseEndpointsFrom({ DATABASE_URL: `postgresql://u:p@${host}:5432/ims_ci?schema=public` })
+    assert.deepEqual([...endpoints], [`${host}|5432`], `${host}: exactly its own endpoint is permitted`)
+    for (const other of hosts.filter((candidate) => candidate !== host)) {
+      assert.equal(endpoints.has(`${other}|5432`), false, `${host}: must NOT permit ${other}`)
+    }
+    derived += 1
+  }
+  assert.equal(derived, hosts.length, 'every host was exercised')
+
+  // THE PORT IS PART OF IT. `!isLoopback && port === 5432` would have been a heuristic; this is not.
+  const onOddPort = databaseEndpointsFrom({ DATABASE_URL: 'postgresql://u:p@172.18.0.2:6543/ims' })
+  assert.deepEqual([...onOddPort], ['172.18.0.2|6543'])
+  assert.equal(onOddPort.has('172.18.0.2|5432'), false, 'a different port on the same declared host is NOT permitted')
+
+  // ABSENT URL PERMITS NOTHING — the failure mode that would delete the trap rather than exempt one host.
+  assert.deepEqual([...databaseEndpointsFrom({})], [], 'no configuration permits no host')
+  assert.deepEqual([...databaseEndpointsFrom({ DATABASE_URL: '' })], [], 'a blank URL permits no host')
+  assert.deepEqual([...databaseEndpointsFrom({ DATABASE_URL: 'not a url' })], [], 'an unparseable URL permits no host')
+  assert.deepEqual([...databaseEndpointsFrom({ DATABASE_URL: 'https://api.example.com/v1' })], [],
+    'a NON-postgres URL in DATABASE_URL permits no host')
+  assert.deepEqual([...databaseEndpointsFrom({ DATABASE_URL: 'postgresql:///ims?host=/var/run/postgresql' })], [],
+    'a Unix-socket route names no TCP host, and needs none')
+
+  // THE CONCURRENCY TIER'S VARIABLE IS COVERED: CI re-points DATABASE_SESSION_LOCK_URL at the bridge
+  // address while DATABASE_URL stays on the published loopback port, so omitting this key would have left
+  // test:concurrency broken while test:db looked fixed.
+  assert.ok(databaseUrlEnvKeys.includes('DATABASE_SESSION_LOCK_URL'), 'the session-lock pool URL is declared')
+  assert.ok(databaseUrlEnvKeys.includes('UNIX_SOCKET_DATABASE_URL'), 'the Unix-socket route is declared')
+  assert.deepEqual(
+    [...databaseEndpointsFrom({
+      DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/ims_ci',
+      DATABASE_SESSION_LOCK_URL: 'postgresql://u:p@172.18.0.2:5432/ims_ci',
+    })].sort(),
+    ['127.0.0.1|5432', '172.18.0.2|5432'],
+    'exactly the CI concurrency job’s two declared endpoints',
+  )
+
+  // AND THE FUNCTION IS THE ONE THIS PROCESS USED, not a helper nothing reads.
+  assert.deepEqual([...declaredDatabaseEndpoints].sort(), [...databaseEndpointsFrom(process.env)].sort(),
+    'what the trap parsed at load is what this function returns for this environment')
+})
+
+test('o3d-bhvu r10: a non-loopback endpoint that is NOT the declared database is still refused; the declared one is not', async (t) => {
+  const address = routableAddress()
+  if (!address) {
+    t.skip('no non-loopback IPv4 on this machine, so there is no address to distinguish')
+    return
+  }
+  // TWO listeners on this machine's own routable address. One is "the database", one is simply another
+  // port — nothing here is a vendor, and nothing leaves the host.
+  const database = await listenOnRoutableAddress(address)
+  const notTheDatabase = await listenOnRoutableAddress(address)
+  t.after(async () => { await database.close(); await notTheDatabase.close() })
+
+  const declared = { DATABASE_URL: `postgresql://u:p@${address}:${database.port}/ims_ci?schema=public` }
+  const declaredOther = { DATABASE_URL: `postgresql://u:p@${address}:${notTheDatabase.port}/ims_ci?schema=public` }
+
+  // A — the declared database is REACHED even though it is not loopback. This is the CI failure, fixed.
+  const a = await probeWithDatabaseEnv(declared, address, database.port)
+  // B — the same trapped child, the same configuration, a DIFFERENT port on the SAME host: refused.
+  const b = await probeWithDatabaseEnv(declared, address, notTheDatabase.port)
+  // C — B's exact probe target, with the configuration moved to name it: now reached. B vs C differ in
+  // ONE thing, the declared URL, which is what makes this a derivation and not a hole.
+  const c = await probeWithDatabaseEnv(declaredOther, address, notTheDatabase.port)
+  // D — A's exact probe target with NO database declared at all: refused. Absent URL permits nothing.
+  const d = await probeWithDatabaseEnv({}, address, database.port)
+
+  assert.deepEqual(
+    { a, b, c, d },
+    {
+      a: 'CONNECTED',
+      b: 'REFUSED:OutboundNetworkBlockedError',
+      c: 'CONNECTED',
+      d: 'REFUSED:OutboundNetworkBlockedError',
+    },
+    'declared endpoint reached; anything else on the same routable host refused; permission follows the URL',
+  )
+
+  // THE SERVERS' OWN COUNTS, because a verdict on stdout is the child's word and this is the property.
+  // A reached `database` and D did not: 1. C reached `notTheDatabase` and B did not: 1.
+  assert.equal(database.connections(), 1, `the declared database was connected to exactly once (A, not D), saw ${database.connections()}`)
+  assert.equal(notTheDatabase.connections(), 1, `the other port was connected to exactly once (C, not B), saw ${notTheDatabase.connections()}`)
+
+  // NON-VACUITY: the refusals above are the trap's, and B and D prove a trapped child can still refuse —
+  // so A and C are not passing because the trap failed to install in the child.
+  assert.match(b, /OutboundNetworkBlockedError/, 'B was refused BY THE TRAP, so the child really was trapped')
+  assert.match(d, /OutboundNetworkBlockedError/, 'D was refused BY THE TRAP, so the child really was trapped')
+
+  // E — POSTGRES' OWN PORT ON A ROUTABLE HOST THE URL DOES NOT NAME.
+  //
+  // THIS CASE EXISTS BECAUSE ITS MUTATION SURVIVED. A/B/C/D all use EPHEMERAL listener ports, so a
+  // `!isLoopback(host) && port === 5432` heuristic — the exact wrong shape this exemption was written to
+  // avoid — changed nothing any of them observe, and the mutation that introduces it came back GREEN.
+  // Disclosed rather than quietly removed: the fix is this assertion.
+  //
+  // NO LISTENER IS NEEDED, and that is the discriminator. The trap refuses BEFORE connecting, so a
+  // correct trap answers with its OWN error name; a trap that permitted this would reach a port with
+  // nothing on it and answer ECONNREFUSED under a different name. So the assertion is on the NAME, not
+  // merely on "it did not connect" — which is what makes it able to tell the two apart.
+  const postgresPortElsewhere = await probeWithDatabaseEnv(declared, address, 5432)
+  assert.equal(postgresPortElsewhere, 'REFUSED:OutboundNetworkBlockedError',
+    `${address}:5432 is not the declared endpoint, so the trap — not a missing listener — must refuse it; `
+    + `a port-5432 heuristic would give a different error name here. Saw: ${postgresPortElsewhere}`)
 })
