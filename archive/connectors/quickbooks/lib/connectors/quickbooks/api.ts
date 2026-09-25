@@ -312,39 +312,27 @@ export function escapeQboQueryValue(value: string): string {
   return value.replace(/'/g, "''")
 }
 
-async function findQboAccount(column: 'code' | 'externalAccountId', value: string): Promise<{ value: string } | null> {
-  const hit = await db.accountingAccount.findFirst({
-    where: { connector: QBO_CONNECTOR, [column]: value, active: true },
-    select: { externalAccountId: true },
-  })
-  return hit ? { value: hit.externalAccountId } : null
-}
-
 /**
- * Resolve a CHART-OF-ACCOUNTS setting (an account code, or an Id where the account has no number) to a QBO
- * AccountRef { value: id }. CODE FIRST, then Id.
- *
- * o3d-j625 r6 (review H5) — r5 made THIS function Id-first for every caller, to fix the payment path. But
- * the chart settings store an account's NUMBER (AcctNum) whenever it has one — the settings select offers
- * `a.code`, and `listStoredAccounts` returns `code ?? externalAccountId` — so a journal, bill or invoice
- * line configured as AcctNum "200" re-resolved to whichever account has Id "200": a silent mis-posting on
- * every connector path. The ordering is per SOURCE of the value, so the two sources get two functions.
+ * Resolve an account code or ID to a QBO AccountRef { value: id }.
+ * Looks up AccountingAccount by code first, then by externalAccountId.
+ * Returns null if not found.
  */
 export async function resolveAccountRef(codeOrId: string): Promise<{ value: string } | null> {
   if (!codeOrId) return null
-  return await findQboAccount('code', codeOrId) ?? await findQboAccount('externalAccountId', codeOrId)
-}
 
-/**
- * Resolve a PAYMENT-ACCOUNT MAP value to a QBO AccountRef. ID FIRST, then code.
- *
- * o3d-j625 r5 (review HIGH 6), kept for the one source it was right for: the payment-account map stores the
- * account's Id, and IMS confirmed that Id against the chart before enqueueing
- * (`accountingBankAccountBelongsTo`). Resolving it code-first could send the payment to a DIFFERENT account
- * whose AcctNum happens to equal the confirmed Id — both are short numeric strings in QuickBooks. A value
- * that is genuinely a code still resolves, one lookup later.
- */
-export async function resolvePaymentAccountRef(idOrCode: string): Promise<{ value: string } | null> {
-  if (!idOrCode) return null
-  return await findQboAccount('externalAccountId', idOrCode) ?? await findQboAccount('code', idOrCode)
+  // Try by code (AcctNum) first
+  const byCode = await db.accountingAccount.findFirst({
+    where: { connector: QBO_CONNECTOR, code: codeOrId, active: true },
+    select: { externalAccountId: true },
+  })
+  if (byCode) return { value: byCode.externalAccountId }
+
+  // Try by externalAccountId directly (already a QBO ID)
+  const byId = await db.accountingAccount.findFirst({
+    where: { connector: QBO_CONNECTOR, externalAccountId: codeOrId, active: true },
+    select: { externalAccountId: true },
+  })
+  if (byId) return { value: byId.externalAccountId }
+
+  return null
 }

@@ -1,6 +1,5 @@
 'use server'
 
-import { revalidatePath } from 'next/cache'
 import {
   createWcWebhooks,
   deleteShoppingTaxRateMapping as deleteShoppingTaxRateMappingImpl,
@@ -25,18 +24,8 @@ import {
   type TaxRateMappingRow,
   type WcSyncSettings,
 } from '@/app/actions/wc-sync'
-import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
-import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
-import { shopifyGraphql } from '@/lib/connectors/shopify/api'
-import {
-  getActiveSettingEnvOverrides,
-  getSettingValue,
-  getSettingValues,
-  serializeSettingValue,
-} from '@/lib/settings-store'
-import { isMaskedSecret, maskSecret } from '@/lib/security/secret-mask'
-import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
+import { requirePermission } from '@/lib/auth/server'
+import { getActiveShoppingConnectorInfo } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 
@@ -52,77 +41,6 @@ export type ShoppingConnectorCredentials = {
   envOverrides: Record<string, string>
   connectionTest: IntegrationConnectionTestState
 }
-export type ShopifySyncSettings = {
-  shopify_sync_enabled: string
-}
-export type ShopifyConnectorCredentials = {
-  storeDomain: string
-  adminApiAccessToken: string
-  accessTokenMasked: boolean
-  webhookSecret: string
-  webhookSecretMasked: boolean
-  envOverrides: Record<string, string>
-}
-
-const SHOPIFY_SYNC_SETTING_KEYS = ['shopify_sync_enabled'] as const
-const SHOPIFY_SYNC_DEFAULTS: ShopifySyncSettings = {
-  shopify_sync_enabled: 'false',
-}
-
-type ShopifyConnectionTestResponse = {
-  shop: {
-    name: string
-    myshopifyDomain: string
-  } | null
-}
-
-function normalizeShopifyStoreDomain(value: string): string | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
-
-  try {
-    const withProtocol = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
-    const url = new URL(withProtocol)
-    return url.hostname.toLowerCase() || null
-  } catch {
-    return null
-  }
-}
-
-async function requireSyncPermission() {
-  return requirePermission('sync')
-}
-
-async function requireFreshShoppingAdmin() {
-  return requireFreshPermission('sync')
-}
-
-function mapSyncLogRows(
-  rows: Array<{
-    id: string
-    direction: string
-    status: string
-    entityType: string
-    entityId: string | null
-    externalId: string | null
-    errorMessage: string | null
-    syncedAt: Date | null
-    createdAt: Date
-  }>,
-): ShoppingSyncLogRow[] {
-  return rows.map((row) => ({
-    id: row.id,
-    direction: row.direction,
-    status: row.status,
-    entityType: row.entityType,
-    entityId: row.entityId,
-    externalId: row.externalId,
-    errorMessage: row.errorMessage,
-    syncedAt: row.syncedAt?.toISOString() ?? null,
-    createdAt: row.createdAt.toISOString(),
-  }))
-}
-
 export async function getShoppingIntegrationConnector() {
   // o3d-1fel: the delegate (getActiveShoppingConnectorInfo) is a lib helper with
   // no guard of its own, so the gate has to live here.
@@ -202,198 +120,25 @@ export async function probeShoppingFxHelperPlugin() {
   return probeFxHelperPluginAction()
 }
 
-export async function getShopifySyncSettings(): Promise<ShopifySyncSettings> {
-  await requireSyncPermission()
-  const map = await getSettingValues([...SHOPIFY_SYNC_SETTING_KEYS])
-  const result = { ...SHOPIFY_SYNC_DEFAULTS }
-  for (const key of Object.keys(result) as (keyof ShopifySyncSettings)[]) {
-    const value = map.get(key)
-    if (value) result[key] = value
-  }
-  return result
-}
-
-export async function saveShopifySyncSettings(data: Partial<ShopifySyncSettings>): Promise<{ success: boolean; error?: string }> {
-  await requireSyncPermission()
-  const operations = Object.entries(data)
-    .filter(([key]) => SHOPIFY_SYNC_SETTING_KEYS.includes(key as (typeof SHOPIFY_SYNC_SETTING_KEYS)[number]))
-    .map(([key, value]) => (
-      db.setting.upsert({
-        where: { key },
-        create: { key, value: serializeSettingValue(key, value ?? '') },
-        update: { value: serializeSettingValue(key, value ?? '') },
-      })
-    ))
-
-  if (operations.length > 0) {
-    await db.$transaction(operations)
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'updated',
-      description: 'Updated Shopify sync settings',
-      metadata: { keys: Object.keys(data) },
-    })
-    revalidatePath('/sync')
-  }
-
-  return { success: true }
-}
-
-export async function getShopifyConnectorCredentials(): Promise<ShopifyConnectorCredentials> {
-  await requireSyncPermission()
-  const map = await getSettingValues([
-    'shopify_store_domain',
-    'shopify_admin_api_access_token',
-    'shopify_webhook_secret',
-  ])
-
-  const adminApiAccessToken = map.get('shopify_admin_api_access_token') ?? ''
-  const webhookSecret = map.get('shopify_webhook_secret') ?? ''
-
-  return {
-    storeDomain: map.get('shopify_store_domain') ?? '',
-    adminApiAccessToken: maskSecret(adminApiAccessToken),
-    accessTokenMasked: !!adminApiAccessToken,
-    webhookSecret: maskSecret(webhookSecret),
-    webhookSecretMasked: !!webhookSecret,
-    envOverrides: getActiveSettingEnvOverrides([
-      'shopify_admin_api_access_token',
-      'shopify_webhook_secret',
-    ]),
-  }
-}
-
-export async function saveShopifyConnectorCredentials(
-  storeDomain: string,
-  adminApiAccessToken: string,
-  webhookSecret: string,
-): Promise<{ success: boolean; error?: string; message?: string; code?: string; reason?: string }> {
-  // audit-ohou: structured fresh-auth failure so the client can step-up + retry.
-  try {
-    await requireFreshShoppingAdmin()
-  } catch (e) {
-    const freshAuthFailure = freshAuthFailureResult(e)
-    if (freshAuthFailure) return freshAuthFailure
-    throw e
-  }
-
-  const normalizedDomain = normalizeShopifyStoreDomain(storeDomain)
-  if (!normalizedDomain) {
-    return { success: false, error: 'Store domain is required' }
-  }
-
-  const incomingTokenIsMasked = isMaskedSecret(adminApiAccessToken)
-  const incomingWebhookSecretIsMasked = isMaskedSecret(webhookSecret)
-
-  const [currentToken, currentWebhookSecret] = await Promise.all([
-    incomingTokenIsMasked ? getSettingValue('shopify_admin_api_access_token') : Promise.resolve(adminApiAccessToken),
-    incomingWebhookSecretIsMasked ? getSettingValue('shopify_webhook_secret') : Promise.resolve(webhookSecret),
-  ])
-
-  const nextToken = (currentToken ?? '').trim()
-  if (!nextToken) {
-    return { success: false, error: 'Admin API access token is required' }
-  }
-
-  const connectionTest = await shopifyGraphql<ShopifyConnectionTestResponse>(
-    'query ShopifyConnectionTest { shop { name myshopifyDomain } }',
-    undefined,
-    {
-      url: `https://${normalizedDomain}`,
-      key: nextToken,
-      secret: (currentWebhookSecret ?? '').trim(),
-      storeDomain: normalizedDomain,
-      adminApiAccessToken: nextToken,
-      webhookSecret: (currentWebhookSecret ?? '').trim(),
-    },
-  )
-
-  if (connectionTest.error) {
-    return { success: false, error: connectionTest.error }
-  }
-
-  if (!connectionTest.data?.shop) {
-    return { success: false, error: 'Shopify did not return shop details for these credentials.' }
-  }
-
-  await db.$transaction([
-    db.setting.upsert({
-      where: { key: 'shopify_store_domain' },
-      create: { key: 'shopify_store_domain', value: normalizedDomain },
-      update: { value: normalizedDomain },
-    }),
-    db.setting.upsert({
-      where: { key: 'shopify_admin_api_access_token' },
-      create: {
-        key: 'shopify_admin_api_access_token',
-        value: serializeSettingValue('shopify_admin_api_access_token', nextToken),
-      },
-      update: {
-        value: serializeSettingValue('shopify_admin_api_access_token', nextToken),
-      },
-    }),
-    db.setting.upsert({
-      where: { key: 'shopify_webhook_secret' },
-      create: {
-        key: 'shopify_webhook_secret',
-        value: serializeSettingValue('shopify_webhook_secret', (currentWebhookSecret ?? '').trim()),
-      },
-      update: {
-        value: serializeSettingValue('shopify_webhook_secret', (currentWebhookSecret ?? '').trim()),
-      },
-    }),
-  ])
-
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Updated Shopify connector credentials',
-    metadata: { storeDomain: normalizedDomain },
-  })
-
-  revalidatePath('/sync')
-  return {
-    success: true,
-    message: `Connection verified for ${connectionTest.data.shop.name || connectionTest.data.shop.myshopifyDomain}.`,
-  }
-}
-
-export async function getShopifySyncLogs(limit = 50): Promise<ShoppingSyncLogRow[]> {
-  await requireSyncPermission()
-  const rows = await db.shoppingSyncLog.findMany({
-    where: { connector: 'shopify' },
-    orderBy: { createdAt: 'desc' },
-    take: limit,
-  })
-  return mapSyncLogRows(rows)
-}
-
-export async function triggerShopifyManualSync(
-  type: 'orders' | 'products' | 'stock',
-): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  await requireSyncPermission()
-
-  if (type !== 'stock') {
-    return {
-      success: false,
-      error: 'Shopify manual order and product sync are not wired yet',
-    }
-  }
-
-  try {
-    const result = await syncShoppingConnectorStock('shopify')
-    return { success: true, result }
-  } catch (error) {
-    return { success: false, error: String(error) }
-  }
-}
-
+/**
+ * The connector-keyed sync-log reader.
+ *
+ * ONE CONNECTOR TODAY (o3d-remove-parked-connectors): Shopify was the other arm and is archived.
+ * The parameter is kept rather than dropped because every caller passes the connector it resolved,
+ * and a second connector adds an arm here instead of a new exported action at every call site.
+ */
 export async function getShoppingSyncLogsForConnector(
   connector: ShoppingConnectorId,
   limit = 50,
 ): Promise<ShoppingSyncLogRow[]> {
-  if (connector === 'shopify') return getShopifySyncLogs(limit)
-  return getShoppingSyncLogs(limit)
+  // GUARDED HERE, not only by the delegate. Every arm below delegates to an action that takes
+  // `sync` itself, but the switch means this export is no longer a plain tail call to one of them,
+  // so the server-action guard detector cannot see through it — and an arm added later that reads
+  // rows directly would be unguarded with nothing to say so. Cheap, and it fails closed.
+  await requirePermission('sync')
+
+  switch (connector) {
+    case 'woocommerce':
+      return getShoppingSyncLogs(limit)
+  }
 }

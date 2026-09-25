@@ -2,6 +2,7 @@
  * WooCommerce → IMS order import.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -1009,7 +1010,7 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
   metaKey: string
   accountingPayload: Record<string, unknown>
   /** o3d-j625: the chart the frozen account codes came from, parked with them. */
-  chartConnector: 'xero' | 'quickbooks' | null
+  chartConnector: AccountingConnectorId | null
 }): Promise<void> {
   const held = buildHeldSalesInvoicePayload({
     externalOrderId: String(params.wcOrder.id),

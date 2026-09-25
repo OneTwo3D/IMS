@@ -1,5 +1,6 @@
 'use server'
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
@@ -1600,7 +1601,7 @@ export async function applySalesOrderStatusTransition(
         // this transition itself read, not a caller's earlier snapshot.
         withdrawalApprovedAt: true,
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
-        // so a Shopify-linked order also gets its IMS status pushed back.
+        // so an order linked to any registered storefront also gets its IMS status pushed back.
         shoppingLinks: { select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
@@ -1882,7 +1883,7 @@ export async function applySalesOrderStatusTransition(
 
     // Push status back to the order's shopping connector(s) (fire-and-forget).
     // b8i6.1: routed through the facade so it dispatches to the order's actual
-    // connector (WooCommerce pushes; Shopify is skipped until it gains a push).
+    // connector (WooCommerce pushes; a connector without a push port is skipped).
     if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
       pushSalesOrderStatus(id, targetStatus)
         .then((res) => {
@@ -2131,7 +2132,7 @@ async function queueRefundAccountingActions(input: {
     // Bound OUTSIDE the transaction callback below: TypeScript discards the narrowing above once the
     // property is read inside a closure, and the point of the guard is that the three states are
     // distinguished exactly once.
-    const chartConnector: 'xero' | 'quickbooks' | null = sync.chartConnector
+    const chartConnector: AccountingConnectorId | null = sync.chartConnector
     if (sync.type === 'COGS_REVERSAL') {
       // r8: the WHOLE answer, not a bare boolean — see queueAccountingSyncTxWithOutcome. The default
       // is a refusal because an obligation whose enqueue never answered is owed, not settled; it is
@@ -3790,7 +3791,7 @@ export async function addPayment(input: {
     })
 
     // o3d-j625 r5 (review M-12): which books the receipt was registered in, for the FX journal below.
-    const registeredFor: { connector: 'xero' | 'quickbooks' | null } = { connector: null }
+    const registeredFor: { connector: AccountingConnectorId | null } = { connector: null }
     if (!input.refundId) {
       registeredFor.connector = await registerInvoicePaymentWithLedger({
         orderId: input.orderId,

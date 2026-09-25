@@ -4,14 +4,11 @@ import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
-import { ShopifySyncClient } from './shopify-sync-client'
 import { WMS_PANEL_ENTRIES, WmsSyncPanel, listWmsIntegrationCards } from './wms-sync-panel'
 import { AccountingConnectorPanel, isAccountingConnectorUiId } from './accounting-connector-panel'
 import { isWmsConnectorId, type WmsConnectorId } from '@/lib/connectors/wms/types'
 import type { WmsSyncDashboardData } from '@/app/actions/wms-sync'
 import type {
-  ShopifyConnectorCredentials,
-  ShopifySyncSettings,
   ShoppingConnectorCredentials,
   ShoppingStatusMappingRow,
   ShoppingSyncLogRow,
@@ -41,9 +38,6 @@ type Props = {
   /** Live accounting tax rates (fetched on page load when connected). */
   accountingTaxRates: Array<{ taxType: string; name: string; rate: number }>
   shoppingCredentials: ShoppingConnectorCredentials
-  shopifySettings: ShopifySyncSettings
-  shopifyCredentials: ShopifyConnectorCredentials
-  shopifyLogs: ShoppingSyncLogRow[]
   accountingSettings: AccountingConnectorSettings & { secretMasked: boolean }
   accountingConnected: boolean
   accountingTenantName?: string
@@ -103,14 +97,6 @@ const NON_WMS_CONNECTORS: ConnectorDef[] = [
     available: true,
   },
   {
-    id: 'shopify',
-    name: 'Shopify',
-    description: 'Sync orders, products and stock with Shopify',
-    logo: '/images/shopify-banner.png',
-    category: 'shopping',
-    available: true,
-  },
-  {
     id: 'rest-api',
     name: 'REST API',
     description: 'Integrate any system via the One Two Inventory REST API',
@@ -123,14 +109,6 @@ const NON_WMS_CONNECTORS: ConnectorDef[] = [
     name: 'Xero',
     description: 'Sync invoices, COGS journals and purchase invoices',
     logo: '/images/xero.svg',
-    category: 'accounting',
-    available: true,
-  },
-  {
-    id: 'quickbooks',
-    name: 'QuickBooks',
-    description: 'Sync invoices, COGS journals and purchase invoices',
-    logo: '/images/qb-logo-stacked.svg',
     category: 'accounting',
     available: true,
   },
@@ -162,8 +140,6 @@ function wmsConnectorCards(availableWmsConnectorIds: readonly WmsConnectorId[]):
 const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   // eslint-disable-next-line @next/next/no-img-element
   woocommerce: <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-8 object-contain" />,
-  // eslint-disable-next-line @next/next/no-img-element
-  shopify: <img src="/images/shopify-banner.png" alt="Shopify" className="h-8 object-contain" />,
   'rest-api': (
     <div className="h-8 flex items-center gap-2">
       <svg viewBox="0 0 24 24" className="h-7 w-7 text-primary" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
@@ -176,22 +152,16 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   ...Object.fromEntries(WMS_PANEL_ENTRIES.map((entry) => [entry.id, entry.logo])),
   // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
-  // eslint-disable-next-line @next/next/no-img-element
-  quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData, availableWmsConnectorIds, ambiguousWmsConnectorIds }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, accountingSettings, accountingConnected, accountingTenantName, accountingBlockedReason, accountingHasStoredToken, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, wmsData, availableWmsConnectorIds, ambiguousWmsConnectorIds }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const requestedConnector = searchParams.get('connector')
   const activeConnector = (
     requestedConnector === 'woocommerce' && !pluginState.woocommerce
   ) || (
-    requestedConnector === 'shopify' && !pluginState.shopify
-  ) || (
     requestedConnector === 'xero' && !pluginState.xero
-  ) || (
-    requestedConnector === 'quickbooks' && !pluginState.quickbooks
   ) || (
     // A connector this build does not OFFER has no panel to open, however the URL was arrived at
     // (round 12, Codex HIGH 2). `?connector=` is operator-supplied, and the grid is not the only
@@ -212,14 +182,11 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   }
 
   const woocommerceConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
-  const shopifyConnected = pluginState.shopify && !!shopifyCredentials.storeDomain && !!shopifyCredentials.adminApiAccessToken
   const wmsConfigured = Boolean(wmsData?.configured)
   const connectors = [...NON_WMS_CONNECTORS, ...wmsConnectorCards(availableWmsConnectorIds)]
   const visibleConnectors = connectors.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
-    if (connector.id === 'shopify') return pluginState.shopify
     if (connector.id === 'xero') return pluginState.xero
-    if (connector.id === 'quickbooks') return pluginState.quickbooks
     if (isWmsConnectorId(connector.id)) return pluginState[connector.id]
     return true
   })
@@ -343,28 +310,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     )
   }
 
-  if (activeConnector === 'shopify') {
-    return (
-      <div className="space-y-4">
-        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
-          ← Back to Integrations
-        </button>
-        <div className="flex items-center gap-3 mb-2">
-          {CONNECTOR_LOGOS.shopify}
-          <div>
-            <h2 className="text-lg font-semibold">Shopify Connector</h2>
-            <p className="text-xs text-muted-foreground">Configure Shopify credentials, webhook verification, and stock sync.</p>
-          </div>
-        </div>
-        <ShopifySyncClient
-          settings={shopifySettings}
-          credentials={shopifyCredentials}
-          logs={shopifyLogs}
-        />
-      </div>
-    )
-  }
-
   if (activeConnector === 'woocommerce') {
     return (
       <div className="space-y-4">
@@ -406,11 +351,6 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
                 {c.id === 'woocommerce' && woocommerceConnected && (
-                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-                    Connected
-                  </span>
-                )}
-                {c.id === 'shopify' && shopifyConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>
@@ -467,7 +407,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {(c.id === 'xero' || c.id === 'quickbooks') && accountingConnected && (
+                {isAccountingConnectorUiId(c.id) && accountingConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

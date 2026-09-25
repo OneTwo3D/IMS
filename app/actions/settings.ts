@@ -577,71 +577,6 @@ export async function autoLinkXeroTaxRates(): Promise<{
   }
 }
 
-export async function autoLinkQuickBooksTaxRates(): Promise<{
-  success: boolean
-  linked: number
-  alreadyLinked: number
-  unmatched: string[]
-  quickBooksRatesCount: number
-  error?: string
-  warning?: string
-}> {
-  await requirePermission('settings.company')
-  try {
-    const { getQuickBooksTaxCodes } = await import('@/lib/connectors/quickbooks/accounts')
-    const qboRates = await getQuickBooksTaxCodes()
-    const qboByName = new Map<string, { id: string; name: string }>()
-    for (const rate of qboRates) {
-      qboByName.set(rate.name.trim().toLowerCase(), rate)
-    }
-
-    const imsRates = await db.taxRate.findMany({
-      where: { active: true },
-      select: { id: true, name: true, accountingTaxType: true },
-    })
-
-    let linked = 0
-    let alreadyLinked = 0
-    const unmatched: string[] = []
-
-    // ONE TRANSACTION, for the same reason as the Xero path above.
-    const plan = imsRates.flatMap((ims) => {
-      if (ims.accountingTaxType) { alreadyLinked++; return [] }
-      const match = qboByName.get(ims.name.trim().toLowerCase())
-      if (!match) { unmatched.push(ims.name); return [] }
-      return [{ id: ims.id, taxType: match.id }]
-    })
-    await db.$transaction(async (tx) => {
-      for (const entry of plan) {
-        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
-      }
-    })
-    linked = plan.length
-
-    const postCommit = await runPostCommit(async () => {
-      await logActivity({
-        entityType: 'SETTING',
-        tag: 'settings',
-        action: 'quickbooks_tax_rates_linked',
-        description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
-        metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
-      })
-      revalidatePath('/settings/accounting')
-    }, 'Failed to record the auto-link')
-    return {
-      success: true,
-      linked,
-      alreadyLinked,
-      unmatched,
-      quickBooksRatesCount: qboRates.length,
-      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
-    }
-  } catch (e) {
-    unstable_rethrow(e)
-    return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], quickBooksRatesCount: 0, error: String(e) }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Generate + map missing accounting tax rates (onetwo3d-ims-30tg)
 // ---------------------------------------------------------------------------
@@ -797,36 +732,6 @@ export async function generateMissingXeroTaxRates(
   } catch (e) {
     unstable_rethrow(e)
     return { success: false, created: 0, failed: [], externalRatesCount: 0, supported: true, error: String(e) }
-  }
-}
-
-/**
- * QuickBooks does not yet support programmatic tax-code creation. Return an
- * unsupported result so the connector-agnostic caller/UI degrades gracefully
- * (create the codes in QuickBooks, then use Auto-link).
- */
-export async function previewMissingQuickBooksTaxRates(): Promise<MissingTaxRatePreviewResult> {
-  await requirePermission('settings.company')
-  return {
-    success: true,
-    toCreate: [],
-    alreadyMapped: 0,
-    skippedExisting: 0,
-    externalRatesCount: 0,
-    supported: false,
-    error: 'Generating tax codes in QuickBooks is not supported yet — create them in QuickBooks, then use Auto-link.',
-  }
-}
-
-export async function generateMissingQuickBooksTaxRates(_taxRateIds: string[], _reportTypeOverrides?: Record<string, string>): Promise<MissingTaxRateGenerateResult> {
-  await requirePermission('settings.company')
-  return {
-    success: false,
-    created: 0,
-    failed: [],
-    externalRatesCount: 0,
-    supported: false,
-    error: 'Generating tax codes in QuickBooks is not supported yet.',
   }
 }
 
@@ -1196,7 +1101,7 @@ export async function saveIntegrationPluginState(
   // requests then both observed both connectors disabled, one enabled Xero and the other
   // QuickBooks, their writes serialized, and the result was BOTH ENABLED — an invalid state that
   // no later validation ever revisits and that getActiveConnector silently resolves Xero-first, so
-  // nothing ever complains. WooCommerce/Shopify had the identical race.
+  // nothing ever complains. The shopping pair had the identical race before Shopify was archived.
   //
   // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
   // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state

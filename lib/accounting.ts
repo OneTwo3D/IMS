@@ -4,6 +4,11 @@
 
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
+import {
+  ACCOUNTING_CONNECTORS,
+  getAccountingConnectorDefinition,
+  type AccountingConnectorId,
+} from '@/lib/connectors/accounting-registry'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
@@ -20,7 +25,8 @@ import {
   PRIOR_ATTEMPT_SELECT,
   priorAttemptsWhere,
 } from '@/lib/domain/accounting/prior-posting-evidence'
-import { connectorNativePayloadIdKeys } from '@/lib/accounting/connector-provenance'
+import { connectorNativePayloadIdKeys, type StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
+import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { clearAccountingPostingRefusal, recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { defaultPostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
@@ -86,9 +92,13 @@ export type AccountingSettings = {
   connector: AccountingConnectorInfo['id'] | null
 }
 
+// o3d-remove-parked-connectors: `id` and `name` were hand-written unions ('xero' | 'quickbooks' /
+// 'Xero' | 'QuickBooks') — a fourth copy of the accounting id union, and a second copy of a label the
+// registry already carries. Both now come from the registry, so registering a connector widens this
+// by construction and its label has ONE source.
 type AccountingConnectorInfo = {
-  id: 'xero' | 'quickbooks'
-  name: 'Xero' | 'QuickBooks'
+  id: AccountingConnectorId
+  name: string
 }
 
 const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
@@ -110,22 +120,6 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   TAX_RATE_SYNC: 'xero_sync_tax_rate',
 }
 
-const QUICKBOOKS_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
-  SALES_INVOICE: 'quickbooks_sync_sales_invoice',
-  SALES_INVOICE_UPDATE: 'quickbooks_sync_sales_invoice',
-  CREDIT_NOTE: 'quickbooks_sync_credit_note',
-  PURCHASE_INVOICE: 'quickbooks_sync_purchase_invoice',
-  PURCHASE_INVOICE_UPDATE: 'quickbooks_sync_purchase_invoice',
-  COGS_JOURNAL: 'quickbooks_sync_cogs_journal',
-  COGS_REVERSAL: 'quickbooks_sync_cogs_reversal',
-  STOCK_RECEIPT: 'quickbooks_sync_stock_receipt',
-  INVENTORY_ADJUSTMENT: 'quickbooks_sync_inventory_adjustment',
-  STOCK_ALLOCATION: 'quickbooks_sync_stock_allocation',
-  REALISED_FX_JOURNAL: 'quickbooks_sync_realised_fx_journal',
-  UNREALISED_FX_JOURNAL: 'quickbooks_sync_unrealised_fx_journal',
-  MANUFACTURING_JOURNAL: 'quickbooks_sync_manufacturing_journal',
-  MANUFACTURING_RECLASS: 'quickbooks_sync_manufacturing_journal',
-}
 
 const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   syncEnabled: false,
@@ -151,9 +145,19 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   connector: null,
 }
 
+/**
+ * The first registered accounting connector whose plugin is enabled, or null.
+ *
+ * o3d-remove-parked-connectors: this was `if xero … if quickbooks …`, i.e. Xero-first by virtue of
+ * being written first. It now walks `ACCOUNTING_CONNECTORS` in its declared order, so the precedence
+ * lives in the registry — the same shape `resolveActiveAccountingConnector` (the LOCKED form, in
+ * lib/integration-plugin-selection-lock.ts) uses, which is what keeps the two one rule over two
+ * sources rather than two rules. With one connector registered they are indistinguishable.
+ */
 async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
-  if (await isIntegrationPluginEnabled('xero')) return 'xero'
-  if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
+  for (const connector of ACCOUNTING_CONNECTORS) {
+    if (await isIntegrationPluginEnabled(connector.id)) return connector.id
+  }
   return null
 }
 
@@ -179,7 +183,8 @@ async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo
  * DECIDED: REFUSE THE ENQUEUE, rather than queue it and stop counting it as relief.
  *
  *   Refusing is the only one of the two that is safe in BOTH directions. A queued row on a
- *   non-active connector is NOT undrainable — `triggerXeroSync` / `triggerQuickBooksSync`, the
+ *   non-active connector is NOT undrainable — `triggerXeroSync` (and any future connector's own
+ *   manual trigger), the
  *   manual Sync buttons, gate on `<connector>_sync_enabled` AND NOTHING ELSE and never resolve the
  *   active connector at all (this is established, and pinned by a test, in
  *   lib/domain/accounting/sync-row-claimability.ts). So "a row nobody will process" is a claim about
@@ -228,7 +233,9 @@ export async function getActiveAccountingConnectorInfo(): Promise<AccountingConn
   if (!connector) return null
   return {
     id: connector,
-    name: connector === 'xero' ? 'Xero' : 'QuickBooks',
+    // From the registry (o3d-remove-parked-connectors); it was `connector === 'xero' ? 'Xero' : …`,
+    // which made every unrecognised connector display as the other one.
+    name: getAccountingConnectorDefinition(connector).label,
   }
 }
 
@@ -493,7 +500,7 @@ async function refuseUnattributableChart(params: {
    *               whole finding is about.
    *   other id    the payload carries the OTHER connector's document id. The mis-routing itself.
    */
-  documentConnector?: AccountingConnectorInfo['id'] | null
+  documentConnector?: StoredAccountingConnector | null
   /**
    * o3d-j625 r4 — WHETHER A REFUSAL HERE SHOULD BE RECORDED AS OUTSTANDING WORK IN THE EXCEPTION INBOX.
    *
@@ -764,7 +771,7 @@ export async function queueAccountingSync(params: {
    * `null` is the recorded answer "nobody knows" — a row linked before the provenance column existed.
    * It is a refusal, not a pass: see the column's own contract in prisma/schema.prisma.
    */
-  documentConnector?: AccountingConnectorInfo['id'] | null
+  documentConnector?: StoredAccountingConnector | null
   connector?: AccountingConnectorInfo['id']
 }): Promise<AccountingEnqueueOutcome> {
   // o3d-j625: FIRST, before any resolution — this is the guard that makes a second resolution
@@ -853,19 +860,32 @@ export async function queueAccountingSync(params: {
   // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It
   // is `params.connector` verbatim — never `connector`, which is the resolved-or-pinned value and
   // would silently turn EVERY unpinned enqueue into a pinned one.
+  // ONE CONNECTOR QUEUE TODAY (o3d-remove-parked-connectors). The QuickBooks arm was archived; the
+  // switch is kept (rather than collapsed to a bare `queueXeroSync` call) because it is exhaustive
+  // over `AccountingConnectorId`, so registering a connector makes this a `tsc` error until its own
+  // queue is wired. That error is the point.
+  //
+  // o3d-j625 r12 (merge): the switch ASSIGNS rather than returns, because the clear below must happen
+  // on every path out of here — see the next comment. The `never` default is what keeps the tsc error:
+  // widen `AccountingConnectorId` and that assignment stops compiling.
   let routed: AccountingEnqueueOutcome
-  if (connector === 'quickbooks') {
-    const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-    routed = { ...await queueQuickBooksSync({ ...params, pinnedLedger: params.connector }), connector }
-  } else {
-    const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-    routed = { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
+  switch (connector) {
+    case 'xero': {
+      const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
+      routed = { ...await queueXeroSync({ ...params, pinnedLedger: params.connector }), connector }
+      break
+    }
+    default: {
+      const unregisteredConnector: never = connector
+      return unregisteredConnector
+    }
   }
   // o3d-j625 r4 — AND A POSTING THAT IS NOW QUEUED IS NO LONGER OUTSTANDING.
   //
   // The inbox row a refusal left behind is cleared by the posting being MADE, never by a timer or by an
   // operator ticking it off: this is the only event that means the debt is gone. `already-queued` counts —
-  // a row for this posting is durable either way, which is what the debt was about.
+  // a row for this posting is durable either way, which is what the debt was about. It is AFTER the
+  // switch, not inside a case, so a connector wired in later cannot forget it.
   if (routed.queued) {
     const { db } = await import('@/lib/db')
     await clearAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting)
@@ -908,21 +928,20 @@ async function getAccountingPostingContextFor(connector: string, type: Accountin
     return { connector, postingMode }
   }
 
-  // o3d-j625 r5 (review L-12): a connector this build does not know answers `null`, which every caller
-  // reads as "this type does not post" — i.e. nothing is owed. That is the safe direction for the QUEUE
-  // (nothing is written) and the wrong one for a caller settling an obligation on it, so the state is
-  // recorded rather than left silent. It is unreachable for the two connectors this build ships.
-  if (connector !== 'quickbooks') {
-    void logUnknownAccountingConnector(connector, type)
-    return null
-  }
-  const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
-  const settings = await getQuickBooksSettings()
-  if (settings.quickbooks_sync_enabled !== 'true') return null
-  const settingKey = QUICKBOOKS_SYNC_TYPE_SETTING[type]
-  const postingMode = settingKey ? String(settings[settingKey as keyof typeof settings] ?? '') : 'submitted'
-  if (!postingMode || postingMode === 'off') return null
-  return { connector, postingMode }
+  // An id this build does not know is NOT "enabled by default" — it gets no posting context. This is
+  // the branch the doc comment above promises, and o3d-remove-parked-connectors left it in place
+  // after archiving the QuickBooks arm rather than letting the Xero `if` fall through to `null` by
+  // accident. `connector` is typed `string` on purpose: this is the pinned form, and a pin read back
+  // from a stored row can name a connector this build no longer ships.
+  //
+  // o3d-j625 r5 (review L-12) — AND IT IS RECORDED RATHER THAN SILENT, which the archiving makes MORE
+  // load-bearing, not less. `null` is read by every caller as "this type does not post", i.e. nothing
+  // is owed: the safe direction for the QUEUE (nothing is written) and the wrong one for a caller
+  // settling an obligation. Before the removal this was unreachable for the connectors the build
+  // shipped; now a stored `quickbooks` pin on an existing row reaches it, which is exactly the state an
+  // operator needs named. Kept because it is about an UNKNOWN id, not about QuickBooks.
+  void logUnknownAccountingConnector(connector, type)
+  return null
 }
 
 /**
@@ -962,14 +981,13 @@ export async function isDailyBatchPostingEnabledForChart(
 
 async function dailyBatchPostingEnabledFor(connector: AccountingConnectorInfo['id'] | null): Promise<boolean> {
   if (!connector) return false
-  if (connector === 'xero') {
-    const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
-    const settings = await getXeroSettings()
-    return settings.xero_sync_enabled === 'true' && settings.xero_daily_batch_enabled === 'true'
+  switch (connector) {
+    case 'xero': {
+      const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
+      const settings = await getXeroSettings()
+      return settings.xero_sync_enabled === 'true' && settings.xero_daily_batch_enabled === 'true'
+    }
   }
-  const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
-  const settings = await getQuickBooksSettings()
-  return settings.quickbooks_sync_enabled === 'true' && settings.quickbooks_daily_batch_enabled === 'true'
 }
 
 /** review L-12: reported once per call, never thrown — the caller's own answer is unchanged. */
@@ -1038,15 +1056,22 @@ export async function isAccountingSyncTypeEnabledFor(
 export type ChartPostingVerdict =
   | { verdict: 'post'; connector: AccountingConnectorInfo['id'] }
   | { verdict: 'not-configured'; connector: AccountingConnectorInfo['id'] }
-  | { verdict: 'chart-retired'; chartConnector: AccountingConnectorInfo['id']; activeConnector: AccountingConnectorInfo['id'] | null }
+  | { verdict: 'chart-retired'; chartConnector: StoredAccountingConnector; activeConnector: AccountingConnectorInfo['id'] | null }
   | { verdict: 'no-chart' }
 
 export async function accountingPostingVerdictForChart(
-  chartConnector: AccountingConnectorInfo['id'] | null,
+  // STORED, not routable (o3d-j625 r12, merging o3d-remove-parked-connectors). This function's whole job
+  // is to judge a chart, and the judgement that matters most is "this build cannot route it" — a chart
+  // read back off a sales order or a bill can name an archived connector, and typing the parameter as a
+  // registered id would make that state unrepresentable at the one place it has to be detected.
+  chartConnector: StoredAccountingConnector | null,
   type: AccountingSyncType,
 ): Promise<ChartPostingVerdict> {
   if (chartConnector === null) return { verdict: 'no-chart' }
   const activeConnector = await getActiveAccountingConnectorId()
+  // A chart this build does not register IS retired, literally: nothing can post it. Asked before the
+  // equality below so the narrowing to a routable id is the registry's and not a comparison's.
+  if (!isRegisteredAccountingConnector(chartConnector)) return { verdict: 'chart-retired', chartConnector, activeConnector }
   if (activeConnector !== chartConnector) return { verdict: 'chart-retired', chartConnector, activeConnector }
   return (await getAccountingPostingContextFor(chartConnector, type)) === null
     ? { verdict: 'not-configured', connector: chartConnector }
@@ -1153,7 +1178,7 @@ export async function queueAccountingSyncTx(
      * `null` is the recorded answer "nobody knows" — a row linked before the provenance column existed.
      * It is a refusal, not a pass: see the column's own contract in prisma/schema.prisma.
      */
-    documentConnector?: AccountingConnectorInfo['id'] | null
+    documentConnector?: StoredAccountingConnector | null
     reportOutcome?: (outcome: AccountingEnqueueOutcome) => void
     /**
      * o3d-j625 r5 (review HIGH 4) — RECORD A REFUSAL HERE AS OUTSTANDING WORK.
@@ -1644,35 +1669,6 @@ export async function getAccountingSettingsFor(
         connector,
       }
     }
-    case 'quickbooks': {
-      const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
-      const qs = await getQuickBooksSettings()
-      return {
-        syncEnabled: qs.quickbooks_sync_enabled === 'true',
-        salesAccount: qs.quickbooks_sales_account,
-        shippingAccount: qs.quickbooks_shipping_account,
-        discountAccount: qs.quickbooks_discount_account,
-        cogsAccount: qs.quickbooks_cogs_account,
-        // QuickBooks out of scope for audit-o3yb — empty falls back to transit.
-        inventoryRevaluationAccount: '',
-        inventoryAccount: qs.quickbooks_inventory_account,
-        allocatedInventoryAccount: qs.quickbooks_allocated_inventory_account,
-        unearnedRevenueAccount: qs.quickbooks_unearned_revenue_account,
-        transitAccount: qs.quickbooks_transit_account,
-        accountsReceivableAccount: qs.quickbooks_accounts_receivable_account,
-        accountsPayableAccount: qs.quickbooks_accounts_payable_account,
-        realisedFxGainLossAccount: qs.quickbooks_realised_fx_gain_loss_account,
-        unrealisedFxGainLossAccount: qs.quickbooks_unrealised_fx_gain_loss_account,
-        manufacturingOverheadAccount: qs.quickbooks_manufacturing_overhead_account,
-        paymentAccountMap: paymentMapSetting?.value ?? '{}',
-        invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
-        billUrlTemplate: billUrlSetting?.value ?? '',
-        reverseChargeSalesTaxType,
-        reverseChargePurchaseTaxType,
-        // o3d-j625: and every code above is QUICKBOOKS's.
-        connector,
-      }
-    }
   }
 }
 
@@ -1733,10 +1729,6 @@ export async function listAccountCodes(): Promise<AccountCode[]> {
       const { listStoredAccounts } = await import('@/lib/connectors/xero/accounts')
       return listStoredAccounts()
     }
-    case 'quickbooks': {
-      const { listStoredAccounts } = await import('@/lib/connectors/quickbooks/accounts')
-      return listStoredAccounts()
-    }
   }
 }
 
@@ -1775,10 +1767,6 @@ export async function listAccountingBankAccountsWithChart(): Promise<{
       const { listStoredBankAccounts } = await import('@/lib/connectors/xero/accounts')
       return { connector, accounts: await listStoredBankAccounts() }
     }
-    case 'quickbooks': {
-      const { listStoredBankAccounts } = await import('@/lib/connectors/quickbooks/accounts')
-      return { connector, accounts: await listStoredBankAccounts() }
-    }
   }
 }
 
@@ -1791,10 +1779,10 @@ export type AccountBalanceSnapshotSyncResult = { fetched: number; persisted: num
 /**
  * Sync GL account-balance snapshots from the active accounting connector (used by the
  * account-balance-snapshot cron and the on-demand GL reconciliation refresh). Connector
- * -agnostic: dispatches to the active connector's implementation. QuickBooks has no
- * trial-balance/account-balance ingestion yet (needs the QBO trial-balance API + a QBO
- * sandbox — see onetwo3d-ims-khdw.1), so under QBO it returns a clear unsupported result
- * rather than silently succeeding; the GL reconciliations then degrade to unavailable.
+ * -agnostic: dispatches to the active connector's implementation. A connector with no
+ * trial-balance/account-balance ingestion has no arm in the switch, which is a `tsc` error the day
+ * it is registered — deliberately, because the alternative (a silent default) is what let the
+ * archived QuickBooks connector report snapshot success it never achieved.
  */
 export async function syncAccountingAccountBalanceSnapshots(options?: {
   balanceDate?: Date | string
@@ -1809,12 +1797,5 @@ export async function syncAccountingAccountBalanceSnapshots(options?: {
       const { syncXeroAccountBalanceSnapshots } = await import('@/lib/connectors/xero/account-balances')
       return syncXeroAccountBalanceSnapshots(options)
     }
-    case 'quickbooks':
-      return {
-        fetched: 0,
-        persisted: 0,
-        skipped: 0,
-        errors: ['QuickBooks account-balance snapshot ingestion is not implemented (onetwo3d-ims-khdw.1)'],
-      }
   }
 }

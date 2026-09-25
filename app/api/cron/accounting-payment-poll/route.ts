@@ -25,17 +25,8 @@ export async function GET(request: Request) {
     return NextResponse.json(result)
   }
 
-  if (await isIntegrationPluginEnabled('quickbooks')) {
-    const [pollingEnabled, syncEnabled] = await Promise.all([
-      db.setting.findUnique({ where: { key: 'quickbooks_payment_polling_enabled' } }),
-      db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } }),
-    ])
-    if (pollingEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks payment polling disabled' })
-    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks sync disabled' })
-    const { pollQuickBooksPayments } = await import('@/lib/connectors/quickbooks/payment-poller')
-    const result = await pollQuickBooksPayments()
-    return NextResponse.json(result)
-  }
+  // The QuickBooks branch was here and is archived (o3d-remove-parked-connectors): plugin +
+  // `quickbooks_payment_polling_enabled` + `quickbooks_sync_enabled`, then `pollQuickBooksPayments()`.
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
 }

@@ -1,3 +1,5 @@
+import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { accountingPostingKey, type AccountingPostingKey } from '@/lib/accounting/posting-key'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
 
@@ -38,14 +40,18 @@ type QueueAccountingSyncTxParams = {
    * `queueAccountingSyncTx`'s own declaration: this local type is what the injected enqueue is checked
    * against, so leaving it optional here would let the real required parameter be satisfied by a
    * `undefined` that type-checks at the injection site.
+   *
+   * o3d-j625 r12: ROUTABLE, not stored — this is what the ENQUEUE receives, and the enqueue writes the row
+   * under it. The module's own input (`MaybeQueuePurchaseInvoiceUpdateParams.chartConnector`) is the stored
+   * form, and the `!== 'xero'` gate is what turns one into the other.
    */
-  chartConnector: 'xero' | 'quickbooks' | null
+  chartConnector: AccountingConnectorId | null
   /**
    * o3d-j625 r3 (Codex HIGH 2) — WHOSE BILL `payload.accountingInvoiceId` IS. Declared here for the
    * same reason `chartConnector` is: this local type is what the injected enqueue is checked against,
    * so omitting it would let the real parameter be satisfied by an `undefined` that type-checks.
    */
-  documentConnector: 'xero' | 'quickbooks' | null
+  documentConnector: StoredAccountingConnector | null
 }
 
 // 6oyu.4 (khdw): a bill edit reposts to Xero, changing the NET (transit) leg from the
@@ -60,9 +66,9 @@ type TransitSubledgerUpdateInput = {
 
 /** o3d-j625 r4: the shape of `accountingPostingVerdictForChart`'s answer, restated so this module stays injectable. */
 export type PurchaseInvoiceUpdatePostingVerdict =
-  | { verdict: 'post'; connector: 'xero' | 'quickbooks' }
-  | { verdict: 'not-configured'; connector: 'xero' | 'quickbooks' }
-  | { verdict: 'chart-retired'; chartConnector: 'xero' | 'quickbooks'; activeConnector: 'xero' | 'quickbooks' | null }
+  | { verdict: 'post'; connector: AccountingConnectorId }
+  | { verdict: 'not-configured'; connector: AccountingConnectorId }
+  | { verdict: 'chart-retired'; chartConnector: StoredAccountingConnector; activeConnector: AccountingConnectorId | null }
   | { verdict: 'no-chart' }
 
 export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx> = {
@@ -74,7 +80,7 @@ export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx
    * refuse. The verdict is asked OF THE CHART'S CONNECTOR, and a retired chart is a refusal.
    */
   postingVerdictForChart: (
-    chartConnector: 'xero' | 'quickbooks' | null,
+    chartConnector: StoredAccountingConnector | null,
     type: 'PURCHASE_INVOICE_UPDATE',
   ) => Promise<PurchaseInvoiceUpdatePostingVerdict>
   queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
@@ -154,7 +160,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
    * connector" were three independent answers to one question with a full bill recalculation and a
    * line-by-line update between them. There is one answer now and it comes from the caller.
    */
-  chartConnector: 'xero' | 'quickbooks' | null
+  chartConnector: StoredAccountingConnector | null
   /**
    * o3d-j625 r3 (Codex HIGH 2) — WHICH CONNECTOR'S BILL `accountingPayload.accountingInvoiceId` NAMES.
    *
@@ -163,7 +169,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
    * account code came from — cannot speak for it. `null` means the link predates the provenance column
    * and the enqueue refuses rather than assuming the active connector.
    */
-  documentConnector: 'xero' | 'quickbooks' | null
+  documentConnector: StoredAccountingConnector | null
   idempotencyKey: string | null
   // 6oyu.4 (khdw): the bill's NET (transit) subtotal before and after this edit, in
   // base currency, so the transit subledger records the signed movement (new − old).
@@ -179,7 +185,12 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   const connector: AccountingConnectorInfo = params.chartConnector
     ? { id: params.chartConnector, name: params.chartConnector === 'xero' ? 'Xero' : 'QuickBooks' }
     : null
-  if (connector?.id !== 'xero') {
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): the gate reads the PARAM rather than
+  // `connector.id`. Same value by construction (the line above derives one from the other), but a literal
+  // comparison against the raw stored form is what narrows it to a ROUTABLE id for the enqueue below —
+  // which is the point: a chart naming an archived connector must not reach `queueAccountingSyncTx`, and
+  // now it cannot, by type.
+  if (params.chartConnector !== 'xero') {
     await params.tx.activityLog.create({
       data: {
         entityType: 'PURCHASE_ORDER',

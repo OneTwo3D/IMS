@@ -8,6 +8,7 @@
  * endpoint worth exposing — so the shared logic lives here and app/actions/sales.ts imports it.
  */
 
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -156,7 +157,11 @@ export async function loadInvoicePaymentSyncRows(
       couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),
       // ...and the mark it would have written, which identifies the attempt even if its amount or
       // date has since been corrected in the ledger.
-      settlementMarker: connector === 'xero' || connector === 'quickbooks'
+      // REGISTRY-CHECKED, not a literal pair (o3d-remove-parked-connectors). `connector` here comes
+      // from a stored row, so it can name a connector this build no longer ships (rows stamped
+      // `quickbooks` still exist in development databases). Such a row gets a null marker, which the
+      // caller reads as "no identifying mark" rather than inventing one.
+      settlementMarker: isRegisteredAccountingConnector(connector)
         ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
         : null,
     }
@@ -222,7 +227,7 @@ export function payloadAccountingInvoiceId(payload: unknown): string | null {
  */
 export type PostedInvoiceEvidence = {
   /** The connector whose processor made the call — not whichever one is active when this runs. */
-  connector: 'xero' | 'quickbooks'
+  connector: AccountingConnectorId
   /** The ledger invoice id THIS attempt returned — not whatever the order points at when this runs. */
   accountingInvoiceId: string
 }
@@ -1193,7 +1198,7 @@ export function deferredReceiptsFailedDescription(params: { connector: string; e
  * the symmetric case (markBillPaid) was fixed this round. `null` when nothing was resolved or nothing was
  * registered.
  */
-export type InvoicePaymentRegistrationConnector = 'xero' | 'quickbooks' | null
+export type InvoicePaymentRegistrationConnector = AccountingConnectorId | null
 
 export async function registerInvoicePaymentWithLedger(params: {
   orderId: string
@@ -1340,7 +1345,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     if (!so) return registeredFor.connector
 
     const connectorId: PostedInvoiceEvidence['connector'] | null = pinned ? pinned.connector : (activeConnector?.id ?? null)
-    registeredFor.connector = (connectorId === 'xero' || connectorId === 'quickbooks') ? connectorId : null
+    registeredFor.connector = isRegisteredAccountingConnector(connectorId) ? connectorId : null
     // Only a tie-break for the remedy's wording — see `deferredRecovery`.
     preferredConnector = connectorId
 

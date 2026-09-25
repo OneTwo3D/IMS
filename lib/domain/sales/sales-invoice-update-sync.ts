@@ -1,3 +1,5 @@
+import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
 export type SalesInvoiceUpdateConnectorInfo = {
@@ -25,7 +27,7 @@ export type SalesInvoiceUpdateQueueParams = {
    * Checked before anything else below, so a mismatch is reported as a mismatch rather than as
    * "QuickBooks updates are not supported yet", which would be a true sentence about the wrong fact.
    */
-  chartConnector: 'xero' | 'quickbooks' | null
+  chartConnector: StoredAccountingConnector | null
   /**
    * o3d-j625 r3 (Codex HIGH 2) — WHICH CONNECTOR'S INVOICE `accountingInvoiceId` IS.
    *
@@ -39,7 +41,7 @@ export type SalesInvoiceUpdateQueueParams = {
    * `null` = the link predates `SalesOrder.accountingInvoiceConnector`. FAIL CLOSED: refused and reported,
    * never resolved to the active connector.
    */
-  documentConnector: 'xero' | 'quickbooks' | null
+  documentConnector: StoredAccountingConnector | null
 }
 
 /**
@@ -62,8 +64,13 @@ type QueueAccountingSync = (params: {
   referenceId: string
   payload: Record<string, unknown>
   idempotencyKey: string
-  chartConnector: 'xero' | 'quickbooks' | null
-  documentConnector: 'xero' | 'quickbooks' | null
+  // ROUTABLE, not stored (o3d-j625 r12): the facade writes the row UNDER this connector, so it may only
+  // be given one this build can route. The two guards above — chart equals the active connector, and the
+  // `!== 'xero'` skip below — are what narrow the stored form to it before this is called.
+  chartConnector: AccountingConnectorId | null
+  // The DOCUMENT connector stays the stored form: the facade compares it against the chart and refuses a
+  // mismatch, which is exactly how a link naming an archived connector is caught.
+  documentConnector: StoredAccountingConnector | null
 }) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'; connector: string | null }>
 
 type LogActivity = (params: {

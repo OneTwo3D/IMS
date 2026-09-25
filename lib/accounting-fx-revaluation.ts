@@ -1,3 +1,4 @@
+import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { postingIsOwed } from '@/lib/domain/accounting/enqueue-outcome'
@@ -392,9 +393,7 @@ export async function runArApFxRevaluation(input?: {
     // naming this run's connector is the mis-attribution being fixed, and `null` would answer
     // `not-configured`, which is the one no-op an obligation ledger is allowed to settle with. So the
     // reversal is left OUTSTANDING and said to be outstanding.
-    const chartConnector = prior.connector === 'xero' || prior.connector === 'quickbooks'
-      ? prior.connector
-      : null
+    const chartConnector = isRegisteredAccountingConnector(prior.connector) ? prior.connector : null
     if (chartConnector === null) {
       const { logActivity } = await import('@/lib/activity-log')
       await logActivity({

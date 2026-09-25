@@ -31,19 +31,10 @@ mock.module('@/lib/connectors/xero/api', {
 })
 
 /** QuickBooks responses, keyed by path, for the bill-payment shapes this connector really writes. */
-let qboResponses: Record<string, unknown> = {}
-const qboCalls: string[] = []
+// o3d-remove-parked-connectors: `qboResponses` / `qboCalls` and the `@/lib/connectors/quickbooks/api`
+// mock they fed were here, for the deleted BillPaymentCheck case below.
 
-mock.module('@/lib/connectors/quickbooks/api', {
-  namedExports: {
-    qboGet: async (p: string) => {
-      qboCalls.push(p)
-      const body = qboResponses[p]
-      if (body === undefined) return { ok: false, status: 404, error: 'not stubbed' }
-      return { ok: true, status: 200, data: body }
-    },
-  },
-})
+// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 
 /** Where the lost-exclusion incident is asserted to be DURABLE (round 6, HIGH 4). */
 const activityEntries: Array<Record<string, unknown>> = []
@@ -315,7 +306,9 @@ test('a non-money post is never gated (o3d-0m56)', async () => {
  */
 const MONEY_POSTS = [
   { file: 'lib/connectors/xero/sync-processor.ts', branches: ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] },
-  { file: 'lib/connectors/quickbooks/sync-processor.ts', branches: ['INVOICE_PAYMENT', 'BILL_PAYMENT'] },
+  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/sync-processor.ts` (INVOICE_PAYMENT,
+  // BILL_PAYMENT) was the second entry and is archived. A second processor is added here in the same
+  // commit that writes it, or its money branches are unfenced with nothing to say so.
 ]
 
 for (const target of MONEY_POSTS) {
@@ -532,42 +525,19 @@ test('a rival whose outcome cannot be read stops the post (o3d-0m56)', async () 
  * o3d-0m56 round 4 (Codex) — the three doubles the review said must exist.
  * ------------------------------------------------------------------------------------------- */
 
-test('a BillPaymentCheck-shaped settlement stops a repeat bill payment (o3d-0m56 r4, CRITICAL 1)', async () => {
-  // The link QuickBooks records on a Bill is named after the PayType, so IMS's own
-  // `PayType: 'Check'` posts land as `BillPaymentCheck` — NOT `BillPayment`. A probe matching the
-  // entity name found none of them, reported an empty ledger, and the fence read that as
-  // permission to pay the bill a second time. This is the fence-level expression of that: the
-  // settlement is real, it carries this entry's own mark, and the post must be refused.
-  const { settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
-  qboCalls.length = 0
-  qboResponses = {
-    'bill/bill-1': { Bill: { TotalAmt: 10, Balance: 0, LinkedTxn: [{ TxnId: '77', TxnType: 'BillPaymentCheck' }] } },
-    'billpayment/77': {
-      BillPayment: {
-        TxnDate: '2026-08-01',
-        PrivateNote: settlementMarkerFor('log-1'),
-        Line: [{ Amount: 10, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }],
-      },
-    },
-  }
-  const billPayload = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
-  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: new Date('2026-08-01T10:00:00Z'), payload: billPayload, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' }])
-
-  const verdict = await (await load())({
-    connector: 'quickbooks',
-    type: 'BILL_PAYMENT',
-    referenceType: 'PurchaseInvoice',
-    referenceId: 'pi-1',
-    entryId: 'log-1',
-    payload: billPayload,
-    postingDate: '2026-08-01',
-    db,
-  })
-
-  assert.deepEqual(qboCalls, ['bill/bill-1', 'billpayment/77'])
-  assert.equal(verdict.proceed, false, 'the bill is already paid; sending again pays it twice')
-  assert.match(verdict.proceed === false ? verdict.error : '', /already holds a settlement/)
-})
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): 'a BillPaymentCheck-shaped settlement
+// stops a repeat bill payment (o3d-0m56 r4, CRITICAL 1)'.
+//
+// It drove the QuickBooks probe with a QuickBooks wire fixture: the link that connector records on a
+// Bill is named after the PayType, so IMS's own `PayType: 'Check'` posts landed as
+// `BillPaymentCheck`, NOT `BillPayment` — a probe matching the entity name found none of them,
+// reported an empty ledger, and the fence read that as permission to pay the bill a second time.
+// Both the probe arm and the connector are archived, and the case cannot be re-pointed at Xero: the
+// fixture IS the QuickBooks wire shape, and pointing it at Xero's probe would assert nothing.
+//
+// The FENCE itself — that a settlement carrying this entry's own mark refuses the post — is still
+// asserted above and below through the Xero arm. What is lost is the demonstration on a second
+// ledger's document shapes, which is where this CRITICAL actually lived.
 
 test('a human settlement made BEFORE any attempt stops the first post (o3d-0m56 r4, HIGH 3)', async () => {
   // The case a first attempt cannot know about from its own history, and the reason the free pass

@@ -439,18 +439,22 @@ function paymentRequest(type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT') {
 // --------------------------------------------------------------------------------------------
 
 test('[o3d-j625 r3] PRECONDITION: a payment carrying a document id IS written when its provenance agrees — the rule is not "always refuse"', async () => {
-  reset(['quickbooks'])
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): this ran the whole case under the SECOND
+  // connector, which is now unregistered. The rule under test is about the chart and the document AGREEING
+  // — it never depended on which connector that was — so the case runs under the registered one and proves
+  // the same thing.
+  reset(['xero'])
   const { queueAccountingSync } = await import('@/lib/accounting')
 
   const outcome = await queueAccountingSync({
     ...paymentRequest('INVOICE_PAYMENT'),
-    chartConnector: 'quickbooks',
-    documentConnector: 'quickbooks',
+    chartConnector: 'xero',
+    documentConnector: 'xero',
   })
 
   assert.equal(outcome.queued, true)
   assert.equal(routed.length, 1, 'the control case writes exactly one row')
-  assert.equal(routed[0].queue, 'quickbooks')
+  assert.equal(routed[0].queue, 'xero')
 })
 
 // --------------------------------------------------------------------------------------------
@@ -463,14 +467,19 @@ for (const [label, documentConnector] of [
   ['the OTHER connector (the id survived the switch)', 'xero'],
 ] as const) {
   test(`[o3d-j625 r3] facade: a payload carrying a document id attributed to ${label} is REFUSED, and says so`, async () => {
-    reset(['quickbooks'])
+    reset(['xero'])
     const { queueAccountingSync } = await import('@/lib/accounting')
 
-    // The chart check passes on its own: QuickBooks' chart, QuickBooks active. That is exactly the state
-    // after a switch in which r2 approved the payment.
+    // The chart check passes on its own: the active connector's chart, that connector active. That is
+    // exactly the state after a switch in which r2 approved the payment.
+    //
+    // o3d-j625 r12: the two sides are SWAPPED relative to the original (chart was the second connector,
+    // document was Xero). The mismatch is what is under test and it is unchanged — and the document now
+    // names an ARCHIVED connector, which is the realistic form of this defect after
+    // o3d-remove-parked-connectors: `SalesOrder.accountingInvoiceConnector` still holds `quickbooks` rows.
     const outcome = await queueAccountingSync({
       ...paymentRequest('INVOICE_PAYMENT'),
-      chartConnector: 'quickbooks',
+      chartConnector: 'xero',
       ...(documentConnector === undefined ? {} : { documentConnector }),
     })
 
@@ -484,13 +493,14 @@ for (const [label, documentConnector] of [
   })
 
   test(`[o3d-j625 r3] in-transaction: a payload carrying a document id attributed to ${label} is REFUSED`, async () => {
-    reset(['quickbooks'])
+    reset(['xero'])
     const { queueAccountingSyncTx } = await import('@/lib/accounting')
 
     const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
     const queued = await queueAccountingSyncTx(transactionDouble() as never, {
       ...paymentRequest('BILL_PAYMENT'),
-      chartConnector: 'quickbooks',
+      // o3d-j625 r12: chart and document swapped, as above — the document is the archived id now.
+      chartConnector: 'xero',
       ...(documentConnector === undefined ? {} : { documentConnector }),
       reportOutcome: (outcome) => { answered.outcome = outcome },
     })
@@ -532,7 +542,7 @@ test('[o3d-j625 r3] every connector-native key is guarded, each on its own', asy
       referenceType: 'SupplierCreditNote',
       referenceId: 'cn-1',
       payload: { [key]: 'SOME-NATIVE-ID' },
-      chartConnector: 'quickbooks',
+      chartConnector: 'xero',
       documentConnector: null,
     })
     assert.equal(outcome.reason, 'refused', `${key} with no provenance is refused`)
@@ -785,10 +795,14 @@ test('[o3d-j625 r5 HIGH 5] the payment-account confirmation admits what the POST
 test('[o3d-j625 r5 HIGH 5] CONTROL: the confirmation still refuses a value that is not in THIS connector\'s chart', async () => {
   const { accountingBankAccountBelongsTo } = await import('@/lib/accounting')
   storedAccounts.length = 0
-  storedAccounts.push({ connector: 'xero', code: '090', externalAccountId: 'xero-uuid-bank', active: true, type: 'BANK' })
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): the OTHER connector moved from the argument to
+  // the stored row, because that is where an archived id actually occurs — `AccountingAccount.connector`
+  // is a plain string and archiving deleted no rows. The property is identical and still observable: a
+  // code or id that exists ONLY under a different connector does not belong to the one being asked about.
+  storedAccounts.push({ connector: 'quickbooks', code: '090', externalAccountId: 'qbo-uuid-bank', active: true, type: 'BANK' })
 
-  assert.equal(await accountingBankAccountBelongsTo('quickbooks', '090'), false, 'another connector\'s code')
-  assert.equal(await accountingBankAccountBelongsTo('quickbooks', 'xero-uuid-bank'), false, 'another connector\'s id')
+  assert.equal(await accountingBankAccountBelongsTo('xero', '090'), false, 'another connector\'s code')
+  assert.equal(await accountingBankAccountBelongsTo('xero', 'qbo-uuid-bank'), false, 'another connector\'s id')
   assert.equal(await accountingBankAccountBelongsTo('xero', 'nope'), false, 'a value in no chart at all')
   assert.equal(await accountingBankAccountBelongsTo('xero', ''), false, 'nothing mapped')
 })

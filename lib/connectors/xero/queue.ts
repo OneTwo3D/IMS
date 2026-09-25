@@ -3,6 +3,7 @@
  * Moved from app/actions/xero-sync.ts — this is an internal utility, not a server action.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
@@ -87,7 +88,7 @@ export async function queueXeroSync(params: {
    * a value that cannot be an outcome, and the conversion asks the fence. See
    * lib/domain/accounting/pinned-enqueue-fence.ts.
    */
-  pinnedLedger?: 'xero' | 'quickbooks'
+  pinnedLedger?: AccountingConnectorId
   // o3d-2sm1 r7: and it SAYS what it did — see ConnectorEnqueueOutcome. Every early return below
   // wrote nothing, and a caller discharging an obligation has to be able to tell which of them was a
   // decision that nothing will ever post and which left the posting owed.

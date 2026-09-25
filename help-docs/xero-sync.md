@@ -1,5 +1,13 @@
 # Xero Accounting Sync
 
+> **QuickBooks Online was removed in 2026-09.** Xero is the only accounting connector One Two
+> Inventory ships. This page still mentions QuickBooks in places — every one of those mentions is
+> **historical**, and is kept for one reason: most of them explain why a rule on the Xero side is
+> shaped the way it is, by contrast with a connector that behaved differently. Nothing on this page
+> describes a QuickBooks control you can use, because there is no longer a QuickBooks connector to
+> control. If you have sync rows or documents recorded against QuickBooks from before the removal,
+> see **Sync → Exceptions**, which still lists them and tells you what to do about each one.
+
 One Two Inventory integrates with Xero to keep your accounting records in sync. The system acts as a **sub-ledger** — Xero handles invoicing, payments, and bank reconciliation, while the IMS creates daily correction journals to control when revenue is recognised and how inventory flows through your accounts.
 
 ## Connection Setup
@@ -360,7 +368,11 @@ purpose. Setting both to the *same* single organisation is fine, so you can migr
 `XERO_TENANT_ID` alongside `XERO_ALLOWED_TENANT_NAMES` is fine too: a name narrows what the id chose
 rather than competing with it.
 
-**QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
+> **Historical note (2026-09):** the paragraph below described the QuickBooks connector, which has
+> since been removed (see the release notes). It is kept because the CONTRAST is the reason this
+> control exists on Xero, and the next accounting connector has to be asked the same question.
+
+**QuickBooks** did not have this control. It did not share the same defect — Intuit sends the company
 (`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
 but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not
 stopped the way a Xero one is.

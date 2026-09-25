@@ -482,7 +482,7 @@ test('seam/ui: the wizard CAN be completed with a registered connector that has 
     const plugins = pluginStateWithAcme(true)
     assert.equal(
       isIntegrationsStepReady(plugins, {
-        woocommerce: false, shopify: false, accounting: false, wms: data.configured,
+        woocommerce: false, accounting: false, wms: data.configured,
       }),
       true,
       'the connection is live, so the step is complete — it used to be permanently blocked',
@@ -501,7 +501,7 @@ test('seam/ui: and it still CANNOT be completed when that connector is genuinely
     const data = await wmsOnboarding.getWmsOnboardingConnectionData()
     assert.equal(
       isIntegrationsStepReady(pluginStateWithAcme(true), {
-        woocommerce: false, shopify: false, accounting: false, wms: data.configured,
+        woocommerce: false, accounting: false, wms: data.configured,
       }),
       false,
       'an enabled WMS with no connection is still an incomplete step — the gate was not removed',

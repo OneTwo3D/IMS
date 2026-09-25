@@ -1512,6 +1512,16 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
       FENCE_DISPLAY_DECLARATIONS,
+      // o3d-xi3w r4: the recovery root, the lock and the record, pointed at this scenario's own
+      // directory. The critical section below opens and flocks that lock file for real, and these rigs
+      // run as an ordinary account: leaving the shipped /etc path in place would measure "this account
+      // cannot write /etc" rather than the ordering. The wait is shortened because no scenario here has a
+      // second holder, so a long one could only ever be a hang.
+      `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dir)}`,
+      `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dir, 'app'))}`,
+      `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dir, 'db-fence-identity.env'))}`,
+      `DB_FENCE_RECORD_LOCK=${JSON.stringify(join(dir, 'db-fence-record.lock'))}`,
+      'DB_FENCE_RECORD_LOCK_WAIT=5',
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
@@ -1519,6 +1529,18 @@ test('a refused INITIAL fence leaves no authority behind, and a standing one is 
       // measuring a publication that cannot report the bytes it published.
       shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      // o3d-xi3w r4: db_fence_raise() no longer calls the publisher directly. It binds the recovery
+      // record to the artefact THIS operation is pinned to and publishes the authority inside ONE
+      // critical section held on ${DB_FENCE_RECORD_LOCK}, so a stale write cannot land behind the raise.
+      // Lifted rather than stubbed, for the reason everything else in these rigs is: a stub would
+      // measure an ordering the shipped script does not have.
+      shellFunction(FENCE_LIBRARY, '_fence_record_lock_ready'),
+      shellFunction(FENCE_LIBRARY, '_fence_valid_version_name'),
+      shellFunction(FENCE_LIBRARY, '_fence_version_of_entry'),
+      shellFunction(FENCE_LIBRARY, 'fence_record_script_digest'),
+      shellFunction(FENCE_LIBRARY, '_fence_rewrite_record_binding'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_bind_and_run'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_critical_section'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
       `state=${JSON.stringify(stateFile)}`,
@@ -1716,6 +1738,16 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
       FENCE_DISPLAY_DECLARATIONS,
+      // o3d-xi3w r4: the recovery root, the lock and the record, pointed at this scenario's own
+      // directory. The critical section below opens and flocks that lock file for real, and these rigs
+      // run as an ordinary account: leaving the shipped /etc path in place would measure "this account
+      // cannot write /etc" rather than the ordering. The wait is shortened because no scenario here has a
+      // second holder, so a long one could only ever be a hang.
+      `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dir)}`,
+      `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dir, 'app'))}`,
+      `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dir, 'db-fence-identity.env'))}`,
+      `DB_FENCE_RECORD_LOCK=${JSON.stringify(join(dir, 'db-fence-record.lock'))}`,
+      'DB_FENCE_RECORD_LOCK_WAIT=5',
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
@@ -1723,6 +1755,18 @@ test('db_fence_raise clears the authority a FAILED PUBLICATION left behind (o3d-
       // measuring a publication that cannot report the bytes it published.
       shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      // o3d-xi3w r4: db_fence_raise() no longer calls the publisher directly. It binds the recovery
+      // record to the artefact THIS operation is pinned to and publishes the authority inside ONE
+      // critical section held on ${DB_FENCE_RECORD_LOCK}, so a stale write cannot land behind the raise.
+      // Lifted rather than stubbed, for the reason everything else in these rigs is: a stub would
+      // measure an ordering the shipped script does not have.
+      shellFunction(FENCE_LIBRARY, '_fence_record_lock_ready'),
+      shellFunction(FENCE_LIBRARY, '_fence_valid_version_name'),
+      shellFunction(FENCE_LIBRARY, '_fence_version_of_entry'),
+      shellFunction(FENCE_LIBRARY, 'fence_record_script_digest'),
+      shellFunction(FENCE_LIBRARY, '_fence_rewrite_record_binding'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_bind_and_run'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_critical_section'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
       `state=${JSON.stringify(stateFile)}`,
@@ -2128,6 +2172,16 @@ test('only a status that means the revokes may be on the medium stamps the recor
       `db_fence_authorise_plan_program() {\n  cat <<'AUTHORISE_PLAN_EOF'\n${AUTHORISE_PLAN_PROGRAM}AUTHORISE_PLAN_EOF\n}`,
       `db_fence_mark_applied_program() {\n  cat <<'MARK_APPLIED_EOF'\n${MARK_APPLIED_PROGRAM}MARK_APPLIED_EOF\n}`,
       FENCE_DISPLAY_DECLARATIONS,
+      // o3d-xi3w r4: the recovery root, the lock and the record, pointed at this scenario's own
+      // directory. The critical section below opens and flocks that lock file for real, and these rigs
+      // run as an ordinary account: leaving the shipped /etc path in place would measure "this account
+      // cannot write /etc" rather than the ordering. The wait is shortened because no scenario here has a
+      // second holder, so a long one could only ever be a hang.
+      `DB_FENCE_RECOVERY_DIR=${JSON.stringify(dir)}`,
+      `DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(join(dir, 'app'))}`,
+      `DB_FENCE_IDENTITY_FILE=${JSON.stringify(join(dir, 'db-fence-identity.env'))}`,
+      `DB_FENCE_RECORD_LOCK=${JSON.stringify(join(dir, 'db-fence-record.lock'))}`,
+      'DB_FENCE_RECORD_LOCK_WAIT=5',
       shellFunction(FENCE_LIBRARY, 'db_fence_authorise_plan'),
       shellFunction(FENCE_LIBRARY, 'db_fence_mark_authority_applied'),
       // o3d-secops r32: db_fence_publish_authority() reads the digest of what it wrote through the
@@ -2135,6 +2189,18 @@ test('only a status that means the revokes may be on the medium stamps the recor
       // measuring a publication that cannot report the bytes it published.
       shellFunction(FENCE_LIBRARY, 'db_fence_machine_field'),
       shellFunction(FENCE_LIBRARY, 'db_fence_publish_authority'),
+      // o3d-xi3w r4: db_fence_raise() no longer calls the publisher directly. It binds the recovery
+      // record to the artefact THIS operation is pinned to and publishes the authority inside ONE
+      // critical section held on ${DB_FENCE_RECORD_LOCK}, so a stale write cannot land behind the raise.
+      // Lifted rather than stubbed, for the reason everything else in these rigs is: a stub would
+      // measure an ordering the shipped script does not have.
+      shellFunction(FENCE_LIBRARY, '_fence_record_lock_ready'),
+      shellFunction(FENCE_LIBRARY, '_fence_valid_version_name'),
+      shellFunction(FENCE_LIBRARY, '_fence_version_of_entry'),
+      shellFunction(FENCE_LIBRARY, 'fence_record_script_digest'),
+      shellFunction(FENCE_LIBRARY, '_fence_rewrite_record_binding'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_bind_and_run'),
+      shellFunction(FENCE_LIBRARY, '_fence_raise_critical_section'),
       shellFunction(FENCE_LIBRARY, 'db_fence_clear_authority'),
       mutate(shellFunction(FENCE_LIBRARY, 'db_fence_raise')),
       `state=${JSON.stringify(stateFile)}`,

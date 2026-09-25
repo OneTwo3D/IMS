@@ -200,33 +200,52 @@ test('non-money-moving types never refuse (o3d-0m56)', () => {
   }
 })
 
+/**
+ * o3d-remove-parked-connectors — THE SUBJECT OF THE 'PER CONNECTOR' CASES IS NOW AN UNREGISTERED ID.
+ *
+ * `effectiveTokenFor` has two derivations: a stamped follow-up key wins for everyone, and failing
+ * that, the connector decides whether the generic queue's `_idempotencyKey` counts. QuickBooks
+ * honoured it; Xero's payment branches ignore it and derive from the row id. That branch is KEPT in
+ * lib/domain/accounting/followup-retry-guard.ts, unreachable while one connector is registered,
+ * because folding the two together would apply one connector's reading to the other and could allow
+ * a retry that is not safe.
+ *
+ * These cases are what stop that fold happening by accident, so they are kept — driving an id the
+ * union no longer contains rather than a second registered connector. Weaker subject, same property.
+ * Recorded in docs/archive/quickbooks-connector-removal.md.
+ */
+const RETIRED_CONNECTOR = 'quickbooks' as unknown as Parameters<typeof effectiveTokenFor>[0]
+
 test('the effective token is derived PER CONNECTOR (o3d-0m56)', () => {
-  // QuickBooks has always honoured the generic queue's _idempotencyKey; Xero's payment branches
-  // have always ignored it and derived from the row id. Folding them together would misreport
-  // one connector's history and could allow the wrong retries.
   const row = { id: 'log-1', payload: { _idempotencyKey: 'invoice-payment:payment:p1' } }
-  assert.equal(effectiveTokenFor('quickbooks', row), 'invoice-payment:payment:p1')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, row), 'invoice-payment:payment:p1')
   assert.equal(effectiveTokenFor('xero', row), 'log-1', 'Xero payment branches ignore the generic key')
 
   // A stamped follow-up key wins for both.
   const stamped = { id: 'log-2', payload: { _followUpIdempotencyKey: 'stable', _idempotencyKey: 'generic' } }
-  assert.equal(effectiveTokenFor('quickbooks', stamped), 'stable')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, stamped), 'stable')
   assert.equal(effectiveTokenFor('xero', stamped), 'stable')
 
   // A whitespace generic key is still a STRING, and getIdempotencySource returns it verbatim —
   // so the guard must too. This assertion previously encoded my own non-blank check and would
   // have kept the divergence alive.
-  assert.equal(effectiveTokenFor('quickbooks', { id: 'log-3', payload: { _idempotencyKey: '  ' } }), '  ')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-3', payload: { _idempotencyKey: '  ' } }), '  ')
   // Absent (or a non-string) falls back to the row id, for both.
-  assert.equal(effectiveTokenFor('quickbooks', { id: 'log-3b', payload: { _idempotencyKey: 42 } }), 'log-3b')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-3b', payload: { _idempotencyKey: 42 } }), 'log-3b')
   assert.equal(effectiveTokenFor('xero', { id: 'log-4', payload: null }), 'log-4')
 })
 
 // --- Both actions must actually consult the guard ---
 
+// ONE ACTION TODAY (o3d-remove-parked-connectors): `app/actions/quickbooks-sync.ts` was the second
+// entry and is archived. The loop is kept rather than inlined — it is the list a second connector's
+// retry action joins, and every assertion in it is about a SHAPE (plan before reset, reset restricted
+// to the allowed ids, siblings loaded by document) that any connector's action has to satisfy.
+//
+// WHAT IS LOST: the loop no longer shows that TWO independently-written actions satisfy the shape,
+// which is what made "the guard is consulted" a property of the pattern rather than of one file.
 const ACTIONS = [
   { name: 'xero', file: 'app/actions/xero-sync.ts' },
-  { name: 'quickbooks', file: 'app/actions/quickbooks-sync.ts' },
 ]
 
 for (const action of ACTIONS) {
@@ -283,13 +302,13 @@ test('the token derivation mirrors each processor EXACTLY, empty string included
   // — an EMPTY string included — so two rows carrying '' post under the same token. Requiring a
   // non-blank value here handed them their row ids instead: two distinct tokens, and a refused
   // retry that was actually safe.
-  assert.equal(effectiveTokenFor('quickbooks', { id: 'log-1', payload: { _idempotencyKey: '' } }), '')
-  assert.equal(effectiveTokenFor('quickbooks', { id: 'log-2', payload: { _idempotencyKey: '' } }), '')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-1', payload: { _idempotencyKey: '' } }), '')
+  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-2', payload: { _idempotencyKey: '' } }), '')
 
   // ...so a pair of them is unambiguous and must NOT refuse.
   const rows = [
-    { id: 'log-1', effectiveToken: effectiveTokenFor('quickbooks', { id: 'log-1', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
-    { id: 'log-2', effectiveToken: effectiveTokenFor('quickbooks', { id: 'log-2', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
+    { id: 'log-1', effectiveToken: effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-1', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
+    { id: 'log-2', effectiveToken: effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-2', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
   ]
   assert.deepEqual(
     plan({ type: 'INVOICE_PAYMENT', reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
@@ -301,22 +320,22 @@ test('the token derivation mirrors each processor EXACTLY, empty string included
   assert.equal(effectiveTokenFor('xero', { id: 'log-1', payload: { _idempotencyKey: '' } }), 'log-1')
 })
 
-test('the guard\'s derivation matches the processors in source (o3d-0m56)', async () => {
-  // Pinned against the real definitions, so a change to either processor's precedence breaks
-  // here rather than silently desynchronising the guard.
-  const [xero, qbo] = await Promise.all([
-    readFile(path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8'),
-    readFile(path.join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8'),
-  ])
+test('the guard\'s derivation matches the processor in source (o3d-0m56)', async () => {
+  // Pinned against the real definition, so a change to the processor's precedence breaks here rather
+  // than silently desynchronising the guard.
+  //
+  // o3d-remove-parked-connectors: the QuickBooks half of this case read
+  // `lib/connectors/quickbooks/sync-processor.ts` off disk and pinned that IT accepted any string
+  // generic key, empty included. That file is archived, so the assertion would ENOENT. The guard's
+  // corresponding branch is kept and is still covered above, by the per-connector token cases — what
+  // is no longer proven is that the guard's reading MATCHES a real second processor's, which is the
+  // half a source pin was for. `git show archive/quickbooks-connector:lib/connectors/quickbooks/sync-processor.ts`
+  // has the definition it was pinned against.
+  const xero = await readFile(path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
   assert.match(
     xero,
     /function followUpIdempotencySource\([^)]*\)[^{]*\{\s*return readFollowUpIdempotencyKey\(payload\) \?\? entryId/,
     'Xero must still derive follow-up token then row id, and never the generic key',
-  )
-  assert.match(
-    qbo,
-    /const followUpKey = readFollowUpIdempotencyKey\(payload\)\s*\n\s*if \(followUpKey\) return followUpKey\s*\n\s*if \(typeof payload\._idempotencyKey === 'string'\) return payload\._idempotencyKey/,
-    'QuickBooks must still accept ANY string generic key, empty included',
   )
 })
 

@@ -3,7 +3,6 @@
  * Mirrors lib/connectors/xero/queue.ts with per-type enable/disable gating.
  */
 
-import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -123,8 +122,6 @@ export async function queueQuickBooksSync(params: {
     let deletedOrder = false
     // o3d-i0o6 r8: the pinned ledger stopped being the active one while this enqueue was in flight.
     let pinnedLedgerRetired = false
-    // o3d-j625 r7: the posting was marked handled — posted by hand — so nothing is written for it.
-    let handledByHand = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -174,7 +171,8 @@ export async function queueQuickBooksSync(params: {
         if (staleDiscount) return
       }
 
-      const created = await createAccountingSyncLogRow(tx, {
+      const log = await tx.accountingSyncLog.create({
+        data: {
           connector: 'quickbooks',
           type: params.type,
           status: 'PENDING',
@@ -185,12 +183,8 @@ export async function queueQuickBooksSync(params: {
           // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
-        })
-      if (!created) {
-        handledByHand = true
-        return
-      }
-      const log = created
+        },
+      })
       try {
         const baseCurrency = await getBaseCurrencyCode()
         await mirrorAccountingSyncLogToEvent(tx, {
@@ -221,9 +215,6 @@ export async function queueQuickBooksSync(params: {
     // payload it was built from had been superseded, or the ledger it was pinned to is no longer the
     // one being serviced. The posting is still owed in every case.
     if (deletedOrder || staleDiscount || pinnedLedgerRetired) return { queued: false, reason: 'refused' }
-    // Not owed: the ledger has it, by hand. `queued: true` in the sense every caller reads — a counterpart
-    // exists — with the reason saying it was not IMS that put it there.
-    if (handledByHand) return { queued: true, reason: 'handled-by-hand' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.

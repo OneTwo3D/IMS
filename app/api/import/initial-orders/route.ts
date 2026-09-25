@@ -5,7 +5,7 @@ import { parseShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
 // b8i6.5: route the import by shopping connector. Defaults to WooCommerce for
 // back-compat; an unknown connector is rejected (400) and a known-but-unbuilt
-// one (e.g. Shopify, whose order import isn't implemented yet) returns 501.
+// one whose order import isn't implemented returns 501.
 
 // POST — start the initial order import (returns immediately)
 export async function POST(req: NextRequest) {

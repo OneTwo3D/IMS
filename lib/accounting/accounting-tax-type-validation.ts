@@ -11,6 +11,8 @@
  * not cached), so it is the only connector where a stale display can drive a bad write.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+
 export type TaxTypeValidation = { ok: true } | { ok: false; error: string }
 
 /**
@@ -57,7 +59,7 @@ export function classifyXeroTaxType(
  */
 export async function validateAccountingTaxTypeForWrite(
   taxType: string,
-  connector?: 'xero' | 'quickbooks' | null,
+  connector?: AccountingConnectorId | null,
 ): Promise<TaxTypeValidation> {
   const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
   const active = connector === undefined ? await getActiveAccountingConnectorInfo() : (connector ? { id: connector } : null)

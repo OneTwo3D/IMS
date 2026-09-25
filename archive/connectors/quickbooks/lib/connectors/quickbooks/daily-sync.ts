@@ -13,7 +13,6 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
-import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -220,7 +219,8 @@ async function createPendingSyncLog(
     currency: string
   },
 ): Promise<string> {
-  const created = await createAccountingSyncLogRow(tx, {
+  const log = await tx.accountingSyncLog.create({
+    data: {
       connector: QBO_CONNECTOR,
       type: params.type,
       status: 'PENDING',
@@ -231,12 +231,8 @@ async function createPendingSyncLog(
       // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
       // money-attempt-provenance.ts. A row created without it is never recycled again.
       ...stampingCustodyOnCreate(),
-    })
-  // o3d-j625 r7: a daily-batch journal has no refusal kind, so nothing can mark it handled and the
-  // primitive cannot suppress it. If that ever changes, this must decide what a suppressed batch means
-  // rather than carry on without a row.
-  if (!created) throw new Error(`Daily-batch journal ${params.type} ${params.referenceId} was suppressed as handled by hand, which no daily-batch posting can be.`)
-  const log = created
+    },
+  })
   // Mirror failure must not abort the whole daily batch: the sync log is already
   // created (and will post), so swallow + warn here exactly as queueAccountingSyncTx
   // does, instead of rolling back every order in the group (cogs-audit scjz.40).

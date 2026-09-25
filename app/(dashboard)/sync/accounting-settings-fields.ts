@@ -1,16 +1,26 @@
+import {
+  ACCOUNTING_CONNECTORS,
+  type AccountingConnectorId as RegistryAccountingConnectorId,
+} from '@/lib/connectors/accounting-registry'
+
 // iwrm: connector-agnostic definitions for the accounting account-mapping +
 // sync settings form (shared by xero-client.tsx and its tests).
 //
-// Account/sync settings are keyed per connector (xero_* vs quickbooks_*). The
-// field definitions hold the connector-agnostic SUFFIX; the form resolves the
-// full key via `${connectorId}_${suffix}`, so one form drives both Xero and
-// QuickBooks. `connectors` restricts a field to the connectors that actually
-// define that setting key (omit = available on both). Keeping this pure (no
-// React) makes the save-payload mapping unit-testable — this is a save-path bug
-// that previously hardcoded xero_* keys, silently dropping qbo_* mappings.
+// Account/sync settings are keyed per connector (`<connector>_<suffix>`). The field definitions hold
+// the connector-agnostic SUFFIX; the form resolves the full key via `${connectorId}_${suffix}`, so one
+// form drives every accounting connector. `connectors` restricts a field to the connectors that
+// actually define that setting key (omit = available on all of them). Keeping this pure (no React)
+// makes the save-payload mapping unit-testable — this is a save-path bug that previously hardcoded
+// xero_* keys, silently dropping the other connector's mappings.
+//
+// o3d-remove-parked-connectors: `ACCOUNTING_CONNECTOR_IDS` was a SIXTH hand-written spelling of the
+// accounting id union (`['xero', 'quickbooks']`). It is derived from the registry now, so a field
+// restricted with `connectors: [...]` cannot name an id the app does not register, and registering one
+// widens this list without an edit here.
 
-export const ACCOUNTING_CONNECTOR_IDS = ['xero', 'quickbooks'] as const
-export type AccountingConnectorId = (typeof ACCOUNTING_CONNECTOR_IDS)[number]
+export const ACCOUNTING_CONNECTOR_IDS: readonly RegistryAccountingConnectorId[] =
+  ACCOUNTING_CONNECTORS.map((connector) => connector.id)
+export type AccountingConnectorId = RegistryAccountingConnectorId
 
 export type AccountFieldDef = {
   suffix: string

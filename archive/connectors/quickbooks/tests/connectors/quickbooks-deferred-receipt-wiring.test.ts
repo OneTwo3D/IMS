@@ -75,8 +75,6 @@ const order = {
   orderNumber: 'SO-1',
   externalOrderNumber: null as string | null,
   accountingInvoiceId: null as string | null,
-  // o3d-j625 r3: written by the back-reference in the same statement as the id, exactly as the real one.
-  accountingInvoiceConnector: null as string | null,
   currency: 'GBP',
   totalForeign: 100,
   taxForeign: 0,
@@ -165,11 +163,8 @@ mock.module('@/lib/accounting', {
     // o3d-ekn8 r2: the explicit-connector form, which is what a pinned hand-off must ask.
     isAccountingSyncTypeEnabledFor: async (connector: string) => live.typeEnabledFor(connector),
     getActiveAccountingConnectorInfo: async () => ({ id: live.activeConnector }),
-    getPaymentAccountMap: async () => JSON.stringify({ 'card:GBP': 'QBO-BANK-1' }), // o3d-j625 r5: production returns the setting's JSON STRING
+    getPaymentAccountMap: async () => ({ default: 'QBO-BANK-1' }),
     lookupPaymentAccount: () => 'QBO-BANK-1',
-    // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
-    // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.
-    accountingBankAccountBelongsTo: async () => true,
     queueAccountingSyncTxWithOutcome: async (
       _tx: unknown,
       params: {
@@ -210,7 +205,7 @@ mock.module('@/lib/domain/accounting/back-reference', {
     // The write that puts accountingInvoiceId on the order. Modelled rather than stubbed away: the
     // re-drive re-READS the order, and it is this write landing BEFORE the follow-ups that makes the
     // DOCUMENT_NOT_POSTED refusal stop applying. Setting it here reproduces that ordering exactly.
-    applyBackReference: async (_db: unknown, params: { externalId: string; connector: string }) => {
+    applyBackReference: async (_db: unknown, params: { externalId: string }) => {
       // o3d-ekn8 r5: and it can REFUSE. The unique index on accounting_invoice_id turns a document
       // already claimed locally into a throw, which this connector swallows — leaving the order with
       // no link while the invoice sits in QuickBooks.
@@ -219,8 +214,6 @@ mock.module('@/lib/domain/accounting/back-reference', {
       // pointing at a document this post did not create, while `syncResult.externalId` is still the id
       // this post returned. That divergence is the whole of o3d-ekn8 r2.
       order.accountingInvoiceId = live.reinvoiceTo ?? params.externalId
-      // o3d-j625 r3: the real write records WHOSE document it is beside the id (back-reference.ts).
-      order.accountingInvoiceConnector = params.connector
       return { outcome: 'applied' as const, attribution: { reason: '' } }
     },
     backReferenceHolder: () => ({}),
@@ -270,8 +263,6 @@ mock.module('@/lib/connectors/quickbooks/api', {
     qboPostIdempotent: async () => ({ ok: true, data: {} }),
     qboUploadAttachment: async () => ({ ok: true }),
     resolveAccountRef: async () => ({ value: 'qbo-bank-1' }),
-    // o3d-j625 r6 (review H5): the payment paths resolve through their own, Id-first function.
-    resolvePaymentAccountRef: async () => ({ value: 'qbo-bank-1' }),
   },
 })
 
@@ -305,7 +296,6 @@ test.beforeEach(() => {
   order.totalForeign = 100
   // The state the defect lives in: the receipt exists, the invoice does NOT yet.
   order.accountingInvoiceId = null
-  order.accountingInvoiceConnector = null
   lateReceipts.length = 0
 })
 

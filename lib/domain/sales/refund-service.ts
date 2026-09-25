@@ -1,3 +1,4 @@
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import type { AccountingSettings } from '@/lib/accounting'
@@ -344,7 +345,7 @@ export type RefundAccountingSyncRequest = {
    * about a connector (the credit note, the COGS reversal): those keep the active-connector
    * resolution they have always had.
    */
-  connector?: 'xero' | 'quickbooks'
+  connector?: AccountingConnectorId
   /**
    * o3d-j625 — THE CONNECTOR WHOSE CHART THE ACCOUNT CODES IN `payload` CAME FROM.
    *
@@ -356,12 +357,16 @@ export type RefundAccountingSyncRequest = {
    *
    * Carried on the request for the same reason the pin is: the request is the only thing that crosses
    * the gap to the hand-off, and it is persisted to `accountingRetrySyncs` and replayed by the retry —
-   * so a journal staged against Xero's chart and retried a week later must still be routed to Xero's
-   * queue, or refused, rather than written into whatever is active when someone presses retry.
+   * so a journal staged against one chart and retried a week later must still be routed to that
+   * connector's queue, or refused, rather than written into whatever is active when someone presses
+   * retry.
    *
    * THREE STATES, AND ALL THREE ARE DISTINCT (o3d-j625 r2, Codex HIGH 2):
    *
-   *   'xero' / 'quickbooks'  the chart these codes came from. Route the row through that connector.
+   *   an `AccountingConnectorId`  the chart these codes came from. Route the row through that
+   *                          connector. (One id is registered today — o3d-remove-parked-connectors —
+   *                          and a request persisted before that names an archived one, which is
+   *                          exactly why this is a stored value and not a re-resolution.)
    *   `null`                 NOTHING WAS SWITCHED ON WHEN THE CODES WERE READ, so they are the
    *                          empty-string defaults. Write nothing — `not-configured`. This is a
    *                          POSITIVE STATEMENT and must survive the round trip through
@@ -376,7 +381,7 @@ export type RefundAccountingSyncRequest = {
    *                          obligation unmet, and says why (see `queueRefundAccountingActions`). It is
    *                          the only state that does not reach an enqueue at all.
    */
-  chartConnector?: 'xero' | 'quickbooks' | null
+  chartConnector?: AccountingConnectorId | null
 }
 
 /**
@@ -1085,7 +1090,7 @@ async function stageRefundAccountingReversals(
      * switch org doesn't subtract reversals posted to a different ledger. Resolved by the
      * server-action layer (the unit-tested domain path passes none → no connector filter).
      */
-    activeConnector?: 'xero' | 'quickbooks'
+    activeConnector?: AccountingConnectorId
   },
 ): Promise<{
   accountingSyncs: RefundAccountingSyncRequest[]
@@ -3001,7 +3006,24 @@ function parseRefundAccountingRetrySyncs(
       // `undefined` — `{...}` and `{connector: undefined}` are the same request to every consumer
       // but not to a structural comparison, and one of those consumers is the persisted JSON this
       // very function round-trips.
-      ...(entry.connector === 'xero' || entry.connector === 'quickbooks'
+      // REGISTRY-CHECKED (o3d-remove-parked-connectors); it was the two literals this build happened
+      // to ship, so checking the registry means a connector registered later is honoured without an
+      // edit here.
+      //
+      // o3d-r5uk: DROPPING AN UNREGISTERED PIN IS NOT SAFE, and it is not what this line is for.
+      // `AccountingSyncLog`/`accountingRetrySyncs` still hold `quickbooks` pins — retiring the
+      // connector deleted no rows — and an ABSENT `connector` means "resolve the active connector"
+      // (see the field's own doc at RefundAccountingSyncRequest). So dropping the key here would
+      // re-queue a reversal that was proved against QuickBooks into XERO'S BOOKS, silently. Before
+      // the registry check the literal `=== 'quickbooks'` kept the pin, `pinnedLedgerIsServiced`
+      // found the active connector was not it, and the enqueue answered `refused` — the posting left
+      // owed and visible, which is the correct answer.
+      //
+      // The pin is therefore still only carried when this build can route it, AND
+      // `unserviceableRefundAccountingRetryPins` below refuses the whole retry when any entry names
+      // one it cannot. The two together are what keeps "drop the key" from meaning "post it
+      // somewhere else".
+      ...(isRegisteredAccountingConnector(entry.connector)
         ? { connector: entry.connector }
         : {}),
       // o3d-j625: AND THE CHART SURVIVES THE ROUND TRIP, for exactly the reason above — this parser
@@ -3025,13 +3047,57 @@ function parseRefundAccountingRetrySyncs(
       // Still a SPREAD, and the third state is still meaningful: a key MISSING from the stored JSON is a
       // request staged before this field existed, which nothing here can attribute. It stays absent and
       // the hand-off refuses it rather than inventing either of the other two answers.
-      ...(entry.chartConnector === 'xero'
-        || entry.chartConnector === 'quickbooks'
-        || entry.chartConnector === null
+      // REGISTRY-CHECKED (o3d-j625 r12, merging o3d-remove-parked-connectors), and the direction is
+      // the opposite of the `connector` pin above for a reason. A pin this build cannot route must be
+      // KEPT, because dropping it means "resolve the active connector" and would post a QuickBooks-proved
+      // reversal into Xero's books. An unroutable CHART must be DROPPED, because absent means "staged
+      // before this field existed", which the hand-off REFUSES — leaving the obligation owed and saying
+      // so, which is the right answer for account codes this build cannot attribute to a routable ledger.
+      ...(isRegisteredAccountingConnector(entry.chartConnector) || entry.chartConnector === null
         ? { chartConnector: entry.chartConnector }
         : {}),
     }]
   })
+}
+
+/**
+ * The connector pins in a persisted retry stage that THIS BUILD CANNOT ROUTE (o3d-r5uk).
+ *
+ * Read from the raw JSON rather than from the parsed requests, because the parser's job is to build
+ * a request this build can act on and it necessarily drops what it cannot — which is exactly the
+ * information needed here. Distinct, sorted, so the refusal names each ledger once.
+ *
+ * WHY NOT DROP THE ENTRY INSTEAD: an entry that parses to nothing makes `persistedSyncs` empty, and
+ * an empty persisted stage is a DIFFERENT event on the retry path — one whose success writes
+ * `accountingRetryRequired: false` and `accountingRetrySyncs: DbNull`, erasing the only durable mark
+ * that this refund's accounting was ever unfinished. Refusing keeps the mark, the affordance and the
+ * evidence; see the o3d-2sm1 note at the retry's `revenueDeferredDate` branch, which argues the same
+ * asymmetry for a different undecidable.
+ */
+export function unserviceableRefundAccountingRetryPins(
+  value: Prisma.JsonValue | null | undefined,
+): string[] {
+  if (!Array.isArray(value)) return []
+  const pins = new Set<string>()
+  for (const entry of value) {
+    if (!isRecord(entry)) continue
+    const pin = entry.connector
+    if (typeof pin !== 'string') continue
+    const trimmed = pin.trim()
+    if (trimmed.length === 0) continue
+    if (!isRegisteredAccountingConnector(trimmed)) pins.add(trimmed)
+  }
+  return [...pins].sort()
+}
+
+/** The refusal an unserviceable pin produces, named so an operator knows which ledger and why. */
+export function unserviceableRefundAccountingRetryError(pins: readonly string[]): string {
+  return 'This refund\'s staged accounting reversals are pinned to '
+    + `${pins.join(', ')}, which this build no longer ships. They are NOT re-queued: an unpinned `
+    + 'retry would post them to the active ledger instead, crediting one set of books for a '
+    + 'reversal that was proved against another. The refund keeps its retry flag and its staged '
+    + 'reversals, so nothing is lost — reconnect that ledger, or raise the reversals against it by '
+    + 'hand and clear the flag.'
 }
 
 /**
@@ -3087,7 +3153,7 @@ export async function createSalesOrderRefund(
      */
     chargeback?: boolean
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
-    activeAccountingConnector?: 'xero' | 'quickbooks'
+    activeAccountingConnector?: AccountingConnectorId
     /**
      * o3d-w00 (Codex r8 #6): will a CREDIT NOTE actually be posted for this refund? That — not "is an
      * accounting plugin enabled" — is what gates the posted-VAT fence below.
@@ -4675,7 +4741,7 @@ export async function retrySalesOrderRefundAccounting(
     refundId: string
     accountingSettings: AccountingSettings
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
-    activeAccountingConnector?: 'xero' | 'quickbooks'
+    activeAccountingConnector?: AccountingConnectorId
     /**
      * o3d-w00 (Codex r8 #4): whether a CREDIT NOTE will actually post, asked AGAIN here.
      *
@@ -4793,6 +4859,13 @@ export async function retrySalesOrderRefundAccounting(
             input.accountingSettings.reverseChargeSalesTaxType,
           )
         : null
+
+      // o3d-r5uk: asked BEFORE the parse, because the parse is what makes an unroutable pin
+      // invisible. Refusing leaves `accountingRetryRequired` set and the staged syncs on the row.
+      const unserviceablePins = unserviceableRefundAccountingRetryPins(refund.accountingRetrySyncs)
+      if (unserviceablePins.length > 0) {
+        return { success: false, error: unserviceableRefundAccountingRetryError(unserviceablePins) }
+      }
 
       const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
       if (persistedSyncs.length > 0) {

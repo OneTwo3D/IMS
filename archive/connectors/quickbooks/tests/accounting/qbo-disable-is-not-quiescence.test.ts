@@ -188,9 +188,7 @@ mock.module('@/lib/accounting', {
     isAccountingConnectorConnected: async () => true,
     resolveActiveAccountingConnector: async () => state.activeConnector,
     lookupPaymentAccount: async () => null,
-    getPaymentAccountMap: async () => '{}', // o3d-j625 r5: production returns the setting's JSON STRING
-    // o3d-j625 r4: the processor confirms the mapped account against its own chart; held here.
-    accountingBankAccountBelongsTo: async () => true,
+    getPaymentAccountMap: async () => ({}),
   },
 })
 mock.module('@/lib/activity-log', {

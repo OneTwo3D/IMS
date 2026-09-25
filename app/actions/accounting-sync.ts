@@ -2,7 +2,12 @@
 
 import { revalidatePath } from 'next/cache'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
+import {
+  ACCOUNTING_CONNECTORS,
+  getAccountingConnector,
+  getAccountingConnectorDefinition,
+  type AccountingConnectorId as RegistryAccountingConnectorId,
+} from '@/lib/connectors/accounting-registry'
 import { accountMappingRuleKeys, validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
 import {
@@ -109,7 +114,19 @@ export type AccountingConnectionStatus = {
   hasStoredToken?: boolean
 }
 
-export type AccountingConnectorId = 'xero' | 'quickbooks'
+// o3d-remove-parked-connectors: aliased from the registry rather than re-declared. This was the
+// second of five unlinked copies of the same union; this module's clients import it from here, so
+// the name stays and only its source changes.
+//
+// It has to be a type ALIAS. Writing it as `export type { AccountingConnectorId }` — a re-export of
+// the binding imported above — made `next build` fail with "Export AccountingConnectorId doesn't
+// exist in target module" at all five pages that import this module, because this is a `'use server'`
+// module and the name reaches the generated server-action manifest as if it were a runtime export.
+// `tsc`, eslint, test:unit and check:all all passed on that version: the build is the ONLY gate that
+// catches it. The single-statement form IS fine (see `export type { XeroSettings } from ...` in
+// app/actions/xero-sync.ts, which builds) — it is specifically the split import-then-re-export shape
+// that breaks, so do not "tidy" this alias into one.
+export type AccountingConnectorId = RegistryAccountingConnectorId
 
 export type AccountingSyncReadiness = {
   ready: boolean
@@ -125,11 +142,23 @@ export type AccountingSyncReadiness = {
   missingScopes: string[]
 }
 
+/**
+ * The preferred connector if it is enabled, otherwise the first registered one that is.
+ *
+ * o3d-remove-parked-connectors: this was four hand-written `if`s naming two connectors — so a third
+ * registered connector was silently unresolvable here even with its own plugin switch on, and the
+ * "prefer what the caller asked for" rule was spelled once per connector. Both halves are now walks
+ * over `ACCOUNTING_CONNECTORS`, in its declared order, which is the same rule
+ * `getActiveAccountingConnectorId` (lib/accounting.ts) and `resolveActiveAccountingConnector`
+ * (the locked form) apply.
+ */
 async function getActiveConnector(preferredConnector?: AccountingConnectorId): Promise<AccountingConnectorId | null> {
-  if (preferredConnector === 'xero' && await isIntegrationPluginEnabled('xero')) return 'xero'
-  if (preferredConnector === 'quickbooks' && await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
-  if (await isIntegrationPluginEnabled('xero')) return 'xero'
-  if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
+  if (preferredConnector && ACCOUNTING_CONNECTORS.some((connector) => connector.id === preferredConnector)) {
+    if (await isIntegrationPluginEnabled(preferredConnector)) return preferredConnector
+  }
+  for (const connector of ACCOUNTING_CONNECTORS) {
+    if (await isIntegrationPluginEnabled(connector.id)) return connector.id
+  }
   return null
 }
 
@@ -445,7 +474,9 @@ export async function getAccountingIntegrationConnector() {
   if (!connector) return null
   return {
     id: connector,
-    name: connector === 'xero' ? 'Xero' : 'QuickBooks',
+    // From the registry (o3d-remove-parked-connectors); `=== 'xero' ? 'Xero' : 'QuickBooks'` labelled
+    // every connector that was not Xero as QuickBooks.
+    name: getAccountingConnectorDefinition(connector).label,
     category: 'accounting' as const,
   }
 }
@@ -562,7 +593,7 @@ export async function saveAccountingConnectionSettings(
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
-    return { success: false, error: 'Enable Xero or QuickBooks first.' }
+    return { success: false, error: 'Enable an accounting connector first.' }
   }
   // audit-ohou: surface the fresh-auth gate (thrown deep in the connector) as a
   // structured result so the client can step-up re-auth and retry.
@@ -588,7 +619,7 @@ export async function testAccountingConnection(): Promise<{ success: boolean; er
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   if (!connector) {
-    return { success: false, error: 'Enable Xero or QuickBooks first.' }
+    return { success: false, error: 'Enable an accounting connector first.' }
   }
   return connector.testConnection()
 }
@@ -609,7 +640,7 @@ export async function connectAccountingConnector(
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
-    return { success: false, error: 'Enable Xero or QuickBooks first.' }
+    return { success: false, error: 'Enable an accounting connector first.' }
   }
   // audit-ohou: same step-up passthrough for the OAuth connect path.
   try {
@@ -639,7 +670,7 @@ export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string
   await requireRole('ADMIN', 'FINANCE')
   const connector = await getActiveAccountingConnector()
   if (!connector) {
-    return { fetched: 0, persisted: 0, skipped: 0, errors: ['Enable Xero or QuickBooks first.'] }
+    return { fetched: 0, persisted: 0, skipped: 0, errors: ['Enable an accounting connector first.'] }
   }
   return connector.syncAccountBalanceSnapshots(balanceDate)
 }
@@ -755,10 +786,15 @@ export async function reconcileSettledAccountingSyncRow(
       where: { id: entryId },
       select: { id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true, payload: true },
     })
-    if (!row || (row.connector !== 'xero' && row.connector !== 'quickbooks')) {
+    // REGISTRY-CHECKED, not two literals (o3d-remove-parked-connectors). The stored value is a plain
+    // String column, so a row can name a connector this build does not ship — including rows stamped
+    // `quickbooks` before it was archived. Such a row is refused here, which is the correct answer:
+    // this action reads that connector's ledger, and there is nothing to read it with.
+    const storedConnector = ACCOUNTING_CONNECTORS.find((entry) => entry.id === row?.connector)?.id
+    if (!row || !storedConnector) {
       return { success: false, error: 'That sync entry no longer exists.' }
     }
-    const connector = row.connector
+    const connector = storedConnector
 
     // Read the ledger BEFORE opening the transaction: a network call inside the scope lock would
     // let one slow remote block every payment enqueue in the system.

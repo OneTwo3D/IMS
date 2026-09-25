@@ -31,6 +31,7 @@
  * settings change between hold and release cannot quietly alter what posts.
  */
 
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
@@ -111,7 +112,7 @@ export type HeldSalesInvoicePayload = {
    * active-connector resolution it has always had. It is NOT part of {@link isHeldSalesInvoicePayload}'s
    * verdict for the same reason — a legacy hold is still a valid hold and must still be releasable.
    */
-  chartConnector?: 'xero' | 'quickbooks' | null
+  chartConnector?: AccountingConnectorId | null
 }
 
 /**
@@ -217,7 +218,7 @@ export function buildHeldSalesInvoicePayload(params: {
   metaKey: string
   accountingPayload: Record<string, unknown>
   /** o3d-j625: whose chart `accountingPayload`'s account codes are. Frozen with them. */
-  chartConnector: 'xero' | 'quickbooks' | null
+  chartConnector: AccountingConnectorId | null
 }): HeldSalesInvoicePayload {
   // Defensive: never park a payload that already carries a number (see isHeldSalesInvoicePayload).
   const { invoiceNumber: _discarded, ...rest } = params.accountingPayload
@@ -260,8 +261,8 @@ export function buildReleasedSalesInvoicePayload(
  */
 export function heldSalesInvoiceChartConnector(
   held: HeldSalesInvoicePayload,
-): 'xero' | 'quickbooks' | null | undefined {
+): AccountingConnectorId | null | undefined {
   if (held.chartConnector === null) return null
-  if (held.chartConnector === 'xero' || held.chartConnector === 'quickbooks') return held.chartConnector
+  if (isRegisteredAccountingConnector(held.chartConnector)) return held.chartConnector
   return undefined
 }

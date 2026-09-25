@@ -255,7 +255,22 @@ function salesInvoiceRequest(salesAccount: string) {
 // 1. THE RIG CAN FIND THE DEFECT
 // --------------------------------------------------------------------------------------------
 
-test('[o3d-j625] THE RIG CAN SEE THE DEFECT: a QuickBooks row carrying Xero’s account codes is observable through this fixture', async () => {
+/**
+ * o3d-j625 r12 (merging o3d-remove-parked-connectors) — WHAT THIS CONTROL IS NOW, AND WHAT IT LOST.
+ *
+ * It used to produce the mis-attributed row itself: a caller naming QuickBooks while the payload carried
+ * Xero's `X-SALES`, so the row went to the QuickBooks queue with a Xero code on it. That demonstrated the
+ * thing this mechanism does NOT prove — every enqueue is ATTRIBUTED, never that the attribution is TRUE —
+ * and it needed TWO ROUTABLE CONNECTORS to exist. With one registered connector, `chartConnector` cannot
+ * name a queue other than the active one (it is typed to the registry), so that demonstration is gone.
+ *
+ * WHAT IT STILL DOES, which is the half the rest of the file depends on: it establishes that this fixture
+ * CAN write a row at all. Without that, every "nothing was written" assertion below could be passing
+ * because the fixture is incapable of writing. Filed rather than faked: the attribution-is-not-truth
+ * demonstration is recoverable from `git show da093f85:tests/accounting/chart-connector-routing.test.ts`,
+ * and it is what a second registered connector would restore.
+ */
+test('[o3d-j625] THE RIG CAN WRITE: an attributed enqueue is observable through this fixture', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
 
@@ -265,36 +280,16 @@ test('[o3d-j625] THE RIG CAN SEE THE DEFECT: a QuickBooks row carrying Xero’s 
   assert.equal(settings.salesAccount, 'X-SALES', 'precondition: the chart read resolved Xero')
   assert.equal(settings.connector, 'xero', 'precondition: and the chart says so')
 
-  // THE SWITCH COMMITS, somewhere in the payload build — the numbering read, the tax-rate lookup, the
-  // line map. Nothing in the unpinned path serialises against it and nothing is meant to.
-  enabledPlugins = ['quickbooks']
-
-  // o3d-j625 r2 — WHY THIS CONTROL CHANGED SHAPE, AND WHAT IT STILL ESTABLISHES.
-  //
-  // r1's control reproduced the defect by OMITTING `chartConnector`, because omitting it meant "resolve
-  // the connector again". As of r2 the parameter is required and an omission is REFUSED at runtime too
-  // (see refuseUnattributableChart), so that state no longer produces a row at all — the test below
-  // pins that. What this control still has to establish is that the mis-attributed row is OBSERVABLE
-  // through this fixture: without it, every "nothing was written" assertion in this file could be
-  // passing because the fixture cannot write anything.
-  //
-  // So it is produced the only way left: a caller that NAMES A CHART THAT IS NOT ITS OWN. The payload's
-  // one account code is Xero's `X-SALES`, the call claims QuickBooks, QuickBooks is active — and the
-  // facade dutifully writes a QuickBooks row carrying a Xero account code. That is exactly the row the
-  // defect produced, and it is a reminder of what this mechanism does NOT prove: it proves every
-  // enqueue is ATTRIBUTED, never that the attribution is TRUE. The truth of each attribution is
-  // established per site by the SITE tests at the foot of
-  // tests/accounting/chart-connector-call-sites.test.ts.
   const outcome = await queueAccountingSync({
     ...salesInvoiceRequest(settings.salesAccount),
-    chartConnector: 'quickbooks',
+    chartConnector: 'xero',
   })
 
-  // The mis-attribution, in one assertion: the row is QuickBooks's, the code on it is Xero's.
   assert.equal(outcome.queued, true)
-  assert.equal(routed.length, 1)
-  assert.equal(routed[0].queue, 'quickbooks', 'the row is written under the connector the call NAMED')
-  assert.equal(routed[0].salesAccount, 'X-SALES', 'while its account code came from Xero’s chart')
+  assert.equal(routed.length, 1, 'the fixture writes a row when the enqueue is attributed — so a later '
+    + '"nothing was written" assertion is about the refusal and not about the fixture')
+  assert.equal(routed[0].queue, 'xero', 'the row is written under the connector the call NAMED')
+  assert.equal(routed[0].salesAccount, 'X-SALES', 'carrying the code the chart read gave it')
 })
 
 test('[o3d-j625 r2] an UNCHARTERED enqueue — reachable only by a cast now — is REFUSED, not resolved again', async () => {
@@ -412,23 +407,19 @@ test('[o3d-j625] a chart read while NO connector was on writes nothing, even tho
   assert.equal(outcome.connector, null)
 })
 
-test('[o3d-j625] a chart and a PIN that name different ledgers are refused, not reconciled', async () => {
-  reset(['xero'])
-  const { queueAccountingSync } = await import('@/lib/accounting')
-
-  const outcome = await queueAccountingSync({
-    ...salesInvoiceRequest('X-SALES'),
-    // The proof says these pounds belong in Xero's books; the payload is written in QuickBooks's
-    // account numbers. Honouring either one writes the other one's mistake.
-    connector: 'xero',
-    chartConnector: 'quickbooks',
-  })
-
-  assert.equal(routed.length, 0)
-  assert.equal(outcome.queued, false)
-  assert.equal(outcome.reason, 'refused')
-  assert.equal(outcome.connector, 'xero', 'the pin is what the caller is owed an answer about')
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors) — A CASE THAT NO LONGER HAS A SUBJECT.
+//
+// '[o3d-j625] a chart and a PIN that name different ledgers are refused, not reconciled' pinned that a
+// `connector` PROOF and a `chartConnector` naming DIFFERENT ledgers is a refusal rather than a choice
+// between them. Both parameters are typed to the connector registry, and the registry has one entry, so
+// "different ledgers" cannot be constructed: there is no second routable id to disagree with.
+//
+// NOT replaced with a weaker case, deliberately. The nearest expressible states — `chartConnector: null`
+// with a pin — answer `not-configured`, which is a DIFFERENT verdict about a different fact, and a test
+// asserting that while claiming to cover this rule would be the "proof of an adjacent property" the
+// review brief names. The rule is still enforced in `lib/accounting.ts` (the pin/chart comparison is
+// unchanged); it is the TEST that is now unobservable. Recoverable verbatim from
+// `git show da093f85:tests/accounting/chart-connector-routing.test.ts`.
 
 test('[o3d-j625] the refusal is RECORDED, because almost every site it protects ignores the return value', async () => {
   reset(['xero'])
@@ -552,25 +543,26 @@ const TX_REQUEST = {
   unlockedOrderScopeReason: 'test harness: the order guard is doubled to a non-order scope',
 }
 
-test('[o3d-j625] the in-transaction rig can see the mis-attributed row too', async () => {
+test('[o3d-j625] the in-transaction rig can write a row too', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
 
-  // The same control, and the same reason for its shape, as the facade one above: the row that must be
-  // OBSERVABLE for the refusal assertions below to mean anything — a QuickBooks row carrying Xero's
-  // `X-INV`. Produced by naming a chart that is not this payload's.
+  // The same control, and the same reason for its shape, as the facade one above: a row that must be
+  // OBSERVABLE for the refusal assertions below to mean anything. o3d-j625 r12: it used to be a
+  // MIS-ATTRIBUTED row (the second connector's queue carrying Xero's `X-INV`), which one registered
+  // connector cannot express — see the note on the facade control. What remains, and what the refusal
+  // assertions actually need, is that this fixture inserts when the enqueue is attributed.
   const control = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
     payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
-    chartConnector: 'quickbooks',
+    chartConnector: 'xero',
   })
 
   assert.equal(control, true)
   assert.equal(insertedInTx.length, 1)
-  assert.equal(insertedInTx[0].connector, 'quickbooks', 'the row goes to the connector the call NAMED')
-  assert.equal(insertedInTx[0].salesAccount, 'X-INV', 'carrying Xero’s inventory account')
+  assert.equal(insertedInTx[0].connector, 'xero', 'the row goes to the connector the call NAMED')
+  assert.equal(insertedInTx[0].salesAccount, 'X-INV', 'carrying the chart read\'s inventory account')
 })
 
 test('[o3d-j625 r2] the in-transaction enqueue REFUSES an unchartered request as well', async () => {

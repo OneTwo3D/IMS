@@ -12,6 +12,7 @@ import {
   ledgerDifferenceMagnitudeBound,
   parseLedgerAmount,
   partitionPaymentReversals,
+  readLedgerDifferenceAsNumber,
   readDecimalAsNumber,
   listedLedgerPaymentIds,
   unregisteredLocalReceipts,
@@ -22,7 +23,26 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import { qboLedgerAmount } from '@/lib/connectors/quickbooks/payment-poller'
+/**
+ * o3d-remove-parked-connectors — THE ROUTE THE TWO r16 CASES USED IS ARCHIVED.
+ *
+ * They drove `qboLedgerAmount`, the QuickBooks poller's `TotalAmt - Balance` reader: the production
+ * caller that turned a pair of decoded doubles into a settled figure. Its rule was two production
+ * functions in a fixed order — refuse either operand the SCALE rule cannot read (`parseLedgerAmount`),
+ * then take the DIFFERENCE under its own magnitude bound (`readLedgerDifferenceAsNumber`) — and both
+ * of those still ship. So the composition is spelled out here, once, from the shipped pieces.
+ *
+ * WHAT IS LOST, stated plainly: the cases no longer show that a real connector's reader performs that
+ * composition. This helper is the test's own arrangement of two production rules, which is a weaker
+ * subject than a production caller, and a connector that composed them differently (or forgot one)
+ * would not be caught here. The next accounting connector's own reader should be driven through these
+ * same figures.
+ */
+function settledFigureUnderBothRules(total: number, balance: number, currency: string): number | null {
+  if (parseLedgerAmount(total, currency) === null) return null
+  if (parseLedgerAmount(balance, currency) === null) return null
+  return readLedgerDifferenceAsNumber(total, balance, currency)
+}
 import { currencyMinorUnits, ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
 
 const SINCE = new Date('2026-07-17T12:00:00.000Z')
@@ -845,7 +865,7 @@ test('[o3d-psrx r12] a figure too small to survive conversion is UNREADABLE, nev
   // AND THE UNDERFLOW HALF OF THE GUARD, ASKED AT ITS OWN DOOR. `readDecimalAsNumber` is what refuses
   // a figure whose `toNumber()` is a fabricated zero, and after r18 no currency's scale admits a
   // 400-decimal token, so `parseLedgerAmount` can no longer carry one to it. The guard is still spent
-  // on every derived amount (`readLedgerDifferenceAsNumber`, `qboLedgerAmountFrom`), so it is tested
+  // on every derived amount (`readLedgerDifferenceAsNumber` and each connector's own reader), so it is tested
   // where it lives rather than through a door that is now shut.
   assert.equal(readDecimalAsNumber(toDecimal(tooSmall)), null,
     'a decimal whose double is 0 must be UNREADABLE at the conversion itself — zero is the reading '
@@ -1518,16 +1538,14 @@ test('[o3d-psrx r16] the r15 residual — a payload FINER than its minor unit �
   assert.equal(parseLedgerAmount(three.Balance, 'GBP'), null)
   // r15 measured this pair's decoded settlement at 0.004 against a true 0.006, so it crossed the
   // threshold. It can no longer be computed at all, which is the point: the operands never arrive.
-  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: three.TotalAmt, Balance: three.Balance,
-    CurrencyRef: { value: 'GBP' } }).paid, null,
+  assert.equal(settledFigureUnderBothRules(three.TotalAmt, three.Balance, 'GBP'), null,
     'THE ROUTE: the settled figure r15 could only watch go wrong is now UNREADABLE, and null withholds')
 
   // FOUR decimals at 2^40, the second figure r15 measured (true 0.0051, read 0.0048). Same answer.
   const four = await decodeJsonAmounts('{"TotalAmt":1099511627776.0062,"Balance":1099511627776.0011}')
   assert.equal(parseLedgerAmount(four.TotalAmt, 'GBP'), null)
   assert.equal(parseLedgerAmount(four.Balance, 'GBP'), null)
-  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: four.TotalAmt, Balance: four.Balance,
-    CurrencyRef: { value: 'GBP' } }).paid, null)
+  assert.equal(settledFigureUnderBothRules(four.TotalAmt, four.Balance, 'GBP'), null)
 
   // AND CODEX'S OWN PAIR, which is the one case where the scale rule alone is not the reason. A token
   // of `35184372088832.003` decodes to a double whose shortest reading is `35184372088832` — scale 0,
@@ -1540,8 +1558,7 @@ test('[o3d-psrx r16] the r15 residual — a payload FINER than its minor unit �
     + 'number, and a whole number of pounds is quantized')
   assert.equal(parseLedgerAmount(codex.Balance, 'GBP'), null,
     'while its partner reads back at three decimals and is refused, so the pair never subtracts')
-  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: codex.TotalAmt, Balance: codex.Balance,
-    CurrencyRef: { value: 'GBP' } }).paid, null,
+  assert.equal(settledFigureUnderBothRules(codex.TotalAmt, codex.Balance, 'GBP'), null,
     'THE ROUTE for the finding\'s own reproduction: 0.006 true, 0.004 decoded, and now UNREADABLE')
 
   // THE STRING ARM IS UNCHANGED AND IS STILL THE CONTROL: the same figures as text are refused by the
@@ -1573,8 +1590,7 @@ test('[o3d-psrx r16] scale alone does NOT close the class for a DIFFERENCE, and 
   // the threshold the difference is about to be compared against.
   assert.ok(Math.abs(hidden.TotalAmt) >= ledgerDifferenceMagnitudeBound('GBP'),
     'precondition: this is the one binade where spacing exceeds the epsilon')
-  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: hidden.TotalAmt, Balance: hidden.Balance,
-    CurrencyRef: { value: 'GBP' } }).paid, null,
+  assert.equal(settledFigureUnderBothRules(hidden.TotalAmt, hidden.Balance, 'GBP'), null,
     'so the settled figure is UNREADABLE rather than a zero — without this bound it is exactly 0, '
     + 'which is HOLDS_NOTHING, which clears paidAt over a payment the ledger is still holding')
 
@@ -1582,8 +1598,7 @@ test('[o3d-psrx r16] scale alone does NOT close the class for a DIFFERENCE, and 
   // read, so this is a bound and not a blanket refusal of large figures.
   const readable = await decodeJsonAmounts('{"TotalAmt":17592186044416.02,"Balance":17592186044416.01}')
   assert.ok(Math.abs(readable.TotalAmt) < ledgerDifferenceMagnitudeBound('GBP'))
-  assert.equal(qboLedgerAmount({ Id: 'r', TotalAmt: readable.TotalAmt, Balance: readable.Balance,
-    CurrencyRef: { value: 'GBP' } }).paid, 0.01,
+  assert.equal(settledFigureUnderBothRules(readable.TotalAmt, readable.Balance, 'GBP'), 0.01,
     'a whole penny still survives a subtraction here, exactly as r15 measured')
 
   // AND THE RULE, STATED RATHER THAN SAMPLED: in every supported precision the difference bound is

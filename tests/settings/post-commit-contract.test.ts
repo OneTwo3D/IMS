@@ -123,7 +123,7 @@ test('Next control-flow throws are RETHROWN, not classified as a post-commit fai
 test('the plugin-selection guard inherits the rethrow rather than owning a second catch', async () => {
   // It used to have its own catch-all, which is where finding 4 landed. It now delegates, so there
   // is one place where framework control flow is recognised and one place to get it wrong.
-  const committed = { woocommerce: true, shopify: false, xero: true, quickbooks: false, mintsoft: false }
+  const committed = { woocommerce: true, xero: true, quickbooks: false, mintsoft: false }
   const redirectError = Object.assign(new Error('NEXT_REDIRECT'), { digest: 'NEXT_REDIRECT;replace;/login;307;' })
 
   await assert.rejects(
@@ -373,7 +373,7 @@ test('every committing settings writer is discovered — an empty scan proves no
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
       'app/actions/onboarding.ts#setOnboardingStep',
-      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      // o3d-remove-parked-connectors: `autoLinkQuickBooksTaxRates` was a committing writer here.
       'app/actions/settings.ts#autoLinkXeroTaxRates',
       'app/actions/settings.ts#createAdjustmentReason',
       'app/actions/settings.ts#createPurchaseUnit',
@@ -426,7 +426,7 @@ test('...and the guard is actually being used, so the check above is not vacuous
       'app/actions/onboarding.ts#dismissOnboarding',
       'app/actions/onboarding.ts#saveOnboardingPluginState',
       'app/actions/onboarding.ts#setOnboardingStep',
-      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      // o3d-remove-parked-connectors: `autoLinkQuickBooksTaxRates` was a committing writer here.
       'app/actions/settings.ts#autoLinkXeroTaxRates',
       'app/actions/settings.ts#createAdjustmentReason',
       'app/actions/settings.ts#createPurchaseUnit',

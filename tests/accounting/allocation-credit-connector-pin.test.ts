@@ -102,15 +102,7 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 
-mock.module('@/lib/connectors/quickbooks/queue', {
-  namedExports: {
-    queueQuickBooksSync: async (params: { type: string; referenceId: string }) => {
-      if (quickbooksSyncEnabled !== 'true') return { queued: false, reason: 'not-configured' }
-      queued.push({ queue: 'quickbooks', type: params.type, referenceId: params.referenceId })
-      return { queued: true }
-    },
-  },
-})
+// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 
 const REQUEST = {
   type: 'UNEARNED_REV_REVERSAL' as const,
@@ -130,7 +122,7 @@ test('o3d-i0o6 r3: a PINNED facade enqueue is answered BY the named connector, n
   reset()
   // Both plugins on. `getActiveAccountingConnectorId` is Xero-first, so 'xero' is the active one and
   // an UNPINNED enqueue would go there; the pin names it explicitly and is answered for it.
-  enabledPlugins = ['xero', 'quickbooks']
+  enabledPlugins = ['xero']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
   // o3d-j625 r2: the chart is REQUIRED now and names the same ledger as the pin — the only combination
@@ -148,7 +140,7 @@ test('o3d-i0o6 r7: a pin to a ledger that is no longer the ACTIVE connector writ
   // The switch that happens between staging and the hand-off: QuickBooks is active now. Xero's own
   // sync toggle is untouched by that switch and is still 'true' — which is precisely why the
   // enqueue's own gate said yes and a PENDING Xero row was written that nothing scheduled drains.
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSync } = await import('@/lib/accounting')
@@ -189,19 +181,30 @@ test('o3d-i0o6 r3: a pinned enqueue whose connector does not post this type writ
   assert.deepEqual(queued, [], 'it did NOT fall back to the active connector')
 })
 
-test('o3d-i0o6 r3 / o3d-j625 r2: an UNPINNED enqueue is answered by its CHART\u2019s connector', async () => {
+test('o3d-i0o6 r3: an UNPINNED enqueue still resolves the active connector, exactly as before', async () => {
+  // o3d-remove-parked-connectors: this enabled ONLY the second connector and asserted the enqueue
+  // followed it — which showed the resolution was real rather than a constant. With one registered
+  // connector that distinction is unobservable here, so the case asserts what remains: an unpinned
+  // enqueue takes its connector from the resolution and reports it. Recorded in
+  // docs/archive/quickbooks-connector-removal.md.
+  //
+  // o3d-j625 r12 (merge): the branch's version of this case enabled `quickbooks` and asserted the row
+  // followed its CHART rather than a re-resolution. That assertion is now UNOBSERVABLE for the same
+  // reason, so development's version stands. What survives is the requirement itself — `chartConnector`
+  // is mandatory on the request (a tsc error to omit), which is what removed the second resolution.
+  // Filed as a follow-up rather than faked with one connector.
   reset()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = ['xero']
 
   const { queueAccountingSync } = await import('@/lib/accounting')
   // o3d-j625 r2: "unpinned AND unchartered" no longer exists — `chartConnector` is required, so there
   // is no caller left that makes the enqueue resolve the connector for itself. What "unpinned" now
   // means is exactly this: no PROOF about a ledger, but still a statement about whose account codes are
   // in the payload, and the row follows that statement.
-  const outcome = await queueAccountingSync({ ...REQUEST, chartConnector: 'quickbooks' })
+  const outcome = await queueAccountingSync({ ...REQUEST, chartConnector: 'xero' })
 
-  assert.equal(outcome.connector, 'quickbooks')
-  assert.deepEqual(queued.map((row) => row.queue), ['quickbooks'])
+  assert.equal(outcome.connector, 'xero')
+  assert.deepEqual(queued.map((row) => row.queue), ['xero'])
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -275,7 +278,7 @@ function fenceOnlyTx(): unknown {
 
 test('o3d-i0o6 r7: the IN-TRANSACTION enqueue refuses a pin that is not the active connector', async () => {
   reset()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   assert.equal(xeroSyncEnabled, 'true', 'the premise: the pinned connector still posts, on its own gate')
 
   const { queueAccountingSyncTx } = await import('@/lib/accounting')

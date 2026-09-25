@@ -73,16 +73,26 @@ test('END-TO-END: a malformed configured app URL also degrades to a safe relativ
 
 // --- connector selection + gating (valid Xero/QBO shapes) -----------------
 
-test('END-TO-END: a QuickBooks callback (realmId present) selects the quickbooks connector', async () => {
+// o3d-remove-parked-connectors — REPLACED, and the replacement asserts the STRONGER property.
+//
+// This used to be two cases: "a callback carrying `realmId` selects quickbooks" and "a callback
+// without one selects xero". That discrimination existed because QuickBooks sent a `realmId` and Xero
+// never does — and it decided the connector from a query parameter the CALLER controls. With
+// QuickBooks archived the route no longer looks at `realmId` at all, and the case worth locking is
+// that it CANNOT be steered by one: a caller-supplied `realmId` must not change which connector the
+// callback is handled as. That is a security property, not a parity one, so it is asserted directly
+// rather than deleted with the connector.
+test('END-TO-END: a caller-supplied realmId cannot steer which connector handles the callback', async () => {
   const res = await handleAccountingCallback(
     hostileRequest('error=cancelled&realmId=123'),
-    deps({ appUrl: CONFIGURED, enabled: (p) => p === 'quickbooks' }),
+    deps({ appUrl: CONFIGURED, enabled: (p) => p === 'xero' }),
   )
   assert.equal(new URL(location(res)).origin, CONFIGURED)
-  assert.match(location(res), /connector=quickbooks/)
+  assert.match(location(res), /connector=xero/, 'the registered connector handles it, not one named by the query string')
+  assert.doesNotMatch(location(res), /connector=quickbooks/)
 })
 
-test('END-TO-END: a Xero callback (no realmId) selects the xero connector', async () => {
+test('END-TO-END: an ordinary callback (no realmId) selects the registered connector', async () => {
   const res = await handleAccountingCallback(
     hostileRequest('error=cancelled'),
     deps({ appUrl: CONFIGURED, enabled: (p) => p === 'xero' }),

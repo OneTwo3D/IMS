@@ -1,13 +1,39 @@
 /**
  * o3d-j625 r3 — PURE connector-provenance helpers for connector-native identifiers.
  *
- * Deliberately IMPORT-FREE: lib/accounting.ts re-exports these, and many tests mock that module whole.
- * Keeping the pure halves here means those mocks never re-implement a provenance rule by hand — a
- * re-implementation in a fixture is a second copy of the rule, and a second copy is what drifts.
+ * Deliberately free of any import that carries BEHAVIOUR: lib/accounting.ts re-exports these, and many
+ * tests mock that module whole. Keeping the pure halves here means those mocks never re-implement a
+ * provenance rule by hand — a re-implementation in a fixture is a second copy of the rule, and a second
+ * copy is what drifts.
+ *
+ * o3d-j625 r12 (merging o3d-remove-parked-connectors): it now imports the CONNECTOR REGISTRY, and only
+ * that. `ACCOUNTING_CONNECTORS` is a frozen literal list with no side effects and no database, so this
+ * module stays pure and safe to import from a fixture — and the reason the comment above gives (mocks of
+ * `lib/accounting`) is untouched, because the registry is not `lib/accounting`. The alternative was to
+ * keep spelling the roster as a literal pair here, which is the second copy of the rule that this very
+ * comment warns about, and which after the archiving would have gone on accepting an id the build cannot
+ * route.
  */
 
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+
 /** A connector this build can route a posting to. */
-export type RoutableAccountingConnector = 'xero' | 'quickbooks'
+export type RoutableAccountingConnector = AccountingConnectorId
+
+/**
+ * A connector id AS IT WAS STORED — on a sync row, a sales order's `accountingInvoiceConnector`, a held
+ * invoice, a persisted retry stage — which is NOT the same type as a routable one (o3d-j625 r12, merging
+ * o3d-remove-parked-connectors).
+ *
+ * Those columns are plain strings with no foreign key, and archiving a connector deleted no rows, so a
+ * stored value can name a connector this build does not register: development databases hold `quickbooks`
+ * rows right now. Typing such a field `AccountingConnectorId` would be a CLAIM THAT CANNOT BE TRUE of a
+ * value read back from the database, and it would make the code that exists to detect exactly that case
+ * impossible to write or to test. `isRegisteredAccountingConnector` is the narrowing from this to
+ * {@link RoutableAccountingConnector}, and development's `getAccountingPostingContextFor` types its own
+ * pinned parameter `string` for the same reason.
+ */
+export type StoredAccountingConnector = string
 
 /**
  * o3d-j625 r3 (Codex HIGH 2, HIGH 3) — THE PAYLOAD KEYS THAT HOLD SOMEBODY ELSE'S PRIMARY KEY.
@@ -65,7 +91,7 @@ export const CONNECTOR_NATIVE_PAYLOAD_ID_KEYS = [
 export function asRoutableAccountingConnector(
   value: string | null | undefined,
 ): RoutableAccountingConnector | null {
-  return value === 'xero' || value === 'quickbooks' ? value : null
+  return isRegisteredAccountingConnector(value) ? value : null
 }
 
 /** Which of {@link CONNECTOR_NATIVE_PAYLOAD_ID_KEYS} this payload actually carries a value for. */

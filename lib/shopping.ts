@@ -1,32 +1,32 @@
 /**
  * Generic shopping facade — core code imports ONLY from here, never from connector modules.
+ *
+ * WHY EVERY DISPATCH IS STILL A `switch (connector)` WITH ONE ARM (o3d-remove-parked-connectors).
+ * Shopify was archived (see archive/connectors/README.md and
+ * docs/archive/shopify-connector-removal.md), so `ShoppingConnectorId` is a union of one and each of
+ * the fifteen switches below has a single `case 'woocommerce'`. They are deliberately NOT inlined:
+ * this file is the seam a second storefront is threaded through, and the switches are the list of ports it must
+ * answer. Collapsing them to direct WooCommerce calls would delete that list, and re-deriving it
+ * would mean re-reading every caller. Each switch is exhaustive over the union, so adding an id to
+ * `SHOPPING_CONNECTORS` makes every port a `tsc` error until it is answered — which is the whole
+ * value of keeping them.
+ *
+ * WHAT IS UNPROVEN WHILE ONE CONNECTOR SHIPS. `tests/connectors/shopping-contract.test.ts` drives
+ * the generic layer with a fictitious `'newshop'` id, but nothing routes a second id through these
+ * switches, because no second id exists to route. The genericity of THIS file is therefore
+ * type-checked, not tested. See docs/archive/shopify-connector-removal.md, "What is no longer
+ * proven".
  */
 
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
-import type { ProductLifecycleStatus, ProductType, SalesOrderStatus } from '@/app/generated/prisma/client'
-import type { DeliveryStatus, StockUpdate } from '@/lib/connectors/types'
-import type { WcPartialShipmentPush, PartialShipmentPushResult } from '@/lib/connectors/woocommerce/sync/partial-shipment'
+import type { SalesOrderStatus } from '@/app/generated/prisma/client'
+import type { DeliveryStatus } from '@/lib/connectors/types'
+import type { WcPartialShipmentPush } from '@/lib/connectors/woocommerce/sync/partial-shipment'
 export type { WcPartialShipmentPush, WcPartialShipmentLine } from '@/lib/connectors/woocommerce/sync/partial-shipment'
 import type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
 export type { WmsOrderStatusMeta } from '@/lib/connectors/woocommerce/sync/wms-status'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
-import { getShoppingConnector, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
-import { getShopifySettings } from '@/lib/connectors/shopify/settings'
-
-type StockCandidateProduct = {
-  id: string
-  sku: string
-  type: ProductType
-  lifecycleStatus: ProductLifecycleStatus
-  productComponents: Array<{
-    componentId: string
-    qty: unknown
-    component: {
-      type: ProductType
-      lifecycleStatus: ProductLifecycleStatus
-    }
-  }>
-}
+import { getShoppingConnector, SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
 export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string }
 export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string }
@@ -47,191 +47,20 @@ export type ShoppingExternalLink = {
 }
 export type ShoppingProductLinkResult = { link: ShoppingExternalLink | null; error?: string }
 
-function computeKitAvailability(
-  product: StockCandidateProduct,
-  warehouseIds: string[],
-  stockByProductWarehouse: Map<string, Map<string, number>>,
-  productById: Map<string, StockCandidateProduct>,
-  memo: Map<string, number>,
-  stack: Set<string>,
-): number {
-  if (memo.has(product.id)) return memo.get(product.id) ?? 0
-  if (product.productComponents.length === 0) {
-    memo.set(product.id, 0)
-    return 0
-  }
-  if (stack.has(product.id)) {
-    memo.set(product.id, 0)
-    return 0
-  }
-
-  stack.add(product.id)
-
-  let total = 0
-  for (const warehouseId of warehouseIds) {
-    let kitsInWarehouse = Number.POSITIVE_INFINITY
-
-    for (const component of product.productComponents) {
-      const required = Number(component.qty)
-      if (!Number.isFinite(required) || required <= 0 || component.component.lifecycleStatus === 'ARCHIVED') {
-        kitsInWarehouse = 0
-        break
-      }
-
-      let available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
-      if (component.component.type === 'KIT') {
-        const nested = productById.get(component.componentId)
-        available = nested
-          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack)
-          : 0
-      }
-
-      kitsInWarehouse = Math.min(kitsInWarehouse, Math.floor(available / required))
-    }
-
-    total += Number.isFinite(kitsInWarehouse) ? kitsInWarehouse : 0
-  }
-
-  stack.delete(product.id)
-  memo.set(product.id, total)
-  return total
-}
-
-async function buildShoppingStockUpdates(
-  productIds?: string[],
-  options?: { force?: boolean; webhookQty?: number | null; connector?: ShoppingConnectorId },
-): Promise<StockUpdate[]> {
-  const { db } = await import('@/lib/db')
-  const skipReasons: Record<string, number> = {}
-  const recordSkip = (reason: string, count = 1) => {
-    skipReasons[reason] = (skipReasons[reason] ?? 0) + count
-  }
-
-  const warehouses = await db.warehouse.findMany({
-    where: { syncToStore: true, active: true },
-    select: { id: true },
-  })
-  if (warehouses.length === 0) {
-    recordSkip('no_syncable_warehouses', 1)
-    await emitStockSyncSkipLog(skipReasons, 0, options?.connector)
-    return []
-  }
-
-  const warehouseIds = warehouses.map((warehouse) => warehouse.id)
-  const scopedProductIds = productIds && productIds.length > 0 ? [...new Set(productIds)] : null
-
-  const scopedComponentIds = scopedProductIds
-    ? [
-        ...new Set(
-          (
-            await db.productComponent.findMany({
-              where: { productId: { in: scopedProductIds } },
-              select: { componentId: true },
-            })
-          ).map((row) => row.componentId),
-        ),
-      ]
-    : []
-  const scopedStockProductIds = scopedProductIds
-    ? [...new Set([...scopedProductIds, ...scopedComponentIds])]
-    : null
-
-  const stockLevels = await db.stockLevel.findMany({
-    where: {
-      warehouseId: { in: warehouseIds },
-      ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
-    },
-    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
-  })
-
-  const stockByProduct = new Map<string, number>()
-  const stockByProductWarehouse = new Map<string, Map<string, number>>()
-  for (const stockLevel of stockLevels) {
-    const available = Math.max(0, Number(stockLevel.quantity) - Number(stockLevel.reservedQty))
-    stockByProduct.set(stockLevel.productId, (stockByProduct.get(stockLevel.productId) ?? 0) + available)
-
-    const byWarehouse = stockByProductWarehouse.get(stockLevel.productId) ?? new Map<string, number>()
-    byWarehouse.set(stockLevel.warehouseId, available)
-    stockByProductWarehouse.set(stockLevel.productId, byWarehouse)
-  }
-
-  const physicalProductIds = [...new Set(stockLevels.map((stockLevel) => stockLevel.productId))]
-  // Pull candidates without the lifecycle/SKU filter so we can count
-  // those skip reasons explicitly instead of silently dropping them.
-  const rawProducts = await db.product.findMany({
-    where: scopedProductIds
-      ? {
-          OR: [
-            { id: { in: scopedProductIds } },
-            { type: 'KIT', productComponents: { some: { componentId: { in: scopedProductIds } } } },
-          ],
-        }
-      : {
-          OR: [
-            { id: { in: physicalProductIds } },
-            { type: 'KIT', productComponents: { some: {} } },
-          ],
-        },
-    select: {
-      id: true,
-      sku: true,
-      type: true,
-      lifecycleStatus: true,
-      productComponents: {
-        select: {
-          componentId: true,
-          qty: true,
-          component: { select: { type: true, lifecycleStatus: true } },
-        },
-      },
-    },
-  })
-
-  const allowedLifecycle = new Set<ProductLifecycleStatus>(['DRAFT', 'ACTIVE', 'EOL', 'ARCHIVED'])
-  const products = rawProducts.filter((product) => {
-    if (!product.sku) {
-      recordSkip('blank_sku')
-      return false
-    }
-    if (!allowedLifecycle.has(product.lifecycleStatus)) {
-      recordSkip(`lifecycle_${product.lifecycleStatus.toLowerCase()}`)
-      return false
-    }
-    if (product.type === 'VARIABLE') {
-      recordSkip('product_type_variable')
-      return false
-    }
-    if (product.type === 'NON_INVENTORY') {
-      recordSkip('product_type_non_inventory')
-      return false
-    }
-    return true
-  }) as StockCandidateProduct[]
-  const productById = new Map(products.map((product) => [product.id, product]))
-  const kitAvailabilityMemo = new Map<string, number>()
-
-  const updates = products.map((product) => {
-    const computedQuantity = product.type === 'KIT'
-      ? computeKitAvailability(
-          product,
-          warehouseIds,
-          stockByProductWarehouse,
-          productById,
-          kitAvailabilityMemo,
-          new Set<string>(),
-        )
-      : (stockByProduct.get(product.id) ?? 0)
-
-    return {
-      sku: product.sku,
-      productId: product.id,
-      quantity: options?.force && product.lifecycleStatus === 'ARCHIVED' ? 0 : computedQuantity,
-    }
-  })
-
-  await emitStockSyncSkipLog(skipReasons, updates.length, options?.connector)
-  return updates
-}
+// DELETED, NOT KEPT (o3d-remove-parked-connectors): `computeKitAvailability` and
+// `buildShoppingStockUpdates` — a ~185-line connector-agnostic stock-update builder (kit
+// availability, warehouse scoping, SKU/lifecycle skip accounting) whose ONLY caller was Shopify's
+// `syncStock`. WooCommerce has never used it: `pushStockToWc` builds its own updates inside the
+// connector, under its own advisory lock and settings snapshot.
+//
+// This is the ShipHero `stock-sync-helpers.ts` lesson repeating, and it is worth recording rather
+// than quietly deleting: a module presented as the shared, connector-neutral layer was in fact a
+// SECOND implementation that one connector used and the other did not. The generic-looking name was
+// the only thing generic about it. A future storefront should expect to write its own builder (or to
+// lift WooCommerce's out of the connector deliberately), not to find one waiting.
+//
+// Recoverable at `git show archive/shopify-connector:lib/shopping.ts`.
+// `emitStockSyncSkipLog` below SURVIVES: the WooCommerce arm calls it directly.
 
 async function emitStockSyncSkipLog(
   skipReasons: Record<string, number>,
@@ -261,17 +90,15 @@ async function emitStockSyncSkipLog(
 
 async function listConfiguredShoppingConnectorIds(): Promise<ShoppingConnectorId[]> {
   const { db } = await import('@/lib/db')
-  const [pluginState, url, key, secret, shopifySettings] = await Promise.all([
+  const [pluginState, url, key, secret] = await Promise.all([
     getIntegrationPluginState(),
     db.setting.findUnique({ where: { key: 'wc_url' } }),
     db.setting.findUnique({ where: { key: 'wc_consumer_key' } }),
     db.setting.findUnique({ where: { key: 'wc_consumer_secret' } }),
-    getShopifySettings(),
   ])
 
   const connectors: ShoppingConnectorId[] = []
   if (pluginState.woocommerce && url?.value && key?.value && secret?.value) connectors.push('woocommerce')
-  if (pluginState.shopify && shopifySettings.shopify_store_domain && shopifySettings.shopify_admin_api_access_token) connectors.push('shopify')
   return connectors
 }
 
@@ -307,8 +134,8 @@ export async function syncShoppingConnectorStock(
         forceProductIds: options?.force && productIds ? [...new Set(productIds)] : [],
         source: options?.webhookQty != null ? 'WC_WEBHOOK' : 'MANUAL',
       })
-      // Surface the same skip/push telemetry the Shopify path emits, derived
-      // from pushStockToWc's StockSyncResult. Emit whenever any product was
+      // Surface the same skip/push telemetry a connector with its own stock port emits,
+      // derived from pushStockToWc's StockSyncResult. Emit whenever any product was
       // skipped or unmatched, regardless of whether other products synced
       // successfully — partial-run gaps still need audit visibility.
       const skipped = result.skipped ?? 0
@@ -326,20 +153,6 @@ export async function syncShoppingConnectorStock(
       }
       return result
     }
-    case 'shopify': {
-      const shopifySettings = await getShopifySettings()
-      if (shopifySettings.shopify_sync_enabled !== 'true') {
-        return { synced: 0, errors: ['Shopify sync is disabled in settings'] }
-      }
-
-      const updates = await buildShoppingStockUpdates(productIds, { ...options, connector: 'shopify' })
-      if (updates.length === 0) {
-        return { synced: 0, errors: ['No stocked products with syncable SKUs were found'] }
-      }
-
-      const { syncStock } = await import('@/lib/connectors/shopify')
-      return syncStock(updates)
-    }
   }
 }
 
@@ -356,10 +169,6 @@ export async function enqueueStockSync(
         await enqueueAndProcessImmediateWcStockSync(productIds, reason, options)
         return
       }
-      case 'shopify': {
-        await syncShoppingConnectorStock('shopify', productIds, options)
-        return
-      }
     }
   }))
 }
@@ -374,8 +183,6 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
         const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
         return { connector, result: await pushImsProductToWc(productId) }
       }
-      case 'shopify':
-        return { connector, result: { success: true, skipped: true } }
     }
   }))
 
@@ -400,8 +207,6 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
         const { pushImsTrackingToWc } = await import('@/lib/connectors/woocommerce/sync/tracking-sync')
         return { connector, result: await pushImsTrackingToWc(orderId) }
       }
-      case 'shopify':
-        return { connector, result: { success: true, skipped: true } }
     }
   }))
 
@@ -420,7 +225,7 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
  * Push one despatched part of a split fulfilment to whichever shopping
  * connector(s) own the order. WMS-neutral: any WMS reconciler calls this via the
  * facade so the storefront representation stays connector-agnostic (WooCommerce
- * records a partial shipment today; Shopify can implement its own later).
+ * records a partial shipment today; a second storefront implements its own).
  */
 export async function pushPartialShipmentToShopping(
   orderId: string,
@@ -435,9 +240,6 @@ export async function pushPartialShipmentToShopping(
         const { pushPartialShipmentToWc } = await import('@/lib/connectors/woocommerce/sync/partial-shipment')
         return { connector, result: await pushPartialShipmentToWc(orderId, input) }
       }
-      case 'shopify':
-        // Shopify has no partial-shipment representation wired yet.
-        return { connector, result: { supported: false, ok: true, skipped: true } as PartialShipmentPushResult }
     }
   }))
 
@@ -458,7 +260,7 @@ export async function pushPartialShipmentToShopping(
 /**
  * Push the live WMS order status onto the order's storefront record so storefront admins
  * can see it (WooCommerce writes `_oti_wms_*` meta the companion plugin renders). WMS- and
- * storefront-neutral; Shopify can implement its own surface later.
+ * storefront-neutral; a second storefront implements its own surface.
  */
 export async function pushWmsOrderStatusToShopping(
   orderId: string,
@@ -473,8 +275,6 @@ export async function pushWmsOrderStatusToShopping(
         const { pushWmsOrderStatusToWc } = await import('@/lib/connectors/woocommerce/sync/wms-status')
         return { connector, result: await pushWmsOrderStatusToWc(orderId, input) }
       }
-      case 'shopify':
-        return { connector, result: { success: true, skipped: true } as { success: boolean; skipped?: boolean; error?: string } }
     }
   }))
 
@@ -492,8 +292,8 @@ export async function pushWmsOrderStatusToShopping(
  * Push an IMS sales-order status change back to whichever shopping connector(s)
  * the order is linked to. Each connector's pusher resolves the order's own link
  * and no-ops if the order isn't linked to it, so this safely fans out to every
- * runnable connector. Shopify has no IMS->store status push yet (its delivery
- * status is read-only), so it is skipped rather than failing the order update.
+ * runnable connector. A connector with no IMS->store status push returns
+ * `{ success: true, skipped: true }` rather than failing the order update.
  */
 export async function pushSalesOrderStatus(orderId: string, status: SalesOrderStatus): Promise<PushOrderStatusResult> {
   const connectors = await listRunnableShoppingConnectorIds()
@@ -506,8 +306,6 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
         await pushImsStatusToWc(orderId, status)
         return { connector, result: { success: true } }
       }
-      case 'shopify':
-        return { connector, result: { success: true, skipped: true } }
     }
   }))
 
@@ -526,8 +324,8 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
  * Fan the current FX rate set out to every configured shopping connector so the
  * storefront, IMS and the accounting platform share one rate. Each connector
  * owns its own push + telemetry (e.g. WooCommerce records fxRatePushLog +
- * last_wc_fx_push_at for the settings UI). Shopify has no FX push capability
- * yet, so it is reported as unsupported and skipped. Never throws per-connector
+ * last_wc_fx_push_at for the settings UI). A connector with no FX push capability
+ * reports `supported: false` and is skipped. Never throws per-connector
  * failures — they are returned so the caller can decide how to surface them.
  */
 export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResult[]> {
@@ -570,9 +368,6 @@ export async function pushFxRatesToConnectors(): Promise<FxRatePushConnectorResu
           return { connector, supported: true, pushed: 0, errors: [String(e).slice(0, 240)] }
         }
       }
-      case 'shopify':
-        // No FX-rate push capability on Shopify yet — skip rather than error.
-        return { connector, supported: false, pushed: 0, errors: [] }
     }
   }))
 }
@@ -584,12 +379,6 @@ export async function getOrderDeliveryStatus(orderId: string): Promise<DeliveryS
       case 'woocommerce': {
         const { getWcDeliveryStatusForSalesOrder } = await import('@/lib/connectors/woocommerce/delivery')
         const status = await getWcDeliveryStatusForSalesOrder(orderId)
-        if (status) return status
-        break
-      }
-      case 'shopify': {
-        const { getDeliveryStatus } = await import('@/lib/connectors/shopify')
-        const status = await getDeliveryStatus(orderId)
         if (status) return status
         break
       }
@@ -610,13 +399,6 @@ export async function getExternalProductLinks(sku: string): Promise<{ links: Sho
         const result = await getWcProductExternalLink(sku)
         if (result.link) links.push(result.link)
         else if (result.error) errors.push(`WooCommerce: ${result.error}`)
-        break
-      }
-      case 'shopify': {
-        const { getProductLink } = await import('@/lib/connectors/shopify')
-        const result = await getProductLink(sku)
-        if (result.link) links.push(result.link)
-        else if (result.error) errors.push(`Shopify: ${result.error}`)
         break
       }
     }
@@ -640,11 +422,6 @@ export async function hasExternalProductLink(productId: string): Promise<boolean
         if (await hasWcProductExternalLink(productId)) return true
         break
       }
-      case 'shopify': {
-        const { hasShopifyProductExternalLink } = await import('@/lib/connectors/shopify/links')
-        if (await hasShopifyProductExternalLink(productId)) return true
-        break
-      }
     }
   }
   return false
@@ -659,12 +436,6 @@ export async function getSalesOrderAdminLinks(orderId: string): Promise<Shopping
       case 'woocommerce': {
         const { getWcSalesOrderAdminLink } = await import('@/lib/connectors/woocommerce/links')
         const link = await getWcSalesOrderAdminLink(orderId)
-        if (link) links.push(link)
-        break
-      }
-      case 'shopify': {
-        const { getOrderAdminLink } = await import('@/lib/connectors/shopify')
-        const link = await getOrderAdminLink(orderId)
         if (link) links.push(link)
         break
       }
@@ -691,7 +462,22 @@ export async function handleShoppingWebhook(
     // retryable 423. WooCommerce falls through to handleWcWebhook, which verifies the signature and then
     // durably PERSISTS the delivery (deferred, replayed once re-enabled) instead of dropping it — a 423 would
     // depend entirely on WooCommerce's finite retry, after which the order is lost.
-    return Response.json({ error: `${getShoppingConnector(connector).label} plugin is disabled` }, { status: 423 })
+    //
+    // STATICALLY UNREACHABLE FOR A REGISTERED ID TODAY, AND KEPT ON PURPOSE
+    // (o3d-remove-parked-connectors). With Shopify archived, the only registered `connector` is
+    // `'woocommerce'`, so no registered id can take this branch. It is the DEFAULT-DENY half of the
+    // rule — a connector that has not declared a deferred-persist path must not have its deliveries
+    // dropped while its plugin is off — and deleting it would mean the next connector's first
+    // webhook is accepted by omission. `tests/shopping-dispatcher-disabled-persist.test.ts` still
+    // drives it, with an id the union does not contain; that is a weaker subject than a second
+    // shipped connector and is recorded in docs/archive/shopify-connector-removal.md.
+    //
+    // THE LABEL IS RESOLVED DEFENSIVELY, and that is not cosmetic: `getShoppingConnector` THROWS on
+    // an id it does not know, so composing the refusal message out of it turned a refusal into a
+    // 500 for exactly the id this branch exists to refuse. A dispatcher must not crash while saying
+    // no.
+    const label = SHOPPING_CONNECTORS.find((entry) => entry.id === connector)?.label ?? connector
+    return Response.json({ error: `${label} plugin is disabled` }, { status: 423 })
   }
 
   switch (connector) {
@@ -699,11 +485,16 @@ export async function handleShoppingWebhook(
       const { handleWcWebhook } = await import('@/lib/connectors/woocommerce/webhooks')
       return handleWcWebhook(resource, request, rawBody)
     }
-    case 'shopify': {
-      const { handleWebhook } = await import('@/lib/connectors/shopify')
-      return handleWebhook({ request, resource, rawBody })
-    }
   }
+
+  // DEFAULT-DENY for an id with no webhook arm (o3d-remove-parked-connectors). Archiving Shopify
+  // removed the second `case`, and without this the switch would fall off its end and the function
+  // would return `undefined` — which is a runtime crash in the route, not a refusal. A registered
+  // connector that has not wired a webhook handler gets a named 501 instead.
+  return Response.json(
+    { error: `${connector} has no shopping webhook handler in this build` },
+    { status: 501 },
+  )
 }
 
 /**
@@ -722,7 +513,13 @@ export async function isEmptyShoppingWebhookBodyAllowed(
       const { isEmptyWcWebhookBodyAllowed } = await import('@/lib/connectors/woocommerce/webhooks')
       return isEmptyWcWebhookBodyAllowed(request)
     }
-    case 'shopify':
-      return false
   }
+
+  // DEFAULT-DENY, and it has to be written rather than implied (o3d-remove-parked-connectors).
+  // Shopify's arm used to BE this answer (`case 'shopify': return false`), so archiving it left the
+  // switch falling off its end and returning `undefined` for any id it does not name. `undefined` is
+  // falsy, so the route happens to behave the same — which is precisely the kind of accident that
+  // stops being true the first time a caller writes `=== false`. The rule is: a connector that has
+  // not declared an empty-body quirk does not get one.
+  return false
 }

@@ -1,3 +1,5 @@
+import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
+import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
@@ -49,10 +51,10 @@ function baseParams<Tx extends { activityLog: { create: (input: ActivityLogCreat
   // this function no longer resolves the connector for itself, because the payload's transit account and
   // tax-type code came from the caller's settings read and a second resolution is the o3d-j625 defect.
   // So the tests that used to vary that dependency now vary this.
-  chartConnector: 'xero' | 'quickbooks' | null = 'xero',
+  chartConnector: StoredAccountingConnector | null = 'xero',
   // o3d-j625 r3: whose BILL `accountingPayload.accountingInvoiceId` is. Defaulted to the chart so the
   // existing cases keep testing what they tested; varied by the r3 case below.
-  documentConnector: 'xero' | 'quickbooks' | null = chartConnector,
+  documentConnector: StoredAccountingConnector | null = chartConnector,
 ) {
   return {
     tx,
@@ -83,7 +85,9 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -121,7 +125,9 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -155,7 +161,9 @@ test('maybeQueuePurchaseInvoiceUpdate skips disabled sync type without warning l
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'not-configured' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'not-configured' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -181,7 +189,9 @@ test('maybeQueuePurchaseInvoiceUpdate skips bills without external accounting id
   }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => {
       queueCalls.push(input)
       return true
@@ -203,7 +213,9 @@ test('maybeQueuePurchaseInvoiceUpdate records the signed transit delta (new − 
   const transitRows: Array<{ sourceType: string; sourceRef: string; idempotencyKey: string; baseDelta: number; journalDate: string }> = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async () => true,
     recordTransitSubledgerMovement: async (_tx, input) => {
       transitRows.push({ ...input, baseDelta: Number(input.baseDelta) })
@@ -230,7 +242,9 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the upd
   const transitRows: unknown[] = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async () => true,
     recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
   }
@@ -249,7 +263,9 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the que
   const transitRows: unknown[] = []
   const tx = { activityLog: { create: async (_input: ActivityLogCreateCall) => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     // queue declines (e.g. no active posting context) — no GL counterpart exists.
     queueAccountingSyncTx: async () => false,
     recordTransitSubledgerMovement: async (_tx, input) => { transitRows.push(input) },
@@ -280,9 +296,13 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
   // failing on a missing function.
   const deps = {
     isAccountingSyncTypeEnabled: async () => false,
-    postingVerdictForChart: async (chart: 'xero' | 'quickbooks' | null, type: 'PURCHASE_INVOICE_UPDATE') => {
+    postingVerdictForChart: async (chart: StoredAccountingConnector | null, type: 'PURCHASE_INVOICE_UPDATE') => {
       asked.push([chart, type])
-      return { verdict: 'chart-retired' as const, chartConnector: 'xero' as const, activeConnector: 'quickbooks' as const }
+      // o3d-j625 r12 (merging o3d-remove-parked-connectors): this said `activeConnector: 'quickbooks'`.
+      // With one registered connector "a DIFFERENT connector is active" cannot be expressed; `null` —
+      // nothing switched on — is the retired-chart state that remains observable, and it is the one this
+      // case is actually about (a retired chart is a REFUSAL, not `skipped-disabled`).
+      return { verdict: 'chart-retired' as const, chartConnector: 'xero' as const, activeConnector: null }
     },
     queueAccountingSyncTx: async () => { enqueues++; return true },
     recordTransitSubledgerMovement: async () => {},
@@ -307,7 +327,9 @@ async function enqueuedParamsFor(accountingInvoiceId: string, idempotencyKey: st
   const tx = { activityLog: { create: async () => {} } }
   const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
     recordTransitSubledgerMovement: async () => {},
-    postingVerdictForChart: async (chart) => (chart ? { verdict: 'post' as const, connector: chart } : { verdict: 'no-chart' as const }),
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
     queueAccountingSyncTx: async (_tx, input) => { calls.push(input as unknown as Record<string, unknown>); return true },
   }
   const params = { ...baseParams(tx, deps), accountingInvoiceId, accountingPayload: { ...basePayload(), accountingInvoiceId }, idempotencyKey }
@@ -361,7 +383,7 @@ test('[o3d-j625 r6 H2/H3] bill B\'s update row does not clear bill A\'s refusal;
 
   const billA = await enqueuedParamsFor('xero-bill-A', 'purchase-invoice-update:A:h1')
   await recordAccountingPostingRefusal(client, purchaseInvoiceUpdatePostingKey(billA.params), {
-    kind: 'purchase_invoice_update', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r',
+    kind: 'purchase_invoice_update', chartConnector: 'xero', activeConnector: null, reason: 'retired_chart', committed: 'c', remedy: 'r',
   })
   const rowFrom = (enqueued: Record<string, unknown>) => ({
     connector: 'xero', status: 'PENDING', type: enqueued.type, referenceType: enqueued.referenceType,

@@ -16,7 +16,7 @@ export type ApiRoutePolicyEntry = {
 export const apiRouteAuthPolicy = {
   '/api/accounting/callback': {
     access: 'xero-oauth',
-    reason: 'Public accounting OAuth callback for Xero and QuickBooks; OAuth state is consumed before connector tokens are stored.',
+    reason: 'Public accounting OAuth callback; OAuth state is consumed before connector tokens are stored.',
   },
   '/api/auth/[...nextauth]': {
     access: 'public-webhook',

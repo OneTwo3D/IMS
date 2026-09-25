@@ -36,11 +36,10 @@ export async function GET(request: Request) {
     return NextResponse.json({ mode: apply ? 'apply' : 'report', ...report })
   }
 
-  // QuickBooks reconciliation is not built yet — its poller uses a different mechanism (o3d-… QBO
-  // parity follow-up). Degrade gracefully rather than silently claim success.
-  if (await isIntegrationPluginEnabled('quickbooks')) {
-    return NextResponse.json({ skipped: true, reason: 'Payment reconcile not yet implemented for QuickBooks' })
-  }
+  // o3d-remove-parked-connectors: the QuickBooks arm here answered a NAMED skip — "payment reconcile
+  // not yet implemented for QuickBooks" — rather than falling through to "no accounting plugin
+  // enabled", which would have read as a configuration problem. That distinction is the pattern a
+  // second ledger without a reconcile sweep should copy; the arm itself went with the connector.
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
 }

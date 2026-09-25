@@ -1,3 +1,4 @@
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { LandedCostMethod, Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
@@ -537,13 +538,14 @@ function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }
     .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
-const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | 'quickbooks' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: AccountingConnectorId | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
   // o3d-j625 r5 (review M-7) — ONE RESOLUTION, NOT TWO RUN IN PARALLEL.
   //
   // This is the same pair deleted elsewhere this round, and it is not read-only: the connector this context
   // reports is handed to `syncAccountingAccountBalanceSnapshots`, which PERSISTS snapshots. Resolved once
   // and the chart read FOR it, so the account codes and the connector the snapshots are written under
-  // cannot be two different connectors' after a switch between the two reads.
+  // cannot be two different connectors' after a switch between the two reads. (The type is
+  // `AccountingConnectorId` since o3d-remove-parked-connectors made the registry the roster.)
   const [baseCurrency, connectorInfo] = await Promise.all([getBaseCurrencyCode(), getActiveAccountingConnectorInfo()])
   const settings = await getAccountingSettingsFor(connectorInfo?.id ?? null)
   return {

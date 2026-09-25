@@ -530,7 +530,7 @@ model FxRate {
 /// any errors occurred.
 model FxRatePushLog {
   id           String   @id @default(cuid())
-  connector    String   // 'woocommerce' | future: 'shopify' | etc.
+  connector    String   // 'woocommerce' | a future storefront id
   pushedAt     DateTime @default(now())
   ratesCount   Int
   status       String   // 'OK' | 'FAILED' | 'SKIPPED'

@@ -59,14 +59,12 @@ test('o3d-i0o6 r6: an enabled-but-switched-off Xero does NOT hand the tick to Qu
   assert.deepEqual(await resolve(), { connector: null, reason: 'Xero sync disabled' })
 })
 
-test('o3d-i0o6 r6: QuickBooks is the scheduled sweep only when the Xero PLUGIN is off', async () => {
-  state.enabled = ['quickbooks']
-  state.settings = { ...ON }
-  assert.deepEqual(await resolve(), { connector: 'quickbooks' })
-
-  state.settings = { ...ON, quickbooks_sync_enabled: 'false' }
-  assert.deepEqual(await resolve(), { connector: null, reason: 'QuickBooks sync disabled' })
-})
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): 'o3d-i0o6 r6: QuickBooks is the scheduled
+// sweep only when the Xero PLUGIN is off'. It was the second arm of `DAILY_BATCH_SWEEPS`, and it is
+// the case that made "route order is load-bearing — the FIRST enabled plugin decides, whether or not
+// its own switches then turn the run into a skip" observable at all. With one entry in the list, the
+// order is unobservable and a resolver that ignored the list entirely would pass every case left.
+// Recorded in docs/archive/quickbooks-connector-removal.md.
 
 test('o3d-i0o6 r6: no accounting plugin at all means no sweep is coming for anything', async () => {
   state.enabled = []

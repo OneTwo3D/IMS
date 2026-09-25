@@ -7,6 +7,7 @@
  * in the caller's transaction.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabledForChart, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -39,7 +40,7 @@ type ShipmentCogsRevaluationSyncOptions = {
      * routed, and the enqueue is now declared to require an answer. `null` is the answer for "no
      * connector was switched on", which writes nothing.
      */
-    connector: 'xero' | 'quickbooks' | null
+    connector: AccountingConnectorId | null
   }
   queueAccountingSync?: typeof queueAccountingSyncTx
   /**

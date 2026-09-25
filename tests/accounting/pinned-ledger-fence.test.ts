@@ -1,3 +1,4 @@
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -92,11 +93,8 @@ mock.module('@/lib/connectors/xero/settings', {
     getXeroSettings: async () => ({ xero_sync_enabled: 'true' }),
   },
 })
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({ quickbooks_sync_enabled: 'true' }),
-  },
-})
+// o3d-remove-parked-connectors: a mock for `@/lib/connectors/quickbooks/settings` was here, freezing
+// that connector's master toggle on for the same reason. It went with the connector.
 // ALLOCATION_REVERSAL and UNEARNED_REV_REVERSAL are in neither connector's SYNC_TYPE_SETTING map, so
 // their posting mode is the unconditional 'submitted' — there is no per-type setting to stub, and the
 // only gate in front of the fence is the connector's own `*_sync_enabled`, left on above so that a
@@ -213,6 +211,9 @@ const TX_REQUEST = {
   chartConnector: 'xero' as const,
 }
 
+/** An id the accounting union does not contain — see the pin case below. */
+const OTHER_LEDGER = 'another-ledger' as unknown as AccountingConnectorId
+
 const FACADE_REQUEST = {
   type: 'UNEARNED_REV_REVERSAL' as const,
   referenceType: 'SalesOrderRefund',
@@ -222,10 +223,17 @@ const FACADE_REQUEST = {
   chartConnector: 'xero' as const,
 }
 
-function reset(selection: { xero: boolean; quickbooks: boolean }): void {
+/**
+ * o3d-remove-parked-connectors: `selection` carried a `quickbooks` member, and "the selection moved
+ * off the pin" was expressed as `{ xero: false, quickbooks: true }`. QuickBooks is archived, so that
+ * state is now `{ xero: false }` — no registered accounting connector enabled, the locked read
+ * resolves to `null`, and a pin naming Xero is a pin on a ledger nothing is servicing. The fence's
+ * comparison (`resolveActiveAccountingConnector(locked) !== pinned`) and every refusal below are
+ * unchanged; what is no longer modelled is a switch to a second LIVE ledger.
+ */
+function reset(selection: { xero: boolean }): void {
   settingsTable.clear()
   settingsTable.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, String(selection.xero))
-  settingsTable.set(INTEGRATION_PLUGIN_SETTING_KEYS.quickbooks, String(selection.quickbooks))
   stalePooledSelection = null
   created.length = 0
   trace = []
@@ -236,7 +244,7 @@ function reset(selection: { xero: boolean; quickbooks: boolean }): void {
 // ---------------------------------------------------------------------------------------------
 
 test('[o3d-i0o6 r8] the in-transaction enqueue takes the plugin-selection lock on the INSERTING transaction, before the insert', async () => {
-  reset({ xero: true, quickbooks: false })
+  reset({ xero: true })
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, { ...TX_REQUEST, connector: 'xero' })
@@ -257,8 +265,8 @@ test('[o3d-i0o6 r8] the in-transaction enqueue takes the plugin-selection lock o
 test('[o3d-i0o6 r8] the in-transaction enqueue refuses on the LOCKED read, even where the pooled read still says the pin is active', async () => {
   // THE WINDOW, as production produces it. The switch to QuickBooks has committed; a pooled read
   // taken before that commit — the shape of every read r7's check was made of — still answers 'xero'.
-  reset({ xero: false, quickbooks: true })
-  stalePooledSelection = { xero: true, quickbooks: false }
+  reset({ xero: false })
+  stalePooledSelection = { xero: true }
 
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
   // A holder rather than a bare `let`: the assignment happens in a callback, which control-flow
@@ -285,7 +293,7 @@ test('[o3d-i0o6 r8] an UNPINNED in-transaction enqueue takes no selection lock a
   // The guarantee that makes the fence safe to add: every existing caller keeps the active-connector
   // resolution by not passing a pin, and pays nothing — no advisory lock, no row locks, no new
   // serialisation on the ordinary queue traffic.
-  reset({ xero: true, quickbooks: false })
+  reset({ xero: true })
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, TX_REQUEST)
@@ -301,7 +309,7 @@ test('[o3d-i0o6 r8] an UNPINNED in-transaction enqueue takes no selection lock a
 // ---------------------------------------------------------------------------------------------
 
 test('[o3d-i0o6 r8] the facade hands the pin to the connector queue, which locks the selection on its own inserting transaction', async () => {
-  reset({ xero: true, quickbooks: false })
+  reset({ xero: true })
   const { queueAccountingSync } = await import('@/lib/accounting')
 
   const outcome = await queueAccountingSync({ ...FACADE_REQUEST, connector: 'xero' })
@@ -321,8 +329,8 @@ test('[o3d-i0o6 r8] the facade path refuses inside the queue transaction when th
   // awaits an import, a settings read, a provenance read, a transaction, an order lock and a
   // stale-discount check before the insert. The pooled answer here is 'xero, still active' — so the
   // facade's own check PASSES, exactly as it did in production — and the switch has since committed.
-  reset({ xero: false, quickbooks: true })
-  stalePooledSelection = { xero: true, quickbooks: false }
+  reset({ xero: false })
+  stalePooledSelection = { xero: true }
 
   const { queueAccountingSync } = await import('@/lib/accounting')
   const outcome = await queueAccountingSync({ ...FACADE_REQUEST, connector: 'xero' })
@@ -336,7 +344,7 @@ test('[o3d-i0o6 r8] the facade path refuses inside the queue transaction when th
 })
 
 test('[o3d-i0o6 r8] an UNPINNED facade enqueue takes no selection lock', async () => {
-  reset({ xero: true, quickbooks: false })
+  reset({ xero: true })
   const { queueAccountingSync } = await import('@/lib/accounting')
 
   const outcome = await queueAccountingSync(FACADE_REQUEST)
@@ -349,34 +357,29 @@ test('[o3d-i0o6 r8] an UNPINNED facade enqueue takes no selection lock', async (
 
 test('[o3d-i0o6 r8] a pin naming another ledger cannot get a row out of this queue', async () => {
   // Unreachable through the facade, which routes by the pin. Asserted because the queues are the
-  // things that WRITE, and a queue that ignored a pin it cannot satisfy would write a Xero row for a
-  // QuickBooks proof — the original defect, one layer down.
-  reset({ xero: true, quickbooks: false })
+  // things that WRITE, and a queue that ignored a pin it cannot satisfy would write a Xero row for
+  // another ledger's proof — the original defect, one layer down.
+  //
+  // o3d-remove-parked-connectors: the pin used to name 'quickbooks', the other REGISTERED connector.
+  // It now names an id the union does not contain, which is also the shape a stored row can still
+  // have in a development database. Same property, weaker subject.
+  reset({ xero: true })
   const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
 
-  const outcome = await queueXeroSync({ ...FACADE_REQUEST, pinnedLedger: 'quickbooks' })
+  const outcome = await queueXeroSync({ ...FACADE_REQUEST, pinnedLedger: OTHER_LEDGER })
 
   assert.equal(outcome.queued, false)
   assert.equal(outcome.reason, 'refused')
-  assert.deepEqual(created, [], 'no xero row for a quickbooks pin')
+  assert.deepEqual(created, [], 'no xero row for another ledger\'s pin')
 })
 
-test('[o3d-i0o6 r8] the QuickBooks queue is fenced too', async () => {
-  // Cross-ported rather than left as "Xero is the one that matters today": the defect is about ANY
-  // two connectors, and a fence on one of them is not a fence.
-  reset({ xero: true, quickbooks: false })
-  stalePooledSelection = { xero: false, quickbooks: true }
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): '[o3d-i0o6 r8] the QuickBooks queue is
+// fenced too'. It drove `queueQuickBooksSync`, archived with the connector, and it carried BOTH
+// directions — the refusal AND the control that showed the refusal was a narrowing rather than a
+// blanket ("and the control, so the refusal above is a narrowing"). Its own comment said why it
+// existed: "the defect is about ANY two connectors, and a fence on one of them is not a fence."
+//
+// With one registered connector, no test in this file exercises the ALLOWED direction for a pin on a
+// non-Xero ledger, because there is no such ledger to allow. That is the sharpest single loss in this
+// removal and it is recorded in docs/archive/quickbooks-connector-removal.md.
 
-  const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-  const outcome = await queueQuickBooksSync({ ...FACADE_REQUEST, pinnedLedger: 'quickbooks' })
-
-  assert.deepEqual(created, [],
-    'the locked read says xero is active (xero-first over the table), so a quickbooks pin refuses')
-  assert.equal(outcome.reason, 'refused')
-
-  // And the control, so the refusal above is a narrowing rather than a blanket.
-  reset({ xero: false, quickbooks: true })
-  const allowed = await queueQuickBooksSync({ ...FACADE_REQUEST, pinnedLedger: 'quickbooks' })
-  assert.equal(allowed.queued, true)
-  assert.deepEqual(created, [{ connector: 'quickbooks', type: 'UNEARNED_REV_REVERSAL' }])
-})
