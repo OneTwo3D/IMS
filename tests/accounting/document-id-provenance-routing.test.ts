@@ -454,10 +454,19 @@ for (const [label, documentConnector] of [
   ['UNDECLARED (a site that never thought about provenance)', undefined],
   ['NULL (the link predates the column that records it — fail closed)', null],
   // o3d-j625 r12: the OTHER connector was 'xero' here because the chart was the second one. With the chart
-  // now the registered connector, the other side has to be the ARCHIVED id — which is the realistic form of
-  // this row after o3d-remove-parked-connectors and the reason `documentConnector` is typed as the STORED
-  // form rather than a registered id.
-  ['the OTHER connector (the id survived the switch)', 'quickbooks'],
+  // now the registered connector, the other side has to be an id the registry does NOT hold — which is the
+  // realistic form of this row after o3d-remove-parked-connectors and the reason `documentConnector` is
+  // typed as the STORED form rather than a registered id.
+  //
+  // AND THAT IS NOT A WEAKENING, WHICH THE THIRD ROW EXISTS TO PROVE. The guard is
+  // `params.documentConnector !== params.chartConnector` on the values the CALLER declared — no registry
+  // lookup, no database read (lib/accounting.ts, `connectorNativePayloadIdKeys` branch). So a document id
+  // attributed to a connector this build never had is refused for exactly the same reason as one attributed
+  // to a connector it used to have: the claim disagrees with the chart. If provenance were judged by what is
+  // REGISTERED, the archiving would have turned this refusal into a write — which is this branch's original
+  // money defect — and the third row would fail.
+  ['the ARCHIVED connector (the id survived the removal)', 'quickbooks'],
+  ['a connector this build NEVER had (provenance is judged by the claim, not by the registry)', 'a-ledger-ims-never-shipped'],
 ] as const) {
   test(`[o3d-j625 r3] facade: a payload carrying a document id attributed to ${label} is REFUSED, and says so`, async () => {
     reset(['xero'])

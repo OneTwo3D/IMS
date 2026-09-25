@@ -20,14 +20,28 @@ import { refreshShipmentCogsForCostLayerChange } from '@/lib/cost-layers'
 
 function transaction() {
   const subledger: unknown[] = []
+  let aborted = false
   const tx = {
-    // o3d-j625 r12 (merging o3d-c08y): the context probe. c08y refuses to run at all on a client where a
-    // journaled-shipment refusal could not abort the enclosing transaction, so the double answers the
-    // probe the way a real transaction client does rather than the subject being asked to assume it. The
-    // shipment here is positive on both sides, so that refusal never fires; what is under test is the
-    // subledger movement and the claimed delta.
-    $executeRaw: async () => 0,
+    // o3d-j625 r12 (merging o3d-c08y) — THE DOUBLE ANSWERS THE CONTEXT PROBE *AND* ABORTS FOR REAL.
+    //
+    // c08y refuses to run at all on a client where a below-zero refusal could not abort the enclosing
+    // transaction, and its abort is `$executeRaw` on a statement that is MEANT to fail
+    // (`SELECT CAST('<sentinel>' AS int)`); if that statement succeeds, c08y refuses rather than
+    // continuing. So a double whose `$executeRaw` quietly returns 0 would not let a test route around the
+    // guard — but it would also not EXERCISE it. This one behaves like the real client: the abort statement
+    // THROWS, and every delegate afterwards throws 25P02, so a case that reached a refusal could not carry
+    // on reading or writing. The shipments in this file are positive on both sides, so the refusal never
+    // fires; if a future edit makes one negative, the test will fail loudly rather than silently pass.
+    $executeRaw: async (strings: TemplateStringsArray | string, ...values: unknown[]) => {
+      const sql = Array.isArray(strings) ? (strings as TemplateStringsArray).join('?') : String(strings)
+      if (/CAST\(/i.test(sql)) {
+        aborted = true
+        throw Object.assign(new Error(`invalid input syntax for type integer: "${String(values[0] ?? '')}"`), { code: '22P02' })
+      }
+      return 0
+    },
     $executeRawUnsafe: async (sql: string) => {
+      if (aborted) throw Object.assign(new Error('current transaction is aborted, commands ignored until end of transaction block'), { code: '25P02' })
       if (!/^\s*(SAVEPOINT|RELEASE SAVEPOINT)\s/i.test(sql)) {
         throw new Error(`cost-layer-revaluation-declined-enqueue double: unexpected raw statement ${JSON.stringify(sql)}`)
       }
