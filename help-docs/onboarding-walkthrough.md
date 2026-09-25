@@ -13,7 +13,7 @@ You can revisit the wizard at any time before it's completed. Once all required 
 |---|---|---|
 | Company | Organisation name, address, base currency, public app URL, SMTP, branding | Some details can be edited later in **Settings > Company**; base currency is one-time only |
 | Currency | Default tax rate, additional currencies, financial year start | Yes — fully editable in **Settings > Accounting** |
-| Integrations | WooCommerce, Shopify, Xero, QuickBooks, Mintsoft connection credentials | Yes — fully editable in **Settings > Integrations** |
+| Integrations | WooCommerce, Xero, Mintsoft connection credentials | Yes — fully editable in **Settings > Integrations** |
 | Products | CSV import of your product catalogue | Yes — products can be added one-at-a-time or imported in bulk at any time |
 
 The wizard does **not** cover:
@@ -89,7 +89,7 @@ If you use Xero for accounting:
 5. Map IMS account types to Xero accounts (Sales Revenue, COGS, Inventory Asset, Allocated Inventory, etc.). See `xero-sync.md` for the full mapping table.
 6. **Connection test gate:** like WooCommerce, sync remains disabled until you successfully test from **Sync → Xero**.
 
-### Shopify, QuickBooks, Mintsoft
+### Mintsoft
 
 Each follows a similar pattern — paste credentials, the system tests them, then sync becomes available. Mintsoft is unusual in that the save step also runs a live API test, so the gate is satisfied immediately.
 
@@ -122,7 +122,7 @@ Click **New Product** to add one at a time. The form has more options than the C
 
 ### Shopping-connector import (optional)
 
-If you've connected WooCommerce or Shopify, the products step lets you import the catalogue directly from the storefront. Products are created with `lifecycleStatus = ACTIVE` and matched to existing IMS products by SKU.
+If you've connected WooCommerce, the products step lets you import the catalogue directly from the storefront. Products are created with `lifecycleStatus = ACTIVE` and matched to existing IMS products by SKU.
 
 
 ## After the wizard — recommended next steps

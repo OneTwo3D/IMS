@@ -1007,7 +1007,7 @@ Create `/var/lib/one-two-inventory/invoice-pdfs` during deployment with the same
 owner as the IMS application process and restrictive permissions, for example
 `chown app:app /var/lib/one-two-inventory/invoice-pdfs` and
 `chmod 750 /var/lib/one-two-inventory/invoice-pdfs`. Connector PDFs are usually
-re-fetchable from Xero or QuickBooks, so they do not need the same backup policy
+re-fetchable from the accounting connector, so they do not need the same backup policy
 as the database, but include the directory in operational snapshots if customer
 invoice links must remain available during connector outages. Plan disk capacity
 for roughly 50-500 KB per invoice PDF; 100,000 invoices can consume about
@@ -1260,7 +1260,7 @@ Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the reques
 
 ### Integrations
 
-For each connected integration (WooCommerce, Xero, Shopify, QuickBooks, Mintsoft):
+For each connected integration (WooCommerce, Xero, Mintsoft):
 
 - [ ] Credentials configured.
 - [ ] **Connection test passes** — the connection test gate blocks sync until you click "Test Connection" successfully. Verify by visiting Sync > {Integration} and looking for the green "Connected" badge.
@@ -4079,22 +4079,105 @@ written to a `.part` file and renamed on completion; if it fails, the partial fi
 the failure banner says there is no restore point for this run rather than naming a truncated
 file as one.
 
-**`IMS_BACKUP_DIR` is not validated, and three rounds of trying to make that harmless were
-withdrawn rather than shipped** (o3d-ov60, o3d-noka). The dump, the rename that publishes it and
-the `rm --` that prunes beside it are all done **by root, through the pathname this variable
-names**. Under the shipped default that is unreachable — `/var/backups` has a root-owned parent, so
-nothing but root can plant or rename anything on the way to it. Point `IMS_BACKUP_DIR` underneath a
-directory the **service account** owns and it becomes reachable: `mkdir -p` accepts a
-symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
-predictable name that account may plant a named pipe at, which makes root's `gzip >` block
-indefinitely with the service stopped, cron stopped and the database connections already fenced.
+<a id="where-the-pre-update-dump-may-go"></a>
+### Where the pre-update dump may go
 
-**Until `o3d-noka` lands, treat this as an operator constraint rather than a defended path: point
-`IMS_BACKUP_DIR` only at a directory whose whole ancestry is root-owned and writable by nobody
-else, and bind-mount a backup volume under such a path rather than symlinking one.** Note that
-`APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
+**`IMS_BACKUP_DIR` is validated, and a path that fails the rule is a refusal rather than a dump**
+(o3d-noka, closing o3d-ov60 site 5). The dump, the rename that publishes it and the `rm --` that
+prunes beside it are all done **by root**, so `scripts/update.sh` now walks the path this variable
+names from `/` downwards and requires **every component, the backup directory included**, to be:
+
+* a **real directory** — never a symbolic link, and never anything else;
+* owned by **root** (or by the account the run executes as, which on a host is root);
+* **writable by nobody else** — `mode & 0022 == 0`. For a directory that **already exists** this
+  really does bound any POSIX ACL as well, because when an ACL carries a mask entry the group bits
+  reported for the inode *are* that mask, and every named-user, named-group and group entry is
+  effective only through it. It does **not** bound what a **default** ACL does to a file or directory
+  **created inside** — see *The dump's own permissions* below, which is where that is handled.
+
+The sticky bit is credited for a component **above** the backup directory's parent and for no other:
+a sticky directory can have an existing entry renamed or removed only by that entry's owner, which
+settles the question for an ancestor that already exists, and settles nothing for a directory in
+which anybody may still **create** a name. `/var/backups/<app>` passes. `/tmp/backups` does not.
+
+The walk is a `chdir` per component with each landing checked against the inode its directory entry
+named, so an ancestor is never re-resolved by name, and the directory it ends on is handed to the
+dump as an **open descriptor**: the redirection, the publishing rename and the prune are all
+`openat`/`renameat`/`unlinkat` against that descriptor, not three fresh resolutions of a pathname.
+A component that cannot be stat'ed, or cannot be entered, is a **refusal** — not an absence of
+evidence. The refusal **names the component that failed** and says what to do about it.
+
+<a id="the-dumps-own-permissions"></a>
+#### The dump's own permissions, and why a POSIX default ACL does not decide them
+
+**The dump file is created at mode `0600`, with the mode given as an argument, and the mode it
+actually got is read back before a single byte is written.** A directory this run creates is set to
+`0700` and its achieved mode is read back too. Neither rests on the process umask, and that is a
+correction rather than a flourish: the first version of this check wrote the dump under `umask 077`
+and said that was enough.
+
+**It was not, if the backup directory (or any directory above one this run creates) carries a POSIX
+*default* ACL.** A default ACL is invisible in the permission bits, is inherited by everything
+created inside the directory, and its inheritance **ignores the umask completely** — the new file's
+bits are the mode the creating call *asked for* intersected with the inherited entries, and a shell
+redirection asks for `0666`. Measured on a root-owned `0755` directory carrying
+`default:user:imsapp:r-x`, which passes every question the ancestry rule asks: the dump came out
+`0644` and the service account read it. With the default ACL one level up instead, the two
+directories the walk itself created came out `0755`, not the `0700` that was claimed.
+
+**A default ACL on the backup directory is therefore tolerated rather than refused.** Reading ACLs
+in the walk would have meant requiring `getfacl` (the `acl` package) at the migration step, with the
+service already stopped, and refusing an operator's legitimate arrangement — a default ACL is how you
+give an off-host backup agent access to the directory — for a risk the explicit creation mode already
+removes. What is *not* tolerated is a destination this run cannot verify private: if the mode it
+reads back off the write descriptor has any group or other bit, the run **refuses**, names the mode
+it saw, names the default ACL as the mechanism, deletes the partial it had created and migrates
+nothing. Take the default ACL off with `setfacl -k <dir>` if you see that refusal.
+
+**What this does not buy.** A pre-existing root-owned `0755` backup directory is still listable and
+readable by every account, so the **names and timestamps** of the dumps in it are visible; their
+**contents** are not. A backup directory an *earlier* release already created `0755` is **accepted as
+it stands and not corrected** — its mode satisfies the rule — so tighten it by hand if you want even
+the listing private. A directory *this* run creates is `0700`, so on the default path there is
+nothing to tighten. And a default ACL inherited onto a directory this run created is **left in
+place**: it can no longer affect anything this code writes, because every file it creates is given an
+explicit mode.
+
+**What this costs, because it is an operator-visible narrowing of a documented "anywhere"
+override.** An `IMS_BACKUP_DIR` under `/var/lib/<app>`, under `/opt/<app>`, or anywhere else the
+**service account** owns is now refused. That was the point: `mkdir -p` accepts a
+symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
+predictable name in a directory that account can watch — so before this change that account could
+redirect root's dump and root's prune into a directory of its choosing (measured: a dump written and
+published inside a root-owned `0700` directory the account could not even list, and two pre-existing
+root-owned files there deleted by the prune), or plant a named pipe at the partial's name and make
+root's `gzip >` block for ever with the service stopped, cron stopped and the database connections
+already fenced. **And the dump is now created by `install -m 0600 /dev/null` rather than by the
+redirection alone**, which replaces a named pipe or a symbolic link standing at the partial's name
+with a regular file instead of blocking on it or writing through it — a second, independent reason
+that class of plant is dead. If coreutils' `install` is not on the host's `PATH`, the run **refuses**
+rather than falling back to a creation whose mode a default ACL could decide.
+
+**To keep backups on another volume, bind-mount it under a root-owned path; do not symlink one.** A
+symbolic link at any component is refused, because nothing proves the path its target resolves
+through — the same rule, and the same reason, as the state roots in *Putting a state root on another disk*, above.
+
+**The refusal happens at the migration step, with the service already stopped.** Nothing is
+migrated, the schema is untouched and the previous release is still the one on disk, so a re-run
+after fixing `IMS_BACKUP_DIR` is clean — but the site is down while you fix it. Validate the value
+before you start a cutover; moving the check into pre-flight is filed as a follow-up to `o3d-noka`.
+
+Note that `APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
 application's own upload/backup area under the state directory, it is owned by the service account
 by design, and it is **not** a valid value for `IMS_BACKUP_DIR`.
+
+**`scripts/backup.sh` is NOT covered by any of this.** It is an unwired legacy helper: its
+`APP_NAME` is `onetwoinventory` where every installed path is `one-two-inventory`, so on a real host
+it exits at its own `.env` check before it writes anything, and nothing in `install.sh` schedules
+it. It still carries the old shape — `mkdir -p "$1"`, `gzip > "$1/backup-<stamp>.sql.gz"`, an
+`ln -sf` at a predictable `latest.sql.gz`, and a `find … -delete` prune — so **do not wire it into
+cron against an app-owned directory**. Making it reachable means giving it this rule first; that is
+filed as a follow-up to `o3d-noka`, and a regression fails if its paths are repaired without it.
 
 What was tried and withdrawn, so that nobody re-attempts it: a symlink-proof walk anchored at the
 override's own parent directory (it validates only the final component, because the walk treats its
@@ -4109,8 +4192,11 @@ so they add no window the entrypoint does not already have (true only of a tree 
 which is why r5 refuses root out of any other — best-effort, and blind to a relabelled tree: see
 *[The supported bootstrap](#supported-bootstrap)*) — and pinning the helper would only move
 the boundary to a script read from the same checkout. `scripts/lib/pin-source-file.mjs` was built
-for exactly that and deleted for exactly that reason. The same late-read shape already ships twice,
-in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
+for exactly that and deleted for exactly that reason. **Constraining the override is what made all
+three rounds unnecessary**: nothing but root can now plant a symbolic link, a named pipe or a stale
+`.part` at any name involved, so a plain redirection has no TOCTOU left to lose and no helper has to
+be executed at the least recoverable moment of the cutover. The same late-read shape still ships
+twice, in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
 
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
@@ -4377,7 +4463,6 @@ Key variables in the `.env` file:
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret. Install-time seed only — the live value is the `wc_consumer_secret` setting |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
 | `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
-| `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
 | `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` | Maximum pending Mintsoft ASN booked-in webhook events processed by one sweeper run. Default `250`. |
 | `CONNECTOR_FETCH_TIMEOUT_MS` | Default whole-request timeout for validated connector HTTP requests, including redirects and composed with any caller-supplied `AbortSignal`. Invalid values fall back to `30000`. |
@@ -4473,7 +4558,7 @@ first, in any of the **four lock domains** this repository takes a session advis
 
 | Lock domain | Held by | Reached from |
 | --- | --- | --- |
-| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the Xero and QuickBooks sync processors and from operator-triggered settlement actions — and the daily Xero and QuickBooks accounting batches, which run on the same holder |
+| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the accounting sync processor and from operator-triggered settlement actions — and the daily accounting batch, which runs on the same holder |
 | Xero payment write | `lib/connectors/xero/payment-write-lock.ts` | The Xero payment poller and apply-mode payment reconciliation |
 | WMS dispatch sweep | `lib/domain/wms/dispatch-sweep-lock.ts` | The dispatch sweep, and the operator actions that mutate dispatch state under it |
 | Restore selection | `app/api/backup/restore/route.ts` | A restore |

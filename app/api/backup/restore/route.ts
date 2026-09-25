@@ -580,11 +580,16 @@ export type RestoreLockContext = {
  * name an entry point that does not, because such a route contains nothing to grep for. The
  * inventory has to start from the ROUTES and classify each one. Doing that:
  *
- *   app/api/webhooks/shopping/[connector]/[resource]  → FENCED only for `woocommerce`. The route
- *       itself never reads the flag; `handleShoppingWebhook` dispatches on the connector and only
- *       `handleWcWebhook` checks it (first thing it does, before any write). A `shopify` delivery
- *       to the same route reaches `lib/connectors/shopify` unfenced — currently a 501 stub, so it
- *       is not a live writer, but it is not fenced either and will not become fenced by itself.
+ *   app/api/webhooks/shopping/[connector]/[resource]  → FENCED only for `woocommerce`, which is
+ *       the only shopping connector this build registers. The route itself never reads the flag;
+ *       `handleShoppingWebhook` dispatches on the connector and only `handleWcWebhook` checks it
+ *       (first thing it does, before any write). So every delivery this build can accept IS fenced
+ *       — but by the handler, not by the route, and the classification stays `woocommerce-only`
+ *       rather than `yes` for exactly that reason. The second connector's delivery used to reach
+ *       `lib/connectors/shopify` unfenced; o3d-remove-parked-connectors archived that connector, so
+ *       the gap closed by REMOVAL, not by fencing. The next connector registered here is unfenced
+ *       by omission unless its own handler consults the flag — which is the fact this classification
+ *       exists to keep visible.
  * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
  *   app/api/webhooks/mintsoft/asn-booked-in            → FENCED as of o3d-hl8l. The route consults
  *       the flag as its FIRST statement, before the body is read and before the signature is
@@ -702,9 +707,10 @@ export type RestoreLockContext = {
  * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
  *   • FENCED: scheduled jobs (`app/api/cron/*`), WooCommerce webhooks, and the Mintsoft ASN
  *     booked-in webhook.
- *   • NOT FENCED: the accounting OAuth callback, a `shopify` delivery to the shopping webhook
- *     route, interactive writes from the dashboard, other API routes, and anything holding a
- *     direct database connection. The
+ *   • NOT FENCED: the accounting OAuth callback, interactive writes from the dashboard, other API
+ *     routes, and anything holding a direct database connection. (A delivery for a shopping
+ *     connector whose handler does not consult the flag also belongs here; there is no such
+ *     connector in this build — o3d-remove-parked-connectors.) The
  *     operator has to take the application out of service to stop those; the message below says so
  *     in those words rather than implying it is already down.
  *

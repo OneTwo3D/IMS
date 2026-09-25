@@ -1069,13 +1069,10 @@ export function MintsoftClient({ data, configured }: Props) {
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Order Lookup Connector</Label>
-              <Select value={orderLookupConnector} onChange={(event) => setOrderLookupConnector(event.target.value as '' | 'woocommerce' | 'shopify')}>
+              <Select value={orderLookupConnector} onChange={(event) => setOrderLookupConnector(event.target.value as '' | 'woocommerce')}>
                 <option value="">None</option>
                 {data.availableOrderLookupConnectors.includes('woocommerce') ? (
                   <option value="woocommerce">WooCommerce</option>
-                ) : null}
-                {data.availableOrderLookupConnectors.includes('shopify') ? (
-                  <option value="shopify">Shopify</option>
                 ) : null}
               </Select>
               <p className="text-xs text-muted-foreground">

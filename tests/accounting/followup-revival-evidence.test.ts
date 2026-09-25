@@ -90,7 +90,8 @@ test('a ROTATED token and a non-money type are never probed (o3d-0m56)', async (
   assert.deepEqual(xeroCalls, [], 'neither may cost an API call')
 })
 
-for (const connector of ['xero', 'quickbooks']) {
+// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+for (const connector of ['xero']) {
   test(`${connector}: the processor asks before it revives, and stops when the answer is no (o3d-0m56)`, async () => {
     // Both enqueue helpers are module-private, so this pins the WIRING: the evidence call sits
     // between the plan and the write, and a refusal returns rather than falling through.
@@ -116,7 +117,8 @@ for (const connector of ['xero', 'quickbooks']) {
   })
 }
 
-for (const connector of ['xero', 'quickbooks']) {
+// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+for (const connector of ['xero']) {
   test(`${connector}: the revival's candidate rows carry remoteAttemptedAt (o3d-0m56 r8)`, async () => {
     // The revival WRITES OVER the payload of the row it recycles, and that payload is where an
     // earlier attempt is recorded: its anchors, its amount and date, and the token whose mark the
@@ -139,7 +141,8 @@ for (const connector of ['xero', 'quickbooks']) {
   })
 }
 
-for (const connector of ['xero', 'quickbooks']) {
+// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+for (const connector of ['xero']) {
   test(`${connector}: the revival reads the CUSTODY the row carries, not a global epoch (o3d-0m56 r10)`, async () => {
     // A NULL `remoteAttemptedAt` is only proof for a row nothing but a stamping binary has handled.
     // Round 9 answered that with an epoch resolved per enqueue; round 10 reads it off the row, so

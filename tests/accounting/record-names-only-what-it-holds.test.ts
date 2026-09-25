@@ -191,7 +191,9 @@ function everyIncidentMessage(): { label: string; text: string }[] {
 async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<string>>; common: Set<string> }> {
   const sources: [string, string][] = [
     ['lib/connectors/xero/sync-processor.ts', 'unrecordedPostedDocumentRecord'],
-    ['lib/connectors/quickbooks/sync-processor.ts', 'unpersistedQboPostRecord'],
+    // o3d-remove-parked-connectors: the archived QuickBooks builder was the second source, so this
+    // rule was checked against TWO builders — which is what the finding above was about (dropping a
+    // field from ONE builder used to pass). One builder now.
   ]
   const perBuilder = new Map<string, Set<string>>()
   for (const [file, builder] of sources) {
@@ -375,14 +377,24 @@ const PLACEHOLDER = /\{([A-Za-z]+)\}/g
 test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every record builder writes', async () => {
   const { common: retained } = await retainedMetadataKeys()
 
-  // NOT VACUOUS: the comparison can fail. `rowNamesExternalId` is a real key of the Xero builder,
-  // and it is exactly the kind of field a shared wording must not lean on.
+  // NOT VACUOUS: the comparison can fail.
+  //
+  // o3d-remove-parked-connectors — HOW THAT IS ESTABLISHED NOW. It used to be established by a key
+  // one builder wrote and the other did not (`rowNamesExternalId`, Xero-only): with two builders, the
+  // INTERSECTION was demonstrably narrower than either. With one builder the intersection IS that
+  // builder's key set, so no key can be in one and not the other, and the non-vacuity has to be shown
+  // differently: a key the builder does NOT write must not be reported as retained. That still fails
+  // if `retainedMetadataKeys()` silently returned everything, which is the failure mode this guards.
   const { perBuilder } = await retainedMetadataKeys()
+  assert.equal(perBuilder.size, 1, 'one builder ships; a second must be added to retainedMetadataKeys()')
   assert.ok(
     perBuilder.get('unrecordedPostedDocumentRecord')!.has('rowNamesExternalId'),
     'the Xero builder writes rowNamesExternalId',
   )
-  assert.ok(!retained.has('rowNamesExternalId'), 'and it is NOT common to both, so a declaration of it must fail')
+  assert.ok(
+    !retained.has('aKeyNoBuilderWrites'),
+    'a key no builder writes must not be reported as retained, or the comparison below is vacuous',
+  )
 
   // ROUND 12: the replay table is in here now. Its `BILL_ATTACHMENT.MADE` entry is what declares
   // `ledgerTargetId`, so this assertion is what proves BOTH record builders retain the bill id the

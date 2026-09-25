@@ -135,7 +135,7 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
   state.result = {
     status: 'scheduler-failed',
     error: 'crontab write failed: no crontab for ims',
-    pluginState: buildIntegrationPluginState((id) => id === 'woocommerce' || id === 'quickbooks'),
+    pluginState: buildIntegrationPluginState((id) => id === 'woocommerce' || id === 'mintsoft'),
   }
   const screen = await mountSettings()
 
@@ -148,30 +148,32 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
   assert.ok(!/text-destructive/.test(html), 'and nothing is rendered as a failure')
   assert.deepEqual(
     switchStates(tree),
-    PLUGIN_ORDER.map((id) => id === 'woocommerce' || id === 'quickbooks'),
-    'the switches show the COMMITTED state read back under the lock — QuickBooks, not the Xero the '
+    PLUGIN_ORDER.map((id) => id === 'woocommerce' || id === 'mintsoft'),
+    'the switches show the COMMITTED state read back under the lock — Mintsoft, not the Xero the '
       + 'page was rendered with',
   )
 })
 
 test('a REFUSAL rolls the switches back and states the reason', async () => {
   // The one outcome that committed nothing, and therefore the only one a rollback describes.
-  state.result = { status: 'refused', error: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
+  // o3d-remove-parked-connectors: the refusal reason was the accounting pair's, whose group went with
+  // QuickBooks. The action's result is stubbed here, so this asserts the SCREEN's handling of a
+  // refusal, not which rule produced it; the reason is now the one surviving group's.
+  state.result = { status: 'refused', error: 'Enable one WMS connector at a time — order push, dispatch and every WMS sweep route to a single warehouse.' }
   const screen = await mountSettings()
-  // QuickBooks ON while Xero is already on — the illegal combination the action refuses. Moving a
-  // switch first is what makes the rollback observable: requested and previous must differ, or the
-  // assertion below passes for a screen that never rolls back at all.
-  toggle(screen.render().tree, indexOfPlugin('quickbooks'), true)
+  // A switch moved before Save — what makes the rollback observable: requested and previous must
+  // differ, or the assertion below passes for a screen that never rolls back at all.
+  toggle(screen.render().tree, indexOfPlugin('mintsoft'), true)
   assert.deepEqual(
     switchStates(screen.render().tree),
-    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'quickbooks'),
+    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'mintsoft'),
     'the operator moved it',
   )
 
   await screen.click(screen.render().controls.find((c) => c.label.includes('Save')))
 
   const { html, tree } = screen.render()
-  assert.match(html, /Enable either Xero or QuickBooks/)
+  assert.match(html, /Enable one WMS connector at a time/)
   assert.ok(!/>Saved</.test(html), 'nothing was saved, so nothing says it was')
   assert.ok(!/was SAVED, but the scheduler/.test(html))
   assert.deepEqual(
@@ -187,14 +189,14 @@ test('a REJECTION does not roll back, and reports the outcome as unknown', async
   // the first two; this screen cannot tell them apart, so it asserts neither.
   state.rejectWith = new Error('Failed to fetch')
   const screen = await mountSettings()
-  toggle(screen.render().tree, indexOfPlugin('quickbooks'), true)
+  toggle(screen.render().tree, indexOfPlugin('mintsoft'), true)
 
   await screen.click(screen.render().controls.find((c) => c.label.includes('Save')))
 
   const { html, tree } = screen.render()
   assert.deepEqual(
     switchStates(tree),
-    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'quickbooks'),
+    PLUGIN_ORDER.map((id) => ENABLED_BY_DEFAULT.has(id) || id === 'mintsoft'),
     'the switches are NOT rolled back over an outcome nobody knows',
   )
   assert.match(html, /NOT known whether this selection was stored/)

@@ -40,6 +40,10 @@ function makeTx(order: { id: string; accountingInvoiceId: string | null } | null
   const queued: Array<Record<string, unknown>> = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       findUnique: async ({ select }: { select: Record<string, unknown> }) => (
         // Select-aware: the COGS read and the delete-protection read ask for different columns, and
@@ -113,11 +117,36 @@ test('o3d-zpa7: a shipment that has vanished is refused rather than enqueued bli
   assert.equal(result.cogsRevaluationDelta.toString(), '0')
 })
 
-test('o3d-zpa7: the chain that makes the race unreachable is pinned in both connectors', () => {
+test('o3d-zpa7: the chain that makes the race unreachable is pinned in every registered connector', async () => {
   // These two where-clauses are the middle links. If either loses its condition, an order with no
   // accountingInvoiceId can reach a journaled shipment, the enqueue starts refusing work it used to
   // do, and THIS test says which link moved — instead of the change looking harmless.
-  for (const connector of ['xero', 'quickbooks']) {
+  //
+  // o3d-c08y r2 moved Group B's selection into ONE shared constant (the batch must probe, lock and
+  // then re-read through the same clause), so that link is pinned where it now lives — and the
+  // connector is pinned to USE it, and pinned NOT to carry its own inlined copy. The last check is an
+  // absence check, so unlike the `includes` above it cannot be satisfied by a second, weaker clause
+  // sitting beside the right one.
+  const shared = readFileSync(join(process.cwd(), 'lib/domain/accounting/daily-batch-group-b-lock.ts'), 'utf8')
+    .replace(/\s+/g, ' ')
+  assert.ok(
+    shared.includes("status: 'SHIPPED', shipmentJournalDate: null, order: { refundStatus: { not: 'FULL' }, revenueDeferredDate: { not: null },"),
+    'DAILY_BATCH_GROUP_B_SHIPMENT_WHERE must still require revenueDeferredDate — it is what ties a journaled '
+    + 'shipment to Group A1 (o3d-zpa7)',
+  )
+
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was
+  // checked against TWO independently-written implementations. It is now checked against one — and the
+  // shared-clause assertion above is what the second implementation used to corroborate.
+  //
+  // The roster is DERIVED from the accounting registry, not typed: a connector registered without a
+  // `lib/connectors/<id>/daily-sync.ts` carrying these clauses fails here, and an empty registry fails
+  // the floor below rather than silently turning this test into a no-op.
+  const { ACCOUNTING_CONNECTORS } = await import('@/lib/connectors/accounting-registry')
+  const connectors = ACCOUNTING_CONNECTORS.map((entry) => entry.id)
+  assert.ok(connectors.length > 0, 'PRECONDITION: the registry lists at least one accounting connector')
+  let checked = 0
+  for (const connector of connectors) {
     const src = readFileSync(join(process.cwd(), `lib/connectors/${connector}/daily-sync.ts`), 'utf8')
       .replace(/\s+/g, ' ')
 
@@ -126,10 +155,17 @@ test('o3d-zpa7: the chain that makes the race unreachable is pinned in both conn
       `${connector} Group A1 must still require accountingInvoiceId — it is what makes the order undeletable (o3d-zpa7)`,
     )
     assert.ok(
-      src.includes("status: 'SHIPPED', shipmentJournalDate: null, order: { refundStatus: { not: 'FULL' }, revenueDeferredDate: { not: null },"),
-      `${connector} Group B must still require revenueDeferredDate — it is what ties a journaled shipment to A1 (o3d-zpa7)`,
+      src.includes('where: DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,'),
+      `${connector} Group B must still select through the shared clause (o3d-zpa7 / o3d-c08y)`,
     )
+    assert.ok(
+      !src.includes("shipmentJournalDate: null, order: {"),
+      `${connector} Group B must not carry its own inlined selection clause — one clause, one place, or the `
+      + 'batches can drift apart again (o3d-c08y)',
+    )
+    checked += 1
   }
+  assert.equal(checked, connectors.length, `every registered connector was checked: ${JSON.stringify(connectors)}`)
 })
 
 test('o3d-zpa7: only Group B writes shipmentJournalDate, so the chain has no side entrance', () => {
@@ -164,7 +200,8 @@ test('o3d-zpa7: only Group B writes shipmentJournalDate, so the chain has no sid
 
   assert.deepEqual(
     [...writers].sort(),
-    ['lib/connectors/quickbooks/daily-sync.ts', 'lib/connectors/xero/daily-sync.ts'],
+    // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+    ['lib/connectors/xero/daily-sync.ts'],
     'a writer of shipmentJournalDate outside daily-batch Group B would bypass Group A1 and break the '
     + 'o3d-zpa7 unreachability argument — the landed-cost enqueue would then be racing a real hard delete',
   )

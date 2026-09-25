@@ -9,6 +9,21 @@ import {
   RefundAccountingObligationsUnmet,
   type RefundAccountingObligation,
 } from '@/lib/domain/sales/refund-accounting-obligations'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+/**
+ * A LEDGER THIS BUILD NO LONGER SERVICES (o3d-remove-parked-connectors).
+ *
+ * Three cases below are about a refund raised while the books are on one ledger against a debit that
+ * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. They
+ * named 'quickbooks', the second REGISTERED connector; it is archived, so the id is no longer in the
+ * union. They are kept rather than deleted, driving the retired id, because that is not a hypothetical
+ * state: `AccountingSyncLog.connector` is a plain String column and development databases hold
+ * `quickbooks` rows right now, so "a debit standing in a ledger this build cannot post to" is exactly
+ * what an operator will meet. Weaker subject than two live ledgers, and recorded as such in
+ * docs/archive/quickbooks-connector-removal.md.
+ */
+const OTHER_LEDGER = 'quickbooks' as unknown as AccountingConnectorId
+
 
 /**
  * o3d-2sm1 ROUND 7 (Codex HIGH) — A NON-THROWING QUEUE NO-OP MUST NOT CLEAR THE RECOVERY FLAG.
@@ -119,7 +134,7 @@ test('o3d-2sm1 r7: the connector is PINNED for the whole hand-off — a flip is 
   // coming down over the mixture.
   const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, COGS_REVERSAL], postingEnabled())
   ledger.account(CREDIT_NOTE, { queued: true, connector: 'xero' })
-  ledger.account(COGS_REVERSAL, { queued: true, connector: 'quickbooks' })
+  ledger.account(COGS_REVERSAL, { queued: true, connector: OTHER_LEDGER })
 
   assert.throws(
     () => ledger.settle(),
@@ -171,7 +186,7 @@ test('o3d-2sm1 r8: a connector flip between the pin and the IN-TRANSACTION enque
   // was recorded beside it — but it was written for QuickBooks, and the credit note that preceded it
   // went to Xero. Under r7 this bare `true` settled the obligation and the recovery flag came down
   // over a refund whose postings are split across two ledgers.
-  ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'quickbooks' })
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: OTHER_LEDGER })
 
   assert.throws(
     () => ledger.settle(),
@@ -298,11 +313,7 @@ test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
       'export async function queueXeroSync(',
       /notConfiguredUnderPinnedLedgerFence\(params\.pinnedLedger\)/,
     ],
-    [
-      'lib/connectors/quickbooks/queue.ts',
-      'export async function queueQuickBooksSync(',
-      /notConfiguredUnderPinnedLedgerFence\(params\.pinnedLedger\)/,
-    ],
+    // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
     [
       'lib/accounting.ts',
       'export async function queueAccountingSync(',

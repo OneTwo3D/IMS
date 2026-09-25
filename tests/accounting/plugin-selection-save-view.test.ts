@@ -31,19 +31,22 @@ import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outco
 // switches they apply the answer to.
 // ---------------------------------------------------------------------------
 
+// o3d-remove-parked-connectors: `quickbooks` was a member here and was the plugin the fixtures
+// switched ON to make `requested` differ from `previous`. It is archived, so the second plugin is now
+// `mintsoft` — a registered plugin that is off by default. What this file tests is the RESOLVER
+// (which of requested / committed / previous a given outcome should render), and that is indifferent
+// to which plugin moved, as long as two distinguishable states exist.
 function pluginState(over: Partial<IntegrationPluginState> = {}): IntegrationPluginState {
   return {
     woocommerce: false,
-    shopify: false,
     xero: false,
-    quickbooks: false,
     mintsoft: false,
     ...over,
   } as IntegrationPluginState
 }
 
 const previous = pluginState({ woocommerce: true, xero: true })
-const requested = pluginState({ woocommerce: true, quickbooks: true })
+const requested = pluginState({ woocommerce: true, mintsoft: true })
 
 test('a REFUSAL restores the previous selection — the one outcome that committed nothing', () => {
   const view = resolvePluginSelectionSaveView({
@@ -60,8 +63,8 @@ test('a REFUSAL restores the previous selection — the one outcome that committ
 
 test('a SCHEDULER FAILURE keeps the committed selection and warns about the scheduler only', () => {
   // THE FIX. Previously this returned `{ success: false }` and the caller restored `previous`, so
-  // the wizard showed Xero while QuickBooks was what dispatched.
-  const committed = pluginState({ woocommerce: true, quickbooks: true })
+  // the wizard showed one selection while a different one was what dispatched.
+  const committed = pluginState({ woocommerce: true, mintsoft: true })
   const view = resolvePluginSelectionSaveView({
     attempt: {
       kind: 'result',
@@ -85,14 +88,14 @@ test('the committed state wins over the requested one when they differ', () => {
   // The server reads its answer back under the selection lock, so it can legitimately differ from
   // the payload (a key this step does not offer, a concurrent partial write that landed first).
   // Showing the request instead would reintroduce a UI that disagrees with the database.
-  const committed = pluginState({ woocommerce: true, quickbooks: true, mintsoft: true })
+  const committed = pluginState({ woocommerce: true, xero: true, mintsoft: true })
   const view = resolvePluginSelectionSaveView({
     attempt: { kind: 'result', result: { status: 'scheduler-failed', error: 'nope', pluginState: committed } },
     requested,
     previous,
   })
 
-  assert.equal(view.plugins.mintsoft, true, 'the database\'s answer, not the request')
+  assert.equal(view.plugins.xero, true, 'the database\'s answer, not the request')
 })
 
 test('a plain SAVE shows the requested selection with no warning at all', () => {
@@ -148,7 +151,7 @@ test('a non-Error rejection still produces the unknown-outcome message', () => {
 // guard, so the two shapes cannot be treated differently again.
 // ---------------------------------------------------------------------------
 
-const committedState = pluginState({ woocommerce: true, quickbooks: true })
+const committedState = pluginState({ woocommerce: true, mintsoft: true })
 
 test('a post-commit step that RETURNS a failure is scheduler-failed, carrying the committed state', async () => {
   const result = await completePluginSelectionSave({

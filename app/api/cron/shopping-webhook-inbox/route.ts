@@ -3,9 +3,7 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { CRON_RATE_LIMIT_FIVE_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
-import { getShopifySettings } from '@/lib/connectors/shopify/settings'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { processPendingShopifyWebhookEvents } from '@/lib/jobs/shopify/process-shopping-webhook-events'
 import { processPendingWcWebhookEvents } from '@/lib/jobs/woocommerce/process-shopping-webhook-events'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
@@ -17,7 +15,7 @@ function normalizeCronError(error: unknown): string {
 }
 
 async function runConnectorTick(input: {
-  connector: 'woocommerce' | 'shopify'
+  connector: 'woocommerce'
   pluginDisabledReason: string
   syncDisabledReason: string
   getSyncEnabled: () => Promise<boolean>
@@ -62,11 +60,6 @@ async function getWcSyncEnabled(): Promise<boolean> {
   return enabled?.value === 'true'
 }
 
-async function getShopifySyncEnabled(): Promise<boolean> {
-  const settings = await getShopifySettings()
-  return settings.shopify_sync_enabled === 'true'
-}
-
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
@@ -79,7 +72,11 @@ export async function GET(request: Request) {
   const { runId, result } = await runCronWithLogging({
     jobName: 'shopping-webhook-inbox',
     run: async () => {
-      const [woocommerce, shopify] = await Promise.all([
+      // ONE CONNECTOR TICK TODAY (o3d-remove-parked-connectors). Shopify was the second element of
+      // this Promise.all and is archived. The per-connector tick helper, its two gate reasons and the
+      // `connectors` envelope are deliberately kept: they are what a second storefront adds an
+      // element to, and the response shape operators and the cron log already read stays stable.
+      const [woocommerce] = await Promise.all([
         runConnectorTick({
           connector: 'woocommerce',
           pluginDisabledReason: 'woocommerce_plugin_disabled',
@@ -87,16 +84,9 @@ export async function GET(request: Request) {
           getSyncEnabled: getWcSyncEnabled,
           processPendingEvents: processPendingWcWebhookEvents,
         }),
-        runConnectorTick({
-          connector: 'shopify',
-          pluginDisabledReason: 'shopify_plugin_disabled',
-          syncDisabledReason: 'shopify_sync_disabled',
-          getSyncEnabled: getShopifySyncEnabled,
-          processPendingEvents: processPendingShopifyWebhookEvents,
-        }),
       ])
 
-      return { connectors: { woocommerce, shopify } } as Record<string, unknown>
+      return { connectors: { woocommerce } } as Record<string, unknown>
     },
   })
 

@@ -1,3 +1,4 @@
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
@@ -19,7 +20,9 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
  * a rule about scheduling written by something that does no scheduling, and the day the route
  * changed, the sweeps would go on reporting (or silencing) against the old one.
  */
-export type DailyBatchSweepConnector = 'xero' | 'quickbooks'
+// o3d-remove-parked-connectors: another copy of the accounting id union. Aliased to the registry's
+// one so a registered connector widens it, and so an id here is necessarily a plugin id.
+export type DailyBatchSweepConnector = AccountingConnectorId
 
 export type DailyBatchSweepSchedule =
   /** This connector's sweep is the one the cron runs. */
@@ -39,7 +42,6 @@ const DAILY_BATCH_SWEEPS: ReadonlyArray<{
   syncEnabledKey: string
 }> = [
   { connector: 'xero', label: 'Xero', batchEnabledKey: 'xero_daily_batch_enabled', syncEnabledKey: 'xero_sync_enabled' },
-  { connector: 'quickbooks', label: 'QuickBooks', batchEnabledKey: 'quickbooks_daily_batch_enabled', syncEnabledKey: 'quickbooks_sync_enabled' },
 ]
 
 export async function resolveScheduledDailyBatchSweep(): Promise<DailyBatchSweepSchedule> {

@@ -284,43 +284,17 @@ test('ROUND 10: the recorded posting mode is the same predicate the request stat
     'the record would otherwise call a draft live, or a live posting a draft')
 })
 
-// MUTATION THAT KILLS THIS (run): add a `payload._postingMode` read anywhere under
-// lib/connectors/quickbooks — the scan finds it and fails, which is the point: the day this
-// connector honours a draft mode, resolving LIVE unconditionally becomes the same falsehood the
-// Xero side was corrected for.
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): 'ROUND 10: QuickBooks records LIVE because
+// it has no draft form, and the day it gets one this fails'. It scanned every file under
+// `lib/connectors/quickbooks` for a `_postingMode` READ (writing the key into an outgoing payload is
+// the queue recording an operator setting; reading it back would mean the connector acts on it), and
+// pinned that the escalation therefore records `postingMode: 'LIVE'` unconditionally. The directory
+// does not exist, so the scan cannot run — and the claim it guarded is moot: there is no connector to
+// gain a draft form.
 //
-// ROUTE: every QuickBooks connector source is read from disk; the escalation's own literal is read
-// out of the shipped processor.
-test('ROUND 10: QuickBooks records LIVE because it has no draft form, and the day it gets one this fails', async () => {
-  const { readdir } = await import('node:fs/promises')
-  const dir = path.join(process.cwd(), 'lib/connectors/quickbooks')
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.ts'))
-  assert.ok(files.length > 10, `sanity: ${files.length} QuickBooks connector files`)
-  let sawWrite = false
-  for (const file of files) {
-    const raw = await readFile(path.join(dir, file), 'utf8')
-    // COMMENTS ARE NOT CODE. A prose note about the key (there is one in the processor, explaining
-    // why the record resolves LIVE) must not read as this connector acting on it.
-    const source = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '')
-    for (const [whole] of source.matchAll(/[.\w]*_postingMode\s*[:.]?/g)) {
-      // Writing the key into an outgoing payload is fine — that is the queue recording the operator
-      // setting. READING it back would mean this connector acts on it.
-      if (/^_postingMode\s*:/.test(whole)) { sawWrite = true; continue }
-      assert.fail(`${file} reads _postingMode ("${whole}") — QuickBooks now has a posting mode, so the `
-        + 'unrecorded-post record must stop resolving LIVE unconditionally')
-    }
-  }
-  assert.ok(sawWrite, 'the scan must have seen the key at all, or it proves nothing')
-
-  const processor = await readFile(path.join(dir, 'sync-processor.ts'), 'utf8')
-  assert.match(processor, /postingMode: 'LIVE'/, 'and that is what the escalation records')
-
-  // So no QuickBooks message can ever take a draft branch.
-  for (const type of ['SALES_INVOICE', 'COGS_JOURNAL'] as AccountingSyncType[]) {
-    const message = qbo(type, { outcome: { postingMode: 'LIVE' } })
-    assert.doesNotMatch(message, /DRAFT/, type)
-  }
-})
+// THE SHAPE IS WORTH COPYING for the next connector that records LIVE unconditionally: scan its whole
+// directory for a READ of the key, tell a write apart from a read, and assert the scan saw the key at
+// all so it cannot pass over an empty directory.
 
 // MUTATION THAT KILLS THIS (run): delete `externalEffect: 'NONE'` from either connector's disabled
 // branch (or `'MADE'` from either upload branch) — the block scan finds a success return that says
@@ -328,8 +302,10 @@ test('ROUND 10: QuickBooks records LIVE because it has no draft form, and the da
 //
 // ROUTE: the BILL_ATTACHMENT case block is extracted from each shipped processor and every
 // success-return inside it is inspected.
-test('ROUND 10: both BILL_ATTACHMENT handlers record which of the two things they did', async () => {
-  for (const file of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+test('ROUND 10: the BILL_ATTACHMENT handler records which of the two things it did', async () => {
+  // o3d-remove-parked-connectors: the archived QuickBooks processor was the second file, so "BOTH
+  // handlers" was a real cross-port claim. One handler now.
+  for (const file of ['lib/connectors/xero/sync-processor.ts']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     const at = source.indexOf("case 'BILL_ATTACHMENT': {")
     assert.ok(at > 0, `${file} must still have a BILL_ATTACHMENT branch`)

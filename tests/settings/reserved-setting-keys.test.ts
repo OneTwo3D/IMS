@@ -58,7 +58,11 @@ test('every family named in the module maps to a refusal message', async () => {
   // The families' own constants supply the keys, so a key added to a family is covered here without
   // this file changing — but only if the walk actually reached them.
   assert.equal(checked, RESERVED_SETTING_KEYS.length, 'every reserved key belongs to a named family')
-  assert.ok(checked >= 12, `the walk reached ${checked} keys`)
+  // o3d-remove-parked-connectors: the floor was 12 while `plugin_shopify_enabled` and
+  // `plugin_quickbooks_enabled` were plugin keys. It is lowered to the number the tree now holds.
+  // This is a VACUITY guard — the `checked === RESERVED_SETTING_KEYS.length` assertion above is the
+  // rule, and it is what actually ties the walk to the list.
+  assert.ok(checked >= 10, `the walk reached ${checked} keys`)
 })
 
 test('the run-time-built families are prefixes something actually builds', () => {

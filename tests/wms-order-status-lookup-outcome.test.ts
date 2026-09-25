@@ -29,7 +29,7 @@ mock.module('@/lib/connectors/wms/types', {
 })
 
 mock.module('@/lib/connectors/wms/order-lookup', {
-  namedExports: { resolveWmsOrderLookupConnector: async () => 'woocommerce' },
+  namedExports: { resolveWmsOrderLookupConnector: async () => ({ kind: 'one', connector: 'woocommerce' }) },
 })
 
 mock.module('@/lib/connectors/wms/registry', {

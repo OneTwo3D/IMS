@@ -801,9 +801,7 @@ test('every read is made with the arguments it claims, and every result reaches 
     shoppingStatusMappings: [{ sentinel: 'shoppingStatusMappings' }],
     shoppingLogs: [{ sentinel: 'shoppingLogs' }],
     shoppingCredentials: { sentinel: 'shoppingCredentials' },
-    shopifySettings: { sentinel: 'shopifySettings' },
-    shopifyCredentials: { sentinel: 'shopifyCredentials' },
-    shopifyLogs: [{ sentinel: 'shopifyLogs' }],
+    // o3d-remove-parked-connectors: three archived Shopify sentinels were here.
     // Shaped: the page maps this to {id,name} for `taxRates` and passes it whole as `imsTaxRates`.
     taxRatesRaw: [{ id: 'tax-id', name: 'tax-name', sentinel: 'taxRatesRaw' }],
     accountingSettings: { sentinel: 'accountingSettings' },
@@ -828,9 +826,7 @@ test('every read is made with the arguments it claims, and every result reaches 
   state.reads.getShoppingStatusMappings = () => s.shoppingStatusMappings
   state.reads.getShoppingSyncLogs = () => s.shoppingLogs
   state.reads.getShoppingConnectorCredentials = () => s.shoppingCredentials
-  state.reads.getShopifySyncSettings = () => s.shopifySettings
-  state.reads.getShopifyConnectorCredentials = () => s.shopifyCredentials
-  state.reads.getShopifySyncLogs = () => s.shopifyLogs
+  // o3d-remove-parked-connectors: the three Shopify reads were here; the connector is archived.
   state.reads.getTaxRates = () => s.taxRatesRaw
   state.reads.getAccountingSettingsMasked = () => s.accountingSettings
   state.reads.getAccountingConnectionStatus = () => s.accountingStatus
@@ -859,9 +855,7 @@ test('every read is made with the arguments it claims, and every result reaches 
     { name: 'getShoppingStatusMappings', args: [] },
     { name: 'getShoppingSyncLogs', args: [100] },
     { name: 'getShoppingConnectorCredentials', args: [] },
-    { name: 'getShopifySyncSettings', args: [] },
-    { name: 'getShopifyConnectorCredentials', args: [] },
-    { name: 'getShopifySyncLogs', args: [100] },
+    // o3d-remove-parked-connectors: three archived Shopify reads were here.
     { name: 'getTaxRates', args: [] },
     { name: 'getAccountingSettingsMasked', args: [] },
     { name: 'getAccountingConnectionStatus', args: [] },
@@ -896,7 +890,8 @@ test('every read is made with the arguments it claims, and every result reaches 
     'accountingReadiness', 'accountingSettings',
     'accountingTaxRates', 'accountingTenantName', 'ambiguousWmsConnectorIds', 'availableWmsConnectorIds',
     'currencies', 'imsTaxRates', 'paymentAccountMap',
-    'paymentMethodCombos', 'pluginState', 'shopifyCredentials', 'shopifyLogs', 'shopifySettings',
+    // o3d-remove-parked-connectors: 'shopifyCredentials', 'shopifyLogs', 'shopifySettings' were here.
+    'paymentMethodCombos', 'pluginState',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
     'shoppingStatusMappings', 'shoppingTaxMappings', 'taxRates', 'wmsData',
   ], 'the dashboard prop set is pinned: a new prop must be wired here deliberately')
@@ -920,9 +915,7 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.shoppingStatusMappings, s.shoppingStatusMappings)
   assert.equal(props.shoppingLogs, s.shoppingLogs)
   assert.equal(props.shoppingCredentials, s.shoppingCredentials)
-  assert.equal(props.shopifySettings, s.shopifySettings)
-  assert.equal(props.shopifyCredentials, s.shopifyCredentials)
-  assert.equal(props.shopifyLogs, s.shopifyLogs)
+  // o3d-remove-parked-connectors: three archived Shopify props were asserted here.
   assert.equal(props.imsTaxRates, s.taxRatesRaw)
   assert.deepEqual(props.taxRates, [{ id: 'tax-id', name: 'tax-name' }], 'projected to id+name, not passed whole')
   assert.equal(props.accountingSettings, s.accountingSettings)

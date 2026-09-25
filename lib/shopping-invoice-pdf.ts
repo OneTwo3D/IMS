@@ -8,7 +8,6 @@ const SHOPPING_INVOICE_PDF_CLOCK_SKEW_SECONDS = 5 * 60
 
 const SHOPPING_INVOICE_SECRET_SETTING: Record<ShoppingConnectorId, string> = {
   woocommerce: 'wc_invoice_pdf_secret',
-  shopify: 'shopify_invoice_pdf_secret',
 }
 
 export type ShoppingInvoicePdfRequest = {

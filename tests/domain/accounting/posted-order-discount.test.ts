@@ -429,13 +429,11 @@ test('the adapter rules this derivation replays are pinned to the adapters thems
     'Xero must still omit the order-discount line when no discount account code is supplied',
   )
 
-  const qbo = readFileSync(join(process.cwd(), 'lib/connectors/quickbooks/invoices.ts'), 'utf8')
-  const orderLevel = qbo.slice(qbo.indexOf('// Order-level discount'))
-  assert.match(
-    orderLevel.slice(0, orderLevel.indexOf('const invoiceBody')),
-    /if \(data\.discountAmount && data\.discountAmount > 0\) \{/,
-    'QuickBooks must still post its order-level discount on the amount alone',
-  )
+  // o3d-remove-parked-connectors: the second half read `lib/connectors/quickbooks/invoices.ts` and
+  // pinned that THAT adapter posts its order-level discount on the amount ALONE, with no account-code
+  // guard. The two adapters DISAGREEING is what this derivation replays — so with one adapter left the
+  // "adapter rules" this test names are now a single rule, and a second connector that guards on an
+  // account code (or does not) must be pinned here in the commit that adds it.
 })
 
 // ---------------------------------------------------------------------------

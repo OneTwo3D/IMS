@@ -51,14 +51,15 @@ const UNIT_COST = 4
  * A DISPATCHED STOCK TRANSFER with its own OPEN ASN at the destination, and an unprocessed booked-in
  * event for it.
  *
- * TRANSFER-BACKED, NOT PURCHASE-BACKED, and the reason is a finding of its own: a webhook book-in of
- * a PURCHASE-backed ASN that actually adds stock is rejected outright by the
- * `stock_movements_reporting_evidence_guard` constraint trigger — the service writes its
- * PURCHASE_RECEIPT movement with `referenceType: 'WmsAsnMap'` and the trigger accepts only
- * `'PurchaseOrder'`. That is o3d-gles, filed separately and NOT fixed here; the last test in this file
- * pins the collision, because o3d-btiw was MASKING it (with every received quantity reading zero, the
- * receipt insert was never reached). The transfer book-in writes TRANSFER_IN, which the trigger does
- * not cover, so it is the path on which "the goods are credited" can actually be proven end to end.
+ * TRANSFER-BACKED. When these tests were written, a webhook book-in of a PURCHASE-backed ASN that
+ * actually added stock was rejected outright by the `stock_movements_reporting_evidence_guard`
+ * constraint trigger — the service wrote its PURCHASE_RECEIPT movement with
+ * `referenceType: 'WmsAsnMap'` and the trigger accepts only `'PurchaseOrder'`. That was o3d-gles, and
+ * o3d-btiw was MASKING it: with every received quantity reading zero, the receipt insert was never
+ * reached. o3d-gles has since landed (#703), and the LAST test in this file now proves the
+ * purchase-backed credit and the evidence the guard demands. The transfer path is kept as the primary
+ * end-to-end proof because TRANSFER_IN is not subject to that guard at all, so it isolates the
+ * quantity question from the evidence question.
  */
 async function seedMappedAsn(label: string) {
   const { db } = await import('@/lib/db')
@@ -492,32 +493,83 @@ test(
 )
 
 // ---------------------------------------------------------------------------
-// WHAT FIXING o3d-btiw UNMASKS — o3d-gles
+// THE PURCHASE-BACKED PATH, NOW THAT o3d-gles HAS LANDED
 // ---------------------------------------------------------------------------
 
+/**
+ * THE GUARD'S OWN EVIDENCE SUBQUERY, run as a read, so the success arm proves the evidence EXISTS
+ * rather than proving only that nothing threw. Copied from the guard, and from o3d-gles's own test
+ * (tests/concurrency/wms-purchase-receipt-evidence.concurrent.test.ts), which is the authority on
+ * what the trigger looks for.
+ *
+ * `referenceTypeUnderTest` is a parameter for one reason: the control below runs the SAME join with
+ * `'WmsAsnMap'`, the value booked-in-service wrote before o3d-gles, and requires 0. Without that, a
+ * count of 1 would only say "this query matches something", not "it matches because the movement
+ * names the purchase order".
+ */
+async function countGuardEvidenceForMovement(movementId: string, referenceTypeUnderTest: string): Promise<number> {
+  const { db } = await import('@/lib/db')
+  const rows = await db.$queryRaw<{ n: bigint }[]>`
+    SELECT COUNT(*)::bigint AS n
+      FROM "stock_movements" sm
+      JOIN "cost_layers" cl
+        ON cl."productId" = sm."productId"
+       AND cl."warehouseId" = sm."toWarehouseId"
+       AND ABS(cl."receivedQty" - sm.qty) <= 0.0001
+     WHERE sm.id = ${movementId}
+       AND sm.type = 'PURCHASE_RECEIPT'
+       AND sm."referenceType" = ${referenceTypeUnderTest}
+       AND sm."referenceId" IS NOT NULL
+       AND EXISTS (
+         SELECT 1 FROM "purchase_order_lines" pol
+          WHERE pol.id = cl."poLineId"
+            AND pol."poId" = sm."referenceId"
+       )`
+  return Number(rows[0]!.n)
+}
+
+/** The guard must be ON, DEFERRABLE and INITIALLY DEFERRED, or a green arm proves nothing at all. */
+async function assertGuardIsArmed() {
+  const { db } = await import('@/lib/db')
+  const rows = await db.$queryRaw<{ tgenabled: string; tgdeferrable: boolean; tginitdeferred: boolean }[]>`
+    SELECT t.tgenabled::text AS tgenabled, t.tgdeferrable, t.tginitdeferred
+      FROM pg_trigger t
+      JOIN pg_class c ON c.oid = t.tgrelid
+     WHERE c.relname = 'stock_movements'
+       AND t.tgname = 'stock_movements_reporting_evidence_guard'`
+  assert.equal(rows.length, 1, 'the o3d-gles evidence guard must exist on stock_movements')
+  console.log(`[po] guard armed: ${JSON.stringify(rows[0])}`)
+  assert.equal(rows[0]!.tgenabled, 'O', 'the guard must be ENABLED, or this test measures nothing')
+  assert.equal(rows[0]!.tgdeferrable, true, 'the guard must be DEFERRABLE')
+  assert.equal(rows[0]!.tginitdeferred, true, 'the guard must be INITIALLY DEFERRED, or it would not fire at COMMIT')
+}
+
 test(
-  'a PURCHASE-backed book-in now REACHES the receipt insert, and is refused by the o3d-gles guard',
+  'a PURCHASE-backed book-in CREDITS the stock, and the evidence the o3d-gles guard demands is really present',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
     /**
-     * o3d-btiw WAS MASKING o3d-gles, and this pins the hand-off.
+     * o3d-btiw WAS MASKING o3d-gles, AND BOTH ARE NOW FIXED — this is the hand-off, asserted.
      *
      * `stock_movements_reporting_evidence_guard` (a DEFERRED constraint trigger) accepts a
-     * PURCHASE_RECEIPT movement only when its `referenceType` is `'PurchaseOrder'`.
-     * `booked-in-service.ts` writes `'WmsAsnMap'`, so a purchase-backed book-in that adds stock cannot
-     * commit — o3d-gles. Until this branch that was INVISIBLE from the booked-in path: every live ASN
-     * item normalized to a received quantity of zero, so `stockQtyToAdd` was always zero and the
-     * movement was never inserted. Reading `QuantityBooked` makes the path reach it on the first real
-     * callback.
+     * PURCHASE_RECEIPT movement only when it NAMES THE PURCHASE ORDER that vouches for the units —
+     * `referenceType: 'PurchaseOrder'`, `referenceId` = the PO — and only when a cost layer for the
+     * same product, warehouse and quantity hangs off a line of that same PO. `booked-in-service.ts`
+     * used to write `referenceType: 'WmsAsnMap'`, so a purchase-backed book-in that added stock could
+     * not commit; o3d-gles (#703) is what fixed that. Until o3d-btiw, the collision was INVISIBLE from
+     * the booked-in path: every live ASN item normalized to a received quantity of zero, so
+     * `stockQtyToAdd` was always zero and the receipt insert was never reached. Reading
+     * `QuantityBooked` makes the path reach it on the first real callback.
      *
-     * THIS TEST ASSERTS THE PRESENT, WRONG BEHAVIOUR ON PURPOSE, so the change ships with the
-     * consequence written down and measured rather than discovered in production. WHEN o3d-gles IS
-     * FIXED THIS TEST MUST BE REPLACED by the credit assertions the transfer test above makes — a red
-     * here is the signal that it has been.
+     * This test therefore asserts the CREDIT — and, because "nothing threw" is not the same claim as
+     * "the evidence the guard wants exists", it re-runs the guard's own join as a read and requires it
+     * to match, with a control that requires 0 for the pre-gles reference type.
      */
     loadEnv()
     const { db } = await import('@/lib/db')
     const { processBookedInEvent } = await import('@/lib/domain/wms/booked-in-service')
+
+    await assertGuardIsArmed()
 
     const uid = `${Date.now().toString(36)}${Math.floor(Math.random() * 1_679_616).toString(36).padStart(4, '0')}`.toUpperCase()
     const tag = `BTIWPO-${process.pid}-${uid}`
@@ -577,7 +629,7 @@ test(
           }],
         },
       },
-      select: { id: true },
+      select: { id: true, lines: { select: { id: true } } },
     })
     const event = await db.wmsInboundReceiptEvent.create({
       data: {
@@ -588,7 +640,6 @@ test(
       },
       select: { id: true },
     })
-    void asn
 
     const outcome = await processBookedInEvent(event.id, {
       fetchRemoteAsn: async () => remoteAsnFromLiveBody({
@@ -596,25 +647,59 @@ test(
       }),
     })
 
-    // PRE-o3d-btiw this was `requires_review` with `missing_local_line` and no movement attempt at
-    // all. It now gets as far as inserting the PURCHASE_RECEIPT, which is the proof that the quantity
-    // IS being read — and then o3d-gles rejects it at COMMIT.
-    assert.equal(outcome.status, 'failed', JSON.stringify(outcome))
-    assert.match(
-      outcome.status === 'failed' ? outcome.error : '',
-      /PURCHASE_RECEIPT\) requires matching cost-layer evidence/,
-      'the failure must be o3d-gles and nothing else',
-    )
-    // NOTHING PARTIAL SURVIVES: the transaction rolled back whole.
+    assert.equal(outcome.status, 'processed', JSON.stringify(outcome))
+
+    // THE GOODS ARE CREDITED.
     const level = await db.stockLevel.findUnique({
       where: { productId_warehouseId: { productId: product.id, warehouseId: warehouse.id } },
       select: { quantity: true },
     })
-    assert.equal(Number(level?.quantity ?? 0), 0)
+    assert.equal(Number(level?.quantity ?? 0), EXPECTED_QTY, 'the booked quantity must be in stock')
     const poLine = await db.purchaseOrderLine.findUniqueOrThrow({
       where: { id: po.lines[0]!.id },
       select: { qtyReceived: true },
     })
-    assert.equal(Number(poLine.qtyReceived), 0)
+    assert.equal(Number(poLine.qtyReceived), EXPECTED_QTY, 'the purchase order line must be receipted')
+
+    // EXACTLY ONE INBOUND MOVEMENT, AND IT NAMES THE PURCHASE ORDER (o3d-gles).
+    const movements = await db.stockMovement.findMany({
+      where: { productId: product.id, toWarehouseId: warehouse.id },
+      select: { id: true, type: true, qty: true, referenceType: true, referenceId: true, idempotencyKey: true },
+      orderBy: { createdAt: 'asc' },
+    })
+    console.log(`[po] examined ${movements.length} committed stock_movements row(s): ${JSON.stringify(movements)}`)
+    assert.equal(movements.length, 1, 'exactly one movement must have committed for this receipt')
+    const movement = movements[0]!
+    assert.equal(movement.type, 'PURCHASE_RECEIPT')
+    // DERIVED, never typed: the expected reference is the seeded purchase order's own id.
+    assert.equal(movement.referenceType, 'PurchaseOrder')
+    assert.equal(movement.referenceId, po.id, 'the movement must name the purchase order that vouches for the units')
+    assert.equal(Number(movement.qty), EXPECTED_QTY)
+
+    // THE COST LAYER THE GUARD JOINS TO IS REALLY THERE, AND HANGS OFF THIS PO'S LINE.
+    const layers = await db.costLayer.findMany({
+      where: { productId: product.id, warehouseId: warehouse.id },
+      select: { poLineId: true, receivedQty: true, unitCostBase: true },
+    })
+    console.log(`[po] examined ${layers.length} cost_layers row(s): ${JSON.stringify(layers)}`)
+    assert.equal(layers.length, 1, 'one receipt lays one cost layer')
+    assert.equal(layers[0]!.poLineId, po.lines[0]!.id, 'the layer must hang off the purchase order line that was received')
+    assert.equal(Number(layers[0]!.receivedQty), EXPECTED_QTY)
+
+    // AND THE GUARD'S OWN JOIN FINDS IT — with a control that proves the join discriminates on the
+    // very field o3d-gles changed, rather than matching anything at all.
+    const evidence = await countGuardEvidenceForMovement(movement.id, 'PurchaseOrder')
+    const preGlesEvidence = await countGuardEvidenceForMovement(movement.id, 'WmsAsnMap')
+    console.log(`[po] the guard's own evidence join matched ${evidence} row(s) as 'PurchaseOrder' and ${preGlesEvidence} as 'WmsAsnMap'`)
+    assert.equal(evidence, 1, "the guard's own evidence join must find the cost layer — a pass with 0 would mean the guard was bypassed, not satisfied")
+    assert.equal(preGlesEvidence, 0, 'CONTROL: the same join finds nothing for the reference type booked-in wrote before o3d-gles')
+
+    // THE ASN LINE IS STILL WHAT MAKES THE RECEIPT IDEMPOTENT — line-granular, in the key.
+    const { wmsPurchaseReceiptMovementKey } = await import('@/lib/domain/inventory/stock-movement-idempotency')
+    assert.equal(
+      movement.idempotencyKey,
+      wmsPurchaseReceiptMovementKey({ asnLineMapId: asn.lines[0]!.id, receiptEventId: event.id }),
+      'the ASN line map id must still be carried by the idempotency key',
+    )
   },
 )

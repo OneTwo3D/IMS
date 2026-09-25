@@ -48,17 +48,9 @@ const NON_WMS_PLUGIN_COPY: Record<NonWmsIntegrationPluginId, { label: string; de
     label: 'WooCommerce plugin',
     description: 'Enables the shopping connector, webhooks, sync UI, and WooCommerce-specific scheduler jobs.',
   },
-  shopify: {
-    label: 'Shopify plugin',
-    description: 'Reserves the shopping connector slot, settings, and sync/dashboard wiring for Shopify.',
-  },
   xero: {
     label: 'Xero plugin',
     description: 'Enables the accounting connector, callback flow, sync UI, and accounting scheduler jobs backed by Xero.',
-  },
-  quickbooks: {
-    label: 'QuickBooks plugin',
-    description: 'Reserves the accounting connector slot, settings, and sync/dashboard wiring for QuickBooks.',
   },
 }
 

@@ -242,7 +242,11 @@ const ledgerHoldsTheAttemptOn = (invoiceId: string) =>
 
 const ACTIONS = [
   { connector: 'xero', module: '@/app/actions/xero-sync', fn: 'retryFailedXeroSync', refusalAction: 'xero_manual_retry_refused' },
-  { connector: 'quickbooks', module: '@/app/actions/quickbooks-sync', fn: 'retryFailedQuickBooksSync', refusalAction: 'quickbooks_manual_retry_refused' },
+  // o3d-remove-parked-connectors: the second entry was `app/actions/quickbooks-sync.ts`'s
+  // `retryFailedQuickBooksSync`, and every case in the loop below therefore ran against BOTH manual
+  // retry actions. It is archived. The loop shape is kept so a second action inherits every case;
+  // what is lost is the cross-port evidence that the o3d-0m56 guard is honoured by an
+  // independently-written second action.
 ] as const
 
 type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
@@ -251,7 +255,7 @@ type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; 
  * o3d-e2mz: a per-row retry now carries the attempt the operator was looking at, and Xero refuses one
  * that names none. The wrapper supplies the row's CURRENT revision, which is exactly what the sync log
  * would have shown them — so every scenario below still exercises the o3d-0m56 guard rather than
- * bouncing off the attempt preflight. QuickBooks stamps no revision and ignores the argument.
+ * bouncing off the attempt preflight. A connector that stamps no revision ignores the argument.
  *
  * Passing the live value is deliberate: a hard-coded one would go stale the moment a scenario revives a
  * row, and the tests that are ABOUT a stale revision pass their own (see manual-retry-guard.test.ts).
@@ -470,40 +474,6 @@ for (const action of ACTIONS) {
     assert.deepEqual(state.events.filter((e) => e.kind === 'lock'), [], 'and no money lock either')
   })
 }
-
-test('quickbooks: rows sharing the generic idempotency key are NOT ambiguous (o3d-0m56)', async () => {
-  // QuickBooks honours `_idempotencyKey`, so two rows carrying the same one post under the same
-  // Request-Id and Intuit deduplicates. Deriving the token from the row id instead — as Xero's
-  // payment branches do — would refuse this safe retry. The action must apply its OWN
-  // connector's derivation, not a shared one.
-  seed('quickbooks')
-  for (const id of ['a1', 'a2']) {
-    state.rows.find((r) => r.id === id)!.payload = payload('inv-1', { _idempotencyKey: 'invoice-payment:payment:p1' })
-  }
-  const { retryFailedQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
-
-  const result = await retryFailedQuickBooksSync('a1')
-
-  assert.equal(result.success, true, 'a shared token is the ordinary QuickBooks shape')
-  assert.equal(statusOf('a1'), 'PENDING')
-
-  // ...and the same payload on Xero, whose payment branches ignore the generic key, stays
-  // ambiguous — two row ids, two tokens.
-  seed('xero')
-  for (const id of ['a1', 'a2']) {
-    state.rows.find((r) => r.id === id)!.payload = payload('inv-1', { _idempotencyKey: 'invoice-payment:payment:p1' })
-  }
-  // ...against a ledger that DOES hold the attempt, so the two tokens are genuinely ambiguous and
-  // the refusal is about the derivation rather than about an empty ledger.
-  ledgerHoldsTheAttemptOn('inv-1')
-  const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-  assert.equal(
-    (await retryFailedXeroSync('a1', state.rows.find((row) => row.id === 'a1')?.attemptRevision)).success,
-    false,
-    'Xero never sent that key',
-  )
-  assert.equal(statusOf('a1'), 'FAILED')
-})
 
 for (const action of ACTIONS) {
   test(`${action.connector}: two tokens the ledger holds NEITHER of are recoverable (o3d-0m56)`, async () => {

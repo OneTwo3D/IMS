@@ -176,6 +176,80 @@ test('settings-store migration logs write failures', async () => {
   })
 })
 
+// ---------------------------------------------------------------------------
+// o3d-remove-parked-connectors round 3 — THE WRITER'S ANSWER IS A CONTRACT, AND AN UNREADABLE
+// ANSWER IS NOT A RACE.
+//
+// `migrateEncryptedSettingValue` read `result.count` off whatever the writer returned. A writer
+// that returned `null` therefore threw `TypeError: Cannot read properties of null (reading
+// 'count')`, the best-effort catch swallowed it into a console.warn, and the function reported
+// 'failed' with a message that named neither the contract nor the culprit. CI's `validate` job hit
+// exactly that.
+//
+// The three-way distinction below is the whole point, and it is why the short fix (`result?.count
+// ?? 0`) is wrong: that lands on 'raced', which ASSERTS another writer already re-encrypted the row
+// — a statement that the row is now safe. These cases pin that a contract violation stays in
+// 'failed' and can never be collapsed into 'raced'.
+// ---------------------------------------------------------------------------
+
+test('settings-store migration reports migrated when the writer says it wrote a row', async () => {
+  // The positive control for the two cases below: the SAME call shape, differing only in what the
+  // writer returns. Without it, "null is failed" could be true because nothing ever succeeds.
+  await withEnvAsync({ SETTINGS_ENCRYPTION_KEY: TEST_KEY_BASE64, ENCRYPTION_KEY: undefined }, async () => {
+    const warnings: unknown[][] = []
+    const result = await migrateEncryptedSettingValue('wc_consumer_secret', 'legacy-secret', {
+      writer: async () => ({ count: 1 }),
+      warn: (...args) => warnings.push(args),
+    })
+    assert.equal(result, 'migrated')
+    assert.deepEqual(warnings, [], 'a successful migration warns about nothing')
+  })
+})
+
+test('settings-store migration FAILS CLOSED on a writer that returns null, and says whose contract broke', async () => {
+  await withEnvAsync({ SETTINGS_ENCRYPTION_KEY: TEST_KEY_BASE64, ENCRYPTION_KEY: undefined }, async () => {
+    const warnings: unknown[][] = []
+    const result = await migrateEncryptedSettingValue('wc_consumer_secret', 'legacy-secret', {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      writer: (async () => null) as any,
+      warn: (...args) => warnings.push(args),
+    })
+
+    assert.notEqual(result, 'raced', "'raced' says another writer already re-encrypted the row — that is not known here")
+    assert.notEqual(result, 'migrated')
+    assert.equal(result, 'failed')
+
+    const message = `${String(warnings[0]?.[0] ?? '')} ${String(warnings[0]?.[1] ?? '')}`
+    assert.match(message, /wc_consumer_secret/, 'the key, so an operator knows which row is still plaintext')
+    assert.match(message, /returned null instead of \{ count: number \}/, 'what came back, and what was required')
+    assert.doesNotMatch(
+      message,
+      /Cannot read properties/,
+      'the anonymous property-access TypeError is what made the CI failure unreadable',
+    )
+  })
+})
+
+test('settings-store migration FAILS CLOSED on a writer whose result has no numeric count', async () => {
+  // The near-miss: an object arrives, so an optional-chain would have read `undefined` and answered
+  // 'raced'. Two shapes, because `{}` and `{ count: '1' }` are different mistakes.
+  await withEnvAsync({ SETTINGS_ENCRYPTION_KEY: TEST_KEY_BASE64, ENCRYPTION_KEY: undefined }, async () => {
+    let checked = 0
+    for (const [shape, value] of [['no count', {}], ['a string count', { count: '1' }]] as const) {
+      const warnings: unknown[][] = []
+      const result = await migrateEncryptedSettingValue('wc_consumer_secret', 'legacy-secret', {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        writer: (async () => value) as any,
+        warn: (...args) => warnings.push(args),
+      })
+      assert.equal(result, 'failed', `${shape} must fail closed, not report a race`)
+      assert.match(String(warnings[0]?.[1] ?? ''), /instead of \{ count: number \}/, shape)
+      checked += 1
+    }
+    assert.equal(checked, 2, 'both shapes must have been exercised')
+  })
+})
+
 test('settings-store bulk migration summarizes migrated, skipped, and raced rows', async () => {
   await withEnvAsync({ SETTINGS_ENCRYPTION_KEY: TEST_KEY_BASE64, ENCRYPTION_KEY: undefined }, async () => {
     const current = encryptSettingValue('wc_consumer_secret', 'already-current')

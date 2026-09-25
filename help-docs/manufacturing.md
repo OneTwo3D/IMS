@@ -126,7 +126,7 @@ When the order completes:
 
 ### Accounting journal
 
-On completion, OTI queues a journal entry to your accounting connector (Xero or QuickBooks):
+On completion, OTI queues a journal entry to your accounting connector (Xero):
 
 ```
 DR  Inventory Account              [total overhead]
@@ -160,4 +160,4 @@ To use this feature, configure under **Settings → Accounting**:
 - **Inventory account** — already required for general operations; reused as the debit side
 - **COGS account** — reused for retro reclass journals
 
-The setting keys are `xero_manufacturing_overhead_account` / `quickbooks_manufacturing_overhead_account` and the per-type toggle is `xero_sync_manufacturing_journal` / `quickbooks_sync_manufacturing_journal`.
+The setting keys are `<connector>_manufacturing_overhead_account` (today `xero_manufacturing_overhead_account`) and the per-type toggle is `<connector>_sync_manufacturing_journal` (today `xero_sync_manufacturing_journal`).

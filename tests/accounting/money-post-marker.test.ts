@@ -31,7 +31,12 @@ test('xero stamps the mark on both kinds of payment, and keeps the operator\'s r
   assert.match(billBody, /\.filter\(Boolean\)\.join\(' '\)/, 'and an absent operator reference must not leave a stray space')
 })
 
-test('quickbooks stamps the mark in PrivateNote on both kinds of payment (o3d-0m56)', async () => {
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): the QuickBooks half of this file read
+// `lib/connectors/quickbooks/sync-processor.ts` off disk and pinned that it stamps IMS's mark in
+// `PrivateNote` on both kinds of payment, and that the QuickBooks probe reads the same field. With
+// the connector archived, the remaining case pins only the Xero pair — the mark is written to the
+// field the probe reads, on ONE connector. Enable the block below when a second connector lands.
+test.skip('quickbooks stamps the mark in PrivateNote on both kinds of payment (o3d-0m56)', async () => {
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8')
   for (const branch of ['INVOICE_PAYMENT', 'BILL_PAYMENT']) {
     const at = source.indexOf(`case '${branch}': {`)
@@ -45,7 +50,10 @@ test('both probes read the field the mark is written to (o3d-0m56)', async () =>
   // A mark that is sent and never read back is worse than none: it looks like protection.
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/accounting-settlement-probe.ts'), 'utf8')
   assert.match(source, /reference: str\(p\.Reference\) \|\| null/, 'Xero payments expose Reference')
-  assert.match(source, /reference: str\(settlement\.PrivateNote\) \|\| null/, 'QuickBooks payments expose PrivateNote')
+  // o3d-remove-parked-connectors: the QuickBooks half read `settlement.PrivateNote` and is archived
+  // with its probe arm. So this case now shows the mark is read back on ONE connector — and the rule
+  // it protects ("a mark that is sent and never read back is worse than none: it looks like
+  // protection") is a per-connector obligation the next connector has to satisfy for itself.
   // Xero credit-note allocations have no reference field at all — stated in the code, so the
   // weaker evidence for that one type is a documented limit rather than an oversight.
   assert.match(source, /No reference field exists on a Xero credit-note allocation/)

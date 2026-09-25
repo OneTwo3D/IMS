@@ -124,11 +124,16 @@ test('[o3d-psrx r2] EVERY writer of SalesOrder.paidAt names unregisteredPaidAt i
     'lib/connectors/woocommerce/sync/order-import.ts',      // the initial import AND the paid-later update
     'lib/connectors/xero/payment-poller.ts',                // forward pass + the reversal's clear
     'lib/connectors/xero/payment-reconcile.ts',             // the backlog sweep
-    'lib/connectors/quickbooks/payment-poller.ts',          // forward pass + the reversal's clear
+    // o3d-remove-parked-connectors: `lib/connectors/quickbooks/payment-poller.ts` was enumerated here
+    // (forward pass + the reversal's clear) and is archived.
   ]) {
     assert.ok(files.has(expected), `${expected} writes SalesOrder.paidAt and the scan did not reach it`)
   }
-  assert.ok(writers.length >= 10,
+  // o3d-remove-parked-connectors: the floor was 10 while the archived QuickBooks poller contributed
+  // two write sites. It is lowered to the number the tree now holds. This is a VACUITY guard — it
+  // stops a broken walk making an empty scan look clean — not a claim about how many writers there
+  // ought to be; the `unpaired` assertion below is the rule.
+  assert.ok(writers.length >= 8,
     `expected every enumerated paidAt writer, found ${writers.length}: `
     + JSON.stringify(writers.map((w) => `${w.file}:${w.line}`)))
 

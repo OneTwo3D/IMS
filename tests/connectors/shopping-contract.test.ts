@@ -9,7 +9,6 @@ import {
 } from '@/lib/connectors/shopping-registry'
 import {
   persistShoppingWebhookEvent,
-  persistShopifyWebhookEvent,
   persistWcWebhookEvent,
   WC_WEBHOOK_EVENT_STATUS,
   type ShoppingWebhookEventConnector,
@@ -119,8 +118,24 @@ function makeFakeRepo(store: FakeStore, connector: ShoppingWebhookEventConnector
 
 // ---- Registry is the single, data-driven INGRESS gate -----------------------------
 
+/**
+ * o3d-remove-parked-connectors — WHAT THIS ASSERTION USED TO SAY, AND WHY IT SAYS LESS NOW.
+ *
+ * It was `>= 2`, and that was the one place the SHIPPED registry was proved to be genuinely
+ * multi-entry rather than a WooCommerce constant with extra steps. Shopify was the second entry and
+ * is archived, so no assertion over the shipped registry can prove that any more: with one entry,
+ * "the ingress is registry-driven" and "the ingress hardcodes WooCommerce" produce identical
+ * results here. Lowering it to `>= 1` is therefore a REAL loss of coverage, not a cosmetic edit,
+ * and it is recorded as such in docs/archive/shopify-connector-removal.md ("What is no longer
+ * proven"). What IS still proved below, and matters more, is that the persist and process CORES
+ * take the connector as a parameter — those tests drive a fictitious 'newshop' through them and
+ * would fail if the core grew a `=== 'woocommerce'` branch.
+ *
+ * Do not raise this back to `>= 2` with a fixture entry: a registry the app does not ship is not
+ * the registry the ingress reads.
+ */
 test('every registered shopping connector resolves and has the required fields (fi70j)', () => {
-  assert.ok(SHOPPING_CONNECTORS.length >= 2)
+  assert.ok(SHOPPING_CONNECTORS.length >= 1)
   const ids = SHOPPING_CONNECTORS.map((c) => c.id)
   assert.equal(new Set(ids).size, ids.length, 'connector ids must be unique')
   for (const def of SHOPPING_CONNECTORS) {
@@ -147,9 +162,13 @@ test('the same payload is a DISTINCT event per connector — the core does not s
   const store = makeStore()
   const input = { resource: 'orders' as const, topic: 'order.created', externalEventId: 'e1', rawBody: '{"id":1}', payload: { id: 1 } }
   const wc = await persistShoppingWebhookEvent(makeFakeRepo(store, 'woocommerce'), input, { connector: 'woocommerce' })
-  const sh = await persistShoppingWebhookEvent(makeFakeRepo(store, 'shopify'), input, { connector: 'shopify' })
+  const sh = await persistShoppingWebhookEvent(
+    makeFakeRepo(store, 'newshop' as ShoppingWebhookEventConnector),
+    input,
+    { connector: 'newshop' as ShoppingWebhookEventConnector },
+  )
   assert.equal(wc.event.connector, 'woocommerce')
-  assert.equal(sh.event.connector, 'shopify')
+  assert.equal(sh.event.connector, 'newshop')
   assert.equal(store.rows.size, 2)
 })
 
@@ -166,22 +185,26 @@ test('a hypothetical new connector flows through the identical persist path (fi7
 
 test('persist core dedups a replayed event by (connector, resource, payloadHash) (fi70j)', async () => {
   const store = makeStore()
-  const repo = makeFakeRepo(store, 'shopify')
+  const repo = makeFakeRepo(store, 'newshop' as ShoppingWebhookEventConnector)
   const input = { resource: 'orders' as const, topic: null, rawBody: '{"id":7}', payload: { id: 7 } }
-  const first = await persistShoppingWebhookEvent(repo, input, { connector: 'shopify' })
-  const replay = await persistShoppingWebhookEvent(repo, input, { connector: 'shopify' })
+  const first = await persistShoppingWebhookEvent(repo, input, { connector: 'newshop' as ShoppingWebhookEventConnector })
+  const replay = await persistShoppingWebhookEvent(repo, input, { connector: 'newshop' as ShoppingWebhookEventConnector })
   assert.equal(first.status, 'created')
   assert.equal(replay.status, 'duplicate')
   assert.equal(replay.event.id, first.event.id)
 })
 
-test('connector-specific persist wrappers only set their connector, sharing the core (fi70j)', async () => {
+// ONE WRAPPER LEFT (o3d-remove-parked-connectors). This case used to compare TWO connector-specific
+// wrappers -- persistWcWebhookEvent and persistShopifyWebhookEvent -- and the comparison is what
+// showed neither of them did anything but name its connector. With Shopify archived there is one
+// wrapper, so the case now shows only that IT delegates with its own connector; a core that
+// hardcoded 'woocommerce' would still pass it. The delegation is covered above instead, by driving
+// the core directly with 'newshop'.
+test('the connector-specific persist wrapper only sets its connector, sharing the core (fi70j)', async () => {
   const store = makeStore()
   const input = { resource: 'orders' as const, topic: null, rawBody: '{"id":9}', payload: { id: 9 } }
   const wc = await persistWcWebhookEvent(makeFakeRepo(store, 'woocommerce'), input)
-  const sh = await persistShopifyWebhookEvent(makeFakeRepo(store, 'shopify'), input)
   assert.equal(wc.event.connector, 'woocommerce')
-  assert.equal(sh.event.connector, 'shopify')
 })
 
 // ---- Webhook DISPATCH/processing is connector-agnostic ---------------------------
@@ -219,17 +242,17 @@ test('process core handles an arbitrary connector via the generic path (fi70j)',
 
 test('process core dead-letters an unsupported resource without retry (fi70j)', async () => {
   const store = makeStore()
-  const repo = makeFakeRepo(store, 'shopify')
+  const repo = makeFakeRepo(store, 'newshop' as ShoppingWebhookEventConnector)
   // A row with a resource the core does not handle (orders/products/refunds only).
   store.rows.set('evt-x', {
-    id: 'evt-x', connector: 'shopify', resource: 'customers', externalEventId: null, topic: null,
+    id: 'evt-x', connector: 'newshop', resource: 'customers', externalEventId: null, topic: null,
     payloadHash: 'h', payloadJson: {}, originAttestation: 'unproven:not-applicable', status: WC_WEBHOOK_EVENT_STATUS.pending, attempts: 0,
     nextAttemptAt: null, processedAt: null, lastError: null, receivedAt: NOW, updatedAt: NOW,
   })
   let dispatched = false
   const result = await processShoppingWebhookEvent(
     'evt-x',
-    processorOptions(repo, 'shopify', async () => {
+    processorOptions(repo, 'newshop', async () => {
       dispatched = true
       return new Response(null, { status: 200 })
     }),
@@ -240,26 +263,26 @@ test('process core dead-letters an unsupported resource without retry (fi70j)', 
 
 test('process core retries a retryable HTTP failure and dead-letters a permanent one (fi70j)', async () => {
   const store = makeStore()
-  const repo = makeFakeRepo(store, 'shopify')
+  const repo = makeFakeRepo(store, 'newshop' as ShoppingWebhookEventConnector)
   const seed = async (id: number) =>
     (
       await persistShoppingWebhookEvent(
         repo,
         { resource: 'orders', topic: null, rawBody: `{"id":${id}}`, payload: { id } },
-        { connector: 'shopify' },
+        { connector: 'newshop' as ShoppingWebhookEventConnector },
       )
     ).event.id
 
   const retryable = await processShoppingWebhookEvent(
     await seed(503),
-    processorOptions(repo, 'shopify', async () => new Response('busy', { status: 503 })),
+    processorOptions(repo, 'newshop', async () => new Response('busy', { status: 503 })),
   )
   assert.equal(retryable.status, 'failed') // 5xx → retry scheduled
   assert.ok(retryable.status === 'failed' && retryable.nextAttemptAt instanceof Date)
 
   const permanent = await processShoppingWebhookEvent(
     await seed(400),
-    processorOptions(repo, 'shopify', async () => new Response('bad', { status: 400 })),
+    processorOptions(repo, 'newshop', async () => new Response('bad', { status: 400 })),
   )
   assert.equal(permanent.status, 'dead_letter') // 4xx (non-429/408) → permanent
 })

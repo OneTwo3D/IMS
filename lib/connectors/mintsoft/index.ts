@@ -204,7 +204,16 @@ export {
   createMintsoftAsn,
   createMintsoftBundle,
   fetchMintsoftAsnById,
+  fetchMintsoftAsnListRows,
   fetchMintsoftAsns,
+  fetchMintsoftAsnsForDuplicateRecovery,
+  MINTSOFT_ASN_LIST_RECENT_WINDOW_DAYS,
+  mintsoftAsnListRecentWindowSince,
+  MintsoftAsnListIncompleteError,
+  MintsoftAsnCreateRejectedError,
+  MintsoftAsnCreateVerificationError,
+  MintsoftAsnQuantityNotRepresentableError,
+  mintsoftAsnExpectationFromCreateInput,
   fetchMintsoftBundle,
   fetchMintsoftProduct,
   fetchMintsoftProductBySku,
@@ -214,6 +223,32 @@ export {
   mintsoftRequest,
   upsertMintsoftProduct,
 } from './api/client'
+export {
+  decideMintsoftAsnCreation,
+  findRecoverableMintsoftAsn,
+  MintsoftAsnRecoveryAmbiguousMatchError,
+  MintsoftAsnRecoveryLineIdentityUnreadableError,
+  MintsoftAsnRecoveryLineSetOverlapError,
+  MintsoftAsnRecoveryMapUnreadableError,
+  MintsoftAsnRecoveryQuantityConflictError,
+  MintsoftAsnRecoveryQuantityRoundedError,
+  MintsoftAsnRecoveryQuantityUnreadableError,
+  MintsoftAsnRecoveryWarehouseMismatchError,
+  type MintsoftAsnRecoveryCriteria,
+} from './api/asn-recovery'
+export {
+  compareMintsoftAsnAgainstExpectation,
+  describeMintsoftAsnDifference,
+  isProofThatMintsoftAsnIsNotThisOne,
+  readMintsoftAsnMapState,
+  requireMintsoftAsnCreationVerdict,
+  MINTSOFT_ASN_DIFFERENCE_KINDS,
+  type MintsoftAsnCreationVerdict,
+  type MintsoftAsnDifference,
+  type MintsoftAsnExpectation,
+  type MintsoftAsnMapKnowledge,
+  type MintsoftAsnMapState,
+} from './api/asn-creation-rule'
 export { fetchMintsoftOrderList, fetchMintsoftOrderStatus, normalizeMintsoftOrderRow } from './api/orders'
 export { cancelMintsoftOrder, pushMintsoftOrder, updateMintsoftOrder } from './api/order-push'
 export {

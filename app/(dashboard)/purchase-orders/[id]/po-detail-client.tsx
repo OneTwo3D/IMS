@@ -706,7 +706,7 @@ function WmsAsnDialog({
             <span>
               <span className="font-medium">Enable booked-in callback</span>
               <span className="block text-muted-foreground">
-                When enabled, {connectorLabel} will call back into IMS when the ASN is booked in so the PO receipt can be reconciled automatically.
+                When enabled, IMS expects a booked-in callback so the PO receipt can be reconciled automatically. The callback URL cannot be sent on the ASN &mdash; {connectorLabel} has no such field &mdash; so it must be configured in {connectorLabel} itself; this only checks that IMS is ready to receive it.
               </span>
             </span>
           </label>
