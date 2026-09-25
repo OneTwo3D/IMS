@@ -47,7 +47,12 @@ test('[o3d-j625 r6 H3] no code outside the primitive creates an accounting sync 
     'PRECONDITION: the primitive holds exactly the one create the census defers to')
   const callers = files.filter(([, source]) => /createAccountingSyncLogRow\(/.test(blankNonCode(source)))
   console.log(`[o3d-j625 r6] files calling the sync-row primitive: ${callers.length}`)
-  assert.ok(callers.length >= 7, `PRECONDITION: the seven row writers route through it (found ${callers.length})`)
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): FOUR, not seven. The three that went are
+  // `lib/connectors/quickbooks/{queue,daily-sync,sync-processor}.ts`, which are archived — the floor
+  // follows the subjects and is lowered by exactly the number that left. What it is for is unchanged: a
+  // walk that stops finding callers must not pass by finding none. The real guard is the absence check
+  // below, which is universal over every production source and does not care how many there are.
+  assert.ok(callers.length >= 4, `PRECONDITION: the four row writers route through it (found ${callers.length})`)
   assert.deepEqual(offenders(files), [],
     'these create accounting sync rows directly, so a refusal their posting discharges is never cleared. '
     + 'Create the row with createAccountingSyncLogRow (lib/domain/accounting/sync-log-row.ts).')

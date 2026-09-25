@@ -44,11 +44,10 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({ quickbooks_sync_enabled: qboSyncEnabled, quickbooks_transit_account: 'Q-TRANSIT' }),
-  },
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors): the SECOND CONNECTOR'S SETTINGS MOCK WAS HERE, and
+// removing it is not cosmetic — `mock.module` RESOLVES its specifier, so a mock of an archived module makes
+// the whole file fail to load with ERR_MODULE_NOT_FOUND. Every case that needed the second connector's
+// chart is adapted or removed above/below, each saying which.
 mock.module('@/lib/auth', {
   namedExports: {
     auth: async () => ({ user: { id: 'u1', email: 'u@example.test', name: 'U', role: 'ADMIN', supplierId: null, sessionInvalidReason: null, totpEnabled: false, totpVerified: false } }),
@@ -164,9 +163,13 @@ test('[o3d-j625 r4 HIGH 2] PRECONDITION: with no switch the credit note is POSTE
   assert.deepEqual(committed.syncRows, [{ connector: 'xero', type: 'PURCHASE_CREDIT_NOTE' }])
 })
 
+// o3d-j625 r12 (merging o3d-remove-parked-connectors): the matrix had a second row — "the active
+// connector SWITCHES to a QuickBooks with sync off after the chart read". An unregistered plugin flag
+// resolves to NO active connector now, so that row became a duplicate of the first rather than a second
+// state, and a duplicate row dressed as a matrix is how a test comes to look broader than it is. One row,
+// and the state it drives is the one that remains: the chart is retired because nothing is active.
 for (const [label, flip, qboSync] of [
   ['the active connector is DISABLED after the chart read', { reads: 1, to: [] as string[] }, 'true'],
-  ['the active connector SWITCHES to a QuickBooks with sync off after the chart read', { reads: 1, to: ['quickbooks'] }, 'false'],
 ] as const) {
   test(`[o3d-j625 r4 HIGH 2] ${label}: the credit note is NOT posted with no ledger entry — it is refused and stays DRAFT`, async () => {
     reset({ reads: flip.reads, to: [...flip.to] }, qboSync)
@@ -180,13 +183,11 @@ for (const [label, flip, qboSync] of [
   })
 }
 
-test('[o3d-j625 r4 HIGH 2] CONTROL: an AGREEING QuickBooks chart still posts LOCALLY — the no-poster escape valve is untouched', async () => {
-  reset(null)
-  // Modelled by switching the QuickBooks chart in: a QuickBooks chart, QuickBooks active, has no
-  // ACCPAYCREDIT poster, so it posts locally exactly as before.
-  enabledPlugins = ['quickbooks']
-  const result = await post()
-  assert.equal(result.success, true, JSON.stringify(result))
-  assert.equal(committed.posted, 1, 'posted in IMS')
-  assert.equal(committed.syncRows.length, 0, 'with nothing queued, because nothing posts ACCPAYCREDIT there')
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors) — REMOVED, no subject.
+//
+// '[o3d-j625 r4 HIGH 2] CONTROL: an AGREEING QuickBooks chart still posts LOCALLY — the no-poster escape
+// valve is untouched' needed a connector that has NO ACCPAYCREDIT poster, so that an agreeing chart posts
+// in IMS and queues nothing. The one registered connector HAS that poster, so the escape valve cannot be
+// exercised at all. It was a control for the refusals above — it showed they were refusals and not the
+// escape valve firing — and losing it is a real weakening, recorded in o3d-5ktph. Verbatim at
+// `git show da093f85:tests/accounting/supplier-credit-note-chart-verdict.test.ts`.

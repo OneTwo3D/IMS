@@ -14,6 +14,7 @@
  * The harness below is copied verbatim from chart-connector-routing.test.ts (lines 1–253 there) rather
  * than imported, because node:test module mocks are per-file.
  */
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -129,28 +130,10 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({
-      quickbooks_sync_enabled: 'true',
-      quickbooks_sync_sales_invoice: 'submitted',
-      quickbooks_sync_inventory_adjustment: 'submitted',
-      quickbooks_sales_account: 'Q-SALES',
-      quickbooks_shipping_account: 'Q-SHIP',
-      quickbooks_discount_account: 'Q-DISC',
-      quickbooks_cogs_account: 'Q-COGS',
-      quickbooks_inventory_account: 'Q-INV',
-      quickbooks_allocated_inventory_account: 'Q-ALLOC',
-      quickbooks_unearned_revenue_account: 'Q-UNEARNED',
-      quickbooks_transit_account: 'Q-TRANSIT',
-      quickbooks_accounts_receivable_account: 'Q-AR',
-      quickbooks_accounts_payable_account: 'Q-AP',
-      quickbooks_realised_fx_gain_loss_account: 'Q-RFX',
-      quickbooks_unrealised_fx_gain_loss_account: 'Q-UFX',
-      quickbooks_manufacturing_overhead_account: 'Q-MOH',
-    }),
-  },
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors): the SECOND CONNECTOR'S SETTINGS MOCK WAS HERE, and
+// removing it is not cosmetic — `mock.module` RESOLVES its specifier, so a mock of an archived module makes
+// the whole file fail to load with ERR_MODULE_NOT_FOUND. Every case that needed the second connector's
+// chart is adapted or removed above/below, each saying which.
 
 // --------------------------------------------------------------------------------------------
 // The queues, the activity log, and the transaction double
@@ -170,9 +153,7 @@ function recordRouted(queue: 'xero' | 'quickbooks') {
 mock.module('@/lib/connectors/xero/queue', {
   namedExports: { queueXeroSync: recordRouted('xero') },
 })
-mock.module('@/lib/connectors/quickbooks/queue', {
-  namedExports: { queueQuickBooksSync: recordRouted('quickbooks') },
-})
+// o3d-j625 r12: and the second connector's QUEUE mock, for the same reason. There is one connector queue.
 
 /** Activity records written by the facade. */
 const activity: Array<{ action: string; description: string; metadata?: Record<string, unknown> }> = []
@@ -422,7 +403,15 @@ function salesInvoiceRequest(salesAccount: string) {
 }
 
 
-const CHART_CONNECTORS = ['xero', 'quickbooks'] as const
+/**
+ * THE REGISTERED ROSTER, from the registry (o3d-j625 r12, merging o3d-remove-parked-connectors).
+ *
+ * It was the literal pair `['xero', 'quickbooks']`, which after the archiving would have driven this sweep
+ * with an id no plugin flag can make active — the sweep would fail for a reason that is not the rule under
+ * test. Derived, with a floor below, so an empty registry fails loudly instead of passing by iterating
+ * nothing.
+ */
+const CHART_CONNECTORS = ACCOUNTING_CONNECTORS.map((connector) => connector.id)
 
 /** A payment whose payload carries the two connector-native ids the finding is about. */
 function paymentRequest(type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT') {
@@ -514,6 +503,9 @@ for (const [label, documentConnector] of [
 test('[o3d-j625 r3] the rule is read off the PAYLOAD, so a payload with NO document id needs no declaration', async () => {
   // Otherwise every journal site would have to declare a provenance it has nothing to declare about,
   // and an optional parameter that every caller passes as noise is a parameter nobody reads.
+  assert.ok(CHART_CONNECTORS.length > 0,
+    'PRECONDITION: the registry names at least one connector — an empty roster would make this sweep '
+    + 'examine nothing and pass')
   for (const chart of CHART_CONNECTORS) {
     reset([chart])
     const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
@@ -535,7 +527,9 @@ test('[o3d-j625 r3] every connector-native key is guarded, each on its own', asy
   ].sort())
   let refusedCount = 0
   for (const key of CONNECTOR_NATIVE_PAYLOAD_ID_KEYS) {
-    reset(['quickbooks'])
+    // o3d-j625 r12: ran under the second connector; the rule is "a native id with no provenance is
+    // refused", which does not depend on which connector is active.
+    reset(['xero'])
     const { queueAccountingSync } = await import('@/lib/accounting')
     const outcome = await queueAccountingSync({
       type: 'PURCHASE_CREDIT_NOTE',
@@ -569,7 +563,13 @@ test('[o3d-j625 r3] an EMPTY id is not an id — a payload with `accountingInvoi
 test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never narrowed to a supported one', async () => {
   const { asRoutableAccountingConnector } = await import('@/lib/accounting')
   assert.equal(asRoutableAccountingConnector('xero'), 'xero')
-  assert.equal(asRoutableAccountingConnector('quickbooks'), 'quickbooks')
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors) — AND `quickbooks` IS NOW SUCH A VALUE. This line
+  // read `'quickbooks'` before, because the build routed it; the connector is archived, the normaliser asks
+  // the REGISTRY rather than a literal pair, and a stored `quickbooks` therefore answers `null`. That is not
+  // a weakening of this test, it is the case it exists for — `AccountingSyncLog`/`accountingRetrySyncs` hold
+  // those rows right now, and the alternative (a literal pair) would have gone on routing a connector whose
+  // queue is gone.
+  assert.equal(asRoutableAccountingConnector('quickbooks'), null)
   assert.equal(asRoutableAccountingConnector('shiphero'), null)
   assert.equal(asRoutableAccountingConnector(''), null)
   assert.equal(asRoutableAccountingConnector(null), null)
@@ -587,9 +587,15 @@ test('[o3d-j625 r4] accountingPostingVerdictForChart keeps "chart retired" apart
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'post', connector: 'xero' })
   // Posting mode for this type is not in the Xero settings double, i.e. switched off, while Xero is active.
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'COGS_REVERSAL'), { verdict: 'not-configured', connector: 'xero' })
-  // The chart is Xero's and QuickBooks is active: owed, not off — whatever QuickBooks' own toggles say.
-  reset(['quickbooks'])
-  assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: 'quickbooks' })
+  // o3d-j625 r12: this enabled the SECOND connector and asserted the verdict named it as active. An
+  // unregistered plugin flag resolves to NO active connector now, so that state is the `reset([])` case
+  // below and the two have merged. What this case keeps is the distinction the test is named for — a
+  // retired chart is `chart-retired` and NOT `not-configured` — which the `reset([])` line proves.
+  //
+  // AND THE NEW ARM: a chart naming a connector this build does not register is retired too, which is the
+  // realistic form of it after the archiving and is checked here rather than left to inference.
+  reset(['xero'])
+  assert.deepEqual(await accountingPostingVerdictForChart('quickbooks', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'quickbooks', activeConnector: 'xero' })
   reset([])
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: null })
   assert.deepEqual(await accountingPostingVerdictForChart(null, 'SALES_INVOICE'), { verdict: 'no-chart' })

@@ -690,7 +690,14 @@ test('[o3d-j625 r2] `chartConnector` is declared REQUIRED on both enqueues and o
   // o3d-j625 r4: FIVE. The two chart-scoped verdicts (`accountingPostingVerdictForChart`,
   // `isDailyBatchPostingEnabledForChart`) take the same REQUIRED parameter, for the same reason — an optional
   // one would let a caller fall back to asking the active connector, which is the defect they replace.
-  const required = code.match(/chartConnector:\s*AccountingConnectorInfo\[[^\]]*\]\s*\|\s*null/g) ?? []
+  //
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): the form is now EITHER spelling, because
+  // `accountingPostingVerdictForChart` takes the STORED form (`StoredAccountingConnector | null`) rather
+  // than a registered id. That is deliberate and it is the one site where it must be: its whole job is to
+  // answer `chart-retired` for a chart this build cannot route, and a value read back off a sales order or
+  // a bill can name an archived connector. What this census is about — REQUIRED, never optional — is
+  // unchanged at all five sites, and the absence check above is what enforces it.
+  const required = code.match(/chartConnector:\s*(?:AccountingConnectorInfo\[[^\]]*\]|StoredAccountingConnector)\s*\|\s*null/g) ?? []
   assert.equal(
     required.length,
     5,

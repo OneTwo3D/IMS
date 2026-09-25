@@ -170,11 +170,17 @@ test('[o3d-j625 r3 HIGH 4] the same-date read names the connector in its WHERE �
 // ---------------------------------------------------------------------------------------------------
 
 test('[o3d-j625 r3 MEDIUM] a REFUSED reversal is not counted as reversed, and is counted as owed', async () => {
-  // A prior QuickBooks revaluation, plus today's QuickBooks row so the fresh half is skipped and the
-  // counts below are attributable to the reversal alone.
-  reset('quickbooks', [
-    revaluationRow('qbo-prior', 'quickbooks', '2026-06-01'),
-    revaluationRow('qbo-today', 'quickbooks', VALUATION_DATE),
+  // A prior revaluation, plus today's row so the fresh half is skipped and the counts below are
+  // attributable to the reversal alone.
+  //
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): this ran under the SECOND connector. A prior row
+  // naming an unregistered connector is now refused as UNROUTABLE before the enqueue is reached, which
+  // would have made this case pass or fail for a reason that is not the one under test — the injected
+  // refusal. Under the registered connector the reversal reaches the enqueue and the injected refusal is
+  // what changes the count, which is what the following case's PRECONDITION pairs with.
+  reset('xero', [
+    revaluationRow('reval-prior', 'xero', '2026-06-01'),
+    revaluationRow('reval-today', 'xero', VALUATION_DATE),
   ])
   state.refuseKinds.add('reversal')
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
@@ -188,9 +194,11 @@ test('[o3d-j625 r3 MEDIUM] a REFUSED reversal is not counted as reversed, and is
 })
 
 test('[o3d-j625 r3 MEDIUM] PRECONDITION: the same reversal, NOT refused, IS counted — the refusal is what changed the count', async () => {
-  reset('quickbooks', [
-    revaluationRow('qbo-prior', 'quickbooks', '2026-06-01'),
-    revaluationRow('qbo-today', 'quickbooks', VALUATION_DATE),
+  // The SAME fixture as the case above, minus the injected refusal — see the note there on why it runs
+  // under the registered connector since o3d-remove-parked-connectors.
+  reset('xero', [
+    revaluationRow('reval-prior', 'xero', '2026-06-01'),
+    revaluationRow('reval-today', 'xero', VALUATION_DATE),
   ])
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 

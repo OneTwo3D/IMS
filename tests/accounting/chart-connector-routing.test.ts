@@ -109,28 +109,10 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({
-      quickbooks_sync_enabled: 'true',
-      quickbooks_sync_sales_invoice: 'submitted',
-      quickbooks_sync_inventory_adjustment: 'submitted',
-      quickbooks_sales_account: 'Q-SALES',
-      quickbooks_shipping_account: 'Q-SHIP',
-      quickbooks_discount_account: 'Q-DISC',
-      quickbooks_cogs_account: 'Q-COGS',
-      quickbooks_inventory_account: 'Q-INV',
-      quickbooks_allocated_inventory_account: 'Q-ALLOC',
-      quickbooks_unearned_revenue_account: 'Q-UNEARNED',
-      quickbooks_transit_account: 'Q-TRANSIT',
-      quickbooks_accounts_receivable_account: 'Q-AR',
-      quickbooks_accounts_payable_account: 'Q-AP',
-      quickbooks_realised_fx_gain_loss_account: 'Q-RFX',
-      quickbooks_unrealised_fx_gain_loss_account: 'Q-UFX',
-      quickbooks_manufacturing_overhead_account: 'Q-MOH',
-    }),
-  },
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors): the SECOND CONNECTOR'S SETTINGS MOCK WAS HERE, and
+// removing it is not cosmetic — `mock.module` RESOLVES its specifier, so a mock of an archived module makes
+// the whole file fail to load with ERR_MODULE_NOT_FOUND. Every case that needed the second connector's
+// chart is adapted or removed above/below, each saying which.
 
 // --------------------------------------------------------------------------------------------
 // The queues, the activity log, and the transaction double
@@ -150,9 +132,7 @@ function recordRouted(queue: 'xero' | 'quickbooks') {
 mock.module('@/lib/connectors/xero/queue', {
   namedExports: { queueXeroSync: recordRouted('xero') },
 })
-mock.module('@/lib/connectors/quickbooks/queue', {
-  namedExports: { queueQuickBooksSync: recordRouted('quickbooks') },
-})
+// o3d-j625 r12: and the second connector's QUEUE mock, for the same reason. There is one connector queue.
 
 /** Activity records written by the facade. */
 const activity: Array<{ action: string; description: string; metadata?: Record<string, unknown> }> = []
@@ -363,21 +343,16 @@ test('[o3d-j625] it is not "always refuse": with the chart still active the row 
   assert.equal(routed[0].salesAccount, 'X-SALES', 'the codes and the queue are the same connector’s')
 })
 
-test('[o3d-j625] the QuickBooks chart routes to the QuickBooks queue — the rule is about agreement, not about Xero', async () => {
-  reset(['quickbooks'])
-  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
-  const settings = await getAccountingSettings()
-  assert.equal(settings.salesAccount, 'Q-SALES')
-
-  await queueAccountingSync({
-    ...salesInvoiceRequest(settings.salesAccount),
-    chartConnector: settings.connector,
-  })
-
-  assert.equal(routed.length, 1)
-  assert.equal(routed[0].queue, 'quickbooks')
-  assert.equal(routed[0].salesAccount, 'Q-SALES')
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors) — REMOVED, no subject.
+//
+// '[o3d-j625] the QuickBooks chart routes to the QuickBooks queue — the rule is about agreement, not about
+// Xero' asserted that the rule generalises: a SECOND connector's chart routes to that connector's queue,
+// so the mechanism is about chart-and-queue AGREEMENT and not about Xero specifically. One registered
+// connector cannot express it, and the case immediately above proves the agreement for the one there is.
+// The generalisation is now type-checked only (everything is keyed by `AccountingConnectorId`) — the
+// registry says so itself: "do not read a green suite as evidence that a second accounting connector would
+// work". Recorded in o3d-5ktph; verbatim at
+// `git show da093f85:tests/accounting/chart-connector-routing.test.ts`.
 
 test('[o3d-j625] a chart read while NO connector was on writes nothing, even though one has since come on', async () => {
   reset([])
@@ -421,42 +396,17 @@ test('[o3d-j625] a chart read while NO connector was on writes nothing, even tho
 // unchanged); it is the TEST that is now unobservable. Recoverable verbatim from
 // `git show da093f85:tests/accounting/chart-connector-routing.test.ts`.
 
-test('[o3d-j625] the refusal is RECORDED, because almost every site it protects ignores the return value', async () => {
-  reset(['xero'])
-  const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
-  const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
-
-  await queueAccountingSync({
-    ...salesInvoiceRequest(settings.salesAccount),
-    chartConnector: settings.connector,
-  })
-
-  const refusals = activity.filter((entry) => entry.action === 'accounting_enqueue_refused_retired_chart')
-  assert.equal(refusals.length, 1, `the refusal must leave a record. Activity: ${JSON.stringify(activity)}`)
-  assert.match(refusals[0].description, /NOTHING WAS QUEUED/)
-  assert.match(refusals[0].description, /still OUTSTANDING/)
-  assert.match(refusals[0].description, /SALES_INVOICE for SalesOrder order-1/)
-  assert.equal(refusals[0].metadata?.chartConnector, 'xero')
-
-  // o3d-j625 r2 (Codex MEDIUM 2) — AND IT NAMES THE CONNECTOR IT WAS REFUSED IN FAVOUR OF.
-  //
-  // r1 recorded only the chart. So the record said "built from Xero's chart, and Xero is no longer the
-  // active connector" and could not say what IS active — which is the half that decides what an
-  // operator does next (switch the selection back, or raise the posting in the other books). The
-  // reviewer's note is sharper than untidiness: no application consumer reads this action, the generic
-  // Activity page is the only reader, so whatever is not IN the record is not available anywhere.
-  assert.equal(
-    refusals[0].metadata?.activeConnector,
-    'quickbooks',
-    'the refusal must name the connector that is active NOW, not only the retired chart',
-  )
-  assert.match(
-    refusals[0].description,
-    /active accounting connector is now quickbooks/,
-    `the description must name both ends of the switch. Got: ${refusals[0].description}`,
-  )
-})
+// o3d-j625 r12 (merging o3d-remove-parked-connectors) — REMOVED, and what it covered now lives below.
+//
+// '[o3d-j625] the refusal is RECORDED, because almost every site it protects ignores the return value'
+// switched the active connector to the SECOND one mid-case and asserted the refusal record names the
+// connector that is active NOW (r2, Codex MEDIUM 2) as well as the retired chart. With one registered
+// connector a retired chart can only mean NOTHING is active, which is precisely the case below — and that
+// case asserts the same record, the same action, and the nullable half of the same field. So the loss is
+// the NAMED-successor half of MEDIUM 2, not the record itself. Recorded in o3d-5ktph.
+//
+// The description assertions that went with it (NOTHING WAS QUEUED / still OUTSTANDING / the posting is
+// named) are re-asserted below so they are not lost with the case.
 
 test('[o3d-j625 r2] and when NOTHING is active, the refusal says that rather than naming a connector', async () => {
   // The other end of MEDIUM 2: `activeConnector` is nullable, and a record whose only statement about
@@ -481,6 +431,12 @@ test('[o3d-j625 r2] and when NOTHING is active, the refusal says that rather tha
   )
   assert.equal(refusals[0].metadata?.activeConnector, null)
   assert.match(refusals[0].description, /no accounting connector at all/)
+  // o3d-j625 r12: carried over from the case removed above, so removing it costs no coverage of WHAT the
+  // record says — only of the named-successor half, which needs a second registered connector.
+  assert.match(refusals[0].description, /NOTHING WAS QUEUED/)
+  assert.match(refusals[0].description, /still OUTSTANDING/)
+  assert.match(refusals[0].description, /SALES_INVOICE for SalesOrder order-1/)
+  assert.equal(refusals[0].metadata?.chartConnector, 'xero')
 })
 
 test('[o3d-j625] a chartered enqueue reads the plugin selection ONCE — there is no second resolution left to disagree', async () => {

@@ -64,9 +64,13 @@ const activity: Array<{ action: string; description: string; metadata?: Record<s
  */
 let syncLogRows: Array<{ id: string; connector: string; payload: unknown }> = []
 
+// o3d-j625 r12: the historic journal's own codes. They are deliberately NOT the codes in `settings`
+// above — that difference is what makes "the reversal came from the prior payload" observable. They used
+// to be the second connector's (`Q-*`); with one registered connector the point is the DIFFERENCE, not
+// whose chart they were.
 const PRIOR_LINES = [
-  { accountCode: 'Q-AR', description: 'Unrealised FX gain on SO-9', debit: 12, credit: 0 },
-  { accountCode: 'Q-UFX', description: 'Unrealised FX gain on SO-9', debit: 0, credit: 12 },
+  { accountCode: 'HIST-AR', description: 'Unrealised FX gain on SO-9', debit: 12, credit: 0 },
+  { accountCode: 'HIST-UFX', description: 'Unrealised FX gain on SO-9', debit: 0, credit: 12 },
 ]
 
 function priorRevaluation(connector: string) {
@@ -155,11 +159,22 @@ function reset(rows: Array<{ id: string; connector: string; payload: unknown }>)
   activity.length = 0
 }
 
-test('[o3d-j625 r2] the reversal is routed by the SOURCE ROW’s connector, not by the active chart', async () => {
-  // The prior revaluation was posted under QUICKBOOKS. The active connector is XERO, so
-  // `settings.connector` — what r1 passed — would say 'xero'. The two deliberately disagree; without
-  // that disagreement this test could not tell the fix from the defect.
-  reset([priorRevaluation('quickbooks'), TODAYS_REVALUATION])
+/**
+ * o3d-j625 r12 (merging o3d-remove-parked-connectors) — WHAT THIS CASE CAN AND CANNOT STILL SEE.
+ *
+ * It used to post the prior revaluation under QUICKBOOKS while XERO was active, so the source row's
+ * connector and the active chart DISAGREED and the routing could be told apart from the defect. With one
+ * registered connector that disagreement cannot exist: a prior row naming an unregistered connector is now
+ * REFUSED rather than routed anywhere, which is the case the sibling test below ('a source row naming a
+ * connector this build cannot route is REFUSED and REPORTED') owns — and that is the half of the r2 defect
+ * that mattered, because the defect was SUBSTITUTING the active chart.
+ *
+ * What remains observable here, and it is not nothing: the reversal's LINES come from the prior journal's
+ * own payload rather than from this run's settings. The prior payload's codes are deliberately not the
+ * settings' codes, so a run that rebuilt the lines from settings would fail this. Recorded in o3d-5ktph.
+ */
+test('[o3d-j625 r2] the reversal’s lines come from the SOURCE ROW’s payload, not from this run’s chart', async () => {
+  reset([priorRevaluation(ACTIVE_CONNECTOR), TODAYS_REVALUATION])
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 
   const result = await runArApFxRevaluation({ valuationDate: '2026-06-02' })
@@ -171,7 +186,7 @@ test('[o3d-j625 r2] the reversal is routed by the SOURCE ROW’s connector, not 
   // THE ACCOUNT CODES ON IT ARE THE HISTORIC ROW'S, which is the whole reason its chart is that row's.
   assert.deepEqual(
     reversals[0].accountCodes.sort(),
-    ['Q-AR', 'Q-UFX'],
+    ['HIST-AR', 'HIST-UFX'],
     'the reversal’s lines come from the PRIOR journal’s payload, not from this run’s settings',
   )
   assert.equal(
