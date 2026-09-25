@@ -134,7 +134,7 @@ export function buildStockMovementValueFieldsFromTotal(params: {
       'the caller already created rolls back with its enclosing transaction. A credit-derived ' +
       '(negative-basis) cost ' +
       'layer cannot be represented downstream: cogs_entries would keep the negative sign for this same ' +
-      'consumption, and the Xero and QuickBooks daily syncs emit a COGS journal pair only when the ' +
+      'consumption, and the accounting daily sync emits a COGS journal pair only when the ' +
       'batch total is above zero, so the journal would be dropped silently. Correct the credit cost ' +
       'line that drove the basis negative (o3d-gd2f).',
     )

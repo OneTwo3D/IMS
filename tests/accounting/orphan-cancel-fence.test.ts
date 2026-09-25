@@ -438,21 +438,20 @@ test('the LOCKED resolution and the POOLED one answer identically for every comb
   const { getAccountingIntegrationConnector } = await import('@/app/actions/accounting-sync')
   const { resolveActiveAccountingConnector } = await import('@/lib/integration-plugin-selection-lock')
 
-  for (const [xero, quickbooks] of [[false, false], [true, false], [false, true], [true, true]] as const) {
-    // The pooled path is driven by isIntegrationPluginEnabled, which this file's double answers
-    // from state.activeConnector — so it can only express one at a time. The both-on case is
-    // therefore checked against the resolver alone, and it is the case that matters most: it is
-    // the invalid state finding 1 could produce, and Xero-first is what silently picks a winner.
-    if (xero && quickbooks) {
-      assert.equal(resolveActiveAccountingConnector({ xero, quickbooks }), 'xero')
-      continue
-    }
-    state.activeConnector = xero ? 'xero' : quickbooks ? 'quickbooks' : null
+  // o3d-remove-parked-connectors — THE TABLE HAS COLLAPSED FROM FOUR ROWS TO TWO, AND THAT IS A LOSS.
+  //
+  // It enumerated `[xero, quickbooks]` over all four combinations, and the row that mattered most was
+  // BOTH ON: the invalid state finding 1 could produce, where the two resolvers could silently pick
+  // different winners. With one registered accounting connector there is no both-on state and no
+  // precedence to disagree about, so what is left is the agreement of the two resolvers on the only
+  // two states that exist. Recorded in docs/archive/quickbooks-connector-removal.md.
+  for (const xero of [false, true] as const) {
+    state.activeConnector = xero ? 'xero' : null
     const pooled = await getAccountingIntegrationConnector()
     assert.equal(
       pooled?.id ?? null,
-      resolveActiveAccountingConnector({ xero, quickbooks }),
-      `xero=${xero} quickbooks=${quickbooks}`,
+      resolveActiveAccountingConnector({ xero }),
+      `xero=${xero}`,
     )
   }
 })
@@ -481,7 +480,11 @@ test('the generic key-value writer is still not a way around the lock', async ()
   // here until the allowlist landed, and it is now refused in its own right, which would have made
   // this assertion pass without the plugin key ever being looked at.
   await assert.rejects(
-    () => setSettings({ financial_year_start: '04-01', plugin_quickbooks_enabled: 'true' }),
+    // o3d-remove-parked-connectors: this used `plugin_quickbooks_enabled`, a plugin key the generic
+    // writer must refuse. QuickBooks is archived, so the key is no longer a plugin key at all and the
+    // writer refuses it for a DIFFERENT reason (not a writable preference) — which would have made
+    // this case pass for the wrong reason. It now names a key that IS still a plugin key.
+    () => setSettings({ financial_year_start: '04-01', plugin_xero_enabled: 'true' }),
     /must be written atomically and under the connector-selection lock/,
   )
 

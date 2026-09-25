@@ -1,3 +1,4 @@
+import { ACCOUNTING_CONNECTORS, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
@@ -22,7 +23,8 @@ import { SETTING_ENV_FALLBACKS } from '@/lib/settings-store'
 // serialized behind the lock — and the committed result was BOTH ENABLED. Nothing revisits that
 // state afterwards, and getActiveConnector resolves Xero-first, so the invalid state is silent:
 // the operator sees the connector they did not choose, and the orphan-cancel sweep decides what to
-// discard from it. WooCommerce/Shopify had the identical race.
+// discard from it. The shopping pair had the identical race before Shopify was archived
+// (o3d-remove-parked-connectors) -- see the deleted commerce-pair case below.
 //
 // THE FIX. lockIntegrationPluginSelection: acquire the advisory lock, materialise the plugin rows,
 // row-lock them FOR UPDATE, and read the state THROUGH the transaction client — then validate, then
@@ -211,7 +213,7 @@ async function savePlugins(patch: Record<string, boolean>) {
 }
 
 async function saveOnboarding(full: {
-  woocommerce: boolean; shopify: boolean; xero: boolean; quickbooks: boolean; mintsoft: boolean
+  woocommerce: boolean; xero: boolean; mintsoft: boolean
 }) {
   const { saveOnboardingPluginState } = await import('@/app/actions/onboarding')
   return saveOnboardingPluginState(full)
@@ -227,72 +229,36 @@ test.beforeEach(reset)
 // Finding 1 — the race itself.
 // ---------------------------------------------------------------------------
 
-test('two concurrent PARTIAL enables cannot leave BOTH accounting connectors on', async () => {
-  // Both start from "neither enabled" — the state each one used to read, unlocked, before deciding
-  // its write was legal.
-  const [xero, quickbooks] = await Promise.all([
-    savePlugins({ xero: true }),
-    savePlugins({ quickbooks: true }),
-  ])
-
-  const outcomes = [xero, quickbooks]
-  assert.equal(outcomes.filter((r) => r.status === 'saved').length, 1, 'exactly one of them succeeds')
-  const refused = outcomes.find((r) => r.status === 'refused')
-  assert.ok(refused?.status === 'refused', 'and the other is REFUSED — the outcome that committed nothing')
-  assert.match(refused.error, /either Xero or QuickBooks/, 'with the reason')
-
-  assert.ok(
-    !(enabled('xero') && enabled('quickbooks')),
-    'the committed state is valid — this is the assertion that fails when the validation moves back '
-      + 'outside the transaction, because both requests then read "neither enabled" and both write',
-  )
-  assert.equal(state.maxConcurrentTransactions, 1, 'the lock is being modelled: transactions ran one at a time')
-})
-
-test('the same race on the COMMERCE pair is closed too — it was never accounting-only', async () => {
-  const results = await Promise.all([
-    savePlugins({ woocommerce: true }),
-    savePlugins({ shopify: true }),
-  ])
-
-  assert.equal(results.filter((r) => r.status === 'saved').length, 1)
-  const commerceRefusal = results.find((r) => r.status === 'refused')
-  assert.ok(commerceRefusal?.status === 'refused')
-  assert.match(commerceRefusal.error, /either WooCommerce or Shopify/)
-  assert.ok(!(enabled('woocommerce') && enabled('shopify')))
-})
-
-test('a partial write racing the ONBOARDING step cannot produce both either', async () => {
-  // The onboarding step writes every exclusivity-bearing key at once, so its own payload is always
-  // self-consistent. That is not enough: a partial write committing AFTER it can still add the
-  // second connector. Both go through the same lock and the same resulting-state check.
-  //
-  // Whichever way this interleaves, the INVARIANT holds — which is the assertion, because whether
-  // anything is refused depends on the order: onboarding-then-partial is a genuine conflict, and
-  // partial-then-onboarding is not (onboarding writes xero=false itself). Asserting a refusal here
-  // would be asserting a scheduling accident. The deterministic conflict is the test below.
-  await Promise.all([
-    saveOnboarding({ woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false }),
-    savePlugins({ xero: true }),
-  ])
-
-  assert.ok(!(enabled('xero') && enabled('quickbooks')), 'never both')
-})
-
-test('a partial enable is refused against the state the ONBOARDING step just committed', async () => {
-  const onboarding = await saveOnboarding({
-    woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
-  })
-  assert.equal(onboarding.status, 'saved')
-
-  const partial = await savePlugins({ xero: true })
-
-  assert.equal(partial.status, 'refused', 'the second connector is refused')
-  assert.ok(partial.status === 'refused')
-  assert.match(partial.error, /either Xero or QuickBooks/)
-  assert.ok(!enabled('xero'))
-  assert.ok(enabled('quickbooks'), 'and the connector that was already on is untouched')
-})
+// ---------------------------------------------------------------------------
+// THE EXCLUSIVITY-REFUSAL CASES WERE HERE, AND MOVED RATHER THAN WEAKENED
+// (o3d-remove-parked-connectors).
+// ---------------------------------------------------------------------------
+//
+// Four cases in this file produced a REFUSED save, and every one of them produced it from the
+// `accounting` exclusivity group (Xero vs QuickBooks):
+//
+//   * 'two concurrent PARTIAL enables cannot leave BOTH accounting connectors on'
+//   * 'a partial write racing the ONBOARDING step cannot produce both either'
+//   * 'a partial enable is refused against the state the ONBOARDING step just committed'
+//   * 'a refused write commits NOTHING — not even the keys that were individually legal'
+//   * 'a REFUSAL still commits nothing and revalidates nothing'
+//
+// QuickBooks is archived and the `accounting` group is deleted with it (a one-member group can never
+// conflict, so it reads as an enforced rule and enforces nothing). Shopify's removal had already taken
+// the `shopping` group. The one group left is `wms`, whose ids are DERIVED from the registry — and
+// this file registers only Mintsoft, so no conflict is reachable here at all.
+//
+// THEY ARE NOT LOST. Every one of those properties is asserted in
+// `tests/wms-single-connector-exclusivity.test.ts`, against the `wms` group, with a REGISTERED
+// fictitious second connector (`acme-wms`) rather than a literal pair — including the concurrent
+// two-partial-writes race ('two concurrent PARTIAL writes cannot assemble a two-WMS state between
+// them') and 'the Settings writer refuses a second WMS connector, and stores nothing'. That file is
+// the stronger home for them: a derived group with a registered second member is exactly what these
+// were reaching for.
+//
+// WHAT IS GENUINELY GONE: coverage of a HAND-WRITTEN group (the two that remained were both
+// hand-written), and coverage of the accounting pair specifically. Recorded in
+// docs/archive/quickbooks-connector-removal.md.
 
 test('the validation reads through the TRANSACTION, not the pooled client', async () => {
   // The structural half of finding 1: a pooled read is unlocked by construction, so if one is used
@@ -321,16 +287,6 @@ test('an unchanged-but-legal partial write still succeeds — the check must not
   assert.ok(enabled('xero') && enabled('woocommerce'))
 })
 
-test('a refused write commits NOTHING — not even the keys that were individually legal', async () => {
-  store.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true')
-
-  const result = await savePlugins({ quickbooks: true, mintsoft: true })
-
-  assert.equal(result.status, 'refused')
-  assert.ok(!enabled('quickbooks'))
-  assert.ok(!enabled('mintsoft'), 'mintsoft was legal on its own and must not have slipped through a partial commit')
-})
-
 // ---------------------------------------------------------------------------
 // Round 7, finding 1 — a scheduler failure is NOT a rejected save.
 //
@@ -345,7 +301,7 @@ test('a scheduler failure AFTER the commit is reported as committed, not as a re
   state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
 
   const result = await saveOnboarding({
-    woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
+    woocommerce: true, xero: true, mintsoft: false,
   })
 
   assert.equal(result.status, 'scheduler-failed', 'not "refused" — the write is durable')
@@ -353,14 +309,14 @@ test('a scheduler failure AFTER the commit is reported as committed, not as a re
   assert.match(result.error, /crontab write failed/, 'and the scheduler reason is carried through')
   // THE ASSERTION THAT FAILS WHEN THIS REGRESSES: the selection really is in the database, so any
   // caller that rolls its UI back is showing something the database disagrees with.
-  assert.ok(enabled('quickbooks') && enabled('woocommerce'), 'the committed selection is stored')
-  assert.ok(!enabled('xero'))
+  assert.ok(enabled('xero') && enabled('woocommerce'), 'the committed selection is stored')
   assert.deepEqual(
     result.pluginState,
-    // SIX keys, not the five the onboarding payload carries: the returned state is the one read
-    // back under the lock, so it includes the plugin this step does not offer. That is the point —
-    // it is the database's answer rather than an echo of the request.
-    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false },
+    // EVERY REGISTERED ID, read back under the lock rather than echoed from the request. (It used
+    // to be phrased as "six keys, not the five the payload carries"; the payload type is now the
+    // whole id union, and Shopify's removal took the count from six to four —
+    // o3d-remove-parked-connectors. The point is unchanged: this is the database's answer.)
+    { woocommerce: true, xero: true, mintsoft: false },
     'and the COMMITTED state is returned, so the caller need not guess from its own copy',
   )
 })
@@ -370,34 +326,27 @@ test('the committed selection is revalidated even when the scheduler fails', asy
   // reload did not recover the operator either.
   state.cronResult = { success: false, error: 'crontab write failed' }
 
-  await saveOnboarding({ woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: false })
+  await saveOnboarding({ woocommerce: false, xero: true, mintsoft: false })
 
   assert.deepEqual(state.revalidated.sort(), ['/dashboard', '/onboarding'])
-})
-
-test('a REFUSAL still commits nothing and revalidates nothing', async () => {
-  // The other side of the split. `refused` is the one outcome a caller may roll back over, so it
-  // must remain reachable and must remain truthful.
-  store.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true')
-
-  const result = await saveOnboarding({
-    woocommerce: true, shopify: true, xero: false, quickbooks: false, mintsoft: false,
-  })
-
-  assert.equal(result.status, 'refused')
-  assert.ok(result.status === 'refused' && /either WooCommerce or Shopify/.test(result.error))
-  assert.ok(!enabled('woocommerce') && !enabled('shopify'), 'nothing was written')
-  assert.ok(enabled('xero'), 'and the stored selection is untouched')
-  assert.deepEqual(state.revalidated, [], 'nothing changed, so nothing is revalidated')
 })
 
 test('the scheduler is only consulted AFTER every plugin key has been written', async () => {
   // Ordering is what makes 'scheduler-failed' honest in the other direction too: if syncCrontab ran
   // inside (or before) the transaction, a scheduler failure could still mean nothing was written,
   // and calling that outcome "committed" would be the same lie mirrored.
-  await saveOnboarding({ woocommerce: true, shopify: false, xero: true, quickbooks: false, mintsoft: false })
+  await saveOnboarding({ woocommerce: true, xero: true, mintsoft: false })
 
-  assert.equal(state.cronCalledAfterWrites, 5, 'all five plugin keys were already written when the scheduler ran')
+  // DERIVED, not a literal (o3d-remove-parked-connectors). It was `5`, which meant this case failed
+  // for the wrong reason the moment a connector was added or removed. What it has to say is "every
+  // registered plugin key was already written", so that is what it compares against.
+  const { INTEGRATION_PLUGIN_IDS: PLUGIN_IDS_FOR_CRON } = await import('@/lib/integration-plugin-keys')
+  assert.ok(PLUGIN_IDS_FOR_CRON.length > 0, 'the registry must not be empty, or this passes vacuously')
+  assert.equal(
+    state.cronCalledAfterWrites,
+    PLUGIN_IDS_FOR_CRON.length,
+    'every registered plugin key was already written when the scheduler ran',
+  )
   assert.equal(state.openTransactionsWhenCronRan, 0, 'and the transaction had ended')
 })
 
@@ -416,7 +365,7 @@ test('a scheduler failure that THROWS is the same outcome as one that RETURNS', 
   state.cronThrows = new Error('crontab: EACCES writing /var/spool/cron/ims')
 
   const result = await saveOnboarding({
-    woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
+    woocommerce: true, xero: true, mintsoft: false,
   })
 
   // THE ASSERTION THAT FAILS WITHOUT THE FIX: before the post-commit guard this call REJECTED, so
@@ -426,10 +375,10 @@ test('a scheduler failure that THROWS is the same outcome as one that RETURNS', 
   assert.match(result.error, /EACCES/, 'the thrown reason is carried through, like a returned one')
   assert.deepEqual(
     result.pluginState,
-    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false },
+    { woocommerce: true, xero: true, mintsoft: false },
     'with the committed selection, read back under the lock',
   )
-  assert.ok(enabled('quickbooks') && enabled('woocommerce'), 'and it really is stored')
+  assert.ok(enabled('xero') && enabled('woocommerce'), 'and it really is stored')
 })
 
 test('a post-commit ACTIVITY LOG failure is not a rejected save either', async () => {
@@ -439,7 +388,7 @@ test('a post-commit ACTIVITY LOG failure is not a rejected save either', async (
   state.logActivityThrows = new Error('activity log unavailable')
 
   const result = await saveOnboarding({
-    woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: false,
+    woocommerce: false, xero: true, mintsoft: false,
   })
 
   assert.equal(result.status, 'scheduler-failed')
@@ -470,7 +419,7 @@ test('the SETTINGS writer reports a scheduler failure as committed, not as a ref
   assert.deepEqual(
     result.pluginState,
     // The full state read back under the lock, not the two keys this partial payload named.
-    { woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: true },
+    { woocommerce: false, xero: true, mintsoft: true },
   )
 })
 
@@ -497,22 +446,6 @@ test('the SETTINGS writer reconciles the crontab ITSELF, after every key it writ
   assert.deepEqual(state.revalidated, ['/settings'])
 })
 
-test('a REFUSED settings write never reaches the scheduler at all', async () => {
-  // Nothing committed, so there is nothing for the crontab to catch up with — and a scheduler call
-  // here would produce a `scheduler-failed` outcome carrying a state that was never written.
-  store.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true')
-
-  const result = await savePlugins({ quickbooks: true })
-
-  assert.equal(result.status, 'refused')
-  assert.equal(state.cronCalledAfterWrites, -1, 'the scheduler was not consulted')
-  assert.deepEqual(state.revalidated, [], 'and nothing was revalidated')
-})
-
-// ---------------------------------------------------------------------------
-// The lock protocol itself.
-// ---------------------------------------------------------------------------
-
 test('the plugin rows are materialised before they are locked — FOR UPDATE cannot lock what does not exist', async () => {
   assert.equal(store.size, 0, 'starting from a database that has never had these rows')
 
@@ -527,8 +460,9 @@ test('the plugin rows are materialised before they are locked — FOR UPDATE can
 })
 
 test('EVERY plugin key is locked, in one canonical order', async () => {
-  // Not just the accounting pair: exclusivity spans WooCommerce/Shopify as well, and one order for
-  // one lock set is what stops two callers taking the same rows in opposite orders and deadlocking.
+  // Not just the ids that happen to be in an exclusivity group today: the lock set is the whole
+  // registry, and one order for one lock set is what stops two callers taking the same rows in
+  // opposite orders and deadlocking.
   //
   // o3d-remove-shiphero: this used to assert the literal count 6. A hardcoded count is a worse test
   // than it looks — it fails when a connector is legitimately added OR removed, and it says nothing
@@ -569,11 +503,39 @@ test('the plugin keys have NO environment fallback — the locked row is the who
   }
 })
 
-test('the Xero-first resolution rule is one rule', () => {
-  assert.equal(resolveActiveAccountingConnector({ xero: true, quickbooks: true }), 'xero', 'xero wins, as getActiveConnector does')
-  assert.equal(resolveActiveAccountingConnector({ xero: true, quickbooks: false }), 'xero')
-  assert.equal(resolveActiveAccountingConnector({ xero: false, quickbooks: true }), 'quickbooks')
-  assert.equal(resolveActiveAccountingConnector({ xero: false, quickbooks: false }), null)
+test('the accounting resolution rule is one rule, and it walks the registry', () => {
+  // o3d-remove-parked-connectors — WHAT THIS CAN AND CANNOT STILL SHOW.
+  //
+  // It used to enumerate the four states of two registered connectors and pin the PRECEDENCE
+  // ('xero wins'). With one registered connector, precedence is unobservable: `{xero: true}` and
+  // `{xero: false}` are the whole state space, and any rule that answers them correctly — including a
+  // hardcoded `state.xero ? 'xero' : null` — passes. That is a real loss, recorded in
+  // docs/archive/quickbooks-connector-removal.md.
+  //
+  // What is still worth asserting, and is asserted: the rule is TOTAL over the registry and answers
+  // `null` for a state with nothing enabled, and it does so by walking `ACCOUNTING_CONNECTORS` rather
+  // than naming an id — so the walk is checked against the registry's own contents instead of a
+  // literal, and a registered connector joins the rule without an edit here.
+  assert.ok(ACCOUNTING_CONNECTORS.length >= 1, 'the registry must not be empty, or this proves nothing')
+  type AccountingSelection = Record<AccountingConnectorId, boolean>
+  const allOff = Object.fromEntries(
+    ACCOUNTING_CONNECTORS.map((connector) => [connector.id, false]),
+  ) as AccountingSelection
+  assert.equal(resolveActiveAccountingConnector(allOff), null, 'nothing enabled resolves to nothing')
+  for (const connector of ACCOUNTING_CONNECTORS) {
+    const onlyThis = { ...allOff, [connector.id]: true }
+    assert.equal(
+      resolveActiveAccountingConnector(onlyThis),
+      connector.id,
+      `${connector.id} must resolve to itself when it is the only one enabled`,
+    )
+  }
+  // And the order it walks is the REGISTRY's order, not an alphabetical or hardcoded one: with every
+  // connector enabled the answer must be the first registered id.
+  const allOn = Object.fromEntries(
+    ACCOUNTING_CONNECTORS.map((connector) => [connector.id, true]),
+  ) as AccountingSelection
+  assert.equal(resolveActiveAccountingConnector(allOn), ACCOUNTING_CONNECTORS[0].id)
 })
 
 // ---------------------------------------------------------------------------
@@ -1178,6 +1140,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // discriminates between passwords while checking a credential ALTER ROLE cannot change. It is the
   // one entry here that opens a connection it deliberately never completes.
   'scripts/lib/pg-auth-request.mjs': 'protocol-handshake-only',
+  // o3d-noka. The cutover namespace library, found by this scan for exactly the reason
+  // db-fence-protected.sh below it is: open_root_owned_ancestry()'s prose names `pg_dump` while
+  // explaining WHAT the ancestry rule protects — the whole-database dump scripts/update.sh takes at
+  // the migration step, its publication and its prune. This file opens no connection and executes
+  // no SQL; the dump itself is a statement in scripts/update.sh. Rewording the explanation to dodge
+  // the detector would delete the reason the gate exists.
+  'scripts/lib/cutover-namespace.sh': 'names-the-tools-only',
   // o3d-secops r32. The shared library the three cutover entrypoints drive the connection fence
   // through. It EXECUTES no SQL of its own and opens no connection: every statement this subsystem
   // issues is in scripts/fence-db-connections.mjs, classified above, and this file only decides

@@ -165,26 +165,12 @@ const XERO_SETTINGS = {
   xero_cogs_account: '310',
 } as never
 
-const QBO_SETTINGS = {
-  quickbooks_sales_account: '200',
-  quickbooks_unearned_revenue_account: '830',
-  quickbooks_inventory_account: '630',
-  quickbooks_allocated_inventory_account: '631',
-  quickbooks_cogs_account: '310',
-} as never
 
 async function runXeroSweep(): Promise<string[]> {
   const { recreateMissingDailyBatchLogs } = await import('@/lib/connectors/xero/daily-sync')
   return recreateMissingDailyBatchLogs(XERO_SETTINGS, 'GBP')
 }
 
-async function runQboSweep(): Promise<string[]> {
-  const { recreateMissingDailyBatchLogs } = await import('@/lib/connectors/quickbooks/daily-sync')
-  // o3d-i0o6 r4: this sweep now RETURNS its refusals too, as the Xero twin already did, and the run
-  // pushes them onto `result.errors`. A test that threw the return value away could not tell a
-  // refused batch from a skipped one.
-  return recreateMissingDailyBatchLogs(QBO_SETTINGS, 'GBP')
-}
 
 function reset() {
   salesOrderRows = { a1: [], a2: [] }
@@ -200,9 +186,6 @@ const STAMP_NEXT_DAY = new Date('2026-07-21T00:04:11.000Z')
 const XERO_A1_REF = 'A1-2026-07-20-1a2b3c4d'
 const XERO_A2_REF = 'A2-2026-07-20-1a2b3c4d'
 const XERO_B_REF = 'B-2026-07-20-1a2b3c4d'
-const QBO_A1_REF = 'A1-2026-07-20'
-const QBO_A2_REF = 'A2-2026-07-20'
-const QBO_B_REF = 'B-2026-07-20'
 
 /**
  * o3d-i0o6 r4 — THE PASS HISTORY THE REAL A2 WRITER LEAVES BESIDE THE STAMP.
@@ -214,7 +197,7 @@ const QBO_B_REF = 'B-2026-07-20'
  * and those have their own tests below.
  */
 function a2Passes(
-  connector: 'xero' | 'quickbooks',
+  connector: 'xero',
   ...entries: Array<{ amount: number; batchRef: string | null; syncLogId?: string | null }>
 ): Array<Record<string, unknown>> {
   return entries.map((entry, index) => ({
@@ -233,15 +216,15 @@ function a2Passes(
  *
  * o3d-i0o6 r5: the connector is REQUIRED rather than defaulted to 'xero'. A batch reference names a
  * group and a date and no ledger, so the only thing that says which books a pass put its pounds in
- * is the pass's own `connector` — and while this helper hardcoded 'xero', every QuickBooks fixture
- * in this file described a QuickBooks batch whose passes were written by the Xero writer. That is a
+ * is the pass's own `connector` — and while this helper hardcoded 'xero', every second-connector
+ * fixture in this file described that connector's batch with passes written by the Xero writer. That is a
  * row neither writer can produce, and it is exactly the state the ledger filter refuses, so those
  * fixtures would have measured the refusal instead of the behaviour they are about.
  */
 function onePass(
   batchRef: string,
   amount: number,
-  connector: 'xero' | 'quickbooks',
+  connector: 'xero',
 ): Array<Record<string, unknown>> {
   return a2Passes(connector, { amount, batchRef })
 }
@@ -335,49 +318,6 @@ test('Xero: a legacy A2 row with a cumulative amount and no pass history is REFU
   assert.match(refusals[0], /DAILY_BATCH_INVENTORY_ALLOC not recreated/)
   assert.match(refusals[0], /SO-LEGACY/, 'the refusal names the order a human has to go and check')
   assert.match(refusals[0], /no pass history/)
-})
-
-test('QuickBooks: a legacy A2 row with a cumulative amount and no pass history is REFUSED too (o3d-i0o6 r4)', async () => {
-  // THE TWIN OF THE TEST ABOVE, because the defect is the twin. QuickBooks is being retired, but
-  // while it ships it posts to a real ledger, and a refusal that exists on one connector and not the
-  // other is how the two sweeps drift back apart. Its sweep had no return value at all before this
-  // round, so a refusal there had nowhere to go: the batch was simply not rebuilt, silently.
-  reset()
-  salesOrderRows.a2 = [{ id: 'so-legacy-qbo', orderNumber: 'SO-LEGACY-QBO', inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
-
-  const refusals = await runQboSweep()
-
-  assert.deepEqual(created, [], 'a cumulative figure may not be rebuilt into one batch on QuickBooks either')
-  assert.equal(refusals.length, 1, 'and the operator has to be told there too')
-  assert.match(refusals[0], /DAILY_BATCH_INVENTORY_ALLOC not recreated/)
-  assert.match(refusals[0], /SO-LEGACY-QBO/, 'the refusal names the order a human has to go and check')
-  assert.match(refusals[0], /no pass history/)
-})
-
-test('QuickBooks: a pass history that does not ACCOUNT for the cumulative figure is refused (o3d-i0o6 r4)', async () => {
-  // The history is present and readable and still cannot answer the question: it accounts for £30 of
-  // an £80 recorded debit, so £50 was written by something that recorded no pass. Taking the £30 as
-  // "this batch's share" would rebuild a batch for a figure the row itself contradicts, and taking
-  // the £80 is the defect this round closes. Neither: the row is reported.
-  //
-  // Same test as `proveAllocationDebitPosting` applies to the same row on the credit side, so one
-  // row cannot be unprovable to the reader and self-evident to the writer.
-  reset()
-  salesOrderRows.a2 = [{
-    id: 'so-short-history',
-    orderNumber: 'SO-SHORT-HISTORY',
-    inventoryAllocatedDate: STAMP_NEXT_DAY,
-    inventoryAllocatedBatchRef: QBO_A2_REF,
-    allocationBatchAmount: 80,
-    allocationBatchPasses: onePass(QBO_A2_REF, 30, 'quickbooks'),
-  }]
-
-  const refusals = await runQboSweep()
-
-  assert.deepEqual(created, [], 'a figure the history does not account for may not be rebuilt')
-  assert.equal(refusals.length, 1)
-  assert.match(refusals[0], /SO-SHORT-HISTORY/)
-  assert.match(refusals[0], /account for £30\.00/)
 })
 
 test('Xero: a legacy row still sees a digest-suffixed live log for its derived date (scjz.37, o3d-0qoo)', async () => {
@@ -565,190 +505,30 @@ test('Xero: rows of one split batch stay one journal, and a second batch keeps i
 })
 
 // ---------------------------------------------------------------------------
-// QuickBooks
+// THE QUICKBOOKS HALF OF THIS FILE IS DELETED (o3d-remove-parked-connectors)
 // ---------------------------------------------------------------------------
-
-test('QuickBooks: a midnight-crossing A1/A2/B row whose log is live under the PERSISTED ref is NOT recreated (o3d-0qoo)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80, 'quickbooks') }]
-  shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
-  syncLogs = [
-    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: QBO_A1_REF, status: 'SYNCED' },
-    { connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: QBO_A2_REF, status: 'SYNCED' },
-    { connector: 'quickbooks', type: 'DAILY_BATCH_GROUP_B', referenceId: QBO_B_REF, status: 'PENDING' },
-  ]
-
-  await runQboSweep()
-
-  assert.deepEqual(created, [], 'recreating any of these double-posts a journal already in the ledger')
-})
-
-test('QuickBooks: a genuinely missing log is recreated under the PERSISTED ref, dated from it (o3d-0qoo)', async () => {
-  reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80, 'quickbooks') }]
-  shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
-
-  await runQboSweep()
-
-  assert.deepEqual(
-    created.map((log) => [log.type, log.referenceId, log.payload.date]),
-    [
-      ['DAILY_BATCH_INVENTORY_ALLOC', QBO_A2_REF, '2026-07-20'],
-      ['DAILY_BATCH_GROUP_B', QBO_B_REF, '2026-07-20'],
-    ],
-    'rebuilt under the batch\'s own identity and dated from it, not from the stage stamp',
-  )
-})
-
-test('QuickBooks: a legacy row with no persisted ref behaves exactly as before (o3d-0qoo)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
-
-  await runQboSweep()
-
-  assert.equal(created.length, 1)
-  assert.equal(created[0].referenceId, 'A1-2026-07-21', 'pre-migration rows still derive from the stamp')
-  assert.equal(created[0].payload.date, '2026-07-21')
-})
-
-test('QuickBooks: a legacy row with a live log on its derived date is skipped (o3d-0qoo)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
-  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.deepEqual(created, [])
-})
-
-// o3d-0qoo r1 on the QuickBooks side.
 //
-// QuickBooks' live writer stamps the BARE `<group>-<date>` (no entity digest), so two
-// same-date batches share one referenceId and a digest split cannot arise here. The same
-// defect still does: a persisted `A1-2026-07-20` bucket whose rows were stamped after UTC
-// midnight also probed the derived `A1-2026-07-21`, which is a REAL and DIFFERENT daily
-// batch's identity on this connector. A live 07-21 log therefore vouched for a missing
-// 07-20 one, and the 07-20 journal was never rebuilt — the same silent understatement.
-
-test('QuickBooks: a persisted-ref row is NOT vouched for by the NEXT DAY\'s batch log (o3d-0qoo r1)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
-  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.equal(created.length, 1, 'A1-2026-07-21 is another batch — it cannot stand in for A1-2026-07-20')
-  assert.equal(created[0].referenceId, QBO_A1_REF)
-  assert.equal(created[0].payload.date, '2026-07-20')
-})
-
-test('QuickBooks: one live batch and one missing batch on adjacent days recreates exactly one (o3d-0qoo r1)', async () => {
-  reset()
-  salesOrderRows.a1 = [
-    // Batch 2026-07-20, stamped after midnight. Its log is MISSING.
-    { revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 },
-    // Batch 2026-07-21, stamped the same day. Its log is LIVE.
-    { revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: 'A1-2026-07-21', unearnedRevenueAmount: 55 },
-  ]
-  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.deepEqual(
-    created.map((log) => [log.referenceId, log.payload.date, log.payload.narration]),
-    [[QBO_A1_REF, '2026-07-20', 'Recreated revenue deferral batch: 1 order(s), £120.00']],
-    'only the missing batch, carrying only its own value',
-  )
-})
-
-test('QuickBooks: a missing Group B batch is not vouched for by the next day\'s live one (o3d-0qoo r1)', async () => {
-  reset()
-  shipmentRows = [
-    { shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: QBO_B_REF, revenueRecognizedAmount: 60, cogsBatchAmount: 40 },
-    { shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: 'B-2026-07-21', revenueRecognizedAmount: 5, cogsBatchAmount: 3 },
-  ]
-  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-21', status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.deepEqual(
-    created.map((log) => [log.type, log.referenceId, log.payload.date]),
-    [['DAILY_BATCH_GROUP_B', QBO_B_REF, '2026-07-20']],
-  )
-})
-
-test('QuickBooks: a missing A2 batch is not vouched for by the next day\'s live one (o3d-0qoo r1)', async () => {
-  reset()
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: QBO_A2_REF, allocationBatchAmount: 80, allocationBatchPasses: onePass(QBO_A2_REF, 80, 'quickbooks') }]
-  syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-21', status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.equal(created.length, 1)
-  assert.equal(created[0].referenceId, QBO_A2_REF)
-  assert.equal(created[0].payload.date, '2026-07-20')
-})
-
-test('QuickBooks: a persisted-ref batch whose OWN log is live is still skipped (o3d-0qoo r1)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
-  syncLogs = [
-    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: QBO_A1_REF, status: 'PENDING' },
-    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' },
-  ]
-
-  await runQboSweep()
-
-  assert.deepEqual(created, [], 'narrowing the probe must not start double-posting live batches')
-})
-
-test('QuickBooks: a LEGACY row on the same date as a live log is still treated as live (o3d-0qoo r1)', async () => {
-  reset()
-  // No persisted ref → identity unknown → keeps the wide derived probe. Losing it would
-  // double-post a journal already in the ledger.
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: null, unearnedRevenueAmount: 120 }]
-  salesOrderRows.a2 = [{ inventoryAllocatedDate: STAMP_NEXT_DAY, inventoryAllocatedBatchRef: null, allocationBatchAmount: 80 }]
-  shipmentRows = [{ shipmentJournalDate: STAMP_NEXT_DAY, shipmentJournalBatchRef: null, revenueRecognizedAmount: 60, cogsBatchAmount: 40 }]
-  syncLogs = [
-    { connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' },
-    { connector: 'quickbooks', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceId: 'A2-2026-07-21', status: 'SYNCED' },
-    { connector: 'quickbooks', type: 'DAILY_BATCH_GROUP_B', referenceId: 'B-2026-07-21', status: 'PENDING' },
-  ]
-
-  await runQboSweep()
-
-  assert.deepEqual(created, [], 'a bucket with no known identity must keep the derived probe')
-})
-
-test('QuickBooks: an UNPARSEABLE persisted ref still widens to the derived probe (o3d-0qoo r1)', async () => {
-  for (const badRef of ['A1-2026-7-20', 'INVRECON-2026-07-20', 'A1-2026-07-20-ABCDEF12']) {
-    reset()
-    salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: badRef, unearnedRevenueAmount: 120 }]
-    syncLogs = [{ connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: 'A1-2026-07-21', status: 'SYNCED' }]
-
-    await runQboSweep()
-
-    assert.deepEqual(created, [], `an unparseable ref (${badRef}) must not narrow the probe and double-post`)
-  }
-})
-
-test('QuickBooks: a live log for ANOTHER connector never counts as this one (o3d-0qoo)', async () => {
-  reset()
-  salesOrderRows.a1 = [{ revenueDeferredDate: STAMP_NEXT_DAY, revenueDeferredBatchRef: QBO_A1_REF, unearnedRevenueAmount: 120 }]
-  syncLogs = [{ connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: QBO_A1_REF, status: 'SYNCED' }]
-
-  await runQboSweep()
-
-  assert.equal(created.length, 1, 'the QuickBooks ledger is still missing this journal')
-  assert.equal(created[0].referenceId, QBO_A1_REF)
-})
+// Fourteen `QuickBooks: …` cases ran the archived `lib/connectors/quickbooks/daily-sync.ts` sweep.
+// They were the twin of every Xero case above, and the reason they existed is stated in one of their
+// own comments: "a refusal that exists on one connector and not the other is how the two sweeps drift
+// back apart." There is no second sweep to drift from any more.
+//
+// One detail worth keeping in view for the next connector: QuickBooks' writer stamped the BARE
+// `<group>-<date>` reference with no entity digest, so two same-date batches shared one referenceId
+// and a digest split could not arise on it — while Xero's suffixes a digest. The o3d-0qoo defect
+// (a persisted `A1-2026-07-20` bucket also probing the derived `A1-2026-07-21` and being vouched for
+// by the NEXT day's live log) appeared on BOTH despite that difference, which is what made it a rule
+// about the probe rather than about a reference format. A connector that invents its own reference
+// format must be re-tested against it.
+//
+// Recoverable with the connector:
+// `git show archive/quickbooks-connector:tests/accounting/daily-batch-recreate-persisted-ref.test.ts`.
 
 // ---------------------------------------------------------------------------
 // o3d-o97 r3 — a debit nothing will ever relieve must not be rebuilt.
 // ---------------------------------------------------------------------------
 
-test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on either connector', async () => {
+test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated (o3d-remove-parked-connectors: was "on either connector")', async () => {
   // Group A2 and Group B both exclude `refundStatus: FULL` for ever, so an A2 debit posted under
   // a fully-refunded order has nothing left in IMS that can relieve it. That used to be
   // unreachable here because the refund path always cleared the A2 stamp; it is reachable now,
@@ -760,9 +540,10 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated, on 
   // rebuild it. Without the refundStatus exclusion the sweep would answer the refund's refusal by
   // posting a brand-new, permanently unrelievable debit under the very order being held open for
   // someone to resolve.
+  // ONE CONNECTOR TODAY (o3d-remove-parked-connectors); the loop is kept so a second sweep inherits
+  // the case, and the per-`label` assertion messages still name which one failed.
   for (const [label, ref, run] of [
     ['xero', XERO_A2_REF, runXeroSweep],
-    ['quickbooks', QBO_A2_REF, runQboSweep],
   ] as const) {
     reset()
     salesOrderRows.a2 = [{
@@ -997,12 +778,15 @@ test('o3d-i0o6 r4: an A2 batch worth less than a PENNY is not rebuilt as a £0.0
   // `totalAllocatedValueNumber`) and raise no log at all in that case, so the rebuild now asks the
   // same question the same way.
   //
-  // Reachable on QuickBooks in particular: its A2 pass rounds the per-order figure to 2dp only on
-  // the unshipped branch, so an order valued from shipment snapshots can contribute a sub-penny
-  // tail. Xero rounds unconditionally today; the guard is the same on both because the rule is.
+  // This was reachable on the archived QuickBooks writer in particular: its A2 pass rounded the
+  // per-order figure to 2dp only on the unshipped branch, so an order valued from shipment snapshots
+  // could contribute a sub-penny tail. Xero rounds unconditionally, so on Xero alone the case is a
+  // guard against a state Xero's own writer does not produce — kept because the RULE is about the
+  // rebuild, and the next connector may round like the archived one did.
+  // ONE CONNECTOR TODAY (o3d-remove-parked-connectors); the loop is kept so a second sweep inherits
+  // the case, and the per-`label` assertion messages still name which one failed.
   for (const [label, ref, run] of [
     ['xero', XERO_A2_REF, runXeroSweep],
-    ['quickbooks', QBO_A2_REF, runQboSweep],
   ] as const) {
     reset()
     salesOrderRows.a2 = [{

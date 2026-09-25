@@ -1932,13 +1932,18 @@ test(
  * The assertions pin it to that branch and not the raced one by the refusal wording,
  * which the two do not share.
  *
- * TRANSFER-BACKED, NOT PURCHASE-BACKED, for a reason worth writing down: the
- * webhook book-in of a PURCHASE-backed ASN that actually adds stock is rejected
- * outright by the `stock_movement_inbound_evidence` trigger — it writes its
- * PURCHASE_RECEIPT movement with `referenceType: 'WmsAsnMap'` and the trigger only
- * accepts `'PurchaseOrder'` — so no purchase-backed fixture can stage a real
- * receipt. That is a separate defect, filed on its own; it is NOT what this arm is
- * about. The transfer book-in writes TRANSFER_IN, which the trigger does not cover.
+ * TRANSFER-BACKED, NOT PURCHASE-BACKED. The original reason no longer holds and is
+ * recorded here so nobody re-derives it: until o3d-gles the webhook book-in of a
+ * PURCHASE-backed ASN that actually added stock was rejected outright by
+ * `stock_movements_reporting_evidence_guard`, because it wrote its PURCHASE_RECEIPT
+ * movement with `referenceType: 'WmsAsnMap'` while the guard only accepts
+ * `'PurchaseOrder'`, so no purchase-backed fixture could stage a real receipt.
+ * o3d-gles fixed the writer (the movement now names the purchase order that vouches
+ * for the units) and a purchase-backed fixture CAN now stage one — see
+ * tests/concurrency/wms-purchase-receipt-evidence.concurrent.test.ts. This arm stays
+ * transfer-backed because that is the shape it was written around, not because the
+ * purchase path is unusable; the transfer book-in writes TRANSFER_IN, which the
+ * trigger does not cover.
  *
  * SEQUENTIAL ON PURPOSE: the receipt commits BEFORE alignment begins, so there is no
  * interleaving to force and nothing here depends on the scheduler. It still needs a

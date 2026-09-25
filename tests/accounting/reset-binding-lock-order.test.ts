@@ -238,11 +238,18 @@ test('o3d-2w2j r2: the key lists are the ones the writers actually use', async (
   // IT — a re-export would be a cycle. So the duplication is CHECKED here rather than trusted.
   const { XERO_TENANT_PIN_SETTING_KEY, XERO_PIN_RELEASE_WITNESS_SETTING_KEY } =
     await import('@/lib/connectors/xero/tenant-guard')
-  const { QBO_EXPECTED_REALM_KEY } = await import('@/lib/connectors/quickbooks/auth')
+
+  // o3d-remove-parked-connectors: the second pin key was checked against `QBO_EXPECTED_REALM_KEY`,
+  // exported by the archived QuickBooks auth module. The KEY itself stays in the exclusion list on
+  // purpose — a development database that ran QuickBooks still holds that row, and dropping it from
+  // the list would let a wholesale settings delete take it in scan order and reopen the deadlock this
+  // module closes. With the module gone there is nothing left to check the spelling AGAINST, so it is
+  // asserted as a literal and marked as such; that is weaker, and it is the honest weaker thing.
+  const RETIRED_REALM_PIN_KEY = 'quickbooks_expected_realm_id'
 
   assert.deepEqual([...ACCOUNTING_BINDING_PIN_SETTING_KEYS],
-    [XERO_TENANT_PIN_SETTING_KEY, QBO_EXPECTED_REALM_KEY])
+    [XERO_TENANT_PIN_SETTING_KEY, RETIRED_REALM_PIN_KEY])
   assert.deepEqual([...ACCOUNTING_BINDING_WITNESS_SETTING_KEYS], [XERO_PIN_RELEASE_WITNESS_SETTING_KEY])
   assert.deepEqual([...ACCOUNTING_BINDING_SETTING_KEYS],
-    [XERO_TENANT_PIN_SETTING_KEY, QBO_EXPECTED_REALM_KEY, XERO_PIN_RELEASE_WITNESS_SETTING_KEY])
+    [XERO_TENANT_PIN_SETTING_KEY, RETIRED_REALM_PIN_KEY, XERO_PIN_RELEASE_WITNESS_SETTING_KEY])
 })

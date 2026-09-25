@@ -122,16 +122,23 @@ export type WmsAsnLineInput = {
   quantity: number
 }
 
+/**
+ * NO CALLBACK URL TRAVELS ON AN ASN (o3d-vcw8, round 5). `callbackUrl` and `autoCallback` used to be part
+ * of this input and were sent as `CallbackUrl`/`AutoCallback`. The string "Callback" appears ZERO times in
+ * the whole Mintsoft API document, so there was never a field for them to travel in and no warehouse ever
+ * received them; an input a connector cannot act on is a promise IMS cannot keep, so it is gone from the
+ * contract rather than silently dropped inside one connector. Booked-in correlation is by `reference`
+ * (`POReference`) plus `lines[].sourceLineId`, both proven to round-trip verbatim on 2026-09-24, read back
+ * over the polling/sweep path — and, for the webhook, by the `externalAsnId` the payload carries.
+ */
 export type WmsAsnInput = {
   externalWarehouseId: string
   reference: string
-  callbackUrl?: string | null
   supplierReference?: string | null
   carrier?: string | null
   eta?: string | null
   packagingType?: WmsAsnPackagingType | null
   packageCount?: number | null
-  autoCallback?: boolean
   lines: WmsAsnLineInput[]
 }
 

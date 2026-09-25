@@ -14,9 +14,6 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_password: 'MINTSOFT_PASSWORD',
   mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
-  shopify_admin_api_access_token: 'SHOPIFY_ADMIN_API_ACCESS_TOKEN',
-  shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
-  shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
@@ -75,7 +72,52 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
 // operator's value), exactly like the SMTP_* variables. After that the Settings
 // UI is the single source of truth.
 
+/**
+ * CREDENTIAL KEYS OF CONNECTORS THIS BUILD NO LONGER SHIPS (o3d-r5uk).
+ *
+ * Retiring a connector removes the code that reads its secrets. It does NOT remove the `Setting`
+ * rows that hold them: this branch ships no migration and deletes no data, and the ShipHero
+ * removal before it (2c2fd9fa) shipped none either, so an upgraded installation still stores a
+ * Shopify admin token, a ShipHero refresh token and their webhook secrets -- in whatever form they
+ * were last written.
+ *
+ * Membership of `SENSITIVE_SETTING_KEYS` is what gates `app/actions/settings.ts:getSetting` on the
+ * `settings` permission, and `getSetting` takes an ARBITRARY key from any internal principal. So
+ * dropping a key from the set at the moment its connector is archived does not tidy anything away:
+ * it converts a stored credential from admin-only to readable by WAREHOUSE and READONLY, by name,
+ * through a server action. It also stops `serializeSettingValue`/`deserializeSettingValue`
+ * encrypting it at rest and takes it out of `bulkMigrateEncryptedSettings`'s scan, so a legacy
+ * plaintext row stays plaintext for good.
+ *
+ * MEASURED, not reasoned about: on the head this list was added to, a WAREHOUSE session calling
+ * getSetting() against a seeded row got all six values back in clear -- the three shopify_* keys
+ * because this branch removed them, the three shiphero_* keys because PR #680 removed them and
+ * nobody noticed. `quickbooks_client_secret` was refused, because the QuickBooks removal left it
+ * in the set; that asymmetry is what showed the other two removals were the mistake.
+ *
+ * THE RULE: a credential key stays here for as long as a row for it may exist, i.e. until a
+ * migration deletes the rows. Removing a key from this list is a data-retention decision, not a
+ * code-cleanup one. tests/security/setting-secret-read-authorization.test.ts pins this list by its
+ * own literals -- NOT by iterating SENSITIVE_SETTING_KEYS, which is why deleting the shopify keys
+ * left the suite green.
+ *
+ * `SETTING_ENV_FALLBACKS` is deliberately NOT symmetrical: it decides which value WINS for code
+ * that reads the key, and there is no such code left, so the SHOPIFY_* and SHIPHERO_* entries are gone
+ * from it. This list decides who may read the row and whether it is encrypted, which has to outlive
+ * the code.
+ */
+export const RETIRED_CREDENTIAL_SETTING_KEYS: readonly string[] = [
+  'quickbooks_client_secret',
+  'shiphero_access_token',
+  'shiphero_refresh_token',
+  'shiphero_webhook_secret',
+  'shopify_admin_api_access_token',
+  'shopify_invoice_pdf_secret',
+  'shopify_webhook_secret',
+]
+
 export const SENSITIVE_SETTING_KEYS = new Set([
+  ...RETIRED_CREDENTIAL_SETTING_KEYS,
   'backup_s3_secret_key',
   'backup_sftp_password',
   'backup_sftp_private_key',
@@ -88,10 +130,6 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'mintsoft_password',
   'mintsoft_username',
   'mintsoft_webhook_secret',
-  'quickbooks_client_secret',
-  'shopify_admin_api_access_token',
-  'shopify_invoice_pdf_secret',
-  'shopify_webhook_secret',
   'trackship_api_key',
   // o3d-512h: the WooCommerce consumer KEY, not only the secret. getWcCredentials
   // has always masked it before returning it to the client (app/actions/wc-sync.ts),
@@ -125,6 +163,15 @@ async function writeMigratedSettingValue(
   })
 }
 
+/** What came back, named for the warning, without printing a credential if one is in there. */
+function describeWriterResult(result: unknown): string {
+  if (result === null) return 'null'
+  if (result === undefined) return 'undefined'
+  if (typeof result !== 'object') return typeof result
+  const count = (result as { count?: unknown }).count
+  return count === undefined ? 'an object with no `count`' : `an object whose \`count\` is a ${typeof count}`
+}
+
 export async function migrateEncryptedSettingValue(
   key: string,
   value: string,
@@ -144,6 +191,30 @@ export async function migrateEncryptedSettingValue(
       value,
       encryptSettingValue(key, plaintext),
     )
+    // THE WRITER'S ANSWER IS CHECKED, NOT READ THROUGH (o3d-remove-parked-connectors round 3).
+    //
+    // This used to be `result.count > 0` on an unchecked value, and a writer that returned `null`
+    // therefore raised `TypeError: Cannot read properties of null (reading 'count')` — which the
+    // best-effort catch below swallowed into a `console.warn` and a 'failed'. That is what CI's
+    // `validate` job reported — a bare TypeError naming no contract and no culprit — while the read
+    // path carried on as if it had merely lost a race with the database and the row stayed
+    // plaintext.
+    //
+    // WHY NOT `result?.count ?? 0`, THE SHORTER FIX. That lands on 'raced', and 'raced' is not a
+    // hedge: it asserts that ANOTHER writer already re-encrypted this row, i.e. the row is now
+    // safe and there is nothing left to do. Answering that for a result nobody can read is
+    // reporting a benign outcome for an unknown state — the exact pattern this branch has spent
+    // three rounds removing elsewhere. So an unreadable answer fails CLOSED, into 'failed', which
+    // `bulkMigrateEncryptedSettings` counts and `scripts/cli.ts` exits non-zero on.
+    //
+    // What changes is only the DIAGNOSIS: the throw names the key and what came back, so a broken
+    // writer is distinguishable from a database or crypto error without a debugger.
+    if (!result || typeof (result as { count?: unknown }).count !== 'number') {
+      throw new Error(
+        `the migration writer for ${key} returned ${describeWriterResult(result)} instead of `
+        + '{ count: number }, so whether the row was re-encrypted is UNKNOWN',
+      )
+    }
     return result.count > 0 ? 'migrated' : 'raced'
   } catch (error) {
     const warn = options.warn ?? console.warn
@@ -152,6 +223,26 @@ export async function migrateEncryptedSettingValue(
   }
 }
 
+/**
+ * THE OPPORTUNISTIC READ-PATH MIGRATION, AND IT IS NOT BELT-AND-BRACES — IT IS THE BELT.
+ *
+ * `bulkMigrateEncryptedSettings` below is the deliberate sweep, and it has exactly ONE caller in the
+ * tree: `scripts/cli.ts`, a command an operator types. It is wired into no install, update or deploy
+ * script. So for a legacy row that predates encryption at rest — or one belonging to a RETIRED
+ * connector, whose keys stay in `SENSITIVE_SETTING_KEYS` for exactly this reason (see
+ * `RETIRED_CREDENTIAL_SETTING_KEYS` above) — this call is the only thing in the product that ever
+ * encrypts it.
+ *
+ * DO NOT SUPPRESS IT FOR A KEY NOTHING ELSE READS. That was considered for the retired credentials
+ * and rejected: the beneficiary of encryption at rest is not IMS's code, it is the credential, which
+ * is still live at the vendor after the connector is archived (archiving deletes no rows and revokes
+ * nothing). And the only principal who can trigger this path is one holding the `settings`
+ * permission — the operator who came to rotate or clear the credential. "Not on read" for a key
+ * nothing else reads is "never".
+ *
+ * Pinned by the ADMIN positive control in tests/security/setting-secret-read-authorization.test.ts,
+ * which asserts the compare-and-swap, the ciphertext and the SILENCE of the best-effort catch.
+ */
 async function maybeMigrateSetting(key: string, value: string): Promise<void> {
   await migrateEncryptedSettingValue(key, value)
 }

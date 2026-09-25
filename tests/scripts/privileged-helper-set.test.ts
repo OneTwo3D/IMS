@@ -3219,8 +3219,12 @@ test('[o3d-z5be] CENSUS: the tree-wide statements its tokeniser can classify are
     { file: 'scripts/update.sh', op: COPY_GIT, guard: G('${APP_DIR}/.git') },
     { file: 'scripts/update.sh', op: CHOWN_APP, guard: G('${APP_DIR}') },
     { file: 'scripts/update.sh', op: CLONE_RM, line: MKTEMP_LINE, guard: null, why: MKTEMP },
-    { file: 'scripts/update.sh', op: /^mv "\$\{BACKUP_PARTIAL\}" "\$\{BACKUP_TARGET\}"$/, guard: null, why: 'one finished dump file renamed onto its final name, not a tree' },
-    { file: 'scripts/update.sh', op: /^xargs -r rm --$/, line: /^\s*ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz 2>\/dev\/null \| tail -n \+11 \| xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
+    // o3d-noka: both are now aimed at ${BACKUP_AT}, which is `/proc/self/fd/N` on the directory
+    // open_root_owned_ancestry() walked to — renameat and unlinkat rather than a third and fourth
+    // resolution of an operator-settable pathname. The guard before the prune still asks about
+    // ${BACKUP_DIR}, because containment is a question about pathnames.
+    { file: 'scripts/update.sh', op: /^mv -T "\$\{BACKUP_PARTIAL\}" "\$\{BACKUP_AT\}\/\$\{BACKUP_BASENAME\}"$/, guard: null, why: 'one finished dump file renamed onto its final name under the pinned descriptor, not a tree' },
+    { file: 'scripts/update.sh', op: /^xargs -r rm --$/, line: /^\s*ls -t "\$\{BACKUP_AT\}"\/pre-update-\*\.sql\.gz 2>\/dev\/null \| tail -n \+11 \| xargs -r rm --$/, guard: G('${BACKUP_DIR}') },
     ...Array.from({ length: 3 }, () => ({ file: 'scripts/deploy.sh', op: PUB, guard: null, why: PUBLISH })),
   ]
 
@@ -4619,6 +4623,11 @@ test('[o3d-z5be] the two guards added in r7 REFUSE when the target overlaps the 
       'ls() { echo "ls $*" >> "${CALLS}"; }',
       'xargs() { echo "xargs $*" >> "${CALLS}"; }',
       `BACKUP_DIR=${JSON.stringify(backupDir)}`,
+      // o3d-noka: the DELETE is aimed at ${BACKUP_AT} — `/proc/self/fd/N` on the directory the
+      // ancestry walk pinned — while the guard is asked about the PATHNAME, because containment is a
+      // question about pathnames. This rig measures the GUARD, so both name the same directory; the
+      // descriptor itself is measured in tests/scripts/install-root-safe-writes.test.ts.
+      `BACKUP_AT=${JSON.stringify(backupDir)}`,
       pruner,
       'echo "COMPLETED"',
     ].join('\n'))

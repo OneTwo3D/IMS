@@ -9,7 +9,19 @@
 // can surface them and offer a bulk-cancel. Pure functions over plain rows.
 // ---------------------------------------------------------------------------
 
-export type AccountingConnectorId = 'xero' | 'quickbooks'
+// o3d-remove-parked-connectors: this module DECLARED its own `AccountingConnectorId`, shadowing the
+// registry's with an identical-but-unlinked copy. It is re-exported from the registry instead, so the
+// two cannot drift and every existing importer keeps the spelling it already uses.
+//
+// AND THE SURFACE THIS MODULE IS FOR IS NOW UNREACHABLE BY A CONNECTOR SWITCH. With one accounting
+// connector registered there is no switch to strand rows, so `orphanGroups` can only be non-empty
+// for a connector this build no longer ships — which is exactly the state a development database is
+// in after this branch (rows stamped `quickbooks`). That is not a reason to delete it: the summary is
+// how those rows become visible and cancellable, and a second ledger reinstates the original case.
+// See docs/archive/quickbooks-connector-removal.md.
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+
+export type { AccountingConnectorId }
 
 /** Per-connector count of live (PENDING/PROCESSING) sync rows — the shape a Prisma groupBy yields. */
 export type ConnectorLiveCount = { connector: string; count: number }

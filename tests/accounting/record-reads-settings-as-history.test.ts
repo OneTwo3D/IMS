@@ -461,7 +461,9 @@ test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bi
   // that spends a field only one connector writes cannot be followed on the other.
   for (const [file, builder] of [
     ['lib/connectors/xero/sync-processor.ts', 'unrecordedPostedDocumentRecord'],
-    ['lib/connectors/quickbooks/sync-processor.ts', 'unpersistedQboPostRecord'],
+    // o3d-remove-parked-connectors: the archived QuickBooks builder was the second source, so this
+    // rule was checked against TWO builders — which is what the finding above was about (dropping a
+    // field from ONE builder used to pass). One builder now.
   ] as [string, string][]) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     const start = source.indexOf(`function ${builder}`)
@@ -615,15 +617,12 @@ test('ROUND 13 (Codex HIGH): a record written before the bill id was retained re
   // shipped builder still writes; `ledgerTargetId` is the one round 12 added, and its ABSENCE is
   // the whole case. A test whose fixture drifted into a shape no record ever carried would prove
   // nothing about the records in the database.
-  const source = await readFile(
-    path.join(process.cwd(), 'lib/connectors/quickbooks/sync-processor.ts'), 'utf8',
-  )
-  const metadataAt = source.indexOf('sanitizeActivityLogMetadata({')
-  const builderKeys = source.slice(metadataAt, source.indexOf('}))', metadataAt))
-  for (const key of Object.keys(PRE_ROUND_12_METADATA)) {
-    assert.match(builderKeys, new RegExp(`^\\s+${key}:`, 'm'), `the builder still writes ${key}`)
-  }
-  assert.match(builderKeys, /^\s+ledgerTargetId:/m, 'and it writes the key this fixture omits')
+  // o3d-remove-parked-connectors: this read the ARCHIVED QuickBooks builder to prove the fixture is a
+  // shape a record really had. The builder is gone, so the fixture can no longer be checked against
+  // the code that produced it — it is now a shape taken from the archived builder and frozen here.
+  // That is a real weakening: a fixture that drifts from every real record proves nothing about the
+  // records in the database, and nothing now notices the drift. Recoverable for reference at
+  // `git show archive/quickbooks-connector:lib/connectors/quickbooks/sync-processor.ts`.
 
   // A RECORD WITH NO RECORDED OUTCOME AT ALL — written before round 10 — is safe by the same rule:
   // an absent key reads as "not recorded", never as a live upload.
@@ -711,8 +710,8 @@ test('ROUND 13 (Codex HIGH): the current remedy is shown only where the stored o
 // be added without appearing here.
 test('ROUND 13 (Codex HIGH): every path that builds one of these records reads the bill id off the payload', async () => {
   let constructions = 0
+  // o3d-remove-parked-connectors: the archived QuickBooks processor was the first file here.
   for (const file of [
-    'lib/connectors/quickbooks/sync-processor.ts',
     'lib/connectors/xero/sync-processor.ts',
   ]) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
@@ -727,7 +726,10 @@ test('ROUND 13 (Codex HIGH): every path that builds one of these records reads t
       )
     }
   }
-  assert.equal(constructions, 2, 'both processors build exactly one, and both were checked')
+  // o3d-remove-parked-connectors: this was 2 — one construction per processor — and the archived
+  // QuickBooks processor was the second. The count is the VACUITY guard (a walk that found none must
+  // fail), not a claim about how many there ought to be.
+  assert.equal(constructions, 1, 'the processor builds exactly one, and it was checked')
 
   // A payload written before this branch existed carries no `accountingInvoiceId`, and that is what
   // makes both of those constructions land in the safe cell.

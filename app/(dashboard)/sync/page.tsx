@@ -1,3 +1,4 @@
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Metadata } from 'next'
 import Link from 'next/link'
 import { History } from 'lucide-react'
@@ -6,9 +7,6 @@ import { redirect } from 'next/navigation'
 import {
   getShoppingConnectorCredentials,
   getShoppingConnectorPaymentMethods,
-  getShopifyConnectorCredentials,
-  getShopifySyncLogs,
-  getShopifySyncSettings,
   getShoppingStatusMappings,
   getShoppingSyncLogs,
   getShoppingSyncSettings,
@@ -175,7 +173,7 @@ export default async function SyncPage() {
   // Plugins switches unreachable in precisely the state those switches caused, which is the same
   // shape as HIGH 2: a misconfiguration that removes its own remedy.
   const anyIntegrationPluginEnabled = !!(
-    pluginState.woocommerce || pluginState.shopify || pluginState.xero || pluginState.quickbooks
+    pluginState.woocommerce || ACCOUNTING_CONNECTORS.some((connector) => pluginState[connector.id])
     || wmsResolution.kind !== 'none'
   )
 
@@ -227,18 +225,6 @@ export default async function SyncPage() {
     getShoppingStatusMappings(),
     getShoppingSyncLogs(100),
     getShoppingConnectorCredentials(),
-    pluginState.shopify ? getShopifySyncSettings() : Promise.resolve({ shopify_sync_enabled: 'false' }),
-    pluginState.shopify
-      ? getShopifyConnectorCredentials()
-      : Promise.resolve({
-          storeDomain: '',
-          adminApiAccessToken: '',
-          accessTokenMasked: false,
-          webhookSecret: '',
-          webhookSecretMasked: false,
-          envOverrides: {},
-        }),
-    pluginState.shopify ? getShopifySyncLogs(100) : Promise.resolve([]),
     getTaxRates(),
     getAccountingSettingsMasked(),
     getAccountingConnectionStatus(),
@@ -277,16 +263,13 @@ export default async function SyncPage() {
   // Hoisted, so the destructuring stays positional next to the reads above instead of being
   // rebuilt by index. Every promise is already settled by the time this runs.
   async function readDashboard() {
-    const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, wmsData] = await Promise.all(dashboardReads)
+    const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, taxRatesRaw, accountingSettings, accountingStatus, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, wmsData] = await Promise.all(dashboardReads)
     return {
       shoppingSettings,
       shoppingTaxMappings,
       shoppingStatusMappings,
       shoppingLogs,
       shoppingCredentials,
-      shopifySettings,
-      shopifyCredentials,
-      shopifyLogs,
       taxRatesRaw,
       accountingSettings,
       accountingStatus,
@@ -310,7 +293,7 @@ export default async function SyncPage() {
 
   // Only hit the accounting Tax Rates API when an accounting connector is live —
   // otherwise the sync page would pay for a round-trip on every render.
-  const accountingTaxRates = dashboard && (pluginState.xero || pluginState.quickbooks) && dashboard.accountingStatus.connected
+  const accountingTaxRates = dashboard && ACCOUNTING_CONNECTORS.some((connector) => pluginState[connector.id]) && dashboard.accountingStatus.connected
     // o3d-r30: passive display read — the settings page rate list may be up to 4h stale; the explicit
     // "Refresh Xero tax rates" button and the authoritative auto-link both read live.
     ? (await panel('accounting tax rates', () => fetchAccountingTaxRates({ allowCache: true }))) ?? []
@@ -382,9 +365,6 @@ export default async function SyncPage() {
           imsTaxRates={dashboard.taxRatesRaw}
           accountingTaxRates={accountingTaxRates}
           shoppingCredentials={dashboard.shoppingCredentials}
-          shopifySettings={dashboard.shopifySettings}
-          shopifyCredentials={dashboard.shopifyCredentials}
-          shopifyLogs={dashboard.shopifyLogs}
           accountingSettings={dashboard.accountingSettings}
           accountingConnected={dashboard.accountingStatus.connected}
           accountingTenantName={dashboard.accountingStatus.tenantName}

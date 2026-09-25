@@ -114,10 +114,6 @@ export async function getAccountingBatchPreview(
     const { getXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')
     return getXeroDailyBatchPreview(opts)
   }
-  if (connector?.id === 'quickbooks') {
-    const { getQuickBooksDailyBatchPreview } = await import('@/app/actions/quickbooks-daily-batch')
-    return getQuickBooksDailyBatchPreview(opts)
-  }
   return emptyAccountingBatchPreview()
 }
 
@@ -131,11 +127,6 @@ export async function getAccountingBatchHistory(
     const rows = await getXeroDailyBatchHistory(days)
     return rows.map(mapHistoryDay)
   }
-  if (connector?.id === 'quickbooks') {
-    const { getQuickBooksDailyBatchHistory } = await import('@/app/actions/quickbooks-daily-batch')
-    const rows = await getQuickBooksDailyBatchHistory(days)
-    return rows.map(mapHistoryDay)
-  }
   return []
 }
 
@@ -145,10 +136,6 @@ export async function refreshAccountingBatchPreview(): Promise<AccountingBatchPr
   if (connector?.id === 'xero') {
     const { refreshXeroDailyBatchPreview } = await import('@/app/actions/xero-daily-batch')
     return refreshXeroDailyBatchPreview()
-  }
-  if (connector?.id === 'quickbooks') {
-    const { refreshQuickBooksDailyBatchPreview } = await import('@/app/actions/quickbooks-daily-batch')
-    return refreshQuickBooksDailyBatchPreview()
   }
   return emptyAccountingBatchPreview()
 }

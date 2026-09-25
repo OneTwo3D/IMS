@@ -13,6 +13,7 @@
  */
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 // o3d-78rq: the SAME reader both connectors' amount readings already go through, answering with the
 // Decimal rather than the double. It lives beside `parseLedgerAmount` in the Xero module because that
 // is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
@@ -60,9 +61,10 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function num(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
-}
+// o3d-remove-parked-connectors: `num()` was here and lost its only callers with the QuickBooks arm —
+// it read the wire doubles on `QboPaymentLine.Amount`. Xero's arm reads through
+// `readLedgerStatedAmount`, which accepts `number | string` and is the reading that survived o3d-obyd.
+// Recoverable at `git show archive/quickbooks-connector:lib/connectors/accounting-settlement-probe.ts`.
 
 /* ------------------------------------------------------------------------------------------- *
  * o3d-r948 — THE COMPLETENESS CROSS-CHECKS, IN DECIMAL, AT THIS DOCUMENT'S OWN MINOR UNIT.
@@ -1239,7 +1241,6 @@ async function resolveCreditNoteRefunds(
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
 export type XeroFetcher = <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
-export type QboFetcher = <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
 
 export async function probeXeroSettlement(
   target: SettlementProbeTarget,
@@ -2144,417 +2145,34 @@ export async function probeXeroSettlement(
 // become a fraction of the document's own minor unit. The direction they failed in was TOO WIDE,
 // which is the direction that lets a `clear` be built from an incomplete list — see
 // `completenessBand`, which is now the single answer for all four checks and both connectors.
-
-type QboLinkedTxn = { TxnId?: string; TxnType?: string }
-type QboPaymentLine = { Amount?: number; LinkedTxn?: QboLinkedTxn[] }
-type QboDocumentBody = {
-  LinkedTxn?: QboLinkedTxn[]
-  /**
-   * The document's face value and what is still owed on it — the shape-independent cross-check.
-   *
-   * o3d-obyd: `number | string`, and the string is not a defensive maybe. QuickBooks serialises these
-   * as JSON STRINGS — `"1200.00"`, `"0.00"` — which is o3d-psrx r10's finding on this same connector,
-   * where `typeof row.Balance === 'number'` failed on a real `Balance` and the payment poller moved to
-   * `parseLedgerAmount`. Declaring them as `number` is what made a reader that only accepted numbers
-   * look correct beside them; the type now says what the wire says.
-   */
-  TotalAmt?: number | string
-  Balance?: number | string
-  /**
-   * o3d-78rq — the currency the applied amounts below are stated in. QuickBooks OMITS this whenever
-   * multicurrency is off, which is the ordinary single-currency company, so `null` is the common case
-   * and not an error: `ledgerMinorUnits(null)` answers it exactly as it answers every other unstated
-   * currency in this repository.
-   */
-  CurrencyRef?: { value?: string }
-}
-
-/**
- * WHAT QUICKBOOKS ACTUALLY WRITES INTO `LinkedTxn.TxnType` (Codex round 4, finding 1).
- *
- * The entity you POST is `BillPayment`. The link QuickBooks then records on the Bill is NOT
- * `BillPayment` — it is `BillPaymentCheck` or `BillPaymentCreditCard`, named after the PayType.
- * IMS posts `PayType: 'Check'`, so every bill payment this system has ever made is recorded as
- * `BillPaymentCheck`, and a probe matching on `BillPayment` found NONE of them. It reported
- * `records: []`, the classifier read that as `clear`, and the fence treated "I looked and there
- * is nothing" as permission to pay the bill again. A probe that cannot see a real settlement is
- * worse than no probe at all, because the fence claims a coverage it does not have.
- *
- * Hence three rules, not one:
- *
- *  1. PAYMENT links — the shape IMS itself posts — are enumerated and READ. Both bill-payment
- *     spellings, plus the bare entity name defensively, because a name that has changed once can
- *     change again and the cost of accepting an extra alias is nil.
- *  2. Links that are KNOWN not to be that shape are ignored, and which ones they are is written
- *     down (below) instead of being left to a silent `filter`.
- *  3. Anything else FAILS THE PROBE. An unclassified link type is exactly the state this bug was
- *     in for a whole release: a settlement the probe cannot account for, silently dropped. It is
- *     now an `unknown`, which every caller treats as a refusal.
- */
-const QBO_PAYMENT_LINK_TYPES: Record<'Bill' | 'Invoice', ReadonlySet<string>> = {
-  // Read from /billpayment/{id} whichever of the three names the link carries.
-  Bill: new Set(['BillPaymentCheck', 'BillPaymentCreditCard', 'BillPayment']),
-  // Customer payments keep the plain entity name on the invoice's link.
-  Invoice: new Set(['Payment']),
-}
-
-/**
- * RECOGNISED, AND NOT THEREFORE HARMLESS (Codex round 5, finding 3).
- *
- * These links take money off the document by a shape IMS neither posts nor reads. Round 4 lumped
- * them in with the links that take NO money off it and ignored both, so a bill an operator had
- * settled with a vendor credit or a journal entry came back from this probe as `records: []` —
- * which the classifier reads as `clear` and the fence acts on. "Recognised" was doing the work of
- * "accounted for", and they are not the same claim: an unrecognised type fails closed, while a
- * recognised-but-uncovered one was reported as a positive clear. That is a lie about money.
- *
- * They are still not fetched — none of them can BE an IMS attempt, and reading five more entity
- * shapes to measure them is a bigger change than this fence should carry. What they do instead is
- * make the document's own arithmetic decide: see the settlement accounting at the end of
- * `probeQuickBooksSettlement`. A linked vendor credit that has taken nothing off the balance
- * changes no verdict; one that has taken money off leaves an amount no readable payment explains,
- * and the probe then refuses instead of reporting a clear it cannot support.
- */
-const QBO_UNCOVERED_SETTLEMENT_LINK_TYPES: ReadonlySet<string> = new Set([
-  'CreditMemo', 'VendorCredit', 'Deposit', 'JournalEntry', 'Refund', 'RefundReceipt',
-  'Check', 'Expense', 'Purchase', 'Transfer', 'CreditCardCredit', 'CreditCardPayment',
-  // The other document kind's payment link. Treated as a settlement rather than as noise: it is
-  // payment-shaped money movement, and its appearing on a document this probe does not read it
-  // for means the reasoning about which endpoint holds the settlements is already off.
-  'Payment', 'BillPayment', 'BillPaymentCheck', 'BillPaymentCreditCard',
-])
-
-/**
- * Links that carry no money off the document at all: what it was raised FROM, and what was billed
- * ONTO it. These genuinely are noise, and ignoring them is what stops the probe refusing every
- * bill that came from a purchase order.
- */
-const QBO_NON_SETTLING_LINK_TYPES: ReadonlySet<string> = new Set([
-  'Estimate', 'PurchaseOrder', 'SalesReceipt', 'TimeActivity', 'ReimburseCharge', 'Charge',
-  'Invoice', 'Bill', 'InventoryQuantityAdjustment',
-])
-
-/**
- * The amount a QuickBooks payment applied to ONE document.
- *
- * Not TotalAmt: a payment can settle several invoices at once, and IMS's own attempt posts a single
- * line for a single document. Summing the lines linked to this document is what compares like with
- * like. A payment with no readable line for it yields null, which reads as `unknown`.
- */
-function qboAmountAppliedTo(
-  lines: QboPaymentLine[] | undefined,
-  documentId: string,
-  txnType: string,
-  currency: string | null,
-): { wire: number | null; exact: Decimal | null } {
-  if (!lines) return { wire: null, exact: null }
-  let wire: number | null = null
-  let exact: Decimal | null = null
-  for (const line of lines) {
-    const linked = (line.LinkedTxn ?? []).some(
-      (t) => str(t.TxnId) === documentId && str(t.TxnType) === txnType,
-    )
-    if (!linked) continue
-    const amount = num(line.Amount)
-    if (amount === null) return { wire: null, exact: null }
-    // o3d-mm51: the EXACT term takes the same magnitude reading the document's own figures now do.
-    // `explained` is the side of `shortBy` that ACCOUNTS for money, so a decode that can no longer
-    // hold half a minor unit inflates it and swallows the very shortfall it was measuring. The `wire`
-    // term is deliberately left as the untouched double: `statedAmount` judges THAT one with the rule
-    // its own decision needs (`readLedgerStatedAmount`, the full amount bound plus the scale), and a
-    // line this reading refuses makes the whole payment unmeasurable, which withholds.
-    const reading = wireAmount(amount, currency)
-    if (reading.value === null) return { wire: null, exact: null }
-    // TWO READINGS OF THE SAME LINES, FROM ONE WALK (o3d-r948).
-    //
-    // `wire` is the double sum, UNCHANGED, and it is what `statedAmount` is asked about — the record's
-    // amount must be a figure `readLedgerStatedAmount` can prove the ledger stated, and a summed
-    // double is exactly the shape that rule exists to judge (o3d-78rq).
-    //
-    // `exact` is the same lines added as decimals, for the completeness arithmetic, which asks a
-    // different question and must not lose a minor unit in its own addition. They are returned
-    // together so nothing can ever sum a DIFFERENT set of lines for the two answers.
-    wire = (wire ?? 0) + amount
-    exact = (exact ?? toDecimal(0)).add(reading.value)
-  }
-  return { wire, exact }
-}
-
-export async function probeQuickBooksSettlement(
-  target: SettlementProbeTarget,
-  qboGet: QboFetcher,
-): Promise<LedgerSettlementProbe> {
-  const payload = asRecord(target.payload)
-  const documentId = str(payload.accountingInvoiceId)
-  if (target.type === 'PURCHASE_CREDIT_NOTE_ALLOCATION') {
-    // The QuickBooks processor has no branch for this type, so a row of it cannot have posted here
-    // — but "cannot have posted" is a claim about code, and this module's contract is evidence.
-    return { ok: false, reason: 'QuickBooks does not post credit-note allocations, so IMS cannot read one back' }
-  }
-  if (!documentId) return { ok: false, reason: 'the row records no document id to check' }
-
-  const isBill = target.type === 'BILL_PAYMENT'
-  const documentPath = isBill ? 'bill' : 'invoice'
-  const documentKey = isBill ? 'Bill' : 'Invoice'
-  const settlementPath = isBill ? 'billpayment' : 'payment'
-  // The entity NAME a payment is read back under, which is not the same string as the LINK type
-  // the document carries — see QBO_PAYMENT_LINK_TYPES.
-  const settlementKey = isBill ? 'BillPayment' : 'Payment'
-  const linkedType = isBill ? 'Bill' : 'Invoice'
-  const paymentLinkTypes = QBO_PAYMENT_LINK_TYPES[documentKey]
-
-  const doc = await qboGet<Record<string, QboDocumentBody | undefined>>(
-    `${documentPath}/${encodeURIComponent(documentId)}`,
-  )
-  if (!doc.ok) return { ok: false, reason: doc.error ?? `HTTP ${doc.status}` }
-  const body = doc.data?.[documentKey]
-  if (!body) return { ok: false, reason: `QuickBooks returned no ${documentKey.toLowerCase()} for that id` }
-
-  const links = body.LinkedTxn ?? []
-  // Rule 3 first, so an unclassified link cannot be quietly outvoted by classified ones.
-  //
-  // A link with NO READABLE TYPE counts as unclassified (Codex round 5, finding 4, escape one).
-  // Round 4 excluded `type !== ''` from this filter, so a link whose TxnType was absent, blank or
-  // not a string was matched by nothing: not a payment, so never read; not unclassified, so never
-  // refused. It is the same "a settlement the probe cannot account for, silently dropped" this
-  // rule exists to stop, wearing a missing field instead of a new name.
-  const unclassified = [...new Set(links.map((t) => str(t.TxnType) || '(untyped)').filter(
-    (type) => !paymentLinkTypes.has(type) && !QBO_UNCOVERED_SETTLEMENT_LINK_TYPES.has(type)
-      && !QBO_NON_SETTLING_LINK_TYPES.has(type),
-  ))]
-  if (unclassified.length > 0) {
-    return {
-      ok: false,
-      reason: `QuickBooks linked ${unclassified.join(', ')} to this ${documentKey.toLowerCase()} and this `
-        + 'probe cannot tell whether that settles it',
-    }
-  }
-
-  const paymentLinks = links.filter((t) => paymentLinkTypes.has(str(t.TxnType)))
-  // A PAYMENT LINK WITH NO ID cannot be fetched, and dropping it is the second escape (Codex
-  // round 5, finding 4). `.filter(Boolean)` removed it silently, leaving a settlement this probe
-  // KNOWS exists out of the record list it then reports as complete — the same shape as the
-  // unreadable-settlement refusal below, and it must fail the same way.
-  if (paymentLinks.some((t) => str(t.TxnId) === '')) {
-    return {
-      ok: false,
-      reason: `QuickBooks linked a ${settlementKey} to this ${documentKey.toLowerCase()} with no id, `
-        + 'so IMS cannot read what it settled',
-    }
-  }
-  const settlementIds = paymentLinks.map((t) => str(t.TxnId))
-
-  const documentCurrency = ledgerCurrencyCode(body.CurrencyRef?.value)
-  const records: LedgerSettlementRecord[] = []
-  // o3d-78rq: as on the Xero side, the applied figures are kept for the completeness arithmetic and
-  // the records carry the ones `readLedgerStatedAmount` will vouch for. `qboAmountAppliedTo` SUMS a
-  // payment's lines, and a sum of doubles is exactly where a figure stops being the one the ledger
-  // stated — which is why the record's reading is asked of that sum rather than assumed of it.
-  //
-  // o3d-r948: and the completeness term is the SAME lines added exactly. Two readings, one walk.
-  const wireApplied: Array<Decimal | null> = []
-  for (const id of settlementIds) {
-    const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
-      `${settlementPath}/${encodeURIComponent(id)}`,
-    )
-    // A settlement we know EXISTS but cannot read is the most dangerous shape of all: dropping it
-    // would leave a clear verdict built from an incomplete list.
-    if (!res.ok) return { ok: false, reason: `could not read ${settlementKey} ${id}: ${res.error ?? `HTTP ${res.status}`}` }
-    const settlement = res.data?.[settlementKey]
-    if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
-    const date = str(settlement.TxnDate)
-    const applied = qboAmountAppliedTo(settlement.Line, documentId, linkedType, documentCurrency)
-    wireApplied.push(applied.exact)
-    records.push({
-      ...statedAmount(applied.wire, documentCurrency),
-      date: date.length >= 10 ? date.slice(0, 10) : null,
-      id,
-      // PrivateNote is where IMS writes its mark on this connector.
-      reference: str(settlement.PrivateNote) || null,
-    })
-  }
-
-  // o3d-acctmoney — AND THE THIRD IDENTITY WAS AUDITED FOR THE SAME OMISSION. `Balance` has no CIS
-  // term: the Construction Industry Scheme is a UK payroll deduction Xero models on the document and
-  // QuickBooks Online does not model at all. What DOES come off a QuickBooks `Balance` without being
-  // a payment — a deposit, a vendor credit, a credit memo, a journal entry — is money genuinely OFF
-  // the document, so `TotalAmt - Balance` counting it is CORRECT and it surfaces here as an
-  // unexplained amount rather than as a false agreement. That is the opposite of the CIS case, where
-  // the figure was never a settlement at all, and it is why this arm needs no change.
-  //
-  // o3d-jfhi — AND THAT AUDIT WAS RE-RUN AGAINST THE PUBLISHED CONTRACT RATHER THAN AGAINST THE
-  // FIELD NAMES ANYONE COULD THINK OF, BECAUSE THAT IS THE DIFFERENCE THE FINDING WAS ABOUT.
-  //
-  // SOURCE: Intuit's QuickBooks Online entity reference for `Invoice` and `Bill`.
-  //
-  //   Balance        "The balance reflecting any payments made against the transaction. Initially
-  //                  this will be equal to the TotalAmt."
-  //   TotalAmt       "Indicates the total amount of the transaction. This includes the total of all
-  //                  the charges, allowances and taxes."
-  //   Deposit        "Amount in deposit against the Invoice. Supported for Invoice only."
-  //   HomeBalance,   the same two figures in the company's HOME currency.
-  //   HomeTotalAmt
-  //   DiscountAmt    "Indicates the discount amount that is applied on the transaction as a whole."
-  //
-  // WHAT THE RE-READ FOUND THAT THE INFERRED LIST DID NOT. `Deposit` is a documented FIELD on the
-  // Invoice entity, and the paragraph above knew "deposit" only as a `LinkedTxn` TYPE. They are not
-  // the same thing: a deposit recorded in the field can reduce `Balance` while linking NOTHING, so
-  // the `uncovered` list stays empty and the refusal's sentence falls to "links no transaction that
-  // accounts for it" — which is, as it happens, exactly the right sentence.
-  //
-  // AND IT IS STILL NOT A TERM, WHICH IS THE OPPOSITE CONCLUSION TO THE CIS ONE AND FOR THE REASON
-  // THAT DISTINGUISHES THEM: A DEPOSIT IS MONEY THAT MOVED. A customer paid it. `TotalAmt - Balance`
-  // counting it is the truth, and IMS genuinely cannot see it, so the honest answer is the
-  // unexplained-shortfall refusal this arm already gives — not a subtraction. Subtracting it would
-  // UNDERSTATE what has come off the document, which is the direction that forges a proved zero and
-  // authorises a second payment. `CISDeduction` is subtracted precisely because NO money moved: it is
-  // the reason a subcontractor is owed less, not a settlement anyone made.
-  //
-  // `Bill` carries no `Deposit` at all — the contract says "Supported for Invoice only" — so the bill
-  // arm's identity is `TotalAmt - Balance` with nothing else documented against it.
-  //
-  // AND THE PAIR READ IS THE TRANSACTION-CURRENCY ONE ON PURPOSE. `HomeTotalAmt`/`HomeBalance` are
-  // the same two figures converted, and this arm sizes its band with `CurrencyRef` — the transaction
-  // currency. Mixing one of each would compare a converted figure against an unconverted collection
-  // at the wrong minor unit. Named for the reason the Xero arm names `BankAmount`: adjacent field,
-  // similar spelling, silent FX difference.
-  //
-  // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING. Everything above depends on a list of type names
-  // being right, and the bug this replaces was a list of type names being wrong. `TotalAmt` and
-  // `Balance` are not names — they are the document's own account of how much of it has been
-  // settled, by any means whatsoever. So the question asked here is arithmetic, not vocabulary:
-  // is every penny that has come off this document explained by a settlement this probe actually
-  // READ? Whatever is not is money moved by something the record list below does not contain, and
-  // a `clear` built from that list would be a claim the list cannot support.
-  //
-  // Round 4 asked this only when NOTHING was linked, which is why finding 3 was possible: a
-  // vendor credit or a journal entry appears as a link, was "recognised", and so suppressed the
-  // only check that could have noticed it had taken money off the bill.
-  //
-  // WHAT THIS COSTS, STATED. A document part-settled by a shape IMS does not read — a vendor
-  // credit, a deposit, a manual journal — can no longer be posted to automatically; the row fails
-  // visibly and a human resolves it. That is a real cost and it is the right way round: the
-  // alternative is the fence being told the document is clear when an operator has already
-  // settled it. Restoring automatic coverage means READING those entities (each has its own line
-  // and link shape), which is a bigger change than this fence should carry — tracked separately.
-  //
-  // o3d-obyd — ARM 3 OF 3, AND THE ONE THE FINDING IS ABOUT. QuickBooks sends these two as STRINGS —
-  // that is o3d-psrx r10, recorded in this connector's own payment poller, which is why the poller
-  // reads them through `parseLedgerAmount`. This probe was not moved with it, so `TotalAmt: "1200.00"`
-  // with `Balance: "0.00"` read as no figures at all, `applied` was null, and with nothing uncovered
-  // linked the check below did not run: `ok: true` over an EMPTY record list, `clear`, and a second
-  // payment against a bill QuickBooks reports as fully settled.
-  const totalRead = wireAmount(body.TotalAmt, documentCurrency)
-  const balanceRead = wireAmount(body.Balance, documentCurrency)
-  const cannotRun = completenessCannotRun([['TotalAmt', totalRead], ['Balance', balanceRead]])
-  if (cannotRun !== null) {
-    return {
-      ok: false,
-      reason: `QuickBooks states ${cannotRun} on this ${documentKey.toLowerCase()}, which IMS cannot read `
-        + 'as an amount, so it cannot tell how much of it is already settled',
-    }
-  }
-  const total = totalRead.value
-  const balance = balanceRead.value
-  const applied = total !== null && balance !== null ? subtractMoney(total, balance) : null
-  // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
-  // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
-  const explained = sumExact(wireApplied)
-  // `Payment` and the bill-payment spellings appear in BOTH tables — they are the covered shape on
-  // one document kind and an uncovered one on the other — so the payment table wins first, or a
-  // settlement this probe has just READ would be counted as one it cannot account for.
-  const uncovered = [...new Set(links.map((t) => str(t.TxnType)).filter(
-    (type) => !paymentLinkTypes.has(type) && QBO_UNCOVERED_SETTLEMENT_LINK_TYPES.has(type),
-  ))]
-  if (applied === null) {
-    // The document's own numbers are missing, so nothing can be reconciled against them. Only a
-    // problem when a settlement IMS cannot measure is linked — otherwise the read payments are
-    // the whole picture and the classifier judges them on their own terms.
-    if (uncovered.length > 0) {
-      return {
-        ok: false,
-        reason: `QuickBooks links ${uncovered.join(', ')} to this ${documentKey.toLowerCase()} and reports no `
-          + 'total or balance, so IMS cannot tell how much of it is already settled',
-      }
-    }
-    // o3d-mm51 (Codex HIGH 2) — AND ABSENCE MUST NOT DO MORE THAN SKIP.
-    //
-    // THE DEFECT. o3d-obyd drew ABSENT apart from UNREADABLE and was right to: a check that cannot be
-    // run must not FAIL, or every ordinary document would refuse. What it then let absence do is more
-    // than skip. With no `TotalAmt` and no `Balance`, `applied` is null, the arithmetic above is
-    // skipped, and control fell through to `return { ok: true, records }` — over an EMPTY record
-    // list, which `classifyLedgerSettlement` reads as `clear`. That is not the ABSENCE of a
-    // conclusion, it is the POSITIVE conclusion "nothing has settled this document" drawn from having
-    // no figure to read, and `clear` is what authorises a money post. A sparse or schema-degraded
-    // `{ Bill: {} }` could buy a second payment with it.
-    //
-    // SO THE TWO ARE SEPARATED. Skipping arithmetic that cannot be done stays — that part was right.
-    // CONTRIBUTING A CONCLUSION does not: when the document states neither figure AND this probe read
-    // no settlement of its own, it has nothing to answer from in EITHER direction, and it says so
-    // rather than answering in the permissive one.
-    //
-    // WHAT AN ORDINARY FIRST PAYMENT DOES — which is what absence was kept permissive FOR, and it
-    // still works. QuickBooks states `TotalAmt` and `Balance` on every bill and invoice that exists,
-    // and an unpaid one states them EQUAL. So the ordinary first payment reads `TotalAmt "1200.00"`
-    // with `Balance "1200.00"`, `applied` is exactly 0, `statesAnything` is false, the check PASSES,
-    // and the probe answers `ok: true` with an empty record list — `clear`, and the payment posts.
-    // That is emptiness PROVED by two stated figures rather than assumed from two missing ones, which
-    // is the whole difference. The refusal below is reachable only by a document that states neither,
-    // and that is not a shape QuickBooks sends for a document that is there.
-    //
-    // AND A DOCUMENT WITH NO FIGURES WHOSE SETTLEMENTS THIS PROBE DID READ still answers — but
-    // o3d-obyd r31 corrected WHAT it answers. This paragraph used to end "`records` is then evidence
-    // in its own right and the verdict is decided by comparing it", and that is true only of a
-    // COMPARISON THAT MATCHES. With no `TotalAmt` and no `Balance` nothing measured the link list, so
-    // a linked payment that is not ours does not show that ours is absent — QuickBooks may simply not
-    // have sent it. Such an answer is now marked unproved and a non-match yields `unknown`; a match
-    // still yields `present`. See `settlementAnswer` and `LedgerSettlementProbe.provedComplete`.
-    //
-    // o3d-nk5n: and this rule is the SHARED one rather than this arm's own. Both Xero arms reached
-    // the same fall-through and were closed by routing through the same function — `applied` is this
-    // arm's `settled`. Shared rather than re-spelled so that a change to the rule cannot reach one
-    // connector and miss the other; r31 is that guarantee being cashed, since it changed the rule for
-    // all three arms by changing one function.
-  } else if (statesAnything(applied, documentCurrency)
-    && (explained === null || shortBy(applied, explained, documentCurrency))) {
-    return {
-      ok: false,
-      reason: `QuickBooks reports ${formatLedgerMoney(applied)} already applied to this ${documentKey.toLowerCase()} but `
-        + (explained === null
-          ? 'IMS could not measure what the payments it links applied to it'
-          : `only ${formatLedgerMoney(explained)} of it is accounted for by payments IMS can read`)
-        + (uncovered.length > 0
-          ? ` (${uncovered.join(', ')} linked)`
-          : links.length === 0 ? ' and links no transaction that accounts for it' : ''),
-    }
-  }
-  // o3d-zo4j — PAIR 4 OF 4, AND IT IS THE ONE THAT IS A BOUND RATHER THAN AN IDENTITY — WHICH IS WHY
-  // IT TAKES THE EXCESS RULE AND NOT THE MIRROR OF THE SHORTFALL ONE.
-  //
-  // `TotalAmt - Balance` counts money off this document by ANY means, including the vendor credits,
-  // deposits and journals this probe does not read; `explained` counts only the payment lines it did.
-  // So the honest relation is `explained <= applied`, not equality — that inequality is exactly why
-  // the shortfall check above is a real check and not a tautology. It also makes an EXCESS a
-  // contradiction outright: every payment line linked to this document reduces its `Balance` by the
-  // amount of that line, so the read payments can never account for MORE than the document says has
-  // come off it. A voided QuickBooks payment states a zero line and an unapplied one is not linked,
-  // so neither reaches this sum; the one shape that could produce an excess innocently is a payment
-  // AMENDED between the document read and the payment read, and a picture assembled across an edit is
-  // not one to certify a collection from either.
-  //
-  // THE EXCESS ARM ONLY, for the same reason the invoice's payment pair takes only that one.
-  // `qboAmountAppliedTo` sets its two readings in ONE walk, so `exact` is null exactly when `wire` is
-  // — and `wire` is what the record's amount is read from, so every unmeasurable term here leaves a
-  // record with a null amount and `classifyLedgerSettlement` withholds on that record before it
-  // reaches the completeness gate. Measured: a linked BillPayment whose lines name a DIFFERENT bill
-  // yields `unknown` today. A `|| explained === null` arm would be unfalsifiable.
-  const paymentsExceedApplied = applied !== null && explained !== null
-    && exceeds(explained, applied, documentCurrency)
-  return settlementAnswer(applied, paymentsExceedApplied, records,
-    `QuickBooks states no total or balance on this ${documentKey.toLowerCase()} and IMS read no `
-    + 'settlement against it, so it has nothing to tell from — an empty answer here would say '
-    + 'that nothing has settled the document rather than report what does')
-}
+// THE QUICKBOOKS ARM WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
+//
+// About 410 lines: `QboLinkedTxn` / `QboPaymentLine` / `QboDocumentBody`, the three link-type sets
+// (`QBO_PAYMENT_LINK_TYPES`, `QBO_UNCOVERED_SETTLEMENT_LINK_TYPES`, `QBO_NON_SETTLING_LINK_TYPES`),
+// `qboAmountAppliedTo` and `probeQuickBooksSettlement`. Recoverable at
+// `git show archive/quickbooks-connector:lib/connectors/accounting-settlement-probe.ts`.
+//
+// WHAT THAT ARM WAS EVIDENCE FOR, and why its loss is worth naming rather than just deleting. Four
+// of this file's hardest-won rules exist because QuickBooks behaves differently from Xero, and the
+// QuickBooks arm is what demonstrated each of them:
+//
+//   * STRING-TYPED MONEY. QuickBooks serialises `TotalAmt` and `Balance` as strings (o3d-obyd), and
+//     a guard that read them as numbers answered `null` to a numeric STRING — spending a refusal as
+//     permission on an ordinary bill. `readLedgerStatedAmount` still accepts `number | string` for
+//     exactly that reason, and `tests/accounting/settlement-probe-string-amounts.test.ts` still
+//     pins it. That test now exercises the rule through the XERO arm only, so the rule survives and
+//     its original motivating connector does not.
+//   * A MISSING CURRENCY ON A SETTLEMENT LINE (o3d-78rq). QuickBooks omits `CurrencyRef` on payment
+//     lines in the home currency; the completeness band and the currency-agnostic comparison exist
+//     because of that.
+//   * `LinkedTxn.TxnType` NAMING SOMETHING OTHER THAN WHAT YOU POSTED. You POST a `BillPayment` and
+//     QuickBooks records the link as something else; the three link-type sets were the classified
+//     answer, and the "unclassified link type refuses rather than guesses" rule came from it.
+//   * THE `OPERATOR_ASSERTION` SETTLEMENT SURFACE exists largely because QuickBooks has no
+//     reconcile sweep. It is KEPT — see docs/archive/quickbooks-connector-removal.md.
+//
+// `probeLedgerSettlement` below is still connector-keyed, and is still the seam a second ledger's
+// probe registers at.
 
 /**
  * Ask a connector what it already holds against the document this row targets.
@@ -2563,7 +2181,7 @@ export async function probeQuickBooksSettlement(
  * action failure, which reads to an operator as "try again" — the opposite of the intended refusal.
  */
 export async function probeLedgerSettlement(
-  connector: 'xero' | 'quickbooks',
+  connector: AccountingConnectorId,
   target: SettlementProbeTarget,
 ): Promise<LedgerSettlementProbe> {
   // o3d-r948 r6 — THE TWO-SNAPSHOT PROVENANCE READ WAS HERE, AND IS GONE.
@@ -2578,16 +2196,27 @@ export async function probeLedgerSettlement(
   // it. A sound version is REQUEST-BOUND, not snapshot-bound: propagate the `tenantId` `XeroResponse`
   // already carries and the `realmId` `qboFetch` resolves and drops, and refuse a multi-fetch probe
   // whose responses disagree. bd o3d-llyw has the estimate.
+  // ONE ARM TODAY (o3d-remove-parked-connectors). Kept as an exhaustive `switch` over
+  // `AccountingConnectorId` rather than collapsed to a direct `probeXeroSettlement` call: a ledger
+  // registered without a probe of its own must be a `tsc` error here, because the caller spends a
+  // probe's silence as PERMISSION to post — a default arm answering "nothing found" would hand a
+  // second connector the exact failure mode o3d-obyd was about.
   try {
-    return connector === 'xero'
-      ? await (async () => {
+    switch (connector) {
+      case 'xero': {
         const { xeroGet } = await import('./xero/api')
         return await probeXeroSettlement(target, xeroGet as XeroFetcher)
-      })()
-      : await (async () => {
-        const { qboGet } = await import('./quickbooks/api')
-        return await probeQuickBooksSettlement(target, qboGet as QboFetcher)
-      })()
+      }
+      default:
+        // A connector with no probe REFUSES, it does not answer "nothing found". `connector` is
+        // narrowed to `never` here, so this arm is unreachable while the switch is exhaustive; it is
+        // written because a probe that cannot run and a probe that found nothing are the opposite
+        // verdicts to the caller, and falling off the end would have returned `undefined`.
+        return {
+          ok: false,
+          reason: `No settlement probe is registered for the ${String(connector)} accounting connector`,
+        }
+    }
   } catch (e) {
     return { ok: false, reason: e instanceof Error ? e.message : String(e) }
   }
@@ -2618,7 +2247,7 @@ export function settlementProbeKey(target: SettlementProbeTarget): string {
  * attempt could have committed this document, so there is nothing to have happened twice.
  */
 export async function ledgerClearsFollowUpRevival(params: {
-  connector: 'xero' | 'quickbooks'
+  connector: AccountingConnectorId
   type: string
   payload: unknown
   tokenDisposition: 'pinned' | 'rotated'
@@ -2681,7 +2310,7 @@ export async function ledgerClearsFollowUpRevival(params: {
  * and (correctly) un-revivable while the ledger still holds the payment.
  */
 export type MoneyPostFenceParams = {
-  connector: 'xero' | 'quickbooks'
+  connector: AccountingConnectorId
   entryId: string
   type: string
   referenceType: string

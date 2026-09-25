@@ -27,9 +27,9 @@ test('integrations onboarding makes connection verification and production readi
 
   assert.match(text, /Save & Test Connection/)
   assert.match(text, /Connect & Verify Xero/)
-  assert.match(text, /Connect & Verify QuickBooks/)
   assert.match(text, /onboarding cannot continue until Xero is connected/)
-  assert.match(text, /onboarding cannot continue until QuickBooks is connected/)
+  // o3d-remove-parked-connectors: the same two assertions existed for QuickBooks, which is what made
+  // this a claim about the STEP rather than about one connector's card. Its card is archived.
   assert.match(text, /CRON_SECRET/)
   assert.match(text, /Enable scheduled backups/)
   assert.match(text, /remote backup target/)

@@ -142,7 +142,7 @@ export async function fetchAllFxRatesInternal(): Promise<{
     }
 
     // b8i6.2: fan the new rates out to every configured shopping connector via
-    // the facade (each owns its own push + telemetry; Shopify is skipped until it
+    // the facade (each owns its own push + telemetry; a connector is skipped until it
     // gains an FX push). Failure here must never roll back the inbound fetch.
     if (updated.length) {
       try {

@@ -1049,23 +1049,30 @@ test('with NO connector active, every unresolved row is adoptable — nothing is
 // ---------------------------------------------------------------------------
 // ROUND 5 (Codex HIGH #1) — "NOT THE ACTIVE CONNECTOR" WAS ONLY HALF THE ADOPTION PRECONDITION.
 //
-// The four tests above all leave every sync toggle off, so their retired connector is genuinely
-// unreachable. Turn one on and the premise collapses: `triggerQuickBooksSync` gates on
-// `quickbooks_sync_enabled` and NOTHING ELSE, so a QuickBooks row is claimable by anyone holding
-// `sync` whichever connector is active. Adopting there settles a row the next press reclaims.
+// The four tests above all leave every sync toggle off, so their connector is genuinely unreachable.
+// Turn one on and the premise collapses: `triggerXeroSync` gates on `xero_sync_enabled` and NOTHING
+// ELSE — it never resolves the active connector — so with the Xero PLUGIN off and that toggle left on,
+// an Xero row is "stranded" and still claimable by anyone holding `sync`. Adopting there settles a row
+// the next press reclaims.
+//
+// o3d-remove-parked-connectors round 2 (Codex MEDIUM): these two were written against QuickBooks, and
+// that is no longer the state they describe. Archiving QuickBooks removed the gate, so its toggle is
+// a dead `settings` row rather than an open claim path, and the rule now says so — see the [archived]
+// block at the end of this file. They are asked of the LIVE connector, which is where the round-5
+// fact still holds.
 // ---------------------------------------------------------------------------
 
-test('[round 5] a retired-connector row is NOT adopted while that connector’s sync toggle is on', async () => {
+test('[round 5] a stranded row is NOT adopted while its own connector’s sync toggle is on', async () => {
   const settle = await loadAction()
-  state.activeConnector = 'xero'
-  state.syncEnabled = new Set(['quickbooks'])
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  state.activeConnector = null
+  state.syncEnabled = new Set(['xero'])
+  state.rows = [syncRow({ connector: 'xero', attemptRevision: 0 })]
 
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
 
   assert.equal(result.success, false)
   assert.equal('code' in result ? result.code : null, 'CONNECTOR_STILL_CLAIMABLE')
-  assert.match('error' in result ? result.error : '', /quickbooks_sync_enabled/, 'the operator is given the lever')
+  assert.match('error' in result ? result.error : '', /xero_sync_enabled/, 'the operator is given the lever')
   assert.equal(stored().status, 'FAILED', 'nothing was written')
   assert.equal(stored().attemptRevision, 0)
   assert.equal(settlementAudit().length, 0, 'and no assertion was recorded against anyone’s name')
@@ -1073,10 +1080,10 @@ test('[round 5] a retired-connector row is NOT adopted while that connector’s 
 
 test('[round 5] the toggle is the ONLY difference between that refusal and the adoption', async () => {
   const settle = await loadAction()
-  state.activeConnector = 'xero'
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  state.activeConnector = null
+  state.rows = [syncRow({ connector: 'xero', attemptRevision: 0 })]
 
-  state.syncEnabled = new Set(['quickbooks'])
+  state.syncEnabled = new Set(['xero'])
   assert.equal((await settle('log-1', notPosted({ observedAttemptRevision: 0 }))).success, false)
 
   state.syncEnabled = new Set()
@@ -1212,4 +1219,61 @@ test('a second key naming the SAME document is not a contradiction', async () =>
 
   assert.equal(result.success, true)
   assert.equal(stored().externalTransactionId, 'INV-9001')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-remove-parked-connectors ROUND 2 (Codex MEDIUM) — THE ARCHIVED CONNECTOR'S LEFT-BEHIND
+// TOGGLE MUST NOT BLOCK SETTLEMENT OF A STRANDED FINANCIAL ROW.
+//
+// Archiving QuickBooks deleted no `quickbooks_sync_enabled` Setting row, and there is no Sync
+// control left that writes one. The round-5 rule read that stored value as proof a claim path was
+// open, so a stranded revision-0 QuickBooks row was refused with an instruction to turn off a
+// checkbox the Sync page no longer renders: a financial row with no claim path and no exit.
+//
+// BOTH DIRECTIONS ARE ASSERTED. The archived connector is settleable WITH the toggle on; the LIVE
+// connector is still refused with the toggle on, so this is not "always settleable".
+// ---------------------------------------------------------------------------
+
+test('[archived] a revision-0 row on an ARCHIVED connector is adopted even with its stored toggle ON', async () => {
+  const settle = await loadAction()
+  state.activeConnector = 'xero'
+  // The exact state the finding describes: the Setting row survives the archive.
+  state.syncEnabled = new Set(['quickbooks'])
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+
+  const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+
+  assert.equal(result.success, true, 'nothing in this build can claim a quickbooks row, so adoption is sound')
+  assert.equal(stored().status, 'CANCELLED')
+  assert.equal(stored().attemptRevision, 1)
+  assert.equal('adoptedAttempt' in result ? result.adoptedAttempt : null, true)
+})
+
+test('[archived] and the ONLY difference is whether THIS BUILD services the connector', async () => {
+  // The control differs in exactly ONE thing: the connector on the row. Same status, same revision 0,
+  // same assertion, and in BOTH runs that connector's `<id>_sync_enabled` is 'true' and it is not the
+  // active one. The live connector must still be refused, or the fix is just "always settleable".
+  //
+  // The live half is reachable and not contrived: the Xero plugin off (no active connector) while
+  // `xero_sync_enabled` is still 'true'. `triggerXeroSync` gates on that toggle ALONE, so the Xero
+  // processor can still claim the row and would overwrite a settlement made now.
+  const settle = await loadAction()
+  state.activeConnector = null
+
+  state.syncEnabled = new Set(['quickbooks'])
+  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  const archived = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(archived.success, true, 'archived: no worker in this deployment can claim it')
+  assert.equal(stored().attemptRevision, 1)
+
+  state.syncEnabled = new Set(['xero'])
+  state.rows = [syncRow({ connector: 'xero', attemptRevision: 0 })]
+  state.activity = []
+  const live = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
+  assert.equal(live.success, false, 'live: the operator still has to quiesce it')
+  assert.equal('code' in live ? live.code : null, 'CONNECTOR_STILL_CLAIMABLE')
+  assert.match('error' in live ? live.error : '', /xero_sync_enabled/, 'and the lever named EXISTS in Sync settings')
+  assert.equal(stored().status, 'FAILED', 'nothing was written')
+  assert.equal(stored().attemptRevision, 0)
+  assert.equal(settlementAudit().length, 0)
 })

@@ -1,3 +1,4 @@
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { NextResponse } from 'next/server'
 import { buildAccountingCallbackUri, resolveAppOrigin } from '@/lib/accounting/callback-url'
 import { logActivity } from '@/lib/activity-log'
@@ -47,19 +48,23 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
   const code = url.searchParams.get('code')
   const state = url.searchParams.get('state')
   const error = url.searchParams.get('error')
-  // QBO passes realmId as a query parameter; Xero does not
-  const realmId = url.searchParams.get('realmId')
+  // o3d-remove-parked-connectors: THE CONNECTOR DISCRIMINATION WAS `!!realmId`, AND IT IS GONE.
+  //
+  // QuickBooks callbacks carried a `realmId` query parameter and Xero's never do, so this route
+  // decided which connector had initiated the flow by looking for it — with a plugin-enabled read as
+  // a fallback. With QuickBooks archived there is one registered connector, so the discrimination has
+  // nothing to discriminate and a `realmId` on an inbound callback is now just an unexpected
+  // parameter. It is NOT treated as a signal of any kind: an attacker-supplied `realmId` must not be
+  // able to steer this route, and with the QuickBooks branch gone the only thing it could steer
+  // towards no longer exists.
+  //
+  // A SECOND CONNECTOR MUST NOT REINSTATE THIS SHAPE. Deciding the connector from a parameter the
+  // caller controls is how a callback ends up consuming one connector's OAuth state under another's
+  // flow. The right discriminator is the `state` this route already consumes, which IMS minted and
+  // can bind to the connector that started the flow.
+  const connector = ACCOUNTING_CONNECTORS[0].id
 
-  // Determine which connector initiated this OAuth flow.
-  // QBO callbacks always include realmId; Xero callbacks never do.
-  // Also check which plugin is enabled as a fallback.
-  const isQuickBooks = !!realmId || (await deps.isPluginEnabled('quickbooks'))
-  const connector = isQuickBooks ? 'quickbooks' : 'xero'
-
-  if (connector === 'xero' && !(await deps.isPluginEnabled('xero'))) {
-    return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
-  }
-  if (connector === 'quickbooks' && !(await deps.isPluginEnabled('quickbooks'))) {
+  if (!(await deps.isPluginEnabled(connector))) {
     return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
   }
 
@@ -91,30 +96,6 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
     // identical for exact OAuth matching (Codex). Non-null here since `origin`
     // (derived from the same publicAppUrl) is non-null past the guard above.
     const redirectUri = buildAccountingCallbackUri(publicAppUrl) as string
-
-    if (connector === 'quickbooks') {
-      const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')
-      const oauthState = await consumeQuickBooksOAuthState(state)
-      if (!oauthState) {
-        return await redirectWithStatus(origin, connector, { accounting_error: 'Invalid or expired OAuth state' })
-      }
-      if (!realmId) {
-        return await redirectWithStatus(origin, connector, { accounting_error: 'Missing realmId in QuickBooks callback' }, oauthState.returnPath)
-      }
-      const result = await exchangeCodeForTokens(code, realmId, redirectUri)
-      if (result.success) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          entityId: oauthState.initiatorUserId,
-          action: 'accounting_connector_connected',
-          tag: 'sync',
-          description: `Connected accounting company: ${result.tenantName}`,
-          metadata: { connector: 'quickbooks', tenantName: result.tenantName, initiatorUserId: oauthState.initiatorUserId },
-        })
-        return await redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' }, oauthState.returnPath)
-      }
-      return await redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' }, oauthState.returnPath)
-    }
 
     // Xero flow
     const { consumeXeroOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/xero/auth')

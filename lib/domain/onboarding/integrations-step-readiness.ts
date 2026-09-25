@@ -1,3 +1,4 @@
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { IntegrationPluginState } from '@/lib/integration-plugin-keys'
 
@@ -20,13 +21,13 @@ import type { IntegrationPluginState } from '@/lib/integration-plugin-keys'
  * `configured` the REAL facade produced.
  *
  * WMS ENABLEMENT IS DERIVED, never a named member: any registered connector being on means a WMS
- * is in play, which is the same rule `isIntegrationModuleVisible` applies.
+ * is in play, which is the same rule `isIntegrationModuleVisible` applies. o3d-remove-parked-connectors
+ * made ACCOUNTING enablement derived the same way, from ACCOUNTING_CONNECTORS, rather than
+ * `plugins.xero || plugins.quickbooks`.
  */
 export type IntegrationsStepConnections = {
   /** The WooCommerce store's credentials are saved. */
   woocommerce: boolean
-  /** The Shopify store's credentials are saved. */
-  shopify: boolean
   /** The selected accounting connector has a live connection. */
   accounting: boolean
   /** The active WMS connector's connection is set up — `WmsOnboardingConnectionData.configured`. */
@@ -39,10 +40,10 @@ export function isIntegrationsStepReady(
 ): boolean {
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
   // At least one connector has to be chosen: an all-off step is not "ready", it is skipped.
-  const anyChosen = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || wmsEnabled
+  const accountingEnabled = ACCOUNTING_CONNECTORS.some((connector) => plugins[connector.id])
+  const anyChosen = plugins.woocommerce || accountingEnabled || wmsEnabled
   return anyChosen
     && (plugins.woocommerce ? connected.woocommerce : true)
-    && (plugins.shopify ? connected.shopify : true)
-    && ((plugins.xero || plugins.quickbooks) ? connected.accounting : true)
+    && (accountingEnabled ? connected.accounting : true)
     && (wmsEnabled ? connected.wms : true)
 }

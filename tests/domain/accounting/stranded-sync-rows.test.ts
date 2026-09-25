@@ -251,17 +251,20 @@ test('a STRANDED row at revision 0 reaches the remedy by adoption — this list 
 // ---------------------------------------------------------------------------
 
 test('[round 5] a revision-0 row whose connector can STILL claim it is refused, not adopted', () => {
-  const row = stranded({ status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
+  const row = stranded({ connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
   assert.equal(row.settleable, false, 'adopting here is overwritten by the next press of the Sync button')
   assert.equal(row.requiresAttemptAdoption, false)
   assert.equal(row.settlementCaveat, null, 'a caveat is for a decision that can be made')
 })
 
 test('[round 5] and it says WHY, naming the toggle — not the generic active-connector sentence', () => {
-  const row = stranded({ status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
+  // o3d-remove-parked-connectors round 2 (Codex MEDIUM): asked of a LIVE connector. A still-claimable
+  // ARCHIVED connector no longer exists as a state — nothing services it, so it is quiesced — and the
+  // message must not name a Sync-settings key that was archived with the code behind it.
+  const row = stranded({ connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
   const reason = row.notSettleableReason ?? ''
   // The lever, by its settings key: an operator cannot act on "it is claimable".
-  assert.match(reason, /quickbooks_sync_enabled/)
+  assert.match(reason, /xero_sync_enabled/)
   assert.match(reason, /manual\s+Sync button/)
   // And NOT the wording for a row on the ACTIVE connector, whose remedy (retry it, the processor
   // stamps an attempt) is a different action against a different cause.
@@ -272,7 +275,11 @@ test('[round 5] the question is asked PER CONNECTOR, so one quiesced connector d
   // With no accounting plugin enabled at all, buildStrandedSyncRowWhere selects EVERY unresolved
   // row, so one page carries both connectors. A single boolean for the page would adopt rows on a
   // connector nobody asked about.
-  const onlyXeroQuiesced = (connector: string) => connector === 'xero'
+  //
+  // Round 2: the pairing is now archived-vs-live, which is the only shape the real rule can produce —
+  // `isAccountingConnectorQuiesced` answers `true` for an archived connector unconditionally, and the
+  // live one's answer still depends on its toggle.
+  const onlyArchivedQuiesced = (connector: string) => connector === 'quickbooks'
   const page = pageStrandedSyncRows(
     [
       { ...sourceRow({ id: 'log-x', connector: 'xero', attemptRevision: 0 }) },
@@ -280,12 +287,12 @@ test('[round 5] the question is asked PER CONNECTOR, so one quiesced connector d
     ],
     10,
     NOW,
-    onlyXeroQuiesced,
+    onlyArchivedQuiesced,
   )
   const byId = new Map(page.rows.map((row) => [row.id, row]))
-  assert.equal(byId.get('log-x')?.settleable, true, 'the quiesced connector keeps the adoption remedy')
-  assert.equal(byId.get('log-q')?.settleable, false, 'the one that can still sweep does not')
-  assert.match(byId.get('log-q')?.notSettleableReason ?? '', /quickbooks_sync_enabled/)
+  assert.equal(byId.get('log-q')?.settleable, true, 'the quiesced connector keeps the adoption remedy')
+  assert.equal(byId.get('log-x')?.settleable, false, 'the one that can still sweep does not')
+  assert.match(byId.get('log-x')?.notSettleableReason ?? '', /xero_sync_enabled/)
 })
 
 test('[round 5] a FENCED row is unaffected — the fence, not the toggle, is what protects it', () => {

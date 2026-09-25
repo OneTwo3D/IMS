@@ -176,20 +176,20 @@ test('syncAccountingAccountBalanceSnapshots still runs for FINANCE, which holds 
   currentRole = 'FINANCE'
   const { syncAccountingAccountBalanceSnapshots } = await import('@/app/actions/accounting-sync')
   const result = await syncAccountingAccountBalanceSnapshots()
-  assert.deepEqual(result.errors, ['Enable Xero or QuickBooks first.'])
+  assert.deepEqual(result.errors, ['Enable an accounting connector first.'])
 })
 
 test('ADMIN reaches every guarded dispatcher', async () => {
   currentRole = 'ADMIN'
   const mod = await import('@/app/actions/accounting-sync')
   assert.deepEqual(await mod.testAccountingConnection(), {
-    success: false, error: 'Enable Xero or QuickBooks first.',
+    success: false, error: 'Enable an accounting connector first.',
   })
   assert.deepEqual(await mod.saveAccountingConnectionSettings('id', 'secret'), {
-    success: false, error: 'Enable Xero or QuickBooks first.',
+    success: false, error: 'Enable an accounting connector first.',
   })
   assert.deepEqual(await mod.connectAccountingConnector('id', 'secret', 'https://ims.example.test'), {
-    success: false, error: 'Enable Xero or QuickBooks first.',
+    success: false, error: 'Enable an accounting connector first.',
   })
 })
 

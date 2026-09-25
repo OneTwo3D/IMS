@@ -105,10 +105,15 @@ function reversalDecidingSources(): Array<[string, string]> {
 
 test('[o3d-psrx r3] the walk actually reaches the files this rule is about', () => {
   const files = reversalDecidingSources().map(([file]) => file)
-  // THE CENSUS. Both connectors, by name — the whole finding was that one of them was missing.
+  // THE CENSUS, by name — the whole finding was that a connector's poller was missing from the walk.
+  //
+  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/payment-poller.ts` was the second entry,
+  // and it was the one that had been missing. It is archived, so the census is down to one file. That
+  // makes the census weaker in exactly the direction the finding was about — a walk that reached only
+  // ONE reversal-deciding file is now indistinguishable from a complete one — so a second connector's
+  // poller must be added here in the commit that writes it.
   for (const expected of [
     'lib/connectors/xero/payment-poller.ts',
-    'lib/connectors/quickbooks/payment-poller.ts',
   ]) {
     assert.ok(files.includes(expected),
       `${expected} decides payment reversals and the scan did not reach it. Every assertion below `
