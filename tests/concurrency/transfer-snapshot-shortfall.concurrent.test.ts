@@ -1,6 +1,8 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+
+import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 import { config } from 'dotenv'
 
 /**
@@ -289,18 +291,15 @@ test(
     // Mintsoft says all ten were booked in. It is not wrong — the goods are on the
     // shelf. The snapshot simply cannot cost four of them.
     const outcome = await processBookedInEvent(event.id, {
-      fetchRemoteAsn: async () => ({
+      // o3d-btiw: through the real normalizer over a live-shaped Mintsoft body, so this test
+      // cannot pass while the wire shape goes unread.
+      fetchRemoteAsn: async () => liveMintsoftBookedInAsnRef({
         externalAsnId: tag,
-        status: 'RECEIVED',
-        lines: [{
-          externalLineId: asn.lines[0]!.externalAsnLineId,
-          sourceLineId: transferLineId,
-          externalProductId: null,
-          sku: tag,
-          quantity: LINE_QTY,
-          raw: null,
-        }],
-        raw: null,
+        externalLineId: asn.lines[0]!.externalAsnLineId,
+        sourceLineId: transferLineId,
+        sku: tag,
+        expectedQty: LINE_QTY,
+        bookedQty: LINE_QTY,
       }),
     })
 
@@ -351,18 +350,15 @@ test(
     })
 
     const outcome = await processBookedInEvent(event.id, {
-      fetchRemoteAsn: async () => ({
+      // o3d-btiw: through the real normalizer over a live-shaped Mintsoft body, so this test
+      // cannot pass while the wire shape goes unread.
+      fetchRemoteAsn: async () => liveMintsoftBookedInAsnRef({
         externalAsnId: tag,
-        status: 'RECEIVED',
-        lines: [{
-          externalLineId: asn.lines[0]!.externalAsnLineId,
-          sourceLineId: transferLineId,
-          externalProductId: null,
-          sku: tag,
-          quantity: LINE_QTY,
-          raw: null,
-        }],
-        raw: null,
+        externalLineId: asn.lines[0]!.externalAsnLineId,
+        sourceLineId: transferLineId,
+        sku: tag,
+        expectedQty: LINE_QTY,
+        bookedQty: LINE_QTY,
       }),
     })
 

@@ -112,6 +112,47 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
 - `/api/cron/mintsoft-webhook-sweeper` drains at most `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` persisted events per run. Leave it unset for the default `250`.
 - Line deltas are applied only for previously unaccounted received quantities.
 
+#### What IMS books in: `QuantityBooked`, not `QuantityReceieved` (o3d-btiw)
+
+A live Mintsoft `ASNItem` carries four quantities — `QuantityExpected`, `QuantityReceieved` (Mintsoft's
+own misspelling), `QuantityBooked` and `OnOrder` — and IMS reads them in exactly one place,
+`lib/connectors/mintsoft/api/asn-quantities.ts`.
+
+- **`QuantityBooked` is the quantity the booked-in path acts on.** IMS's book-in raises
+  `stock_levels.quantity`, lays FIFO cost layers and moves the source line's `qtyReceived`; that is a
+  STOCK figure, and IMS's stock at a WMS warehouse is also reconciled continuously by the stock-sync
+  alignment against **the quantity Mintsoft holds in stock**, which only moves when an ASN is booked in.
+  Crediting on the dock count instead would leave IMS higher than the warehouse, and an `ALIGN_TO_WMS`
+  binding would then align DOWN over a receipt whose cost layers are already laid.
+- **`QuantityReceieved` is carried, not discarded.** Units that have arrived but are not yet booked in
+  appear as `remoteArrivedQty` on every dry-run line (so in `reviewDetails`), and a processed callback
+  that finds any such line is logged as a **WARNING** naming the lines and both quantities. A partial
+  book-in is normal, so it reports rather than blocks.
+- **There is no fallback and no maximum between the two.** An unreadable `QuantityBooked` is
+  `remote_quantity_unreadable` even when `QuantityReceieved` is perfectly readable.
+- **`OnOrder` and the ASN header's `Quantity` are never read as goods quantities.** `OnOrder` tracked the
+  expected quantity on one ASN and was zero on another; the header `Quantity` is a count of goods-in
+  PACKAGES (`GoodsInType`) and equalled the sum of its items' expected quantities on only 3 of the
+  tenant's 223 live ASNs.
+- **An absent or unreadable quantity is never zero.** Zero means the warehouse booked nothing in. Absent,
+  non-numeric, `NaN`, `Infinity` or negative means UNKNOWN: the line is pinned to what has already been
+  accounted for, nothing is applied, and the callback goes to `REQUIRES_REVIEW` with an
+  approval-blocked warning. Before o3d-btiw the shared normalizer looked for `qty`/`Quantity`/
+  `receivedQty`, none of which a live ASN item carries, so every line read as a measured zero: a real
+  callback applied nothing, and a second one reported the warehouse as having gone backwards
+  (`remote_regression`).
+
+The e2e fake (`app/api/e2e/mintsoft/[...slug]/route.ts`) serves `GET /api/ASN/{id}` in this shape, with
+per-item `receivedQuantity`/`bookedQuantity` a seed can set, so an ASN that has arrived but is not booked
+in is expressible. It previously served an invented `AsnId`/`Reference`/`Status`/`Lines` shape that
+agreed with the equally invented reader, which is how every e2e run passed.
+
+**A purchase-backed book-in that adds stock still fails at commit (o3d-gles):** the service writes its
+`PURCHASE_RECEIPT` movement with `referenceType: 'WmsAsnMap'` and
+`stock_movements_reporting_evidence_guard` accepts only `'PurchaseOrder'`. o3d-btiw was masking that —
+with every received quantity reading zero, the movement was never inserted. Transfer-backed book-ins
+write `TRANSFER_IN`, which the guard does not cover, and work.
+
 ### Purchase-order ASN lines are not landed-quantity aware yet
 
 The two asymmetries above are one scope boundary, not two oversights. A purchase-order line has no
@@ -134,7 +175,7 @@ double-stock bug. The order is therefore o3d-papk first, then the PO retry path.
 
 Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
 
-- Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, or missing transfer cost-layer snapshot.
+- Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, missing transfer cost-layer snapshot, an **unreadable remote quantity** and a **missing remote ASN item** (the last two are o3d-btiw: an operator acknowledging a warning cannot supply a quantity the warehouse never served).
 - `received_over_expected` is a variance warning. It always requires admin review, but approval accepts the over-receipt and lets processing continue.
 - Approval requires fresh admin auth and the admin mutation header. Successful approvals stamp `reviewedAt` and `reviewedBy`; failed approval attempts remain visible through `lastError` and activity logs without stamping those success fields.
 - Activity logs include aggregate and line-level warning details so post-hoc audits can identify which ASN lines were approved.

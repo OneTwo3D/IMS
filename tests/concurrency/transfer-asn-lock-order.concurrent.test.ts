@@ -1,6 +1,8 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+
+import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 import { config } from 'dotenv'
 
 /**
@@ -348,18 +350,14 @@ async function runBookedIn(seeded: Awaited<ReturnType<typeof seedDispatchedTrans
     select: { id: true },
   })
   return processBookedInEvent(event.id, {
-    fetchRemoteAsn: async () => ({
+    // o3d-btiw: built from a LIVE-SHAPED Mintsoft body through the real normalizer, not fabricated.
+    fetchRemoteAsn: async () => liveMintsoftBookedInAsnRef({
       externalAsnId: seeded.tag,
-      status: 'RECEIVED',
-      lines: [{
-        externalLineId: seeded.externalAsnLineId,
-        sourceLineId: seeded.transferLineId,
-        externalProductId: null,
-        sku: seeded.tag,
-        quantity: LINE_QTY,
-        raw: null,
-      }],
-      raw: null,
+      externalLineId: seeded.externalAsnLineId,
+      sourceLineId: seeded.transferLineId,
+      sku: seeded.tag,
+      expectedQty: LINE_QTY,
+      bookedQty: LINE_QTY,
     }),
   })
 }
@@ -1329,18 +1327,14 @@ async function seedPurchaseAsnWorld(label: string) {
       select: { id: true },
     })
     return processBookedInEvent(event.id, {
-      fetchRemoteAsn: async () => ({
+      // o3d-btiw: through the real normalizer over a live-shaped body.
+      fetchRemoteAsn: async () => liveMintsoftBookedInAsnRef({
         externalAsnId: asn.reference,
-        status: 'RECEIVED',
-        lines: [{
-          externalLineId: asn.externalAsnLineId,
-          sourceLineId: asn.poLineId,
-          externalProductId: null,
-          sku: tag,
-          quantity: asn.qty,
-          raw: null,
-        }],
-        raw: null,
+        externalLineId: asn.externalAsnLineId,
+        sourceLineId: asn.poLineId,
+        sku: tag,
+        expectedQty: asn.qty,
+        bookedQty: asn.qty,
       }),
     })
   }
@@ -2055,18 +2049,14 @@ async function seedStaleBasisWorld(label: string) {
       select: { id: true },
     })
     return processBookedInEvent(event.id, {
-      fetchRemoteAsn: async () => ({
+      // o3d-btiw: through the real normalizer over a live-shaped body.
+      fetchRemoteAsn: async () => liveMintsoftBookedInAsnRef({
         externalAsnId: asn.reference,
-        status: 'RECEIVED',
-        lines: [{
-          externalLineId: asn.externalAsnLineId,
-          sourceLineId: asn.transferLineId,
-          externalProductId: null,
-          sku: tag,
-          quantity: LINE_QTY,
-          raw: null,
-        }],
-        raw: null,
+        externalLineId: asn.externalAsnLineId,
+        sourceLineId: asn.transferLineId,
+        sku: tag,
+        expectedQty: LINE_QTY,
+        bookedQty: LINE_QTY,
       }),
     })
   }

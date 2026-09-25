@@ -184,7 +184,16 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
         sourceLineId: line.sourceLineId,
         externalProductId: line.externalProductId,
         sku: line.sku,
-        quantity: line.quantity,
+        // o3d-btiw: a just-created ASN expects the requested quantity and has received none of it.
+        // ZERO HERE IS A MEASUREMENT, not an unknown — this fake warehouse really has booked in
+        // nothing yet, which is why it is `reported` rather than `unreadable`.
+        expectedQty: line.quantity,
+        receipt: {
+          kind: 'reported' as const,
+          bookedIntoStockQty: 0,
+          arrivedAtWarehouseQty: 0,
+          basis: 'Acme fake WMS: nothing booked in on create',
+        },
         raw: null,
       })),
       raw: null,

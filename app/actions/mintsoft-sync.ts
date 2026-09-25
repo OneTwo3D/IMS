@@ -3240,7 +3240,11 @@ export async function createMintsoftPurchaseOrderAsn(
       const lineBySourceId = new Map(asn.lines.map((line) => [line.sourceLineId, line]))
       return reservation.lines.every((line) => {
         const matchedLine = lineBySourceId.get(line.sourceLineId)
-        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.expectedQty)
+        // o3d-btiw: duplicate recovery matches an ASN on what it EXPECTS, never on what has been
+        // received against it. That was always this site's intent, but it read `quantity` — the same
+        // overloaded field the booked-in path read as RECEIVED — which on the live ASNItem shape was
+        // `null` for every item, so this predicate answered false for every candidate.
+        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.expectedQty, line.expectedQty)
       })
     })
 
@@ -4343,7 +4347,8 @@ export async function createMintsoftTransferAsn(
       return reservation.lines.every((line) => {
         const matchedLine = lineBySourceId.get(line.sourceLineId)
         // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation.
-        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.quantity, line.outstanding.qtyNumber)
+        // o3d-btiw: the EXPECTED quantity, for the reason given at the purchase-order site above.
+        return Boolean(matchedLine) && quantitiesMatch(matchedLine?.expectedQty, line.outstanding.qtyNumber)
       })
     })
 

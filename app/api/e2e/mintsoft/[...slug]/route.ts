@@ -46,12 +46,26 @@ type FakeMintsoftReturn = {
   receivedAt: string | null
 }
 
+/**
+ * o3d-btiw — THE FAKE HOLDS AN ASN ITEM'S THREE QUANTITIES SEPARATELY, because live Mintsoft does.
+ * `quantity` is the EXPECTED quantity (`ASNItem.QuantityExpected`); `receivedQuantity` and
+ * `bookedQuantity` are `QuantityReceieved` (Mintsoft's spelling) and `QuantityBooked`, and they
+ * default to 0 because a newly created ASN has had nothing booked in. A seed can move them, which is
+ * the whole point: before this, the fake had ONE quantity and served it as an invented `Quantity` key,
+ * so no e2e run could reach the booked-in reconciliation at all — which is why e2e never saw that
+ * every live ASN item normalized to a received quantity of zero.
+ */
 type FakeMintsoftAsnLine = {
   id: string
   sourceLineId: string
   productId: string | null
   sku: string | null
+  /** `ASNItem.QuantityExpected`. */
   quantity: number
+  /** `ASNItem.QuantityReceieved` — arrived at the warehouse. */
+  receivedQuantity: number
+  /** `ASNItem.QuantityBooked` — booked into the warehouse's stock; the quantity IMS books in. */
+  bookedQuantity: number
 }
 
 type FakeMintsoftAsn = {
@@ -224,12 +238,17 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
           const sourceLineId = asString(recordLine?.sourceLineId)
           if (!lineId || !sourceLineId) return null
 
+          const quantity = asNumber(recordLine?.quantity, 0)
           return {
             id: lineId,
             sourceLineId,
             productId: asString(recordLine?.productId),
             sku: asString(recordLine?.sku),
-            quantity: asNumber(recordLine?.quantity, 0),
+            quantity,
+            // o3d-btiw: a seed that says nothing about receipts describes an ASN nothing has been
+            // booked in against, which is what a freshly created one is.
+            receivedQuantity: asNumber(recordLine?.receivedQuantity, 0),
+            bookedQuantity: asNumber(recordLine?.bookedQuantity, 0),
           } satisfies FakeMintsoftAsnLine
         })
         .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
@@ -283,26 +302,61 @@ function mapMintsoftProductResponse(product: FakeMintsoftProduct) {
   }
 }
 
+/**
+ * `GET /api/ASN/{id}` IN THE LIVE `ASN`/`ASNItem` SHAPE (o3d-btiw; captured from ASN 6114 and 6117 by
+ * read-only GETs on ClientId 89, 2026-09-18 and 2026-09-24, recorded on bd o3d-vcw8 and o3d-btiw).
+ *
+ * IT USED TO SERVE AN IMAGINED SHAPE — `AsnId`, `Reference`, `Status`, and `Lines` of
+ * `{ AsnLineId, SourceLineId, ProductId, SKU, Quantity }` — which agreed with an equally imagined
+ * client. Mintsoft serves `ID`, `POReference`, `ASNStatus` as an OBJECT with `Name` (and no
+ * `ExternalName`: that trick is order-only), and `Items` of
+ * `{ ID, ASNId, ProductId, SKU, QuantityExpected, QuantityReceieved (sic), QuantityBooked, OnOrder,
+ *    SourceLineId, Complete, … }`. A fake that agrees with a broken client is how every e2e run
+ * passed against a contract Mintsoft does not serve.
+ *
+ * The header `Quantity` is the count of goods-in PACKAGES, not units — it equalled the sum of the
+ * items' expected quantities on only 3 of the tenant's 223 live ASNs.
+ */
 function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
+  const asnId = /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id
   return {
-    AsnId: /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id,
-    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
-    Reference: asn.reference,
-    SupplierReference: asn.supplierReference,
-    Carrier: asn.carrier,
-    ETA: asn.eta,
-    CallbackUrl: asn.callbackUrl,
-    AutoCallback: asn.autoCallback,
-    Status: asn.status,
-    CreatedAt: asn.createdAt,
-    Lines: asn.lines.map((line) => ({
-      AsnLineId: line.id,
-      SourceLineId: line.sourceLineId,
+    CLIENTSHORTNAME: 'E2E Fake Client',
+    POReference: asn.reference,
+    Supplier: null,
+    SupplierNotes: asn.supplierReference,
+    EstimatedDelivery: asn.eta,
+    Comments: asn.carrier,
+    GoodsInType: 'Carton',
+    // PACKAGE count, never units.
+    Quantity: 1,
+    ASNStatus: { Name: asn.status, Colour: 'purple', TextColour: null, ID: null },
+    ASNStatusId: null,
+    Shipped: false,
+    Items: asn.lines.map((line) => ({
+      ID: line.id,
+      ASNId: asnId,
       ProductId: line.productId && /^\d+$/.test(line.productId) ? Number(line.productId) : line.productId,
       SKU: line.sku,
-      Quantity: line.quantity,
+      QuantityExpected: line.quantity,
+      QuantityReceieved: line.receivedQuantity,
+      QuantityBooked: line.bookedQuantity,
+      OnOrder: 0,
+      SSCCNumber: null,
+      SourceLineId: line.sourceLineId,
+      Complete: line.bookedQuantity >= line.quantity,
     })),
+    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
+    ID: asnId,
+    LastUpdated: asn.createdAt,
   }
+}
+
+/**
+ * `GET /api/ASN/{id}` in the live shape. Exported so the fake's ASN contract can be unit-tested
+ * without the e2e harness — a fake nobody checks is how an invented shape survived (o3d-btiw).
+ */
+export function fakeMintsoftAsnById(asn: FakeMintsoftAsn) {
+  return mapMintsoftAsnResponse(asn)
 }
 
 export function parseFakeMintsoftDirectAsnPath(path: string): string | null {
@@ -585,6 +639,9 @@ export async function POST(
           productId: asString(recordLine?.ProductId ?? recordLine?.productId),
           sku: asString(recordLine?.SKU ?? recordLine?.sku),
           quantity: asNumber(recordLine?.Quantity ?? recordLine?.quantity, 0),
+          // o3d-btiw: nothing has arrived or been booked in against an ASN that was just created.
+          receivedQuantity: 0,
+          bookedQuantity: 0,
         } satisfies FakeMintsoftAsnLine
       })
       .filter((line): line is FakeMintsoftAsnLine => Boolean(line))

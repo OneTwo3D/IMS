@@ -1,4 +1,5 @@
 import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import { readMintsoftAsnItemExpectedQty, readMintsoftAsnItemReceipt } from './asn-quantities'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
@@ -235,7 +236,16 @@ export function normalizeMintsoftAsnLine(value: unknown): WmsAsnLineRef | null {
     sourceLineId,
     externalProductId: getFirstString(record, PRODUCT_ID_KEYS),
     sku: getFirstString(record, STOCK_SKU_KEYS),
-    quantity: getFirstNumber(record, RETURN_QTY_KEYS),
+    // o3d-btiw. These two reads used to be ONE — `quantity: getFirstNumber(record, RETURN_QTY_KEYS)`
+    // — over `qty`/`Qty`/`quantity`/`Quantity`/`returnedQty`/`receivedQty`, and a live Mintsoft
+    // `ASNItem` carries NONE of those keys (3098 of 3098 items, both ASN routes; bd o3d-vcw8,
+    // o3d-btiw). So every live line arrived with `quantity: null`, the booked-in processor read that
+    // as 0 received and applied nothing while calling itself processed. The item's real quantities
+    // are `QuantityExpected`, `QuantityReceieved` (sic) and `QuantityBooked`, they answer DIFFERENT
+    // questions, and asn-quantities.ts is the one place that says which is which and what an
+    // unreadable one means.
+    expectedQty: readMintsoftAsnItemExpectedQty(record),
+    receipt: readMintsoftAsnItemReceipt(record),
     raw: record,
   }
 }

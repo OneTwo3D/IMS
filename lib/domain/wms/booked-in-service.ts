@@ -11,6 +11,7 @@ import {
   buildBookedInDryRun,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
+  resolveRemoteBookedInQuantity,
   sliceTransferSnapshotForReceipt,
   type BookedInDryRun,
   type BookedInDryRunWarningCode,
@@ -67,6 +68,12 @@ const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
   'missing_local_line',
   'unsupported_source_type',
   'cost_layer_snapshot_missing',
+  // o3d-btiw. An operator acknowledging a warning cannot supply a quantity the warehouse never
+  // served, so these two must not be approvable: approval would resume with the unknown quantity
+  // still unknown. The remedy is to make the WMS serve the quantity (or to correct the mapping) and
+  // re-check the ASN, which is what the review message says.
+  'remote_quantity_unreadable',
+  'missing_remote_line',
 ])
 
 
@@ -477,10 +484,24 @@ export async function processBookedInEvent(
         .map((line) => {
           const remoteLine = remoteLineByExternalId.get(line.externalAsnLineId)
             ?? remoteLineBySourceId.get(line.sourceLineId)
-          const currentRemoteReceivedQty = Math.max(0, Number(remoteLine?.quantity ?? 0))
+          // o3d-btiw. This USED TO BE `Math.max(0, Number(remoteLine?.quantity ?? 0))`, which turned
+          // both "no remote item at all" and "a remote quantity IMS could not read" into a measured
+          // ZERO. Against the live Mintsoft ASNItem shape that was EVERY line — the normalizer read
+          // `qty`/`Quantity`/`receivedQty`, the wire serves `QuantityExpected`/`QuantityReceieved`/
+          // `QuantityBooked` — so a real booked-in callback applied nothing and reported itself
+          // processed, and a second one reported the warehouse as having gone backwards. Unknown now
+          // pins the line to what has already been accounted for and raises an approval-blocked
+          // review warning instead.
+          const remote = resolveRemoteBookedInQuantity(remoteLine)
+          const currentRemoteReceivedQty = remote.refusal
+            ? Number(line.lastProcessedReceivedQty)
+            : Math.max(0, remote.bookedIntoStockQty ?? 0)
           return {
             ...line,
             currentRemoteReceivedQty,
+            remoteQuantityRefusal: remote.refusal,
+            remoteArrivedQty: remote.arrivedAtWarehouseQty,
+            remoteQuantityBasis: remote.basis,
             currentReceivedQty: Math.min(
               Number(line.expectedQty),
               currentRemoteReceivedQty,
@@ -491,6 +512,16 @@ export async function processBookedInEvent(
       const actionableLines = candidateLines
         .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
 
+      // NOT WIDENED HERE, DELIBERATELY (o3d-h66s, filed 2026-09-25). These two reads feed
+      // `localLineExists`, and because they are restricted to lines with a POSITIVE delta, a line with
+      // NO delta reports its IMS line as MISSING — an approval-blocked `missing_local_line` about a
+      // line that exists and is healthy. o3d-btiw makes that the COMMON case rather than an edge one:
+      // a DELIVERED ASN with nothing booked in yet is exactly a zero delta, and the o3d-bhvu round-8
+      // recovery enqueues a recheck for precisely those. It moves NO stock and corrupts NO figure, so
+      // under the 2026-09-25 scope rule — fix only deploy-blocking faults, file the rest — it is filed
+      // as o3d-h66s and NOT fixed on this branch. The concurrency test "a readable zero is a
+      // MEASUREMENT" pins the present behaviour and carries the instruction to flip it when o3d-h66s
+      // lands.
       const purchaseActionableLines = actionableLines.filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
       const transferActionableLines = actionableLines.filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
 
@@ -591,6 +622,12 @@ export async function processBookedInEvent(
                 ? Boolean(transferLine)
                 : undefined,
             costLayerSnapshot: transferLine?.costLayerSnapshot,
+            // o3d-btiw — carried into the dry run so a refusal, and the arrived-but-not-booked gap,
+            // are persisted on `wms_inbound_receipt_events.reviewDetails` and visible to the operator
+            // instead of being facts only the warehouse holds.
+            remoteQuantityRefusal: line.remoteQuantityRefusal,
+            remoteArrivedQty: line.remoteArrivedQty,
+            remoteQuantityBasis: line.remoteQuantityBasis,
           }
         }),
       })
@@ -1236,6 +1273,22 @@ export async function processBookedInEvent(
         asnMapId: asnMap.id,
         asnStatusBefore: asnMap.status as string,
         asnStatusAfter,
+        // o3d-btiw — THE OTHER QUANTITY, MADE VISIBLE RATHER THAN DISCARDED. IMS books in what the
+        // warehouse has booked into ITS stock (`QuantityBooked`), because that is the figure the WMS
+        // stock-sync alignment reconciles against; goods that have ARRIVED but are not yet booked in
+        // are deliberately NOT credited. That is the right call, but it is not a number to throw
+        // away: without this list, "the warehouse has 10 of these and IMS has 6" is a fact only
+        // Mintsoft holds. A partial book-in is normal, so it is reported rather than blocking.
+        arrivedNotYetBookedIn: candidateLines
+          .filter((line) => line.remoteArrivedQty != null && line.remoteArrivedQty > line.currentRemoteReceivedQty)
+          .map((line) => ({
+            asnLineMapId: line.id,
+            externalAsnLineId: line.externalAsnLineId,
+            sku: line.sku,
+            arrivedAtWarehouseQty: line.remoteArrivedQty,
+            bookedIntoStockQty: line.currentRemoteReceivedQty,
+            basis: line.remoteQuantityBasis,
+          })),
       }
     }, STOCK_TX_OPTIONS)
 
@@ -1289,15 +1342,22 @@ export async function processBookedInEvent(
       }
     }
 
+    const arrivedNotYetBookedIn = ('arrivedNotYetBookedIn' in processed && processed.arrivedNotYetBookedIn) || []
     await logActivity({
       entityType: 'SYNC',
       entityId: event.id,
       tag: 'sync',
       action: 'mintsoft_booked_in_processed',
-      description: `Processed Mintsoft ASN booked-in webhook ${event.externalAsnId}`,
+      // o3d-btiw: goods sitting at the warehouse that IMS has deliberately not booked in are a
+      // WARNING, not a silent detail — it is the one reading this fix declines to act on.
+      ...(arrivedNotYetBookedIn.length > 0 ? { level: 'WARNING' as const } : {}),
+      description: arrivedNotYetBookedIn.length > 0
+        ? `Processed Mintsoft ASN booked-in webhook ${event.externalAsnId} — ${arrivedNotYetBookedIn.length} line(s) have arrived at the warehouse but are not yet booked into its stock, so IMS has not booked them either`
+        : `Processed Mintsoft ASN booked-in webhook ${event.externalAsnId}`,
       metadata: {
         externalAsnId: event.externalAsnId,
         productCount: processed.productIds.length,
+        ...(arrivedNotYetBookedIn.length > 0 ? { arrivedNotYetBookedIn } : {}),
       },
       resolveUser: false,
     })
