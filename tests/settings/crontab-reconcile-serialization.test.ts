@@ -1621,6 +1621,9 @@ test('[o3d-batch-ret] the application and the installer RESOLVE the same lock pa
  * `parentWritable` is the ONE thing that differs between the assertion and its control.
  */
 async function swapAfterPreparation(parentWritable: boolean): Promise<{
+  shellComposed: string
+  appResolved: string
+  appSource: string
   shellInode: string
   pathNamesAfterSwap: string
   swapSucceeded: boolean
@@ -1643,6 +1646,14 @@ async function swapAfterPreparation(parentWritable: boolean): Promise<{
   const ready = join(root, 'ready.fifo')
   const go = join(root, 'go.fifo')
   await sh(`mkfifo '${ready}' '${go}'`)
+  // A DECOY AT THE PRE-RELOCATION LOCATION, and it is load-bearing for this test rather than scenery.
+  // $STATE_DIRECTORY is set below, and it holds a perfectly usable lock file of its own — so an
+  // application that preferred it, or that anchored its derivation anywhere but the namespace root,
+  // would resolve a DIFFERENT pathname and then take an exclusion the shell will never contend for.
+  // That is the "both sides must derive the same location" half of the finding, and without the decoy
+  // this test would pass on it.
+  mkdirSync(join(legacy, CRONTAB_LOCK_DIRNAME_EXPECTED), { recursive: true, mode: 0o755 })
+  writeFileSync(join(legacy, CRONTAB_LOCK_DIRNAME_EXPECTED, '.crontab-reconcile.lock'), '')
 
   // --- THE SHELL PARTY: the shipped library, the shipped composition, the shipped preparation.
   const shell = spawn('bash', ['-c', `set -u
@@ -1655,6 +1666,7 @@ IMS_CRONTAB_LOCK_WAIT_SECONDS=30
 source '${CRONTAB_LOCK_LIB}'
 source '${CUTOVER_NAMESPACE_LIB}'
 crontab_lock_paths "\${CUTOVER_ROOT_DIR}" '${legacy}'
+echo "COMPOSED=\${CRONTAB_LOCK_FILE}"
 prepare_crontab_lock
 echo "PINNED=$(LC_ALL=C stat -L -c '%d:%i' "/proc/self/fd/\${CRONTAB_LOCK_FD}")"
 body() {
@@ -1703,10 +1715,19 @@ echo "RC=\${rc}"
   let shellHeldDuringApp = false
   let appEnteredAfterShell = false
   let appInodeAfterShell: string | null = null
+  let appResolved = ''
+  let appSource = ''
   try {
     process.env.OTI_CUTOVER_STATE_ROOT = namespaceRoot
     process.env.OTI_CRONTAB_LOCK_WAIT_MS = '300'
-    delete process.env.STATE_DIRECTORY
+    // SET, NOT DELETED (see the decoy above): systemd's own answer is present and points at a usable
+    // lock, so an application that resolved from it instead of from the namespace root would silently
+    // take the wrong inode.
+    process.env.STATE_DIRECTORY = legacy
+    const { crontabReconcileLockPath } = await import('@/lib/crontab-reconcile-lock')
+    const located = crontabReconcileLockPath()
+    appResolved = located.ok ? located.path : `REFUSED: ${located.error}`
+    appSource = located.ok ? located.source : 'refused'
     const outcome = await withCrontabReconcileLock(async (lock) => {
       appInodeDuringShell = `${fstatSync(lock.fd).dev}:${fstatSync(lock.fd).ino}`
       // MEASURED FROM INSIDE THE APPLICATION'S OWN CRITICAL SECTION: is the SHELL's lock still held
@@ -1732,7 +1753,8 @@ echo "RC=\${rc}"
     else process.env.OTI_CUTOVER_STATE_ROOT = savedRoot
     if (savedWait === undefined) delete process.env.OTI_CRONTAB_LOCK_WAIT_MS
     else process.env.OTI_CRONTAB_LOCK_WAIT_MS = savedWait
-    if (savedState !== undefined) process.env.STATE_DIRECTORY = savedState
+    if (savedState === undefined) delete process.env.STATE_DIRECTORY
+    else process.env.STATE_DIRECTORY = savedState
     if (shell.exitCode === null && shell.signalCode === null) {
       await writeFile(go, 'go\n').catch(() => {})
       await awaitExit(shell, `the shell party in ${root}`).catch(() => {})
@@ -1740,6 +1762,9 @@ echo "RC=\${rc}"
     chmodSync(namespaceRoot, 0o755)
   }
   return {
+    shellComposed: (shellOut.match(/^COMPOSED=(\S+)$/m) ?? ['', ''])[1],
+    appResolved,
+    appSource,
     shellInode,
     pathNamesAfterSwap,
     swapSucceeded,
@@ -1766,6 +1791,18 @@ test('[o3d-batch-ret] the directory is SWAPPED after the shell prepared, and the
   // WHAT THIS ASSERTION EXAMINED, printed so a reader can see the scenario really happened rather
   // than take the pass on trust.
   const examined = JSON.stringify(sealed, null, 1)
+
+  // PRECONDITION 0 — THE TWO PARTIES COMPOSED THE SAME PATHNAME, each from its own side: the shell
+  // by running the shipped `crontab_lock_paths`, the application by running the shipped
+  // `crontabReconcileLockPath`. If they did not, nothing below is a statement about exclusion at all
+  // — and because BOTH would still resolve without error, this assertion is the only thing that can
+  // see it. $STATE_DIRECTORY is deliberately set to a directory holding a usable lock of its own, so
+  // an application that preferred it would fail HERE rather than pass by luck.
+  assert.equal(sealed.appResolved, sealed.shellComposed,
+    `the two parties must derive ONE pathname, and the application must not have been drawn to the `
+    + `pre-relocation location \`$STATE_DIRECTORY\` still names:\n${examined}`)
+  assert.equal(sealed.appSource, 'shared',
+    `and it must get there through the SHARED branch:\n${examined}`)
 
   // PRECONDITION 1 — the swap was really ATTEMPTED and was REFUSED by the parent's permissions.
   // That is the remedy: a parent the attempting account may not write.
@@ -1811,6 +1848,9 @@ test('[o3d-batch-ret] CONTROL: with a parent the account CAN write, that same sw
   const writable = await swapAfterPreparation(true)
   const examined = JSON.stringify(writable, null, 1)
 
+  assert.equal(writable.appResolved, writable.shellComposed,
+    `the control must differ from the assertion above in exactly ONE thing — the parent's mode — so `
+    + `the two parties must still be composing one pathname here:\n${examined}`)
   assert.equal(writable.swapSucceeded, true,
     `the rename must succeed when its parent is writable — that is the finding:\n${examined}`)
   assert.notEqual(writable.pathNamesAfterSwap, writable.shellInode,
