@@ -1809,8 +1809,32 @@ const FENCE_LIB = readFileSync(join(REPO, FENCE_LIBRARY), 'utf8')
  */
 const PROTECTED_LIBRARY_CONSTANTS = [
   'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE', 'DB_FENCE_PROTECTED_APP_DIR',
-  'DB_FENCE_SCRIPT_COPY', 'DB_FENCE_STAGED_APP_DIR', 'DB_FENCE_RETIRED_APP_DIR',
-  'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE', 'DB_FENCE_RELEASE_WRAPPER',
+  'DB_FENCE_SCRIPT_COPY',
+  // o3d-xi3w: the two fixed names a publication used (`.app.staged`, `.app.retired`) are GONE -- one
+  // name per KIND is what let a second privileged run refill the first run's staging tree between
+  // assembling it and hashing it. What replaces them is one `mktemp -d` per run plus these, which decide
+  // which names a publication may hold and which the sweep may reap.
+  'DB_FENCE_PUBLISH_KIND', 'DB_FENCE_PUBLISH_PREFIX', 'DB_FENCE_VERSION_PREFIX',
+  'DB_FENCE_POINTER_PREFIX', 'DB_FENCE_RETIRE_PREFIX',
+  // o3d-xi3w r2: the FIFTH prefix, and it is the one an EXECUTION writes rather than a publication.
+  // `.inuse-fence.<pid>.<that process's start time>` is one symbolic link per fence operation whose text
+  // is the publication that operation resolved: it is the PIN every later helper invocation of the
+  // operation is bound to, and the LIVENESS MARKER the sweep honours before reclaiming a version. Re-aim
+  // the prefix and the pin is written and looked for somewhere else, which makes every invocation read
+  // the mutable pointer again -- the finding -- and makes the sweep reclaim a tree that is being executed.
+  'DB_FENCE_INUSE_PREFIX',
+  // o3d-xi3w r4: THE ONE LOCK, and the bound on waiting for it. The lock file is the object the raise's
+  // critical section opens and flocks so that binding the recovery record and publishing the authority
+  // cannot be interleaved with another run's write of the same lines: re-aim the path and two runs take
+  // two different locks and exclude nothing, which is the round-4 finding with a longer name. The wait
+  // decides whether a busy peer is waited for or refused, so a value another path could set is a way to
+  // turn every raise into a refusal (0) or a hang.
+  'DB_FENCE_RECORD_LOCK', 'DB_FENCE_RECORD_LOCK_WAIT',
+  'DB_FENCE_ARTEFACT_FILE', 'DB_FENCE_MANIFEST_FILE',
+  // o3d-xi3w: where a pre-pointer release left the record and the manifest. This run REMOVES them once
+  // it has migrated such an installation, so they are paths the mechanism acts on.
+  'DB_FENCE_LEGACY_ARTEFACT_FILE', 'DB_FENCE_LEGACY_MANIFEST_FILE',
+  'DB_FENCE_RELEASE_WRAPPER',
   'DB_FENCE_REFENCE_WRAPPER', 'DB_FENCE_RESOLVE_WRAPPER',
   'DB_FENCE_VENDOR_ROOTS', 'DB_FENCE_VENDOR_MAX_FILES',
   'DB_FENCE_ARTEFACT_RECIPE', 'DB_FENCE_ARTEFACT_SOURCE_TEXT', 'DB_FENCE_EXPECTED_SHA256',
@@ -1827,6 +1851,13 @@ const PROTECTED_LIBRARY_CONSTANTS = [
 const MUTABLE_LIBRARY_NAMES: Readonly<Record<string, string>> = {
   DB_FENCE_ROTATION_NOTE: 'a report: the library sets it to say why a divergence was not promoted',
   DB_FENCE_SEAL_REASON: 'a report: _fence_tree_is_sealed() names the offending path in it',
+  // o3d-xi3w. The pointer check and the shared ownership decision both answer in a variable rather than
+  // on stdout, because every fence publication and resolution runs inside a command substitution and a
+  // value assigned in one dies with the subshell -- which is how the first version of this library
+  // reported every refusal with an empty sentence.
+  DB_FENCE_STANDING_REASON:
+    'a report: why the documented name would not be followed. _fence_standing_artefact_ok() returns the '
+    + 'VERDICT as its status and writes only the sentence here; nothing branches on this value',
   DB_FENCE_PROBE_ARTEFACT_SHA256: 'a report: what the tree this checkout would publish hashes to',
   DB_FENCE_PROBE_STANDING_SHA256: 'a report: what the artefact already standing hashes to',
   DB_FENCE_PROBE_REASON: 'a report: why there is nothing to preflight with, and after '
@@ -4156,11 +4187,11 @@ test('[o3d-secops] a new library path declared next to the protected ones fails 
 
   // AND A DECLARATION THAT DISAPPEARS FAILS TOO, so the census is an equality and not a subset: a
   // list that still claims a name the library has stopped declaring is a list nobody has read.
-  const removed = FENCE_LIB.replace(/^readonly DB_FENCE_RETIRED_APP_DIR=.*$/m, '')
+  const removed = FENCE_LIB.replace(/^readonly DB_FENCE_RETIRE_PREFIX=.*$/m, '')
   assert.notEqual(removed, FENCE_LIB, 'precondition: the declaration this deletes must exist')
   const orphaned = unclassifiedLibraryNames(removed, FENCE_LIBRARY)
   assert.equal(orphaned.length, 1, orphaned.join('\n'))
-  assert.match(orphaned[0], /no longer declares DB_FENCE_RETIRED_APP_DIR/, orphaned[0])
+  assert.match(orphaned[0], /no longer declares DB_FENCE_RETIRE_PREFIX/, orphaned[0])
 })
 
 /**

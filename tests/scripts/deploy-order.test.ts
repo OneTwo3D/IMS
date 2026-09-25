@@ -12,8 +12,10 @@ import {
   protectedLibraryLines,
   protectedLibraryLinesAt,
   sealCheckoutModes,
+  standingRecordPath,
   writeCheckoutPg,
   protectedPaths,
+  standingHelperPath,
   writeFenceCheckout,
 } from './fence-artefact-harness.ts'
 import { shellConstant, shellFunction, shellFunctionDefinitions } from './shell-symbol.ts'
@@ -7164,7 +7166,9 @@ test('a deleted .env does not stop the connection fence being adopted', () => {
       `and aimed at the identity the record says that fence was raised against:\n${log}`,
     )
     assert.ok(
-      log.includes(join(recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
+      // THE VERSIONED PATH, which is what the resolution hands back since o3d-xi3w r2 — the documented
+      // name is a mutable object and a path through it names whatever it resolves to at exec time.
+      log.includes(standingHelperPath(recovery)),
       `and run from the root-owned copy, because the checkout's is gone:\n${log}`,
     )
     assert.ok(
@@ -7425,7 +7429,9 @@ test('a fence script replaced in the checkout is never the one that runs', () =>
       const log = readCalls(dirs.state)
 
       assert.ok(log.length > 0, `${scenario.label}: precondition — the fence helper was invoked at all:\n${result.output}`)
-      assert.ok(log.includes(protectedCopy), `${scenario.label}: must run the root-owned copy:\n${log}`)
+      // Read AFTER the run, and from the harness, because what is executed is the versioned publication
+      // the pointer names and not a path through the pointer (o3d-xi3w r2).
+      assert.ok(log.includes(standingHelperPath(dirs.recovery)), `${scenario.label}: must run the root-owned copy:\n${log}`)
       assert.ok(!log.includes(checkoutScript), `${scenario.label}: and never the path the application account rewrote:\n${log}`)
 
       // AND THE SUBSTITUTE NEVER BECOMES THE PROTECTED ONE. An adoption that republished the copy
@@ -7612,7 +7618,7 @@ test('the recovery record lives where the application user cannot rewrite it', (
     const reassign = lines.filter(
       (candidate) =>
         isCode(candidate) &&
-        /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|STAGED_APP_DIR|RETIRED_APP_DIR|ARTEFACT_FILE|MANIFEST_FILE|VENDOR_ROOTS)=/.test(candidate),
+        /^\s*DB_FENCE_(RECOVERY_DIR|SCRIPT_COPY|IDENTITY_FILE|PROTECTED_APP_DIR|PUBLISH_PREFIX|VERSION_PREFIX|POINTER_PREFIX|RETIRE_PREFIX|ARTEFACT_FILE|MANIFEST_FILE|VENDOR_ROOTS)=/.test(candidate),
     )
     assert.deepEqual(reassign, [], `${label} must not redefine the protected-helper paths the library owns`)
   }
@@ -7638,10 +7644,26 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // MUTATION ROUTE: add `ln -sfn "${app_modules}" "${DB_FENCE_PROTECTED_APP_DIR}/node_modules"`
   // back into _fence_stage_and_publish() and the first assertion fails by name.
   const libraryCode = LIBRARY_LINES.filter((candidate) => isCode(candidate)).join('\n')
-  assert.ok(
-    !/\bln -s/.test(libraryCode),
-    'the protected artefact may contain no symlink the library creates: a symlink is followed by node and is not covered by the artefact digest',
-  )
+  // THE ONE LINK THE LIBRARY CREATES IS THE PUBLICATION'S POINTER, and it is the documented name itself
+  // rather than anything inside the tree (o3d-xi3w). That is what makes a publication one `rename(2)`:
+  // the name resolves to the previous artefact before the flip and to the new one after it, with no
+  // instant in between, and `rename` over a symbolic link cannot nest one tree inside another the way it
+  // can over a directory. It is not covered by the artefact digest because it is not part of the
+  // artefact — what it NAMES is, and the name is validated against one shape before it is ever followed.
+  //
+  // MUTATION ROUTE: add `ln -sfn "${app_modules}" "${staged}/node_modules"` back into
+  // _fence_stage_and_publish() and this fails, naming the second link.
+  const links = LIBRARY_LINES.filter((candidate) => isCode(candidate) && /\bln -s/.test(candidate)).map((candidate) => candidate.trim())
+  assert.deepEqual(links, ['ln -s -- "${target}" "${name}"'],
+    `the only link the library may create is the publication pointer, in _fence_link_owned: ${links.join(' | ')}`)
+  assert.match(shellFunction(LIBRARY, '_fence_link_owned'), /_fence_owned_name "\$\{name\}" "\$\{what\}"/,
+    'and it must check the NAME it is about to create, so nothing can be linked outside the recovery root')
+  // AND NOTHING INSIDE THE PUBLISHED TREE MAY BE A LINK, which is where r32's property actually lives:
+  // a symlink inside the tree IS followed by node and is NOT hashed by the manifest.
+  assert.match(shellFunction(LIBRARY, '_fence_tree_is_sealed'), /! -type d -a ! -type f/,
+    'the seal must still refuse anything in the tree that is not a regular file or a directory')
+  assert.match(libraryCode, /_fence_link_owned "\$\{version_name\}\/\$\{tree_name\}" "\$\{pointer_tmp\}"/,
+    'and the pointer names one versioned directory and one tree, relatively, so it cannot leave the recovery root')
   assert.match(
     libraryCode,
     /cp -R --no-dereference -- "\$\{app_dir\}\/\$\{relative\}" "\$\{staged\}\/\$\{relative\}"/,
@@ -7652,13 +7674,44 @@ test('the recovery record lives where the application user cannot rewrite it', (
   // silently, which is an escape the digest would then bless.
   assert.match(
     libraryCode,
-    /find "\$root" \\\( ! -type d -a ! -type f \\\) -print -quit/,
+    // `-H` dereferences the START POINT and nothing else (o3d-xi3w): the documented name is now a
+    // symbolic link into the versioned directory, and without it the start point itself would answer
+    // "neither a regular file nor a directory" and every sealing check of a standing artefact would
+    // refuse it. Links INSIDE the tree are still found, and still refused by name.
+    /find -H "\$root" \\\( ! -type d -a ! -type f \\\) -print -quit/,
     'and anything in the published tree that is not a regular file or a directory must be refused',
   )
 
   // AND IT IS CREATED ROOT-OWNED. 0755 rather than the snapshot directory's 0700 because the
   // fence runs AS THE APPLICATION USER and has to read both files; neither holds a secret.
   const publish = shellFunction(UPDATE_LINES.join('\n'), 'publish_fence_recovery_record')
+  // AND THE DIGEST IT BINDS COMES FROM THE RESOLUTION (o3d-xi3w r3), which hands back the entry file of
+  // the versioned publication THIS operation is pinned to for its whole length — never from
+  // ${DB_FENCE_SCRIPT_COPY}, which is a path through the pointer and therefore a statement about
+  // whatever another privileged run has aimed it at by the time it is hashed. That difference is the
+  // fence being RAISED by one release and RELEASED by another.
+  //
+  // IT IS A LEXICAL CHECK, and it is stated as one: the two paths name the same file on any box where
+  // nothing publishes in the window, so no fixture can tell them apart — what distinguishes them is
+  // which name is written down. The ABSENCE half is universal, so a line that hashes the documented name
+  // again ANYWHERE in the function fails it, correction or no correction beside it.
+  assert.ok(
+    !/file_sha256 "\$\{DB_FENCE_SCRIPT_COPY\}"/.test(publish),
+    `the record's digest must not be taken through the documented name:\n${publish}`,
+  )
+  assert.match(publish, /script="\$\(db_fence_script_in_use\)" \|\| return 1/,
+    'it must be taken from the publication this operation is pinned to, through the one resolution')
+  assert.match(publish, /digest="\$\(file_sha256 "\$\{script\}"\)" \|\| return 1/,
+    'and that path is what is hashed')
+  // AND THE RECORD NAMES THE PUBLICATION AS WELL AS THE BYTES (o3d-xi3w r4). The raise's critical section
+  // rewrites both lines again immediately before it publishes the authority, so this earlier write is what
+  // covers the one state that section cannot: a run KILLED between this record and that authority. Lexical
+  // for the same reason the digest check above is -- no fixture can distinguish "written here" from
+  // "written there" on a box where nothing intervenes.
+  assert.match(publish, /version="\$\(_fence_version_of_entry "\$\{script\}"\)" \|\| version=""/,
+    'the publication this operation is pinned to must be taken from the same resolution')
+  assert.match(publish, /printf 'fence_script_version=%s\\n' "\$\{version\}"/,
+    'and written into the record, so a release resolves the raising publication and not whatever the pointer names')
   assert.match(publish, /chown root:root "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'the recovery directory must be root-owned')
   assert.match(publish, /chmod 755 "\$\{DB_FENCE_RECOVERY_DIR\}"/, 'and traversable by the account that runs the fence')
   // THE CREDENTIAL IS NOT IN IT. A record that carried DEPLOY_ADMIN_DATABASE_URL would be a
@@ -8905,7 +8958,7 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
   //     and case 2 fails: the protected copy becomes v2 with nothing authorising it.
   //   * drop the `[[ "${digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]` refusal from
   //     _fence_stage_and_publish() and case 3 fails: a wrong expected digest publishes anyway.
-  //   * delete the _fence_rewrite_record_digest() call and case 4 fails at the record assertion,
+  //   * delete the _fence_rewrite_record_binding() call and case 4 fails at the record assertion,
   //     and every later run would be refused by db_fence_script_in_use() — a rotation that bricks
   //     the mechanism is not a rotation.
   //   * delete the ${DB_FENCE_STATE} arm and case 5 rotates the helper out from under a standing
@@ -8922,7 +8975,8 @@ test('r31: the protected helper is bootstrapped once and then only rotated by an
     writeFileSync(helper, V1)
     const bootstrap = runShell(rotationHarness(dirs, ['db_fence_script_in_use && echo']))
     assert.equal(bootstrap.status, 0, `the bootstrap must succeed:\n${bootstrap.output}`)
-    assert.match(bootstrap.output, new RegExp(copy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'and return the protected path')
+    assert.match(bootstrap.output, new RegExp(escapeRe(standingHelperPath(dirs.recovery))),
+      'and return the protected path — the versioned publication, not the mutable documented name (o3d-xi3w r2)')
     assert.equal(readFileSync(copy, 'utf8'), V1, 'and hold the checkout bytes')
     // The record a raised fence would have written, so the digest binding is live for the rest.
     writeFileSync(
@@ -9058,7 +9112,7 @@ test('r34: a dry run computes the candidate digest by READING, and hands back no
     )
     assert.match(published.output, /^RC=0$/m, `the digest a dry run reports must authorise the publication:\n${published.output}`)
     assert.equal(
-      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(join(dirs.recovery, 'db-fence-artefact.sha256'), 'utf8'))?.[1],
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(standingRecordPath(dirs.recovery), 'utf8'))?.[1],
       candidate,
       'and be what the record ends up holding',
     )
@@ -9163,7 +9217,7 @@ test('o3d-secops r3: after a real publish and a real preflight, the six steering
     assert.match(run.output, /^PREFLIGHT=0$/m, `and the preflight path with it:\n${run.output}`)
     assert.ok(existsSync(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')),
       'and the artefact really was published, which is what proves _fence_source_trust() ran')
-    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+    assert.match(run.output, new RegExp(`^PROBE=\\[${escapeRe(standingHelperPath(dirs.recovery))}\\]$`, 'm'),
       `and something really was executed:\n${run.output}`)
 
     // THE CLAIM.
@@ -9275,7 +9329,7 @@ test('o3d-secops r3: each entrypoint\'s own preflight line runs the standing art
       assert.match(exec, /\bDEPLOY_ADMIN_DATABASE_URL=\S+/,
         `${script}: including the credential the preflight needs: ${exec}`)
       assert.ok(
-        exec.endsWith(`node ${join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs')} --preflight `),
+        exec.endsWith(`node ${standingHelperPath(dirs.recovery)} --preflight `),
         `${script}: and then the STANDING artefact, appended by the library: ${exec}`,
       )
     }
@@ -9349,7 +9403,8 @@ test('r32: a dependency substituted in the checkout is never the one the protect
     const resolved = runShell(artefactHarness(dir, ['script="$(db_fence_script_in_use)" || exit 1', 'echo "SCRIPT=${script}"']))
     assert.equal(resolved.status, 0, `the artefact must publish:\n${resolved.output}`)
     const script = /^SCRIPT=(.+)$/m.exec(resolved.output)?.[1]
-    assert.equal(script, protectedPaths(dir).helper, `and the resolved script is the protected one:\n${resolved.output}`)
+    assert.equal(script, standingHelperPath(protectedPaths(dir).recovery),
+      `and the resolved script is the protected one:\n${resolved.output}`)
 
     // THE SWAP. The account owns node_modules and does not need to delete anything — only to
     // supply something that works.
@@ -11418,7 +11473,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     // reporting the candidate does not mean running it. Observed as the argv the runner was given.
     assert.match(
       probe.output,
-      new RegExp(`^PROBE=\\[${escapeRe(join(dirs.recovery, 'app', 'scripts', 'fence-db-connections.mjs'))}\\]$`, 'm'),
+      new RegExp(`^PROBE=\\[${escapeRe(standingHelperPath(dirs.recovery))}\\]$`, 'm'),
       `the standing artefact is what a preflight executes:\n${probe.output}`,
     )
     assert.match(probe.output, /^CONTENT=\[\/\/ v1\]$/m, 'the OLD bytes, because the artefact did not move')
@@ -11431,7 +11486,7 @@ test('r34: a dry run reports the tree it WOULD publish, not the one already stan
     )
     assert.match(rotated.output, /^RC=0$/m, `the reported candidate must authorise the rotation:\n${rotated.output}`)
     assert.equal(
-      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(join(dirs.recovery, 'db-fence-artefact.sha256'), 'utf8'))?.[1],
+      /^fence_artefact_sha256=([0-9a-f]{64})$/m.exec(readFileSync(standingRecordPath(dirs.recovery), 'utf8'))?.[1],
       candidate,
       'and be what the record then holds',
     )

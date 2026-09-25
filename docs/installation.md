@@ -2466,7 +2466,7 @@ So the precedence is inverted, and it is one rule for every privileged artefact:
 | artefact | which source decides | `APP_DIR/.env` / the checkout |
 | --- | --- | --- |
 | the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
-| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
+| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** — since o3d-xi3w that name is a symbolic link into the versioned directory one publication commits | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
 | `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
 | the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
 | the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
@@ -2591,7 +2591,7 @@ deployment. There are three sources and they are not interchangeable:
    release checksums, and it is what the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every
    target that needs one.
 2. **A host that has already published this release.**
-   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256` there.
+   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` there.
 3. **`--print-fence-digest` or `--dry-run` on the target itself — for comparison only.** Either
    prints the same line, assembled
    from the checkout under question, so it can **confirm** the release's value and can never stand
@@ -2611,15 +2611,91 @@ run somewhere that is *not* the machine being deployed, or the checksum publishe
 Deriving it on the target would authenticate the checkout against itself, and nothing computed from
 `APP_DIR` can authenticate `APP_DIR`. (That command is given inline rather than as a copy-pasteable
 block on purpose: it is a step for a workstation, not for the machine mid-cutover.)
-The **whole artefact** — the entry file and the vendored dependency closure — is then assembled at
-`/etc/ims-cutover-recovery/.app.staged`, which only root can write; it is sealed (ownership and
-modes), checked (nothing but regular files and directories), digested **from that staged tree**,
-and only then renamed into place, with the previous tree moved aside rather than deleted so a
-failure between the two renames leaves the *old* artefact standing rather than none. The tree that
-was verified is the tree that is published, and the checkout is never read again after the copy. A
+The **whole artefact** — the entry file and the vendored dependency closure — is then assembled in a
+directory of that publication's own, `/etc/ims-cutover-recovery/.publish-fence.<pid>.<rand>`, which only
+root can write; it is sealed (ownership and modes), checked (nothing but regular files and directories),
+digested **from that staged tree**, given its digest record and manifest *inside* that directory, made
+durable, renamed to `.version-fence.<pid>.<rand>`, and committed by flipping one symbolic link —
+`/etc/ims-cutover-recovery/app` — onto it with a single `rename(2)`. The tree that was verified is the
+tree that is published, and the checkout is never read again after the copy. **One name per run and one
+rename to commit** is what closed o3d-xi3w: the staging and retirement names used to be one per *kind*, so
+a second privileged run could empty and refill the first run's staging tree between the instant it
+assembled it and the instant it hashed it (measured: a run that had matched `IMS_FENCE_SCRIPT_SHA256`
+against its own entry file published the other run's, and recorded the digest of the one it had checked);
+and the previous sequence moved the standing tree aside *before* renaming the new one in, so the
+documented name did not exist in between — and `mv src dst` with `dst` an existing **directory** moves
+src *inside* it and returns **success**, which left one publication's whole tree nested one level down
+inside the other's with both runs reporting that they had published. Neither is reachable now: the
+documented name is a symbolic link that is replaced in one operation, and every rename this library makes
+passes `-T`, which refuses a directory destination outright. The full argument is above
+`_fence_publish_unwind()` in `scripts/lib/db-fence-protected.sh`, and so is the rule that **a rollback
+never destroys the only usable artefact** (o3d-xi3w r4): the one migration moves a legacy directory to
+`/etc/ims-cutover-recovery/.retired-fence.<pid>.<rand>`, and if the pointer creation or the commit rename
+then fails, that name is deleted **only** when the artefact is back where it was — proved by the rename's
+own status — or when the documented name holds a committed replacement that is sealed and hashes to its
+own record. Otherwise it is **kept**, and the refusal names its path with the command that puts it back.
+It used to be deleted unconditionally, one line after a restore whose status was discarded, so a restore
+that failed left the documented name absent and the legacy artefact gone. A
 rotation also moves `fence_script_sha256` in the recovery record with the file it names; leaving it
 behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
 rotation.
+
+**And that record is bound to whatever is standing, by compare-and-swap** (o3d-xi3w r3). The flip commits
+a whole versioned tree in one `rename(2)`, but `fence_script_sha256` lives in
+`/etc/ims-cutover-recovery/db-fence-identity.env`, outside it — so it used to be written *after* the flip
+from a digest read *before* it, and two publishers interleaved: A commits A, B commits B and records B's
+digest, A then records the digest it was still holding. The pointer names one publication and the record
+names another, and `db_fence_script_in_use()` then refuses to execute the artefact that is standing — an
+outage of the fence itself, on a box where nothing is wrong with either tree. A publisher **killed**
+between its flip and that write leaves exactly the same state, with no concurrency at all. Both were
+measured before the fix, and two consecutive later runs repaired neither.
+
+What the record says now is *what is standing*, never *what this run published*: each attempt reads the
+pointer, takes the entry digest out of the **versioned directory** it names (an immutable path), writes
+it, and reads the pointer again — if it has moved, the write was stale and the attempt is made once more
+against the publication that is standing now. A run whose own publication was superseded therefore binds
+the **winner's** digest and reports a lost race instead of a rotation. Nothing is adopted that does not
+authenticate itself: the digest is taken only from a tree that is sealed and hashes to what its own
+record beside it binds. And a run that **publishes nothing** repairs a record it finds stale before it
+decides anything else, which is what makes the killed-publisher state recoverable without an operator —
+except while a fence is standing, where the repair is refused for the same reason a rotation is.
+
+**And while a fence stands, the record names the publication that RAISED it — and the release resolves
+through that, not through the pointer** (o3d-xi3w r4). This is the invariant the whole mechanism is held
+to, stated once above `_fence_bind_record_to_standing()`:
+
+* **while a fence stands**, `/etc/ims-cutover-recovery/db-fence-identity.env` names the raising
+  publication by `fence_script_version` as well as by `fence_script_sha256`, and every run that resolves
+  the fence helper is bound to **that** publication;
+* **while no fence stands**, it names what the pointer names, and a run that finds otherwise rebinds it
+  itself.
+
+Three properties make the first clause true. The record carries the **version**, so a publication that
+commits after the raise cannot change which tree the release runs — before this it could, and did:
+measured, a publication landing between the raise's resolution and its authority made the release execute
+*another release's* entry file with this fence's grantee list, and when the two digests disagreed instead,
+the fence could not be released at all, because the repair is refused while a fence stands. The raise
+**binds that record and publishes the authority inside one critical section**, held on
+`/etc/ims-cutover-recovery/db-fence-record.lock`, and every other writer of those two lines takes the same
+lock and refuses under it while an authority is present — so a stale write either lands before the raise
+binds, and is overwritten by it, or does not land at all. And the **sweep keeps** the version a standing
+fence's record names, because the pointer has moved on, that publisher is long gone and nothing in the
+tree is open, so every other question the sweep asks says "take it".
+
+The lock is `flock(2)`, opened read-only on a root-owned `0600` file in the recovery root. It is
+admissible where r3 refused a lock because the **kernel** releases it when the holder's last descriptor
+closes, including on `SIGKILL` and on a power cut: there is no file for an operator to remove and no
+liveness test to get wrong, and a bounded wait makes a wedged peer a refusal rather than a hang. Stated
+plainly: a record written by a release older than this one carries no version, and the resolution then
+falls back to the pointer **and the digest check**, which is exactly what those installations did before.
+A **pre-pointer installation** is no longer one of those cases: since r5 its fence operations execute out
+of an adopted versioned directory (below), so a fence raised there records a version like any other.
+
+And the record a **raise** writes carries the digest of the artefact **that operation is pinned to**, not
+of whatever `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` resolves to at the instant it
+is hashed: a cutover is bound to one publication at its first resolution and raises the fence with that
+one, so a record naming any other would mean a later run releasing that fence with a different release's
+helper.
 
 A rotation republishes **both halves together** — a new entry file and a freshly resolved closure —
 which is the only way the vendored packages ever move. The consequence, stated because it is a real
@@ -2633,11 +2709,90 @@ Two more properties of the rotation:
 * it is **refused while a fence may be standing** (`db-connect-fence.json` exists). The helper that
   raised a fence is the helper that must release it, from a record the raise wrote; swapping
   versions across that pair is how a release stops meaning what the fence meant.
-* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (the whole
-  tree, since r32 — removing only the entry file leaves a vendored closure the next publication
-  would have to reconcile). Only root can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
+* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (since r32 the
+  whole artefact, not just the entry file — removing only the entry file leaves a vendored closure the
+  next publication would have to reconcile; since o3d-xi3w that name is a symbolic link, so this removes
+  the pointer and the versioned directory it named is reaped by the next publication's sweep). Only root
+  can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
   deliberately an act at the console rather than a flag. Do it only with no fence standing — with a
   record present and the copy gone, every run refuses by design.
+
+**What is executed is the versioned directory, and one fence operation executes exactly one of them.**
+Making the *publication* atomic left the *resolution* naming a mutable object: `db_fence_script_in_use()`
+authenticated the standing artefact and handed back a path **through** the pointer, and the caller then
+gave that string to `node` with `DEPLOY_ADMIN_DATABASE_URL` beside it. A concurrent publisher's flip lands
+between the two (measured: an invocation that pinned `IMS_FENCE_ARTEFACT_SHA256`, matched it and returned
+0 then executed a *different release's* entry file), and raising a fence is not one invocation — each
+entrypoint resolves the helper seven times across a cutover, and two of those ran different releases. So
+the resolution now seals, digests and authenticates the **versioned directory** and hands back
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/app/scripts/fence-db-connections.mjs`, which nothing
+writes into after its publication renamed it there; and it records which publication this operation is
+bound to in `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>`, so every later invocation of the
+same operation resolves to that one and not to a newer one. The pin is a file rather than a shell variable
+because it has to be: every caller resolves the helper inside a command substitution, and a value assigned
+there dies with the subshell. Its name carries the operation's pid **and** the start time `/proc` reports
+for that pid, so a marker left by a dead run whose pid has been reused is not mistaken for this one's; the
+sweep reaps it when its holder is gone, and never reclaims a version a live holder names. The deploy driver's own
+snapshot answers the same question a different way, by resolving its pointer once at entry and holding the
+descriptor it is already reading from. A pin cannot skip a check: it selects a candidate, and the seal, the record
+beside the tree, the tree's own digest, `IMS_FENCE_ARTEFACT_SHA256` and the entry digest the recovery
+record binds are then all checked against **that** tree.
+
+**And a pre-pointer installation is *adopted*, not followed** (o3d-xi3w r5). On a box no pointer-era
+release has published to, `/etc/ims-cutover-recovery/app` is not a pointer — it is the tree, a real
+directory at a well-known name, and a well-known name is a mutable object. Measured: a run authenticated
+that tree completely (seal, record beside the tree, tree digest, entry digest), returned the path, and
+then executed a *concurrent publisher's* helper with `DEPLOY_ADMIN_DATABASE_URL` beside it, because that
+publisher had performed the one migration in between and the same string now resolved through its pointer.
+The re-read after the pin cannot help; a replacement that lands after it is exactly the case.
+
+So the resolution never hands that name back. Before it pins anything it gives the operation its own
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` directory whose files are **hard links to the
+standing tree's own inodes**, with the legacy `db-fence-artefact.sha256` and `.manifest` copied in beside
+them, and everything after that is about a name no other run can hold. Three things this is *not*, each
+deliberate:
+
+* it is **not a migration**. `rename(2)` will not put a symbolic link over a non-empty directory, so
+  publishing a legacy tree into a version must *move* the only artefact on the box — and a power cut in
+  the interval where the documented name does not exist leaves a standing fence with no helper to release
+  it by, which is the worst state this mechanism has. The adoption moves nothing and deletes nothing
+  outside its own staging name, so it has no unwind and a kill at any instant leaves only residue the
+  sweep reaps. The one migration stays where it belongs: in the next **authenticated** publication.
+* it is **not a publication**. Nothing is written at the documented name, the legacy record beside it is
+  left alone, and the box stays pre-pointer until a real publication migrates it. Nothing therefore has to
+  be *authenticated* that this path cannot authenticate — a migration would put bytes at the documented
+  name that no invocation pinned, which the publication refuses to do by design.
+* it is **not a copy**. `--link` means the adopted tree is a second *name* for the same inodes, so there
+  are no second bytes to prove equal to the first. Only root can write the recovery root and no path in
+  the library ever writes *into* a standing tree — a publication renames it aside and then deletes it, and
+  a delete unlinks — so the concurrent publisher that used to substitute these bytes cannot reach them at
+  all. `db_fence_script_in_use()` still asks every question it asked before, of the adopted directory.
+
+It is **made durable before it takes its version name**, and that ordering is the point (found by the
+review of this round). The first draft took no barrier at all, on the argument that nothing outside the
+operation ever names the directory — which is wrong by one step: the **raise** writes the version into
+`db-fence-identity.env`, durably, so a power cut could leave a standing fence naming a version that exists
+with files missing, and every later resolution would find it, fail its digest check and refuse. A version
+that does not exist at all degrades to the pointer and is harmless; one that half exists is not. So the
+whole tree is flushed (`sync --file-system`, because `sync <dir>` flushes one directory entry and the tree
+has nested ones) *before* the rename that gives it a name a record could hold, a barrier that cannot be
+taken is a refusal with the staging tree removed, and the flush of the name *after* the rename is not a
+refusal — the directory is complete by then and declining to fence over it would be the worse trade. The
+publication's own tree barrier was widened the same way in the same change.
+
+The adopted directory is an ordinary `.version-fence.<pid>.<rand>`: the sweep keeps it while its pid is
+alive, while a pin names it and while a standing fence's record binds it, and reaps it afterwards. One
+consequence is the point — a fence **raised** on such a box now records a `fence_script_version`, so
+clause (A) of the invariant above holds there instead of falling back. `--dry-run` and
+`--print-fence-digest` are unaffected: they resolve without a pin, they never adopt, and they still write
+nothing.
+
+The operator wrappers are the deliberate exception and check the **documented** name against the digest
+this operation was pinned to. They are run by hand after the cutover process has exited, so a versioned
+path baked into one could name a publication the sweep has since reclaimed — a recovery route that
+evaporates — while the digest is what stops one release raising a fence and another releasing it: if
+anything published in between, the wrapper refuses and says the artefact has changed since the fence was
+raised.
 
 **One mechanism, three entrypoints.** The rule now lives in `scripts/lib/db-fence-protected.sh`,
 sourced by `install.sh`, `update.sh` and `deploy.sh`, and no entrypoint has fence-helper resolution
@@ -2706,11 +2861,14 @@ exactly, and it is **copied**, root-owned, into the mirror:
 
 | path | what it is |
 | --- | --- |
+| `/etc/ims-cutover-recovery/app` | a **symbolic link** to `.version-fence.<pid>.<rand>/app`, and the single mutable object of a publication (o3d-xi3w) |
+| `/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` | one publication, complete and immutable: the tree, its record and its manifest together. **This is what is executed**; the pointer is only how the first invocation of an operation finds it |
+| `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>` | one **fence operation's pin**: a symbolic link naming the publication that operation resolved. Every later invocation of that operation is bound to it, and the sweep will not reclaim a version a live holder names (o3d-xi3w) |
 | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` | the only file executed |
 | `/etc/ims-cutover-recovery/app/node_modules/pg/…` | a real root-owned directory, not a link |
 | `/etc/ims-cutover-recovery/app/node_modules/pg-protocol/…` etc. | …and the rest of the resolved closure (13 packages, ~140 files) |
-| `/etc/ims-cutover-recovery/db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to |
-| `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to. Named **through the pointer**, so it is always the record of the artefact that is standing: the kernel resolves `..` from the directory the link landed in, and one rename therefore commits the tree and its record together |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
 | `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
 | `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
 | `/etc/ims-cutover-recovery/resolve-legacy-db-fence` | the one-time operator resolution for an authority that carries no applied stamp (o3d-secops r26). No banner prints it and no cutover runs it — the validator's refusal is the only thing that names it |
@@ -2747,8 +2905,9 @@ cd /etc/ims-cutover-recovery/app && find . -type f -printf '%P\0' | LC_ALL=C sor
 That is the literal command the library computes with; a test asserts that the library, this page
 and the recorded value all agree, because a documented check that does not reproduce is a check an
 operator concludes is broken and stops running. Compare its output with `fence_artefact_sha256` in
-`/etc/ims-cutover-recovery/db-fence-artefact.sha256`. When they differ,
-`cd /etc/ims-cutover-recovery/app && sha256sum -c /etc/ims-cutover-recovery/db-fence-artefact.manifest`
+`/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` — the record of whatever is standing, reached
+through the pointer. When they differ,
+`cd /etc/ims-cutover-recovery/app && sha256sum -c ../db-fence-artefact.manifest`
 names **which** file moved, which "the digest changed" does not.
 
 The digest is **verified before every execution**, along with the seal (every file owned by root,

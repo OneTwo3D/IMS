@@ -3591,6 +3591,52 @@ function withFenceLibrary(t: TestContext, recovery: string, program: string, rep
   return { status: out.status ?? -1, stdout: out.stdout ?? '', stderr: out.stderr ?? '' }
 }
 
+test('[o3d-xi3w] privileged-helpers.sh REFUSES TO LOAD without the library whose decision its guards make', (t) => {
+  // o3d-xi3w moved the ownership decision the run-time guards make, and the /proc walk the sweep needs,
+  // into lib/db-fence-protected.sh, which all three entrypoints already source FIRST and whose
+  // publication primitives this library already used. The hazard that creates is specific: a missing
+  // function in bash is a command that is NOT FOUND, so `if _priv_name_inside_root …; then return 0; fi`
+  // would print an error, take its failure branch, and — for a guard whose refusal is the else — the
+  // operation it protects would run UNCHECKED. A claim about what callers source cannot close that, so
+  // the order is enforced at load.
+  const work = createTempDirSync('helpers-load-order-', t)
+  // The shape is the entrypoints' own: `source … || { echo FATAL …; exit 1; }`, so what is asserted is
+  // that the source RETURNS NON-ZERO — which is what those lines act on — and that the body is not run.
+  const alone = spawnSync('bash', ['-c',
+    `set -uo pipefail\nsource ${JSON.stringify(join(REPO, LIB_REL))} || { echo REFUSED; exit 9; }\necho REACHED`],
+    { encoding: 'utf8', cwd: work })
+  assert.equal(alone.status, 9, `sourcing it alone must refuse: ${alone.stdout}${alone.stderr}`)
+  assert.match(alone.stdout ?? '', /^REFUSED$/m, 'and the caller\'s own failure branch must run')
+  assert.doesNotMatch(alone.stdout ?? '', /^REACHED$/m, 'and nothing after the source may run')
+  assert.match(alone.stderr ?? '', /FATAL: _priv_path_inside_root\(\) is not defined/, alone.stderr ?? '')
+  assert.match(alone.stderr ?? '', /db-fence-protected\.sh has not been sourced before/, 'and say which order is wrong')
+
+  // NOT VACUOUS: the same source, with the fence library first, loads and the guards are callable.
+  const ordered = spawnSync('bash', ['-c',
+    `set -uo pipefail\nsource ${JSON.stringify(join(REPO, FENCE_LIB_REL))}\nsource ${JSON.stringify(join(REPO, LIB_REL))}\ndeclare -F driver_require_owned_path >/dev/null && echo REACHED`],
+    { encoding: 'utf8', cwd: work })
+  assert.equal(ordered.status, 0, ordered.stderr ?? '')
+  assert.match(ordered.stdout ?? '', /^REACHED$/m, 'the documented order must load')
+
+  // AND THE LIST IS THE FUNCTIONS IT REALLY TAKES: every `_priv_`/`_fence_` name this library CALLS is
+  // one the load-time check names, so a new borrowing cannot be added without extending the check.
+  // Read from the COMMAND POSITION of every code line, not from the text: this file names several of
+  // these functions in prose, and a comment is not a call.
+  const called = new Set(codeLines(LIB_SOURCE)
+    .flatMap((line) => shellCommands(line.text))
+    .map((words) => commandName(words).name)
+    // …less the check's own loop variable, which the tokeniser reads out of `for _priv_required in …`
+    // as a command name and which is a variable, not a function.
+    .filter((name) => /^_(?:priv|fence)_/.test(name) && name !== '_priv_required'))
+  const checked = new Set((/^for _priv_required in ([\s\S]*?); do$/m.exec(LIB_SOURCE)?.[1] ?? '')
+    .split(/[\s\\]+/).filter((word) => word.startsWith('_')))
+  assert.ok(checked.size >= 8, `precondition: the load-time check names ${checked.size} functions`)
+  const borrowed = [...called].filter((name) => !LIB_SOURCE.includes(`\n${name}() {`)).sort()
+  assert.ok(borrowed.length > 0, 'precondition: this library really does borrow functions')
+  assert.deepEqual(borrowed.filter((name) => !checked.has(name)), [],
+    `every borrowed function must be named in the load-time check: ${borrowed.join(', ')}`)
+})
+
 test('[o3d-z5be] RUN-TIME GUARD _fence_require_owned_tree: the fence copies into, and deletes, nothing outside its recovery root — even with a readonly re-aimed', (t) => {
   const recovery = join(createTempDirSync('runtime-guard-recovery-', t), 'recovery')
   mkdirSync(recovery)
@@ -3616,8 +3662,8 @@ test('[o3d-z5be] RUN-TIME GUARD _fence_require_owned_tree: the fence copies into
   // REVIEW M2: re-aiming a readonly needs no line that spells a privileged word. With the staging name
   // pointed at ${APP_DIR}, _fence_stage_and_publish must refuse before its `rm -rf` of it.
   const retargeted = withFenceLibrary(t, recovery, '_fence_stage_and_publish\necho AFTER',
-    ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`])
-  assertRefusedAndEnded(retargeted, 'a staging name re-aimed at ${APP_DIR}', victim)
+    ['readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"', `readonly DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(app)}`])
+  assertRefusedAndEnded(retargeted, 'the protected artefact name re-aimed at ${APP_DIR}', victim)
 
   // THE PROBE DIRECTORY (r12, review H1): accepted only when the CALLER PASSES it as "$3" and it is what
   // `mktemp -d` makes — a real directory owned by this uid, named `tmp.` + ten characters, directly in
@@ -3754,7 +3800,7 @@ test('[o3d-z5be] RUN-TIME GUARDS end the RUN from a subshell, a command substitu
   const unwind = `driver_publish_unwind ${JSON.stringify(app)} "${root}/.p" "${root}/.r" "${root}/helpers" 0`
   const recovery = join(createTempDirSync('runtime-guard-ctx-', t), 'recovery')
   mkdirSync(recovery)
-  const reaim: [string, string] = ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`]
+  const reaim: [string, string] = ['readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"', `readonly DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(app)}`]
   const contexts = (cmd: string) => [
     ['a command substitution', `: "$(${cmd})"`],
     ['the update.sh shape: x="$(f)" || true', `f() { ${cmd}; }; x="$(f)" || true`],
@@ -3820,7 +3866,7 @@ test('[o3d-z5be] RUN-TIME: a refusal inside the EXIT trap does not cut the trap 
   const recovery = join(createTempDirSync('runtime-guard-trap-', t), 'recovery')
   mkdirSync(recovery)
   const { app, victim } = appTree(t)
-  const reaim: [string, string] = ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`]
+  const reaim: [string, string] = ['readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"', `readonly DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(app)}`]
   const handler = [
     'on_exit() {',
     '  local status=$?',
@@ -3856,7 +3902,7 @@ test('[o3d-z5be] RUN-TIME: a refusal inside the EXIT trap does not cut the trap 
  *  readonly at load (IMS_DRIVER_*, DB_FENCE_*), cleared at load (_FENCE_OWNED_TMP,
  *  IMS_DRIVER_OVERLAP_EXTRA_IDS), set by the caller on the same line (IMS_CHOWN_TREE_ROOT), or bounded by
  *  the check itself (TMPDIR only locates a `tmp.XXXXXXXXXX` probe directory). */
-const HOSTILE_GLOBALS = ['_FENCE_OWNED_TMP', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_STAGED_APP_DIR', 'DB_FENCE_RETIRED_APP_DIR',
+const HOSTILE_GLOBALS = ['_FENCE_OWNED_TMP', 'DB_FENCE_RECOVERY_DIR',
   'DB_FENCE_PROTECTED_APP_DIR', 'IMS_DRIVER_ROOT', 'IMS_DRIVER_HELPER_DIR', 'IMS_DRIVER_PROGRAM_DIR', 'IMS_DRIVER_OVERLAP_EXTRA_IDS',
   'IMS_CHOWN_TREE_ROOT', 'TMPDIR']
 
@@ -3873,7 +3919,7 @@ test('[o3d-z5be] RUN-TIME GUARDS hold with every global they consult pre-set in 
   const runningLib = join(release, 'scripts', 'lib')
   mkdirSync(runningLib, { recursive: true })
   const fn = shellFunction(INSTALL_SOURCE, 'chown_state_tree', 'scripts/install.sh')
-  const reaim: [string, string] = ['readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"', `readonly DB_FENCE_STAGED_APP_DIR=${JSON.stringify(app)}`]
+  const reaim: [string, string] = ['readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"', `readonly DB_FENCE_PROTECTED_APP_DIR=${JSON.stringify(app)}`]
   let cases = 0
   for (const name of HOSTILE_GLOBALS) {
     const env = { [name]: hostile }
@@ -3899,6 +3945,20 @@ test('[o3d-z5be] RUN-TIME GUARDS hold with every global they consult pre-set in 
   // And each library does clear or fix the names at load, so the list above is not merely what happened
   // to be tried: a name the guards read must be one of these forms.
   assert.match(readFileSync(join(REPO, FENCE_LIB_REL), 'utf8'), /^unset -v _FENCE_OWNED_TMP$/m, 'the fence library clears the name r11 read')
+  // AND THE SHARED OWNERSHIP DECISION LEAVES NO SCRIPT-SCOPE NAME AT ALL (o3d-xi3w): _priv_path_inside_root
+  // and _priv_name_inside_root PRINT `<fault>|<canonical path>|<canonical root>` and every caller takes
+  // that into a `local` of the frame that refuses, so there is nothing here for an inherited value to
+  // steer. A draft that reported through globals is what the declaration census in
+  // install-root-safe-writes.test.ts rejected: a value a `case` branches on is a decision, not a report.
+  for (const fn of ['_priv_path_inside_root', '_priv_name_inside_root']) {
+    const body = shellFunction(readFileSync(join(REPO, FENCE_LIB_REL), 'utf8'), fn, FENCE_LIB_REL)
+    assert.match(body, /^\s*printf '(?:inside|outside|absolute|dotdot|canon)\|/m, `${fn}() must print its answer`)
+    const declared = new Set((/^\s*local ([^\n]*)$/m.exec(body)?.[1] ?? '').split(/\s+/).map((w) => w.split('=')[0]))
+    assert.ok(declared.size > 2, `precondition: ${fn}() declares its locals on one line`)
+    const assigned = [...body.matchAll(/(?:^|[\s;(])([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m) => m[1])
+      .filter((name) => !declared.has(name) && name !== 'local')
+    assert.deepEqual(assigned, [], `${fn}() must assign nothing but its own locals, and assigns: ${assigned.join(', ')}`)
+  }
   assert.match(LIB_SOURCE, /^IMS_DRIVER_OVERLAP_EXTRA_IDS=""$/m, 'privileged-helpers clears its one non-readonly input')
 })
 
@@ -3950,7 +4010,11 @@ const ALLOW_CLASSES = new Set(['text', 'comment', 'single-inode', 'read-only', '
 /** THE RUN-TIME GUARDS an allowlist entry of a tree-changing class must be protected by (r11). The
  *  allowlist is text; it cannot bind a variable's VALUE (review M2). These functions check the value, at
  *  the operation, and exit on a path outside what the code owns. */
-const RUNTIME_GUARDS = new Set(['driver_require_owned_path', '_driver_owned_name', '_fence_require_owned_tree', 'privileged_spare_running_tree'])
+const RUNTIME_GUARDS = new Set(['driver_require_owned_path', '_driver_owned_name', '_fence_require_owned_tree', '_fence_owned_name', 'privileged_spare_running_tree'])
+/** The guards that check a NAME and do not follow a final symbolic link (o3d-xi3w added the fence's, which
+ *  the artefact's pointer flip needs). They cover the name ALONE — never a path under it — and only for an
+ *  operation that acts on the name itself: rm, mv, ln. */
+const NAME_GUARDS = new Set(['_driver_owned_name', '_fence_owned_name'])
 /** The first variable a word refers to: `"${staged}/${relative}"` → `staged`. */
 function firstVariable(word: string): string | null {
   const m = /\$\{([A-Za-z_][A-Za-z0-9_]*)|\$([A-Za-z_][A-Za-z0-9_]*)/.exec(word)
@@ -4106,13 +4170,13 @@ test('[o3d-z5be] LEXICAL BACKSTOP: in the entrypoints and the libraries they sou
       const fnText = lines.slice(fn!.start, fn!.end).join('\n')
       for (const op of opIndex) {
         const opName = commandName(shellCommands(op.statement)[0] ?? []).name
-        if (entry.guard === '_driver_owned_name') {
+        if (NAME_GUARDS.has(entry.guard!)) {
           assert.ok(['rm', 'mv', 'ln'].includes(opName), `${entry.file}:${hit.n}: a name check covers only rm, mv and ln, not: ${op.statement}`)
         }
         for (const operand of operandWords(op.statement)) {
           const name = firstVariable(operand)
           if (!name) continue
-          const suffix = entry.guard === '_driver_owned_name' ? '' : '(?:/.*)?'
+          const suffix = NAME_GUARDS.has(entry.guard!) ? '' : '(?:/.*)?'
           assert.match(operand, new RegExp(`^\\$(?:\\{${name}\\}|${name})${suffix}$`),
             `${entry.file}:${hit.n}: the operand ${operand} is not exactly what ${entry.guard} checked (\${${name}}${suffix ? ' or a path under it' : ''}): ${op.statement}`)
           const checks = guardCalls.filter((g) => g.k < op.k
