@@ -5516,7 +5516,11 @@ test('[o3d-noka] every ancestry the rule rejects is REFUSED, the refusal names t
     what: 'a component owned by neither root nor this run',
     dir: join(foreign, 'backups'),
     names: shallowestOwned,
-    because: /is owned by uid 999?\d*, which is neither root nor the account this run executes as \(uid 4294967200\)/,
+    // The OWNING uid is computed from the component the refusal must name, for the same reason the
+    // component itself is: a typed uid asserts which account the suite happens to run as. A literal
+    // pattern here matched uid 999 locally and failed CI's runner (uid 1001) — the test was pinning
+    // the environment rather than the refusal.
+    because: new RegExp(`is owned by uid ${statSync(shallowestOwned).uid}, which is neither root nor the account this run executes as \\(uid 4294967200\\)`),
     idStub: 'id() { if [[ "${1:-}" == "-u" ]]; then echo 4294967200; else command id "$@"; fi; }',
   })
 
