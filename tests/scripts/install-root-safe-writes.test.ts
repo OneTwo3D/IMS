@@ -4715,7 +4715,12 @@ const UPDATE_GIT_COPY_RETIRED = [
 
 /** The gate, as it ships, lifted from the file that defines it. */
 const ANCESTRY_FUNCTIONS = ['root_ancestry_refuse', '_root_ancestry_here_is_private',
-  'enter_root_owned_ancestry', 'open_root_owned_ancestry', 'close_root_owned_ancestry'] as const
+  // o3d-noka r2: and the two halves of "private at creation, then verified" — the directory the walk
+  // creates, and the file the dump is written into. They are lifted with the rest because the shipped
+  // block calls them; a harness that left them out would be running a block that cannot work.
+  '_root_ancestry_here_is_now_private',
+  'enter_root_owned_ancestry', 'open_root_owned_ancestry', 'close_root_owned_ancestry',
+  '_private_new_file_refuse', 'open_private_new_file', 'close_private_new_file'] as const
 const ANCESTRY_LIB = ANCESTRY_FUNCTIONS.map((name) => shellFunction(CUTOVER_NS_LIB, name)).join('\n')
 
 /** The shipped backup block, lifted by its own first and last statement. */
@@ -5094,6 +5099,395 @@ test('[o3d-noka] the ACCEPT path proceeds: the dump is taken, published and prun
     + `${backups(backupDir).join(', ')}\n${pruned.stdout}${pruned.stderr}`)
 })
 
+// ---------------------------------------------------------------------------
+// AND THE MODE THAT DUMP IS CREATED WITH IS SET, NOT INHERITED (o3d-noka r2, Codex round-1 HIGH)
+//
+// WHAT r1 CLAIMED AND WHAT IS ACTUALLY TRUE. r1 wrote the dump under `umask 077` and said that
+// closed the confidentiality half — "a whole-database dump is not created readable by the account
+// whose data it is" — and, in the library prose, that `mode & 0022 == 0` "also bounds any POSIX ACL,
+// because the group bits of a file carrying one ARE the ACL mask". The second half of that sentence
+// is a theorem about an inode THAT ALREADY EXISTS. It says nothing about a DEFAULT ACL, which no
+// permission bit of a directory reports, which is inherited by everything created inside it, and
+// whose inheritance DISCARDS THE UMASK ENTIRELY: POSIX.1e computes the new inode's bits from the mode
+// the creating syscall REQUESTED intersected with the inherited default entries, and a shell
+// redirection requests 0666.
+//
+// MEASURED, as root, through scripts/update.sh's own statements: a root-owned 0755 backup directory
+// carrying `default:user:<app>:r-x` passes every question the ancestry walk asks — 0755 is not group-
+// or other-writable — and the dump came out mode 0644, which the application account read. With the
+// default ACL one level up instead, the two directories THE WALK ITSELF CREATED came out 0755 rather
+// than the 0700 r1's prose claimed, and that account could list both.
+//
+// SO PRIVACY IS NO LONGER INFERRED FROM A MODE. It is SET and then READ BACK, on every artefact this
+// code creates: the dump file by open_private_new_file(), which creates it with `install -m 0600` —
+// the mode as an ARGUMENT, which no umask and no inheritance can widen — and then fstats THE WRITE
+// DESCRIPTOR ITSELF before the caller writes a byte; and a directory the walk creates by
+// _root_ancestry_here_is_now_private(), which chmods `.` to 0700 and reads the achieved mode back.
+//
+// WHAT THE TESTS BELOW HAVE TO ESTABLISH, AND WHY EACH ONE IS THERE:
+//
+//   1. THE DEFECT IS REAL ON THE FILESYSTEM UNDER TEST, asserted as a PRECONDITION in every case
+//      rather than taken from the issue: a redirection under `umask 077`, or a `mkdir` under it, is
+//      performed in the very directory the case is about and REQUIRED to come out non-private. On a
+//      filesystem that ignored default ACLs these tests would otherwise pass while examining
+//      nothing, which is this repository's most expensive recurring defect.
+//   2. THE ACL WAS ACTUALLY SET. `setfacl` is required to exist, its exit status is asserted, and the
+//      entry is READ BACK with `getfacl` before the subject runs. A `setfacl` that silently did
+//      nothing cannot make one of these pass.
+//   3. THE ACHIEVED MODE **AND** THE ACHIEVED ACL are both asserted, for the dump, for the partial
+//      that preceded it and for every directory the walk created — `mode & 0077 == 0` and no ACL
+//      entry with any effective permission for anybody but the owner.
+//   4. AND THE VERIFICATION IS SHOWN ABLE TO FIRE: with the creation replaced by one that sets no
+//      mode, the block REFUSES, publishes nothing and takes the partial back off disk.
+//
+// AND `setfacl` MISSING IS A FAILURE, NEVER A SKIP. requireAclTools() asserts both binaries and the
+// filesystem's honesty about them. A check that skips is a check that is not there.
+// ---------------------------------------------------------------------------
+
+/** An account that is NOT the one running this suite, named by uid so it needs no /etc/passwd entry. */
+const OTHER_UID = 65534
+
+/** `setfacl`/`getfacl`, REQUIRED rather than detected. */
+function requireAclTools(): { setfacl: string, getfacl: string } {
+  const found = (name: string) => REAL_BIN_DIRS.map((dir) => join(dir, name)).find((path) => existsSync(path))
+  const setfacl = found('setfacl')
+  const getfacl = found('getfacl')
+  assert.ok(setfacl, 'setfacl must be installed: these tests are ABOUT POSIX ACLs, and one that cannot set an ACL must FAIL rather than skip — a check that skips is a check that is not there (install the `acl` package)')
+  assert.ok(getfacl, 'getfacl must be installed, for the same reason: the achieved ACL is asserted and not inferred')
+  assert.notEqual(OTHER_UID, process.getuid?.(), 'the ACL must grant an account that is not the one running this suite')
+  return { setfacl, getfacl }
+}
+
+/** One `setfacl`, with its status asserted. */
+function setAcl(args: string[], why: string): void {
+  const { setfacl } = requireAclTools()
+  const run = spawnSync(setfacl, args, { encoding: 'utf8' })
+  assert.equal(run.status, 0, `setfacl ${args.join(' ')} must succeed (${why}): ${run.stdout ?? ''}${run.stderr ?? ''}`)
+}
+
+/** An ACL as getfacl prints it, comments dropped. */
+function aclOf(path: string): string[] {
+  const { getfacl } = requireAclTools()
+  const run = spawnSync(getfacl, ['-p', path], { encoding: 'utf8' })
+  assert.equal(run.status, 0, `getfacl ${path} must succeed: ${run.stdout ?? ''}${run.stderr ?? ''}`)
+  return (run.stdout ?? '').split('\n').map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith('#'))
+}
+
+/** THE ACCESS ENTRIES WITH THEIR **EFFECTIVE** PERMISSIONS — the `#effective:` annotation where
+ *  getfacl prints one, the entry's own permissions where it does not. `default:` entries are
+ *  deliberately excluded: they describe what a FUTURE child would inherit and grant nobody anything
+ *  today, and this change tolerates them on purpose (see open_private_new_file()). */
+function effectiveAccess(path: string): { entry: string, effective: string }[] {
+  return aclOf(path).filter((line) => !line.startsWith('default:')).map((line) => {
+    const [text, note] = line.split('#effective:')
+    const fields = text.trim().split(':')
+    return { entry: fields.slice(0, -1).join(':'), effective: (note ?? fields[fields.length - 1]).trim() }
+  })
+}
+
+/** PRIVATE TO ITS OWNER, asserted twice over: by the mode, and by every effective ACL entry. */
+function assertPrivate(path: string, what: string): void {
+  const mode = statSync(path).mode & 0o7777
+  const acl = aclOf(path).join(' / ')
+  assert.equal(mode & 0o77, 0,
+    `${what} must carry no group and no other permission bit — mode was ${mode.toString(8)}; ACL: ${acl}`)
+  const entries = effectiveAccess(path)
+  assert.ok(entries.length >= 3, `${what}: an ACL with no entries was read back, so nothing was examined: ${acl}`)
+  for (const { entry, effective } of entries) {
+    if (entry === 'user:') continue
+    assert.equal(effective, '---',
+      `${what}: the ACL entry ${entry} is effective ${effective}, so an account other than the owner has access: ${acl}`)
+  }
+}
+
+/** A DEFAULT ACL entry naming some other account, read back off the directory. */
+function assertInheritableGrant(dir: string, what: string): void {
+  const acl = aclOf(dir)
+  const named = acl.filter((line) => /^default:(user|group|mask):[^:]*:[r-][w-][x-]$/.test(line) && !/^default:(user|group)::/.test(line))
+  const group = acl.filter((line) => /^default:group::[r-][w-][x-]$/.test(line) && !/^default:group::---$/.test(line))
+  assert.ok(named.length > 0 || group.length > 0,
+    `precondition: ${what} must carry a default ACL that grants something — setfacl may have silently done nothing: ${acl.join(' / ')}`)
+}
+
+/** THE DEFECT, MEASURED IN THIS DIRECTORY ON THIS FILESYSTEM, so no test below can pass because the
+ *  filesystem ignores default ACLs. A redirection under `umask 077` must come out non-private. */
+function assertUmaskIsDiscardedHere(dir: string): void {
+  const witness = join(dir, 'umask-witness')
+  const run = runBash(`(umask 077; echo witness > ${q(witness)})`)
+  assert.equal(run.status, 0, `precondition: the witness file must be creatable: ${run.stdout}${run.stderr}`)
+  const mode = statSync(witness).mode & 0o7777
+  unlinkSync(witness)
+  assert.notEqual(mode & 0o77, 0,
+    `precondition: in ${dir} a redirection under \`umask 077\` must produce a NON-private file (it came out ${mode.toString(8)}). `
+    + 'That is the defect this test is about; if the umask survives here, this filesystem does not inherit default ACLs and '
+    + 'every assertion below would pass without examining anything.')
+}
+
+test('[o3d-noka r2] a DEFAULT ACL on the backup directory does not reach the dump: the mode is SET at creation, not inherited', (t) => {
+  const root = createTempDirSync('ims-noka-acl-dir-', t)
+  const backupDir = join(root, 'one-two-inventory')
+  mkdirSync(backupDir)
+  chmodSync(backupDir, 0o755)
+  setAcl(['-d', '-m', `u:${OTHER_UID}:r-x`, backupDir], 'the default ACL this test is about')
+
+  // PRECONDITIONS, ALL FOUR, BEFORE THE SUBJECT RUNS.
+  assertInheritableGrant(backupDir, 'the backup directory')
+  assert.equal(statSync(backupDir).mode & 0o22, 0,
+    'precondition: the directory must PASS r1\'s mode rule, or this test is about one the gate already refuses for another reason')
+  assert.equal(statSync(backupDir).mode & 0o7777, 0o755,
+    `precondition: and it is the ordinary 0755 an operator would have: ${(statSync(backupDir).mode & 0o7777).toString(8)}`)
+  assertUmaskIsDiscardedHere(backupDir)
+  assert.deepEqual(backups(backupDir), [], 'precondition: nothing has been dumped yet')
+
+  const ran = backupRun(backupDir, UPDATE_BACKUP_BLOCK)
+  assert.match(ran.stdout, /^REACHED_THE_END$/m,
+    `the block must still take its backup in a directory carrying a default ACL — refusing it would be a different change:\n${ran.stdout}${ran.stderr}`)
+  assert.deepEqual(backups(backupDir), [BACKUP_STAMP], `the dump must be published:\n${ran.stdout}${ran.stderr}`)
+  assert.equal(readFileSync(join(backupDir, BACKUP_STAMP), 'utf8'),
+    'THE WHOLE DATABASE, AS ROOT READ IT FROM postgresql://example/db\n', 'and it must be the dump, not an empty file')
+  // THE FINDING, CLOSED: the published dump, and the partial it was renamed from, are private.
+  assertPrivate(join(backupDir, BACKUP_STAMP), 'the published dump in a default-ACL directory')
+  assert.equal(existsSync(join(backupDir, `${BACKUP_STAMP}.part`)), false,
+    'and the partial is gone, because the publication was a rename of that same private inode')
+  // AND THE DIRECTORY'S OWN DEFAULT ACL IS STILL THERE, which is deliberate: what stops it mattering
+  // is the explicit creation mode, not a refusal. Stated here so the tolerance is visible.
+  assertInheritableGrant(backupDir, 'the backup directory, afterwards')
+})
+
+test('[o3d-noka r2] a DEFAULT ACL on an ANCESTOR reaches neither the directories the walk creates nor the dump in them', (t) => {
+  const root = createTempDirSync('ims-noka-acl-anc-', t)
+  chmodSync(root, 0o755)
+  const mid = join(root, 'spool')
+  const backupDir = join(mid, 'one-two-inventory')
+  setAcl(['-d', '-m', `u:${OTHER_UID}:r-x`, root], 'the default ACL on the ancestor')
+
+  assertInheritableGrant(root, 'the ancestor')
+  assert.equal(existsSync(mid), false, 'precondition: the walk must be the one that creates the intermediate component')
+  assert.equal(existsSync(backupDir), false, 'precondition: and the backup directory itself')
+  // THE DEFECT FOR A DIRECTORY, measured here: `mkdir` under `umask 077` in this ancestor must NOT
+  // produce 0700. That is what r1 relied on, and what inheritance takes away.
+  const witness = join(root, 'mkdir-witness')
+  const wrun = runBash(`(umask 077; ${q(REAL.mkdir)} ${q(witness)})`)
+  assert.equal(wrun.status, 0, `precondition: ${wrun.stdout}${wrun.stderr}`)
+  const wmode = statSync(witness).mode & 0o7777
+  rmSync(witness, { recursive: true })
+  assert.notEqual(wmode & 0o77, 0,
+    `precondition: \`mkdir\` under \`umask 077\` inside the ancestor must come out non-private (it came out ${wmode.toString(8)}), `
+    + 'or this filesystem does not inherit default ACLs into subdirectories and nothing below is being examined')
+
+  const ran = backupRun(backupDir, UPDATE_BACKUP_BLOCK)
+  assert.match(ran.stdout, /^REACHED_THE_END$/m, `${ran.stdout}${ran.stderr}`)
+  assert.ok(existsSync(mid) && existsSync(backupDir), `the walk must have created both components:\n${ran.stdout}${ran.stderr}`)
+  // EVERY DIRECTORY THE WALK CREATED, and then the dump.
+  assertPrivate(mid, 'the intermediate component the walk created')
+  assertPrivate(backupDir, 'the backup directory the walk created')
+  assert.deepEqual(backups(backupDir), [BACKUP_STAMP], `${ran.stdout}${ran.stderr}`)
+  assertPrivate(join(backupDir, BACKUP_STAMP), 'the dump inside a directory the walk created under a default ACL')
+  // AND THE RESIDUAL, ASSERTED RATHER THAN LEFT UNSAID: the created directories still carry the
+  // INHERITED DEFAULT ACL. It grants nobody anything today — every access entry above is effective
+  // `---` — and this change does not strip it, because stripping it would need `setfacl` at the
+  // migration step. A future statement that creates a file there with a plain redirection would
+  // inherit it again, which is what the grammar test below exists to catch.
+  assertInheritableGrant(backupDir, 'the directory the walk created')
+})
+
+test('[o3d-noka r2] a GROUP-carried default ACL is no way in either, and a directory with NO ACL at all still gets its backup', (t) => {
+  const root = createTempDirSync('ims-noka-acl-grp-', t)
+
+  // (a) THE GROUP ENTRY CARRIES IT, with no named user anywhere — the shape a `mode & 0022` rule and
+  // a named-user-only test would both miss. `default:mask::rwx` is what lets the inherited
+  // `group::` entry take effect, and the witness below measures that it does.
+  const grouped = join(root, 'grouped')
+  mkdirSync(grouped)
+  chmodSync(grouped, 0o755)
+  setAcl(['-d', '-m', 'g::rwx', grouped], 'the group entry of the default ACL')
+  setAcl(['-d', '-m', 'm::rwx', grouped], 'the default mask that lets it take effect')
+  setAcl(['-d', '-m', 'o::r-x', grouped], 'and the other entry, so the inherited file is world-readable')
+  assertInheritableGrant(grouped, 'the group-carried default ACL')
+  assertUmaskIsDiscardedHere(grouped)
+  const gran = backupRun(grouped, UPDATE_BACKUP_BLOCK)
+  assert.match(gran.stdout, /^REACHED_THE_END$/m, `${gran.stdout}${gran.stderr}`)
+  assertPrivate(join(grouped, BACKUP_STAMP), 'the dump under a group-carried default ACL')
+
+  // (b) A NAMED USER WITH WRITE, which is the shape that also widens the mode the walk sees. Whether
+  // the walk refuses the created directory or accepts it, the dump must not be readable by anybody
+  // else — so this case asserts the disjunction rather than assuming which branch fires.
+  const named = join(root, 'named')
+  mkdirSync(named)
+  chmodSync(named, 0o755)
+  setAcl(['-d', '-m', `u:${OTHER_UID}:rwx`, named], 'a default ACL granting a named account WRITE')
+  setAcl(['-d', '-m', 'm::rwx', named], 'with a mask that lets it take effect')
+  assertInheritableGrant(named, 'the write-granting default ACL')
+  const nran = backupRun(named, UPDATE_BACKUP_BLOCK)
+  if (/^REACHED_THE_END$/m.test(nran.stdout)) {
+    assertPrivate(join(named, BACKUP_STAMP), 'the dump under a write-granting default ACL')
+  } else {
+    assert.equal(backups(named).length, 0,
+      `if the run refused it must have published nothing:\n${nran.stdout}${nran.stderr}`)
+    assert.match(`${nran.stdout}${nran.stderr}`, /REFUSING|ERROR/, `and it must say why:\n${nran.stdout}${nran.stderr}`)
+  }
+
+  // (c) AND NO ACL AT ALL — the control, without which "everything came out private" would be
+  // satisfied by a gate that refuses everything. The file must also carry a MINIMAL ACL: three
+  // entries, no mask, nothing inherited.
+  const plain = join(root, 'plain')
+  mkdirSync(plain)
+  assert.deepEqual(aclOf(plain).filter((line) => line.startsWith('default:')), [],
+    'precondition: this one must have no default ACL')
+  const pran = backupRun(plain, UPDATE_BACKUP_BLOCK)
+  assert.match(pran.stdout, /^REACHED_THE_END$/m,
+    `the ordinary case must still work — a gate that refuses everything passes every other assertion here:\n${pran.stdout}${pran.stderr}`)
+  assert.deepEqual(backups(plain), [BACKUP_STAMP], `${pran.stdout}${pran.stderr}`)
+  assertPrivate(join(plain, BACKUP_STAMP), 'the dump with no ACL anywhere')
+  assert.deepEqual(aclOf(join(plain, BACKUP_STAMP)), ['user::rw-', 'group::---', 'other::---'],
+    `and with no ACL in the picture the dump carries a minimal one: ${aclOf(join(plain, BACKUP_STAMP)).join(' / ')}`)
+})
+
+test('[o3d-noka r2] the achieved mode is VERIFIED and not assumed: a creation that sets no mode is REFUSED, nothing is published, and the partial is taken back off disk', (t) => {
+  const root = createTempDirSync('ims-noka-acl-verify-', t)
+  const backupDir = join(root, 'one-two-inventory')
+  mkdirSync(backupDir)
+  chmodSync(backupDir, 0o755)
+  setAcl(['-d', '-m', `u:${OTHER_UID}:r-x`, backupDir], 'the default ACL this test is about')
+  assertInheritableGrant(backupDir, 'the backup directory')
+  assertUmaskIsDiscardedHere(backupDir)
+
+  // `install` REPLACED BY **r1's OWN CREATION** — a redirection under `umask 077`. That is not an
+  // arbitrary shim: it is the statement this round replaced, so what runs below is the shipped block
+  // with exactly one thing put back, and the control at the end differs from it in exactly one thing
+  // more (the ACL). The subject's own bytes still run.
+  const R1_CREATION = 'install() { (umask 077; : > "${4}"); }'
+  const ran = backupRun(backupDir, UPDATE_BACKUP_BLOCK, { extra: [R1_CREATION] })
+  assert.doesNotMatch(ran.stdout, /^REACHED_THE_END$/m,
+    `the block must not run on to its writes:\n${ran.stdout}${ran.stderr}`)
+  assert.notEqual(ran.status, 0, `and it must exit non-zero:\n${ran.stdout}${ran.stderr}`)
+  const said = `${ran.stdout}${ran.stderr}`
+  assert.match(said, /came out mode 644/,
+    `the refusal must NAME the mode it saw, so an operator can tell this from any other refusal:\n${said}`)
+  assert.match(said, /DEFAULT ACL/, `and name the mechanism:\n${said}`)
+  assert.match(said, /Nothing has been written/, `and say that nothing was written:\n${said}`)
+  assert.deepEqual(backups(backupDir), [], `nothing may be published:\n${said}`)
+  assert.equal(existsSync(join(backupDir, `${BACKUP_STAMP}.part`)), false,
+    `and the partial this run created and then refused must be taken back off disk, not left for the next reader to mistake for a truncated dump:\n${said}`)
+  assert.deepEqual(readdirSync(backupDir), [], `the directory must be empty afterwards: ${readdirSync(backupDir).join(', ')}`)
+  // THE CONTROL, DIFFERING IN EXACTLY ONE THING: the SAME r1 creation, in a directory with NO default
+  // ACL, where `umask 077` is honoured and the file comes out 0600 — so the run proceeds. What the
+  // refusal above caught is therefore the ACL, not the shim, and the refusal is not "this block now
+  // rejects any creation it did not make itself".
+  const clean = join(root, 'no-acl')
+  mkdirSync(clean)
+  assert.deepEqual(aclOf(clean).filter((line) => line.startsWith('default:')), [],
+    'precondition: the control directory must have no default ACL')
+  const cran = backupRun(clean, UPDATE_BACKUP_BLOCK, { extra: [R1_CREATION] })
+  assert.match(cran.stdout, /^REACHED_THE_END$/m,
+    `control: with no default ACL r1's own creation honours its umask and the run proceeds:\n${cran.stdout}${cran.stderr}`)
+  assertPrivate(join(clean, BACKUP_STAMP), 'the control dump')
+})
+
+test('[o3d-noka r2] the disproved claim that a mode bounds a POSIX ACL is not left standing anywhere', () => {
+  /**
+   * AN ABSENCE CHECK, ON PURPOSE (o3d-noka r2). r1's library prose and r1's paragraph in
+   * docs/installation.md both said `mode & 0022 == 0` "also bounds any POSIX ACL, because the group
+   * bits of a file carrying one ARE the ACL mask", and r1's docs said the dump "is written with
+   * `umask 077`". The first is true only of an inode that already exists and says nothing about a
+   * DEFAULT ACL; the second is false outright, because inheritance ignores the umask. Both were the
+   * reasoning the defect rested on.
+   *
+   * THIS IS UNIVERSAL RATHER THAN EXISTENTIAL, which is the only shape that works here: a check that
+   * the CORRECTED sentence is present would be satisfied while the disproved one stood beside it —
+   * this repository's "a correction sitting next to a stale claim" defect. So the disproved phrases
+   * must be ABSENT, and the non-vacuity of that is established by asserting that each phrase is one
+   * the files really did carry, by finding it in this test's own copy of r1's text.
+   */
+  const R1_PHRASES = [
+    'also bounds any POSIX ACL',
+    'POSIX ACLs are not read, only bounded',
+    'the dump is written with `umask 077`',
+    'closes the other half the old shape left open',
+  ] as const
+  // NOT VACUOUS: each phrase must be one that a sentence can actually be built from, shown by
+  // building r1's sentences here and finding every phrase in them. A typo in the list above would
+  // otherwise make this test pass by never matching anything.
+  // r1's OWN LINES, transcribed from commit 4bb906d9 — two from the library, one from
+  // docs/installation.md and one from the call site in scripts/update.sh.
+  const R1_TEXT = [
+    '# `mode & 0022 == 0`. That also bounds any POSIX ACL, because the group bits of a file carrying one',
+    '# ARE the ACL mask. A component that fails is NAMED, with the remedy, and the run STOPS.',
+    '# says that nobody ELSE can influence the path. POSIX ACLs are not read, only bounded. And a',
+    '**A directory this run creates is created 0700, and the dump is written with `umask 077`.** A',
+    '  # dump closes the other half the old shape left open — a whole-database dump is not created',
+  ].join('\n')
+  for (const phrase of R1_PHRASES) {
+    assert.ok(R1_TEXT.includes(phrase),
+      `precondition: ${JSON.stringify(phrase)} must be a phrase r1 actually wrote, or this test forbids nothing`)
+  }
+  for (const [label, text] of [
+    ['scripts/lib/cutover-namespace.sh', CUTOVER_NS_LIB],
+    ['scripts/update.sh', UPDATE_SH],
+    ['docs/installation.md', readFileSync(join(REPO, 'docs/installation.md'), 'utf8')],
+  ] as const) {
+    for (const phrase of R1_PHRASES) {
+      assert.equal(text.includes(phrase), false,
+        `${label} still carries the disproved claim ${JSON.stringify(phrase)}. `
+        + 'A POSIX DEFAULT ACL is not in a directory\'s mode bits at all, and its inheritance ignores the umask: '
+        + 'measured, a root-owned 0755 directory carrying `default:user:<app>:r-x` passes the mode rule and a '
+        + 'dump written under `umask 077` came out 0644. Say what is actually true — the mask theorem holds for '
+        + 'an inode that already exists, and privacy for anything this code CREATES is set at creation and read '
+        + 'back — rather than leaving the reasoning the defect rested on beside the fix (o3d-noka r2).')
+    }
+  }
+})
+
+test('[o3d-noka r2] closing a pinned descriptor does not silence the rest of the entrypoint', () => {
+  /**
+   * FOUND BY A REFUSAL THAT PRINTED NOTHING (o3d-noka r2). r1 closed its descriptor with
+   * `exec {FD}<&- 2>/dev/null || true`. A BARE `exec` CARRYING A REDIRECTION APPLIES THAT REDIRECTION
+   * TO THE SHELL, PERMANENTLY — so that one statement sent every later warning, refusal and `die` of
+   * the whole entrypoint to /dev/null. In scripts/update.sh the close is the LAST statement of the
+   * backup block, so the migrations, the build, the service start and every failure banner after it
+   * printed to nothing. It is o3d-secops r31's finding, which cost eight tests in
+   * tests/scripts/deploy-order.test.ts, reintroduced in a different file; db-fence-protected.sh
+   * carries the brace-group idiom and the explanation in three places.
+   *
+   * AND THE CONTROL IS THE BARE FORM ITSELF, so this test cannot pass on a shell where the grouping
+   * makes no difference.
+   */
+  const probe = (fn: string, name: string, open: string) => runBash([
+    'set -uo pipefail',
+    'IMS_ROOT_ANCESTRY_FD=""',
+    'IMS_PRIVATE_FILE_FD=""',
+    fn,
+    open,
+    'echo "BEFORE-THE-CLOSE" >&2',
+    name,
+    'echo "AFTER-THE-CLOSE" >&2',
+    'echo REACHED_THE_END',
+  ].join('\n'))
+
+  for (const [name, variable, open] of [
+    ['close_root_owned_ancestry', 'IMS_ROOT_ANCESTRY_FD', 'exec {IMS_ROOT_ANCESTRY_FD}< .'],
+    ['close_private_new_file', 'IMS_PRIVATE_FILE_FD', 'exec {IMS_PRIVATE_FILE_FD}> /dev/null'],
+  ] as const) {
+    const shipped = shellFunction(CUTOVER_NS_LIB, name)
+    assert.match(shipped, new RegExp(`\\{ exec \\{${variable}\\}[<>]&-; \\} 2>/dev/null`),
+      `${name}() must close its descriptor inside a brace group, so the suppression is given back at the closing brace`)
+    const ok = probe(shipped, name, open)
+    assert.match(ok.stdout, /^REACHED_THE_END$/m, `${name}: ${ok.stdout}${ok.stderr}`)
+    assert.match(ok.stderr, /BEFORE-THE-CLOSE/, `${name}: precondition, stderr worked before the close`)
+    assert.match(ok.stderr, /AFTER-THE-CLOSE/,
+      `${name}() must leave the shell's stderr alone: everything the entrypoint reports after it depends on that:\n${ok.stdout}${ok.stderr}`)
+
+    // THE CONTROL: r1's bare form, which must go dark. Without it, a shell that ignored the
+    // difference would make the assertion above vacuous.
+    const bare = shipped.replace(`{ exec {${variable}}`, `exec {${variable}}`).replace('&-; } 2>/dev/null', '&- 2>/dev/null')
+    assert.notEqual(bare, shipped, `${name}: the control must differ from the subject`)
+    const dark = probe(bare, name, open)
+    assert.match(dark.stderr, /BEFORE-THE-CLOSE/, `${name}: control, stderr worked before the bare close`)
+    assert.doesNotMatch(dark.stderr, /AFTER-THE-CLOSE/,
+      `${name}: control — the bare \`exec\` form MUST silence stderr, or this test is not measuring anything:\n${dark.stdout}${dark.stderr}`)
+  }
+})
+
 test('[o3d-noka] every ancestry the rule rejects is REFUSED, the refusal names the component, and nothing is written', (t) => {
   assert.notEqual(process.getuid?.(), 0,
     'this suite must run unprivileged: root has CAP_DAC_OVERRIDE, so the unreadable-component cases '
@@ -5328,11 +5722,14 @@ test('[o3d-noka] the dump, the publication and the prune name the DESCRIPTOR, an
   const lines = UPDATE_BACKUP_BLOCK.split('\n').filter((line) => !/^\s*#/.test(line))
   assert.ok(lines.length >= 10, `the block must have been lifted: ${lines.length} statements`)
 
-  const writes = lines.filter((line) => /gzip >|^\s*mv |xargs -r rm --|^\s*BACKUP_PARTIAL=/.test(line))
-  assert.equal(writes.length, 4, `the four statements that name the partial, write, publish and prune:\n${writes.join('\n')}`)
+  const writes = lines.filter((line) => /gzip >|^\s*mv |xargs -r rm --|^\s*BACKUP_PARTIAL=|^\s*open_private_new_file /.test(line))
+  assert.equal(writes.length, 5, `the five statements that create the partial, name it, write, publish and prune:\n${writes.join('\n')}`)
   for (const line of writes) {
-    assert.match(line, /\$\{BACKUP_AT\}|\$\{BACKUP_PARTIAL\}/,
-      `every statement that writes, publishes or deletes must resolve from the pinned descriptor:\n${line}`)
+    // ${IMS_PRIVATE_FILE_FD} joins the list (o3d-noka r2): the dump is written into the descriptor
+    // open_private_new_file() verified private, which is a stronger reference to the proved inode
+    // than a pathname under ${BACKUP_AT}, not a weaker one.
+    assert.match(line, /\$\{BACKUP_AT\}|\$\{BACKUP_PARTIAL\}|\$\{IMS_PRIVATE_FILE_FD\}/,
+      `every statement that creates, writes, publishes or deletes must resolve from the pinned descriptor:\n${line}`)
     assert.doesNotMatch(line, /\$\{BACKUP_DIR\}|\$\{BACKUP_TARGET\}/,
       `and none of them may re-resolve the operator's pathname — that is r1's finding:\n${line}`)
   }
@@ -5342,6 +5739,24 @@ test('[o3d-noka] the dump, the publication and the prune name the DESCRIPTOR, an
   assert.equal(partial.length, 1, `the partial is named once:\n${partial.join('\n')}`)
   assert.match(partial[0], /^\s*BACKUP_PARTIAL="\$\{BACKUP_AT\}\/\$\{BACKUP_BASENAME\}\.part"$/,
     `and it is one component under the descriptor:\n${partial[0]}`)
+
+  // AND THE DUMP'S DESTINATION IS CREATED WITH AN EXPLICIT MODE, BEFORE THE DUMP, AND VERIFIED
+  // (o3d-noka r2, Codex round-1 HIGH). r1 relied on `umask 077`, which POSIX default-ACL inheritance
+  // discards outright. This is the grammar half of that fix: the creation must come BEFORE the write,
+  // its failure must end the run, and the write must name the descriptor it opened — so an edit back
+  // to `gzip > "${BACKUP_PARTIAL}"` fails here as well as in the behaviour tests.
+  const creation = lines.filter((line) => /^\s*open_private_new_file /.test(line))
+  assert.equal(creation.length, 1, `the destination is created once:\n${creation.join('\n')}`)
+  assert.match(creation[0], /^\s*open_private_new_file "\$\{BACKUP_AT\}" "\$\{BACKUP_BASENAME\}\.part" "the pre-update database dump" \|\| die \\$/,
+    `and that creation is one component under the descriptor, propagated with \`|| die\`:\n${creation[0]}`)
+  const dump = lines.filter((line) => /gzip >/.test(line))
+  assert.equal(dump.length, 1, `the dump is written once:\n${dump.join('\n')}`)
+  assert.match(dump[0], /\| gzip >&"\$\{IMS_PRIVATE_FILE_FD\}"/,
+    `and it is written into the descriptor whose mode was read back, never into a name a umask would decide:\n${dump[0]}`)
+  assert.ok(lines.indexOf(creation[0]) < lines.indexOf(dump[0]),
+    'the destination must be created and verified BEFORE the dump, not chmod-ed after it: once there are bytes on disk there is something to read')
+  assert.ok(!/umask[^\n]*gzip|gzip[^\n]*umask/.test(UPDATE_BACKUP_BLOCK.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')),
+    'and the dump statement must not carry a `umask`, which would tell the next reader that the umask is what makes it private')
 
   // AND ${BACKUP_DIR} IS NOT SPELLED ANYWHERE ELSE IN THE BLOCK. Universal, not existential: a new
   // statement using it fails this even if the four above still read correctly.

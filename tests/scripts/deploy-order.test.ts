@@ -11950,6 +11950,13 @@ const CUTOVER_NS_OWNED = [
   'enter_root_owned_ancestry',
   'open_root_owned_ancestry',
   'close_root_owned_ancestry',
+  // o3d-noka r2. Privacy is SET and read back rather than inferred from a mode, because POSIX
+  // default-ACL inheritance discards the umask r1 relied on: the directory the walk creates, and the
+  // file the dump is written into.
+  '_root_ancestry_here_is_now_private',
+  '_private_new_file_refuse',
+  'open_private_new_file',
+  'close_private_new_file',
   'enter_service_subdir',
   'mkdir_service_subdir',
   'own_service_subdir',

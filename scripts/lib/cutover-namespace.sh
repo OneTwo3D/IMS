@@ -318,9 +318,47 @@ own_service_subdir() {
 #
 # THE RULE. Every component from `/` down to AND INCLUDING <dir> must be a real directory — never a
 # symbolic link — owned by root or by the account this run executes as, and writable by nobody else:
-# `mode & 0022 == 0`. That also bounds any POSIX ACL, because the group bits of a file carrying one
-# ARE the ACL mask. A component that fails is NAMED, with the remedy, and the run STOPS: there is no
-# branch below this that writes anyway.
+# `mode & 0022 == 0`. A component that fails is NAMED, with the remedy, and the run STOPS: there is
+# no branch below this that writes anyway.
+#
+# AND WHAT `mode & 0022 == 0` DOES AND DOES NOT SETTLE ABOUT A POSIX ACL — r1 GOT THIS WRONG AND THE
+# CORRECTION IS THE REST OF THIS FUNCTION'S REASON TO EXIST (o3d-noka r2, Codex HIGH). r1's prose
+# claimed this mode bounded any POSIX ACL as well, on the grounds that the group bits of an inode
+# carrying one are its ACL mask. HALF OF THAT IS A THEOREM AND HALF WAS AN OVERREACH, and the
+# difference is the difference between a private database dump and a world-readable one, so it is
+# written out rather than summarised. (The exact sentences r1 shipped are forbidden by name in
+# tests/scripts/install-root-safe-writes.test.ts, so a revert of this prose cannot pass quietly; no
+# text check can stop somebody re-asserting the same idea in new words, which is why the reasoning
+# below is spelled out instead of asserted.)
+#
+#   TRUE, AND STILL RELIED ON HERE — the MASK THEOREM, about an inode that ALREADY EXISTS. When an
+#   ACL carries a mask entry, the group bits reported for the inode ARE that mask, and the effective
+#   permission of every ACL_USER, ACL_GROUP and ACL_GROUP_OBJ entry is its own permission INTERSECTED
+#   with the mask; ACL_OTHER is the other bits; ACL_USER_OBJ is the owner, asked separately. So for a
+#   component that exists, `mode & 0022 == 0` really does mean no account but the owner and root can
+#   WRITE it, ACL or no ACL, and `mode & 0077 == 0` really does mean no account but the owner and
+#   root has ANY access to it. Nothing below reads an ACL, and it does not have to.
+#
+#   FALSE — A DEFAULT ACL IS NOT IN THE MODE BITS AT ALL, and it decides the mode of a child at the
+#   moment the child is CREATED. A directory carries two ACLs: the access ACL, which the mask theorem
+#   covers, and a DEFAULT ACL, which no permission bit of the directory reports and which is
+#   inherited by every file and subdirectory created inside it. Inheritance also DISCARDS THE UMASK:
+#   POSIX.1e computes the new inode's bits from the mode the creating syscall requested intersected
+#   with the inherited default entries, and the process umask is not consulted at all. MEASURED, on
+#   the filesystem this repository is developed on: a root-owned 0755 directory carrying
+#   `default:user:<app>:r-x` passes the rule above, and inside it `(umask 077; … > file)` produces a
+#   file at mode 0644 that the application account reads — the whole-database dump, in the r1 shape
+#   of scripts/update.sh. A `default:group::r-x` with `default:mask::rwx` and no named entry at all
+#   produces 0664. Two directories the walk CREATED in such an ancestor came out 0755 rather than the
+#   0700 r1's prose claimed, and the application account could list both.
+#
+# SO PRIVACY IS NOT INFERRED FROM A MODE HERE; IT IS SET AND THEN VERIFIED, ON EVERY ARTEFACT THIS
+# CODE CREATES. A directory the walk creates is `chmod 0700` on `.` — the inode it is standing in,
+# never a name — and the achieved mode is READ BACK and refused if it is not private
+# (_root_ancestry_here_is_now_private). The dump file is created by open_private_new_file() at an
+# EXPLICIT mode, and its achieved mode is read back off the very descriptor the bytes will travel
+# through, BEFORE the first byte. `umask 077` is kept on the `mkdir` because it is right whenever
+# there is no default ACL, but nothing now DEPENDS on it, which is the whole correction.
 #
 # AND AN UNREADABLE OR UNSTATTABLE COMPONENT IS NOT PERMISSION TO PROCEED. A `stat` that cannot run
 # is the one answer a check like this is most tempted to treat as absence of evidence; it is treated
@@ -349,9 +387,14 @@ own_service_subdir() {
 #     none of the three.
 #
 # WHAT IT DOES NOT CLAIM. ROOT is not constrained by any of this, and is not meant to be: the rule
-# says that nobody ELSE can influence the path. POSIX ACLs are not read, only bounded. And a
-# concurrent rename by root itself between the walk and the open is not excluded — the descriptor
-# makes it harmless rather than impossible, because the operations follow the descriptor.
+# says that nobody ELSE can influence the path. No ACL is READ, by this function or by any other in
+# this file: WRITE access to an existing component is bounded by its mode (the mask theorem above),
+# and the confidentiality of what this code CREATES is established at creation and verified, which
+# is a property of the artefact rather than a question about the directory's attributes. A DEFAULT
+# ACL on an accepted directory is therefore TOLERATED and not refused — see the decision recorded
+# below open_private_new_file() for why that is the choice, and what it costs. And a concurrent
+# rename by root itself between the walk and the open is not excluded — the descriptor makes it
+# harmless rather than impossible, because the operations follow the descriptor.
 #
 # THE STICKY BIT IS CREDITED FOR A STRICT ANCESTOR AND REFUSED FOR THE PARENT AND FOR <dir> ITSELF,
 # which is pin_publish_root_parent()'s distinction and not a convenience. Sticky means an entry can
@@ -381,6 +424,15 @@ own_service_subdir() {
 # data it is, and because a directory this run creates at 0777 would be refused by this run's own
 # next question, which is a confusing way to fail.
 #
+# AND THE COMPONENT THIS RUN CREATED IS THEN MADE PRIVATE AND CHECKED (o3d-noka r2). `umask 077` is
+# DISCARDED by POSIX default-ACL inheritance, so inside a directory carrying one the `mkdir` above
+# produces 0755 (measured) and the mode rule accepts it, because 0755 is not group- or
+# other-WRITABLE. Whether `mkdir` succeeded is therefore read — for one purpose only, which is
+# whether this run is entitled to change the mode: `mkdir` cannot succeed on a name that already
+# exists, so a success means this run created that directory and nobody else's is being altered. An
+# operator's own pre-existing directory is never chmod-ed. Acceptance is still decided by the lstat
+# and the landing checks and not by mkdir's status.
+#
 # WHAT IT COSTS, AND IT IS OPERATOR-VISIBLE. An ${IMS_BACKUP_DIR} pointed underneath
 # /var/lib/${APP_NAME} — a natural choice, since ${APP_DIR}/.env carries a DIFFERENT variable also
 # spelled BACKUP_DIR which IS that path and IS the application's own — now gets a refusal instead of
@@ -398,6 +450,11 @@ own_service_subdir() {
 IMS_ROOT_ANCESTRY_REASON=""
 IMS_ROOT_ANCESTRY_FD=""
 IMS_ROOT_ANCESTRY_INODE=""
+# And open_private_new_file()'s two, at script scope for the same reason (o3d-noka r2): update.sh
+# expands ${IMS_PRIVATE_FILE_REASON} in the refusal its `die` prints and ${IMS_PRIVATE_FILE_FD} in
+# the redirection the dump travels through, both with no default and both under `set -u`.
+IMS_PRIVATE_FILE_REASON=""
+IMS_PRIVATE_FILE_FD=""
 
 root_ancestry_refuse() {
   IMS_ROOT_ANCESTRY_REASON="$1"
@@ -438,12 +495,45 @@ _root_ancestry_here_is_private() {
   return 0
 }
 
+# A COMPONENT THIS RUN JUST CREATED, MADE PRIVATE AND THEN CHECKED (o3d-noka r2, Codex HIGH).
+#
+# WHY IT IS A `chmod` AT ALL, in a file whose publisher section says "no chmod, anywhere on these
+# paths". That rule is about a path ANOTHER ACCOUNT CAN REACH: `chmod` has no `--no-dereference` on
+# Linux, so a raced one follows a link somebody else planted. Neither half applies here. The subject
+# is `.` — the inode this process is standing in after the chdir that pinned it, so there is no name
+# to re-resolve and nothing to follow — and the only accounts that can create or replace a name in
+# the parent are root and the account this run executes as, because the parent was required to
+# satisfy `mode & 0022 == 0` BEFORE the `mkdir`. And it runs only on a directory THIS RUN CREATED
+# (`mkdir` cannot succeed otherwise), so no operator's directory is ever altered.
+#
+# THE ACHIEVED MODE IS READ BACK. A `chmod` whose result is assumed is the same class of mistake as
+# a `umask` whose result is assumed, which is the mistake this whole round is correcting; and on a
+# filesystem that silently narrows or ignores a mode change, the refusal is the right answer. The
+# test is `mode & 0077 == 0` — not `== 0700` — because that is the condition the mask theorem makes
+# sufficient: with no group and no other bit, every ACL_USER, ACL_GROUP and ACL_GROUP_OBJ entry is
+# masked to nothing and ACL_OTHER is nothing, so the directory is private to its owner whatever its
+# ACL says, and no `getfacl` is needed to know it.
+_root_ancestry_here_is_now_private() {
+  local path="$1" mode
+  chmod 0700 . 2>/dev/null || {
+    root_ancestry_refuse "${path} was created by this run and could not then be made private, so a database dump beneath it would be left readable by whatever the containing directory's default ACL grants. Nothing has been written." || return 1
+  }
+  mode="$(LC_ALL=C stat -c '%a' . 2>/dev/null || true)"
+  [[ "${mode}" =~ ^[0-7]+$ ]] || {
+    root_ancestry_refuse "${path} was created by this run, and the permission bits it reports afterwards ('${mode}') cannot be read as octal, so this run cannot establish that it is private. Nothing has been written." || return 1
+  }
+  (( (8#${mode} & 8#77) == 0 )) || {
+    root_ancestry_refuse "${path} was created by this run and is still mode ${mode} after being set to 0700, so another account may read the directory the database dump goes into. Nothing has been written." || return 1
+  }
+  return 0
+}
+
 # THE WALK. It ENDS WITH THE CALLING SHELL INSIDE <dir> on success, and part-way down it on failure
 # — the contract enter_service_subdir() has, for the same reason: the result of a walk is a position
 # and not a string. Callers go through open_root_owned_ancestry(), which restores the working
 # directory either way and hands back a descriptor.
 enter_root_owned_ancestry() {
-  local dir="$1" what="$2" self rel comp path here entry kind landed above i last
+  local dir="$1" what="$2" self rel comp path here entry kind landed above i last created
   local -a comps=()
   IMS_ROOT_ANCESTRY_REASON=""
   IMS_ROOT_ANCESTRY_INODE=""
@@ -492,11 +582,15 @@ enter_root_owned_ancestry() {
     comp="${comps[i]}"
     above="${path}"
     if [[ "${path}" == "/" ]]; then path="/${comp}"; else path="${path}/${comp}"; fi
-    # A PLAIN `mkdir`, so a symbolic link already at this name fails with EEXIST instead of being
-    # worked inside, and 0077 so a dump of the whole database is not created world-readable. The
-    # failure is not read: the lstat below is what decides, whether this run created the component
-    # or found it already there.
-    (umask 077; mkdir -- "${comp}") 2>/dev/null || true
+    # A symbolic link already at this name makes the `mkdir` fail with EEXIST instead of being
+    # worked inside, and 0077 keeps a dump of the whole database off a world-readable directory
+    # where no default ACL overrides it. ACCEPTANCE is decided by the lstat and the landing checks
+    # below and not by this status, whether this run created the component or found it there.
+    # A PLAIN `mkdir`, and its STATUS is read for one purpose only: whether this run created the
+    # component, and so whether it is entitled to set that directory's mode below. `mkdir` cannot
+    # succeed on a name that already exists, so a success is proof of authorship.
+    created=0
+    if (umask 077; mkdir -- "${comp}") 2>/dev/null; then created=1; fi
     # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
     # directories. No `-L`, so a symlinked component reads as "symbolic link" and is refused.
     entry="$(LC_ALL=C stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
@@ -517,6 +611,12 @@ enter_root_owned_ancestry() {
     [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || {
       root_ancestry_refuse "${path} is not in the directory this run had just checked: it was moved into another parent between the check and the step into it. Nothing has been written." || return 1
     }
+    # AND IF THIS RUN CREATED IT, IT IS MADE PRIVATE HERE — after the landing is proved, so the mode
+    # change lands on the inode the walk is standing in, and before the question above the next
+    # iteration asks of it. Inherited from a default ACL, `mkdir` under `umask 077` produces 0755.
+    if (( created == 1 )); then
+      _root_ancestry_here_is_now_private "${path}" || return 1
+    fi
     here="${entry#*|}"
     i=$(( i + 1 ))
   done
@@ -561,10 +661,171 @@ open_root_owned_ancestry() {
   return 0
 }
 
+# THE CLOSE IS GROUPED, AND THAT IS NOT COSMETIC (o3d-noka r2, and it is o3d-secops r31's finding
+# reintroduced). r1 wrote this as `exec {FD}<&- 2>/dev/null || true`. A BARE `exec` CARRYING A
+# REDIRECTION APPLIES THAT REDIRECTION TO THE SHELL, PERMANENTLY -- so that statement sent every
+# later warning, refusal and `die` of the WHOLE ENTRYPOINT to /dev/null. In scripts/update.sh this
+# close is the last statement of the backup block, which means the migrations, the build, the service
+# start and every failure banner after it printed to nothing. It was measured here the way r31
+# measured its own: a refusal this round added printed its reason after a close and the reason
+# vanished. db-fence-protected.sh carries the same idiom and the same comment in three places.
+# Inside `{ ...; }` the suppression belongs to the group and is given back at the closing brace,
+# while the descriptor the `exec` closes is still the shell's.
 close_root_owned_ancestry() {
   [[ -n "${IMS_ROOT_ANCESTRY_FD:-}" ]] || return 0
-  exec {IMS_ROOT_ANCESTRY_FD}<&- 2>/dev/null || true
+  { exec {IMS_ROOT_ANCESTRY_FD}<&-; } 2>/dev/null || true
   IMS_ROOT_ANCESTRY_FD=""
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# A NEW FILE THAT IS PRIVATE BEFORE IT HOLDS A BYTE (o3d-noka r2, Codex round-1 HIGH)
+#
+#   open_private_new_file <at> <name> <what>   leaves ${IMS_PRIVATE_FILE_FD} open on it, for writing
+#   close_private_new_file                     closes it again
+#
+# THE FINDING THIS CLOSES. r1 took the pre-update `pg_dump` under `umask 077` and said that closed
+# the confidentiality half: "a whole-database dump is not created readable by the account whose data
+# it is". A POSIX DEFAULT ACL ON THE DIRECTORY DEFEATS THAT ENTIRELY, and not marginally --
+# inheritance computes the new file's permission bits from the mode the creating syscall REQUESTED
+# intersected with the inherited default entries, AND DOES NOT CONSULT THE UMASK AT ALL. A shell
+# redirection requests 0666. So in a root-owned 0755 directory carrying `default:user:<app>:r-x` --
+# which satisfies every question the ancestry walk asks, because 0755 is not group- or
+# other-writable -- the dump came out mode 0644 and the application account read it. Measured, as
+# root, with scripts/update.sh's own statements lifted out by their text.
+#
+# AND CHMOD-ING IT AFTERWARDS IS NOT THE FIX. By the time a dump has been written there are bytes on
+# disk to read, and the window is as long as the dump takes. The file has to be private at the
+# moment it comes into existence.
+#
+# HOW. `install -m 0600 /dev/null <name>` creates the file with the mode as an ARGUMENT rather than
+# as a default. That is not umask-governed -- a umask only ever clears bits from a requested mode, and
+# the request here has none to clear -- and it is not defeated by inheritance either, because an
+# inherited named or group entry is bounded by the mask, and the mask of a file created with no group
+# bits is empty. Measured on a directory carrying `default:user:<app>:r-x`: mode 0600 and, in fact, a
+# minimal ACL, because `install` also copies its source's (empty) ACL over the inherited one. It has
+# two further properties this block wants and a shell redirection does not have: a FIFO at the name is
+# REPLACED by a regular file rather than blocked on (which is r2's hang), and a symbolic link at the
+# name is REPLACED rather than followed (which is r1's finding, in miniature) -- both measured.
+#
+# AND THE ACHIEVED MODE IS READ BACK OFF THE DESCRIPTOR THE BYTES WILL TRAVEL THROUGH, NOT OFF THE
+# NAME. `exec {FD}> <name>` opens the file for writing; `stat -L` on `/proc/self/fd/N` is an fstat of
+# the inode that descriptor holds. The type, the owner and the mode are taken from THAT, in one
+# `stat`, before the caller writes anything. So the guarantee is not "install was asked for 0600", it
+# is: NO BYTE OF THE DUMP IS EVER WRITTEN INTO AN INODE THIS RUN HAS NOT JUST SEEN TO BE PRIVATE.
+# `mode & 0077 == 0` is the test, and it is sufficient by the mask theorem recorded above
+# open_root_owned_ancestry(): with no group and no other bit there is no mask for an ACL_USER or
+# ACL_GROUP entry to act through and ACL_OTHER is empty, so the file is private whatever its ACL
+# says. No `getfacl` is read, and none is needed.
+#
+# THE DECISION ABOUT ACLs, STATED, BECAUSE THERE WERE TWO WAYS TO GO (o3d-noka r2). The other was to
+# READ ACLs in the walk and refuse any component whose access or default ACL grants another account
+# anything. That was rejected, and what it would have cost is:
+#
+#   * A NEW RUN-TIME DEPENDENCY AT THE WORST MOMENT OF THE CUTOVER. `getfacl` is a separate package
+#     (`acl`) and is not present on every host. A check that cannot read an ACL must, by this
+#     repository's own rule, refuse rather than shrug -- so the change would have turned "the acl
+#     package is not installed" into "this release cannot be deployed", at the migration step, with
+#     the service already stopped.
+#   * A REFUSAL FOR SETUPS THAT ARE NOT DEFECTIVE. A default ACL on a backup volume is how an
+#     operator gives an off-host backup agent access to the directory. Refusing it buys nothing once
+#     the dump itself is private, and it is exactly the kind of narrowing an operator cannot see
+#     coming from the variable's documentation.
+#   * AND IT WOULD STILL BE THE WRONG PROPERTY. "The directory's ACL, when the walk looked" is an
+#     attribute root can change afterwards, and it is one step removed from the thing that matters,
+#     which is the mode of the file the dump goes into. Enforcing that mode at creation and reading
+#     it back off the write descriptor answers the question directly and needs no ACL at all.
+#
+# WHAT THAT CHOICE DOES NOT BUY, SAID PLAINLY. A pre-existing root-owned 0755 backup directory stays
+# readable and listable by every account, ACL or no ACL -- so the NAMES and TIMESTAMPS of the dumps in
+# it are visible, and this change does not alter that; the dumps' CONTENTS are not. A directory this
+# walk CREATES is narrowed to 0700 and verified (_root_ancestry_here_is_now_private), so on the
+# shipped default path nothing is visible either. An inherited DEFAULT ACL on a directory the walk
+# created is left in place: it can no longer affect this code, because every file this code creates
+# gets an explicit mode, but a future statement that creates a file there with a plain redirection
+# would inherit it again. That is what the grammar test in
+# tests/scripts/install-root-safe-writes.test.ts is for -- a new writing statement in the block fails
+# it until somebody decides what it is.
+#
+# NO PROGRAM IS RESOLVED OUT OF THE CHECKOUT. `install` is coreutils, on ${PATH}, exactly as
+# `pg_dump`, `gzip`, `mv`, `ls` and `rm` in the same block are. That is not what r3's finding was
+# about: r3 ran a node helper read out of ${APP_DIR}, which the service account owns and can replace
+# after the operator started the run. Its absence is a REFUSAL here rather than a fallback to a
+# mode-dependent creation, because a fallback would silently reinstate the defect.
+
+# THE REFUSAL, WHICH ALSO TAKES THE FILE BACK OFF DISK. A destination this run created and then
+# refused must not be left behind: a zero-byte `.part` at a mode this function has just declared
+# unacceptable is exactly the artefact the next reader would mistake for a truncated dump. Both
+# operands are required to be non-empty first, so the deletion cannot degenerate into a pathname
+# nobody wrote; and it is ONE COMPONENT under the caller's descriptor, never a re-resolved pathname.
+_private_new_file_refuse() {
+  local at="$1" name="$2" reason="$3"
+  # SAID FIRST, AND THEN ACTED ON. The reason is printed before the descriptor is closed, because a
+  # close written as a bare `exec` with a redirection silences the shell's stderr for good and the
+  # first casualty is the line that explains the refusal -- see close_root_owned_ancestry().
+  IMS_PRIVATE_FILE_REASON="${reason}"
+  echo "REFUSING: ${reason}" >&2
+  close_private_new_file
+  if [[ -n "${at}" && -n "${name}" && "${name}" != */* ]]; then
+    rm -f -- "${at}/${name}" 2>/dev/null || true
+  fi
+  return 1
+}
+
+open_private_new_file() {
+  local at="$1" name="$2" what="$3" self meta kind mode owner
+  IMS_PRIVATE_FILE_FD=""
+  IMS_PRIVATE_FILE_REASON=""
+  self="$(id -u)" || return 1
+  [[ -n "${at}" && -n "${name}" && "${name}" != */* ]] || {
+    IMS_PRIVATE_FILE_REASON="${what} was asked for at a destination this run cannot address as one name under one descriptor (${at}/${name}). Nothing has been written."
+    echo "REFUSING: ${IMS_PRIVATE_FILE_REASON}" >&2
+    return 1
+  }
+  command -v install >/dev/null 2>&1 || {
+    IMS_PRIVATE_FILE_REASON="${what} cannot be created with an explicit permission mode, because coreutils' \`install\` is not on this host's PATH. This run will not fall back to a redirection whose mode comes from the umask: a directory carrying a POSIX default ACL would then decide who may read a dump of the whole database. Install coreutils, or point the destination at a directory with no default ACL. Nothing has been written."
+    echo "REFUSING: ${IMS_PRIVATE_FILE_REASON}" >&2
+    return 1
+  }
+  # THE CREATION, WITH THE MODE AS AN ARGUMENT AND NOT AS A DEFAULT. One component, resolved from the
+  # descriptor the caller passes.
+  install -m 0600 /dev/null "${at}/${name}" 2>/dev/null || {
+    IMS_PRIVATE_FILE_REASON="${what} could not be created at ${name} with a private permission mode. Nothing has been written."
+    echo "REFUSING: ${IMS_PRIVATE_FILE_REASON}" >&2
+    return 1
+  }
+  # A FAILED `exec` REDIRECTION ENDS A NON-INTERACTIVE SHELL, so there is no state below this in
+  # which the caller holds no descriptor and writes anyway.
+  exec {IMS_PRIVATE_FILE_FD}> "${at}/${name}"
+  # ONE `stat`, on the DESCRIPTOR, taking the type, the mode and the owner together so the three
+  # cannot describe different inodes. `-L` because /proc/self/fd/N is a magic symbolic link.
+  meta="$(LC_ALL=C stat -L -c '%F|%a|%u' "/proc/self/fd/${IMS_PRIVATE_FILE_FD}" 2>/dev/null || true)"
+  kind="${meta%%|*}"
+  owner="${meta##*|}"
+  mode="${meta#*|}"; mode="${mode%%|*}"
+  [[ "${meta}" == *"|"*"|"* ]] || {
+    _private_new_file_refuse "${at}" "${name}" "${what} was created at ${name}, but the descriptor opened on it could not be inspected, so this run cannot establish that what it is about to write is private. An uninspectable destination is not permission to write to it. Nothing has been written." || return 1
+  }
+  [[ "${kind}" == regular* ]] || {
+    _private_new_file_refuse "${at}" "${name}" "${what} was created at ${name}, but the descriptor opened on it answers as a ${kind} rather than a regular file, so the bytes would not go where this run believes. Nothing has been written." || return 1
+  }
+  [[ "${mode}" =~ ^[0-7]+$ ]] || {
+    _private_new_file_refuse "${at}" "${name}" "${what} was created at ${name}, and the permission bits its descriptor reports ('${mode}') cannot be read as octal, so this run cannot establish that it is private. Nothing has been written." || return 1
+  }
+  if (( (8#${mode} & 8#77) != 0 )); then
+    _private_new_file_refuse "${at}" "${name}" "${what} was created at ${name} and came out mode ${mode}, which another account can read or write. A POSIX DEFAULT ACL on the destination directory overrides the mode a creation asks for, and the umask is not consulted at all -- so this is not a mode this run can correct and then trust. Take the default ACL off that directory (\`setfacl -k\`), or point the destination somewhere without one. Nothing has been written." || return 1
+  fi
+  [[ "${owner}" == "0" || "${owner}" == "${self}" ]] || {
+    _private_new_file_refuse "${at}" "${name}" "${what} was created at ${name} but belongs to uid ${owner}, which is neither root nor the account this run executes as (uid ${self}), so this run is not writing into a file of its own. Nothing has been written." || return 1
+  }
+  return 0
+}
+
+# GROUPED, for the reason recorded above close_root_owned_ancestry().
+close_private_new_file() {
+  [[ -n "${IMS_PRIVATE_FILE_FD:-}" ]] || return 0
+  { exec {IMS_PRIVATE_FILE_FD}>&-; } 2>/dev/null || true
+  IMS_PRIVATE_FILE_FD=""
   return 0
 }
 

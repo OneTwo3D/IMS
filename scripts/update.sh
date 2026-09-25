@@ -5436,10 +5436,21 @@ else
   # AND NOTHING BUT ROOT CAN NOW REACH ANY NAME INVOLVED, which is what retires r2 and r3 rather
   # than repeating them: the FIFO cannot be planted, the stale `.part` cannot be planted, the
   # symbolic link cannot be planted, so a plain redirection has no TOCTOU left to lose and no
-  # helper has to be executed at the least recoverable moment of the cutover. `umask 077` on the
-  # dump closes the other half the old shape left open — a whole-database dump is not created
-  # readable by the account whose data it is — for the case where the directory itself was created
-  # 0755 by an earlier release.
+  # helper has to be executed at the least recoverable moment of the cutover.
+  #
+  # AND THE CONFIDENTIALITY HALF IS NOT `umask 077`, WHICH IS WHAT r1 CLAIMED AND WHAT r2 CORRECTS
+  # (o3d-noka r2, Codex round-1 HIGH). A POSIX DEFAULT ACL on the backup directory is inherited by
+  # every file created in it, and inheritance computes the new file's permission bits from the mode
+  # the creating syscall REQUESTED intersected with the inherited default entries — THE UMASK IS NOT
+  # CONSULTED AT ALL. A shell redirection requests 0666. So a root-owned 0755 directory carrying
+  # `default:user:imsapp:r-x` satisfies every question the ancestry walk asks (0755 is not group- or
+  # other-writable) and the dump came out 0644, readable by the account whose data it is; measured,
+  # as root, through this very block. The dump file is therefore CREATED with an explicit mode by
+  # open_private_new_file(), and the mode it actually achieved is read back OFF THE DESCRIPTOR THE
+  # BYTES TRAVEL THROUGH before the first byte is written. Nothing here depends on the umask any
+  # more, so there is no `umask` in the dump statement to mislead the next reader; the one on the
+  # `mkdir` in the walk is kept, is right whenever there is no default ACL, and is no longer relied
+  # on, because a directory the walk creates is set to 0700 and that mode is read back too.
   #
   # WHAT IT COSTS, STATED: an ${IMS_BACKUP_DIR} under /var/lib/${APP_NAME} or anywhere else
   # ${APP_USER} owns now REFUSES instead of dumping, and it refuses here, with the service already
@@ -5453,11 +5464,23 @@ else
   BACKUP_AT="/proc/self/fd/${IMS_ROOT_ANCESTRY_FD}"
   info "Backing up database to ${BACKUP_TARGET}..."
   BACKUP_PARTIAL="${BACKUP_AT}/${BACKUP_BASENAME}.part"
+  # THE DESTINATION IS CREATED PRIVATE, AND VERIFIED PRIVATE, BEFORE THE DUMP EXISTS (o3d-noka r2).
+  # One component under the pinned descriptor, created with its mode as an ARGUMENT rather than as a
+  # umask default, and the mode that was ACHIEVED is read back off the write descriptor — see
+  # open_private_new_file() in lib/cutover-namespace.sh for the whole reasoning, including why a
+  # `chmod` after the dump would not do and why no ACL is read anywhere.
+  open_private_new_file "${BACKUP_AT}" "${BACKUP_BASENAME}.part" "the pre-update database dump" || die \
+    "The pre-update database dump cannot be written where nobody else can read it: ${IMS_PRIVATE_FILE_REASON} NOTHING HAS BEEN MIGRATED, the schema is untouched and this release is not on disk yet. A dump of the whole database readable by another account is not a backup this run will take; see docs/installation.md, 'Where the pre-update dump may go'."
   backup_rc=0
   # THE PARTIAL FILE IS DELETED INSIDE THIS STATEMENT, not below the pin (o3d-secops r34, Codex
   # HIGH 2). The placement now runs before the failure is propagated and can itself refuse, and a
   # truncated dump left on disk by that path would be a file nothing names as not-a-restore-point.
-  (umask 077; pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}") || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
+  #
+  # AND THE BYTES GO TO THE DESCRIPTOR, NOT TO THE NAME (o3d-noka r2): ${IMS_PRIVATE_FILE_FD} is the
+  # descriptor whose inode was just read back as a private regular file, so the dump cannot land in a
+  # file created — or re-created — at a mode this run never saw.
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip >&"${IMS_PRIVATE_FILE_FD}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
+  close_private_new_file
   # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
   # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
   # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable

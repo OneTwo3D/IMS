@@ -4089,8 +4089,11 @@ names from `/` downwards and requires **every component, the backup directory in
 
 * a **real directory** — never a symbolic link, and never anything else;
 * owned by **root** (or by the account the run executes as, which on a host is root);
-* **writable by nobody else** — `mode & 0022 == 0`, which also bounds any POSIX ACL, because the
-  group bits of a file carrying one *are* the ACL mask.
+* **writable by nobody else** — `mode & 0022 == 0`. For a directory that **already exists** this
+  really does bound any POSIX ACL as well, because when an ACL carries a mask entry the group bits
+  reported for the inode *are* that mask, and every named-user, named-group and group entry is
+  effective only through it. It does **not** bound what a **default** ACL does to a file or directory
+  **created inside** — see *The dump's own permissions* below, which is where that is handled.
 
 The sticky bit is credited for a component **above** the backup directory's parent and for no other:
 a sticky directory can have an existing entry renamed or removed only by that entry's owner, which
@@ -4104,10 +4107,41 @@ dump as an **open descriptor**: the redirection, the publishing rename and the p
 A component that cannot be stat'ed, or cannot be entered, is a **refusal** — not an absence of
 evidence. The refusal **names the component that failed** and says what to do about it.
 
-**A directory this run creates is created 0700, and the dump is written with `umask 077`.** A
-whole-database dump is not something the account whose data it is should be able to read. A backup
-directory an *earlier* release already created 0755 is **accepted as it stands and not corrected** —
-its mode satisfies the rule — so tighten it by hand if you want the old dumps in it private too.
+<a id="the-dumps-own-permissions"></a>
+#### The dump's own permissions, and why a POSIX default ACL does not decide them
+
+**The dump file is created at mode `0600`, with the mode given as an argument, and the mode it
+actually got is read back before a single byte is written.** A directory this run creates is set to
+`0700` and its achieved mode is read back too. Neither rests on the process umask, and that is a
+correction rather than a flourish: the first version of this check wrote the dump under `umask 077`
+and said that was enough.
+
+**It was not, if the backup directory (or any directory above one this run creates) carries a POSIX
+*default* ACL.** A default ACL is invisible in the permission bits, is inherited by everything
+created inside the directory, and its inheritance **ignores the umask completely** — the new file's
+bits are the mode the creating call *asked for* intersected with the inherited entries, and a shell
+redirection asks for `0666`. Measured on a root-owned `0755` directory carrying
+`default:user:imsapp:r-x`, which passes every question the ancestry rule asks: the dump came out
+`0644` and the service account read it. With the default ACL one level up instead, the two
+directories the walk itself created came out `0755`, not the `0700` that was claimed.
+
+**A default ACL on the backup directory is therefore tolerated rather than refused.** Reading ACLs
+in the walk would have meant requiring `getfacl` (the `acl` package) at the migration step, with the
+service already stopped, and refusing an operator's legitimate arrangement — a default ACL is how you
+give an off-host backup agent access to the directory — for a risk the explicit creation mode already
+removes. What is *not* tolerated is a destination this run cannot verify private: if the mode it
+reads back off the write descriptor has any group or other bit, the run **refuses**, names the mode
+it saw, names the default ACL as the mechanism, deletes the partial it had created and migrates
+nothing. Take the default ACL off with `setfacl -k <dir>` if you see that refusal.
+
+**What this does not buy.** A pre-existing root-owned `0755` backup directory is still listable and
+readable by every account, so the **names and timestamps** of the dumps in it are visible; their
+**contents** are not. A backup directory an *earlier* release already created `0755` is **accepted as
+it stands and not corrected** — its mode satisfies the rule — so tighten it by hand if you want even
+the listing private. A directory *this* run creates is `0700`, so on the default path there is
+nothing to tighten. And a default ACL inherited onto a directory this run created is **left in
+place**: it can no longer affect anything this code writes, because every file it creates is given an
+explicit mode.
 
 **What this costs, because it is an operator-visible narrowing of a documented "anywhere"
 override.** An `IMS_BACKUP_DIR` under `/var/lib/<app>`, under `/opt/<app>`, or anywhere else the
@@ -4118,7 +4152,11 @@ redirect root's dump and root's prune into a directory of its choosing (measured
 published inside a root-owned `0700` directory the account could not even list, and two pre-existing
 root-owned files there deleted by the prune), or plant a named pipe at the partial's name and make
 root's `gzip >` block for ever with the service stopped, cron stopped and the database connections
-already fenced.
+already fenced. **And the dump is now created by `install -m 0600 /dev/null` rather than by the
+redirection alone**, which replaces a named pipe or a symbolic link standing at the partial's name
+with a regular file instead of blocking on it or writing through it — a second, independent reason
+that class of plant is dead. If coreutils' `install` is not on the host's `PATH`, the run **refuses**
+rather than falling back to a creation whose mode a default ACL could decide.
 
 **To keep backups on another volume, bind-mount it under a root-owned path; do not symlink one.** A
 symbolic link at any component is refused, because nothing proves the path its target resolves
