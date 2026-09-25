@@ -2665,17 +2665,31 @@
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
-   "line": "# `touch`, `chown` and `chmod` on that path on every install and every upgrade. All three follow",
+   "line": "# file directly in it and, as root, ran `touch`, `chown` and `chmod` on that path on every install",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
-   "line": "#       `chown`ed to ${APP_USER}, and never written by anyone — its CONTENTS are meaningless,",
+   "line": "#   • NO `chmod`, anywhere on these paths. chmod has no --no-dereference on Linux, so a",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "chown -h root:root .",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h of `.` -- the directory the walk in enter_service_subdir() left this shell standing in, so no component of any pathname is resolved a second time (o3d-txoe)"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "chown -h root:root \"${CRONTAB_LOCK_FILENAME}\"",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive chown -h on a SINGLE COMPONENT resolved against the pinned lock directory (o3d-txoe)"
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
@@ -2686,31 +2700,10 @@
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
-   "line": "#   • NO `chmod`, anywhere on these two paths. chmod has no --no-dereference on Linux, so a",
-   "count": 1,
-   "class": "comment",
-   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
-  },
-  {
-   "file": "scripts/lib/crontab-lock.sh",
    "line": "#     raced chmod is the same escalation with a different verb. Modes come from `umask` at",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
-  },
-  {
-   "file": "scripts/lib/crontab-lock.sh",
-   "line": "chown -h root:root \"${CRONTAB_LOCK_DIR}\"",
-   "count": 1,
-   "class": "single-inode",
-   "reason": "non-recursive chown -h on one named path"
-  },
-  {
-   "file": "scripts/lib/crontab-lock.sh",
-   "line": "chown -h root:root \"${CRONTAB_LOCK_FILE}\"",
-   "count": 1,
-   "class": "single-inode",
-   "reason": "non-recursive chown -h on one named path"
   },
   {
    "file": "scripts/lib/crontab-lock.sh",
@@ -3731,147 +3724,147 @@
    "class": "text",
    "reason": "a printf FORMAT and its arguments: the word is one of the values substituted into the sentence an operator reads, so that the refusal carries the command that puts the preserved artefact back instead of a description of one. Nothing is executed by this statement -- printf writes to stdout, which _fence_stage_and_publish() captures into a local and puts in its refusal."
   },
- {
-  "file": "scripts/lib/db-fence-protected.sh",
-  "line": "if ! cp -R --no-dereference --link --preserve=mode,ownership,timestamps -- \"${legacy}/.\" \"${staged}/\"; then",
-  "count": 1,
-  "class": "code-owned-tree",
-  "reason": "the adoption of a pre-pointer installation (o3d-xi3w r5): HARD-LINKS the files of the artefact standing at the documented name into this operation's own `mktemp -d` directory under the root-only recovery directory, so that the operation has an immutable name for the bytes it authenticated. The source is only ever read, and --link means no second copy of it exists; enforced at run time by _fence_require_owned_tree on the staging directory AND on the tree inside it, in _fence_adopt_legacy",
-  "guard": "_fence_require_owned_tree"
- },
- {
-  "file": "scripts/lib/db-fence-protected.sh",
-  "line": "chown root:root \"${stage}/${record_name}\" \"${stage}/${manifest_name}\" 2>/dev/null || true",
-  "count": 1,
-  "class": "code-owned-tree",
-  "reason": "gives the record and manifest the adoption carried into its own `mktemp -d` directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_adopt_legacy",
-  "guard": "_fence_require_owned_tree"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# with `mv` and prunes beside it with `rm --`, all as root, into a directory an operator names with",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: the finding open_root_owned_ancestry closes)"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# is the route the caller's `mv` and `rm` take, so a descriptor those could not reach is refused",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: why the descriptor is verified by an external command)"
- },
- {
-  "file": "scripts/update.sh",
-  "line": "# `chmod` after the dump would not do and why no ACL is read anywhere.",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# CODE CREATES. A directory the walk creates is `chmod 0700` on `.` — the inode it is standing in,",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# WHY IT IS A `chmod` AT ALL, in a file whose publisher section says \"no chmod, anywhere on these",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# paths\". That rule is about a path ANOTHER ACCOUNT CAN REACH: `chmod` has no `--no-dereference` on",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# THE ACHIEVED MODE IS READ BACK. A `chmod` whose result is assumed is the same class of mistake as",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "chmod 0700 . 2>/dev/null || {",
-  "count": 1,
-  "class": "single-inode",
-  "reason": "chmod on `.` -- the inode the walk is standing in after the chdir that pinned it, never a name, so there is nothing for a symbolic link to redirect; and only on a component this run itself created, inside a parent already required to be writable by nobody else (o3d-noka r2)"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# HOW. `install -m 0600 /dev/null <name>` creates the file with the mode as an ARGUMENT rather than",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# minimal ACL, because `install` also copies its source's (empty) ACL over the inherited one. It has",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# `stat`, before the caller writes anything. So the guarantee is not \"install was asked for 0600\", it",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# NO PROGRAM IS RESOLVED OUT OF THE CHECKOUT. `install` is coreutils, on ${PATH}, exactly as",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "# `pg_dump`, `gzip`, `mv`, `ls` and `rm` in the same block are. That is not what r3's finding was",
-  "count": 1,
-  "class": "comment",
-  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "rm -f -- \"${at}/${name}\" 2>/dev/null || true",
-  "count": 1,
-  "class": "single-inode",
-  "reason": "non-recursive rm -f on ONE name, guarded to a single component under the caller descriptor and to two non-empty operands: the destination this function created and then refused, taken back off disk so a partial at a mode just declared unacceptable is not left behind (o3d-noka r2)"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "command -v install >/dev/null 2>&1 || {",
-  "count": 1,
-  "class": "read-only",
-  "reason": "read-only: `command -v` resolves a name and writes nothing; its absence is the refusal on the next line"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "IMS_PRIVATE_FILE_REASON=\"${what} cannot be created with an explicit permission mode, because coreutils' \\`install\\` is not on this host's PATH. This run will not fall back to a redirection whose mode comes from the umask: a directory carrying a POSIX default ACL would then decide who may read a dump of the whole database. Install coreutils, or point the destination at a directory with no default ACL. Nothing has been written.\"",
-  "count": 1,
-  "class": "text",
-  "reason": "not run: the word is text inside the refusal message an operator reads (IMS_PRIVATE_FILE_REASON)"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "install -m 0600 /dev/null \"${at}/${name}\" 2>/dev/null || {",
-  "count": 1,
-  "class": "single-inode",
-  "reason": "creates ONE file, one component under the caller descriptor, with its permission mode as an ARGUMENT rather than from the umask -- which POSIX default-ACL inheritance ignores. The source is /dev/null, so nothing is copied and the result is an empty private regular file whose achieved mode is read back off the write descriptor below before any byte is written (o3d-noka r2)"
- },
- {
-  "file": "scripts/lib/cutover-namespace.sh",
-  "line": "_private_new_file_refuse \"${at}\" \"${name}\" \"${what} was created at ${name} and came out mode ${mode}, which another account can read or write. A POSIX DEFAULT ACL on the destination directory overrides the mode a creation asks for, and the umask is not consulted at all -- so this is not a mode this run can correct and then trust. Take the default ACL off that directory (\\`setfacl -k\\`), or point the destination somewhere without one. Nothing has been written.\" || return 1",
-  "count": 1,
-  "class": "text",
-  "reason": "not run: `setfacl -k` is quoted inside the refusal message as the remedy an operator applies by hand"
- }
-]
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "if ! cp -R --no-dereference --link --preserve=mode,ownership,timestamps -- \"${legacy}/.\" \"${staged}/\"; then",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "the adoption of a pre-pointer installation (o3d-xi3w r5): HARD-LINKS the files of the artefact standing at the documented name into this operation's own `mktemp -d` directory under the root-only recovery directory, so that the operation has an immutable name for the bytes it authenticated. The source is only ever read, and --link means no second copy of it exists; enforced at run time by _fence_require_owned_tree on the staging directory AND on the tree inside it, in _fence_adopt_legacy",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/db-fence-protected.sh",
+   "line": "chown root:root \"${stage}/${record_name}\" \"${stage}/${manifest_name}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "code-owned-tree",
+   "reason": "gives the record and manifest the adoption carried into its own `mktemp -d` directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_adopt_legacy",
+   "guard": "_fence_require_owned_tree"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# with `mv` and prunes beside it with `rm --`, all as root, into a directory an operator names with",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: the finding open_root_owned_ancestry closes)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# is the route the caller's `mv` and `rm` take, so a descriptor those could not reach is refused",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: why the descriptor is verified by an external command)"
+  },
+  {
+   "file": "scripts/update.sh",
+   "line": "# `chmod` after the dump would not do and why no ACL is read anywhere.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# CODE CREATES. A directory the walk creates is `chmod 0700` on `.` — the inode it is standing in,",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# WHY IT IS A `chmod` AT ALL, in a file whose publisher section says \"no chmod, anywhere on these",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# paths\". That rule is about a path ANOTHER ACCOUNT CAN REACH: `chmod` has no `--no-dereference` on",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# THE ACHIEVED MODE IS READ BACK. A `chmod` whose result is assumed is the same class of mistake as",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "chmod 0700 . 2>/dev/null || {",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "chmod on `.` -- the inode the walk is standing in after the chdir that pinned it, never a name, so there is nothing for a symbolic link to redirect; and only on a component this run itself created, inside a parent already required to be writable by nobody else (o3d-noka r2)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# HOW. `install -m 0600 /dev/null <name>` creates the file with the mode as an ARGUMENT rather than",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# minimal ACL, because `install` also copies its source's (empty) ACL over the inherited one. It has",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `stat`, before the caller writes anything. So the guarantee is not \"install was asked for 0600\", it",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# NO PROGRAM IS RESOLVED OUT OF THE CHECKOUT. `install` is coreutils, on ${PATH}, exactly as",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "# `pg_dump`, `gzip`, `mv`, `ls` and `rm` in the same block are. That is not what r3's finding was",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "rm -f -- \"${at}/${name}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "non-recursive rm -f on ONE name, guarded to a single component under the caller descriptor and to two non-empty operands: the destination this function created and then refused, taken back off disk so a partial at a mode just declared unacceptable is not left behind (o3d-noka r2)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "command -v install >/dev/null 2>&1 || {",
+   "count": 1,
+   "class": "read-only",
+   "reason": "read-only: `command -v` resolves a name and writes nothing; its absence is the refusal on the next line"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "IMS_PRIVATE_FILE_REASON=\"${what} cannot be created with an explicit permission mode, because coreutils' \\`install\\` is not on this host's PATH. This run will not fall back to a redirection whose mode comes from the umask: a directory carrying a POSIX default ACL would then decide who may read a dump of the whole database. Install coreutils, or point the destination at a directory with no default ACL. Nothing has been written.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text inside the refusal message an operator reads (IMS_PRIVATE_FILE_REASON)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "install -m 0600 /dev/null \"${at}/${name}\" 2>/dev/null || {",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "creates ONE file, one component under the caller descriptor, with its permission mode as an ARGUMENT rather than from the umask -- which POSIX default-ACL inheritance ignores. The source is /dev/null, so nothing is copied and the result is an empty private regular file whose achieved mode is read back off the write descriptor below before any byte is written (o3d-noka r2)"
+  },
+  {
+   "file": "scripts/lib/cutover-namespace.sh",
+   "line": "_private_new_file_refuse \"${at}\" \"${name}\" \"${what} was created at ${name} and came out mode ${mode}, which another account can read or write. A POSIX DEFAULT ACL on the destination directory overrides the mode a creation asks for, and the umask is not consulted at all -- so this is not a mode this run can correct and then trust. Take the default ACL off that directory (\\`setfacl -k\\`), or point the destination somewhere without one. Nothing has been written.\" || return 1",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: `setfacl -k` is quoted inside the refusal message as the remedy an operator applies by hand"
+  }
+ ]
 }

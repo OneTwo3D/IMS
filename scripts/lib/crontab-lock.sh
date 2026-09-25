@@ -21,22 +21,67 @@
 # Two consequences, and both are load-bearing for where these helpers are called from:
 #
 #   • A LIVE APPLICATION RUNNING THIS BUILD participates, because lib/crontab-reconcile-lock.ts
-#     resolves $STATE_DIRECTORY/locks/.crontab-reconcile.lock — the same path the entrypoints
-#     resolve from the state directory. Against that process the lock is sufficient on its own.
+#     resolves ${CUTOVER_ROOT_DIR}/locks/.crontab-reconcile.lock — the same path the entrypoints
+#     resolve, from a root-owned parent neither of them can be talked out of. Against that process
+#     the lock is sufficient on its own, and o3d-txoe is why it is that path and not the state
+#     directory's; see THE TWO PARTIES SHARE AN IDENTITY below.
 #
-#   • A LIVE APPLICATION RUNNING THE PREDECESSOR BUILD DOES NOT. On the FIRST rollout of this
-#     protocol the process serving the box was built before it existed: its reconciliation takes
-#     a PostgreSQL session advisory lock, or nothing at all, and no flock this script takes can
-#     reach it. Against that process the ONLY exclusion is that it is not running — which is why
-#     the cutover's own `fence_cron` was moved to AFTER `systemctl stop` and the port drain, and
-#     is not merely wrapped in a lock it would have shared with nobody.
+#   • A LIVE APPLICATION RUNNING THE PREDECESSOR BUILD DOES NOT — except where the bridge below
+#     reaches it. On the FIRST rollout of this protocol the process serving the box was built
+#     before it existed: its reconciliation takes a PostgreSQL session advisory lock, or nothing at
+#     all, and no flock this script takes can reach it. Against that process the ONLY exclusion is
+#     that it is not running — which is why the cutover's own `fence_cron` was moved to AFTER
+#     `systemctl stop` and the port drain, and is not merely wrapped in a lock it would have shared
+#     with nobody. A predecessor built AFTER the shared path existed but BEFORE it moved is a
+#     different case and is bridged; see prepare_legacy_crontab_lock().
 #
 # So the two mechanisms cover different sets, and the entrypoints say which one covers each of
 # their call sites in the comment above it. Every site takes the lock; the sites that run while
 # something may still be serving say so.
 #
 # ---------------------------------------------------------------------------
-# THE DESCRIPTOR, AND WHY IT IS NOT fd 9
+# THE TWO PARTIES SHARE AN IDENTITY, AND THE KERNEL IS WHAT MAKES THEM (o3d-txoe, Codex HIGH)
+# ---------------------------------------------------------------------------
+# A MUTUAL-EXCLUSION PRIMITIVE HAS TWO PARTIES, AND THE ONLY PROPERTY THAT MATTERS IS THAT THEY
+# NAME THE SAME INODE. Until this round the lock lived at ${DATA_DIR}/locks/.crontab-reconcile.lock,
+# and ${DATA_DIR} is the service's systemd StateDirectory — which systemd creates OWNED BY
+# ${APP_USER} and which must stay writable by that account. `rename(2)` asks for write permission on
+# the PARENT and asks nothing whatever about the directory being moved, so that account could:
+#
+#     mv  ${DATA_DIR}/locks  ${DATA_DIR}/locks-aside
+#     mkdir ${DATA_DIR}/locks && : > ${DATA_DIR}/locks/.crontab-reconcile.lock
+#
+# and the two parties then locked whatever inode stood at the name at the instant each of them
+# opened it. Measured, in a real bash against the shipped library and the shipped module: the shell
+# entered on one inode while the application entered on another, BOTH reported exclusion, and the
+# application's committed schedule was discarded by the shell's write of a snapshot taken before it.
+#
+# AND IT COULD NOT BE CLOSED ON ONE SIDE. Pinning the shell's descriptor alone (o3d-q766 r1) made
+# the split PERSIST for a whole run instead of converging on the next acquisition, which is why that
+# attempt was reverted in full. The remedy is a RELOCATION, taken by both parties in one change.
+#
+# THE LOCK NOW LIVES BENEATH A PARENT ${APP_USER} CANNOT RENAME WITHIN:
+#
+#     /                                          root-owned
+#     /etc                                       root-owned, 0755
+#     ${CUTOVER_ROOT_DIR}                        root-owned, 0711  (ensure_cutover_root_dir asserts it)
+#       └── ${CRONTAB_LOCK_DIRNAME}/             root-owned, mode & 0022 == 0, o+x
+#             └── ${CRONTAB_LOCK_FILENAME}       root-owned, world-readable, never written
+#
+# No account but root can create, rename or unlink any component of that pathname, so the pathname
+# resolves to ONE inode for every party that utters it. That is a KERNEL guarantee and not an
+# agreement: it does not depend on the two parties doing the resolution at the same moment, and an
+# ${APP_USER}-initiated rename of any component fails with EACCES rather than splitting them.
+#
+# WHAT REMAINS AN AGREEMENT, stated so it is not mistaken for the above: the two parties must
+# COMPOSE the same pathname out of the same three pieces. ${CUTOVER_ROOT_DIR} is a literal in each
+# entrypoint and CRONTAB_RECONCILE_LOCK_ROOT is the same literal in lib/crontab-reconcile-lock.ts,
+# and tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both — bash evaluating the
+# entrypoint's own declaration, the shipped function asked for its own answer — rather than
+# comparing basenames.
+#
+# ---------------------------------------------------------------------------
+# THE DESCRIPTOR, AND WHY IT IS NOT fd 9, AND WHY IT IS NO LONGER fd 7 EITHER
 # ---------------------------------------------------------------------------
 # All three entrypoints hold the shared CUTOVER lock on fd 9 for the whole run
 # (`acquire_cutover_lock`), and the legacy namespace lock on fd 8. `exec 9<somefile` REPLACES
@@ -44,8 +89,26 @@
 # on an flock RELEASES it. Round 22's crontab section did exactly that: from the moment it ran,
 # the run that was supposedly excluding every other cutover was excluding nothing, and its final
 # `exec 9>&-` left the process with no cutover lock at all. The crontab lock therefore lives on
-# its own descriptor, and it is scoped to a command group rather than `exec`ed, so it cannot
-# leak past the critical section however the body returns.
+# its own descriptor.
+#
+# THAT DESCRIPTOR IS NOW OPENED ONCE, BY prepare_crontab_lock(), WHERE ITS PROOF IS STILL FRESH,
+# AND IS HELD FOR THE REST OF THE RUN (o3d-q766). It used to be a literal 7 attached to a
+# `{ ...; }` group, on the argument that bash before 5.2 does not close an automatically allocated
+# descriptor when its compound command completes — true, and it was the right argument while the
+# descriptor was MEANT to die with the group. It is not any more: the whole point is that the
+# identity established by the preparation is the identity the exclusion is taken on, so bash
+# allocates the number (`exec {CRONTAB_LOCK_FD}<`) and ${CRONTAB_LOCK_FD} is EMPTY until
+# preparation has run. A literal would only have bought a collision with whatever the caller left
+# at 7.
+#
+# THE LOCK IS STILL EXACTLY ONE READ-MODIFY-WRITE LONG, because the release is `flock --unlock` on
+# that descriptor and not the closing of it. flock(2) attaches the lock to the OPEN FILE
+# DESCRIPTION, so LOCK_UN releases it for every duplicate — including one a `crontab -` child
+# inherited — and a descriptor that outlives the critical section therefore does not outlive the
+# exclusion. What DOES change is the reentrancy guard's meaning, and with_crontab_lock() says so:
+# with one descriptor a nested acquisition would SUCCEED (flock on a description that already holds
+# the lock returns at once) and its release would drop the outer call's lock, so ${CRONTAB_LOCK_HELD}
+# is load-bearing rather than an optimisation.
 #
 # READ-ONLY, ALWAYS. flock(2) locks the open file DESCRIPTION whatever its access mode, so a
 # read-only descriptor takes the same exclusive lock — and the lock file is root-owned inside a
@@ -58,21 +121,29 @@
 # two writers two different locks and look like it worked.
 # ---------------------------------------------------------------------------
 
-# The two components, stated ONCE. Every entrypoint composes its lock path out of these and its
-# own state directory, and lib/crontab-reconcile-lock.ts exports the identical pair as
+# The two components, stated ONCE. Every entrypoint composes its lock path out of these and the
+# root-owned cutover namespace, and lib/crontab-reconcile-lock.ts exports the identical pair as
 # CRONTAB_RECONCILE_LOCK_DIRNAME / CRONTAB_RECONCILE_LOCK_FILENAME. That agreement is resolved
 # and asserted in tests/settings/crontab-reconcile-serialization.test.ts.
 CRONTAB_LOCK_DIRNAME="locks"
 CRONTAB_LOCK_FILENAME=".crontab-reconcile.lock"
 
-# The descriptor the exclusion is held on. 8 and 9 belong to the cutover locks; see above.
+# The descriptor the exclusion is held on, and the one the pre-relocation bridge is held on.
 #
-# A LITERAL, NOT A `{varname}<` ALLOCATION. Bash only began closing automatically-allocated
-# descriptors when the compound command they were attached to completes in 5.2; on anything
-# older the fd — and the lock on it — would leak out of the critical section and be held for the
-# rest of the run. A literal fd attached to a `{ ...; }` group is scoped by the group on every
-# bash this ships to. It is stated here as well so the tests can assert the two agree.
-CRONTAB_LOCK_FD=7
+# BOTH ARE EMPTY UNTIL prepare_crontab_lock() HAS RUN, and that is the point: a name bound to a
+# number before anything has been proved is a number with_crontab_lock() could take a lock on
+# without a preparation ever having happened. Under `set -u` an acquisition that reached the
+# `flock` without a preparation aborts the run instead. bash allocates the numbers — `exec
+# {CRONTAB_LOCK_FD}<` — so 8 and 9 (the cutover locks) and 6 (the rotated cutover lock) cannot be
+# collided with, and neither can whatever the caller left at 7. See THE DESCRIPTOR above for why
+# this is no longer the literal it used to be.
+CRONTAB_LOCK_FD=""
+CRONTAB_LEGACY_LOCK_FD=""
+# The pre-relocation location, composed beside the canonical one so the bridge can reach a
+# predecessor build. EMPTY means "no bridge is being attempted"; prepare_legacy_crontab_lock()
+# decides, and says out loud when it declines.
+CRONTAB_LEGACY_LOCK_DIR=""
+CRONTAB_LEGACY_LOCK_FILE=""
 
 # How long a shell writer waits for the application to finish reconciling before it gives up.
 #
@@ -90,119 +161,158 @@ if [[ ! "${CRONTAB_LOCK_WAIT_SECONDS}" =~ ^[0-9]+$ ]] || [[ "${CRONTAB_LOCK_WAIT
   CRONTAB_LOCK_WAIT_SECONDS=60
 fi
 
-# Compose this entrypoint's lock paths from its state directory. The state directory is what
-# systemd hands the service as $STATE_DIRECTORY, which is what the application reads.
+# Compose this entrypoint's lock paths.
 #
-# ABSOLUTE, OR NOTHING. `systemdStateDirectory()` ignores a STATE_DIRECTORY that is not an absolute
-# path — a value that is not absolute is not systemd's, it is something in the environment wearing
-# the name — and falls through to the working directory. An entrypoint composing a relative path
-# here would therefore lock a file the application will never open, which is the "looks locked,
-# excludes nothing" state this whole protocol exists to remove. It is refused rather than resolved.
+#   crontab_lock_paths <cutover-root-dir> <pre-relocation-state-dir>
+#
+# THE FIRST ARGUMENT IS THE ROOT-OWNED NAMESPACE, ${CUTOVER_ROOT_DIR}, and it is the whole of
+# o3d-txoe: the lock must sit beneath a parent ${APP_USER} cannot rename within, and the
+# application must DERIVE the same one. Each entrypoint declares that root as a `readonly` literal
+# and lib/crontab-reconcile-lock.ts declares the identical literal as CRONTAB_RECONCILE_LOCK_ROOT;
+# nothing here reads an environment variable for it, because a lock location an operator can move
+# on one side and not the other is two locks pretending to be one.
+#
+# THE SECOND IS WHERE THE LOCK USED TO BE — the service's systemd StateDirectory — kept only so
+# that a PREDECESSOR build, which resolves its lock there, is still excluded during the one rollout
+# window in which the two builds disagree. See prepare_legacy_crontab_lock(); the bridge is
+# conditional on a precondition it checks, and it says so when it declines.
+#
+# ABSOLUTE, OR NOTHING, for both. A relative path names a different directory for every process
+# that reads it, so an entrypoint composing one would lock a file no other writer will ever open —
+# the "looks locked, excludes nothing" state this whole protocol exists to remove. It is refused
+# rather than resolved.
 crontab_lock_paths() {
-  local state_dir="$1"
-  [[ "${state_dir}" == /* ]] || die \
-    "the crontab reconciliation lock cannot be composed from '${state_dir}': the state directory must be an ABSOLUTE path, because the application resolves the same lock from the STATE_DIRECTORY systemd exports and ignores a value that is not absolute. A relative path here would lock a file no other writer will ever open."
-  CRONTAB_LOCK_DIR="${state_dir}/${CRONTAB_LOCK_DIRNAME}"
+  local root_dir="$1" legacy_state_dir="$2"
+  [[ "${root_dir}" == /* ]] || die \
+    "the crontab reconciliation lock cannot be composed from '${root_dir}': the cutover namespace root must be an ABSOLUTE path, because lib/crontab-reconcile-lock.ts derives the same lock from the identical absolute literal. A relative path here would lock a file no other writer will ever open."
+  [[ "${legacy_state_dir}" == /* ]] || die \
+    "the pre-relocation crontab lock cannot be composed from '${legacy_state_dir}': the state directory must be an ABSOLUTE path. A relative path here would bridge to a file no predecessor will ever open, which reads as covered and is not."
+  CRONTAB_LOCK_DIR="${root_dir}/${CRONTAB_LOCK_DIRNAME}"
   CRONTAB_LOCK_FILE="${CRONTAB_LOCK_DIR}/${CRONTAB_LOCK_FILENAME}"
+  CRONTAB_LEGACY_LOCK_DIR="${legacy_state_dir}/${CRONTAB_LOCK_DIRNAME}"
+  CRONTAB_LEGACY_LOCK_FILE="${CRONTAB_LEGACY_LOCK_DIR}/${CRONTAB_LOCK_FILENAME}"
 }
 
 # ---------------------------------------------------------------------------
-# THE CRONTAB RECONCILIATION LOCK IS ROOT-OWNED, AND NO ROOT-SIDE STEP FOLLOWS A SYMLINK
-# (Codex r24 CRITICAL).
+# THE CRONTAB RECONCILIATION LOCK IS ROOT-OWNED, INSIDE A ROOT-OWNED PARENT NOBODY ELSE CAN
+# RENAME WITHIN, AND NO ROOT-SIDE STEP FOLLOWS A SYMLINK
+# (Codex r24 CRITICAL, and o3d-txoe for where it lives).
 #
-# ${DATA_DIR} is the service's systemd StateDirectory. systemd creates it OWNED BY ${APP_USER},
-# and it MUST be writable by that user — that is what makes the lock reachable under the
-# hardened unit at all (r23). Round 23 then put the lock file directly in it and, as root, ran
-# `touch`, `chown` and `chmod` on that path on every install and every upgrade. All three follow
-# symlinks. So the unprivileged service account — the one account an attacker who reaches this
-# application gets — could replace the lock with a symlink to /etc/shadow and wait: the next
-# installer run would give the target away as ${APP_USER}:${APP_USER}, mode 0664. A root-side
-# write into a directory the service user controls is not a convenience, it is a
-# privilege-escalation primitive.
+# WHERE IT USED TO BE, AND WHY THAT COULD NOT BE MADE SAFE. ${DATA_DIR} is the service's systemd
+# StateDirectory. systemd creates it OWNED BY ${APP_USER}, and it MUST be writable by that user —
+# that is what made the lock reachable under the hardened unit at all (r23). Round 23 put the lock
+# file directly in it and, as root, ran `touch`, `chown` and `chmod` on that path on every install
+# and every upgrade. All three follow symlinks, so the unprivileged service account could replace
+# the lock with a symlink to /etc/shadow and wait. r24 answered that by putting the lock inside a
+# root-owned SUBDIRECTORY of ${DATA_DIR} — which closed the symlink-to-target route and left the
+# one that could not be closed from inside that directory: ${APP_USER} owns the PARENT, and
+# `rename(2)` asks for write permission on the parent and nothing about the directory being moved.
+# So that account could move the root-owned lock directory aside and leave its own at the name, and
+# the two parties then locked whatever inode each of them found. Both reported exclusion; neither
+# had it. Every step below re-derived what it was looking at with lstat and DIED, which made the
+# root-side WRITES safe and did nothing at all for the EXCLUSION — because a refusal and a
+# substitution are not the same outcome, and the application never refused.
 #
-# THE SERVICE USER NEVER NEEDS TO WRITE THIS FILE. `flock(2)` locks the open file DESCRIPTION
-# whatever its access mode, and the application already falls back to a READ-ONLY descriptor
-# when the lock file cannot be opened for writing (lib/crontab-reconcile-lock.ts,
-# `openLockFile`). So the lock can be root's alone and the exclusion still works in both
-# directions:
+# SO THE LOCK MOVED (o3d-txoe). ${CRONTAB_LOCK_DIR} is now ${CUTOVER_ROOT_DIR}/${CRONTAB_LOCK_DIRNAME}:
 #
+#   ${CUTOVER_ROOT_DIR}
+#       root:root, 0711, under root-owned /etc. ensure_cutover_root_dir() in
+#       scripts/lib/cutover-namespace.sh creates it, refuses a symlink at it both before and after
+#       its `mkdir -p`, and reads its owner and mode back off the descriptor it stepped into. This
+#       function calls that one rather than restating it: a rule about where a privileged process
+#       may write cannot be stated twice and stay one rule.
 #   ${CRONTAB_LOCK_DIR}
-#       root:root, 0755. The service user cannot create, replace or remove ANY entry in it, so
-#       the lock file underneath it cannot be swapped — this directory, not the file's mode, is
-#       what closes the finding.
+#       root:root, created by enter_service_subdir()'s walk under `umask 022`, so 0755. Group- and
+#       other-WRITABLE is refused; other-EXECUTABLE is REQUIRED, because ${APP_USER} has to be able
+#       to traverse into it to open the lock — a directory the application cannot reach is an
+#       exclusion the application cannot join.
 #   ${CRONTAB_LOCK_FILE}
-#       root:root, 0644. World-readable so the service can open it read-only and flock it; never
-#       `chown`ed to ${APP_USER}, and never written by anyone — its CONTENTS are meaningless,
-#       only its inode is the lock.
+#       root:root, 0644 from `umask 022` at creation. World-readable so the service can open it
+#       READ-ONLY and flock it; never given away to ${APP_USER}, and never written by anyone — its
+#       CONTENTS are meaningless, only its inode is the lock.
 #
-# NOTHING HERE FOLLOWS A SYMLINK, and each primitive is chosen for that:
+# NOTHING BELOW FOLLOWS A SYMLINK, and each primitive is chosen for that:
 #
-#   • `mkdir` WITHOUT -p — plain mkdir fails with EEXIST on an existing symlink, where
-#     `mkdir -p` succeeds silently and leaves every later step operating inside the link's
-#     target.
+#   • enter_service_subdir() FOR THE DIRECTORY, rather than a `mkdir -p` here. It creates the one
+#     component beneath ${CUTOVER_ROOT_DIR} with a PLAIN `mkdir` (EEXIST on a planted symlink, where
+#     `mkdir -p` succeeds silently inside the link's target), lstats what is there, steps in with
+#     `cd -P`, and proves after the step that the directory it landed in IS the inode the entry
+#     named and that its `..` is still the directory it came from. It leaves this process INSIDE the
+#     proved directory, which is the whole reason the steps after it can name single components.
 #   • `set -C` (noclobber) redirection — open(O_CREAT|O_EXCL), which by POSIX fails with EEXIST
 #     when the final component is a symlink, and so cannot create or truncate the target.
 #     `touch`, and a plain `: >` redirection, both follow.
 #   • `stat` and `[[ -L ]]` — both lstat. `stat -c %F` reports "symbolic link" rather than the
-#     target's type (`stat -L`, which would dereference, is deliberately not used).
+#     target's type. `stat -L` appears below on /proc/self/fd/N and nowhere else, because there
+#     dereferencing the magic link is what makes it an fstat of the OPEN FILE.
 #   • `chown -h` — never dereferences: on a symlink it changes the LINK, so even a path swapped
 #     between the check and the call cannot hand a target away.
-#   • NO `chmod`, anywhere on these two paths. chmod has no --no-dereference on Linux, so a
+#   • NO `chmod`, anywhere on these paths. chmod has no --no-dereference on Linux, so a
 #     raced chmod is the same escalation with a different verb. Modes come from `umask` at
 #     creation, and a mode that is already wrong is REFUSED rather than corrected.
 #
-# AND IT IS RE-ASSERTED ON EVERY RUN, not established once. systemd re-owns a StateDirectory
-# RECURSIVELY when the TOP-LEVEL directory's owner does not match `User=` — so a box where
-# ${DATA_DIR} ends up root-owned for any reason will hand this subdirectory to ${APP_USER} at
-# the next service start. Nothing below trusts what a previous run left: it re-takes ownership
-# and re-derives every fact with lstat, so that case ends in a corrected directory or a refused
-# run rather than in a root-side write into a directory the service user can rewrite.
+# AND THE DESCRIPTOR IS OPENED HERE, WHERE THE PROOF IS STILL FRESH (o3d-q766). The file is opened
+# as a SINGLE COMPONENT from the pinned directory, and the descriptor is then checked against the
+# inode the post-conditions above it passed on — through /proc/self/fd/N, which the kernel resolves
+# to the open file and not to any pathname. with_crontab_lock() flocks THAT descriptor. Nothing
+# after this function resolves ${CRONTAB_LOCK_FILE}'s ancestry a second time, so there is no second
+# lookup for a rename to land between, and there is no window in which root's read-only redirection
+# could reach a named pipe: the only account that can create an entry in the pinned directory is
+# root.
 #
-# WHAT IS STILL POSSIBLE, stated rather than glossed over: ${DATA_DIR} itself belongs to
-# ${APP_USER}, so that user can rename(2) the lock DIRECTORY aside within it — a same-directory
-# rename of a directory does not need write permission on the directory being renamed — and drop
-# a symlink in its place. Which is why every step below re-derives what it is looking at with
-# lstat and DIES: the outcome is a refused run naming the path, never a followed link. Whoever
-# holds the service account can already deny an install a hundred ways; what they must not be
-# able to do is aim a root-side write, and they cannot.
+# WHAT IS STILL POSSIBLE, stated rather than glossed over: ROOT can do anything, including rename
+# ${CRONTAB_LOCK_DIR} aside — the descriptor makes that harmless rather than impossible, which is
+# open_root_owned_ancestry()'s distinction and the same one. ${APP_USER} can do nothing to this
+# pathname at all: every component of it is root-owned and writable by nobody else, so the rename
+# that used to split the two parties now fails with EACCES. Whoever holds the service account can
+# still deny an install a hundred ways — holding this lock is one of them, and it is deliberate,
+# because being able to hold it is what makes the application a party to the exclusion.
 # ---------------------------------------------------------------------------
 prepare_crontab_lock() {
-  local self dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner
+  local self saved dir_meta file_meta dir_kind dir_owner dir_mode file_kind file_owner file_ident held_ident
   # 0 — the EUID guard at the top of every entrypoint has already refused to run as anything
   # else. It is asked rather than hardcoded so the check below reads as "owned by the privileged
   # user that owns this install", which is the property that matters, and so this function can be
   # exercised in a test harness that is not root.
   self="$(id -u)" || die \
     "\`id -u\` failed, so this run cannot establish which uid it is and cannot check that the crontab lock at ${CRONTAB_LOCK_DIR} belongs to it. An unanswerable ownership question is not an ownership proof."
+  [[ -n "${CRONTAB_LOCK_DIR:-}" && -n "${CRONTAB_LOCK_FILE:-}" ]] || die \
+    "prepare_crontab_lock was called before crontab_lock_paths composed the lock's location. This is an ordering bug in the entrypoint, not an operator error."
 
-  # (1) THE DIRECTORY. Plain `mkdir`: a symlink already at this path makes it fail with EEXIST
-  # instead of being followed, and we then refuse below rather than working inside it.
-  if ! (umask 022; mkdir "${CRONTAB_LOCK_DIR}") 2>/dev/null; then
-    [[ "$(LC_ALL=C stat -c '%F' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)" == "directory" ]] || die \
-      "${CRONTAB_LOCK_DIR} exists and is not a directory (a symlink there is how a compromised '${APP_USER}' would aim a root-side write). Remove or fix that path, then run the installer again."
+  # 0b — THE HELPERS THIS PREPARATION IS BUILT OUT OF, NAMED AND REQUIRED RATHER THAN ASSUMED.
+  # scripts/lib/cutover-namespace.sh is sourced by all three entrypoints a few lines after this
+  # library, and bash resolves a function at CALL time, so the order is fine. A harness — or a
+  # future entrypoint — that sourced only this file would otherwise meet "command not found" and an
+  # abort with no explanation. An unavailable proof is not a proof: this refuses rather than
+  # composing the lock somewhere nothing has established.
+  if ! declare -F ensure_cutover_root_dir >/dev/null \
+     || ! declare -F enter_service_subdir >/dev/null \
+     || ! declare -F verify_held_lock >/dev/null \
+     || ! declare -F dir_is_private_to_this_run >/dev/null; then
+    die "the crontab reconciliation lock is prepared beneath the root-owned cutover namespace, and the helpers that create and prove that namespace (ensure_cutover_root_dir, enter_service_subdir, verify_held_lock and dir_is_private_to_this_run, all in scripts/lib/cutover-namespace.sh) are not defined in this shell. This is a sourcing-order bug in the entrypoint, not an operator error: refusing to create a lock inside a directory whose ancestry nothing has proved."
   fi
-  # Take/keep root ownership. `-h` so this is safe even if the path became a symlink just now.
-  chown -h root:root "${CRONTAB_LOCK_DIR}"
 
-  # (2) THE FILE. Created, if missing, with O_CREAT|O_EXCL so a planted symlink is refused rather
-  # than written through; never `touch`ed, and never chowned to the service user.
-  #
-  # The `-e` test is a CONVENIENCE, not the safety: it dereferences, so a symlink to an existing
-  # file reads as "already there", and a DANGLING one reads as "missing" and falls into the
-  # redirection below. `set -C` is what makes both of those safe — O_CREAT|O_EXCL fails with
-  # EEXIST on a symlink and creates nothing, dangling or not — and the lstat that follows is what
-  # refuses.
-  if [[ ! -e "${CRONTAB_LOCK_FILE}" ]]; then
-    ( umask 022; set -C; : > "${CRONTAB_LOCK_FILE}" ) 2>/dev/null || true
-  fi
-  # `stat -c %F` says "regular empty file" for a zero-length one, and this file is ALWAYS empty —
-  # nothing ever writes to it. Both spellings are the same st_mode, and neither is a symlink.
-  file_kind="$(LC_ALL=C stat -c '%F' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
-  [[ "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ]] || die \
-    "${CRONTAB_LOCK_FILE} is not a regular file (it is a ${file_kind:-missing path}). The crontab reconciliation lock must be a plain file that only root can replace; refusing to write to that path."
-  chown -h root:root "${CRONTAB_LOCK_FILE}"
+  # 1 — THE ROOT-OWNED PARENT. Not created here. ensure_cutover_root_dir() owns that question for
+  # the whole repository: it refuses a symlink at ${CUTOVER_ROOT_DIR} before and after its
+  # `mkdir -p`, applies the owner and the 0711 mode to the descriptor it stepped into, and reads
+  # both back off that same descriptor. It is idempotent and every non-dry cutover calls it again
+  # through acquire_cutover_lock(); this call is here because scripts/install.sh prepares the
+  # crontab lock in section 8, BEFORE it takes the cutover lock.
+  ensure_cutover_root_dir || die \
+    "${CUTOVER_ROOT_DIR} could not be established as a directory owned by this run and writable by nobody else, so the crontab reconciliation lock cannot be put beneath it. That parent is the whole of the exclusion: without it the service account can rename the lock directory aside, and the application and this run would then lock different inodes while both reported exclusion. Nothing has been written."
 
-  # (3) THE POST-CONDITIONS, re-read with lstat rather than assumed from the steps above.
+  # 2 — THE LOCK DIRECTORY, one component beneath it, through the walk this repository already has.
+  # enter_service_subdir() DIES on anything it cannot prove and leaves this process INSIDE the
+  # directory, so every step below names a single component and no ancestor is resolved again.
+  saved="$(pwd -P)" || die \
+    "this run cannot establish its own working directory, so it will not walk into ${CRONTAB_LOCK_DIR} and back. Nothing has been written."
+  enter_service_subdir "${CUTOVER_ROOT_DIR}" 022 "${CRONTAB_LOCK_DIR}"
+  # Take/keep root ownership OF THE DIRECTORY THIS PROCESS IS STANDING IN. `.` is answered by the
+  # kernel from the descriptor the walk left this shell holding, so no component is resolved a
+  # second time; `-h` costs nothing, and `.` can never be a symlink.
+  chown -h root:root .
+
+  # 3 — THE DIRECTORY'S POST-CONDITIONS, re-read with an lstat OF `.` rather than assumed from 2.
   #
   # THE `|| true` ON EVERY `stat` HERE IS DELIBERATE, AND IT IS SAFE FOR A STATED REASON
   # (o3d-p9dq, Codex r31 sweep). Each capture is compared against a POSITIVE LITERAL — "directory",
@@ -212,22 +322,159 @@ prepare_crontab_lock() {
   # comparison does not already do. What matters is that this is written down; every OTHER capture
   # in this file whose failure is not already a refusal takes its status explicitly, and the
   # repository walk in tests/settings/crontab-reconcile-serialization.test.ts holds that line.
-  dir_meta="$(LC_ALL=C stat -c '%F|%u|%a' "${CRONTAB_LOCK_DIR}" 2>/dev/null || true)"
+  dir_meta="$(LC_ALL=C stat -c '%F|%u|%a' . 2>/dev/null || true)"
   IFS='|' read -r dir_kind dir_owner dir_mode <<< "${dir_meta}"
   [[ "${dir_kind}" == "directory" && "${dir_owner}" == "${self}" ]] || die \
     "${CRONTAB_LOCK_DIR} must be a directory owned by uid ${self} after preparation, and is '${dir_meta}'."
+  # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
+  # under `set -e`, which is a crash and not a refusal.
+  [[ "${dir_mode}" =~ ^[0-7]+$ ]] || die \
+    "${CRONTAB_LOCK_DIR} reports the permission bits '${dir_mode}', which this run cannot read as octal, so it cannot establish whether another account may replace the lock inside it. Nothing has been written."
   # The whole protection is that the service user cannot write this DIRECTORY. A group- or
   # other-writable mode would give the lock file back to them, so it is refused, not chmod'ed away.
-  (( (8#${dir_mode:-777} & 0022) == 0 )) || die \
+  (( (8#${dir_mode} & 0022) == 0 )) || die \
     "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: group- or other-writable, so '${APP_USER}' could still replace the lock file inside it. Set it to 0755 and run the installer again."
-  file_meta="$(LC_ALL=C stat -c '%F|%u' "${CRONTAB_LOCK_FILE}" 2>/dev/null || true)"
-  IFS='|' read -r file_kind file_owner <<< "${file_meta}"
-  # No mode assertion on the FILE, deliberately: nothing ever reads or writes its contents, and it
-  # cannot be replaced from inside a directory the service user cannot write. Only "root owns it and
-  # it is a plain file" is load-bearing.
+  # AND TRAVERSABLE BY OTHER ACCOUNTS, WHICH IS THE OTHER HALF AND IS NEW (o3d-txoe). The
+  # application runs as ${APP_USER} and has to reach ${CRONTAB_LOCK_FILENAME} inside here to join
+  # the exclusion at all. A directory at 0700 satisfies every rule above it and leaves the
+  # application unable to open the lock — which lib/crontab-reconcile-lock.ts turns into a refused
+  # reconciliation rather than an unserialised one, so it is not a silent split; it is still a
+  # scheduler that has stopped working, and it is this run's to refuse rather than to ship.
+  (( (8#${dir_mode} & 0001) != 0 )) || die \
+    "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: not traversable by other accounts, so '${APP_USER}' cannot open the crontab reconciliation lock inside it and the application cannot join this exclusion. Every reconciliation from the running service would refuse. Set it to 0755 and run the installer again."
+
+  # 4 — THE FILE, as a SINGLE COMPONENT from the directory this process is standing in. Created, if
+  # missing, with O_CREAT|O_EXCL so a planted symlink is refused rather than written through; never
+  # `touch`ed, and never given away to the service user.
+  #
+  # The `-e` test is a CONVENIENCE, not the safety: it dereferences, so a symlink to an existing
+  # file reads as "already there", and a DANGLING one reads as "missing" and falls into the
+  # redirection below. `set -C` is what makes both of those safe — O_CREAT|O_EXCL fails with
+  # EEXIST on a symlink and creates nothing, dangling or not — and the lstat that follows is what
+  # refuses.
+  if [[ ! -e "${CRONTAB_LOCK_FILENAME}" ]]; then
+    ( umask 022; set -C; : > "${CRONTAB_LOCK_FILENAME}" ) 2>/dev/null || true
+  fi
+  # `stat -c %F` says "regular empty file" for a zero-length one, and this file is ALWAYS empty —
+  # nothing ever writes to it. Both spellings are the same st_mode, and neither is a symlink. The
+  # IDENTITY is taken in the SAME stat as the type and the owner, so the three cannot describe
+  # different files, and it is what the descriptor is checked against below.
+  file_meta="$(LC_ALL=C stat -c '%F|%u|%d:%i' "${CRONTAB_LOCK_FILENAME}" 2>/dev/null || true)"
+  IFS='|' read -r file_kind file_owner file_ident <<< "${file_meta}"
+  [[ "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ]] || die \
+    "${CRONTAB_LOCK_FILE} is not a regular file (it is a ${file_kind:-missing path}). The crontab reconciliation lock must be a plain file that only root can replace; refusing to write to that path."
+  chown -h root:root "${CRONTAB_LOCK_FILENAME}"
+  # Re-read AFTER the chown, off the same single component, because the ownership is a
+  # post-condition and not a hope. No mode assertion on the FILE, deliberately: nothing ever reads
+  # or writes its contents, and it cannot be replaced from inside a directory the service user
+  # cannot write. Only "root owns it and it is a plain file" is load-bearing.
+  file_meta="$(LC_ALL=C stat -c '%F|%u|%d:%i' "${CRONTAB_LOCK_FILENAME}" 2>/dev/null || true)"
+  IFS='|' read -r file_kind file_owner file_ident <<< "${file_meta}"
   [[ ( "${file_kind}" == "regular file" || "${file_kind}" == "regular empty file" ) \
-     && "${file_owner}" == "${self}" ]] || die \
+     && "${file_owner}" == "${self}" && -n "${file_ident}" ]] || die \
     "${CRONTAB_LOCK_FILE} must be a regular file owned by uid ${self} after preparation, and is '${file_meta}'."
+
+  # 5 — AND THE DESCRIPTOR, OPENED HERE AND HELD FOR THE RUN (o3d-q766). A single component, from
+  # the pinned directory; READ-ONLY, so there is no O_CREAT and no O_TRUNC in it to aim. A FAILED
+  # `exec` REDIRECTION ENDS A NON-INTERACTIVE SHELL, so there is no state in which this function
+  # returns with ${CRONTAB_LOCK_FD} empty and the caller believing a lock was prepared.
+  exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}"
+  # THE DESCRIPTOR IS THE ONE THE POST-CONDITIONS PASSED ON. verify_held_lock() fstats it through
+  # /proc/self/fd/N — `-L` there is what makes it an fstat of the OPEN FILE rather than a walk of
+  # anything — requires a regular file owned by this run, and requires the NAME's own lstat to be
+  # the same inode. It is asked about the single component, from inside the pinned directory, so not
+  # one ancestor is resolved again.
+  verify_held_lock "${CRONTAB_LOCK_FD}" "${CRONTAB_LOCK_FILENAME}" || die \
+    "the descriptor this run opened on ${CRONTAB_LOCK_FILE} is not that name's own inode, or is not a regular file owned by uid ${self}. Either the open followed a link or the name was replaced between the check and the open. Refusing to take the crontab exclusion on a file this run cannot identify. Nothing has been written."
+  # AND IT IS THE INODE STEP 4 PROVED, asked of the descriptor rather than of the name a third time.
+  held_ident="$(LC_ALL=C stat -L -c '%d:%i' "/proc/self/fd/${CRONTAB_LOCK_FD}" 2>/dev/null || true)"
+  [[ "${held_ident}" == "${file_ident}" ]] || die \
+    "the descriptor this run holds on ${CRONTAB_LOCK_FILE} answers as ${held_ident:-nothing}, which is not the inode its post-conditions were checked against (${file_ident}). Refusing to take the crontab exclusion on a file this run cannot identify. Nothing has been written."
+
+  cd "${saved}" || die \
+    "this run could not return to ${saved} after preparing ${CRONTAB_LOCK_DIR}. Nothing further has been changed."
+
+  prepare_legacy_crontab_lock
+}
+
+# ---------------------------------------------------------------------------
+# THE ONE ROLLOUT WINDOW THE RELOCATION OPENS, AND THE BRIDGE ACROSS IT (o3d-txoe)
+#
+#   prepare_legacy_crontab_lock       sets ${CRONTAB_LEGACY_LOCK_FD}, or says why it did not
+#
+# THE CONSEQUENCE, STATED BEFORE IT IS MITIGATED. Moving a lock is also a way to LOSE one. On the
+# first run after this build reaches an EXISTING host, the process serving that host was built
+# before the relocation and goes on resolving ${CRONTAB_LEGACY_LOCK_FILE} — the old location, inside
+# the service's own StateDirectory. A successor entrypoint that locked only the new location would be
+# excluded from nothing during that window, which is the same silent loss of exclusion this whole
+# round exists to remove. It is the shape state_pre_r22_cutovers_are_not_excluded() answers by saying
+# so; this function answers it by taking BOTH locks wherever that means something.
+#
+# WHICH IS NOT EVERYWHERE, AND THE PRECONDITION IS THE POINT — the same one
+# acquire_legacy_namespace_lock() checks, for the same reason. A lock taken on a name inside a
+# directory another account may write proves nothing: `unlink(2)` and `rename(2)` ask for write
+# permission on the PARENT, so the entry a predecessor locked can be moved out from under it and
+# this run handed a fresh inode at the same name. ${CRONTAB_LEGACY_LOCK_DIR} is root-owned — that was
+# r24's placement, and scripts/install.sh's ownership walk still PRUNES it so it stays that way — but
+# it sits inside ${DATA_DIR}, which ${APP_USER} owns, so THAT account can still rename it aside.
+# Against a predecessor that is merely a predecessor the bridge is real. Against an account that is
+# ATTACKING it is not, and the new location is what defends against that account: the bridge is a
+# continuity measure, never a security boundary, and it is not written down as one.
+#
+# SO IT IS CONDITIONAL, IN BOTH DIRECTIONS:
+#
+#   • NO OLD LOCK FILE AT ALL — a fresh install, or a host whose predecessor predates the shared
+#     path entirely. There is nothing to bridge to and NOTHING IS CREATED: creating the old location
+#     on a fresh host would put a root-owned directory back inside ${DATA_DIR} for no reader, and
+#     would make "the old lock exists" stop meaning "a predecessor may still be using it".
+#   • THE OLD DIRECTORY IS NOT ONE ONLY THIS RUN MAY WRITE — it was handed to ${APP_USER} by an
+#     older release, or replaced. Nothing is opened, nothing is locked, nothing is created, and the
+#     warning says exactly what is not excluded rather than leaving a reader to infer it.
+#
+# AND IT ENDS. The bridge is reached only while ${CRONTAB_LEGACY_LOCK_FILE} exists; removing it is an
+# operator action, documented in docs/installation.md under the first run after this deploy, and
+# until they take it the only cost is one extra `flock` per crontab read-modify-write.
+prepare_legacy_crontab_lock() {
+  local saved meta kind ident held_ident
+  CRONTAB_LEGACY_LOCK_FD=""
+  [[ -n "${CRONTAB_LEGACY_LOCK_DIR:-}" && -n "${CRONTAB_LEGACY_LOCK_FILE:-}" ]] || return 0
+  # A fresh host, or one whose predecessor predates the shared path. Nothing is created; see above.
+  [[ -e "${CRONTAB_LEGACY_LOCK_FILE}" || -L "${CRONTAB_LEGACY_LOCK_FILE}" ]] || return 0
+  if ! dir_is_private_to_this_run "${CRONTAB_LEGACY_LOCK_DIR}"; then
+    warn "${CRONTAB_LEGACY_LOCK_DIR} is not a directory only this run may write, so a lock taken on ${CRONTAB_LEGACY_LOCK_FILE} would prove nothing: the entry can be renamed between a predecessor's open and this one, and both runs would then report an exclusion neither holds. NOTHING WAS OPENED, LOCKED OR CREATED THERE. An application process running a build from BEFORE the crontab lock moved to ${CRONTAB_LOCK_DIR} is NOT excluded by this run; two writers of THIS build still cannot overlap. Restart the service onto this build before anything changes the crontab — see docs/installation.md, 'The first run after the crontab lock moved'."
+    return 0
+  fi
+  saved="$(pwd -P)" || die \
+    "this run cannot establish its own working directory, so it will not walk into ${CRONTAB_LEGACY_LOCK_DIR} and back. Nothing has been written."
+  cd -P "${CRONTAB_LEGACY_LOCK_DIR}" 2>/dev/null || die \
+    "${CRONTAB_LEGACY_LOCK_DIR} could not be entered, although this run had just established that only it may write there. Nothing has been written."
+  # The same pinning as the canonical lock: ONE lstat taking the type and the identity together, a
+  # single-component read-only open, and the descriptor proved against that identity.
+  meta="$(LC_ALL=C stat -c '%F|%d:%i' "${CRONTAB_LOCK_FILENAME}" 2>/dev/null || true)"
+  kind="${meta%%|*}"
+  ident="${meta##*|}"
+  if [[ "${kind}" != "regular file" && "${kind}" != "regular empty file" ]]; then
+    cd "${saved}" || die "this run could not return to ${saved}. Nothing further has been changed."
+    warn "${CRONTAB_LEGACY_LOCK_FILE} is a ${kind:-missing path} rather than a regular file, so this run will not open it to bridge to a predecessor build. NOTHING WAS OPENED OR LOCKED THERE. An application process running a build from BEFORE the crontab lock moved to ${CRONTAB_LOCK_DIR} is NOT excluded by this run."
+    return 0
+  fi
+  exec {CRONTAB_LEGACY_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}"
+  held_ident="$(LC_ALL=C stat -L -c '%d:%i' "/proc/self/fd/${CRONTAB_LEGACY_LOCK_FD}" 2>/dev/null || true)"
+  if ! verify_held_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LOCK_FILENAME}" \
+     || [[ "${held_ident}" != "${ident}" ]]; then
+    # THE CLOSE IS GROUPED, AND THAT IS NOT COSMETIC (o3d-secops r31, o3d-noka r2). A BARE `exec`
+    # CARRYING A REDIRECTION APPLIES THAT REDIRECTION TO THE SHELL, PERMANENTLY — so
+    # `exec {FD}<&- 2>/dev/null` would send every later warning, refusal and `die` of the whole
+    # entrypoint to /dev/null, including the `die` on the very next line. Inside `{ ...; }` the
+    # suppression belongs to the group and is given back at the closing brace.
+    { exec {CRONTAB_LEGACY_LOCK_FD}<&-; } 2>/dev/null || true
+    CRONTAB_LEGACY_LOCK_FD=""
+    cd "${saved}" >/dev/null 2>&1 || true
+    die "the descriptor this run opened on ${CRONTAB_LEGACY_LOCK_FILE} answers as ${held_ident:-nothing} rather than as that name's own inode (${ident}), or is not a regular file owned by this run. That is a substitution inside a directory this run had just established only it may write, so it is REFUSED rather than bridged: this run will not go on to rewrite the crontab behind an exclusion it cannot identify. Nothing has been written."
+  fi
+  cd "${saved}" || die \
+    "this run could not return to ${saved} after pinning ${CRONTAB_LEGACY_LOCK_FILE}. Nothing further has been changed."
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -248,10 +495,23 @@ prepare_crontab_lock() {
 # reconciling right now" from "the write failed". Callers DIE on it: writing without the lock is
 # the defect itself, and skipping the write silently leaves a fenced crontab in place.
 #
-# REENTRANT BY REFUSAL, NOT BY RECURSION. flock on a second, independently opened descriptor for
-# the same file blocks against the first — a nested call would deadlock until the timeout and
-# then report a conflict that is this very process. So a nested call runs the body directly, on
-# the lock the outer call is already holding.
+# REENTRANT BY REFUSAL, NOT BY RECURSION — AND SINCE o3d-q766 THAT GUARD IS LOAD-BEARING RATHER
+# THAN AN OPTIMISATION. It used to be an optimisation with a safety argument attached: each
+# acquisition opened its OWN descriptor, so a nested call would have blocked against the outer one
+# until the timeout and then reported a conflict that was this very process. There is now ONE
+# descriptor, pinned by prepare_crontab_lock() and held for the run, and flock(2) on a description
+# that ALREADY holds the lock returns immediately — so a nested acquisition would SUCCEED, and its
+# `flock --unlock` would release the OUTER call's lock while the outer body was still inside its
+# read-modify-write. ${CRONTAB_LOCK_HELD} is what stops that. A nested call runs the body directly,
+# on the lock the outer call is already holding, and releases nothing.
+#
+# THE RELEASE IS `flock --unlock`, NOT A CLOSE. The descriptor outlives the critical section; the
+# LOCK does not. flock(2) attaches the lock to the OPEN FILE DESCRIPTION, so LOCK_UN releases it for
+# every duplicate of that description — including one a `crontab -` child inherited — and the
+# exclusion is therefore still exactly one read-modify-write long. It is released on EVERY path out
+# of the acquisition, including the one where the body failed, as its own statement rather than on
+# the right of a `&&`: `errexit` is suspended for the whole dynamic extent of the left operand of
+# `&&`/`||`, so a release written there would be a release nothing could observe failing.
 # ---------------------------------------------------------------------------
 CRONTAB_LOCK_CONFLICT=75
 CRONTAB_LOCK_HELD=false
@@ -289,19 +549,69 @@ with_crontab_lock() {
     "$@" || rc=$?
     return "${rc}"
   fi
-  [[ -n "${CRONTAB_LOCK_FILE:-}" ]] || die \
-    "with_crontab_lock was called before CRONTAB_LOCK_FILE was composed (crontab_lock_paths). This is an ordering bug in the entrypoint, not an operator error: a crontab write that cannot be serialized against the application's can silently discard it."
-  [[ -f "${CRONTAB_LOCK_FILE}" ]] || die \
-    "${CRONTAB_LOCK_FILE} is missing or is not a regular file, so this crontab write cannot be serialized against the application's. prepare_crontab_lock creates it; that call must run before anything touches the crontab. Nothing has been written."
-  {
-    if flock --exclusive --timeout "${CRONTAB_LOCK_WAIT_SECONDS}" 7; then
-      CRONTAB_LOCK_HELD=true
-      "$@" || rc=$?
-      CRONTAB_LOCK_HELD=false
-    else
-      rc=${CRONTAB_LOCK_CONFLICT}
+  # NO PATHNAME IS RESOLVED HERE, AND THAT IS THE WHOLE OF o3d-q766 AND o3d-txoe. This used to run a
+  # dereferencing `[[ -f "${CRONTAB_LOCK_FILE}" ]]` and then a SECOND, independent dereferencing
+  # `7<"${CRONTAB_LOCK_FILE}"` — two lookups per acquisition, neither re-deriving owner or inode, and
+  # a rename landing between them put root's read-only redirection on whatever the service account
+  # chose. What is checked instead is that a PREPARATION HAPPENED: ${CRONTAB_LOCK_FD} is empty until
+  # prepare_crontab_lock() has proved the directory, proved the file and opened the descriptor, and
+  # the exclusion is taken on that descriptor and on nothing else.
+  [[ -n "${CRONTAB_LOCK_FD:-}" ]] || die \
+    "with_crontab_lock was called before prepare_crontab_lock pinned the crontab reconciliation lock. This is an ordering bug in the entrypoint, not an operator error: a crontab write that cannot be serialized against the application's can silently discard it. Nothing has been written."
+  # AND THE PATHNAME STILL NAMES THE INODE THIS RUN IS HOLDING, OR THIS RUN REFUSES (o3d-txoe).
+  #
+  # THIS IS NOT THE BY-NAME OPEN COMING BACK. Nothing here opens, creates or writes anything: the
+  # exclusion is taken on ${CRONTAB_LOCK_FD} either way, and the only thing the lookup can do is turn
+  # a run into a refusal. That is the safe direction, and it is why re-resolving the ancestry is
+  # acceptable HERE and is not acceptable for the open — a subverted lookup costs a refused cutover,
+  # where a subverted open cost root a blocking read on a named pipe.
+  #
+  # WHY IT IS HERE AT ALL, GIVEN THE RELOCATION. The relocation is what makes the pathname's meaning
+  # fixed: no account but root can rename a component of ${CRONTAB_LOCK_DIR} or replace the entry
+  # inside it, so this check cannot fire because of ${APP_USER}. What it answers is the objection the
+  # first attempt at the pin earned — that a descriptor held for a whole run makes a divergence
+  # PERSIST where a by-name acquisition would have converged on the next one. Root can still rename
+  # the directory aside; if it does, this run stops rather than going on holding a lock the
+  # application will never contend for. It is the SAME question lib/crontab-reconcile-lock.ts asks on
+  # its side (`fdStillMatchesPath`), asked at the same moment, so the two parties fail the same way.
+  #
+  # WHAT IT DOES NOT CLAIM: a swap performed WHILE this run is inside its critical section is not
+  # caught, by this or by anything else, because the exclusion has already been granted on both
+  # sides. The only thing that closes that case is a parent nobody else can rename within, which is
+  # where the lock now lives. Stated rather than implied, because the difference is the whole of
+  # o3d-txoe.
+  verify_held_lock "${CRONTAB_LOCK_FD}" "${CRONTAB_LOCK_FILE}" || die \
+    "${CRONTAB_LOCK_FILE} no longer names the inode this run pinned when it prepared the crontab reconciliation lock, or that inode is no longer a regular file this run owns. The exclusion this run holds is therefore on a file no other writer will open, and the application's own reconciliation would take a different one — both would report exclusion and neither would have it. Every component of that path is root-owned and writable by nobody else, so this is a privileged change made during this run and not something '${APP_USER}' can cause. Refusing to rewrite the crontab. Nothing has been written."
+  if [[ -n "${CRONTAB_LEGACY_LOCK_FD:-}" ]]; then
+    verify_held_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LEGACY_LOCK_FILE}" || die \
+      "${CRONTAB_LEGACY_LOCK_FILE} no longer names the inode this run pinned for the pre-relocation bridge. Unlike the canonical lock that path IS inside a directory '${APP_USER}' owns, so this is reachable by that account — and it means a predecessor build's reconciliation would take a different inode from this run's. Refusing to rewrite the crontab rather than bridging to nothing. Nothing has been written."
+  fi
+  # THE PRE-RELOCATION LOCK FIRST, WHERE THERE IS ONE, AND IT IS THE OUTER OF THE TWO.
+  # prepare_legacy_crontab_lock() explains what it bridges and what it does not. The order is fixed
+  # — legacy outside, canonical inside — and it cannot deadlock against anything: a predecessor build
+  # takes only the legacy lock, an application on THIS build takes only the canonical one, and every
+  # writer of this build takes the two in this order.
+  if [[ -n "${CRONTAB_LEGACY_LOCK_FD:-}" ]]; then
+    if ! flock --exclusive --timeout "${CRONTAB_LOCK_WAIT_SECONDS}" "${CRONTAB_LEGACY_LOCK_FD}"; then
+      return "${CRONTAB_LOCK_CONFLICT}"
     fi
-  } 7<"${CRONTAB_LOCK_FILE}"
+  fi
+  if flock --exclusive --timeout "${CRONTAB_LOCK_WAIT_SECONDS}" "${CRONTAB_LOCK_FD}"; then
+    CRONTAB_LOCK_HELD=true
+    "$@" || rc=$?
+    CRONTAB_LOCK_HELD=false
+    # Its own statement, and its status is read: a release that silently failed would leave the
+    # exclusion held for the rest of the run, and every later acquisition would then be this very
+    # process reporting a conflict against itself.
+    flock --unlock "${CRONTAB_LOCK_FD}" || die \
+      "the crontab reconciliation lock on ${CRONTAB_LOCK_FILE} could not be released after this read-modify-write, so every later crontab write in this run — and every reconciliation the application attempts — would queue behind a lock this process is still holding. The crontab itself is in whatever state the body left it."
+  else
+    rc=${CRONTAB_LOCK_CONFLICT}
+  fi
+  if [[ -n "${CRONTAB_LEGACY_LOCK_FD:-}" ]]; then
+    flock --unlock "${CRONTAB_LEGACY_LOCK_FD}" || die \
+      "the pre-relocation crontab lock on ${CRONTAB_LEGACY_LOCK_FILE} could not be released after this read-modify-write, so a predecessor build's reconciliation would queue behind a lock this process is still holding. The crontab itself is in whatever state the body left it."
+  fi
   return "${rc}"
 }
 
