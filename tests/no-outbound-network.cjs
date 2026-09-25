@@ -77,6 +77,19 @@
  *   waits for `'connect'` and nothing else can see a connection that did not happen. Throwing
  *   synchronously instead would break every caller that handles `'error'`, which is all of them.
  */
+/* eslint-disable @typescript-eslint/no-require-imports -- this file is deliberately CommonJS; see below */
+/*
+ * THIS FILE IS DELIBERATELY CommonJS, and `require` is the whole reason it exists (see the header): only
+ * a `.cjs` file can be loaded by `--import`, by `--require` (the ONLY thing that installs anything in a
+ * worker thread — `--import` there is accepted and silently ignored, measured on Node 22.23) and by a
+ * plain `require()` from a child that is not running under `tsx`. Rewriting these as `import` would break
+ * all three, and it is the only `.cjs` file in the repository, so the rule stays on everywhere else.
+ *
+ * WHY THIS LINE EXISTS AT ALL (o3d-bhvu round 10): `npm run validate` -> `npm run lint` had been RED on
+ * this branch since the trap was added in round 2/3, with these five errors, and nothing ran it — rounds
+ * 2 to 9 ran check:all and build but never `validate`. CI's `validate` job reported exactly these five
+ * while the branch was otherwise green. Found by running the whole sequence, not by reading the file.
+ */
 const dns = require('node:dns')
 const net = require('node:net')
 const path = require('node:path')
