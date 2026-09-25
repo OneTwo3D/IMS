@@ -490,7 +490,12 @@ mock.module('@/lib/connectors/wms/registry', {
         createAsnCalls.push({ lines: input.lines })
         return {
           externalAsnId: '9001',
-          status: 'OPEN',
+          // o3d-bhvu r9: `'OPEN'` here was IMS'S OWN status name on a ref the Mintsoft connector is
+          // supposed to have produced, and the creators' interpreter accepted it because it also
+          // consulted a table of IMS names. That is the conflation round 9 removed, so this fake now
+          // answers with the status a real Mintsoft create lands on: ASNStatusId 1 / `NEW` (proven on
+          // the owner-sanctioned live create of ASN 6117, 2026-09-24; bd o3d-vcw8).
+          status: 'NEW',
           lines: input.lines.map((line, index) => ({
             externalLineId: `remote-${index}`,
             sourceLineId: line.sourceLineId,

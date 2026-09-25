@@ -1,5 +1,5 @@
 import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
-import { readMintsoftAsnStatusName } from './asn-status'
+import { readMintsoftAsnWireStatusField } from './asn-status'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
@@ -309,8 +309,9 @@ export function normalizeMintsoftAsn(
     // neither: the field is `ASNStatus`, an OBJECT carrying `Name`, alongside a numeric `ASNStatusId`.
     // So every ASN read back by id arrived with `status: null` too, and the creators' normalizer turned
     // that into OPEN. It happened to be harmless for a create (a just-created ASN really is NEW) but it
-    // was the same unread remote field spent as a benign default, and it is the same one reader now.
-    status: readMintsoftAsnStatusName(record),
+    // was the same unread remote field spent as a benign default, and it is the same one reader now —
+    // which, since round 9, resolves MINTSOFT'S 13 published statuses and no IMS name at all.
+    status: readMintsoftAsnWireStatusField(record),
     lines,
     raw: record,
   }

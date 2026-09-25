@@ -638,7 +638,7 @@ test('o3d-bhvu r8: an unreadable remote status is UNKNOWN, and unknown is not OP
 })
 
 test('o3d-bhvu r8: every one of Mintsoft’s 13 ASN statuses is classified, and the booked-in ones are not the open ones', async () => {
-  const { MINTSOFT_ASN_STATUSES, interpretMintsoftAsnReceiptState } = await import('@/lib/connectors/mintsoft/api/asn-status')
+  const { MINTSOFT_ASN_STATUSES, interpretMintsoftWireAsnStatus } = await import('@/lib/connectors/mintsoft/api/asn-status')
   // The 13 statuses GET /api/ASN/Statuses served live on 2026-09-24 (recorded on bd o3d-vcw8).
   const live: Array<[number, string]> = [
     [1, 'NEW'], [2, 'AWAITNGAPPROVAL'], [3, 'AWAITINGDELIVERY'], [4, 'BOOKEDIN'], [5, 'DISCREPANCY'],
@@ -651,7 +651,7 @@ test('o3d-bhvu r8: every one of Mintsoft’s 13 ASN statuses is classified, and 
     const fact = MINTSOFT_ASN_STATUSES.find((candidate) => candidate.id === id)
     assert.ok(fact, `status ${id} ${name} must be in the table`)
     assert.equal(fact.name, name, `status ${id} must be named as Mintsoft names it`)
-    const state = interpretMintsoftAsnReceiptState(name)
+    const state = interpretMintsoftWireAsnStatus(name)
     assert.equal(state.kind, 'known', `${name} must be classified`)
     examined += 1
   }
@@ -659,11 +659,11 @@ test('o3d-bhvu r8: every one of Mintsoft’s 13 ASN statuses is classified, and 
 
   // THE DISCRIMINATION ITSELF: these two sets must not be the same set, or the classification is a no-op.
   const owesReceipt = live.filter(([, name]) => {
-    const state = interpretMintsoftAsnReceiptState(name)
+    const state = interpretMintsoftWireAsnStatus(name)
     return state.kind === 'known' && state.receiptMayHaveHappened
   }).map(([, name]) => name)
   const owesNothing = live.filter(([, name]) => {
-    const state = interpretMintsoftAsnReceiptState(name)
+    const state = interpretMintsoftWireAsnStatus(name)
     return state.kind === 'known' && !state.receiptMayHaveHappened
   }).map(([, name]) => name)
   assert.ok(owesReceipt.length > 0, `some statuses owe a receipt, saw ${owesReceipt.join(', ')}`)
@@ -675,8 +675,8 @@ test('o3d-bhvu r8: every one of Mintsoft’s 13 ASN statuses is classified, and 
   for (const name of ['NEW', 'AWAITINGDELIVERY', 'SHIPPED']) {
     assert.ok(owesNothing.includes(name), `${name} owes none`)
   }
-  assert.equal(interpretMintsoftAsnReceiptState(null).kind, 'unknown', 'no status is unknown, not open')
-  assert.equal(interpretMintsoftAsnReceiptState('NOT-A-STATUS').kind, 'unknown', 'and so is one nobody wired up')
+  assert.equal(interpretMintsoftWireAsnStatus(null).kind, 'unknown', 'no status is unknown, not open')
+  assert.equal(interpretMintsoftWireAsnStatus('NOT-A-STATUS').kind, 'unknown', 'and so is one nobody wired up')
 })
 
 test('o3d-bhvu r8: the post-create read-back reads the status too, from the live ASNStatus OBJECT', async () => {
@@ -727,4 +727,192 @@ test('rig non-vacuity: the fake recheck is what credits the receipt, and without
   recheckCredits = false
   await enqueueMintsoftBookedInRecheckForAsn(REMOTE_ASN_ID, { reason: 'rig' })
   assert.equal(await landedNow(), 0, 'and with crediting off it does not, so the assertion can fail')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bhvu ROUND 9, CODEX HIGH — ONE INTERPRETER SERVED TWO VOCABULARIES.
+//
+// Round 8 put the 13 statuses `GET /api/ASN/Statuses` serves into a table and refused anything outside
+// it. But the same function also consulted a SECOND table of IMS's OWN `WmsAsnStatus` names, so a remote
+// `ASNStatus.Name` that happens to spell an IMS name — `OPEN` above all — was accepted as KNOWN, recorded
+// as OPEN and skipped the receipt recheck, with an `ASNStatusId` nobody recognises sitting right beside it.
+// A remote value borrowed the local meaning. These tests enumerate IMS's vocabulary from the Prisma enum
+// rather than naming `OPEN` alone, so a sixth IMS status is covered the day it is added.
+// ---------------------------------------------------------------------------
+
+async function imsOnlyStatusNames(): Promise<string[]> {
+  const { WmsAsnStatus } = await import('@/app/generated/prisma/enums')
+  const { MINTSOFT_ASN_STATUSES } = await import('@/lib/connectors/mintsoft/api/asn-status')
+  const wire = new Set<string>(MINTSOFT_ASN_STATUSES.map((fact) => fact.name))
+  assert.equal(wire.size, 13, 'precondition: the live table is the 13 statuses Mintsoft published')
+  const imsOnly = Object.values(WmsAsnStatus).filter((name) => !wire.has(name))
+  assert.ok(imsOnly.length >= 5, `precondition: IMS has status names of its own, saw ${imsOnly.join(', ')}`)
+  return imsOnly
+}
+
+test('o3d-bhvu r9: not one of IMS’s own status names is resolvable as a status Mintsoft served', async () => {
+  const { interpretMintsoftWireAsnStatus } = await import('@/lib/connectors/mintsoft/api/asn-status')
+  const imsOnly = await imsOnlyStatusNames()
+  const accepted: Array<{ name: string; state: unknown }> = []
+  for (const name of imsOnly) {
+    const state = interpretMintsoftWireAsnStatus(name)
+    if (state.kind !== 'unknown') accepted.push({ name, state })
+  }
+  console.log(`# r9: examined ${imsOnly.length} IMS-only names (${imsOnly.join(', ')}); ${accepted.length} resolved as remote`)
+  assert.deepEqual(accepted, [], 'an IMS-only name must never resolve against Mintsoft’s table')
+})
+
+test('o3d-bhvu r9: a recovered ASN whose remote status is an IMS-only name refuses, for EVERY such name', async () => {
+  const { createMintsoftTransferAsn } = await loadActions()
+  const imsOnly = await imsOnlyStatusNames()
+  const observed: Array<Record<string, unknown>> = []
+  for (const name of imsOnly) {
+    seedTransfer()
+    recoveryRows = [remoteRow({ name, id: 99 })]
+    const examinedBefore = statusesExamined
+    const result = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
+    assert.equal(statusesExamined - examinedBefore, 1, `${name}: precondition — the remote row really was read`)
+    assert.equal(createAsnCalls.length, 0, `${name}: a second ASN must never be created`)
+    observed.push({
+      name,
+      success: result.success,
+      recorded: adoptedMap()?.status ?? null,
+      rechecks: recheckCalls.length,
+      landed: await landedNow(),
+    })
+  }
+  console.log(`# r9 e2e: examined ${observed.length} IMS-only names: ${JSON.stringify(observed)}`)
+  assert.deepEqual(
+    observed,
+    imsOnly.map((name) => ({ name, success: false, recorded: null, rechecks: 0, landed: 0 })),
+    'an IMS-only name arriving from Mintsoft is an UNREADABLE remote status: refuse, record nothing',
+  )
+})
+
+test('o3d-bhvu r9: Name and ASNStatusId disagreeing is unknown, not a precedence contest', async () => {
+  const { createMintsoftTransferAsn } = await loadActions()
+  const cases = [
+    { label: 'both in the table, naming different statuses', row: { name: 'COMPLETE', id: 3 }, refuses: true },
+    { label: 'name in the table, id outside it', row: { name: 'AWAITINGDELIVERY', id: 99 }, refuses: true },
+    { label: 'name outside the table, id inside it', row: { name: 'MINTSOFT-ADDED-THIS', id: 6 }, refuses: true },
+    { label: 'control: both present and agreeing', row: { name: 'COMPLETE', id: 6 }, refuses: false },
+  ] as const
+  const observed: Array<Record<string, unknown>> = []
+  for (const entry of cases) {
+    seedTransfer()
+    recoveryRows = [remoteRow(entry.row)]
+    const result = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
+    observed.push({ label: entry.label, refused: result.success === false, recorded: adoptedMap()?.status ?? null })
+  }
+  console.log(`# r9 disagreement: examined ${observed.length} cases: ${JSON.stringify(observed)}`)
+  assert.deepEqual(
+    observed,
+    cases.map((entry) => ({
+      label: entry.label,
+      refused: entry.refuses,
+      recorded: entry.refuses ? null : 'BOOKED_IN',
+    })),
+    'every signal present must resolve, and all of them must name the same status — otherwise unknown',
+  )
+})
+
+test('o3d-bhvu r9: BOTH connector ASN readers resolve Mintsoft’s vocabulary only — the list scan and the by-id read-back', async () => {
+  // A GUARD FIXED IN ONE READER AND LEFT WRONG IN ANOTHER is what Codex has caught on every round of this
+  // branch, so this walks both readers over the SAME cases rather than trusting that they share a helper.
+  const { normalizeMintsoftAsnFetchByIdResult } = await import('@/lib/connectors/mintsoft/api/client')
+  const { MINTSOFT_ASN_STATUS_UNREADABLE_MARKER, MINTSOFT_ASN_STATUSES, interpretMintsoftWireAsnStatus }
+    = await import('@/lib/connectors/mintsoft/api/asn-status')
+  const imsOnly = await imsOnlyStatusNames()
+
+  const byIdStatus = (row: Record<string, unknown>): string | null => {
+    const normalized = normalizeMintsoftAsnFetchByIdResult(REMOTE_ASN_ID, { status: 200, data: row })
+    assert.ok(normalized, 'precondition: the by-id body must normalize at all')
+    return normalized.status
+  }
+  const byListStatus = (row: Record<string, unknown>): string | null =>
+    normalizeMintsoftAsnListRowForRecovery(row).status
+
+  let readerPairsExamined = 0
+  for (const name of [...imsOnly, 'SOMETHING-MINTSOFT-ADDED-LATER']) {
+    for (const [label, read] of [['list scan', byListStatus], ['by-id read-back', byIdStatus]] as const) {
+      const status = read(remoteRow({ name, id: 99 }))
+      assert.ok(status, `${label}/${name}: the reader must say WHY, not flatten to null`)
+      assert.ok(
+        status.startsWith(MINTSOFT_ASN_STATUS_UNREADABLE_MARKER),
+        `${label}/${name}: a name outside Mintsoft’s table must come back marked unresolvable, saw ${status}`,
+      )
+      assert.equal(
+        interpretMintsoftWireAsnStatus(status).kind,
+        'unknown',
+        `${label}/${name}: and the marked string must interpret as unknown`,
+      )
+      readerPairsExamined += 1
+    }
+  }
+  // AND THE CONTROL, in the same loop shape: a real Mintsoft status still reads through both readers.
+  for (const [label, read] of [['list scan', byListStatus], ['by-id read-back', byIdStatus]] as const) {
+    const status = read(remoteRow({ name: 'COMPLETE', id: 6 }))
+    assert.equal(status, 'COMPLETE', `${label}: a status Mintsoft really serves must still read`)
+    assert.equal(interpretMintsoftWireAsnStatus(status).kind, 'known', `${label}: and interpret`)
+    readerPairsExamined += 1
+  }
+  console.log(`# r9 readers: examined ${readerPairsExamined} reader/status pairs across 2 readers`)
+  assert.equal(readerPairsExamined, (imsOnly.length + 1) * 2 + 2, 'both readers were walked over every case')
+
+  // THE MARKER CANNOT COLLIDE WITH A STATUS NAME. Universal, not existential.
+  for (const fact of MINTSOFT_ASN_STATUSES) {
+    assert.ok(
+      !fact.name.startsWith(MINTSOFT_ASN_STATUS_UNREADABLE_MARKER) && !MINTSOFT_ASN_STATUS_UNREADABLE_MARKER.startsWith(fact.name),
+      `${fact.name} must not be confusable with the unresolvable marker`,
+    )
+  }
+})
+
+test('o3d-bhvu r9: the refusal tells the operator WHICH of Mintsoft’s status fields disagreed', async () => {
+  // A refusal that says only "cannot be interpreted" sends the operator to Mintsoft with nothing to look
+  // at, and the whole point of a disagreement is that the wire shape is not what we think.
+  const { createMintsoftTransferAsn } = await loadActions()
+  seedTransfer()
+  recoveryRows = [remoteRow({ name: 'COMPLETE', id: 3 })]
+
+  const result = await createMintsoftTransferAsn(TRANSFER_ID, { autoCallback: false })
+
+  assert.equal(result.success, false, 'precondition: a disagreement refuses')
+  const error = String(result.error)
+  assert.match(error, /DISAGREE/, `the refusal must say the fields disagree, saw: ${error}`)
+  assert.match(error, /COMPLETE/, 'and name what the name field said')
+  assert.match(error, /AWAITINGDELIVERY/, 'and what the id field said')
+  assert.equal(
+    error.includes('MINTSOFT_ASN_STATUS_UNREADABLE'),
+    false,
+    'the marker is plumbing and must not reach the operator’s message',
+  )
+})
+
+test('o3d-bhvu r9: readMintsoftAsnWireStatus distinguishes absent, unreadable and resolved, and every signal counts', async () => {
+  const { readMintsoftAsnWireStatus } = await import('@/lib/connectors/mintsoft/api/asn-status')
+  const cases: Array<[string, Record<string, unknown>, 'absent' | 'unreadable' | 'resolved']> = [
+    ['nothing at all', { ID: 1 }, 'absent'],
+    ['a null status object', { ASNStatus: null }, 'absent'],
+    ['a blank status string', { Status: '   ' }, 'absent'],
+    ['the live three-signal shape', { ASNStatus: { Name: 'AWAITINGDELIVERY', ID: 3 }, ASNStatusId: 3 }, 'resolved'],
+    ['an id alone', { ASNStatusId: 6 }, 'resolved'],
+    ['a name alone', { ASNStatus: { Name: 'COMPLETE' } }, 'resolved'],
+    ['a lower-case name', { ASNStatus: { Name: 'complete' } }, 'resolved'],
+    ['an unlisted id alone', { ASNStatusId: 99 }, 'unreadable'],
+    ['an unlisted id beside a listed name', { ASNStatus: { Name: 'COMPLETE' }, ASNStatusId: 99 }, 'unreadable'],
+    ['a NESTED id that disagrees with the name', { ASNStatus: { Name: 'COMPLETE', ID: 3 } }, 'unreadable'],
+    ['a nested id that disagrees with ASNStatusId', { ASNStatus: { Name: 'COMPLETE', ID: 6 }, ASNStatusId: 3 }, 'unreadable'],
+    ['an IMS name', { ASNStatus: { Name: 'OPEN' } }, 'unreadable'],
+    ['a non-integer id', { ASNStatusId: 3.5 }, 'absent'],
+  ]
+  let examined = 0
+  for (const [label, row, expected] of cases) {
+    assert.equal(readMintsoftAsnWireStatus(row).kind, expected, `${label}: expected ${expected}`)
+    examined += 1
+  }
+  assert.equal(readMintsoftAsnWireStatus(null).kind, 'absent', 'no row at all is absent')
+  console.log(`# r9 reading: examined ${examined} raw-row shapes`)
+  assert.equal(examined, cases.length)
+  assert.equal(new Set(cases.map(([, , kind]) => kind)).size, 3, 'all three readings are exercised, not one')
 })

@@ -58,7 +58,7 @@ import {
   runMintsoftReturnsSync,
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
-import { interpretMintsoftAsnReceiptState } from '@/lib/connectors/mintsoft/api/asn-status'
+import { interpretMintsoftWireAsnStatus } from '@/lib/connectors/mintsoft/api/asn-status'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import {
@@ -173,6 +173,15 @@ const mintsoftBindingSelect = {
  * a remote ASN was the default. What a Mintsoft ASN status MEANS is stated once, in the connector
  * (`lib/connectors/mintsoft/api/asn-status.ts`), against the 13 statuses `GET /api/ASN/Statuses` served
  * live on 2026-09-24; anything outside it is `unknown`, and unknown refuses here rather than defaulting.
+ *
+ * ROUND 9, CODEX HIGH — AND THE STATUS IS READ AS MINTSOFT'S WORD, NEVER AS ONE OF IMS'S OWN. Round 8's
+ * interpreter also carried a table of IMS `WmsAsnStatus` names, and IMS's vocabulary overlaps Mintsoft's
+ * textually, so a remote `ASNStatus.Name` of `OPEN` — with an `ASNStatusId` nobody recognised beside it —
+ * was accepted as KNOWN and recorded as an ASN still to arrive, which is the finding round 8 set out to
+ * close arriving by the other door. The two ASN refs this function is ever handed
+ * (`connector.createAsn(...)` and `findExistingRemoteAsn(...)`) are BOTH produced by the Mintsoft
+ * connector's readers, so `status` here is always Mintsoft's word and `interpretMintsoftWireAsnStatus` is
+ * the only resolver that exists for it; the IMS-name table is deleted, not relocated.
  */
 class MintsoftAsnStatusUnreadableError extends Error {
   readonly externalAsnId: string
@@ -208,12 +217,18 @@ class MintsoftAsnReceiptNotReconciledError extends Error {
   }
 }
 
-function requireMintsoftAsnReceiptState(asn: { externalAsnId: string; status: string | null }): {
+/**
+ * `asn.status` MUST BE A VALUE ONE OF THE MINTSOFT CONNECTOR'S ASN READERS PRODUCED — i.e. Mintsoft's own
+ * word about this ASN, or the marked unresolvable string one of those readers emits when Mintsoft's status
+ * fields do not resolve or do not agree. It is never an IMS `WmsAsnStatus` value; round 9's finding was
+ * precisely that one being accepted as if it were Mintsoft's.
+ */
+function requireMintsoftWireAsnReceiptState(asn: { externalAsnId: string; status: string | null }): {
   wmsStatus: WmsAsnStatus
   statusName: string
   receiptMayHaveHappened: boolean
 } {
-  const state = interpretMintsoftAsnReceiptState(asn.status)
+  const state = interpretMintsoftWireAsnStatus(asn.status)
   if (state.kind === 'unknown') {
     throw new MintsoftAsnStatusUnreadableError(asn.externalAsnId, state.detail)
   }
@@ -3472,8 +3487,9 @@ export async function createMintsoftPurchaseOrderAsn(
     kind: 'recovered' | 'created',
   ): Promise<FinalizedAsnOutcome> {
     // ROUND 8, BEFORE ANY WRITE: a status IMS cannot interpret refuses here, so nothing is recorded about
-    // an ASN whose receipt state is unknown. `requireMintsoftAsnReceiptState` has no permissive default.
-    const receiptState = requireMintsoftAsnReceiptState(createdAsn)
+    // an ASN whose receipt state is unknown. `requireMintsoftWireAsnReceiptState` has no permissive
+    // default, and (round 9) resolves Mintsoft's vocabulary only.
+    const receiptState = requireMintsoftWireAsnReceiptState(createdAsn)
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
@@ -4590,8 +4606,9 @@ export async function createMintsoftTransferAsn(
     kind: 'recovered' | 'created',
   ): Promise<FinalizedAsnOutcome> {
     // ROUND 8, BEFORE ANY WRITE: a status IMS cannot interpret refuses here, so nothing is recorded about
-    // an ASN whose receipt state is unknown. `requireMintsoftAsnReceiptState` has no permissive default.
-    const receiptState = requireMintsoftAsnReceiptState(createdAsn)
+    // an ASN whose receipt state is unknown. `requireMintsoftWireAsnReceiptState` has no permissive
+    // default, and (round 9) resolves Mintsoft's vocabulary only.
+    const receiptState = requireMintsoftWireAsnReceiptState(createdAsn)
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {

@@ -291,7 +291,7 @@ test('booked-in ASN lookup routes through the connector direct lookup by default
   const calls: string[] = []
   const asn: WmsAsnRef = {
     externalAsnId: 'ASN 77/2026',
-    status: 'OPEN',
+    status: 'NEW',
     lines: [],
     raw: null,
   }
@@ -331,13 +331,13 @@ test('booked-in ASN lookup can use the bulk lookup rollback flag', async () => {
   const bulkAsns: WmsAsnRef[] = [
     {
       externalAsnId: 'other-asn',
-      status: 'OPEN',
+      status: 'NEW',
       lines: [],
       raw: null,
     },
     {
       externalAsnId: 'ASN 77/2026',
-      status: 'BOOKED_IN',
+      status: 'COMPLETE',
       lines: [],
       raw: null,
     },
@@ -389,7 +389,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
     client.normalizeMintsoftAsnFetchByIdResult(' ASN 77/2026 ', {
       status: 200,
       data: {
-        Status: 'BOOKED_IN',
+        Status: 'COMPLETE',
         Lines: [
           {
             AsnLineId: 'line-1',
@@ -402,7 +402,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
     }),
     {
       externalAsnId: 'ASN 77/2026',
-      status: 'BOOKED_IN',
+      status: 'COMPLETE',
       lines: [
         {
           externalLineId: 'line-1',
@@ -419,7 +419,7 @@ test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback
         },
       ],
       raw: {
-        Status: 'BOOKED_IN',
+        Status: 'COMPLETE',
         Lines: [
           {
             AsnLineId: 'line-1',
@@ -437,7 +437,7 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
   assert.deepEqual(
     normalizers.normalizeMintsoftAsn({
       AsnId: 77,
-      Status: 'OPEN',
+      Status: 'NEW',
       Lines: [
         {
           AsnLineId: 7001,
@@ -457,7 +457,7 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
     }),
     {
       externalAsnId: '77',
-      status: 'OPEN',
+      status: 'NEW',
       lines: [
         {
           externalLineId: '7001',
@@ -490,7 +490,7 @@ test('normalizeMintsoftAsn accepts realistic create responses with explicit line
       ],
       raw: {
         AsnId: 77,
-        Status: 'OPEN',
+        Status: 'NEW',
         Lines: [
           {
             AsnLineId: 7001,
