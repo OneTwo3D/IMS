@@ -1140,6 +1140,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // discriminates between passwords while checking a credential ALTER ROLE cannot change. It is the
   // one entry here that opens a connection it deliberately never completes.
   'scripts/lib/pg-auth-request.mjs': 'protocol-handshake-only',
+  // o3d-noka. The cutover namespace library, found by this scan for exactly the reason
+  // db-fence-protected.sh below it is: open_root_owned_ancestry()'s prose names `pg_dump` while
+  // explaining WHAT the ancestry rule protects — the whole-database dump scripts/update.sh takes at
+  // the migration step, its publication and its prune. This file opens no connection and executes
+  // no SQL; the dump itself is a statement in scripts/update.sh. Rewording the explanation to dodge
+  // the detector would delete the reason the gate exists.
+  'scripts/lib/cutover-namespace.sh': 'names-the-tools-only',
   // o3d-secops r32. The shared library the three cutover entrypoints drive the connection fence
   // through. It EXECUTES no SQL of its own and opens no connection: every statement this subsystem
   // issues is in scripts/fence-db-connections.mjs, classified above, and this file only decides
