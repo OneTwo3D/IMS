@@ -41,11 +41,13 @@ import * as realTypes from '../lib/connectors/wms/types.ts'
 
 const ACME_SETTING_KEY = `plugin_${ACME_WMS_ID}_enabled`
 const MINTSOFT_SETTING_KEY = 'plugin_mintsoft_enabled'
+// o3d-remove-parked-connectors: `plugin_shopify_enabled` and `plugin_quickbooks_enabled` were here.
+// Both connectors are archived, so neither is a plugin id any more and the selection lock no longer
+// takes their rows. This list is spelled INDEPENDENTLY of the shipped derivation on purpose — that is
+// what makes the fixture-audit case below a real check — so it has to be edited when the id set does.
 const ALL_KEYS = [
   'plugin_woocommerce_enabled',
-  'plugin_shopify_enabled',
   'plugin_xero_enabled',
-  'plugin_quickbooks_enabled',
   MINTSOFT_SETTING_KEY,
   ACME_SETTING_KEY,
 ]

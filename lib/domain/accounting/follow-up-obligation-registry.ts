@@ -57,30 +57,44 @@ const XERO_RECOVERY: FollowUpObligationRecovery = { consumer: 'sweep' }
 // ---------------------------------------------------------------------------
 
 /**
- * QUICKBOOKS HAS THE CLAIM SIDE OF THE PROTOCOL AND NOT THE CONSUMER SIDE, and `blockedBy` names the
- * CURRENT blocker — not the one this codebase named for three rounds. o3d-s36z (realm isolation)
- * CLOSED on 2026-08-21 and unblocked nothing here: the remaining prerequisites are POST-TIME
- * AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION on the rows a consumer would create. See the block
- * at the end of lib/connectors/quickbooks/sync-processor.ts for the order of work.
+ * QUICKBOOKS HAD THE CLAIM SIDE OF THE PROTOCOL AND NOT THE CONSUMER SIDE, and `blockedBy` names the
+ * blocker as it stood when the connector was archived — not the one this codebase named for three
+ * rounds. o3d-s36z (realm isolation) CLOSED on 2026-08-21 and unblocked nothing here.
+ *
+ * o3d-remove-parked-connectors — WHY THIS ENTRY SURVIVES THE CONNECTOR.
+ *
+ * The connector is archived, so no row will ever CLAIM a new obligation on it. The entry is kept
+ * because the registry has a second job: `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` is what
+ * `buildFollowUpObligationBacklogWhere` selects on, and that backlog is the /sync/exceptions section
+ * "Accounting follow-ups owed, with nothing to re-drive them". Development databases hold SYNCED and
+ * FAILED `quickbooks` rows with a non-null `backReferenceFollowUpsPendingAt` right now. Deleting this
+ * entry would empty that query of its only population and take those rows off the one screen that
+ * lists them — turning a visible stranded obligation into an invisible one, which is precisely the
+ * failure this registry was written to prevent.
+ *
+ * It declares `consumer: 'none'`, which was true while it shipped and is more true now: there is no
+ * cron branch for it at all. The remedy is unchanged and still correct — READ AND ESCALATE, create
+ * nothing — with one addition: the connector is gone, so "nothing will come back for it" is now
+ * structural rather than a wiring gap.
  */
 const QUICKBOOKS_RECOVERY: FollowUpObligationRecovery = {
   consumer: 'none',
-  blockedBy: 'the QuickBooks back-reference repair sweep is not bound and no cron invokes it (o3d-8prh: '
-    + 'this connector does not enforce the connection/realm verdict at post time, and its follow-up rows '
-    + 'record no origin, so a re-enqueued payment could post to a different company)',
+  blockedBy: 'the QuickBooks connector was ARCHIVED (o3d-remove-parked-connectors), so there is no '
+    + 'processor, no repair sweep and no cron branch for it at all; before that, the sweep was already '
+    + 'unbound (o3d-8prh: the connector did not enforce the connection/realm verdict at post time, and '
+    + 'its follow-up rows record no origin, so a re-enqueued payment could post to a different company)',
   operatorRemedy: 'READ AND ESCALATE — DO NOT CREATE ANYTHING FOR THIS ROW, and in particular do not register a '
-    + 'payment. NOTHING will come back for it, but that does NOT establish that its follow-ups never ran (see '
-    + 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN), and reading QuickBooks first does NOT make creation safe: the '
-    + 'follow-ups are separate LOCAL queue rows and INVOICE_PAYMENT is enqueued BEFORE INVOICE_PDF, so this marker '
-    + 'survives a pass in which a payment is already sitting PENDING locally and has simply not executed yet. You '
-    + 'would read QuickBooks, see no payment, create one, and the queued row would post its own afterwards — its '
-    + 'request id cannot deduplicate a payment a human created, and a second payment against an invoice is not '
-    + 'undoable. The row is listed in the exception inbox under "Accounting follow-ups owed, with nothing to '
-    + 're-drive them" (/sync/exceptions): open the document in QuickBooks, record what is actually there — payment, '
-    + 'PDF, email, attachment — and hand that reading to accounting. Deciding what may be created requires the '
-    + "document's remaining local follow-up rows to be held or cancelled first, under one lock, which IMS does not "
-    + 'yet do (o3d-8prh) — so there is no self-service remedy here and this surface deliberately offers none. '
-    + 'Reading the document is safe to repeat as often as you like',
+    + 'payment. This row was written by a connector this build no longer ships (see docs/archive/), so NOTHING '
+    + 'will come back for it — but that does NOT establish that its follow-ups never ran (see '
+    + 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN), and reading the accounting package first does NOT make creation '
+    + 'safe: the follow-ups are separate LOCAL queue rows and INVOICE_PAYMENT is enqueued BEFORE INVOICE_PDF, so '
+    + 'this marker survives a pass in which a payment is already sitting PENDING locally and has simply not '
+    + 'executed yet. You would read the ledger, see no payment, create one, and the queued row would post its own '
+    + 'afterwards — its request id cannot deduplicate a payment a human created, and a second payment against an '
+    + 'invoice is not undoable. The row is listed in the exception inbox under "Accounting follow-ups owed, with '
+    + 'nothing to re-drive them" (/sync/exceptions): open the document in the accounting package, record what is '
+    + 'actually there — payment, PDF, email, attachment — and hand that reading to accounting. Reading the '
+    + 'document is safe to repeat as often as you like',
 }
 
 /**
@@ -110,7 +124,9 @@ export function followUpObligationRecoveryFor(connector: string): FollowUpObliga
     consumer: 'none',
     blockedBy: `no entry for connector "${connector}" in ACCOUNTING_FOLLOW_UP_RECOVERY, so nothing is known to `
       + 'read its retained markers back',
-    operatorRemedy: 'declare the connector in lib/domain/accounting/follow-up-obligation-registry.ts. Until then '
+    operatorRemedy: 'if this connector is one this build no longer ships, the row is historical — see docs/archive/ '
+      + 'for what was removed and when, and treat it exactly as below. Otherwise declare the connector in '
+      + 'lib/domain/accounting/follow-up-obligation-registry.ts. Until then '
       + 'treat any listed row as an UNKNOWN outcome, not an undone one: READ the document in the accounting '
       + 'package, record what is already present, and ESCALATE that reading. Do not create a payment, PDF or email '
       + 'from this surface — an absent document is not proof that nothing is queued to produce one, and on the '

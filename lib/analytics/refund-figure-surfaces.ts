@@ -147,6 +147,20 @@ export const RETURNS_MIXED_BASIS_NOTICE =
 // The inventory. Generated from the field-name sweep, then classified by hand, one file at a time.
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * o3d-remove-parked-connectors — FIVE ENTRIES WERE REMOVED WITH THE QUICKBOOKS CONNECTOR.
+ *
+ * `app/actions/quickbooks-{sync,daily-batch}.ts` and `lib/connectors/quickbooks/{daily-sync,
+ * payment-poller,settings}.ts`, all classified `not-refund-sensitive` ("ledger posting / out of scope
+ * by owner instruction"). `tests/analytics/refund-figure-surface-coverage.test.ts` refuses a STALE
+ * entry — one naming a file the tree no longer has — so they had to go in the same commit as the
+ * archive.
+ *
+ * THIS CENSUS IS NOT LEFT VACUOUS BY THAT: its population is every file in the tree that mentions a
+ * refund-sensitive figure name, the sweep is re-run from the tree on every test run, and 80-odd
+ * entries remain. What changed is only that the five QuickBooks files are no longer in the tree to
+ * classify.
+ */
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'app/(dashboard)/analytics/_components/sales-analytics-page-utils.ts',
@@ -310,20 +324,6 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Supplier aging net amount: consistent-net, with the return credit proved net rather than assumed.',
   },
   {
-    file: 'app/actions/quickbooks-daily-batch.ts',
-    figures: ['totalRevenue'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      'Ledger posting (and out of scope by owner instruction).',
-  },
-  {
-    file: 'app/actions/quickbooks-sync.ts',
-    figures: ['quickbooks_unearned_revenue_account'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      'Unearned-revenue account setting key (and out of scope by owner instruction).',
-  },
-  {
     file: 'app/actions/sales-stats.ts',
     figures: ['avgMarginPct', 'avgMarginPctBound', 'avgOrderValue', 'grossProfit', 'grossRevenue', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'netTotal', 'netTotalBasis', 'totalGrossProfit', 'totalGrossRevenue', 'totalNetRevenue'],
     treatment: 'basis-aware',
@@ -374,7 +374,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/accounting.ts',
-    figures: ['quickbooks_unearned_revenue_account', 'unearnedRevenueAccount', 'xero_unearned_revenue_account'],
+    figures: ['unearnedRevenueAccount', 'xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
     reason:
       'Unearned-revenue account resolution. Ledger account.',
@@ -385,27 +385,6 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     treatment: 'not-refund-sensitive',
     reason:
       'Not a figure: `revenueDeferredDate` is a TIMESTAMP marking that an order’s revenue recognition was deferred, and it appears in this file only inside the o3d-3zgy proof that the shipment-journal enqueue cannot race a hard delete. No refund line moves a date, and this file computes no revenue, profit or margin.',
-  },
-  {
-    file: 'lib/connectors/quickbooks/daily-sync.ts',
-    figures: ['proportionalRevenue', 'quickbooks_unearned_revenue_account', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenue', 'totalRevenueDeferred', 'unearnedRevenueAmount'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      'Ledger posting (out of scope by owner instruction).',
-  },
-  {
-    file: 'lib/connectors/quickbooks/payment-poller.ts',
-    figures: ['revenueDeferredDate'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      'Ledger deferral date (out of scope by owner instruction).',
-  },
-  {
-    file: 'lib/connectors/quickbooks/settings.ts',
-    figures: ['quickbooks_unearned_revenue_account'],
-    treatment: 'not-refund-sensitive',
-    reason:
-      'Account setting key (out of scope by owner instruction).',
   },
   {
     file: 'lib/connectors/woocommerce/sync/coupon-discount-backfill.ts',
@@ -454,7 +433,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     figures: ['revenueDeferredDate'],
     treatment: 'not-refund-sensitive',
     reason:
-      'o3d-c08y r2. It carries Group B’s SELECTION clause (of which revenueDeferredDate is one condition) and locks the cost layers the window references, so the batch can re-read its figures under the lock. It computes no figure and publishes none — the only thing it can cause is that a window is refused and retried next run. The figures Group B then posts are the ledger postings already declared under xero/daily-sync.ts and quickbooks/daily-sync.ts.',
+      'o3d-c08y r2. It carries Group B’s SELECTION clause (of which revenueDeferredDate is one condition) and locks the cost layers the window references, so the batch can re-read its figures under the lock. It computes no figure and publishes none — the only thing it can cause is that a window is refused and retried next run. The figures Group B then posts are the ledger postings already declared under xero/daily-sync.ts.',
   },
   {
     file: 'lib/domain/accounting/daily-batch-preview.ts',

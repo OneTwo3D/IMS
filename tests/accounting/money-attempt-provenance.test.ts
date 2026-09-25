@@ -212,8 +212,13 @@ test('the epoch, its settings key and its cache are GONE (o3d-0m56 r10)', async 
 
 test('every accounting sync row this codebase creates is created INSIDE custody (o3d-0m56 r10)', async () => {
   // A row created without custody can never be recycled again — safe, but it silently gives up the
-  // revival bookkeeping for that scope, and nothing in the types would say so. Seven creation sites
-  // exist; this is what stops the eighth being written without one.
+  // revival bookkeeping for that scope, and nothing in the types would say so. This is what stops the
+  // next one being written without one.
+  //
+  // o3d-remove-parked-connectors: the floor was 7 while the QuickBooks connector shipped three of the
+  // sites. It is lowered to the number the tree now holds. The floor is a VACUITY guard — it exists so
+  // a broken glob cannot make an empty walk look clean — not a claim about how many sites there ought
+  // to be, so lowering it with the population is correct; the `offenders` assertion below is the rule.
   const { globSync } = await import('node:fs')
   const files = globSync('lib/**/*.ts', { cwd: process.cwd() })
   const offenders: string[] = []
@@ -226,7 +231,7 @@ test('every accounting sync row this codebase creates is created INSIDE custody 
       if (!block.includes('stampingCustodyOnCreate()')) offenders.push(`${file}:${match.index}`)
     }
   }
-  assert.ok(sites >= 7, `expected the known creation sites, found ${sites}`)
+  assert.ok(sites >= 4, `expected the known creation sites, found ${sites}`)
   assert.deepEqual(offenders, [], 'every accountingSyncLog.create must spread stampingCustodyOnCreate()')
 })
 
@@ -276,7 +281,7 @@ test('the repair runs BEFORE either processor claims anything (o3d-0m56 r10)', a
   // difference between it and round 9's answer to the same question.
   for (const [file, entry] of [
     ['lib/connectors/xero/sync-processor.ts', 'export async function processPendingXeroSync()'],
-    ['lib/connectors/quickbooks/sync-processor.ts', 'export async function processPendingQuickBooksSync()'],
+    // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
   ] as const) {
     const text = await source(file)
     const start = text.indexOf(entry)

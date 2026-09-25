@@ -147,8 +147,9 @@ the transfer helper:
   only requires `totalValueBase = ROUND(qty * unitCostBase, 6)` — it **admits** a negative pair —
   and the evidence trigger at `:126` short-circuits on `NEW.qty <= 0` (`:131-133`) and only checks
   a `cogs_entries` row *exists*, never its sign.
-- **Both journals, and eight other accounting paths.** Still unguarded, and **not fixable without
-  the decision** (§4).
+- **The journal, and eight other accounting paths.** Still unguarded, and **not fixable without
+  the decision** (§4). (o3d-remove-parked-connectors: this said "both journals" when there were two
+  accounting connectors; the QuickBooks one is archived — item (e) — so there is one live journal.)
 
 ## 3. Question 2 — what does closing P1 `o3d-eiuo` require?
 
@@ -246,8 +247,8 @@ file:line re-read at this head.
 | b | Representation — movements/layers | `prisma/schema.prisma:859`, `:1009`, `:1012`; migration `20260602103000:108-121` | These **do** admit signed values (identity CHECK, not positivity). The decision is whether a signed `totalValueBase` is the representation or a credit gets its own movement/journal type. `cost_layers.unitCostBase` has no constraint of any kind |
 | c | Movement value | `lib/domain/inventory/stock-movement-value.ts` | Stop refusing (§5) and instead carry the sign: `unitCostBase = signedTotal / signedQty`, `totalValueBase = ABS(qty) × unitCostBase`. **`qty` must stay a magnitude** — a negative stored qty is a `critical` invariant finding (`invariants.ts:825`) and is separately barred by `stock_movements_qty_nonnegative`. Also decide the sibling's throw at `:59-61`, which would become inconsistent |
 | d | Xero journal | `lib/connectors/xero/daily-sync.ts:2104` and `:2144` | Post the pair **reversed** (credit COGS, debit Allocated Inventory) for a negative total, with `Math.abs`. Also `:1998`, where the precomputed-COGS consistency check is itself gated on `cogsBatchAmount > 0` and so goes vacuous, and the legacy fallback at `:2005` (`precomputedCogs.lte(0)`), which routes a negative precomputed COGS into the legacy allocation-consumption path |
-| e | QuickBooks journal | `lib/connectors/quickbooks/daily-sync.ts:1324` and `:1354`; vacuous checks at `:1224` and `:1229` | Identical change; both connectors must move together or the two ledgers diverge. **Still open after o3d-c08y r2:** QuickBooks Group B now reads its costs under the cost-layer lock (so it sees the committed value, not a stale one), but it has none of the o3d-sidy refusals — a negative basis is journalled with its COGS pair dropped and the shipment stamped |
-| f | **Both journals stamp their markers anyway** | `xero/daily-sync.ts:2151-2206`, subledger row at `:2199-2205` | When the COGS pair is dropped, `shipmentJournalDate`, `cogsBatchAmount`, `allocatedReliefAmount` and the `DISPATCH` subledger row are **still written**, so the batch is never retried and the loss is permanent |
+| e | QuickBooks journal — **ARCHIVED, NOT FIXED** | `archive/connectors/quickbooks/lib/connectors/quickbooks/daily-sync.ts:1324` and `:1354`; vacuous checks at `:1224` and `:1229` (tag `archive/quickbooks-connector`) | **No longer a live path** (o3d-remove-parked-connectors, #698): the processor is archived out of the built tree — excluded from `tsconfig` `exclude`, the eslint ignore list, the `tests/**` glob and the `check:*` scan roots — and neither cron route can reach it (`app/api/cron/accounting-sync/route.ts` has one executable arm, `xero`; `app/api/cron/accounting-daily-batch/route.ts` switches exhaustively over `DailyBatchSweepConnector` = `AccountingConnectorId` = `'xero'`). The defect is **not fixed, it travels with the archive**, and the archived copy never received o3d-c08y's probe→lock→read either: it has neither the o3d-sidy refusals nor the lock ordering. Tracked by **o3d-tedw**. A second accounting connector must satisfy this row before it is registered |
+| f | **The journal stamps its markers anyway** (and the archived QuickBooks copy did too) | `xero/daily-sync.ts:2151-2206`, subledger row at `:2199-2205` | When the COGS pair is dropped, `shipmentJournalDate`, `cogsBatchAmount`, `allocatedReliefAmount` and the `DISPATCH` subledger row are **still written**, so the batch is never retried and the loss is permanent |
 | g | **Shipment COGS revaluation** | `buildShipmentCogsRevaluationSyncPayload`, `lib/cost-layers.ts:59`, gates at `:79` (`oldCogs.gt(0)`) and `:85` (`newCogs.gt(0)`) | Worse than a skip. The `0.01` materiality test at `:69` uses `.abs()`, so the payload is **not** null. On a sign flip (+100 → −50) the reverse-old legs post and the repost-new legs never exist: the GL lands at 0 instead of −50. With both sides negative, `lines` is `[]`, the payload is still enqueued, and it dies at `lib/connectors/xero/journals.ts:157` (`'Journal has no non-zero lines'`) as a permanently failed sync row. Compounded twice: `:192-198` records the **full signed** delta into the COGS subledger (which accepts a signed `baseDelta`, `lib/domain/accounting/cogs-subledger-movement.ts:48-55`), and `:1174` makes the caller subtract the whole delta from its own retrospective journal, so the dropped portion posts nowhere. Callers: `landed-cost-service.ts:470`, `:1169`, `:1497`, `app/actions/manufacturing.ts:1570`. **Now REFUSED for an already-journaled shipment (o3d-c08y):** `refreshShipmentCogsForCostLayerChange` checks every affected shipment before writing, and if a journaled one would go below zero (or already is) it writes an ERROR activity entry on its own connection, aborts the enclosing transaction and throws `JournaledShipmentRevaluationRefusedError`. The whole revaluation rolls back — layer, snapshots, shipment COGS, PO line, and the freight-line edit when it came from the action — so the GL and the COGS subledger cannot disagree. The builder also throws on a negative side instead of dropping its legs. Signed support must remove both (search for that error name) and post the repost reversed with `Math.abs`, as `MANUFACTURING_RECLASS` does |
 | h | Supplier-return journal | `app/actions/purchase-orders.ts:2550` — `totalReturnedCostBase.gt(0.000001)` | Stock and layers are reduced and committed, but **no `INVENTORY_ADJUSTMENT` journal** (`:2552-2576`) and **no transit subledger row** (`:2581-2589`, inside the same `if`). The khdw transit reconciliation drifts by the return's value with nothing recording why |
 | i | Stock-adjustment journal | `buildInventoryAdjustmentJournal`, `lib/domain/inventory/stock-adjustment-apply.ts:33`; `Math.abs` at `:58`; direction from `qty` alone at `:70-77`; inputs at `:309-311` | The magnitude survives and the sign is discarded, while debit/credit comes solely from the quantity sign. A positive adjustment at −£4/unit posts **DR Inventory / CR write-off** when the correct entry is the reverse — a 2× error in the wrong direction against the cost-layer change it is meant to tie to |
@@ -272,7 +273,7 @@ migration.
 - **A journal that cannot be represented is not the worst case; one that posts the wrong way round
   is.** (i) already does this today, and (g) already under-posts. A reversed COGS pair posted with
   the wrong sign convention debits inventory and credits COGS on a *normal* batch if the
-  `Math.abs` and the line order are not changed together. Both connectors, both directions, and
+  `Math.abs` and the line order are not changed together. Both directions, and
   the retention/reconciliation readers (`lib/domain/accounting/cogs-gl-reconciliation.ts`) would
   need the same convention — the one already used at `manufacturing.ts:1678-1689`.
 - **A batch that nets to zero.** A window mixing a `+£100` and a `−£100` shipment currently emits
@@ -376,19 +377,22 @@ they overstated the cost of refusing. The truthful version:
   shipment below zero refuse instead; an UN-journaled shipment driven negative is still refused
   only later, by the daily batch (o3d-sidy).
 - **That hand-off to the daily batch needed the batch to read under the lock, which it did not.**
-  o3d-c08y round 2 (Codex HIGH, reproduced on a scratch database): both Group B implementations loaded
-  the shipment window — snapshots and `cogsBatchAmount` — and locked the referenced cost layers
-  afterwards, so a batch parked on that lock resumed from its stale POSITIVE copy, journalled it and
-  stamped `shipmentJournalDate`, and the o3d-sidy refusal never saw the committed negative. Both
-  batches now probe ids, lock (`lib/domain/accounting/daily-batch-group-b-lock.ts`), then read; the
-  closure — that nothing they compute from escapes the locked set — is asserted, not argued.
-  **QuickBooks residual:** it now reads the committed value like Xero, but it still has NONE of the
-  three refusals (they were built for Xero only), so a negative basis reaching it is journalled with
-  its COGS pair dropped — items (e) and (f) above, unchanged.
+  o3d-c08y round 2 (Codex HIGH, reproduced on a scratch database): Group B loaded the shipment window —
+  snapshots and `cogsBatchAmount` — and locked the referenced cost layers afterwards, so a batch parked
+  on that lock resumed from its stale POSITIVE copy, journalled it and stamped `shipmentJournalDate`,
+  and the o3d-sidy refusal never saw the committed negative. It now probes ids, locks
+  (`lib/domain/accounting/daily-batch-group-b-lock.ts`), then reads; the closure — that nothing it
+  computes from escapes the locked set — is asserted, not argued. The helper is connector-agnostic and
+  lives outside `lib/connectors/`, so a second connector inherits the ordering by calling it.
+  **On QuickBooks:** round 2 also gave the QuickBooks batch this ordering, and o3d-c08y round 3 REMOVED
+  that change rather than carrying it, because #698 archived the processor before the branch merged.
+  Neither the ordering nor the o3d-sidy refusals exist in the archived copy, and no live path reaches
+  it — item (e) above, and o3d-tedw.
 
 ### What is gained by waiting
 
-The change touches both connectors' journal sign conventions plus eight further accounting paths,
+The change touches the journal's sign conventions (one connector since o3d-remove-parked-connectors —
+it was two) plus eight further accounting paths,
 which is the most expensive kind of mistake in this codebase to make quietly — and it now also
 requires a **migration** relaxing validated CHECK constraints on `inventory_snapshots` (§4.1),
 which is not a change to make as a rider on a narrow sign fix. The gap is real but bounded, it is

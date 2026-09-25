@@ -23,15 +23,16 @@ import test, { mock } from 'node:test'
  * The recalc had already subtracted the whole -10.00 as "shipment-owned", so it posted NOWHERE.
  * `FOR UPDATE` re-reads the row it locks, but Group B selected only `id`.
  *
- * THIS FILE drives the REAL `runDailyBatchSync` for BOTH connectors against doubles, and expresses the
+ * THIS FILE drives the REAL `runDailyBatchSync` for EVERY REGISTERED connector against doubles (one
+ * today — see the registry-derived matrix assertion below), and expresses the
  * interleaving exactly where it happens: the double flips its stored snapshot from +4.00 to -6.00 WHEN
  * THE COST-LAYER LOCK STATEMENT IS ISSUED — i.e. it models the revaluation committing while the batch
  * waits on that lock, which is what was observed. A batch that reads before locking therefore sees
  * +4.00 and a batch that reads after locking sees -6.00, and the two are distinguishable in the
  * journal it writes.
  *
- * It is a WIRING test as well as a behaviour one: the probe/lock/read helper proves nothing unless both
- * batches call it in that order, and a unit test of the helper alone would have passed throughout the
+ * It is a WIRING test as well as a behaviour one: the probe/lock/read helper proves nothing unless the
+ * batch calls it in that order, and a unit test of the helper alone would have passed throughout the
  * whole period this defect existed. The ORDER of the three statements is asserted, not just that they
  * all happened.
  */
@@ -180,18 +181,6 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({
-      quickbooks_sync_enabled: 'true',
-      quickbooks_sales_account: '200',
-      quickbooks_unearned_revenue_account: '830',
-      quickbooks_inventory_account: '630',
-      quickbooks_allocated_inventory_account: '631',
-      quickbooks_cogs_account: '310',
-    }),
-  },
-})
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/activity-log', {
   namedExports: { logActivity: async (params: Record<string, unknown>) => { world.activity.push(params) } },
@@ -229,12 +218,30 @@ mock.module('@/lib/domain/accounting/cogs-subledger-movement', {
   },
 })
 
-// Both connectors run the ordering and stale-value tests; what they do with the reloaded NEGATIVE
-// basis differs, so that is asserted per connector below rather than parameterised here.
+// EVERY registered accounting connector runs the ordering and stale-value tests; what a connector does
+// with the reloaded NEGATIVE basis differs, so that is asserted per connector below rather than
+// parameterised here.
+//
+// o3d-remove-parked-connectors: QuickBooks was the second entry and is archived out of the built tree
+// (archive/connectors/quickbooks/, tag archive/quickbooks-connector), so there is one entry today. The
+// roster is ASSERTED against the registry below rather than trusted — a one-element matrix that quietly
+// became a zero-element one would make every `for (const connector of CONNECTORS)` test below vanish
+// without a single failure, and a connector added back without an entry here would be untested.
 const CONNECTORS = [
   { name: 'xero', load: () => import('@/lib/connectors/xero/daily-sync') },
-  { name: 'quickbooks', load: () => import('@/lib/connectors/quickbooks/daily-sync') },
 ] as const
+
+test('o3d-c08y r2: the connector matrix below covers EVERY registered accounting connector', async () => {
+  // DERIVED from the registry, never typed: if `ACCOUNTING_CONNECTORS` grows, this fails until the new
+  // connector is driven through the probe->lock->read assertions too.
+  const { ACCOUNTING_CONNECTORS } = await import('@/lib/connectors/accounting-registry')
+  assert.ok(ACCOUNTING_CONNECTORS.length > 0, 'PRECONDITION: the registry lists at least one connector')
+  assert.deepEqual(
+    CONNECTORS.map((connector) => connector.name).slice().sort(),
+    ACCOUNTING_CONNECTORS.map((connector) => connector.id).slice().sort(),
+    'every registered accounting connector must be driven by this file, and nothing archived may be',
+  )
+})
 
 type JournalLine = { accountCode: string; debit?: number; credit?: number }
 const groupB = () => world.created.filter((entry) => entry.type === 'DAILY_BATCH_GROUP_B')
@@ -322,24 +329,22 @@ test('xero Group B REFUSES the order on the reloaded negative basis: nothing sta
   assert.equal(logged[0].level, 'ERROR')
 })
 
-test('quickbooks RESIDUAL, recorded rather than implied: it reloads the committed basis but has no negative-basis refusal', async () => {
-  // o3d-sidy added the negative-basis refusals to the XERO batch only; the QuickBooks batch still drops
-  // a negative COGS pair under its `> 0` gate (docs/todo/negative-basis-cost-layers-decision.md item
-  // (e)) and stamps the shipment anyway (item (f)). This round did not change that — it is deliberately
-  // out of scope (QuickBooks is not taking new work) — and this test pins what QuickBooks DOES now do,
-  // so the gap is a recorded expectation instead of a surprise: it posts the committed -6.00 basis
-  // (i.e. no COGS line), never the stale +4.00.
-  reset()
-  const { runDailyBatchSync } = await import('@/lib/connectors/quickbooks/daily-sync')
-
-  const result = await runDailyBatchSync()
-
-  assert.deepEqual(result.errors, [], 'QuickBooks raises no refusal today — the gap this test records')
-  const [journal] = groupB()
-  assert.ok(journal, 'it still writes its batch journal')
-  assert.match(String(journal.payload.narration), /COGS £-6\.00/, 'from the RELOADED basis, not the stale 4.00')
-  assert.deepEqual(cogsDebit(), [], 'with the negative COGS pair dropped by its `> 0` gate (decision-doc item (e))')
-})
+// THE QUICKBOOKS RESIDUAL TEST WAS HERE, AND IS DELETED RATHER THAN PORTED (o3d-c08y r3).
+//
+// It pinned what QuickBooks Group B did with a reloaded NEGATIVE basis: no refusal, the negative COGS
+// pair dropped by its `> 0` gate and the shipment stamped anyway (decision-doc items (e)/(f)), which was
+// the Codex HIGH on ff613aa3. o3d-remove-parked-connectors (#698) archived that processor out of the
+// built tree, so there is no longer a live path by which a negative cost basis can reach QuickBooks
+// Group B: `app/api/cron/accounting-sync/route.ts` has one executable arm (`xero`) and
+// `app/api/cron/accounting-daily-batch/route.ts` switches exhaustively over `DailyBatchSweepConnector`
+// = `AccountingConnectorId` = `'xero'`. Keeping the test would have meant importing
+// `archive/connectors/quickbooks/...`, i.e. re-attaching an archived connector to the live test matrix
+// to pin a defect that can no longer be reached.
+//
+// The defect itself is NOT fixed — it travels with the archive. o3d-tedw stays open and the archive tag
+// message names it. If a QuickBooks (or any second) connector is ever un-archived, the registry-derived
+// matrix assertion above fails until it is driven through these tests, and the negative-basis refusal
+// o3d-tedw describes has to be written before it can pass them.
 
 for (const connector of CONNECTORS) {
   test(`${connector.name} Group B refuses the window when the reloaded data references a cost layer it did not lock`, async () => {

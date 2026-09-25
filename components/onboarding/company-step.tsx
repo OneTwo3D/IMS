@@ -319,7 +319,7 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
         <div>
           <h3 className="text-sm font-medium">Public App URL</h3>
           <p className="text-xs text-muted-foreground mt-1">
-            Used for Xero and QuickBooks callbacks, webhooks, and scheduled jobs.
+            Used for accounting callbacks, webhooks, and scheduled jobs.
           </p>
         </div>
         <div className="space-y-1.5">

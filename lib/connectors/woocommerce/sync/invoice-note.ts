@@ -1,6 +1,6 @@
 /**
  * Push accounting invoice metadata to a WooCommerce order.
- * This is a shopping channel concern — Shopify would have its own equivalent.
+ * This is a shopping channel concern — a second storefront has its own equivalent.
  */
 
 import { db } from '@/lib/db'

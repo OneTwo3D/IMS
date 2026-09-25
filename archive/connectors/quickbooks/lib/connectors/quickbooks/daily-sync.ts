@@ -36,11 +36,6 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import {
-  assertGroupBSnapshotsWereLocked,
-  DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
-  lockCostLayersForGroupBWindow,
-} from '@/lib/domain/accounting/daily-batch-group-b-lock'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
@@ -262,6 +257,16 @@ async function createPendingSyncLog(
   // o3d-o97 r3: parity with the Xero batch — the row's own id, so a caller can record a
   // journal's identity rather than only the amount it carried.
   return log.id
+}
+
+async function lockCostLayers(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
+  )
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
@@ -893,24 +898,16 @@ export async function runDailyBatchSync(): Promise<{
     // o3d-4ajo: a lost lock means another job can already be running.
     batchLock.assertHeld('Group B (shipment revenue + COGS)')
     const groupBCount = await db.$transaction(async (tx) => {
-      // o3d-c08y r2 (Codex HIGH): PROBE -> LOCK -> READ, the same ordering as the Xero batch and
-      // through the same helper. Reading the snapshots before locking the cost layers they reference
-      // let a landed-cost revaluation commit a negative basis in the window and be posted from the
-      // stale positive copy; the real read below also revalidates status under the lock. See
-      // lib/domain/accounting/daily-batch-group-b-lock.ts.
-      const candidates = await tx.shipment.findMany({
-        where: DAILY_BATCH_GROUP_B_SHIPMENT_WHERE,
-        select: { id: true, orderId: true, lines: { select: { costLayerSnapshot: true } } },
-        orderBy: { createdAt: 'asc' },
-      })
-      if (candidates.length === 0) {
-        return 0
-      }
-      const candidateShipmentIds = candidates.map((row) => row.id)
-      const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates })
-
       const shipments = await tx.shipment.findMany({
-        where: { ...DAILY_BATCH_GROUP_B_SHIPMENT_WHERE, id: { in: candidateShipmentIds } },
+        where: {
+          status: 'SHIPPED',
+          shipmentJournalDate: null,
+          order: {
+            refundStatus: { not: 'FULL' },
+            revenueDeferredDate: { not: null },
+            inventoryAllocatedDate: { not: null },
+          },
+        },
         select: {
           id: true,
           orderId: true,
@@ -999,14 +996,12 @@ export async function runDailyBatchSync(): Promise<{
         }),
       ])
 
-      // o3d-c08y r2: the locks were taken above, before any of this was read; this asserts the closure
-      // that makes it sound (see the Xero batch and the helper's module comment).
-      assertGroupBSnapshotsWereLocked(lockedCostLayerIds, [
-        { what: 'the shipment lines it would post', rows: shipments.flatMap((shipment) => shipment.lines) },
-        { what: 'the order allocations it would consume from', rows: orderAllocations },
-        { what: 'the already-journaled shipment lines it nets against', rows: priorShipmentLines },
-        { what: 'the refund lines it nets against', rows: priorRefundLines },
-      ])
+      const referencedCostLayerIds = Array.from(new Set(
+        orderAllocations.flatMap((allocation) => (
+          parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
+        )),
+      ))
+      await lockCostLayers(tx, referencedCostLayerIds)
       const graph = await loadFulfillmentProductGraph(
         tx,
         Array.from(new Set(

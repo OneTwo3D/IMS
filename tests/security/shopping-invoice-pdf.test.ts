@@ -12,6 +12,7 @@ import {
   parseShoppingInvoicePdfRequest,
   signShoppingInvoicePdfRequestBody,
 } from '../../lib/shopping-invoice-pdf.ts'
+import type { ShoppingConnectorId } from '../../lib/connectors/shopping-registry.ts'
 
 const SECRET = 'shopping-invoice-secret'
 const WEBHOOK_SECRET = 'webhook-secret'
@@ -57,8 +58,13 @@ test('shopping invoice PDF requests parse only for matching connector and curren
   if (guestParsed.valid) {
     assert.equal(guestParsed.request.externalOrderKey, 'wc_order_key_123')
   }
+  // o3d-remove-parked-connectors: this used to name 'shopify', the second REGISTERED connector.
+  // With one connector registered the only way left to prove the connector is actually CHECKED
+  // (rather than the body's own field being trusted) is an id the union does not contain. The
+  // property is the same one — a signed link minted for one connector must not open another's
+  // invoice — but the subject is weaker, and the archive note records that.
   assert.deepEqual(
-    parseShoppingInvoicePdfRequest(body, 'shopify', { now: NOW }),
+    parseShoppingInvoicePdfRequest(body, 'another-connector' as unknown as ShoppingConnectorId, { now: NOW }),
     { valid: false, reason: 'connector_mismatch' },
   )
   assert.deepEqual(

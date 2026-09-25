@@ -1007,7 +1007,7 @@ Create `/var/lib/one-two-inventory/invoice-pdfs` during deployment with the same
 owner as the IMS application process and restrictive permissions, for example
 `chown app:app /var/lib/one-two-inventory/invoice-pdfs` and
 `chmod 750 /var/lib/one-two-inventory/invoice-pdfs`. Connector PDFs are usually
-re-fetchable from Xero or QuickBooks, so they do not need the same backup policy
+re-fetchable from the accounting connector, so they do not need the same backup policy
 as the database, but include the directory in operational snapshots if customer
 invoice links must remain available during connector outages. Plan disk capacity
 for roughly 50-500 KB per invoice PDF; 100,000 invoices can consume about
@@ -1260,7 +1260,7 @@ Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the reques
 
 ### Integrations
 
-For each connected integration (WooCommerce, Xero, Shopify, QuickBooks, Mintsoft):
+For each connected integration (WooCommerce, Xero, Mintsoft):
 
 - [ ] Credentials configured.
 - [ ] **Connection test passes** — the connection test gate blocks sync until you click "Test Connection" successfully. Verify by visiting Sync > {Integration} and looking for the green "Connected" badge.
@@ -2466,7 +2466,7 @@ So the precedence is inverted, and it is one rule for every privileged artefact:
 | artefact | which source decides | `APP_DIR/.env` / the checkout |
 | --- | --- | --- |
 | the four identity values | `db-fence-identity.env` whenever it exists | read only to be **compared**; a mismatch is a refusal at **both** adoption call sites |
-| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
+| the fence script **and its imports** | `/etc/ims-cutover-recovery/app/`, a root-owned, wholly digested tree, and the only thing **executed** — since o3d-xi3w that name is a symbolic link into the versioned directory one publication commits | published into the protected path **once**, never run in place, and its dependency closure copied rather than linked — see r31 and r32 below |
 | `DEPLOY_ADMIN_DATABASE_URL` | the **root invocation** | fills in only when the invocation is silent; a disagreement is announced |
 | the environment snapshot | the root-owned `zz-` drop-in, which systemd loads **last** | overridden by it for the length of one cutover |
 | the fence state file | the database itself, cross-checked against the record | app-writable by necessity — `--fence` refuses to re-apply a state whose `database` is not the one the connection is attached to |
@@ -2591,7 +2591,7 @@ deployment. There are three sources and they are not interchangeable:
    release checksums, and it is what the operator passes as `IMS_FENCE_ARTEFACT_SHA256` on every
    target that needs one.
 2. **A host that has already published this release.**
-   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/db-fence-artefact.sha256` there.
+   `grep '^fence_artefact_sha256=' /etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` there.
 3. **`--print-fence-digest` or `--dry-run` on the target itself — for comparison only.** Either
    prints the same line, assembled
    from the checkout under question, so it can **confirm** the release's value and can never stand
@@ -2611,15 +2611,91 @@ run somewhere that is *not* the machine being deployed, or the checksum publishe
 Deriving it on the target would authenticate the checkout against itself, and nothing computed from
 `APP_DIR` can authenticate `APP_DIR`. (That command is given inline rather than as a copy-pasteable
 block on purpose: it is a step for a workstation, not for the machine mid-cutover.)
-The **whole artefact** — the entry file and the vendored dependency closure — is then assembled at
-`/etc/ims-cutover-recovery/.app.staged`, which only root can write; it is sealed (ownership and
-modes), checked (nothing but regular files and directories), digested **from that staged tree**,
-and only then renamed into place, with the previous tree moved aside rather than deleted so a
-failure between the two renames leaves the *old* artefact standing rather than none. The tree that
-was verified is the tree that is published, and the checkout is never read again after the copy. A
+The **whole artefact** — the entry file and the vendored dependency closure — is then assembled in a
+directory of that publication's own, `/etc/ims-cutover-recovery/.publish-fence.<pid>.<rand>`, which only
+root can write; it is sealed (ownership and modes), checked (nothing but regular files and directories),
+digested **from that staged tree**, given its digest record and manifest *inside* that directory, made
+durable, renamed to `.version-fence.<pid>.<rand>`, and committed by flipping one symbolic link —
+`/etc/ims-cutover-recovery/app` — onto it with a single `rename(2)`. The tree that was verified is the
+tree that is published, and the checkout is never read again after the copy. **One name per run and one
+rename to commit** is what closed o3d-xi3w: the staging and retirement names used to be one per *kind*, so
+a second privileged run could empty and refill the first run's staging tree between the instant it
+assembled it and the instant it hashed it (measured: a run that had matched `IMS_FENCE_SCRIPT_SHA256`
+against its own entry file published the other run's, and recorded the digest of the one it had checked);
+and the previous sequence moved the standing tree aside *before* renaming the new one in, so the
+documented name did not exist in between — and `mv src dst` with `dst` an existing **directory** moves
+src *inside* it and returns **success**, which left one publication's whole tree nested one level down
+inside the other's with both runs reporting that they had published. Neither is reachable now: the
+documented name is a symbolic link that is replaced in one operation, and every rename this library makes
+passes `-T`, which refuses a directory destination outright. The full argument is above
+`_fence_publish_unwind()` in `scripts/lib/db-fence-protected.sh`, and so is the rule that **a rollback
+never destroys the only usable artefact** (o3d-xi3w r4): the one migration moves a legacy directory to
+`/etc/ims-cutover-recovery/.retired-fence.<pid>.<rand>`, and if the pointer creation or the commit rename
+then fails, that name is deleted **only** when the artefact is back where it was — proved by the rename's
+own status — or when the documented name holds a committed replacement that is sealed and hashes to its
+own record. Otherwise it is **kept**, and the refusal names its path with the command that puts it back.
+It used to be deleted unconditionally, one line after a restore whose status was discarded, so a restore
+that failed left the documented name absent and the legacy artefact gone. A
 rotation also moves `fence_script_sha256` in the recovery record with the file it names; leaving it
 behind would make every subsequent run refuse, and a rotation that bricks the mechanism is not a
 rotation.
+
+**And that record is bound to whatever is standing, by compare-and-swap** (o3d-xi3w r3). The flip commits
+a whole versioned tree in one `rename(2)`, but `fence_script_sha256` lives in
+`/etc/ims-cutover-recovery/db-fence-identity.env`, outside it — so it used to be written *after* the flip
+from a digest read *before* it, and two publishers interleaved: A commits A, B commits B and records B's
+digest, A then records the digest it was still holding. The pointer names one publication and the record
+names another, and `db_fence_script_in_use()` then refuses to execute the artefact that is standing — an
+outage of the fence itself, on a box where nothing is wrong with either tree. A publisher **killed**
+between its flip and that write leaves exactly the same state, with no concurrency at all. Both were
+measured before the fix, and two consecutive later runs repaired neither.
+
+What the record says now is *what is standing*, never *what this run published*: each attempt reads the
+pointer, takes the entry digest out of the **versioned directory** it names (an immutable path), writes
+it, and reads the pointer again — if it has moved, the write was stale and the attempt is made once more
+against the publication that is standing now. A run whose own publication was superseded therefore binds
+the **winner's** digest and reports a lost race instead of a rotation. Nothing is adopted that does not
+authenticate itself: the digest is taken only from a tree that is sealed and hashes to what its own
+record beside it binds. And a run that **publishes nothing** repairs a record it finds stale before it
+decides anything else, which is what makes the killed-publisher state recoverable without an operator —
+except while a fence is standing, where the repair is refused for the same reason a rotation is.
+
+**And while a fence stands, the record names the publication that RAISED it — and the release resolves
+through that, not through the pointer** (o3d-xi3w r4). This is the invariant the whole mechanism is held
+to, stated once above `_fence_bind_record_to_standing()`:
+
+* **while a fence stands**, `/etc/ims-cutover-recovery/db-fence-identity.env` names the raising
+  publication by `fence_script_version` as well as by `fence_script_sha256`, and every run that resolves
+  the fence helper is bound to **that** publication;
+* **while no fence stands**, it names what the pointer names, and a run that finds otherwise rebinds it
+  itself.
+
+Three properties make the first clause true. The record carries the **version**, so a publication that
+commits after the raise cannot change which tree the release runs — before this it could, and did:
+measured, a publication landing between the raise's resolution and its authority made the release execute
+*another release's* entry file with this fence's grantee list, and when the two digests disagreed instead,
+the fence could not be released at all, because the repair is refused while a fence stands. The raise
+**binds that record and publishes the authority inside one critical section**, held on
+`/etc/ims-cutover-recovery/db-fence-record.lock`, and every other writer of those two lines takes the same
+lock and refuses under it while an authority is present — so a stale write either lands before the raise
+binds, and is overwritten by it, or does not land at all. And the **sweep keeps** the version a standing
+fence's record names, because the pointer has moved on, that publisher is long gone and nothing in the
+tree is open, so every other question the sweep asks says "take it".
+
+The lock is `flock(2)`, opened read-only on a root-owned `0600` file in the recovery root. It is
+admissible where r3 refused a lock because the **kernel** releases it when the holder's last descriptor
+closes, including on `SIGKILL` and on a power cut: there is no file for an operator to remove and no
+liveness test to get wrong, and a bounded wait makes a wedged peer a refusal rather than a hang. Stated
+plainly: a record written by a release older than this one carries no version, and the resolution then
+falls back to the pointer **and the digest check**, which is exactly what those installations did before.
+A **pre-pointer installation** is no longer one of those cases: since r5 its fence operations execute out
+of an adopted versioned directory (below), so a fence raised there records a version like any other.
+
+And the record a **raise** writes carries the digest of the artefact **that operation is pinned to**, not
+of whatever `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` resolves to at the instant it
+is hashed: a cutover is bound to one publication at its first resolution and raises the fence with that
+one, so a record naming any other would mean a later run releasing that fence with a different release's
+helper.
 
 A rotation republishes **both halves together** — a new entry file and a freshly resolved closure —
 which is the only way the vendored packages ever move. The consequence, stated because it is a real
@@ -2633,11 +2709,90 @@ Two more properties of the rotation:
 * it is **refused while a fence may be standing** (`db-connect-fence.json` exists). The helper that
   raised a fence is the helper that must release it, from a record the raise wrote; swapping
   versions across that pair is how a release stops meaning what the fence meant.
-* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (the whole
-  tree, since r32 — removing only the entry file leaves a vendored closure the next publication
-  would have to reconcile). Only root can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
+* the **second rotation path is root itself**: remove `/etc/ims-cutover-recovery/app` (since r32 the
+  whole artefact, not just the entry file — removing only the entry file leaves a vendored closure the
+  next publication would have to reconcile; since o3d-xi3w that name is a symbolic link, so this removes
+  the pointer and the versioned directory it named is reaped by the next publication's sweep). Only root
+  can, and the next run bootstraps. It is the escape hatch for a box whose expected digest has been lost, and it is
   deliberately an act at the console rather than a flag. Do it only with no fence standing — with a
   record present and the copy gone, every run refuses by design.
+
+**What is executed is the versioned directory, and one fence operation executes exactly one of them.**
+Making the *publication* atomic left the *resolution* naming a mutable object: `db_fence_script_in_use()`
+authenticated the standing artefact and handed back a path **through** the pointer, and the caller then
+gave that string to `node` with `DEPLOY_ADMIN_DATABASE_URL` beside it. A concurrent publisher's flip lands
+between the two (measured: an invocation that pinned `IMS_FENCE_ARTEFACT_SHA256`, matched it and returned
+0 then executed a *different release's* entry file), and raising a fence is not one invocation — each
+entrypoint resolves the helper seven times across a cutover, and two of those ran different releases. So
+the resolution now seals, digests and authenticates the **versioned directory** and hands back
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/app/scripts/fence-db-connections.mjs`, which nothing
+writes into after its publication renamed it there; and it records which publication this operation is
+bound to in `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>`, so every later invocation of the
+same operation resolves to that one and not to a newer one. The pin is a file rather than a shell variable
+because it has to be: every caller resolves the helper inside a command substitution, and a value assigned
+there dies with the subshell. Its name carries the operation's pid **and** the start time `/proc` reports
+for that pid, so a marker left by a dead run whose pid has been reused is not mistaken for this one's; the
+sweep reaps it when its holder is gone, and never reclaims a version a live holder names. The deploy driver's own
+snapshot answers the same question a different way, by resolving its pointer once at entry and holding the
+descriptor it is already reading from. A pin cannot skip a check: it selects a candidate, and the seal, the record
+beside the tree, the tree's own digest, `IMS_FENCE_ARTEFACT_SHA256` and the entry digest the recovery
+record binds are then all checked against **that** tree.
+
+**And a pre-pointer installation is *adopted*, not followed** (o3d-xi3w r5). On a box no pointer-era
+release has published to, `/etc/ims-cutover-recovery/app` is not a pointer — it is the tree, a real
+directory at a well-known name, and a well-known name is a mutable object. Measured: a run authenticated
+that tree completely (seal, record beside the tree, tree digest, entry digest), returned the path, and
+then executed a *concurrent publisher's* helper with `DEPLOY_ADMIN_DATABASE_URL` beside it, because that
+publisher had performed the one migration in between and the same string now resolved through its pointer.
+The re-read after the pin cannot help; a replacement that lands after it is exactly the case.
+
+So the resolution never hands that name back. Before it pins anything it gives the operation its own
+`/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` directory whose files are **hard links to the
+standing tree's own inodes**, with the legacy `db-fence-artefact.sha256` and `.manifest` copied in beside
+them, and everything after that is about a name no other run can hold. Three things this is *not*, each
+deliberate:
+
+* it is **not a migration**. `rename(2)` will not put a symbolic link over a non-empty directory, so
+  publishing a legacy tree into a version must *move* the only artefact on the box — and a power cut in
+  the interval where the documented name does not exist leaves a standing fence with no helper to release
+  it by, which is the worst state this mechanism has. The adoption moves nothing and deletes nothing
+  outside its own staging name, so it has no unwind and a kill at any instant leaves only residue the
+  sweep reaps. The one migration stays where it belongs: in the next **authenticated** publication.
+* it is **not a publication**. Nothing is written at the documented name, the legacy record beside it is
+  left alone, and the box stays pre-pointer until a real publication migrates it. Nothing therefore has to
+  be *authenticated* that this path cannot authenticate — a migration would put bytes at the documented
+  name that no invocation pinned, which the publication refuses to do by design.
+* it is **not a copy**. `--link` means the adopted tree is a second *name* for the same inodes, so there
+  are no second bytes to prove equal to the first. Only root can write the recovery root and no path in
+  the library ever writes *into* a standing tree — a publication renames it aside and then deletes it, and
+  a delete unlinks — so the concurrent publisher that used to substitute these bytes cannot reach them at
+  all. `db_fence_script_in_use()` still asks every question it asked before, of the adopted directory.
+
+It is **made durable before it takes its version name**, and that ordering is the point (found by the
+review of this round). The first draft took no barrier at all, on the argument that nothing outside the
+operation ever names the directory — which is wrong by one step: the **raise** writes the version into
+`db-fence-identity.env`, durably, so a power cut could leave a standing fence naming a version that exists
+with files missing, and every later resolution would find it, fail its digest check and refuse. A version
+that does not exist at all degrades to the pointer and is harmless; one that half exists is not. So the
+whole tree is flushed (`sync --file-system`, because `sync <dir>` flushes one directory entry and the tree
+has nested ones) *before* the rename that gives it a name a record could hold, a barrier that cannot be
+taken is a refusal with the staging tree removed, and the flush of the name *after* the rename is not a
+refusal — the directory is complete by then and declining to fence over it would be the worse trade. The
+publication's own tree barrier was widened the same way in the same change.
+
+The adopted directory is an ordinary `.version-fence.<pid>.<rand>`: the sweep keeps it while its pid is
+alive, while a pin names it and while a standing fence's record binds it, and reaps it afterwards. One
+consequence is the point — a fence **raised** on such a box now records a `fence_script_version`, so
+clause (A) of the invariant above holds there instead of falling back. `--dry-run` and
+`--print-fence-digest` are unaffected: they resolve without a pin, they never adopt, and they still write
+nothing.
+
+The operator wrappers are the deliberate exception and check the **documented** name against the digest
+this operation was pinned to. They are run by hand after the cutover process has exited, so a versioned
+path baked into one could name a publication the sweep has since reclaimed — a recovery route that
+evaporates — while the digest is what stops one release raising a fence and another releasing it: if
+anything published in between, the wrapper refuses and says the artefact has changed since the fence was
+raised.
 
 **One mechanism, three entrypoints.** The rule now lives in `scripts/lib/db-fence-protected.sh`,
 sourced by `install.sh`, `update.sh` and `deploy.sh`, and no entrypoint has fence-helper resolution
@@ -2706,11 +2861,14 @@ exactly, and it is **copied**, root-owned, into the mirror:
 
 | path | what it is |
 | --- | --- |
+| `/etc/ims-cutover-recovery/app` | a **symbolic link** to `.version-fence.<pid>.<rand>/app`, and the single mutable object of a publication (o3d-xi3w) |
+| `/etc/ims-cutover-recovery/.version-fence.<pid>.<rand>/` | one publication, complete and immutable: the tree, its record and its manifest together. **This is what is executed**; the pointer is only how the first invocation of an operation finds it |
+| `/etc/ims-cutover-recovery/.inuse-fence.<pid>.<start time>` | one **fence operation's pin**: a symbolic link naming the publication that operation resolved. Every later invocation of that operation is bound to it, and the sweep will not reclaim a version a live holder names (o3d-xi3w) |
 | `/etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs` | the only file executed |
 | `/etc/ims-cutover-recovery/app/node_modules/pg/…` | a real root-owned directory, not a link |
 | `/etc/ims-cutover-recovery/app/node_modules/pg-protocol/…` etc. | …and the rest of the resolved closure (13 packages, ~140 files) |
-| `/etc/ims-cutover-recovery/db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to |
-| `/etc/ims-cutover-recovery/db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` | what the tree hashes to, and what the entry file hashes to. Named **through the pointer**, so it is always the record of the artefact that is standing: the kernel resolves `..` from the directory the link landed in, and one rename therefore commits the tree and its record together |
+| `/etc/ims-cutover-recovery/app/../db-fence-artefact.manifest` | per-file digests, so a mismatch can name the file |
 | `/etc/ims-cutover-recovery/release-db-fence` | the root-owned recovery wrapper (below) |
 | `/etc/ims-cutover-recovery/refence-db` | the same, for raising the fence again |
 | `/etc/ims-cutover-recovery/resolve-legacy-db-fence` | the one-time operator resolution for an authority that carries no applied stamp (o3d-secops r26). No banner prints it and no cutover runs it — the validator's refusal is the only thing that names it |
@@ -2747,8 +2905,9 @@ cd /etc/ims-cutover-recovery/app && find . -type f -printf '%P\0' | LC_ALL=C sor
 That is the literal command the library computes with; a test asserts that the library, this page
 and the recorded value all agree, because a documented check that does not reproduce is a check an
 operator concludes is broken and stops running. Compare its output with `fence_artefact_sha256` in
-`/etc/ims-cutover-recovery/db-fence-artefact.sha256`. When they differ,
-`cd /etc/ims-cutover-recovery/app && sha256sum -c /etc/ims-cutover-recovery/db-fence-artefact.manifest`
+`/etc/ims-cutover-recovery/app/../db-fence-artefact.sha256` — the record of whatever is standing, reached
+through the pointer. When they differ,
+`cd /etc/ims-cutover-recovery/app && sha256sum -c ../db-fence-artefact.manifest`
 names **which** file moved, which "the digest changed" does not.
 
 The digest is **verified before every execution**, along with the seal (every file owned by root,
@@ -3920,22 +4079,105 @@ written to a `.part` file and renamed on completion; if it fails, the partial fi
 the failure banner says there is no restore point for this run rather than naming a truncated
 file as one.
 
-**`IMS_BACKUP_DIR` is not validated, and three rounds of trying to make that harmless were
-withdrawn rather than shipped** (o3d-ov60, o3d-noka). The dump, the rename that publishes it and
-the `rm --` that prunes beside it are all done **by root, through the pathname this variable
-names**. Under the shipped default that is unreachable — `/var/backups` has a root-owned parent, so
-nothing but root can plant or rename anything on the way to it. Point `IMS_BACKUP_DIR` underneath a
-directory the **service account** owns and it becomes reachable: `mkdir -p` accepts a
-symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
-predictable name that account may plant a named pipe at, which makes root's `gzip >` block
-indefinitely with the service stopped, cron stopped and the database connections already fenced.
+<a id="where-the-pre-update-dump-may-go"></a>
+### Where the pre-update dump may go
 
-**Until `o3d-noka` lands, treat this as an operator constraint rather than a defended path: point
-`IMS_BACKUP_DIR` only at a directory whose whole ancestry is root-owned and writable by nobody
-else, and bind-mount a backup volume under such a path rather than symlinking one.** Note that
-`APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
+**`IMS_BACKUP_DIR` is validated, and a path that fails the rule is a refusal rather than a dump**
+(o3d-noka, closing o3d-ov60 site 5). The dump, the rename that publishes it and the `rm --` that
+prunes beside it are all done **by root**, so `scripts/update.sh` now walks the path this variable
+names from `/` downwards and requires **every component, the backup directory included**, to be:
+
+* a **real directory** — never a symbolic link, and never anything else;
+* owned by **root** (or by the account the run executes as, which on a host is root);
+* **writable by nobody else** — `mode & 0022 == 0`. For a directory that **already exists** this
+  really does bound any POSIX ACL as well, because when an ACL carries a mask entry the group bits
+  reported for the inode *are* that mask, and every named-user, named-group and group entry is
+  effective only through it. It does **not** bound what a **default** ACL does to a file or directory
+  **created inside** — see *The dump's own permissions* below, which is where that is handled.
+
+The sticky bit is credited for a component **above** the backup directory's parent and for no other:
+a sticky directory can have an existing entry renamed or removed only by that entry's owner, which
+settles the question for an ancestor that already exists, and settles nothing for a directory in
+which anybody may still **create** a name. `/var/backups/<app>` passes. `/tmp/backups` does not.
+
+The walk is a `chdir` per component with each landing checked against the inode its directory entry
+named, so an ancestor is never re-resolved by name, and the directory it ends on is handed to the
+dump as an **open descriptor**: the redirection, the publishing rename and the prune are all
+`openat`/`renameat`/`unlinkat` against that descriptor, not three fresh resolutions of a pathname.
+A component that cannot be stat'ed, or cannot be entered, is a **refusal** — not an absence of
+evidence. The refusal **names the component that failed** and says what to do about it.
+
+<a id="the-dumps-own-permissions"></a>
+#### The dump's own permissions, and why a POSIX default ACL does not decide them
+
+**The dump file is created at mode `0600`, with the mode given as an argument, and the mode it
+actually got is read back before a single byte is written.** A directory this run creates is set to
+`0700` and its achieved mode is read back too. Neither rests on the process umask, and that is a
+correction rather than a flourish: the first version of this check wrote the dump under `umask 077`
+and said that was enough.
+
+**It was not, if the backup directory (or any directory above one this run creates) carries a POSIX
+*default* ACL.** A default ACL is invisible in the permission bits, is inherited by everything
+created inside the directory, and its inheritance **ignores the umask completely** — the new file's
+bits are the mode the creating call *asked for* intersected with the inherited entries, and a shell
+redirection asks for `0666`. Measured on a root-owned `0755` directory carrying
+`default:user:imsapp:r-x`, which passes every question the ancestry rule asks: the dump came out
+`0644` and the service account read it. With the default ACL one level up instead, the two
+directories the walk itself created came out `0755`, not the `0700` that was claimed.
+
+**A default ACL on the backup directory is therefore tolerated rather than refused.** Reading ACLs
+in the walk would have meant requiring `getfacl` (the `acl` package) at the migration step, with the
+service already stopped, and refusing an operator's legitimate arrangement — a default ACL is how you
+give an off-host backup agent access to the directory — for a risk the explicit creation mode already
+removes. What is *not* tolerated is a destination this run cannot verify private: if the mode it
+reads back off the write descriptor has any group or other bit, the run **refuses**, names the mode
+it saw, names the default ACL as the mechanism, deletes the partial it had created and migrates
+nothing. Take the default ACL off with `setfacl -k <dir>` if you see that refusal.
+
+**What this does not buy.** A pre-existing root-owned `0755` backup directory is still listable and
+readable by every account, so the **names and timestamps** of the dumps in it are visible; their
+**contents** are not. A backup directory an *earlier* release already created `0755` is **accepted as
+it stands and not corrected** — its mode satisfies the rule — so tighten it by hand if you want even
+the listing private. A directory *this* run creates is `0700`, so on the default path there is
+nothing to tighten. And a default ACL inherited onto a directory this run created is **left in
+place**: it can no longer affect anything this code writes, because every file it creates is given an
+explicit mode.
+
+**What this costs, because it is an operator-visible narrowing of a documented "anywhere"
+override.** An `IMS_BACKUP_DIR` under `/var/lib/<app>`, under `/opt/<app>`, or anywhere else the
+**service account** owns is now refused. That was the point: `mkdir -p` accepts a
+symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
+predictable name in a directory that account can watch — so before this change that account could
+redirect root's dump and root's prune into a directory of its choosing (measured: a dump written and
+published inside a root-owned `0700` directory the account could not even list, and two pre-existing
+root-owned files there deleted by the prune), or plant a named pipe at the partial's name and make
+root's `gzip >` block for ever with the service stopped, cron stopped and the database connections
+already fenced. **And the dump is now created by `install -m 0600 /dev/null` rather than by the
+redirection alone**, which replaces a named pipe or a symbolic link standing at the partial's name
+with a regular file instead of blocking on it or writing through it — a second, independent reason
+that class of plant is dead. If coreutils' `install` is not on the host's `PATH`, the run **refuses**
+rather than falling back to a creation whose mode a default ACL could decide.
+
+**To keep backups on another volume, bind-mount it under a root-owned path; do not symlink one.** A
+symbolic link at any component is refused, because nothing proves the path its target resolves
+through — the same rule, and the same reason, as the state roots in *Putting a state root on another disk*, above.
+
+**The refusal happens at the migration step, with the service already stopped.** Nothing is
+migrated, the schema is untouched and the previous release is still the one on disk, so a re-run
+after fixing `IMS_BACKUP_DIR` is clean — but the site is down while you fix it. Validate the value
+before you start a cutover; moving the check into pre-flight is filed as a follow-up to `o3d-noka`.
+
+Note that `APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
 application's own upload/backup area under the state directory, it is owned by the service account
 by design, and it is **not** a valid value for `IMS_BACKUP_DIR`.
+
+**`scripts/backup.sh` is NOT covered by any of this.** It is an unwired legacy helper: its
+`APP_NAME` is `onetwoinventory` where every installed path is `one-two-inventory`, so on a real host
+it exits at its own `.env` check before it writes anything, and nothing in `install.sh` schedules
+it. It still carries the old shape — `mkdir -p "$1"`, `gzip > "$1/backup-<stamp>.sql.gz"`, an
+`ln -sf` at a predictable `latest.sql.gz`, and a `find … -delete` prune — so **do not wire it into
+cron against an app-owned directory**. Making it reachable means giving it this rule first; that is
+filed as a follow-up to `o3d-noka`, and a regression fails if its paths are repaired without it.
 
 What was tried and withdrawn, so that nobody re-attempts it: a symlink-proof walk anchored at the
 override's own parent directory (it validates only the final component, because the walk treats its
@@ -3950,8 +4192,11 @@ so they add no window the entrypoint does not already have (true only of a tree 
 which is why r5 refuses root out of any other — best-effort, and blind to a relabelled tree: see
 *[The supported bootstrap](#supported-bootstrap)*) — and pinning the helper would only move
 the boundary to a script read from the same checkout. `scripts/lib/pin-source-file.mjs` was built
-for exactly that and deleted for exactly that reason. The same late-read shape already ships twice,
-in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
+for exactly that and deleted for exactly that reason. **Constraining the override is what made all
+three rounds unnecessary**: nothing but root can now plant a symbolic link, a named pipe or a stale
+`.part` at any name involved, so a plain redirection has no TOCTOU left to lose and no helper has to
+be executed at the least recoverable moment of the cutover. The same late-read shape still ships
+twice, in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
 
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.
@@ -4207,7 +4452,7 @@ Key variables in the `.env` file:
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
-| `DATABASE_URL` | PostgreSQL connection string. **A transaction-pooling proxy in front of this URL is not supported, and is not planned** — point it at PostgreSQL itself; see *Connection pooling in front of `DATABASE_URL` is not supported* below for what is refused, where, and what is not detected. **The schema may be named in either spelling, but only one of them** (o3d-1izw): Prisma's `?schema=` or libpq's `options=-c search_path=`. Whichever is present decides the schema for *both* halves of the application — the schema Prisma qualifies generated queries with, and the `search_path` every raw statement and all three release gates resolve through — and a URL naming no schema is pinned explicitly to `public` rather than left on the server default. A URL that names **two different** schemas, or a `search_path` that is a list rather than one schema, is **refused**: the runtime does not start, the deploy check exits non-zero and `preflight:production` fails, each naming both values. Any *other* startup setting inside `options` (`application_name`, `statement_timeout`, …) is preserved. **Quoting matters in `search_path`, exactly as it does to the server**: `search_path=TenantA` is the schema `tenanta` (PostgreSQL folds an unquoted identifier) while `search_path="TenantA"` is `TenantA`, so the two are pinned differently and `?schema=TenantA` beside an unquoted `search_path=TenantA` is a **conflict**, not agreement; a non-ASCII schema name is **conditional on this deployment**, and quoting no longer settles it (o3d-2k5r r19). PostgreSQL splits a startup `options` by asking `isspace()` **one byte at a time**, so whether the UTF-8 bytes of a name end a token is a property of the server's `server_encoding` and `LC_CTYPE` and not of the string, and a backslash does not help — `pg_split_opts()` consumes the escape and exactly one byte. So the server is **asked**: a sanitised probe connection (no `options`, no `?schema=`) reads the encoding and ctype and then round-trips those exact characters through a custom GUC. Where they come back unchanged the name is **carried**; where the probe has not run, could not reach the server, or measured a change, the URL is **refused** with the measurement and with the alternative — `ALTER SCHEMA "<name>" RENAME TO <ascii_name>;` and the matching `DATABASE_URL`. The probe runs from `instrumentation.ts` at startup, from `preflight:production`, and from `scripts/check-wms-push-state-enum.mjs`, which `deploy.sh` runs **before it stops the old server** — so an unsupported schema is a pre-deploy rejection, not a failed restart. The verdict is held **once per process** and shared by every bundled copy of the module (a versioned `globalThis` slot), which is what makes the runtime honour a probe `instrumentation.ts` ran: the production build emits that module into several chunks and a per-module verdict never reached the one that builds the database adapter (o3d-2k5r r20). A positive verdict is bound to the **physical backend** that gave it, not to the `host:port/database` in the URL (o3d-2k5r r21): that is a *logical* endpoint, and a pooler, a load balancer, a multi-A-record name or a failover pair can serve the probe from one PostgreSQL and the application's pool from another. The probe therefore opens **three** connections and records who served each — `inet_server_addr()`, `inet_server_port()`, the server version, the encoding and the ctype — and will only settle a positive verdict when all three agree; when they do not it settles **not established**, naming both backends, and the refusal stands. A **refusal** needs no such agreement: an unsafe answer from any backend behind the endpoint is safe to apply to all of them, so only the permission is bound to a server. **Three agreeing samples are evidence, not a census** — a round-robin over two backends puts all three on one about an eighth of the time, and sticky or weighted routing makes that likelier — so the samples are not what enforces the rule (o3d-2k5r r22). The probe decides whether the bytes survive and **names the backend that said so**; whether a given connection may carry them is then decided **per physical connection**. Every new connection the application's pool opens asks the backend that answered it for its identity and its effective `search_path`, and is **refused before it can run a query** unless both match what the verdict recorded — so a failover, a re-pointed pooler or an unsampled member gets a refused connection with a reason rather than the permission. The same check wraps the raw `pg` clients the three out-of-process gates and the provisioning seeder use. It costs **nothing** for an ASCII schema name (no check is attached at all) and one round trip per new physical connection for a non-ASCII one — none per query. That per-connection check also **refuses any connection that does not reach the backend directly** (o3d-2k5r r23). A client socket is not a server backend: a transaction- or statement-pooling proxy re-assigns the *server* side between units of work, so a check run when the socket came up says nothing about the backend that runs the next statement. The connection therefore asks `pg_stat_activity` what peer the backend accepted and compares it with this process's own socket; anything that terminated the connection and opened its own — which every pooler must, to multiplex it — is named and refused. **This restricts nothing that worked**, and that is measured rather than assumed: against **PgBouncer 1.24.1** in front of PostgreSQL 17.11, with the default configuration and in **both** `pool_mode = transaction` and `pool_mode = session`, a startup `options=-c search_path=…` is rejected by the pooler outright (`FATAL: unsupported startup parameter in options: search_path`); and where an operator has named the parameter in `ignore_startup_parameters` or `track_extra_parameters` the connection is accepted and the option is **silently discarded** — `current_setting('search_path')` came back `"$user", public` and the query resolved `public`, and a `-c statement_timeout=1234` sent the same way returned `1234ms` direct and `0` through the pooler, so no startup `options` content reaches the backend at all. A non-ASCII schema behind a pooler was therefore **already broken, silently**; this reports it. Two consequences are stated rather than hidden. A plain **TCP NAT or port-forward** also rewrites the peer and is refused too, even though it cannot multiplex — connect the application to the backend directly, or rename the schema to ASCII. And over a **Unix-domain socket** the backend reports no peer at all (`client_addr` NULL, `client_port` -1), so directness cannot be shown there either — and that is **refused, not skipped** (o3d-2k5r r24). It was skipped until r24, on the cover that the `search_path` comparison would catch any real pooler; it does not, because that comparison is a single reading taken when the connection came up and says nothing about the backend that runs the next statement. **Odyssey 1.5.3-rc1, measured rather than cited**: it pools transactions over Unix sockets, and through it the backend reported `client_addr` NULL and `client_port` -1 exactly as a direct connection does, so the two are indistinguishable on that path. What it costs is exactly this: a deployment that connects over a Unix-domain socket **and** names a schema whose characters need a non-ASCII startup option is refused at boot. There are two cheap ways out — point `DATABASE_URL` at `127.0.0.1` over TCP, where the peer comparison can be made and a direct connection passes it, or rename the schema to ASCII. A **pooler's `pool_mode` is not readable from an ordinary SQL connection**, so this detects *interposition*, not the pooling mode. The probe also re-runs at every boot, in `preflight:production`, and before a deploy stops the old server, so a replaced server is re-measured rather than assumed. What is left is the loud case only: a backend that *splits* on the byte refuses the startup packet outright, which is a connection error rather than a silent write to the wrong schema. Every pool in the process is built from this same configuration — the Prisma pool, the three session-advisory-lock pools (`lib/db/pinned-advisory-lock.ts`, the Xero payment-write lock and the WMS dispatch-sweep lock) and the backup-restore selection-lock client — so none of them is a second, unguarded route into the database; a repository check fails the build if a new one appears (o3d-2k5r r23). **A connection that will take a SESSION advisory lock is held to a stricter rule than the data path, and to it on every schema** (o3d-2k5r r25). The per-connection check above is attached only where a non-ASCII startup option is being carried, because that is the permission it exists to spend — so on an **ASCII** schema, which is every ordinary deployment, nothing checked that the lock's connection reached the backend directly. A session advisory lock lives on ONE backend session, and pooling destroys the affinity between the IMS client and that session — what then happens to the lock is per pooler: it may be reset/released with the server connection, or left attached to a backend handed to another client. Measured against **Odyssey 1.5.3-rc1** in transaction-pooling mode, *that* pooler released it: two clients each acquired the same key and each were told they held it while `pg_locks` showed neither did. The money-post lock fences a ledger read and an external payment, so that is a document paid twice. The four holders — `lib/db/pinned-advisory-lock.ts` (which the money-post lock and the daily accounting batches run on), the Xero payment-write lock, the WMS dispatch-sweep lock and the backup-restore selection lock — therefore build their connections through `lib/db/session-lock-pool.ts`, which attaches the directness proof unconditionally; a repository check fails if a fifth holder opens its own connection instead. It costs **one round trip per new physical connection on those pools only** (`max` 2-4, a handful of low-frequency jobs) and **nothing at all on the data path**, which is unchanged. Behind a pooler the refusal names `DATABASE_SESSION_LOCK_URL` — see its own row below. Taking such a connection is **bounded on every deployment, override or not** (o3d-2k5r r28): the directness proof is one statement on the lock's own socket, and a server that accepts the connection and then stops answering used to hang the acquisition — and with it whatever was taking the lock, a money post, accounting batch, WMS sweep or restore among them — indefinitely. It now has a 5 s client-side bound, with a 30 s backstop over the whole acquisition (pg-pool's connect, the proof, and the wait for a free connection on a full lock pool, which carried no timer of its own); on expiry the connection's socket is destroyed and the caller is told the lock was **not** taken. This makes the session that took the lock the session that keeps it; it does **not** make the lock durable, which still ends with its connection, and it does **not** make a session advisory lock a sufficient exclusion for money movement — see `DATABASE_SESSION_LOCK_URL` below and **o3d-ic9a (P1)**. The one deliberate exception is `preflight:production`'s connectivity probe, whose only statement is `SELECT 1` and so resolves no object. **Known gap:** `next build` evaluates `lib/db` in worker processes that never run `instrumentation.ts`, so a build on a deployment with such a schema is refused; build with the schema renamed, or with `DATABASE_URL` unset. And **`?options=` or `?schema=` written twice is refused**: `URLSearchParams.get()` reads the first while the driver connects with the last, so the reader and the connection would be looking at different schemas. |
+| `DATABASE_URL` | PostgreSQL connection string. **A transaction-pooling proxy in front of this URL is not supported, and is not planned** — point it at PostgreSQL itself; see *Connection pooling in front of `DATABASE_URL` is not supported* below for what is refused, where, and what is not detected. **The schema may be named in either spelling, but only one of them** (o3d-1izw): Prisma's `?schema=` or libpq's `options=-c search_path=`. Whichever is present decides the schema for *both* halves of the application — the schema Prisma qualifies generated queries with, and the `search_path` every raw statement and all three release gates resolve through — and a URL naming no schema is pinned explicitly to `public` rather than left on the server default. A URL that names **two different** schemas, or a `search_path` that is a list rather than one schema, is **refused**: the runtime does not start, the deploy check exits non-zero and `preflight:production` fails, each naming both values. Any *other* startup setting inside `options` (`application_name`, `statement_timeout`, …) is preserved. **Quoting matters in `search_path`, exactly as it does to the server**: `search_path=TenantA` is the schema `tenanta` (PostgreSQL folds an unquoted identifier) while `search_path="TenantA"` is `TenantA`, so the two are pinned differently and `?schema=TenantA` beside an unquoted `search_path=TenantA` is a **conflict**, not agreement. **A vertical tab (0x0B) outside double quotes in a `search_path` is refused** (o3d-ik1j): PostgreSQL 17 and later trim it off a `search_path` element while 16 and earlier keep it as part of the name, so which schema such a URL names depends on the server's major version — remove it, or double-quote the name if the character really is part of it (inside quotes it is literal on every version and is carried); a non-ASCII schema name is **conditional on this deployment**, and quoting no longer settles it (o3d-2k5r r19). PostgreSQL splits a startup `options` by asking `isspace()` **one byte at a time**, so whether the UTF-8 bytes of a name end a token is a property of the server's `server_encoding` and `LC_CTYPE` and not of the string, and a backslash does not help — `pg_split_opts()` consumes the escape and exactly one byte. So the server is **asked**: a sanitised probe connection (no `options`, no `?schema=`) reads the encoding and ctype and then round-trips those exact characters through a custom GUC. Where they come back unchanged the name is **carried**; where the probe has not run, could not reach the server, or measured a change, the URL is **refused** with the measurement and with the alternative — `ALTER SCHEMA "<name>" RENAME TO <ascii_name>;` and the matching `DATABASE_URL`. The probe runs from `instrumentation.ts` at startup, from `preflight:production`, and from `scripts/check-wms-push-state-enum.mjs`, which `deploy.sh` runs **before it stops the old server** — so an unsupported schema is a pre-deploy rejection, not a failed restart. The verdict is held **once per process** and shared by every bundled copy of the module (a versioned `globalThis` slot), which is what makes the runtime honour a probe `instrumentation.ts` ran: the production build emits that module into several chunks and a per-module verdict never reached the one that builds the database adapter (o3d-2k5r r20). A positive verdict is bound to the **physical backend** that gave it, not to the `host:port/database` in the URL (o3d-2k5r r21): that is a *logical* endpoint, and a pooler, a load balancer, a multi-A-record name or a failover pair can serve the probe from one PostgreSQL and the application's pool from another. The probe therefore opens **three** connections and records who served each — `inet_server_addr()`, `inet_server_port()`, the server version, the encoding and the ctype — and will only settle a positive verdict when all three agree; when they do not it settles **not established**, naming both backends, and the refusal stands. A **refusal** needs no such agreement: an unsafe answer from any backend behind the endpoint is safe to apply to all of them, so only the permission is bound to a server. **Three agreeing samples are evidence, not a census** — a round-robin over two backends puts all three on one about an eighth of the time, and sticky or weighted routing makes that likelier — so the samples are not what enforces the rule (o3d-2k5r r22). The probe decides whether the bytes survive and **names the backend that said so**; whether a given connection may carry them is then decided **per physical connection**. Every new connection the application's pool opens asks the backend that answered it for its identity and its effective `search_path`, and is **refused before it can run a query** unless both match what the verdict recorded — so a failover, a re-pointed pooler or an unsampled member gets a refused connection with a reason rather than the permission. The same check wraps the raw `pg` clients the three out-of-process gates and the provisioning seeder use. It costs **nothing** for an ASCII schema name (no check is attached at all) and one round trip per new physical connection for a non-ASCII one — none per query. That per-connection check also **refuses any connection that does not reach the backend directly** (o3d-2k5r r23). A client socket is not a server backend: a transaction- or statement-pooling proxy re-assigns the *server* side between units of work, so a check run when the socket came up says nothing about the backend that runs the next statement. The connection therefore asks `pg_stat_activity` what peer the backend accepted and compares it with this process's own socket; anything that terminated the connection and opened its own — which every pooler must, to multiplex it — is named and refused. **This restricts nothing that worked**, and that is measured rather than assumed: against **PgBouncer 1.24.1** in front of PostgreSQL 17.11, with the default configuration and in **both** `pool_mode = transaction` and `pool_mode = session`, a startup `options=-c search_path=…` is rejected by the pooler outright (`FATAL: unsupported startup parameter in options: search_path`); and where an operator has named the parameter in `ignore_startup_parameters` or `track_extra_parameters` the connection is accepted and the option is **silently discarded** — `current_setting('search_path')` came back `"$user", public` and the query resolved `public`, and a `-c statement_timeout=1234` sent the same way returned `1234ms` direct and `0` through the pooler, so no startup `options` content reaches the backend at all. A non-ASCII schema behind a pooler was therefore **already broken, silently**; this reports it. Two consequences are stated rather than hidden. A plain **TCP NAT or port-forward** also rewrites the peer and is refused too, even though it cannot multiplex — connect the application to the backend directly, or rename the schema to ASCII. And over a **Unix-domain socket** the backend reports no peer at all (`client_addr` NULL, `client_port` -1), so directness cannot be shown there either — and that is **refused, not skipped** (o3d-2k5r r24). It was skipped until r24, on the cover that the `search_path` comparison would catch any real pooler; it does not, because that comparison is a single reading taken when the connection came up and says nothing about the backend that runs the next statement. **Odyssey 1.5.3-rc1, measured rather than cited**: it pools transactions over Unix sockets, and through it the backend reported `client_addr` NULL and `client_port` -1 exactly as a direct connection does, so the two are indistinguishable on that path. What it costs is exactly this: a deployment that connects over a Unix-domain socket **and** names a schema whose characters need a non-ASCII startup option is refused at boot. There are two cheap ways out — point `DATABASE_URL` at `127.0.0.1` over TCP, where the peer comparison can be made and a direct connection passes it, or rename the schema to ASCII. A **pooler's `pool_mode` is not readable from an ordinary SQL connection**, so this detects *interposition*, not the pooling mode. The probe also re-runs at every boot, in `preflight:production`, and before a deploy stops the old server, so a replaced server is re-measured rather than assumed. What is left is the loud case only: a backend that *splits* on the byte refuses the startup packet outright, which is a connection error rather than a silent write to the wrong schema. Every pool in the process is built from this same configuration — the Prisma pool, the three session-advisory-lock pools (`lib/db/pinned-advisory-lock.ts`, the Xero payment-write lock and the WMS dispatch-sweep lock) and the backup-restore selection-lock client — so none of them is a second, unguarded route into the database; a repository check fails the build if a new one appears (o3d-2k5r r23). **A connection that will take a SESSION advisory lock is held to a stricter rule than the data path, and to it on every schema** (o3d-2k5r r25). The per-connection check above is attached only where a non-ASCII startup option is being carried, because that is the permission it exists to spend — so on an **ASCII** schema, which is every ordinary deployment, nothing checked that the lock's connection reached the backend directly. A session advisory lock lives on ONE backend session, and pooling destroys the affinity between the IMS client and that session — what then happens to the lock is per pooler: it may be reset/released with the server connection, or left attached to a backend handed to another client. Measured against **Odyssey 1.5.3-rc1** in transaction-pooling mode, *that* pooler released it: two clients each acquired the same key and each were told they held it while `pg_locks` showed neither did. The money-post lock fences a ledger read and an external payment, so that is a document paid twice. The four holders — `lib/db/pinned-advisory-lock.ts` (which the money-post lock and the daily accounting batches run on), the Xero payment-write lock, the WMS dispatch-sweep lock and the backup-restore selection lock — therefore build their connections through `lib/db/session-lock-pool.ts`, which attaches the directness proof unconditionally; a repository check fails if a fifth holder opens its own connection instead. It costs **one round trip per new physical connection on those pools only** (`max` 2-4, a handful of low-frequency jobs) and **nothing at all on the data path**, which is unchanged. Behind a pooler the refusal names `DATABASE_SESSION_LOCK_URL` — see its own row below. Taking such a connection is **bounded on every deployment, override or not** (o3d-2k5r r28): the directness proof is one statement on the lock's own socket, and a server that accepts the connection and then stops answering used to hang the acquisition — and with it whatever was taking the lock, a money post, accounting batch, WMS sweep or restore among them — indefinitely. It now has a 5 s client-side bound, with a 30 s backstop over the whole acquisition (pg-pool's connect, the proof, and the wait for a free connection on a full lock pool, which carried no timer of its own); on expiry the connection's socket is destroyed and the caller is told the lock was **not** taken. This makes the session that took the lock the session that keeps it; it does **not** make the lock durable, which still ends with its connection, and it does **not** make a session advisory lock a sufficient exclusion for money movement — see `DATABASE_SESSION_LOCK_URL` below and **o3d-ic9a (P1)**. The one deliberate exception is `preflight:production`'s connectivity probe, whose only statement is `SELECT 1` and so resolves no object. **Known gap:** `next build` evaluates `lib/db` in worker processes that never run `instrumentation.ts`, so a build on a deployment with such a schema is refused; build with the schema renamed, or with `DATABASE_URL` unset. And **`?options=` or `?schema=` written twice is refused**: `URLSearchParams.get()` reads the first while the driver connects with the last, so the reader and the connection would be looking at different schemas. |
 | `DATABASE_SESSION_LOCK_URL` | **This does not make a pooled `DATABASE_URL` supported** — a transaction-pooling proxy in front of `DATABASE_URL` is unsupported (see *Connection pooling in front of `DATABASE_URL` is not supported* below); this override only keeps the four session locks correct where something is nonetheless interposed, and says nothing about the data path. Set it **only when the lock connections cannot be shown to reach PostgreSQL directly** — `DATABASE_URL` points at a connection pooler (PgBouncer, Odyssey, pgcat, RDS Proxy, a provider's pooled port), or at a **Unix-domain socket**, where the backend reports no peer at all and directness is unprovable. A **direct, non-pooled** URL for the **same database and the same schema**, used only by the connections that hold a PostgreSQL **session advisory lock** — the money-post lock, the Xero payment-write lock, the WMS dispatch-sweep lock and the backup-restore selection lock. Ordinary query traffic keeps using `DATABASE_URL`. Leave it unset when `DATABASE_URL` is already direct: unset and blank both mean "use `DATABASE_URL`". **It must be TCP** — over a Unix-domain socket the backend names no peer, so directness cannot be shown and the connection is refused anyway; use `host=127.0.0.1`. A URL naming a **different database**, or resolving to a **different schema**, is **refused rather than used**: an exclusion taken somewhere other than where the work happens is not an exclusion. Host and port are deliberately not compared — differing is the point of it, which is exactly why matching names cannot be the check. **The override is therefore MEASURED at runtime, not trusted because it agrees on names** (o3d-2k5r r26): on every lock acquisition, a session advisory lock is taken on a connection made from this URL and a connection made from `DATABASE_URL` is asked for the same key; it must be **blocked**, or the override is refused. Shared advisory-lock space is the property a lock needs, and it is the one thing an identifier cannot establish — a `pg_basebackup` clone or a restored dump carries the **same** database name, the **same** schema, the **same** database OID and the **same** `pg_control_system()` system identifier as production, all of which was measured against a real clone rather than assumed. The check runs **per lock acquisition** — every checkout from a session-lock pool and every connect of a session-lock client re-measures (o3d-2k5r r27) — after the directness proof, so a deployment refused for interposition never pays for it: two throwaway connections and four statements, **3–13 ms** measured, and nothing per query, nothing on the data path and nothing at all where no override is set. It was measured **once per process** until r27, and that was wrong for a reason worth stating: the URL *strings* do not change when a pooler is restarted onto another primary, a DNS record is re-pointed or a managed failover promotes a replica, but **what they reach does** — so a process that measured at boot went on treating a boot-time sample as authorisation for an external money post for as long as it lived, while a process started after the change locked the other server, and both were told they held the lock. Re-measuring per acquisition takes that exposure from the life of the process to the milliseconds between the probe and the lock it licenses. The probe is also **bounded end to end**: 5 s to open each connection, 5 s per statement (client-side, because a pooler silently discards a startup `statement_timeout`), and a 20 s deadline over the whole of it that destroys both connections at the socket and refuses — a server or pooler that accepts a socket and then stops answering must not leave whatever was acquiring the lock — a money post, an accounting batch, a WMS sweep or a restore among them — waiting for it forever. **The acquisition the probe licenses is bounded too, and that is a separate fix** (o3d-2k5r r28): until r28 the deadline covered only the probe's two throwaway connections, while the first statement on the *actual* lock socket — the directness proof — had no bound at all, so a server that completed the handshake and then went quiet left the acquisition pending forever with the probe never reached and no probe connection ever opened. That statement now has a **5 s** client-side bound and the whole acquisition a **30 s** backstop, and on expiry the **lock connection's own socket is destroyed** rather than politely closed — `end()` waits for a server reply, which is precisely what a wedged server will not give. The witness takes a **transaction-level** lock inside an explicit `begin`/`rollback`, so nothing is left behind on a pooled server connection, and the probe key is **random**, so two instances booting at once cannot refuse each other. It does not falsely refuse the deployment it exists for: measured against **PgBouncer 1.24.1** in `pool_mode = transaction`, with and without the pinned `-c search_path` startup option, the witness was blocked and the override admitted. Every unclear answer — an unreachable side, a holder that could not take its own key, an answer that is not literally "blocked" — is a **refusal**, and the refusal says what it costs: every session lock in the process taken where the work never happens, every holder told it holds it, and the money-post lock letting two workers **pay the same document twice** with no other symptom. Do not route around it by unsetting the check; point the override at the PostgreSQL that actually serves `DATABASE_URL`. **What this does and does not claim, stated plainly because narrowing a window reads too easily as closing one:** it **detects** configurations in which a session advisory lock demonstrably does not exclude — an override that reaches a different PostgreSQL from the data path — and refuses them. It does **not** make a session advisory lock a sufficient exclusion for money movement, and nothing in this release does. A check is a *sample* taken before the thing it licenses; there is always a window between the two, and no number of samples becomes the property. The session lock also remains non-durable (it ends with its connection), remains dependent on the deployment's connection topology, and the `lost` flag remains a best-effort notification. What would settle the money path is durable, fenced lease state written through the authoritative `DATABASE_URL` transaction, paired with connector idempotency — tracked as **o3d-ic9a (P1 since the 2026-08-28 rescope, which makes connector-side idempotency the first step rather than the lease)** and deliberately not attempted here. **Without an override the question does not arise** — the lock connections and the data path are built from one string by one derivation — so no probe is attached and nothing is paid; the remaining case there, one hostname resolving to two PostgreSQL servers, is filed as `o3d-2vko`. Read in one place (`lib/db/session-lock-pool.ts`), so it reaches every lock or none (o3d-2k5r r25). |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
 | `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way for BOTH a locally provisioned Redis and one you already run, and leaves `REDIS_PASSWORD` empty when it does |
@@ -4218,7 +4463,6 @@ Key variables in the `.env` file:
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret. Install-time seed only — the live value is the `wc_consumer_secret` setting |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
 | `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
-| `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
 | `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` | Maximum pending Mintsoft ASN booked-in webhook events processed by one sweeper run. Default `250`. |
 | `CONNECTOR_FETCH_TIMEOUT_MS` | Default whole-request timeout for validated connector HTTP requests, including redirects and composed with any caller-supplied `AbortSignal`. Invalid values fall back to `30000`. |
@@ -4314,7 +4558,7 @@ first, in any of the **four lock domains** this repository takes a session advis
 
 | Lock domain | Held by | Reached from |
 | --- | --- | --- |
-| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the Xero and QuickBooks sync processors and from operator-triggered settlement actions — and the daily Xero and QuickBooks accounting batches, which run on the same holder |
+| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the accounting sync processor and from operator-triggered settlement actions — and the daily accounting batch, which runs on the same holder |
 | Xero payment write | `lib/connectors/xero/payment-write-lock.ts` | The Xero payment poller and apply-mode payment reconciliation |
 | WMS dispatch sweep | `lib/domain/wms/dispatch-sweep-lock.ts` | The dispatch sweep, and the operator actions that mutate dispatch state under it |
 | Restore selection | `app/api/backup/restore/route.ts` | A restore |

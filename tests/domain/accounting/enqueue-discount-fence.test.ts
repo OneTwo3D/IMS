@@ -239,14 +239,7 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-mock.module('@/lib/connectors/quickbooks/settings', {
-  namedExports: {
-    getQuickBooksSettings: async () => ({
-      quickbooks_sync_enabled: 'true',
-      quickbooks_sync_sales_invoice: 'submitted',
-    }),
-  },
-})
+// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 
 const ENTRY = {
   orderId: 'order-1',
@@ -410,24 +403,6 @@ test('an unrelated document type is NOT fenced by the order discount (Codex r1 F
   })
 
   assert.equal(world.syncLogs.length, 1)
-})
-
-test('QuickBooks is fenced identically — the cross-port rule (Codex r1 F1)', async () => {
-  const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
-  const { STALE_ORDER_DISCOUNT_ENQUEUE_ACTION } = await import('@/lib/domain/accounting/enqueue-order-guard')
-  resetWorld()
-  world.orders[0].discountAmount = 0
-
-  await queueQuickBooksSync({
-    type: 'SALES_INVOICE',
-    referenceType: 'SalesOrder',
-    referenceId: 'order-1',
-    payload: { invoiceNumber: 'INV-1', discountAmount: 10 },
-  })
-
-  assert.equal(world.syncLogs.length, 0)
-  assert.equal(world.activity[0]?.action, STALE_ORDER_DISCOUNT_ENQUEUE_ACTION)
-  assert.equal(world.activity[0]?.metadata?.connector, 'quickbooks')
 })
 
 test('a non-numeric discount fails CLOSED rather than being read as zero (Codex r1 F1)', async () => {

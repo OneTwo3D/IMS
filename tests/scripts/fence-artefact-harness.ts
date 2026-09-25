@@ -12,7 +12,7 @@
  * is a reader of that rule.
  */
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createTempDirSync } from './temp-dir.ts'
 
@@ -225,6 +225,39 @@ export function protectedLibraryLines(root: string): string[] {
   return protectedLibraryLinesAt(join(root, 'recovery'))
 }
 
+/**
+ * THE RECORD OR MANIFEST OF WHATEVER IS STANDING, named THROUGH the pointer exactly as the library names
+ * it (o3d-xi3w): `<recovery>/app/../db-fence-artefact.sha256`.
+ *
+ * path.join() MUST NOT BE USED for this: it collapses the `..` LEXICALLY and names
+ * `<recovery>/db-fence-artefact.sha256`, which is where a pre-pointer release left the record and not
+ * where the standing one lives. The whole device is that the KERNEL resolves `app` first — a symbolic
+ * link into the versioned directory that holds the tree, its record and its manifest together — so this
+ * path always reaches the record of the tree that is standing, and one rename commits both. On an
+ * installation no pointer-era publication has touched yet, the same string resolves to the old location.
+ */
+export function standingRecordPath(recovery: string, name = 'db-fence-artefact.sha256'): string {
+  return `${join(recovery, 'app')}/../${name}`
+}
+
+/**
+ * THE PATH THE RESOLUTION HANDS BACK, AND THEREFORE THE PATH THAT IS EXECUTED (o3d-xi3w r2).
+ *
+ * `db_fence_script_in_use()` used to return `<recovery>/app/scripts/fence-db-connections.mjs` — a path
+ * THROUGH the pointer, so a concurrent publisher's flip between the check and the exec changed which
+ * release ran. It now returns the entry file of the VERSIONED publication that pointer names, which
+ * nothing writes into after its own publication renamed it there. Every harness that asserts on what was
+ * executed reads it from here rather than composing it, so a change of shape is one edit and not twenty.
+ *
+ * On an installation no pointer-era publication has migrated yet the documented name is still a real
+ * directory, and then it IS the base — the same string, resolved by the kernel rather than by this.
+ */
+export function standingHelperPath(recovery: string): string {
+  const documented = join(recovery, 'app')
+  const version = lstatSync(documented).isSymbolicLink() ? readlinkSync(documented) : 'app'
+  return join(recovery, version, 'scripts', 'fence-db-connections.mjs')
+}
+
 /** Where the published artefact and its record end up, for assertions. */
 export function protectedPaths(root: string): {
   recovery: string
@@ -243,8 +276,8 @@ export function protectedPaths(root: string): {
     app: join(recovery, 'app'),
     helper: join(recovery, 'app', 'scripts', 'fence-db-connections.mjs'),
     pgEntry: join(recovery, 'app', 'node_modules', 'pg', 'lib', 'index.js'),
-    artefactFile: join(recovery, 'db-fence-artefact.sha256'),
-    manifestFile: join(recovery, 'db-fence-artefact.manifest'),
+    artefactFile: standingRecordPath(recovery),
+    manifestFile: standingRecordPath(recovery, 'db-fence-artefact.manifest'),
     releaseWrapper: join(recovery, 'release-db-fence'),
     refenceWrapper: join(recovery, 'refence-db'),
     // o3d-secops r26: the third wrapper, which no cutover runs. It is the one-time operator way

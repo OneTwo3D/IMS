@@ -1,5 +1,13 @@
 # Xero Accounting Sync
 
+> **QuickBooks Online was removed in 2026-09.** Xero is the only accounting connector One Two
+> Inventory ships. This page still mentions QuickBooks in places — every one of those mentions is
+> **historical**, and is kept for one reason: most of them explain why a rule on the Xero side is
+> shaped the way it is, by contrast with a connector that behaved differently. Nothing on this page
+> describes a QuickBooks control you can use, because there is no longer a QuickBooks connector to
+> control. If you have sync rows or documents recorded against QuickBooks from before the removal,
+> see **Sync → Exceptions**, which still lists them and tells you what to do about each one.
+
 One Two Inventory integrates with Xero to keep your accounting records in sync. The system acts as a **sub-ledger** — Xero handles invoicing, payments, and bank reconciliation, while the IMS creates daily correction journals to control when revenue is recognised and how inventory flows through your accounts.
 
 ## Connection Setup
@@ -360,7 +368,11 @@ purpose. Setting both to the *same* single organisation is fine, so you can migr
 `XERO_TENANT_ID` alongside `XERO_ALLOWED_TENANT_NAMES` is fine too: a name narrows what the id chose
 rather than competing with it.
 
-**QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
+> **Historical note (2026-09):** the paragraph below described the QuickBooks connector, which has
+> since been removed (see the release notes). It is kept because the CONTRAST is the reason this
+> control exists on Xero, and the next accounting connector has to be asked the same question.
+
+**QuickBooks** did not have this control. It did not share the same defect — Intuit sends the company
 (`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
 but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not
 stopped the way a Xero one is.
@@ -2256,10 +2268,9 @@ batch (and then meets the already-journaled refusal above). Nothing needs config
 
 **What this does not cover.** Other places a negative cost can reach are catalogued in
 `docs/todo/negative-basis-cost-layers-decision.md`. Whether IMS should ever post a negative cost
-basis at all is an open decision (o3d-gd2f). In particular the **QuickBooks** daily batch reads its
-costs under the lock in the same way, but it has none of the three refusals above: a negative cost
-that reaches it is still journalled with its COGS line dropped. The refusals were built for Xero
-(o3d-sidy); QuickBooks is tracked separately.
+basis at all is an open decision (o3d-gd2f). The three checks above are Xero's, and Xero is the only
+accounting connector this build ships — the QuickBooks daily batch had none of them, and it was
+archived (see the note at the top of this page) rather than given them.
 
 ### Which batch a row belongs to
 

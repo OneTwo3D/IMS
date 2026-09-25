@@ -254,32 +254,6 @@ test('[o3d-0bfh r2] and a SETTLED one is not turned into a refusal either', asyn
   assert.deepEqual(outcome, { enqueued: true, deferredReceiptsSettled: true, obligationFenced: true })
 })
 
-test('[o3d-9kek r6] QuickBooks exports NO back-reference sweep binding, and never runs the sweep', async () => {
-  captured.length = 0
-  cursorStoreConnectors.length = 0
-
-  const processor = await import('@/lib/connectors/quickbooks/sync-processor') as Record<string, unknown>
-  const index = await import('@/lib/connectors/quickbooks') as Record<string, unknown>
-
-  for (const [label, mod] of [['sync-processor', processor], ['connector index', index]] as const) {
-    const sweepExports = Object.keys(mod).filter((name) => /repair.*BackReference/i.test(name))
-    assert.deepEqual(
-      sweepExports,
-      [],
-      `${label} must not export a back-reference repair sweep for QuickBooks: the sweep is scoped by connector `
-      + 'alone and a QuickBooks id is realm-local, so it can stamp a previous realm\'s id onto a live document, '
-      + 'and this connector checks no connection verdict at post time. o3d-s36z has closed and is NOT the '
-      + 'remaining blocker — o3d-8prh is; read the block at the end of the QuickBooks sync-processor for the '
-      + 'order of work before re-adding it (o3d-8prh).',
-    )
-  }
-
-  // Nothing merely importing the QuickBooks processor may reach the sweep either — a module-level
-  // call or a re-export under a different name would be caught here rather than in production.
-  assert.deepEqual(captured, [], 'no QuickBooks sweep run')
-  assert.deepEqual(cursorStoreConnectors, [], 'no QuickBooks sweep cursor')
-})
-
 // ---------------------------------------------------------------------------
 // o3d-0bfh r16 (Codex HIGH) — AND THE CALLER'S SETTLEMENT PREREQUISITE REACHES THE FENCE TOO.
 //

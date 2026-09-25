@@ -8,7 +8,7 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { isShoppingConnectorId } from '@/lib/fulfillment/shopping-order-lookup'
+import { isShoppingConnectorId, shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
 // A fulfillment update originates from either a storefront (shopping) connector
@@ -134,11 +134,45 @@ type ResolvedOrder = {
   status: string
 }
 
+/**
+ * o3d-r5uk (Codex round 2 HIGH 2) — A WAREHOUSE POINTED AT AN ARCHIVED STOREFRONT FAILS CLOSED HERE,
+ * AND SAYS SO ONCE PER EVENT.
+ *
+ * `WmsConnection.orderLookupConnector` is a plain String and can still say `shopify`. Returning
+ * `null` is the fail-closed answer — `resolveOrderForExternalFulfillment` finds no order and
+ * `applyExternalFulfillmentUpdate` refuses with `order_not_found` — but `order_not_found` is a
+ * misleading thing to tell an operator about a misconfiguration, and this path has been bitten by a
+ * silent refusal before (o3d-xnwu, forty lines down). So the unsupported case is logged with the
+ * offending value.
+ *
+ * NOT a new `ExternalFulfillmentRefusal` member: the refusal would have to be threaded out through
+ * `resolveOrderForExternalFulfillment`'s `ResolvedOrder | null` return, which two connectors and the
+ * WooCommerce completion flow read, and widening that union changes what
+ * `PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS` and `REFUSALS_AWAITING_REFUNDS` are total over. The
+ * misread — answering WooCommerce for a Shopify-configured warehouse — is what had to stop; the
+ * refusal code it lands on is a separate question, filed rather than smuggled in here.
+ */
 async function resolveShoppingConnectorForSource(
   source: ExternalFulfillmentSource,
 ): Promise<ShoppingConnectorId | null> {
   if (isShoppingConnectorId(source)) return source
-  if (isWmsConnectorId(source)) return resolveWmsOrderLookupConnector(source)
+  if (isWmsConnectorId(source)) {
+    const resolution = await resolveWmsOrderLookupConnector(source)
+    if (resolution.kind === 'one') return resolution.connector
+    if (resolution.kind === 'unsupported') {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'external_fulfillment_order_lookup_unsupported',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `${source} fulfilment could not resolve a storefront to look the order up in: `
+          + shoppingOrderLookupSkipReason(resolution),
+        metadata: { source, connectors: [...resolution.connectors], from: resolution.from },
+        resolveUser: false,
+      })
+    }
+    return null
+  }
   return null
 }
 

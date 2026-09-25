@@ -6,7 +6,7 @@ import { getOnboardingState } from '@/app/actions/onboarding'
 import { getOrganisation, getBaseCurrencySettings, getEmailSettings } from '@/app/actions/company'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getTaxRates, getWarehousesForSettings } from '@/app/actions/settings'
-import { getShoppingConnectorCredentials, getShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
+import { getShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import { getAccountingSettingsMasked, getAccountingConnectionStatus } from '@/app/actions/accounting-sync'
 import { getWmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import { detectPublicAppUrlFromHeaders, getPublicAppUrlInfo } from '@/lib/public-app-url'
@@ -33,7 +33,6 @@ export default async function OnboardingPage() {
     warehouses,
     financialYearStart,
     wcCredentials,
-    shopifyCredentials,
     accountingSettings,
     accountingStatus,
     wmsConnection,
@@ -48,7 +47,6 @@ export default async function OnboardingPage() {
     getWarehousesForSettings(),
     getSettingValue('financial_year_start'),
     getShoppingConnectorCredentials(),
-    getShopifyConnectorCredentials(),
     getAccountingSettingsMasked(),
     getAccountingConnectionStatus(),
     getWmsOnboardingConnectionData(),
@@ -74,7 +72,6 @@ export default async function OnboardingPage() {
       companyConfigured={onboardingState.companyConfigured}
       currencyConfigured={onboardingState.currencyConfigured}
       wcCredentials={wcCredentials}
-      shopifyCredentials={shopifyCredentials}
       accountingSettings={accountingSettings}
       accountingStatus={accountingStatus}
       wmsConnection={wmsConnection}

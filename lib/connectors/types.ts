@@ -1,7 +1,7 @@
 /**
  * Shared interfaces for platform connectors.
  *
- * Shopping connectors: WooCommerce, Shopify (future)
+ * Shopping connectors: WooCommerce
  * Accounting connectors: Xero (current), QuickBooks (future)
  */
 

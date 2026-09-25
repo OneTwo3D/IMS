@@ -608,7 +608,7 @@ export async function recreateTransferCostLayersFromSnapshotSlice(
           .map((offender) => `entry #${offender.index} from source layer ${offender.sourceCostLayerId} — ` +
             `${offender.qty} units at ${offender.unitCostBase}/unit`)
           .join('; ') +
-        `. A negative basis cannot be represented downstream: the Xero and QuickBooks daily syncs emit a ` +
+        `. A negative basis cannot be represented downstream: the accounting daily sync emits a ` +
         `COGS journal pair only when the batch total is above zero, so a credit-derived COGS would be ` +
         `dropped with no sync-log row recording the skip. Nothing has been created and this transaction has been ` +
         `aborted. The thing to correct is the credit freight line that drove this layer's cost negative ` +

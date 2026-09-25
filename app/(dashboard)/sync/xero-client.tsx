@@ -1,5 +1,6 @@
 'use client'
 
+import { ACCOUNTING_CONNECTORS, getAccountingConnectorDefinition } from '@/lib/connectors/accounting-registry'
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight, ChevronDown, Undo2 } from 'lucide-react'
@@ -151,8 +152,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   // operator to disconnect it — so the button has to stay on screen (o3d-9tbz).
   const [hasStoredToken, setHasStoredToken] = useState(initHasStoredToken ?? initConnected)
   const [tenantName, setTenantName] = useState(initTenant)
-  const [clientId, setClientId] = useState(init.client_id ?? init.xero_client_id ?? init.quickbooks_client_id ?? '')
-  const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? init.quickbooks_client_secret ?? '')
+  const [clientId, setClientId] = useState(init.client_id ?? init.xero_client_id ?? '')
+  const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? '')
   const [msg, setMsg] = useState<string | null>(null)
   const [connectMsg, setConnectMsg] = useState<string | null>(null)
   const [connectMsgTone, setConnectMsgTone] = useState<'info' | 'error'>('info')
@@ -182,8 +183,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [releasingId, setReleasingId] = useState<string | null>(null)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
-  const connectorId: AccountingConnectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
-  const connectorLabel = connectorId === 'quickbooks' ? 'QuickBooks' : 'Xero'
+  // o3d-remove-parked-connectors: this read `?connector=quickbooks ? 'quickbooks' : 'xero'`, i.e. the
+  // panel's connector came from a hand-written pair and every unrecognised value silently became
+  // Xero. It now resolves through the registry, so an unknown `?connector=` falls back to the first
+  // registered connector explicitly and the LABEL comes from that connector's definition rather than
+  // from a second ternary.
+  const requestedConnector = searchParams.get('connector')
+  const connectorId: AccountingConnectorId =
+    ACCOUNTING_CONNECTORS.find((connector) => connector.id === requestedConnector)?.id
+    ?? ACCOUNTING_CONNECTORS[0].id
+  const connectorLabel = getAccountingConnectorDefinition(connectorId).label
   // iwrm: resolve a connector-agnostic setting suffix to the active connector's
   // prefixed key (xero_* vs quickbooks_*). `settings`/`s` are already keyed for
   // the active connector by the registry, so the form must read/write the same.

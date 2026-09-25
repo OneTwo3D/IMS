@@ -1,3 +1,4 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
@@ -93,11 +94,12 @@ const probeId = (label: string) => `I0O6R8-${label}-${process.pid}-${randomUUID(
  * their posting mode is the unconditional 'submitted' — nothing else to switch on.
  */
 async function startFromXeroActive(db: Db): Promise<void> {
+  // o3d-remove-parked-connectors: `plugin_quickbooks_enabled` and `quickbooks_sync_enabled` were
+  // seeded here too. QuickBooks is archived; the rows are no longer read by anything, so seeding them
+  // would be theatre.
   for (const [key, value] of [
     [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'],
-    [INTEGRATION_PLUGIN_SETTING_KEYS.quickbooks, 'false'],
     ['xero_sync_enabled', 'true'],
-    ['quickbooks_sync_enabled', 'true'],
   ] as Array<[string, string]>) {
     await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
   }
@@ -109,7 +111,20 @@ async function startFromXeroActive(db: Db): Promise<void> {
  * `holdMs` keeps the transaction open AFTER the write so the other side can be observed waiting on
  * it. Returns how long the whole transaction took, which is the measurement.
  */
-async function switchToQuickBooks(
+/**
+ * o3d-remove-parked-connectors — WHAT THE SWITCH IS NOW.
+ *
+ * This was `switchToQuickBooks`: it turned Xero's plugin off and QuickBooks' on, under the selection
+ * lock, exactly as `saveIntegrationPluginState` does. QuickBooks is archived, so the switch is now
+ * "turn the pinned ledger OFF" — which produces the SAME state the fence has to refuse on (the locked
+ * read no longer resolves to the pinned connector) through the same writer and the same lock, and is
+ * the state a real install reaches by disabling its accounting plugin.
+ *
+ * What is no longer raced is a switch BETWEEN two live ledgers. Every timing property this file
+ * measures — that the fence's read WAITS on the switcher's lock, and that the verdict is taken after
+ * it commits — is unchanged, because those are properties of the lock, not of the number of ids.
+ */
+async function switchAwayFromXero(
   db: Db,
   lockIntegrationPluginSelection: Awaited<ReturnType<typeof loadDeps>>['lockIntegrationPluginSelection'],
   options: { holdMs?: number; onLockHeld?: () => void } = {},
@@ -120,7 +135,6 @@ async function switchToQuickBooks(
     options.onLockHeld?.()
     for (const [key, value] of [
       [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'false'],
-      [INTEGRATION_PLUGIN_SETTING_KEYS.quickbooks, 'true'],
     ] as Array<[string, string]>) {
       await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
@@ -200,7 +214,7 @@ test(
 
     const switcher = (async () => {
       await enqueueHasInserted
-      return switchToQuickBooks(db, lockIntegrationPluginSelection)
+      return switchAwayFromXero(db, lockIntegrationPluginSelection)
     })()
 
     const [, switchMs] = await Promise.all([enqueue, switcher])
@@ -264,7 +278,7 @@ test(
 
     const switcher = (async () => {
       await enqueueHasInserted
-      return switchToQuickBooks(db, lockIntegrationPluginSelection)
+      return switchAwayFromXero(db, lockIntegrationPluginSelection)
     })()
 
     const [, switchMs] = await Promise.all([enqueue, switcher])
@@ -293,7 +307,7 @@ test(
      * production — arrives behind it.
      *
      * Fenced, the queue's transaction blocks on the selection lock, wakes after the switch commits,
-     * reads QuickBooks, and refuses with nothing written. Unfenced, its pooled pre-check passes and it
+     * reads the switched-off selection, and refuses with nothing written. Unfenced, its pooled pre-check passes and it
      * inserts a Xero row immediately — the row nothing scheduled drains, which the orphan path counts
      * as posted relief.
      */
@@ -306,7 +320,7 @@ test(
     const signal: { fire?: () => void } = {}
     const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
 
-    const switcher = switchToQuickBooks(db, lockIntegrationPluginSelection, {
+    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
       holdMs: HOLD_MS,
       onLockHeld: () => signal.fire!(),
     })
@@ -370,7 +384,7 @@ test(
      * is what the r8 unit fixture could not express — it stubs both toggles to `'true'`.
      *
      * Fenced, the queue cannot answer from that toggle: it takes the selection lock, parks behind the
-     * switch, wakes after it commits, reads QuickBooks and refuses. Unfenced, it returns
+     * switch, wakes after it commits, reads the switched-off selection and refuses. Unfenced, it returns
      * `not-configured` in a couple of milliseconds without waiting for anything — which is why the
      * elapsed time is asserted as well as the reason. The timing is the part no fixture can fake.
      */
@@ -385,7 +399,7 @@ test(
     const signal: { fire?: () => void } = {}
     const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
 
-    const switcher = switchToQuickBooks(db, lockIntegrationPluginSelection, {
+    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
       holdMs: HOLD_MS,
       onLockHeld: () => signal.fire!(),
     })

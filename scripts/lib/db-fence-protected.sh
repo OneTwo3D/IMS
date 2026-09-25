@@ -103,13 +103,33 @@
 # THE SECOND ROTATION PATH IS ROOT ITSELF: remove ${DB_FENCE_PROTECTED_APP_DIR}. Only root can,
 # the directory says so, and the next run bootstraps. It is the escape hatch for a box whose
 # expected digest has been lost, and it is deliberately an act at the console rather than a flag.
+# It removes a symbolic link; the versioned directory it named is then reaped by the next
+# publication's sweep, along with any other residue no pointer names.
 #
-# STAGING IS INSIDE THE PROTECTED DIRECTORY, AND THE VERIFIED TREE IS THE PUBLISHED TREE. The
-# whole artefact is assembled at ${DB_FENCE_STAGED_APP_DIR}, which only root can write; it is
-# sealed (ownership and modes), checked (no symlinks, no devices, nothing but regular files and
-# directories), digested, and only then renamed into place. There is no window in which the
-# checkout can change between the check and the publication, because after the copy the checkout
-# is not read again.
+# THE DOCUMENTED NAME IS A POINTER, AND THE VERIFIED TREE IS THE PUBLISHED TREE (o3d-xi3w). Each
+# publication assembles the whole artefact in a directory of its own, which only root can write —
+# `.publish-fence.<pid>.<mktemp suffix>` under ${DB_FENCE_RECOVERY_DIR} — seals it (ownership and
+# modes), checks it (no symlinks, no devices, nothing but regular files and directories), digests
+# it, writes the record and the manifest INTO it, makes the whole thing durable, renames it to
+# `.version-fence.<pid>.<suffix>`, and only then flips ${DB_FENCE_PROTECTED_APP_DIR} — a symbolic
+# link — onto it with one rename(2). There is no window in which the checkout can change between
+# the check and the publication, because after the copy the checkout is not read again; there is no
+# window in which the documented name is absent or half-published, because the flip is a single
+# rename of a single object; and there is no state in which the record describes a tree that has
+# moved, because the record is inside the directory the flip commits. The full argument, and the
+# three defects this replaced, are written out above _fence_publish_unwind() below.
+#
+# WHAT IS STILL DUPLICATED, AND WHY (o3d-xi3w). driver_publish_tree() in lib/privileged-helpers.sh
+# performs the same sequence for the deploy driver and the helper snapshot, and this file does not
+# call it. What the two DO share is stated at each site: the ownership decision
+# (_priv_path_inside_root / _priv_name_inside_root), the /proc walk both sweeps need
+# (_priv_open_paths), and the sealing, manifest, digest, durable-file and fsync primitives, which
+# live here and which privileged-helpers.sh calls. What is not shared is the sequence, because six
+# things differ between the two publications — the root, the variable a refusal is reported in, the
+# record's format, which tree is assembled, which names are documented, and the sweep's kind — and
+# parameterising all six means passing function names, which is a construct neither this file's
+# reader nor the static census in tests/scripts/privileged-helper-set.test.ts can resolve. Merging
+# them into one primitive is filed as follow-up work rather than done here.
 #
 # ROTATION IS REFUSED WHILE A FENCE MAY BE STANDING. ${DB_FENCE_STATE} existing means a fence was
 # raised and not yet released; the helper that RELEASES it restores grants from a record the
@@ -298,17 +318,58 @@
 
 readonly DB_FENCE_RECOVERY_DIR="/etc/ims-cutover-recovery"
 readonly DB_FENCE_IDENTITY_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-identity.env"
+# THE ONE LOCK THIS MECHANISM TAKES, AND THE KERNEL IS WHAT RELEASES IT (o3d-xi3w r4, Codex HIGH 1). It
+# excludes nothing but writers of ${DB_FENCE_IDENTITY_FILE}'s binding lines, and it is held across the
+# pair of writes that must not be interleaved -- see THE INVARIANT above _fence_bind_record_to_standing().
+# `flock(2)` is released by the kernel when the holder's last descriptor closes, INCLUDING on SIGKILL and
+# on a power cut, so a holder that dies blocks nothing and there is no liveness test to get wrong; that is
+# the whole reason a lock is admissible here where round 3 refused one. It is opened READ-ONLY (a lock
+# needs no write access, and an open with no O_CREAT and no O_TRUNC has nothing for a planted name to
+# aim), it lives in the root-owned recovery root that nothing else may write, and it is created 0600 so
+# that no other account can open a descriptor on it and hold it against every future cutover.
+readonly DB_FENCE_RECORD_LOCK="${DB_FENCE_RECOVERY_DIR}/db-fence-record.lock"
+# A BOUNDED WAIT AND NOT AN INDEFINITE ONE. The other holder is a cutover publishing an authority, which
+# is one node process and a few renames; a wait that cannot end would turn a wedged peer into a hung
+# cutover, and every caller treats the timeout as a refusal that publishes and replaces nothing.
+readonly DB_FENCE_RECORD_LOCK_WAIT=120
 readonly DB_FENCE_PROTECTED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/app"
 readonly DB_FENCE_SCRIPT_COPY="${DB_FENCE_PROTECTED_APP_DIR}/scripts/fence-db-connections.mjs"
-# The whole artefact is assembled here and renamed into place in one step; the previous one is
-# moved aside under this name so a failed swap leaves the OLD tree standing rather than none.
-readonly DB_FENCE_STAGED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.staged"
-readonly DB_FENCE_RETIRED_APP_DIR="${DB_FENCE_RECOVERY_DIR}/.app.retired"
+# THE FOUR NAMES ONE PUBLICATION USES, AND THEY ARE PER RUN AND NOT PER KIND (o3d-xi3w). They used to be
+# two fixed names — `${DB_FENCE_RECOVERY_DIR}/.app.staged` and `.app.retired` — and a fixed staging name is
+# a directory a SECOND privileged run empties and refills while the first is between assembling its tree
+# and hashing it: measured, with the first run then publishing and recording bytes it had never
+# authenticated. Each publication now takes `<prefix>fence.<pid>.<mktemp suffix>`, so no two runs can hold
+# the same name and nothing has to tell its own staging tree from somebody else's.
+readonly DB_FENCE_PUBLISH_KIND="fence"
+readonly DB_FENCE_PUBLISH_PREFIX=".publish-"
+readonly DB_FENCE_VERSION_PREFIX=".version-"
+readonly DB_FENCE_POINTER_PREFIX=".pointer-"
+readonly DB_FENCE_RETIRE_PREFIX=".retired-"
+# AND THE FIFTH NAME, WHICH IS NOT A PUBLICATION'S BUT AN EXECUTION'S (o3d-xi3w r2, Codex HIGH).
+# `<prefix>fence.<pid>.<that process's start time>` is one symbolic link per FENCE OPERATION, its text the
+# same string the pointer carries, and it does two jobs that are really one: it is the PIN — every helper
+# invocation of that operation resolves through it, so they cannot end up on different releases — and it
+# is the LIVENESS MARKER the sweep honours, so a version another run is executing out of is never
+# reclaimed. The start time is in the name because a pid alone is reused: /proc says whether the process
+# that wrote a marker is the process reading it, and a marker that is not this operation's is ignored.
+readonly DB_FENCE_INUSE_PREFIX=".inuse-"
 # What the published tree hashes to, and the per-file manifest that says WHICH file moved when it
 # stops matching. Root-owned, beside the tree and not inside it: a record that lived in the tree
 # would be part of its own digest.
-readonly DB_FENCE_ARTEFACT_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.sha256"
-readonly DB_FENCE_MANIFEST_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.manifest"
+#
+# AND NAMED THROUGH THE POINTER, `..` AND ALL, SO THAT ONE RENAME COMMITS BOTH (o3d-xi3w; the driver
+# publication's ${IMS_DRIVER_HELPER_RECORD} is the same device). ${DB_FENCE_PROTECTED_APP_DIR} is a
+# symbolic link into the versioned directory that holds the tree, its record and its manifest together,
+# so this path resolves to the record OF THE TREE THAT IS STANDING — and the record can no longer
+# describe a tree that has since been replaced, which it could when it was written after the swap. On an
+# installation this release has not published to yet, where the documented name is still a real
+# directory, the very same path resolves to where the record has always been.
+readonly DB_FENCE_ARTEFACT_FILE="${DB_FENCE_PROTECTED_APP_DIR}/../db-fence-artefact.sha256"
+readonly DB_FENCE_MANIFEST_FILE="${DB_FENCE_PROTECTED_APP_DIR}/../db-fence-artefact.manifest"
+# WHERE A PRE-POINTER RELEASE LEFT THEM. Read by nothing: they are removed once this run has migrated
+# such an installation, so that no stale record is left claiming a digest for a tree that has moved.
+readonly DB_FENCE_LEGACY_ARTEFACT_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.sha256"
+readonly DB_FENCE_LEGACY_MANIFEST_FILE="${DB_FENCE_RECOVERY_DIR}/db-fence-artefact.manifest"
 # The two commands an operator is ever given. Root-owned, generated by root at fence time with
 # this run's state file and connection identity baked in, so that what is PRINTED is a path that
 # exists and runs — see db_fence_publish_operator_wrappers().
@@ -408,6 +469,121 @@ _fence_fsync_path() {
   return 1
 }
 
+# EVERY ENTRY OF A TREE, NOT JUST ITS TOP DIRECTORY (o3d-xi3w r5, Codex HIGH). `sync <dir>` flushes ONE
+# directory entry. A tree assembled under a staging name has nested directories and files of its own, and
+# once a fence is RAISED with it the recovery record names that version DURABLY -- so a power cut that left
+# the version present and INCOMPLETE would leave a fence whose helper resolves, fails its own digest check
+# and refuses, which is the one outcome this file treats as worse than not publishing. `sync --file-system`
+# flushes the filesystem the tree is on: every entry, in one call, with no recursive walk to get wrong and
+# no search program to aim. A kernel or coreutils that will not do it falls back to a whole-system sync,
+# which is what
+# _fence_fsync_path() above already falls back to.
+_fence_fsync_tree() {
+  local target="$1"
+  # THE FALLBACK IS FOR AN ABSENT OPTION AND NEVER FOR A FAILED FLUSH (r5, second review of this round).
+  # `sync --file-system` is syncfs(2), which REPORTS writeback errors; bare `sync` is sync(2), which on
+  # Linux cannot. So a `||` between them turns a reported I/O error into a success and this whole barrier
+  # into a comment. Support is asked of the program itself and only its ABSENCE chooses the weaker form;
+  # where it is there, its status is this function's status.
+  if LC_ALL=C sync --help 2>/dev/null | grep -qF -- '--file-system'; then
+    sync --file-system "$target" 2>/dev/null
+    return
+  fi
+  # NO syncfs ON THIS coreutils (it arrived in 8.24, together with operands). The barrier is then the one
+  # this file had before r5 -- a whole-system flush whose status cannot distinguish a writeback error --
+  # and that is said here rather than presented as the same guarantee.
+  sync 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# "IS THIS PATH INSIDE THE TREE THIS CODE OWNS?" — ASKED IN ONE PLACE (o3d-xi3w)
+# ---------------------------------------------------------------------------
+#
+# THREE PUBLICATIONS ASK IT: the protected fence artefact below, and the helper snapshot and the deploy
+# driver in lib/privileged-helpers.sh. o3d-xi3w exists because the same primitive written twice
+# DIVERGED — the fence publication still carried the retire-then-rename and record-after-swap defects
+# that the driver had had fixed twice — so the decision is made here, once, and the four guards above it
+# (_fence_require_owned_tree, driver_require_owned_path, _driver_owned_name and _fence_owned_name) differ
+# only in which root they name and in how they refuse.
+#
+# WHY THIS SIDE OF THE EDGE. privileged-helpers.sh already takes this file's publication primitives
+# (_fence_tree_is_sealed, _fence_tree_manifest, _fence_tree_digest, _fence_publish_file,
+# _fence_fsync_path) and every entrypoint sources this file FIRST, so the dependency runs one way. The
+# fence harnesses source this library ALONE, and a check here that called into privileged-helpers.sh
+# would be an undefined command in them.
+#
+# WHAT IS SHARED IS THE DECISION AND NOT THE REFUSAL. These two answer 0 or 1 and print nothing: the
+# fence ends the run through _fence_owned_refuse, the driver through driver_owned_refuse →
+# privileged_end_run(), and each keeps the sentence its own operator reads. It also keeps the static
+# net's binding rule intact — the guard named in tests/scripts/privileged-word-allowlist.json is still
+# called in the same function as the operation it protects, on that operation's own operand.
+#
+# WHAT THEY ANSWER, AND WHY IT IS ON STDOUT AND NOT IN A GLOBAL. Each prints one line,
+# `<fault>|<canonical path>|<canonical root>`, and returns 0 only when the path is inside the root. The
+# fault is one of `inside`, `absolute`, `dotdot`, `canon` (nothing to compare) and `outside`, so the
+# caller's `case` names the outcomes in the open rather than mapping status numbers — and each caller
+# takes the line into a `local` of the frame that consumes it. A SCRIPT-SCOPE name would not do: a value
+# that steers a `case` or an equality is a DECISION and not a report, and the declaration census in
+# tests/scripts/install-root-safe-writes.test.ts refuses one at a sink for exactly the reason that matters
+# here — anything able to pre-set it would be choosing which refusal is made, or whether one is.
+
+# CANONICAL AND STRICTLY INSIDE ${2} — for an operation that FOLLOWS the path: a copy INTO it, `chown -R`,
+# `chmod -R`, `rm -rf NAME/`. Absolute, no `.` or `..` component, and CANONICALISING — every symbolic
+# link resolved, a final one included — to something strictly below the canonical root. A symlink under
+# the root that points at ${APP_DIR} therefore fails here.
+_priv_path_inside_root() {
+  local path="$1" root_dir="$2" root canon
+  case "${path}" in
+    /*) ;;
+    *) printf 'absolute||'; return 1 ;;
+  esac
+  case "/${path}/" in
+    */../*|*/./*) printf 'dotdot||'; return 1 ;;
+  esac
+  root="$(readlink -m -- "${root_dir}" 2>/dev/null)" || root=""
+  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
+  if [[ -z "${canon}" ]]; then
+    printf 'canon||%s' "${root}"
+    return 1
+  fi
+  if [[ -n "${root}" && "${root}" != "/" && "${canon}" == "${root}/"?* ]]; then
+    printf 'inside|%s|%s' "${canon}" "${root}"
+    return 0
+  fi
+  printf 'outside|%s|%s' "${canon}" "${root}"
+  return 1
+}
+
+# THE NAME'S OWN LOCATION, STRICTLY INSIDE ${2} — for an operation on the NAME: unlink it, rename it,
+# create a link at it. It does NOT follow a final symbolic link (the parent canonicalises and the last
+# component stays a plain name), so a pointer whose target has gone, or points elsewhere, can be removed
+# — while `rm -rf NAME/`, `NAME/*` and `chmod -R NAME`, which all follow it, are the other function's
+# business (o3d-z5be r12 L2, r13 MED-1).
+_priv_name_inside_root() {
+  local path="$1" root_dir="$2" root parent base canon
+  case "${path}" in
+    /*) ;;
+    *) printf 'absolute||'; return 1 ;;
+  esac
+  case "/${path}/" in
+    */../*|*/./*) printf 'dotdot||'; return 1 ;;
+  esac
+  root="$(readlink -m -- "${root_dir}" 2>/dev/null)" || root=""
+  base="${path##*/}"
+  parent="$(readlink -m -- "${path%/*}/" 2>/dev/null)" || parent=""
+  if [[ -z "${base}" || -z "${parent}" ]]; then
+    printf 'canon||%s' "${root}"
+    return 1
+  fi
+  canon="${parent%/}/${base}"
+  if [[ -n "${root}" && "${root}" != "/" && "${canon}" == "${root}/"?* && "${canon#"${root}/"}" != */ ]]; then
+    printf 'inside|%s|%s' "${canon}" "${root}"
+    return 0
+  fi
+  printf 'outside|%s|%s' "${canon}" "${root}"
+  return 1
+}
+
 # IS THIS A TREE THIS LIBRARY OWNS? IF NOT, THE OPERATION NEVER RUNS (o3d-z5be r11/r12).
 #
 # The fence copies into, deletes, re-owns and re-modes trees named by variables — one by a PARAMETER
@@ -430,20 +606,17 @@ _fence_fsync_path() {
 # privileged_end_run() (TERM trapped and a substitution in an argument; TERM ignored; `bash -c`; inside
 # an EXIT-trap handler): the refused operation never runs in any of them.
 _fence_require_owned_tree() {
-  local path="$1" what="$2" probe="${3:-}" root canon owned base tmp
-  case "${path}" in
-    /*) ;;
-    *) _fence_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
-  esac
-  case "/${path}/" in
-    */../*|*/./*) _fence_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
-  esac
-  root="$(readlink -m -- "${DB_FENCE_RECOVERY_DIR}" 2>/dev/null)" || root=""
-  canon="$(readlink -m -- "${path}" 2>/dev/null)" || canon=""
-  [[ -n "${canon}" ]] || _fence_owned_refuse "${what}" "${path}" "could not be canonicalised"
-  if [[ -n "${root}" && "${root}" != "/" && "${canon}" == "${root}/"?* ]]; then
+  local path="$1" what="$2" probe="${3:-}" answer canon owned base tmp
+  if answer="$(_priv_path_inside_root "${path}" "${DB_FENCE_RECOVERY_DIR}")"; then
     return 0
   fi
+  canon="${answer#*|}"
+  canon="${canon%%|*}"
+  case "${answer%%|*}" in
+    absolute) _fence_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+    dotdot) _fence_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+    canon) _fence_owned_refuse "${what}" "${path}" "could not be canonicalised" ;;
+  esac
   if [[ -n "${probe}" && ! -L "${probe}" && -d "${probe}" ]] \
      && [[ "$(stat -c '%u' -- "${probe}" 2>/dev/null)" == "$(id -u)" ]]; then
     owned="$(readlink -m -- "${probe}" 2>/dev/null)" || owned=""
@@ -469,6 +642,69 @@ _fence_owned_refuse() {
     kill -TERM "$$" 2>/dev/null || true
   fi
   exit 1
+}
+
+# EVERY OPEN FILE, CURRENT DIRECTORY AND EXECUTABLE THIS ACCOUNT CAN SEE, as physical paths, one per
+# line. Shared by both sweeps (o3d-xi3w): _fence_sweep_publications() below and driver_open_paths() in
+# lib/privileged-helpers.sh, which is a call to this. The globs name the per-process directories directly
+# rather than walking /proc, which keeps this at a few milliseconds; a find racing an exiting process is
+# expected and its status is therefore not read — but each CALLER treats an EMPTY answer as "the question
+# could not be asked" and deletes nothing, which is the conservative direction for a sweep.
+_priv_open_paths() {
+  find /proc/[0-9]*/fd /proc/[0-9]*/cwd /proc/[0-9]*/exe -maxdepth 1 -type l -printf '%l\n' 2>/dev/null || true
+}
+
+# IS THIS NAME'S OWN LOCATION INSIDE THE RECOVERY ROOT? (o3d-xi3w.) The publication below commits by
+# RENAMING A SYMBOLIC LINK, so it operates on NAMES — a pointer it created, a pointer it replaces, a
+# version directory it is about to delete — and a check that canonicalised the final component would
+# refuse to remove a pointer whose target had gone and, worse, could be followed by an operation that
+# does. PRIVATE, exactly as _driver_owned_name is: it is called by the three helpers below, each of which
+# performs its one operation on the name it has just checked, so no caller can check a name and then act
+# THROUGH it.
+_fence_owned_name() {
+  local path="$1" what="$2" answer canon root
+  if answer="$(_priv_name_inside_root "${path}" "${DB_FENCE_RECOVERY_DIR}")"; then
+    return 0
+  fi
+  canon="${answer#*|}"
+  canon="${canon%%|*}"
+  root="${answer##*|}"
+  case "${answer%%|*}" in
+    absolute) _fence_owned_refuse "${what}" "${path}" "is not an absolute path" ;;
+    dotdot) _fence_owned_refuse "${what}" "${path}" "has a '.' or '..' component" ;;
+  esac
+  _fence_owned_refuse "${what}" "${path}" "is not a name strictly inside ${DB_FENCE_RECOVERY_DIR} (${root:-unresolvable}); it resolves to '${canon:-nothing}'"
+}
+
+# THE THREE OPERATIONS ON A NAME, each performed on exactly the name it has just checked, and each the
+# fence's counterpart of driver_unlink_owned / driver_rename_owned / driver_link_owned. They are four
+# lines apiece rather than one shared set because the REFUSAL differs: the driver's ends the run through
+# privileged_end_run(), which lives in the library that is sourced after this one and is undefined in the
+# harnesses that source this file alone. The decision both of them make — _priv_name_inside_root — is
+# shared, which is the half that had diverged.
+#
+# `-T` ON EVERY RENAME, and it is not a tidiness flag (o3d-xi3w). `mv -f src dst` with `dst` an existing
+# DIRECTORY moves src INSIDE it and RETURNS SUCCESS; that is how the publication this replaces could
+# report that it had published its own tree while another run's files were what executed. `-T` makes the
+# destination a name and never a directory to move into, so the only outcomes left are "replaced" and
+# "failed". `quiet` as the last argument discards the operation's own error output, never the refusal's.
+_fence_unlink_owned() {
+  local name="$1" what="$2" quiet="${3:-}"
+  _fence_owned_name "${name}" "${what}"
+  if [[ "${quiet}" == "quiet" ]]; then rm -rf -- "${name}" 2>/dev/null; else rm -rf -- "${name}"; fi
+}
+
+_fence_rename_owned() {
+  local from="$1" to="$2" what="$3" quiet="${4:-}"
+  _fence_owned_name "${from}" "${what} (the name being moved)"
+  _fence_owned_name "${to}" "${what} (the name it is moved to)"
+  if [[ "${quiet}" == "quiet" ]]; then mv -T -- "${from}" "${to}" 2>/dev/null; else mv -T -- "${from}" "${to}"; fi
+}
+
+_fence_link_owned() {
+  local target="$1" name="$2" what="$3"
+  _fence_owned_name "${name}" "${what}"
+  ln -s -- "${target}" "${name}"
 }
 
 # CLEARED AT LOAD (r12, review H1): the name r11 consulted. Nothing reads it now; clearing it means no
@@ -506,6 +742,44 @@ file_sha256() {
 # SHAPE is an operator error, and comparing against it would silently never match.
 fence_valid_sha256() {
   [[ "${1:-}" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# IS THIS ONE PUBLICATION OF THIS RECOVERY ROOT? The same shape _fence_standing_artefact_ok() holds the
+# pointer's text to, asked of a bare name: one `.version-fence.<pid>.<suffix>` component, so a value read
+# out of a file can never introduce an absolute path, a `..` or a second directory level.
+_fence_valid_version_name() {
+  [[ "$1" =~ ^\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+$ ]]
+}
+
+# WHICH PUBLICATION AN ENTRY FILE BELONGS TO, by name. Empty (and non-zero) for an entry that is not
+# inside one -- a pre-pointer installation's is not -- because there is then no version to bind.
+_fence_version_of_entry() {
+  local entry="$1" tree version rest
+  tree="${DB_FENCE_PROTECTED_APP_DIR##*/}"
+  [[ "${entry}" == "${DB_FENCE_RECOVERY_DIR}/"* ]] || return 1
+  rest="${entry#"${DB_FENCE_RECOVERY_DIR}/"}"
+  version="${rest%%/*}"
+  [[ "${rest#*/}" == "${tree}/scripts/"* ]] || return 1
+  _fence_valid_version_name "${version}" || return 1
+  printf '%s' "${version}"
+}
+
+# The PUBLICATION ${DB_FENCE_IDENTITY_FILE} binds the fence it records to (o3d-xi3w r4), and only from a
+# COMPLETE record. It is the second half of the binding the digest line begins: the digest says WHICH
+# BYTES and this says WHICH PUBLICATION they are in, which is what a release needs when the documented
+# pointer has moved on since the fence was raised. Absent on a record written before this round, which
+# falls back to the pointer and the digest check -- exactly the behaviour those installations had. A
+# PRE-POINTER INSTALLATION IS NOT ONE OF THOSE CASES SINCE r5: its fence operations execute out of an
+# adopted `.version-fence.<pid>.<suffix>` directory of the standing tree's own inodes, so a raise there
+# records a version like any other.
+fence_record_script_version() {
+  local version
+  [[ -f "${DB_FENCE_IDENTITY_FILE}" ]] || return 1
+  grep -qE '^fence_identity_complete=1$' "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null || return 1
+  version="$(grep -m1 -E '^fence_script_version=' "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null)" || return 1
+  version="${version#fence_script_version=}"
+  _fence_valid_version_name "${version}" || return 1
+  printf '%s' "${version}"
 }
 
 # The digest ${DB_FENCE_IDENTITY_FILE} binds to the fence it records, and only from a COMPLETE
@@ -573,13 +847,17 @@ _fence_tree_is_sealed() {
   [[ -d "$root" ]] || { DB_FENCE_SEAL_REASON="${root} is not a directory"; return 1; }
   uid="$(id -u)" || return 1
 
-  offender="$(find "$root" \( ! -type d -a ! -type f \) -print -quit 2>/dev/null)" || return 1
+  # `-H` DEREFERENCES THE START POINT AND NOTHING ELSE (o3d-xi3w). The documented name is a symbolic link
+  # into the versioned directory that holds the standing tree, and without this the start point itself
+  # answers "neither a regular file nor a directory" and every sealing check of a published artefact would
+  # refuse it. Links INSIDE the tree are still found and still refused, which is what this test is for.
+  offender="$(find -H "$root" \( ! -type d -a ! -type f \) -print -quit 2>/dev/null)" || return 1
   if [[ -n "$offender" ]]; then
     DB_FENCE_SEAL_REASON="${offender} is neither a regular file nor a directory. The artefact digest is taken over regular files only, so a symlink, device or socket inside the protected tree is executable surface the digest does not cover — which is the substitution this mechanism exists to close. Nothing was published and nothing will be executed from ${root}."
     return 1
   fi
 
-  offender="$(find "$root" \( ! -uid "${uid}" -o -perm /022 \) -print -quit 2>/dev/null)" || return 1
+  offender="$(find -H "$root" \( ! -uid "${uid}" -o -perm /022 \) -print -quit 2>/dev/null)" || return 1
   if [[ -n "$offender" ]]; then
     DB_FENCE_SEAL_REASON="${offender} inside the protected tree is not owned by uid ${uid} or is writable by group or other, so the account this protection is against could rewrite it between the digest check and the exec. Nothing was published and nothing will be executed from ${root}."
     return 1
@@ -918,10 +1196,655 @@ _fence_vendor_into() {
 # PUBLICATION
 # ---------------------------------------------------------------------------
 
-# Assemble the WHOLE artefact under a staging name only root can write, seal it, digest it,
-# require it to match whatever the invocation pinned, and only then rename it into place. The
-# verified tree is the published tree: after the copy the checkout is never read again, so there
-# is no interval in which it can change the outcome.
+# THE PUBLICATION IS ONE RENAME OF ONE SYMBOLIC LINK (o3d-xi3w).
+#
+# Assemble, seal, digest, authenticate, RECORD, make the whole thing durable, and only then FLIP ONE
+# SYMBOLIC LINK. The flip is the last mutation of the publication and it is a single rename(2).
+#
+# THIS IS driver_publish_tree()'s SHAPE, AND NOT A SECOND ANSWER TO THE SAME QUESTION. o3d-z5be r3
+# arrived at it for the deploy driver, which borrowed its primitives from this file; o3d-xi3w exists
+# because the fence artefact kept the sequence the driver had had fixed twice. What the two publications
+# share is stated where it lives: _priv_path_inside_root / _priv_name_inside_root make the ownership
+# decision for both, _priv_open_paths answers the sweep's third question for both, and the sealing,
+# manifest, digest, durable-file and fsync primitives were always this file's. What is NOT shared is the
+# SEQUENCE below, and the reason is written out under WHAT IS STILL DUPLICATED in the header.
+#
+# WHAT THE PREVIOUS SEQUENCE WAS, AND WHY IT COULD NOT BE FIXED BY NARROWING. It was: assemble at a fixed
+# name, move the standing tree aside to a second fixed name, mv the staging tree onto the documented name,
+# delete the moved-aside copy, and THEN write the record. Three defects, all measured before this was
+# changed (o3d-xi3w):
+#
+#   * A FIXED STAGING NAME IS NOT THIS RUN'S. A second privileged run begins its own publication by
+#     deleting and refilling that name, so the tree the first run HASHES need not be the tree it
+#     ASSEMBLED. Measured: run A, pinned with IMS_FENCE_SCRIPT_SHA256 and having matched its own entry
+#     file, published the OTHER run's entry file and recorded the digest of the one it had checked. A pin
+#     that authenticates bytes nobody publishes is worse than no pin at all.
+#   * BETWEEN THE RETIRE AND THE RENAME THE DOCUMENTED NAME DID NOT EXIST, so a second run could put ITS
+#     tree there first -- and `mv src dst` with `dst` an existing DIRECTORY does not replace dst, it moves
+#     src INSIDE it AND RETURNS SUCCESS. Measured: the loser's whole tree ended up one level down inside
+#     the winner's, the loser's `mv` reported success, and the record then bound the loser's digest to a
+#     tree that hashed to something else -- after which nothing can be executed out of the artefact at all,
+#     because the record and the tree disagree for as long as both stand.
+#   * THE RECORD WAS WRITTEN AFTER THE SWAP, and the moved-aside copy was deleted BEFORE it. A failure
+#     writing the record therefore returned nonzero -- callers say "the fence artefact could not be
+#     established" -- with the NEW tree already standing and nothing left to restore.
+#
+# WHY THIS IS ATOMIC AND NOT MERELY NARROWER. There is no interval to narrow. The versioned directory is
+# built under a name no other run can hold, and it is complete -- tree, record and manifest -- before it is
+# reachable from any documented name; the pointer is then replaced by rename(2), which the kernel performs
+# as one operation. ONE RESOLUTION of ${DB_FENCE_PROTECTED_APP_DIR} at any instant, including an instant
+# during a publication, yields either the previous artefact or this one, never neither and never half of
+# one, and the rename cannot silently nest because its destination is a symbolic link and not a directory.
+# `-T` on every rename this file makes is the belt on that: it refuses a directory destination outright.
+#
+# AND A LOCK OVER THE CRITICAL SECTION IS NOT THE ANSWER HERE EITHER, for the reason driver_publish_tree()
+# gives: the other publisher may be a DIFFERENT RELEASE. update.sh from release N-7 can be publishing
+# while install.sh from release N does, and mutual exclusion requires every participant to have heard of
+# the protocol. A rename requires nothing of the other participant.
+#
+# AND THE LOSER OF A RACE LOSES CLEANLY. Both runs publish complete, sealed, separately-authenticated
+# trees; the later rename decides which stands. The loser then reads the pointer back, finds it does not
+# name the tree it published, and REFUSES rather than reporting a rotation -- so no caller can announce a
+# digest for bytes the fence will not execute.
+#
+# WHAT THE RECORD IS NOW PART OF. ${DB_FENCE_ARTEFACT_FILE} and ${DB_FENCE_MANIFEST_FILE} are named
+# through the pointer (`<protected dir>/../<name>`), so they live inside the versioned directory the flip
+# commits: one commit point can only commit one object, and a record beside the pointer would be a second
+# mutable object -- which is the defect above, back again by the door marked "tidier path".
+
+# IS THERE A COMMITTED REPLACEMENT AT THE DOCUMENTED NAME? (o3d-xi3w r4, Codex HIGH 2.) Asked by the
+# unwind, and only there, before it may delete what it moved aside.
+#
+# "SOMETHING IS AT THAT NAME" IS NOT AN ANSWER. `-e` is satisfied by a dangling pointer, by a tree a
+# publication is still assembling, by a directory whose record was never written and by one that no longer
+# hashes to the record beside it -- and none of those is an artefact any later run will execute. The
+# question the unwind has to ask before destroying the only other copy is the EXECUTION path's question,
+# so it is asked with the execution path's own primitives: the documented name resolves to one publication
+# of this root, that publication holds an entry file, its tree is sealed, and it hashes to what its own
+# record beside it binds. Anything less is answered `no`, and `no` means KEEP.
+_fence_committed_replacement() {
+  local base entry bound_record bound_tree
+  base="$(_fence_resolve_version)" || return 1
+  entry="${base}/scripts/${DB_FENCE_SCRIPT_COPY##*/}"
+  [[ -f "${entry}" ]] || return 1
+  _fence_tree_is_sealed "${base}" || return 1
+  bound_record="$(fence_record_artefact_digest "${base}")" || return 1
+  bound_tree="$(_fence_tree_digest "${base}")" || return 1
+  [[ -n "${bound_record}" && "${bound_record}" == "${bound_tree}" ]] || return 1
+  return 0
+}
+
+# WHAT IS AT THE DOCUMENTED NAME AFTER AN UNWIND, SAID IN ONE PLACE. Every refusal below used to end
+# "whatever stands there is unchanged", which is a sentence about the ordinary case asserted on every
+# path -- including the one where this run had moved the only artefact aside and could not put it back.
+# A claim that is true on five paths and false on the sixth is the shape a stale line beside its own
+# correction has, so the clause is composed from what the unwind actually did instead of being restated.
+_fence_preserved_note() {
+  local preserved="$1"
+  if [[ -z "${preserved}" ]]; then
+    printf ' Whatever was standing at %s is unchanged.' "${DB_FENCE_PROTECTED_APP_DIR}"
+    return 0
+  fi
+  printf ' AND %s IS NOW ABSENT: this run had to move the artefact that was there aside for the one migration a pre-pointer installation needs, could not put it back, and has PRESERVED it at %s rather than deleting it -- it is the only previously usable fence artefact on this box and nothing else has a copy of it. Put it back before the next cutover (as root: %s -T %s %s), or discard it deliberately and let the next privileged run bootstrap from the release.' "${DB_FENCE_PROTECTED_APP_DIR}" "${preserved}" "mv" "${preserved}" "${DB_FENCE_PROTECTED_APP_DIR}"
+}
+
+# UNDOING A PUBLICATION THAT HAS NOT COMMITTED YET. Called from the failure paths between the versioned
+# directory existing and the pointer being flipped -- the only interval in which this run has created
+# anything under the recovery root that it must take away again.
+#
+# A MOVED-ASIDE ARTEFACT IS PUT BACK ONLY IF NOTHING HAS TAKEN THE DOCUMENTED NAME. A concurrent
+# publication that flipped its own pointer in while this one was failing owns that name now, and moving an
+# old directory over it would be this mechanism destroying a good artefact on its way out. `-e` alone would
+# not do: what was moved aside can be a POINTER as well as a legacy directory, and a symbolic link whose
+# publication has been swept answers neither -e nor -d.
+#
+# AND THE RETIREMENT NAME IS DELETED ONLY ONCE SOMETHING ELSE IS USABLE (o3d-xi3w r4, Codex HIGH 2). It
+# used to be deleted unconditionally, one line after a restore whose status was discarded with `|| true`
+# -- so a restore that failed (a full or faulted filesystem is enough; measured with an injected rename
+# failure) left the documented name ABSENT and then destroyed the only copy of what had been there. That
+# is the one outcome this file treats as worse than not publishing, and it was reachable from two ordinary
+# failures: the pointer creation and the commit rename. So there are now exactly three ways the retirement
+# name may be removed, and NOTHING ELSE IS ONE:
+#
+#   * nothing was ever moved aside, so there is nothing at that name to lose;
+#   * what was moved aside is BACK at the documented name, proved by the rename's own status;
+#   * the documented name holds a COMMITTED REPLACEMENT that authenticates itself, which is
+#     _fence_committed_replacement() above and is the execution path's question rather than `-e`.
+#
+# Otherwise it is KEPT, and its path is printed on stdout so that the refusal names it. On stdout and not
+# in ${DB_FENCE_ROTATION_NOTE}, because every caller of this function assigns that name on the very next
+# line; the caller reads this through a command substitution into a local of its own frame and renders it
+# with _fence_preserved_note(). The residue is a directory under the root-owned recovery root, which the
+# sweep restores onto an absent documented name before it deletes anything -- so the preserved copy is
+# picked up by the next ordinary run as well as by the operator the refusal addresses.
+_fence_publish_unwind() {
+  local version_dir="$1" pointer_tmp="$2" retire_dir="$3" migrated="$4" moved=0 disposable=0
+  if (( migrated == 1 )) && { [[ -e "${retire_dir}" ]] || [[ -L "${retire_dir}" ]]; }; then
+    moved=1
+  fi
+  if (( moved == 0 )); then
+    disposable=1
+  elif [[ ! -e "${DB_FENCE_PROTECTED_APP_DIR}" ]] && [[ ! -L "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+    if _fence_rename_owned "${retire_dir}" "${DB_FENCE_PROTECTED_APP_DIR}" "the moved-aside fence artefact the unwind restores" quiet; then
+      disposable=1
+    fi
+  elif _fence_committed_replacement; then
+    disposable=1
+  fi
+  _fence_unlink_owned "${version_dir}" "the version directory the unwind deletes" quiet || true
+  if (( disposable == 1 )); then
+    _fence_unlink_owned "${retire_dir}" "the retire directory the unwind deletes" quiet || true
+  else
+    printf '%s' "${retire_dir}"
+  fi
+  _fence_unlink_owned "${pointer_tmp}" "the temporary pointer the unwind deletes" quiet || true
+  return 0
+}
+
+# THE RESIDUE PUBLISHING BY POINTER FLIP LEAVES, AND WHAT MAY BE TAKEN AWAY (o3d-xi3w). It is the cost of
+# not overwriting: a staging directory whose run was killed before its rename, a SUPERSEDED versioned
+# directory that no pointer names any more, a leftover temporary pointer, and a moved-aside directory from
+# an interrupted migration. Leaving them forever would fill the recovery root with every release ever
+# deployed. The argument for each question is driver_sweep_orphans()'s, written out in full above it in
+# lib/privileged-helpers.sh; this is the same sweep for the one kind this root holds.
+#
+# THREE QUESTIONS, AND NO TWO OF THEM ALONE WOULD DO: is any pointer naming it (the standing artefact is
+# never touched, whatever the pid in its name says); is its publisher gone (a live pid is SKIPPED, so a
+# publication in flight is never taken); and is anything reading out of it (the fence is EXECUTED out of
+# these directories, by an account this one hands an administrative credential). An unanswerable third
+# question deletes nothing at all.
+#
+# AND THE WORST CASE IS NOT A SUBSTITUTION: this only ever deletes, and deleting cannot put bytes
+# anywhere. The one thing it puts BACK rather than taking away is a moved-aside artefact whose migration
+# nobody finished, and only onto a name that is ABSENT, so it can never displace a publication that has
+# committed.
+# IS A LIVE FENCE OPERATION PINNED TO THIS VERSION? (o3d-xi3w r2.) The sweep's third question — "is
+# anything reading out of it" — is answered by _priv_open_paths() only while a file in the tree is OPEN,
+# and the fence is executed in BURSTS: a cutover resolves the artefact, prints banners, runs a plan,
+# validates it as root, and only then execs `node` out of it, four times over. Between those bursts
+# nothing in the version is open, its publisher is very likely a deploy that finished weeks ago, and the
+# pointer may since have been flipped by another run — so all three of the existing questions say "take
+# it" about a directory the next exec of a live cutover is going to run. That is why the pin is a file and
+# not a shell variable: it outlives the command substitutions every caller resolves through, and it is
+# the one thing on the filesystem that says a version is SPOKEN FOR.
+#
+# It only ever KEEPS. A marker that cannot be read, or whose text is not this version's, keeps nothing,
+# and a marker whose holder is gone is reaped by the sweep below like any other residue.
+_fence_version_held() {
+  local name="$1" entry base rest pid text
+  [[ -n "${name}" ]] || return 1
+  for entry in "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_INUSE_PREFIX}${DB_FENCE_PUBLISH_KIND}."*; do
+    [[ -L "${entry}" ]] || continue
+    base="${entry##*/}"
+    rest="${base%.*}"
+    pid="${rest##*.}"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || continue
+    kill -0 "${pid}" 2>/dev/null || continue
+    text="$(readlink -- "${entry}" 2>/dev/null)" || continue
+    [[ "${text%%/*}" != "${name}" ]] || return 0
+  done
+  return 1
+}
+
+_fence_sweep_publications() {
+  local keep="$1" entry base rest pid standing="" open_paths="" bound=""
+  # AND THE PUBLICATION A STANDING FENCE WILL BE RELEASED WITH IS KEPT (o3d-xi3w r4). It is the fifth
+  # question, and it is not covered by any of the others: the pointer may have moved on since the fence
+  # was raised, that publisher is very likely gone, and between the bursts of a cutover nothing in the
+  # tree is open. Reclaiming it would leave a fence standing with no helper to release it by.
+  if [[ -n "${DB_FENCE_STATE:-}" && -f "${DB_FENCE_STATE:-}" ]]; then
+    bound="$(fence_record_script_version)" || bound=""
+  fi
+
+  for entry in "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_RETIRE_PREFIX}${DB_FENCE_PUBLISH_KIND}."*; do
+    [[ "${entry}" != "${keep}" ]] || continue
+    [[ -d "${entry}" ]] || continue
+    [[ ! -L "${entry}" ]] || continue
+    base="${entry##*/}"
+    rest="${base%.*}"
+    pid="${rest##*.}"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || continue
+    if kill -0 "${pid}" 2>/dev/null; then
+      continue
+    fi
+    [[ ! -e "${DB_FENCE_PROTECTED_APP_DIR}" ]] || continue
+    [[ ! -L "${DB_FENCE_PROTECTED_APP_DIR}" ]] || continue
+    _fence_rename_owned "${entry}" "${DB_FENCE_PROTECTED_APP_DIR}" "the moved-aside fence artefact the sweep restores" quiet || true
+  done
+
+  # WHAT IS STANDING, READ OFF THE POINTER ITSELF rather than assumed from a name. Only the first
+  # component matters: the link is <version dir>/<tree>, and it is the version dir that is at risk.
+  if [[ -L "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+    standing="$(readlink -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || standing=""
+    standing="${standing%%/*}"
+  fi
+  for entry in "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_PUBLISH_PREFIX}${DB_FENCE_PUBLISH_KIND}."* \
+               "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_VERSION_PREFIX}${DB_FENCE_PUBLISH_KIND}."* \
+               "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_RETIRE_PREFIX}${DB_FENCE_PUBLISH_KIND}."* \
+               "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_INUSE_PREFIX}${DB_FENCE_PUBLISH_KIND}."* \
+               "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_POINTER_PREFIX}${DB_FENCE_PUBLISH_KIND}."*; do
+    # A symbolic link is reaped as a link and never followed; anything else must be a directory.
+    if [[ ! -L "${entry}" ]] && [[ ! -d "${entry}" ]]; then
+      continue
+    fi
+    [[ "${entry}" != "${keep}" ]] || continue
+    base="${entry##*/}"
+    [[ -z "${standing}" || "${base}" != "${standing}" ]] || continue
+    [[ -z "${bound}" || "${base}" != "${bound}" ]] || continue
+    rest="${base%.*}"
+    pid="${rest##*.}"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || continue
+    if kill -0 "${pid}" 2>/dev/null; then
+      continue
+    fi
+    if [[ -z "${open_paths}" ]]; then
+      open_paths="$(_priv_open_paths)"
+      [[ -n "${open_paths}" ]] || return 0
+    fi
+    if [[ "${open_paths}" == *"${entry}"* ]]; then
+      continue
+    fi
+    # AND THE FOURTH QUESTION, ASKED LAST AND ON ITS OWN (o3d-xi3w r2): is a live fence operation PINNED
+    # to it? It is asked here, immediately before the unlink, rather than once at the top of the sweep,
+    # because a pin taken while this loop was working through earlier entries has to be seen. What is
+    # left is a window two syscalls wide, and its outcome is a REFUSAL and never a substitution: the run
+    # that took the pin re-reads the directory after taking it and stops if it has gone, and a version
+    # that disappears after that makes `node` fail to find a file. Nothing can make it run other bytes.
+    if _fence_version_held "${base}"; then
+      continue
+    fi
+    _fence_unlink_owned "${entry}" "the superseded fence publication the sweep deletes" quiet || true
+  done
+  return 0
+}
+
+# MAY THE DOCUMENTED NAME BE FOLLOWED AT ALL? (o3d-xi3w; driver_standing_tree() is its counterpart.)
+#
+# THE LINK TEXT IS VALIDATED RATHER THAN RESOLVED, and that is the whole of the safety argument. A
+# realpath would say where we landed; this says where we are ALLOWED to land: exactly one
+# `.version-fence.<pid>.<suffix>` component and one tree component beneath the recovery root, so there is
+# no absolute path, no `..` and no second directory level a link could use to leave the one directory
+# whose ownership and modes this mechanism establishes. It matters because what is reached THROUGH this
+# name is executed with DEPLOY_ADMIN_DATABASE_URL beside it, and because the artefact's record is named
+# through it too. Only root can write the recovery root, so only root can have created the link; a
+# malformed one is therefore a refusal with a reason rather than a path handed to node.
+#
+# A REAL DIRECTORY IS ACCEPTED: an installation last published by a release that predates the pointer is
+# exactly that until the next publication migrates it.
+DB_FENCE_STANDING_REASON=""
+_fence_standing_artefact_ok() {
+  local link owner
+  DB_FENCE_STANDING_REASON=""
+  if [[ ! -L "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+    if [[ -d "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+      return 0
+    fi
+    DB_FENCE_STANDING_REASON="there is nothing published at ${DB_FENCE_PROTECTED_APP_DIR}"
+    return 1
+  fi
+  owner="$(LC_ALL=C stat -c '%u' -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || owner=""
+  if [[ "${owner}" != "$(id -u)" ]]; then
+    DB_FENCE_STANDING_REASON="${DB_FENCE_PROTECTED_APP_DIR} is owned by uid ${owner:-nobody this run could read} and not by this account, so it is not a pointer this publication mechanism wrote"
+    return 1
+  fi
+  link="$(readlink -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || link=""
+  if [[ ! "${link}" =~ ^\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    DB_FENCE_STANDING_REASON="${DB_FENCE_PROTECTED_APP_DIR} names '${link:-nothing}', which is not one versioned publication directory and one tree beneath ${DB_FENCE_RECOVERY_DIR}. A pointer that could name anything else could name a tree outside the only directory whose ownership this mechanism establishes, so it is refused rather than followed"
+    return 1
+  fi
+  if [[ ! -d "${DB_FENCE_RECOVERY_DIR}/${link}" ]]; then
+    DB_FENCE_STANDING_REASON="${DB_FENCE_PROTECTED_APP_DIR} names ${link}, which is not a directory under ${DB_FENCE_RECOVERY_DIR}: the publication it pointed at has been removed"
+    return 1
+  fi
+  return 0
+}
+
+# WHICH PROCESS A PID IS. The start time /proc reports for it, in clock ticks since boot, which together
+# with the pid identifies a process for as long as the machine is up — a pid on its own does not, and this
+# name is read back by the same process minutes later, after every pid on the box may have been handed
+# out again. The second field of /proc/<pid>/stat is the executable's name IN PARENTHESES and may itself
+# contain spaces and parentheses, so the fields are counted from after the LAST ')', which is /proc's own
+# documented rule; starttime is field 22, and therefore the 20th of what is left.
+_fence_process_start_time() {
+  local pid="$1" line rest field
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  line="$(cat "/proc/${pid}/stat" 2>/dev/null)" || return 1
+  rest="${line##*) }"
+  field="$(printf '%s\n' "${rest}" | awk '{print $20}')" || return 1
+  [[ "${field}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "${field}"
+}
+
+# WHERE THIS FENCE OPERATION'S PIN LIVES. One name per operation, in the root-owned recovery directory,
+# derived from nothing but the shell's own pid and the start time /proc reports for it. Composed rather
+# than remembered, because every reader of it is a subshell of the same process.
+_fence_operation_pin() {
+  local stamp
+  stamp="$(_fence_process_start_time "$$")" || return 1
+  printf '%s' "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_INUSE_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.${stamp}"
+}
+
+# WHICH PUBLICATION THE DOCUMENTED NAME RESOLVES TO, AND IT WRITES NOTHING. Split out of the binder
+# because the unprivileged modes need it: `--dry-run` and `--print-fence-digest` run as an ordinary
+# account by design (scripts/update.sh refuses root-only for the other modes), so they cannot create a
+# marker in a root-owned directory — and they still must not take a digest, or run a preflight, THROUGH a
+# name another run can re-aim. They get the immutable versioned path without a pin, which is all a single
+# invocation needs; the pin is about an OPERATION made of several.
+#
+# Prints the base directory of the tree that is standing, or the reason it will not be followed.
+_fence_resolve_version() {
+  local text tree
+  tree="${DB_FENCE_PROTECTED_APP_DIR##*/}"
+  if ! _fence_standing_artefact_ok; then
+    printf '%s' "${DB_FENCE_STANDING_REASON}"
+    return 1
+  fi
+  if [[ -L "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+    text="$(readlink -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || text=""
+  else
+    text="${tree}"
+  fi
+  if [[ -z "${text}" ]]; then
+    printf '%s' "${DB_FENCE_PROTECTED_APP_DIR} could not be read as either a pointer or a directory"
+    return 1
+  fi
+  printf '%s' "${DB_FENCE_RECOVERY_DIR}/${text}"
+  return 0
+}
+
+# THE ONE THING A PRE-POINTER INSTALLATION HAS NO IMMUTABLE NAME FOR, GIVEN ONE (o3d-xi3w r5, Codex HIGH).
+#
+# THE FINDING. Round 2 gave every fence operation an immutable tree to execute out of, by resolving the
+# documented pointer once and pinning the VERSIONED DIRECTORY it names. On an installation that has never
+# been published to by a pointer-era release the documented name is not a pointer: it is the tree itself,
+# a real directory at a well-known name — and a well-known name is a mutable object. Measured (rigP): run A
+# resolved it, checked everything db_fence_script_in_use() checks — the seal, the record beside the tree,
+# the tree digest, the entry digest — returned the path, and then executed a CONCURRENT publisher's helper
+# with DEPLOY_ADMIN_DATABASE_URL beside it, because that publisher had performed the ONE MIGRATION in
+# _fence_stage_and_publish() in between and the same string now resolved through its pointer into its
+# version. The re-read after the pin cannot help: a replacement that lands after it is precisely the case.
+#
+# WHAT THIS DOES, AND WHY IT IS NOT A PUBLICATION. What the operation needs is an IMMUTABLE PATH to the
+# bytes it authenticated, not a published one. So this gives it its own versioned directory whose files are
+# HARD LINKS to the legacy tree's own inodes, with the legacy record and manifest beside them, and returns
+# that. The documented name is never read again by this operation and never WRITTEN by this function at
+# all. Three consequences, and they are the reason this shape was chosen over the two Codex offered:
+#
+#   * NOTHING CAN BE LOST. rename(2) will not put a symbolic link over a non-empty directory, so MIGRATING
+#     a legacy installation — publishing its tree into a version and flipping a pointer in — must move the
+#     only artefact on the box, and there is then an interval in which the documented name does not exist.
+#     A power cut in that interval leaves a box with a standing fence and no helper to release it by, which
+#     is the worst state this file has and the one r4 spent a round making unreachable from a failed
+#     rollback. This function moves nothing and deletes nothing outside its own staging name, so it has no
+#     unwind, and a kill at any instant leaves residue the sweep reaps rather than a fence nobody can drop.
+#   * NOTHING IS PUBLISHED, so nothing has to be AUTHENTICATED to a standard this cannot meet. A migration
+#     would put bytes at the documented name that no invocation pinned, which _fence_stage_and_publish()
+#     refuses to do by design; this only makes a second name for bytes that are already standing.
+#   * THE BYTES ARE THE SAME INODES, not a copy that has to be proved equal to one. Only root can write
+#     the recovery root, and no path in this file ever writes INTO a standing tree — a publication renames
+#     it aside and then DELETES it, and a delete unlinks rather than truncating — so the concurrent publisher
+#     that used to substitute
+#     these bytes now cannot reach them at all. db_fence_script_in_use() still asks every question it asked
+#     before, of the directory that is returned here.
+#
+# IT IS A `.version-fence.<pid>.<suffix>` DIRECTORY AND DELIBERATELY NOT A NEW KIND OF NAME. It holds a
+# tree, a record and a manifest, exactly as a publication's version directory does; what it lacks is a
+# pointer naming it, which is the same status a SUPERSEDED version has and which the sweep already
+# understands — kept while its pid is alive, while a pin names it and while a standing fence's record binds
+# it, reaped afterwards. So the pin's shape, _fence_valid_version_name(), _fence_version_of_entry() and
+# _fence_sweep_publications() all apply to it unchanged, and one of them is the point: a fence RAISED on
+# such a box now records a version, so clause (A) of THE INVARIANT holds there instead of falling back.
+#
+# AND IT IS MADE DURABLE BEFORE IT TAKES ITS VERSION NAME (r5, Codex review of this round). The first draft
+# argued it need not be, because nothing outside the operation ever names this directory -- which is wrong
+# by one step: the RAISE writes this version into ${DB_FENCE_IDENTITY_FILE}, durably, so a power cut could
+# leave a standing fence naming a version that exists with files missing, and every later resolution would
+# find it, fail its digest check and refuse. A version that does not exist at all degrades to the pointer
+# and is harmless; one that half exists is not. So the whole tree is flushed before the rename that names
+# it, the recovery root after, and a barrier that cannot be taken is a REFUSAL with the staging tree
+# removed -- the same order and the same direction as a publication's.
+#
+# Prints the `<version>/<tree>` text the pin records, or the reason it could not, on stdout — both ways,
+# for _fence_bind_version()'s reason (every caller reads it through a command substitution).
+_fence_adopt_legacy() {
+  local legacy="${DB_FENCE_PROTECTED_APP_DIR}" tree record_name manifest_name
+  local ident_before="" ident_after="" stage suffix version_name version_dir staged
+  tree="${DB_FENCE_PROTECTED_APP_DIR##*/}"
+  record_name="${DB_FENCE_ARTEFACT_FILE##*/}"
+  manifest_name="${DB_FENCE_MANIFEST_FILE##*/}"
+  if [[ -L "${legacy}" ]] || [[ ! -d "${legacy}" ]]; then
+    printf '%s' "${legacy} is no longer the pre-pointer directory this run found there a moment ago, so another privileged run is committing at that name and there is nothing here to adopt; re-run"
+    return 1
+  fi
+  # SEALED BEFORE ANYTHING IS LINKED, so the link farm below cannot be talked into making a second name
+  # for a symlink, a device or a file this account does not own. It is asked again of the farm by
+  # db_fence_script_in_use(); asked here it decides what may be linked at all.
+  if ! _fence_tree_is_sealed "${legacy}"; then
+    printf '%s' "${legacy} is a pre-pointer installation's fence artefact and it is not sealed, so it will not be given a versioned name and nothing will be executed out of it: ${DB_FENCE_SEAL_REASON}"
+    return 1
+  fi
+  ident_before="$(LC_ALL=C stat -c '%D|%i' -- "${legacy}" 2>/dev/null)" || ident_before=""
+  if [[ -z "${ident_before}" ]]; then
+    printf '%s' "${legacy} could not be inspected, so this run cannot tell whether the tree it is about to take a versioned copy of is still the one it checked"
+    return 1
+  fi
+  stage="$(mktemp -d "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_PUBLISH_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.XXXXXX" 2>/dev/null)" || {
+    printf '%s' "a private directory in which to give ${legacy} a versioned name could not be created under ${DB_FENCE_RECOVERY_DIR}, so this operation has no immutable path to the fence artefact and will not execute one through ${legacy}, which any concurrent publication may replace"
+    return 1
+  }
+  # EVERY NAME OFF THE ONE SUFFIX, by the same argument _fence_stage_and_publish() makes: `mktemp -d`
+  # created that name atomically, so no second run holds it and no second mktemp is needed.
+  suffix="${stage##*.}"
+  version_name="${DB_FENCE_VERSION_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.${suffix}"
+  version_dir="${DB_FENCE_RECOVERY_DIR}/${version_name}"
+  staged="${stage}/${tree}"
+  # AND THE SWEEP IS ASKED HERE, for the reason the residue exists at all: on a box whose documented name
+  # is still a directory NOTHING EVER PUBLISHES -- so the sweep, which only ever runs at the start of a
+  # publication, would never run, and one adoption per cutover would accumulate for as long as the box is
+  # never rotated. It is the publisher's own call with the publisher's own argument: this run's directory is
+  # what it may not take, an adoption whose pid is alive or whose pin names it is kept by the questions it
+  # already asks, and it can only ever delete residue.
+  _fence_sweep_publications "${stage}"
+  _fence_require_owned_tree "${stage}" "the directory a pre-pointer fence artefact is adopted into"
+  _fence_require_owned_tree "${staged}" "the adopted fence tree"
+  if ! mkdir -p "${staged}"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run that could not create its tree" quiet || true
+    printf '%s' "${staged} could not be created, so ${legacy} has no immutable name this operation can execute out of"
+    return 1
+  fi
+  # HARD LINKS AND NOT A COPY. `--link` makes this directory a second NAME for the legacy tree's files, so
+  # there is no second set of bytes for a reader to wonder about; the modes and ownership the seal check
+  # asks about are the inodes' own and therefore identical by construction.
+  if ! cp -R --no-dereference --link --preserve=mode,ownership,timestamps -- "${legacy}/." "${staged}/"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run whose link farm failed" quiet || true
+    printf '%s' "${legacy} could not be given a versioned name under ${DB_FENCE_RECOVERY_DIR}, so this operation has no immutable path to the fence artefact"
+    return 1
+  fi
+  # THE RECORD AND THE MANIFEST TRAVEL WITH IT, because `<tree>/../<name>` is how every reader finds them
+  # and the tree's parent is now the version directory. They are carried when they are there and NOT
+  # invented when they are not: an installation with no record beside its tree is refused by
+  # db_fence_script_in_use() today and must go on being refused, by the check that owns that question.
+  if [[ -f "${DB_FENCE_LEGACY_ARTEFACT_FILE}" ]] \
+     && ! cat < "${DB_FENCE_LEGACY_ARTEFACT_FILE}" > "${stage}/${record_name}"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run that could not carry the record" quiet || true
+    printf '%s' "the digest record beside ${legacy} could not be carried into the versioned name this operation would execute out of, so nothing would say what that tree is supposed to hash to"
+    return 1
+  fi
+  if [[ -f "${DB_FENCE_LEGACY_MANIFEST_FILE}" ]] \
+     && ! cat < "${DB_FENCE_LEGACY_MANIFEST_FILE}" > "${stage}/${manifest_name}"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run that could not carry the manifest" quiet || true
+    printf '%s' "the per-file manifest beside ${legacy} could not be carried into the versioned name this operation would execute out of"
+    return 1
+  fi
+  chown root:root "${stage}/${record_name}" "${stage}/${manifest_name}" 2>/dev/null || true
+  # AND THE SOURCE IS IDENTIFIED AGAIN, because the walk above is not one operation. Device and inode
+  # identify an object across a rename, so what this catches is the documented name holding a DIFFERENT
+  # object — a pointer a concurrent publication flipped in while this was reading. A torn farm is caught
+  # after that by the tree digest, which is where that question belongs.
+  if [[ -L "${legacy}" ]]; then
+    ident_after="a symbolic link another privileged run committed there"
+  else
+    ident_after="$(LC_ALL=C stat -c '%D|%i' -- "${legacy}" 2>/dev/null)" || ident_after=""
+  fi
+  if [[ "${ident_after}" != "${ident_before}" ]]; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run whose source was replaced under it" quiet || true
+    printf '%s' "${legacy} became ${ident_after:-something this run could not inspect} while this run was giving it a versioned name, so another privileged run published there at that instant. NOTHING of this run's has been created and the artefact standing at ${legacy} is untouched; re-run and it will resolve through that publication"
+    return 1
+  fi
+  # THE BARRIER, AND IT IS BEFORE THE RENAME. After the rename this directory can be named by a durable
+  # recovery record; before it, it is a staging name nothing has heard of, so a failure here is a refusal
+  # that costs nothing. The whole tree and not just its top entry -- see _fence_fsync_tree().
+  if ! _fence_fsync_tree "${stage}"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run that could not make it durable" quiet || true
+    printf '%s' "the versioned copy of the artefact standing at ${legacy} could not be made durable, so this run will not let a fence be raised with a version a power cut could leave incomplete. Nothing has been created and ${legacy} is untouched"
+    return 1
+  fi
+  if ! _fence_rename_owned "${stage}" "${version_dir}" "the adopted pre-pointer fence artefact, becoming its version"; then
+    _fence_unlink_owned "${stage}" "the adoption directory of a run that could not name its version" quiet || true
+    printf '%s' "the versioned name ${version_dir} could not be taken for the artefact standing at ${legacy}, so this operation has no immutable path to it"
+    return 1
+  fi
+  # AND THE NAME ITSELF IS FLUSHED. A failure here is NOT a refusal and must not be: the directory is
+  # complete and this operation can execute out of it now, and the only thing at risk is a crash later in
+  # the same cutover -- against which refusing to fence at all is the worse trade. The version is reported
+  # so that the caller pins it; what a fence RAISED with it needs durably is the record, and that write
+  # makes its own barriers.
+  _fence_fsync_path "${DB_FENCE_RECOVERY_DIR}" || true
+  printf '%s' "${version_name}/${tree}"
+  return 0
+}
+
+# THE IMMUTABLE TREE THIS FENCE OPERATION EXECUTES OUT OF, AND IT IS THE SAME ONE EVERY TIME IT ASKS
+# (o3d-xi3w r2, Codex HIGH).
+#
+# THE FINDING. Round 1 made publication atomic and left the RESOLUTION naming a mutable object.
+# db_fence_script_in_use() validated the standing artefact and handed back ${DB_FENCE_SCRIPT_COPY} — a
+# path THROUGH the pointer — and the caller then handed that string to `node` with
+# DEPLOY_ADMIN_DATABASE_URL beside it. A concurrent publisher's flip lands in the gap: measured, an
+# invocation pinned with IMS_FENCE_ARTEFACT_SHA256 matched the standing artefact, returned 0, and then
+# executed a DIFFERENT release's entry file. Raising a fence is also not one invocation — the three
+# entrypoints resolve the helper seven times apiece — and two of those invocations ran different releases
+# in the same cutover. A digest that authenticates a tree and a path that names whatever is standing when
+# it is dereferenced are two different statements; the pin was only ever about the first.
+#
+# THE ANSWER IS THE VERSIONED DIRECTORY, WHICH NOTHING EVER WRITES INTO AGAIN. A publication assembles
+# under its own name, seals it, and renames it to `.version-fence.<pid>.<suffix>`; after that rename every
+# step only reads. So the tree that was checked is the tree that runs, for as long as the directory exists
+# — and the pointer is then only the way the FIRST invocation of an operation finds it.
+#
+# AND THE PIN IS A SYMBOLIC LINK AND NOT A VARIABLE, WHICH IS FORCED (not a preference). Every caller in
+# all three entrypoints resolves the helper as `script="$(resolve_fence_script)"`, inside a command
+# substitution: a script-scope name assigned in there dies with the subshell, which is the same reason
+# this function's refusals go to stderr. The pin therefore has to be on the filesystem, and the only
+# filesystem this mechanism owns is the root-owned recovery directory. Its name carries the operation's
+# pid AND the start time /proc reports for that pid, so a marker left behind by a dead run whose pid has
+# been reused is not mistaken for this operation's.
+#
+# WHAT A FORGED OR STALE PIN CAN BUY, ASKED THE RIGHT WAY ROUND. Only root can write the recovery
+# directory, so only root can create one of these. If one appeared anyway, it selects a candidate and
+# nothing more: the text is held to the same shape the pointer's is, the object must still be a real
+# directory inside the recovery root, and everything db_fence_script_in_use() checked before — the seal,
+# the record beside the tree, the tree's own digest, IMS_FENCE_ARTEFACT_SHA256 and the entry digest the
+# recovery record binds — is then checked against THAT tree and nothing else. A pin cannot skip a check;
+# it can only choose between complete publications root itself made, and a wrong choice is refused by the
+# entry digest the identity record binds.
+#
+# THE PRE-POINTER INSTALLATION GETS IMMUTABILITY TOO, AND IT IS NOT THE POINTER THAT GIVES IT (r5, Codex
+# HIGH). Its documented name is a real directory, which is a MUTABLE object: a run that authenticated that
+# tree and then handed the same string to `node` executed a concurrent publisher's helper instead, because
+# the publisher had migrated the name in between. So this function never returns that name.
+# _fence_adopt_legacy() above gives the operation its own `.version-fence.<pid>.<suffix>` directory holding
+# the SAME FILE INODES, and the pin records THAT — so the text below always has a version component, and a
+# pin that names a bare tree is not something this code can produce any more.
+#
+# ANSWERS ON STDOUT, BOTH WAYS, AND LEAVES NO SCRIPT-SCOPE NAME BEHIND (the round-1 lesson, in the one
+# place it bites hardest): the base directory when it can bind one, and the REASON when it cannot. Every
+# caller reads it through a command substitution — which is the whole finding — so a reason left in a
+# global would die with the subshell and the refusal would print an empty explanation. Measured: the first
+# draft of this function did exactly that.
+_fence_bind_version() {
+  local pin text tree base version adopted
+  tree="${DB_FENCE_PROTECTED_APP_DIR##*/}"
+  if ! pin="$(_fence_operation_pin)"; then
+    printf '%s' "/proc does not report this process's own identity, so the fence artefact cannot be pinned for the length of this operation"
+    return 1
+  fi
+  if [[ -L "${pin}" ]]; then
+    # THIS OPERATION HAS ALREADY RESOLVED ONCE. The pointer is not consulted at all now: that is the
+    # whole point, and re-reading it is exactly the bug.
+    text="$(readlink -- "${pin}" 2>/dev/null)" || text=""
+    if [[ ! "${text}" =~ ^\.version-fence\.[1-9][0-9]*\.[A-Za-z0-9]+/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "${text##*/}" != "${tree}" ]]; then
+      printf '%s' "the pin this fence operation took at ${pin} names '${text:-nothing}', which is not one versioned publication and one ${tree} tree beneath ${DB_FENCE_RECOVERY_DIR}"
+      return 1
+    fi
+    if [[ -L "${DB_FENCE_RECOVERY_DIR}/${text}" ]] || [[ ! -d "${DB_FENCE_RECOVERY_DIR}/${text}" ]]; then
+      printf '%s' "this fence operation is pinned to ${DB_FENCE_RECOVERY_DIR}/${text} and that is no longer a directory it can execute out of. Another privileged run has published over the artefact this operation authenticated, and running the new one instead would mean raising and releasing one fence with two different releases. Let this run finish or fail, and re-run"
+      return 1
+    fi
+    printf '%s' "${DB_FENCE_RECOVERY_DIR}/${text}"
+    return 0
+  fi
+  # THE FIRST RESOLUTION OF THIS OPERATION. WHILE A FENCE STANDS IT DOES NOT READ THE POINTER AT ALL
+  # (o3d-xi3w r4, Codex HIGH 1): it reads the publication the record binds, which is clause (A) of THE
+  # INVARIANT. The version that raised a fence is the version that must release it, and the pointer is a
+  # statement about the LATEST publication rather than about that one -- measured before this: a run that
+  # published between the raise's resolution and its authority made the release execute ITS entry file
+  # instead, with the fence's own grantee list. The record's version is held to the same one-component
+  # shape the pointer's text is, the object must still be a real directory in this root, and every check
+  # db_fence_script_in_use() makes is then made against THAT tree, so this selects a candidate and can
+  # skip nothing.
+  #
+  # AND AN UNRESOLVABLE OR ABSENT VERSION FALLS BACK TO THE POINTER, deliberately: a record written by a
+  # release older than this one carries no version, and a new refusal on such an installation would be a
+  # fence nobody can release. The entry digest the record binds is still checked either way, so the
+  # fallback is the behaviour those installations already had and not a hole.
+  text=""
+  if [[ -n "${DB_FENCE_STATE:-}" && -f "${DB_FENCE_STATE:-}" ]]; then
+    version="$(fence_record_script_version)" || version=""
+    if [[ -n "${version}" ]] && [[ ! -L "${DB_FENCE_RECOVERY_DIR}/${version}/${tree}" ]] \
+       && [[ -d "${DB_FENCE_RECOVERY_DIR}/${version}/${tree}" ]]; then
+      text="${version}/${tree}"
+    fi
+  fi
+  if [[ -z "${text}" ]]; then
+    if ! base="$(_fence_resolve_version)"; then
+      printf '%s' "${base}"
+      return 1
+    fi
+    text="${base#"${DB_FENCE_RECOVERY_DIR}/"}"
+    # AND A PRE-POINTER INSTALLATION IS ADOPTED RATHER THAN FOLLOWED (r5, Codex HIGH). The resolution
+    # answers with the documented name ITSELF on such a box -- one component, and it is the tree -- which
+    # is the one mutable path this whole shape was left with. _fence_adopt_legacy() turns it into a
+    # versioned directory of the same inodes, and a failure to do that is a REFUSAL: handing back the
+    # mutable name is what let a run execute another release's helper after authenticating this one's.
+    if [[ "${text}" == "${tree}" ]]; then
+      if ! adopted="$(_fence_adopt_legacy)"; then
+        printf '%s' "${adopted}"
+        return 1
+      fi
+      text="${adopted}"
+    fi
+  fi
+  if ! _fence_link_owned "${text}" "${pin}" "this fence operation's pin on the artefact it resolved"; then
+    printf '%s' "this fence operation could not record which publication it resolved, at ${pin}, so it cannot guarantee that the tree it authenticates is the tree it executes"
+    return 1
+  fi
+  # AND THE OBJECT IS READ AGAIN AFTER THE PIN EXISTS, which is what makes the pin a guarantee rather than
+  # a hope: a sweep that was already deciding about this version when the pin was taken is caught here,
+  # and the answer is a refusal with the pin withdrawn.
+  if [[ -L "${DB_FENCE_RECOVERY_DIR}/${text}" ]] || [[ ! -d "${DB_FENCE_RECOVERY_DIR}/${text}" ]]; then
+    _fence_unlink_owned "${pin}" "the pin of an operation whose publication went away as it was taken" quiet || true
+    printf '%s' "${DB_FENCE_RECOVERY_DIR}/${text} went away between this run reading ${DB_FENCE_PROTECTED_APP_DIR} and recording that it had; re-run"
+    return 1
+  fi
+  printf '%s' "${DB_FENCE_RECOVERY_DIR}/${text}"
+  return 0
+}
+
+# Assemble the WHOLE artefact under a name no other run can hold, seal it, digest it, require it to match
+# whatever the invocation pinned, record it beside the tree, and only then commit it with one rename. The
+# verified tree is the published tree: after the copy the checkout is never read again, so there is no
+# interval in which it can change the outcome, and after the digest nothing writes into the tree at all.
 _fence_stage_and_publish() {
   local app_dir script_digest artefact_digest manifest
   # THE PROVENANCE ANSWER IS THIS CALL'S (o3d-secops r3, Codex HIGH). _fence_source_trust(), two
@@ -932,11 +1855,12 @@ _fence_stage_and_publish() {
   # per call), so it is a `local` of the frame that consumes it, and there is no script-scope name
   # for another path to pre-set. Every caller of _fence_vendor_into() declares it the same way.
   local DB_FENCE_SOURCE_UNTRUSTED_PATH=""
-  # FIRST, BEFORE ANYTHING ELSE: THE THREE TREES THIS FUNCTION DELETES, RE-OWNS, RE-MODES AND RENAMES ARE CHECKED AT RUN TIME
-  # (o3d-z5be r11, review M2): they are readonly names, and re-aiming one of them — at ${APP_DIR}, say —
-  # needs no line that spells a privileged command. A name outside the recovery root ends the run.
-  _fence_require_owned_tree "${DB_FENCE_STAGED_APP_DIR}" "the fence staging copy"
-  _fence_require_owned_tree "${DB_FENCE_RETIRED_APP_DIR}" "the fence retired copy"
+  local run_dir suffix version_name version_dir pointer_tmp retire_dir staged link
+  local tree_name record_name manifest_name legacy_ident="" moved_ident="" migrated=0 preserved=""
+  # FIRST, BEFORE ANYTHING ELSE: THE DOCUMENTED NAME THIS FUNCTION RENAMES, LINKS AND READS IS CHECKED AT
+  # RUN TIME (o3d-z5be r11, review M2): it is a readonly, and re-aiming it — at ${APP_DIR}, say — needs no
+  # line that spells a privileged command. A name outside the recovery root ends the run, before anything
+  # has been created. The per-run names below are checked as they are derived.
   _fence_require_owned_tree "${DB_FENCE_PROTECTED_APP_DIR}" "the protected fence copy"
   [[ -f "${DB_FENCE_SCRIPT}" ]] || {
     DB_FENCE_ROTATION_NOTE="${DB_FENCE_SCRIPT} is not in this checkout, so there is nothing to publish into ${DB_FENCE_SCRIPT_COPY}"
@@ -945,45 +1869,72 @@ _fence_stage_and_publish() {
   app_dir="$(dirname "$(dirname "${DB_FENCE_SCRIPT}")")"
   _fence_protected_dir_ready || return 1
 
-  [[ -n "${DB_FENCE_STAGED_APP_DIR}" ]] || return 1
-  rm -rf "${DB_FENCE_STAGED_APP_DIR}" || return 1
-  mkdir -p "${DB_FENCE_STAGED_APP_DIR}/scripts" || return 1
-
-  cat < "${DB_FENCE_SCRIPT}" > "${DB_FENCE_STAGED_APP_DIR}/scripts/fence-db-connections.mjs" || {
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1
+  # THE PER-RUN STAGING DIRECTORY (o3d-xi3w). `mktemp -d` creates it atomically, so no second run can be
+  # assembling in the same place — and the delete of a fixed name that used to stand here could not tell
+  # its own staging tree from another run's.
+  run_dir="$(mktemp -d "${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_PUBLISH_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.XXXXXX" 2>/dev/null)" || {
+    DB_FENCE_ROTATION_NOTE="a private staging directory for the fence artefact could not be created under ${DB_FENCE_RECOVERY_DIR}, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR} and whatever stands there is unchanged."
+    return 1
   }
-  script_digest="$(file_sha256 "${DB_FENCE_STAGED_APP_DIR}/scripts/fence-db-connections.mjs")" || {
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1
+  # EVERY OTHER NAME THIS PUBLICATION USES COMES OFF THAT ONE SUFFIX, so all four are unique to this call
+  # by the same argument that makes the mktemp unique — no second mktemp, and no name another run holds.
+  suffix="${run_dir##*.}"
+  version_name="${DB_FENCE_VERSION_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.${suffix}"
+  version_dir="${DB_FENCE_RECOVERY_DIR}/${version_name}"
+  pointer_tmp="${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_POINTER_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.${suffix}"
+  retire_dir="${DB_FENCE_RECOVERY_DIR}/${DB_FENCE_RETIRE_PREFIX}${DB_FENCE_PUBLISH_KIND}.$$.${suffix}"
+  # THE THREE NAMES INSIDE ONE PUBLICATION, TAKEN FROM THE DOCUMENTED PATHS RATHER THAN RESTATED, so the
+  # tree keeps the pointer's own basename inside the versioned directory and `<pointer>/../<record>`
+  # reaches the record of the tree that is standing.
+  tree_name="${DB_FENCE_PROTECTED_APP_DIR##*/}"
+  record_name="${DB_FENCE_ARTEFACT_FILE##*/}"
+  manifest_name="${DB_FENCE_MANIFEST_FILE##*/}"
+  staged="${run_dir}/${tree_name}"
+  _fence_require_owned_tree "${run_dir}" "the fence staging directory"
+  _fence_require_owned_tree "${staged}" "the fence staged tree"
+  _fence_sweep_publications "${run_dir}"
+
+  mkdir -p "${staged}/scripts" || { rm -rf "${run_dir}"; return 1; }
+  cat < "${DB_FENCE_SCRIPT}" > "${staged}/scripts/fence-db-connections.mjs" || {
+    rm -rf "${run_dir}"; return 1
+  }
+  script_digest="$(file_sha256 "${staged}/scripts/fence-db-connections.mjs")" || {
+    rm -rf "${run_dir}"; return 1
   }
   if [[ -n "${DB_FENCE_EXPECTED_SHA256}" ]] && [[ "${script_digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]; then
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+    rm -rf "${run_dir}"
     DB_FENCE_ROTATION_NOTE="IMS_FENCE_SCRIPT_SHA256 expects ${DB_FENCE_EXPECTED_SHA256} but ${DB_FENCE_SCRIPT} hashes to ${script_digest}, so it was NOT published to ${DB_FENCE_SCRIPT_COPY}"
     return 1
   fi
 
   # THE IMPORTS, BEFORE THE PUBLICATION AND NOT AFTER IT. A tree that cannot import `pg` is a
-  # fence that dies at exec, and a failure discovered after the rename would leave exactly that
+  # fence that dies at exec, and a failure discovered after the commit would leave exactly that
   # standing.
-  if ! _fence_vendor_into "${app_dir}" "${DB_FENCE_STAGED_APP_DIR}"; then
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+  if ! _fence_vendor_into "${app_dir}" "${staged}"; then
+    rm -rf "${run_dir}"
     [[ -n "${DB_FENCE_ROTATION_NOTE}" ]] || DB_FENCE_ROTATION_NOTE="the fence helper's dependency closure could not be vendored into ${DB_FENCE_PROTECTED_APP_DIR}"
     return 1
   fi
 
-  chown -R root:root "${DB_FENCE_STAGED_APP_DIR}" 2>/dev/null || true
-  chmod -R u=rwX,go=rX "${DB_FENCE_STAGED_APP_DIR}" || { rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1; }
+  chown -R root:root "${staged}" 2>/dev/null || true
+  chmod -R u=rwX,go=rX "${staged}" || { rm -rf "${run_dir}"; return 1; }
+  # AND THE VERSIONED DIRECTORY ITSELF, which this staging directory becomes. `mktemp -d` makes it 0700,
+  # and the protected artefact is EXECUTED AS THE APPLICATION USER — so a 0700 directory above the tree
+  # would make every cutover fail at exec with a permission error rather than publish anything.
+  chown root:root "${run_dir}" 2>/dev/null || true
+  chmod 755 "${run_dir}" || { rm -rf "${run_dir}"; return 1; }
 
-  if ! _fence_tree_is_sealed "${DB_FENCE_STAGED_APP_DIR}"; then
+  if ! _fence_tree_is_sealed "${staged}"; then
     DB_FENCE_ROTATION_NOTE="${DB_FENCE_SEAL_REASON}"
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+    rm -rf "${run_dir}"
     return 1
   fi
 
-  manifest="$(_fence_tree_manifest "${DB_FENCE_STAGED_APP_DIR}")" || { rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1; }
-  artefact_digest="$(_fence_tree_digest "${DB_FENCE_STAGED_APP_DIR}")" || { rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1; }
+  manifest="$(_fence_tree_manifest "${staged}")" || { rm -rf "${run_dir}"; return 1; }
+  artefact_digest="$(_fence_tree_digest "${staged}")" || { rm -rf "${run_dir}"; return 1; }
 
   if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] && [[ "${artefact_digest}" != "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+    rm -rf "${run_dir}"
     DB_FENCE_ROTATION_NOTE="IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} but the artefact assembled from ${app_dir} hashes to ${artefact_digest}, so NOTHING was published to ${DB_FENCE_PROTECTED_APP_DIR}. The entry file hashes to ${script_digest}; the difference is therefore in the vendored dependency closure unless that value also differs."
     return 1
   fi
@@ -1007,7 +1958,7 @@ _fence_stage_and_publish() {
   # publication and on every one after it. The two ways out are both stated in the message,
   # because a refusal whose precondition nobody can satisfy is worse than the finding it closes.
   if [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && -n "${DB_FENCE_SOURCE_UNTRUSTED_PATH}" ]]; then
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+    rm -rf "${run_dir}"
     if [[ -n "${DB_FENCE_EXPECTED_SHA256}" ]]; then
       DB_FENCE_ROTATION_NOTE="IMS_FENCE_SCRIPT_SHA256 IS NOT SUFFICIENT HERE, so NOTHING was published to ${DB_FENCE_PROTECTED_APP_DIR}. It authenticates the entry file only — ${script_digest}, which did match — and the artefact also vendors that helper's dependency closure out of ${app_dir}, where ${DB_FENCE_SOURCE_UNTRUSTED_PATH} is owned or writable by an account other than this one. Leaving the entry file alone and replacing one file inside a vendored package would therefore have been sealed, digested and recorded as trusted. Re-run supplying IMS_FENCE_ARTEFACT_SHA256=<digest of the WHOLE tree> as well. ${DB_FENCE_ARTEFACT_SOURCE_TEXT} FOR INFORMATION ONLY, the tree assembled from ${app_dir} just now hashes to ${artefact_digest} — that value is REPORTED AND NOT AUTHENTICATED, it is what the checkout being questioned says about itself, so compare it against the release before pinning it."
       return 1
@@ -1016,41 +1967,490 @@ _fence_stage_and_publish() {
     return 1
   fi
 
-  # THE SWAP. The previous tree is moved aside rather than deleted, so a failure between the two
-  # renames leaves the OLD artefact standing — which still fences — rather than none, which does
-  # not.
-  [[ -n "${DB_FENCE_RETIRED_APP_DIR}" ]] || return 1
-  rm -rf "${DB_FENCE_RETIRED_APP_DIR}" || return 1
-  if [[ -e "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
-    mv -f "${DB_FENCE_PROTECTED_APP_DIR}" "${DB_FENCE_RETIRED_APP_DIR}" || { rm -rf "${DB_FENCE_STAGED_APP_DIR}"; return 1; }
-  fi
-  if ! mv -f "${DB_FENCE_STAGED_APP_DIR}" "${DB_FENCE_PROTECTED_APP_DIR}"; then
-    [[ -e "${DB_FENCE_RETIRED_APP_DIR}" ]] && mv -f "${DB_FENCE_RETIRED_APP_DIR}" "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null
-    rm -rf "${DB_FENCE_STAGED_APP_DIR}"
+  # THE RECORD AND THE MANIFEST, WRITTEN BESIDE THE TREE AND BEFORE ANYTHING IS REACHABLE (o3d-xi3w).
+  # They used to be written after the swap, so a failure here left the new tree standing while the caller
+  # reported that nothing had been published. Here they are inside the directory the flip commits: a
+  # failure at this point has nothing to undo but this run's own staging tree, and the artefact standing at
+  # the documented name — with the record that describes IT — is still the one every path resolves to.
+  if ! printf 'fence_artefact_sha256=%s\nfence_script_sha256=%s\nfence_artefact_recipe=%s\nfence_artefact_complete=1\n' \
+    "${artefact_digest}" "${script_digest}" "${DB_FENCE_ARTEFACT_RECIPE}" \
+    | _fence_publish_file "${run_dir}/${record_name}"; then
+    rm -rf "${run_dir}"
+    DB_FENCE_ROTATION_NOTE="the digest record for the fence artefact could not be written, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR} and whatever stands there is unchanged."
     return 1
   fi
-  rm -rf "${DB_FENCE_RETIRED_APP_DIR}"
+  if ! printf '%s\n' "${manifest}" | _fence_publish_file "${run_dir}/${manifest_name}"; then
+    rm -rf "${run_dir}"
+    DB_FENCE_ROTATION_NOTE="the per-file manifest for the fence artefact could not be written, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR} and whatever stands there is unchanged."
+    return 1
+  fi
+  chown root:root "${run_dir}/${record_name}" "${run_dir}/${manifest_name}" 2>/dev/null || true
+  # THE WHOLE TREE, NOT JUST ITS TOP ENTRY (r5, Codex review of this round, found in the adoption and the
+  # same defect class here): the vendored closure is nested directories and files, and `sync <dir>` flushes
+  # one directory entry.
+  if ! _fence_fsync_tree "${run_dir}"; then
+    rm -rf "${run_dir}"
+    DB_FENCE_ROTATION_NOTE="the fence artefact could not be made durable before publication, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR} and whatever stands there is unchanged."
+    return 1
+  fi
 
-  # The record LAST, and only once the tree it describes is the one on disk. A digest published
-  # ahead of its tree is a refusal on the next run.
-  printf 'fence_artefact_sha256=%s\nfence_script_sha256=%s\nfence_artefact_recipe=%s\nfence_artefact_complete=1\n' \
-    "${artefact_digest}" "${script_digest}" "${DB_FENCE_ARTEFACT_RECIPE}" \
-    | _fence_publish_file "${DB_FENCE_ARTEFACT_FILE}" || return 1
-  printf '%s\n' "${manifest}" | _fence_publish_file "${DB_FENCE_MANIFEST_FILE}" || return 1
-  chown root:root "${DB_FENCE_ARTEFACT_FILE}" "${DB_FENCE_MANIFEST_FILE}" 2>/dev/null || true
-  _fence_fsync_path "${DB_FENCE_RECOVERY_DIR}" || return 1
+  # THE PUBLICATION BECOMES A VERSION. One rename, into a name nothing else can hold, after which the
+  # directory is immutable: every later step only reads it.
+  if ! _fence_rename_owned "${run_dir}" "${version_dir}" "the fence staging directory, becoming its version"; then
+    rm -rf "${run_dir}"
+    DB_FENCE_ROTATION_NOTE="the fence artefact could not be moved to ${version_dir}, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR} and whatever stands there is unchanged."
+    return 1
+  fi
+  if ! _fence_fsync_path "${DB_FENCE_RECOVERY_DIR}"; then
+    preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${migrated}")"
+    DB_FENCE_ROTATION_NOTE="${DB_FENCE_RECOVERY_DIR} could not be made durable, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR}.$(_fence_preserved_note "${preserved}")"
+    return 1
+  fi
+
+  # THE ONE MIGRATION: A DOCUMENTED NAME THAT IS STILL A REAL DIRECTORY. rename(2) will not put a symbolic
+  # link over a non-empty directory, so an installation last published by a release that wrote the tree
+  # there directly has to have that directory moved away once. The destination is a name unique to this
+  # publication, which is the whole point — a destination that already existed as a directory is what let
+  # the previous sequence nest one tree inside another and call it success.
+  #
+  # AND THE TEST AND THE MOVE ARE TWO OPERATIONS, SO WHAT WAS MOVED IS CHECKED. Two publishers that both
+  # see the legacy directory can have the second arrive after the first has committed its pointer, and the
+  # rename would then move that fresh symbolic link aside — reopening the absent-name interval this scheme
+  # exists to remove. So the object is identified by lstat BEFORE the move (device and inode identify an
+  # object a rename carries) and what is at the retirement name is compared with it AFTER; a mismatch is
+  # put back and refused, because destroying a good artefact on the way past is the one outcome worse than
+  # not publishing.
+  if [[ ! -L "${DB_FENCE_PROTECTED_APP_DIR}" ]] && [[ -e "${DB_FENCE_PROTECTED_APP_DIR}" ]]; then
+    legacy_ident="$(LC_ALL=C stat -c '%F|%D|%i' -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || legacy_ident=""
+    if [[ "${legacy_ident%%|*}" != "directory" ]]; then
+      preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" 0)"
+      DB_FENCE_ROTATION_NOTE="${DB_FENCE_PROTECTED_APP_DIR} is ${legacy_ident:-something this run could not inspect} and no longer the directory it found there a moment ago, so another privileged run is committing at that name. NOTHING has been published and NOTHING has been moved aside; re-running this one will publish over whatever stands there.$(_fence_preserved_note "${preserved}")"
+      return 1
+    fi
+    if ! _fence_rename_owned "${DB_FENCE_PROTECTED_APP_DIR}" "${retire_dir}" "the legacy fence artefact, moved aside"; then
+      preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" 0)"
+      DB_FENCE_ROTATION_NOTE="${DB_FENCE_PROTECTED_APP_DIR} is a directory from a release that published the artefact there directly and it could not be moved aside, so nothing was published.$(_fence_preserved_note "${preserved}")"
+      return 1
+    fi
+    migrated=1
+    moved_ident="$(LC_ALL=C stat -c '%F|%D|%i' -- "${retire_dir}" 2>/dev/null)" || moved_ident=""
+    if [[ "${moved_ident}" != "${legacy_ident}" ]]; then
+      preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${migrated}")"
+      DB_FENCE_ROTATION_NOTE="${DB_FENCE_PROTECTED_APP_DIR} was replaced between the instant this run inspected it and the instant it moved it aside: it moved ${moved_ident:-something it could not inspect} and not the directory it had found (${legacy_ident}). Another privileged run published there at that instant; what this run moved has been put back and NOTHING of this run's has been published.$(_fence_preserved_note "${preserved}")"
+      return 1
+    fi
+  fi
+
+  # THE POINTER, BUILT UNDER ITS OWN NAME AND THEN RENAMED. A `ln -sfn` onto the documented name would
+  # unlink it and create it again, and between the two it resolves to nothing at all — for a name a
+  # cutover runs a program out of four times, that is the window this scheme exists to not have.
+  if ! _fence_link_owned "${version_name}/${tree_name}" "${pointer_tmp}" "the fence artefact's temporary pointer"; then
+    preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${migrated}")"
+    DB_FENCE_ROTATION_NOTE="the pointer for the fence artefact could not be created under ${DB_FENCE_RECOVERY_DIR}, so nothing was published to ${DB_FENCE_PROTECTED_APP_DIR}.$(_fence_preserved_note "${preserved}")"
+    return 1
+  fi
+
+  # THE COMMIT. Everything above this line is invisible to the documented name; everything below it only
+  # reads. One rename(2): the name resolves to the previous artefact before it and to this one after it,
+  # with no third state and no possibility of nesting, because the destination is a symbolic link.
+  if ! _fence_rename_owned "${pointer_tmp}" "${DB_FENCE_PROTECTED_APP_DIR}" "the fence artefact's pointer flip"; then
+    preserved="$(_fence_publish_unwind "${version_dir}" "${pointer_tmp}" "${retire_dir}" "${migrated}")"
+    DB_FENCE_ROTATION_NOTE="the fence artefact could not be published at ${DB_FENCE_PROTECTED_APP_DIR}.$(_fence_preserved_note "${preserved}")"
+    return 1
+  fi
+  # AND THE COMMIT IS MADE DURABLE, AND A FAILURE TO DO SO IS REPORTED RATHER THAN DISCARDED. The refusal
+  # does NOT undo the flip and must not try: the pointer is committed and names a complete, sealed,
+  # digested, authenticated tree, and rolling it back over a fault that is about the DISK would replace a
+  # good artefact with an older one. What it refuses to do is REPORT a publication.
+  if ! _fence_fsync_path "${DB_FENCE_RECOVERY_DIR}"; then
+    DB_FENCE_ROTATION_NOTE="THE FENCE ARTEFACT IS STANDING at ${DB_FENCE_PROTECTED_APP_DIR} — the pointer was flipped to ${version_name}/${tree_name}, and that tree is complete, sealed and digested — but ${DB_FENCE_RECOVERY_DIR} could not be flushed to disk, so THE COMMIT IS NOT DURABLE: a crash before the operating system writes that directory out can leave the documented name resolving to the PREVIOUS artefact, or — on an installation whose legacy directory this run had to move aside — to nothing at all. Nothing is reported as published. This is a fault on the underlying device rather than an operator error: fix it, re-run, and check what ${DB_FENCE_PROTECTED_APP_DIR} resolves to afterwards."
+    return 1
+  fi
+
+  # AND THE POINTER IS READ BACK, so a run that lost a race says so instead of reporting a rotation for
+  # bytes the fence will not execute. The tree standing there is another run's complete, separately
+  # authenticated publication — not a corruption to repair, but a later write to the one object.
+  link="$(readlink -- "${DB_FENCE_PROTECTED_APP_DIR}" 2>/dev/null)" || link=""
+  if [[ "${link}" != "${version_name}/${tree_name}" ]]; then
+    _fence_unlink_owned "${retire_dir}" "the retire directory of a publication that lost the race" quiet || true
+    DB_FENCE_ROTATION_NOTE="${DB_FENCE_PROTECTED_APP_DIR} names ${link:-a tree this publication did not create} and this run published ${version_name}/${tree_name}: another privileged run published the fence artefact at the same moment and its copy is the one standing there. Nothing of this run's is being reported as published; that run's tree was authenticated by its own operator and is complete, and re-running this one will publish over it."
+    return 1
+  fi
+  _fence_unlink_owned "${retire_dir}" "the legacy fence artefact this publication superseded" quiet || true
+  # AND THE RECORD A PRE-POINTER RELEASE LEFT BESIDE THE TREE GOES WITH IT. It describes a tree that has
+  # just been moved away and deleted, and a stale record claiming a digest is exactly what this round is
+  # about; every reader takes the record through the pointer now.
+  if (( migrated == 1 )); then
+    rm -f "${DB_FENCE_LEGACY_ARTEFACT_FILE}"
+    rm -f "${DB_FENCE_LEGACY_MANIFEST_FILE}"
+  fi
   return 0
 }
 
-# The artefact digest the standing record binds, from a COMPLETE record and nowhere else.
+# The artefact digest the record BESIDE ONE TREE binds, from a COMPLETE record and nowhere else.
+#
+# THE TREE IS AN ARGUMENT AND HAS NO DEFAULT (o3d-xi3w r2; o3d-z5be's follow-up made
+# driver_require_owned_path arity-2 for the same reason). Two different questions are asked of this
+# function and they used to be spelt the same: "what does the artefact STANDING at the documented name
+# claim to be" — which is what a publication and a probe want — and "what does the tree THIS OPERATION IS
+# PINNED TO claim to be", which is what the run that is about to execute it wants. An omitted argument
+# that fell back to the documented name would answer the first question to a caller asking the second,
+# which is the finding this round closes with the reading swapped round.
+#
+# The record's own basename comes from ${DB_FENCE_ARTEFACT_FILE} rather than being restated, so the two
+# readers cannot come to disagree about what the file is called, and `<tree>/../<name>` is the round-1
+# device: through the pointer it reaches the standing version's record, on a pinned version directory it
+# reaches that version's, and on a pre-pointer installation it reaches where the record has always been.
 fence_record_artefact_digest() {
-  local digest
-  [[ -f "${DB_FENCE_ARTEFACT_FILE}" ]] || return 1
-  grep -qE '^fence_artefact_complete=1$' "${DB_FENCE_ARTEFACT_FILE}" 2>/dev/null || return 1
-  digest="$(grep -m1 -E '^fence_artefact_sha256=' "${DB_FENCE_ARTEFACT_FILE}" 2>/dev/null)" || return 1
+  local base="$1" record digest
+  [[ -n "${base}" ]] || return 1
+  record="${base}/../${DB_FENCE_ARTEFACT_FILE##*/}"
+  [[ -f "${record}" ]] || return 1
+  grep -qE '^fence_artefact_complete=1$' "${record}" 2>/dev/null || return 1
+  digest="$(grep -m1 -E '^fence_artefact_sha256=' "${record}" 2>/dev/null)" || return 1
   digest="${digest#fence_artefact_sha256=}"
   fence_valid_sha256 "${digest}" || return 1
   printf '%s' "${digest}"
+}
+
+# ===========================================================================================
+# THE INVARIANT THE RECOVERY RECORD IS HELD TO. IT IS STATED HERE, ONCE, AND EVERY RULE BELOW IS A
+# CONSEQUENCE OF IT (o3d-xi3w r4). Three rounds each fixed a SEQUENCE and each made a new interleaving
+# reachable; what follows is the property, and the tests drive it from several interleavings -- including a
+# killed publisher -- rather than re-walking one order of events.
+#
+#   (A) WHILE A FENCE STANDS, the recovery record names the publication that RAISED it -- by entry digest
+#       AND by version -- and every run that resolves the fence helper is bound to THAT publication. So a
+#       release always has something to execute, and it is never another release's helper.
+#
+#   (B) WHILE NO FENCE STANDS, the record names the publication the documented pointer names -- BY ENTRY
+#       DIGEST AND BY VERSION, and a pointer that names no version (a pre-pointer installation) means a
+#       record that carries none; a run that finds otherwise rebinds it, itself, with no operator.
+#
+# WHY (A) HOLDS. Two writes have to agree, and they are made one after the other by two different runs:
+# the pointer flip, which any publisher makes, and the record binding, which the RAISE makes. So:
+#
+#   * The record carries the VERSION as well as the digest (fence_record_script_version), and
+#     _fence_bind_version() resolves through the record's version -- not through the pointer -- for as
+#     long as a fence stands. A publication that commits after the raise therefore cannot change which
+#     tree the release runs, and does not have to be prevented from committing.
+#   * The raise binds that record and publishes the authority INSIDE ONE CRITICAL SECTION
+#     (_fence_raise_critical_section), held on ${DB_FENCE_RECORD_LOCK}, and every other writer of those
+#     two lines takes the same lock and, under it, REFUSES while an authority is present. A stale write
+#     therefore either lands before the raise binds -- and is overwritten by it -- or does not land at all.
+#     That is the compare-and-swap round 3 reached for, made atomic by serialising the two writers instead
+#     of by re-reading after the fact.
+#   * The lock is `flock(2)`, which the kernel releases when the holder dies. Round 3 rejected a lock
+#     because a holder killed while holding it would block every future publication; that objection is
+#     about an advisory FILE somebody has to remove, and it does not apply to this one. Nothing here
+#     outlives the process that took it, and a timeout makes a wedged peer a refusal rather than a hang.
+#   * The sweep keeps the version a standing fence's record names, so the tree a release needs cannot be
+#     reclaimed while it is needed.
+#   * AND THERE IS ALWAYS A VERSION TO NAME, on a pre-pointer installation as much as on any other (r5).
+#     Such a box's documented name is the tree itself and names no publication, so before r5 a fence
+#     raised there recorded NO version and clause (A) fell back to the pointer and the digest check.
+#     _fence_adopt_legacy() now gives each fence OPERATION its own `.version-fence.<pid>.<suffix>`
+#     directory of the SAME FILE INODES before anything is executed, the raise records THAT, and the
+#     sweep's fifth question keeps it for as long as the fence stands. Nothing is published to do it and
+#     the documented name is not touched, so the box stays pre-pointer until an authenticated publication
+#     migrates it -- which is why clause (B) is unchanged there: while no fence stands the record names
+#     what the pointer names, and on such a box the pointer names no version, so neither does the record.
+#
+# WHAT IS STILL NOT GUARANTEED, SAID PLAINLY. If the record's version is absent (a record written by a
+# release older than this one) or no longer resolvable, the resolution falls back to the pointer and the
+# digest check, which is exactly what those installations did before -- no new refusal, and no new
+# substitution either, because the digest check is still made.
+# ===========================================================================================
+
+# WHETHER THE ONE LOCK CAN BE TAKEN AT ALL, and it is created rather than assumed. The recovery root is
+# root-owned and unwritable by anything else, so a name inside it cannot be planted by the account this
+# defends against; what this refuses is a name that is not a plain file, because `flock` on a directory or
+# a symlink's target is not the exclusion this claims to take. 0600 at creation, from the umask rather
+# than a chmod: a lock file any account may OPEN is a lock any account may HOLD, indefinitely, against
+# every future cutover.
+_fence_record_lock_ready() {
+  [[ -d "${DB_FENCE_RECOVERY_DIR}" ]] || return 1
+  [[ ! -L "${DB_FENCE_RECORD_LOCK}" ]] || return 1
+  if [[ -e "${DB_FENCE_RECORD_LOCK}" ]]; then
+    [[ -f "${DB_FENCE_RECORD_LOCK}" ]] || return 1
+    [[ -r "${DB_FENCE_RECORD_LOCK}" ]] || return 1
+    return 0
+  fi
+  ( umask 077; : > "${DB_FENCE_RECORD_LOCK}" ) 2>/dev/null || return 1
+  [[ -f "${DB_FENCE_RECORD_LOCK}" ]] && [[ ! -L "${DB_FENCE_RECORD_LOCK}" ]] && [[ -r "${DB_FENCE_RECORD_LOCK}" ]]
+}
+
+# THE RECOVERY RECORD BINDS THE PUBLICATION THAT IS STANDING, AND IS WRITTEN ONLY WHILE THAT IS STILL
+# TRUE (o3d-xi3w r3, Codex HIGH; r4 made the write and the fence gate one critical section).
+#
+# THE FINDING. Round 1 made the publication itself atomic — one rename of a pointer commits a whole
+# versioned tree together with its own record and its own manifest — and left ONE statement about the
+# artefact outside that rename: `fence_script_sha256` in ${DB_FENCE_IDENTITY_FILE}, which
+# publish_fence_script_copy() rewrote AFTER the flip, from a digest it had already read. Two publishers
+# therefore interleave: A commits A's version; B commits B's and binds B's entry digest; A, still holding
+# the digest it read before B's flip, binds A's. The pointer then names B while the record names A — and
+# db_fence_script_in_use(), which checks the entry file of the standing publication against the digest the
+# record binds, REFUSES EVERY LATER RUN. Measured before the fix, with both publications complete and
+# neither tree wrong: the resolution refused twice in a row and repaired nothing. The per-run publication
+# names round 1 introduced are what make that interleaving reachable, and reading the pointer back after
+# the flip — which round 1 does — does not protect a write that happens after the read.
+#
+# AND THAT REFUSAL IS THE WORST OUTCOME THIS FILE HAS. It is not a substitution: it is the fence mechanism
+# declining to run at all, on an installation where nothing is wrong with either tree. Every path goes
+# through this one resolution — preflight, raise, the migration URL, release, the exit trap's re-fence and
+# both operator wrappers — so a cutover can neither fence nor unfence, and the box is left needing an
+# operator who knows to supply IMS_FENCE_ARTEFACT_SHA256 by hand.
+#
+# A COMPARE-AND-SWAP AND NOT A ROTATION LOCK, chosen and not defaulted to. A lock held across the flip and
+# the record write would serialise publishers, and it would be a NEW way for this mechanism to stop
+# working: a holder killed while holding it blocks every future publication, so the lock needs a liveness
+# test to break it (/proc, as the r2 pin uses) — and that test is then load-bearing in both directions,
+# since breaking a live holder's lock reopens the race it was taken to close. A publication that REFUSES
+# because another is in flight is also an outage of the kind this round exists to remove. The swap adds no
+# state that can outlive a run, needs no unwinding, and cannot be held by anybody.
+#
+# WHAT IT SWAPS ON, WHICH IS THE WHOLE DESIGN. The record does not say what THIS run published; it says
+# what IS STANDING. So each attempt reads the pointer, takes the entry digest out of the VERSIONED
+# directory it names — an immutable path, so that value can never become a statement about some other
+# tree — writes it, and reads the pointer AGAIN. If it still names the same publication, the record just
+# written describes it. If it has moved, another publisher committed inside the window, this attempt's
+# value is stale, and the loop goes round with the new one. A run whose own publication was superseded
+# therefore ends by binding THE WINNER'S digest, which is the state the next run needs, and its caller
+# reports a lost race instead of a rotation.
+#
+# IT ONLY EVER ADOPTS A PUBLICATION THAT AUTHENTICATES ITSELF. A digest is taken from a tree only after
+# that tree is sealed and hashes to what its own record beside it binds — the same two questions
+# db_fence_script_in_use() asks before executing it. So this cannot launder a tree somebody modified in
+# place into the record: it refuses, and the execution path goes on refusing, exactly as it did before.
+#
+# AND THERE ARE FOUR WAYS OUT, none of which leaves the mechanism unusable:
+#   * `bound`     — the record now binds the entry file of the publication the pointer named after the
+#                   write, re-read to say so.
+#   * `unchanged` — it already did, which is every ordinary run.
+#   * `absent`    — there is no complete recovery record binding a script digest at all (a box that has
+#                   published but never raised a fence). Minting one is not this function's business:
+#                   the run that RAISES a fence writes the record, and nothing is bound until it does.
+#   * `refused`   — with the reason, either because nothing could be authenticated or because every
+#                   attempt lost to another publisher. The record then holds a digest that was standing
+#                   moments before, and THE NEXT RUN REPAIRS IT: _fence_repair_record() below calls this
+#                   on the paths that publish nothing, so an ordinary cutover fixes a record it finds
+#                   stale — whoever left it stale, including a publisher killed between its flip and its
+#                   record write, which is a state no locking scheme prevents either.
+#
+# ANSWERS ON STDOUT, `<outcome>|<digest or reason>`, and not in a script-scope name. Every caller reads it
+# through a command substitution, so a value assigned in here dies with the subshell; and the caller
+# BRANCHES on the outcome, which makes it a decision rather than a report — the round-1 lesson, and the
+# reason the declaration census would refuse a global here.
+# ANSWERS ON STDOUT, AND TAKES THE ONE LOCK. Opened and closed in this one frame, with a single exit
+# path, so no descriptor outlives the call; everything that decides or writes is in the locked body.
+_fence_bind_record_to_standing() {
+  local fd rc=0
+  if ! _fence_record_lock_ready; then
+    printf 'refused|the fence recovery record at %s could not be locked: %s is not a plain file this run can create or open, so the write that binds that record cannot be serialised against a run raising a fence. Nothing has been written' "${DB_FENCE_IDENTITY_FILE}" "${DB_FENCE_RECORD_LOCK}"
+    return 1
+  fi
+  # THE OPEN IS GROUPED, AND THAT IS NOT COSMETIC (o3d-secops r31, and it cost eight tests there). A BARE
+  # `exec` WITH A REDIRECTION applies that redirection TO THE SHELL, PERMANENTLY -- so
+  # `exec {fd}< file 2>/dev/null` sends every later refusal, warning and `die` of the whole entrypoint to
+  # /dev/null. Inside `{ ...; }` the suppression belongs to the group and is taken back at its closing
+  # brace, while the descriptor the `exec` opens is still the shell's. And a failed `exec` redirection ENDS
+  # a non-interactive shell, so the `||` below could never have run: _fence_record_lock_ready() is what
+  # establishes that the name is there and openable, and it is asked first.
+  { exec {fd}< "${DB_FENCE_RECORD_LOCK}"; } 2>/dev/null
+  if flock -w "${DB_FENCE_RECORD_LOCK_WAIT}" -x "${fd}" 2>/dev/null; then
+    _fence_bind_record_locked || rc=$?
+  else
+    printf 'refused|another privileged run has held the fence recovery record lock at %s for more than %s seconds, so this run will not write %s behind it. Nothing has been written and nothing has been published' "${DB_FENCE_RECORD_LOCK}" "${DB_FENCE_RECORD_LOCK_WAIT}" "${DB_FENCE_IDENTITY_FILE}"
+    rc=1
+  fi
+  { exec {fd}<&-; } 2>/dev/null || true
+  return "${rc}"
+}
+
+_fence_bind_record_locked() {
+  local attempts=4 attempt=0 base after entry digest recorded bound_record bound_tree version recorded_version
+  # THE ONE PLACE THE FENCE GATE IS ASKED, AND IT IS ASKED UNDER THE LOCK (o3d-xi3w r4, Codex HIGH 1).
+  # It used to be asked by _fence_repair_record() before it called this, and by the rotation path before
+  # it, which is a check that can be true when it is made and false when the write lands. Under the lock
+  # it cannot: the run that raises a fence binds this record and publishes that authority without
+  # releasing in between, so an authority being present here means the record is already the raise's and
+  # is not this run's to touch -- the version that raised a standing fence is the version that must
+  # release it.
+  if [[ -n "${DB_FENCE_STATE:-}" && -f "${DB_FENCE_STATE:-}" ]]; then
+    printf 'standing|a connection fence is recorded at %s, so %s was left exactly as the run that raised that fence wrote it: the version that raised a standing fence is the version that must release it, and this run has published and replaced nothing' "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_FILE}"
+    return 1
+  fi
+  while (( attempt < attempts )); do
+    attempt=$(( attempt + 1 ))
+    if ! base="$(_fence_resolve_version)"; then
+      printf 'refused|%s' "${base}"
+      return 1
+    fi
+    entry="${base}/scripts/${DB_FENCE_SCRIPT_COPY##*/}"
+    if ! digest="$(file_sha256 "${entry}")"; then
+      printf 'refused|the fence artefact standing at %s holds no entry file at %s, so there is nothing for the recovery record to bind' "${DB_FENCE_PROTECTED_APP_DIR}" "${entry}"
+      return 1
+    fi
+    recorded="$(fence_record_script_digest)" || recorded=""
+    if [[ -z "${recorded}" ]]; then
+      printf 'absent|%s' "${digest}"
+      return 0
+    fi
+    # AND "UNCHANGED" IS ABOUT THE VERSION AS WELL AS THE DIGEST (r5, second review of this round). Asked
+    # about the digest alone, this branch left a STALE VERSION standing for ever: a pre-pointer box that
+    # raised a fence records its adopted version, and after the release the pointer names no version while
+    # the record still names that one -- so clause (B) was false there, with nothing able to repair it,
+    # because the entry file had not changed. The same hole admits a publication whose entry file is
+    # identical and whose dependency closure is not. Both lines are written by one awk into one file, so
+    # asking about both is the only way to ask whether the record describes what is standing.
+    version="$(_fence_version_of_entry "${entry}")" || version=""
+    recorded_version="$(fence_record_script_version)" || recorded_version=""
+    if [[ "${recorded}" == "${digest}" && "${recorded_version}" == "${version}" ]]; then
+      printf 'unchanged|%s' "${digest}"
+      return 0
+    fi
+    # NOTHING IS ADOPTED THAT DOES NOT AUTHENTICATE ITSELF, and this is asked only when the two disagree,
+    # so the ordinary run above pays for none of it.
+    if ! _fence_tree_is_sealed "${base}"; then
+      printf 'refused|the fence artefact standing at %s is not sealed, so the recovery record was NOT rebound to it: %s' "${DB_FENCE_PROTECTED_APP_DIR}" "${DB_FENCE_SEAL_REASON}"
+      return 1
+    fi
+    bound_record="$(fence_record_artefact_digest "${base}")" || bound_record=""
+    bound_tree="$(_fence_tree_digest "${base}")" || bound_tree=""
+    if [[ -z "${bound_record}" || "${bound_record}" != "${bound_tree}" ]]; then
+      printf 'refused|the fence artefact standing at %s is not the tree its own record binds (record: %s; tree: %s), so the recovery record was NOT rebound to it' "${DB_FENCE_PROTECTED_APP_DIR}" "${bound_record:-none}" "${bound_tree:-unreadable}"
+      return 1
+    fi
+    if ! _fence_rewrite_record_binding "${digest}" "${version}"; then
+      printf 'refused|the recovery record at %s could not be rewritten to bind %s' "${DB_FENCE_IDENTITY_FILE}" "${digest}"
+      return 1
+    fi
+    # THE SWAP'S SECOND HALF. Anything but the publication this attempt read makes the write stale, and
+    # the next attempt writes what is standing NOW rather than reporting what was standing then.
+    if ! after="$(_fence_resolve_version)"; then
+      printf 'refused|%s' "${after}"
+      return 1
+    fi
+    if [[ "${after}" == "${base}" ]]; then
+      printf 'bound|%s' "${digest}"
+      return 0
+    fi
+  done
+  printf 'refused|%s was published over %d times while the recovery record at %s was being bound to it, so this run cannot say that the record describes what is standing. It binds a publication that was standing moments ago; the next privileged run repairs it before it decides anything else, and nothing has been published or replaced by this one' "${DB_FENCE_PROTECTED_APP_DIR}" "${attempts}" "${DB_FENCE_IDENTITY_FILE}"
+  return 1
+}
+
+# THE REPAIR, MADE BY A RUN THAT PUBLISHES NOTHING (o3d-xi3w r3), which is what makes "a publisher that
+# loses can leave a state a later run fixes by itself" true rather than hopeful. The states it fixes are
+# the two nothing else can: a publisher outraced between its flip and its record write, and a publisher
+# KILLED between them — measured, both leave the resolution refusing for ever, on an artefact root itself
+# published and that authenticates against its own record.
+#
+# IT IS NOT DONE WHILE A FENCE IS STANDING, and that is the same rule that refuses a rotation there: the
+# version that raised a fence is the version that must release it, so re-pointing the record at a
+# different publication under a standing fence would be this mechanism arranging exactly the substitution
+# it exists to prevent. That costs nothing real, because a rotation cannot happen under a standing fence
+# either — so the mismatch this repairs cannot be created there. The one residue, stated rather than
+# hidden: a publisher committing inside the window in which a raise writes its record would leave a
+# mismatch under a fence that is then standing, and that state needs the operator (the artefact is intact;
+# re-publishing it with IMS_FENCE_ARTEFACT_SHA256 after the release is what clears it).
+#
+# IT REPORTS ON STDERR AND NEVER IN ${DB_FENCE_ROTATION_NOTE}: the note is the caller's verdict on a
+# ROTATION, and every branch below this one sets it, so a repair written there would be silently
+# overwritten by the very next line. A repair is also never a refusal — it publishes nothing, replaces
+# nothing and can only make a later resolution possible — so it reports what it did and returns 0, and the
+# resolution that follows refuses on its own terms if the record still cannot be bound.
+_fence_repair_record() {
+  local bound
+  # A RUN THAT CANNOT WRITE THE RECOVERY ROOT HAS NOTHING TO REPAIR, AND SAYS NOTHING (o3d-xi3w r4).
+  # `--dry-run` and `--print-fence-digest` resolve the artefact as an ORDINARY account by design, and they
+  # reach this line: such a run can neither take the lock (the lock file is root-owned 0600, and creating
+  # it needs the root-owned directory) nor rewrite the record, so every one of them would print a refusal
+  # about a repair it was never able to make. Asked as "can this account write that directory" rather than
+  # "is this root", because that is the property the repair actually needs.
+  if [[ ! -w "${DB_FENCE_RECOVERY_DIR}" ]]; then
+    return 0
+  fi
+  if ! bound="$(_fence_bind_record_to_standing)"; then
+    # A STANDING FENCE IS NOT A FAILURE TO REPORT (o3d-xi3w r4). The gate that says so now lives inside
+    # the locked body, which is the only place it can be asked and acted on without a gap; reaching it is
+    # the ordinary state of every run made while a fence is up, and it is silent for the same reason it
+    # was silent when this function asked the question itself.
+    if [[ "${bound%%|*}" == "standing" ]]; then
+      return 0
+    fi
+    echo "The recovery record at ${DB_FENCE_IDENTITY_FILE} does not bind the fence artefact standing at ${DB_FENCE_PROTECTED_APP_DIR} and could not be repaired: ${bound#*|}. Nothing has been published and nothing has been replaced." >&2
+    return 0
+  fi
+  case "${bound%%|*}" in
+    bound)
+      echo "The recovery record at ${DB_FENCE_IDENTITY_FILE} did not bind the entry file of the fence artefact standing at ${DB_FENCE_PROTECTED_APP_DIR} — the state a publication outraced or killed between committing its pointer and writing that record leaves behind — and it now binds ${bound#*|}, taken out of that publication's own versioned directory after it was found sealed and equal to the digest its own record carries. Nothing was published and no bytes were replaced." >&2
+      ;;
+  esac
+  return 0
+}
+
+# THE RAISE BINDS THE RECORD AND PUBLISHES THE AUTHORITY WITHOUT LETTING GO IN BETWEEN (o3d-xi3w r4,
+# Codex HIGH 1). This is clause (A) of THE INVARIANT above, in code: from the instant an authority exists,
+# ${DB_FENCE_IDENTITY_FILE} names the publication the fence was raised with, and every other writer of
+# those lines takes this same lock and finds that authority.
+#
+# THE ORDER IS THE POINT. Bind FIRST, publish the authority SECOND, both under the lock:
+#   * bind first, because the authority is what makes a fence standing, and a record bound after it would
+#     be a record written while other runs had already been told to leave it alone;
+#   * under one lock, because a publisher that commits between the two would otherwise leave the record
+#     naming a publication the release is not bound to -- which round 3 disclosed as a residue needing an
+#     operator, and which is measured: the release ran ANOTHER release's helper, not a refusal.
+# A bind that fails REFUSES BEFORE ANYTHING IS REVOKED, which is the direction this file always fails in:
+# a fence that cannot be released is worse than one that was never raised.
+#
+# THE DIGEST IS TAKEN FROM THE ENTRY FILE THIS OPERATION IS PINNED TO and never re-resolved here. The
+# caller has already authenticated it through db_fence_script_in_use(); re-reading the documented name at
+# this point is the very mistake the pin exists to remove.
+_fence_raise_critical_section() {
+  local entry="$1" state_file="$2" fd rc=0
+  shift 2
+  if ! _fence_record_lock_ready; then
+    echo "NOT FENCED: ${DB_FENCE_RECORD_LOCK} is not a plain file this run can create or open, so the recovery record cannot be bound to the fence artefact this run would raise the fence with without another privileged run being able to write it at the same moment. A release resolves the helper through that record. Nothing has been revoked." >&2
+    return 1
+  fi
+  # GROUPED, for the reason written out above _fence_bind_record_to_standing(): a bare `exec` with a
+  # redirection redirects the SHELL, permanently, and a failed one ends it -- so the openability of the
+  # name is established by _fence_record_lock_ready() above and not by a `||` that cannot be reached.
+  { exec {fd}< "${DB_FENCE_RECORD_LOCK}"; } 2>/dev/null
+  if flock -w "${DB_FENCE_RECORD_LOCK_WAIT}" -x "${fd}" 2>/dev/null; then
+    _fence_raise_bind_and_run "${entry}" "$@" || rc=$?
+  else
+    echo "NOT FENCED: another privileged run has held ${DB_FENCE_RECORD_LOCK} for more than ${DB_FENCE_RECORD_LOCK_WAIT} seconds. That lock is held across one binding of ${DB_FENCE_IDENTITY_FILE} and one publication of an authority, so something is wedged rather than merely busy: \`fuser -v ${DB_FENCE_RECORD_LOCK}\` names it. Nothing has been revoked." >&2
+    rc=1
+  fi
+  { exec {fd}<&-; } 2>/dev/null || true
+  return "${rc}"
+}
+
+_fence_raise_bind_and_run() {
+  local entry="$1" digest version
+  shift
+  # NOTHING TO BIND IS NOT A FAILURE, and it is asked first. A box that has published an artefact but
+  # never raised a fence has no COMPLETE recovery record: db_fence_script_in_use() then makes no
+  # entry-digest check at all, so there is nothing here for a later release to disagree with and nothing
+  # for this run to protect. Minting a record is not this function's business -- update.sh writes one
+  # before the revoke, and it writes both binding lines itself for the run that is killed between that
+  # write and this one. Where a record DOES exist, a binding that cannot be made is a REFUSAL BEFORE
+  # ANYTHING IS REVOKED, which is the direction this file always fails in: a fence that cannot be
+  # released is worse than one that was never raised.
+  if fence_record_script_digest >/dev/null 2>&1; then
+    if ! digest="$(file_sha256 "${entry}")"; then
+      echo "NOT FENCED: ${entry} is the fence artefact this run would raise the fence with and it could not be digested, so the recovery record cannot be bound to it and a later release would have nothing that identifies the helper this fence was raised by. Nothing has been revoked." >&2
+      return 1
+    fi
+    version="$(_fence_version_of_entry "${entry}")" || version=""
+    if ! _fence_rewrite_record_binding "${digest}" "${version}"; then
+      echo "NOT FENCED: ${DB_FENCE_IDENTITY_FILE} could not be bound to ${entry}, the fence artefact this run would raise the fence with. A release resolves the helper through that record, so raising a fence now could mean releasing it with a different release's helper. Nothing has been revoked." >&2
+      return 1
+    fi
+  fi
+  "$@"
 }
 
 # THE ONLY WRITER of ${DB_FENCE_PROTECTED_APP_DIR}, and it refuses to overwrite one from the
@@ -1059,7 +2459,7 @@ fence_record_artefact_digest() {
 # Returns 0 when an artefact is standing afterwards — whether this call published it, rotated it,
 # or left the existing one alone — and 1 when there is none and none could be made.
 publish_fence_script_copy() {
-  local existing="" candidate=""
+  local existing="" candidate="" bound="" standing_digest="" standing_artefact="" superseded=0
   DB_FENCE_ROTATION_NOTE=""
 
   if [[ -n "${DB_FENCE_EXPECTED_SHA256}" ]] && ! fence_valid_sha256 "${DB_FENCE_EXPECTED_SHA256}"; then
@@ -1069,6 +2469,15 @@ publish_fence_script_copy() {
   if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] && ! fence_valid_sha256 "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}"; then
     DB_FENCE_ROTATION_NOTE="IMS_FENCE_ARTEFACT_SHA256='${DB_FENCE_EXPECTED_ARTEFACT_SHA256}' is not a sha256 digest (64 lowercase hex characters). Refusing to treat it as one."
     return 1
+  fi
+
+  # AND BEFORE ANY OF THE DECISIONS BELOW, A RECORD THAT DOES NOT DESCRIBE WHAT IS STANDING IS REPAIRED
+  # (o3d-xi3w r3). It is first because every branch under it reasons about the standing artefact, and
+  # because a run that publishes nothing is the ONLY thing that ever visits a box left in that state.
+  # There is nothing standing to repair against until the bootstrap below has run, so it is asked on the
+  # path where an artefact already exists and nowhere else.
+  if [[ -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
+    _fence_repair_record
   fi
 
   if [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
@@ -1099,7 +2508,7 @@ publish_fence_script_copy() {
     # THE STRONGER PIN DECIDES. If the standing artefact already hashes to what the invocation
     # asked for, there is nothing to rotate whatever the entry file's own digest says.
     local standing=""
-    standing="$(fence_record_artefact_digest)" || standing=""
+    standing="$(fence_record_artefact_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing=""
     if [[ -n "${standing}" && "${standing}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
       if [[ -z "${DB_FENCE_EXPECTED_SHA256}" || "${existing}" == "${DB_FENCE_EXPECTED_SHA256}" ]]; then
         return 0
@@ -1119,24 +2528,75 @@ publish_fence_script_copy() {
   fi
 
   _fence_stage_and_publish || return 1
-  # THE RECORD'S DIGEST MOVES WITH THE FILE IT NAMES. Leaving it behind would make
-  # db_fence_script_in_use() refuse every subsequent run — a rotation that bricks the mechanism is
-  # not a rotation. Only the digest line is touched; the identity of the fence that record
-  # describes is not this run's to restate.
-  _fence_rewrite_record_digest "$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || return 1
-  DB_FENCE_ROTATION_NOTE="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} was rotated: the entry file is now $(file_sha256 "${DB_FENCE_SCRIPT_COPY}") and the whole tree hashes to $(fence_record_artefact_digest), which are the digests this invocation authenticated."
+  # THE RECORD'S DIGEST MOVES WITH THE FILE IT NAMES, AND THE FILE IT NAMES IS WHAT IS STANDING
+  # (o3d-xi3w, and r3). Leaving it behind would make db_fence_script_in_use() refuse every subsequent
+  # run — a rotation that bricks the mechanism is not a rotation — and writing THIS run's digest
+  # unconditionally does the same thing whenever another publisher committed between the flip and here,
+  # which is the finding this round closes. Only the digest line is ever touched; the identity of the
+  # fence that record describes is not this run's to restate.
+  if ! bound="$(_fence_bind_record_to_standing)"; then
+    # A FENCE WENT UP WHILE THIS ROTATION WAS PUBLISHING (o3d-xi3w r4). The gate a few lines up saw none,
+    # and the binder -- which asks under the lock, so its answer cannot go stale between the ask and the
+    # write -- found one. The publication itself stands and authenticates; what may not happen is moving
+    # the record off the publication that standing fence was raised with, so this says so and refuses to
+    # report a rotation rather than pretending the record describes the new tree.
+    if [[ "${bound%%|*}" == "standing" ]]; then
+      DB_FENCE_ROTATION_NOTE="${bound#*|}. The artefact this run published is complete and stands at ${DB_FENCE_PROTECTED_APP_DIR}, but the fence that is up will be released with the publication its own record names, and no rotation is being reported. Release the fence, then re-run with IMS_FENCE_SCRIPT_SHA256."
+      return 1
+    fi
+    DB_FENCE_ROTATION_NOTE="the fence artefact was published, but the recovery record at ${DB_FENCE_IDENTITY_FILE} could not be bound to what is standing at ${DB_FENCE_PROTECTED_APP_DIR}: ${bound#*|}. A run that resolves the fence helper while the two disagree will refuse rather than execute it, so nothing is being reported as published; the next privileged run repairs the record before it decides anything else."
+    return 1
+  fi
+  standing_digest="${bound#*|}"
+  # AND A PUBLICATION THAT WAS SUPERSEDED AFTER IT COMMITTED SAYS SO (o3d-xi3w r3). The pointer read-back
+  # inside _fence_stage_and_publish() catches a run that lost the FLIP; this catches the other order —
+  # this run flipped, and another run flipped after it — which is exactly the interleaving that used to
+  # leave the record describing a tree nobody was running. The record binds the winner, so the mechanism
+  # is usable and no operator has to repair anything; what is refused is REPORTING this run's rotation,
+  # because the sentence below would otherwise say that the digests standing there are "the digests this
+  # invocation authenticated" about another operator's release.
+  #
+  # AND IT COMPARES AGAINST THE PINS, NEVER AGAINST THE CHECKOUT. Re-hashing ${DB_FENCE_SCRIPT} at this
+  # point would be reading an application-owned file again AFTER the publication, so a checkout that
+  # changed in between would make a publication that won report a race it never lost — the same mistake
+  # as authenticating a tree against the source it came from. ${DB_FENCE_EXPECTED_SHA256} and
+  # ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} are `readonly`, they are precisely what this invocation
+  # authenticated, and this path cannot be reached without at least one of them: a run with neither
+  # returned above without publishing anything.
+  standing_artefact="$(fence_record_artefact_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing_artefact=""
+  if [[ -n "${DB_FENCE_EXPECTED_SHA256}" && "${standing_digest}" != "${DB_FENCE_EXPECTED_SHA256}" ]]; then
+    superseded=1
+  fi
+  if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && "${standing_artefact}" != "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
+    superseded=1
+  fi
+  if (( superseded == 1 )); then
+    DB_FENCE_ROTATION_NOTE="this run published the artefact this invocation authenticated, and what stands at ${DB_FENCE_PROTECTED_APP_DIR} is a different one — its entry file is ${standing_digest:-unreadable} and its tree hashes to ${standing_artefact:-unreadable}: another privileged run published at the same moment and its copy is the one standing there. The recovery record binds THAT copy, so the fence is executable and nothing needs repairing; nothing of this run's is being reported as published, and re-running this one will publish over it."
+    return 1
+  fi
+  DB_FENCE_ROTATION_NOTE="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} was rotated: the entry file is now ${standing_digest} and the whole tree hashes to ${standing_artefact:-a value this run could not obtain}, which are the digests this invocation authenticated, and the recovery record binds that entry file."
   return 0
 }
 
-# Replace ONLY the fence_script_sha256 line of a complete recovery record, keeping every other
-# line and the terminating sentinel exactly where they were. A record with no such line, or no
-# record at all, is left alone: there is then nothing bound to the old file.
-_fence_rewrite_record_digest() {
-  local digest="$1" rewritten
+# Replace ONLY the two BINDING lines of a complete recovery record -- the entry digest and the
+# publication it is in -- keeping every other line and the terminating sentinel exactly where they were.
+# A record with no digest line, or no record at all, is left alone: there is then nothing bound to the
+# old file. The version line is rewritten in place when it is there and inserted immediately before the
+# sentinel when it is not, so a record written by a release that predates it gains one the first time a
+# fence is raised; an EMPTY version removes it, which is what a pre-pointer installation must record,
+# because a version name nobody can resolve is worse than none.
+#
+# BOTH LINES OR NEITHER. They are written by the one awk into the one file that one rename commits, so
+# no reader can see a digest from this run beside a version from the last one.
+_fence_rewrite_record_binding() {
+  local digest="$1" version="${2:-}" rewritten
   fence_valid_sha256 "${digest}" || return 1
+  [[ -z "${version}" ]] || _fence_valid_version_name "${version}" || return 1
   fence_record_script_digest >/dev/null 2>&1 || return 0
-  rewritten="$(awk -v d="${digest}" '
+  rewritten="$(awk -v d="${digest}" -v v="${version}" '
     /^fence_script_sha256=/ { print "fence_script_sha256=" d; next }
+    /^fence_script_version=/ { next }
+    /^fence_identity_complete=1$/ { if (v != "") { print "fence_script_version=" v }; print; next }
     { print }
   ' "${DB_FENCE_IDENTITY_FILE}" 2>/dev/null)" || return 1
   [[ -n "${rewritten}" ]] || return 1
@@ -1157,7 +2617,7 @@ _fence_rewrite_record_digest() {
 # reason goes to stderr because every caller reads this through a command substitution, and a
 # global set inside one dies with the subshell.
 db_fence_script_in_use() {
-  local recorded actual recorded_artefact actual_artefact
+  local recorded actual recorded_artefact actual_artefact base entry
 
   # THE RECORD IS READ BEFORE ANYTHING IS PUBLISHED. A record naming a copy that is GONE is not a
   # bootstrap: only root can delete out of the protected directory, so it is a state the
@@ -1176,7 +2636,11 @@ db_fence_script_in_use() {
   fi
   if [[ -n "${DB_FENCE_ROTATION_NOTE}" ]]; then echo "${DB_FENCE_ROTATION_NOTE}" >&2; fi
 
-  # Re-read: an authenticated rotation moves the record's digest with the file it names.
+  # Re-read: an authenticated rotation moves the record's digest with the file it names — and so does the
+  # repair that publication makes when it finds a record describing something other than what is standing
+  # (o3d-xi3w r3), which is the state a publisher outraced or killed between its pointer flip and its own
+  # record write leaves behind. Without this re-read the run that repaired it would go on to refuse on the
+  # value it read before.
   recorded="$(fence_record_script_digest)" || recorded=""
 
   if [[ ! -f "${DB_FENCE_SCRIPT_COPY}" ]]; then
@@ -1184,38 +2648,61 @@ db_fence_script_in_use() {
     return 1
   fi
 
-  # THE WHOLE TREE, NOT THE ENTRY FILE (o3d-2sm1.5 r32, Codex CRITICAL). Everything below runs
-  # before the path is handed back, because the path is handed straight to `node` with an
-  # administrative database credential beside it.
-  if ! _fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}"; then
-    echo "The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is not sealed, so it will not be executed: ${DB_FENCE_SEAL_REASON}" >&2
+  # AND THE DOCUMENTED NAME IS ONE THIS MECHANISM MAY FOLLOW, AND IS THEN LEFT BEHIND (o3d-xi3w, r1 and
+  # r2). It is a symbolic link into the versioned directory a publication commits, so the link text is
+  # validated rather than resolved — anything but one versioned publication of this root is refused
+  # instead of run. And the path this function HANDS BACK is that versioned directory's own, because the
+  # documented name is a mutable object: everything below this line would otherwise be a statement about
+  # whatever it happened to resolve to at the instant it was read, and a concurrent publisher's flip
+  # lands between that instant and the exec. _fence_bind_version() does both, and RECORDS which
+  # publication this operation is bound to, so that every later invocation of the same operation — a
+  # cutover resolves the helper seven times — gets this one and not a newer one.
+  if ! base="$(_fence_bind_version)"; then
+    echo "The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} will not be followed: ${base:-no reason was recorded}. Nothing will be executed out of it. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — and supply IMS_FENCE_ARTEFACT_SHA256 from the release." >&2
+    return 1
+  fi
+  # THE ENTRY FILE'S NAME COMES OFF THE DOCUMENTED PATH rather than being written out again, so the copy
+  # that is executed and the copy every message names are the same string composed once.
+  entry="${base}/scripts/${DB_FENCE_SCRIPT_COPY##*/}"
+  if [[ ! -f "${entry}" ]]; then
+    echo "${base} is the publication this fence operation is pinned to, and it holds no fence script at ${entry}. Nothing will be executed." >&2
     return 1
   fi
 
-  recorded_artefact="$(fence_record_artefact_digest)" || recorded_artefact=""
-  if [[ -z "${recorded_artefact}" ]]; then
-    echo "There is no complete artefact record at ${DB_FENCE_ARTEFACT_FILE}, so nothing says what ${DB_FENCE_PROTECTED_APP_DIR} is supposed to hash to and the tree cannot be authenticated. Discard it and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256." >&2
+  # THE WHOLE TREE, NOT THE ENTRY FILE (o3d-2sm1.5 r32, Codex CRITICAL). Everything below runs
+  # before the path is handed back, because the path is handed straight to `node` with an
+  # administrative database credential beside it — and every one of these checks is now made against
+  # ${base}, the directory nothing writes into after its publication renamed it there, rather than
+  # through a name another run can re-aim between the check and the exec.
+  if ! _fence_tree_is_sealed "${base}"; then
+    echo "The fence artefact at ${base} is not sealed, so it will not be executed: ${DB_FENCE_SEAL_REASON}" >&2
     return 1
   fi
-  actual_artefact="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || actual_artefact=""
+
+  recorded_artefact="$(fence_record_artefact_digest "${base}")" || recorded_artefact=""
+  if [[ -z "${recorded_artefact}" ]]; then
+    echo "There is no complete artefact record beside ${base}, so nothing says what it is supposed to hash to and the tree cannot be authenticated. Discard the artefact and let the next run republish — ${DB_FENCE_SUDO_PREFIX}rm -rf ${DB_FENCE_PROTECTED_APP_DIR} — or supply IMS_FENCE_ARTEFACT_SHA256." >&2
+    return 1
+  fi
+  actual_artefact="$(_fence_tree_digest "${base}")" || actual_artefact=""
   if [[ "${actual_artefact}" != "${recorded_artefact}" ]]; then
-    echo "The protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is not the tree its record binds (record: ${recorded_artefact}; tree: ${actual_artefact:-unreadable}). Refusing to run it. ${DB_FENCE_MANIFEST_FILE} lists the per-file digests: \`cd ${DB_FENCE_PROTECTED_APP_DIR} && sha256sum -c ${DB_FENCE_MANIFEST_FILE}\` names which file moved." >&2
+    echo "The fence artefact at ${base} is not the tree its record binds (record: ${recorded_artefact}; tree: ${actual_artefact:-unreadable}). Refusing to run it. ${base}/../${DB_FENCE_MANIFEST_FILE##*/} lists the per-file digests: \`cd ${base} && sha256sum -c ${base}/../${DB_FENCE_MANIFEST_FILE##*/}\` names which file moved." >&2
     return 1
   fi
   if [[ -n "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" && "${recorded_artefact}" != "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; then
-    echo "IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} but the standing artefact at ${DB_FENCE_PROTECTED_APP_DIR} is ${recorded_artefact}. Refusing to run a tree this invocation did not authenticate." >&2
+    echo "IMS_FENCE_ARTEFACT_SHA256 expects ${DB_FENCE_EXPECTED_ARTEFACT_SHA256} but the artefact this operation is pinned to at ${base} is ${recorded_artefact}. Refusing to run a tree this invocation did not authenticate." >&2
     return 1
   fi
 
   if [[ -n "${recorded}" ]]; then
-    actual="$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || actual=""
+    actual="$(file_sha256 "${entry}")" || actual=""
     if [[ "${actual}" != "${recorded}" ]]; then
-      echo "The root-owned fence script at ${DB_FENCE_SCRIPT_COPY} is not the one the recovery record binds to this fence (record: ${recorded}; file: ${actual:-unreadable}). Refusing to run it." >&2
+      echo "The root-owned fence script at ${entry} is not the one the recovery record binds to this fence (record: ${recorded}; file: ${actual:-unreadable}). Refusing to run it." >&2
       return 1
     fi
   fi
 
-  printf '%s' "${DB_FENCE_SCRIPT_COPY}"
+  printf '%s' "${entry}"
   return 0
 }
 
@@ -2515,7 +4002,12 @@ db_fence_raise() {
 
   # STEP 2, PRIVILEGED: validated field by field, rebuilt from root own template, and published
   # durably. A failure here is the refusal that keeps the asymmetry closed.
-  if ! db_fence_publish_authority "${plan}" "${state_file}" "${database}" "${app_role}"; then
+  # THE BINDING AND THE PUBLICATION, UNDER ONE LOCK (o3d-xi3w r4, Codex HIGH 1). See THE INVARIANT above
+  # _fence_bind_record_to_standing(): ${fence_script} is the entry file this operation is PINNED to, so
+  # the record is bound to the publication this fence is actually raised with, and the authority that
+  # makes the fence standing is published before the lock is dropped.
+  if ! _fence_raise_critical_section "${fence_script}" "${state_file}" \
+       db_fence_publish_authority "${plan}" "${state_file}" "${database}" "${app_role}"; then
     # A PUBLICATION FAILS WITH THE RECORD ALREADY VISIBLE MORE OFTEN THAN IT LOOKS (o3d-secops r25,
     # Codex HIGH). The validator's LAST barrier is the directory fsync, which runs AFTER the atomic
     # rename: when it fails it says so and deliberately leaves the authority in place, because the
@@ -2712,7 +4204,26 @@ db_fence_publish_operator_wrappers() {
     return 1
   fi
   _fence_protected_dir_ready || return 1
-  artefact_digest="$(fence_record_artefact_digest)" || return 1
+  # THE DIGEST THE WRAPPER IS WRITTEN FOR IS THE ONE THIS OPERATION IS PINNED TO (o3d-xi3w r2), and the
+  # PATH it checks stays the documented name. That pairing is deliberate, and each half has its reason.
+  # The wrapper runs LATER, by hand, after this process has exited and its pin with it, so a versioned
+  # path baked into it could name a publication the sweep has since reclaimed — a recovery route that
+  # evaporates. The documented name always resolves to something. What the wrapper must never do is run a
+  # DIFFERENT release from the one the cutover fenced with, and that is what the digest settles: it is
+  # this operation's, so if another run published in the meantime the wrapper refuses and says the
+  # artefact has changed since the fence was raised, which is the sentence an operator needs.
+  #
+  # ON THE ORDINARY PATH THE TWO ARE THE SAME TREE: this is called from resolve_fence_script(), in the
+  # same command substitution as db_fence_script_in_use(), so the pin is this shell's own and names what
+  # is standing. Where there is no pin at all — a caller that publishes wrappers without resolving a
+  # helper — the question being asked really is "what is standing", and that is what is answered.
+  local pinned_base=""
+  pinned_base="$(_fence_bind_version)" || pinned_base=""
+  if [[ -n "${pinned_base}" ]]; then
+    artefact_digest="$(fence_record_artefact_digest "${pinned_base}")" || return 1
+  else
+    artefact_digest="$(fence_record_artefact_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || return 1
+  fi
 
   local identity="" arg expected_database="" expected_app_role="" expected_app_user="" baked_program baked_stamp baked_inspect baked_clear
   # The validator these wrappers carry is the library's own, captured with its status taken: a
@@ -3479,17 +4990,28 @@ _fence_probe_assemble() {
 _fence_standing_artefact() {
   local standing="" recorded=""
   _fence_standing_sha=""
+  _fence_standing_base=""
   _fence_standing_reason=""
   [[ -f "${DB_FENCE_SCRIPT_COPY}" ]] || return 1
-  _fence_tree_is_sealed "${DB_FENCE_PROTECTED_APP_DIR}" || return 1
-  standing="$(_fence_tree_digest "${DB_FENCE_PROTECTED_APP_DIR}")" || standing=""
+  # AND THE DOCUMENTED NAME IS ONE THIS MECHANISM MAY FOLLOW, AND THE ANSWER IS THE VERSIONED DIRECTORY
+  # IT NAMES (o3d-xi3w, r1 and r2): the same resolution the execution path makes, because a digest taken
+  # THROUGH a pointer nobody validated is a digest of whatever that pointer reached, and one taken through
+  # a validated pointer is still a digest of whatever it reached at the instant it was dereferenced. A
+  # refusal here reports as "no usable standing artefact", which is what it is.
+  if ! _fence_standing_base="$(_fence_resolve_version)"; then
+    _fence_standing_reason="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} will not be followed: ${_fence_standing_base:-no reason was recorded}."
+    _fence_standing_base=""
+    return 1
+  fi
+  _fence_tree_is_sealed "${_fence_standing_base}" || return 1
+  standing="$(_fence_tree_digest "${_fence_standing_base}")" || standing=""
   _fence_standing_sha="${standing}"
-  recorded="$(fence_record_artefact_digest)" || recorded=""
+  recorded="$(fence_record_artefact_digest "${_fence_standing_base}")" || recorded=""
   if [[ -n "${standing}" && "${standing}" == "${recorded}" ]] &&
      { [[ -z "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]] || [[ "${standing}" == "${DB_FENCE_EXPECTED_ARTEFACT_SHA256}" ]]; }; then
     return 0
   fi
-  _fence_standing_reason="the protected fence artefact at ${DB_FENCE_PROTECTED_APP_DIR} is not one this run may execute: it hashes to ${standing:-nothing readable}, its record binds ${recorded:-nothing}${DB_FENCE_EXPECTED_ARTEFACT_SHA256:+, and this invocation pinned ${DB_FENCE_EXPECTED_ARTEFACT_SHA256}}."
+  _fence_standing_reason="the fence artefact at ${_fence_standing_base} is not one this run may execute: it hashes to ${standing:-nothing readable}, its record binds ${recorded:-nothing}${DB_FENCE_EXPECTED_ARTEFACT_SHA256:+, and this invocation pinned ${DB_FENCE_EXPECTED_ARTEFACT_SHA256}}."
   return 1
 }
 
@@ -3501,7 +5023,7 @@ _fence_standing_artefact() {
 # Returns 0 when it established at least one digest — a producer nobody can take a status from is a
 # shape this subsystem no longer carries anywhere.
 db_fence_probe_digests() {
-  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_reason=""
+  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_base="" _fence_standing_reason=""
   DB_FENCE_PROBE_ARTEFACT_SHA256=""
   DB_FENCE_PROBE_STANDING_SHA256=""
   if _fence_probe_assemble; then DB_FENCE_PROBE_ARTEFACT_SHA256="${_fence_probe_sha}"; fi
@@ -3555,7 +5077,7 @@ db_fence_probe_report() {
 # the caller's banner asserts, and it is the only thing this function reports through a variable.
 db_fence_preflight() {
   local notice="${1:-}" probe="" rc=0
-  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_reason=""
+  local _fence_probe_dir="" _fence_probe_sha="" _fence_standing_sha="" _fence_standing_base="" _fence_standing_reason=""
   DB_FENCE_PROBE_REASON=""
   [[ -n "${notice}" ]] || return 1
   shift
@@ -3566,7 +5088,16 @@ db_fence_preflight() {
   # THE STANDING ARTEFACT FIRST: it is the only thing on the box that has been through the
   # publication gate.
   if _fence_standing_artefact; then
-    probe="${DB_FENCE_SCRIPT_COPY}"
+    # AND THE PROBE RUNS THE VERSIONED PATH, not the documented one (o3d-xi3w r2). This is a helper
+    # invocation like any other: it is handed DEPLOY_ADMIN_DATABASE_URL, and a path through the pointer
+    # would be a statement about whatever is standing when node dereferences it rather than about the
+    # tree _fence_standing_artefact() has just sealed, digested and authenticated.
+    #
+    # IT TAKES NO PIN, AND THAT IS NOT AN OVERSIGHT. This is the `--dry-run` path, which runs as an
+    # ordinary account on purpose, so it cannot write a marker into a root-owned directory; and it is ONE
+    # invocation running `--preflight`, which reads. The pin exists to keep the SEVERAL invocations of a
+    # cutover on one release, and a single invocation of an immutable path has nothing to disagree with.
+    probe="${_fence_standing_base}/scripts/${DB_FENCE_SCRIPT_COPY##*/}"
     "${notice}" "This dry run probes with the root-owned artefact at ${probe}, which is the"
     "${notice}" "tree this box already publishes and verifies — not with the checkout's copy."
   else

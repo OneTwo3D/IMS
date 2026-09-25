@@ -35,8 +35,13 @@ export async function getWmsOrderStatusForSalesOrder(salesOrderId: string): Prom
   const connector = getWmsConnector(connectorId)
   if (!connector.fetchOrderStatus) return null
 
-  const lookupConnector = await resolveWmsOrderLookupConnector(connectorId)
-  if (!lookupConnector) return null
+  // o3d-r5uk: every non-`one` resolution renders no chip. That includes a connection pointed at an
+  // ARCHIVED storefront — this is a read for a page render, so it must not write an activity log,
+  // and showing a chip resolved by guesswork would name a warehouse status that belongs to another
+  // store's order. The sweep (lib/domain/wms/order-status-sweep.ts) is the surface that reports WHY.
+  const lookupResolution = await resolveWmsOrderLookupConnector(connectorId)
+  if (lookupResolution.kind !== 'one') return null
+  const lookupConnector = lookupResolution.connector
 
   const link = await db.shoppingOrderLink.findUnique({
     where: { connector_orderId: { connector: lookupConnector, orderId: salesOrderId } },

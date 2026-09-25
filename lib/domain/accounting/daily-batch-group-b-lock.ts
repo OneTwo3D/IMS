@@ -4,9 +4,11 @@
  *
  * THE DEFECT, measured on a scratch database before this module existed (probe kept at
  * /var/tmp/ims-session-park-20260913/c08y2-probe/race.ts, outside the repository; network trapped, own
- * throwaway database): both daily batches loaded the whole shipment
+ * throwaway database): the daily batch loaded the whole shipment
  * window — including `shipment_lines.costLayerSnapshot` and `cogsBatchAmount` — and only THEN locked
- * the cost layers those snapshots reference. A landed-cost revaluation holding those layer locks
+ * the cost layers those snapshots reference. (The then-present QuickBooks batch had the same shape;
+ * o3d-remove-parked-connectors archived it before this branch merged, so it was NOT given this
+ * ordering and keeps the defect inside `archive/` — o3d-tedw.) A landed-cost revaluation holding those layer locks
  * parked the batch at
  *
  *     SELECT id FROM "cost_layers" WHERE id IN ($1) FOR UPDATE      <- observed in pg_stat_activity

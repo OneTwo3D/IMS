@@ -60,10 +60,15 @@
  */
 export const ACCOUNTING_BINDING_PIN_SETTING_KEYS = [
   'xero_expected_tenant_id',
+  // o3d-remove-parked-connectors: QuickBooks is archived and no code writes this row any more — but a
+  // development database that ran QuickBooks still HOLDS it, and this list is what a wholesale
+  // settings delete excludes so it cannot take the row in scan order and deadlock against the pin
+  // trigger. A retired key in an exclusion list costs nothing and removing it reopens exactly the
+  // cycle this module exists to close, on the one install where the row is present.
   'quickbooks_expected_realm_id',
 ] as const
 
-/** The Xero release witness. QuickBooks has no release receipt, so it has no witness row. */
+/** The Xero release witness. The archived QuickBooks connector had no release receipt, so no witness row. */
 export const ACCOUNTING_BINDING_WITNESS_SETTING_KEYS = ['xero_pin_release_witness'] as const
 
 /** Every binding row that lives in `settings`, for a bulk delete's exclusion list. */

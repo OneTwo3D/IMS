@@ -340,6 +340,12 @@ readonly APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 readonly APP_DIR="${IMS_APP_DIR:-/opt/${APP_NAME}}"
 readonly DATA_DIR="${IMS_DATA_DIR:-/var/lib/${APP_NAME}}"
+# CONSTRAINED, NOT MERELY OVERRIDABLE (o3d-noka). The value is still whatever the operator sets, and
+# it is still only resolved at the pre-migration dump — but before a single byte is written there,
+# open_root_owned_ancestry() requires every component of it, from `/` down to and including this
+# directory, to be a real directory owned by root and writable by nobody else, and REFUSES by name
+# what is not. See the block at the dump, and docs/installation.md, "Where the pre-update dump may
+# go". Not `readonly`, for the reason it never was: install.sh's declarations are the argument.
 BACKUP_DIR="${IMS_BACKUP_DIR:-/var/backups/${APP_NAME}}"
 SERVICE_UNIT="${IMS_SERVICE_UNIT:-${APP_NAME}.service}"
 readonly DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
@@ -3119,7 +3125,7 @@ remove_db_identity_snapshot() {
 # matters, which is the run that is killed between the two. A fence raised with no record is
 # exactly the state r28 left un-adoptable.
 publish_fence_recovery_record() {
-  local digest
+  local digest script version=""
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would publish ${DB_FENCE_IDENTITY_FILE} and a root-owned copy of the fence script at ${DB_FENCE_SCRIPT_COPY}"
     return 0
@@ -3146,13 +3152,32 @@ publish_fence_recovery_record() {
   # is consistent with itself. publish_fence_script_copy() now bootstraps when there is no
   # protected copy and otherwise leaves the standing one alone; an upgrade is an authenticated
   # rotation (IMS_FENCE_SCRIPT_SHA256 on the root invocation) and never an implicit consequence of
-  # raising a fence. See scripts/lib/db-fence-protected.sh.
-  publish_fence_script_copy || return 1
+  # raising a fence. See scripts/lib/db-fence-protected.sh. That call is no longer made here on its
+  # own: db_fence_script_in_use() below makes it, first thing, and then resolves — so the ensuring
+  # and the digest are one answer about one publication instead of two about whatever each found.
   # THE DIGEST IS TAKEN FROM THE PUBLISHED COPY, not from the checkout, because the copy is what
   # will run. Binding the two closes the copy/use race r29 left: the file whose digest the record
   # names is the file the fence is raised with, and every later adoption, release and re-fence
   # checks that it still is.
-  digest="$(file_sha256 "${DB_FENCE_SCRIPT_COPY}")" || return 1
+  #
+  # AND IT IS THE COPY THIS OPERATION IS PINNED TO, NOT WHATEVER THE DOCUMENTED NAME RESOLVES TO
+  # (o3d-xi3w r3). This used to publish and then hash ${DB_FENCE_SCRIPT_COPY}, a path THROUGH the
+  # pointer — so a privileged run publishing between those two lines made this record bind an entry
+  # file this run is not going to execute: the fence would be raised by the version this operation
+  # pinned and RELEASED, later, by the one the record named. db_fence_script_in_use() publishes
+  # exactly as the removed call did, and then hands back the entry file of the versioned
+  # publication this operation is bound to for its whole length — which is the file the fence is
+  # about to be raised with, and therefore the only digest this record may carry.
+  #
+  # AND THE RECORD NAMES THE PUBLICATION AS WELL AS THE BYTES (o3d-xi3w r4). The digest says WHICH BYTES;
+  # the version says WHICH PUBLICATION they are in, and that is what a release needs once the documented
+  # pointer has moved on -- see THE INVARIANT in scripts/lib/db-fence-protected.sh. Both are taken from the
+  # entry file THIS operation is pinned to. It is written here as well as in the raise's critical section
+  # because this write happens BEFORE the revoke and the critical section happens after it: a run killed
+  # between the two leaves a record that already names the right publication.
+  script="$(db_fence_script_in_use)" || return 1
+  digest="$(file_sha256 "${script}")" || return 1
+  version="$(_fence_version_of_entry "${script}")" || version=""
   {
     printf 'db_app_host=%s\n' "${DB_IDENTITY_HOST}"
     printf 'db_app_port=%s\n' "${DB_IDENTITY_PORT}"
@@ -3160,6 +3185,7 @@ publish_fence_recovery_record() {
     printf 'db_app_database=%s\n' "${DB_IDENTITY_DATABASE}"
     printf 'db_connect_fence_state=%s\n' "${DB_FENCE_STATE}"
     printf 'fence_script_sha256=%s\n' "${digest}"
+    if [[ -n "${version}" ]]; then printf 'fence_script_version=%s\n' "${version}"; fi
     printf 'recorded_at=%s\n' "$(date -Iseconds)"
     # THE LAST LINE, AND IT IS THE POINT OF IT, exactly as marker_complete=1 is: a record that
     # does not end here was never published in one piece, and a HALF-READ IDENTITY IS A DIFFERENT
@@ -5345,15 +5371,21 @@ header "Pre-migration database backup (nothing is serving)"
 # ONLY once pg_dump has actually finished. The dump runs to a `.part` file first: a
 # truncated dump is not a restore point, and naming one as though it were is worse than
 # admitting there is none.
-BACKUP_TARGET="${BACKUP_DIR}/pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
+#
+# THE BASENAME IS ITS OWN VARIABLE (o3d-noka). ${BACKUP_TARGET} is now a string for the OPERATOR —
+# the banner, the log line and ${BACKUP_FILE} — and nothing below resolves it. What the writes are
+# aimed at is ONE COMPONENT under a descriptor; see the block below.
+BACKUP_BASENAME="pre-update-$(date +%Y%m%d-%H%M%S).sql.gz"
+BACKUP_TARGET="${BACKUP_DIR}/${BACKUP_BASENAME}"
 if $DRY_RUN; then
   echo -e "${YELLOW}[DRY]${RESET}   would pg_dump to ${BACKUP_TARGET}"
 else
   # ---------------------------------------------------------------------------
-  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND
-  # (o3d-ov60 r4). Three rounds tried to make a root-side dump safe INSIDE a directory
-  # ${APP_USER} may own, and each closed its finding by opening a worse one. The record is here,
-  # at the site, so the next reader does not re-attempt any of the three.
+  # THE OVERRIDE IS CONSTRAINED, AND THAT IS WHAT DISSOLVED THIS WHOLE SITE (o3d-noka, closing
+  # o3d-ov60 site 5). Three rounds tried to make a root-side `pg_dump` safe INSIDE a directory
+  # ${APP_USER} may own, and each closed its finding by opening a worse one. The record stays here,
+  # at the site, so the next reader does not re-attempt any of the three — and so that nobody
+  # mistakes the shape below for a fourth attempt at the same thing.
   #
   #   r1  replaced `mkdir -p "${BACKUP_DIR}"` with the symlink-proof walk — through
   #       mkdir_service_subdir(), THE TWIN THAT RESTORES THE WORKING DIRECTORY. The dump, the
@@ -5372,59 +5404,83 @@ else
   #
   #   r3  removed the hang by naming `O_EXCL|O_NONBLOCK` somewhere a shell can name them: a node
   #       helper, scripts/lib/write-new-file.mjs, resolved from ${IMS_SCRIPT_LIB_DIR}. THAT TURNED
-  #       A DENIAL OF SERVICE INTO ARBITRARY CODE EXECUTION AS ROOT, and it is why this block is
-  #       back where it started. The documented update is `cd /opt/one-two-inventory` and then
-  #       `bash scripts/update.sh`; install.sh and the clone path a few hundred lines above both
-  #       `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, so that checkout — and everything the
-  #       helper would be resolved out of — belongs to the service account.
+  #       A DENIAL OF SERVICE INTO ARBITRARY CODE EXECUTION AS ROOT, and it is why no program is
+  #       named anywhere in this block. The documented update is `cd /opt/one-two-inventory` and
+  #       then `bash scripts/update.sh`; install.sh and the clone path a few hundred lines above
+  #       both `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"`, so that checkout — and everything
+  #       a helper would be resolved out of — belongs to the service account. AND "PIN THE HELPER"
+  #       IS NOT THE ANSWER: it moves the boundary rather than establishing one, because the pin
+  #       would be computed by a script read from the same checkout. scripts/lib/pin-source-file.mjs
+  #       existed to authenticate exactly such bytes and was DELETED in o3d-secops r22 for that
+  #       reason, with a guard in tests/scripts/deploy-order.test.ts that fails if it comes back.
+  #       The same late-read shape still ships twice, in install.sh's chown_state_tree() and its
+  #       auth probe; that is o3d-kyqa, a repository-wide design and not a line in this block.
   #
-  # WHY THE THREE `source`s AT THE TOP OF THIS FILE ARE NOT THE SAME THING, since a reader will
-  # reach for them as the counter-example. The paragraph above ${IMS_SCRIPT_LIB_DIR} has always
-  # said it: they are read AT STARTUP, in the same instant as this file's own body and out of the
-  # same tree, so they add NO WINDOW THE ENTRYPOINT DOES NOT ALREADY HAVE — in a tree only root can
-  # write. Out of one the service account can write that is false (o3d-z5be r5, Codex HIGH 1), and
-  # root running out of such a tree is refused at the top of this file and unsupported. A helper read at THIS
-  # line is read a build, a stop and a drain later — and after this run has itself re-handed the
-  # tree to the account — so replacing it between the two is a window r3 opened and nothing else
-  # in this file had. That distinction is this repository's own, and it is the entire reason the
-  # connection-fence helper has a root-owned protected copy and a digest supplied on the
-  # privileged invocation.
+  # WHAT EVERY ONE OF THOSE ROUNDS WAS TRYING TO SURVIVE WAS AN UNVALIDATED ${IMS_BACKUP_DIR}, and
+  # THAT is what is fixed. The rule and its whole justification are above
+  # open_root_owned_ancestry() in lib/cutover-namespace.sh: every component from `/` down to and
+  # including the backup directory must be a real directory, owned by root or by the account this
+  # run executes as, and writable by nobody else — walked one component at a time as a CHDIR with
+  # each landing checked against the inode its entry named, refused by NAME when it is not, and
+  # handed back as an open DESCRIPTOR rather than as a string. An unreadable or unstattable
+  # component is a refusal and not a shrug. There is no branch here that writes anyway.
   #
-  # AND "PIN THE HELPER" IS NOT THE ANSWER: it moves the boundary rather than establishing one,
-  # because the pin would be computed by a script that was itself read from the same checkout.
-  # scripts/lib/pin-source-file.mjs existed to authenticate exactly such bytes and was DELETED in
-  # o3d-secops r22 for that reason, with a guard in tests/scripts/deploy-order.test.ts that fails
-  # if it comes back. The same shape ships twice already, in install.sh's chown_state_tree() and
-  # its auth probe; one more instance is not a fix and one instance repaired alone is theatre.
-  # That is o3d-kyqa, and it is a repository-wide design, not a line in this block.
+  # SO ALL THREE OPERATIONS ARE AIMED AT ${BACKUP_AT}, WHICH IS `/proc/self/fd/N` ON THE PROVED
+  # DIRECTORY, and the kernel resolves that to the open directory rather than to a pathname: the
+  # redirection is openat(N, …), the `mv` is renameat(N, …), and the prune's glob and its `rm --`
+  # are read out of that same descriptor. Not one of them re-resolves a component of
+  # ${BACKUP_DIR}, which is precisely what r1 could not say. ${BACKUP_DIR} is still spelled twice
+  # below — in the message an operator reads, and in the overlap guard, which asks a question about
+  # a PATHNAME by nature — and neither of those writes anything.
   #
-  # WHAT WOULD ACTUALLY CLOSE THIS SITE IS CONSTRAINING THE OVERRIDE, NOT DEFENDING AGAINST IT
-  # (o3d-noka). Everything above follows from one fact: `IMS_BACKUP_DIR` moves a root-side
-  # `pg_dump`, `mv` and `rm --` wherever an operator names, including underneath a path
-  # ${APP_USER} owns, and nothing validates it. Require instead that every component of that path,
-  # from the filesystem root down, is a real directory owned by the account this run executes as
-  # and writable by no one else, and REFUSE what is not — and then nothing but root can plant a
-  # FIFO, a symlink or a stale `.part` at the predictable name, a name-check before the
-  # redirection has no TOCTOU left to lose, no helper is needed at all, and the dump stops being
-  # readable by the service account into the bargain. That is an operator-visible narrowing of a
-  # documented "anywhere" override; it is its own change, with its own docs and its own review.
+  # AND NOTHING BUT ROOT CAN NOW REACH ANY NAME INVOLVED, which is what retires r2 and r3 rather
+  # than repeating them: the FIFO cannot be planted, the stale `.part` cannot be planted, the
+  # symbolic link cannot be planted, so a plain redirection has no TOCTOU left to lose and no
+  # helper has to be executed at the least recoverable moment of the cutover.
   #
-  # SO WHAT IS SHIPPED HERE IS THE STATUS QUO ANTE, HONESTLY LABELLED. `mkdir -p` accepts a
-  # symlink-to-directory at its final component, and the three operations below resolve
-  # ${BACKUP_DIR} and ${BACKUP_TARGET} by name. Under the shipped default that is unreachable —
-  # /var/backups has a root-owned parent and nothing but root can plant or rename anything in it.
-  # Under an `IMS_BACKUP_DIR` pointed into a tree the service account owns it is reachable, and it
-  # was reachable before this branch and is no worse for it. A denial of service that has always
-  # been here is not a regression; a root code-execution path introduced while closing it is.
+  # AND THE CONFIDENTIALITY HALF IS NOT `umask 077`, WHICH IS WHAT r1 CLAIMED AND WHAT r2 CORRECTS
+  # (o3d-noka r2, Codex round-1 HIGH). A POSIX DEFAULT ACL on the backup directory is inherited by
+  # every file created in it, and inheritance computes the new file's permission bits from the mode
+  # the creating syscall REQUESTED intersected with the inherited default entries — THE UMASK IS NOT
+  # CONSULTED AT ALL. A shell redirection requests 0666. So a root-owned 0755 directory carrying
+  # `default:user:imsapp:r-x` satisfies every question the ancestry walk asks (0755 is not group- or
+  # other-writable) and the dump came out 0644, readable by the account whose data it is; measured,
+  # as root, through this very block. The dump file is therefore CREATED with an explicit mode by
+  # open_private_new_file(), and the mode it actually achieved is read back OFF THE DESCRIPTOR THE
+  # BYTES TRAVEL THROUGH before the first byte is written. Nothing here depends on the umask any
+  # more, so there is no `umask` in the dump statement to mislead the next reader; the one on the
+  # `mkdir` in the walk is kept, is right whenever there is no default ACL, and is no longer relied
+  # on, because a directory the walk creates is set to 0700 and that mode is read back too.
+  #
+  # WHAT IT COSTS, STATED: an ${IMS_BACKUP_DIR} under /var/lib/${APP_NAME} or anywhere else
+  # ${APP_USER} owns now REFUSES instead of dumping, and it refuses here, with the service already
+  # stopped. That is an operator-visible narrowing of a documented "anywhere" override; it is in
+  # docs/installation.md under "Where the pre-update dump may go", and the remedy is a bind mount
+  # under a root-owned path rather than a symbolic link. Validating it EARLIER, before anything is
+  # stopped, is worth having and is not this change: o3d-noka's follow-up.
   # ---------------------------------------------------------------------------
-  mkdir -p "${BACKUP_DIR}"
+  open_root_owned_ancestry "${BACKUP_DIR}" "the backup directory (IMS_BACKUP_DIR)" || die \
+    "The pre-update database dump has nowhere it may be written: ${IMS_ROOT_ANCESTRY_REASON} NOTHING HAS BEEN MIGRATED, the schema is untouched and this release is not on disk yet. Point IMS_BACKUP_DIR at a directory whose every component from / downwards is a real directory owned by root and writable by nobody else, or unset it and take the default /var/backups/${APP_NAME}; see docs/installation.md, 'Where the pre-update dump may go'."
+  BACKUP_AT="/proc/self/fd/${IMS_ROOT_ANCESTRY_FD}"
   info "Backing up database to ${BACKUP_TARGET}..."
-  BACKUP_PARTIAL="${BACKUP_TARGET}.part"
+  BACKUP_PARTIAL="${BACKUP_AT}/${BACKUP_BASENAME}.part"
+  # THE DESTINATION IS CREATED PRIVATE, AND VERIFIED PRIVATE, BEFORE THE DUMP EXISTS (o3d-noka r2).
+  # One component under the pinned descriptor, created with its mode as an ARGUMENT rather than as a
+  # umask default, and the mode that was ACHIEVED is read back off the write descriptor — see
+  # open_private_new_file() in lib/cutover-namespace.sh for the whole reasoning, including why a
+  # `chmod` after the dump would not do and why no ACL is read anywhere.
+  open_private_new_file "${BACKUP_AT}" "${BACKUP_BASENAME}.part" "the pre-update database dump" || die \
+    "The pre-update database dump cannot be written where nobody else can read it: ${IMS_PRIVATE_FILE_REASON} NOTHING HAS BEEN MIGRATED, the schema is untouched and this release is not on disk yet. A dump of the whole database readable by another account is not a backup this run will take; see docs/installation.md, 'Where the pre-update dump may go'."
   backup_rc=0
   # THE PARTIAL FILE IS DELETED INSIDE THIS STATEMENT, not below the pin (o3d-secops r34, Codex
   # HIGH 2). The placement now runs before the failure is propagated and can itself refuse, and a
   # truncated dump left on disk by that path would be a file nothing names as not-a-restore-point.
-  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
+  #
+  # AND THE BYTES GO TO THE DESCRIPTOR, NOT TO THE NAME (o3d-noka r2): ${IMS_PRIVATE_FILE_FD} is the
+  # descriptor whose inode was just read back as a private regular file, so the dump cannot land in a
+  # file created — or re-created — at a mode this run never saw.
+  pg_dump "${MIGRATION_DATABASE_URL}" | gzip >&"${IMS_PRIVATE_FILE_FD}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }
+  close_private_new_file
   # THE RESTORE POINT IS PLACED BEFORE IT IS OFFERED AS ONE (o3d-secops r33, Codex HIGH 2).
   # `pg_dump` is a consumer of the same movable string as everything else, and the aggregate
   # sighting could be satisfied entirely by prisma -- so a dump of ANOTHER cluster was recordable
@@ -5436,16 +5492,25 @@ else
   # Status captured, pin first, failure propagated after it (o3d-secops r34, Codex HIGH 2).
   pin_migration_window "The pre-migration backup"
   [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete; the partial file has been deleted. Nothing has been migrated and there is no restore point for this run."
-  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"
+  # ONE COMPONENT, RESOLVED FROM THE PINNED DESCRIPTOR — renameat(N, …), and never ${BACKUP_TARGET},
+  # which would resolve every component of the operator's override a second time. `-T` so a
+  # directory somehow standing at the final name is refused rather than moved into.
+  mv -T "${BACKUP_PARTIAL}" "${BACKUP_AT}/${BACKUP_BASENAME}"
   BACKUP_FILE="${BACKUP_TARGET}"
   success "Backup saved: ${BACKUP_FILE}"
   # WHAT THIS ONE CLOSES, AND WHAT IT DOES NOT (o3d-z5be r8, review LOW 6). The delete below is a GLOB at
   # one level, `pre-update-*.sql.gz`, so an overlapping ${BACKUP_DIR} could only reach a file in the
   # running tree that is named like a backup — not the entrypoint, and not its libraries. The guard is
-  # kept because ${BACKUP_DIR} is operator-settable (IMS_BACKUP_DIR, o3d-noka) and because every
-  # tree-wide statement in these files answers the same question, not because a hole is known here.
+  # kept because ${BACKUP_DIR} is operator-settable (IMS_BACKUP_DIR) and because every tree-wide
+  # statement in these files answers the same question, not because a hole is known here. It is asked
+  # of the PATHNAME because containment is a question about pathnames; the DELETE itself is aimed at
+  # the descriptor, so the guard and the operation no longer disagree about which directory is meant.
   privileged_spare_running_tree "${BACKUP_DIR}" "the backup directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
-  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
+  ls -t "${BACKUP_AT}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --
+  # AND THE DESCRIPTOR IS CLOSED HERE rather than left to the end of the run: nothing after this
+  # line writes a backup, and an open directory descriptor inherited by the migration, the build and
+  # every child they spawn is a handle on a directory none of them has any business in.
+  close_root_owned_ancestry
 fi
 
 header "Running database migrations"

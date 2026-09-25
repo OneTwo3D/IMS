@@ -38,11 +38,12 @@ import * as realSettingsStore from '../lib/settings-store.ts'
 /** The setting key the derived map must mint for a registered connector, spelled independently. */
 const ACME_SETTING_KEY = `plugin_${ACME_WMS_ID}_enabled`
 
+// o3d-remove-parked-connectors: `plugin_quickbooks_enabled` was here (and `plugin_shopify_enabled`
+// before it). Both connectors are archived. Spelled independently of the shipped derivation on
+// purpose, so this has to be edited when the id set does.
 const SHIPPED_KEYS = [
   'plugin_woocommerce_enabled',
-  'plugin_shopify_enabled',
   'plugin_xero_enabled',
-  'plugin_quickbooks_enabled',
   'plugin_mintsoft_enabled',
 ]
 const ALL_KEYS = [...SHIPPED_KEYS, ACME_SETTING_KEY]
@@ -180,7 +181,10 @@ test('seam/plugin-state: a registered WMS connector gets an id, a setting key an
     keys.INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.includes(ACME_SETTING_KEY),
     'and its row is inside the selection lock — a row outside it is a row a concurrent writer can move',
   )
-  assert.equal(keys.INTEGRATION_PLUGIN_IDS.length, 6)
+  // o3d-remove-parked-connectors: 6 while Shopify and QuickBooks were registered; 4 now
+  // (woocommerce, xero, mintsoft, acme-wms). Spelled independently of the derivation, so it has to
+  // be edited when the id set does — which is the point of writing it out at all.
+  assert.equal(keys.INTEGRATION_PLUGIN_IDS.length, SHIPPED_KEYS.length + 1)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -280,7 +284,7 @@ test('seam/plugin-state: the Settings screen renders a switch for a registered c
   const switches = switchesIn(tree)
 
   assert.equal(
-    switches.length, 6,
+    switches.length, SHIPPED_KEYS.length + 1,
     'one switch per REGISTERED plugin — the screen used to hard-write five, so a sixth had no control at all',
   )
   assert.ok(switches.some((s) => s.label === ACME_WMS_ID), 'including one keyed by the registered connector’s id')
@@ -314,7 +318,7 @@ test('seam/plugin-state: toggling that switch and pressing Save SENDS the connec
   )
   assert.deepEqual(
     Object.keys(payload).sort(),
-    ['acme-wms', 'mintsoft', 'quickbooks', 'shopify', 'woocommerce', 'xero'],
+    ['acme-wms', 'mintsoft', 'woocommerce', 'xero'],
     'the WHOLE selection is sent, over every registered plugin',
   )
 })

@@ -3,6 +3,7 @@ import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/connectors/wms/enabled-connector'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
+import { shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 
 /**
  * Connector-agnostic WMS order-status sweep. Refreshes the cached snapshot for
@@ -77,8 +78,17 @@ export async function runWmsOrderStatusSweep(
     return { skipped: 'Active WMS connector has no order-status support', scanned: 0, updated: 0, failed: 0 }
   }
 
-  const lookupConnector = await resolveWmsOrderLookupConnector(connectorId)
-  if (!lookupConnector) return { skipped: 'No order-lookup connector resolved', scanned: 0, updated: 0, failed: 0 }
+  // o3d-r5uk: a warehouse connection can still name an ARCHIVED storefront, and this sweep is the
+  // surface the Codex finding describes — it queries the 3PL by the resolved storefront's order
+  // numbers, stores the answer against those orders and pushes the status back to that storefront.
+  // So the refusal is reported with the value that caused it rather than folded into "none": an
+  // operator reading "No order-lookup connector resolved" against a connection that very visibly
+  // names one would go looking in the wrong place.
+  const lookupResolution = await resolveWmsOrderLookupConnector(connectorId)
+  if (lookupResolution.kind !== 'one') {
+    return { skipped: shoppingOrderLookupSkipReason(lookupResolution), scanned: 0, updated: 0, failed: 0 }
+  }
+  const lookupConnector = lookupResolution.connector
 
   const staleMinutes = options?.staleMinutes ?? DEFAULT_STALE_MINUTES
   const batchSize = options?.batchSize ?? DEFAULT_BATCH_SIZE

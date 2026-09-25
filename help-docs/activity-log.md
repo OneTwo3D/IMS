@@ -138,7 +138,8 @@ whatever the configured period says:
 | Entry | Why it is kept | What clears it |
 |---|---|---|
 | Direct-create fulfilment markers | An order entered fulfilment and its allocation coverage has not been verified | The reallocation sweep, on every outcome |
-| `xero_posted_document_unrecorded` / `quickbooks_posted_document_unrecorded` | The only record that a document was accepted by the ledger and could not be linked back | A person reconciling the duplicate in the ledger |
+| `xero_posted_document_unrecorded` | The only record that a document was accepted by the ledger and could not be linked back | A person reconciling the duplicate in the ledger |
+| `quickbooks_posted_document_unrecorded` | The same record, written by the QuickBooks connector before it was removed in 2026-09. Entries from before then are still in the log and still mean what they say | A person reconciling the duplicate in the ledger |
 | `wc_refund_park_recovered` | The only surviving evidence that a parked WooCommerce refund was recovered | Nothing — it is a join target for a later correctness check |
 | **Withheld payment-reversal markers** | The marker **is** the work queue: it is what brings a reversal IMS could not decide back in front of the poller | The recheck closing it, after which the whole document's markers expire normally |
 

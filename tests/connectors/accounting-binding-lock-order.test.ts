@@ -90,7 +90,7 @@ test('o3d-2w2j: a step that throws stops the sequence, so nothing after it is ac
 
 test('o3d-2w2j: every writer of more than one binding row acquires them through the helper', () => {
   const xeroAuth = readFileSync('lib/connectors/xero/auth.ts', 'utf8')
-  const qboAuth = readFileSync('lib/connectors/quickbooks/auth.ts', 'utf8')
+  // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
   const guard = readFileSync('lib/connectors/xero/tenant-guard.ts', 'utf8')
 
   const body = (source: string, from: string, to: string) => {
@@ -120,18 +120,16 @@ test('o3d-2w2j: every writer of more than one binding row acquires them through 
   assert.ok(!/\$transaction\(\[\s*\n\s*db\.(setting|accountingToken)\./.test(disconnect),
     'the binding rows must not be spelt straight into the transaction array')
 
-  // 3. THE THIRD ACQUIRER, found by this branch: the QuickBooks disconnect had the SAME inversion —
-  //    `accountingToken.deleteMany` and then the realm pin, in one transaction. It is a smaller
-  //    hazard (the QuickBooks consent writes its two rows in separate auto-commit statements, so it
-  //    never holds both at once) but it is the same rule, and "no writer contends today" is a fact
-  //    about the current callback rather than a property of the rows.
-  const qbo = body(qboAuth, 'export async function disconnect(', 'export async function refreshToken(')
-  assert.match(qbo, /\.\.\.orderedAccountingBindingWrites\(\{/)
-  const pinAt = qbo.indexOf('pin: db.setting.deleteMany({ where: { key: QBO_EXPECTED_REALM_KEY } })')
-  const tokenAt = qbo.indexOf('token: db.accountingToken.deleteMany({ where: { connector: QBO_CONNECTOR } })')
-  assert.ok(pinAt > -1 && tokenAt > -1, 'both QuickBooks binding rows are named')
-  assert.ok(!/\$transaction\(\[\s*\n\s*db\.accountingToken\.deleteMany/.test(qbo),
-    'and the token row is no longer taken first')
+  // 3. THE THIRD ACQUIRER IS GONE WITH ITS CONNECTOR (o3d-remove-parked-connectors).
+  //
+  //    It was the QuickBooks disconnect, and finding it is why this test exists in this shape: it had
+  //    the SAME inversion Xero's had — `accountingToken.deleteMany` and then the realm pin, in one
+  //    transaction — and it was found by asking "who else acquires more than one binding row?" rather
+  //    than by looking where the bug had already been. The connector is archived.
+  //
+  //    WHAT THAT COSTS: this test now inspects ONE disconnect, so it can no longer show that the
+  //    helper is used by an independently-written second acquirer. The census question it embodies is
+  //    the valuable part and it still has to be asked of any new connector.
 
   // 4. The raw-SQL writer the provisioner and the recovery script share.
   assert.match(guard, /return orderedAccountingBindingWrites<XeroPinSqlStatement>\(\{/)
