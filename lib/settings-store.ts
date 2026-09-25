@@ -163,6 +163,15 @@ async function writeMigratedSettingValue(
   })
 }
 
+/** What came back, named for the warning, without printing a credential if one is in there. */
+function describeWriterResult(result: unknown): string {
+  if (result === null) return 'null'
+  if (result === undefined) return 'undefined'
+  if (typeof result !== 'object') return typeof result
+  const count = (result as { count?: unknown }).count
+  return count === undefined ? 'an object with no `count`' : `an object whose \`count\` is a ${typeof count}`
+}
+
 export async function migrateEncryptedSettingValue(
   key: string,
   value: string,
@@ -182,6 +191,30 @@ export async function migrateEncryptedSettingValue(
       value,
       encryptSettingValue(key, plaintext),
     )
+    // THE WRITER'S ANSWER IS CHECKED, NOT READ THROUGH (o3d-remove-parked-connectors round 3).
+    //
+    // This used to be `result.count > 0` on an unchecked value, and a writer that returned `null`
+    // therefore raised `TypeError: Cannot read properties of null (reading 'count')` — which the
+    // best-effort catch below swallowed into a `console.warn` and a 'failed'. That is what CI's
+    // `validate` job reported — a bare TypeError naming no contract and no culprit — while the read
+    // path carried on as if it had merely lost a race with the database and the row stayed
+    // plaintext.
+    //
+    // WHY NOT `result?.count ?? 0`, THE SHORTER FIX. That lands on 'raced', and 'raced' is not a
+    // hedge: it asserts that ANOTHER writer already re-encrypted this row, i.e. the row is now
+    // safe and there is nothing left to do. Answering that for a result nobody can read is
+    // reporting a benign outcome for an unknown state — the exact pattern this branch has spent
+    // three rounds removing elsewhere. So an unreadable answer fails CLOSED, into 'failed', which
+    // `bulkMigrateEncryptedSettings` counts and `scripts/cli.ts` exits non-zero on.
+    //
+    // What changes is only the DIAGNOSIS: the throw names the key and what came back, so a broken
+    // writer is distinguishable from a database or crypto error without a debugger.
+    if (!result || typeof (result as { count?: unknown }).count !== 'number') {
+      throw new Error(
+        `the migration writer for ${key} returned ${describeWriterResult(result)} instead of `
+        + '{ count: number }, so whether the row was re-encrypted is UNKNOWN',
+      )
+    }
     return result.count > 0 ? 'migrated' : 'raced'
   } catch (error) {
     const warn = options.warn ?? console.warn
@@ -190,6 +223,26 @@ export async function migrateEncryptedSettingValue(
   }
 }
 
+/**
+ * THE OPPORTUNISTIC READ-PATH MIGRATION, AND IT IS NOT BELT-AND-BRACES — IT IS THE BELT.
+ *
+ * `bulkMigrateEncryptedSettings` below is the deliberate sweep, and it has exactly ONE caller in the
+ * tree: `scripts/cli.ts`, a command an operator types. It is wired into no install, update or deploy
+ * script. So for a legacy row that predates encryption at rest — or one belonging to a RETIRED
+ * connector, whose keys stay in `SENSITIVE_SETTING_KEYS` for exactly this reason (see
+ * `RETIRED_CREDENTIAL_SETTING_KEYS` above) — this call is the only thing in the product that ever
+ * encrypts it.
+ *
+ * DO NOT SUPPRESS IT FOR A KEY NOTHING ELSE READS. That was considered for the retired credentials
+ * and rejected: the beneficiary of encryption at rest is not IMS's code, it is the credential, which
+ * is still live at the vendor after the connector is archived (archiving deletes no rows and revokes
+ * nothing). And the only principal who can trigger this path is one holding the `settings`
+ * permission — the operator who came to rotate or clear the credential. "Not on read" for a key
+ * nothing else reads is "never".
+ *
+ * Pinned by the ADMIN positive control in tests/security/setting-secret-read-authorization.test.ts,
+ * which asserts the compare-and-swap, the ciphertext and the SILENCE of the best-effort catch.
+ */
 async function maybeMigrateSetting(key: string, value: string): Promise<void> {
   await migrateEncryptedSettingValue(key, value)
 }

@@ -54,6 +54,36 @@ mock.module('@/lib/auth', {
  * pre-existing assertion below still sees the `null` it was written against.
  */
 const seededSettingRows = new Map<string, string>()
+
+/**
+ * THE READ PATH RE-ENCRYPTS A LEGACY ROW, SO THIS FILE MUST BE HERMETIC ABOUT THE KEY (round 3).
+ *
+ * `getSettingValue` calls `maybeMigrateSetting`, which is a NO-OP until a settings encryption key is
+ * configured — `migrateEncryptedSettingValue` returns 'skipped' before it touches the database. So
+ * with no key this file's positive control saw ONE database call, and with a key it sees TWO. It
+ * passed locally and failed CI's `validate` job on exactly that difference
+ * (.github/workflows/production-readiness.yml sets SETTINGS_ENCRYPTION_KEY at the top level).
+ *
+ * A test whose expected CALL LIST depends on ambient environment is not a gate, so the key is set
+ * HERE rather than inherited. `resolveAesEncryptionKey` reads `process.env` on every call and caches
+ * nothing, and node:test gives each test FILE its own process, so this is file-local. The value is
+ * shaped like CI's (32 raw bytes) and is deliberately a different string, so nothing can come to
+ * depend on the two being equal.
+ */
+process.env.SETTINGS_ENCRYPTION_KEY = 'setting_secret_read_auth_test_k_'
+delete process.env.ENCRYPTION_KEY
+
+/**
+ * Every `setting.updateMany` the read path issued, with its arguments — so the re-encryption can be
+ * asserted on WHAT IT WROTE and WHAT IT FENCED ON, not merely on having happened.
+ *
+ * THE STUB ANSWERS WITH A SHAPED RESULT, and that matters. It used to answer `null` to everything
+ * but a seeded `findUnique`, and `migrateEncryptedSettingValue` read `.count` off it: the resulting
+ * TypeError was swallowed by the migration's best-effort catch, so the row was NOT re-encrypted and
+ * nothing said so. A double that answers faithfully but answers the wrong question is the fixture
+ * masking this suite exists to avoid.
+ */
+const settingWrites: Array<{ where: unknown; data: unknown }> = []
 const recorder = createRecordingDb((ctx: QueryContext) => {
   if (ctx.model === 'setting' && ctx.op === 'findUnique') {
     const key = (ctx.args[0] as { where?: { key?: unknown } } | undefined)?.where?.key
@@ -61,6 +91,13 @@ const recorder = createRecordingDb((ctx: QueryContext) => {
       const value = seededSettingRows.get(key)
       if (value !== undefined) return { key, value }
     }
+  }
+  if (ctx.model === 'setting' && ctx.op === 'updateMany') {
+    const args = (ctx.args[0] ?? {}) as { where?: unknown; data?: unknown }
+    settingWrites.push({ where: args.where, data: args.data })
+    // Prisma's own contract for a batch write. One row matched, because the compare-and-swap is
+    // against the value this test seeded and nothing else has moved it.
+    return { count: 1 }
   }
   return null
 })
@@ -415,20 +452,88 @@ for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY'] as const) {
  * authorization rather than about an empty stub: the same seeded row, read by ADMIN, comes back with
  * its value. So the refusals withheld something that was really there and really readable — which is
  * exactly the exposure that was measured before the fix.
+ *
+ * ROUND 3 — AND THE READ RE-ENCRYPTS THE ROW, WHICH IS THE OTHER HALF OF WHY THE KEY STAYS IN
+ * `SENSITIVE_SETTING_KEYS`.
+ *
+ * The seeded value is PLAINTEXT, deliberately: that is the state an upgraded installation is in.
+ * Retiring a connector ships no migration, so its credential row still holds "whatever form it was
+ * last written" — and `RETIRED_CREDENTIAL_SETTING_KEYS` exists precisely so such a row is gated AND
+ * encrypted at rest rather than left plaintext for good.
+ *
+ * THE ONLY AUTOMATIC PATH THAT ENCRYPTS IT IS THIS READ. `bulkMigrateEncryptedSettings` has one
+ * caller in the tree — `scripts/cli.ts`, a manual command wired into no install, update or deploy
+ * script — so the opportunistic read-path migration is not belt-and-braces, it is the belt. And the
+ * only principal who can trigger it is one holding `settings`: the operator who came to rotate or
+ * clear the credential. So this test asserts the migration's EFFECT and its SILENCE, not just that a
+ * second call happened — a call-count assertion alone passes while the write throws and the row
+ * stays plaintext, which is exactly what it did before the writer's result was checked.
  */
 test('the seeded retired-connector rows ARE readable — by ADMIN, and only by ADMIN', async () => {
   currentRole = 'ADMIN'
   const { getSetting } = await import('@/app/actions/settings')
-  for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
-    seededSettingRows.set(key, `seeded-secret-for-${key}`)
-    recorder.reset()
-    assert.equal(
-      await getSetting(key),
-      `seeded-secret-for-${key}`,
-      `${key} must still be readable by a principal WITH the settings permission — `
-      + 'over-gating a retired credential would break the operator\'s only route to rotate or clear it',
-    )
-    recorder.assertCalls(['setting.findUnique'], `ADMIN reading ${key}`)
-    seededSettingRows.delete(key)
+  const { hasSettingsEncryptionKey, isCurrentEncryptedSettingValue, decryptSettingValue } =
+    await import('@/lib/security/encrypted-settings')
+
+  // THE PRECONDITION, ASSERTED. Without a key the migration returns 'skipped' before touching the
+  // database and every assertion below about the write would vacuously describe a call list of one.
+  assert.ok(
+    hasSettingsEncryptionKey(),
+    'this file sets SETTINGS_ENCRYPTION_KEY at module scope; without it the read-path migration '
+    + 'never fires and the re-encryption assertions below prove nothing',
+  )
+
+  let checked = 0
+  const originalWarn = console.warn
+  const warnings: unknown[][] = []
+  console.warn = (...args: unknown[]) => { warnings.push(args) }
+  try {
+    for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+      const plaintext = `seeded-secret-for-${key}`
+      seededSettingRows.set(key, plaintext)
+      recorder.reset()
+      settingWrites.length = 0
+      warnings.length = 0
+
+      assert.equal(
+        await getSetting(key),
+        plaintext,
+        `${key} must still be readable by a principal WITH the settings permission — `
+        + 'over-gating a retired credential would break the operator\'s only route to rotate or clear it',
+      )
+
+      // The read, then the opportunistic re-encryption. Exact, and in order.
+      recorder.assertCalls(['setting.findUnique', 'setting.updateMany'], `ADMIN reading ${key}`)
+
+      // COMPARE-AND-SWAP, not a blind write: the update is fenced on the value that was read, so a
+      // concurrent rotation cannot be overwritten with a re-encryption of the value it replaced.
+      assert.equal(settingWrites.length, 1, `${key}: exactly one re-encryption write`)
+      const write = settingWrites[0]!
+      assert.deepEqual(write.where, { key, value: plaintext }, `${key}: the write must be fenced on the value read`)
+
+      // AND IT ACTUALLY RE-ENCRYPTED. Not "a write was attempted" — the ciphertext is in the current
+      // format and decrypts back to the credential.
+      const written = (write.data as { value?: unknown }).value
+      assert.ok(typeof written === 'string', `${key}: the write must carry a value`)
+      assert.ok(isCurrentEncryptedSettingValue(written), `${key}: must be re-encrypted in the current format`)
+      assert.notEqual(written, plaintext, `${key}: a plaintext rewrite is not a migration`)
+      assert.equal(decryptSettingValue(key, written), plaintext, `${key}: and it must decrypt back to the credential`)
+
+      // SILENCE. `migrateEncryptedSettingValue` is best-effort: it catches everything and warns.
+      // A warning here means the row was NOT re-encrypted and the suite would otherwise not notice —
+      // which is precisely how a null-returning stub hid a TypeError behind a green test.
+      assert.deepEqual(
+        warnings, [],
+        `${key}: the migration must not have warned — a swallowed failure leaves the credential plaintext. `
+        + `Got: ${warnings.map((w) => w.map(String).join(' ')).join(' | ')}`,
+      )
+
+      seededSettingRows.delete(key)
+      checked += 1
+    }
+  } finally {
+    console.warn = originalWarn
   }
+  assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
+  assert.ok(checked >= 7, `expected at least 7 retired credential keys, checked ${checked}`)
 })
