@@ -2348,11 +2348,21 @@ Three things about those rows:
   sync** run settles it under the posting's lock, which is the wait the original job was not allowed to
   make. If the job holding the lock queued the posting, nothing is owed and the claim disappears; if that
   job rolled back or never queued it, the refusal becomes an ordinary row on this list. "Queued" here means
-  a posting IMS can see was queued *while the refusal was waiting* — an **earlier** entry for the same
+  a posting IMS **watched appear** while the refusal was waiting — an **earlier** entry for the same
   document (successive edits of one invoice, successive payments of one bill) does not settle it, because
-  the ledger would still be holding the earlier version. It is logged as
-  `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal itself is
-  in the accounting activity log as always.
+  the ledger would still be holding the earlier version; nor does an entry that was later **cancelled**,
+  because a cancelled entry is never going to reach the ledger; nor does an entry released back to the
+  connector from cancelled, because that is the same entry going round again rather than a new one. It is
+  logged as `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal
+  itself is in the accounting activity log as always.
+* **When IMS cannot tell whether a posting beat a refusal, it lists the refusal.** Outside the window
+  above — a refusal that was never made to wait for anything — IMS has no way to know whether an entry
+  already in the sync log was queued before or after the refusal was decided: the two timestamps may have
+  been written by different IMS processes, and comparing clocks is not the same as knowing which of two
+  events happened first. So
+  such a refusal is listed. If you find a row here whose posting is in fact sitting in the accounting sync
+  log, that is this choice: look at the sync log entry and settle it there, and note that *Mark as handled*
+  will refuse the row while IMS may already have posted it, and tell you so.
 * **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not
   settled one of those held refusals within about 15 minutes, it is listed in this section marked
   **Unconfirmed — not yet known to be owed**, so a reconciler that has stopped running is visible instead

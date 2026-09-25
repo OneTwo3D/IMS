@@ -292,25 +292,49 @@ test(
   },
 )
 
+/**
+ * o3d-j625 r12 (Codex round 11, HIGH 1) — THIS TEST USED TO PIN THE OTHER ANSWER, AND IT WAS THE LOSS.
+ *
+ * Until r12 a refusal decided before a clear was discharged by `resolvedAt`/`queued` on the row, with no
+ * look at whether a posting still existed. Codex executed the consequence: an enqueue whose row is
+ * CANCELLED before it can post — the capacity guard, a deleted payment, an operator settling NOT_POSTED —
+ * leaves that column behind, and the refusal it discharges is owed. `resolvedAt` records that an enqueue
+ * once happened; the obligation is about whether the ledger has the posting or is going to get it.
+ *
+ * So the column is no longer evidence, and the case this test drives — a clear with NOTHING queued behind
+ * it, which is what a stale refusal looks like from here — is now RECORDED. It is the safe direction: the
+ * deferred path, where a refusal really can lose a race with an enqueue, is answered by the baseline
+ * instead (the r10/r11/r12 tests below), with no clock and no column.
+ */
 test(
-  '[o3d-j625 r9] and a refusal decided BEFORE that clear does not reopen it',
+  '[o3d-j625 r12] a refusal decided BEFORE a clear IS recorded — `resolvedAt` is not evidence a posting exists',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const { db, recordAccountingPostingRefusal, clearAccountingPostingRefusal } = await loadDeps()
     const referenceId = probeId('decided-before')
     t.after(cleanup(db, referenceId))
-    await seedOutstandingRefusal(db, referenceId)
+    const refusalId = await seedOutstandingRefusal(db, referenceId)
 
-    // The refusal is decided HERE, and lands after the posting has been queued and the row cleared. The
-    // only difference from the control above is which side of the clear the decision falls on.
+    // The refusal is decided HERE, and lands after the row has been cleared as queued.
     const decidedAt = new Date()
     await sleep(20)
     await clearAccountingPostingRefusal(db as never, keyFor(referenceId))
+    const cleared = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
+    })
+    assert.equal(cleared.resolution, 'queued', 'PRECONDITION: the row carries the clear\'s own resolution')
+    assert.ok(cleared.resolvedAt && cleared.resolvedAt.getTime() > decidedAt.getTime(),
+      'PRECONDITION: stamped AFTER the decision — exactly the state r11 discharged on')
+    const live = await db.accountingSyncLog.count({ where: { referenceId, status: { not: 'CANCELLED' } } })
+    console.log(`[r12] live sync rows for ${referenceId}: ${live}; resolution=${cleared.resolution}`)
+    assert.equal(live, 0, 'PRECONDITION: and NOTHING is queued — no row can post this')
+
     await recordAccountingPostingRefusal(db as never, keyFor(referenceId), refusalRecord('retired_chart'), { decidedAt })
 
     const rows = await inboxView(db, referenceId)
-    assert.equal(rows.length, 0,
-      `a refusal decided before the posting was queued is stale and must not reopen the row. ${describe(rows)}`)
+    assert.equal(rows.length, 1,
+      'no posting exists for this key, so nothing can discharge the refusal — whatever `resolvedAt` says. '
+      + `${describe(rows)}`)
   },
 )
 
@@ -780,8 +804,26 @@ test(
  * several posting types share ONE key across successive postings (SALES_INVOICE_UPDATE and friends), so a
  * row created BEFORE the decision is an EARLIER posting and discharges nothing.
  */
+/**
+ * o3d-j625 r12 (Codex round 11, HIGH 2) — AND THIS ONE USED TO PIN THE CLOCK COMPARISON.
+ *
+ * r9's residual: an enqueue that both starts and commits in the gap before an UNCONTENDED refusal takes
+ * the key. r10 discharged it because the sync row's `createdAt` beat `decidedAt`, and round 11 showed that
+ * comparison orders the clocks of TWO IMS PROCESSES, not two events — a process running fast stamps an
+ * OLDER row with a LATER `createdAt` and swallows a real debt (the r12 skew tests below reproduce it).
+ *
+ * There is no ordering available to a single process that is not a clock: `createdAt`, `resolvedAt` and
+ * `decidedAt` are all written by whichever process happened to be there. So the window is open again and
+ * the refusal is RECORDED — a debt that may not be owed, which an operator can read, close, and which
+ * `markPostingHandled` refuses to "post by hand" while IMS may already have posted it. The alternative was
+ * a debt that was owed and which nothing would ever list.
+ *
+ * THIS IS THE COST OF THE ROUND, stated as a test rather than in prose. It does NOT touch the deferred
+ * path: there the refusal has a baseline, and the case r10 worried about most ("the reconciler runs minutes
+ * after the claim, uncontended by then") is exactly the one the baseline answers.
+ */
 test(
-  '[o3d-j625 r10] a posting queued AFTER the refusal was decided is not a debt, even with no contention',
+  '[o3d-j625 r12] an UNCONTENDED refusal with a posting queued after it IS recorded — the cost of having no clock',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const { db, recordAccountingPostingRefusal } = await loadDeps()
@@ -792,22 +834,28 @@ test(
     // and its key is free, so the refusal below takes the key at once and has no contention to learn from.
     const decidedAt = new Date()
     await sleep(20)
-    await db.accountingSyncLog.create({
+    const queued = await db.accountingSyncLog.create({
       data: {
         connector: 'xero', type: TYPE, status: 'PENDING', referenceType: REFERENCE_TYPE, referenceId,
         payload: { narration: `o3d-j625 r10 queued after the decision ${referenceId}` },
       },
+      select: { id: true, createdAt: true },
     })
     await sleep(20)
+    console.log(`[r12] uncontended: row ${queued.id}@${queued.createdAt.toISOString()} vs decidedAt=${decidedAt.toISOString()}`)
+    assert.ok(queued.createdAt.getTime() > decidedAt.getTime(),
+      'PRECONDITION: the row\'s stamp really is later than the decision — the state r10 discharged on')
 
     await recordAccountingPostingRefusal(db as never, keyFor(referenceId), refusalRecord('retired_chart'), { decidedAt })
 
     const rows = await inboxView(db, referenceId)
-    assert.equal(rows.length, 0,
-      `the posting was queued after this refusal was decided, so it is queued and nothing is owed. ${describe(rows)}`)
+    assert.equal(rows.length, 1,
+      'this refusal was never shut out of the key, so it observed nothing and has no evidence that the '
+      + 'posting was queued after it was decided — only two clocks, which are not evidence. The debt is '
+      + `kept. ${describe(rows)}`)
     assert.equal(
       await db.activityLog.count({ where: { action: 'accounting_posting_refused_after_queued', description: { contains: referenceId } } }),
-      1, 'and the refusal that was not recorded is reported rather than vanishing')
+      0, 'and nothing is reported as "queued while this was being decided", because nothing established that')
   },
 )
 
@@ -1054,109 +1102,90 @@ test(
 )
 
 /**
- * ── HIGH 2, AND WHAT MEASURING IT FOUND INSTEAD ──
+ * ── o3d-j625 r12 — THE OTHER DIRECTION OF THE SAME CONTROL, AND WHAT REPLACED r11'S `createdAt` PIN ──
  *
- * Codex's mechanism was: `accounting_sync_logs.createdAt` defaults to `now()`, which is TRANSACTION START,
- * so an enqueue that begins before the refusal is decided and inserts after it carries a `createdAt` that
- * predates the decision and is recorded as a false debt.
+ * r11 pinned that `accounting_sync_logs.createdAt` is stamped at the INSERT rather than at transaction
+ * start, because its arm 2 rested on that fact. r12 removed arm 2, so that pin now guards nothing, and a
+ * test whose stated purpose is "this is the fact the comparison rests on" standing beside code with no
+ * comparison is a claim outrunning its evidence. It is replaced by this, which asks the question that
+ * matters now: DOES THE DISCHARGE DEPEND ON THE CLOCK AT ALL?
  *
- * THE COLUMN DEFAULT IS INDEED TRANSACTION START, AND NO ROW THIS CODEBASE WRITES EVER TAKES IT. Prisma
- * supplies `@default(now())` values ITSELF, in the client, at the moment of the INSERT — so `createdAt` is
- * the enqueueing process's own clock reading of when it inserted, not of when its transaction began. This
- * test drives Codex's exact interleaving and proves both halves in the same transaction: the Prisma row's
- * `createdAt` post-dates the decision (so nothing is owed, and nothing is recorded), while a row inserted
- * by RAW SQL in that same transaction takes the DEFAULT and lands on `transaction_timestamp()`, which is
- * the value the finding describes.
+ * The r12 skew tests above show that a LATER stamp does not discharge. This is the complement: a row
+ * queued by a process whose clock is a YEAR BEHIND — a stamp far older than the refusal — still discharges
+ * it, because the refusal watched that row appear. If any clock comparison were reinstated as a necessary
+ * condition, this test goes red. Together the two directions say the outcome is decided by identity and by
+ * nothing else.
  *
- * SO THIS IS A PIN, NOT A REPRODUCTION, and it is worth having as one: it is the fact the arm-2 comparison
- * now rests on, it fails if Prisma ever stops stamping the column, and the raw-SQL row is a working
- * demonstration of the writer that WOULD make the finding real — which is why
- * tests/accounting/sync-log-row-primitive.test.ts refuses any raw `INSERT INTO accounting_sync_logs`.
+ * (The writer that would have made round 10's HIGH 2 real — a raw statement letting the column DEFAULT
+ * apply — is still refused by tests/accounting/sync-log-row-primitive.test.ts, which is where that
+ * property belongs.)
  */
 test(
-  '[o3d-j625 r11] createdAt is stamped at the INSERT, not at transaction start — so an enqueue that BEGAN before the refusal is no false debt',
+  '[o3d-j625 r12] a row queued while the refusal was shut out discharges it even with a stamp a YEAR older',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { db, recordAccountingPostingRefusal, createAccountingSyncLogRow } = await loadDeps()
-    const referenceId = probeId('insert-after-begin-before')
+    const { db, recordAccountingPostingRefusal } = await loadDeps()
+    const [{ lockPostingKey }, { withSavepoint }] = await Promise.all([
+      import('../../lib/domain/accounting/posting-suppression.ts'),
+      import('../../lib/db/savepoint.ts'),
+    ])
+    const referenceId = probeId('r12-behind-clock-discharges')
     const key = updateKeyFor(referenceId)
     t.after(cleanup(db, referenceId))
 
-    const opened: { fire?: () => void } = {}
-    const enqueueHasBegun = new Promise<void>((resolve) => { opened.fire = resolve })
-    const gate: { fire?: () => void } = {}
-    const mayInsert = new Promise<void>((resolve) => { gate.fire = resolve })
-    const seen: { txStart: Date | null; insertedAt: Date | null; prismaId: string | null; rawId: string | null } = {
-      txStart: null, insertedAt: null, prismaId: null, rawId: null,
-    }
-    const rawRowId = `j625r11-raw-${referenceId}`
-
-    // THE ENQUEUE. Its transaction BEGINs now — which is what the column DEFAULT would record — and it
-    // does not write its sync row until it is let through, after the refusal has been decided.
-    const enqueue = db.$transaction(async (tx) => {
-      const [t0] = await tx.$queryRaw<Array<{ at: Date }>>`SELECT transaction_timestamp() AS at`
-      seen.txStart = t0!.at
-      opened.fire!()
-      await mayInsert
-      seen.insertedAt = new Date()
-      const row = await createAccountingSyncLogRow<{ id: string }>(tx, {
-        connector: 'xero',
-        type: UPDATE_TYPE,
-        status: 'PENDING',
-        referenceType: UPDATE_REFERENCE_TYPE,
-        referenceId,
-        payload: { narration: `o3d-j625 r11 inserted after the decision ${referenceId}` },
+    const YEAR_MS = 365 * 24 * 60 * 60 * 1000
+    // The holder takes this posting's key and queues the posting — from a process whose clock is a year
+    // behind, so the row it writes carries a stamp far older than the refusal that is about to be decided.
+    const signal: { fire?: () => void } = {}
+    const holderHasWritten = new Promise<void>((resolve) => { signal.fire = resolve })
+    const written: { id?: string; createdAt?: Date } = {}
+    const holder = db.$transaction(async (tx) => {
+      await lockPostingKey(tx as never, key)
+      const row = await tx.accountingSyncLog.create({
+        data: {
+          connector: 'xero', type: UPDATE_TYPE, status: 'PENDING',
+          referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+          payload: { narration: `o3d-j625 r12 queued by a process a year behind ${referenceId}` },
+          createdAt: new Date(Date.now() - YEAR_MS),
+        },
+        select: { id: true, createdAt: true },
       })
-      seen.prismaId = row?.id ?? null
-      // THE WRITER THE FINDING DESCRIBES, in the same transaction, so the two values are comparable: no
-      // `createdAt` in the statement, so the DEFAULT applies. Nothing in lib/ or app/ writes this way.
-      await tx.$executeRaw`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", payload) VALUES (${rawRowId}, 'xero', ${UPDATE_TYPE}::"AccountingSyncType", 'CANCELLED'::"AccountingSyncStatus", ${UPDATE_REFERENCE_TYPE}, ${referenceId}, '{}'::jsonb)`
-      seen.rawId = rawRowId
+      written.id = row.id
+      written.createdAt = row.createdAt
+      signal.fire!()
+      await sleep(HOLD_MS)
     }, TX)
+    await holderHasWritten
 
-    await enqueueHasBegun
-    await sleep(300)
-    // THE REFUSAL IS DECIDED HERE — after the enqueue's transaction began, before its INSERT.
     const decidedAt = new Date()
-    await sleep(20)
-    gate.fire!()
-    await enqueue // …and it COMMITS before the refusal below takes the key.
+    let deferred: unknown = null
+    await db.$transaction(async (tx) => {
+      deferred = await recordAccountingPostingRefusal(tx as never, key, updateRefusal('retired_chart'), {
+        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+        decidedAt,
+      })
+    }, TX)
+    await holder
 
-    const rows = await db.accountingSyncLog.findMany({
-      where: { referenceId },
-      select: { id: true, createdAt: true, status: true },
-      orderBy: { createdAt: 'asc' },
-    })
-    console.log(`[r11 HIGH-2 pin] sync rows examined for ${referenceId}: ${rows.length} — `
-      + rows.map((r) => `${r.id}@${r.createdAt.toISOString()}/${r.status}`).join(', '))
-    assert.equal(rows.length, 2, 'PRECONDITION: the Prisma row and the raw-SQL row are both there')
-    const prisma = rows.find((r) => r.id === seen.prismaId)
-    const raw = rows.find((r) => r.id === seen.rawId)
-    const txStart = seen.txStart
-    const insertedAt = seen.insertedAt
-    assert.ok(prisma && raw && txStart && insertedAt, 'PRECONDITION: both rows and both clock readings')
-    assert.ok(txStart.getTime() < decidedAt.getTime(),
-      `PRECONDITION: the enqueue's transaction began (${txStart.toISOString()}) BEFORE the refusal was `
-      + `decided (${decidedAt.toISOString()}) — Codex's interleaving, exactly`)
-    assert.ok(insertedAt.getTime() > decidedAt.getTime(),
-      `PRECONDITION: and it INSERTED (${insertedAt.toISOString()}) after it`)
+    assert.deepEqual(deferred, { recorded: false, because: 'contended', deferred: true },
+      'PRECONDITION: the refusal was shut out of the key, so it took a baseline')
+    const claims = await claimsFor(db, referenceId)
+    assert.equal(claims.length, 1, 'PRECONDITION: one claim')
+    const baseline = (claims[0]!.payloadJson as { queuedWhenShutOut?: { ids: string[]; complete: boolean } | null }).queuedWhenShutOut
+    assert.deepEqual(baseline, { ids: [], complete: true },
+      'PRECONDITION: and the baseline is EMPTY and complete — the holder had not committed when it was taken')
+    console.log(`[r12 identity] row ${written.id}@${written.createdAt?.toISOString()} vs decidedAt=`
+      + `${decidedAt.toISOString()}; baseline=${JSON.stringify(baseline)}`)
+    assert.ok(written.createdAt && written.createdAt.getTime() < decidedAt.getTime() - YEAR_MS / 2,
+      'PRECONDITION: the row\'s stamp is far OLDER than the refusal, so no clock comparison would pass it')
 
-    // THE FACT. The DEFAULT would have dated this row from the transaction's start; Prisma did not let it.
-    assert.ok(Math.abs(raw.createdAt.getTime() - txStart.getTime()) < 5,
-      `the raw-SQL row took the column DEFAULT and is dated ${raw.createdAt.toISOString()} — transaction `
-      + `start (${txStart.toISOString()}). That writer is what would make HIGH 2 real, and no writer in `
-      + 'lib/ or app/ inserts this way (tests/accounting/sync-log-row-primitive.test.ts refuses it)')
-    assert.ok(prisma.createdAt.getTime() > decidedAt.getTime(),
-      `the Prisma row is dated ${prisma.createdAt.toISOString()}, AFTER the decision `
-      + `(${decidedAt.toISOString()}): Prisma stamps @default(now()) in the client, at the INSERT. If this `
-      + 'ever stops being true, the arm-2 comparison silently starts recording debts that are not owed')
-
-    await recordAccountingPostingRefusal(db as never, key, updateRefusal('retired_chart'), { decidedAt })
-
-    const inbox = await inboxViewOf(db, key)
-    assert.equal(inbox.length, 0,
-      'the posting was queued AFTER this refusal was decided — the enqueue merely BEGAN before it — so '
-      + `nothing is owed and nothing may be recorded. ${describe(inbox)}`)
+    const result = await reconcile()
+    console.log(`[r12 identity] reconcile: ${JSON.stringify(result)}`)
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 0,
+      'the transaction that held this key QUEUED the posting and the refusal watched its row appear, so '
+      + `nothing is owed — whatever clock stamped it. ${describe(rows)}`)
+    assert.ok(result.settled >= 1, `and the claim settled (${JSON.stringify(result)})`)
   },
 )
 
@@ -1178,6 +1207,12 @@ test(
  * real database. `clockReads` counts the interceptions, so the test also says whether the seam is there at
  * all: on the fixed code the bridge is gone, nothing asks the database what time it is, and the outcome
  * cannot depend on an offset that is never read.
+ *
+ * o3d-j625 r12: and since no clock of ANY kind is compared any more, both halves now KEEP the debt — (a)
+ * because an uncontended refusal has no evidence, (b) because an earlier edit is not evidence. What the
+ * test still establishes is what its name says: the answer does not move with the database host's clock.
+ * It is the offset that is under test here, not the direction of the comparison; the r12 tests further
+ * down are the ones that drive an APPLICATION clock skew, which is the finding round 11 raised.
  */
 async function refuseWithDatabaseClockOffset(
   db: Db,
@@ -1239,9 +1274,13 @@ test(
     const ahead = await refuseWithDatabaseClockOffset(db, aheadKey, aheadDecidedAt, 5 * 60_000)
     const aheadInbox = await inboxViewOf(db, aheadKey)
     console.log(`[r11 HIGH-2] database clock +5min: clock_timestamp reads=${ahead.clockReads}, inbox rows=${aheadInbox.length}`)
-    assert.equal(aheadInbox.length, 0,
-      'the posting is queued, so nothing is owed — and a database clock running AHEAD of this process must '
-      + `not turn that into outstanding work an operator is told to post. ${describe(aheadInbox)}`)
+    // o3d-j625 r12: ONE, not zero, and the change is deliberate. This refusal was never shut out of the
+    // key, so it observed nothing and has no evidence that the posting was queued after it was decided —
+    // see the r12 test above on the cost of having no clock. What this half still establishes is the
+    // property the test is named for: the answer does not move when the DATABASE host's clock does.
+    assert.equal(aheadInbox.length, 1,
+      'an uncontended refusal has no evidence that the posting post-dates it, so the debt is kept — and a '
+      + `database clock running AHEAD of this process changes nothing about that. ${describe(aheadInbox)}`)
 
     // (b) THE SWALLOWED DEBT, the same defect in the direction that loses money. An EARLIER edit is
     //     queued, the refusal of the CURRENT edit follows it, and a database clock five minutes BEHIND
@@ -1274,5 +1313,514 @@ test(
     assert.equal(ahead.clockReads + behind.clockReads, 0,
       'nothing in this path asks the database what time it is any more: both sides of the comparison are '
       + 'IMS process clocks, so there is no domain to bridge and no offset to get wrong')
+  },
+)
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r12 (Codex round 11, two HIGHs) — A STATE THAT LOOKS SETTLED IS NOT PROOF OF A DISCHARGE
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * Round 11 replaced "a live sync row exists" with an IDENTITY baseline and kept two ordering
+ * comparisons beside it. Codex executed both:
+ *
+ *   HIGH 1 — `resolvedAt`/`queued` on the refusal row short-circuits AHEAD of the liveness check, so an
+ *            enqueue whose row was CANCELLED before it could post still discharges a refusal decided
+ *            before it. The accounting debt remains and the inbox drops it. r11's own comment at that
+ *            branch says the sync-log check "sees that where 'it was once queued' cannot" — and the
+ *            early `return` means that check never runs.
+ *
+ *   HIGH 2 — the surviving comparison (`createdAt` vs `decidedAt`) orders two timestamps written by two
+ *            IMS PROCESSES. A deployment runs several (docs/installation.md), and a process whose clock
+ *            is ahead stamps an OLDER row with a LATER `createdAt`, which discharges a refusal decided
+ *            afterwards on another process. The identity baseline does not protect the two cases below:
+ *            an UNCONTENDED refusal (it got the key, so no baseline was taken) and a LEGACY claim
+ *            (written before the baseline field existed).
+ *
+ * And one inference r11 left untested: `releaseRetiredAccountingSyncRowForLiveSale` (o3d-psvi) puts a
+ * CANCELLED row back in front of the connector. r11's baseline read excluded CANCELLED rows, so that
+ * row was absent from the baseline and then appeared "new".
+ *
+ * All four tests below are REPRODUCTIONS written against the r11 head and failing on it. Each asserts
+ * the precondition that the state under test was reached, and prints the rows it examined.
+ */
+
+/** INVOICE_PAYMENT: one RECEIPT against one invoice, so the scope names the payment. */
+const RECEIPT_TYPE = 'INVOICE_PAYMENT'
+const RECEIPT_REFERENCE_TYPE = 'SalesOrder'
+const RECEIPT_KIND = 'invoice_payment_receipt'
+
+const receiptKeyFor = (referenceId: string, paymentId: string) => ({
+  type: RECEIPT_TYPE, referenceType: RECEIPT_REFERENCE_TYPE, referenceId, scope: `payment:${paymentId}`,
+})
+
+const receiptRefusal = (reason: string) => ({
+  kind: RECEIPT_KIND as never,
+  chartConnector: 'xero',
+  activeConnector: 'quickbooks',
+  reason,
+  committed: 'the receipt is recorded against the order in IMS and the invoice shows it as paid',
+  remedy:
+    'Enter the receipt by hand against the invoice in the ledger it belongs to and mark this row handled '
+    + '— that cancels IMS\'s retry, so it is not entered twice.',
+})
+
+async function seedOutstandingRefusalFor(db: Db, key: ReturnType<typeof receiptKeyFor>, kind: string): Promise<string> {
+  const row = await db.accountingPostingRefusal.create({
+    data: {
+      ...key,
+      kind,
+      chartConnector: 'xero',
+      activeConnector: 'quickbooks',
+      reason: 'retired_chart',
+      committed: 'the receipt is recorded against the order in IMS',
+      remedy: 'Enter it by hand in the ledger it belongs to and mark this row handled.',
+    },
+    select: { id: true },
+  })
+  return row.id
+}
+
+/**
+ * ── HIGH 1 ── A ROW THAT EXISTS BUT CANNOT POST IS NOT A DISCHARGE.
+ *
+ * The cancellation here is the one the codebase itself argues is PROVABLY unsent:
+ * `retireOverSettlingInvoicePayment` (lib/domain/accounting/invoice-payment-capacity.ts) retires a
+ * claimed receipt row the capacity guard refused — "the guard runs BEFORE the remote call, so this row
+ * demonstrably never reached the ledger". Its exact patch is applied below. The receipt still stands in
+ * IMS, the ledger does not have it, nothing will retry it: the obligation is real and the only record of
+ * it is the refusal.
+ *
+ * `markPostingHandled` also cancels a PENDING row, and that one is NOT this finding: it sets
+ * `suppressedAt` in the same transaction, and a suppressed posting is correctly never reopened.
+ */
+test(
+  '[o3d-j625 r12] an enqueue whose row was CANCELLED before it could post does not discharge a refusal decided before it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, recordAccountingPostingRefusal, createAccountingSyncLogRow } = await loadDeps()
+    const [{ lockPostingKey }, { withSavepoint }] = await Promise.all([
+      import('../../lib/domain/accounting/posting-suppression.ts'),
+      import('../../lib/db/savepoint.ts'),
+    ])
+    const referenceId = probeId('r12-cancelled-enqueue')
+    const paymentId = `pay-${referenceId}`
+    const key = receiptKeyFor(referenceId, paymentId)
+    t.after(cleanup(db, referenceId))
+    const refusalId = await seedOutstandingRefusalFor(db, key, RECEIPT_KIND)
+
+    // ── T1. THE REFUSAL IS DECIDED, and deferred: another transaction is settling this exact posting,
+    //        and this one is inside a caller's transaction, so it may not wait for the key.
+    const signal: { fire?: () => void } = {}
+    const keyIsHeld = new Promise<void>((resolve) => { signal.fire = resolve })
+    const holder = db.$transaction(async (tx) => {
+      await lockPostingKey(tx as never, key)
+      signal.fire!()
+      await sleep(HOLD_MS)
+    }, TX)
+    await keyIsHeld
+
+    const decidedAt = new Date()
+    let deferred: unknown = null
+    const startedAt = Date.now()
+    await db.$transaction(async (tx) => {
+      deferred = await recordAccountingPostingRefusal(tx as never, key, receiptRefusal('retired_chart'), {
+        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+        decidedAt,
+      })
+    }, TX)
+    const recordMs = Date.now() - startedAt
+    await holder
+    // LOCK EXCLUSION, MEASURED rather than assumed — twice over. The outcome enum is only reachable when
+    // `pg_try_advisory_xact_lock` returned false, and the timing says it did not WAIT for the key either
+    // (which inside a caller's transaction is where a deadlock would come from).
+    console.log(`[r12 HIGH-1] the refusal returned in ${recordMs}ms while the key was held for ${HOLD_MS}ms`)
+    assert.ok(recordMs < HOLD_MS - SLACK_MS,
+      `the refusal took ${recordMs}ms against a ${HOLD_MS}ms hold: it must have been SHUT OUT of the key `
+      + 'without waiting, or this is not the deferred path and the baseline under test was never taken')
+    assert.deepEqual(deferred, { recorded: false, because: 'contended', deferred: true },
+      'PRECONDITION: the refusal took the deferred path and is held as a claim')
+
+    // ── T2. THE POSTING IS ENQUEUED, after the decision, and the primitive clears the refusal row.
+    const queued = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+      connector: 'xero',
+      type: RECEIPT_TYPE,
+      status: 'PENDING',
+      referenceType: RECEIPT_REFERENCE_TYPE,
+      referenceId,
+      payload: { paymentId, _idempotencyKey: `invoice-payment:${referenceId}:${paymentId}` },
+    }), TX)
+    const queuedId = (queued as { id: string } | null)?.id
+    assert.ok(queuedId, 'PRECONDITION: the enqueue wrote its sync row')
+    const cleared = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
+    })
+    assert.equal(cleared.resolution, 'queued', 'PRECONDITION: the enqueue cleared the refusal row')
+    assert.ok(cleared.resolvedAt && cleared.resolvedAt.getTime() > decidedAt.getTime(),
+      `PRECONDITION: it was cleared (${cleared.resolvedAt?.toISOString()}) AFTER the refusal was decided `
+      + `(${decidedAt.toISOString()}) — which is the state that makes r11 return "queued"`)
+
+    // ── T3. AND THAT ROW IS CANCELLED BEFORE IT COULD POST. The capacity guard's own patch, applied to
+    //        the row it would have been applied to; the guard runs before the remote call, so nothing
+    //        reached the ledger.
+    const retired = await db.accountingSyncLog.updateMany({
+      where: { id: queuedId, externalTransactionId: null },
+      data: {
+        status: 'CANCELLED',
+        errorMessage: 'Retired: registering this receipt would over-settle the invoice in the ledger.',
+        processingStartedAt: null,
+      },
+    })
+    assert.equal(retired.count, 1, 'PRECONDITION: the row was retired')
+    const rowsForKey = await db.accountingSyncLog.findMany({
+      where: { referenceId }, select: { id: true, status: true, externalTransactionId: true, createdAt: true },
+    })
+    console.log(`[r12 HIGH-1] sync rows examined for ${referenceId}: ${rowsForKey.length} — `
+      + rowsForKey.map((r) => `${r.id}/${r.status}/extId=${r.externalTransactionId ?? 'null'}`).join(', '))
+    assert.equal(rowsForKey.filter((r) => r.status !== 'CANCELLED').length, 0,
+      'PRECONDITION: NOTHING live is left for this posting — no row can post it')
+
+    // ── T4. THE REPLAY. The debt is real: the receipt stands in IMS, the ledger has nothing, and nothing
+    //        will retry it.
+    const result = await reconcile()
+    console.log(`[r12 HIGH-1] reconcile: ${JSON.stringify(result)}`)
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 1,
+      'THE FINDING: the enqueue that cleared this row was CANCELLED before it could post, so the receipt '
+      + 'is owed. `resolvedAt`/`queued` says an enqueue once happened; it does not say the posting is in '
+      + `the ledger or on its way there, and the inbox must list it. ${describe(rows)}`)
+    assert.equal(rows[0]!.reason, 'retired_chart', 'with the refusing site\'s own reason')
+  },
+)
+
+/**
+ * ── HIGH 2 (a) ── AN UNCONTENDED REFUSAL, AND A SYNC ROW WRITTEN BY A PROCESS WHOSE CLOCK IS AHEAD.
+ *
+ * `accounting_sync_logs.createdAt` is stamped BY THE WRITING PROCESS (r11 measured this: Prisma supplies
+ * `@default(now())` in the client, at the INSERT). So the row below is written exactly as an IMS process
+ * running five minutes fast writes it — same column, same client, same path. No fixture models a window:
+ * the only thing that differs from the row beside it is the clock the writer read.
+ *
+ * TRUE ORDER OF EVENTS, which the test itself performs and the database's own clock witnesses: the row is
+ * inserted FIRST, the refusal is decided AFTERWARDS. The debt is real — successive edits of one invoice
+ * share a posting key, so the ledger holds the earlier version and nothing will correct it.
+ */
+test(
+  '[o3d-j625 r12] an UNCONTENDED refusal is not discharged by an older row whose writer\'s clock ran ahead',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, recordAccountingPostingRefusal } = await loadDeps()
+    const referenceId = probeId('r12-skew-uncontended')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const SKEW_MS = 5 * 60_000
+    // EDIT 1, queued by a process whose clock is SKEW_MS fast. Its row is live for ever.
+    const [{ at: beforeInsert }] = await db.$queryRaw<Array<{ at: Date }>>`SELECT clock_timestamp() AS at`
+    const older = await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: UPDATE_TYPE, status: 'SYNCED',
+        referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+        payload: { narration: `o3d-j625 r12 EDIT 1, written by a process running ${SKEW_MS}ms fast` },
+        // What a skewed process's own `new Date()` produces. Nothing else about the write differs.
+        createdAt: new Date(Date.now() + SKEW_MS),
+      },
+      select: { id: true, createdAt: true },
+    })
+
+    // EDIT 2 is refused HERE, on a process whose clock is right. Uncontended: nothing holds the key.
+    const decidedAt = new Date()
+    const [{ at: afterDecision }] = await db.$queryRaw<Array<{ at: Date }>>`SELECT clock_timestamp() AS at`
+
+    console.log(`[r12 HIGH-2a] older row ${older.id} createdAt=${older.createdAt.toISOString()}; `
+      + `refusal decidedAt=${decidedAt.toISOString()}; database clock before the insert=`
+      + `${beforeInsert.toISOString()}, after the decision=${afterDecision.toISOString()}`)
+    // PRECONDITIONS. The true order, and the skew that contradicts it.
+    assert.ok(beforeInsert.getTime() <= afterDecision.getTime(),
+      'PRECONDITION: one clock, the database\'s, witnesses that the insert really preceded the decision')
+    assert.ok(older.createdAt.getTime() > decidedAt.getTime(),
+      `PRECONDITION: and the skewed row's stamp (${older.createdAt.toISOString()}) nonetheless reads as `
+      + `LATER than the refusal (${decidedAt.toISOString()}) — the whole finding`)
+
+    await recordAccountingPostingRefusal(db as never, key, updateRefusal('retired_chart'), { decidedAt })
+
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 1,
+      'THE FINDING: the posting queued BEFORE this refusal was decided does not discharge it. Whether the '
+      + 'debt is kept must not depend on two IMS processes\' clocks agreeing — a comparison of two '
+      + `application timestamps is not evidence of the order of two events. ${describe(rows)}`)
+  },
+)
+
+/**
+ * ── HIGH 2 (b) ── THE SAME DEFECT ON A LEGACY CLAIM, which has no baseline by construction.
+ *
+ * A provisional claim written before r11 carries no `queuedWhenShutOut`, so the replay skips the identity
+ * arm entirely (posting-refusal-reconcile.ts passes it through verbatim, and
+ * posting-refusal-inbox.ts leaves an `undefined` baseline with the clock arm alone). The payload below is
+ * exactly an r10-shaped claim.
+ */
+test(
+  '[o3d-j625 r12] a LEGACY claim with no baseline is not discharged by an older row whose writer\'s clock ran ahead',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db } = await loadDeps()
+    const referenceId = probeId('r12-skew-legacy')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const SKEW_MS = 5 * 60_000
+    const [{ at: beforeInsert }] = await db.$queryRaw<Array<{ at: Date }>>`SELECT clock_timestamp() AS at`
+    const older = await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: UPDATE_TYPE, status: 'SYNCED',
+        referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+        payload: { narration: `o3d-j625 r12 EDIT 1, written by a process running ${SKEW_MS}ms fast` },
+        createdAt: new Date(Date.now() + SKEW_MS),
+      },
+      select: { id: true, createdAt: true },
+    })
+    const decidedAt = new Date()
+    const [{ at: afterDecision }] = await db.$queryRaw<Array<{ at: Date }>>`SELECT clock_timestamp() AS at`
+
+    // AN r10-SHAPED CLAIM: every field r11 reads except `queuedWhenShutOut`, which did not exist.
+    const payloadJson = {
+      key,
+      record: {
+        kind: UPDATE_KIND,
+        chartConnector: 'xero',
+        activeConnector: 'quickbooks',
+        reason: 'retired_chart',
+        committed: updateRefusal('retired_chart').committed,
+        remedy: updateRefusal('retired_chart').remedy,
+      },
+      decidedAt: decidedAt.toISOString(),
+      mergeOnly: false,
+    }
+    assert.equal('queuedWhenShutOut' in payloadJson, false,
+      'PRECONDITION: the claim is LEGACY — it carries no baseline at all')
+    const claim = await db.integrationOutbox.create({
+      data: {
+        connector: 'accounting',
+        operation: 'posting-refusal.provisional',
+        idempotencyKey: `accounting:posting-refusal.provisional:legacy:${referenceId.toLowerCase()}`,
+        payloadJson,
+        status: 'PENDING',
+      },
+      select: { id: true },
+    })
+    t.after(async () => { await db.integrationOutbox.deleteMany({ where: { id: claim.id } }).catch(() => undefined) })
+
+    console.log(`[r12 HIGH-2b] legacy claim ${claim.id}; older row ${older.id} `
+      + `createdAt=${older.createdAt.toISOString()}; decidedAt=${decidedAt.toISOString()}; database clock `
+      + `before the insert=${beforeInsert.toISOString()}, after the decision=${afterDecision.toISOString()}`)
+    assert.ok(beforeInsert.getTime() <= afterDecision.getTime(),
+      'PRECONDITION: the database\'s clock witnesses that the insert preceded the decision')
+    assert.ok(older.createdAt.getTime() > decidedAt.getTime(),
+      'PRECONDITION: and the skewed stamp reads as later than the refusal')
+
+    const result = await reconcile()
+    console.log(`[r12 HIGH-2b] reconcile: ${JSON.stringify(result)}`)
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 1,
+      'THE FINDING: a claim with no baseline has NO evidence that the posting was queued after it was '
+      + 'refused, so the debt must be kept. A clock comparison is not that evidence. '
+      + `${describe(rows)}`)
+  },
+)
+
+/**
+ * ── THE UNTESTED INFERENCE (r11) ── A REVIVED CANCELLED ROW IS NOT A NEW ENQUEUE.
+ *
+ * `releaseRetiredAccountingSyncRowForLiveSale` (app/actions/accounting-sync.ts, o3d-psvi) moves a row the
+ * cancelled-sale sweep retired from CANCELLED back to SYNCED, so the back-reference repair sweep can
+ * finish the link. It writes the SAME ROW — same id, same `createdAt`.
+ *
+ * r11's baseline excluded CANCELLED rows, so such a row was never in the baseline, and after the release
+ * it satisfied "a live row whose id is not in the baseline" — the identity arm's whole test for a NEW
+ * enqueue. r11 believed this correct and did not test it.
+ *
+ * THE ACTION ITSELF IS NOT INVOKED HERE: it is a server action behind `requirePermission('settings')` and
+ * a live SalesOrder, which this tier has no session for (tests/accounting/xero-retired-row-release.test.ts
+ * covers the action). What is driven is the row transition it performs, on the row it performs it on.
+ */
+test(
+  '[o3d-j625 r12] a CANCELLED row RELEASED back to the connector is not a new enqueue, and does not discharge a held refusal',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, recordAccountingPostingRefusal } = await loadDeps()
+    const [{ lockPostingKey }, { withSavepoint }, settlement] = await Promise.all([
+      import('../../lib/domain/accounting/posting-suppression.ts'),
+      import('../../lib/db/savepoint.ts'),
+      import('../../lib/domain/accounting/sync-row-settlement.ts'),
+    ])
+    const referenceId = probeId('r12-released-row')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    // A row the cancelled-sale sweep RETIRED. It is CANCELLED now, and it pre-dates everything below.
+    const retired = await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: UPDATE_TYPE, status: 'CANCELLED',
+        referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+        externalTransactionId: `INV-${referenceId}`,
+        errorMessage: 'Retired: the sale was not live when this row was swept.',
+        payload: { narration: `o3d-j625 r12 a RETIRED posting ${referenceId}` },
+      },
+      select: { id: true, createdAt: true },
+    })
+
+    // A refusal of the CURRENT edit, deferred because another transaction holds the key — and that
+    // transaction queues NOTHING, so the debt is real.
+    const signal: { fire?: () => void } = {}
+    const keyIsHeld = new Promise<void>((resolve) => { signal.fire = resolve })
+    const holder = db.$transaction(async (tx) => {
+      await lockPostingKey(tx as never, key)
+      signal.fire!()
+      await sleep(HOLD_MS)
+    }, TX)
+    await keyIsHeld
+
+    const decidedAt = new Date()
+    let deferred: unknown = null
+    const startedAt = Date.now()
+    await db.$transaction(async (tx) => {
+      deferred = await recordAccountingPostingRefusal(tx as never, key, updateRefusal('retired_chart'), {
+        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+        decidedAt,
+      })
+    }, TX)
+    const recordMs = Date.now() - startedAt
+    await holder
+    console.log(`[r12 release] the refusal returned in ${recordMs}ms while the key was held for ${HOLD_MS}ms`)
+    assert.ok(recordMs < HOLD_MS - SLACK_MS,
+      `the refusal took ${recordMs}ms against a ${HOLD_MS}ms hold — measured, so the baseline under test `
+      + 'really was taken from a caller that had been refused the key')
+    assert.deepEqual(deferred, { recorded: false, because: 'contended', deferred: true },
+      'PRECONDITION: the refusal was deferred, so a baseline was taken for it')
+    const claims = await claimsFor(db, referenceId)
+    assert.equal(claims.length, 1, 'PRECONDITION: exactly one claim')
+    const baseline = (claims[0]!.payloadJson as { queuedWhenShutOut?: { ids: string[]; complete: boolean } | null }).queuedWhenShutOut
+    console.log(`[r12 release] retired row ${retired.id}; claim baseline=${JSON.stringify(baseline)}`)
+
+    // THE RELEASE: the sale is live again, so the operator puts the row back in front of the connector.
+    // The same row, the same id — `applyFencedAttemptDecision`'s patch as the action builds it.
+    const released = await db.accountingSyncLog.updateMany({
+      where: { id: retired.id, status: 'CANCELLED' },
+      data: {
+        status: 'SYNCED',
+        syncedAt: new Date(),
+        errorMessage: 'Released: the sales order is live again.',
+        settlementBasis: settlement.OPERATOR_RELEASE_SETTLEMENT_BASIS,
+      },
+    })
+    assert.equal(released.count, 1, 'PRECONDITION: the retired row was released back to the connector')
+    const live = await db.accountingSyncLog.findMany({
+      where: { referenceId, status: { not: 'CANCELLED' } }, select: { id: true, status: true, createdAt: true },
+    })
+    console.log(`[r12 release] live rows now: ${live.map((r) => `${r.id}/${r.status}@${r.createdAt.toISOString()}`).join(', ')}`)
+    assert.deepEqual(live.map((r) => r.id), [retired.id],
+      'PRECONDITION: the only live row is the RELEASED one — no new enqueue happened')
+    assert.ok(retired.createdAt.getTime() < decidedAt.getTime(),
+      'PRECONDITION: and it was created before the refusal was decided, so it is an OLDER posting')
+
+    const result = await reconcile()
+    console.log(`[r12 release] reconcile: ${JSON.stringify(result)}`)
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 1,
+      'THE FINDING: releasing a retired row does not enqueue anything — it is the same row, with the same '
+      + 'id, put back in front of the connector. The transaction that held this posting\'s key queued '
+      + `nothing, so the edited invoice is still owed. ${describe(rows)}`)
+  },
+)
+
+/**
+ * ── o3d-j625 r12 — THE BASELINE IS ONLY A BASELINE UNDER READ COMMITTED ──
+ *
+ * The identity rule says "a live row whose id was not in the baseline was inserted after the baseline was
+ * taken". That inference needs the baseline read to have seen everything already committed. Under
+ * REPEATABLE READ or SERIALIZABLE the caller's snapshot is fixed at its FIRST statement, so a row committed
+ * after that is invisible to the baseline — and would later read as NEW, discharging a debt that is owed.
+ * It is the r11 finding one isolation level along.
+ *
+ * Driven here, and the interleaving is real: a SERIALIZABLE caller opens and fixes its snapshot, ANOTHER
+ * transaction then queues an earlier edit and commits, and only then is the refusal decided and shut out of
+ * the key. Its baseline read cannot see that row. The subject asks the transaction what isolation it is in
+ * and abstains (`queuedWhenShutOut: null`), so the replay keeps the debt.
+ */
+test(
+  '[o3d-j625 r12] a caller under SERIALIZABLE cannot take a baseline, so the refusal is kept rather than discharged',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, recordAccountingPostingRefusal } = await loadDeps()
+    const [{ lockPostingKey }, { withSavepoint }] = await Promise.all([
+      import('../../lib/domain/accounting/posting-suppression.ts'),
+      import('../../lib/db/savepoint.ts'),
+    ])
+    const referenceId = probeId('r12-serializable-caller')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    // Someone holds this posting's key and queues nothing, so the debt below is real.
+    const held: { fire?: () => void } = {}
+    const keyIsHeld = new Promise<void>((resolve) => { held.fire = resolve })
+    const holder = db.$transaction(async (tx) => {
+      await lockPostingKey(tx as never, key)
+      held.fire!()
+      await sleep(HOLD_MS)
+    }, TX)
+    await keyIsHeld
+
+    const opened: { fire?: () => void } = {}
+    const snapshotFixed = new Promise<void>((resolve) => { opened.fire = resolve })
+    const mayDecide: { fire?: () => void } = {}
+    const goAhead = new Promise<void>((resolve) => { mayDecide.fire = resolve })
+    const seen: { isolation?: string; outcome?: unknown } = {}
+
+    const caller = db.$transaction(async (tx) => {
+      // FIRST statement: this is where a SERIALIZABLE snapshot is taken.
+      const [row] = await tx.$queryRaw<Array<{ level: string }>>`SELECT current_setting('transaction_isolation') AS level`
+      seen.isolation = row!.level
+      opened.fire!()
+      await goAhead
+      seen.outcome = await recordAccountingPostingRefusal(tx as never, key, updateRefusal('retired_chart'), {
+        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+        decidedAt: new Date(),
+      })
+    }, { ...TX, isolationLevel: 'Serializable' })
+
+    await snapshotFixed
+    assert.equal(seen.isolation, 'serializable', 'PRECONDITION: the caller really is SERIALIZABLE')
+    // An EARLIER edit is queued and committed AFTER the caller's snapshot was fixed, so the caller cannot
+    // see it. Under the identity rule an unseen row is a NEW row, which is what must not happen here.
+    const earlier = await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: UPDATE_TYPE, status: 'SYNCED',
+        referenceType: UPDATE_REFERENCE_TYPE, referenceId,
+        payload: { narration: `o3d-j625 r12 an EARLIER edit, committed after the snapshot ${referenceId}` },
+      },
+      select: { id: true },
+    })
+    mayDecide.fire!()
+    await caller
+    await holder
+
+    assert.deepEqual(seen.outcome, { recorded: false, because: 'contended', deferred: true },
+      'PRECONDITION: the refusal was shut out of the key and deferred')
+    const claims = await claimsFor(db, referenceId)
+    assert.equal(claims.length, 1, 'PRECONDITION: one claim')
+    const baseline = (claims[0]!.payloadJson as { queuedWhenShutOut?: unknown }).queuedWhenShutOut
+    console.log(`[r12 isolation] caller isolation=${seen.isolation}; earlier row ${earlier.id}; `
+      + `claim baseline=${JSON.stringify(baseline)}`)
+    assert.equal(baseline, null,
+      'the observation ABSTAINED: a snapshot fixed before that row committed cannot say what was already '
+      + 'there, and `null` is "I cannot tell" rather than "nothing was there"')
+
+    const result = await reconcile()
+    console.log(`[r12 isolation] reconcile: ${JSON.stringify(result)}`)
+    const rows = await inboxViewOf(db, key)
+    assert.equal(rows.length, 1,
+      'the transaction holding the key queued nothing, so the posting is owed — and an unobservable '
+      + `baseline must keep the debt rather than let an unseen row discharge it. ${describe(rows)}`)
   },
 )

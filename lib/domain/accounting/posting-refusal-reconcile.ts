@@ -126,9 +126,10 @@ async function reconcileOne(
         // open its own transaction and WAIT for the key.
         //
         // The baseline, verbatim. `undefined` on a claim written before r11 — and then the key is
-        // PASSED ANYWAY as undefined, which leaves the replay with the decision-time comparison alone:
-        // the direction that keeps a debt. Never rewritten to "nothing was queued", which would let any
-        // live row discharge it — r10's finding exactly.
+        // PASSED ANYWAY as undefined, which is what tells the replay "this is a claim, and it carries no
+        // baseline": since r12 nothing then discharges the refusal, which is the direction that keeps a
+        // debt. Never rewritten to "nothing was queued", which would let any live row discharge it —
+        // r10's finding exactly.
         queuedWhenShutOut: payload.queuedWhenShutOut,
       },
     )

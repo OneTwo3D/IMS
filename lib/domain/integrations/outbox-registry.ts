@@ -109,8 +109,9 @@ export const AccountingPostingRefusalProvisionalPayloadSchema = z.object({
    * OPTIONAL AND NULLABLE, and the three states are three different facts, which is why neither a default
    * nor a required field would do. `undefined` = a claim written before this field existed. `null` = the
    * deferring call was shut out and could not make the observation. An object = the baseline. Only the
-   * third licenses the replay to conclude that the transaction which held the key queued this posting;
-   * the other two leave it with the decision-time comparison, which keeps a debt rather than losing one.
+   * third licenses the replay to conclude that the transaction which held the key queued this posting; on
+   * the other two nothing discharges the refusal and the debt is kept (o3d-j625 r12 — there is no clock
+   * comparison left to fall back to, because a clock does not order two processes' events).
    */
   queuedWhenShutOut: z.object({
     ids: z.array(nonEmptyString),

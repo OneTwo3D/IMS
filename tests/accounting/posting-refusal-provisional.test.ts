@@ -52,7 +52,14 @@ function contendedCallerTransaction(liveSyncRows: Array<{ id: string; payload?: 
   const outbox: OutboxRow[] = []
   const syncLogReads: unknown[] = []
   const client = {
-    $queryRaw: async () => [{ got: false }],
+    // o3d-j625 r12: it now answers TWO questions, and it has to answer both the way a real connection does
+    // — the subject asks the transaction's ISOLATION before it trusts its own baseline read, and a double
+    // that answered that with `got: false` would abstain and prove nothing about the branch under test.
+    $queryRaw: async (strings: TemplateStringsArray) => (
+      Array.isArray(strings) && strings.join('?').includes('transaction_isolation')
+        ? [{ level: 'read committed' }]
+        : [{ got: false }]
+    ),
     // o3d-j625 r11: the BASELINE read — what was already queued when the key was refused. A double with no
     // `findMany` cannot answer it, which is `null` ("I cannot tell"), so the rows are supplied explicitly.
     accountingSyncLog: {

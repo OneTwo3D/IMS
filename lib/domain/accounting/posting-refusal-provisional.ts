@@ -149,8 +149,9 @@ export function buildProvisionalPostingRefusalPayload(
     //
     // `null` is a VALUE here, not an omission: "this call was shut out and could not look", which the
     // replay must not read as "nothing was queued". An older claim, written before this field existed,
-    // parses as `undefined` and the replay falls back to the decision-time comparison alone — which keeps
-    // the debt rather than losing it.
+    // parses as `undefined`, and since r12 the replay then has NO evidence that the posting was queued at
+    // all — so the debt is kept. (Until r12 it fell back to comparing `createdAt` with `decidedAt`, which
+    // Codex round 11 showed orders two IMS processes' clocks rather than two events.)
     queuedWhenShutOut: options.queuedWhenShutOut === undefined ? null : options.queuedWhenShutOut,
   }
 }
@@ -209,9 +210,9 @@ export type UnreconciledProvisionalPostingRefusal = {
   record: AccountingPostingRefusalRecord
   decidedAt: Date
   /**
-   * o3d-j625 r11 — the postings already queued when the refusal was shut out of its key. `null` = it could
-   * not be observed; `undefined` = a claim written before this field existed. Both leave the replay with
-   * the decision-time comparison alone, which keeps the debt.
+   * o3d-j625 r11/r12 — the rows this posting key already had when the refusal was shut out of it. `null` =
+   * it could not be observed; `undefined` = a claim written before this field existed. Either way the replay
+   * has no moment it can point at, so nothing discharges the refusal and the debt is kept.
    */
   queuedWhenShutOut?: QueuedPostingEvidence | null
   /** How many reconciliation attempts have already failed; 0 while it is simply waiting for the drain. */
