@@ -431,7 +431,7 @@ function WmsTransferAsnDialog({
             <span>
               <span className="font-medium">Enable booked-in callback</span>
               <span className="block text-muted-foreground">
-                When enabled, {wmsAsnState.connectorLabel} will call back into IMS when the ASN is booked in so the transfer receipt can be reconciled automatically.
+                When enabled, IMS expects a booked-in callback so the transfer receipt can be reconciled automatically. The callback URL cannot be sent on the ASN &mdash; {wmsAsnState.connectorLabel} has no such field &mdash; so it must be configured in {wmsAsnState.connectorLabel} itself; this only checks that IMS is ready to receive it.
               </span>
             </span>
           </label>

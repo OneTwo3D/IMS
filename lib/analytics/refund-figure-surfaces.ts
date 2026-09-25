@@ -429,6 +429,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'o3d-y14 Group A1 fence. It re-derives each order’s deferral under the batch’s own row locks purely to COMPARE it with the figure the unlocked read produced, and refuses the group on a disagreement — the amount is never published, and the only thing it can cause is that no journal is staged at all. The deferral figure it re-derives is the ledger posting already declared under xero/daily-sync.ts.',
   },
   {
+    file: 'lib/domain/accounting/daily-batch-group-b-lock.ts',
+    figures: ['revenueDeferredDate'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-c08y r2. It carries Group B’s SELECTION clause (of which revenueDeferredDate is one condition) and locks the cost layers the window references, so the batch can re-read its figures under the lock. It computes no figure and publishes none — the only thing it can cause is that a window is refused and retried next run. The figures Group B then posts are the ledger postings already declared under xero/daily-sync.ts.',
+  },
+  {
     file: 'lib/domain/accounting/daily-batch-preview.ts',
     figures: ['revenueDeferredDate', 'totalRevenue'],
     treatment: 'not-refund-sensitive',
