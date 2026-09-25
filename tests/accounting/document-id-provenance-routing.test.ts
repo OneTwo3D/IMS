@@ -453,7 +453,11 @@ test('[o3d-j625 r3] PRECONDITION: a payment carrying a document id IS written wh
 for (const [label, documentConnector] of [
   ['UNDECLARED (a site that never thought about provenance)', undefined],
   ['NULL (the link predates the column that records it — fail closed)', null],
-  ['the OTHER connector (the id survived the switch)', 'xero'],
+  // o3d-j625 r12: the OTHER connector was 'xero' here because the chart was the second one. With the chart
+  // now the registered connector, the other side has to be the ARCHIVED id — which is the realistic form of
+  // this row after o3d-remove-parked-connectors and the reason `documentConnector` is typed as the STORED
+  // form rather than a registered id.
+  ['the OTHER connector (the id survived the switch)', 'quickbooks'],
 ] as const) {
   test(`[o3d-j625 r3] facade: a payload carrying a document id attributed to ${label} is REFUSED, and says so`, async () => {
     reset(['xero'])
@@ -621,7 +625,13 @@ test('[o3d-j625 r4] a refused posting becomes an OUTSTANDING inbox row naming BO
   assert.equal(rows[0].referenceType, 'SalesOrder')
   assert.equal(rows[0].referenceId, 'order-1')
   assert.equal(rows[0].chartConnector, 'xero', 'the chart the codes came from')
-  assert.equal(rows[0].activeConnector, 'quickbooks', 'AND what is active now — the half round 2 omitted')
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
+  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
+  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
+  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
+  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
+  // something rather than being omitted is what this line still holds.
+  assert.equal(rows[0].activeConnector, null, 'AND what is active now — the half round 2 omitted')
   assert.equal(rows[0].reason, 'retired_chart')
   assert.match(String(rows[0].remedy), /back to xero/)
 })
@@ -690,7 +700,13 @@ test('[o3d-j625 r5 HIGH 4] the IN-TRANSACTION enqueue records its refusal when t
   assert.equal(rows[0].type, TX_REQUEST.type)
   assert.equal(rows[0].referenceId, TX_REQUEST.referenceId)
   assert.equal(rows[0].chartConnector, 'xero')
-  assert.equal(rows[0].activeConnector, 'quickbooks', 'both connectors, as the refusal saw them')
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
+  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
+  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
+  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
+  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
+  // something rather than being omitted is what this line still holds.
+  assert.equal(rows[0].activeConnector, null, 'both connectors, as the refusal saw them')
   assert.equal(txModel.txRefusalWrites, 1, 'written through the CALLER\'S TRANSACTION, so it commits with the state that made the debt real')
   assert.equal(txModel.pooledRefusalWrites, 0, 'and not through the pool, where it would survive the caller rolling back')
 })
@@ -941,7 +957,13 @@ test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector an
   })
 
   assert.equal(reported.outcome?.reason, 'refused', 'PRECONDITION')
-  assert.equal(reported.outcome?.activeConnector, 'quickbooks')
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
+  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
+  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
+  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
+  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
+  // something rather than being omitted is what this line still holds.
+  assert.equal(reported.outcome?.activeConnector, null)
   assert.equal(reported.outcome?.refusalRecorded, true)
 })
 

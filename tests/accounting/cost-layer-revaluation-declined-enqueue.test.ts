@@ -21,6 +21,18 @@ import { refreshShipmentCogsForCostLayerChange } from '@/lib/cost-layers'
 function transaction() {
   const subledger: unknown[] = []
   const tx = {
+    // o3d-j625 r12 (merging o3d-c08y): the context probe. c08y refuses to run at all on a client where a
+    // journaled-shipment refusal could not abort the enclosing transaction, so the double answers the
+    // probe the way a real transaction client does rather than the subject being asked to assume it. The
+    // shipment here is positive on both sides, so that refusal never fires; what is under test is the
+    // subledger movement and the claimed delta.
+    $executeRaw: async () => 0,
+    $executeRawUnsafe: async (sql: string) => {
+      if (!/^\s*(SAVEPOINT|RELEASE SAVEPOINT)\s/i.test(sql)) {
+        throw new Error(`cost-layer-revaluation-declined-enqueue double: unexpected raw statement ${JSON.stringify(sql)}`)
+      }
+      return 0
+    },
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
     shipment: {
       findUnique: async () => ({

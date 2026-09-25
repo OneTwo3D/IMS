@@ -28,8 +28,28 @@ mock.module('@/lib/accounting', {
   },
 })
 
+/**
+ * o3d-j625 r12 (merging o3d-c08y) — THE DOUBLE NOW ANSWERS THE CONTEXT PROBE.
+ *
+ * c08y made `refreshShipmentCogsForCostLayerChange` refuse, before reading anything, on a client where a
+ * journaled-shipment refusal could not abort the enclosing transaction: no `$executeRaw`, no raw escape
+ * hatch to probe with, or a client that is provably NOT inside a transaction. That refusal is correct and
+ * this file is not the place to weaken it — so the double answers the probe the way a real transaction
+ * client does. `$executeRawUnsafe` accepts the `SAVEPOINT`/`RELEASE SAVEPOINT` pair
+ * (`isClientInsideTransaction`) rather than ignoring every statement, so "inside a transaction" is
+ * something this double SAYS rather than something the subject assumes; `$executeRaw` exists because the
+ * refusal path needs it. The shipments here are never negative, so the refusal itself never fires — what
+ * is under test is which CHART the questions are asked of.
+ */
 function tx(journaled: boolean) {
   return {
+    $executeRaw: async () => 0,
+    $executeRawUnsafe: async (sql: string) => {
+      if (!/^\s*(SAVEPOINT|RELEASE SAVEPOINT)\s/i.test(sql)) {
+        throw new Error(`cost-layer-refresh-single-chart double: unexpected raw statement ${JSON.stringify(sql)}`)
+      }
+      return 0
+    },
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }, { id: 'shipment-2' }],
     shipment: {
       findUnique: async () => ({

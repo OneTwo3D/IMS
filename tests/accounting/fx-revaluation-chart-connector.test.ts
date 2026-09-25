@@ -189,11 +189,17 @@ test('[o3d-j625 r2] the reversal’s lines come from the SOURCE ROW’s payload,
     ['HIST-AR', 'HIST-UFX'],
     'the reversal’s lines come from the PRIOR journal’s payload, not from this run’s settings',
   )
+  // o3d-j625 r12 (merging o3d-remove-parked-connectors): the SOURCE ROW's connector, which with one
+  // registered connector is also this run's. That equality is why the case above it — 'a source row naming
+  // a connector this build cannot route is REFUSED and REPORTED' — is now the one carrying the half of r2
+  // that needed the two to DIFFER. What this assertion still holds is that the value comes from the ROW
+  // (`prior.connector`) and is not omitted, which a rebuild from settings would also satisfy — so it is the
+  // account codes above, not this line, that distinguish the fix from the defect here. Said plainly rather
+  // than left as an apparent proof (o3d-5ktph).
   assert.equal(
     reversals[0].chartConnector,
-    'quickbooks',
-    'and it must be routed by the connector those codes belong to. `settings.connector` here is '
-    + '‘xero’, which is what r1 passed — it would post a reversal of QuickBooks’s journal into Xero.',
+    ACTIVE_CONNECTOR,
+    'the reversal is routed by the connector the source row names',
   )
 })
 
