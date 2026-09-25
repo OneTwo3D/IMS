@@ -378,7 +378,7 @@ payload is constructed by the same builder used for the original push, so what X
 fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
 without any content change.
 
-If the active accounting connector is QuickBooks (not Xero), IMS records a
+If the active accounting connector is one that does not support this (Xero is the only one shipped today), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill edit path.
 

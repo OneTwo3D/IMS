@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
-import { probeQuickBooksSettlement, probeXeroSettlement } from '@/lib/connectors/accounting-settlement-probe'
+import { probeXeroSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   ledgerAmountMagnitudeBound,
   ledgerDifferenceMagnitudeBound,
@@ -452,44 +452,6 @@ test('[o3d-78rq] each Xero document is read in ITS OWN currency, on both branche
     'and the credit-note branch reads the NOTE\'s currency, which is the one its allocations are in')
 })
 
-test('[o3d-78rq] the QuickBooks probe reads its applied amounts through the SAME rule', async () => {
-  // Both connectors' probes needed it: the QuickBooks applied amount is a SUM of a payment's lines,
-  // which is the one place a figure can stop being the one the ledger stated without any single
-  // field being odd.
-  //
-  // ROUTE: probeQuickBooksSettlement -> qboAmountAppliedTo -> statedAmount -> readLedgerStatedAmount,
-  //        with the currency read from the DOCUMENT's own `CurrencyRef`.
-  // MUTATION (either kills it): read the applied amount against a fixed `'KWD'` rather than the
-  //        document's currency, and the three-decimal figure is admitted; or drop the scale rule from
-  //        `readLedgerStatedAmount`, and it is admitted for every currency.
-  const readable = ledgerDouble({
-    'invoice/inv-1': { Invoice: { LinkedTxn: [{ TxnId: '55', TxnType: 'Payment' }], CurrencyRef: { value: 'GBP' }, TotalAmt: 10, Balance: 0 } },
-    'payment/55': {
-      Payment: { TxnDate: '2026-08-01', Line: [{ Amount: 10, LinkedTxn: [{ TxnId: 'inv-1', TxnType: 'Invoice' }] }] },
-    },
-  })
-  const ok = await probeQuickBooksSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, readable.get)
-  assert.deepEqual(ok.ok ? ok.records : null,
-    [{ amount: toDecimal(10), date: '2026-08-01', id: '55', reference: null }],
-    'the ordinary applied amount is read exactly, and carries no refusal')
-
-  const unreadable = ledgerDouble({
-    'invoice/inv-1': { Invoice: { LinkedTxn: [{ TxnId: '55', TxnType: 'Payment' }], CurrencyRef: { value: 'GBP' }, TotalAmt: 10.005, Balance: 0 } },
-    'payment/55': {
-      Payment: { TxnDate: '2026-08-01', Line: [{ Amount: 10.005, LinkedTxn: [{ TxnId: 'inv-1', TxnType: 'Invoice' }] }] },
-    },
-  })
-  const refused = await probeQuickBooksSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, unreadable.get)
-  assert.deepEqual(refused.ok ? refused.records : null,
-    [{ amount: null, unreadableAmount: '10.005', date: '2026-08-01', id: '55', reference: null }],
-    'a three-decimal figure on a two-decimal document is refused here exactly as it is on the Xero side')
-  assert.equal(
-    classifyLedgerSettlement(describeAttempt('INVOICE_PAYMENT', registrationPayload('10.00')), refused).outcome,
-    'unknown',
-    'and the classifier withholds on it',
-  )
-})
-
 /* ------------------------------------------------------------------------------------------- *
  * 4. THE TWO READERS CANNOT DRIFT.
  * ------------------------------------------------------------------------------------------- */
@@ -626,97 +588,6 @@ test('[o3d-r948] a KWD invoice ONE FIL short of its stated settlement does not r
     'clear',
     'and a first post against an ordinary GBP document is NOT withheld',
   )
-})
-
-test('[o3d-r948] all four completeness checks, on both connectors, are banded by the document currency', async () => {
-  // The finding is about the RULE, not about one branch of it: a flat band left in any of the four
-  // leaves the same false `clear` reachable through a different document shape.
-  //
-  // Each pair below states the same figures twice — once in KWD, where the gap is a whole minor unit,
-  // and once in GBP, where it is noise. The GBP arm is the precondition: it proves the gap is inside
-  // the old flat band, so the KWD arm can only be refusing on the currency-derived one.
-  // MUTATION (any one of them): restore `0.005` at that branch and its KWD arm answers ok:true.
-
-  // (1) ROUTE: the credit-note branch — `Total - RemainingCredit` against the Allocations collection.
-  const creditNote = (currency: string) => ledgerDouble({
-    'CreditNotes/cn-1': {
-      CreditNotes: [{
-        CreditNoteID: 'cn-1',
-        CurrencyCode: currency,
-        Total: 10,
-        RemainingCredit: 9.998,
-        Allocations: [{ Amount: 0.001, Date: DATE, Invoice: { InvoiceID: 'inv-1' } }],
-      }],
-    },
-  }).get
-  const probeNote = (currency: string) => probeXeroSettlement(
-    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { accountingInvoiceId: 'inv-1', creditNoteId: 'cn-1' } },
-    creditNote(currency),
-  )
-  assert.equal((await probeNote('GBP')).ok, true, 'the precondition: two fils of GBP is noise')
-  const noteShort = await probeNote('KWD')
-  assert.equal(noteShort.ok, false)
-  assert.match(reasonOf(noteShort), /0\.002 of this credit note already applied but returned allocations totalling 0\.001/)
-
-  // (2) ROUTE: the invoice `AmountPaid` cross-check — covered end to end above, and re-stated here
-  //     with a NON-EMPTY collection so it is the arithmetic, not the empty list, that refuses.
-  const paidVsList = (currency: string) => probeInvoice(xeroInvoice({
-    CurrencyCode: currency,
-    AmountPaid: 0.002,
-    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 0.001 }],
-  }))
-  assert.equal((await paidVsList('GBP')).ok, true, 'the precondition')
-  const paidShort = await paidVsList('KWD')
-  assert.equal(paidShort.ok, false)
-  assert.match(reasonOf(paidShort), /0\.002 paid against this document but returned payments totalling 0\.001/)
-
-  // (3) ROUTE: the shape-independent settlement accounting — `Total - AmountDue` against everything
-  //     the probe actually read. `AmountPaid` agrees with the collection here, so ONLY this check can
-  //     be the one that fires.
-  //
-  //     o3d-obyd r31 (Codex HIGH 2): and the 0.001 that `AmountPaid` does NOT account for is now
-  //     stated as `AmountCredited`, so `Total - AmountDue` and `AmountPaid + AmountCredited` AGREE at
-  //     0.002. It read `AmountCredited: 0` before, which made those two derivations of one figure
-  //     say 0.002 and 0.001 — an incoherent response, which the probe now refuses outright, and this
-  //     test would have been measuring that refusal rather than the band. The route it names is
-  //     unchanged: the credit is not itemised in any collection, so `explained` is the 0.001 payment
-  //     against a settled 0.002, and the shortfall is the same 0.001 the band decides on.
-  const settledVsExplained = (currency: string) => probeInvoice(xeroInvoice({
-    CurrencyCode: currency,
-    Total: 10.002,
-    AmountDue: 10,
-    AmountPaid: 0.001,
-    AmountCredited: 0.001,
-    Payments: [{ PaymentID: 'PAY-1', Date: DATE, Amount: 0.001 }],
-  }))
-  assert.equal((await settledVsExplained('GBP')).ok, true, 'the precondition')
-  const settledShort = await settledVsExplained('KWD')
-  assert.equal(settledShort.ok, false)
-  assert.match(reasonOf(settledShort), /0\.002 already settled against this document but only 0\.001 of it is accounted for/)
-
-  // (4) ROUTE: the QuickBooks settlement accounting — `TotalAmt - Balance` against the payment lines
-  //     this probe read, with the currency out of the document's own `CurrencyRef`.
-  const qbo = (currency: string) => ledgerDouble({
-    'bill/bill-1': {
-      Bill: {
-        LinkedTxn: [{ TxnId: '9', TxnType: 'BillPaymentCheck' }],
-        CurrencyRef: { value: currency },
-        TotalAmt: 10.002,
-        Balance: 10,
-      },
-    },
-    'billpayment/9': {
-      BillPayment: { TxnDate: DATE, Line: [{ Amount: 0.001, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
-    },
-  }).get
-  const probeBill = (currency: string) => probeQuickBooksSettlement(
-    { type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } },
-    qbo(currency),
-  )
-  assert.equal((await probeBill('GBP')).ok, true, 'the precondition')
-  const billShort = await probeBill('KWD')
-  assert.equal(billShort.ok, false)
-  assert.match(reasonOf(billShort), /0\.002 already applied to this bill but only 0\.001 of it is accounted for/)
 })
 
 test('[o3d-r948] the ordinary two-decimal document is unmoved, and an UNSTATED currency is stricter', async () => {

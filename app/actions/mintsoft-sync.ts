@@ -550,7 +550,9 @@ const MintsoftConnectionInputSchema = z.object({
   username: z.string().optional().default(''),
   password: z.string().optional().default(''),
   webhookSecret: z.string().optional().default(''),
-  orderLookupConnector: z.enum(['', 'woocommerce', 'shopify']).optional().default(''),
+  // '' means "no storefront lookup"; the rest are the registered shopping connector ids
+  // (o3d-remove-parked-connectors removed 'shopify' with the connector).
+  orderLookupConnector: z.enum(['', 'woocommerce']).optional().default(''),
   active: z.boolean().optional(),
 })
 
@@ -1113,11 +1115,9 @@ export async function saveMintsoftOrderDispatchSettings(input: {
 
 function getAvailableOrderLookupConnectors(pluginState: {
   woocommerce: boolean
-  shopify: boolean
 }): ShoppingConnectorId[] {
   const connectors: ShoppingConnectorId[] = []
   if (pluginState.woocommerce) connectors.push('woocommerce')
-  if (pluginState.shopify) connectors.push('shopify')
   return connectors
 }
 

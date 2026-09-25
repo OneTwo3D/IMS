@@ -1,4 +1,5 @@
 import { getSettingValues } from '@/lib/settings-store'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import {
   buildIntegrationPluginState,
@@ -39,11 +40,15 @@ export function isIntegrationModuleVisible(
   // when any backing connector is enabled. Kept data-driven so a new connector
   // (e.g. a 2nd WMS) is picked up by adding it to the registry list, with no
   // edit here.
-  if (module === 'accounting') return state.xero || state.quickbooks
+  // DERIVED from the accounting registry (o3d-remove-parked-connectors), for the same reason the
+  // WMS arm below is derived from WMS_CONNECTOR_IDS: it was `state.xero || state.quickbooks`, so a
+  // registered accounting connector nobody remembered here would have left the Accounting module
+  // hidden while its own switch was on.
+  if (module === 'accounting') return ACCOUNTING_CONNECTORS.some((connector) => state[connector.id])
   if (module === 'wms') return WMS_CONNECTOR_IDS.some((id) => state[id])
 
-  // A per-connector module string (e.g. 'woocommerce', 'shopify', or any WMS
-  // connector id such as 'mintsoft') maps to that plugin's own enabled flag.
+  // A per-connector module string (e.g. 'woocommerce', or any WMS connector id
+  // such as 'mintsoft') maps to that plugin's own enabled flag.
   if (module in state) return state[module as IntegrationPluginId]
 
   return true

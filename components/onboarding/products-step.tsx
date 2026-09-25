@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState, useTransition } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Archive, Check, Download, Loader2, Package, RefreshCw, ShoppingCart, Truck } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
@@ -42,8 +42,6 @@ type Props = {
   shoppingConnectorEnabled: boolean
   wcEnabled: boolean
   wcConnected: boolean
-  shopifyEnabled: boolean
-  shopifyConnected: boolean
   productCount: number
   onImported?: () => void
 }
@@ -52,8 +50,6 @@ export function ProductsStep({
   shoppingConnectorEnabled,
   wcEnabled,
   wcConnected,
-  shopifyEnabled,
-  shopifyConnected,
   productCount,
   onImported,
 }: Props) {
@@ -61,14 +57,12 @@ export function ProductsStep({
   const [wcStarting, setWcStarting] = useState(false)
   const [wcMessage, setWcMessage] = useState<{ text: string; isError: boolean } | null>(null)
   const [wcProgress, setWcProgress] = useState<WcProductSyncProgress | null>(null)
-  const [shopifyPending, startShopifyTransition] = useTransition()
-  const [shopifyMessage, setShopifyMessage] = useState<{ text: string; isError: boolean } | null>(null)
   const wcPollRef = useRef<number | null>(null)
   const wcStartedByUserRef = useRef(false)
   const wcBusy = wcStarting || wcProgress?.status === 'running'
 
   async function callManualSyncApi(
-    connector: 'woocommerce' | 'shopify',
+    connector: 'woocommerce',
     type: 'orders' | 'products' | 'stock',
   ): Promise<ManualSyncResponse> {
     const response = await fetch('/api/shopping/manual-sync', {
@@ -183,23 +177,6 @@ export function ProductsStep({
     }
   }
 
-  function handleShopifyProductSync() {
-    setShopifyMessage(null)
-    startShopifyTransition(async () => {
-      try {
-        const result = await callManualSyncApi('shopify', 'products')
-        if (!result.success) {
-          setShopifyMessage({ text: result.error ?? 'Shopify product sync is not available yet.', isError: true })
-          return
-        }
-        setShopifyMessage({ text: 'Shopify product sync completed.', isError: false })
-        onImported?.()
-      } catch (error) {
-        setShopifyMessage({ text: `Failed to sync products: ${error instanceof Error ? error.message : String(error)}`, isError: true })
-      }
-    })
-  }
-
   return (
     <div className="space-y-6">
       <div>
@@ -286,7 +263,7 @@ export function ProductsStep({
         </div>
       </div>
 
-      {(wcEnabled || wcConnected || shopifyEnabled || shopifyConnected) && (
+      {(wcEnabled || wcConnected) && (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3">
             {(wcEnabled || wcConnected) && (
@@ -312,26 +289,6 @@ export function ProductsStep({
                   max={wcProgress?.totalProducts || undefined}
                   detail={wcProgress ? formatWcProductProgressDetail(wcProgress) : 'Preparing WooCommerce product import...'}
                 />
-              </div>
-            )}
-
-            {(shopifyEnabled || shopifyConnected) && (
-              <div className="flex flex-col gap-1">
-	                <Button
-	                  variant="outline"
-	                  onClick={handleShopifyProductSync}
-	                  disabled
-	                  title={!shopifyConnected ? 'Connect Shopify first to enable product import.' : 'Shopify product import is not wired yet.'}
-	                >
-	                  {shopifyPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-	                  {shopifyPending ? 'Importing...' : 'Import Products from Shopify (coming soon)'}
-	                </Button>
-                {shopifyMessage && (
-                  <span className={`text-xs ${shopifyMessage.isError ? 'text-destructive' : 'text-green-600'}`}>
-                    {shopifyMessage.text}
-                  </span>
-                )}
-                <LoadingProgress active={shopifyPending} label="Syncing Shopify catalog..." />
               </div>
             )}
           </div>

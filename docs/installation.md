@@ -1007,7 +1007,7 @@ Create `/var/lib/one-two-inventory/invoice-pdfs` during deployment with the same
 owner as the IMS application process and restrictive permissions, for example
 `chown app:app /var/lib/one-two-inventory/invoice-pdfs` and
 `chmod 750 /var/lib/one-two-inventory/invoice-pdfs`. Connector PDFs are usually
-re-fetchable from Xero or QuickBooks, so they do not need the same backup policy
+re-fetchable from the accounting connector, so they do not need the same backup policy
 as the database, but include the directory in operational snapshots if customer
 invoice links must remain available during connector outages. Plan disk capacity
 for roughly 50-500 KB per invoice PDF; 100,000 invoices can consume about
@@ -1260,7 +1260,7 @@ Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the reques
 
 ### Integrations
 
-For each connected integration (WooCommerce, Xero, Shopify, QuickBooks, Mintsoft):
+For each connected integration (WooCommerce, Xero, Mintsoft):
 
 - [ ] Credentials configured.
 - [ ] **Connection test passes** — the connection test gate blocks sync until you click "Test Connection" successfully. Verify by visiting Sync > {Integration} and looking for the green "Connected" badge.
@@ -4377,7 +4377,6 @@ Key variables in the `.env` file:
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret. Install-time seed only — the live value is the `wc_consumer_secret` setting |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
 | `WC_INVOICE_PDF_SECRET` | Separate secret used only by the WooCommerce helper plugin to sign customer-visible invoice PDF proxy requests to IMS |
-| `SHOPIFY_INVOICE_PDF_SECRET` | Separate secret used only for Shopify customer-visible invoice PDF proxy requests to IMS |
 | `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` | Maximum pending Mintsoft ASN booked-in webhook events processed by one sweeper run. Default `250`. |
 | `CONNECTOR_FETCH_TIMEOUT_MS` | Default whole-request timeout for validated connector HTTP requests, including redirects and composed with any caller-supplied `AbortSignal`. Invalid values fall back to `30000`. |
@@ -4473,7 +4472,7 @@ first, in any of the **four lock domains** this repository takes a session advis
 
 | Lock domain | Held by | Reached from |
 | --- | --- | --- |
-| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the Xero and QuickBooks sync processors and from operator-triggered settlement actions — and the daily Xero and QuickBooks accounting batches, which run on the same holder |
+| Money post | `lib/db/pinned-advisory-lock.ts` | The money post itself — reached from the accounting sync processor and from operator-triggered settlement actions — and the daily accounting batch, which runs on the same holder |
 | Xero payment write | `lib/connectors/xero/payment-write-lock.ts` | The Xero payment poller and apply-mode payment reconciliation |
 | WMS dispatch sweep | `lib/domain/wms/dispatch-sweep-lock.ts` | The dispatch sweep, and the operator actions that mutate dispatch state under it |
 | Restore selection | `app/api/backup/restore/route.ts` | A restore |

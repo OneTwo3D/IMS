@@ -1,6 +1,8 @@
 import { db } from '@/lib/db'
-import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
-import { inferShoppingOrderLookupConnector } from '@/lib/fulfillment/shopping-order-lookup'
+import {
+  resolveShoppingOrderLookupConnector,
+  type ShoppingOrderLookupResolution,
+} from '@/lib/fulfillment/shopping-order-lookup'
 import type { WmsConnectorId } from './types'
 
 // Re-exported for back-compat; the canonical definition lives in ./types (a
@@ -31,9 +33,16 @@ const prismaPort: WmsOrderLookupPort = {
 }
 
 /**
- * `connector` is a plain string, not `WmsConnectorId`: a WmsConnection row can name a connector
- * this build no longer ships, and the answer for such a row is "no configured lookup", not a
- * type error at the call site that reads it.
+ * `connector` is a plain string, not `WmsConnectorId`: a WmsConnection row can name a WMS
+ * connector this build no longer ships, and the answer for such a row is "no configured lookup",
+ * not a type error at the call site that reads it.
+ *
+ * RETURNS A RESOLUTION, NOT A CONNECTOR-OR-NULL (o3d-r5uk, Codex round 2 HIGH 2). The row's
+ * `orderLookupConnector` is a plain String that can still name an ARCHIVED storefront, and the
+ * three answers — one connector, nothing configured, a value this build cannot service — are not
+ * interchangeable. Collapsing them here is how a Shopify-configured warehouse got its statuses
+ * looked up against WooCommerce order numbers; see the note in
+ * lib/fulfillment/shopping-order-lookup.ts.
  *
  * `port` exists so this can be driven without a database — the second-connector seam test asks it
  * about a FICTITIOUS connector and asserts the query is filtered on the id it was ASKED about. The
@@ -43,7 +52,7 @@ const prismaPort: WmsOrderLookupPort = {
 export async function resolveWmsOrderLookupConnector(
   connector: WmsConnectorId | string,
   port: WmsOrderLookupPort = prismaPort,
-): Promise<ShoppingConnectorId | null> {
+): Promise<ShoppingOrderLookupResolution> {
   const connection = await port.findConnection(connector)
-  return inferShoppingOrderLookupConnector(connection?.orderLookupConnector ?? null)
+  return resolveShoppingOrderLookupConnector(connection?.orderLookupConnector ?? null)
 }

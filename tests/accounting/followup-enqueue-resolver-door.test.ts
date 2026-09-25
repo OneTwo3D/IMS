@@ -22,7 +22,7 @@ import test from 'node:test'
  *
  * HOW THE TESTS REACH THE RESOLVER NOW: they do not import it. Every payload shape is driven through
  * a real connector pass — `repairXeroBackReferences` in tests/accounting/xero-payment-mapping-refusal
- * and `processPendingQuickBooksSync` in tests/connectors/quickbooks-payment-mapping-refusal — which
+ * and (before o3d-remove-parked-connectors) `processPendingQuickBooksSync` in its own test — which
  * is the same door production uses. A test that imported the resolver directly would be re-opening
  * the door in order to check that it is shut.
  *
@@ -131,7 +131,9 @@ test('[o3d-batch-ret r10] neither connector reads the payment payload itself —
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/^[ \t]*\/\/.*$/gm, '')
 
-  for (const rel of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+  // o3d-remove-parked-connectors: the archived QuickBooks processor was the second file in this
+  // walk, so every rule below was checked against TWO independently-written processors. One now.
+  for (const rel of ['lib/connectors/xero/sync-processor.ts']) {
     const source = await readFile(path.join(ROOT, rel), 'utf8')
     // SCOPED TO THE PAYMENT DECISION, which is the boundary this is about. Both files legitimately
     // read `payload.currency` on the DOCUMENT-BUILD paths (the invoice and credit-note posts), and a
@@ -230,7 +232,9 @@ test('[o3d-batch-ret r12] the payload boundary names no currency of its own and 
   // AND NEITHER CONNECTOR MAY REACH FOR IT ON THIS PATH. Round 11 wanted this so the two could not
   // disagree about a resolved value; round 12 wants it because there is no value to resolve, and a
   // connector that resolved one would be re-introducing the substitution one frame out.
-  for (const rel of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+  // o3d-remove-parked-connectors: the archived QuickBooks processor was the second file in this
+  // walk, so every rule below was checked against TWO independently-written processors. One now.
+  for (const rel of ['lib/connectors/xero/sync-processor.ts']) {
     const connector = await readFile(path.join(ROOT, rel), 'utf8')
     const from = connector.indexOf('async function decideInvoicePaymentFollowUp(')
     const to = connector.indexOf('async function enqueueSalesInvoiceFollowUps(')
@@ -295,7 +299,8 @@ test('[o3d-batch-ret r9] nothing imports the raw resolver, and the walk really r
   assert.ok(importers.length >= 4, `the outcome module must still be imported somewhere (found ${importers.length})`)
   assert.deepEqual(
     foldImporters.sort(),
-    ['lib/connectors/quickbooks/sync-processor.ts', 'lib/connectors/xero/sync-processor.ts'],
+    // o3d-remove-parked-connectors: the archived QuickBooks processor was listed here too.
+    ['lib/connectors/xero/sync-processor.ts'],
     'and the fold is imported by exactly the two connectors that ask the money question',
   )
 })

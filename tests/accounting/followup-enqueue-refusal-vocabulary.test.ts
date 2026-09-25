@@ -64,7 +64,10 @@ test('[o3d-peh1 r4] every declared refusal reason is constructed somewhere', asy
 
   const constructors = [
     await source('lib/connectors/xero/sync-processor.ts'),
-    await source('lib/connectors/quickbooks/sync-processor.ts'),
+    // o3d-remove-parked-connectors: the archived QuickBooks processor was a third source here, so a
+    // reason only IT constructed still counted as constructible. With it gone, a declared reason
+    // that only the archived connector ever built would now fail this test — which is the correct
+    // outcome and is why the declaration list was re-read when the connector went.
     await source('lib/domain/accounting/followup-revival.ts'),
   ].join('\n')
 
@@ -106,17 +109,13 @@ test('[o3d-peh1 r4] the revision-0 revival argument is marked Xero-only, and the
   assert.match(paragraph, /XERO-ONLY|Xero-only|A XERO CLAIM MINTS 1/, 'the argument is scoped to this connector')
   assert.match(paragraph, /o3d-rw0w/, 'and the QuickBooks gap is filed rather than left implicit')
 
-  // The gap itself, asserted against the QuickBooks code rather than against the comment: its
-  // revival CAS carries no revision clause at all, which is the ABA the paragraph calls impossible.
-  const qbo = await source('lib/connectors/quickbooks/sync-processor.ts')
-  const cas = qbo.slice(qbo.indexOf("if (plan.action === 'reuse')"))
-  const predicate = cas.slice(cas.indexOf('updateMany'), cas.indexOf('data:'))
-  assert.match(predicate, /status: 'FAILED'/)
-  assert.doesNotMatch(
-    predicate,
-    /attemptRevision/,
-    'if this ever gains a revision clause the comment and o3d-rw0w both need updating',
-  )
+  // o3d-remove-parked-connectors — THE SECOND HALF OF THIS CASE IS GONE.
+  //
+  // It asserted the GAP against the QuickBooks code rather than against the comment: that connector's
+  // revival CAS carried no revision clause at all, which is the ABA the paragraph calls impossible.
+  // The file is archived, so the gap is closed by removal and there is nothing left to assert it
+  // against. What survives above is that the paragraph still scopes its argument to ONE connector and
+  // still files the gap (o3d-rw0w) — which is now a note about a connector this build does not ship.
 })
 
 /**

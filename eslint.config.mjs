@@ -30,6 +30,10 @@ const eslintConfig = defineConfig([
     "next-env.d.ts",
     // Generated Prisma client code.
     "app/generated/prisma/**",
+    // Archived connector implementations (archive/connectors/**). Not built, not
+    // type-checked (tsconfig "exclude"), not linted, and not reachable from any active
+    // code path -- see archive/connectors/README.md.
+    "archive/**",
   ]),
 ]);
 

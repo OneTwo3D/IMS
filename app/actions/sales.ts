@@ -1549,7 +1549,7 @@ export async function applySalesOrderStatusTransition(
         // this transition itself read, not a caller's earlier snapshot.
         withdrawalApprovedAt: true,
         // b8i6.1: detect a shopping order via ANY connector (not just WooCommerce)
-        // so a Shopify-linked order also gets its IMS status pushed back.
+        // so an order linked to any registered storefront also gets its IMS status pushed back.
         shoppingLinks: { select: { id: true }, take: 1 },
         lines: { select: { id: true, productId: true, sku: true, qty: true } },
       },
@@ -1831,7 +1831,7 @@ export async function applySalesOrderStatusTransition(
 
     // Push status back to the order's shopping connector(s) (fire-and-forget).
     // b8i6.1: routed through the facade so it dispatches to the order's actual
-    // connector (WooCommerce pushes; Shopify is skipped until it gains a push).
+    // connector (WooCommerce pushes; a connector without a push port is skipped).
     if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
       pushSalesOrderStatus(id, targetStatus)
         .then((res) => {

@@ -106,6 +106,8 @@ test('the lock id is per document, stable, and a signed int32 (o3d-0m56)', async
   // contending would be a silent correctness one.
   assert.equal(followUpScopeLockId(scope), followUpScopeLockId({ ...scope }))
   for (const different of [
+    // A connector this build no longer registers — a scope key must still be built for a stored row
+    // that names one (o3d-remove-parked-connectors).
     { ...scope, connector: 'quickbooks' },
     { ...scope, type: 'BILL_PAYMENT' },
     { ...scope, referenceType: 'PurchaseInvoice' },
@@ -131,11 +133,9 @@ test('the namespace is registered, so a future lock cannot silently collide with
 const WRITERS = [
   { file: 'lib/accounting.ts', what: 'the shared in-transaction queue (addPayment, markBillPaid)' },
   { file: 'lib/connectors/xero/queue.ts', what: "Xero's own queue" },
-  { file: 'lib/connectors/quickbooks/queue.ts', what: "QuickBooks' own queue" },
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
   { file: 'lib/connectors/xero/sync-processor.ts', what: "Xero's follow-up enqueue" },
-  { file: 'lib/connectors/quickbooks/sync-processor.ts', what: "QuickBooks' follow-up enqueue" },
   { file: 'app/actions/xero-sync.ts', what: 'the Xero manual retry' },
-  { file: 'app/actions/quickbooks-sync.ts', what: 'the QuickBooks manual retry' },
 ]
 
 for (const writer of WRITERS) {

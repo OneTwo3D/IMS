@@ -1,5 +1,6 @@
 'use server'
 
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -222,8 +223,12 @@ class SettlementRefusedError extends Error {
  * four-line plugin-state read.
  */
 async function resolveActiveAccountingConnector(): Promise<string | null> {
-  if (await isIntegrationPluginEnabled('xero')) return 'xero'
-  if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
+  // o3d-remove-parked-connectors: walks the registry rather than naming two connectors, so this
+  // third copy of the resolution rule cannot disagree with the other two about WHICH connectors
+  // exist — only (deliberately) about which client it reads through.
+  for (const connector of ACCOUNTING_CONNECTORS) {
+    if (await isIntegrationPluginEnabled(connector.id)) return connector.id
+  }
   return null
 }
 

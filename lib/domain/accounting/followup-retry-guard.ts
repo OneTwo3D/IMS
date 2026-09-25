@@ -1,3 +1,4 @@
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import {
   FOLLOW_UP_IDEMPOTENCY_KEY,
   readFollowUpIdempotencyKey,
@@ -386,12 +387,19 @@ export function deferredRevivalReason(reference: string, kept: string): string {
  * worse, allow — the wrong retries.
  */
 export function effectiveTokenFor(
-  connector: 'xero' | 'quickbooks',
+  connector: AccountingConnectorId,
   row: { id: string; payload: unknown },
 ): string {
   const stamped = readFollowUpIdempotencyKey(row.payload)
   if (stamped) return stamped
-  if (connector === 'quickbooks') {
+  // o3d-remove-parked-connectors: the generic-`_idempotencyKey` fallback below was the QUICKBOOKS
+  // branch, and it is archived with the connector. It is left here, unreachable while one connector
+  // is registered, because the rule it encodes is a per-connector one that must not be folded into
+  // Xero's: Xero's payment branches have always ignored `_idempotencyKey` and derived from the row
+  // id, so applying QuickBooks' reading to Xero would misreport one connector's history and could
+  // allow the wrong retry. `connector` is compared against a value the union no longer contains,
+  // which `tsc` reports as a no-overlap comparison — hence the explicit widening.
+  if ((connector as string) === 'quickbooks') {
     const generic = asPayload(row.payload)?._idempotencyKey
     // `typeof === 'string'`, NOT a truthiness or trim check — this must mirror
     // getIdempotencySource EXACTLY. That accepts an empty string as the source, so two rows

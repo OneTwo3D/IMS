@@ -1,8 +1,8 @@
 /**
  * Near-realtime draining of the shopping webhook inbox.
  *
- * Inbound WooCommerce/Shopify webhooks persist their event to the inbox and ACK
- * immediately (so WooCommerce/Shopify don't time out and retry). Historically the
+ * Inbound shopping webhooks persist their event to the inbox and ACK
+ * immediately (so the storefront doesn't time out and retry). Historically the
  * inbox was only drained by the 5-minute cron, which made processing lag by up to
  * five minutes. After persisting a NEW event the handler now calls
  * `scheduleInboxDrain(connector)` to drain the inbox in (near) realtime.
@@ -87,7 +87,7 @@ export function createInboxDrainer(
   return { schedule, whenIdle }
 }
 
-type ShoppingConnector = 'woocommerce' | 'shopify'
+type ShoppingConnector = 'woocommerce'
 
 function warnDrainError(connector: ShoppingConnector, error: unknown) {
   console.warn('[shopping-webhook-inbox] eager drain failed', {
@@ -102,10 +102,6 @@ const drainers: Record<ShoppingConnector, InboxDrainer> = {
   woocommerce: createInboxDrainer(
     async () => (await import('@/lib/jobs/woocommerce/process-shopping-webhook-events')).processPendingWcWebhookEvents(),
     { onError: (error) => warnDrainError('woocommerce', error) },
-  ),
-  shopify: createInboxDrainer(
-    async () => (await import('@/lib/jobs/shopify/process-shopping-webhook-events')).processPendingShopifyWebhookEvents(),
-    { onError: (error) => warnDrainError('shopify', error) },
   ),
 }
 

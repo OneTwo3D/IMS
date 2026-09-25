@@ -7,11 +7,12 @@ import test, { mock } from 'node:test'
  * while disconnect wipes them.
  *
  * Left behind, they are read straight back — the lookups short-circuit on a stored id precisely so
- * they never re-verify it — and a Xero ItemID gets handed to QuickBooks, or to a reconnect against
+ * they never re-verify it — and a Xero ItemID gets handed to another ledger, or to a reconnect against
  * a DIFFERENT Xero org, as if it were that system's own id.
  *
- * QuickBooks cleared contacts and Xero did not, which was already live before accountingItemId gave
- * it a second column to leak (o3d-3nc).
+ * The archived QuickBooks connector cleared contacts and Xero did not, which was already live before
+ * accountingItemId gave it a second column to leak (o3d-3nc) — i.e. this rule was found by COMPARING
+ * two connectors, and only one ships now (o3d-remove-parked-connectors).
  */
 
 type Cleared = { model: string; data: unknown }
@@ -31,7 +32,7 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       $transaction: async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]),
-      // findUnique => null: no stored token, so QuickBooks' disconnect skips remote token
+      // findUnique => null: no stored token, so a disconnect skips remote token
       // revocation and goes straight to the local clear-down, which is what is under test here.
       accountingToken: {
         deleteMany: async () => ({ count: 1 }),
@@ -54,10 +55,11 @@ async function disconnectXero() {
   const m = await import('@/lib/connectors/xero/auth')
   return m.disconnect()
 }
-async function disconnectQbo() {
-  const m = await import('@/lib/connectors/quickbooks/auth')
-  return m.disconnect()
-}
+// o3d-remove-parked-connectors: a `disconnectQbo` helper was here, and both cases below ran against
+// BOTH connectors' disconnects. That cross-port was the point — the file's own header says
+// "QuickBooks cleared contacts and Xero did not, which was already live" — so losing it is a real
+// loss: this file now shows one connector's disconnect obeys the rule, not that the rule is the
+// pattern. A second connector's disconnect must be added to the loop below.
 
 test.beforeEach(() => { cleared.length = 0 })
 
@@ -75,14 +77,6 @@ test('disconnecting Xero clears contact AND item ids', async () => {
   assert.deepEqual(cleared.find((c) => c.model === 'supplier')?.data, { accountingContactId: null, accountingContactProvenance: null })
 })
 
-test('disconnecting QuickBooks clears contact AND item ids', async () => {
-  await disconnectQbo()
-
-  const models = cleared.map((c) => c.model).sort()
-  assert.deepEqual(models, ['customer', 'product', 'supplier'])
-  assert.deepEqual(cleared.find((c) => c.model === 'product')?.data, { accountingItemId: null, accountingItemProvenance: null })
-})
-
 // ---------------------------------------------------------------------------
 // o3d-9kek r3 finding 1 — the other half of the same rule. Cached LOOKUP ids are a performance
 // cache with an authoritative source, so disconnect clears them. DOCUMENT ids are not: a bill's
@@ -95,7 +89,7 @@ test('disconnecting QuickBooks clears contact AND item ids', async () => {
 // to a different company sees the old ids as a foreign namespace — inert, not conflicting.
 // ---------------------------------------------------------------------------
 
-for (const [name, disconnectFn] of [['Xero', disconnectXero], ['QuickBooks', disconnectQbo]] as const) {
+for (const [name, disconnectFn] of [['Xero', disconnectXero]] as const) {
   test(`[o3d-9kek r3 f1] disconnecting ${name} KEEPS document external ids`, async () => {
     cleared.length = 0
     await disconnectFn()

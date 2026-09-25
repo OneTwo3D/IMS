@@ -288,7 +288,7 @@ function literalOffsets(text) {
  *   lib/security/public-route-security-policy.ts, lib/integration-plugins.ts,
  *   lib/integration-plugin-keys.ts, lib/integration-connection-test-gate.ts,
  *   lib/settings-store.ts, lib/releases.ts, lib/domain/integrations/outbox-registry.ts.
- * Plugin-enable persistence that enumerates every connector (woo/shopify/xero/qb/wms):
+ * Plugin-enable persistence that enumerates every connector (woo/xero/wms):
  *   app/actions/onboarding.ts (saveOnboardingPluginState).
  *
  * NOT HERE ANY MORE, deliberately (o3d-remove-shiphero round 2): lib/domain/wms/,

@@ -482,7 +482,7 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   // to Mintsoft — the failure mode being a resolver that quietly reads Mintsoft's row for every
   // WMS and links a second warehouse's fulfilments to the wrong storefront.
   const asked: string[] = []
-  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'shopify' }
+  const rows: Record<string, string> = { [ACME_WMS_ID]: 'woocommerce', mintsoft: 'woocommerce' }
   const port = {
     findConnection: async (connector: string) => {
       asked.push(connector)
@@ -491,14 +491,43 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   }
 
   const { resolveWmsOrderLookupConnector } = await import('../lib/connectors/wms/order-lookup.ts')
-  assert.equal(await resolveWmsOrderLookupConnector(ACME_WMS_ID, port), 'woocommerce')
+  assert.deepEqual(
+    await resolveWmsOrderLookupConnector(ACME_WMS_ID, port),
+    { kind: 'one', connector: 'woocommerce' },
+  )
   assert.deepEqual(asked, [ACME_WMS_ID], 'the resolver must filter on the connector it was asked about')
 
-  // THE CONTRAST THAT MAKES IT A TEST OF THE FILTER. Two connectors, two different configured
-  // storefronts. A resolver pinned to Mintsoft's row would answer 'shopify' above — and would
-  // link the fictitious warehouse's fulfilments to a shop that did not sell the order.
-  assert.equal(await resolveWmsOrderLookupConnector('mintsoft', port), 'shopify')
+  assert.deepEqual(
+    await resolveWmsOrderLookupConnector('mintsoft', port),
+    { kind: 'one', connector: 'woocommerce' },
+  )
   assert.deepEqual(asked, [ACME_WMS_ID, 'mintsoft'])
+
+  // THE VALUE CONTRAST IS BACK (o3d-r5uk, Codex round 2 HIGH 2).
+  //
+  // It used to give the two WMS connectors DIFFERENT configured storefronts — 'woocommerce' and
+  // 'shopify' — so a resolver pinned to Mintsoft's row would answer the wrong storefront and link
+  // the fictitious warehouse's fulfilments to a shop that did not sell the order. Archiving Shopify
+  // left one shopping id, and this file recorded the contrast as lost.
+  //
+  // It is recoverable, because the resolver's answers are no longer all of one type: an archived
+  // value RESOLVES DIFFERENTLY from a supported one instead of being narrowed away. Giving the
+  // fictitious warehouse the retired storefront and Mintsoft the supported one restores exactly the
+  // discriminating pair — a resolver reading Mintsoft's row for every WMS would answer
+  // `{ kind: 'one', connector: 'woocommerce' }` below and fail.
+  const retiredRows: Record<string, string> = { [ACME_WMS_ID]: 'shopify', mintsoft: 'woocommerce' }
+  const retiredPort = {
+    findConnection: async (connector: string) => ({ orderLookupConnector: retiredRows[connector] ?? null }),
+  }
+  assert.deepEqual(
+    await resolveWmsOrderLookupConnector(ACME_WMS_ID, retiredPort),
+    { kind: 'unsupported', connectors: ['shopify'], from: 'connection' },
+    'the answer must follow the row of the connector ASKED about, by value and not only by argument',
+  )
+  assert.deepEqual(
+    await resolveWmsOrderLookupConnector('mintsoft', retiredPort),
+    { kind: 'one', connector: 'woocommerce' },
+  )
 })
 
 test('seam/order-lookup: the type guard accepts only registered ids', async () => {

@@ -197,7 +197,8 @@ test('the processors take their post date from this module, not from their own e
   // The only thing that makes drift IMPOSSIBLE rather than unlikely: there is no second copy to
   // drift from. A branch that recomputes `(payload.paymentDate as string)?.slice(...)` is a copy,
   // however faithful it looks on the day it is written.
-  for (const file of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
+  for (const file of ['lib/connectors/xero/sync-processor.ts']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     assert.equal(/\(payload\.paymentDate as string\)\?\.slice/.test(source), false,
       `${file} must not compute a payment date of its own`)

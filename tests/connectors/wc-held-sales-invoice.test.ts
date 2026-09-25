@@ -164,7 +164,7 @@ test('the confirmation asks the SAME question the enqueue dedupes on, so the two
   // own. Asserted on the files themselves, because a drift here is a silent duplicate posting.
   for (const file of [
     'lib/connectors/xero/queue.ts',
-    'lib/connectors/quickbooks/queue.ts',
+    // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
     'lib/accounting.ts',
   ]) {
     const source = readFileSync(file, 'utf8')

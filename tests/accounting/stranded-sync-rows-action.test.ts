@@ -255,17 +255,30 @@ test('the rows come back described, with age and identifying detail', async () =
 
 test('[round 5] the loader reads the sync toggle for the connectors on the page, and no others', async () => {
   const getStrandedAccountingSyncRows = await loadLoader()
-  state.activeConnector = 'xero'
-  state.rows = [dbRow({ connector: 'quickbooks' })]
+  state.activeConnector = null
+  state.rows = [dbRow({ connector: 'xero' })]
 
   await getStrandedAccountingSyncRows()
 
   assert.equal(state.settingQueries.length, 1, 'one query, not one per row')
   assert.deepEqual(
     state.settingQueries[0].where,
-    { key: { in: ['quickbooks_sync_enabled'] } },
-    'only the toggle a row on this page actually needs — xero has no row here',
+    { key: { in: ['xero_sync_enabled'] } },
+    'only the toggle a row on this page actually needs',
   )
+})
+
+test('[archived] a page of ARCHIVED-connector rows reads no toggle at all — there is no gate behind one', async () => {
+  // o3d-remove-parked-connectors round 2 (Codex MEDIUM). The toggle read is what made the surviving
+  // `quickbooks_sync_enabled` row load-bearing. With the connector unregistered there is nothing to
+  // look up, so the query is not even issued.
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.activeConnector = 'xero'
+  state.rows = [dbRow({ connector: 'quickbooks' })]
+
+  await getStrandedAccountingSyncRows()
+
+  assert.deepEqual(state.settingQueries, [])
 })
 
 test('[round 5] a page with no rows asks for no toggles at all', async () => {
@@ -277,36 +290,59 @@ test('[round 5] a page with no rows asks for no toggles at all', async () => {
 
 test('[round 5] the toggle decides whether the row is offered the settle control', async () => {
   const getStrandedAccountingSyncRows = await loadLoader()
-  state.activeConnector = 'xero'
-  state.rows = [dbRow({ connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 })]
+  // The Xero PLUGIN off, so the row is off the active connector and listed here; `triggerXeroSync`
+  // gates on the toggle ALONE and never reads that flag, so the toggle is what decides.
+  state.activeConnector = null
+  state.rows = [dbRow({ connector: 'xero', status: 'PROCESSING', attemptRevision: 0 })]
 
   // Still enabled: the manual Sync button would reclaim it, so adoption is withheld WITH the lever.
-  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  state.settings = new Map([['xero_sync_enabled', 'true']])
   const claimable = (await getStrandedAccountingSyncRows()).rows[0]
   assert.equal(claimable.settleable, false)
   assert.equal(claimable.requiresAttemptAdoption, false)
-  assert.match(claimable.notSettleableReason ?? '', /quickbooks_sync_enabled/)
+  assert.match(claimable.notSettleableReason ?? '', /xero_sync_enabled/)
 
   // One variable changed.
-  state.settings = new Map([['quickbooks_sync_enabled', 'false']])
+  state.settings = new Map([['xero_sync_enabled', 'false']])
   const quiesced = (await getStrandedAccountingSyncRows()).rows[0]
   assert.equal(quiesced.settleable, true)
   assert.equal(quiesced.requiresAttemptAdoption, true)
   assert.equal(quiesced.notSettleableReason, null)
 })
 
+test('[archived] the UI OFFERS the control on an archived-connector row whose stored toggle is still on', async () => {
+  // o3d-remove-parked-connectors round 2 (Codex MEDIUM): the half of the finding that is about what
+  // the operator SEES. Driven through the real loader and the real rule, so it asserts what was put
+  // on the row rather than what the rule was asked.
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.activeConnector = 'xero'
+  state.rows = [dbRow({ connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 })]
+  // The row archiving left behind. The loader does not even read it now, but seed it so this test
+  // would still see it if the read came back.
+  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+
+  const row = (await getStrandedAccountingSyncRows()).rows[0]
+  assert.equal(row.settleable, true, 'nothing in this build can claim it, so the remedy is offered')
+  assert.equal(row.requiresAttemptAdoption, true)
+  assert.equal(row.notSettleableReason, null, 'and no refusal text sends the operator to a missing control')
+})
+
 test('[round 5] two connectors on one page get two different answers', async () => {
   // With no accounting plugin enabled, buildStrandedSyncRowWhere selects EVERY unresolved row, so
   // the page really can carry both — and one connector being quiesced says nothing about the other.
+  //
+  // Round 2: ARCHIVED vs LIVE is the contrast the real rule can now produce, and it is the mirror
+  // pair the finding is about — the archived row keeps the remedy, the live one still does not.
   const getStrandedAccountingSyncRows = await loadLoader()
   state.activeConnector = null
   state.rows = [
     dbRow({ id: 'log-x', connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }),
     dbRow({ id: 'log-q', connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 }),
   ]
-  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  state.settings = new Map([['xero_sync_enabled', 'true'], ['quickbooks_sync_enabled', 'true']])
 
   const byId = new Map((await getStrandedAccountingSyncRows()).rows.map((row) => [row.id, row]))
-  assert.equal(byId.get('log-x')?.settleable, true, 'xero_sync_enabled has no row, so xero is quiesced')
-  assert.equal(byId.get('log-q')?.settleable, false, 'quickbooks can still be swept by its own button')
+  assert.equal(byId.get('log-q')?.settleable, true, 'archived: no worker left to claim it')
+  assert.equal(byId.get('log-x')?.settleable, false, 'live, and its own Sync button can still sweep it')
+  assert.match(byId.get('log-x')?.notSettleableReason ?? '', /xero_sync_enabled/)
 })

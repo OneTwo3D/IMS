@@ -78,13 +78,11 @@ const KNOWN_CURRENT_GRAPH_READERS = [
       + 'has no pin of its own and reaching its sales line is a threading change with a shipment-refusal '
       + 'blast radius.',
   },
-  {
-    file: 'lib/connectors/quickbooks/daily-sync.ts',
-    calls: 1,
-    issue: 'o3d-moc9',
-    why: 'the Group B revenue split; the Xero port of the same computation already reads the pin '
-      + '(lib/connectors/xero/daily-sync.ts), so this is a cross-port divergence in a posting path.',
-  },
+  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/daily-sync.ts` was the second entry here
+  // (1 call, o3d-moc9: the Group B revenue split reading the current graph instead of the pin, a
+  // CROSS-PORT divergence because Xero's port of the same computation already read the pin). The file
+  // is archived, so the divergence is closed by removal. The allowlist REFUSES a stale entry, so it
+  // has to go in the same commit — and o3d-moc9's remaining subject, if any, is now Xero-only.
 ]
 
 function listFiles(dir, out) {

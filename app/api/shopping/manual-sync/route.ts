@@ -1,16 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAdmin } from '@/lib/auth/server'
-import { syncShoppingConnectorStock } from '@/lib/shopping'
+import { SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
 type ManualSyncType = 'orders' | 'products' | 'stock'
-type ShoppingConnector = 'woocommerce' | 'shopify'
 
 function isManualSyncType(value: unknown): value is ManualSyncType {
   return value === 'orders' || value === 'products' || value === 'stock'
 }
 
-function isShoppingConnector(value: unknown): value is ShoppingConnector {
-  return value === 'woocommerce' || value === 'shopify'
+// DERIVED FROM THE REGISTRY, not a second id union (o3d-remove-parked-connectors). This route used
+// to spell `'woocommerce' | 'shopify'` itself, so the ingress accepted exactly the ids somebody had
+// remembered here. Registering a connector now widens what this route accepts by construction.
+function isShoppingConnector(value: unknown): value is ShoppingConnectorId {
+  return typeof value === 'string' && SHOPPING_CONNECTORS.some((connector) => connector.id === value)
 }
 
 function toSerializableResult(result: unknown): unknown {
@@ -57,15 +59,14 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ success: true, started: true })
     }
 
-    if (type !== 'stock') {
-      return NextResponse.json({
-        success: false,
-        error: 'Shopify manual order and product sync are not wired yet',
-      })
-    }
-
-    const result = await syncShoppingConnectorStock('shopify')
-    return NextResponse.json({ success: true, result: toSerializableResult(result) })
+    // A REGISTERED CONNECTOR WITH NO MANUAL-SYNC ARM FAILS VISIBLY, it does not fall through
+    // (o3d-remove-parked-connectors). `isShoppingConnector` is registry-derived, so a second
+    // connector reaches here the day it is registered; answering with a named refusal is what stops
+    // that showing up as a silent success on the operator's Sync screen.
+    return NextResponse.json({
+      success: false,
+      error: `Manual sync is not wired for the ${connector} connector`,
+    }, { status: 501 })
   } catch (error) {
     return NextResponse.json({
       success: false,

@@ -68,18 +68,7 @@ mock.module('@/lib/domain/purchasing/landed-cost-journal-outbox', {
 // imports and calls one again, this double records it and the test below fails. A double that
 // omitted the export would fail with an import error instead, which reads as a broken test rather
 // than as the regression it is.
-mock.module('@/lib/connectors/quickbooks/sync-processor', {
-  namedExports: {
-    processPendingQuickBooksSync: async () => {
-      calls.push({ connector: 'quickbooks', what: 'process' })
-      return { succeeded: 1, failed: 0, skipped: 0 }
-    },
-    repairQuickBooksBackReferences: async () => {
-      calls.push({ connector: 'quickbooks', what: 'repair' })
-      return REPAIR_RESULT
-    },
-  },
-})
+// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 mock.module('@/lib/connectors/xero/sync-processor', {
   namedExports: {
     processPendingXeroSync: async () => {
@@ -106,16 +95,15 @@ async function runCron(plugin: string): Promise<Record<string, unknown>> {
   return await response.json() as Record<string, unknown>
 }
 
-test('[o3d-9kek r6] the QuickBooks cron branch does NOT run the back-reference repair sweep', async () => {
-  const body = await runCron('quickbooks')
-
-  assert.deepEqual(calls, [
-    { connector: 'quickbooks', what: 'process' },
-  ], 'the sweep must not be bound for QuickBooks: it can attribute a previous realm\'s external id (o3d-s36z)')
-  // Nothing to report, and reporting an absent sweep as an empty result would read as "it ran and
-  // found nothing" — which is the opposite of the truth.
-  assert.equal('backReferenceRepair' in body, false)
-})
+// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): '[o3d-9kek r6] the QuickBooks cron branch
+// does NOT run the back-reference repair sweep'. There is no QuickBooks cron branch any more, and the
+// registry entry it checked is deleted with it (see lib/domain/accounting/follow-up-obligation-registry.ts).
+//
+// WHAT THAT COST: this file asserted the asymmetry — one connector's branch runs the sweep, the
+// other's deliberately does not, because a QuickBooks external id is a per-realm integer and a repair
+// could attribute a retired realm's id to a live document. Only the POSITIVE half is left. The rule
+// survives as the registry's `consumer` field plus the contract loop below, which still refuses a
+// declaration the real cron does not honour.
 
 test('[o3d-9kek] the Xero cron branch DOES run it — Xero is the connector with no realm exposure', async () => {
   const body = await runCron('xero')
@@ -143,21 +131,61 @@ test('[o3d-9kek] the Xero cron branch DOES run it — Xero is the connector with
 // ---------------------------------------------------------------------------
 
 /** Which connectors this file has doubles for. Asserted to cover the registry, never to define it. */
-const CONTRACTED_CONNECTORS = ['xero', 'quickbooks'] as const
+// ONE TODAY (o3d-remove-parked-connectors). This list is asserted to COVER the registry, never to
+// define it, so a connector declared without a double here still fails — which is the property.
+const CONTRACTED_CONNECTORS = ['xero'] as const
+
+/**
+ * Connectors the registry declares for HISTORICAL ROWS ONLY (o3d-remove-parked-connectors).
+ *
+ * An archived connector keeps its registry entry because `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` is
+ * what the /sync/exceptions backlog selects on, and rows it wrote still exist. But there is no cron
+ * branch for it, so the loop below cannot establish anything by driving one — and its own precondition
+ * is written precisely to stop a `consumer: 'none'` entry being satisfied "for the wrong reason".
+ *
+ * So these are checked DIFFERENTLY rather than skipped: an archived connector must declare
+ * `consumer: 'none'` (declaring a sweep for a connector with no code would be the exact lie this file
+ * exists to catch), and driving the cron under it must reach NO branch at all. Unlisted still fails.
+ */
+const ARCHIVED_CONNECTORS: Record<string, string> = {
+  quickbooks: 'archived (o3d-remove-parked-connectors) — see docs/archive/quickbooks-connector-removal.md. '
+    + 'Declared so a row written before the archive still gets a named remedy in the exception inbox.',
+}
 
 test('[o3d-0bfh r8] CONTRACT: every registry entry is checked against what the real cron route does', async () => {
   const declared = Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY)
   assert.ok(declared.length > 0, 'the registry must declare something, or this loop asserts nothing')
   for (const connector of declared) {
     assert.ok(
-      (CONTRACTED_CONNECTORS as readonly string[]).includes(connector),
+      (CONTRACTED_CONNECTORS as readonly string[]).includes(connector) || Boolean(ARCHIVED_CONNECTORS[connector]),
       `${connector} is declared in ACCOUNTING_FOLLOW_UP_RECOVERY but this file has no double for it, so its `
-        + 'declaration is checked by nothing. Add the double and list it in CONTRACTED_CONNECTORS.',
+        + 'declaration is checked by nothing. Add the double and list it in CONTRACTED_CONNECTORS — or, if '
+        + 'the connector has been archived, list it in ARCHIVED_CONNECTORS with a reason.',
     )
   }
 
   for (const [connector, recovery] of Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)) {
     await runCron(connector)
+
+    if (ARCHIVED_CONNECTORS[connector]) {
+      assert.equal(
+        recovery.consumer, 'none',
+        connector + " is archived and has no cron branch, so it may only ever declare consumer: 'none'. "
+          + 'Declaring a sweep for a connector whose code is not in the tree is the exact lie this file exists '
+          + 'to catch.',
+      )
+      assert.deepEqual(
+        calls.filter((call) => call.connector === connector), [],
+        connector + ' is archived, so driving the cron under it must reach NO branch at all — if it reached '
+          + 'one, the connector is not archived and this entry is wrong.',
+      )
+      assert.ok(
+        ARCHIVED_CONNECTORS[connector].trim().length > 20,
+        connector + ' needs a stated reason for being listed as archived',
+      )
+      continue
+    }
+
     const swept = calls.some((call) => call.connector === connector && call.what === 'repair')
     // The precondition: this run really did reach the connector's branch. Without it a route that
     // returned `skipped` early would satisfy every `consumer: 'none'` entry for the wrong reason.

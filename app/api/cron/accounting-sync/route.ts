@@ -48,37 +48,18 @@ export async function GET(request: Request) {
     return NextResponse.json({ ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox })
   }
 
-  if (await isIntegrationPluginEnabled('quickbooks')) {
-    const enabled = await db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } })
-    if (enabled?.value !== 'true') {
-      return NextResponse.json({ skipped: true, reason: 'QuickBooks sync disabled' })
-    }
-    if (!(await isAccountingConnectorConnected('quickbooks'))) {
-      return NextResponse.json({ skipped: true, reason: 'QuickBooks not connected' })
-    }
-    // audit-grob: same backstop drain — the landed-cost journals are
-    // connector-agnostic (queueAccountingSync routes to the active connector), so
-    // they must drain under QuickBooks too, not just Xero.
-    const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
-    const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
-    const result = await processPendingQuickBooksSync()
-    // NO back-reference repair sweep in this branch, and that asymmetry with Xero above is
-    // DELIBERATE (o3d-9kek r6). The sweep's candidate query is scoped by connector alone, and a
-    // QuickBooks external id is only meaningful inside one realm — after a reconnect to a different
-    // company it would write a retired realm's id onto a live document, which the payment poller
-    // then acts on as if it were current. Failing to repair is acceptable; repairing onto the wrong
-    // document is not.
-    //
-    // THE PRECONDITION THIS LINE USED TO NAME IS THE WRONG ONE (o3d-0bfh r6, Codex MEDIUM). It said
-    // o3d-s36z (connector-tenant isolation); that CLOSED on 2026-08-21, a row's realm IS recorded
-    // now, and a maintainer following this line would have found the condition satisfied and made
-    // the one-line binding — re-enqueueing a realm-local integer against the wrong company. The real
-    // prerequisites are POST-TIME AUTHORIZATION (o3d-8prh: this connector does not carry the
-    // connection verdict to the last statement before the socket) and ORIGIN PROPAGATION (the
-    // follow-up rows a sweep creates here record no connectionProvenance for that check to read).
-    // The order of work is at the end of lib/connectors/quickbooks/sync-processor.ts.
-    return NextResponse.json({ ...result, landedCostJournalOutbox })
-  }
+  // THE QUICKBOOKS BRANCH WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
+  //
+  // It gated on plugin + `quickbooks_sync_enabled` + a stored token, drained the landed-cost journal
+  // outbox and then ran `processPendingQuickBooksSync()`. Recoverable at
+  // `git show archive/quickbooks-connector:app/api/cron/accounting-sync/route.ts`.
+  //
+  // IT DELIBERATELY RAN NO BACK-REFERENCE REPAIR SWEEP, and that asymmetry with Xero above was the
+  // interesting part: the sweep's candidate query is scoped by connector alone, and a QuickBooks
+  // external id is only meaningful inside one realm, so after a reconnect to a different company it
+  // would have written a retired realm's id onto a live document. The two prerequisites it named —
+  // POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION — are what a second connector would
+  // have to satisfy before its rows may be swept. See docs/archive/quickbooks-connector-removal.md.
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
 }

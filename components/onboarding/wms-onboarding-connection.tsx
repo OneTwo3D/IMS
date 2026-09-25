@@ -15,7 +15,7 @@ import type { MintsoftOnboardingConnectionData } from '@/app/actions/mintsoft-sy
 import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
 
-type ShoppingLookupConnector = 'woocommerce' | 'shopify'
+type ShoppingLookupConnector = 'woocommerce'
 
 /**
  * THE WMS CONNECTION-FORM REGISTRY — the onboarding wizard's setup step for whichever WMS
@@ -333,12 +333,11 @@ function MintsoftConnectionForm({
           <Label className="text-xs">Order Lookup Connector</Label>
           <select
             value={orderLookupConnector}
-            onChange={(e) => setOrderLookupConnector(e.target.value as '' | 'woocommerce' | 'shopify')}
+            onChange={(e) => setOrderLookupConnector(e.target.value as '' | 'woocommerce')}
             className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
           >
             <option value="">None</option>
             {availableOrderLookupConnectors.includes('woocommerce') ? <option value="woocommerce">WooCommerce</option> : null}
-            {availableOrderLookupConnectors.includes('shopify') ? <option value="shopify">Shopify</option> : null}
           </select>
           <p className="text-xs text-muted-foreground">
             {orderLookupRequired

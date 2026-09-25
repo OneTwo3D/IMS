@@ -6,6 +6,30 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## Unreleased
+
+### Parked connectors removed (o3d-remove-parked-connectors)
+
+- **Shopify (shopping) and QuickBooks Online (accounting) are no longer shipped.** The owner's
+  decision (2026-09) is that WooCommerce, Mintsoft and Xero are the active connectors. ShipHero was
+  removed earlier under the same decision. The implementations are archived in-tree under
+  `archive/connectors/<name>/` — excluded from the build, the type check, the linter and every
+  guard — and the last commit in which each was part of the active tree is pinned by an annotated
+  tag (`archive/shopify-connector`, `archive/quickbooks-connector`).
+- **The generic connector design is unchanged.** The shopping and accounting registries, the
+  connector-keyed dispatches, the plugin-selection machinery and the exclusivity-group table all
+  stay, and a new connector is still a registration rather than an edit to the core. What went is
+  the two concrete implementations and their registrations.
+- **What is no longer proven** by the test suite as a result — a shopping registry with two entries,
+  a second id routed through the shopping facade, the commerce exclusivity pair, and (for
+  accounting) the whole cross-connector orphan surface — is enumerated per connector in
+  `docs/archive/shopify-connector-removal.md` and `docs/archive/quickbooks-connector-removal.md`.
+- **No migration. No schema change. No data was touched.** Development databases keep their
+  `shopify`/`quickbooks` rows; each note states the decision and why.
+- Operator-visible: the Shopify and QuickBooks cards, panels, onboarding switches and credential
+  forms are gone from Integrations; their `SHOPIFY_*` / `QUICKBOOKS_*` environment variables are
+  gone from `.env.example`.
+
 ## 2.0.0 - 2026-06-12
 
 ### Reorder Planning & manufacturing (cycle PRs #188–#190)
