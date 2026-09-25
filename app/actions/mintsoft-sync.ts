@@ -58,6 +58,7 @@ import {
   runMintsoftReturnsSync,
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
+import { interpretMintsoftAsnReceiptState } from '@/lib/connectors/mintsoft/api/asn-status'
 import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import {
@@ -159,17 +160,64 @@ const mintsoftBindingSelect = {
   },
 } satisfies MintsoftBindingSelect
 
-function normalizeMintsoftAsnStatus(status: string | null | undefined): WmsAsnStatus {
-  switch (status) {
-    case 'CREATE_PENDING':
-    case 'CREATE_IN_FLIGHT':
-    case 'OPEN':
-    case 'PARTIALLY_BOOKED_IN':
-    case 'BOOKED_IN':
-      return status
-    default:
-      return 'OPEN'
+/**
+ * ROUND 8, CODEX HIGH — THE REMOTE ASN'S STATUS IS READ, AND WHAT CANNOT BE READ IS REFUSED.
+ *
+ * THIS USED TO BE A `switch` WHOSE `default` RETURNED `'OPEN'`, over a field the connector never
+ * populated. `normalizeMintsoftAsnListRowForRecovery` set `status: null` and the by-id normalizer looked
+ * for keys Mintsoft does not serve, so EVERY remote ASN arrived here as `null` and every one was recorded
+ * as still to arrive. For a create that was harmless by luck; for a RECOVERY it was the defect: 198 of the
+ * tenant's 220 live ASNs are COMPLETE, so the ASN a lost create left behind is usually one the warehouse
+ * has already booked in, and recording it OPEN meant no receipt was ever looked for. The cases the switch
+ * listed were IMS's OWN enum names — which Mintsoft never sends — so the only arm that could ever run for
+ * a remote ASN was the default. What a Mintsoft ASN status MEANS is stated once, in the connector
+ * (`lib/connectors/mintsoft/api/asn-status.ts`), against the 13 statuses `GET /api/ASN/Statuses` served
+ * live on 2026-09-24; anything outside it is `unknown`, and unknown refuses here rather than defaulting.
+ */
+class MintsoftAsnStatusUnreadableError extends Error {
+  readonly externalAsnId: string
+
+  constructor(externalAsnId: string, detail: string) {
+    super(
+      `Mintsoft ASN ${externalAsnId} cannot be recorded because its status cannot be interpreted: ${detail}. `
+      + 'An ASN whose status IMS cannot read may already have been booked in at the warehouse, and recording '
+      + 'it as still to arrive would leave that stock in no IMS figure, so this refuses instead. Nothing was '
+      + 'created and no second ASN will be. Check the ASN in Mintsoft, then retry.',
+    )
+    this.name = 'MintsoftAsnStatusUnreadableError'
+    this.externalAsnId = externalAsnId
   }
+}
+
+/**
+ * ROUND 8. The ASN was adopted or created, the warehouse says goods may already have been received against
+ * it, and the receipt reconciliation neither completed nor left anything behind that will retry. There is
+ * no safe silent outcome here: the ASN map row exists (so no duplicate ASN can go out), but the stock is
+ * unaccounted for and nothing is queued to account for it — which is exactly what round 8's finding was.
+ */
+class MintsoftAsnReceiptNotReconciledError extends Error {
+  constructor(externalAsnId: string, remoteStatusName: string | null, detail: string) {
+    super(
+      `Mintsoft ASN ${externalAsnId} is recorded, but Mintsoft reports it as `
+      + `${remoteStatusName ?? 'already received'} and its receipt could not be reconciled: ${detail}. The `
+      + 'goods may already be on the warehouse shelves and are NOT in an IMS stock figure or cost layer yet. '
+      + 'No second ASN was created and none will be. Use "Re-check" on this ASN once the cause is cleared; '
+      + 'the overdue-ASN watchdog will keep reporting it until it is.',
+    )
+    this.name = 'MintsoftAsnReceiptNotReconciledError'
+  }
+}
+
+function requireMintsoftAsnReceiptState(asn: { externalAsnId: string; status: string | null }): {
+  wmsStatus: WmsAsnStatus
+  statusName: string
+  receiptMayHaveHappened: boolean
+} {
+  const state = interpretMintsoftAsnReceiptState(asn.status)
+  if (state.kind === 'unknown') {
+    throw new MintsoftAsnStatusUnreadableError(asn.externalAsnId, state.detail)
+  }
+  return { wmsStatus: state.wmsStatus, statusName: state.statusName, receiptMayHaveHappened: state.receiptMayHaveHappened }
 }
 
 export type MintsoftConnectionSettingsMasked = {
@@ -2640,6 +2688,102 @@ export async function recheckMintsoftAsnBookedIn(
 }
 
 /**
+ * THE RECEIPT A RECOVERED (OR CREATED) ASN ALREADY OWES — o3d-bhvu ROUND 8, CODEX HIGH.
+ *
+ * WHAT WAS WRONG. Both creators followed a successful map with `replayMintsoftBookedInEventsForAsn`, which
+ * re-drives `wms_inbound_receipt_events` rows that ALREADY EXIST. That is the right tool for a callback
+ * that arrived and failed to process. It is the wrong tool — it is a no-op — for the case this branch
+ * exists to handle: a create whose response was lost, whose ASN the warehouse has since booked in, and
+ * whose booked-in callback was never delivered (or was refused by the maintenance fence). There is no row,
+ * so nothing is replayed, and the action reported "Recovered Mintsoft ASN 6117" while the goods on the
+ * shelves were in no IMS stock figure and no cost layer. 198 of the tenant's 220 live ASNs are COMPLETE, so
+ * this is the ordinary case, not a corner.
+ *
+ * WHAT IT DOES INSTEAD. `enqueueMintsoftBookedInRecheckForAsn` RECONSTRUCTS the trigger — it writes a
+ * receipt event marked as a recheck and processes it — and re-drives existing rows when there are any. It
+ * invents no quantities: `processBookedInEvent` re-reads the ASN from the WMS and applies only the delta
+ * over each line's `lastProcessedReceivedQty`, so the warehouse stays the authority and a real callback
+ * arriving later books nothing in twice.
+ *
+ * AND IT CANNOT END QUIETLY. Three outcomes, and each is visible in a different way:
+ *   · RECONCILED (processed or already-applied) — the receipt is accounted for; return no warning.
+ *   · OUTSTANDING (pending, awaiting review, or failed) — an event ROW EXISTS, so the webhook sweeper will
+ *     retry it and the inbound-event inbox shows it. That is a visible pending obligation, so the action
+ *     succeeds, but it says so in the operator's message rather than reporting a plain success.
+ *   · NOTHING AT ALL (the enqueue threw, or reconciled nothing and left nothing to retry) — there is no row,
+ *     nothing will retry, and nobody would ever be told. That THROWS, which fails the job and returns the
+ *     refusal to the operator. The ASN stays mapped, so no duplicate can go out; the remedy is the ASN
+ *     table's "Re-check", which the refusal names.
+ *
+ * WHAT THIS DOES NOT FIX, AND WHERE IT IS TRACKED (o3d-btiw, still open). The SHARED ASN line normalizer
+ * does not read the live `ASNItem`'s `QuantityReceieved`/`QuantityBooked`, so against live Mintsoft the
+ * booked-in processor currently computes a received quantity of ZERO for every line. This closes "no
+ * reconciliation is even attempted" — which is what round 8's finding was — but whether the attempt moves
+ * any stock depends on o3d-btiw. Changing that normalizer changes booked-in semantics for every path and
+ * needs its own decision (received vs booked) and its own tests, so it is not folded in here.
+ */
+async function reconcileMintsoftAsnReceiptAfterMapping(
+  outcome: { kind: string; asnMapId: string; externalAsnId: string; remoteStatusName: string | null },
+  source: { poId?: string; transferId?: string },
+): Promise<string | null> {
+  const statusName = outcome.remoteStatusName ?? 'already received'
+  let counters: Awaited<ReturnType<typeof enqueueMintsoftBookedInRecheckForAsn>>
+  try {
+    counters = await enqueueMintsoftBookedInRecheckForAsn(outcome.externalAsnId, {
+      reason: `${outcome.kind} Mintsoft ASN reported as ${statusName} at the warehouse`,
+    })
+  } catch (error) {
+    console.error(error)
+    const detail = error instanceof Error ? error.message : String(error)
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: outcome.asnMapId,
+      tag: 'sync',
+      action: 'mintsoft_asn_receipt_unreconciled',
+      level: 'ERROR',
+      description: `Mintsoft ASN ${outcome.externalAsnId} is ${statusName} at the warehouse and its receipt could not be reconciled`,
+      metadata: { ...source, externalAsnId: outcome.externalAsnId, remoteStatus: statusName, error: detail },
+    })
+    throw new MintsoftAsnReceiptNotReconciledError(outcome.externalAsnId, outcome.remoteStatusName, detail)
+  }
+
+  const reconciled = counters.processed + counters.duplicates
+  const outstanding = counters.pending + counters.requiresReview + counters.failed
+  if (outstanding > 0) {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: outcome.asnMapId,
+      tag: 'sync',
+      action: 'mintsoft_asn_receipt_pending',
+      level: 'WARNING',
+      description: `Mintsoft ASN ${outcome.externalAsnId} is ${statusName} at the warehouse; its receipt is queued, not yet applied`,
+      metadata: { ...source, externalAsnId: outcome.externalAsnId, remoteStatus: statusName, ...counters },
+    })
+    return `Mintsoft reports ASN ${outcome.externalAsnId} as ${statusName}; its receipt is NOT accounted for yet — `
+      + 'a booked-in recheck is queued and the webhook sweeper will retry it.'
+  }
+
+  if (reconciled === 0) {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: outcome.asnMapId,
+      tag: 'sync',
+      action: 'mintsoft_asn_receipt_unreconciled',
+      level: 'ERROR',
+      description: `Mintsoft ASN ${outcome.externalAsnId} is ${statusName} at the warehouse and its receipt reconciled nothing`,
+      metadata: { ...source, externalAsnId: outcome.externalAsnId, remoteStatus: statusName, ...counters },
+    })
+    throw new MintsoftAsnReceiptNotReconciledError(
+      outcome.externalAsnId,
+      outcome.remoteStatusName,
+      'the booked-in recheck applied nothing and left no event for the sweeper to retry',
+    )
+  }
+
+  return null
+}
+
+/**
  * THE ASN NOBODY RECORDED (round 6, Codex HIGH 1). A create Mintsoft accepted, whose read-back did not
  * confirm the warehouse, the item set or a quantity, leaves an inbound ASN AT THE LIVE WAREHOUSE with no
  * `wms_asn_maps` row pointing at it — deliberately, because recording an ASN that is not what was asked for
@@ -2817,6 +2961,14 @@ export async function createMintsoftPurchaseOrderAsn(
     status: string
     lineCount: number
     warehouseCode: string | null
+    /**
+     * ROUND 8: whether the WAREHOUSE says goods may already have been received against this ASN, so a
+     * receipt reconciliation is owed. Only a remote read can answer it, which is why it is carried here
+     * rather than re-derived from `status`: DELIVERED is recorded OPEN and still owes one.
+     */
+    receiptMayHaveHappened: boolean
+    /** Mintsoft's own name for that status, for the operator-facing message. `null` for an `existing` ASN. */
+    remoteStatusName: string | null
   }
 
   const pendingAsnPrefix = `pending:${parsedId.data}:`
@@ -2832,7 +2984,6 @@ export async function createMintsoftPurchaseOrderAsn(
       sourceLineId: string
       raw: Record<string, unknown> | null
     }>
-    status: string | null
   }) {
     const sourceLineMap = new Map(createdAsn.lines.map((line) => [line.sourceLineId, line]))
     const usedExternalLineIds = new Set<string>()
@@ -2856,7 +3007,6 @@ export async function createMintsoftPurchaseOrderAsn(
         externalAsnLineId: createdLine.externalLineId,
         payload: createdLine.raw ?? null,
         externalAsnId,
-        status: normalizeMintsoftAsnStatus(createdAsn.status),
       }
     })
   }
@@ -3321,6 +3471,9 @@ export async function createMintsoftPurchaseOrderAsn(
     },
     kind: 'recovered' | 'created',
   ): Promise<FinalizedAsnOutcome> {
+    // ROUND 8, BEFORE ANY WRITE: a status IMS cannot interpret refuses here, so nothing is recorded about
+    // an ASN whose receipt state is unknown. `requireMintsoftAsnReceiptState` has no permissive default.
+    const receiptState = requireMintsoftAsnReceiptState(createdAsn)
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
@@ -3355,6 +3508,11 @@ export async function createMintsoftPurchaseOrderAsn(
           status: conflictingAsn.status,
           lineCount: conflictingAsn.lines.length,
           warehouseCode: reservation.warehouseCode,
+          // An ASN IMS ALREADY HELD a row for. Nothing remote was read about it here, so nothing is
+          // claimed about its receipt: it keeps whatever reconciliation it already had, and the
+          // `existing` arm never reached the replay/recheck block in the first place.
+          receiptMayHaveHappened: false,
+          remoteStatusName: null,
         } satisfies FinalizedAsnOutcome
       }
 
@@ -3362,8 +3520,14 @@ export async function createMintsoftPurchaseOrderAsn(
         where: { id: reservation.asnMapId },
         data: {
           externalAsnId: createdAsn.externalAsnId,
-          status: normalizeMintsoftAsnStatus(createdAsn.status),
-          closedAt: normalizeMintsoftAsnStatus(createdAsn.status) === 'BOOKED_IN' ? new Date() : null,
+          status: receiptState.wmsStatus,
+          // NOT `new Date()` FOR A BOOKED-IN ASN (round 8). `closedAt` does not mean "the warehouse has
+          // finished with it", it means the receipt is ACCOUNTED FOR: it removes the ASN from the
+          // alignment's candidate query (`asn.closedAt IS NULL`), from the overdue-ASN watchdog and from
+          // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
+          // before any receipt has been applied, would close the very populations that would otherwise
+          // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          closedAt: null,
         },
       })
 
@@ -3398,9 +3562,11 @@ export async function createMintsoftPurchaseOrderAsn(
         kind,
         asnMapId: reservation.asnMapId,
         externalAsnId: createdAsn.externalAsnId,
-        status: normalizeMintsoftAsnStatus(createdAsn.status),
+        status: receiptState.wmsStatus,
         lineCount: mappedLines.length,
         warehouseCode: reservation.warehouseCode,
+        receiptMayHaveHappened: receiptState.receiptMayHaveHappened,
+        remoteStatusName: receiptState.statusName,
       } satisfies FinalizedAsnOutcome
     }, { maxWait: 5000, timeout: 30000 })
   }
@@ -3412,7 +3578,7 @@ export async function createMintsoftPurchaseOrderAsn(
     let replayWarning: string | null = null
 
     if (reservation.kind === 'existing') {
-      outcome = reservation
+      outcome = { ...reservation, receiptMayHaveHappened: false, remoteStatusName: null }
     } else {
       const recoveredAsn = await findExistingRemoteAsn(reservation)
       if (recoveredAsn) {
@@ -3510,24 +3676,30 @@ export async function createMintsoftPurchaseOrderAsn(
         },
       })
 
-      try {
-        await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
-      } catch (error) {
-        console.error(error)
-        replayWarning = 'Mintsoft booked-in replay did not complete immediately; the webhook sweeper will retry pending events.'
-        await logActivity({
-          entityType: 'SYNC',
-          entityId: outcome.asnMapId,
-          tag: 'sync',
-          action: 'mintsoft_asn_replay_deferred',
-          level: 'WARNING',
-          description: `Deferred booked-in replay for Mintsoft ASN ${outcome.externalAsnId}`,
-          metadata: {
-            poId: parsedId.data,
-            externalAsnId: outcome.externalAsnId,
-            error: error instanceof Error ? error.message : 'Unknown replay error',
-          },
-        })
+      if (outcome.receiptMayHaveHappened) {
+        // ROUND 8: the warehouse says goods may already have been received against this ASN, so the
+        // reconstruction of the trigger is what is owed — not a replay of rows a lost callback never wrote.
+        replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(outcome, { poId: parsedId.data })
+      } else {
+        try {
+          await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
+        } catch (error) {
+          console.error(error)
+          replayWarning = 'Mintsoft booked-in replay did not complete immediately; the webhook sweeper will retry pending events.'
+          await logActivity({
+            entityType: 'SYNC',
+            entityId: outcome.asnMapId,
+            tag: 'sync',
+            action: 'mintsoft_asn_replay_deferred',
+            level: 'WARNING',
+            description: `Deferred booked-in replay for Mintsoft ASN ${outcome.externalAsnId}`,
+            metadata: {
+              poId: parsedId.data,
+              externalAsnId: outcome.externalAsnId,
+              error: error instanceof Error ? error.message : 'Unknown replay error',
+            },
+          })
+        }
       }
     }
 
@@ -3715,6 +3887,14 @@ export async function createMintsoftTransferAsn(
     status: string
     lineCount: number
     warehouseCode: string | null
+    /**
+     * ROUND 8: whether the WAREHOUSE says goods may already have been received against this ASN, so a
+     * receipt reconciliation is owed. Only a remote read can answer it, which is why it is carried here
+     * rather than re-derived from `status`: DELIVERED is recorded OPEN and still owes one.
+     */
+    receiptMayHaveHappened: boolean
+    /** Mintsoft's own name for that status, for the operator-facing message. `null` for an `existing` ASN. */
+    remoteStatusName: string | null
   }
 
   const pendingAsnPrefix = `pending:transfer:${parsedId.data}:`
@@ -3738,7 +3918,6 @@ export async function createMintsoftTransferAsn(
       sourceLineId: string
       raw: Record<string, unknown> | null
     }>
-    status: string | null
   }) {
     const sourceLineMap = new Map(createdAsn.lines.map((line) => [line.sourceLineId, line]))
     const usedExternalLineIds = new Set<string>()
@@ -3763,7 +3942,6 @@ export async function createMintsoftTransferAsn(
         externalAsnLineId: createdLine.externalLineId,
         payload: createdLine.raw ?? null,
         externalAsnId,
-        status: normalizeMintsoftAsnStatus(createdAsn.status),
       }
     })
   }
@@ -4411,6 +4589,9 @@ export async function createMintsoftTransferAsn(
     },
     kind: 'recovered' | 'created',
   ): Promise<FinalizedAsnOutcome> {
+    // ROUND 8, BEFORE ANY WRITE: a status IMS cannot interpret refuses here, so nothing is recorded about
+    // an ASN whose receipt state is unknown. `requireMintsoftAsnReceiptState` has no permissive default.
+    const receiptState = requireMintsoftAsnReceiptState(createdAsn)
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
@@ -4459,6 +4640,11 @@ export async function createMintsoftTransferAsn(
           status: conflictingAsn.status,
           lineCount: conflictingAsn.lines.length,
           warehouseCode: reservation.warehouseCode,
+          // An ASN IMS ALREADY HELD a row for. Nothing remote was read about it here, so nothing is
+          // claimed about its receipt: it keeps whatever reconciliation it already had, and the
+          // `existing` arm never reached the replay/recheck block in the first place.
+          receiptMayHaveHappened: false,
+          remoteStatusName: null,
         } satisfies FinalizedAsnOutcome
       }
 
@@ -4466,8 +4652,14 @@ export async function createMintsoftTransferAsn(
         where: { id: reservation.asnMapId },
         data: {
           externalAsnId: createdAsn.externalAsnId,
-          status: normalizeMintsoftAsnStatus(createdAsn.status),
-          closedAt: normalizeMintsoftAsnStatus(createdAsn.status) === 'BOOKED_IN' ? new Date() : null,
+          status: receiptState.wmsStatus,
+          // NOT `new Date()` FOR A BOOKED-IN ASN (round 8). `closedAt` does not mean "the warehouse has
+          // finished with it", it means the receipt is ACCOUNTED FOR: it removes the ASN from the
+          // alignment's candidate query (`asn.closedAt IS NULL`), from the overdue-ASN watchdog and from
+          // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
+          // before any receipt has been applied, would close the very populations that would otherwise
+          // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          closedAt: null,
         },
       })
 
@@ -4502,9 +4694,11 @@ export async function createMintsoftTransferAsn(
         kind,
         asnMapId: reservation.asnMapId,
         externalAsnId: createdAsn.externalAsnId,
-        status: normalizeMintsoftAsnStatus(createdAsn.status),
+        status: receiptState.wmsStatus,
         lineCount: mappedLines.length,
         warehouseCode: reservation.warehouseCode,
+        receiptMayHaveHappened: receiptState.receiptMayHaveHappened,
+        remoteStatusName: receiptState.statusName,
       } satisfies FinalizedAsnOutcome
     }, { maxWait: 5000, timeout: 30000 })
   }
@@ -4522,7 +4716,7 @@ export async function createMintsoftTransferAsn(
     let replayWarning: string | null = null
 
     if (reservation.kind === 'existing') {
-      outcome = reservation
+      outcome = { ...reservation, receiptMayHaveHappened: false, remoteStatusName: null }
     } else {
       const recoveredAsn = await findExistingRemoteAsn(reservation)
       if (recoveredAsn) {
@@ -4622,24 +4816,30 @@ export async function createMintsoftTransferAsn(
         },
       })
 
-      try {
-        await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
-      } catch (error) {
-        console.error(error)
-        replayWarning = 'Mintsoft booked-in replay did not complete immediately; the webhook sweeper will retry pending events.'
-        await logActivity({
-          entityType: 'SYNC',
-          entityId: outcome.asnMapId,
-          tag: 'sync',
-          action: 'mintsoft_asn_replay_deferred',
-          level: 'WARNING',
-          description: `Deferred booked-in replay for Mintsoft ASN ${outcome.externalAsnId}`,
-          metadata: {
-            transferId: parsedId.data,
-            externalAsnId: outcome.externalAsnId,
-            error: error instanceof Error ? error.message : 'Unknown replay error',
-          },
-        })
+      if (outcome.receiptMayHaveHappened) {
+        // ROUND 8: the warehouse says goods may already have been received against this ASN, so the
+        // reconstruction of the trigger is what is owed — not a replay of rows a lost callback never wrote.
+        replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(outcome, { transferId: parsedId.data })
+      } else {
+        try {
+          await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
+        } catch (error) {
+          console.error(error)
+          replayWarning = 'Mintsoft booked-in replay did not complete immediately; the webhook sweeper will retry pending events.'
+          await logActivity({
+            entityType: 'SYNC',
+            entityId: outcome.asnMapId,
+            tag: 'sync',
+            action: 'mintsoft_asn_replay_deferred',
+            level: 'WARNING',
+            description: `Deferred booked-in replay for Mintsoft ASN ${outcome.externalAsnId}`,
+            metadata: {
+              transferId: parsedId.data,
+              externalAsnId: outcome.externalAsnId,
+              error: error instanceof Error ? error.message : 'Unknown replay error',
+            },
+          })
+        }
       }
     }
 

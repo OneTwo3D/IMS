@@ -6,6 +6,7 @@ import {
   requireMintsoftAsnIsTheOneRequested,
   type MintsoftAsnExpectation,
 } from './asn-creation-rule'
+import { readMintsoftAsnStatusName } from './asn-status'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
@@ -915,7 +916,12 @@ export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unkno
       raw: record,
     }]
   })
-  return { externalAsnId, status: null, lines, raw: row }
+  // ROUND 8, CODEX HIGH: the status IS READ. It used to be `status: null`, and the creators' normalizer
+  // turned that into OPEN — so a COMPLETE ASN recovered after a lost create was recorded as an ASN still
+  // to arrive and its receipt was never reconciled. `null` here now means Mintsoft served nothing this
+  // code recognises, which `interpretMintsoftAsnReceiptState` answers with `unknown` and the creators
+  // refuse; it is no longer a synonym for "open". One reader, shared with the by-id normalizer.
+  return { externalAsnId, status: readMintsoftAsnStatusName(row), lines, raw: row }
 }
 
 export async function fetchMintsoftAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {

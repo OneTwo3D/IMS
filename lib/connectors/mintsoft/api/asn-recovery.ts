@@ -66,10 +66,17 @@ import {
  * as `criteria.mapKnowledge`; and if that read fails, `unreadable` is passed, which refuses rather than
  * permits.
  *
- * WHAT IT STILL DOES NOT LOOK AT (o3d-54al keeps this): the ASN's STATUS. A COMPLETE, booked-in ASN carrying
- * the same reference and exactly the same line ids and quantities is still ADOPTED as though it were this
- * attempt's, which then waits for a booked-in callback that has already happened. Status is orthogonal to
- * everything here and needs its own decision about which `ASNStatusId`s may be adopted at all.
+ * WHAT IT DOES NOT LOOK AT, ON PURPOSE: the ASN's STATUS. A COMPLETE, booked-in ASN carrying the same
+ * reference and exactly the same line ids and quantities IS the ASN this attempt's lost create made, and
+ * adopting it is right — creating a second one for goods already on the shelves is the failure this file
+ * exists to prevent. What the status changes is not WHICH ASN this is but what is OWED once it has been
+ * adopted, and that is the ADOPTER's business, not the matcher's: round 8 (Codex HIGH) moved it there.
+ * The connector reads the status (`asn-status.ts` interprets it against the 13 statuses
+ * `GET /api/ASN/Statuses` serves; anything else is unknown, and unknown is not open), the creators record
+ * it and enqueue a booked-in recheck for an ASN the warehouse may already have received against, and a
+ * status IMS cannot interpret refuses rather than being recorded as an ASN still to arrive. Before round 8
+ * a recovered COMPLETE ASN was written down as OPEN and the attempt waited for a booked-in callback that
+ * had already happened.
  */
 export type MintsoftAsnRecoveryCriteria = MintsoftAsnExpectation & {
   /**

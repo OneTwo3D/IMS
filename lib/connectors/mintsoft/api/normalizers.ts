@@ -1,4 +1,5 @@
 import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import { readMintsoftAsnStatusName } from './asn-status'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
@@ -16,7 +17,6 @@ const RETURN_REASON_KEYS = ['reason', 'Reason', 'returnReason', 'ReturnReason']
 const RETURN_QTY_KEYS = ['qty', 'Qty', 'quantity', 'Quantity', 'returnedQty', 'ReturnedQty', 'returnQty', 'ReturnQty', 'receivedQty', 'ReceivedQty']
 const RETURN_RECEIVED_AT_KEYS = ['receivedAt', 'ReceivedAt', 'createdAt', 'CreatedAt', 'updatedAt', 'UpdatedAt', 'returnDate', 'ReturnDate', 'date', 'Date']
 const ASN_ID_KEYS = ['asnId', 'AsnId', 'ASNId', 'externalAsnId', 'ExternalAsnId', 'id', 'Id', 'ID']
-const ASN_STATUS_KEYS = ['status', 'Status', 'asnStatus', 'AsnStatus']
 const ASN_LINE_ID_KEYS = ['externalAsnLineId', 'ExternalAsnLineId', 'asnLineId', 'AsnLineId', 'lineId', 'LineId', 'lineID', 'LineID', 'id', 'Id', 'ID']
 const ASN_SOURCE_LINE_ID_KEYS = ['sourceLineId', 'SourceLineId', 'referenceLineId', 'ReferenceLineId', 'imsLineId', 'ImsLineId', 'externalReference', 'ExternalReference']
 
@@ -304,7 +304,13 @@ export function normalizeMintsoftAsn(
 
   return {
     externalAsnId,
-    status: getFirstString(record, ASN_STATUS_KEYS),
+    // ROUND 8, CODEX HIGH — THE SAME COLLAPSE ON THE CREATE PATH. This read used to be
+    // `getFirstString(record, ['status', 'Status', 'asnStatus', 'AsnStatus'])`, and live Mintsoft serves
+    // neither: the field is `ASNStatus`, an OBJECT carrying `Name`, alongside a numeric `ASNStatusId`.
+    // So every ASN read back by id arrived with `status: null` too, and the creators' normalizer turned
+    // that into OPEN. It happened to be harmless for a create (a just-created ASN really is NEW) but it
+    // was the same unread remote field spent as a benign default, and it is the same one reader now.
+    status: readMintsoftAsnStatusName(record),
     lines,
     raw: record,
   }
