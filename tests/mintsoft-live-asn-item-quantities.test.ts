@@ -402,3 +402,56 @@ test('the e2e fake can express an ASN that has arrived but is not booked in', ()
   assert.equal(receipt.kind === 'reported' && receipt.bookedIntoStockQty, 0)
   assert.equal(receipt.kind === 'reported' && receipt.arrivedAtWarehouseQty, 12)
 })
+
+/**
+ * THE LIST ROW FAILS CLOSED TOO — `normalizeMintsoftAsnListRowForRecovery` (o3d-btiw, merge of
+ * o3d-bhvu #701).
+ *
+ * `GET /api/ASN/List` is a SECOND wire shape for the same items, read by the duplicate-recovery path,
+ * and it builds `WmsAsnLineRef`s of its own. Nothing consumes their `receipt` today — recovery
+ * decides on `QuantityExpected` and on the status — so this is the test that keeps it true that a
+ * list row cannot start claiming a booked quantity of zero the day something does read it. Zero there
+ * is the assertion that nothing has been booked in, which is exactly the o3d-btiw defect in the other
+ * direction.
+ */
+test('a LIST row with no QuantityBooked is unreadable, not zero (normalizeMintsoftAsnListRowForRecovery)', async () => {
+  const { normalizeMintsoftAsnListRowForRecovery } = await import('@/lib/connectors/mintsoft/api/client')
+
+  // The abridged list item live Mintsoft serves for an ASN's lines: an identity and an expectation.
+  const abridged = normalizeMintsoftAsnListRowForRecovery({
+    ID: 6117,
+    POReference: 'PO-LIST-1',
+    WarehouseId: 6,
+    Items: [{ ID: 90001, SourceLineId: LIVE_ASN_SOURCE_LINE_ID, SKU: 'MS-SKU-1', QuantityExpected: 9 }],
+  })
+  assert.equal(abridged.lines.length, 1, 'PRECONDITION: the row yields exactly one line to examine')
+  assert.equal(abridged.lines[0]!.expectedQty, 9, 'PRECONDITION: the EXPECTED quantity is readable, so the refusal below is about the booked one')
+  assert.equal(abridged.lines[0]!.receipt.kind, 'unreadable')
+  assert.match(
+    abridged.lines[0]!.receipt.kind === 'unreadable' ? abridged.lines[0]!.receipt.detail : '',
+    new RegExp(MINTSOFT_ASN_ITEM_BOOKED_QTY_KEY),
+    'and the refusal names the field it could not read',
+  )
+
+  // NOT VACUOUS: a list row that DOES carry the field reads as a measurement, so the refusal above is
+  // a property of the absent field and not of this code path.
+  const full = normalizeMintsoftAsnListRowForRecovery({
+    ID: 6118,
+    POReference: 'PO-LIST-2',
+    WarehouseId: 6,
+    Items: [{
+      ID: 90002,
+      SourceLineId: LIVE_ASN_SOURCE_LINE_ID,
+      SKU: 'MS-SKU-1',
+      [MINTSOFT_ASN_ITEM_EXPECTED_QTY_KEY]: 9,
+      [MINTSOFT_ASN_ITEM_ARRIVED_QTY_KEY]: 9,
+      [MINTSOFT_ASN_ITEM_BOOKED_QTY_KEY]: 7,
+    }],
+  })
+  assert.deepEqual(full.lines[0]!.receipt, {
+    kind: 'reported',
+    bookedIntoStockQty: 7,
+    arrivedAtWarehouseQty: 9,
+    basis: MINTSOFT_ASN_RECEIPT_BASIS,
+  })
+})
