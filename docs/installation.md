@@ -4079,22 +4079,67 @@ written to a `.part` file and renamed on completion; if it fails, the partial fi
 the failure banner says there is no restore point for this run rather than naming a truncated
 file as one.
 
-**`IMS_BACKUP_DIR` is not validated, and three rounds of trying to make that harmless were
-withdrawn rather than shipped** (o3d-ov60, o3d-noka). The dump, the rename that publishes it and
-the `rm --` that prunes beside it are all done **by root, through the pathname this variable
-names**. Under the shipped default that is unreachable — `/var/backups` has a root-owned parent, so
-nothing but root can plant or rename anything on the way to it. Point `IMS_BACKUP_DIR` underneath a
-directory the **service account** owns and it becomes reachable: `mkdir -p` accepts a
-symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
-predictable name that account may plant a named pipe at, which makes root's `gzip >` block
-indefinitely with the service stopped, cron stopped and the database connections already fenced.
+<a id="where-the-pre-update-dump-may-go"></a>
+### Where the pre-update dump may go
 
-**Until `o3d-noka` lands, treat this as an operator constraint rather than a defended path: point
-`IMS_BACKUP_DIR` only at a directory whose whole ancestry is root-owned and writable by nobody
-else, and bind-mount a backup volume under such a path rather than symlinking one.** Note that
-`APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
+**`IMS_BACKUP_DIR` is validated, and a path that fails the rule is a refusal rather than a dump**
+(o3d-noka, closing o3d-ov60 site 5). The dump, the rename that publishes it and the `rm --` that
+prunes beside it are all done **by root**, so `scripts/update.sh` now walks the path this variable
+names from `/` downwards and requires **every component, the backup directory included**, to be:
+
+* a **real directory** — never a symbolic link, and never anything else;
+* owned by **root** (or by the account the run executes as, which on a host is root);
+* **writable by nobody else** — `mode & 0022 == 0`, which also bounds any POSIX ACL, because the
+  group bits of a file carrying one *are* the ACL mask.
+
+The sticky bit is credited for a component **above** the backup directory's parent and for no other:
+a sticky directory can have an existing entry renamed or removed only by that entry's owner, which
+settles the question for an ancestor that already exists, and settles nothing for a directory in
+which anybody may still **create** a name. `/var/backups/<app>` passes. `/tmp/backups` does not.
+
+The walk is a `chdir` per component with each landing checked against the inode its directory entry
+named, so an ancestor is never re-resolved by name, and the directory it ends on is handed to the
+dump as an **open descriptor**: the redirection, the publishing rename and the prune are all
+`openat`/`renameat`/`unlinkat` against that descriptor, not three fresh resolutions of a pathname.
+A component that cannot be stat'ed, or cannot be entered, is a **refusal** — not an absence of
+evidence. The refusal **names the component that failed** and says what to do about it.
+
+**A directory this run creates is created 0700, and the dump is written with `umask 077`.** A
+whole-database dump is not something the account whose data it is should be able to read. A backup
+directory an *earlier* release already created 0755 is **accepted as it stands and not corrected** —
+its mode satisfies the rule — so tighten it by hand if you want the old dumps in it private too.
+
+**What this costs, because it is an operator-visible narrowing of a documented "anywhere"
+override.** An `IMS_BACKUP_DIR` under `/var/lib/<app>`, under `/opt/<app>`, or anywhere else the
+**service account** owns is now refused. That was the point: `mkdir -p` accepts a
+symlink-to-directory at its final component and returns 0, and `pre-update-<stamp>.sql.gz.part` is a
+predictable name in a directory that account can watch — so before this change that account could
+redirect root's dump and root's prune into a directory of its choosing (measured: a dump written and
+published inside a root-owned `0700` directory the account could not even list, and two pre-existing
+root-owned files there deleted by the prune), or plant a named pipe at the partial's name and make
+root's `gzip >` block for ever with the service stopped, cron stopped and the database connections
+already fenced.
+
+**To keep backups on another volume, bind-mount it under a root-owned path; do not symlink one.** A
+symbolic link at any component is refused, because nothing proves the path its target resolves
+through — the same rule, and the same reason, as the state roots in *Putting a state root on another disk*, above.
+
+**The refusal happens at the migration step, with the service already stopped.** Nothing is
+migrated, the schema is untouched and the previous release is still the one on disk, so a re-run
+after fixing `IMS_BACKUP_DIR` is clean — but the site is down while you fix it. Validate the value
+before you start a cutover; moving the check into pre-flight is filed as a follow-up to `o3d-noka`.
+
+Note that `APP_DIR/.env` carries a *different* variable also spelled `BACKUP_DIR` — that one is the
 application's own upload/backup area under the state directory, it is owned by the service account
 by design, and it is **not** a valid value for `IMS_BACKUP_DIR`.
+
+**`scripts/backup.sh` is NOT covered by any of this.** It is an unwired legacy helper: its
+`APP_NAME` is `onetwoinventory` where every installed path is `one-two-inventory`, so on a real host
+it exits at its own `.env` check before it writes anything, and nothing in `install.sh` schedules
+it. It still carries the old shape — `mkdir -p "$1"`, `gzip > "$1/backup-<stamp>.sql.gz"`, an
+`ln -sf` at a predictable `latest.sql.gz`, and a `find … -delete` prune — so **do not wire it into
+cron against an app-owned directory**. Making it reachable means giving it this rule first; that is
+filed as a follow-up to `o3d-noka`, and a regression fails if its paths are repaired without it.
 
 What was tried and withdrawn, so that nobody re-attempts it: a symlink-proof walk anchored at the
 override's own parent directory (it validates only the final component, because the walk treats its
@@ -4109,8 +4154,11 @@ so they add no window the entrypoint does not already have (true only of a tree 
 which is why r5 refuses root out of any other — best-effort, and blind to a relabelled tree: see
 *[The supported bootstrap](#supported-bootstrap)*) — and pinning the helper would only move
 the boundary to a script read from the same checkout. `scripts/lib/pin-source-file.mjs` was built
-for exactly that and deleted for exactly that reason. The same late-read shape already ships twice,
-in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
+for exactly that and deleted for exactly that reason. **Constraining the override is what made all
+three rounds unnecessary**: nothing but root can now plant a symbolic link, a named pipe or a stale
+`.part` at any name involved, so a plain redirection has no TOCTOU left to lose and no helper has to
+be executed at the least recoverable moment of the cutover. The same late-read shape still ships
+twice, in `install.sh`'s `chown_state_tree()` and its auth probe; that is `o3d-kyqa`.
 
 Never run two versions of IMS against the same database at once — no rolling restart, no
 blue/green overlap, no second instance left running on another port.

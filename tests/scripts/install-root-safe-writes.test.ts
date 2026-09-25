@@ -25,7 +25,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import test, { type TestContext } from 'node:test'
 
 import { maskShellSource, shellAssignments, shellConstant, shellConstantAssignments, shellConstantOptional, shellFunction, shellFunctionBodyCount, shellFunctionDefinitions, shellWordLiteral } from './shell-symbol.ts'
@@ -4713,6 +4713,74 @@ const UPDATE_GIT_COPY_RETIRED = [
   '    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"',
 ].join('\n')
 
+/** The gate, as it ships, lifted from the file that defines it. */
+const ANCESTRY_FUNCTIONS = ['root_ancestry_refuse', '_root_ancestry_here_is_private',
+  'enter_root_owned_ancestry', 'open_root_owned_ancestry', 'close_root_owned_ancestry'] as const
+const ANCESTRY_LIB = ANCESTRY_FUNCTIONS.map((name) => shellFunction(CUTOVER_NS_LIB, name)).join('\n')
+
+/** The shipped backup block, lifted by its own first and last statement. */
+const BACKUP_BLOCK_FIRST = '  open_root_owned_ancestry "${BACKUP_DIR}" "the backup directory (IMS_BACKUP_DIR)" || die \\'
+const BACKUP_BLOCK_LAST = '  close_root_owned_ancestry'
+const UPDATE_BACKUP_BLOCK = shippedUpdateBlock(BACKUP_BLOCK_FIRST, BACKUP_BLOCK_LAST)
+
+/** The r4 statements this change retired, typed here because they are in no shipped file — which is
+ *  what makes them a mutation and not a second reading of the subject. */
+const UPDATE_BACKUP_RETIRED = [
+  '  mkdir -p "${BACKUP_DIR}"',
+  '  info "Backing up database to ${BACKUP_TARGET}..."',
+  '  BACKUP_PARTIAL="${BACKUP_TARGET}.part"',
+  '  backup_rc=0',
+  '  pg_dump "${MIGRATION_DATABASE_URL}" | gzip > "${BACKUP_PARTIAL}" || { backup_rc=$?; rm -f "${BACKUP_PARTIAL}"; }',
+  '  pin_migration_window "The pre-migration backup"',
+  '  [[ "${backup_rc}" -eq 0 ]] || die "pg_dump did not complete"',
+  '  mv "${BACKUP_PARTIAL}" "${BACKUP_TARGET}"',
+  '  BACKUP_FILE="${BACKUP_TARGET}"',
+  '  success "Backup saved: ${BACKUP_FILE}"',
+  '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --',
+].join('\n')
+
+const BACKUP_STAMP = 'pre-update-00000000-000000.sql.gz'
+
+/** One run of a backup block against one ${BACKUP_DIR}. Everything the entrypoint would provide is
+ *  stubbed; the gate, the redirection, the publication and the prune are the shipped bytes.
+ *  `idStub` replaces the ACTING UID, which is the only way a harness with one account can exhibit
+ *  the "owned by somebody else" refusal — the uid is a parameter of the rule (`id -u`) for exactly
+ *  this reason, and every other case here runs with the real one. */
+function backupRun(backupDir: string, block: string, opts: { idStub?: string, extra?: string[] } = {}): Run {
+  return runBash([
+    'set -uo pipefail',
+    ANCESTRY_LIB,
+    'error() { printf "ERROR: %s\\n" "$*" >&2; }',
+    'die() { error "$*"; exit 1; }',
+    'info() { printf "INFO: %s\\n" "$*"; }',
+    'success() { printf "SUCCESS: %s\\n" "$*"; }',
+    'warn() { printf "WARN: %s\\n" "$*" >&2; }',
+    'APP_NAME="one-two-inventory"',
+    'APP_USER="ims-app"',
+    'MIGRATION_DATABASE_URL="postgresql://example/db"',
+    'pg_dump() { printf "THE WHOLE DATABASE, AS ROOT READ IT FROM %s\\n" "$1"; }',
+    'gzip() { cat; }',
+    'pin_migration_window() { :; }',
+    // Stubbed for the reason the r4 rig stubs it (o3d-z5be r7): what is measured here is WHERE the
+    // block writes, not the tree-overlap question, which privileged-helper-set.test.ts measures.
+    'privileged_spare_running_tree() { return 0; }',
+    'IMS_DRIVER_OVERLAP_REASON=""',
+    ...(opts.idStub ? [opts.idStub] : []),
+    `BACKUP_DIR=${q(backupDir)}`,
+    `BACKUP_BASENAME=${q(BACKUP_STAMP)}`,
+    'BACKUP_TARGET="${BACKUP_DIR}/${BACKUP_BASENAME}"',
+    ...(opts.extra ?? []),
+    block,
+    'echo REACHED_THE_END',
+  ].join('\n'))
+}
+
+/** How many `pre-update-*.sql.gz` entries a directory holds, and what they are. */
+function backups(dir: string): string[] {
+  return readdirSync(dir).filter((name) => /^pre-update-.*\.sql\.gz$/.test(name)).sort()
+}
+
+
 test('[o3d-ov60] update.sh copies the git metadata into a directory it created and pinned, never into a name', (t) => {
   // The name update.sh removes and re-creates belongs to ${APP_USER}: `rm -rf` unlinks a symlink
   // without following it, which is correct, and leaves the entry free to be re-created between the
@@ -4805,8 +4873,7 @@ test('[o3d-ov60 r4] the withdrawn backup helper is gone, and update.sh executes 
     'scripts/lib/write-new-file.mjs made root execute bytes out of an ${APP_USER}-owned checkout '
     + 'in the middle of a cutover; it is withdrawn, and an unused copy is an invitation to re-wire it')
 
-  const block = shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --')
-  const code = block.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
+  const code = UPDATE_BACKUP_BLOCK.split('\n').filter((line) => !/^\s*#/.test(line)).join('\n')
   assert.ok(!/\bnode\b/.test(code),
     `update.sh's backup block must run no program resolved out of the checkout:\n${code}`)
   assert.ok(!/BACKUP_WRITER|IMS_BACKUP_WRITER_HELPER/.test(UPDATE_SH),
@@ -4816,12 +4883,15 @@ test('[o3d-ov60 r4] the withdrawn backup helper is gone, and update.sh executes 
   // next reader meets a bare `mkdir -p` and closes it again the same way. Lifted as its own
   // contiguous region, so a paragraph moved away from the statement it explains fails this too.
   const record = shippedUpdateBlock(
-    '  # THIS IS BACK TO `mkdir -p` AND A PLAIN REDIRECTION, AND THAT IS THE RESULT OF THE ROUND',
-    '  mkdir -p "${BACKUP_DIR}"',
+    '  # THE OVERRIDE IS CONSTRAINED, AND THAT IS WHAT DISSOLVED THIS WHOLE SITE (o3d-noka, closing',
+    BACKUP_BLOCK_FIRST,
   )
-  for (const owed of ['o3d-noka', 'o3d-kyqa', 'ARBITRARY CODE EXECUTION AS ROOT']) {
+  // o3d-noka: the three rounds are CLOSED rather than withdrawn now, and the record of what they
+  // each cost has to survive the closure — a block that reads as though nothing had ever gone wrong
+  // here is the clearest possible invitation to reach for a helper again.
+  for (const owed of ['o3d-noka', 'o3d-kyqa', 'ARBITRARY CODE EXECUTION AS ROOT', 'set -C', 'named pipe']) {
     assert.ok(record.includes(owed),
-      `the withdrawal must say ${owed} at the site, or it is a silent revert:\n${record}`)
+      `the record must say ${owed} at the site, or the next round re-attempts it:\n${record}`)
   }
 })
 
@@ -4874,10 +4944,18 @@ test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutove
         // block runs, not the guard. The guard itself is measured in privileged-helper-set.test.ts.
         'privileged_spare_running_tree() { return 0; }',
         'IMS_DRIVER_OVERLAP_REASON=""',
+        // o3d-noka: the shipped block now opens its directory through the ancestry gate, so the gate
+        // comes with it — from the file that defines it — and the entrypoint's own ${APP_NAME},
+        // which its refusal text names. The ancestry here satisfies the rule (a `mkdtemp` 0700
+        // parent this account owns), so the shipped block still REACHES the writes; that is the
+        // whole point of the comparison below.
+        ANCESTRY_LIB,
+        'APP_NAME="one-two-inventory"',
         // THE WINDOW, opened at the call site the shipped block already makes.
         `info() { printf "INFO: %s\\n" "$*"; cat > ${q(helper)} <<'PLANTED'\n${planted}PLANTED\n}`,
         `BACKUP_DIR=${q(backupDir)}`,
-        `BACKUP_TARGET="\${BACKUP_DIR}/${'pre-update-00000000-000000.sql.gz'}"`,
+        `BACKUP_BASENAME=${q(BACKUP_STAMP)}`,
+        'BACKUP_TARGET="${BACKUP_DIR}/${BACKUP_BASENAME}"',
         ...extra,
         statement,
         'echo REACHED_THE_WRITES',
@@ -4919,10 +4997,7 @@ test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutove
 
   // THE SHIPPED BLOCK, through the same rig and the same window. It resolves no program, so the
   // same plant reaches nothing: the redirection is performed by the bash that is already running.
-  const shipped = rig(
-    shippedUpdateBlock('  mkdir -p "${BACKUP_DIR}"', '  ls -t "${BACKUP_DIR}"/pre-update-*.sql.gz 2>/dev/null | tail -n +11 | xargs -r rm --'),
-    [],
-  )
+  const shipped = rig(UPDATE_BACKUP_BLOCK, [])
   assert.equal(existsSync(shipped.owned), false, 'precondition: nothing has been executed yet')
   const clean = runBash(shipped.script)
   assert.match(clean.stdout, /^INFO: /m, `precondition: the same window must have been reached: ${clean.stdout} ${clean.stderr}`)
@@ -4932,6 +5007,401 @@ test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutove
     'the plant must still have happened, or the comparison is between two different runs')
   assert.equal(existsSync(shipped.owned), false,
     'and the shipped block must execute nothing that was planted: it names no program to run')
+})
+
+// ---------------------------------------------------------------------------
+// AND THEN THE OVERRIDE WAS CONSTRAINED, WHICH IS WHAT MADE ALL THREE OF THOSE ROUNDS
+// UNNECESSARY (o3d-noka, closing o3d-ov60 site 5)
+//
+// THE DEFECT, MEASURED BEFORE IT WAS FIXED. With the r4 block on disk, a rig that put one
+// ${APP_USER}-owned component on the way to ${IMS_BACKUP_DIR} and replaced it with a symbolic link
+// got, as root and with the release's own statements:
+//
+//   * a whole-database dump WRITTEN AND PUBLISHED inside a root-owned 0700 directory the account
+//     could not read, write or even list;
+//   * TWO pre-existing root-owned files in that directory DELETED by the `xargs -r rm --` prune;
+//   * and, with a named pipe at the predictable `.part` name, root's `gzip >` BLOCKED until a
+//     timeout killed it — with the service stopped, cron stopped and the connections fenced.
+//
+// WHAT SHIPS NOW. open_root_owned_ancestry() in lib/cutover-namespace.sh walks the override from `/`
+// down to and including the backup directory, one component at a time as a CHDIR, and requires every
+// one of them to be a real directory owned by root or by the account this run executes as and
+// writable by nobody else. It refuses, BY NAME, what is not — including a component it cannot stat
+// or cannot enter — and hands the result back as an open DESCRIPTOR, so the dump, the publishing
+// rename and the prune are all `openat`/`renameat`/`unlinkat` against the inode that was proved.
+//
+// WHAT THE TESTS BELOW HAVE TO ESTABLISH, IN ORDER, BECAUSE A GATE THAT REFUSES EVERYTHING PASSES
+// EVERY REFUSAL TEST WHILE BEING USELESS:
+//
+//   1. the ACCEPT path genuinely proceeds — the dump is taken, published and pruned to ten, through
+//      the descriptor, at a mode the service account cannot read;
+//   2. each rejected ancestry is refused, the refusal NAMES the component, and NOTHING is written;
+//   3. the symlinked-component case is exhibited BEHAVIOURALLY against a victim directory, with the
+//      retired statements through the same rig as the mutation, so the rig is shown able to loot it;
+//   4. and the next edit cannot quietly undo it: the three operations are required, by grammar, to
+//      name the descriptor and not the operator's pathname.
+//
+// THE ACCEPT PATH IS MEASURABLE AT ALL only because the rule accepts a component owned by ROOT OR BY
+// THE ACCOUNT RUNNING THE WALK and credits the sticky bit on a strict ancestor: this suite runs as
+// one unprivileged uid under a 1777 /tmp, where a rule spelled "owned by uid 0" could only ever be
+// observed refusing. That is o3d-noka's own design note, and it is why these tests are not all
+// negative.
+// ---------------------------------------------------------------------------
+
+test('[o3d-noka] the ACCEPT path proceeds: the dump is taken, published and pruned to ten through the pinned descriptor', (t) => {
+  const root = createTempDirSync('ims-noka-accept-', t)
+  const backupDir = join(root, 'one-two-inventory')
+  mkdirSync(backupDir)
+
+  // NOT VACUOUS, ESTABLISHED FIRST: the ancestry really does satisfy the rule this harness can
+  // satisfy, and there is no dump yet. `%a` is printed so a reader of the log knows what was
+  // examined rather than taking "it passed" on trust.
+  assert.notEqual(process.getuid?.(), 0,
+    'this suite must run unprivileged: with uid 0 the owner half of the rule is satisfied by every '
+    + 'directory on the host and the refusals below cannot be exhibited')
+  const chain = [root, backupDir].map((dir) => `${dir} uid=${statSync(dir).uid} mode=${(statSync(dir).mode & 0o7777).toString(8)}`)
+  assert.equal(statSync(root).uid, process.getuid?.(), `precondition: ${chain.join(' | ')}`)
+  assert.equal(statSync(root).mode & 0o22, 0, `precondition: the parent must not be group/other-writable: ${chain.join(' | ')}`)
+  assert.deepEqual(backups(backupDir), [], 'precondition: nothing has been dumped yet')
+
+  const ran = backupRun(backupDir, UPDATE_BACKUP_BLOCK)
+  assert.match(ran.stdout, /^REACHED_THE_END$/m,
+    `the block must run to completion on an ancestry that satisfies the rule — a gate that refuses `
+    + `everything passes every refusal test below while being useless:\n${ran.stdout}${ran.stderr}`)
+  assert.deepEqual(backups(backupDir), [BACKUP_STAMP],
+    `the dump must be published at its final name:\n${ran.stdout}${ran.stderr}`)
+  assert.equal(readFileSync(join(backupDir, BACKUP_STAMP), 'utf8'),
+    'THE WHOLE DATABASE, AS ROOT READ IT FROM postgresql://example/db\n',
+    'and it must be the dump, not an empty file')
+  assert.equal(existsSync(join(backupDir, `${BACKUP_STAMP}.part`)), false,
+    'and the partial must be gone, because the publication was a rename and not a copy')
+  // THE CONFIDENTIALITY HALF (o3d-noka). `umask 077` on the dump, 0700 on a directory the walk
+  // creates: a dump of the whole database is not readable by the account whose data it is.
+  assert.equal(statSync(join(backupDir, BACKUP_STAMP)).mode & 0o7777, 0o600,
+    `the dump must be created private: mode was ${(statSync(join(backupDir, BACKUP_STAMP)).mode & 0o7777).toString(8)}`)
+
+  // AND THE PRUNE RUNS, THROUGH THE SAME DESCRIPTOR. Fourteen in, ten out — which is also the only
+  // measurement that distinguishes "the prune was aimed at the descriptor" from "the prune silently
+  // matched nothing because /proc/self/fd/N is not a directory a glob can be read out of".
+  for (let i = 1; i <= 13; i += 1) {
+    writeFileSync(join(backupDir, `pre-update-2026010${String(i).padStart(2, '0')}-000000.sql.gz`), 'old\n')
+  }
+  assert.equal(backups(backupDir).length, 14, 'precondition: fourteen candidates for a prune that keeps ten')
+  const pruned = backupRun(backupDir, UPDATE_BACKUP_BLOCK, { extra: ['BACKUP_BASENAME="pre-update-00000000-000001.sql.gz"'] })
+  assert.match(pruned.stdout, /^REACHED_THE_END$/m, `${pruned.stdout}${pruned.stderr}`)
+  assert.equal(backups(backupDir).length, 10,
+    `the prune must keep exactly ten, so it was READ AND EXECUTED through the descriptor: `
+    + `${backups(backupDir).join(', ')}\n${pruned.stdout}${pruned.stderr}`)
+})
+
+test('[o3d-noka] every ancestry the rule rejects is REFUSED, the refusal names the component, and nothing is written', (t) => {
+  assert.notEqual(process.getuid?.(), 0,
+    'this suite must run unprivileged: root has CAP_DAC_OVERRIDE, so the unreadable-component cases '
+    + 'below cannot be exhibited as root and would pass without examining anything')
+  const root = createTempDirSync('ims-noka-refuse-', t)
+  const self = String(process.getuid?.())
+
+  /** Each case: what to point ${IMS_BACKUP_DIR} at, what the refusal must NAME, and the words that
+   *  say WHY — so a refusal for the wrong reason cannot satisfy the case. */
+  const cases: Array<{ what: string, dir: string, names: string, because: RegExp, idStub?: string }> = []
+
+  // 1. A COMPONENT OWNED BY SOMEBODY ELSE. The acting uid is the stub's; every directory this
+  //    harness owns is then "neither root nor the account this run executes as" — and the component
+  //    the refusal must name is the SHALLOWEST such one, which under this suite's TMPDIR is the
+  //    sentinel directory rather than the sandbox. It is COMPUTED and not typed, because a typed
+  //    guess at the answer is a test that passes on the wrong component.
+  const foreign = join(root, 'foreign')
+  mkdirSync(join(foreign, 'backups'), { recursive: true })
+  let shallowestOwned = join(foreign, 'backups')
+  for (let dir = dirname(shallowestOwned); dir !== '/'; dir = dirname(dir)) {
+    if (statSync(dir).uid !== 0) shallowestOwned = dir
+  }
+  assert.equal(statSync(shallowestOwned).uid, process.getuid?.(),
+    `precondition: ${shallowestOwned} must be the shallowest component this account owns`)
+  cases.push({
+    what: 'a component owned by neither root nor this run',
+    dir: join(foreign, 'backups'),
+    names: shallowestOwned,
+    because: /is owned by uid 999?\d*, which is neither root nor the account this run executes as \(uid 4294967200\)/,
+    idStub: 'id() { if [[ "${1:-}" == "-u" ]]; then echo 4294967200; else command id "$@"; fi; }',
+  })
+
+  // 2. A GROUP/OTHER-WRITABLE PARENT, which is where the sticky bit is NOT credited: it stops an
+  //    existing entry being replaced and does nothing about who creates one first.
+  const wideParent = join(root, 'wide-parent')
+  mkdirSync(wideParent)
+  chmodSync(wideParent, 0o1777)
+  cases.push({ what: 'a world-writable parent, sticky or not', dir: join(wideParent, 'backups'), names: wideParent, because: /writable by group or other/ })
+
+  // 3. A GROUP/OTHER-WRITABLE BACKUP DIRECTORY, which is the FIFO and the stale `.part` in one:
+  //    anybody may create a name in it.
+  const wideDest = join(root, 'wide-dest', 'backups')
+  mkdirSync(wideDest, { recursive: true })
+  chmodSync(wideDest, 0o777)
+  cases.push({ what: 'a world-writable backup directory', dir: wideDest, names: wideDest, because: /writable by group or other/ })
+
+  // 4. A GROUP/OTHER-WRITABLE, NON-STICKY STRICT ANCESTOR, which anybody may rename aside.
+  const wideAncestor = join(root, 'wide-ancestor')
+  mkdirSync(join(wideAncestor, 'mid', 'backups'), { recursive: true })
+  chmodSync(wideAncestor, 0o777)
+  cases.push({ what: 'a world-writable non-sticky ancestor', dir: join(wideAncestor, 'mid', 'backups'), names: wideAncestor, because: /not sticky/ })
+
+  // 5. A SYMBOLIC LINK AT A COMPONENT — the shape the reproduction used.
+  const linkTarget = join(root, 'elsewhere')
+  mkdirSync(join(linkTarget, 'backups'), { recursive: true })
+  const link = join(root, 'linked')
+  symlinkSync(linkTarget, link)
+  cases.push({ what: 'a symbolic link at a component', dir: join(link, 'backups'), names: link, because: /is a symbolic link, not a real directory/ })
+
+  // 6. A COMPONENT THAT CANNOT BE STAT'ED — it does not exist and cannot be created, because its
+  //    parent is readable and searchable but not writable. An unstattable component is a REFUSAL.
+  const noCreate = join(root, 'no-create')
+  mkdirSync(noCreate)
+  chmodSync(noCreate, 0o500)
+  cases.push({ what: 'a component that cannot be stat\'ed or created', dir: join(noCreate, 'backups'), names: join(noCreate, 'backups'), because: /could not be inspected/ })
+
+  // 7. A COMPONENT THAT CANNOT BE ENTERED, which is the other half of the same sentence.
+  const noEnter = join(root, 'no-enter')
+  mkdirSync(join(noEnter, 'backups'), { recursive: true })
+  chmodSync(noEnter, 0o000)
+  cases.push({ what: 'a component that cannot be entered', dir: join(noEnter, 'backups'), names: noEnter, because: /could not be entered/ })
+
+  // 8 and 9. A path that is not absolute, and one that walks back up through itself.
+  cases.push({ what: 'a relative path', dir: 'backups/here', names: 'backups/here', because: /is not an absolute path/ })
+  cases.push({ what: "a path with a '..' component", dir: `${root}/../${basename(root)}/backups`, names: root, because: /has a '\.' or '\.\.' component/ })
+
+  let examined = 0
+  for (const entry of cases) {
+    const ran = backupRun(entry.dir, UPDATE_BACKUP_BLOCK, entry.idStub ? { idStub: entry.idStub } : {})
+    const said = `${ran.stdout}${ran.stderr}`
+    assert.doesNotMatch(said, /^REACHED_THE_END$/m, `${entry.what}: the block must not complete:\n${said}`)
+    assert.match(said, /^REFUSING: /m, `${entry.what}: the gate must say it is refusing:\n${said}`)
+    assert.match(said, /^ERROR: The pre-update database dump has nowhere it may be written/m,
+      `${entry.what}: and the entrypoint must die on it rather than carry on:\n${said}`)
+    assert.ok(said.includes(entry.names),
+      `${entry.what}: the refusal must NAME ${entry.names}, or an operator cannot act on it:\n${said}`)
+    assert.match(said, entry.because, `${entry.what}: and it must say why:\n${said}`)
+    // NOTHING WAS WRITTEN — asserted over the WHOLE sandbox rather than at one expected path, so a
+    // dump that landed somewhere unexpected is caught too. The two deliberately unreachable
+    // directories are relaxed for the sweep and put back, because a `find` that could not descend
+    // into one of them would be a sweep with a hole exactly where a dump would be hidden; its exit
+    // status is asserted for the same reason.
+    chmodSync(noCreate, 0o700)
+    chmodSync(noEnter, 0o700)
+    const landed = spawnSync('find', [root, '-name', 'pre-update-*'], { encoding: 'utf8' })
+    chmodSync(noCreate, 0o500)
+    chmodSync(noEnter, 0o000)
+    assert.equal(landed.status, 0, `the sweep must have reached everything: ${landed.stderr}`)
+    assert.equal(landed.stdout.trim(), '',
+      `${entry.what}: nothing may be written anywhere under the sandbox:\n${landed.stdout}\n${said}`)
+    examined += 1
+  }
+  // AND THE TWO DELIBERATELY UNREACHABLE DIRECTORIES ARE LEFT REMOVABLE, so this suite's own
+  // temp-directory sweep can take the sandbox away instead of reporting a leak.
+  chmodSync(noCreate, 0o700)
+  chmodSync(noEnter, 0o700)
+
+  // THE PRECONDITION THAT THE LOOP RAN: nine cases, each of which reached its assertions.
+  assert.equal(examined, cases.length)
+  assert.equal(examined, 9, `all nine rejected ancestries must be exercised, examined ${examined}`)
+})
+
+test('[o3d-noka] THE DEFECT, EXHIBITED: the retired statements loot a victim directory through a symlinked component and the shipped block refuses', (t) => {
+  /**
+   * The behavioural half, and the one that stops this becoming a text rule. The rig is the SAME for
+   * both shapes and the plant is the same plant: one component of ${IMS_BACKUP_DIR} is a symbolic
+   * link to a directory holding eleven files that must survive. The retired `mkdir -p` + by-name
+   * shape writes the dump there AND deletes two of them; the shipped block refuses and touches
+   * nothing. If the retired shape ever stops looting, this rig has stopped being able to find the
+   * defect and the shipped half proves nothing.
+   */
+  const rig = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const victim = join(root, 'victim')
+    mkdirSync(victim)
+    for (let i = 1; i <= 11; i += 1) {
+      writeFileSync(join(victim, `pre-update-202609${String(i).padStart(2, '0')}-000000.sql.gz`), 'a real backup\n')
+    }
+    const owned = join(root, 'owned')
+    mkdirSync(owned)
+    symlinkSync(victim, join(owned, 'backups'))
+    return { root, victim, backupDir: join(owned, 'backups') }
+  }
+
+  const mutant = rig('ims-noka-exhibit-retired-')
+  assert.equal(backups(mutant.victim).length, 11, 'precondition: eleven files that must survive')
+  const looted = backupRun(mutant.backupDir, UPDATE_BACKUP_RETIRED)
+  assert.match(looted.stdout, /^REACHED_THE_END$/m,
+    `the retired shape must run to completion — it validates nothing:\n${looted.stdout}${looted.stderr}`)
+  assert.equal(existsSync(join(mutant.victim, BACKUP_STAMP)), true,
+    'THE DEFECT: the dump is written and published inside the directory the link chose, not the one '
+    + `the operator named:\n${looted.stdout}${looted.stderr}`)
+  assert.equal(backups(mutant.victim).length, 10,
+    'AND THE PRUNE DELETES THERE TOO: twelve entries, ten kept, so two files that were already in '
+    + `the victim directory are gone: ${backups(mutant.victim).join(', ')}`)
+
+  const shipped = rig('ims-noka-exhibit-shipped-')
+  const before = backups(shipped.victim)
+  assert.equal(before.length, 11, 'precondition: the same plant, the same eleven files')
+  const refused = backupRun(shipped.backupDir, UPDATE_BACKUP_BLOCK)
+  assert.doesNotMatch(refused.stdout, /^REACHED_THE_END$/m, `${refused.stdout}${refused.stderr}`)
+  assert.match(refused.stderr, /is a symbolic link, not a real directory/,
+    `and it must refuse for THIS reason, naming the component:\n${refused.stdout}${refused.stderr}`)
+  assert.ok(refused.stderr.includes(join(shipped.root, 'owned', 'backups')),
+    `naming the component that failed:\n${refused.stderr}`)
+  assert.deepEqual(backups(shipped.victim), before,
+    `and the victim directory must be untouched — nothing written, nothing deleted:\n${refused.stderr}`)
+  assert.equal(existsSync(join(shipped.victim, `${BACKUP_STAMP}.part`)), false,
+    'not even a partial')
+})
+
+test('[o3d-noka] the PRUNE is held, not merely checked: a component swapped after the gate cannot aim it', (t) => {
+  /**
+   * THE HALF A WALK ALONE CANNOT GIVE, and r1's entire finding (o3d-ov60 r4): a directory proved at
+   * one instant and then operated through its NAME is proved for none of the operations that follow.
+   * So the swap is made THROUGH THE WINDOW THE BLOCK ITSELF MAKES — `success` is called between the
+   * publication and the prune in every version of this block — and the two shapes are compared:
+   *
+   *   SHIPPED    the prune globs `/proc/self/fd/N`, which the kernel resolves to the open directory.
+   *              The rename cannot move it, so the prune reads and deletes inside the directory that
+   *              was proved.
+   *   BY NAME    the same block with `${BACKUP_AT}` replaced by `${BACKUP_DIR}` in the prune — which
+   *              is the mutation, and which follows the planted link and deletes in the victim.
+   *
+   * Both runs PASS the gate: this is not about the gate. It is about whether the gate's answer is
+   * still worth anything three statements later.
+   */
+  const rig = (prefix: string) => {
+    const root = createTempDirSync(prefix, t)
+    const victim = join(root, 'victim')
+    mkdirSync(victim)
+    for (let i = 1; i <= 11; i += 1) {
+      writeFileSync(join(victim, `pre-update-202609${String(i).padStart(2, '0')}-000000.sql.gz`), 'a real backup\n')
+    }
+    const backupDir = join(root, 'backups')
+    mkdirSync(backupDir)
+    // THE SWAP, at the call site the block already makes. `mv` the proved directory aside and leave a
+    // symbolic link to the victim at its name — which is what the account that owns a component of an
+    // unvalidated ${IMS_BACKUP_DIR} could do, and what nothing after a name-check can notice.
+    const swap = `success() { printf "SUCCESS: %s\\n" "$*"; mv ${q(backupDir)} ${q(join(root, 'moved'))}; ln -s ${q(victim)} ${q(backupDir)}; }`
+    return { root, victim, backupDir, moved: join(root, 'moved'), swap }
+  }
+
+  const byName = rig('ims-noka-toctou-byname-')
+  const mutantBlock = UPDATE_BACKUP_BLOCK.split('\n')
+    .map((line) => (/xargs -r rm --/.test(line) ? line.replace('${BACKUP_AT}', '${BACKUP_DIR}') : line))
+    .join('\n')
+  assert.notEqual(mutantBlock, UPDATE_BACKUP_BLOCK, 'the mutation must have changed the prune')
+  assert.match(mutantBlock, /^\s*ls -t "\$\{BACKUP_DIR\}"\/pre-update-\*\.sql\.gz /m, 'to the by-name form')
+  const looted = backupRun(byName.backupDir, mutantBlock, { extra: [byName.swap] })
+  assert.match(looted.stdout, /^SUCCESS: /m, `precondition: the window must have been reached:\n${looted.stdout}${looted.stderr}`)
+  assert.match(looted.stdout, /^REACHED_THE_END$/m, `${looted.stdout}${looted.stderr}`)
+  assert.equal(backups(byName.victim).length, 10,
+    'THE DEFECT: a prune written through the pathname followed the link planted after the gate and '
+    + `deleted inside the victim directory: ${backups(byName.victim).join(', ')}`)
+  assert.equal(backups(byName.moved).length, 1,
+    'and the directory that was actually proved kept its own dump, untouched by its own prune')
+
+  const held = rig('ims-noka-toctou-held-')
+  const before = backups(held.victim)
+  assert.equal(before.length, 11, 'precondition: the same plant, the same eleven files')
+  const ran = backupRun(held.backupDir, UPDATE_BACKUP_BLOCK, { extra: [held.swap] })
+  assert.match(ran.stdout, /^SUCCESS: /m, `precondition: the same window, reached:\n${ran.stdout}${ran.stderr}`)
+  assert.match(ran.stdout, /^REACHED_THE_END$/m, `${ran.stdout}${ran.stderr}`)
+  assert.deepEqual(backups(held.victim), before,
+    `the shipped prune must delete nothing in the victim directory — it never re-resolves the name:\n${ran.stdout}${ran.stderr}`)
+  // AND IT REALLY DID PRUNE, in the directory it was holding: the dump published there is still
+  // there, and the prune ran against that descriptor rather than silently matching nothing.
+  assert.deepEqual(backups(held.moved), [BACKUP_STAMP],
+    `and the proved directory still holds its own dump:\n${ran.stdout}${ran.stderr}`)
+})
+
+test('[o3d-noka] the dump, the publication and the prune name the DESCRIPTOR, and ${BACKUP_DIR} only where nothing is written', () => {
+  /**
+   * A SOURCE-SHAPED CHECK, ABOUT GRAMMAR AND NOT PROXIMITY, and it is the half the behaviour tests
+   * cannot give: `> "${BACKUP_TARGET}"` would pass every one of them on a host where no link is
+   * planted at the instant they run. r1's whole finding was that a directory proved once and
+   * operated through its NAME afterwards is proved for none of the operations — so the three
+   * statements are required to name ${BACKUP_AT}, and the two places ${BACKUP_DIR} may still appear
+   * are enumerated with what each of them does.
+   */
+  const lines = UPDATE_BACKUP_BLOCK.split('\n').filter((line) => !/^\s*#/.test(line))
+  assert.ok(lines.length >= 10, `the block must have been lifted: ${lines.length} statements`)
+
+  const writes = lines.filter((line) => /gzip >|^\s*mv |xargs -r rm --|^\s*BACKUP_PARTIAL=/.test(line))
+  assert.equal(writes.length, 4, `the four statements that name the partial, write, publish and prune:\n${writes.join('\n')}`)
+  for (const line of writes) {
+    assert.match(line, /\$\{BACKUP_AT\}|\$\{BACKUP_PARTIAL\}/,
+      `every statement that writes, publishes or deletes must resolve from the pinned descriptor:\n${line}`)
+    assert.doesNotMatch(line, /\$\{BACKUP_DIR\}|\$\{BACKUP_TARGET\}/,
+      `and none of them may re-resolve the operator's pathname — that is r1's finding:\n${line}`)
+  }
+  // AND ${BACKUP_PARTIAL} IS ITSELF UNDER THE DESCRIPTOR, which is what makes the redirection's
+  // reference to it a reference to the proved inode rather than an alias for ${BACKUP_TARGET}.
+  const partial = lines.filter((line) => /^\s*BACKUP_PARTIAL=/.test(line))
+  assert.equal(partial.length, 1, `the partial is named once:\n${partial.join('\n')}`)
+  assert.match(partial[0], /^\s*BACKUP_PARTIAL="\$\{BACKUP_AT\}\/\$\{BACKUP_BASENAME\}\.part"$/,
+    `and it is one component under the descriptor:\n${partial[0]}`)
+
+  // AND ${BACKUP_DIR} IS NOT SPELLED ANYWHERE ELSE IN THE BLOCK. Universal, not existential: a new
+  // statement using it fails this even if the four above still read correctly.
+  const namesDir = lines.filter((line) => /\$\{BACKUP_DIR\}/.test(line))
+  assert.equal(namesDir.length, 2, `only the gate and the overlap guard may name it:\n${namesDir.join('\n')}`)
+  assert.match(namesDir[0], /^\s*open_root_owned_ancestry "\$\{BACKUP_DIR\}" /,
+    `the gate, which is the one statement whose subject IS the pathname:\n${namesDir[0]}`)
+  assert.match(namesDir[1], /^\s*privileged_spare_running_tree "\$\{BACKUP_DIR\}" /,
+    `and the overlap guard, which asks a question about pathnames and writes nothing:\n${namesDir[1]}`)
+
+  // THE GATE IS THE FIRST STATEMENT IN THE BLOCK, so nothing can be written before it.
+  assert.match(lines[0], /^\s*open_root_owned_ancestry /, `the gate must come first:\n${lines.slice(0, 3).join('\n')}`)
+  // AND A FAILED GATE ENDS THE RUN. `|| die` and nothing else: a `|| warn`, a `|| true` or an `if`
+  // with an else-branch that carried on is the shape this issue exists to forbid.
+  assert.match(UPDATE_BACKUP_BLOCK, /^ {2}open_root_owned_ancestry "\$\{BACKUP_DIR\}" "the backup directory \(IMS_BACKUP_DIR\)" \|\| die \\$/m,
+    'the gate must be propagated with `|| die` and no fallback')
+  assert.ok(!/open_root_owned_ancestry[^\n]*\|\|\s*(true|warn|:)/.test(UPDATE_SH),
+    'update.sh must not carry a version of the gate whose failure is tolerated')
+  // AND IT IS DEFINED ONCE, IN THE LIBRARY. A copy in an entrypoint is how every finding in
+  // lib/cutover-namespace.sh started: one rule, several readers, fixed in the one being read.
+  for (const name of ANCESTRY_FUNCTIONS) {
+    assert.equal(shellFunctionDefinitions(CUTOVER_NS_LIB, name, 'scripts/lib/cutover-namespace.sh').length, 1,
+      `${name}() must be defined exactly once, in the library`)
+    assert.equal(shellFunctionDefinitions(UPDATE_SH, name, 'scripts/update.sh').length, 0,
+      `${name}() must not be copied into scripts/update.sh`)
+  }
+})
+
+test('[o3d-noka] scripts/backup.sh is exempt from the rule ONLY while it cannot reach an installed tree', () => {
+  /**
+   * THE SECOND READER, DECLARED RATHER THAN FORGOTTEN. scripts/backup.sh performs the same sequence
+   * this change constrained — `mkdir -p "$1"`, a root-side `gzip >` at a predictable name, an
+   * `ln -sf` at `latest.sql.gz` and a `find … -delete` prune — into a directory an operator names as
+   * its FIRST ARGUMENT, and it does not go through the gate.
+   *
+   * IT IS EXEMPT BECAUSE IT CANNOT RUN, and that is a precondition rather than an opinion: its
+   * hardcoded ${APP_NAME} is not the installed one, so ${APP_DIR}/.env does not exist and it exits
+   * before its first write; nothing in install.sh schedules it. THIS TEST FAILS THE MOMENT THAT
+   * STOPS BEING TRUE, which is the only honest way to carry an exemption — repair its paths and the
+   * gate has to come with them (o3d-noka follow-up).
+   */
+  const backupSh = readFileSync(join(REPO, 'scripts/backup.sh'), 'utf8')
+  // The VALUE, read the same way out of both files, and both reads are asserted to have found
+  // something — a regex that matched nothing would make this exemption unconditional.
+  const appName = (source: string) => /^(?:readonly )?APP_NAME="([^"]*)"$/m.exec(source)?.[1]
+  assert.ok(appName(backupSh), 'precondition: scripts/backup.sh must assign APP_NAME')
+  assert.ok(appName(INSTALL_SH), 'precondition: scripts/install.sh must assign APP_NAME')
+  const reaches = appName(backupSh) === appName(INSTALL_SH)
+  const gated = /open_root_owned_ancestry/.test(backupSh)
+  assert.ok(!reaches || gated,
+    'scripts/backup.sh now resolves the same ${APP_NAME} as install.sh, so it can read an installed '
+    + '.env and reach its root-side dump, publish and prune. Give it open_root_owned_ancestry (or the '
+    + 'equivalent) before making it reachable: it writes as root into a directory named by its first '
+    + 'argument, with nothing validating the ancestry — o3d-noka.')
+  // NOT VACUOUS: the sequence this is about is still in that file, so the exemption is about a real
+  // reader rather than a file that no longer does any of it.
+  assert.match(backupSh, /^mkdir -p "\$\{BACKUP_DIR\}"$/m, 'precondition: backup.sh still prepares its directory by name')
+  assert.match(backupSh, /gzip -9 > "\$\{BACKUP_FILE\}"/, 'precondition: and still redirects a root-side dump into it')
+  assert.match(backupSh, /find "\$\{BACKUP_DIR\}" -name "backup-\*\.sql\.gz" -mtime/, 'precondition: and still prunes inside it')
+  assert.equal(gated, false, 'precondition: and is not gated, which is what this test is carrying')
 })
 
 // ---------------------------------------------------------------------------

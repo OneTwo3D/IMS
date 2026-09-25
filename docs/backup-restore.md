@@ -2,6 +2,16 @@
 
 The backup system creates full snapshots of your database that can be stored locally, uploaded to remote storage, or used to restore the system to a previous state.
 
+**This is the application's own backup area, and it is not the same thing as the cutover dump.** The
+directory described on this page is `BACKUP_DIR` in `APP_DIR/.env` — under the state directory, owned
+by the service account, written by the application. `scripts/update.sh` also takes a **pre-migration
+dump** immediately before it moves the schema; that one is written **by root**, its directory is
+`IMS_BACKUP_DIR` (default `/var/backups/<app>`), and since o3d-noka every component of that path must
+be a real directory owned by root and writable by nobody else or the cutover refuses. Pointing
+`IMS_BACKUP_DIR` at the directory on this page is therefore a refusal, deliberately — the two
+variables have the same name and opposite ownership requirements. See *[Where the pre-update dump may
+go](installation.md#where-the-pre-update-dump-may-go)* in the installation guide.
+
 ## Creating a Backup
 
 Click **Create Backup** to generate a full PostgreSQL dump of your database. The backup file is:

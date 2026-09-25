@@ -8425,6 +8425,13 @@ test('update.sh never reads a shell variable that only the deleted `source` coul
     // IMS_DRIVER_PUBLISHED_DIGEST, which update.sh expands with no default in its refusals and its
     // driver-refresh report — so leaving it out reports five names as unsupplied.
     ...readFileSync(join(process.cwd(), 'scripts/lib/privileged-helpers.sh'), 'utf8').split(/\r?\n/),
+    // …and the cutover namespace, sourced by all three since o3d-secops r22. It assigns
+    // IMS_ROOT_ANCESTRY_REASON and IMS_ROOT_ANCESTRY_FD at script scope (o3d-noka), which update.sh
+    // expands with no default in its backup-directory refusal and in the three statements aimed at
+    // the descriptor — so leaving it out reports two names as unsupplied. THIS TEST FOUND THEM: the
+    // first draft assigned both only inside the functions that refuse, which `set -u` would have
+    // turned into an "unbound variable" crash in place of the refusal that names the component.
+    ...readFileSync(join(process.cwd(), 'scripts/lib/cutover-namespace.sh'), 'utf8').split(/\r?\n/),
   ]
   const label = 'update.sh'
   const code = [...UPDATE_LINES, ...LIBRARY_LINES].filter((line) => !/^\s*#/.test(line))
@@ -11935,6 +11942,14 @@ const CUTOVER_NS_OWNED = [
   // o3d-ov60. It was defined in install.sh and called only from install.sh, so update.sh's clone
   // path — the same rm -rf and the same cp -a into the same name — could not reach it.
   'copy_tree_into_new_dir',
+  // o3d-noka. The rule about which directory a privileged run may dump the database into. update.sh
+  // is its only caller today; a second copy in an entrypoint is how every finding in this library
+  // started, so it is named here rather than left to be noticed.
+  'root_ancestry_refuse',
+  '_root_ancestry_here_is_private',
+  'enter_root_owned_ancestry',
+  'open_root_owned_ancestry',
+  'close_root_owned_ancestry',
   'enter_service_subdir',
   'mkdir_service_subdir',
   'own_service_subdir',

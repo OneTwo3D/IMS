@@ -292,6 +292,283 @@ own_service_subdir() {
 }
 
 # ---------------------------------------------------------------------------
+# A DIRECTORY A PRIVILEGED RUN MAY DUMP THE DATABASE INTO — THE WHOLE ANCESTRY, OR A REFUSAL
+# (o3d-noka, and it closes o3d-ov60 site 5)
+#
+#   open_root_owned_ancestry <dir> <what>     leaves ${IMS_ROOT_ANCESTRY_FD} open on <dir>
+#   close_root_owned_ancestry                 closes it again
+#
+# THE FINDING, IN ONE SENTENCE. update.sh writes a `pg_dump` of the whole database, publishes it
+# with `mv` and prunes beside it with `rm --`, all as root, into a directory an operator names with
+# ${IMS_BACKUP_DIR} and which nothing validated. The shipped default /var/backups/${APP_NAME} sits
+# under a root-owned parent and is safe; the override moves all three anywhere, including underneath
+# a path ${APP_USER} owns, where that account replaces one component with a symbolic link and root's
+# dump, root's publication and root's delete all land where it chose. Measured, with the release's
+# own statements: a whole-database dump written and published inside a root-owned 0700 directory the
+# account could not even list, two pre-existing root-owned files in it deleted by the prune, and a
+# named pipe at the predictable `.part` name wedging root's redirection for ever.
+#
+# THREE ROUNDS TRIED TO DEFEND THE WRITES INSTEAD OF CONSTRAINING THE PATH, and each closed its
+# finding by opening a worse one — the third turned a denial of service into ARBITRARY CODE
+# EXECUTION AS ROOT. The record is kept at the call site in scripts/update.sh, where the next reader
+# meets it. What that record concluded is this function: ask the question of the PATH, once, and
+# refuse what cannot answer it — after which nothing but root can plant a symlink, a FIFO or a stale
+# `.part` at any name involved, the predictable name has no TOCTOU left to lose, no helper has to be
+# executed, and the dump stops being readable by the service account into the bargain.
+#
+# THE RULE. Every component from `/` down to AND INCLUDING <dir> must be a real directory — never a
+# symbolic link — owned by root or by the account this run executes as, and writable by nobody else:
+# `mode & 0022 == 0`. That also bounds any POSIX ACL, because the group bits of a file carrying one
+# ARE the ACL mask. A component that fails is NAMED, with the remedy, and the run STOPS: there is no
+# branch below this that writes anyway.
+#
+# AND AN UNREADABLE OR UNSTATTABLE COMPONENT IS NOT PERMISSION TO PROCEED. A `stat` that cannot run
+# is the one answer a check like this is most tempted to treat as absence of evidence; it is treated
+# as a refusal, and there is a regression for each of the two shapes it takes (a component that
+# cannot be stat'ed at all, and one whose parent denies this run the search permission to look).
+#
+# WHAT THE GUARANTEE IS, STATED PLAINLY, BECAUSE "check then use" IS THE DEFECT CLASS THIS
+# REPOSITORY KEEPS PRODUCING:
+#
+#   * THE WALK IS A CHDIR, NOT A PATH. Each component is lstat-ed (`stat` with no `-L`, so a link
+#     reads as "symbolic link" and is refused rather than followed), entered with `cd -P`, and then
+#     the directory we LANDED IN is required to be the inode that entry named, with `..` still the
+#     directory we came from. An ancestor is never named again after it has been entered, so a
+#     rename above us cannot redirect anything: the shell holds a descriptor on the inode. This is
+#     enter_service_subdir()'s mechanism and pin_publish_root_parent()'s, unchanged, and the two
+#     checks together also refuse a directory moved WHOLESALE into another parent, which preserves
+#     its inode.
+#   * THE OWNER AND MODE QUESTION IS ASKED OF `.`, never of a name — of the inode this process is
+#     standing in, after the chdir that pinned it.
+#   * AND THE ANSWER IS HANDED BACK AS A DESCRIPTOR, NOT AS A STRING. ${IMS_ROOT_ANCESTRY_FD} is
+#     opened on `.` while this process is inside the proved directory, and the caller aims the dump,
+#     the publication and the prune at `/proc/self/fd/N`, which the KERNEL resolves to the open
+#     directory rather than to a pathname. So the three operations are performed on the very inode
+#     that was proved, and not one of them re-resolves a component. That is the half r1 got wrong:
+#     a directory proved once and operated through its name three times afterwards is proved for
+#     none of the three.
+#
+# WHAT IT DOES NOT CLAIM. ROOT is not constrained by any of this, and is not meant to be: the rule
+# says that nobody ELSE can influence the path. POSIX ACLs are not read, only bounded. And a
+# concurrent rename by root itself between the walk and the open is not excluded — the descriptor
+# makes it harmless rather than impossible, because the operations follow the descriptor.
+#
+# THE STICKY BIT IS CREDITED FOR A STRICT ANCESTOR AND REFUSED FOR THE PARENT AND FOR <dir> ITSELF,
+# which is pin_publish_root_parent()'s distinction and not a convenience. Sticky means an entry can
+# be renamed or unlinked only by its own owner, so for an ANCESTOR that already exists and already
+# belongs to root it settles the question: nobody else can move it, and whatever they may create
+# beside it is a name this walk never utters. At the PARENT it settles nothing, because <dir> may
+# not exist yet and "cannot replace an existing entry" says nothing about who gets to create it.
+# And at <dir> ITSELF it is the wrong question twice over: the prune's glob deletes whatever matches
+# it there, and the dump's `.part` name is predictable, so a directory anybody may create entries in
+# is a directory anybody may plant a FIFO in. A backup directory directly under /tmp is therefore
+# refused, and one inside a 0700 directory that /tmp happens to hold is not.
+#
+# IT IS ALSO WHAT MAKES THE ACCEPT PATH MEASURABLE (o3d-noka, stated as design input on the issue).
+# A walk-from-`/` rule cannot be exhibited by a harness that owns no root-owned directory and can
+# create none: every temporary root available to an unprivileged run — /tmp 1777, /var/tmp 1777 —
+# fails it, correctly. Two properties together make the accept case real rather than asserted: the
+# owner may be ROOT OR THE ACCOUNT RUNNING THIS (`id -u`, asked for the same reason
+# publish_durable_file() asks it rather than hardcoding 0 — in production they are one account), and
+# a sticky ancestor is credited. A harness's own 0700 directory under /tmp therefore PASSES and
+# genuinely proceeds to write, which is what stops "refuse everything" from satisfying every test.
+#
+# A MISSING COMPONENT IS CREATED, one level at a time, with a PLAIN `mkdir` under umask 077 — never
+# `mkdir -p`, which succeeds silently INSIDE a symbolic link's target, and which is the statement
+# this function replaces. The container question is asked of the parent BEFORE the creation, so a
+# component is only ever created inside a directory this walk has already proved; 0077 rather than
+# the ambient umask because a dump of the whole database should not be readable by the account whose
+# data it is, and because a directory this run creates at 0777 would be refused by this run's own
+# next question, which is a confusing way to fail.
+#
+# WHAT IT COSTS, AND IT IS OPERATOR-VISIBLE. An ${IMS_BACKUP_DIR} pointed underneath
+# /var/lib/${APP_NAME} — a natural choice, since ${APP_DIR}/.env carries a DIFFERENT variable also
+# spelled BACKUP_DIR which IS that path and IS the application's own — now gets a refusal instead of
+# a dump. That is the point of the change rather than a side effect of it, and it is written up in
+# docs/installation.md with the remedy: bind-mount the backup volume under a root-owned path, do not
+# symlink it, and do not point it under ${DATA_DIR} or ${APP_DIR}.
+
+# THE REFUSAL CHANNEL, THE DESCRIPTOR AND THE PROVED INODE, DECLARED AT SCRIPT SCOPE — the first
+# script-scope statements in this file, and they earn it. All three entrypoints run under `set -u`,
+# and ${IMS_ROOT_ANCESTRY_REASON} is read by the CALLER's `die`: a name created only by the function
+# that refuses would abort the run with "unbound variable" instead of reporting the component that
+# failed, which is the difference between a refusal and a crash. lib/privileged-helpers.sh declares
+# ${IMS_DRIVER_REASON} at script scope for the same reason, and tests/scripts/deploy-order.test.ts
+# requires it — it found these two.
+IMS_ROOT_ANCESTRY_REASON=""
+IMS_ROOT_ANCESTRY_FD=""
+IMS_ROOT_ANCESTRY_INODE=""
+
+root_ancestry_refuse() {
+  IMS_ROOT_ANCESTRY_REASON="$1"
+  echo "REFUSING: $1" >&2
+  return 1
+}
+
+# THE CONTAINER QUESTION, asked of the directory this process is standing in and never of a name.
+# ONE `stat` takes the owner and the mode together, so the two answers cannot describe different
+# directories. "$1" is that directory's pathname, carried for the refusal only — nothing resolves it.
+_root_ancestry_here_is_private() {
+  local path="$1" sticky_credit="$2" self="$3" meta owner mode
+  meta="$(LC_ALL=C stat -c '%u|%a' . 2>/dev/null || true)"
+  [[ "${meta}" == *"|"* ]] || {
+    root_ancestry_refuse "${path} could not be inspected after this run stepped into it, so nothing here can establish whether another account may replace what lies beneath it. An unreadable component is not permission to continue. Nothing has been written." || return 1
+  }
+  owner="${meta%%|*}"
+  mode="${meta##*|}"
+  # Validated BEFORE `8#` sees it: `8#` on anything that is not octal is a fatal arithmetic error
+  # under `set -e`, which is a crash and not a refusal.
+  [[ "${mode}" =~ ^[0-7]+$ ]] || {
+    root_ancestry_refuse "${path} reported the permission bits '${mode}', which this run cannot read as octal, so it cannot establish whether another account may write that directory. Nothing has been written." || return 1
+  }
+  [[ "${owner}" == "0" || "${owner}" == "${self}" ]] || {
+    root_ancestry_refuse "${path} is owned by uid ${owner}, which is neither root nor the account this run executes as (uid ${self}). That account may replace, rename or re-create every name beneath it, so it — and not this run — would decide where the database dump is written, where it is published and what the prune deletes. Point IMS_BACKUP_DIR at a directory whose whole ancestry is root-owned and writable by nobody else; see docs/installation.md, 'Where the pre-update dump may go'. Nothing has been written." || return 1
+  }
+  if (( (8#${mode} & 8#22) != 0 )); then
+    if (( sticky_credit == 1 )) && (( (8#${mode} & 8#1000) != 0 )); then
+      # Sticky, and above the parent: an existing entry in it can be renamed or unlinked only by its
+      # own owner, so no other account can move this run's way to the backup directory.
+      return 0
+    fi
+    if (( sticky_credit == 1 )); then
+      root_ancestry_refuse "${path} has permission bits ${mode} — writable by group or other, and not sticky — so an account other than this one can rename it and with it every name beneath it, including where the database dump is written and what the prune deletes. Take the group and other WRITE bit off that directory (its permission is checked on every operation, so the change takes effect at once) or move IMS_BACKUP_DIR; see docs/installation.md, 'Where the pre-update dump may go'. Nothing has been written." || return 1
+    fi
+    root_ancestry_refuse "${path} has permission bits ${mode} — writable by group or other — so an account other than this one can create entries in it: a named pipe at the dump's predictable partial name, which wedges a root-side redirection for ever, or a file matching the prune's glob. The sticky bit does not answer this one, because the question here is who may CREATE a name and not who may replace one. Take the group and other WRITE bit off that directory or move IMS_BACKUP_DIR; see docs/installation.md, 'Where the pre-update dump may go'. Nothing has been written." || return 1
+  fi
+  return 0
+}
+
+# THE WALK. It ENDS WITH THE CALLING SHELL INSIDE <dir> on success, and part-way down it on failure
+# — the contract enter_service_subdir() has, for the same reason: the result of a walk is a position
+# and not a string. Callers go through open_root_owned_ancestry(), which restores the working
+# directory either way and hands back a descriptor.
+enter_root_owned_ancestry() {
+  local dir="$1" what="$2" self rel comp path here entry kind landed above i last
+  local -a comps=()
+  IMS_ROOT_ANCESTRY_REASON=""
+  IMS_ROOT_ANCESTRY_INODE=""
+  [[ "${dir}" == /* ]] || {
+    root_ancestry_refuse "${what} (${dir}) is not an absolute path, and a relative one names a different directory for every process that reads it. Nothing has been written." || return 1
+  }
+  dir="${dir%/}"
+  [[ -n "${dir}" ]] || {
+    root_ancestry_refuse "${what} is the filesystem root itself, which is not a directory this run puts a database dump in. Nothing has been written." || return 1
+  }
+  self="$(id -u)" || return 1
+  rel="${dir#/}"
+  while [[ -n "${rel}" ]]; do
+    comp="${rel%%/*}"
+    if [[ "${comp}" == "${rel}" ]]; then rel=""; else rel="${rel#*/}"; fi
+    # A `//` names the directory we are already standing in.
+    [[ -n "${comp}" ]] || continue
+    # `.` and `..` would step outside the walk while it believed it was stepping down it.
+    [[ "${comp}" != "." && "${comp}" != ".." ]] || {
+      root_ancestry_refuse "${what} (${dir}) has a '.' or '..' component, which would step outside the walk while it believed it was stepping down it. Name the directory without them. Nothing has been written." || return 1
+    }
+    comps+=("${comp}")
+  done
+  (( ${#comps[@]} > 0 )) || {
+    root_ancestry_refuse "${what} (${dir}) has no component below the filesystem root. Nothing has been written." || return 1
+  }
+  # THE FIXED TRUSTED ANCESTOR, and the only one there is: `/` is the one directory on the machine
+  # whose name nothing can rebind. Everything between it and <dir> is proved, not assumed.
+  cd -P / 2>/dev/null || {
+    root_ancestry_refuse "the filesystem root could not be entered, so this run has nowhere trustworthy to start the walk to ${dir} from. Nothing has been written." || return 1
+  }
+  here="$(stat -c '%d:%i' . 2>/dev/null || true)"
+  [[ -n "${here}" ]] || {
+    root_ancestry_refuse "the filesystem root could not be identified, so this run cannot establish which directory it walked to ${dir} from. Nothing has been written." || return 1
+  }
+  path="/"
+  last=$(( ${#comps[@]} - 1 ))
+  i=0
+  while (( i <= last )); do
+    # THE PARENT GETS NO STICKY CREDIT, and neither does <dir> itself below the loop. See above.
+    if (( i < last )); then
+      _root_ancestry_here_is_private "${path}" 1 "${self}" || return 1
+    else
+      _root_ancestry_here_is_private "${path}" 0 "${self}" || return 1
+    fi
+    comp="${comps[i]}"
+    above="${path}"
+    if [[ "${path}" == "/" ]]; then path="/${comp}"; else path="${path}/${comp}"; fi
+    # A PLAIN `mkdir`, so a symbolic link already at this name fails with EEXIST instead of being
+    # worked inside, and 0077 so a dump of the whole database is not created world-readable. The
+    # failure is not read: the lstat below is what decides, whether this run created the component
+    # or found it already there.
+    (umask 077; mkdir -- "${comp}") 2>/dev/null || true
+    # ONE lstat, TAKING THE TYPE AND THE IDENTITY TOGETHER, so the two cannot describe different
+    # directories. No `-L`, so a symlinked component reads as "symbolic link" and is refused.
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "${comp}" 2>/dev/null || true)"
+    [[ -n "${entry}" ]] || {
+      root_ancestry_refuse "${path} could not be inspected: it does not exist and could not be created, or ${above} denies this run the search permission to look at it. An unstattable component is not permission to continue. Nothing has been written." || return 1
+    }
+    kind="${entry%%|*}"
+    [[ "${kind}" == "directory" ]] || {
+      root_ancestry_refuse "${path} is a ${kind}, not a real directory. A symbolic link at any component of this path is how another account aims a root-side database dump, its publication and its prune at a directory of their choosing, so this run refuses rather than following it. Replace it with a real directory — bind-mount a backup volume there rather than linking to it; see docs/installation.md, 'Where the pre-update dump may go'. Nothing has been written." || return 1
+    }
+    cd -P "${comp}" 2>/dev/null || {
+      root_ancestry_refuse "${path} could not be entered after this run created or accepted it. Nothing has been written." || return 1
+    }
+    landed="$(stat -c '%d:%i' . 2>/dev/null || true)"
+    [[ "${landed}" == "${entry#*|}" ]] || {
+      root_ancestry_refuse "${path} is not the directory this run had just checked: it was replaced between the check and the step into it. Nothing has been written." || return 1
+    }
+    [[ "$(stat -c '%d:%i' .. 2>/dev/null || true)" == "${here}" ]] || {
+      root_ancestry_refuse "${path} is not in the directory this run had just checked: it was moved into another parent between the check and the step into it. Nothing has been written." || return 1
+    }
+    here="${entry#*|}"
+    i=$(( i + 1 ))
+  done
+  # AND <dir> ITSELF, with no sticky credit: this is the directory the predictable partial name and
+  # the prune's glob both live in.
+  _root_ancestry_here_is_private "${path}" 0 "${self}" || return 1
+  IMS_ROOT_ANCESTRY_INODE="${here}"
+  return 0
+}
+
+# THE WALK'S RESULT, AS A DESCRIPTOR, with the working directory restored either way.
+#
+# ${IMS_ROOT_ANCESTRY_FD} is a NAME rather than one of this file's literal lock descriptors because
+# nothing locks it: `exec {var}<` allocates above 10, which is what publish_durable_file() does with
+# its destination and for the same reason. A FAILED `exec` REDIRECTION ENDS A NON-INTERACTIVE SHELL,
+# so the branch below it is not a fallback that writes anyway — there is no state in which this
+# returns 0 without a descriptor on a proved directory.
+open_root_owned_ancestry() {
+  local dir="$1" what="$2" saved seen
+  IMS_ROOT_ANCESTRY_FD=""
+  saved="$(pwd -P)" || {
+    root_ancestry_refuse "this run cannot establish its own working directory, so it will not walk into ${dir} and back. Nothing has been written." || return 1
+  }
+  if ! enter_root_owned_ancestry "${dir}" "${what}"; then
+    cd "${saved}" >/dev/null 2>&1 || true
+    return 1
+  fi
+  exec {IMS_ROOT_ANCESTRY_FD}< .
+  # AND IT IS THE DIRECTORY THAT WAS WALKED TO, asked through an EXTERNAL command on purpose: that
+  # is the route the caller's `mv` and `rm` take, so a descriptor those could not reach is refused
+  # here rather than at the publication. `-L` because /proc/self/fd/N is a magic symbolic link.
+  seen="$(stat -L -c '%d:%i' "/proc/self/fd/${IMS_ROOT_ANCESTRY_FD}" 2>/dev/null || true)"
+  if [[ "${seen}" != "${IMS_ROOT_ANCESTRY_INODE}" ]]; then
+    close_root_owned_ancestry
+    cd "${saved}" >/dev/null 2>&1 || true
+    root_ancestry_refuse "the descriptor this run opened on ${dir} does not answer as the directory it walked to (${seen:-nothing}, expected ${IMS_ROOT_ANCESTRY_INODE}), so the operations aimed at it could not be shown to land there. Nothing has been written." || return 1
+  fi
+  cd "${saved}" || {
+    close_root_owned_ancestry
+    root_ancestry_refuse "this run could not return to ${saved} after walking to ${dir}. Nothing has been written." || return 1
+  }
+  return 0
+}
+
+close_root_owned_ancestry() {
+  [[ -n "${IMS_ROOT_ANCESTRY_FD:-}" ]] || return 0
+  exec {IMS_ROOT_ANCESTRY_FD}<&- 2>/dev/null || true
+  IMS_ROOT_ANCESTRY_FD=""
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # COPYING A TREE INTO A DIRECTORY THE SERVICE ACCOUNT OWNS (o3d-czpy)
 #
 # IT LIVES HERE, AND NOT IN install.sh, BECAUSE THERE ARE TWO CLONE PATHS (o3d-ov60). o3d-czpy

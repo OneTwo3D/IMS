@@ -1803,24 +1803,24 @@
   },
   {
    "file": "scripts/update.sh",
-   "line": "#       `chown -R \"${APP_USER}:${APP_USER}\" \"${APP_DIR}\"`, so that checkout — and everything the",
+   "line": "#       both `chown -R \"${APP_USER}:${APP_USER}\" \"${APP_DIR}\"`, so that checkout — and everything",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
-   "line": "# `pg_dump`, `mv` and `rm --` wherever an operator names, including underneath a path",
+   "line": "# redirection is openat(N, …), the `mv` is renameat(N, …), and the prune's glob and its `rm --`",
    "count": 1,
    "class": "comment",
    "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
   },
   {
    "file": "scripts/update.sh",
-   "line": "pg_dump \"${MIGRATION_DATABASE_URL}\" | gzip > \"${BACKUP_PARTIAL}\" || { backup_rc=$?; rm -f \"${BACKUP_PARTIAL}\"; }",
+   "line": "(umask 077; pg_dump \"${MIGRATION_DATABASE_URL}\" | gzip > \"${BACKUP_PARTIAL}\") || { backup_rc=$?; rm -f \"${BACKUP_PARTIAL}\"; }",
    "count": 1,
    "class": "single-inode",
-   "reason": "non-recursive rm -f on one named path"
+   "reason": "non-recursive rm -f on one named path (the dump partial, named under the descriptor the ancestry walk pinned); the umask subshell narrows the mode the redirection creates it with (o3d-noka)"
   },
   {
    "file": "scripts/update.sh",
@@ -3746,6 +3746,20 @@
   "class": "code-owned-tree",
   "reason": "gives the record and manifest the adoption carried into its own `mktemp -d` directory to root: the direction that removes write access; enforced at run time by _fence_require_owned_tree in _fence_adopt_legacy",
   "guard": "_fence_require_owned_tree"
+ },
+ {
+  "file": "scripts/lib/cutover-namespace.sh",
+  "line": "# with `mv` and prunes beside it with `rm --`, all as root, into a directory an operator names with",
+  "count": 1,
+  "class": "comment",
+  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: the finding open_root_owned_ancestry closes)"
+ },
+ {
+  "file": "scripts/lib/cutover-namespace.sh",
+  "line": "# is the route the caller's `mv` and `rm` take, so a descriptor those could not reach is refused",
+  "count": 1,
+  "class": "comment",
+  "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs (o3d-noka: why the descriptor is verified by an external command)"
  }
- ]
+]
 }
