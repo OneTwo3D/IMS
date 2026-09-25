@@ -2512,11 +2512,28 @@ order (or, for a rebuild, against the batch reference), naming the shipment and 
 it is listed first in the daily batch run's errors, which marks that cron run failed. A failed cron
 run shows on System Health as a warning, not an alert, so the activity log is the place to look.
 
-**What this does not cover.** Only these three batch paths refuse. Other places a negative cost can
-reach — for example revaluing a shipment that was *already* journaled, which currently posts the
-reversal and drops the negative repost (o3d-c08y) — are catalogued in
+**A shipment that was *already* journaled is protected earlier, at the recalculation itself.**
+Revaluing it below zero used to post the reversal of its old COGS and drop the negative repost, so
+the difference posted nowhere. Now the landed-cost recalculation refuses and changes nothing (see
+*Recalculation after receipt* in the purchasing guide). A refused recalculation leaves that
+shipment's recorded cost as it was, so none of the three batch checks above ever sees a negative
+cost from it (o3d-c08y).
+
+**The checks above read each shipment's cost *after* locking it, so a recalculation running at the
+same time cannot slip a stale value past them.** A landed-cost recalculation may change a shipment's
+recorded cost at any moment, including while a batch run is in progress. The batch used to read the
+whole window first and take its cost-layer locks afterwards, so a run that waited for a recalculation
+to finish then carried on with the figures it had read *before* the wait: it journalled the old,
+positive cost, and the negative one it should have refused was never seen. The batch now reads only
+the list of shipments first, locks their cost layers, and then reads the costs — so a recalculation
+either finished before the lock (the batch sees its result and refuses the order) or waits for the
+batch (and then meets the already-journaled refusal above). Nothing needs configuring (o3d-c08y).
+
+**What this does not cover.** Other places a negative cost can reach are catalogued in
 `docs/todo/negative-basis-cost-layers-decision.md`. Whether IMS should ever post a negative cost
-basis at all is an open decision (o3d-gd2f).
+basis at all is an open decision (o3d-gd2f). The three checks above are Xero's, and Xero is the only
+accounting connector this build ships — the QuickBooks daily batch had none of them, and it was
+archived (see the note at the top of this page) rather than given them.
 
 ### Which batch a row belongs to
 

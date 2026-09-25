@@ -1626,7 +1626,11 @@ async function recalculateManufacturingCostLayers(
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
     const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
       recalcRunId,
+      // BOTH, and they are about different things: the chart this recompute resolved ONCE (o3d-j625 r4,
+      // so every connector question in the refresh is asked of one chart) and the context c08y names in a
+      // below-zero refusal. Neither replaces the other.
       ...(reclassChart ? { accountingSettings: reclassChart } : {}),
+      revaluationContext: { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
     })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
     // (COGS_REVERSAL now / daily batch later), so subtract it from the reclass

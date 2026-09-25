@@ -196,6 +196,10 @@ test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for pos
   const queued: unknown[] = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
       // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
@@ -273,6 +277,10 @@ test('refreshShipmentCogsForCostLayerChange stamps the recalc-run nonce into the
   const queued: Array<{ idempotencyKey?: string }> = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
       // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
@@ -311,6 +319,10 @@ test('refreshShipmentCogsForCostLayerChange does not claim the delta when COGS_R
   const queued: unknown[] = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       // o3d-zpa7: `order.accountingInvoiceId` is the delete-protection precondition the enqueue now
       // asserts (see the dedicated tests below). A journaled shipment always has one, by the A1 -> B
@@ -340,6 +352,10 @@ test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync
   const queued: unknown[] = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: null }),
       update: async () => {},
@@ -373,6 +389,10 @@ test('refreshShipmentCogsForCostLayerChange keeps the un-journaled delta in the 
   const queued: unknown[] = []
   const tx = {
     $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    // o3d-c08y r2: models a REAL transaction client — refreshShipmentCogsForCostLayerChange probes with
+    // SAVEPOINT at entry, because its refusal only means anything where a transaction can be aborted.
+    $executeRawUnsafe: async () => 0,
+    $executeRaw: async () => 0,
     shipment: {
       findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: null }),
       update: async () => {},
