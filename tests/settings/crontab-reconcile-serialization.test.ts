@@ -646,7 +646,13 @@ function shellLockProbe(body: string, waitSeconds: number): string {
   return `set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
-APP_USER='svcuser'
+# THE ACCOUNT THIS HARNESS CAN ACTUALLY BECOME (o3d-txoe r2). prepare_crontab_lock now asks
+# whether \${APP_USER} can OPEN the lock, by attempting it as that account. A harness that is
+# not root cannot become another account at all, and the shipped helper reads that as "the
+# question could not be asked" and REFUSES -- correctly. So the harness names ITSELF, which is
+# the same escape hatch deploy.sh's as_app_user() and install.sh's run_as_user() rely on: the
+# probe then answers with this account's own access(2), which is the real question.
+APP_USER="$(id -un)"
 CUTOVER_ROOT_DIR='${CUTOVER_ROOT}'
 # THE ONE STEP AN UNPRIVILEGED HARNESS CANNOT PERFORM, recorded instead of performed. Everything
 # else below is the shipped code: the walk, the lstat post-conditions, the O_CREAT|O_EXCL create,
@@ -699,6 +705,20 @@ function shellLockPreparationLines(): string[] {
     `CUTOVER_ROOT_DIR='${CUTOVER_ROOT}'`,
     `source '${CUTOVER_NAMESPACE_LIB}'`,
     'chown() { :; }',
+    // AND THE OTHER STEP AN UNPRIVILEGED HARNESS CANNOT PERFORM (o3d-txoe r2). Step 6 of the
+    // preparation asks whether ${APP_USER} can OPEN the lock by attempting it AS that account, and
+    // these programs deliberately keep APP_USER=appuser because they hand it to `crontab -u` and the
+    // shim and three assertions below name it. A harness that is not root cannot become `appuser`,
+    // and the shipped helper reads "I could not ask" as a REFUSAL — correctly — so it is stubbed
+    // here, on exactly the same footing as `chown`.
+    //
+    // THAT IS NOT A HOLE IN THE COVERAGE, and this is where to check it rather than take it: the
+    // probe has its own tests in section 9e, which run the SHIPPED helper with ${APP_USER} named as
+    // the harness's own account so the self branch answers with a real access(2), plus a source rule
+    // that the decision is not made from mode bits, plus a root-only rig for the ACL case. What
+    // these programs are about is the fence/unfence read-modify-write, and a preparation that
+    // refused here would measure none of it.
+    'app_user_can_open() { return 0; }',
     'crontab_lock_paths "${CUTOVER_ROOT_DIR}" ' + `'${LEGACY_STATE_DIR}'`,
     'prepare_crontab_lock',
   ]
@@ -1659,7 +1679,13 @@ async function swapAfterPreparation(parentWritable: boolean): Promise<{
   const shell = spawn('bash', ['-c', `set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
-APP_USER='svcuser'
+# THE ACCOUNT THIS HARNESS CAN ACTUALLY BECOME (o3d-txoe r2). prepare_crontab_lock now asks
+# whether \${APP_USER} can OPEN the lock, by attempting it as that account. A harness that is
+# not root cannot become another account at all, and the shipped helper reads that as "the
+# question could not be asked" and REFUSES -- correctly. So the harness names ITSELF, which is
+# the same escape hatch deploy.sh's as_app_user() and install.sh's run_as_user() rely on: the
+# probe then answers with this account's own access(2), which is the real question.
+APP_USER="$(id -un)"
 CUTOVER_ROOT_DIR='${namespaceRoot}'
 chown() { :; }
 IMS_CRONTAB_LOCK_WAIT_SECONDS=30
@@ -1895,7 +1921,13 @@ async function bridgeProbe(namespaceRoot: string, legacyStateDir: string): Promi
   return sh(`set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
-APP_USER='svcuser'
+# THE ACCOUNT THIS HARNESS CAN ACTUALLY BECOME (o3d-txoe r2). prepare_crontab_lock now asks
+# whether \${APP_USER} can OPEN the lock, by attempting it as that account. A harness that is
+# not root cannot become another account at all, and the shipped helper reads that as "the
+# question could not be asked" and REFUSES -- correctly. So the harness names ITSELF, which is
+# the same escape hatch deploy.sh's as_app_user() and install.sh's run_as_user() rely on: the
+# probe then answers with this account's own access(2), which is the real question.
+APP_USER="$(id -un)"
 CUTOVER_ROOT_DIR='${namespaceRoot}'
 chown() { :; }
 IMS_CRONTAB_LOCK_WAIT_SECONDS=1
@@ -2075,7 +2107,13 @@ test('[o3d-batch-ret] the preparation REFUSES a namespace root, a lock directory
   const unprepared = await sh(`set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
-APP_USER='svcuser'
+# THE ACCOUNT THIS HARNESS CAN ACTUALLY BECOME (o3d-txoe r2). prepare_crontab_lock now asks
+# whether \${APP_USER} can OPEN the lock, by attempting it as that account. A harness that is
+# not root cannot become another account at all, and the shipped helper reads that as "the
+# question could not be asked" and REFUSES -- correctly. So the harness names ITSELF, which is
+# the same escape hatch deploy.sh's as_app_user() and install.sh's run_as_user() rely on: the
+# probe then answers with this account's own access(2), which is the real question.
+APP_USER="$(id -un)"
 source '${CRONTAB_LOCK_LIB}'
 source '${CUTOVER_NAMESPACE_LIB}'
 crontab_lock_paths '${join(HARNESS, 'cutover-state')}' '${LEGACY_STATE_DIR}'
@@ -2095,7 +2133,13 @@ with_crontab_lock body`)
   const divergedRun = await sh(`set -u
 die() { echo "DIE: $*" >&2; exit 1; }
 warn() { echo "WARN: $*" >&2; }
-APP_USER='svcuser'
+# THE ACCOUNT THIS HARNESS CAN ACTUALLY BECOME (o3d-txoe r2). prepare_crontab_lock now asks
+# whether \${APP_USER} can OPEN the lock, by attempting it as that account. A harness that is
+# not root cannot become another account at all, and the shipped helper reads that as "the
+# question could not be asked" and REFUSES -- correctly. So the harness names ITSELF, which is
+# the same escape hatch deploy.sh's as_app_user() and install.sh's run_as_user() rely on: the
+# probe then answers with this account's own access(2), which is the real question.
+APP_USER="$(id -un)"
 CUTOVER_ROOT_DIR='${divergedRoot}'
 chown() { :; }
 IMS_CRONTAB_LOCK_WAIT_SECONDS=1
@@ -2121,6 +2165,271 @@ with_crontab_lock body`)
     `the divergence must really have happened: ${divergedRun.stdout}`)
   assert.doesNotMatch(divergedRun.stdout, /INSIDE/, 'and the body must not have run')
   assert.match(divergedRun.stderr, /no longer names the inode this run pinned/)
+})
+
+
+// ---------------------------------------------------------------------------
+// 9e — LOAD-BEARING: THE LOCK THE SECOND PARTY CANNOT OPEN  (o3d-txoe r2, Codex HIGH)
+//
+// THE FINDING, AND IT IS THE INVERSE OF 9b's. r1 made the two parties name one inode; it said
+// nothing about whether the second can OPEN it. A canonical lock file that already exists as
+// root-owned 0600 — what any privileged run under a 077 umask leaves — satisfied every
+// post-condition the preparation made, because they ask about TYPE, OWNER and IDENTITY. The root
+// entrypoint then rewrote the crontab under an exclusion it really held while the application could
+// not open the file at all, so EVERY reconciliation it attempted was refused and every schedule
+// change already committed to the database was silently never applied. Measured in a real bash with
+// both parties: preparation accepted a 0600 lock, root's rewrite landed, both application
+// reconciliations were refused with EACCES, and neither of their schedule lines reached the crontab.
+//
+// WHY THE ASSERTION IS NOT A MODE COMPARISON, and this is the part that has to be checked rather
+// than trusted: `mode & 0044` does not bound what a POSIX ACL grants or withholds. A 0644 file
+// carrying `user:<app>:---` is UNREADABLE by that account and a bits rule accepts it. So the shipped
+// check asks `access(2)` AS THE ACCOUNT, and the rule below is that no arithmetic on the lock FILE's
+// mode decides it.
+//
+// WHAT THIS SUITE CAN AND CANNOT REACH, said plainly rather than skipped over. An unprivileged
+// single-uid runner has one identity, so it cannot build "root owns the file at 0600 and a DIFFERENT
+// account is shut out", and it cannot build a named-user ACL entry for another account. What it CAN
+// do is exercise the same helper through its self branch, where the answer really is this account's
+// own `access(2)`: a file this account cannot read (mode 0000 — `access(2)` applies the owner class,
+// which has nothing), the repair, a repair that could not work, and a question that could not be
+// asked at all. The two-identity cases are measured by a root rig and reported on the issue; the
+// source rule below is what stops a regression to bits in between.
+// ---------------------------------------------------------------------------
+
+test('[o3d-batch-ret] preparation REFUSES, or repairs, a lock the application account cannot open', async () => {
+  // (1) THE ORDINARY CASE. A lock this account can read is accepted, and NOTHING is widened — a
+  // repair that fired on every install would make the warning meaningless.
+  const fine = join(HARNESS, 'openable-lock')
+  await sh(`rm -rf '${fine}' && mkdir -p '${preparerLockDir(fine)}' && chmod 0755 '${fine}/state' '${preparerLockDir(fine)}'`
+    + ` && : > '${join(preparerLockDir(fine), '.crontab-reconcile.lock')}'`
+    + ` && chmod 0644 '${join(preparerLockDir(fine), '.crontab-reconcile.lock')}'`)
+  const ok = await runInstallerPreparer(fine)
+  assert.equal(ok.code, 0, `${ok.stdout}${ok.stderr}`)
+  assert.doesNotMatch(ok.stderr, /has been widened/,
+    `a lock the account can already open must not be touched:\n${ok.stderr}`)
+  assert.equal(statSync(join(preparerLockDir(fine), '.crontab-reconcile.lock')).mode & 0o777, 0o644)
+
+  // (2) AND (3) ARE ASKED OF ensure_app_user_can_open_lock DIRECTLY, and the reason is a real
+  // constraint rather than convenience. Production's shape is "a descriptor on a file the OTHER party
+  // cannot open": root opens a 0600 lock perfectly well and the service account cannot. A harness
+  // with ONE identity cannot build that through prepare_crontab_lock, because its own pinning `exec`
+  // is the thing that would fail — measured: `exec {FD}<file` on a 0000 file this account owns is
+  // EACCES, so the preparation refuses before the probe is reached, which is the right refusal for
+  // the wrong reason. The equivalent state IS reachable one level down: take the descriptor while the
+  // file is still readable, then narrow it. Permission is checked at `open(2)` and never again, so
+  // the fd survives and the helper meets exactly what it meets in production.
+  assert.notEqual(process.getuid?.(), 0,
+    'this test models the second party with the ordinary DAC read check, which does not apply to '
+    + 'root — run the unit tests as an unprivileged user')
+
+  const helperProbe = async (stubChmod: boolean) => {
+    const dir = mkdtempSync(join(HARNESS, `openability-${stubChmod ? 'stuck' : 'repair'}-`))
+    const lock = join(dir, '.crontab-reconcile.lock')
+    writeFileSync(lock, '')
+    chmodSync(lock, 0o644)
+    return {
+      lock,
+      inode: statSync(lock).ino,
+      run: await sh(`set -u
+die() { echo "DIE: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+APP_USER="$(id -un)"
+source '${CRONTAB_LOCK_LIB}'
+source '${CUTOVER_NAMESPACE_LIB}'
+# The descriptor is taken while the file is still openable, then the file is narrowed — which is the
+# state a root-side preparation is in when the OTHER account cannot open the lock.
+exec {fd}<'${lock}'
+/bin/chmod 0000 '${lock}'
+echo "BEFORE=$(if [ -r '${lock}' ]; then echo readable; else echo unreadable; fi)"
+${stubChmod ? 'chmod() { :; }' : ''}
+rc=0
+ensure_app_user_can_open_lock "\${fd}" '${lock}' 'the crontab reconciliation lock' || rc=$?
+echo "RC=\${rc}"
+echo "AFTER=$(if [ -r '${lock}' ]; then echo readable; else echo unreadable; fi)"`),
+    }
+  }
+
+  // (2) A LOCK THE OTHER PARTY CANNOT OPEN IS REPAIRED, AND THE REPAIR IS PROVED BY ASKING AGAIN.
+  const repair = await helperProbe(false)
+  assert.match(repair.run.stdout, /^BEFORE=unreadable$/m,
+    `precondition: the account must genuinely be unable to read it first:\n${repair.run.stdout}${repair.run.stderr}`)
+  assert.match(repair.run.stdout, /^RC=0$/m,
+    `the helper must repair this, not refuse it:\n${repair.run.stdout}${repair.run.stderr}`)
+  assert.match(repair.run.stdout, /^AFTER=readable$/m,
+    'the PROPERTY, not the call: the account must actually be able to read it afterwards')
+  assert.match(repair.run.stderr, /has been widened to 0644 by this run/,
+    `and it must SAY it widened the file — a silent repair is how a guard stops meaning anything:\n${repair.run.stderr}`)
+  assert.match(repair.run.stderr, /o3d-txoe/, 'and name the finding it is repairing')
+  assert.equal(statSync(repair.lock).ino, repair.inode,
+    'and it is the SAME inode — the repair is an fchmod of the descriptor, not a replacement, so the '
+    + 'lock the application will open is the one this run pinned')
+  assert.equal(statSync(repair.lock).mode & 0o777, 0o644)
+
+  // (3) A REPAIR THAT COULD NOT WORK IS A REFUSAL. `chmod` stubbed to a no-op that reports success is
+  // exactly the state narrow_held_lock()'s prose worries about — a read-only mount, an immutable
+  // attribute, or an ACL the mode cannot reach all look like this from here.
+  const stuck = await helperProbe(true)
+  assert.match(stuck.run.stdout, /^BEFORE=unreadable$/m, stuck.run.stdout)
+  assert.match(stuck.run.stdout, /^RC=1$/m,
+    `a permission this run could not repair must be a refusal:\n${stuck.run.stdout}${stuck.run.stderr}`)
+  assert.match(stuck.run.stdout, /^AFTER=unreadable$/m,
+    'and the file is still unreadable — the refusal is not a report of a repair that happened')
+  assert.doesNotMatch(stuck.run.stderr, /has been widened/,
+    'and it must NOT claim to have widened anything')
+
+  // …and the refusal the CALLER builds on it ends the run and says what the consequence would be.
+  // Reached end to end by making the probe itself answer NO, which is the one lever a single-uid
+  // harness has over the account's access without touching the pinning open.
+  const unopenable = join(HARNESS, 'unopenable-lock')
+  await sh(`rm -rf '${unopenable}' && mkdir -p '${preparerLockDir(unopenable)}'`
+    + ` && chmod 0755 '${unopenable}/state' '${preparerLockDir(unopenable)}'`
+    + ` && : > '${join(preparerLockDir(unopenable), '.crontab-reconcile.lock')}'`
+    + ` && chmod 0644 '${join(preparerLockDir(unopenable), '.crontab-reconcile.lock')}'`)
+  const refused = await runInstallerPreparer(unopenable, { stubs: ['app_user_can_open() { return 1; }'] })
+  assert.equal(refused.code, 1, `the preparation must END the run:\n${refused.stdout}${refused.stderr}`)
+  assert.match(refused.stderr, /cannot open/)
+  assert.ok(refused.stderr.includes(join(preparerLockDir(unopenable), '.crontab-reconcile.lock')),
+    'and name the file')
+  assert.match(refused.stderr, /every reconciliation the running service attempts is REFUSED/,
+    'and say what the consequence would have been, which is the whole reason this is not a warning')
+
+  // (4) A QUESTION THAT COULD NOT BE ASKED IS A REFUSAL TOO, which is the other half of failing
+  // closed: `runuser` exits non-zero both when the file is unreadable and when it cannot assume the
+  // account, and reading the second as "unreadable" would send this run into a pointless repair
+  // while reading it as "fine" would ship the defect.
+  const unasked = join(HARNESS, 'unaskable-lock')
+  await sh(`rm -rf '${unasked}' && mkdir -p '${preparerLockDir(unasked)}' && chmod 0755 '${unasked}/state' '${preparerLockDir(unasked)}'`
+    + ` && : > '${join(preparerLockDir(unasked), '.crontab-reconcile.lock')}'`
+    + ` && chmod 0644 '${join(preparerLockDir(unasked), '.crontab-reconcile.lock')}'`)
+  const noAccount = await runInstallerPreparer(unasked, { appUser: "'no-such-account-o3d-txoe'" })
+  assert.equal(noAccount.code, 1,
+    `a permission question this run could not ask must END the run, even though the FILE is 0644 and `
+    + `every bits rule would have accepted it:\n${noAccount.stdout}${noAccount.stderr}`)
+  assert.match(noAccount.stderr, /could not run a command as that account at all/)
+  assert.match(noAccount.stderr, /An unanswerable permission question is not permission/)
+})
+
+test('[o3d-batch-ret] the openability decision is not made from mode BITS, on either lock', () => {
+  // THE RULE THIS SUITE CAN HOLD THAT ITS ONE IDENTITY CANNOT DEMONSTRATE. `mode & 0044` accepts a
+  // 0644 file whose ACL withholds read from the service account, and refuses a 0640 file whose ACL
+  // grants it — o3d-noka r2 established that a mode does not bound an ACL, and this question is the
+  // direction where the mask theorem gives nothing. So the decision must be an ATTEMPTED ACCESS, and
+  // this is an ABSENCE check, which is universal: no arithmetic on the lock file's mode anywhere in
+  // the two preparation bodies or in the helper they call.
+  const body = withoutCommentsOrMessages([
+    installerPreparer(),
+    installerPreparer('prepare_legacy_crontab_lock'),
+    installerPreparer('app_user_can_open'),
+    installerPreparer('ensure_app_user_can_open_lock'),
+  ].join('\n'))
+
+  // It must ASK, as the account, and it must read the answer as a TOKEN rather than as a status.
+  assert.match(body, /self="\$\(id -un\)" \|\| return 2/,
+    'the probe must TAKE the status of `id -un`: its own caller invokes it with `|| rc=$?`, which '
+    + 'suspends errexit, so an `id` that could not run would otherwise yield the empty string and '
+    + 'fall through to a branch trying to become an account nothing had named (the r30/r31 rule)')
+  assert.match(body, /if \[\[ "\$\{self\}" == "\$\{APP_USER\}" \]\]; then/,
+    'and it must compare the running account against ${APP_USER} — that is the branch that makes '
+    + 'the mechanism exercisable by a harness with one identity')
+  assert.match(body, /runuser -u "\$\{APP_USER\}" -- sh -c 'if \[ -r "\$1" \]; then echo YES; else echo NO; fi'/,
+    'and it must BECOME that account and ask access(2) there')
+  assert.match(body, /YES\) return 0 ;;/)
+  assert.match(body, /NO\) {2}return 1 ;;/)
+  assert.match(body, /\*\) {3}return 2 ;;/,
+    'and anything that is neither answer must be status 2 — the question could not be asked')
+
+  // AND THE REPAIR IS AIMED AT THE DESCRIPTOR, never at the pathname.
+  assert.match(body, /chmod 0644 "\/proc\/self\/fd\/\$\{fd\}"/,
+    'the widening must be an fchmod through the magic link, as narrow_held_lock() does it')
+  const chmods = body.split('\n').map((l) => l.trim()).filter((l) => /(^|[^_\w])chmod\b/.test(l))
+  assert.deepEqual(chmods, ['chmod 0644 "/proc/self/fd/${fd}" 2>/dev/null || true'],
+    `exactly one chmod in these four bodies, and it names no pathname: ${chmods.join(' / ')}`)
+  // ITS STATUS IS DELIBERATELY DISCARDED, and that is only safe because the PROPERTY is asked again
+  // afterwards. A `chmod` whose result is assumed is the mistake this whole file is about; what makes
+  // `|| true` correct here is the probe on the next line, so the two are asserted together.
+  const afterChmod = body.split('\n').map((l) => l.trim())
+  const chmodAt = afterChmod.findIndex((l) => l.startsWith('chmod 0644 "/proc/self/fd/'))
+  assert.notEqual(chmodAt, -1)
+  assert.ok(afterChmod.slice(chmodAt + 1, chmodAt + 4).some((l) => l.startsWith('app_user_can_open ')),
+    'the repair must be followed by the SAME question being asked again, within three statements — '
+    + `otherwise the discarded status is the only evidence it worked: ${afterChmod.slice(chmodAt + 1, chmodAt + 4).join(' / ')}`)
+
+  // THE ABSENCE RULE. No `8#` arithmetic and no octal mask appears on a lock FILE's mode anywhere in
+  // the openability path. (The lock DIRECTORY's own `& 0022`/`& 0001` rules live in a different body
+  // and are sound in the refusing direction; see the prose there.)
+  const fileModeArithmetic = body.split('\n').map((l) => l.trim())
+    .filter((l) => /8#/.test(l) && /file_mode|lock_mode|FILE/.test(l))
+  assert.deepEqual(fileModeArithmetic, [],
+    `the openability decision must not be computed from the lock file's permission bits: ${fileModeArithmetic.join(' / ')}`)
+  // NOT VACUOUS: the rule fires on the statement it is about, appended to the same body.
+  const withBits = `${body}\nfile_mode=644\n(( (8#\${file_mode} & 0044) != 0 )) || die "FILE unreadable"`
+  assert.notDeepEqual(
+    withBits.split('\n').map((l) => l.trim()).filter((l) => /8#/.test(l) && /file_mode|lock_mode|FILE/.test(l)),
+    [], 'the absence rule must still catch a bits-based decision about the lock file')
+
+  // AND BOTH LOCKS GO THROUGH THE ONE HELPER, so the rule is not fixed in one place and left wrong
+  // in the other. Asked of the two preparation bodies, as an exact roster.
+  const calls = withoutCommentsOrMessages(
+    `${installerPreparer()}\n${installerPreparer('prepare_legacy_crontab_lock')}`)
+    .split('\n').map((l) => l.trim()).filter((l) => l.includes('ensure_app_user_can_open_lock'))
+  assert.deepEqual(calls, [
+    'ensure_app_user_can_open_lock "${CRONTAB_LOCK_FD}" "${CRONTAB_LOCK_FILE}" "the crontab reconciliation lock" || die \\',
+    'if ! ensure_app_user_can_open_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LEGACY_LOCK_FILE}" "the pre-relocation crontab lock"; then',
+  ], `the canonical lock DIES and the pre-relocation one DECLINES, and both ask: ${calls.join(' / ')}`)
+})
+
+test('[o3d-batch-ret] a PRE-RELOCATION lock the application cannot open DECLINES the bridge rather than ending the run', async () => {
+  // The one thing that differs between the two call sites, and it is deliberate: the canonical
+  // exclusion is unaffected, so refusing the whole cutover over a lock belonging to a build being
+  // retired would trade a working exclusion for none.
+  const { namespaceRoot, legacy, legacyLockDir, legacyLock } = bridgeSandbox('unopenable')
+  mkdirSync(legacyLockDir, { recursive: true, mode: 0o755 })
+  writeFileSync(legacyLock, '')
+  chmodSync(legacyLock, 0o644)
+
+  // THE PROBE IS MADE TO ANSWER "NO" FOR THE PRE-RELOCATION LOCK ONLY, which is the one lever a
+  // single-uid harness has: it cannot own a file its own account may not open AND have the privileged
+  // side open it, and narrowing the file would make the pinning `exec` fail first (see section 9e's
+  // note on that). The helper under test is the shipped one and so is everything it calls; what is
+  // substituted is the ANSWER a second identity would have given.
+  const run = await sh(`set -u
+die() { echo "DIE: $*" >&2; exit 1; }
+warn() { echo "WARN: $*" >&2; }
+APP_USER="$(id -un)"
+CUTOVER_ROOT_DIR='${namespaceRoot}'
+chown() { :; }
+IMS_CRONTAB_LOCK_WAIT_SECONDS=1
+source '${CRONTAB_LOCK_LIB}'
+source '${CUTOVER_NAMESPACE_LIB}'
+app_user_can_open() { case "$1" in *'${CRONTAB_LOCK_DIRNAME_EXPECTED}'/*) [[ "$1" == '${legacyLock}' ]] && return 1 ;; esac; return 0; }
+crontab_lock_paths "\${CUTOVER_ROOT_DIR}" '${legacy}'
+prepare_crontab_lock
+echo "LEGACY_FD=\${CRONTAB_LEGACY_LOCK_FD:-none}"
+body() { echo INSIDE; }
+rc=0
+with_crontab_lock body || rc=$?
+echo "RC=\${rc}"`)
+
+  assert.equal(run.code, 0,
+    `the run must CONTINUE — the canonical exclusion is unaffected:\n${run.stdout}${run.stderr}`)
+  assert.match(run.stdout, /^INSIDE$/m, 'and the crontab read-modify-write must still happen')
+  assert.match(run.stdout, /^LEGACY_FD=none$/m,
+    `no descriptor may be left open on a lock that excludes nothing:\n${run.stdout}`)
+  assert.match(run.stderr, /cannot open .*\.crontab-reconcile\.lock/)
+  assert.match(run.stderr, /NOTHING IS LOCKED THERE/)
+  assert.match(run.stderr, /is NOT excluded by this run/,
+    'and it must say what is not excluded rather than leaving a reader to infer it')
+  assert.match(run.stderr, /already refusing every reconciliation for the same reason/,
+    'and say that the predecessor is in the same state, which is why there is nothing to bridge to')
+
+  // NOT VACUOUS: the same sandbox, with the probe answering YES for that path, takes the bridge. So
+  // the decline above is a decision about openability and not a bridge that never works.
+  const bridged = await bridgeProbe(namespaceRoot, legacy)
+  assert.equal(bridged.code, 0, `${bridged.stdout}${bridged.stderr}`)
+  assert.doesNotMatch(bridged.stdout, /^LEGACY_FD=none$/m,
+    `a readable pre-relocation lock must still be pinned:\n${bridged.stdout}`)
+  assert.match(bridged.stdout, /^LEGACY_HELD=yes$/m)
 })
 
 // ---------------------------------------------------------------------------
@@ -2689,12 +2998,18 @@ function preparerLockDir(root: string): string {
   return join(root, 'state', CRONTAB_LOCK_DIRNAME_EXPECTED)
 }
 
-async function runInstallerPreparer(root: string): Promise<PreparerRun> {
+async function runInstallerPreparer(
+  root: string,
+  opts: { stubs?: string[]; appUser?: string } = {},
+): Promise<PreparerRun> {
   const chownLog = join(root, 'chown.log')
   writeFileSync(chownLog, '')
   const script = [
     'set -euo pipefail',
-    "APP_USER='svcuser'",
+    // o3d-txoe r2 -- the probe in step 6 attempts the open AS ${APP_USER}; a harness that is not
+    // root cannot become another account, and the shipped helper refuses when it cannot ask. So it
+    // names itself and the probe answers with this account's own access(2).
+    `APP_USER=${opts.appUser ?? '"$(id -un)"'}`,
     // THE SHIPPED COMPOSITION AND THE HELPERS IT IS BUILT OUT OF (o3d-txoe). The paths are no
     // longer assigned here: `crontab_lock_paths` composes them from the namespace root, so a change
     // to the derivation moves what these tests plant against instead of leaving them testing a copy.
@@ -2711,6 +3026,7 @@ async function runInstallerPreparer(root: string): Promise<PreparerRun> {
     // `chmod` is ensure_cutover_root_dir()'s, on the NAMESPACE ROOT and never on the lock paths —
     // recorded alongside the chowns so the "no chmod on the lock paths" rule stays measurable.
     `crontab_lock_paths "\${CUTOVER_ROOT_DIR}" '${join(root, 'legacy-state')}'`,
+    ...(opts.stubs ?? []),
     'prepare_crontab_lock',
     'printf \'PREPARED=%s\\n\' "${CRONTAB_LOCK_FILE}"',
     'printf \'PINNED=%s\\n\' "$(LC_ALL=C stat -L -c \'%d:%i\' "/proc/self/fd/${CRONTAB_LOCK_FD}")"',

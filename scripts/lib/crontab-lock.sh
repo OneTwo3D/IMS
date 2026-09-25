@@ -194,6 +194,151 @@ crontab_lock_paths() {
 }
 
 # ---------------------------------------------------------------------------
+# CAN THE OTHER PARTY OPEN THIS LOCK? ASKED BY ATTEMPTING IT AS THAT ACCOUNT (o3d-txoe r2, Codex HIGH)
+#
+#   app_user_can_open <path>     0 = yes   1 = no   2 = the question could not be asked
+#
+# THE FINDING THIS ANSWERS, AND IT IS THE INVERSE OF THE ONE r1 FIXED. r1 made both parties name one
+# inode. It said nothing about whether the second party can OPEN it. A canonical lock file that
+# already exists as root-owned 0600 — what any privileged run under a 077 umask leaves, and what an
+# operator or an older release can leave — passed every post-condition above, because they ask about
+# the TYPE and the OWNER and not about permission. root then rewrites the crontab under an exclusion
+# it really holds while the application cannot open the file at all, so EVERY reconciliation it
+# attempts is refused and every schedule change it has already committed is silently never applied.
+# Measured: preparation accepted a 0600 lock, root's rewrite landed, both application
+# reconciliations were refused with EACCES, and neither of their schedule lines reached the crontab.
+#
+# WHY THIS IS NOT A MODE COMPARISON, which is the obvious way to write it and is wrong here
+# (o3d-noka r2 established the same point about the other direction). `mode & 0044` does not bound
+# what a POSIX ACL grants or withholds:
+#
+#   • a file at 0644 carrying `user:${APP_USER}:---` is UNREADABLE by that account, and a bits check
+#     says it is fine;
+#   • a file at 0640 carrying `user:${APP_USER}:r--` IS readable by it, and a bits check refuses a
+#     host that works.
+#
+# The mask theorem o3d-noka relies on runs one way only: `mode & 0077 == 0` PROVES private, because
+# ACL_MASK is the group bits and ACL_OTHER is the other bits, so nothing can grant what they deny.
+# The converse does not hold, and this question is the converse — so the bits cannot answer it and
+# are not asked. `access(2)`, which is what `[ -r ]` performs, consults the ACL.
+#
+# SO THE QUESTION IS ASKED BY BECOMING THE ACCOUNT, and the answer is a TOKEN rather than an exit
+# status. `runuser ... -- test -r` exits 1 both when the file is unreadable and when `runuser` itself
+# could not assume the account, and those are not the same answer: the first is a state this run may
+# repair, the second is a question it cannot ask at all. A missing token is therefore status 2, and
+# every caller treats 2 as a REFUSAL — an unanswerable permission question is not permission.
+#
+# `id -un` VS ${APP_USER}, AND WHY THE SELF BRANCH IS NOT A HOLE. This is deploy.sh's own
+# `as_app_user()` shape, kept for the same two reasons: on a host where the application already runs
+# as this account there is nothing to become, and a harness that is not root can exercise the
+# mechanism. It is not a way to pass trivially — the question really is "can that account open it",
+# and when this run IS that account the answer really is its own `access(2)`. Where the application
+# runs as root the answer is yes for any mode, and that is correct rather than vacuous: root can
+# open any file, so there is no second party to be shut out.
+#
+# `run_as_user()` IN install.sh AND update.sh IS NOT REUSED, deliberately: it takes the account as an
+# argument, has three branches, and returns the command's status — so it cannot distinguish "no" from
+# "could not ask", which is the whole point here. `as_app_user()` exists only in deploy.sh. A library
+# sourced by all three needs its own, and this is it.
+app_user_can_open() {
+  local path="$1" answer self
+  [[ -n "${APP_USER:-}" ]] || return 2
+  # THE STATUS IS TAKEN, not discarded (o3d-p9dq r30/r31, and the census in
+  # tests/settings/crontab-reconcile-serialization.test.ts enforces it). This body is invoked by
+  # ensure_app_user_can_open_lock() as `app_user_can_open … || rc=$?`, which suspends errexit for its
+  # whole dynamic extent — so an `id` that could not run would yield the empty string, fall through to
+  # the branch below, and have that branch try to become an account nothing had named. 2 is "the
+  # question could not be asked", and every caller treats it as a refusal.
+  self="$(id -un)" || return 2
+  if [[ "${self}" == "${APP_USER}" ]]; then
+    [[ -r "${path}" ]] || return 1
+    return 0
+  fi
+  if command -v runuser >/dev/null 2>&1; then
+    answer="$(runuser -u "${APP_USER}" -- sh -c 'if [ -r "$1" ]; then echo YES; else echo NO; fi' sh "${path}" 2>/dev/null || true)"
+  elif command -v sudo >/dev/null 2>&1; then
+    answer="$(sudo -n -u "${APP_USER}" sh -c 'if [ -r "$1" ]; then echo YES; else echo NO; fi' sh "${path}" 2>/dev/null || true)"
+  else
+    return 2
+  fi
+  case "${answer}" in
+    YES) return 0 ;;
+    NO)  return 1 ;;
+    *)   return 2 ;;
+  esac
+}
+
+# THE LOCK IS MADE OPENABLE BY THE OTHER PARTY, AND THAT IS PROVED BY ASKING IT AGAIN
+#
+#   ensure_app_user_can_open_lock <fd> <path> <what>   0 = it can   1 = it cannot, and why is said
+#
+# SET, THEN PROVE — NOT ASSERT, AND NOT SET-AND-HOPE. This is the shape r23 settled on for the
+# cutover lock in scripts/lib/cutover-namespace.sh (`narrow_held_lock`), arrived at there by the
+# same argument in the opposite direction, and the reasoning transfers whole:
+#
+#   • A BARE ASSERTION TURNS AN AMBIENT UMASK INTO A REFUSED CUTOVER FOREVER. Preparation runs as
+#     root on every install, deploy and update, so the one reachable cause — a lock file created
+#     under a 077 umask by a privileged run — is a state this run can simply fix. Refusing it
+#     instead would mean an operator hand-chmod-ing a file whose contents are meaningless before
+#     any cutover could proceed, for a property this run is entitled to set.
+#   • AND SET-AND-HOPE IS THE MISTAKE THIS WHOLE FILE IS ABOUT. The `chmod` is therefore followed by
+#     the SAME probe that failed, so what is established is the PROPERTY and not the call. An ACL
+#     that denies the account, a read-only mount, an immutable attribute and a `chmod` that silently
+#     did nothing all survive the repair and all end in a refusal naming the file.
+#
+# WHAT REFUSING INSTEAD WOULD HAVE COST, stated because r1 stated the same for the relocation: every
+# host whose lock file was ever created under a restrictive umask would refuse every cutover until an
+# operator intervened, and the operator-facing symptom — "the installer will not run" — is further
+# from the cause than the one this leaves, which is a warning saying what was widened and why.
+# WHAT SETTING COSTS, and it is not nothing: this run widens a file a previous privileged run
+# created. It is defensible only because of what that file is — root-owned, ALWAYS EMPTY, its
+# contents meaningless, inside a directory no unprivileged account may write — so 0644 discloses
+# nothing, and because being openable by ${APP_USER} is not a weakening but the POINT: it is what
+# makes the application a party to the exclusion at all. The DoS that comes with it (any local
+# account may open this file and hold the lock) is pre-existing, deliberate and bounded by
+# ${CRONTAB_LOCK_WAIT_SECONDS}; it is the trade cutover-namespace.sh declines for the CUTOVER lock,
+# which no unprivileged party is meant to hold, and accepts here, where one is.
+#
+# THE `chmod` IS AIMED AT THE DESCRIPTOR, NEVER AT THE PATHNAME. `chmod /proc/self/fd/N` is an
+# `fchmod(2)` in the only spelling a shell has — the kernel resolves the magic link to the OPEN FILE
+# — which is exactly why the "no chmod, anywhere on these paths" rule above does not reach it: that
+# rule is about `chmod` having no `--no-dereference` on Linux, and there is no pathname here to
+# follow. `narrow_held_lock()` makes the identical move for the identical reason. verify_held_lock()
+# is re-asked BEFORE the change, so the inode being widened is still the one that pathname names.
+#
+# AND THE PROBE IS OF THE FULL PATHNAME, WHICH IS THE POINT AND NOT AN OVERSIGHT. `access(2)`
+# resolves every component, so one question answers the file's own permission AND the traversability
+# of ${CRONTAB_LOCK_DIR} and of ${CUTOVER_ROOT_DIR} above it — the second party has to walk that path
+# too. The mode check on the directory further up is the earlier, cheaper, better-worded half of the
+# same question; this is the authority. (The directory's `& 0001` rule can over-refuse a hand-built
+# directory whose ACL grants `x` without the bit: a refusal, the safe direction, and not a
+# configuration this installer produces, which creates that directory 0755 itself.)
+ensure_app_user_can_open_lock() {
+  local fd="$1" path="$2" what="$3" rc=0
+  app_user_can_open "${path}" || rc=$?
+  if (( rc == 0 )); then
+    return 0
+  fi
+  if (( rc == 2 )); then
+    warn "this run could not establish whether '${APP_USER}' can open ${what} at ${path}: it could not run a command as that account at all (no runuser, no sudo, or no such account). An unanswerable permission question is not permission."
+    return 1
+  fi
+  # It said NO. Repair the inode this run is holding, then ask the same question again.
+  verify_held_lock "${fd}" "${path}" || {
+    warn "${path} is no longer the inode this run pinned, so the permission this run would repair is not the permission the other party will meet. Nothing has been changed there."
+    return 1
+  }
+  chmod 0644 "/proc/self/fd/${fd}" 2>/dev/null || true
+  rc=0
+  app_user_can_open "${path}" || rc=$?
+  if (( rc == 0 )); then
+    warn "${what} at ${path} could not be opened by '${APP_USER}' and has been widened to 0644 by this run. It is root-owned, always empty and inside a directory no unprivileged account may write, so its contents disclose nothing; being openable by that account is what makes the application a party to this exclusion (o3d-txoe)."
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # THE CRONTAB RECONCILIATION LOCK IS ROOT-OWNED, INSIDE A ROOT-OWNED PARENT NOBODY ELSE CAN
 # RENAME WITHIN, AND NO ROOT-SIDE STEP FOLLOWS A SYMLINK
 # (Codex r24 CRITICAL, and o3d-txoe for where it lives).
@@ -340,6 +485,14 @@ prepare_crontab_lock() {
   # application unable to open the lock — which lib/crontab-reconcile-lock.ts turns into a refused
   # reconciliation rather than an unserialised one, so it is not a silent split; it is still a
   # scheduler that has stopped working, and it is this run's to refuse rather than to ship.
+  #
+  # THIS IS THE EARLIER, CHEAPER HALF OF ONE QUESTION, AND NOT THE AUTHORITY (o3d-txoe r2). Step 6
+  # below asks the whole of it — can ${APP_USER} open ${CRONTAB_LOCK_FILE} — by attempting it as
+  # that account, and `access(2)` resolves every component, so the traversability of this directory
+  # is inside that answer. What this keeps is a refusal that names the DIRECTORY when the directory
+  # is the cause, which the probe's message cannot do. Its cost, stated: a bits rule can over-refuse
+  # a hand-built directory whose ACL grants `x` without the bit. That is the safe direction, and it
+  # is not a directory this installer produces — it creates this one 0755 itself.
   (( (8#${dir_mode} & 0001) != 0 )) || die \
     "${CRONTAB_LOCK_DIR} is mode ${dir_mode}: not traversable by other accounts, so '${APP_USER}' cannot open the crontab reconciliation lock inside it and the application cannot join this exclusion. Every reconciliation from the running service would refuse. Set it to 0755 and run the installer again."
 
@@ -375,10 +528,19 @@ prepare_crontab_lock() {
     "${CRONTAB_LOCK_FILE} must be a regular file owned by uid ${self} after preparation, and is '${file_meta}'."
 
   # 5 — AND THE DESCRIPTOR, OPENED HERE AND HELD FOR THE RUN (o3d-q766). A single component, from
-  # the pinned directory; READ-ONLY, so there is no O_CREAT and no O_TRUNC in it to aim. A FAILED
-  # `exec` REDIRECTION ENDS A NON-INTERACTIVE SHELL, so there is no state in which this function
-  # returns with ${CRONTAB_LOCK_FD} empty and the caller believing a lock was prepared.
-  exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}"
+  # the pinned directory; READ-ONLY, so there is no O_CREAT and no O_TRUNC in it to aim.
+  #
+  # AND THE OPEN'S SUCCESS IS CHECKED (o3d-txoe r2). r1 wrote "a FAILED `exec` REDIRECTION ENDS A
+  # NON-INTERACTIVE SHELL, so there is no state in which this function returns with
+  # ${CRONTAB_LOCK_FD} empty" — and that is NOT TRUE OF THIS LIBRARY. Measured: under `set -u` alone
+  # a failed `exec {VAR}<file` prints bash's error, leaves ${VAR} UNSET, and CONTINUES with status 0.
+  # It ends the shell only because all three entrypoints also set `errexit`, which is a property of
+  # the caller and not of this file. The failure direction was safe by luck — an empty fd makes
+  # `stat -L /proc/self/fd/` answer "directory", which verify_held_lock() refuses — and a guarantee
+  # that rests on which of two wrong things happens first is not a guarantee. It is asked instead.
+  exec {CRONTAB_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}" || true
+  [[ -n "${CRONTAB_LOCK_FD:-}" ]] || die \
+    "${CRONTAB_LOCK_FILE} could not be opened read-only by this run, so there is no descriptor to take the crontab exclusion on. The file is root-owned inside a directory only root may write, so on a supported install this means something outside the permission bits is refusing the open — a mandatory-access-control policy, or a privileged run without CAP_DAC_OVERRIDE. Refusing to rewrite the crontab without the exclusion. Nothing has been written."
   # THE DESCRIPTOR IS THE ONE THE POST-CONDITIONS PASSED ON. verify_held_lock() fstats it through
   # /proc/self/fd/N — `-L` there is what makes it an fstat of the OPEN FILE rather than a walk of
   # anything — requires a regular file owned by this run, and requires the NAME's own lstat to be
@@ -390,6 +552,19 @@ prepare_crontab_lock() {
   held_ident="$(LC_ALL=C stat -L -c '%d:%i' "/proc/self/fd/${CRONTAB_LOCK_FD}" 2>/dev/null || true)"
   [[ "${held_ident}" == "${file_ident}" ]] || die \
     "the descriptor this run holds on ${CRONTAB_LOCK_FILE} answers as ${held_ident:-nothing}, which is not the inode its post-conditions were checked against (${file_ident}). Refusing to take the crontab exclusion on a file this run cannot identify. Nothing has been written."
+
+  # 6 — AND THE OTHER PARTY CAN OPEN IT, which the five steps above do not establish and which is
+  # the whole of o3d-txoe r2. They ask about the TYPE, the OWNER and the IDENTITY; a root-owned 0600
+  # file satisfies every one of them and leaves the application unable to open the lock at all, so
+  # every reconciliation it attempts is refused and every schedule it has already committed is
+  # silently never applied. That is the INVERSE of the defect r1 fixed — not both parties entering,
+  # but one party never entering — and it is a wrong result in production either way.
+  #
+  # ASKED OF THE FULL PATHNAME, BY BECOMING THE ACCOUNT, and REPAIRED-THEN-PROVED rather than
+  # asserted. See ensure_app_user_can_open_lock() above for why it is not a mode comparison, why the
+  # `chmod` is aimed at the descriptor, and what refusing instead would have cost.
+  ensure_app_user_can_open_lock "${CRONTAB_LOCK_FD}" "${CRONTAB_LOCK_FILE}" "the crontab reconciliation lock" || die \
+    "'${APP_USER}' cannot open ${CRONTAB_LOCK_FILE}, and this run could not make it openable. The application takes ITS half of this exclusion by opening that file read-only, so with it unopenable every reconciliation the running service attempts is REFUSED — and a schedule an operator saved, and the database has already committed, is then never projected into the crontab while every page reports it enabled. The reason is above. Fix it so that account can read the file (an ACL that withholds it, a read-only mount, or an immutable attribute are the states this run cannot repair) and run this again. Nothing has been written."
 
   cd "${saved}" || die \
     "this run could not return to ${saved} after preparing ${CRONTAB_LOCK_DIR}. Nothing further has been changed."
@@ -458,7 +633,14 @@ prepare_legacy_crontab_lock() {
     warn "${CRONTAB_LEGACY_LOCK_FILE} is a ${kind:-missing path} rather than a regular file, so this run will not open it to bridge to a predecessor build. NOTHING WAS OPENED OR LOCKED THERE. An application process running a build from BEFORE the crontab lock moved to ${CRONTAB_LOCK_DIR} is NOT excluded by this run."
     return 0
   fi
-  exec {CRONTAB_LEGACY_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}"
+  # Its success is CHECKED for the reason above, and an open that failed DECLINES the bridge rather
+  # than ending the run: the canonical exclusion is unaffected by anything at this path.
+  exec {CRONTAB_LEGACY_LOCK_FD}<"${CRONTAB_LOCK_FILENAME}" || true
+  if [[ -z "${CRONTAB_LEGACY_LOCK_FD:-}" ]]; then
+    cd "${saved}" >/dev/null 2>&1 || true
+    warn "${CRONTAB_LEGACY_LOCK_FILE} could not be opened read-only by this run, so nothing can be locked on it. NOTHING WAS OPENED OR LOCKED THERE. An application process running a build from BEFORE the crontab lock moved to ${CRONTAB_LOCK_DIR} is NOT excluded by this run; two writers of THIS build still cannot overlap."
+    return 0
+  fi
   held_ident="$(LC_ALL=C stat -L -c '%d:%i' "/proc/self/fd/${CRONTAB_LEGACY_LOCK_FD}" 2>/dev/null || true)"
   if ! verify_held_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LOCK_FILENAME}" \
      || [[ "${held_ident}" != "${ident}" ]]; then
@@ -471,6 +653,23 @@ prepare_legacy_crontab_lock() {
     CRONTAB_LEGACY_LOCK_FD=""
     cd "${saved}" >/dev/null 2>&1 || true
     die "the descriptor this run opened on ${CRONTAB_LEGACY_LOCK_FILE} answers as ${held_ident:-nothing} rather than as that name's own inode (${ident}), or is not a regular file owned by this run. That is a substitution inside a directory this run had just established only it may write, so it is REFUSED rather than bridged: this run will not go on to rewrite the crontab behind an exclusion it cannot identify. Nothing has been written."
+  fi
+  # AND THE SAME QUESTION AS THE CANONICAL LOCK, so the rule is not fixed in one place and left wrong
+  # in the other (o3d-txoe r2). The counterparty of THIS inode is a PREDECESSOR application, which
+  # runs as the same account — so a pre-relocation lock that account cannot open excludes nothing,
+  # and a bridge to it would report a continuity that does not exist. It is repaired the same way and
+  # proved the same way.
+  #
+  # A DECLINE AND NOT A `die`, which is the one thing that differs and is deliberate: the CANONICAL
+  # exclusion is unaffected, so refusing the whole cutover over a lock belonging to a build being
+  # retired would trade a working exclusion for none. The statement is the same shape as the other
+  # two decline paths, and it says what is not excluded rather than leaving a reader to infer it.
+  if ! ensure_app_user_can_open_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LEGACY_LOCK_FILE}" "the pre-relocation crontab lock"; then
+    { exec {CRONTAB_LEGACY_LOCK_FD}<&-; } 2>/dev/null || true
+    CRONTAB_LEGACY_LOCK_FD=""
+    cd "${saved}" >/dev/null 2>&1 || true
+    warn "'${APP_USER}' cannot open ${CRONTAB_LEGACY_LOCK_FILE} and this run could not make it openable, so a lock taken on it would exclude nothing: a PREDECESSOR application resolves that path and takes its half of the exclusion by opening that file, and it cannot. NOTHING IS LOCKED THERE and the descriptor has been closed. An application process running a build from BEFORE the crontab lock moved to ${CRONTAB_LOCK_DIR} is NOT excluded by this run — and is itself already refusing every reconciliation for the same reason. Two writers of THIS build still cannot overlap. See docs/installation.md, 'The first run after the crontab lock moved'."
+    return 0
   fi
   cd "${saved}" || die \
     "this run could not return to ${saved} after pinning ${CRONTAB_LEGACY_LOCK_FILE}. Nothing further has been changed."

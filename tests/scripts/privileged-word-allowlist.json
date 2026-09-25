@@ -2762,6 +2762,55 @@
    "reason": "non-recursive rm -f on one named path"
   },
   {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#   • AND SET-AND-HOPE IS THE MISTAKE THIS WHOLE FILE IS ABOUT. The `chmod` is therefore followed by",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "#     that denies the account, a read-only mount, an immutable attribute and a `chmod` that silently",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "# THE `chmod` IS AIMED AT THE DESCRIPTOR, NEVER AT THE PATHNAME. `chmod /proc/self/fd/N` is an",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "# rule is about `chmod` having no `--no-dereference` on Linux, and there is no pathname here to",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "chmod 0644 \"/proc/self/fd/${fd}\" 2>/dev/null || true",
+   "count": 1,
+   "class": "single-inode",
+   "reason": "an fchmod(2) in the only spelling a shell has: /proc/self/fd/N is a magic link the kernel resolves to the OPEN FILE, so no component of any pathname is walked and there is nothing for a rename to aim. The same move narrow_held_lock() makes, and the PROPERTY it sets is proved by re-asking access(2) as ${APP_USER} on the next statement rather than by this call's status (o3d-txoe r2)"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "[[ -n \"${CRONTAB_LOCK_FD:-}\" ]] || die \\\n\"${CRONTAB_LOCK_FILE} could not be opened read-only by this run, so there is no descriptor to take the crontab exclusion on. The file is root-owned inside a directory only root may write, so on a supported install this means something outside the permission bits is refusing the open — a mandatory-access-control policy, or a privileged run without CAP_DAC_OVERRIDE. Refusing to rewrite the crontab without the exclusion. Nothing has been written.\"",
+   "count": 1,
+   "class": "text",
+   "reason": "not run: the word is text or an argument (die) -- 'install' appears only inside the operator message"
+  },
+  {
+   "file": "scripts/lib/crontab-lock.sh",
+   "line": "# `chmod` is aimed at the descriptor, and what refusing instead would have cost.",
+   "count": 1,
+   "class": "comment",
+   "reason": "a comment by lexer state that quotes code in backticks or $( ); the strict rule reads it, and nothing on it runs"
+  },
+  {
    "file": "scripts/lib/cutover-namespace.sh",
    "line": "#   there and returns 0. `chown` and `chmod` then both DEREFERENCE, as root, so `deploy` pointed",
    "count": 1,
