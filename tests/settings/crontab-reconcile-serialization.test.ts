@@ -2355,18 +2355,39 @@ test('[o3d-batch-ret] the openability decision is not made from mode BITS, on ei
     'the repair must be followed by the SAME question being asked again, within three statements — '
     + `otherwise the discarded status is the only evidence it worked: ${afterChmod.slice(chmodAt + 1, chmodAt + 4).join(' / ')}`)
 
-  // THE ABSENCE RULE. No `8#` arithmetic and no octal mask appears on a lock FILE's mode anywhere in
-  // the openability path. (The lock DIRECTORY's own `& 0022`/`& 0001` rules live in a different body
-  // and are sound in the refusing direction; see the prose there.)
-  const fileModeArithmetic = body.split('\n').map((l) => l.trim())
-    .filter((l) => /8#/.test(l) && /file_mode|lock_mode|FILE/.test(l))
-  assert.deepEqual(fileModeArithmetic, [],
-    `the openability decision must not be computed from the lock file's permission bits: ${fileModeArithmetic.join(' / ')}`)
-  // NOT VACUOUS: the rule fires on the statement it is about, appended to the same body.
-  const withBits = `${body}\nfile_mode=644\n(( (8#\${file_mode} & 0044) != 0 )) || die "FILE unreadable"`
+  // THE ABSENCE RULE, AND IT IS THE ONLY THING IN THIS SUITE THAT CAN SEE A REGRESSION TO BITS.
+  // A harness with one identity cannot tell an attempted access from a mode comparison
+  // BEHAVIOURALLY — both answer "no" for a file it cannot read and "yes" after the repair — so the
+  // distinction has to be held at the source. It is stated as an ABSENCE, which is universal:
+  // NOTHING a `stat` returns may decide this question, anywhere in the probe.
+  const probe = withoutCommentsOrMessages(installerPreparer('app_user_can_open'))
+  assert.doesNotMatch(probe, /\bstat\b/,
+    'the openability decision must not be computed from anything `stat` returns — a mode cannot '
+    + 'answer it (o3d-noka r2: a mode does not bound an ACL), and every bits-based form of this '
+    + `check needs a stat:\n${probe}`)
+  assert.doesNotMatch(probe, /8#/, 'and no octal arithmetic decides it either')
+  // AND THE TWO STATEMENTS THAT DO DECIDE IT ARE AN EXACT ROSTER, so a third route cannot be added
+  // beside them.
+  const decisions = probe.split('\n').map((l) => l.trim())
+    .filter((l) => /return 0|return 1|return 2/.test(l))
+  assert.deepEqual(decisions, [
+    '[[ -n "${APP_USER:-}" ]] || return 2',
+    'self="$(id -un)" || return 2',
+    '[[ -r "${path}" ]] || return 1',
+    'return 0',
+    'return 2',
+    'YES) return 0 ;;',
+    'NO)  return 1 ;;',
+    '*)   return 2 ;;',
+  ], `the probe's decisions must be exactly these: ${decisions.join(' / ')}`)
+  // NOT VACUOUS, both ways: the stat rule fires on the bits form appended to the same body, and the
+  // roster fires on a route added beside the two that are allowed.
+  assert.match(`${probe}\nfile_mode="$(LC_ALL=C stat -c '%a' "${'${path}'}")"`, /\bstat\b/,
+    'the stat rule must still catch a bits-based decision')
   assert.notDeepEqual(
-    withBits.split('\n').map((l) => l.trim()).filter((l) => /8#/.test(l) && /file_mode|lock_mode|FILE/.test(l)),
-    [], 'the absence rule must still catch a bits-based decision about the lock file')
+    `${probe}\n[[ "${'${path}'}" == /etc/* ]] && return 0`.split('\n').map((l) => l.trim())
+      .filter((l) => /return 0|return 1|return 2/.test(l)),
+    decisions, 'and the roster must still catch a third route')
 
   // AND BOTH LOCKS GO THROUGH THE ONE HELPER, so the rule is not fixed in one place and left wrong
   // in the other. Asked of the two preparation bodies, as an exact roster.
@@ -2377,6 +2398,61 @@ test('[o3d-batch-ret] the openability decision is not made from mode BITS, on ei
     'ensure_app_user_can_open_lock "${CRONTAB_LOCK_FD}" "${CRONTAB_LOCK_FILE}" "the crontab reconciliation lock" || die \\',
     'if ! ensure_app_user_can_open_lock "${CRONTAB_LEGACY_LOCK_FD}" "${CRONTAB_LEGACY_LOCK_FILE}" "the pre-relocation crontab lock"; then',
   ], `the canonical lock DIES and the pre-relocation one DECLINES, and both ask: ${calls.join(' / ')}`)
+})
+
+test('[o3d-batch-ret] a pinning `exec` that FAILED is refused by this library, not by the caller\'s errexit', async () => {
+  // A ROUND-1 CLAIM THAT WAS FALSE, AND THE TEST THAT WOULD HAVE CAUGHT IT. r1 wrote: "A FAILED
+  // `exec` REDIRECTION ENDS A NON-INTERACTIVE SHELL, so there is no state in which this function
+  // returns with ${CRONTAB_LOCK_FD} empty and the caller believing a lock was prepared." MEASURED
+  // here: that is true only under `errexit`, which all three entrypoints happen to set — so it was a
+  // property of the CALLER, not of this library, and the library shipped a guarantee it did not make.
+  //
+  // The failure direction was safe by luck: an unset fd makes `/proc/self/fd/` a DIRECTORY, which
+  // verify_held_lock() refuses. A guarantee that rests on which of two wrong things happens first is
+  // not a guarantee, so the open's success is now asked.
+  const root = join(HARNESS, 'unopenable-pin')
+  const lock = join(preparerLockDir(root), '.crontab-reconcile.lock')
+  await sh(`rm -rf '${root}' && mkdir -p '${preparerLockDir(root)}' && chmod 0755 '${root}/state' '${preparerLockDir(root)}'`
+    + ` && : > '${lock}' && chmod 0000 '${lock}'`)
+  assert.notEqual(process.getuid?.(), 0,
+    'root bypasses the DAC read check, so this test needs an unprivileged runner')
+  assert.equal((await sh(`test -r '${lock}'`)).code === 0, false,
+    'precondition: the open this test needs to fail must genuinely be impossible for this account')
+
+  // WITHOUT errexit — which is what this library alone guarantees. The `exec` fails, the shell
+  // CONTINUES, and the refusal must come from the check this round added.
+  const lax = await runInstallerPreparer(root, { errexit: false })
+  assert.equal(lax.code, 1,
+    `a pinning open that failed must END the run even with errexit off:\n${lax.stdout}${lax.stderr}`)
+  assert.match(lax.stderr, /could not be opened read-only by this run, so there is no descriptor to take the crontab exclusion on/,
+    `and the refusal must be THIS library's, naming the file — not bash's redirection error followed `
+    + `by whatever happens next:\n${lax.stderr}`)
+  assert.ok(lax.stderr.includes(lock), 'and it must name the path')
+  assert.doesNotMatch(lax.stdout, /^PREPARED=/m,
+    'and the preparation must not report having prepared anything')
+
+  // PRECONDITION FOR THE CLAIM ABOVE, measured rather than asserted from the manual: the bare
+  // redirection really does leave the variable unset and really does continue.
+  const bareBehaviour = await sh(`set -uo pipefail\nFD=""\nexec {FD}<'${lock}' || true\n`
+    + `echo "CONTINUED=yes FD=[\${FD}]"\nexit 0`)
+  assert.match(bareBehaviour.stdout, /^CONTINUED=yes FD=\[\]$/m,
+    `the whole reason this check exists: without errexit a failed \`exec {VAR}<\` leaves the variable `
+    + `unset and carries on:\n${bareBehaviour.stdout}${bareBehaviour.stderr}`)
+
+  // AND WITH errexit — the entrypoints' own setting — the run also stops, so the check has not made
+  // anything worse for them. It is the SAME sandbox, so this is one thing differing.
+  const strict = await runInstallerPreparer(root)
+  assert.equal(strict.code, 1, `${strict.stdout}${strict.stderr}`)
+
+  // NOT VACUOUS: the same sandbox with a lock this account CAN open prepares normally, under both
+  // settings. So the refusals above are about the failed open and not about the harness.
+  await sh(`chmod 0644 '${lock}'`)
+  for (const errexit of [true, false]) {
+    const fine = await runInstallerPreparer(root, { errexit })
+    assert.equal(fine.code, 0,
+      `a lock this account can open must prepare (errexit=${errexit}):\n${fine.stdout}${fine.stderr}`)
+    assert.match(fine.stdout, new RegExp(`^PREPARED=${lock}$`, 'm'))
+  }
 })
 
 test('[o3d-batch-ret] a PRE-RELOCATION lock the application cannot open DECLINES the bridge rather than ending the run', async () => {
@@ -3000,12 +3076,15 @@ function preparerLockDir(root: string): string {
 
 async function runInstallerPreparer(
   root: string,
-  opts: { stubs?: string[]; appUser?: string } = {},
+  opts: { stubs?: string[]; appUser?: string; errexit?: boolean } = {},
 ): Promise<PreparerRun> {
   const chownLog = join(root, 'chown.log')
   writeFileSync(chownLog, '')
   const script = [
-    'set -euo pipefail',
+    // `errexit` IS AN OPTION HERE, and that is the point of one test below (o3d-txoe r2): the
+    // entrypoints all set it, so a failed `exec` redirection ends them — but this LIBRARY must
+    // refuse on its own terms, because that guarantee is the caller's and not its own.
+    opts.errexit === false ? 'set -uo pipefail' : 'set -euo pipefail',
     // o3d-txoe r2 -- the probe in step 6 attempts the open AS ${APP_USER}; a harness that is not
     // root cannot become another account, and the shipped helper refuses when it cannot ask. So it
     // names itself and the probe answers with this account's own access(2).
