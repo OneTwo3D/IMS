@@ -209,7 +209,7 @@ test('a same-reference, same-line-id ASN whose QUANTITY differs is an unresolved
     // PRECONDITION, so the refusal is doing work rather than restating a state that never arises: the row
     // really does carry our reference and EXACTLY our line ids, and the quantity really is readable.
     assert.equal(hasNoLineIdentityMatch(asn, criteria), false, `precondition (${label}): the line identity matches`)
-    assert.equal(asn.lines.find((entry) => entry.sourceLineId === line)?.quantity, remote, `precondition (${label}): and the remote quantity is readable`)
+    assert.equal(asn.lines.find((entry) => entry.sourceLineId === line)?.expectedQty, remote, `precondition (${label}): and the remote EXPECTED quantity is readable`)
     assert.throws(
       () => findRecoverableMintsoftAsn([asn], criteria),
       (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityConflictError
@@ -369,7 +369,7 @@ test('an expected quantity Mintsoft did not return is UNRESOLVED, never permissi
   ] as const) {
     const asn = row(580, 'PO-1', 6, [MATCHING_ITEMS[0]!, { ID: 2, SourceLineId: 'line-b', QuantityExpected: quantityExpected }])
     assert.equal(asn.lines.length, 2, `precondition (${label}): the line is still matched by SourceLineId`)
-    assert.equal(asn.lines[1]!.quantity, null, `precondition (${label}): and its quantity is unreadable`)
+    assert.equal(asn.lines[1]!.expectedQty, null, `precondition (${label}): and its expected quantity is unreadable`)
     assert.throws(
       () => findRecoverableMintsoftAsn([asn], RESERVATION),
       (error: unknown) => error instanceof MintsoftAsnRecoveryQuantityUnreadableError

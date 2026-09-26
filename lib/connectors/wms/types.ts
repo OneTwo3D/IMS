@@ -142,12 +142,67 @@ export type WmsAsnInput = {
   lines: WmsAsnLineInput[]
 }
 
+/**
+ * WHAT A WAREHOUSE HAS DONE WITH ONE ASN LINE'S GOODS — or a statement that it did not say.
+ * o3d-btiw.
+ *
+ * WHY THIS IS A UNION AND NOT A NUMBER. Until this type existed, a normalized ASN line carried a
+ * single `quantity: number | null`, and `null` meant BOTH "the warehouse reports nothing arrived"
+ * and "IMS could not read what the warehouse reported". The booked-in processor spent the ambiguity
+ * on the harmless-looking reading, `Math.max(0, Number(remoteLine?.quantity ?? 0))`, so an ASN whose
+ * quantities IMS could not read applied nothing and reported itself PROCESSED — and, on a second
+ * callback, reported the warehouse as having gone BACKWARDS. Unknown is not a quantity, and it must
+ * not be representable as one.
+ *
+ * WHY THERE ARE TWO NUMBERS. Arriving at a warehouse and being booked into its stock are different
+ * events, and warehouses report them separately (Mintsoft: `QuantityReceieved` vs `QuantityBooked`).
+ * `bookedIntoStockQty` is the one IMS acts on — it is the event that moves the WMS's own stock, which
+ * is the figure IMS's stock-sync alignment reconciles against. `arrivedAtWarehouseQty` is carried
+ * BESIDE it rather than discarded, so "goods are at the warehouse that IMS has not booked" is a
+ * number in the dry run, the receipt-review details and the processed-event log instead of a fact
+ * only the WMS holds. See lib/connectors/mintsoft/api/asn-quantities.ts for the decision in full.
+ */
+export type WmsAsnLineReceipt =
+  | {
+      kind: 'reported'
+      /** The quantity the warehouse has booked into its own stock. THE quantity IMS books in. */
+      bookedIntoStockQty: number
+      /**
+       * The quantity the warehouse says physically arrived, when it reports that separately.
+       * `null` means it did not report a readable one — NOT that nothing arrived.
+       */
+      arrivedAtWarehouseQty: number | null
+      /** The remote field this reading came from, for the audit trail (e.g. `Mintsoft ASNItem.QuantityBooked`). */
+      basis: string
+    }
+  | {
+      kind: 'unreadable'
+      /** Why, in words a reviewer can act on. Reaches the operator as a review warning. */
+      detail: string
+      /**
+       * The arrived quantity IS STILL CARRIED when the booked one cannot be read, because it is then
+       * the only number the warehouse served and the one a reviewer needs. Discarding it here was a
+       * defect of the first cut of this type, caught by its own test: "the other quantity stays
+       * visible" has to hold on the refusal path too, or the refusal is the quietest place in the
+       * system. `null` means neither was readable.
+       */
+      arrivedAtWarehouseQty: number | null
+    }
+
 export type WmsAsnLineRef = {
   externalLineId: string
   sourceLineId: string
   externalProductId: string | null
   sku: string | null
-  quantity: number | null
+  /**
+   * What the ASN says SHOULD arrive (Mintsoft: `ASNItem.QuantityExpected`), or `null` when the WMS
+   * served nothing readable. Deliberately NOT the same field as the receipt below: duplicate
+   * recovery matches an ASN on its expectations, the booked-in path acts on its receipts, and one
+   * `quantity` field serving both is how o3d-btiw happened.
+   */
+  expectedQty: number | null
+  /** What the warehouse has actually done with the goods. See `WmsAsnLineReceipt`. */
+  receipt: WmsAsnLineReceipt
   raw: Record<string, unknown> | null
 }
 

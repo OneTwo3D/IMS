@@ -146,7 +146,8 @@ test('duplicate recovery reads the WHOLE tenant and finds its ASN on page 2, by 
   assert.equal(target.raw?.POReference, 'PO-TARGET')
   assert.equal(target.lines.length, 1)
   assert.equal(target.lines[0]!.sourceLineId, 'line-9999')
-  assert.equal(target.lines[0]!.quantity, 4, 'the EXPECTED quantity, not the received one')
+  // o3d-btiw: the field is now NAMED expectedQty, so the comment and the code agree.
+  assert.equal(target.lines[0]!.expectedQty, 4, 'the EXPECTED quantity, not the received one')
   assert.equal(asns.length, tenant().length, 'every ASN in the tenant, both warehouses')
 })
 

@@ -6,6 +6,7 @@ import {
   requireMintsoftAsnIsTheOneRequested,
   type MintsoftAsnExpectation,
 } from './asn-creation-rule'
+import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
@@ -912,7 +913,15 @@ export function normalizeMintsoftAsnListRowForRecovery(row: Record<string, unkno
       sourceLineId,
       externalProductId: record.ProductId == null ? null : String(record.ProductId),
       sku: typeof record.SKU === 'string' ? record.SKU : null,
-      quantity: expected,
+      expectedQty: expected,
+      // o3d-btiw: A LIST ROW IS A WmsAsnLineRef LIKE ANY OTHER, AND IT MUST FAIL CLOSED. The receipt
+      // goes through the same reader as the by-id normalizer, so a list row that carries no
+      // `QuantityBooked` — which is what `GET /api/ASN/List` serves when IncludeASNItems is on but
+      // the item is abridged — comes back `unreadable` rather than as a quantity of zero. A zero
+      // here would be a claim that nothing has been booked in, and the recovery path would record a
+      // COMPLETE ASN as owing its whole receipt (or, with the delta guard, as owing nothing at all).
+      // Whether Mintsoft serves the field on a list item is not something the caller has to know.
+      receipt: readMintsoftAsnItemReceipt(record),
       raw: record,
     }]
   })

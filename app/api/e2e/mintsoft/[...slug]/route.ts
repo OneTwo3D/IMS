@@ -46,12 +46,26 @@ type FakeMintsoftReturn = {
   receivedAt: string | null
 }
 
+/**
+ * o3d-btiw — THE FAKE HOLDS AN ASN ITEM'S THREE QUANTITIES SEPARATELY, because live Mintsoft does.
+ * `quantity` is the EXPECTED quantity (`ASNItem.QuantityExpected`); `receivedQuantity` and
+ * `bookedQuantity` are `QuantityReceieved` (Mintsoft's spelling) and `QuantityBooked`, and they
+ * default to 0 because a newly created ASN has had nothing booked in. A seed can move them, which is
+ * the whole point: while the fake held ONE quantity, no e2e run could reach the booked-in
+ * reconciliation at all — which is why e2e never saw that every live ASN item normalized to a
+ * received quantity of zero.
+ */
 type FakeMintsoftAsnLine = {
   id: string
   sourceLineId: string
   productId: string | null
   sku: string | null
+  /** `ASNItem.QuantityExpected`. */
   quantity: number
+  /** `ASNItem.QuantityReceieved` — arrived at the warehouse. */
+  receivedQuantity: number
+  /** `ASNItem.QuantityBooked` — booked into the warehouse's stock; the quantity IMS books in. */
+  bookedQuantity: number
 }
 
 /**
@@ -259,6 +273,10 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
             productId: asString(recordLine?.productId),
             sku: asString(recordLine?.sku),
             quantity: asNumber(recordLine?.quantity, 0),
+            // o3d-btiw: a seed that says nothing about receipts describes an ASN nothing has been
+            // booked in against, which is what a freshly created one is.
+            receivedQuantity: asNumber(recordLine?.receivedQuantity, 0),
+            bookedQuantity: asNumber(recordLine?.bookedQuantity, 0),
           } satisfies FakeMintsoftAsnLine
         })
         .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
@@ -337,11 +355,14 @@ function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
       ASNId: asnId,
       ProductId: line.productId && /^\d+$/.test(line.productId) ? Number(line.productId) : line.productId,
       QuantityExpected: line.quantity,
-      QuantityReceieved: 0,
-      QuantityBooked: 0,
+      // o3d-btiw: the two quantities booked-in actually reads. They were hardcoded to 0, so the fake
+      // could serve the live KEY NAMES and still never express an ASN that has been booked in — the
+      // only state in which the reconciliation does any work.
+      QuantityReceieved: line.receivedQuantity,
+      QuantityBooked: line.bookedQuantity,
       OnOrder: 0,
       SSCCNumber: null,
-      Complete: false,
+      Complete: line.bookedQuantity >= line.quantity,
       SourceLineId: line.sourceLineId,
       SKU: line.sku,
       ID: line.id,
@@ -430,6 +451,9 @@ export function fakeMintsoftAsnCreateResult(
         productId: asString(recordLine?.ProductId),
         sku: asString(recordLine?.SKU),
         quantity: asNumber(recordLine?.Quantity, 0),
+        // o3d-btiw: nothing has arrived or been booked in against an ASN that was just created.
+        receivedQuantity: 0,
+        bookedQuantity: 0,
       } satisfies FakeMintsoftAsnLine
     })
     .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
