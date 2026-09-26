@@ -396,6 +396,18 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
   )
   // o3d-j625 r7: the handled-by-hand exit writes nothing either, and says so.
   assert.equal(queuedAnswers.filter((answer) => answer[0].includes("reason: 'handled-by-hand'")).length, 1)
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — AND THE FIFTH SUPPRESSION EXIT IS NOT A QUEUED ONE.
+   *
+   * The primitive's other suppression answer is a LIVE HAND-POSTING CLAIM: an operator is in the ledger
+   * making the posting now, so nothing was written AND nothing exists there yet. r16 answered it with
+   * `queued: true, reason: 'handled-by-hand'` — the same exit as the line above — and on a reused posting key
+   * that discarded a later edit with no row and no debt. It must leave through the out-channel like every
+   * other exit, and it must NOT be one of the four counted above.
+   */
+  const deferredAnswers = [...body.matchAll(/return answer\(\{ queued: false, reason: 'hand-post-deferred'[^}]*\}, ([^)]*)\)/g)]
+  assert.equal(deferredAnswers.length, 1,
+    'the live-claim exit answers `queued: false` through the same channel — one exit, and not a queued one')
   for (const answer of queuedAnswers) {
     assert.equal(
       answer[1],

@@ -261,6 +261,17 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   // false so nothing was recorded outstanding either. The scoping fix in posting-mark-handled.ts makes
   // `handled-by-hand` unreachable for this type; this guard is what makes the shape unreachable whatever a
   // later change does to that, because it asks about the row rather than about the counterpart.
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — AND THE OTHER SUPPRESSION ANSWER IS NOW `queued: false`.
+   *
+   * r16 read a LIVE hand-posting claim through the same answer as a completed hand posting, so `queued` was
+   * `true` for an edit IMS had merely postponed: this guard's `reason !== 'handled-by-hand'` happened to be
+   * false and no transit movement was written, but `purchaseInvoiceUpdateIsOwed('queued')` was also false, so
+   * NOTHING recorded the debt and the edit was discarded silently. The claim now answers
+   * `{ queued: false, reason: 'hand-post-deferred' }`, which makes this guard false through `queued` itself and
+   * makes the caller report the posting as owed. The `handled-by-hand` clause below is unchanged and still
+   * needed: that one really is `queued: true` with no row.
+   */
   if (queued && enqueued.reason !== 'handled-by-hand') {
     await params.deps.recordTransitSubledgerMovement(params.tx, {
       sourceType: 'PURCHASE_BILL_UPDATE',

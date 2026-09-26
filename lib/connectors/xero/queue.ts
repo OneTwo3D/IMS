@@ -173,6 +173,9 @@ export async function queueXeroSync(params: {
     let pinnedLedgerRetired = false
     // o3d-j625 r7: the posting was marked handled — posted by hand — so nothing is written for it.
     let handledByHand = false
+    // o3d-j625 r18: an operator holds the hand-posting CLAIM — declined, and still OWED. See the note at the
+    // primitive's answer below for why this cannot share `handledByHand`.
+    let handPostDeferred = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
@@ -267,11 +270,17 @@ export async function queueXeroSync(params: {
           // money-attempt-provenance.ts. A row created without it is never recycled again.
           ...stampingCustodyOnCreate(),
         })
-      if (!created) {
-        handledByHand = true
+      // o3d-j625 r18 (Codex round 17, HIGH 1): the two suppressions are no longer one answer. A completed
+      // hand posting is a counterpart in the ledger; a live CLAIM is an operator typing one, so the posting is
+      // still owed and — on a reused posting key — what was declined may be a LATER edit than the one being
+      // posted. The primitive has recorded the postponement; this reports it as NOT queued, which is what makes
+      // the caller record the debt rather than settle it.
+      if (created.suppressed !== null) {
+        if (created.suppressed === 'handled_by_hand') handledByHand = true
+        else handPostDeferred = true
         return
       }
-      const log = created
+      const log = created.row
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
@@ -309,6 +318,8 @@ export async function queueXeroSync(params: {
     // Not owed: the ledger has it, by hand. `queued: true` in the sense every caller reads — a counterpart
     // exists — with the reason saying it was not IMS that put it there.
     if (handledByHand) return { queued: true, reason: 'handled-by-hand' }
+    // OWED, not settled: nothing is in the ledger yet and IMS wrote no row. See the r18 note above.
+    if (handPostDeferred) return { queued: false, reason: 'hand-post-deferred' }
     return { queued: true }
   } catch (error) {
     // A concurrent insert already queued this posting, so the counterpart exists — already present.

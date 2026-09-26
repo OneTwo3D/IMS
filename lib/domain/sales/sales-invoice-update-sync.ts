@@ -71,7 +71,7 @@ type QueueAccountingSync = (params: {
   // The DOCUMENT connector stays the stored form: the facade compares it against the chart and refuses a
   // mismatch, which is exactly how a link naming an archived connector is caught.
   documentConnector: StoredAccountingConnector | null
-}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'; connector: string | null }>
+}) => Promise<{ queued: boolean; reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'; connector: string | null }>
 
 type LogActivity = (params: {
   entityType: 'SALES_ORDER'
@@ -247,14 +247,31 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     return
   }
   if (!enqueued.queued) {
+    /**
+     * o3d-j625 r18 (Codex round 17, HIGH 1) — AND ONE OF THE WAYS IT CAN DECLINE IS NOT A REFUSAL AT ALL.
+     *
+     * `hand-post-deferred` means an operator holds the hand-posting claim on this posting: IMS declined
+     * because they are in the ledger updating the invoice themselves, not because anything is wrong. Round 17's
+     * finding is that r16 answered this state `queued: true` and this whole block was skipped, so a later edit
+     * left no record anywhere. It is recorded like every other decline — the debt is the point — with the
+     * sentence that is actually true of it, because "the accounting queue REFUSED it (an unresolved earlier
+     * attempt, a deleted order, …)" would send an operator hunting for a cause that does not exist.
+     */
+    const handPostDeferred = enqueued.reason === 'hand-post-deferred'
     await deps.logActivity({
       entityType: 'SALES_ORDER',
       entityId: params.salesOrderId,
       action: 'sales_invoice_update_not_queued',
       tag: 'accounting',
       level: 'ERROR',
-      description:
-        `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
+      description: handPostDeferred
+        ? `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
+          + 'IMS. An operator has taken this posting to settle it BY HAND and still holds it, so IMS did not '
+          + `queue this edit — and accounting invoice ${params.accountingInvoiceId} shows neither this version `
+          + 'nor, yet, theirs. This stays outstanding in the exception inbox while they hold it and after they '
+          + 'finish; nothing requeues it on its own. Re-save the order to queue its current version once the '
+          + 'refused posting shows no claim.'
+        : `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
         + `IMS. The accounting queue REFUSED it (an unresolved earlier attempt, a deleted order, a stale discount, `
         + `or an accounting connector change under the write — see the accounting activity log), so accounting `
         + `invoice ${params.accountingInvoiceId} still shows the PREVIOUS version and nothing retries this on its `
@@ -272,10 +289,15 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       posting,
       chartConnector: params.chartConnector,
       activeConnector: connector?.id ?? null,
-      reason: 'enqueue_refused',
+      // o3d-j625 r18: the machine code says WHICH decline this was, so the inbox row and the log agree and an
+      // operator is not sent to look for a cause when the cause is a colleague holding the posting.
+      reason: handPostDeferred ? 'hand_post_claim_held' : 'enqueue_refused',
       committed: `the order ${params.orderNumber} is updated in IMS`,
-      remedy:
-        'Re-save the order once the cause is resolved (see the accounting activity log), or correct the '
+      remedy: handPostDeferred
+        ? 'An operator is settling this posting by hand — see "Postings being settled by hand". IMS did not '
+          + 'queue THIS edit, and will not while they hold it. When the claim ends, re-save the order to queue '
+          + 'its current version, or post that version by hand and mark this row handled.'
+        : 'Re-save the order once the cause is resolved (see the accounting activity log), or correct the '
         + 'invoice by hand in the ledger and mark this row handled — that stops IMS updating it too.',
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector, enqueueReason: enqueued.reason ?? null },
     })

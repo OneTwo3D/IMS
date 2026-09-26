@@ -324,11 +324,24 @@ export type ConnectorEnqueueOutcome = {
    * still going to post, and rolling back an empty transaction while telling the operator "nothing
    * was sent" is the one message that guarantees nobody goes looking for it.
    */
-  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'
   /*
    * `handled-by-hand` (o3d-j625 r7) — `queued: true` WITHOUT A WRITE, like `already-queued`: someone
    * marked this exact posting handled after posting it BY HAND, so IMS did not post it and never will
    * (posting-suppression.ts). A counterpart exists in the ledger; it is not owed; it was not IMS's.
+   */
+  /*
+   * `hand-post-deferred` (o3d-j625 r18, Codex round 17 HIGH 1) — `queued: FALSE`, and the difference from
+   * `handled-by-hand` is the whole of round 17's HIGH 1. An operator holds the hand-posting CLAIM on this
+   * posting key (`claimPostingForHandPosting`): they are in the ledger making the posting now, so IMS must
+   * not queue it — and nothing exists in the ledger yet, so it is STILL OWED. r16 answered
+   * `{ queued: true, reason: 'handled-by-hand' }` for this state, and on a posting key successive postings
+   * SHARE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT) that DISCARDED a later edit: no sync
+   * row, and no refusal either, because every consumer reads `queued: true` as "a counterpart exists".
+   *
+   * `postingIsOwed` therefore answers TRUE for it, which is what makes each reporting site record the debt,
+   * and the postponement is ALSO recorded on the refusal row itself (`handPostDeferredCount`) so that
+   * releasing or resolving the claim discharges it instead of closing a debt the ledger never received.
    */
 }
 
@@ -801,8 +814,37 @@ export async function queueAccountingSync(params: {
     const { db } = await import('@/lib/db')
     const suppression = await readPostingSuppression(db as unknown as PostingSuppressionClient, posting)
     if (suppression.suppressed) {
-      await reportSuppressedPosting(posting, suppression)
-      return { queued: true, reason: 'handled-by-hand', connector: params.connector ?? params.chartConnector ?? null, posting }
+      /**
+       * ── o3d-j625 r18 (Codex round 17, HIGH 1) — TWO STATES, TWO ANSWERS ──
+       *
+       * r16 returned ONE answer here for both, and `{ queued: true, reason: 'handled-by-hand' }` is the
+       * answer that means "a counterpart exists in the ledger, nothing is owed". For a COMPLETED hand posting
+       * that is exactly right. For an ACTIVE CLAIM it is the opposite of right: the operator is still in the
+       * ledger, nothing exists, and on a posting key successive postings SHARE the thing IMS is declining may
+       * be a LATER, DIFFERENT edit. Every consumer read `queued: true` and recorded nothing, so that edit was
+       * discarded with no sync row, no refusal and no debt — the ledger quietly behind IMS.
+       *
+       * The postponement is RECORDED before this returns (`recordHandPostDeferral`), causally, under the
+       * claim it matched — that is what lets `releasePostingHandPostClaim` and `markPostingHandled` discharge
+       * it rather than close a debt the ledger never received.
+       *
+       * `'no-claim'` means the claim was given back between the read above and that write. This read is
+       * UNLOCKED (see the r8 note: the enforcement is the primitive's, under the key's lock), so that is an
+       * ordinary race and the honest response is to FALL THROUGH and enqueue: there is no claim, nothing to
+       * postpone, and the primitive re-asks the whole question under the lock anyway.
+       */
+      if (suppression.basis === 'hand_post_claim') {
+        const { recordHandPostDeferral, HandPostDeferralUnrecordableError } = await import('@/lib/domain/accounting/posting-suppression')
+        const recorded = await recordHandPostDeferral(db as unknown as PostingSuppressionClient, posting, decidedAt)
+        if (recorded === 'unrecordable') throw new HandPostDeferralUnrecordableError(posting)
+        if (recorded === 'recorded') {
+          await reportSuppressedPosting(posting, suppression)
+          return { queued: false, reason: 'hand-post-deferred', connector: params.connector ?? params.chartConnector ?? null, posting }
+        }
+      } else {
+        await reportSuppressedPosting(posting, suppression)
+        return { queued: true, reason: 'handled-by-hand', connector: params.connector ?? params.chartConnector ?? null, posting }
+      }
     }
   }
   const unattributable = await refuseUnattributableChart({ ...params, recordRefusalAsOutstanding: true, posting, decidedAt })
@@ -1540,8 +1582,17 @@ export async function queueAccountingSyncTx(
         ...stampingCustodyOnCreate(),
       }, { createInSavepoint: true })
     // o3d-j625 r7: marked handled — posted by hand. Nothing written; not owed.
-    if (!created) return answer({ queued: true, reason: 'handled-by-hand' }, context.connector)
-    const log = created
+    //
+    // o3d-j625 r18 (Codex round 17, HIGH 1): and a LIVE CLAIM is the other answer, which is NOT that. The
+    // operator is in the ledger now, nothing exists there yet, and on a reused posting key what IMS has just
+    // declined may be a later edit than the one they are posting. `queued: false` is what makes every
+    // consumer of this outcome record the debt instead of treating it as settled; the primitive has already
+    // recorded the postponement on the refusal row so the claim's end can discharge it.
+    if (created.suppressed !== null) {
+      if (created.suppressed === 'handled_by_hand') return answer({ queued: true, reason: 'handled-by-hand' }, context.connector)
+      return answer({ queued: false, reason: 'hand-post-deferred' }, context.connector)
+    }
+    const log = created.row
     if (context.connector === 'xero') {
       const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
       await scheduleXeroAccountingOutbox(tx, {

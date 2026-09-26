@@ -444,8 +444,17 @@ async function createPendingSyncLog(
   // o3d-j625 r7: a daily-batch journal has no refusal kind, so nothing can mark it handled and the
   // primitive cannot suppress it. If that ever changes, this must decide what a suppressed batch means
   // rather than carry on without a row.
-  if (!created) throw new Error(`Daily-batch journal ${params.type} ${params.referenceId} was suppressed as handled by hand, which no daily-batch posting can be.`)
-  const log = created
+  //
+  // o3d-j625 r18: and it now says WHICH suppression it would have been, because the two need opposite
+  // handling if this ever becomes reachable — a completed hand posting means the batch is in the ledger, a
+  // live claim means it is not yet and the batch must be re-driven after the claim ends.
+  if (created.suppressed !== null) {
+    throw new Error(
+      `Daily-batch journal ${params.type} ${params.referenceId} was suppressed (${created.suppressed}), which no `
+      + 'daily-batch posting can be: no refusal kind names one, so nothing can claim or mark it.',
+    )
+  }
+  const log = created.row
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
   })

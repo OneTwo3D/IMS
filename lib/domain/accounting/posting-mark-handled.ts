@@ -41,6 +41,8 @@ export type MarkHandledClient = PostingSuppressionClient & {
       kind: string | null; resolvedAt: Date | null
       /** o3d-j625 r16: who is settling this posting by hand right now, and since when. NULL = nobody. */
       handPostClaimedAt?: Date | null; handPostClaimedBy?: string | null
+      /** o3d-j625 r18: how many postings IMS declined to queue while that claim has been held. */
+      handPostDeferredCount?: number | null
     } | null>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
@@ -60,7 +62,21 @@ export type MarkHandledResult =
    * Returned rather than inferred, because the operator-facing sentence differs and a caller cannot
    * re-derive it without re-implementing the rule.
    */
-  | { ok: true; cancelledSyncRows: string[]; kind: PostingRefusalKind; suppressed: boolean }
+  | {
+      ok: true
+      cancelledSyncRows: string[]
+      kind: PostingRefusalKind
+      suppressed: boolean
+      /**
+       * o3d-j625 r18 (Codex round 17, HIGH 1) — HOW MANY POSTINGS IMS POSTPONED WHILE THE CLAIM WAS HELD,
+       * and whether the debt therefore SURVIVES this mark. See the block at the write for the argument; the
+       * short form is that on a REUSED posting key the operator posted an EARLIER version by hand, so the
+       * ledger still does not hold the current document and the row must stay listed.
+       */
+      deferredEdits: number
+      /** `true` when the refusal was deliberately NOT resolved because a later posting is still owed. */
+      stillOutstanding: boolean
+    }
   /**
    * o3d-j625 r16 (Codex round 15, HIGH 1) — `not_claimed` and `claimed_by_other` are the two answers the
    * CLAIM added. A hand posting is only safe if IMS was standing back while it was made, so the mark asks
@@ -232,6 +248,8 @@ async function cancelProvablyUnsentRows(
 const REFUSAL_SELECT = {
   id: true, type: true, referenceType: true, referenceId: true, scope: true, kind: true, resolvedAt: true,
   handPostClaimedAt: true, handPostClaimedBy: true,
+  // o3d-j625 r18: read by BOTH acts that end a claim, because both have to discharge what was postponed.
+  handPostDeferredCount: true,
 } as const
 
 type LoadedRefusal = NonNullable<Awaited<ReturnType<MarkHandledClient['accountingPostingRefusal']['findUnique']>>>
@@ -360,7 +378,15 @@ export async function claimPostingForHandPosting(
   )
   const claimed = await tx.accountingPostingRefusal.updateMany({
     where: { id: row.id, resolvedAt: null, handPostClaimedAt: null },
-    data: { handPostClaimedAt: now, handPostClaimedBy: params.userId },
+    data: {
+      handPostClaimedAt: now,
+      handPostClaimedBy: params.userId,
+      // o3d-j625 r18: a NEW act starts with nothing postponed. Both ways the previous claim could have ended
+      // discharged its count already; resetting here is what stops a leftover from an interrupted discharge
+      // keeping this refusal outstanding for ever.
+      handPostDeferredCount: 0,
+      handPostDeferredAt: null,
+    },
   })
   // Not a `claimed_by_other`: the row was unclaimed under this lock a statement ago, so a zero count means
   // the row moved in a way this transaction cannot describe. Thrown, so the cancellations roll back with it.
@@ -382,26 +408,56 @@ export async function claimPostingForHandPosting(
  * ever settle because the person who took it has gone. Who held it is returned so the caller can say so.
  */
 export type HandPostReleaseResult =
-  | { ok: true; releasedFrom: string | null; heldSince: Date }
+  | {
+      ok: true
+      releasedFrom: string | null
+      heldSince: Date
+      /**
+       * o3d-j625 r18 — what IMS declined to queue while the claim was held, so the caller can SAY SO. The
+       * refusal stays outstanding and those postponements are added to its own count; nothing requeues them
+       * on its own, which is why the operator has to be told rather than left to notice.
+       */
+      deferredEdits: number
+    }
   | Extract<MarkHandledResult, { ok: false }>
   | { ok: false; code: 'not_claimed'; message: string }
 
 export async function releasePostingHandPostClaim(
   tx: MarkHandledClient,
-  params: { id: string },
+  params: { id: string; now?: Date },
 ): Promise<HandPostReleaseResult> {
+  const now = params.now ?? new Date()
   const loaded = await loadRefusalUnderItsKey(tx, params.id)
   if (!loaded.ok) return loaded.result
   const { row } = loaded
   if (!row.handPostClaimedAt) {
     return { ok: false, code: 'not_claimed', message: 'Nobody is settling this posting by hand, so there is no claim to release.' }
   }
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — AND THE RELEASE DISCHARGES WHAT THE CLAIM POSTPONED.
+   *
+   * While the claim was held, every enqueue of this posting key was declined and COUNTED
+   * (`recordHandPostDeferral`). Releasing it does not requeue those postings — on a reused key the correct
+   * posting is the CURRENT state of the document, not the state at the instant of the decline, so replaying
+   * a stored payload would post a version a third edit had already superseded. What the release does is
+   * convert the count into what an operator can see and act on: the refusal stays OUTSTANDING, its
+   * `refusedCount` carries the postponed postings, and `lastRefusedAt` moves to now so the row reads as
+   * current debt rather than as the stale episode it would otherwise look like. The remedy those kinds
+   * already carry ("re-save the document and IMS queues it again") is the discharge.
+   */
+  const deferredEdits = row.handPostDeferredCount ?? 0
   const released = await tx.accountingPostingRefusal.updateMany({
     where: { id: row.id, resolvedAt: null, handPostClaimedAt: { not: null } },
-    data: { handPostClaimedAt: null, handPostClaimedBy: null },
+    data: {
+      handPostClaimedAt: null,
+      handPostClaimedBy: null,
+      handPostDeferredCount: 0,
+      handPostDeferredAt: null,
+      ...(deferredEdits > 0 ? { refusedCount: { increment: deferredEdits }, lastRefusedAt: now } : {}),
+    },
   })
   if (released.count === 0) throw new MarkHandledRaceError()
-  return { ok: true, releasedFrom: row.handPostClaimedBy ?? null, heldSince: row.handPostClaimedAt }
+  return { ok: true, releasedFrom: row.handPostClaimedBy ?? null, heldSince: row.handPostClaimedAt, deferredEdits }
 }
 
 export async function markPostingHandled(
@@ -475,6 +531,64 @@ export async function markPostingHandled(
    * update again").
    */
   const keyIsReused = postingKeyIsReusedAcrossPostings(row.type)
+  /**
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — A POSTING IMS POSTPONED DURING THE CLAIM IS NOT SETTLED BY
+   * THE HAND POSTING THAT ENDS IT — ON A REUSED KEY
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * `handPostDeferredCount` is how many enqueues of this posting key IMS declined while the claim was held
+   * (`recordHandPostDeferral`, incremented causally under the key's lock). Whether the hand posting SETTLES
+   * them is a question about the key, and both answers are load-bearing:
+   *
+   *   · A KEY THAT NAMES ONE POSTING FOR EVER. Every declined enqueue was a RETRY of the very posting the
+   *     operator has just made by hand. The hand posting satisfies them, the row resolves, and `suppressedAt`
+   *     stops the retries for good — exactly as r7 designed. Nothing is lost by closing it.
+   *   · A REUSED KEY (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT). A declined enqueue may be
+   *     a LATER, DIFFERENT posting — the document was edited again while the operator was in the ledger. The
+   *     operator posted the version they had; the ledger does not hold the current one; and the refusal row
+   *     means precisely "the ledger does not hold the current version of this document". Resolving it here is
+   *     the loss round 17 found: the debt closes, no sync row exists, and nothing anywhere says the ledger is
+   *     behind.
+   *
+   * SO ON A REUSED KEY WITH SOMETHING POSTPONED, THE ROW IS NOT RESOLVED. The claim is given back (IMS may
+   * queue the current version from now on), the postponed postings are added to `refusedCount` with
+   * `lastRefusedAt` moved to now, and the operator is told — by the caller, from `stillOutstanding` — that
+   * what they posted is already superseded. It is NOT a refusal of their mark: the ledger write they made is
+   * real and is recorded in the activity log; what is refused is the CLAIM THAT THE DEBT IS DISCHARGED.
+   *
+   * WHY NOT REPLAY THE POSTPONED PAYLOAD INSTEAD. On these three types the posting OVERWRITES a document the
+   * ledger already holds, so the only correct posting is the CURRENT state — replaying the payload captured
+   * at the instant of the decline would write a version that a third edit had already superseded. There is
+   * also no re-derive-and-enqueue entry point keyed on a posting key, and inventing a global one to serve
+   * this path would be a much larger surface than the debt it replaces. `clearing: 'retried'` already
+   * promises these kinds' discharge ("Re-saving the bill queues the update again"); what was missing was the
+   * DEBT that tells an operator to, and that is what this keeps.
+   */
+  const deferredEdits = row.handPostDeferredCount ?? 0
+  const keepOutstanding = keyIsReused && deferredEdits > 0
+  if (keepOutstanding) {
+    const kept = await tx.accountingPostingRefusal.updateMany({
+      where: { id: row.id, resolvedAt: null, kind: { in: markableKinds } },
+      data: {
+        handPostClaimedAt: null,
+        handPostClaimedBy: null,
+        handPostDeferredCount: 0,
+        handPostDeferredAt: null,
+        refusedCount: { increment: deferredEdits },
+        lastRefusedAt: now,
+      },
+    })
+    if (kept.count === 0) throw new MarkHandledRaceError()
+    return {
+      ok: true,
+      cancelledSyncRows: cancelIds,
+      kind: row.kind as PostingRefusalKind,
+      suppressed: false,
+      deferredEdits,
+      stillOutstanding: true,
+    }
+  }
   const resolved = await tx.accountingPostingRefusal.updateMany({
     where: { id: row.id, resolvedAt: null, kind: { in: markableKinds } },
     data: {
@@ -483,6 +597,11 @@ export async function markPostingHandled(
       resolvedBy: params.userId,
       resolutionNote: params.note,
       ...(keyIsReused ? {} : { suppressedAt: now }),
+      // o3d-j625 r18: the count is DISCHARGED here too. On this branch the postponed enqueues were retries
+      // of the posting just made by hand (or there were none), so closing the row settles them — but leaving
+      // a non-zero count behind would make a LATER episode of the same key start already "in debt".
+      handPostDeferredCount: 0,
+      handPostDeferredAt: null,
       /**
        * o3d-j625 r16 — AND THE CLAIM IS GIVEN BACK HERE, which matters most on exactly the keys the block
        * above declines to suppress. On a reused key the claim is the ONLY thing standing between IMS and
@@ -495,5 +614,12 @@ export async function markPostingHandled(
     },
   })
   if (resolved.count === 0) throw new MarkHandledRaceError()
-  return { ok: true, cancelledSyncRows: cancelIds, kind: row.kind as PostingRefusalKind, suppressed: !keyIsReused }
+  return {
+    ok: true,
+    cancelledSyncRows: cancelIds,
+    kind: row.kind as PostingRefusalKind,
+    suppressed: !keyIsReused,
+    deferredEdits,
+    stillOutstanding: false,
+  }
 }

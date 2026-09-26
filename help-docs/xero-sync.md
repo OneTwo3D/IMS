@@ -2363,6 +2363,29 @@ Three things about those rows:
   hand — press *Mark as handled* instead, or the ledger can get it twice. Releasing somebody else's claim is
   allowed (otherwise a posting nobody can settle would be stuck for ever) and is recorded as a **warning**.
 
+  **Every posting being settled by hand is listed in its own section — *Postings being settled by hand*.**
+  A claim never times out, on purpose: one that lapsed on a timer would re-open exactly the interval it
+  closes, leaving an operator in the ledger with IMS free to queue the posting again. So a claim ends only
+  when somebody confirms the posting or releases it, and that is only safe if every claim can be found. That
+  section lists **all** of them — with who holds each one, how long it has been held, and how many postings
+  IMS has declined to queue behind it — independently of the refusal list below, which shows the *oldest 50
+  debts* and would otherwise hide a newer claim behind unrelated work. Anything held far longer than a hand
+  posting takes is flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
+  **Anybody with sync access may release anybody's claim**, which is the answer rather than an oversight: if
+  only the holder could, a claim taken by somebody who has left would suppress that posting for ever.
+
+  **If the document is saved again while you hold it, the row does not close.** While your claim is held IMS
+  declines to queue that posting — including a *later version* of the same document, on the entries where
+  successive versions share one (an invoice update, a bill update, a bill payment). Each decline is counted
+  on the row, and shown in the claims section as *postponed behind it*. When you then press *Mark as handled*
+  IMS records the posting you really made, **and leaves the row outstanding**, because you posted the version
+  you had and the ledger still does not hold the current one. The page says so instead of "marked as handled".
+  Releasing the claim does the same: the postponed attempts are added to the row's count and its clock moves
+  to now. Nothing re-queues them by itself — **re-save the document** and IMS queues its current version, or
+  post that current version by hand and mark it again. On every other kind of posting the entry names one
+  posting for ever, so a declined attempt was a *retry* of what you just posted by hand: those rows close and
+  suppress exactly as before.
+
   **An earlier version of the same document does not block you.** For the postings where successive versions
   share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
   *previous* version. IMS names that document on the row and tells you your hand posting **replaces** it;

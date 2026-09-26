@@ -150,7 +150,9 @@ test(
     }
 
     // ── OPERATOR B, in its own transaction, re-queues the same posting through the production primitive.
-    const requeued = await db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+    // o3d-j625 r18: the primitive now NAMES which suppression declined it — `.row` is the written row, and a
+    // live CLAIM is reported as `hand_post_claim` rather than sharing a completed hand posting's answer.
+    const requeuedResult = await db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero',
       type: MJ.type as never,
       status: 'PENDING',
@@ -158,7 +160,8 @@ test(
       referenceId,
       payload: { narration: `o3d-j625 r16 operator B re-queue ${referenceId}` },
     }), TX)
-    console.log(`[r16 HIGH-1] operator B's re-queue produced: ${requeued === null ? 'NOTHING (refused)' : `row ${requeued.id}`}`)
+    const requeued = requeuedResult.row
+    console.log(`[r16 HIGH-1] operator B's re-queue produced: ${requeued === null ? `NOTHING (refused: ${requeuedResult.suppressed})` : `row ${requeued.id}`}`)
 
     if (requeued !== null) {
       // The worker then posts it, which is what makes this a DUPLICATE rather than a race nobody notices.
@@ -228,11 +231,11 @@ test(
 
     const took = await db.$transaction((tx) => mark.claimPostingForHandPosting(tx as never, { id: refusalId, userId: 'operator-A' }), TX)
     assert.equal(took.ok, true)
-    const enqueue = () => db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+    const enqueue = async () => (await db.$transaction((tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
       connector: 'xero', type: MJ.type as never, status: 'PENDING',
       referenceType: MJ.referenceType, referenceId,
       payload: { narration: `o3d-j625 r16 release probe ${referenceId}` },
-    }), TX)
+    }), TX)).row
     assert.equal(await enqueue(), null, 'PRECONDITION: while the claim is held the enqueue is refused')
 
     const released = await db.$transaction((tx) => mark.releasePostingHandPostClaim(tx as never, { id: refusalId }), TX)

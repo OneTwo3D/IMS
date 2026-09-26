@@ -92,3 +92,22 @@ export const ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING =
 /** o3d-j625 r6 (review H4): the heading detail of the recently-resolved list. */
 export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
   'How each refused posting left the list: queued by IMS, or marked handled by a person after posting it by hand.'
+
+/**
+ * o3d-j625 r18 (Codex round 17, HIGH 2) — the heading detail of the ACTIVE HAND-POST CLAIMS section.
+ *
+ * A hand-post claim never expires: r16 rejected a timer because a claim that lapsed would re-open exactly the
+ * interval it closes. That is only safe if every claim can be FOUND and given back, and until this section
+ * existed the only Release control rode on the oldest-50 refusal list — so a claim behind 50 older debts was a
+ * suppression nobody could reach. This section is the answer, and it says out loud who may end a claim.
+ */
+export const ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL =
+  'Postings an operator has taken to settle BY HAND. While a posting is held here IMS will not queue it — that '
+  + 'is what stops it reaching the ledger twice — and a claim never expires, so it ends only when somebody '
+  + 'confirms the posting or releases it. Every active claim is listed here whatever its refusal\'s age, with '
+  + 'how long it has been held. ANYBODY with sync access may release ANYBODY\'s claim, deliberately: otherwise '
+  + 'a claim taken by someone who has left would suppress that posting for ever. Releases are recorded.'
+
+/** What "held a long time" means on the section above — a signal to look, never an expiry that acts. */
+export const ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE =
+  'Held far longer than a hand posting takes. Nothing will end it on its own: ask the holder, or release it.'

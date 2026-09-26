@@ -65,6 +65,17 @@ export type FollowUpEnqueueDeclineReason =
    * replacement does not cover is kept: the revival is refused, visibly, with a remedy.
    */
   | 'unprobed_unfenced_reuse'
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — AN OPERATOR HOLDS THE HAND-POSTING CLAIM ON THIS POSTING.
+   *
+   * They took the refusal for hand posting (`claimPostingForHandPosting`) and are in the ledger raising this
+   * follow-up themselves, so IMS must not queue it — and nothing exists in the ledger yet, so it is STILL
+   * OWED. r16 reported this state through the same answer a COMPLETED hand posting gives, which every caller
+   * reads as "a counterpart exists": the sweep then settled the parent row over a follow-up that had never
+   * been queued and never would be. The postponement is recorded on the refusal row
+   * (`handPostDeferredCount`), so it is discharged when the claim ends — but the caller must not settle on it.
+   */
+  | 'hand_post_claim_held'
 
 /**
  * o3d-batch-ret ROUND 6 (Codex HIGH) — A REFUSAL THAT HAPPENS BEFORE THE ENQUEUE IS EVER CALLED.

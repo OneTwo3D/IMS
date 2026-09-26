@@ -208,7 +208,11 @@ test(
     // MANUFACTURING_JOURNAL's key names one posting for ever, so the mark does write the permanent
     // suppression. Asserted rather than matched away: it is the fact the operator-facing sentence is built
     // from, and a mark that silently stopped suppressing this kind would reintroduce the double post.
-    assert.deepEqual(marked, { ok: true, cancelledSyncRows: [], kind: KIND, suppressed: true },
+    // o3d-j625 r18: `deferredEdits`/`stillOutstanding` are part of the answer now — how many postings IMS
+    // declined to queue while the claim was held, and whether the debt therefore survived the mark. Both are
+    // the quiet values here (nothing was saved behind this operator), and asserting them rather than matching
+    // them away is what makes this a control for the reused-key case that does keep the row open.
+    assert.deepEqual(marked, { ok: true, cancelledSyncRows: [], kind: KIND, suppressed: true, deferredEdits: 0, stillOutstanding: false },
       'the operator marked the posting handled, and this key suppresses for ever')
     assert.ok(recordMs >= HOLD_MS - SLACK_MS,
       `the refusal completed in ${recordMs}ms, so it did NOT overlap the ${HOLD_MS}ms the mark held its `
@@ -254,14 +258,16 @@ test(
     // A real enqueue: the row-creating primitive takes the posting key's lock, writes the sync row and
     // clears the refusal, all inside one transaction that is then held open.
     const enqueue = db.$transaction(async (tx) => {
-      created = await createAccountingSyncLogRow<{ id: string }>(tx, {
+      // o3d-j625 r18: the primitive answers `{ row, suppressed }` so its four callers can tell a completed
+      // hand posting from a live claim. Nothing is suppressed here, so `.row` is the written row.
+      created = (await createAccountingSyncLogRow<{ id: string }>(tx, {
         connector: 'xero',
         type: TYPE,
         status: 'PENDING',
         referenceType: REFERENCE_TYPE,
         referenceId,
         payload: { narration: `o3d-j625 r9 probe ${referenceId}` },
-      })
+      })).row
       signal.fire!()
       await sleep(HOLD_MS)
     }, TX)
@@ -1131,7 +1137,7 @@ test(
       + live.map((r) => `${r.id}@${r.createdAt.toISOString()}/${r.status}`).join(', '))
     assert.equal(live.length, 1,
       'PRECONDITION: exactly ONE live sync row survives — edit 1\'s. Edit 2\'s went with its rollback')
-    assert.equal(live[0]!.id, (edit1 as { id: string }).id, 'PRECONDITION: and it is edit 1\'s row')
+    assert.equal(live[0]!.id, edit1.row!.id, 'PRECONDITION: and it is edit 1\'s row')
     assert.ok(live[0]!.createdAt.getTime() < decidedAt.getTime(),
       `PRECONDITION: edit 1's row (${live[0]!.createdAt.toISOString()}) pre-dates the refusal `
       + `(${decidedAt.toISOString()}), so it is an OLDER posting and discharges nothing`)
@@ -1317,7 +1323,7 @@ test(
       payload: { narration: `o3d-j625 r11 queued after the decision ${aheadRef}` },
     }), TX)
     assert.ok(queued, 'PRECONDITION: the posting was queued')
-    const queuedRow = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: (queued as { id: string }).id }, select: { createdAt: true } })
+    const queuedRow = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.row!.id }, select: { createdAt: true } })
     assert.ok(queuedRow.createdAt.getTime() > aheadDecidedAt.getTime(),
       `PRECONDITION: it was queued (${queuedRow.createdAt.toISOString()}) AFTER the refusal was decided `
       + `(${aheadDecidedAt.toISOString()}), so nothing is owed`)
@@ -1347,7 +1353,7 @@ test(
     assert.ok(earlier, 'PRECONDITION: the earlier edit was queued')
     await sleep(20)
     const behindDecidedAt = new Date()
-    const earlierRow = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: (earlier as { id: string }).id }, select: { createdAt: true } })
+    const earlierRow = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: earlier.row!.id }, select: { createdAt: true } })
     assert.ok(earlierRow.createdAt.getTime() < behindDecidedAt.getTime(),
       `PRECONDITION: the earlier edit (${earlierRow.createdAt.toISOString()}) pre-dates this refusal `
       + `(${behindDecidedAt.toISOString()}), so the ledger holds a stale invoice and the debt is REAL`)
@@ -1500,7 +1506,7 @@ test(
       referenceId,
       payload: { paymentId, _idempotencyKey: `invoice-payment:${referenceId}:${paymentId}` },
     }), TX)
-    const queuedId = (queued as { id: string } | null)?.id
+    const queuedId = queued.row?.id
     assert.ok(queuedId, 'PRECONDITION: the enqueue wrote its sync row')
     const cleared = await db.accountingPostingRefusal.findUniqueOrThrow({
       where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
@@ -2016,7 +2022,9 @@ test(
       payload: { narration: `o3d-j625 r13 the same journal again ${referenceId}` },
     }), TX)
     console.log(`[r13 control] suppressedAt=${row.suppressedAt?.toISOString()} laterRow=${JSON.stringify(later)}`)
-    assert.equal(later, null,
+    // o3d-j625 r18: and the primitive NAMES which suppression refused it — `handled_by_hand`, the permanent
+    // one, not a live claim (the mark cleared that). The distinction is the whole of round 17's HIGH 1.
+    assert.deepEqual(later, { row: null, suppressed: 'handled_by_hand' },
       'and IMS still refuses to write it: the operator posted THIS journal by hand, and posting it again '
       + 'would put a second one in the ledger')
   },

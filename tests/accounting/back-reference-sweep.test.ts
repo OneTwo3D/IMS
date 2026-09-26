@@ -2685,9 +2685,10 @@ test('[o3d-bqw7 r2] a TRUE discard warning that cannot be written still holds it
 // ---------------------------------------------------------------------------
 // o3d-peh1 — THE ENQUEUE REFUSED, AND THE SWEEP REPORTED THE ROW AS RECOVERED.
 //
-// `enqueueFollowUps` declines on purpose in THREE cases — an ambiguous idempotency-token history, a
-// ledger that will not confirm the attempt is absent, and a revival target with no attempt revision
-// whose type the ledger probe does not speak for; together they are the whole of
+// `enqueueFollowUps` declines on purpose in FOUR cases — an ambiguous idempotency-token history, a
+// ledger that will not confirm the attempt is absent, a revival target with no attempt revision
+// whose type the ledger probe does not speak for, and an operator holding the hand-posting claim on the
+// posting (o3d-j625 r18); together they are the whole of
 // `FollowUpEnqueueDeclineReason` (not of `FollowUpEnqueueRefusalReason`, which since o3d-batch-ret r6
 // also carries the connector's own pre-enqueue refusals). Each logged a WARNING and then returned normally, and the dependency was
 // typed `Promise<void>`, so this sweep — which is a CALLER THAT ACTS ON THE RETURN — read the

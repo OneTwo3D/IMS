@@ -72,6 +72,11 @@ export type PostingSuppressionClient = {
       /** o3d-j625 r16: an operator is in the ledger posting this BY HAND right now. See the type below. */
       handPostClaimedAt: Date | null; handPostClaimedBy: string | null
     } | null>
+    /**
+     * o3d-j625 r18: the DEFERRAL RECORD's write. See {@link recordHandPostDeferral} — it is the statement
+     * that makes "IMS postponed an edit" a durable fact rather than an inference from two clocks.
+     */
+    updateMany?(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
 }
 
@@ -92,6 +97,18 @@ export type PrismaClientCanAlwaysReadTheSuppression = AssertTrue<
   Prisma.TransactionClient extends {
     $executeRaw: (query: TemplateStringsArray, ...values: never[]) => unknown
     accountingPostingRefusal: { findUnique: (args: never) => unknown }
+  } ? true : false
+>
+/**
+ * o3d-j625 r18 — AND THE SAME PROOF FOR THE DEFERRAL WRITE, for exactly the same reason.
+ *
+ * `recordHandPostDeferral` answers `'unrecordable'` when the client carries no `updateMany`, and its callers
+ * treat that as a refusal rather than as permission to drop the edit. This fires if a real transaction client
+ * ever stops being able to make that write, so `'unrecordable'` stays a statement about TEST DOUBLES.
+ */
+export type PrismaClientCanAlwaysRecordTheDeferral = AssertTrue<
+  Prisma.TransactionClient extends {
+    accountingPostingRefusal: { updateMany: (args: never) => unknown }
   } ? true : false
 >
 /**
@@ -390,6 +407,81 @@ export async function readPostingSuppression(
       metadata: { ...key },
     }).catch(() => { /* nothing else to try — and a failed report must not soften the refusal below */ })
     throw new PostingSuppressionUnreadableError(key, error)
+  }
+}
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r18 (Codex round 17, HIGH 1) — RECORD THAT IMS POSTPONED A POSTING BECAUSE OF A LIVE CLAIM
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * WHAT WENT WRONG IN r16. The claim and a completed hand posting were read through one channel and answered
+ * with one outcome, `{ queued: true, reason: 'handled-by-hand' }`. That answer means "a counterpart exists in
+ * the ledger, nothing is owed" — `postingIsOwed` reads it that way, the landed-cost outbox reads it that way,
+ * and both invoice-update modules read it before deciding whether to record the debt. An operator who is
+ * still TYPING the posting has put a counterpart nowhere. On the three posting keys successive postings SHARE
+ * (`postingKeyIsReusedAcrossPostings`), saving a LATER edit during the claim therefore wrote no sync row and
+ * recorded no refusal, and ending the claim requeued nothing.
+ *
+ * THIS FUNCTION IS THE OTHER HALF OF TELLING THE TRUTH. The enqueue now answers `queued: false` with its own
+ * reason (`hand-post-deferred`), which is what makes every `queued`-reading consumer record the debt; and this
+ * marks the refusal row so that the two acts which END a claim can DISCHARGE what was postponed rather than
+ * closing a debt the ledger never received.
+ *
+ * WHY A COUNTER AND NOT A TIMESTAMP COMPARISON. "Was a refusal recorded after the claim was taken" is
+ * answerable from `lastRefusedAt > handPostClaimedAt`, and that comparison is between two IMS PROCESSES'
+ * clocks — exactly the class of evidence round 12 removed from this module, because a process running fast
+ * stamps an older event with a later time. Missing a postponement means closing the debt, which is the defect.
+ * So the increment happens in the statement that MATCHES the live claim, and is therefore causal.
+ *
+ * THE PREDICATE IS THE EVIDENCE. `resolvedAt: null` and `handPostClaimedAt: { not: null }` are in the WHERE,
+ * so a claim released between the read and this write matches nothing and the answer is `'no-claim'` — which
+ * the callers use to PROCEED with the enqueue rather than to postpone it. The row is never postponed against a
+ * claim that is not there.
+ *
+ *   'recorded'      the postponement is durable, in whatever transaction the caller is using.
+ *   'no-claim'      the claim is gone (or the row is resolved): do NOT postpone, queue it.
+ *   'unrecordable'  this client cannot make the write. A TEST DOUBLE only — see
+ *                   {@link PrismaClientCanAlwaysRecordTheDeferral} — and callers refuse rather than drop the
+ *                   edit, because an unrecordable postponement is indistinguishable from the lost edit.
+ */
+export type HandPostDeferralRecord = 'recorded' | 'no-claim' | 'unrecordable'
+
+export async function recordHandPostDeferral(
+  client: PostingSuppressionClient,
+  key: PostingRefusalKey,
+  at: Date,
+): Promise<HandPostDeferralRecord> {
+  const table = client.accountingPostingRefusal
+  if (!table || typeof table.updateMany !== 'function') return 'unrecordable'
+  // NOT under a savepoint: this write must commit or roll back with the caller's own work. A postponement
+  // recorded over an edit whose transaction rolled back would be a debt for an edit that never existed, and a
+  // postponement lost while the edit committed is the finding itself.
+  const { count } = await table.updateMany({
+    where: { ...key, resolvedAt: null, handPostClaimedAt: { not: null } },
+    data: { handPostDeferredCount: { increment: 1 }, handPostDeferredAt: at },
+  })
+  return count > 0 ? 'recorded' : 'no-claim'
+}
+
+/**
+ * THROWN when a postponement could not be RECORDED, so the edit may not be silently dropped (o3d-j625 r18).
+ *
+ * The same shape of decision as {@link PostingSuppressionUnreadableError}: raised before the caller's enqueue
+ * writes anything, so nothing has happened and the operation may simply be attempted again. What it must
+ * never become is a `queued: true` of any kind, or a `queued: false` nobody records — those are the two ways
+ * round 17's lost edit happened.
+ */
+export class HandPostDeferralUnrecordableError extends Error {
+  readonly retryable = true
+  readonly posting: PostingRefusalKey
+  constructor(key: PostingRefusalKey) {
+    super(
+      `An operator is settling ${key.type} for ${key.referenceType} ${key.referenceId} by hand, so IMS did not `
+      + 'queue this posting — and it could not record that it had postponed it. Nothing was written; retry.',
+    )
+    this.name = 'HandPostDeferralUnrecordableError'
+    this.posting = key
   }
 }
 

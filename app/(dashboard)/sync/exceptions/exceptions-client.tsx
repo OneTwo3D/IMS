@@ -6,6 +6,8 @@ import {
   ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
   ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
   ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
+  ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL,
+  ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE,
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
   ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
 } from '@/lib/domain/accounting/posting-refusal-copy'
@@ -118,7 +120,11 @@ export function ExceptionsClient({ data }: Props) {
         setError(typeof result?.error === 'string' ? result.error : 'The action failed.')
         return
       }
-      setNotice(successMessage)
+      // o3d-j625 r18 (Codex round 17, HIGH 1): the SERVER's sentence wins when it has one. "Marked as
+      // handled" is a false success claim over a posting whose debt is still owed, and only the server knows
+      // which happened — see MutationResult.notice in app/actions/sync-exceptions.ts.
+      const served = (result as { notice?: unknown }).notice
+      setNotice(typeof served === 'string' && served !== '' ? served : successMessage)
       router.refresh()
     })
   }
@@ -1003,6 +1009,72 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
                   <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {/*
+        o3d-j625 r18 (Codex round 17, HIGH 2) — EVERY ACTIVE HAND-POST CLAIM, IN ITS OWN SECTION.
+
+        BEFORE the refusal list, not after it: a claim is a posting IMS is actively declining to queue, and the
+        section below is capped at the oldest 50 debts — which is exactly how a newer claim became unreachable.
+        Its Release control acts on `refusalId`, so it works whether or not that refusal is rendered below.
+      */}
+      {data.accountingHandPostClaims.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Postings being settled by hand (${data.summary.accountingHandPostClaims})`}
+            detail={ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL}
+            shown={data.accountingHandPostClaims.length}
+            total={data.summary.accountingHandPostClaims}
+          />
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Posting</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>Held by</TableHead>
+                <TableHead>Held for</TableHead>
+                <TableHead>Postponed behind it</TableHead>
+                <TableHead>Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingHandPostClaims.map((claim) => (
+                <TableRow key={claim.refusalId}>
+                  <TableCell className="text-xs">{claim.type}</TableCell>
+                  <TableCell className="text-xs font-mono">{claim.referenceType}/{claim.referenceId}</TableCell>
+                  <TableCell className="text-xs">
+                    {claim.mine ? 'You' : (claim.byName ?? 'another operator')}
+                    <div className="text-muted-foreground">since {formatDateTime(claim.at)}</div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {claim.heldForHours < 1 ? 'under an hour' : `${claim.heldForHours} h`}
+                    {claim.stale ? (
+                      <div className="text-amber-700">{ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE}</div>
+                    ) : null}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {/* o3d-j625 r18 HIGH 1: postings IMS has already declined behind this claim. Shown HERE so
+                        the holder learns before going to the ledger that the document has moved on. */}
+                    {claim.deferredEdits > 0
+                      ? `${claim.deferredEdits} — the document has been saved again since; this refusal will stay open`
+                      : 'none'}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                    >
+                      <XCircle className="h-3 w-3 mr-1" />Release
+                    </Button>
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>

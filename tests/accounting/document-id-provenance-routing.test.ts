@@ -1079,7 +1079,9 @@ test('[o3d-j625 r7 H-B] the primitive itself refuses a suppressed key, under the
     connector: 'xero', type: 'COGS_JOURNAL', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: 'po-9',
     payload: { _idempotencyKey: 'k-9' },
   } as never)
-  assert.equal(row, null)
+  // o3d-j625 r18: `{ row: null, suppressed: 'handled_by_hand' }` — the primitive now NAMES which suppression,
+  // because the four callers need opposite answers for a completed hand posting and a live claim.
+  assert.deepEqual(row, { row: null, suppressed: 'handled_by_hand' })
   assert.deepEqual(created, [], 'no row')
   assert.equal(locks.length, 1, 'the per-key lock was taken before the suppression was read')
   // CONTROL: a different posting on the same PO is written.
@@ -1087,7 +1089,7 @@ test('[o3d-j625 r7 H-B] the primitive itself refuses a suppressed key, under the
     connector: 'xero', type: 'COGS_JOURNAL', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: 'po-9',
     payload: { _idempotencyKey: 'k-10' },
   } as never)
-  assert.deepEqual(other, { id: 'row-1' })
+  assert.deepEqual(other, { row: { id: 'row-1' }, suppressed: null })
 })
 
 // ---------------------------------------------------------------------------------------------------
@@ -1118,13 +1120,13 @@ test('[o3d-j625 r8 HIGH] the primitive REFUSES when the suppression cannot be RE
   })
 
   // PRECONDITION: with the read WORKING, this exact posting is refused and nothing is written.
-  assert.equal(await createAccountingSyncLogRow(tx as never, journalRow('k-r8') as never), null,
-    'PRECONDITION: a READABLE suppression refuses')
+  assert.deepEqual(await createAccountingSyncLogRow(tx as never, journalRow('k-r8') as never),
+    { row: null, suppressed: 'handled_by_hand' }, 'PRECONDITION: a READABLE suppression refuses')
   assert.deepEqual(insertedInTx, [], 'PRECONDITION: and writes nothing')
 
   // PRECONDITION / CONTROL: the insert this test claims does NOT happen is reachable through this same
   // double. Without this, "nothing was written" could be passing because nothing can ever be written.
-  assert.ok(await createAccountingSyncLogRow(tx as never, journalRow('k-r8-unsuppressed') as never),
+  assert.ok((await createAccountingSyncLogRow(tx as never, journalRow('k-r8-unsuppressed') as never)).row,
     'PRECONDITION: an unsuppressed posting IS created')
   assert.equal(insertedInTx.length, 1, 'PRECONDITION: the create double really inserts')
   insertedInTx.length = 0
@@ -1181,4 +1183,145 @@ test("[o3d-j625 r8 HIGH] the facade refuses a suppression it cannot read, and ne
   assert.equal(routed.length, 0, 'and nothing was written')
   assert.deepEqual(outstandingRefusals(), [],
     'and no refusal was recorded over a posting that may already be in the ledger by hand')
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r18 (Codex round 17, HIGH 1) — AN ACTIVE CLAIM IS NOT A COMPLETED HAND POSTING.
+//
+// r16 gave an operator a CLAIM to take before going to the ledger, and read it through the same
+// suppression channel a completed hand posting uses. One answer then did two jobs:
+//
+//   a COMPLETED hand posting  "do not queue this — a human already put it in the ledger"  → nothing owed
+//   an ACTIVE claim           "do not queue this YET — a human is in the ledger now"      → still owed
+//
+// Collapsed into `{ queued: true, reason: 'handled-by-hand' }`, the second is a LOST EDIT: on a posting
+// key successive edits SHARE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT), saving a later
+// edit while an operator holds the claim for an earlier refused one writes no sync row, and every consumer
+// reads `queued: true` as "a counterpart exists", so no refusal is recorded either. Nothing anywhere says
+// the ledger is behind. That is strictly worse than the duplicate r16 set out to stop, because a duplicate
+// is visible in the ledger and this is visible nowhere.
+//
+// THE TWO TESTS BELOW ARE THE REPRODUCTIONS, written before the fix. They are about the OUTCOME the enqueue
+// hands its callers, because that is the thing that was ambiguous.
+// ---------------------------------------------------------------------------------------------------
+
+/** The refusal row an operator is holding: outstanding, claimed, and NOT marked handled. */
+function claimedRefusal(key: { type: string; referenceType: string; referenceId: string; scope: string }, kind: string) {
+  const row: Record<string, unknown> & { handPostDeferredCount: number } = {
+    id: `ref-claim-${refusals.length + 1}`,
+    ...key,
+    kind,
+    chartConnector: 'xero',
+    activeConnector: 'xero',
+    reason: 'retired_chart',
+    committed: 'the document stands in IMS and the ledger does not have this posting',
+    remedy: 'Post it by hand in the ledger it belongs to and mark this row handled.',
+    refusedCount: 1,
+    firstRefusedAt: new Date('2026-09-26T08:00:00.000Z'),
+    lastRefusedAt: new Date('2026-09-26T08:00:00.000Z'),
+    resolvedAt: null,
+    suppressedAt: null,
+    handPostClaimedAt: new Date('2026-09-26T09:00:00.000Z'),
+    handPostClaimedBy: 'operator-A' as string | null,
+    // o3d-j625 r18: the column both discharge paths read. The double's `applyRefusalUpdate` applies the
+    // atomic increment, so this moves exactly as the database's would.
+    handPostDeferredCount: 0,
+    handPostDeferredAt: null as Date | null,
+  }
+  refusals.push(row)
+  return row
+}
+
+test('[o3d-j625 r18 HIGH 1] the FACADE tells an active claim apart from a completed hand posting', async () => {
+  reset(['xero'])
+  const [{ getAccountingSettings, queueAccountingSync }, { accountingPostingKey }] = await Promise.all([
+    import('@/lib/accounting'),
+    import('@/lib/accounting/posting-key'),
+  ])
+  const settings = await getAccountingSettings()
+  const request = {
+    ...salesInvoiceRequest(settings.salesAccount),
+    chartConnector: settings.connector,
+  }
+  const key = accountingPostingKey(request as never)
+  const row = claimedRefusal(key, 'sales_invoice_held_release')
+
+  const outcome = await queueAccountingSync(request as never)
+  console.log(`[r18 facade] outcome=${JSON.stringify(outcome)}`)
+
+  // PRECONDITION — the claim was the thing that stopped it, and it was READ.
+  assert.ok(activity.some((entry) => entry.action === 'accounting_posting_suppressed_hand_post_claimed'),
+    `PRECONDITION: the claim is what declined this enqueue. Activity: ${JSON.stringify(activity.map((a) => a.action))}`)
+  assert.equal(routed.length, 0, 'PRECONDITION: nothing was queued')
+
+  // THE FINDING. `queued: true` is the answer that means "a counterpart exists in the ledger, stop": it is
+  // what `postingIsOwed` reads, what the landed-cost outbox reads, and what both invoice-update modules
+  // read before deciding whether to record the debt. An operator who is still TYPING the posting has not
+  // put a counterpart anywhere.
+  assert.equal(outcome.queued, false,
+    'THE FINDING (round 17 HIGH 1): an operator HOLDING a claim is not a posting that has been made. '
+    + 'Answering `queued: true` tells every consumer a counterpart exists, so the later edit is dropped '
+    + 'with no sync row, no refusal and no debt — the ledger silently behind IMS.')
+  assert.equal(outcome.reason, 'hand-post-deferred',
+    'and the reason must be DISTINGUISHABLE from `handled-by-hand` at every call site, not merely logged '
+    + 'differently: the two require opposite handling.')
+  assert.equal(row.handPostDeferredCount, 1,
+    'and the deferred edit is recorded on the refusal row, causally — under the claim, not by comparing '
+    + 'two application clocks (round 12 removed the last of those).')
+  assert.equal(outcome.posting?.scope, key.scope, 'keyed on THIS enqueue, so a reporting site can record it')
+})
+
+test('[o3d-j625 r18 HIGH 1] the IN-TRANSACTION enqueue tells them apart too, and a COMPLETED hand posting is unchanged', async () => {
+  reset(['xero'])
+  const [{ getAccountingSettings, queueAccountingSyncTx }, { accountingPostingKey }] = await Promise.all([
+    import('@/lib/accounting'),
+    import('@/lib/accounting/posting-key'),
+  ])
+  const settings = await getAccountingSettings()
+  const request = { ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector }
+  const key = accountingPostingKey(request as never)
+
+  // 1. CLAIMED — the deferral.
+  const claimed = claimedRefusal(key, 'sales_invoice_held_release')
+  const deferred: { outcome?: { queued: boolean; reason?: string } } = {}
+  const answeredDeferred = await queueAccountingSyncTx(transactionDouble() as never, { ...request, reportOutcome: (o: { queued: boolean; reason?: string }) => { deferred.outcome = o } } as never)
+  console.log(`[r18 tx claimed] queued=${answeredDeferred} outcome=${JSON.stringify(deferred.outcome)}`)
+  assert.deepEqual(insertedInTx, [], 'PRECONDITION: nothing was written while the claim is held')
+  assert.equal(answeredDeferred, false,
+    'THE FINDING: the boolean every in-transaction caller reads said TRUE for an edit IMS had merely '
+    + 'postponed, so the transit subledger and the obligation ledger both treated it as posted')
+  assert.equal(deferred.outcome?.reason, 'hand-post-deferred')
+  assert.equal(claimed.handPostDeferredCount, 1, 'and the postponed edit is recorded')
+
+  // 2. COMPLETED — unchanged, which is what makes the change above a DISTINCTION rather than a widening.
+  reset(['xero'])
+  const settled = claimedRefusal(key, 'sales_invoice_held_release')
+  settled.handPostClaimedAt = null
+  settled.handPostClaimedBy = null
+  settled.suppressedAt = new Date('2026-09-26T09:30:00.000Z')
+  settled.resolvedAt = new Date('2026-09-26T09:30:00.000Z')
+  const done: { outcome?: { queued: boolean; reason?: string } } = {}
+  const answeredDone = await queueAccountingSyncTx(transactionDouble() as never, { ...request, reportOutcome: (o: { queued: boolean; reason?: string }) => { done.outcome = o } } as never)
+  console.log(`[r18 tx suppressed] queued=${answeredDone} outcome=${JSON.stringify(done.outcome)}`)
+  assert.equal(answeredDone, true, 'a posting a human really made IS a counterpart, and still says so')
+  assert.equal(done.outcome?.reason, 'handled-by-hand')
+  assert.equal(settled.handPostDeferredCount ?? 0, 0, 'and nothing is postponed, because nothing is owed')
+})
+
+/**
+ * o3d-j625 r18 (Codex round 17, HIGH 1) — AND `postingIsOwed` READS THE NEW REASON AS OWED.
+ *
+ * This is the one predicate every reporting site consults, and it is a whitelist of what is NOT owed
+ * (`queued: true`, or `not-configured`). A `hand-post-deferred` therefore reads as owed with no special case —
+ * asserted rather than assumed, because a later change that "tidied" it into the not-owed list would restore
+ * round 17's lost edit at every one of those sites at once, and nothing else in this file would notice.
+ */
+test('[o3d-j625 r18 HIGH 1] a postponed posting is OWED, and a completed hand posting is not', async () => {
+  const { postingIsOwed } = await import('@/lib/domain/accounting/enqueue-outcome')
+  assert.equal(postingIsOwed({ queued: false, reason: 'hand-post-deferred' }), true,
+    'an operator is typing the posting: nothing is in the ledger, so it is owed')
+  assert.equal(postingIsOwed({ queued: true, reason: 'handled-by-hand' }), false,
+    'CONTROL: a posting a human really made is not owed — the distinction, not a widening')
+  assert.equal(postingIsOwed({ queued: false, reason: 'not-configured' }), false, 'CONTROL: nothing will ever post it')
+  assert.equal(postingIsOwed({ queued: false, reason: 'refused' }), true, 'CONTROL: the ordinary refusal')
 })

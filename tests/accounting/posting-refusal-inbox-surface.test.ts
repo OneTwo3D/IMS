@@ -88,6 +88,25 @@ const receiptBRefusal = {
 }
 
 function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
+  // o3d-j625 r18 (Codex round 17, HIGH 2): the ACTIVE-CLAIM predicate. Evaluated rather than canned,
+  // because the property under test is which rows a claims view admits — and a double that ignored this
+  // half would pass the whole of `allRows` back and hide the very limit the finding is about.
+  if ('handPostClaimedAt' in where) {
+    const claimed = where.handPostClaimedAt
+    const held = row.handPostClaimedAt instanceof Date
+    if (claimed && typeof claimed === 'object' && 'not' in (claimed as object)) {
+      if ((claimed as { not: unknown }).not === null && !held) return false
+    } else if (claimed === null && held) return false
+  }
+  /**
+   * o3d-j625 r18 — AND THE HOLDER, because a double that ignores a predicate grants it.
+   *
+   * DISCLOSED RIG FAULT, found by the mutation harness and not by the test: without this clause, scoping the
+   * claims query to `handPostClaimedBy: viewerId` — which hides a departed colleague's claim, the whole of
+   * HIGH 2 — left the reproduction GREEN, because the double returned every row whatever the query asked.
+   * An unevaluated predicate is a predicate the test cannot be about.
+   */
+  if ('handPostClaimedBy' in where && where.handPostClaimedBy !== row.handPostClaimedBy) return false
   if (!('resolvedAt' in where)) return true
   const condition = where.resolvedAt
   if (condition && typeof condition === 'object' && 'gte' in (condition as object)) {
@@ -96,7 +115,29 @@ function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string,
   return row.resolvedAt === condition
 }
 
-const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number; resolvedWhere?: Record<string, unknown> } = {}
+/**
+ * o3d-j625 r18 (Codex round 17, HIGH 2) — THE DOUBLE NOW HONOURS `orderBy` AND `take`.
+ *
+ * It used to return every matching row whatever the query asked for, so a section capped at 50 rows looked
+ * uncapped and the finding — "a claim beyond the limit is not in the actionable UI" — was invisible to this
+ * file. Honouring both is what lets the reproduction below hold 50 older refusals in front of a newer claim.
+ */
+function pageRefusals(rows: Array<Record<string, unknown>>, orderBy: unknown, take: number | undefined): Array<Record<string, unknown>> {
+  const sorted = [...rows]
+  if (orderBy && typeof orderBy === 'object') {
+    const [field, direction] = Object.entries(orderBy as Record<string, string>)[0] ?? []
+    if (field) {
+      sorted.sort((a, b) => {
+        const left = a[field] instanceof Date ? (a[field] as Date).getTime() : 0
+        const right = b[field] instanceof Date ? (b[field] as Date).getTime() : 0
+        return direction === 'desc' ? right - left : left - right
+      })
+    }
+  }
+  return typeof take === 'number' ? sorted.slice(0, take) : sorted
+}
+
+const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number; resolvedWhere?: Record<string, unknown>; claimsWhere?: Record<string, unknown>; claimsOrderBy?: unknown; claimsTake?: number } = {}
 
 const emptyModel = {
   findMany: async () => [],
@@ -156,14 +197,20 @@ const db = new Proxy({
     findMany: async ({ where, orderBy, take }: { where: Record<string, unknown>; orderBy?: unknown; take?: number }) => {
       // o3d-j625 r6: the page also reads RECENTLY RESOLVED rows (review H4). Only the OUTSTANDING list's
       // arguments are recorded here — the resolved list is asserted by its own test below.
-      if (where.resolvedAt === null) {
+      // o3d-j625 r18: and the ACTIVE-CLAIM read is recorded separately, because the whole of HIGH 2 is that
+      // it must not be the refusal list's query — same predicate, same ordering, same cap would be the bug.
+      if ('handPostClaimedAt' in where) {
+        seen.claimsWhere = where
+        seen.claimsOrderBy = orderBy
+        seen.claimsTake = take
+      } else if (where.resolvedAt === null) {
         seen.listWhere = where
         seen.listOrderBy = orderBy
         seen.listTake = take
       } else {
         seen.resolvedWhere = where
       }
-      return allRows.filter((row) => matchesRefusalWhere(row, where))
+      return pageRefusals(allRows.filter((row) => matchesRefusalWhere(row, where)), orderBy, take)
     },
   },
   $queryRaw: async () => [],
@@ -597,4 +644,112 @@ test('[o3d-j625 r16 HIGH 1] a claim held by the VIEWER says post it now, then co
   assert.match(row.handPostOrder, /IMS will not queue this posting while you hold it/,
     'which is the promise the claim actually makes, and the reason the order is safe')
   assert.match(row.handPostOrder, /"Mark as handled"/, 'and the acknowledgement is the SECOND step')
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r18 (Codex round 17, HIGH 2) — EVERY ACTIVE CLAIM MUST BE DISCOVERABLE AND RELEASABLE
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * A hand-post claim has NO EXPIRY, deliberately: r16 rejected a timer because a claim that lapsed would
+ * re-open exactly the interval it closes. That decision is only safe if a human can always find the claim
+ * and give it back. Round 17's finding is that they cannot: the only claim display and the only Release
+ * control ride on the OUTSTANDING REFUSAL LIST, which takes the oldest 50 by `firstRefusedAt` with no claim
+ * priority, no pagination and no stale-claim alert. With 50 older refusals standing, a holder who leaves
+ * can leave a NEWER claim outside the actionable UI indefinitely — IMS goes on declining that posting while
+ * the inbox shows nothing but an aggregate count.
+ *
+ * THE REPRODUCTION: 50 older refusals, then one newer refusal that is CLAIMED. The claim must be reachable
+ * without depending on the refusal list's limit or its ordering.
+ */
+test('[o3d-j625 r18 HIGH 2] an active claim behind 50 older refusals is still listed, with its holder and age, and releasable', async () => {
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const added: Array<Record<string, unknown>> = []
+  // 50 older debts — exactly the cap, so the claimed row below cannot be the 51st by luck.
+  for (let index = 0; index < 50; index += 1) {
+    added.push({
+      id: `older-${index}`,
+      type: 'MANUFACTURING_JOURNAL',
+      referenceType: 'ProductionOrder',
+      referenceId: `po-old-${index}`,
+      scope: '',
+      kind: 'manufacturing_journal',
+      chartConnector: 'xero',
+      activeConnector: null,
+      reason: 'retired_chart',
+      committed: 'the production order is completed in IMS',
+      remedy: 'Post the manufacturing journal by hand and mark this row handled.',
+      refusedCount: 1,
+      firstRefusedAt: new Date(`2026-08-${String((index % 28) + 1).padStart(2, '0')}T08:00:00.000Z`),
+      lastRefusedAt: new Date('2026-09-01T08:00:00.000Z'),
+      resolvedAt: null,
+      handPostClaimedAt: null,
+      handPostClaimedBy: null,
+    })
+  }
+  const claimedRow = {
+    id: 'claimed-newer',
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-claimed',
+    scope: '',
+    kind: 'sales_invoice_update',
+    chartConnector: 'xero',
+    activeConnector: null,
+    reason: 'retired_chart',
+    committed: 'the order is updated in IMS',
+    remedy: 'Re-save the order once the cause is resolved, or correct the invoice by hand in the ledger.',
+    refusedCount: 1,
+    // NEWER than all fifty, which is precisely why the oldest-first cap hides it.
+    firstRefusedAt: new Date('2026-09-25T08:00:00.000Z'),
+    lastRefusedAt: new Date('2026-09-25T08:00:00.000Z'),
+    resolvedAt: null,
+    handPostClaimedAt: new Date('2026-09-20T08:00:00.000Z'),
+    handPostClaimedBy: 'u2',
+  }
+  added.push(claimedRow)
+  allRows.push(...added)
+
+  try {
+    const data = await getExceptionInboxData()
+
+    // PRECONDITION — the cap really bites, and the claimed row really is outside it. Printed, so a fixture
+    // that stopped exercising the limit is visible rather than inferred.
+    console.log(`[r18 HIGH-2] refusal rows listed=${data.accountingPostingRefusals.length} `
+      + `claimed row present=${data.accountingPostingRefusals.some((row) => row.id === 'claimed-newer')}`)
+    assert.equal(data.accountingPostingRefusals.length, 50,
+      'PRECONDITION: the actionable list is capped at 50 and the cap is reached')
+    assert.equal(data.accountingPostingRefusals.some((row) => row.id === 'claimed-newer'), false,
+      'PRECONDITION (and the finding): the claim is NOT in the list that carries the Release control')
+
+    // THE FINDING. A claim with no expiry must be reachable independently of that list.
+    const claims = (data as unknown as { accountingHandPostClaims?: Array<Record<string, unknown>> }).accountingHandPostClaims
+    assert.ok(Array.isArray(claims),
+      'THE FINDING (round 17 HIGH 2): there is no view of the active hand-post claims at all. The only '
+      + 'Release control rides on the oldest-50 refusal list, so a claim behind 50 older debts is a '
+      + 'permanent suppression nobody can reach — and r16 removed the expiry that would otherwise end it.')
+    assert.equal(claims.length, 1, 'every active claim, not the ones that happen to be in the refusal page')
+    const claim = claims[0] as Record<string, unknown>
+    assert.equal(claim.refusalId, 'claimed-newer', 'named by the row Release acts on, so the control works from here')
+    assert.equal(claim.by, 'u2')
+    assert.equal(claim.byName, 'u2', 'a user id in an instruction is not something an operator can act on')
+    assert.equal(claim.mine, false, 'the viewer is u1')
+    assert.equal(claim.at, '2026-09-20T08:00:00.000Z')
+    assert.equal(typeof claim.heldForHours, 'number', 'and its AGE, which is the only stale signal a claim can have')
+    assert.equal(claim.stale, true, 'held since 2026-09-20 — long past the threshold, and flagged as such')
+    assert.equal(claim.type, 'SALES_INVOICE_UPDATE')
+    assert.equal(claim.referenceId, 'so-claimed')
+
+    // AND IT IS COUNTED, so the page can say "N postings are being settled by hand" without listing them.
+    assert.equal((data.summary as unknown as { accountingHandPostClaims?: number }).accountingHandPostClaims, 1)
+
+    // AND IT IS ITS OWN QUERY. Same predicate/ordering/cap as the refusal list would be the bug itself.
+    assert.ok(seen.claimsWhere, 'the claims view has its own query')
+    assert.deepEqual(seen.claimsOrderBy, { handPostClaimedAt: 'asc' },
+      'OLDEST CLAIM FIRST — a claim is stale by age, and `firstRefusedAt` says nothing about when it was taken')
+    assert.ok((seen.claimsTake ?? 0) > 50,
+      `and its cap is not the refusal list's: ${seen.claimsTake} vs ${seen.listTake}`)
+  } finally {
+    for (const row of added) allRows.splice(allRows.indexOf(row), 1)
+  }
 })

@@ -1214,9 +1214,10 @@ async function recordEnqueueRestingOnAssertion(
  * cheaper to pin directly than through a full post-and-follow-up loop.
  *
  * o3d-peh1 — IT RETURNS WHETHER THE FOLLOW-UP IS ACTUALLY OWED, and every path out of it says so.
- * THREE of them decline deliberately, and they are the whole of `FollowUpEnqueueDeclineReason`: an
- * ambiguous token history, a ledger that will not confirm the attempt is absent, and a revival
- * target with no attempt revision whose type the ledger probe does not speak for. They are NOT the
+ * FOUR of them decline deliberately, and they are the whole of `FollowUpEnqueueDeclineReason`: an
+ * ambiguous token history, a ledger that will not confirm the attempt is absent, a revival
+ * target with no attempt revision whose type the ledger probe does not speak for, and (o3d-j625 r18) an
+ * operator holding the hand-posting claim on the posting, who is raising it in the ledger by hand. They are NOT the
  * whole of `FollowUpEnqueueRefusalReason`, which since o3d-batch-ret r6 also carries what a
  * connector refuses BEFORE reaching this function — see `decideInvoicePaymentFollowUp`. A live row holding
  * the scope under a DIFFERENT token is NOT one of them: `resolveLostFollowUpRevival` either answers
@@ -1555,8 +1556,20 @@ export async function enqueueFollowUpSyncLog(
         })
       // o3d-j625 r7: this follow-up was marked handled — posted by hand — so nothing is owed and nothing
       // was written (the primitive reported it). Done, in the only sense that matters: IMS must not post it.
-      if (!created) return 'done' as const
-      const log = created
+      /**
+       * o3d-j625 r18 (Codex round 17, HIGH 1) — AND A LIVE CLAIM IS NOT DONE.
+       *
+       * An operator is in the ledger raising this follow-up by hand. Nothing exists yet, nothing was written,
+       * and the postponement is recorded on the refusal row (the primitive did it) so the end of the claim
+       * accounts for it. It leaves here as a REFUSAL rather than as `'done'`, because every caller of this
+       * function settles the parent row on `enqueued: true` — which is how r16's single answer let the sweep
+       * stamp a row over a follow-up that had never been queued.
+       */
+      if (created.suppressed !== null) {
+        if (created.suppressed === 'handled_by_hand') return 'done' as const
+        return 'hand-post-claim-held' as const
+      }
+      const log = created.row
       // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
       // exist without the line that says so.
       await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
@@ -1565,6 +1578,30 @@ export async function enqueueFollowUpSyncLog(
       })
       return 'done' as const
     })
+    /**
+     * o3d-j625 r18 — THE POSTING IS BEING RAISED BY HAND, SO THE FOLLOW-UP IS STILL OWED.
+     *
+     * Reported as a refusal with its own reason and its own remedy, because the ONE value a caller may
+     * settle on is `enqueued: true` (see FollowUpEnqueueOutcome) — and the back-reference sweep settles the
+     * parent row on it. The refusal clears itself: the claim ends, IMS may queue the follow-up again, and the
+     * refusal row for the posting carries the postponement until then.
+     */
+    if (outcome === 'hand-post-claim-held') {
+      const message =
+        `An operator is settling ${type} for ${referenceType} ${referenceId} by hand — they took it in the `
+        + 'accounting exception inbox before going to the ledger, so IMS did not queue this follow-up and '
+        + 'nothing is in the ledger for it yet. It is still owed: when they confirm it (or release the claim) '
+        + 'this can be re-driven. Look at the refused posting in Sync exceptions, which names who holds it.'
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_followup_enqueue_refused',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: message,
+        metadata: { type, referenceType, referenceId, reason: 'hand_post_claim_held' },
+      })
+      return refusedFollowUpEnqueue({ type, referenceType, referenceId, reason: 'hand_post_claim_held', message })
+    }
     if (outcome === 'cas-lost' && plan.action === 'reuse') {
       // o3d-peh1: the resolver's verdict IS this call's verdict. It either finds a live row carrying
       // our token (enqueued, by somebody else), re-plans — whose own outcome must travel back out —

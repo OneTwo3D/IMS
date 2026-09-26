@@ -135,6 +135,43 @@ import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 const SECTION_LIMIT = 50
 
 /**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r18 (Codex round 17, HIGH 2) — EVERY ACTIVE HAND-POST CLAIM IS DISCOVERABLE AND RELEASABLE
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * A hand-post claim has NO EXPIRY, and that is deliberate: r16 rejected a timer because a claim that lapsed
+ * on one would re-open exactly the interval it closes (an operator would be in the ledger with IMS free to
+ * queue the posting again). Round 17's finding is what that decision costs unless the claim can always be
+ * FOUND: the only claim display and the only Release control rode on the outstanding-refusal list, which
+ * takes the oldest {@link SECTION_LIMIT} by `firstRefusedAt` with no claim priority and no pagination. With
+ * 50 older refusals standing, a holder who leaves could leave a NEWER claim outside the actionable UI
+ * indefinitely — IMS goes on declining that posting and the inbox shows only an aggregate count.
+ *
+ * So the claims are their OWN section, with their own query, their own predicate and their own cap:
+ *
+ *   · the predicate is the claim (`handPostClaimedAt: { not: null }`), not the debt's age;
+ *   · the ordering is OLDEST CLAIM FIRST, because a claim is stale by how long it has been held and
+ *     `firstRefusedAt` says nothing about when it was taken;
+ *   · the cap is {@link HAND_POST_CLAIM_LIMIT}, far above the refusal section's, and the page states the
+ *     true total whenever it bites — so a claim cannot be hidden by the number of unrelated debts;
+ *   · every row carries its holder, its AGE and a STALE flag, which is the only signal a claim without an
+ *     expiry can have;
+ *   · the Release control is offered on every one of them, whoever holds it. WHO MAY RELEASE ANOTHER
+ *     OPERATOR'S CLAIM: ANYBODY WITH THE `sync` PERMISSION, and that is the answer rather than an omission.
+ *     Restricting it to the holder would make a departed holder's claim a permanent suppression, which is the
+ *     very failure this section exists to end. The release is logged at WARNING naming who released whose.
+ */
+const HAND_POST_CLAIM_LIMIT = 500
+
+/**
+ * When a held claim starts reading as STALE. Not an expiry and nothing acts on it: it is the age at which the
+ * page says "this has been held a long time — is the holder still on it?", which is what makes a claim nobody
+ * is going to finish findable rather than merely present. 24 hours, because a hand posting is minutes of work
+ * inside one shift, so a claim that has survived a night is one nobody came back to.
+ */
+const HAND_POST_CLAIM_STALE_HOURS = 24
+
+/**
  * How many of a drift cohort's orders the page RENDERS.
  *
  * Only a rendering bound — the digest Isolate is bound to always covers the
@@ -552,6 +589,36 @@ export type AccountingPostingRefusalRow = {
    * cleaner if the site's sentence is never rewritten at all, so the two sentences are now two fields.
    */
   handPostOrder: string | null
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 1) — HOW MANY POSTINGS IMS HAS DECLINED TO QUEUE BEHIND A LIVE CLAIM.
+   *
+   * Non-zero only while a claim is held. On a REUSED posting key it is the reason this refusal will NOT close
+   * when the holder marks it handled: they are posting the version they had, and IMS has since been asked to
+   * post a later one. Rendered so the holder learns it before they go to the ledger, not afterwards.
+   */
+  handPostDeferredEdits: number
+}
+
+/**
+ * o3d-j625 r18 (Codex round 17, HIGH 2) — ONE ACTIVE HAND-POSTING CLAIM, reachable without the refusal list.
+ *
+ * `refusalId` is what Release acts on, so the control works from this row alone. `heldForHours` and `stale`
+ * are the age signal a claim with no expiry has instead of a timer, and `deferredEdits` says how many
+ * postings IMS has already declined to queue behind this claim — a number that only grows while it is held.
+ */
+export type AccountingHandPostClaimRow = {
+  refusalId: string
+  type: string
+  referenceType: string
+  referenceId: string
+  kind: string | null
+  at: string
+  by: string | null
+  byName: string | null
+  mine: boolean
+  heldForHours: number
+  stale: boolean
+  deferredEdits: number
 }
 
 /** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
@@ -601,6 +668,16 @@ export type ExceptionInboxSummary = {
    * section) and broken out so "the inbox total went up" can be told from "a posting is owed".
    */
   accountingPostingRefusalsUnconfirmed: number
+  /**
+   * o3d-j625 r18 (Codex round 17, HIGH 2): how many postings an operator is settling BY HAND right now.
+   *
+   * NOT added to `total`, deliberately. A claim is not new work — it is somebody already doing the work on a
+   * refusal that `accountingPostingRefusals` has already counted, and adding it would double-count the same
+   * debt and make the inbox badge go UP when an operator starts settling something. It is here so the claims
+   * section can state its true size when its own cap bites, and so "N postings are being settled by hand" is
+   * answerable without listing them.
+   */
+  accountingHandPostClaims: number
   total: number
 }
 
@@ -619,6 +696,8 @@ export type ExceptionInboxData = {
   accountingFollowUpObligations: AccountingFollowUpObligationRow[]
   accountingPostingRefusals: AccountingPostingRefusalRow[]
   accountingPostingRefusalsResolved: ResolvedAccountingPostingRefusalRow[]
+  /** o3d-j625 r18 (Codex round 17, HIGH 2): every active hand-posting claim, independent of the list above. */
+  accountingHandPostClaims: AccountingHandPostClaimRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -864,7 +943,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   // host's. Read before the batch because the predicate is built from it; `null` (unreadable clock)
   // means no grace at all, which lists every marked row — noise in the safe direction.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents, accountingFollowUpObligations, outstandingPostingRefusals, unconfirmedPostingRefusals, handPostClaims] = await Promise.all([
     // o3d-92fu / o3d-2k5r: the count is over EVERY blocked push state, not DEAD_LETTER alone — a
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
@@ -893,6 +972,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // left to the integration-outbox section so that a reconciler which never runs is visible as what it
     // is: a posting whose fate IMS has not established.
     countUnreconciledProvisionalPostingRefusals({ client: db }),
+    // o3d-j625 r18 (Codex round 17, HIGH 2): how many postings are being settled by hand right now. Its own
+    // count, so the claims section can say "showing N of M" when its cap bites — see HAND_POST_CLAIM_LIMIT
+    // for why a claim must never be discoverable only through the oldest-50 refusal page.
+    db.accountingPostingRefusal.count({ where: { resolvedAt: null, handPostClaimedAt: { not: null } } }),
   ])
 
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
@@ -911,6 +994,8 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     accountingFollowUpObligations,
     accountingPostingRefusals: outstandingPostingRefusals + unconfirmedPostingRefusals,
     accountingPostingRefusalsUnconfirmed: unconfirmedPostingRefusals,
+    // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
+    accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
       + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
@@ -988,7 +1073,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows, handPostClaimRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -1131,6 +1216,24 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         // operator who cannot see that somebody else holds it will post it as well.
         handPostClaimedAt: true,
         handPostClaimedBy: true,
+        // o3d-j625 r18: how many postings IMS has declined to queue behind this claim.
+        handPostDeferredCount: true,
+      },
+    }),
+    /**
+     * o3d-j625 r18 (Codex round 17, HIGH 2) — THE ACTIVE CLAIMS, AS THEIR OWN QUERY.
+     *
+     * Its own predicate (the claim, not the debt's age), its own ordering (OLDEST CLAIM FIRST — a claim is
+     * stale by how long it has been held) and its own cap. Sharing the refusal list's query is the finding
+     * itself: a claim behind 50 older debts was unreachable, with no expiry to end it.
+     */
+    db.accountingPostingRefusal.findMany({
+      where: { resolvedAt: null, handPostClaimedAt: { not: null } },
+      orderBy: { handPostClaimedAt: 'asc' },
+      take: HAND_POST_CLAIM_LIMIT,
+      select: {
+        id: true, type: true, referenceType: true, referenceId: true, kind: true,
+        handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
       },
     }),
   ])
@@ -1476,6 +1579,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             queuedRow,
             earlierPostings,
             handPostClaim,
+            handPostDeferredEdits: row.handPostDeferredCount,
             // o3d-j625 r16: the site's own remedy, VERBATIM, in every case — round 12's property with the
             // exception r14 introduced removed again. What to do FIRST is its own field.
             remedy: row.remedy,
@@ -1490,6 +1594,36 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       ...await loadUnconfirmedPostingRefusals(),
     ],
     accountingPostingRefusalsResolved: await loadResolvedPostingRefusals(),
+    /**
+     * o3d-j625 r18 (Codex round 17, HIGH 2) — EVERY ACTIVE CLAIM, whether or not its refusal is on the page.
+     *
+     * The age is computed here from the stored stamp rather than in the browser, so the STALE verdict the
+     * page shows and the number an operator reads cannot disagree with each other.
+     */
+    accountingHandPostClaims: await (async () => {
+      const holders = await namesOfUsers(handPostClaimRows.map((row) => row.handPostClaimedBy))
+      const now = Date.now()
+      return handPostClaimRows.flatMap((row) => {
+        // The predicate above guarantees it; narrowed rather than asserted, so a widened query cannot ship a
+        // claim row with no claim time and an age of "now".
+        if (!row.handPostClaimedAt) return []
+        const heldForHours = (now - row.handPostClaimedAt.getTime()) / 3_600_000
+        return [{
+          refusalId: row.id,
+          type: row.type,
+          referenceType: row.referenceType,
+          referenceId: row.referenceId,
+          kind: row.kind,
+          at: row.handPostClaimedAt.toISOString(),
+          by: row.handPostClaimedBy,
+          byName: row.handPostClaimedBy ? (holders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
+          mine: row.handPostClaimedBy === viewerId,
+          heldForHours: Math.round(heldForHours * 10) / 10,
+          stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
+          deferredEdits: row.handPostDeferredCount,
+        }]
+      })
+    })(),
   }
 
   return {
@@ -1501,7 +1635,15 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   }
 }
 
-type MutationResult = { success: boolean; error?: string } | FreshAuthFailureResult
+/**
+ * o3d-j625 r18 (Codex round 17, HIGH 1) — `notice` IS WHY A SUCCESS MAY NOT SAY WHAT THE BUTTON SAID.
+ *
+ * "Marked as handled" is the right sentence when the debt closed. On a REUSED posting key with a later
+ * version postponed behind the claim it is a false success claim: the operator's ledger write happened, but
+ * the obligation is still owed and the row stays listed. A mutation that needs to say that hands back the
+ * sentence rather than letting the page guess from `success: true`.
+ */
+type MutationResult = { success: boolean; error?: string; notice?: string } | FreshAuthFailureResult
 
 /**
  * o3d-j625 r10 (Codex round 9, HIGH) — the PROVISIONAL claims, rendered in the refusal section's own shape.
@@ -1544,6 +1686,9 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     earlierPostings: [],
     handPostClaim: null,
     handPostOrder: null,
+    // o3d-j625 r18: an unconfirmed claim has no established posting key and cannot be taken for hand posting
+    // at all, so nothing can have been postponed behind it.
+    handPostDeferredEdits: 0,
   }))
 }
 
@@ -1812,15 +1957,33 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
       description:
         'Released the hand-posting claim on a refused accounting posting. IMS may queue and post it again '
         + 'from now on — if it was already posted by hand and not confirmed here, the ledger can get it '
-        + 'twice. The refusal is still outstanding in the exception inbox.',
+        + 'twice. The refusal is still outstanding in the exception inbox.'
+        // o3d-j625 r18 (Codex round 17, HIGH 1): and what IMS declined to queue while the claim was held is
+        // named, because nothing requeues those postings on its own — the outstanding row is the record and
+        // re-saving the document is what queues the CURRENT version.
+        + (result.deferredEdits > 0
+          ? ` While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for this key; they `
+            + 'have been added to the refusal\'s count and it stays outstanding. Nothing requeues them by '
+            + 'itself — re-save the document to queue its current version.'
+          : ''),
       metadata: {
         refusalId: id, releasedBy: session.user.id,
         heldBy: result.releasedFrom, heldSince: result.heldSince.toISOString(),
+        deferredEdits: result.deferredEdits,
       },
       resolveUser: false,
     })
     revalidatePath('/sync/exceptions')
-    return { success: true }
+    return {
+      success: true,
+      ...(result.deferredEdits > 0
+        ? {
+            notice: `Released. While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for `
+              + 'this key; they are counted on the refusal, which stays outstanding. Nothing requeues them by '
+              + 'itself — re-save the document to queue its current version.',
+          }
+        : {}),
+    }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure
@@ -1881,17 +2044,46 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
           ? 'IMS will not post this posting again'
           : 'IMS will not re-post this edit, and a LATER edit of this document will be queued as usual — '
             + 'this posting key is one successive edits share')
-        + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.'),
+        + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.')
+        /**
+         * o3d-j625 r18 (Codex round 17, HIGH 1) — AND WHETHER THE DEBT IS ACTUALLY DISCHARGED.
+         *
+         * On a reused posting key, a posting IMS declined to queue while the claim was held may be a LATER
+         * version of the same document. The operator posted the version they had; the ledger still does not
+         * hold the current one. The row therefore stays OUTSTANDING and the record says so — it is not a
+         * refusal of their mark (the ledger write they made is real and is recorded here), it is a refusal of
+         * the claim that the obligation is met.
+         */
+        + (result.stillOutstanding
+          ? ` This row STAYS OUTSTANDING: while the claim was held, IMS was asked to post ${result.deferredEdits} `
+            + 'later version(s) of this document and declined, so the ledger does not hold the current one. '
+            + 'Re-save the document to queue it, or post the current version by hand and mark it again.'
+          : ''),
       metadata: {
         refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed,
         cancelledSyncRows: result.cancelledSyncRows,
         // The machine-readable half of the sentence above: whether a permanent suppression was written.
         suppressed: result.suppressed,
+        deferredEdits: result.deferredEdits,
+        stillOutstanding: result.stillOutstanding,
       },
       resolveUser: false,
     })
     revalidatePath('/sync/exceptions')
-    return { success: true }
+    // See MutationResult.notice: the page must not say "marked as handled" over a debt that is still owed.
+    // Spread rather than a `notice: undefined`, so a success with nothing to add is byte-for-byte the answer
+    // every other mutation gives — an explicit `undefined` key is a different object to a deep-equal.
+    return {
+      success: true,
+      ...(result.stillOutstanding
+        ? {
+            notice: 'Your hand posting is recorded, but this row STAYS OUTSTANDING: IMS was asked to post '
+              + `${result.deferredEdits} later version(s) of this document while you held it and declined, so `
+              + 'the ledger does not hold the current one. Re-save the document to queue it, or post the '
+              + 'current version by hand and mark it again.',
+          }
+        : {}),
+    }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

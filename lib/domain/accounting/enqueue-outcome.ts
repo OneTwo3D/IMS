@@ -48,7 +48,7 @@ import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal
  */
 export type EnqueueOutcomeLike = {
   queued: boolean
-  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand'
+  reason?: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | 'hand-post-deferred'
   connector?: string | null
   /**
    * o3d-j625 r5 (review HIGH 1/2/3) — THE POSTING KEY, FROM THE ENQUEUE'S OWN PARAMS.
@@ -73,6 +73,10 @@ export type EnqueueOutcomeLike = {
  * `queued: false, not-configured` no — there is no connector, or it does not post this type, so no GL
  *                                counterpart will ever exist and nothing is outstanding.
  * `queued: false, refused`       YES.
+ * `queued: false, hand-post-deferred` YES (o3d-j625 r18) — an operator holds the hand-posting claim, so IMS
+ *                                declined to queue it WHILE they are in the ledger. Nothing exists yet. This
+ *                                needs no special case: it is not `not-configured`, so it reads as owed, and
+ *                                that is what makes each reporting site record the debt round 17 found lost.
  * `queued: false`, no reason     YES, and that is the answer the boolean in-transaction enqueue gives.
  *                                A bare `false` cannot tell the two apart, so it is read the SAFE way:
  *                                treating an unknown as `not-configured` would settle an obligation on

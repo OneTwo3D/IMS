@@ -2,7 +2,14 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
-import { lockPostingKey, readPostingSuppression, reportSuppressedPosting, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
+import {
+  HandPostDeferralUnrecordableError,
+  lockPostingKey,
+  readPostingSuppression,
+  recordHandPostDeferral,
+  reportSuppressedPosting,
+  type PostingSuppressionClient,
+} from '@/lib/domain/accounting/posting-suppression'
 
 /**
  * o3d-j625 r6 (review H3) — THE ONE PLACE AN ACCOUNTING SYNC ROW IS CREATED, AND THEREFORE THE ONE PLACE A
@@ -30,21 +37,37 @@ export type SyncLogRowClient = {
 }
 
 /**
- * Returns the created row, or `null` when the posting was MARKED HANDLED — posted by hand — in which case
- * nothing is written and the refusal is reported (o3d-j625 r7). The `null` is in the return type so that
- * every caller has to decide what "already posted by hand" means for it; none can post around it.
+ * ── o3d-j625 r18 (Codex round 17, HIGH 1) — THE ANSWER IS NO LONGER `T | null` ──
  *
- * o3d-j625 r16 (Codex round 15, HIGH 1): `null` ALSO means an operator is posting it by hand RIGHT NOW —
- * they took the refusal for hand posting (`claimPostingForHandPosting`) before going to the ledger, and the
- * claim is read through the same suppression channel under this same lock. That is what makes "the worker
- * cannot post it while they are typing it" a property of this function rather than of a sentence in the
- * exception inbox. The two are told apart by `PostingSuppression.basis` and reported differently; they are
- * NOT told apart here, because the answer this function has to give is identical: write nothing.
+ * r7 returned `null` for "marked handled — posted by hand", and r16 made the SAME `null` also mean "an
+ * operator is posting it by hand right now", on the argument that the answer this function has to give is
+ * identical: write nothing. Round 17 showed what that costs one level up. The four callers turn this answer
+ * into an enqueue OUTCOME, and for a completed hand posting the right outcome is `{ queued: true }` — a
+ * counterpart exists, stop retrying — while for a live claim it is the opposite: nothing exists, the posting
+ * is still owed, and on a REUSED posting key the thing being postponed may be a DIFFERENT, LATER edit. One
+ * `null` could not carry both, so every caller answered `handled-by-hand` and the later edit was lost with no
+ * sync row, no refusal and no debt.
+ *
+ * So the two are told apart HERE, in a shape no caller can read as the row: `{ row, suppressed }`. A `if
+ * (!created)` on the old return would have compiled and silently become always-false; this does not compile
+ * at all until each site says what it means to do, which is the point of changing the shape rather than
+ * adding a field.
+ *
+ *   { row, suppressed: null }                 written.
+ *   { row: null, suppressed: 'handled_by_hand' }  a human already put it in the ledger. Nothing is owed.
+ *   { row: null, suppressed: 'hand_post_claim' }  a human is in the ledger NOW. Still owed, and POSTPONED:
+ *                                                 the postponement is recorded on the refusal row before
+ *                                                 this returns, so the act that ends the claim can discharge
+ *                                                 it. See recordHandPostDeferral.
  *
  * THROWS `PostingSuppressionUnreadableError` when whether it was marked handled cannot be READ (o3d-j625
- * r8). That is a third answer, not a `null`: `null` asserts a counterpart exists in the ledger, and an
- * unreadable state asserts nothing at all. Nothing is written, so the caller may retry.
+ * r8), and `HandPostDeferralUnrecordableError` when a postponement cannot be RECORDED (r18). Both are a
+ * third answer rather than a `row: null`: nothing is written, nothing is asserted, and the caller may retry.
  */
+export type CreateAccountingSyncLogRowResult<T> =
+  | { row: T; suppressed: null }
+  | { row: null; suppressed: 'handled_by_hand' | 'hand_post_claim' }
+
 export async function createAccountingSyncLogRow<T extends { id: string }>(
   client: SyncLogRowClient,
   data: Prisma.AccountingSyncLogUncheckedCreateInput,
@@ -55,7 +78,7 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
      */
     createInSavepoint?: boolean
   },
-): Promise<T | null> {
+): Promise<CreateAccountingSyncLogRowResult<T>> {
   const key = accountingPostingKeyForRow({
     type: String(data.type),
     referenceType: data.referenceType,
@@ -72,8 +95,27 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
   await lockPostingKey(client as unknown as PostingSuppressionClient, key)
   const suppression = await readPostingSuppression(client as unknown as PostingSuppressionClient, key)
   if (suppression.suppressed) {
-    await reportSuppressedPosting(key, suppression)
-    return null
+    /**
+     * o3d-j625 r18 — A LIVE CLAIM IS RECORDED AS A POSTPONEMENT BEFORE THIS RETURNS, OR NOTHING IS RETURNED.
+     *
+     * The read above happened under this key's advisory lock, and so does this write, so `'no-claim'` here
+     * means the claim was given back between them by a transaction that could not have been serialised with
+     * this one (a client that cannot take the lock: a structural test double). The honest response is to
+     * PROCEED — there is no claim, so there is nothing to postpone and the row should be written — never to
+     * postpone against a claim nobody holds. `'unrecordable'` throws: an unrecorded postponement is
+     * indistinguishable from the lost edit this round is about.
+     */
+    if (suppression.basis === 'hand_post_claim') {
+      const recorded = await recordHandPostDeferral(client as unknown as PostingSuppressionClient, key, new Date())
+      if (recorded === 'unrecordable') throw new HandPostDeferralUnrecordableError(key)
+      if (recorded === 'recorded') {
+        await reportSuppressedPosting(key, suppression)
+        return { row: null, suppressed: 'hand_post_claim' }
+      }
+    } else {
+      await reportSuppressedPosting(key, suppression)
+      return { row: null, suppressed: 'handled_by_hand' }
+    }
   }
   const create = () => client.accountingSyncLog.create({ data }) as Promise<T>
   const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
@@ -82,5 +124,5 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     key,
     { withSavepoint: <R,>(fn: () => Promise<R>) => withSavepoint(client, fn) },
   )
-  return row
+  return { row, suppressed: null }
 }
