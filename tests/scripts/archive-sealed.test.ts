@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -23,18 +23,19 @@ const REPO = process.cwd()
 const SCRIPT = 'scripts/check-archive-sealed.mjs'
 const MANIFEST = path.join(REPO, 'scripts/archive-sealed-manifest.tsv')
 
+/**
+ * BOTH STREAMS, ALWAYS. The check prints refusals AND non-fatal NOTICEs on stderr, so a rig that
+ * reads only stdout cannot tell a locus that ran from one that announced it could not run — which is
+ * the same "it printed nothing" failure this whole file exists about.
+ */
+function runSealAt(cwd: string, script: string, env: Record<string, string> = {}): { status: number; output: string } {
+  const result = spawnSync('node', [script], { cwd, encoding: 'utf8', env: { ...process.env, ...env } })
+  assert.equal(result.error, undefined, `could not run ${script}: ${result.error?.message ?? ''}`)
+  return { status: result.status ?? -1, output: `${result.stdout ?? ''}${result.stderr ?? ''}` }
+}
+
 function runSeal(env: Record<string, string> = {}): { status: number; output: string } {
-  try {
-    const stdout = execFileSync('node', [SCRIPT], {
-      cwd: REPO,
-      encoding: 'utf8',
-      env: { ...process.env, ...env },
-    })
-    return { status: 0, output: stdout }
-  } catch (error) {
-    const err = error as { status?: number; stdout?: string; stderr?: string }
-    return { status: err.status ?? -1, output: `${err.stdout ?? ''}${err.stderr ?? ''}` }
-  }
+  return runSealAt(REPO, SCRIPT, env)
 }
 
 function withTamperedManifest(mutate: (lines: string[]) => string[], run: (file: string) => void): void {
@@ -163,13 +164,7 @@ function git(cwd: string, args: string[]): string {
 }
 
 function runSealIn(cwd: string, env: Record<string, string> = {}): { status: number; output: string } {
-  try {
-    const stdout = execFileSync('node', [SCRIPT_ABS], { cwd, encoding: 'utf8', env: { ...process.env, ...env } })
-    return { status: 0, output: stdout }
-  } catch (error) {
-    const err = error as { status?: number; stdout?: string; stderr?: string }
-    return { status: err.status ?? -1, output: `${err.stdout ?? ''}${err.stderr ?? ''}` }
-  }
+  return runSealAt(cwd, SCRIPT_ABS, env)
 }
 
 /** A sealed repository: two archived files, committed, with a manifest the script itself wrote. */
@@ -183,7 +178,11 @@ function withScratchRepo(run: (repo: string) => void): void {
     writeFileSync(path.join(repo, 'archive/connectors/two.ts'), 'export const two = 2\n')
     git(repo, ['add', '-A'])
     git(repo, ['commit', '-qm', 'seal'])
-    const manifest = execFileSync('node', [SCRIPT_ABS, '--write'], { cwd: repo, encoding: 'utf8' })
+    const manifest = execFileSync('node', [SCRIPT_ABS, '--write'], {
+      cwd: repo,
+      encoding: 'utf8',
+      env: { ...process.env, ARCHIVE_SEAL_REWRITE: '1' },
+    })
     // PRECONDITION: the rig must really have something sealed, or every refusal below is vacuous.
     assert.equal(manifest.split('\n').filter((l) => l.startsWith('archive/')).length, 2, 'PRECONDITION: the scratch repo must seal exactly its two archived files')
     writeFileSync(path.join(repo, 'scripts/archive-sealed-manifest.tsv'), manifest)
@@ -223,14 +222,14 @@ test('o3d-bddq: the same change, once COMMITTED, is still refused', () => {
   })
 })
 
-test('o3d-bddq: an UNSTAGED working-tree edit under archive/ is refused — `git add -A` would commit it', () => {
+test('o3d-bddq: a WORKTREE edit under archive/ is refused — `git add -A` would commit it', () => {
   withScratchRepo((repo) => {
     writeFileSync(path.join(repo, 'archive/connectors/two.ts'), 'export const two = 222\n')
     // PRECONDITION: unstaged, NOT added — note the leading space in porcelain's XY column.
     assert.equal(git(repo, ['status', '--porcelain', '--', 'archive/']).replace(/\n$/, ''), ' M archive/connectors/two.ts')
     const { status, output } = runSealIn(repo)
     assert.equal(status, 1, `an unstaged edit must refuse:\n${output}`)
-    assert.match(output, /UNSTAGED\s+archive\/connectors\/two\.ts/)
+    assert.match(output, /WORKTREE\s+MODIFIED\s+archive\/connectors\/two\.ts/)
   })
 })
 
@@ -239,7 +238,7 @@ test('o3d-bddq: an UNTRACKED file dropped into archive/ is refused', () => {
     writeFileSync(path.join(repo, 'archive/connectors/three.ts'), 'export const three = 3\n')
     const { status, output } = runSealIn(repo)
     assert.equal(status, 1, `an untracked archived file must refuse:\n${output}`)
-    assert.match(output, /UNTRACKED\s+archive\/connectors\/three\.ts/)
+    assert.match(output, /UNTRACKED\s+PRESENT\s+archive\/connectors\/three\.ts/)
   })
 })
 
@@ -265,21 +264,214 @@ test('o3d-bddq: an UNRESOLVED MERGE CONFLICT inside archive/ is refused outright
     const { status, output } = runSealIn(repo)
     assert.equal(status, 1, `an unresolved archive/ conflict must refuse:\n${output}`)
     assert.match(output, /UNRESOLVED MERGE CONFLICT/)
-    assert.match(output, /CONFLICT\s+archive\/connectors\/one\.ts/)
+    assert.match(output, /CONFLICT\s+UNMERGED\s+archive\/connectors\/one\.ts/)
   })
 })
 
-test('o3d-bddq: a ref is an EXPLICIT opt-in and the default is never a ref', () => {
+/**
+ * ROUND 3, FINDING 1 — THE SUBJECT IS HEAD *AND* THE INDEX AND WORKING TREE.
+ *
+ * Round 1 compared only `git ls-tree HEAD` and was blind mid-merge. Round 2 moved the subject to the
+ * index and the working tree and became blind to a change that was COMMITTED and then restored in
+ * the index — Codex reproduced exactly that on PR #707 and the check returned success. Neither
+ * subject was ever the right answer on its own. This is the round-2 reproduction, kept as a test.
+ */
+test('o3d-bddq r3: a change COMMITTED and then restored in the index and working tree is refused, and names HEAD', () => {
+  withScratchRepo((repo) => {
+    const file = path.join(repo, 'archive/connectors/one.ts')
+    const sealedBlob = git(repo, ['rev-parse', 'HEAD:archive/connectors/one.ts']).trim()
+    // Commit a bad archived blob.
+    writeFileSync(file, 'export const one = 999 // hybrid\n')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 'hybrid'])
+    // Restore the sealed blob in the INDEX and the WORKING TREE, leaving it wrong only in HEAD.
+    writeFileSync(file, 'export const one = 1\n')
+    git(repo, ['add', '--', 'archive/connectors/one.ts'])
+
+    const headBlob = git(repo, ['rev-parse', 'HEAD:archive/connectors/one.ts']).trim()
+    const indexBlob = git(repo, ['ls-files', '-s', '--', 'archive/connectors/one.ts']).trim().split(/\s+/)[1]
+    // PRECONDITIONS: this is the round-2 finding's exact shape, asserted rather than assumed.
+    assert.notEqual(headBlob, indexBlob, 'PRECONDITION: HEAD and the index must hold DIFFERENT blobs')
+    assert.equal(indexBlob, sealedBlob, 'PRECONDITION: the index must hold the SEALED blob')
+    assert.equal(readFileSync(file, 'utf8'), 'export const one = 1\n', 'PRECONDITION: the working tree is sealed too')
+
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, `a committed-then-restored archive change must refuse:\n${output}`)
+    assert.match(output, /HEAD\s+CHANGED\s+archive\/connectors\/one\.ts/, 'the refusal must name HEAD as the wrong subject')
+    // And it must NOT blame the index, which is correct here: a message that cannot tell the reader
+    // which subject is wrong sends them looking in the wrong place.
+    assert.doesNotMatch(output, /INDEX\s+CHANGED/, 'the index is sealed and must not be blamed')
+  })
+})
+
+test('o3d-bddq r3: a ref substitutes for HEAD but never replaces the INDEX and WORKTREE subjects', () => {
   withScratchRepo((repo) => {
     writeFileSync(path.join(repo, 'archive/connectors/one.ts'), 'export const one = 999 // hybrid\n')
     git(repo, ['add', '--', 'archive/connectors/one.ts'])
-    // HEAD is still sealed, so the ref mode — which CI uses on a checked-out merge commit — passes...
+    // HEAD is sealed, so under round 2's semantics `ARCHIVE_SEAL_REF=HEAD` passed while a hybrid sat
+    // staged. Asking for a ref now only says WHICH COMMIT is the committed subject.
     const byRef = runSealIn(repo, { ARCHIVE_SEAL_REF: 'HEAD' })
-    assert.equal(byRef.status, 0, `an explicit clean ref must still be checkable:\n${byRef.output}`)
-    assert.match(byRef.output, /at ref HEAD/)
-    // ...while the DEFAULT, which is what a mid-merge branch actually runs, refuses.
-    const byDefault = runSealIn(repo)
-    assert.equal(byDefault.status, 1, `the default must be the subject that catches the hazard:\n${byDefault.output}`)
-    assert.match(byDefault.output, /the index and working tree/)
+    assert.equal(byRef.status, 1, `naming a clean ref must not switch off the index subject:\n${byRef.output}`)
+    assert.match(byRef.output, /INDEX\s+CHANGED\s+archive\/connectors\/one\.ts/)
+    assert.doesNotMatch(byRef.output, /ref HEAD\s+CHANGED/, 'the named ref is clean and must not be blamed')
   })
+})
+
+/**
+ * ROUND 3, FINDING 2 — THE CO-CHANGE MUST DECLARE ITSELF.
+ *
+ * A manifest of expected hashes that lives in the same repository as the files it guards can always
+ * be rewritten by the commit that changes them. That is inherent. So the guard does not pretend to
+ * forbid it: a diff that changes both the manifest and anything under archive/ is REFUSED unless a
+ * commit message in that diff carries `Archive-Seal-Rewrite: <reason>`. Silently legal becomes
+ * must-be-declared, which is the honest reachable property.
+ */
+function reseal(repo: string): void {
+  const manifest = execFileSync('node', [SCRIPT_ABS, '--write'], {
+    cwd: repo,
+    encoding: 'utf8',
+    env: { ...process.env, ARCHIVE_SEAL_REWRITE: '1' },
+  })
+  writeFileSync(path.join(repo, 'scripts/archive-sealed-manifest.tsv'), manifest)
+}
+
+test('o3d-bddq r3: rewriting the manifest in the SAME COMMIT as an archive change is refused', () => {
+  withScratchRepo((repo) => {
+    writeFileSync(path.join(repo, 'archive/connectors/one.ts'), 'export const one = 999\n')
+    git(repo, ['add', '-A'])
+    reseal(repo)
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 'change the archive and re-seal it in one go'])
+    // PRECONDITION: the manifest now AGREES with the tree — every blob check below passes, which is
+    // exactly the round-2 finding. Only the co-change locus can see this.
+    const tip = git(repo, ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD']).trim().split('\n').sort()
+    assert.deepEqual(tip, ['archive/connectors/one.ts', 'scripts/archive-sealed-manifest.tsv'],
+      'PRECONDITION: one commit must touch both the manifest and archive/')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, `a manifest rewritten alongside the archive change must refuse:\n${output}`)
+    assert.match(output, /CO-CHANGE/)
+    assert.match(output, /Archive-Seal-Rewrite/)
+    assert.match(output, /archive\/connectors\/one\.ts/)
+    // Not a blob mismatch — the manifest agrees with the tree. Proof that the co-change locus is
+    // what fired, and not some other check quietly doing the work.
+    assert.doesNotMatch(output, /CHANGED\s+archive\//, 'the blob checks must all pass here')
+  })
+})
+
+test('o3d-bddq r3: the same commit PASSES when it declares itself with the Archive-Seal-Rewrite trailer', () => {
+  withScratchRepo((repo) => {
+    writeFileSync(path.join(repo, 'archive/connectors/one.ts'), 'export const one = 999\n')
+    git(repo, ['add', '-A'])
+    reseal(repo)
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 'change the archive and re-seal it in one go', '-m', 'Archive-Seal-Rewrite: unarchiving the connector for o3d-test'])
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 0, `a declared re-seal must pass:\n${output}`)
+    assert.match(output, /archived path\(s\) match/)
+  })
+})
+
+test('o3d-bddq r3: the co-change is caught when SPLIT ACROSS TWO COMMITS on a branch', () => {
+  withScratchRepo((repo) => {
+    const base = git(repo, ['rev-parse', 'HEAD']).trim()
+    git(repo, ['branch', '-f', 'sealbase', base])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    writeFileSync(path.join(repo, 'archive/connectors/one.ts'), 'export const one = 999\n')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 'touch the archive'])
+    reseal(repo)
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 're-seal, separately, with no trailer anywhere'])
+    // PRECONDITION: NEITHER commit touches both, so the tip locus cannot see this.
+    const tip = git(repo, ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD']).trim().split('\n')
+    assert.deepEqual(tip, ['scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: the tip commit touches only the manifest')
+    const { status, output } = runSealIn(repo, { ARCHIVE_SEAL_BASE_REF: 'sealbase' })
+    assert.equal(status, 1, `a split co-change must still refuse against the branch base:\n${output}`)
+    assert.match(output, /BRANCH\s+CO-CHANGE/)
+    assert.match(output, /archive\/connectors\/one\.ts/)
+  })
+})
+
+test('o3d-bddq r3: an unresolvable base ANNOUNCES that the BRANCH locus did not run', () => {
+  withScratchRepo((repo) => {
+    const { status, output } = runSealIn(repo, { ARCHIVE_SEAL_BASE_REF: 'refs/heads/no-such-base' })
+    // A locus that cannot run must say so rather than be silently absent — "it printed nothing" is
+    // how this whole defect class travels.
+    assert.match(output, /BRANCH co-change locus did NOT RUN/)
+    assert.equal(status, 0, `an absent base is announced, not fatal:\n${output}`)
+  })
+})
+
+test('o3d-bddq r3: --write refuses without the explicit ARCHIVE_SEAL_REWRITE opt-in', () => {
+  withScratchRepo((repo) => {
+    let status = 0
+    let output = ''
+    try {
+      output = execFileSync('node', [SCRIPT_ABS, '--write'], {
+        cwd: repo,
+        encoding: 'utf8',
+        env: { ...process.env, ARCHIVE_SEAL_REWRITE: '' },
+      })
+    } catch (error) {
+      const err = error as { status?: number; stdout?: string; stderr?: string }
+      status = err.status ?? -1
+      output = `${err.stdout ?? ''}${err.stderr ?? ''}`
+    }
+    assert.equal(status, 1, `--write must not regenerate the manifest as a side effect:\n${output}`)
+    assert.match(output, /explicit opt-in/)
+    assert.doesNotMatch(output, /^archive\//m, 'and it must not have emitted a manifest')
+  })
+})
+
+/**
+ * ROUND 3, FINDING 3 — CI MUST RUN THE SEAL UNCONDITIONALLY, AND THE IRONY IS THE POINT.
+ *
+ * The seal's only CI home was `npm run validate`, whose job is gated on the Production Readiness
+ * change classifier — and that classifier treats a diff as cheap when EVERY path matches `*.md`,
+ * `docs/*`, `.gitignore` or `CHANGELOG.md`. Three of the 50 sealed paths are Markdown, including the
+ * recovery instructions, so a diff that changed nothing but archived Markdown skipped the only gate
+ * that can see archive/ at all. `paths-ignore: ["**\/*.md"]` is NOT the remedy here, for the same
+ * reason.
+ */
+const SEAL_WORKFLOW = path.join(REPO, '.github/workflows/archive-seal.yml')
+
+/**
+ * Comment lines removed. The header of that workflow EXPLAINS why it has no `paths:` filter and no
+ * `needs: classify_changes`, so an absence check run over the raw text would be satisfied by the
+ * prose describing the very thing it is looking for — the existential/universal trap in reverse.
+ */
+function effectiveYaml(file: string): string {
+  return readFileSync(file, 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line))
+    .join('\n')
+}
+
+test('o3d-bddq r3: a CI workflow runs the archive seal with no path filter and no conditional', () => {
+  assert.ok(existsSync(SEAL_WORKFLOW), 'PRECONDITION: .github/workflows/archive-seal.yml must exist')
+  const yaml = effectiveYaml(SEAL_WORKFLOW)
+  const runs = yaml.split('\n').filter((line) => /npm run check:archive-sealed/.test(line))
+  // PRECONDITION with a printed count: a workflow that does not invoke the seal would satisfy every
+  // absence assertion below.
+  assert.equal(runs.length, 1, `the workflow must invoke the seal exactly once, found ${runs.length}`)
+  assert.match(yaml, /^\s*pull_request:/m, 'it must run on pull requests')
+  assert.match(yaml, /^\s*push:/m, 'and on pushes to development')
+  // ABSENCE checks are universal, which is why they are used here: a `paths:` filter or a job-level
+  // `if:`/`needs:` anywhere in this file is a way for the seal not to run.
+  assert.doesNotMatch(yaml, /^\s*paths(-ignore)?:/m, 'a path filter is exactly the defect being fixed')
+  assert.doesNotMatch(yaml, /^\s*if:/m, 'a conditional is exactly the defect being fixed')
+  assert.doesNotMatch(yaml, /^\s*needs:/m, 'depending on the change classifier is the defect being fixed')
+  // The BRANCH co-change locus needs history to resolve a base; without this it degrades to a notice.
+  assert.match(yaml, /fetch-depth: 0/, 'full history, so the BRANCH co-change locus can actually run')
+})
+
+test('o3d-bddq r3: the seal is NOT reachable only through the classifier-gated validate job', () => {
+  const readiness = readFileSync(path.join(REPO, '.github/workflows/production-readiness.yml'), 'utf8')
+  // The classifier is still there and still skips on a `.md`-only diff; that is not this test's
+  // subject. What this asserts is that the seal does not depend on it.
+  const gatedJobs = readiness.match(/needs: classify_changes/g) ?? []
+  assert.ok(gatedJobs.length > 0, 'PRECONDITION: the classifier still gates jobs in this workflow')
+  const seal = effectiveYaml(SEAL_WORKFLOW)
+  assert.match(seal, /npm run check:archive-sealed/, 'PRECONDITION: the stripped workflow still invokes the seal')
+  assert.doesNotMatch(seal, /classify_changes/, 'the seal workflow must not consult the change classifier')
 })
