@@ -203,6 +203,16 @@ const SECTION_LIMIT = 50
 const HAND_POST_CLAIM_PAGE = 50
 
 /**
+ * o3d-j625 r22 (Codex round 21, HIGH) — HOW MANY LONGEST-HELD CLAIMS THE AGE-ORDERED HEAD SHOWS.
+ *
+ * The walk is ordered by identity now, so its first page is no longer the oldest claims. This block is what
+ * keeps a stranded claim surfacing without being hunted, and it is deliberately SHORT: it is a display aid,
+ * not a route to every claim, and the complete walk is directly beneath it. Ten, because the question it
+ * answers is "is anything being sat on?", which a screenful answers and a hundred rows obscure.
+ */
+const HAND_POST_CLAIM_LONGEST_HELD = 10
+
+/**
  * When a held claim starts reading as STALE. Not an expiry and nothing acts on it: it is the age at which the
  * page says "this has been held a long time — is the holder still on it?", which is what makes a claim nobody
  * is going to finish findable rather than merely present. 24 hours, because a hand posting is minutes of work
@@ -742,6 +752,13 @@ export type ExceptionInboxData = {
    * last. Its presence is what makes the section a WALK rather than a cap — see HAND_POST_CLAIM_PAGE.
    */
   accountingHandPostClaimsNextCursor: string | null
+  /**
+   * o3d-j625 r22 (Codex round 21, HIGH): the claims held LONGEST, age-ordered, independent of the walk — the
+   * surfacing that oldest-claim-first bought before the walk moved to identity ordering.
+   */
+  accountingHandPostClaimsLongestHeld: AccountingHandPostClaimRow[]
+  /** o3d-j625 r22: the total as of the walk's LAST page, or `null` while it continues. See `totalAtEnd`. */
+  accountingHandPostClaimsTotalAtEnd: number | null
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -1635,6 +1652,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
      */
     accountingHandPostClaims: handPostClaimPage.claims,
     accountingHandPostClaimsNextCursor: handPostClaimPage.nextCursor,
+    accountingHandPostClaimsLongestHeld: handPostClaimPage.longestHeld,
+    accountingHandPostClaimsTotalAtEnd: handPostClaimPage.totalAtEnd,
   }
 
   return {
@@ -1858,27 +1877,45 @@ async function namesOfUsers(ids: Array<string | null>): Promise<Map<string, stri
  * is a KEYSET over `(handPostClaimedAt, id)` rather than an offset or Prisma's own `cursor`, and why `id` is
  * in the sort key.
  */
-const HAND_POST_CLAIM_CURSOR_SEPARATOR = '|'
-
 /**
- * `<ISO claim time>|<refusal id>`. Opaque to the client, which only ever hands back what it was given.
+ * ── o3d-j625 r22 (Codex round 21, HIGH) — THE CURSOR IS THE ROW'S IDENTITY, AND NOTHING ELSE ──
  *
- * An unparseable or unknown cursor is treated as NO cursor — the walk restarts at the oldest claim rather
- * than returning nothing. Returning nothing would make every claim after a mangled cursor unreachable,
- * which is this round's finding arriving through its own remedy.
+ * r20's cursor was `<ISO claim time>|<refusal id>`, a keyset over `(handPostClaimedAt, id)`. Round 21 found
+ * the hole, and it is in the FIRST component: `handPostClaimedAt` is REWRITTEN every time a claim is taken,
+ * from the application process's own clock — and this module already knows those clocks disagree, which is
+ * exactly why r18 counted deferrals with a causal counter instead of comparing `lastRefusedAt` with
+ * `handPostClaimedAt`. So a claim beyond page one that is RELEASED and RE-TAKEN on a slower process gets a
+ * new timestamp that can fall BEFORE the cursor page one issued, and no later page returns it. The walk then
+ * ends and the page says it has shown every active claim while that one is still held. A re-take with a
+ * LATER timestamp has the mirror defect and returns the claim twice. Round 19's finding, arriving through the
+ * remedy for round 19's finding.
+ *
+ * THE FIX IS A KEY THAT CANNOT MOVE, not a reconciliation that notices it moved: the cursor is the row's
+ * `id`. An id is assigned when the refusal row is created and is never rewritten by any act in this module —
+ * not by taking a claim, not by releasing one, not by re-taking it, not by the mark. So a re-take cannot
+ * change which side of an issued cursor a row falls on, and "every active claim lies on exactly one page" is
+ * true by construction rather than by argument about clocks. It is also already unique, so the total order
+ * r20 needed a tiebreak for is now the whole of the key — r20's reasoning for having `id` in the sort key at
+ * all stands, and this is that reasoning taken to its conclusion.
+ *
+ * WHAT THE OPERATOR-VISIBLE ORDERING BECOMES, stated rather than glossed: the WALK is ordered by identity,
+ * which carries no meaning an operator should read. Oldest-claim-first is NOT preserved as the walk's order,
+ * so the thing it bought — a stranded claim surfacing without being hunted — is preserved another way:
+ * {@link AccountingHandPostClaimPage.longestHeld} is the claims held LONGEST, by age, queried independently
+ * of the walk and rendered above it, and every row in both carries its age and its stale flag. That block
+ * cannot hide anything, because the complete walk is directly beneath it.
+ *
+ * An unparseable or unknown cursor is still treated as NO cursor — the walk restarts at the first claim
+ * rather than returning nothing, because returning nothing would make every claim after a mangled cursor
+ * unreachable, which is round 19's finding arriving through ITS remedy.
  */
-function decodeHandPostClaimCursor(cursor: string | null | undefined): { at: Date; id: string } | null {
-  if (typeof cursor !== 'string' || cursor === '') return null
-  const separator = cursor.indexOf(HAND_POST_CLAIM_CURSOR_SEPARATOR)
-  if (separator <= 0) return null
-  const at = new Date(cursor.slice(0, separator))
-  const id = cursor.slice(separator + 1)
-  if (Number.isNaN(at.getTime()) || id === '') return null
-  return { at, id }
+function decodeHandPostClaimCursor(cursor: string | null | undefined): { id: string } | null {
+  if (typeof cursor !== 'string' || cursor.trim() === '') return null
+  return { id: cursor }
 }
 
-function encodeHandPostClaimCursor(row: { handPostClaimedAt: Date; id: string }): string {
-  return `${row.handPostClaimedAt.toISOString()}${HAND_POST_CLAIM_CURSOR_SEPARATOR}${row.id}`
+function encodeHandPostClaimCursor(row: { id: string }): string {
+  return row.id
 }
 
 /**
@@ -1910,6 +1947,27 @@ export type AccountingHandPostClaimPage = {
   total: number
   /** How many match the lookup, or `null` when there was none. */
   matched: number | null
+  /**
+   * o3d-j625 r22 (Codex round 21, HIGH) — THE CLAIMS HELD LONGEST, by age, independent of the walk.
+   *
+   * The walk is ordered by identity now (see {@link decodeHandPostClaimCursor}), so its first page is no
+   * longer "the oldest claims" and the surfacing that ordering bought has to come from somewhere. This is it:
+   * a short, bounded, age-ordered block rendered ABOVE the walk. It is a display aid and NOT the reachability
+   * path — it cannot hide a claim, because the complete walk is directly beneath it — so being bounded is not
+   * the defect r20 removed. Only sent for the FIRST page of an unfiltered walk; a later page or a lookup has
+   * no business re-stating it.
+   */
+  longestHeld: AccountingHandPostClaimRow[]
+  /**
+   * o3d-j625 r22 — WHETHER "that is every active claim" IS EARNED, and it is the server that says so.
+   *
+   * Identity ordering makes a RE-TAKE unable to move a row across an issued cursor. It cannot make a row that
+   * becomes claimed DURING the walk appear after the cursor — no non-snapshot pagination can, and pretending
+   * otherwise is how a completeness claim becomes a lie. So the walk's last page carries the total counted AT
+   * THAT MOMENT, and the page only says it has shown everything when what it has shown accounts for it;
+   * otherwise it says how many appeared meanwhile. The sentence is a measurement, not an assumption.
+   */
+  totalAtEnd: number | null
 }
 
 async function loadHandPostClaimPage(params: {
@@ -1925,66 +1983,88 @@ async function loadHandPostClaimPage(params: {
     ? active
     : { AND: [active, handPostClaimSearchWhere(search)] }
   /**
-   * THE KEYSET PREDICATE. Strictly after `(at, id)` in the same total order the rows are sorted by, so it
-   * names a POSITION IN THE ORDER rather than a row that has to still be there: a claim released between two
-   * pages cannot end the walk, and nothing is skipped when the set shrinks under it.
+   * THE KEYSET PREDICATE, over the row's IDENTITY (o3d-j625 r22). Strictly after `id` in the same total order
+   * the rows are sorted by, so it names a POSITION IN THE ORDER rather than a row that has to still be there:
+   * a claim released between two pages cannot end the walk, and nothing is skipped when the set shrinks under
+   * it. And because `id` is never rewritten, a claim RELEASED AND RE-TAKEN mid-walk cannot move from one side
+   * of this predicate to the other — which is what r20's timestamp keyset allowed, on nothing more than two
+   * application clocks disagreeing.
    */
   const where: Prisma.AccountingPostingRefusalWhereInput = after === null
     ? filtered
-    : {
-        AND: [
-          filtered,
-          { OR: [{ handPostClaimedAt: { gt: after.at } }, { handPostClaimedAt: after.at, id: { gt: after.id } }] },
-        ],
-      }
-  const [rows, total, matched] = await Promise.all([
+    : { AND: [filtered, { id: { gt: after.id } }] }
+  const CLAIM_SELECT = {
+    id: true, type: true, referenceType: true, referenceId: true, kind: true,
+    handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
+  } as const
+  const wantsLongestHeld = after === null && search === ''
+  const [rows, total, matched, longest] = await Promise.all([
     db.accountingPostingRefusal.findMany({
       where,
-      // BOTH keys, in this order: `handPostClaimedAt` is not unique, and without `id` two claims taken in the
-      // same millisecond are ordered arbitrarily — enough for one of them to straddle a page boundary and
-      // never be returned. A total order is what makes "every claim is on exactly one page" true.
-      orderBy: [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
+      // IDENTITY, and only identity. r20 sorted by `[{ handPostClaimedAt }, { id }]` and needed the second key
+      // because the first is not unique; round 21 showed the first is not STABLE either, and a cursor over a
+      // value a re-take rewrites can place the same row on both sides of itself. One immutable unique key is
+      // both a total order and a fixed one.
+      orderBy: [{ id: 'asc' }],
       // One more than the page, so "is there a next page" is answered by what was read rather than by
       // comparing a count taken at another instant.
       take: HAND_POST_CLAIM_PAGE + 1,
-      select: {
-        id: true, type: true, referenceType: true, referenceId: true, kind: true,
-        handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
-      },
+      select: CLAIM_SELECT,
     }),
     db.accountingPostingRefusal.count({ where: active }),
     search === '' ? Promise.resolve(null) : db.accountingPostingRefusal.count({ where: filtered }),
+    // The age-ordered head, on the first page of an unfiltered walk only. This is the ONE place
+    // `handPostClaimedAt` still orders anything, and it is safe here precisely because nothing paginates
+    // through it: it is a bounded look at the longest-held claims, not a route to all of them.
+    wantsLongestHeld
+      ? db.accountingPostingRefusal.findMany({
+          where: active,
+          orderBy: [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
+          take: HAND_POST_CLAIM_LONGEST_HELD,
+          select: CLAIM_SELECT,
+        })
+      : Promise.resolve([]),
   ])
   const page = rows.slice(0, HAND_POST_CLAIM_PAGE)
   const last = page.length > 0 ? page[page.length - 1] : null
-  const holders = await namesOfUsers(page.map((row) => row.handPostClaimedBy))
+  const holders = await namesOfUsers([...page, ...longest].map((row) => row.handPostClaimedBy))
   const now = (params.now ?? new Date()).getTime()
+  type ClaimRow = (typeof page)[number]
+  const render = (row: ClaimRow): AccountingHandPostClaimRow[] => {
+    // The predicate guarantees it; narrowed rather than asserted, so a widened query cannot ship a claim
+    // row with no claim time and an age of "now".
+    if (!row.handPostClaimedAt) return []
+    const heldForHours = (now - row.handPostClaimedAt.getTime()) / 3_600_000
+    return [{
+      refusalId: row.id,
+      type: row.type,
+      referenceType: row.referenceType,
+      referenceId: row.referenceId,
+      kind: row.kind,
+      at: row.handPostClaimedAt.toISOString(),
+      by: row.handPostClaimedBy,
+      byName: row.handPostClaimedBy ? (holders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
+      mine: row.handPostClaimedBy === params.viewerId,
+      heldForHours: Math.round(heldForHours * 10) / 10,
+      stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
+      deferredEdits: row.handPostDeferredCount,
+    }]
+  }
+  // A next cursor EXACTLY when a row beyond this page was read. Never derived from `total`, which is counted
+  // in another statement and would advertise a page that is not there (or hide one that is).
+  const nextCursor = rows.length > page.length && last ? encodeHandPostClaimCursor({ id: last.id }) : null
   return {
-    claims: page.flatMap((row) => {
-      // The predicate guarantees it; narrowed rather than asserted, so a widened query cannot ship a claim
-      // row with no claim time and an age of "now".
-      if (!row.handPostClaimedAt) return []
-      const heldForHours = (now - row.handPostClaimedAt.getTime()) / 3_600_000
-      return [{
-        refusalId: row.id,
-        type: row.type,
-        referenceType: row.referenceType,
-        referenceId: row.referenceId,
-        kind: row.kind,
-        at: row.handPostClaimedAt.toISOString(),
-        by: row.handPostClaimedBy,
-        byName: row.handPostClaimedBy ? (holders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
-        mine: row.handPostClaimedBy === params.viewerId,
-        heldForHours: Math.round(heldForHours * 10) / 10,
-        stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
-        deferredEdits: row.handPostDeferredCount,
-      }]
-    }),
-    // A next cursor EXACTLY when a row beyond this page was read. Never derived from `total`, which is
-    // counted in another statement and would advertise a page that is not there (or hide one that is).
-    nextCursor: rows.length > page.length && last?.handPostClaimedAt ? encodeHandPostClaimCursor({ handPostClaimedAt: last.handPostClaimedAt, id: last.id }) : null,
+    claims: page.flatMap(render),
+    nextCursor,
     total,
     matched,
+    longestHeld: longest.flatMap(render),
+    /**
+     * o3d-j625 r22 — the total AS OF THE LAST PAGE, and only then. The client compares it with how many it has
+     * actually shown before printing "that is every active claim", so the sentence is earned. `null` while the
+     * walk continues: a mid-walk total says nothing about the end of it.
+     */
+    totalAtEnd: nextCursor === null ? total : null,
   }
 }
 

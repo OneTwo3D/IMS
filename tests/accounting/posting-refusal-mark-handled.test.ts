@@ -709,16 +709,259 @@ test('[o3d-j625 r20] an unreadable cursor RESTARTS the walk rather than returnin
   for (let index = 0; index < 5; index += 1) {
     refusals.push(claimed(`m-${index}`, `2026-09-01T00:00:0${index}.000Z`))
   }
-  for (const bad of ['', 'not-a-cursor', '|only-an-id', 'not-a-date|m-2', '2026-09-01T00:00:01.000Z|']) {
-    const page = await listClaims({ cursor: bad })
-    console.log(`[r20 bad cursor] ${JSON.stringify(bad)} -> ${page.claims.length} claims`)
+  /**
+   * o3d-j625 r22 — RE-STATED FOR AN IDENTITY CURSOR, because the set of unreadable forms shrank with the key.
+   *
+   * r20's cursor was `<ISO time>|<id>` and could be malformed five ways. A cursor is now the bare row id, so
+   * the only forms that carry no position are the empty and blank ones — and those still restart the walk
+   * rather than returning nothing. An id that no longer EXISTS is not unreadable and is deliberately not
+   * treated as such: the keyset compares values, so a released row's id still names the position it had.
+   */
+  for (const blank of ['', '   ', '\t']) {
+    const page = await listClaims({ cursor: blank })
+    console.log(`[r20 bad cursor] ${JSON.stringify(blank)} -> ${page.claims.length} claims`)
     assert.equal(page.claims.length, 5,
-      `an unreadable cursor (${JSON.stringify(bad)}) must return the FIRST page, not an empty one — an empty `
-      + 'one makes every claim after it unreachable, which is the defect this round exists to remove')
+      `a cursor carrying no position (${JSON.stringify(blank)}) must return the FIRST page, not an empty one — `
+      + 'an empty one makes every claim after it unreachable, which is round 19\'s defect')
   }
-  // CONTROL: a cursor that IS readable still advances, so "restart" is the degrade and not the behaviour.
-  const after = await listClaims({ cursor: '2026-09-01T00:00:02.000Z|m-2' })
+  // CONTROL: a cursor that names a position still advances, so "restart" is the degrade and not the behaviour.
+  const after = await listClaims({ cursor: 'm-2' })
   assert.deepEqual(after.claims.map((claim) => claim.refusalId), ['m-3', 'm-4'],
-    'CONTROL: a well-formed cursor advances past its position')
-  assert.equal(ok(await releaseClaim('m-4')), true, 'and what it reaches is releasable')
+    'CONTROL: a cursor naming a position advances past it')
+  // AND A POSITION WHOSE ROW IS GONE still advances rather than restarting or ending: that is the whole point
+  // of comparing values instead of using Prisma's positional cursor (o3d-j625 r20).
+  assert.equal(ok(await releaseClaim('m-2')), true)
+  assert.deepEqual((await listClaims({ cursor: 'm-2' })).claims.map((claim) => claim.refusalId), ['m-3', 'm-4'],
+    'a cursor whose row has been released still names its position — the walk neither ends nor restarts')
+  /**
+   * AND A CURSOR NOBODY ISSUED CANNOT SILENTLY END THE WALK EARLY. An identity cursor is a bare string, so a
+   * mangled one can sort past every row and return nothing — which is why the completeness sentence is a
+   * MEASUREMENT (`totalAtEnd`) and not an inference from an empty page. Asserted, because "it cannot happen"
+   * was the shape of r20's cap argument.
+   */
+  const past = await listClaims({ cursor: 'zzzzzzzz' })
+  console.log(`[r20 bad cursor] beyond-every-id -> ${past.claims.length} claims, totalAtEnd=${past.totalAtEnd}`)
+  assert.equal(past.claims.length, 0, 'it returns nothing, as any position past the end would')
+  assert.ok((past.totalAtEnd ?? 0) > 0,
+    'but it reports the true total AS OF THEN, so the page says "showing 0 of N" rather than "that is every '
+    + 'active claim" — the sentence is earned even when the cursor was never ours')
+  assert.equal(ok(await releaseClaim('m-4')), true, 'and what the walk reaches is releasable')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r22 (Codex round 21, HIGH) — A RE-TAKEN CLAIM CANNOT BE SKIPPED, OR SEEN TWICE, BY THE WALK
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// r20's cursor was a keyset over `(handPostClaimedAt, id)` and r20 called the pagination "the completeness
+// guarantee" — "no claim is unreachable" was meant to be a property of the ordering. Round 21 found that the
+// FIRST component of that key is REWRITTEN on every re-take, from the application process's own clock, and
+// this module already knows those clocks disagree: it is exactly why r18 counted deferrals with a causal
+// counter instead of comparing `lastRefusedAt` with `handPostClaimedAt`. So:
+//
+//   · RE-TAKEN ON A SLOWER PROCESS, new stamp BEFORE page one's cursor → no later page returns the claim.
+//     The walk ends, the page says it has shown every active claim, and that one is still held. Round 19's
+//     defect arriving through the remedy for round 19's defect.
+//   · RE-TAKEN with a LATER stamp → the claim is returned again on a later page. Shown twice.
+//
+// THE FIX IS A KEY THAT CANNOT MOVE: the cursor is the row's `id`, assigned at creation and rewritten by
+// nothing in this module. The tests below therefore assert a property of the ORDERING rather than of a
+// timing, and they SIMULATE the disagreeing clocks explicitly — the re-take is driven through the real
+// `claimPostingForHandPosting` with an injected `now`, which is precisely what a process whose clock is
+// behind (or ahead) would write. Nothing here depends on how fast the test runs.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+async function reclaim(id: string, at: string, userId = 'user-3') {
+  const { claimPostingForHandPosting } = await import('@/lib/domain/accounting/posting-mark-handled')
+  return claimPostingForHandPosting(tx as never, { id, userId, now: new Date(at) })
+}
+
+/**
+ * Walk from page one to the end, returning every claim id the walk yielded — WITH duplicates, because
+ * "returned twice" is one of the two failures and a Set would hide it.
+ */
+async function walkAllClaimIds(): Promise<string[]> {
+  const seen: string[] = []
+  let page = await listClaims()
+  let guard = 0
+  for (;;) {
+    seen.push(...page.claims.map((claim) => claim.refusalId))
+    if (!page.nextCursor || guard > 20) break
+    guard += 1
+    page = await listClaims({ cursor: page.nextCursor })
+  }
+  return seen
+}
+
+/** The state round 21 describes: a full first page, and one claim beyond it that nobody has seen yet. */
+function seedUnseenTarget(): { firstPageLastAt: Date } {
+  for (let index = 0; index < CLAIM_PAGE; index += 1) {
+    // Ids ascend with the claim times here, so page one is the same set under either ordering — the
+    // reproduction is about the RE-TAKE, not about which rows page one happens to contain.
+    refusals.push(claimed(`page1-${String(index).padStart(3, '0')}`, `2026-09-10T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
+  }
+  // Beyond page one under both orderings: later claim time AND a later id.
+  refusals.push(claimed('zz-target', '2026-09-11T00:00:00.000Z', 'user-2', { referenceId: 'po-retake' }))
+  return { firstPageLastAt: new Date(`2026-09-10T00:00:${String((CLAIM_PAGE - 1) % 60).padStart(2, '0')}.000Z`) }
+}
+
+test('[o3d-j625 r22 HIGH] an UNSEEN claim re-taken with an EARLIER stamp (a slower clock) is still returned, exactly once', async () => {
+  const { firstPageLastAt } = seedUnseenTarget()
+
+  const first = await listClaims()
+  assert.equal(first.claims.length, CLAIM_PAGE, 'PRECONDITION: page one is full, so there is a boundary')
+  assert.equal(first.claims.some((claim) => claim.refusalId === 'zz-target'), false,
+    'PRECONDITION: and the target is BEYOND it — unseen, which is round 21\'s case')
+  assert.ok(first.nextCursor, 'PRECONDITION: the walk continues')
+
+  // ── THE CONCURRENT ACT, entirely legitimate: somebody gives the claim back and somebody takes it again.
+  //    The re-take runs on a process whose clock is BEHIND, so the stamp it writes lands before the one page
+  //    one was built from. Simulated by injecting `now`, not by racing the test runner.
+  assert.equal(ok(await releaseClaim('zz-target')), true, 'released')
+  const skewed = '2026-09-09T00:00:00.000Z'
+  const retaken = await reclaim('zz-target', skewed)
+  assert.equal(retaken.ok, true, `re-taken (${JSON.stringify(retaken)})`)
+  const target = refusals.find((row) => row.id === 'zz-target')!
+  console.log(`[r22 earlier] page1 last claim time=${firstPageLastAt.toISOString()} `
+    + `re-taken at=${target.handPostClaimedAt?.toISOString()} holder=${target.handPostClaimedBy}`)
+  assert.ok(target.handPostClaimedAt && target.handPostClaimedAt < firstPageLastAt,
+    'PRECONDITION — AND THE MECHANISM: the re-take wrote a stamp EARLIER than the last row of page one, which '
+    + 'is what a keyset over `handPostClaimedAt` puts on the far side of its own cursor. Two application '
+    + 'clocks disagreeing is all it takes, and this module already knows they do (o3d-j625 r12, r18).')
+  assert.equal(target.handPostClaimedBy, 'user-3', 'and it really is held again, by somebody else')
+
+  // ── THE PROPERTY. Continue the SAME walk from the cursor page one issued.
+  const rest: string[] = []
+  let cursor: string | null = first.nextCursor
+  let guard = 0
+  while (cursor && guard < 20) {
+    const page = await listClaims({ cursor })
+    rest.push(...page.claims.map((claim) => claim.refusalId))
+    cursor = page.nextCursor
+    guard += 1
+  }
+  console.log(`[r22 earlier] rest of the walk=${JSON.stringify(rest)}`)
+  assert.deepEqual(rest, ['zz-target'],
+    'THE FINDING: with a cursor over a REWRITABLE key the re-taken claim falls before the saved position and '
+    + 'no later page returns it — the walk ends, the page says it has shown every active claim, and this one '
+    + 'is still held by user-3. The cursor is the row IDENTITY now, which a re-take cannot rewrite, so the '
+    + 'claim is on exactly one page whatever any clock says.')
+
+  // AND IT IS RELEASABLE FROM THERE, which is the whole point of reaching it.
+  assert.equal(ok(await releaseClaim('zz-target')), true)
+  assert.equal(refusals.find((row) => row.id === 'zz-target')!.handPostClaimedAt, null)
+})
+
+test('[o3d-j625 r22 HIGH] an UNSEEN claim re-taken with a LATER stamp is returned ONCE, not twice', async () => {
+  seedUnseenTarget()
+  const first = await listClaims()
+  assert.equal(first.claims.some((claim) => claim.refusalId === 'zz-target'), false, 'PRECONDITION: unseen')
+
+  assert.equal(ok(await releaseClaim('zz-target')), true)
+  // A clock that is AHEAD. Under r20's keyset this is the mirror defect: the row sorts later than before, so
+  // it is returned on a later page as well as being counted as a fresh position — shown twice.
+  assert.equal((await reclaim('zz-target', '2026-09-30T00:00:00.000Z')).ok, true)
+
+  const everything = await walkAllClaimIds()
+  const occurrences = everything.filter((id) => id === 'zz-target').length
+  console.log(`[r22 later] walk length=${everything.length} distinct=${new Set(everything).size} target occurrences=${occurrences}`)
+  assert.equal(occurrences, 1,
+    'THE MIRROR FINDING: a re-take with a LATER stamp moves the row to a position the walk has not passed, so '
+    + 'a timestamp keyset hands it to the operator a second time. Identity does not move, so it appears once.')
+  assert.equal(everything.length, CLAIM_PAGE + 1, 'and the walk as a whole is exactly the claim set')
+  assert.equal(new Set(everything).size, everything.length, 'with no row on two pages')
+})
+
+test('[o3d-j625 r22] the walk visits every claim exactly once while claims are re-taken THROUGHOUT it', async () => {
+  // Not one boundary but every page: after each page, release and re-take a claim the walk has NOT reached,
+  // alternating a clock that is behind and one that is ahead. If the ordering key can move, one of these
+  // lands on the wrong side of the cursor.
+  for (let index = 0; index < CLAIM_PAGE * 2 + 5; index += 1) {
+    refusals.push(claimed(`c-${String(index).padStart(3, '0')}`, `2026-09-15T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
+  }
+  const active = refusals.length
+  const seen: string[] = []
+  let page = await listClaims()
+  let flip = 0
+  let guard = 0
+  for (;;) {
+    seen.push(...page.claims.map((claim) => claim.refusalId))
+    if (!page.nextCursor || guard > 20) break
+    // A row the walk has not reached yet: the LAST one by id, which is also the last one it would reach.
+    const unseen = `c-${String(active - 1).padStart(3, '0')}`
+    if (!seen.includes(unseen)) {
+      assert.equal(ok(await releaseClaim(unseen)), true)
+      assert.equal((await reclaim(unseen, flip % 2 === 0 ? '2026-09-01T00:00:00.000Z' : '2026-10-01T00:00:00.000Z')).ok, true)
+      flip += 1
+    }
+    guard += 1
+    page = await listClaims({ cursor: page.nextCursor })
+  }
+  console.log(`[r22 throughout] re-takes=${flip} seen=${seen.length} distinct=${new Set(seen).size} of ${active}`)
+  assert.ok(flip >= 2, 'PRECONDITION: the re-take really happened between pages, more than once')
+  assert.equal(seen.length, active, 'every claim was returned')
+  assert.equal(new Set(seen).size, active, 'exactly once each — none skipped and none repeated')
+})
+
+/**
+ * o3d-j625 r22 — AND THE COMPLETENESS SENTENCE IS A MEASUREMENT.
+ *
+ * Identity ordering stops a RE-TAKE moving a row across an issued cursor. It cannot make a claim TAKEN during
+ * the walk appear after the cursor — no non-snapshot pagination can — so "that is every active claim" must be
+ * checked rather than assumed. The server sends the total as of the LAST page and the page compares it with
+ * what it actually showed. Asserted here because a sentence nobody checks is how r20's cap read as complete.
+ */
+test('[o3d-j625 r22] the last page carries the total AS OF THEN, and only the last page', async () => {
+  for (let index = 0; index < CLAIM_PAGE + 3; index += 1) {
+    refusals.push(claimed(`t-${String(index).padStart(3, '0')}`, `2026-09-16T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
+  }
+  const first = await listClaims()
+  assert.equal(first.totalAtEnd, null, 'a mid-walk total says nothing about the end of the walk, so it is withheld')
+  assert.ok(first.nextCursor)
+
+  // A claim TAKEN while the operator is walking, on a row whose id sorts BEFORE the cursor page one issued —
+  // the case identity ordering cannot and does not cover, and no non-snapshot pagination can.
+  refusals.push(claimed('a-late-arrival', '2026-09-16T12:00:00.000Z'))
+  const last = await listClaims({ cursor: first.nextCursor })
+  console.log(`[r22 earned] page1=${first.claims.length} page2=${last.claims.length} totalAtEnd=${last.totalAtEnd}`)
+  assert.equal(last.nextCursor, null, 'PRECONDITION: this is the last page')
+  assert.equal(last.totalAtEnd, CLAIM_PAGE + 4,
+    'and it reports the total AS OF THEN — including the claim taken mid-walk, which is what lets the page say '
+    + '"showing N of M" instead of claiming completeness it cannot have')
+  assert.equal(last.claims.some((claim) => claim.refusalId === 'a-late-arrival'), false,
+    'PRECONDITION: the mid-walk arrival sorts BEFORE the cursor, so this walk never sees it — which is the '
+    + 'residual identity ordering does not close and must therefore not be called complete')
+  assert.ok(first.claims.length + last.claims.length < (last.totalAtEnd ?? 0),
+    `the walk showed ${first.claims.length + last.claims.length} of ${last.totalAtEnd}: FEWER than the total, `
+    + 'which is exactly the state the page must report as "showing N of M" rather than as complete')
+})
+
+test('[o3d-j625 r22] the LONGEST-HELD head is age-ordered, bounded, and only on the first unfiltered page', async () => {
+  refusals.push(claimed('young', '2026-09-20T00:00:00.000Z', 'user-2', { referenceId: 'po-young' }))
+  refusals.push(claimed('ancient', '2026-01-01T00:00:00.000Z', 'user-2', { referenceId: 'po-ancient' }))
+  refusals.push(claimed('middling', '2026-06-01T00:00:00.000Z', 'user-2', { referenceId: 'po-middling' }))
+
+  const first = await listClaims()
+  console.log(`[r22 head] walk=${JSON.stringify(first.claims.map((c) => c.refusalId))} `
+    + `longestHeld=${JSON.stringify(first.longestHeld.map((c) => c.refusalId))}`)
+  // THE PROPERTY THE WALK GAVE UP. Identity ordering puts 'ancient' in the middle of the walk ('ancient' <
+  // 'middling' < 'young' is a coincidence of these names, so the walk is asserted only to CONTAIN them);
+  // the head is what makes the longest-held one impossible to miss.
+  assert.deepEqual(first.longestHeld.map((claim) => claim.refusalId), ['ancient', 'middling', 'young'],
+    'HELD LONGEST FIRST — the surfacing oldest-claim-first bought, kept as a display aid now that the walk is '
+    + 'ordered by a key a re-take cannot rewrite')
+  assert.equal(first.longestHeld[0]!.stale, true, 'and the longest-held one is flagged')
+  assert.ok(first.longestHeld.length <= 10, 'bounded: it is a look, not a route — the complete walk is below it')
+
+  // NOT re-stated on a later page or under a lookup: it is about the whole set, and repeating it there would
+  // make a filtered view look like it had extra rows.
+  for (let index = 0; index < CLAIM_PAGE; index += 1) {
+    refusals.push(claimed(`pad-${String(index).padStart(3, '0')}`, `2026-09-21T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
+  }
+  const paged = await listClaims()
+  assert.ok(paged.nextCursor, 'PRECONDITION: there is a second page now')
+  assert.deepEqual((await listClaims({ cursor: paged.nextCursor })).longestHeld, [], 'not on a later page')
+  assert.deepEqual((await listClaims({ search: 'po-ancient' })).longestHeld, [], 'nor under a lookup')
+  // CONTROL: it IS non-empty on the first unfiltered page, so the two assertions above are about the
+  // condition and not about a field that is always empty.
+  assert.ok(paged.longestHeld.length > 0, 'CONTROL: the first unfiltered page does carry it')
 })

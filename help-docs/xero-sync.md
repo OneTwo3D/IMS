@@ -2372,12 +2372,23 @@ Three things about those rows:
   many postings IMS has declined to queue behind it. Anything held far longer than a hand posting takes is
   flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
 
-  **Reaching a claim does not depend on how many there are.** The section shows a *page* of claims, oldest
-  claim first, and **Show more claims** walks to the end — it is a page, not a limit, and the heading states
-  the true total throughout. If you know the document, do not walk: the **Find** box goes straight to it. It
-  searches the **reference id** (an order or PO number), the **reference type**, the **posting type** and the
-  **refusal id** — it does **not** search the holder's name, so an empty result there is not evidence that
-  nobody holds the posting. Clearing the box returns to the first page.
+  **Reaching a claim does not depend on how many there are.** The section shows a *page* of claims and
+  **Show more claims** walks to the end — it is a page, not a limit, and the heading states the true total
+  throughout. **The full list is in no particular order**, deliberately: paging through it is ordered by each
+  row's own identity, which never changes, so releasing and re-taking a claim while you are paging cannot move
+  it past you or show it to you twice. What that ordering gives up is "oldest first", so the longest-held
+  claims are listed *separately at the top* — start there, because those are the ones most likely to have been
+  forgotten, and each of them has its own Release.
+
+  When the walk reaches the end it says so — and it says it only when the number of claims it showed you
+  accounts for the number that existed at that moment. If somebody took a posting for hand posting while you
+  were paging, it says **"showing N of M — reload to see them"** instead of claiming to have shown you
+  everything.
+
+  If you know the document, do not walk: the **Find** box goes straight to it. It searches the **reference
+  id** (an order or PO number), the **reference type**, the **posting type** and the **refusal id** — it does
+  **not** search the holder's name, so an empty result there is not evidence that nobody holds the posting.
+  Clearing the box returns to the first page.
 
   **Anybody with sync access may release anybody's claim**, which is the answer rather than an oversight: if
   only the holder could, a claim taken by somebody who has left would suppress that posting for ever. The

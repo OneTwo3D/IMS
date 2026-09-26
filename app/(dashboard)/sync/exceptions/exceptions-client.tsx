@@ -7,6 +7,7 @@ import {
   ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
   ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL,
+  ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE,
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
@@ -118,12 +119,19 @@ export function ExceptionsClient({ data }: Props) {
   const [claimsTotal, setClaimsTotal] = useState(data.summary.accountingHandPostClaims)
   const [claimsMatched, setClaimsMatched] = useState<number | null>(null)
   const [claimSearch, setClaimSearch] = useState('')
+  /**
+   * o3d-j625 r22 (Codex round 21, HIGH) — WHAT THE WALK HAS ACCOUNTED FOR, so the completeness sentence is a
+   * MEASUREMENT. `null` while the walk continues; on the last page it is the total the server counted at that
+   * moment, and the page says "that is every active claim" only when what it has shown accounts for it.
+   */
+  const [claimsTotalAtEnd, setClaimsTotalAtEnd] = useState<number | null>(data.accountingHandPostClaimsTotalAtEnd)
   if (claimsBase !== data.accountingHandPostClaims) {
     setClaimsBase(data.accountingHandPostClaims)
     setClaims(data.accountingHandPostClaims)
     setClaimsCursor(data.accountingHandPostClaimsNextCursor)
     setClaimsTotal(data.summary.accountingHandPostClaims)
     setClaimsMatched(null)
+    setClaimsTotalAtEnd(data.accountingHandPostClaimsTotalAtEnd)
     setClaimSearch('')
   }
 
@@ -136,6 +144,7 @@ export function ExceptionsClient({ data }: Props) {
       setClaimsCursor(page.nextCursor)
       setClaimsTotal(page.total)
       setClaimsMatched(page.matched)
+      setClaimsTotalAtEnd(page.totalAtEnd)
     })
   }
 
@@ -1071,6 +1080,36 @@ export function ExceptionsClient({ data }: Props) {
             shown={claims.length}
             total={claimsMatched ?? claimsTotal}
           />
+          {/* o3d-j625 r22 (Codex round 21, HIGH): the LONGEST-HELD claims, age-ordered. The walk below is
+              ordered by identity now — a key a re-take cannot rewrite — so its first page is no longer "the
+              oldest claims", and this is what keeps a stranded claim surfacing without being hunted. It is a
+              display aid and cannot hide anything: the complete walk is directly beneath it. */}
+          {data.accountingHandPostClaimsLongestHeld.length > 0 ? (
+            <div className="space-y-1">
+              <p className="text-xs font-medium">{ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL}</p>
+              <ul className="text-xs text-muted-foreground space-y-1">
+                {data.accountingHandPostClaimsLongestHeld.map((claim) => (
+                  <li key={`longest-${claim.refusalId}`} className="flex items-center gap-2">
+                    <span className={claim.stale ? 'text-amber-700' : undefined}>
+                      {claim.heldForHours < 1 ? 'under an hour' : `${claim.heldForHours} h`}
+                    </span>
+                    <span className="font-mono">{claim.referenceType}/{claim.referenceId}</span>
+                    <span>{claim.type}</span>
+                    <span>— {claim.mine ? 'you' : (claim.byName ?? 'another operator')}</span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                    >
+                      <XCircle className="h-3 w-3 mr-1" />Release
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
           {/* o3d-j625 r20: the LOOKUP. Reaching a claim must not depend on how many unrelated ones exist,
               and walking pages to find one document is reachable in principle and unusable in practice. */}
           <div className="space-y-1">
@@ -1155,10 +1194,19 @@ export function ExceptionsClient({ data }: Props) {
               Show more claims
             </Button>
           ) : (
+            /*
+             * o3d-j625 r22 (Codex round 21, HIGH): the sentence is EARNED. Identity ordering stops a re-take
+             * moving a row across an issued cursor, but it cannot make a claim TAKEN during the walk appear
+             * after the cursor — no non-snapshot pagination can, and claiming otherwise is how a completeness
+             * statement becomes a lie. So the server sends the total as of the last page and this compares it
+             * with what was actually shown.
+             */
             <p className="text-xs text-muted-foreground">
-              {claimsMatched === null
-                ? 'That is every active claim.'
-                : `That is every active claim matching "${claimSearch}".`}
+              {claimsMatched !== null
+                ? `That is every active claim matching "${claimSearch}".`
+                : claimsTotalAtEnd !== null && claims.length < claimsTotalAtEnd
+                  ? `Showing ${claims.length} of ${claimsTotalAtEnd} — ${claimsTotalAtEnd - claims.length} posting(s) were taken for hand posting while you were looking. Reload to see them.`
+                  : 'That is every active claim.'}
             </p>
           )}
         </Card>

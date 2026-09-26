@@ -123,3 +123,16 @@ export const ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT =
 /** What "held a long time" means on the section above — a signal to look, never an expiry that acts. */
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE =
   'Held far longer than a hand posting takes. Nothing will end it on its own: ask the holder, or release it.'
+
+/**
+ * o3d-j625 r22 (Codex round 21, HIGH) — the heading of the LONGEST-HELD block.
+ *
+ * The walk beneath it is ordered by the row's identity, because `handPostClaimedAt` is rewritten on every
+ * re-take from an application clock and a cursor over a rewritable key can put the same row on both sides of
+ * itself. Identity carries no meaning an operator should read, so the surfacing that oldest-claim-first bought
+ * lives here instead: a short age-ordered look at what is being sat on. It is a display aid — nothing
+ * paginates through it and nothing can hide behind it, because the complete walk is directly below.
+ */
+export const ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL =
+  'Held longest first — the ones most likely to have been forgotten. The full list below is in no particular '
+  + 'order (it is ordered so that paging through it cannot miss anything), so start here.'

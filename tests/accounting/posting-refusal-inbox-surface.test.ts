@@ -107,6 +107,17 @@ function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string,
    * An unevaluated predicate is a predicate the test cannot be about.
    */
   if ('handPostClaimedBy' in where && where.handPostClaimedBy !== row.handPostClaimedBy) return false
+  /**
+   * o3d-j625 r22 — THE IDENTITY KEYSET. The walk's cursor is now `{ id: { gt: … } }`; a double that ignored it
+   * would return every row whatever page was asked for, which is the rig fault r18 disclosed on this very
+   * evaluator (an unevaluated predicate is a predicate the test cannot be about).
+   */
+  if ('id' in where) {
+    const bound = where.id
+    if (bound && typeof bound === 'object' && 'gt' in (bound as object)) {
+      if (!(String(row.id) > String((bound as { gt: unknown }).gt))) return false
+    } else if (bound !== row.id) return false
+  }
   if (!('resolvedAt' in where)) return true
   const condition = where.resolvedAt
   if (condition && typeof condition === 'object' && 'gte' in (condition as object)) {
@@ -137,7 +148,7 @@ function pageRefusals(rows: Array<Record<string, unknown>>, orderBy: unknown, ta
   return typeof take === 'number' ? sorted.slice(0, take) : sorted
 }
 
-const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number; resolvedWhere?: Record<string, unknown>; claimsWhere?: Record<string, unknown>; claimsOrderBy?: unknown; claimsTake?: number } = {}
+const seen: { countWhere?: Record<string, unknown>; listWhere?: Record<string, unknown>; listOrderBy?: unknown; listTake?: number; resolvedWhere?: Record<string, unknown>; claimsWhere?: Record<string, unknown>; claimsOrderBy?: unknown; claimsTake?: number; longestHeldOrderBy?: unknown; longestHeldTake?: number } = {}
 
 const emptyModel = {
   findMany: async () => [],
@@ -199,10 +210,19 @@ const db = new Proxy({
       // arguments are recorded here — the resolved list is asserted by its own test below.
       // o3d-j625 r18: and the ACTIVE-CLAIM read is recorded separately, because the whole of HIGH 2 is that
       // it must not be the refusal list's query — same predicate, same ordering, same cap would be the bug.
-      if ('handPostClaimedAt' in where) {
-        seen.claimsWhere = where
-        seen.claimsOrderBy = orderBy
-        seen.claimsTake = take
+      if ('handPostClaimedAt' in where || 'AND' in where) {
+        // o3d-j625 r22: there are TWO claim reads now and they must not overwrite each other's record — the
+        // WALK (ordered by identity, the reachability path) and the age-ordered LONGEST-HELD head (a display
+        // aid). Told apart by their ordering, which is the very thing under test.
+        const keys = (Array.isArray(orderBy) ? orderBy : [orderBy]) as Array<Record<string, string>>
+        if (keys[0] && 'handPostClaimedAt' in keys[0]) {
+          seen.longestHeldOrderBy = orderBy
+          seen.longestHeldTake = take
+        } else {
+          seen.claimsWhere = where
+          seen.claimsOrderBy = orderBy
+          seen.claimsTake = take
+        }
       } else if (where.resolvedAt === null) {
         seen.listWhere = where
         seen.listOrderBy = orderBy
@@ -746,15 +766,22 @@ test('[o3d-j625 r18 HIGH 2] an active claim behind 50 older refusals is still li
     // AND IT IS ITS OWN QUERY. Same predicate/ordering/cap as the refusal list would be the bug itself.
     assert.ok(seen.claimsWhere, 'the claims view has its own query')
     /**
-     * o3d-j625 r20 (Codex round 19, HIGH) — BOTH sort keys, in this order.
+     * o3d-j625 r22 (Codex round 21, HIGH) — THE WALK IS ORDERED BY IDENTITY, AND BY NOTHING ELSE.
      *
-     * OLDEST CLAIM FIRST because a claim is stale by how long it has been held and `firstRefusedAt` says
-     * nothing about when it was taken; and `id` second because `handPostClaimedAt` is not unique, so without
-     * it two claims taken in the same millisecond are ordered arbitrarily and one can straddle a page
-     * boundary and be returned on neither page. A TOTAL order is what makes the walk complete.
+     * r20 ordered it `[{ handPostClaimedAt }, { id }]` — oldest claim first, with the id as a total-order
+     * tiebreak because the timestamp is not unique. Round 21 showed the timestamp is not STABLE either: it is
+     * rewritten on every re-take from an application clock, and a cursor over a rewritable key can put the
+     * same row on both sides of itself, so a re-taken claim beyond page one is skipped (or shown twice) and
+     * the walk still reports completeness. An id is assigned at creation and rewritten by nothing here, so it
+     * is both total and FIXED. The surfacing oldest-claim-first bought moves to `longestHeld`, below.
      */
-    assert.deepEqual(seen.claimsOrderBy, [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
-      'OLDEST CLAIM FIRST, with the id as a total-order tiebreak')
+    assert.deepEqual(seen.claimsOrderBy, [{ id: 'asc' }],
+      'IDENTITY, which a re-take cannot rewrite — the walk\'s completeness is a property of that')
+    assert.deepEqual(seen.longestHeldOrderBy, [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
+      'and the age-ordered head is the ONE place the claim time still orders anything — nothing paginates '
+      + 'through it, so a rewritable key is harmless there')
+    assert.ok((seen.longestHeldTake ?? 0) > 0 && (seen.longestHeldTake ?? 0) <= 10,
+      `and it is short: ${seen.longestHeldTake} rows, a look rather than a route`)
     // r18 asserted the cap was BIGGER than the refusal list's. Round 19's finding is that a bigger cap is
     // still a cap, so what is asserted now is that the section carries a way PAST it.
     assert.equal(
@@ -855,4 +882,125 @@ test('[o3d-j625 r20] the lookup hint names every field the query matches, and di
   // searched, and a hint that stayed silent about it would make an empty result look like an absent claim.
   assert.doesNotMatch(predicate, /handPostClaimedBy/, 'PRECONDITION: the holder is genuinely not searched')
   assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /NOT the holder/i, 'and the page says so')
+})
+
+/**
+ * o3d-j625 r22 (Codex round 21, HIGH) — THE INBOX SHIPS THE AGE-ORDERED HEAD, AND THE PAGE RENDERS IT.
+ *
+ * The walk is ordered by identity, so its first page is no longer the oldest claims. `longestHeld` is what
+ * keeps a stranded claim surfacing without being hunted, and it is only useful if the page actually draws it
+ * with a Release on each row. The behavioural half (what the query returns) is proven in
+ * tests/accounting/posting-refusal-mark-handled; this is the half that is a fact about the component.
+ *
+ * WHAT WOULD STILL PASS THIS: a head rendered below the walk rather than above it (position is not asserted —
+ * only that it exists, is age-ordered and is actionable), and a head whose rows are visually cramped. What it
+ * does establish is that the surfacing is not merely computed and then dropped.
+ */
+test('[o3d-j625 r22 HIGH] the inbox ships the longest-held head, and the page draws it with a Release on each row', async () => {
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const added = [
+    { id: 'lh-ancient', at: new Date('2026-01-01T00:00:00.000Z') },
+    { id: 'lh-recent', at: new Date('2026-09-25T00:00:00.000Z') },
+  ].map((seed) => ({
+    id: seed.id,
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: `so-${seed.id}`,
+    scope: '',
+    kind: 'sales_invoice_update',
+    chartConnector: 'xero',
+    activeConnector: null,
+    reason: 'retired_chart',
+    committed: 'the order is updated in IMS',
+    remedy: 'Re-save the order once the cause is resolved.',
+    refusedCount: 1,
+    firstRefusedAt: new Date('2026-09-25T08:00:00.000Z'),
+    lastRefusedAt: new Date('2026-09-25T08:00:00.000Z'),
+    resolvedAt: null,
+    handPostClaimedAt: seed.at,
+    handPostClaimedBy: 'u2',
+  }))
+  allRows.push(...added)
+  try {
+    const data = await getExceptionInboxData()
+    const head = (data as unknown as { accountingHandPostClaimsLongestHeld?: Array<{ refusalId: string; stale: boolean }> })
+      .accountingHandPostClaimsLongestHeld
+    console.log(`[r22 surface head] ${JSON.stringify(head?.map((claim) => claim.refusalId))} `
+      + `totalAtEnd=${(data as unknown as { accountingHandPostClaimsTotalAtEnd?: number | null }).accountingHandPostClaimsTotalAtEnd}`)
+    assert.ok(Array.isArray(head), 'the inbox payload carries it')
+    assert.deepEqual(head.map((claim) => claim.refusalId), ['lh-ancient', 'lh-recent'], 'held longest FIRST')
+    assert.equal(head[0]!.stale, true, 'and the longest-held one is flagged')
+    assert.equal(
+      (data as unknown as { accountingHandPostClaimsTotalAtEnd?: number | null }).accountingHandPostClaimsTotalAtEnd,
+      2,
+      'and the last page of the walk carries the total AS OF THEN, so the completeness sentence is measured')
+
+    const { readFile } = await import('node:fs/promises')
+    const path = await import('node:path')
+    const source = await readFile(
+      path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
+      'utf8',
+    )
+    const start = source.indexOf('{data.accountingHandPostClaimsLongestHeld.map(')
+    assert.ok(start >= 0, 'the page must map over the head, or this test asserts nothing about rendering')
+    const block = source.slice(start, source.indexOf('</ul>', start))
+    console.log(`[r22 surface head] rendered block = ${block.length} chars`)
+    assert.match(block, /setReleasingRefusal\(\{ id: claim\.refusalId/,
+      'each head row offers Release, wired to the id the release action takes')
+    assert.match(block, /heldForHours/, 'and shows how long it has been held, which is the whole point of the block')
+    /*
+     * NOT GATED ON WHOSE CLAIM IT IS. The rule is about the GRAMMAR of the guard — a conditional wrapping an
+     * ELEMENT — not about the identifier appearing at all: the row legitimately reads `claim.mine ? 'you' :
+     * …` to name the holder, and banning the word would make this test about the wording instead of the
+     * control. A holder-only Release is a departed holder's permanent suppression, which is what both this
+     * block and the walk beneath it exist to end.
+     */
+    assert.doesNotMatch(block, /claim\.mine \?\s*\(/, 'and its Release is not wrapped in a holder conditional')
+    assert.doesNotMatch(block, /\?\s*\(\s*<Button/, 'nor in any other conditional')
+    assert.match(block, /claim\.mine \? 'you'/, 'CONTROL: the identifier IS present, for the holder\'s name — so '
+      + 'the checks above are about a conditional around the control and not about a word never written here')
+  } finally {
+    for (const row of added) allRows.splice(allRows.indexOf(row), 1)
+  }
+})
+
+/**
+ * o3d-j625 r22 — THE COMPLETENESS SENTENCE IS GUARDED BY THE MEASUREMENT, in the component that prints it.
+ *
+ * FOUND BY THE MUTATION HARNESS, NOT BY A TEST: `totalAtEnd` is asserted on the server side, and the page
+ * compares it with what it showed — but nothing examined that comparison, so removing it left every test
+ * green. "That is every active claim" is the one sentence in this section that can be false, and a sentence
+ * nobody checks is how r20's cap read as complete for two rounds.
+ *
+ * WHAT WOULD STILL PASS THIS: a comparison written with the operands swapped (it asserts the operands appear,
+ * not the inequality's direction — the behaviour of the number itself is asserted server-side), and wording
+ * an operator might misread. It does establish that the claim of completeness is conditional on the count.
+ */
+test('[o3d-j625 r22] the page prints "every active claim" only when the measurement accounts for it', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
+    'utf8',
+  )
+  const at = source.indexOf('That is every active claim.')
+  assert.ok(at >= 0, 'the sentence must still be in the page, or this test asserts nothing')
+  // The ternary that decides it: from the enclosing `{` of the expression to the sentence itself.
+  const decision = source.slice(source.lastIndexOf('{claimsMatched', 0 + at), at)
+  console.log(`[r22 sentence] deciding expression = ${decision.replace(/\s+/g, ' ').slice(0, 200)}`)
+  /**
+   * THE GUARD'S GRAMMAR, not the identifier's presence. DISCLOSED: the first version of this assertion was
+   * `match(decision, /claimsTotalAtEnd/)` and the mutation harness found it GREEN — replacing the deciding
+   * condition with `false` leaves `claimsTotalAtEnd` in the `Showing … of …` message inside the branch it
+   * guards, and an existential check over the whole slice is satisfied by that. What has to be asserted is
+   * the COMPARISON that decides, immediately before the `?` it decides.
+   */
+  assert.match(decision, /claimsTotalAtEnd !== null\s*&&\s*claims\.length < claimsTotalAtEnd\s*\?/,
+    'the completeness sentence must be conditional on the total measured at the END of the walk, compared '
+    + 'against how many rows were actually shown — identity ordering stops a RE-TAKE crossing the cursor, but '
+    + 'a claim TAKEN during the walk can still sort before it, and no non-snapshot pagination can promise '
+    + 'otherwise')
+  assert.match(source.slice(at - 600, at), /Showing \$\{claims\.length\} of \$\{claimsTotalAtEnd\}/,
+    'and the other branch SAYS SO in numbers rather than staying silent')
+  assert.match(source.slice(at - 600, at), /Reload to see them/, 'with something the operator can do about it')
 })
