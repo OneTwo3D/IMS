@@ -1993,7 +1993,7 @@ test('[o3d-z5be] docs/installation.md makes the writable-tree invocation UNSUPPO
  * uses it to remove the write-nothing guard).
  */
 function runPrelude(t: TestContext, rel: 'scripts/update.sh' | 'scripts/deploy.sh', flags: string[], transform = (text: string) => text) {
-  const cut = rel === 'scripts/update.sh' ? /^DEPLOY_META_SOURCE=""$/ : /^crontab_lock_paths "\$\{CUTOVER_STATE_DIR\}"$/
+  const cut = rel === 'scripts/update.sh' ? /^DEPLOY_META_SOURCE=""$/ : /^crontab_lock_paths "\$\{CUTOVER_ROOT_DIR\}" "\$\{CUTOVER_STATE_DIR\}"$/
   const lines = ENTRYPOINT_SOURCE.get(rel)!.split('\n')
   const end = lines.findIndex((line) => cut.test(line))
   assert.ok(end > 100, `${rel}: the prelude must be cut after the startup publication (line ${end})`)

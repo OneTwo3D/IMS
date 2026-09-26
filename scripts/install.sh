@@ -710,10 +710,13 @@ readonly LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
 PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
-# The crontab reconciliation lock is composed from ${DATA_DIR} by crontab_lock_paths(), just
-# below the library that defines it — the two components live in scripts/lib/crontab-lock.sh and
-# nowhere else, because deploy.sh and update.sh compose the same path from their own state
-# directory and the application derives it from $STATE_DIRECTORY (lib/crontab-reconcile-lock.ts).
+# The crontab reconciliation lock is composed from ${CUTOVER_ROOT_DIR} by crontab_lock_paths(),
+# just below the library that defines it — the two components live in scripts/lib/crontab-lock.sh
+# and nowhere else, because deploy.sh and update.sh compose the same path from the same root-owned
+# namespace and the application derives it from the identical literal
+# (lib/crontab-reconcile-lock.ts, CRONTAB_RECONCILE_LOCK_ROOT). It is NOT under ${DATA_DIR} any
+# more: that directory belongs to ${APP_USER}, which could rename the lock directory aside inside
+# it (o3d-txoe).
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
 readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
@@ -1300,7 +1303,22 @@ if [[ "$(id -u)" == "0" ]]; then
     exit 1
   fi
 fi
-crontab_lock_paths "${DATA_DIR}"
+# WHERE THE CRONTAB RECONCILIATION LOCK LIVES, AND WHY IT IS NOT THE STATE DIRECTORY (o3d-txoe).
+#
+# FIRST ARGUMENT: ${CUTOVER_ROOT_DIR}, the root-owned cutover namespace. Every component of it is
+# root-owned and writable by nobody else, so ${APP_USER} cannot rename any of them and the pathname
+# therefore resolves to ONE inode for this script and for lib/crontab-reconcile-lock.ts alike. It
+# used to be the StateDirectory, which systemd creates OWNED BY ${APP_USER} — and `rename(2)` needs
+# write permission on the PARENT and nothing at all on what it moves, so that account could put the
+# root-owned lock directory aside and leave its own at the name. Both writers then reported an
+# exclusion neither had.
+#
+# SECOND ARGUMENT: where the lock USED TO BE, so that a predecessor build — which still resolves it
+# there — is excluded during the one rollout window in which the two builds disagree. The bridge is
+# conditional on a precondition the library checks and says out loud when it declines; see
+# prepare_legacy_crontab_lock() in scripts/lib/crontab-lock.sh. The two components come from the
+# library, so no entrypoint has a path of its own to get wrong.
+crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${DATA_DIR}"
 DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"
 # THE APPLICATION'S CONNECTION IDENTITY, WHICH THIS INSTALLER OWNS OUTRIGHT (o3d-2sm1.5 r19).
 #
@@ -3990,11 +4008,13 @@ enter_service_root() {
 # THE RECURSIVE OWNERSHIP CHANGE OVER A STATE ROOT, AIMED AT INODES (o3d-n8xx, Codex CRITICAL)
 #
 # THE FINDING. ${DATA_DIR}'s chown could not follow ${LOG_DIR}'s to `chown -Rh .` because it must
-# PRUNE two subtrees — the root-owned crontab lock directory, and every staging directory
+# PRUNE two subtrees — the root-owned PRE-RELOCATION crontab lock directory (o3d-txoe moved the
+# canonical one out of this tree; the old name is kept root-owned so the bridge to a predecessor
+# build still means something), and every staging directory
 # publish_durable_file() has left behind, at any depth — and `chown -R` cannot express a prune. So
 # it stayed as
 #
-#     find "${DATA_DIR}" \( -path "${CRONTAB_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) \
+#     find "${DATA_DIR}" \( -path "${CRONTAB_LEGACY_LOCK_DIR}" -o -name "${PUBLISH_STAGE_DIRNAME}" \) \
 #       -prune -o -exec chown -h "${APP_USER}:${APP_USER}" {} +
 #
 # and `find -exec` ENUMERATES PATHNAMES and hands them to a `chown` that resolves them AGAIN
@@ -6163,7 +6183,8 @@ fence_cron_locked() {
 # section 12b proved it is this build — so DRAINING covers nothing here and the lock is the only
 # exclusion there is. It is sufficient, and for a reason the fence cannot rely on: the process that
 # can race this one was built by THIS run, so it participates in this protocol by construction
-# (lib/crontab-reconcile-lock.ts resolves the same inode from $STATE_DIRECTORY).
+# (lib/crontab-reconcile-lock.ts derives the same inode from the same root-owned literal, and no
+# account but root can change what that pathname names — o3d-txoe).
 unfence_cron() {
   ${CRON_FENCED} || return 0
   [[ -f "${CRON_BACKUP}" ]] || return 0
@@ -8349,12 +8370,27 @@ migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR
 # is not written in shell. What changes here is that the lock prune is named as a SINGLE COMPONENT —
 # resolved against the descriptor of the directory it sits in, never as a pathname.
 #
+# WHAT IS PRUNED HERE IS THE PRE-RELOCATION LOCK DIRECTORY, AND IT IS STILL PRUNED (o3d-txoe).
+# The canonical crontab lock has moved out of ${DATA_DIR} altogether — it is now
+# ${CUTOVER_ROOT_DIR}/${CRONTAB_LOCK_DIRNAME}, beneath a parent ${APP_USER} cannot rename within —
+# so nothing this walk touches is the lock every writer of THIS build takes. The directory at
+# ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME} is where the lock USED to be, and a process running the
+# PREDECESSOR build still resolves it there. Handing it to ${APP_USER} would take away the one
+# precondition prepare_legacy_crontab_lock() needs to bridge to that process — it locks that inode
+# only while the directory is one no other account may write — so the prune stays, and it is the
+# legacy path it is checked against.
+#
 # THE LOCK DIRECTORY'S NAME AND ITS PATH ARE THE SAME FACT, AND THIS SAYS SO. crontab_lock_paths()
-# composes ${CRONTAB_LOCK_DIR} as ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME}; the walk prunes the single
-# component. If those two ever stop agreeing the prune would silently protect nothing, so they are
-# checked against each other here rather than left to be true.
-[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
-  "the crontab lock directory is ${CRONTAB_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
+# composes ${CRONTAB_LEGACY_LOCK_DIR} as ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME}; the walk prunes the
+# single component. If those two ever stop agreeing the prune would silently protect nothing, so
+# they are checked against each other here rather than left to be true.
+[[ "${CRONTAB_LEGACY_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \
+  "the pre-relocation crontab lock directory is ${CRONTAB_LEGACY_LOCK_DIR}, which is not ${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}: the recursive ownership change over the state directory prunes it by its single name component, and a name that does not compose the same path would prune nothing. This is a bug in this script, not an operator error."
+# AND THE CANONICAL LOCK IS NOT UNDER THIS TREE AT ALL, which is what makes the paragraph above
+# true rather than merely plausible. A future edit that composed it back out of ${DATA_DIR} would
+# put it inside the directory this walk hands to ${APP_USER}, which is the defect o3d-txoe fixed.
+[[ "${CRONTAB_LOCK_DIR}" != "${DATA_DIR%/}/"* ]] || die \
+  "the crontab reconciliation lock directory is ${CRONTAB_LOCK_DIR}, which is inside ${DATA_DIR} — the tree this run hands to '${APP_USER}'. That account could then rename it aside and the application and this run would lock different inodes while both reported exclusion (o3d-txoe). This is a bug in this script, not an operator error."
 privileged_spare_running_tree "${DATA_DIR}" "the state directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
 chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"
 # ${LOG_DIR}'S OWNERSHIP IS AIMED AT A DESCRIPTOR, NOT AT A NAME (o3d-secops r7 second pass,
@@ -9197,10 +9233,13 @@ Restart=always
 RestartSec=5
 
 # systemd creates/owns /var/lib/${APP_NAME} for ${APP_USER} and exports its absolute path to the
-# service as \$STATE_DIRECTORY. That export is the ONLY thing that makes the application and this
-# installer lock the same crontab file (see the crontab section below): the app reads
-# \$STATE_DIRECTORY, this script writes \${DATA_DIR}, and StateDirectory=${APP_NAME} is what makes
-# those the same directory. It is also what survives ProtectSystem=strict in the hardened unit at
+# service as \$STATE_DIRECTORY. The crontab reconciliation lock NO LONGER lives there (o3d-txoe):
+# systemd creates a StateDirectory OWNED BY ${APP_USER}, and that account can rename a root-owned
+# subdirectory aside inside it, so the lock moved to ${CUTOVER_ROOT_DIR} where every component is
+# root-owned and writable by nobody else. What \$STATE_DIRECTORY is still load-bearing for is the
+# listener proof in section 12b — a process without it, or with another unit's, is not this unit's
+# child — the application's own backups and uploads, and the PRE-RELOCATION lock a predecessor build
+# still resolves. It is also what survives ProtectSystem=strict in the hardened unit at
 # deploy/systemd/ims-stage.service, which a lock file in \${APP_DIR} does not.
 StateDirectory=${APP_NAME}
 StateDirectoryMode=0750
@@ -9389,14 +9428,28 @@ fi
 # built. It does not prove that process is systemd's. A same-build process started by hand out of
 # ${APP_DIR} — by an operator, by a stale PM2 entry, by a test harness — after the port was drained
 # can win the bind while `systemctl start` returns 0 for a unit that then fails to bind at all.
-# That process satisfies the fetch and satisfies nothing else, and the difference is not academic:
-# NOT BEING THE UNIT'S CHILD, IT HAS NO $STATE_DIRECTORY. lib/crontab-reconcile-lock.ts then falls
-# through to `path.join(process.cwd(), 'locks', '.crontab-reconcile.lock')` — a DIFFERENT INODE from
-# the ${CRONTAB_LOCK_FILE} section 16 locks — so the installer and the application would each hold
-# an exclusion against nobody and overwrite each other's managed block.
+# That process satisfies the fetch and satisfies nothing else.
 #
-# So four facts are established, and the last one is the one that closes the loop because it asks
-# the PROCESS where its lock is rather than asking the installer:
+# WHAT THIS CHECK USED TO CARRY, AND NO LONGER DOES (o3d-txoe). Until the crontab lock moved, the
+# argument here was about the lock's LOCATION: not being the unit's child, an impostor has no
+# $STATE_DIRECTORY, so lib/crontab-reconcile-lock.ts fell through to
+# `path.join(process.cwd(), 'locks', '.crontab-reconcile.lock')` — a different inode from the one
+# section 16 locks — and the installer and the application each held an exclusion against nobody.
+# THAT SENTENCE IS NO LONGER TRUE, and it is corrected rather than left standing: the lock is now
+# derived from ${CUTOVER_ROOT_DIR}, a literal both writers carry, so it does not depend on
+# $STATE_DIRECTORY at all and an impostor running THIS build takes the very same inode. The
+# relocation discharged that half of the argument.
+#
+# WHY THE CHECK IS STILL A DIE, restated for what it does carry. It is an IDENTITY proof about the
+# process serving the port, and three things still rest on it: that the process answering is the
+# unit this run wrote (and therefore reads the database this run migrated and the environment file
+# this run published, neither of which the asset fetch says anything about); that it is not a
+# PREDECESSOR build, which resolves its lock under $STATE_DIRECTORY and is reached only by
+# prepare_legacy_crontab_lock()'s conditional bridge; and that `systemctl start` returning 0 was not
+# masking a unit that failed to bind while something else held the port.
+#
+# So four facts are established, and the last one asks the PROCESS which unit's state directory it
+# was given rather than taking systemd's word for which process is listening:
 #
 #   1. systemd reports the unit ACTIVE, and gives a MainPID and a ControlGroup for it.
 #   2. Something is listening on :${APP_PORT}, and `ss` can name the pids that hold those sockets.
@@ -9406,7 +9459,9 @@ fi
 #      in the unit's cgroup while only one of them is MainPID.
 #   4. The LISTENER's own effective STATE_DIRECTORY — read out of /proc/<pid>/environ, which is the
 #      only place a process's live environment can be read from — has ${DATA_DIR} as its first
-#      colon-separated element, which is exactly what crontabReconcileLockPath() joins onto.
+#      colon-separated element, which is what the unit this run wrote declares as StateDirectory=.
+#      A process with a different one, or with none, is not this unit's child whatever else it
+#      serves. (It is no longer what crontabReconcileLockPath() joins onto; see o3d-txoe above.)
 #
 # WHEN /proc/<pid>/environ CANNOT BE READ. It is mode 0400 owned by the process's real uid, and
 # this script has already refused to run as anything but root, so the only realistic failures are
@@ -9513,14 +9568,14 @@ prove_listener_belongs_to_unit() {
       return 1
     }
     [[ -n "${state_dir}" ]] || {
-      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with NO STATE_DIRECTORY in its environment, so it resolves its crontab lock under its own working directory instead of ${CRONTAB_LOCK_FILE}"
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with NO STATE_DIRECTORY in its environment, so it was not started by ${APP_NAME}.service and this run cannot say which build, which database or which environment file it is serving"
       return 1
     }
     # The application takes the FIRST colon-separated entry (lib/crontab-reconcile-lock.ts,
     # systemdStateDirectory), so that is the one compared — not "contains".
     first="${state_dir%%:*}"
     [[ "${first}" == "${DATA_DIR}" ]] || {
-      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with STATE_DIRECTORY='${state_dir}', whose first entry '${first}' is not ${DATA_DIR}, so it locks a different file from ${CRONTAB_LOCK_FILE}"
+      LISTENER_PROOF_REASON="pid ${pid} holds :${APP_PORT} with STATE_DIRECTORY='${state_dir}', whose first entry '${first}' is not ${DATA_DIR}, so it is another unit's process and not the one this run wrote and started"
       return 1
     }
   done
@@ -9532,9 +9587,9 @@ prove_listener_belongs_to_unit() {
 APP_SERVICE_LISTENER_PROVED=false
 if prove_listener_belongs_to_unit; then
   APP_SERVICE_LISTENER_PROVED=true
-  success "The listener(s) on :${APP_PORT} (${LISTENER_PIDS}) belong to ${APP_NAME}.service and resolve ${CRONTAB_LOCK_FILE}."
+  success "The listener(s) on :${APP_PORT} (${LISTENER_PIDS}) belong to ${APP_NAME}.service, with ${DATA_DIR} as their state directory, and take ${CRONTAB_LOCK_FILE}."
 else
-  die "The new build is answering on port ${APP_PORT}, but this run could NOT establish that the process serving it is ${APP_NAME}.service's own: ${LISTENER_PROOF_REASON}. That matters for one specific reason: the crontab lock this installer is about to take is only an exclusion against a process whose \$STATE_DIRECTORY is ${DATA_DIR}, and a listener that is not this unit's child has none. The migration applied and the service was started; fix the listener (stop whatever else holds :${APP_PORT}, check \`systemctl status ${APP_NAME}.service\`) and re-run, which adopts the state this run left."
+  die "The new build is answering on port ${APP_PORT}, but this run could NOT establish that the process serving it is ${APP_NAME}.service's own: ${LISTENER_PROOF_REASON}. That matters because the crontab this installer is about to rewrite is shared with whatever is serving that port, and the only process this run has proved anything about is the unit it wrote and started: a listener that is not this unit's child may be running the PREDECESSOR build, which resolves its crontab lock under \$STATE_DIRECTORY rather than under ${CUTOVER_ROOT_DIR}, and may be reading a different database and a different environment file from the ones this run just migrated and published. The migration applied and the service was started; fix the listener (stop whatever else holds :${APP_PORT}, check \`systemctl status ${APP_NAME}.service\`) and re-run, which adopts the state this run left."
 fi
 
 # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH). The new build is serving and everything
@@ -9835,20 +9890,37 @@ trap 'rm -f "${CRON_BLOCK_FILE}"' EXIT
 # write below performs it through with_crontab_lock(), on the same path, exactly as this script's
 # cutover fence and unwind now do and as deploy.sh and update.sh do (o3d-p9dq).
 #
-# THAT PATH IS THE SERVICE'S systemd StateDirectory, NOT ${APP_DIR} (Codex r23 HIGH). A lock file
-# beside the app cannot be opened at all under the hardened unit shipped in
+# THAT PATH IS NOT ${APP_DIR} (Codex r23 HIGH) AND IT IS NOT THE StateDirectory EITHER (o3d-txoe).
+# A lock file beside the app cannot be opened at all under the hardened unit shipped in
 # deploy/systemd/ims-stage.service: ProtectSystem=strict remounts everything read-only except the
 # few paths that unit names, so the app's very first reconciliation would fail with EROFS on a real
-# install. A StateDirectory is created by systemd, owned by the service user, and implicitly
-# read-write under ProtectSystem=strict — and systemd hands its absolute path to the service as
-# $STATE_DIRECTORY, which is what the app reads. So:
+# install. r23 moved it to the service's systemd StateDirectory, which systemd creates and hands to
+# the service as $STATE_DIRECTORY — and which systemd creates OWNED BY ${APP_USER}. `rename(2)` asks
+# for write permission on the PARENT and nothing at all about what it moves, so that account could
+# put the root-owned lock directory aside within it and leave its own at the name; the two writers
+# then locked whatever inode each of them found, both reported exclusion, and the loser's schedule
+# was discarded after being reported as saved.
 #
-#   ${DATA_DIR}/locks/.crontab-reconcile.lock
-#     ==  path.join($STATE_DIRECTORY, 'locks', '.crontab-reconcile.lock')
+# SO IT IS NOW DERIVED FROM ${CUTOVER_ROOT_DIR}, WHOSE WHOLE ANCESTRY IS ROOT-OWNED:
 #
-# because DATA_DIR=/var/lib/${APP_NAME} and the unit written above sets StateDirectory=${APP_NAME}.
-# Both sides derive from that one declaration; neither has a path of its own to get wrong.
-# tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both and asserts they are equal.
+#   ${CUTOVER_ROOT_DIR}/locks/.crontab-reconcile.lock
+#     ==  path.join(CRONTAB_RECONCILE_LOCK_ROOT, 'locks', '.crontab-reconcile.lock')
+#
+# with CRONTAB_RECONCILE_LOCK_ROOT the identical literal in lib/crontab-reconcile-lock.ts. No
+# account but root can create, rename or unlink any component of that pathname, so it resolves to
+# ONE inode for every party that utters it — a kernel guarantee and not an agreement about timing.
+# Neither side has a path of its own to get wrong, and
+# tests/settings/crontab-reconcile-serialization.test.ts RESOLVES both — bash evaluating this
+# script's own `readonly CUTOVER_ROOT_DIR=` declaration, the shipped function asked for its own
+# answer — and asserts they are equal, rather than comparing basenames.
+#
+# ${CUTOVER_ROOT_DIR} IS STILL REACHABLE UNDER THE HARDENED UNIT, which is the property r23 moved
+# the lock for and which this round had to re-establish rather than assume. ProtectSystem=strict
+# makes /etc read-ONLY for the service, not invisible, and `flock(2)` needs no write access at all:
+# the lock file is opened READ-ONLY by lib/crontab-reconcile-lock.ts's own fallback, which is the
+# normal path on an installed host because the file is root-owned. Section 10 of
+# tests/settings/crontab-reconcile-serialization.test.ts checks that against every
+# write-constraining directive the shipped unit actually names.
 #
 # THE FILE IS NOT CREATED HERE, AND NOT WRITTEN HERE (Codex r24 CRITICAL). `prepare_crontab_lock`
 # in section 8 made it — root-owned, inside a root-owned directory — before the service was ever
@@ -9882,8 +9954,9 @@ CRON_BOOTSTRAP_WRITTEN=no
 # WRITE GOES THROUGH (o3d-p9dq). It used to be an inline `exec 9<lock; flock 9; …; exec 9>&-`, which
 # had a second defect nobody had asked about: `acquire_cutover_lock` holds the SHARED CUTOVER LOCK
 # on fd 9 for the whole run, so `exec 9<` replaced that descriptor — releasing the cutover lock —
-# and `exec 9>&-` then left the run holding no cutover lock at all. with_crontab_lock() scopes its
-# descriptor to a command group and uses fd 7.
+# and `exec 9>&-` then left the run holding no cutover lock at all. with_crontab_lock() flocks the
+# descriptor prepare_crontab_lock() pinned, on a number bash allocated above 10, and releases it
+# with `flock --unlock` rather than by closing it (o3d-q766, o3d-txoe).
 bootstrap_managed_crontab_block_locked() {
   # BOOTSTRAP, NOT RECONCILE (Codex r22 HIGH). The block below carries the INSTALLER's default
   # schedules, not the operator's committed settings, so writing it over an existing managed block
