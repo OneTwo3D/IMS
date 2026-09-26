@@ -89,6 +89,10 @@ run_step 'migration conventions'          npm run check:migration-conventions
 run_step 'server action guards'           npm run check:server-action-guards
 run_step 'unit tests'                     npm run test:unit
 run_step 'workflow docs'                  npm run docs:workflows:check
+# o3d-bddq: archive/ is excluded from tsconfig, eslint, the test glob and every check:* SCAN_ROOT, so
+# a rename heuristic can merge a branch's edits into an archived file with NO conflict marker and
+# nothing else here can see it. It happened twice in one day. This step is the only gate that looks.
+run_step 'archive sealed'                 npm run check:archive-sealed
 run_step 'prisma schema scope'            npm run db:schema:scope -- "${schema_scope_base_ref}" "${schema_scope_head_ref}"
 
 # THE SUMMARY IS THE POINT OF THE EXERCISE. It lists every step and its result, so a reader can see
