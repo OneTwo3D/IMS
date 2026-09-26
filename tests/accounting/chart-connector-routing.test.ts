@@ -1,3 +1,4 @@
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../helpers/plugin-selection-double.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -182,7 +183,12 @@ const insertedInTx: Array<{ connector: string; type: string; salesAccount: unkno
 function transactionDouble() {
   return {
     $executeRaw: async () => 1,
-    $queryRaw: async () => [],
+    // o3d-j625 r13: the selection FENCE now runs on every enqueue (see tests/helpers/plugin-selection-double.ts).
+    // Answered from `enabledPlugins`, the same source the `isIntegrationPluginEnabled` mock above answers
+    // from, so this fixture cannot hold two disagreeing notions of which connector is active.
+    $queryRaw: async (query: TemplateStringsArray) => (
+      isLockedPluginSelectionRead(query) ? lockedPluginSelectionRows(enabledPlugins) : []
+    ),
     accountingSyncLog: {
       findMany: async () => [],
       create: async ({ data }: { data: { connector: string; type: string; payload: Record<string, unknown> } }) => {
@@ -562,14 +568,26 @@ test('[o3d-j625] the in-transaction enqueue refuses a retired chart, and reports
   assert.equal(answered.outcome?.connector, 'xero')
 })
 
-test('[o3d-j625] the in-transaction row follows the CHART when the selection moves between the check and the insert', async () => {
+/**
+ * o3d-j625 r13 (Codex on the merged head, HIGH) — INVERTED, AND THE r2 PROPERTY IS STRONGER FOR IT.
+ *
+ * This case drove the selection MOVING between the chart check and the insert and required a row to be
+ * written anyway, under the chart. The first half of that is still right — the row must never follow a
+ * RE-RESOLUTION — but the second half is the r13 HIGH: a row under a connector the selection has left is a
+ * row `/api/cron/accounting-sync` will never process, and writing it clears the outstanding refusal, so the
+ * identity rule is handed false evidence. The enqueue now refuses instead, under the selection lock.
+ *
+ * WHAT STILL REFUTES THE ORIGINAL DEFECT. r2's defect wrote a row under the OTHER connector (one ledger's
+ * row carrying the other's codes). "Nothing is written" excludes that outcome as completely as "a xero row
+ * is written" did, and it also excludes the r13 one — so this assertion is strictly stronger than the one it
+ * replaces. That the row follows the CHART rather than a re-resolution when the selection has NOT moved is
+ * the next test, which is where that property belongs now that this window has a verdict of its own.
+ */
+test('[o3d-j625 r13] a selection that MOVES between the check and the insert is refused, and writes nothing', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
 
-  // The same window as the facade test above: the chart check reads Xero, the switch commits, and the
-  // POSTING CONTEXT and the insert must still be the chart's. Resolving the connector again here is what
-  // wrote one ledger's row with the other's codes.
   selectionReads = 0
   flipToQuickBooksAfterReads = 1
 
@@ -579,10 +597,12 @@ test('[o3d-j625] the in-transaction row follows the CHART when the selection mov
     chartConnector: settings.connector,
   })
 
-  assert.equal(queued, true)
-  assert.equal(insertedInTx.length, 1)
-  assert.equal(insertedInTx[0].connector, 'xero', 'the posting context and the insert follow the chart')
-  assert.equal(insertedInTx[0].salesAccount, 'X-INV')
+  assert.equal(queued, false,
+    'the selection moved out from under this enqueue, so the fence refuses: a row written now would be '
+    + 'one nothing drains, and answering `queued` would clear the outstanding refusal for it (o3d-j625 r13)')
+  assert.deepEqual(insertedInTx, [],
+    'and NOTHING is written — which rules out the r2 defect (a row under the other connector) as well as '
+    + 'the r13 one (a row under a connector that is no longer serviced)')
 })
 
 test('[o3d-j625] the in-transaction enqueue writes under the CHART’S connector while it is still active', async () => {

@@ -184,7 +184,12 @@ test(
     await mark
 
     // PRECONDITIONS. Without these every assertion below would hold over a mark that never happened.
-    assert.deepEqual(marked, { ok: true, cancelledSyncRows: [], kind: KIND }, 'the operator marked the posting handled')
+    // o3d-j625 r13: `suppressed` is part of the answer now, and `true` is the right value HERE —
+    // MANUFACTURING_JOURNAL's key names one posting for ever, so the mark does write the permanent
+    // suppression. Asserted rather than matched away: it is the fact the operator-facing sentence is built
+    // from, and a mark that silently stopped suppressing this kind would reintroduce the double post.
+    assert.deepEqual(marked, { ok: true, cancelledSyncRows: [], kind: KIND, suppressed: true },
+      'the operator marked the posting handled, and this key suppresses for ever')
     assert.ok(recordMs >= HOLD_MS - SLACK_MS,
       `the refusal completed in ${recordMs}ms, so it did NOT overlap the ${HOLD_MS}ms the mark held its `
       + 'transaction open — the interleaving under test was never reached')
@@ -1822,5 +1827,148 @@ test(
     assert.equal(rows.length, 1,
       'the transaction holding the key queued nothing, so the posting is owed — and an unobservable '
       + `baseline must keep the debt rather than let an unseen row discharge it. ${describe(rows)}`)
+  },
+)
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r13 (independent review, HIGH) — "MARK AS HANDLED" MUST NOT SUPPRESS EVERY *LATER* POSTING
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * `AccountingPostingRefusal.suppressedAt` is written in exactly one place (`markPostingHandled`) and
+ * cleared nowhere — the migration says so: "set once by the mark, never cleared" — and it is keyed on the
+ * POSTING KEY. For nearly every type that key names ONE posting for ever, so the suppression is exactly the
+ * operator's assertion made durable.
+ *
+ * THREE TYPES ARE DIFFERENT BY DESIGN, and their own scope rules say so: SALES_INVOICE_UPDATE,
+ * PURCHASE_INVOICE_UPDATE and BILL_PAYMENT share one key across SUCCESSIVE, DISTINCT postings. On those the
+ * suppression was a one-way door across every FUTURE posting, and the review executed the whole chain:
+ *
+ *   mark one refusal handled → the cause clears (the connector is reconnected, the provenance repaired) →
+ *   the bill is edited again → `createAccountingSyncLogRow` reads the suppression and returns `null` →
+ *   the enqueue answers `{ queued: true, reason: 'handled-by-hand' }` → `recordTransitSubledgerMovement`
+ *   writes a movement for a GL journal that does not exist → `purchaseInvoiceUpdateIsOwed('queued')` is
+ *   false, so nothing is recorded outstanding.
+ *
+ * IMS then holds edit n, the ledger holds edit 1, the transit subledger claims a movement the GL never
+ * received, and nothing anywhere says so — the divergence lib/domain/accounting/enqueue-outcome.ts calls
+ * "the worst outcome in the issue", reached through the remedy for it.
+ *
+ * The test below drives the suppression half against a real database. The `queued: true` half and the
+ * orphan movement are unit-testable through the module's own injected deps and are pinned in
+ * tests/domain/purchasing/purchase-invoice-update-sync.test.ts.
+ */
+
+const BILL_UPDATE_TYPE = 'PURCHASE_INVOICE_UPDATE'
+const BILL_UPDATE_REFERENCE_TYPE = 'PurchaseOrder'
+
+/** The key a bill update carries: the PO is the reference, the bill is named in the payload. */
+const billUpdateKey = (poId: string, billId: string) => ({
+  type: BILL_UPDATE_TYPE, referenceType: BILL_UPDATE_REFERENCE_TYPE, referenceId: poId, scope: `bill:${billId}`,
+})
+
+test(
+  '[o3d-j625 r13] marking a BILL UPDATE handled does not suppress the NEXT edit of that bill',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, markPostingHandled, createAccountingSyncLogRow } = await loadDeps()
+    const poId = probeId('r13-bill-update')
+    const billId = `BILL-${poId}`
+    const key = billUpdateKey(poId, billId)
+    t.after(async () => {
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: poId } }).catch(() => undefined)
+      await db.accountingPostingRefusal.deleteMany({ where: { referenceId: poId } }).catch(() => undefined)
+      await db.activityLog.deleteMany({ where: { description: { contains: poId } } }).catch(() => undefined)
+    })
+
+    // EDIT 1 was refused (a retired chart), and the operator posted it by hand and marked it handled.
+    const refusal = await db.accountingPostingRefusal.create({
+      data: {
+        ...key,
+        kind: 'purchase_invoice_update',
+        chartConnector: 'xero',
+        activeConnector: null,
+        reason: 'retired_chart',
+        committed: 'the edited bill stands in IMS and the ledger holds the previous version',
+        remedy: 'Correct the bill by hand in the ledger it belongs to and mark this row handled.',
+      },
+      select: { id: true },
+    })
+    const marked = await db.$transaction(async (tx) => markPostingHandled(tx as never, {
+      id: refusal.id, userId: 'j625r13-operator', note: 'corrected bill by hand',
+    }), TX)
+    assert.equal((marked as { ok: boolean }).ok, true, `PRECONDITION: the mark succeeded: ${JSON.stringify(marked)}`)
+
+    const afterMark = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusal.id }, select: { resolvedAt: true, resolution: true, suppressedAt: true },
+    })
+    console.log(`[r13 mark] resolution=${afterMark.resolution} suppressedAt=${afterMark.suppressedAt?.toISOString() ?? 'null'} `
+      + `markResult=${JSON.stringify(marked)}`)
+    assert.equal(afterMark.resolution, 'handled_manually', 'the operator\'s assertion is recorded')
+    assert.ok(afterMark.resolvedAt, 'and the debt is closed')
+    assert.equal(afterMark.suppressedAt, null,
+      'THE FINDING: no PERMANENT suppression may be written on a posting key that successive edits SHARE. '
+      + 'It is written once and cleared nowhere, so it would silence every later edit of this bill for ever.')
+    assert.equal((marked as { suppressed?: boolean }).suppressed, false,
+      'and the result SAYS so, so the operator-facing sentence can be true about which of the two happened')
+
+    // THE CAUSE CLEARS AND THE BILL IS EDITED AGAIN — a DIFFERENT posting on the same key.
+    const laterEdit = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+      connector: 'xero',
+      type: BILL_UPDATE_TYPE,
+      status: 'PENDING',
+      referenceType: BILL_UPDATE_REFERENCE_TYPE,
+      referenceId: poId,
+      payload: { accountingInvoiceId: billId, _idempotencyKey: `purchase-invoice-update:${poId}:edit-2` },
+    }), TX)
+
+    console.log(`[r13 later edit] row=${JSON.stringify(laterEdit)}`)
+    assert.ok(laterEdit,
+      'THE FINDING: the LATER edit is a DIFFERENT posting that the ledger still needs, and it must be '
+      + 'queued. `null` here is the silent suppression — the enqueue then answers `handled-by-hand`, the '
+      + 'caller reads `queued: true`, and a transit movement is written for a GL journal that does not exist.')
+    const live = await db.accountingSyncLog.count({ where: { referenceId: poId, status: { not: 'CANCELLED' } } })
+    assert.equal(live, 1, 'exactly one live row: the later edit is queued')
+  },
+)
+
+test(
+  '[o3d-j625 r13] CONTROL — marking a posting whose key names ONE posting for ever DOES still suppress',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * Without this the fix above is satisfied by having stopped suppressing altogether — which would
+     * reintroduce the double post the mark exists to prevent. MANUFACTURING_JOURNAL is document-scoped and
+     * there is exactly one completion journal per production order, so a later posting on that key is the
+     * SAME posting and must stay suppressed for ever.
+     */
+    const { db, markPostingHandled, createAccountingSyncLogRow } = await loadDeps()
+    const referenceId = probeId('r13-suppress-control')
+    t.after(cleanup(db, referenceId))
+    const refusalId = await seedOutstandingRefusal(db, referenceId)
+
+    const marked = await db.$transaction(async (tx) => markPostingHandled(tx as never, {
+      id: refusalId, userId: 'j625r13-operator', note: 'posted by hand as journal MJ-9',
+    }), TX)
+    assert.equal((marked as { ok: boolean }).ok, true, 'PRECONDITION: the mark succeeded')
+    assert.equal((marked as { suppressed?: boolean }).suppressed, true, 'and it DID suppress')
+
+    const row = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { suppressedAt: true },
+    })
+    assert.ok(row.suppressedAt, 'the suppression is written for a key that names one posting for ever')
+
+    const later = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+      connector: 'xero',
+      type: TYPE,
+      status: 'PENDING',
+      referenceType: REFERENCE_TYPE,
+      referenceId,
+      payload: { narration: `o3d-j625 r13 the same journal again ${referenceId}` },
+    }), TX)
+    console.log(`[r13 control] suppressedAt=${row.suppressedAt?.toISOString()} laterRow=${JSON.stringify(later)}`)
+    assert.equal(later, null,
+      'and IMS still refuses to write it: the operator posted THIS journal by hand, and posting it again '
+      + 'would put a second one in the ledger')
   },
 )

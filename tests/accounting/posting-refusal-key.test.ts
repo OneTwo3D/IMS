@@ -386,3 +386,43 @@ test('[o3d-j625 r5] the detector FIRES on a hand-built key and ACCEPTS the deriv
   // `blankNonCode` empties string BODIES, so the shape is what identifies it — an object literal.
   assert.match(handBuilt[0]!, /^\{ type: '\s*', referenceType: '\s*', referenceId: poId, scope: '' \}$/)
 })
+
+/**
+ * o3d-j625 r13 (independent review, HIGH) — THE DECLARED SET OF REUSED KEYS, AND WHAT MAKES MEMBERSHIP
+ * CHECKABLE.
+ *
+ * `markPostingHandled` asks `postingKeyIsReusedAcrossPostings` whether to write a permanent suppression, so
+ * the set has to be more than a comment. The NECESSARY condition is checkable and is checked here: a member's
+ * scope must be STABLE across two different payload contents, because a scope that varies with the content
+ * already distinguishes successive postings and cannot be reused by them. The converse — that no type
+ * OUTSIDE the set is reused — is a statement about what each posting MEANS, carried by each scope rule's own
+ * comment; it is enumerated, not inferred, and this test says so rather than implying completeness.
+ */
+test('[o3d-j625 r13] every REUSED posting key is stable across payload contents, and the set is not empty', async () => {
+  const { accountingPostingKey, REUSED_POSTING_KEY_TYPES, postingKeyIsReusedAcrossPostings } =
+    await import('@/lib/accounting/posting-key')
+
+  assert.ok(REUSED_POSTING_KEY_TYPES.size > 0,
+    'an empty set would make `postingKeyIsReusedAcrossPostings` answer false for everything and this test '
+    + 'examine nothing — the suppression would go back to being permanent on every key')
+  console.log(`[r13] reused posting-key types examined: ${[...REUSED_POSTING_KEY_TYPES].join(', ')}`)
+
+  for (const type of REUSED_POSTING_KEY_TYPES) {
+    const of = (idempotencyKey: string) => accountingPostingKey({
+      type,
+      referenceType: 'PurchaseOrder',
+      referenceId: 'ref-1',
+      idempotencyKey,
+      payload: { accountingInvoiceId: 'BILL-1', paymentId: 'PAY-1', _idempotencyKey: idempotencyKey },
+    })
+    assert.equal(of('content-a').scope, of('content-b').scope,
+      `${type} is declared REUSED, so two different contents must land on ONE key — otherwise the key `
+      + 'already tells successive postings apart and marking one handled could not silence the next')
+    assert.equal(postingKeyIsReusedAcrossPostings(type), true, `${type} answers the predicate`)
+  }
+
+  // And the predicate is not a constant: a type whose scope IS the content hash is not reused.
+  assert.equal(postingKeyIsReusedAcrossPostings('COGS_JOURNAL'), false,
+    'COGS_JOURNAL is keyed on its own idempotency key, so successive journals have different keys and the '
+    + 'suppression is correctly permanent for it')
+})

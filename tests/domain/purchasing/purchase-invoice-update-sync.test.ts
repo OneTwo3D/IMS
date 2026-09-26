@@ -109,8 +109,65 @@ test('maybeQueuePurchaseInvoiceUpdate queues Xero PURCHASE_INVOICE_UPDATE when e
       // account are one resolution.
       chartConnector: 'xero',
       documentConnector: 'xero',
+      // o3d-j625 r13 (independent review, HIGH): the module reads the enqueue's REASON, not just its
+      // boolean, because `handled-by-hand` answers `queued: true` while writing no row — and the transit
+      // subledger movement below it is keyed to a row. Asserted as a function rather than matched away, so
+      // dropping the callback (and with it the guard) fails here.
+      reportOutcome: queueCalls.at(-1) !== undefined
+        ? (queueCalls.at(-1) as { reportOutcome?: unknown }).reportOutcome
+        : undefined,
     },
   ])
+  assert.equal(typeof (queueCalls[0] as { reportOutcome?: unknown }).reportOutcome, 'function',
+    'the enqueue is asked for the whole answer: without `reportOutcome` the module cannot tell a row it '
+    + 'queued from a posting a human posted, and the transit movement would be written for both')
+})
+
+/**
+ * o3d-j625 r13 (independent review, HIGH) — `queued: true` IS NOT "IMS WROTE A ROW", AND THE SUBLEDGER
+ * MOVEMENT IS KEYED TO A ROW.
+ *
+ * `handled-by-hand` answers `queued: true` deliberately: a counterpart exists because a human posted it, and
+ * `postingIsOwed` is right to read it that way. It is the WRONG answer to the question this module's transit
+ * write asks, which is "is there a GL journal for the movement I am about to record". The review's chain
+ * ended here — a suppressed posting answered `queued: true`, a transit movement of (new − previous) was
+ * recorded, and the subledger claimed a movement the GL never received while
+ * `purchaseInvoiceUpdateIsOwed('queued')` reported nothing owed.
+ *
+ * The scoping fix in posting-mark-handled.ts makes `handled-by-hand` unreachable for THIS type (its key is
+ * shared by successive edits, so it no longer suppresses at all). This test pins the guard that makes the
+ * SHAPE unreachable whatever a later change does to that, by asking about the row rather than the counterpart.
+ */
+test('[o3d-j625 r13] an enqueue answering handled-by-hand records NO transit movement', async () => {
+  const activityLogCalls: ActivityLogCreateCall[] = []
+  const movements: unknown[] = []
+  const tx = { activityLog: { create: async (input: ActivityLogCreateCall) => { activityLogCalls.push(input) } } }
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async (_tx, input) => { movements.push(input) },
+    postingVerdictForChart: async (chart) => (isRegisteredAccountingConnector(chart)
+      ? { verdict: 'post' as const, connector: chart }
+      : chart ? { verdict: 'chart-retired' as const, chartConnector: chart, activeConnector: null } : { verdict: 'no-chart' as const }),
+    // The posting was marked handled: a counterpart exists in the ledger because a human posted it, and IMS
+    // wrote NOTHING. Both halves of that are what the real enqueue answers in this state.
+    queueAccountingSyncTx: async (_tx, input) => {
+      (input as { reportOutcome?: (o: { queued: boolean; reason?: string }) => void })
+        .reportOutcome?.({ queued: true, reason: 'handled-by-hand' })
+      return true
+    },
+  }
+
+  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps))
+
+  assert.deepEqual(movements, [],
+    'THE FINDING: no transit-subledger movement may be recorded for a GL journal that does not exist. The '
+    + 'guard asks whether IMS QUEUED a row, not whether a counterpart exists — those are different questions '
+    + 'and `queued: true` is the answer to the second one.')
+  // The outcome stays 'queued', and that is deliberate: nothing is OWED (a human posted it), which is what
+  // `purchaseInvoiceUpdateIsOwed` is asked. Flipping it to a refusal would report a hand-posted update as
+  // outstanding work for ever and invite a second posting.
+  assert.equal(result, 'queued',
+    'nothing is owed — a counterpart exists — so the outcome is still `queued`; what changed is only that '
+    + 'the subledger is not told about a journal IMS never queued')
 })
 
 test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queueing', async () => {

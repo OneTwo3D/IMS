@@ -14,6 +14,7 @@
  * The harness below is copied verbatim from chart-connector-routing.test.ts (lines 1–253 there) rather
  * than imported, because node:test module mocks are per-file.
  */
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../helpers/plugin-selection-double.ts'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
@@ -72,6 +73,18 @@ import test, { mock } from 'node:test'
 
 /** Which accounting plugins are on. Mutated MID-TEST to model the switch committing. */
 let enabledPlugins: string[] = ['xero']
+/**
+ * o3d-j625 r13 — WHAT THE LOCKED READ SEES, when a test needs it to differ from the pooled reads.
+ *
+ * `null` (the default) means "the same selection everything else sees", which is the coherent fixture and
+ * the one every test should use. Setting it models the production race the fence exists for: the pooled
+ * chart check and the pooled pin check both answer from the selection as it was, a switch commits, and the
+ * LOCKED read inside the enqueue's transaction sees the new one. Named and defaulted off, because until r13
+ * this state was reached by ACCIDENT — the `tx` double answered every `$queryRaw` with `[]`, so the locked
+ * read found no plugin rows at all and the fixture contradicted its own `isIntegrationPluginEnabled` mock.
+ * A test that passed on that contradiction was not testing what it said.
+ */
+let lockedSelectionMovedTo: string[] | null = null
 
 /**
  * How many plugin-selection reads the facade has made, and a switch that commits AFTER a given number
@@ -235,7 +248,16 @@ const SUPPRESSION_READ_FAILURE = '57014: canceling statement due to statement ti
 function transactionDouble() {
   return {
     $executeRaw: async () => 1,
-    $queryRaw: async () => [],
+    // o3d-j625 r13: the selection FENCE now runs on every enqueue (see tests/helpers/plugin-selection-double.ts).
+    // Answered from `enabledPlugins`, the same source the `isIntegrationPluginEnabled` mock above answers
+    // from, so this fixture cannot hold two disagreeing notions of which connector is active —
+    // UNLESS a test asks for exactly that with `lockedSelectionMovedTo`, which models the one state where the
+    // two legitimately differ: a switch that committed after the pooled reads and before the locked one.
+    $queryRaw: async (query: TemplateStringsArray) => (
+      isLockedPluginSelectionRead(query)
+        ? lockedPluginSelectionRows(lockedSelectionMovedTo ?? enabledPlugins)
+        : []
+    ),
     accountingPostingRefusal: txRefusalTable(),
     accountingSyncLog: {
       // o3d-j625 r6: a prior attempt the in-transaction enqueue's idempotency check can find (M2's case).
@@ -387,6 +409,9 @@ function reset(selection: string[]): void {
   enabledPlugins = selection
   selectionReads = 0
   flipToQuickBooksAfterReads = null
+  // o3d-j625 r13: cleared here, so the one test that sets it cannot leak a divergent locked selection into
+  // every test after it — which is how a fixture seam becomes a silent global.
+  lockedSelectionMovedTo = null
   routed.length = 0
   insertedInTx.length = 0
   activity.length = 0
@@ -918,6 +943,12 @@ test('[o3d-j625 r6 M4] a PINNED ledger the selection no longer services refuses 
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
+  // o3d-j625 r13: SAID OUT LOUD. The refusal under test is the LOCKED one, so the locked read has to see a
+  // selection that no longer services the pin while the pooled reads still do — the switch committing in
+  // between. Until r13 this came for free from a double that answered every raw query with `[]`; that made
+  // the whole fixture inconsistent, and the r13 fence turned the inconsistency into a green test asserting
+  // the opposite of what it said.
+  lockedSelectionMovedTo = []
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,

@@ -1,3 +1,5 @@
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../../helpers/plugin-selection-double.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -190,9 +192,27 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
     // SALES_INVOICE_UPDATE. Recorded into the same event log the rest of the fixture uses, so the
     // lock's position relative to the read and the insert stays visible to these tests rather than
     // being quietly absorbed.
-    $executeRaw: async () => {
-      world.events.push('producer:scope-lock')
+    // o3d-j625 r13 — AND THE LABEL HAS TO MATCH THE STATEMENT.
+    //
+    // This pushed 'producer:scope-lock' for EVERY raw execute, which was true while the follow-up scope lock
+    // was the only one. The selection fence now issues two of its own before it (the advisory lock and the
+    // row materialisation), so the unlabelled version recorded three 'producer:scope-lock' events and the
+    // sequence assertion below became a statement about nothing in particular. Discriminated, so the event
+    // log says which lock is which and the ORDER — fence, then scope lock, then the write — stays visible.
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const sql = Array.isArray(strings) ? strings.join('?') : String(strings)
+      if (/insert\s+into\s+settings/i.test(sql)) world.events.push('producer:selection-fence-materialise')
+      else if (sql.includes('pg_advisory_xact_lock') && values[0] === ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY) {
+        world.events.push('producer:selection-fence-lock')
+      } else world.events.push('producer:scope-lock')
       return 1
+    },
+    // o3d-j625 r13: the SELECTION FENCE runs on every enqueue now, so the double answers its locked read
+    // (tests/helpers/plugin-selection-double.ts), recorded in the same log for the same reason.
+    $queryRaw: async (strings: TemplateStringsArray) => {
+      if (!isLockedPluginSelectionRead(strings)) return []
+      world.events.push('producer:selection-fence-read')
+      return lockedPluginSelectionRows(['xero'])
     },
   })
   return tx
@@ -316,7 +336,16 @@ test('a producer that SNAPSHOTTED before blocking on the lock cannot queue the s
     // 'producer:scope-lock' is the o3d-11rf follow-up scope lock, which now covers MIRRORED types
     // and so applies to SALES_INVOICE. Its position is the point: the producer reaches it only
     // AFTER the backfill's write, which is what "the producer really did run second" means here.
-    ['backfill:lock', 'producer:start', 'backfill:write', 'producer:scope-lock', 'producer:done'],
+    //
+    // o3d-j625 r13 added the three 'selection-fence' events ahead of it — the enqueue now takes the
+    // plugin-selection lock, materialises the rows and reads them under it, on EVERY enqueue rather than
+    // only pinned ones. They are listed rather than filtered out: the documented lock order is
+    // order row -> plugin selection -> follow-up scope, and this sequence is now the thing that shows it.
+    [
+      'backfill:lock', 'producer:start', 'backfill:write',
+      'producer:selection-fence-lock', 'producer:selection-fence-materialise', 'producer:selection-fence-read',
+      'producer:scope-lock', 'producer:done',
+    ],
     'the producer really did run second, after the lock was released — the interleaving under test',
   )
 

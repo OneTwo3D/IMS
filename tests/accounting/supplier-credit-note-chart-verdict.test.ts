@@ -1,3 +1,4 @@
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../helpers/plugin-selection-double.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -111,7 +112,12 @@ function transactionClient(pending: Array<() => void>) {
     },
     activityLog: { create: async () => ({ id: 'a-1' }) },
     $executeRaw: async () => 1,
-    $queryRaw: async () => [],
+    // o3d-j625 r13: the selection FENCE now runs on every enqueue (see tests/helpers/plugin-selection-double.ts).
+    // Answered from `enabledPlugins`, the same source the `isIntegrationPluginEnabled` mock above answers
+    // from, so this fixture cannot hold two disagreeing notions of which connector is active.
+    $queryRaw: async (query: TemplateStringsArray) => (
+      isLockedPluginSelectionRead(query) ? lockedPluginSelectionRows(enabledPlugins) : []
+    ),
   }
   return new Proxy(modelled as Record<string, unknown>, {
     get: (target, key: string) => (key in target ? target[key] : empty),

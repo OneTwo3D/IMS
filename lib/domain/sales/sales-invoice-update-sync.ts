@@ -287,14 +287,26 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     action: 'sales_invoice_update_queued',
     tag: 'accounting',
     level: 'INFO',
+    // o3d-j625 r13 (independent review, HIGH) — AND `handled-by-hand` IS NOT "QUEUED".
+    //
+    // This said "Queued sales invoice update for X" for every true answer, including the one that means
+    // IMS wrote NOTHING because the posting was marked handled — a false success claim in the only record
+    // of the event, with `alreadyQueued: false` beside it. The suppression that produced it can no longer
+    // cover a later edit (posting-mark-handled.ts scopes it off reused posting keys), so this is the
+    // narrower case now: the operator marked THIS edit handled. Either way the record has to say which
+    // happened, because `queued: true` here answers "a counterpart exists" and not "IMS queued one".
     description: enqueued.reason === 'already-queued'
       ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was already queued`
-      : `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
+      : enqueued.reason === 'handled-by-hand'
+        ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was NOT queued: `
+          + 'it is marked handled — posted by hand in the ledger — so IMS does not post it too'
+        : `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
     metadata: {
       accountingInvoiceId: params.accountingInvoiceId,
       orderNumber: params.orderNumber,
       idempotencyKey: params.idempotencyKey,
       alreadyQueued: enqueued.reason === 'already-queued',
+      handledByHand: enqueued.reason === 'handled-by-hand',
     },
   })
 }
