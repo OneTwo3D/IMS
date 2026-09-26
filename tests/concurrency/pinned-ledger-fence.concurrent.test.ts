@@ -239,31 +239,38 @@ test(
   },
 )
 
+/**
+ * o3d-j625 r13 (Codex on the merged head, HIGH) — THIS CONTROL ASSERTED THE DEFECT, AND IS INVERTED.
+ *
+ * It ran test 1's race with the pin removed and required the switch NOT to be blocked, on the stated
+ * grounds that "the unpinned path still resolves-then-writes without a fence … it is filed rather than
+ * fenced, because fencing it would put a global advisory lock in front of every accounting enqueue".
+ * Codex executed that residual: an unpinned call whose connector is deactivated between the chart read
+ * and the insert writes a row nothing will ever process AND clears the outstanding refusal, so the
+ * identity rule this branch spent four rounds building is handed false evidence. The fence is now
+ * unconditional, so the first arm below is the opposite of what this test used to say.
+ *
+ * ITS STRUCTURAL JOB SURVIVES, AND IT HAD TO. The measurement in test 1 means "the FENCE blocked the
+ * switch" only if something else — the order lock, the follow-up scope lock, the pool — is not doing the
+ * blocking. With every enqueue now fenced, an unpinned call can no longer be that negative control, so
+ * the second arm supplies one: an enqueue whose SYNC TOGGLE IS OFF is answered before the fenced
+ * transaction is ever opened (`notConfiguredUnderPinnedLedgerFence` with no pin — see
+ * lib/connectors/xero/queue.ts), so it takes no selection lock and does NOT block the switch. Two arms
+ * differing in exactly one setting, and the one that takes the fence is the one that blocks.
+ */
 test(
-  '[o3d-i0o6 r8] THE CONTROL — an UNPINNED enqueue takes no fence, and the switch sails past it',
+  '[o3d-j625 r13] an UNPINNED enqueue is fenced TOO — and an enqueue that never opens the fenced transaction still is not',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    /**
-     * The same race, the same timings, the same helper — with the pin removed.
-     *
-     * This is what makes the measurement above mean something. An unpinned enqueue resolves the
-     * active connector for itself and takes no selection lock by design, so the switch is NOT
-     * blocked; if it were blocked here too, the timing in test 1 would be evidence of some unrelated
-     * serialisation (the follow-up scope lock, the pool, the order guard) rather than of the fence.
-     *
-     * It also states the residual honestly: the unpinned path still resolves-then-writes without a
-     * fence. No proof is split across the two reads there — the row is written for whatever was
-     * active at resolution, `assertAllocationReversalQueued` is never consulted for it, and the
-     * orphan sweep and the manual Sync button both handle it — so it is not the money path this
-     * branch closes. It is filed rather than fenced, because fencing it would put a global advisory
-     * lock in front of every accounting enqueue in the system.
-     */
     const { db, queueAccountingSyncTx, lockIntegrationPluginSelection } = await loadDeps()
     await startFromXeroActive(db)
     const referenceId = probeId('tx-unpinned')
+    const offReferenceId = probeId('tx-unpinned-sync-off')
     t.after(cleanup(db, referenceId))
+    t.after(cleanup(db, offReferenceId))
     t.after(() => startFromXeroActive(db))
 
+    // ── ARM 1: unpinned, connector ACTIVE, sync ON. The fence is taken, so the switch must wait for it.
     const signal: { fire?: () => void } = {}
     const enqueueHasInserted = new Promise<void>((resolve) => { signal.fire = resolve })
     let queued: boolean | null = null
@@ -289,12 +296,59 @@ test(
 
     const [, switchMs] = await Promise.all([enqueue, switcher])
 
-    assert.equal(queued, true, 'the unpinned enqueue writes, resolving the active connector itself')
-    assert.ok(switchMs < HOLD_MS - SLACK_MS,
-      `the unpinned enqueue blocked the switch for ${switchMs}ms. It takes no selection lock, so `
-      + 'something else is serialising these two — and the fence measured in test 1 would then be '
-      + 'evidence of that something else rather than of the lock',
-    )
+    assert.equal(queued, true, 'the unpinned enqueue still writes when its chart IS the active connector')
+    assert.ok(switchMs >= HOLD_MS - SLACK_MS,
+      `the switch committed in ${switchMs}ms while an unpinned enqueue that had inserted was still open. `
+      + 'Since o3d-j625 r13 that enqueue holds the selection lock too, so a switch must not be able to '
+      + `land between its chart read and its commit (it waited ${switchMs}ms of a ${HOLD_MS}ms hold)`)
+
+    // ── ARM 2, THE NEGATIVE CONTROL. It has to come from the FACADE, and finding that out is part of
+    //    what r13 established: in `queueAccountingSyncTx` the fence is now unconditional AND FIRST (ahead
+    //    of the posting context, because that context answers from the connector's own toggle and would
+    //    say "yes, it posts" for a connector the cron has stopped servicing), so there is no longer ANY
+    //    unfenced enqueue path there to use as a control — measured, the toggled-off tx call blocked the
+    //    switch for 508ms of a 500ms hold.
+    //
+    //    The facade still has one: with the sync toggle off and no pin, `queueXeroSync` answers
+    //    `not-configured` from its own settings read BEFORE `db.$transaction` is ever opened
+    //    (`notConfiguredUnderPinnedLedgerFence` with no pin), so it takes no selection lock. That is the
+    //    arm that must NOT block the switch — and it is what says arm 1's wait is the fence rather than
+    //    the pool, the order guard or the follow-up scope lock.
+    await startFromXeroActive(db)
+    await setSetting(db, 'xero_sync_enabled', 'false')
+    const { queueAccountingSync } = await loadDeps()
+    let offOutcome: { queued: boolean; reason?: string } | null = null
+    const offSignal: { fire?: () => void } = {}
+    const offSwitchHoldsTheLock = new Promise<void>((resolve) => { offSignal.fire = resolve })
+    const offSwitcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
+      holdMs: HOLD_MS,
+      onLockHeld: () => offSignal.fire!(),
+    })
+    const offEnqueue = (async () => {
+      await offSwitchHoldsTheLock
+      const startedAt = Date.now()
+      offOutcome = await queueAccountingSync({
+        type: 'ALLOCATION_REVERSAL',
+        referenceType: REFERENCE_TYPE,
+        referenceId: offReferenceId,
+        payload: payloadFor(offReferenceId),
+        chartConnector: 'xero',
+      })
+      return Date.now() - startedAt
+    })()
+    const [, offElapsedMs] = await Promise.all([offSwitcher, offEnqueue])
+    await setSetting(db, 'xero_sync_enabled', 'true')
+
+    assert.equal((offOutcome as unknown as { queued: boolean } | null)?.queued, false,
+      'PRECONDITION: with the type switched off nothing is queued')
+    assert.deepEqual(await db.accountingSyncLog.findMany({ where: { referenceId: offReferenceId }, select: { id: true } }), [],
+      'PRECONDITION: and nothing was written, so this arm really did answer before the fenced write')
+    console.log(`[r13 fence isolation] the fenced arm blocked the switch for ${switchMs}ms; the unfenced `
+      + `(facade, sync-off) arm returned in ${offElapsedMs}ms without waiting out the ${HOLD_MS}ms hold`)
+    assert.ok(offElapsedMs < HOLD_MS - SLACK_MS,
+      `an enqueue answered BEFORE any fenced transaction waited ${offElapsedMs}ms on a switch holding the `
+      + 'selection. It takes no selection lock, so something else is serialising these two — and every '
+      + 'timing in this file would then be evidence of that something else rather than of the fence')
   },
 )
 
@@ -499,5 +553,224 @@ test(
     )
     assert.ok(elapsedMs < HOLD_MS,
       `an uncontended fenced answer took ${elapsedMs}ms — it should acquire, read and release`)
+  },
+)
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r13 (Codex on the merged head, HIGH) — AN UNPINNED ENQUEUE CAN DISCHARGE A DEBT WITH A ROW
+ * NOTHING WILL EVER PROCESS
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * THE FINDING. The chart check reads the active connector BEFORE queueing, but the locked check inside
+ * the enqueue's own transaction was conditional on a PIN — `params.pinnedLedger` in
+ * lib/connectors/xero/queue.ts, `params.connector` in `queueAccountingSyncTx`. An UNPINNED call supplied
+ * neither, so it skipped the fence entirely: if Xero was deactivated between the chart read and the
+ * insert, the call still wrote a Xero row and answered `queued: true`.
+ *
+ * WHY THAT IS THIS BRANCH'S OWN SUBJECT MATTER AND NOT HARDENING. `queueAccountingSync` CLEARS the
+ * outstanding refusal on `queued: true` (r4), and the r12 identity rule then sees a live sync row whose
+ * id is not in the baseline and correctly concludes "a posting was queued since I was shut out". The
+ * rule is right; the evidence it is handed is false. The row's connector is no longer the active one, so
+ * `/api/cron/accounting-sync` returns `skipped` before it looks at any row — the posting never happens
+ * and the debt is gone. That is precisely the outcome the whole of r9-r12 exists to prevent, arriving
+ * through the enqueue instead of through the reconciler.
+ *
+ * THE INTERLEAVING IS THE ONE THE FACADE TEST ABOVE ESTABLISHED, with the pin removed: the switch goes
+ * FIRST and holds the selection uncommitted, so the enqueue's pooled chart read — under READ COMMITTED —
+ * still answers "xero is active", exactly as it does in production. Nothing is modelled: no fixture moves
+ * a setting after a read, and no double supplies a verdict. Fenced, the enqueue's transaction blocks on
+ * the selection lock, wakes after the switch commits, reads the switched-off selection and refuses with
+ * nothing written. Unfenced, it inserts immediately and clears the debt.
+ *
+ * AND THE CONTROL IS TEST 'r13 POSITIVE CONTROL' BELOW: the same unpinned call with Xero still ACTIVE
+ * must still queue and still clear. Without it, "the unpinned enqueue refused" would be satisfied by
+ * having broken unpinned enqueues altogether.
+ */
+
+/** The posting key an ALLOCATION_REVERSAL with no `_reversalToken` in its payload produces. */
+const unpinnedPostingKey = (referenceId: string) => ({
+  type: 'ALLOCATION_REVERSAL', referenceType: REFERENCE_TYPE, referenceId, scope: '',
+})
+
+/** An outstanding refusal for that posting — the debt whose discharge is the finding. */
+async function seedDebt(db: Db, referenceId: string): Promise<string> {
+  const row = await db.accountingPostingRefusal.create({
+    data: {
+      ...unpinnedPostingKey(referenceId),
+      kind: 'allocation_reversal',
+      chartConnector: 'xero',
+      activeConnector: 'xero',
+      reason: 'retired_chart',
+      committed: 'the allocation trim stands in IMS',
+      remedy: 'Post the reversal by hand in the ledger it belongs to.',
+    },
+    select: { id: true },
+  })
+  return row.id
+}
+
+/** Exactly what the exception inbox lists (app/actions/sync-exceptions.ts: `resolvedAt: null`). */
+async function debtIsOutstanding(db: Db, referenceId: string): Promise<boolean> {
+  return (await db.accountingPostingRefusal.count({
+    where: { ...unpinnedPostingKey(referenceId), resolvedAt: null },
+  })) === 1
+}
+
+function cleanupDebt(db: Db, referenceId: string): () => Promise<void> {
+  return async () => {
+    await db.accountingPostingRefusal.deleteMany({ where: { referenceId } }).catch(() => undefined)
+  }
+}
+
+test(
+  '[o3d-j625 r13] the FACADE, UNPINNED: a connector deactivated before the insert must not let the row discharge the debt',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, queueAccountingSync, lockIntegrationPluginSelection } = await loadDeps()
+    const { isIntegrationPluginEnabled } = await import('../../lib/integration-plugins.ts')
+    await startFromXeroActive(db)
+    const referenceId = probeId('r13-facade-unpinned')
+    t.after(cleanup(db, referenceId))
+    t.after(cleanupDebt(db, referenceId))
+    t.after(() => startFromXeroActive(db))
+    await seedDebt(db, referenceId)
+    assert.equal(await debtIsOutstanding(db, referenceId), true, 'PRECONDITION: the debt is outstanding')
+
+    const signal: { fire?: () => void } = {}
+    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
+    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
+      holdMs: HOLD_MS,
+      onLockHeld: () => signal.fire!(),
+    })
+
+    const enqueue = (async () => {
+      await switchHoldsTheLock
+      const startedAt = Date.now()
+      // NO `connector`: an unpinned call. It still names the CHART its codes came from (required since
+      // r2), and that chart is what decides the queue — so it is the connector whose continued
+      // servicing this enqueue depends on, pin or no pin.
+      const outcome = await queueAccountingSync({
+        type: 'ALLOCATION_REVERSAL',
+        referenceType: REFERENCE_TYPE,
+        referenceId,
+        payload: payloadFor(referenceId),
+        chartConnector: 'xero',
+      })
+      return { outcome, elapsedMs: Date.now() - startedAt }
+    })()
+
+    const [, { outcome, elapsedMs }] = await Promise.all([switcher, enqueue])
+
+    // WHAT THE CRON WILL DO WITH A ROW WRITTEN HERE — established, not asserted by assumption.
+    assert.equal(await isIntegrationPluginEnabled('xero'), false,
+      'PRECONDITION: Xero is no longer an enabled plugin, which is the FIRST gate in '
+      + '/api/cron/accounting-sync — it returns `skipped: No accounting plugin enabled` before it looks '
+      + 'at a single row, so a xero row written now is one nothing will ever process')
+
+    const written = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true, status: true } })
+    console.log(`[r13 facade] outcome=${JSON.stringify(outcome)} elapsed=${elapsedMs}ms rows=${JSON.stringify(written)} `
+      + `debtOutstanding=${await debtIsOutstanding(db, referenceId)}`)
+
+    assert.deepEqual(written, [],
+      'THE FINDING, first half: nothing may be written for a connector that stopped being serviced '
+      + 'before the insert. Such a row is PENDING for ever and the accounting cron skips it.')
+    assert.equal(outcome.queued, false, 'and the caller is told it was not queued')
+    assert.equal(await debtIsOutstanding(db, referenceId), true,
+      'THE FINDING, second half: the debt is STILL OUTSTANDING. `queued: true` clears the refusal row '
+      + '(r4) and the r12 identity rule then reads that row as proof a posting was queued — so an '
+      + 'un-processable row does not merely sit there, it discharges a debt that is owed.')
+    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
+      `the enqueue returned in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms hold, so its `
+      + 'verdict was NOT taken under the selection lock — measured, so "it refused" cannot be a pooled '
+      + 'read that happened to land late')
+  },
+)
+
+test(
+  '[o3d-j625 r13] the IN-TRANSACTION enqueue, UNPINNED: same gap, same refusal',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, queueAccountingSyncTx, lockIntegrationPluginSelection } = await loadDeps()
+    await startFromXeroActive(db)
+    const referenceId = probeId('r13-tx-unpinned')
+    t.after(cleanup(db, referenceId))
+    t.after(cleanupDebt(db, referenceId))
+    t.after(() => startFromXeroActive(db))
+    await seedDebt(db, referenceId)
+
+    const signal: { fire?: () => void } = {}
+    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
+    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
+      holdMs: HOLD_MS,
+      onLockHeld: () => signal.fire!(),
+    })
+
+    let queued: boolean | null = null
+    const caller = (async () => {
+      await switchHoldsTheLock
+      const startedAt = Date.now()
+      await db.$transaction(async (tx) => {
+        queued = await queueAccountingSyncTx(tx, {
+          type: 'ALLOCATION_REVERSAL',
+          referenceType: REFERENCE_TYPE,
+          referenceId,
+          payload: payloadFor(referenceId),
+          chartConnector: 'xero',
+        })
+      }, TX)
+      return Date.now() - startedAt
+    })()
+
+    const [, elapsedMs] = await Promise.all([switcher, caller])
+
+    const written = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true, status: true } })
+    console.log(`[r13 tx] queued=${queued} elapsed=${elapsedMs}ms rows=${JSON.stringify(written)} `
+      + `debtOutstanding=${await debtIsOutstanding(db, referenceId)}`)
+
+    assert.deepEqual(written, [],
+      'the in-transaction enqueue has the same gap — its locked check ran only when `params.connector` '
+      + 'was set — and the same consequence: a row for an unserviced connector.')
+    assert.equal(queued, false, 'and the boolean the caller acts on says nothing was queued')
+    assert.equal(await debtIsOutstanding(db, referenceId), true, 'so the debt is kept')
+    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
+      `the caller's transaction returned in ${elapsedMs}ms rather than waiting out the ${HOLD_MS}ms hold, `
+      + 'so its verdict was not taken under the selection lock')
+  },
+)
+
+test(
+  '[o3d-j625 r13] POSITIVE CONTROL — an UNPINNED enqueue with the connector still ACTIVE still queues, and still clears the debt',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * Without this the two tests above are satisfied by having disabled unpinned enqueues altogether.
+     * Same call, same absence of a pin, same required chart — and no switch racing it.
+     */
+    const { db, queueAccountingSync } = await loadDeps()
+    await startFromXeroActive(db)
+    const referenceId = probeId('r13-positive')
+    t.after(cleanup(db, referenceId))
+    t.after(cleanupDebt(db, referenceId))
+    await seedDebt(db, referenceId)
+    assert.equal(await debtIsOutstanding(db, referenceId), true, 'PRECONDITION: the debt is outstanding')
+
+    const outcome = await queueAccountingSync({
+      type: 'ALLOCATION_REVERSAL',
+      referenceType: REFERENCE_TYPE,
+      referenceId,
+      payload: payloadFor(referenceId),
+      chartConnector: 'xero',
+    })
+
+    const written = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true, status: true } })
+    console.log(`[r13 control] outcome=${JSON.stringify(outcome)} rows=${JSON.stringify(written)} `
+      + `debtOutstanding=${await debtIsOutstanding(db, referenceId)}`)
+
+    assert.equal(outcome.queued, true, 'an unpinned enqueue against the ACTIVE connector still queues')
+    assert.deepEqual(written.map((row) => row.connector), ['xero'], 'and writes exactly one xero row')
+    assert.equal(await debtIsOutstanding(db, referenceId), false,
+      'and THAT row legitimately clears the debt — the posting really is queued to the connector the '
+      + 'cron services, which is the whole difference from the two tests above')
   },
 )

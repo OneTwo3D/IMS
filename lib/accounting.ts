@@ -842,6 +842,18 @@ export async function queueAccountingSync(params: {
   // from the fenced check because it is the SAME PREDICATE over a different source: "is the pinned
   // connector the active one", Xero-first, pooled here and locked there. It can only refuse earlier,
   // never permit something the fence would refuse.
+  //
+  // o3d-j625 r13 — WHY THIS ONE IS STILL GATED ON THE PIN, when the FENCE two paths down no longer is.
+  //
+  // Codex's r13 HIGH is the general form "a check conditional on a parameter, so the caller who omits it
+  // gets less checking", and this line has that shape — so it was re-examined rather than left alone.
+  // It is sound, and the reason is that the unpinned case is ALREADY answered, earlier and identically:
+  // `refuseUnattributableChart` runs above this and returns `reason: 'refused'` (never
+  // `not-configured`) when the chart is not the active connector. So the precedence this line exists to
+  // establish — `refused` ahead of the connector's own `not-configured` — is already established for an
+  // unpinned call by the chart check, and adding the pin predicate's twin here would be a second copy of
+  // that verdict rather than a check the unpinned path lacks. What the unpinned path DID lack was the
+  // LOCKED one, because no earlier read can survive to the insert; that is what r13 fixed.
   if (params.connector && !await pinnedLedgerIsServiced(params.connector)) {
     return { queued: false, reason: 'refused', connector }
   }
@@ -1337,15 +1349,48 @@ export async function queueAccountingSyncTx(
     // review L1: the WHOLE answer, so the caller sees the active connector and that the row was recorded.
     return answer(unattributable, unattributable.connector)
   }
-  if (params.connector && !await pinnedLedgerIsServicedUnderLock(tx, params.connector)) {
-    return answer({ queued: false, reason: 'refused' }, params.connector, {
-      reason: 'pinned_ledger_not_serviced',
-      remedy:
-        `This posting was proved against ${params.connector}, which is no longer the active accounting `
-        + 'connector. Settle the accounting connector selection, then raise the posting again from its '
-        + 'source document.',
-      detail: { pinnedConnector: params.connector },
-    })
+  //
+  // o3d-j625 r13 (Codex on the merged head, HIGH) — AND THE FENCE IS NO LONGER CONDITIONAL ON A PIN.
+  //
+  // It was `if (params.connector && !await …)`, so an UNPINNED call skipped it: the caller with the
+  // LEAST evidence got the LEAST checking. `refuseUnattributableChart` above compares the chart against
+  // the active connector, but that read is unlocked and several awaits from the insert — deactivate the
+  // connector in between and an unpinned call wrote its row anyway and answered `queued: true`. That
+  // answer clears the outstanding refusal (r4), and the r12 identity rule reads the row as proof a
+  // posting was queued, while `/api/cron/accounting-sync` skips the connector before looking at any
+  // row. The debt is discharged and the posting never happens.
+  //
+  // WHAT AN UNPINNED CALL MEANS HERE, since the answer decides the shape of the fix. It is NOT "no
+  // connector to check": `chartConnector` is REQUIRED (r2) and a `null` one has already been refused, so
+  // there is always exactly one connector this row will be written under — `routedConnector`, the pin
+  // where there is one and the chart otherwise. So the fence RESOLVES-AND-LOCKS over that rather than
+  // refusing for want of a pin: refusing would break every legitimate unpinned enqueue, and there is no
+  // third case left to refuse. The pin still decides what the refusal is CALLED, because "proved
+  // against" and "built from the chart of" are different facts an operator acts on differently.
+  //
+  // HOISTED ABOVE THE POSTING CONTEXT, which is why the chart-null return and `routedConnector` moved up
+  // with it: `getAccountingPostingContextFor` answers from the named connector's own sync toggle and
+  // would say "yes, it posts" for a connector the cron has stopped servicing. The fence has to be first.
+  if (params.chartConnector === null) return answer({ queued: false, reason: 'not-configured' }, null)
+  const routedConnector = params.connector ?? params.chartConnector
+  if (!await pinnedLedgerIsServicedUnderLock(tx, routedConnector)) {
+    return answer({ queued: false, reason: 'refused' }, routedConnector, params.connector
+      ? {
+          reason: 'pinned_ledger_not_serviced',
+          remedy:
+            `This posting was proved against ${params.connector}, which is no longer the active accounting `
+            + 'connector. Settle the accounting connector selection, then raise the posting again from its '
+            + 'source document.',
+          detail: { pinnedConnector: params.connector },
+        }
+      : {
+          reason: 'chart_ledger_not_serviced',
+          remedy:
+            `This posting's account codes came from ${routedConnector}'s chart, and ${routedConnector} is no `
+            + 'longer the active accounting connector, so a row queued to it would never be posted. Settle '
+            + 'the accounting connector selection, then raise the posting again from its source document.',
+          detail: { chartConnector: routedConnector },
+        })
   }
   // o3d-i0o6: the PIN wins where one was given. `getAccountingPostingContextFor` asks the same
   // question of the named connector that `getAccountingPostingContext` asks of whichever is active,
@@ -1361,8 +1406,8 @@ export async function queueAccountingSyncTx(
   // parameter to be made optional again. The `null` chart is answered as `not-configured` here, which is
   // exactly what that branch produced for "nothing is switched on", so the behaviour for that state is
   // unchanged; what is removed is the path that would have resolved a DIFFERENT connector.
-  if (params.chartConnector === null) return answer({ queued: false, reason: 'not-configured' }, null)
-  const routedConnector = params.connector ?? params.chartConnector
+  // o3d-j625 r13: the chart-null return and `routedConnector` are now ABOVE, with the fence that needs
+  // them. This line is where they were used first.
   const context = await getAccountingPostingContextFor(routedConnector, params.type)
   // A DECISION: there is no connector, or its sync (or this type) is switched off. No counterpart
   // will ever exist for this posting, so nothing is left outstanding.

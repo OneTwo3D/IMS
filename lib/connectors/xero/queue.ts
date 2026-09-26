@@ -110,6 +110,13 @@ export async function queueXeroSync(params: {
   // this call site is written; `notConfiguredUnderPinnedLedgerFence` is the one conversion, and it
   // asks the fence first. An unpinned enqueue is answered immediately, with no lock and no
   // transaction — see that module for the whole argument.
+  // o3d-j625 r13 — AND THIS ASYMMETRY WAS RE-EXAMINED TOO, and kept. `notConfiguredUnderPinnedLedgerFence`
+  // asks the fence only for a PINNED call, and an unpinned one is answered `not-configured` immediately.
+  // That is not the r13 defect: `not-configured` here is a statement about the connector whose toggle was
+  // just read, and for an unpinned call that connector IS the one the row would be written under (the
+  // chart's — the facade routes by it). A pinned call is the case where the two can differ, which is why
+  // it alone needs the fence before a no-op may settle its obligation. Nothing posts under a connector
+  // whose toggle is off, whoever is asking, so there is no row for a switch to strand.
   const gate = connectorSyncGate(settings.xero_sync_enabled, settingKey ? settings[settingKey] : 'submitted')
   if (!gate.posts) return await notConfiguredUnderPinnedLedgerFence(params.pinnedLedger)
   const postingMode = gate.postingMode
@@ -189,7 +196,23 @@ export async function queueXeroSync(params: {
       // ORDER: sales-order row lock (just above) -> plugin selection -> follow-up scope. The same
       // three, in the same order, as the in-transaction enqueue in lib/accounting.ts; and no
       // plugin-selection writer holds a sales-order row, so neither pair can cycle.
-      if (params.pinnedLedger && !await pinnedLedgerIsServicedUnderLock(tx, 'xero')) {
+      //
+      // o3d-j625 r13 (Codex on the merged head, HIGH) — AND IT IS NO LONGER CONDITIONAL ON A PIN.
+      //
+      // This read used to be `if (params.pinnedLedger && !await …)`, so an UNPINNED call skipped the
+      // fence entirely — the case with the LEAST evidence got the LEAST checking. The facade reads the
+      // active connector before it routes here, and that read cannot survive to this insert: with Xero
+      // deactivated in between, an unpinned call still wrote a Xero row and answered `queued: true`.
+      // That answer CLEARS the outstanding refusal (r4), and the r12 identity rule then reads the row
+      // as proof a posting was queued — while `/api/cron/accounting-sync` skips Xero before it looks at
+      // any row, so the posting never happens. A debt discharged by a row nothing will process.
+      //
+      // EVERY row this queue writes is a Xero row, whoever asked for it, so Xero being the serviced
+      // ledger at COMMIT is a precondition of the write and not a favour to a pinned caller. The pin
+      // still decides what the refusal is CALLED (`pinnedLedgerRetired` reports the same refusal for
+      // both, and the facade's own report names the chart where there is no pin); it no longer decides
+      // whether the question is asked.
+      if (!await pinnedLedgerIsServicedUnderLock(tx, 'xero')) {
         pinnedLedgerRetired = true
         return
       }
