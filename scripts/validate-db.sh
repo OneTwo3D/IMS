@@ -15,10 +15,11 @@ npm run db:generate
 # DATABASE_URL (onetwo3d_ims_dev) is not, and must not be.
 #
 # CI dependency: .github/workflows/schema-guardrails.yml (job `fresh-db-drift`) runs this
-# same suite on every PR that touches tests/concurrency, DB validation, schema, or
-# migration files, against a per-run postgres service database that the job stamps and
-# declares. So the suite IS gated on every such PR; what this script decides is only
-# whether it also runs here.
+# same suite against a per-run postgres service database that the job stamps and declares.
+# Since o3d-fuls0 that workflow is triggered by `paths-ignore: ["**/*.md"]` rather than by an
+# allowlist of subjects -- the allowlist named the tests and seven hand-picked subjects, and
+# most of what this tier pins was not on it -- so the suite is gated on every pull request
+# that is not documentation-only. What this script decides is only whether it also runs here.
 if [ -n "${IMS_CONCURRENCY_SCRATCH_DB:-}" ]; then
   npm run test:concurrency
 else
