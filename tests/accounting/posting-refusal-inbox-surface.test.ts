@@ -745,11 +745,114 @@ test('[o3d-j625 r18 HIGH 2] an active claim behind 50 older refusals is still li
 
     // AND IT IS ITS OWN QUERY. Same predicate/ordering/cap as the refusal list would be the bug itself.
     assert.ok(seen.claimsWhere, 'the claims view has its own query')
-    assert.deepEqual(seen.claimsOrderBy, { handPostClaimedAt: 'asc' },
-      'OLDEST CLAIM FIRST — a claim is stale by age, and `firstRefusedAt` says nothing about when it was taken')
-    assert.ok((seen.claimsTake ?? 0) > 50,
-      `and its cap is not the refusal list's: ${seen.claimsTake} vs ${seen.listTake}`)
+    /**
+     * o3d-j625 r20 (Codex round 19, HIGH) — BOTH sort keys, in this order.
+     *
+     * OLDEST CLAIM FIRST because a claim is stale by how long it has been held and `firstRefusedAt` says
+     * nothing about when it was taken; and `id` second because `handPostClaimedAt` is not unique, so without
+     * it two claims taken in the same millisecond are ordered arbitrarily and one can straddle a page
+     * boundary and be returned on neither page. A TOTAL order is what makes the walk complete.
+     */
+    assert.deepEqual(seen.claimsOrderBy, [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
+      'OLDEST CLAIM FIRST, with the id as a total-order tiebreak')
+    // r18 asserted the cap was BIGGER than the refusal list's. Round 19's finding is that a bigger cap is
+    // still a cap, so what is asserted now is that the section carries a way PAST it.
+    assert.equal(
+      (data as unknown as { accountingHandPostClaimsNextCursor?: string | null }).accountingHandPostClaimsNextCursor ?? null,
+      null,
+      'one claim fits on the first page, so there is no next page to advertise')
+    assert.equal(seen.claimsTake, 51, 'the page is read with ONE row over, which is how "is there a next page" is answered')
   } finally {
     for (const row of added) allRows.splice(allRows.indexOf(row), 1)
   }
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r20 (Codex round 19, HIGH) — THE RELEASE CONTROL IS RENDERED FOR EVERY CLAIM THE WALK RETURNS
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * r18's HIGH-2 test asserted that each claim row CARRIED `refusalId` — the field Release acts on — and I
+ * disclosed at the time that carrying the field is not offering the control. Round 19's finding is about a
+ * claim "the UI renders Release only for" some of, so the field is exactly the wrong thing to assert.
+ *
+ * The behavioural half is proven where it can be executed: tests/accounting/posting-refusal-mark-handled
+ * walks past the page boundary, finds the claim, and RELEASES it through the real server action. What is
+ * left is that the page offers that action on every row it draws, and that is a fact about the component's
+ * source, so it is read as source — the same way this repository already asserts the inbox's other copy.
+ *
+ * WHAT WOULD STILL PASS THIS: a Release button rendered outside the claims table, or one wired to the wrong
+ * id. The first is excluded by slicing the claims `.map(` block itself; the second by requiring the handler
+ * to name `claim.refusalId`, which is the id the action takes. What it does NOT establish is that the
+ * button is reachable on a narrow screen or that the row is visible — no source test can.
+ */
+test('[o3d-j625 r20 HIGH] the claims section offers Release on EVERY row, unconditionally', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
+    'utf8',
+  )
+
+  // The claims table's row block, sliced so nothing outside it can satisfy the assertions below.
+  const start = source.indexOf('{claims.map((claim) => (')
+  assert.ok(start >= 0, 'the claims table must still map over the walked rows, or this test asserts nothing')
+  const end = source.indexOf('</Table>', start)
+  assert.ok(end > start, 'and the block must terminate, or the slice is the whole file')
+  const block = source.slice(start, end)
+  console.log(`[r20 control] claims row block = ${block.length} chars`)
+
+  const releaseHandlers = [...block.matchAll(/setReleasingRefusal\(\{ id: claim\.refusalId/g)]
+  console.log(`[r20 control] Release handlers bound to claim.refusalId: ${releaseHandlers.length}`)
+  assert.equal(releaseHandlers.length, 1,
+    'exactly ONE Release control per claim row, wired to the id the release action takes')
+  assert.match(block, /Release\s*<\/Button>/, 'and it is labelled Release, which is what the operator looks for')
+
+  /**
+   * AND IT IS NOT CONDITIONAL. This is the assertion round 19's finding is really about: r16's REFUSAL rows
+   * gate their controls on `handPostClaim`/`mine`, and a claims row that did the same would hide the control
+   * on exactly the claims a departed holder left behind. The check is about the GRAMMAR of the guard — any
+   * `mine`, any `?`-guarded Button — rather than about proximity to a correcting comment.
+   */
+  const releaseCell = block.slice(block.lastIndexOf('<TableCell', block.indexOf('setReleasingRefusal')))
+  assert.doesNotMatch(releaseCell, /claim\.mine/,
+    'the Release control must not be gated on whose claim it is — anybody with sync may end one, and a '
+    + 'holder-only control is a departed holder\'s permanent suppression')
+  assert.doesNotMatch(releaseCell, /\?\s*\(\s*<Button/,
+    'nor gated on anything else: every row the walk returns is one somebody must be able to act on')
+
+  // NON-VACUITY: the same slice DOES contain a conditional elsewhere in the row, so "no conditional" is a
+  // fact about this cell and not about a regex that never matches anything in this file.
+  assert.match(block, /claim\.stale \? \(/, 'the row does render something conditionally, so the check above can fail')
+})
+
+/**
+ * o3d-j625 r20 — AND THE PAGE SAYS WHAT THE LOOKUP SEARCHES, in the words the query actually uses.
+ *
+ * "I searched and it was not there" must never be evidence that a claim does not exist. The hint and the
+ * predicate are written in two places and would otherwise drift; this holds them together.
+ */
+test('[o3d-j625 r20] the lookup hint names every field the query matches, and disclaims the one it does not', async () => {
+  const [{ ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT }, { readFile }, path] = await Promise.all([
+    import('@/lib/domain/accounting/posting-refusal-copy'),
+    import('node:fs/promises'),
+    import('node:path'),
+  ])
+  const actions = await readFile(path.join(process.cwd(), 'app', 'actions', 'sync-exceptions.ts'), 'utf8')
+  const start = actions.indexOf('function handPostClaimSearchWhere')
+  assert.ok(start >= 0, 'the search predicate must still be a named function, or this test asserts nothing')
+  const predicate = actions.slice(start, actions.indexOf('\n}', start))
+  const fields = ['id', 'referenceId', 'referenceType', 'type']
+  for (const field of fields) {
+    assert.match(predicate, new RegExp(`\\b${field}:`), `PRECONDITION: the query matches ${field}`)
+  }
+  console.log(`[r20 hint] predicate fields=${JSON.stringify(fields)}`)
+  assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /reference id/i)
+  assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /reference type/i)
+  assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /posting type/i)
+  assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /refusal id/i)
+  // The disclaimer is the load-bearing half: the holder's NAME is resolved after the read, so it cannot be
+  // searched, and a hint that stayed silent about it would make an empty result look like an absent claim.
+  assert.doesNotMatch(predicate, /handPostClaimedBy/, 'PRECONDITION: the holder is genuinely not searched')
+  assert.match(ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT, /NOT the holder/i, 'and the page says so')
 })

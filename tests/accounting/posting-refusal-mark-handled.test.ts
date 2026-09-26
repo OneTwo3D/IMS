@@ -28,22 +28,96 @@ const locks: string[] = []
 const mirrorWrites: Array<{ syncLogId?: string; status: string; voidBasis?: string }> = []
 let denyFresh = false
 
+/**
+ * o3d-j625 r20 (Codex round 19, HIGH) — THE DOUBLE EVALUATES `AND`, `OR`, `gt` AND `contains` TOO.
+ *
+ * The claims WALK is a keyset predicate (`handPostClaimedAt gt X OR (= X AND id gt Y)`, nested under an
+ * `AND` with the active-claim filter) and the LOOKUP is an `OR` of `contains`. A double that ignored any of
+ * them would return every row whatever the query asked — which is exactly the rig fault r18 disclosed on the
+ * inbox-surface double, where an unevaluated `handPostClaimedBy` made a viewer-scoped query look correct.
+ * These clauses are the subject here, so they are executed rather than skipped.
+ */
 function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
   for (const [key, condition] of Object.entries(where)) {
+    if (key === 'AND') {
+      const clauses = (Array.isArray(condition) ? condition : [condition]) as Array<Record<string, unknown>>
+      if (!clauses.every((clause) => matches(row, clause))) return false
+      continue
+    }
+    if (key === 'OR') {
+      const clauses = (Array.isArray(condition) ? condition : [condition]) as Array<Record<string, unknown>>
+      if (!clauses.some((clause) => matches(row, clause))) return false
+      continue
+    }
     const value = row[key]
     if (condition && typeof condition === 'object' && !(condition instanceof Date)) {
       if ('in' in (condition as object) && !(condition as { in: unknown[] }).in.includes(value)) return false
       if ('not' in (condition as object) && value === (condition as { not: unknown }).not) return false
+      if ('gt' in (condition as object)) {
+        const bound = (condition as { gt: unknown }).gt
+        const left = value instanceof Date ? value.getTime() : value
+        const right = bound instanceof Date ? bound.getTime() : bound
+        if (!(left !== undefined && left !== null && right !== undefined && right !== null && (left as number | string) > (right as number | string))) return false
+      }
+      if ('contains' in (condition as object)) {
+        const needle = String((condition as { contains: unknown }).contains)
+        const insensitive = (condition as { mode?: string }).mode === 'insensitive'
+        const haystack = String(value ?? '')
+        const hit = insensitive
+          ? haystack.toLowerCase().includes(needle.toLowerCase())
+          : haystack.includes(needle)
+        if (!hit) return false
+      }
+    } else if (condition instanceof Date) {
+      // o3d-j625 r20: the keyset's equality leg compares a DATE (`handPostClaimedAt: after.at`). Two Date
+      // objects are never `===`, so without this the tie-break leg matched nothing and a page boundary
+      // falling inside a group of same-instant claims dropped every one of them.
+      if (!(value instanceof Date) || value.getTime() !== condition.getTime()) return false
     } else if (value !== condition) return false
   }
   return true
 }
 
+/** `orderBy` as Prisma takes it: one object, or several applied in order. Dates and strings both compare. */
+function sortRefusals(rows: Refusal[], orderBy: unknown): Refusal[] {
+  const keys = (Array.isArray(orderBy) ? orderBy : orderBy ? [orderBy] : []) as Array<Record<string, 'asc' | 'desc'>>
+  return [...rows].sort((a, b) => {
+    for (const key of keys) {
+      const [field, direction] = Object.entries(key)[0]!
+      const left = (a as unknown as Record<string, unknown>)[field]
+      const right = (b as unknown as Record<string, unknown>)[field]
+      const l = left instanceof Date ? left.getTime() : left
+      const r = right instanceof Date ? right.getTime() : right
+      if (l === r) continue
+      const cmp = (l as number | string) < (r as number | string) ? -1 : 1
+      return direction === 'desc' ? -cmp : cmp
+    }
+    return 0
+  })
+}
+
 const refusalTable = {
-  findUnique: async ({ where }: { where: { id?: string; type_referenceType_referenceId_scope?: Record<string, unknown> } }) =>
-    (where.id !== undefined
+  // o3d-j625 r20: the claims WALK and the LOOKUP read through these two, so the double has to page and
+  // count the way the database does — `take` is honoured, or a page boundary is not a page boundary.
+  findMany: async ({ where, orderBy, take }: { where: Record<string, unknown>; orderBy?: unknown; take?: number }) => {
+    const hits = sortRefusals(refusals.filter((row) => matches(row as unknown as Record<string, unknown>, where)), orderBy)
+    return typeof take === 'number' ? hits.slice(0, take) : hits
+  },
+  count: async ({ where }: { where: Record<string, unknown> }) =>
+    refusals.filter((row) => matches(row as unknown as Record<string, unknown>, where)).length,
+  /**
+   * A COPY, as a real client returns (o3d-j625 r20). The double used to hand back the LIVE object, so a
+   * later `updateMany` in the same call mutated the snapshot the caller was still reading — and
+   * `releasePostingHandPostClaim`, which reports `heldSince` from the row it loaded, read back the `null`
+   * its own write had just set. That is an artefact of the rig, not of the code, and it is fixed here
+   * rather than worked around in the assertion.
+   */
+  findUnique: async ({ where }: { where: { id?: string; type_referenceType_referenceId_scope?: Record<string, unknown> } }) => {
+    const hit = where.id !== undefined
       ? refusals.find((row) => row.id === where.id)
-      : refusals.find((row) => matches(row as unknown as Record<string, unknown>, where.type_referenceType_referenceId_scope!))) ?? null,
+      : refusals.find((row) => matches(row as unknown as Record<string, unknown>, where.type_referenceType_referenceId_scope!))
+    return hit ? { ...hit } : null
+  },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = refusals.filter((row) => matches(row as unknown as Record<string, unknown>, where))
     // o3d-j625 r9: Prisma's atomic increment, modelled — the refusal record now writes an EXISTING row
@@ -103,9 +177,18 @@ const tx = {
     return 1
   },
 }
+/** o3d-j625 r20: the claims page resolves holder NAMES; a user id in an instruction is not actionable. */
+const users: Array<{ id: string; name: string | null }> = [
+  { id: 'user-1', name: 'Viewer One' },
+  { id: 'user-2', name: 'Holder Two' },
+]
 mock.module('@/lib/db', {
   namedExports: {
-    db: { ...tx, $transaction: async <T>(fn: (client: unknown) => Promise<T>) => fn(tx) },
+    db: {
+      ...tx,
+      user: { findMany: async ({ where }: { where: { id: { in: string[] } } }) => users.filter((u) => where.id.in.includes(u.id)) },
+      $transaction: async <T>(fn: (client: unknown) => Promise<T>) => fn(tx),
+    },
   },
 })
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
@@ -407,4 +490,235 @@ test('[o3d-j625 r6 H4/r7] a row IMS cleared by QUEUEING the posting, refused aga
   assert.equal(refusals[0]!.resolvedBy, null)
   assert.equal(refusals[0]!.resolutionNote, null)
   assert.equal(refusals[0]!.refusedCount, 1, 'and the count is this episode\'s')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r20 (Codex round 19, HIGH) — EVERY ACTIVE CLAIM IS REACHABLE AND RELEASABLE, WHATEVER THE COUNT
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// r18 gave the claims their own section with a cap of 500 and argued a number far above the refusal list's
+// 50 could not hide one. Round 19 reproduced the same defect at 500: with 500 older claims AND enough older
+// refusals a newer claim is in NEITHER list, its holder can leave, the claim never expires, and the
+// aggregate count gives nobody a way to act on it. A cap of any size is a reachability limit, so the answer
+// is not a bigger number — it is that nothing is unreachable.
+//
+// These tests use a page of 50 (the shipped HAND_POST_CLAIM_PAGE) and put the target BEYOND it, which is
+// the boundary round 19 said was untested. Every one of them ends in a RELEASE through the real action, not
+// in "the row came back": reachable and releasable is the property, and r18's own disclosure was that its
+// HIGH-2 test asserted `refusalId` was present rather than that anything could be done with it.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+const CLAIM_PAGE = 50
+
+/** An OUTSTANDING refusal held by `holder` since `at` — one active hand-post claim. */
+function claimed(id: string, at: string, holder = 'user-2', overrides: Partial<Refusal> = {}): Refusal {
+  return refusal(id, 'stock_receipt_journal', {
+    handPostClaimedAt: new Date(at),
+    handPostClaimedBy: holder,
+    ...overrides,
+  })
+}
+
+/** Seed `count` active claims, oldest first, plus one TARGET taken last so it sorts to the very end. */
+function seedClaimsPast(count: number, target: { id: string; referenceId: string }): void {
+  for (let index = 0; index < count; index += 1) {
+    const minute = String(index).padStart(3, '0')
+    refusals.push(claimed(`older-${minute}`, `2026-09-01T00:00:${'00'}.${minute}Z`))
+  }
+  refusals.push(claimed(target.id, '2026-09-20T12:00:00.000Z', 'user-2', { referenceId: target.referenceId }))
+}
+
+async function listClaims(params?: { cursor?: string | null; search?: string | null }) {
+  const { listAccountingHandPostClaimsAction } = await import('@/app/actions/sync-exceptions')
+  return listAccountingHandPostClaimsAction(params)
+}
+
+async function releaseClaim(id: string) {
+  const { releaseAccountingPostingRefusalHandPostClaimAction } = await import('@/app/actions/sync-exceptions')
+  return releaseAccountingPostingRefusalHandPostClaimAction(id)
+}
+
+test('[o3d-j625 r20 HIGH] a claim BEYOND the first page is reached by walking the cursor — and released from there', async () => {
+  seedClaimsPast(CLAIM_PAGE + 10, { id: 'target', referenceId: 'po-target-walk' })
+
+  const first = await listClaims()
+  // PRECONDITIONS — the boundary is really crossed. Printed, so a fixture that stopped exercising it is
+  // visible rather than inferred: this is the exact shape round 19 said was never tested.
+  console.log(`[r20 walk] page1=${first.claims.length} total=${first.total} cursor=${first.nextCursor} `
+    + `targetOnPage1=${first.claims.some((claim) => claim.refusalId === 'target')}`)
+  assert.equal(first.claims.length, CLAIM_PAGE, 'PRECONDITION: the first page is full, so the page boundary bites')
+  assert.equal(first.total, CLAIM_PAGE + 11, 'PRECONDITION: and there are more active claims than one page')
+  assert.equal(first.claims.some((claim) => claim.refusalId === 'target'), false,
+    'PRECONDITION (and round 19\'s finding): the target is NOT on the first page')
+
+  // THE WALK. Every page carries the cursor to the next, so the far end is reachable by following them.
+  let cursor = first.nextCursor
+  let found = null as null | { refusalId: string; by: string | null; byName: string | null }
+  let pages = 1
+  while (cursor && pages < 20) {
+    const page = await listClaims({ cursor })
+    pages += 1
+    found = page.claims.find((claim) => claim.refusalId === 'target') ?? found
+    cursor = page.nextCursor
+  }
+  console.log(`[r20 walk] pages walked=${pages} found=${JSON.stringify(found)}`)
+  assert.ok(found, 'THE FINDING: a claim past the page boundary must be REACHABLE — r18 stopped at the cap '
+    + 'and the claim behind it could never be acted on, with no expiry to end it')
+  assert.equal(found.by, 'user-2')
+  assert.equal(found.byName, 'Holder Two', 'with the holder NAMED — a user id is not something to act on')
+  assert.equal(cursor, null, 'and the walk ENDS: the last page says so rather than looping')
+
+  // AND RELEASABLE FROM THERE. This is the whole point of reaching it, and r18 asserted only the field.
+  const released = await releaseClaim('target')
+  console.log(`[r20 walk] release=${JSON.stringify(released)}`)
+  assert.equal(ok(released), true)
+  const row = refusals.find((r) => r.id === 'target')!
+  assert.equal(row.handPostClaimedAt, null, 'the claim is given back')
+  assert.equal(row.handPostClaimedBy, null)
+  assert.equal(row.resolvedAt, null, 'and the refusal stays outstanding, as a release always leaves it')
+})
+
+test('[o3d-j625 r20 HIGH] a claim beyond the first page is reached by LOOKUP — and released from there', async () => {
+  seedClaimsPast(CLAIM_PAGE + 10, { id: 'target', referenceId: 'po-target-lookup' })
+  const first = await listClaims()
+  assert.equal(first.claims.some((claim) => claim.refusalId === 'target'), false, 'PRECONDITION: off page 1')
+
+  const hit = await listClaims({ search: 'PO-TARGET-LOOKUP' })
+  console.log(`[r20 lookup] matched=${hit.matched} total=${hit.total} ids=${JSON.stringify(hit.claims.map((c) => c.refusalId))}`)
+  assert.equal(hit.matched, 1, 'the lookup says how many matched, not how many exist')
+  assert.equal(hit.total, CLAIM_PAGE + 11, 'and still reports the true total, so a search cannot hide the rest')
+  assert.deepEqual(hit.claims.map((claim) => claim.refusalId), ['target'],
+    'THE SECOND ROUTE: an operator who knows the DOCUMENT goes straight to it — case-insensitively, because '
+    + 'a reference typed in the other case is not a different document')
+
+  assert.equal(ok(await releaseClaim(hit.claims[0]!.refusalId)), true)
+  assert.equal(refusals.find((r) => r.id === 'target')!.handPostClaimedAt, null)
+})
+
+test('[o3d-j625 r20] the lookup matches exactly what the page says it matches — and nothing else', async () => {
+  refusals.push(claimed('by-ref', '2026-09-01T00:00:00Z', 'user-2', { referenceId: 'so-9001' }))
+  refusals.push(claimed('by-type', '2026-09-01T00:00:01Z', 'user-2', { type: 'CREDIT_NOTE', referenceId: 'so-9002' }))
+  refusals.push(claimed('by-reftype', '2026-09-01T00:00:02Z', 'user-2', { referenceType: 'SupplierCreditNote', referenceId: 'so-9003' }))
+  refusals.push(claimed('other', '2026-09-01T00:00:03Z', 'user-2', { referenceId: 'so-9004' }))
+
+  assert.deepEqual((await listClaims({ search: 'so-9001' })).claims.map((c) => c.refusalId), ['by-ref'], 'reference id')
+  assert.deepEqual((await listClaims({ search: 'CREDIT_NOTE' })).claims.map((c) => c.refusalId), ['by-type'], 'posting type')
+  assert.deepEqual((await listClaims({ search: 'SupplierCreditNote' })).claims.map((c) => c.refusalId), ['by-reftype'], 'reference type')
+  assert.deepEqual((await listClaims({ search: 'by-reftype' })).claims.map((c) => c.refusalId), ['by-reftype'], 'the refusal id')
+  // THE ABSENCE HALF, which is the one that makes the hint honest: the page says NOT the holder's name, and
+  // it means it. Without this the hint could promise less than the code does and nobody would notice.
+  assert.deepEqual((await listClaims({ search: 'Holder Two' })).claims.map((c) => c.refusalId), [],
+    'the holder NAME is not searched, and the hint on the page says so')
+  assert.equal((await listClaims({ search: '   ' })).claims.length, 4, 'a blank search is no search, not "match nothing"')
+  assert.equal((await listClaims({ search: '   ' })).matched, null, 'and it is reported as no search at all')
+})
+
+test('[o3d-j625 r20] the walk does not skip a claim when one is RELEASED under it — the reason the cursor is a keyset', async () => {
+  for (let index = 0; index < CLAIM_PAGE + 3; index += 1) {
+    refusals.push(claimed(`c-${String(index).padStart(3, '0')}`, `2026-09-01T00:00:00.${String(index).padStart(3, '0')}Z`))
+  }
+  const first = await listClaims()
+  assert.equal(first.claims.length, CLAIM_PAGE, 'PRECONDITION: a full first page')
+  const cursorRow = first.claims[CLAIM_PAGE - 1]!.refusalId
+
+  // The operator does exactly what this section is for: they release a claim they just read. With an OFFSET
+  // every later row would move up one and the first row of page 2 would never be returned; with PRISMA's
+  // positional `cursor` the row the cursor NAMES has just stopped matching, so page 2 would come back empty
+  // and every claim after it would be unreachable. A keyset over (handPostClaimedAt, id) names a POSITION.
+  assert.equal(ok(await releaseClaim(cursorRow)), true, 'PRECONDITION: the cursor row itself is released')
+  assert.equal(ok(await releaseClaim(first.claims[0]!.refusalId)), true, 'PRECONDITION: and one before it')
+
+  const second = await listClaims({ cursor: first.nextCursor })
+  console.log(`[r20 keyset] page2=${JSON.stringify(second.claims.map((c) => c.refusalId))}`)
+  assert.deepEqual(second.claims.map((claim) => claim.refusalId), ['c-050', 'c-051', 'c-052'],
+    'the three claims after the cursor are all still returned — none skipped by a shifted offset, and the '
+    + 'walk not ended by a cursor row that no longer exists')
+  assert.equal(second.nextCursor, null)
+  assert.equal(ok(await releaseClaim('c-052')), true, 'and the last one is releasable from there')
+})
+
+test('[o3d-j625 r20] two claims taken in the SAME millisecond are both reached — the id is in the sort key', async () => {
+  // Fill a page with claims that all share one instant, so the page boundary falls INSIDE the tie. Without
+  // `id` in the order the tie is broken arbitrarily by the database and one of them can sit on neither page.
+  for (let index = 0; index < CLAIM_PAGE + 2; index += 1) {
+    refusals.push(claimed(`tie-${String(index).padStart(3, '0')}`, '2026-09-01T00:00:00.000Z'))
+  }
+  const first = await listClaims()
+  const second = await listClaims({ cursor: first.nextCursor })
+  const seen = [...first.claims, ...second.claims].map((claim) => claim.refusalId)
+  console.log(`[r20 tie] page1=${first.claims.length} page2=${second.claims.length} distinct=${new Set(seen).size}`)
+  assert.equal(seen.length, CLAIM_PAGE + 2, 'every claim appears')
+  assert.equal(new Set(seen).size, CLAIM_PAGE + 2, 'exactly once — no row on two pages and none on neither')
+  assert.equal(ok(await releaseClaim('tie-051')), true, 'and the one past the boundary is releasable')
+})
+
+/**
+ * o3d-j625 r20 (round 19's open next step) — A NON-HOLDER RELEASES ANOTHER OPERATOR'S CLAIM.
+ *
+ * r18 STATED that anybody with `sync` may do this and gave the reason (a claim taken by someone who has left
+ * would otherwise suppress that posting for ever). Round 19 listed verifying it as unproven, so it was a
+ * claim about the code rather than a property of it. Driven end to end here: the viewer is `user-1`, the
+ * holder is `user-2`, and what is asserted is the WRITE and the RECORD, not the wording.
+ */
+test('[o3d-j625 r20] a NON-HOLDER with sync releases another operator\'s claim, and the WARNING names who released whose', async () => {
+  refusals.push(claimed('held-by-two', '2026-09-20T08:00:00.000Z', 'user-2'))
+  const before = refusals[0]!
+  assert.equal(before.handPostClaimedBy, 'user-2', 'PRECONDITION: the holder is NOT the viewer')
+
+  const result = await releaseClaim('held-by-two')
+  console.log(`[r20 non-holder] result=${JSON.stringify(result)} permissions=${JSON.stringify(permissionsAsked)}`)
+
+  assert.equal(ok(result), true, 'THE PROPERTY: a non-holder is not refused — otherwise a departed holder\'s '
+    + 'claim is a permanent suppression, which is what this whole section exists to end')
+  assert.equal(permissionsAsked.includes('fresh:sync'), true,
+    'and it is still gated: the release is a WRITE, fresh-authenticated like every other one here')
+  assert.equal(before.handPostClaimedAt, null, 'the claim is cleared')
+  assert.equal(before.handPostClaimedBy, null)
+  assert.equal(before.resolvedAt, null, 'the refusal stays OUTSTANDING — releasing settles nothing')
+
+  const entry = activity.find((item) => item.action === 'accounting_posting_refusal_hand_post_claim_released')
+  console.log(`[r20 non-holder] activity=${JSON.stringify(entry)}`)
+  assert.ok(entry, 'the release is recorded')
+  assert.equal((entry as { level?: string }).level, 'WARNING',
+    'at WARNING: taking a posting back from somebody who may have posted it by hand is the one act that can '
+    + 'let the ledger get it twice, and it has to be findable afterwards')
+  assert.equal(entry.metadata?.heldBy, 'user-2', 'naming WHOSE claim it was')
+  assert.equal(entry.metadata?.releasedBy, 'user-1', 'and WHO took it back — two different people, recorded as such')
+  assert.equal(typeof entry.metadata?.heldSince, 'string', 'and since when they had held it')
+})
+
+test('[o3d-j625 r20 CONTROL] releasing a posting NOBODY holds is still refused', async () => {
+  refusals.push(refusal('unheld', 'stock_receipt_journal'))
+  const result = await releaseClaim('unheld')
+  assert.equal(ok(result), false,
+    'CONTROL: the release above succeeded because the claim EXISTED and a non-holder may end it — not '
+    + 'because this action succeeds unconditionally')
+  assert.match(errorOf(result), /Nobody is settling this posting by hand/)
+})
+
+/**
+ * o3d-j625 r20 — A CURSOR THAT CANNOT BE READ RESTARTS THE WALK; IT DOES NOT END IT.
+ *
+ * Found by the mutation harness, not by the tests above: making `decodeHandPostClaimCursor` answer a
+ * far-future position instead of `null` left every one of them green, because none ever handed back
+ * anything but a cursor the server had just issued. A browser that has been open across a deploy, a copied
+ * URL, a truncated string — any of those and the walk would return an empty page for ever, which is this
+ * round's finding arriving through its own remedy. So the degrade is asserted rather than assumed.
+ */
+test('[o3d-j625 r20] an unreadable cursor RESTARTS the walk rather than returning nothing', async () => {
+  for (let index = 0; index < 5; index += 1) {
+    refusals.push(claimed(`m-${index}`, `2026-09-01T00:00:0${index}.000Z`))
+  }
+  for (const bad of ['', 'not-a-cursor', '|only-an-id', 'not-a-date|m-2', '2026-09-01T00:00:01.000Z|']) {
+    const page = await listClaims({ cursor: bad })
+    console.log(`[r20 bad cursor] ${JSON.stringify(bad)} -> ${page.claims.length} claims`)
+    assert.equal(page.claims.length, 5,
+      `an unreadable cursor (${JSON.stringify(bad)}) must return the FIRST page, not an empty one — an empty `
+      + 'one makes every claim after it unreachable, which is the defect this round exists to remove')
+  }
+  // CONTROL: a cursor that IS readable still advances, so "restart" is the degrade and not the behaviour.
+  const after = await listClaims({ cursor: '2026-09-01T00:00:02.000Z|m-2' })
+  assert.deepEqual(after.claims.map((claim) => claim.refusalId), ['m-3', 'm-4'],
+    'CONTROL: a well-formed cursor advances past its position')
+  assert.equal(ok(await releaseClaim('m-4')), true, 'and what it reaches is releasable')
 })

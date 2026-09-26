@@ -7,6 +7,7 @@ import {
   ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
   ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL,
+  ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE,
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
   ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
@@ -14,7 +15,7 @@ import {
 import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Search, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
@@ -37,6 +38,7 @@ import {
   clearPennyMismatchFlag,
   dismissWithdrawnDispatch,
   claimAccountingPostingRefusalForHandPostingAction,
+  listAccountingHandPostClaimsAction,
   markAccountingPostingRefusalHandledAction,
   releaseAccountingPostingRefusalHandPostClaimAction,
   endHeldMaintenanceWindow,
@@ -98,6 +100,44 @@ export function ExceptionsClient({ data }: Props) {
    */
   const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string } | null>(null)
   const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string } | null>(null)
+  /**
+   * o3d-j625 r20 (Codex round 19, HIGH) — THE CLAIMS SECTION IS A WALK, NOT A CAP.
+   *
+   * r18's section drew the 500 oldest claims and stopped; round 19 showed that with 500 older claims and
+   * enough older refusals a newer claim is in neither list, and its holder can leave. The rows are held here
+   * so "Show more" can APPEND the next page and the lookup can REPLACE them, and they are seeded from the
+   * server's first page so the initial render needs no round trip.
+   *
+   * `claimsBase` is the server page these came from: `router.refresh()` deliberately preserves useState, so
+   * without it a release would re-render the section from stale local rows. Comparing the identity of the
+   * server's array is what re-seeds the walk whenever the page reloads underneath it.
+   */
+  const [claimsBase, setClaimsBase] = useState(data.accountingHandPostClaims)
+  const [claims, setClaims] = useState(data.accountingHandPostClaims)
+  const [claimsCursor, setClaimsCursor] = useState(data.accountingHandPostClaimsNextCursor)
+  const [claimsTotal, setClaimsTotal] = useState(data.summary.accountingHandPostClaims)
+  const [claimsMatched, setClaimsMatched] = useState<number | null>(null)
+  const [claimSearch, setClaimSearch] = useState('')
+  if (claimsBase !== data.accountingHandPostClaims) {
+    setClaimsBase(data.accountingHandPostClaims)
+    setClaims(data.accountingHandPostClaims)
+    setClaimsCursor(data.accountingHandPostClaimsNextCursor)
+    setClaimsTotal(data.summary.accountingHandPostClaims)
+    setClaimsMatched(null)
+    setClaimSearch('')
+  }
+
+  /** One page of claims, appended (walking) or replacing (a new lookup, or restarting the walk). */
+  function loadClaims(options: { cursor: string | null; search: string; append: boolean }) {
+    setError('')
+    startTransition(async () => {
+      const page = await listAccountingHandPostClaimsAction({ cursor: options.cursor, search: options.search })
+      setClaims((current) => (options.append ? [...current, ...page.claims] : page.claims))
+      setClaimsCursor(page.nextCursor)
+      setClaimsTotal(page.total)
+      setClaimsMatched(page.matched)
+    })
+  }
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -1023,14 +1063,37 @@ export function ExceptionsClient({ data }: Props) {
         section below is capped at the oldest 50 debts — which is exactly how a newer claim became unreachable.
         Its Release control acts on `refusalId`, so it works whether or not that refusal is rendered below.
       */}
-      {data.accountingHandPostClaims.length > 0 ? (
+      {claims.length > 0 || claimsTotal > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`Postings being settled by hand (${data.summary.accountingHandPostClaims})`}
+            title={`Postings being settled by hand (${claimsTotal})`}
             detail={ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL}
-            shown={data.accountingHandPostClaims.length}
-            total={data.summary.accountingHandPostClaims}
+            shown={claims.length}
+            total={claimsMatched ?? claimsTotal}
           />
+          {/* o3d-j625 r20: the LOOKUP. Reaching a claim must not depend on how many unrelated ones exist,
+              and walking pages to find one document is reachable in principle and unusable in practice. */}
+          <div className="space-y-1">
+            <Label htmlFor="hand-post-claim-search">{ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT}</Label>
+            <div className="flex gap-2">
+              <Input
+                id="hand-post-claim-search"
+                value={claimSearch}
+                placeholder="Order or PO number, posting type, or refusal id"
+                onChange={(event) => setClaimSearch(event.target.value)}
+                onKeyDown={(event) => { if (event.key === 'Enter') loadClaims({ cursor: null, search: claimSearch, append: false }) }}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={isPending}
+                onClick={() => loadClaims({ cursor: null, search: claimSearch, append: false })}
+              >
+                <Search className="h-3 w-3 mr-1" />Find
+              </Button>
+            </div>
+          </div>
           <Table>
             <TableHeader>
               <TableRow>
@@ -1043,7 +1106,7 @@ export function ExceptionsClient({ data }: Props) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {data.accountingHandPostClaims.map((claim) => (
+              {claims.map((claim) => (
                 <TableRow key={claim.refusalId}>
                   <TableCell className="text-xs">{claim.type}</TableCell>
                   <TableCell className="text-xs font-mono">{claim.referenceType}/{claim.referenceId}</TableCell>
@@ -1079,6 +1142,25 @@ export function ExceptionsClient({ data }: Props) {
               ))}
             </TableBody>
           </Table>
+          {/* o3d-j625 r20: the walk. Present EXACTLY when the server said a row beyond this page was read,
+              so an operator can always get to the far end — which is what makes the section's cap a page. */}
+          {claimsCursor ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={isPending}
+              onClick={() => loadClaims({ cursor: claimsCursor, search: claimSearch, append: true })}
+            >
+              Show more claims
+            </Button>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              {claimsMatched === null
+                ? 'That is every active claim.'
+                : `That is every active claim matching "${claimSearch}".`}
+            </p>
+          )}
         </Card>
       ) : null}
 

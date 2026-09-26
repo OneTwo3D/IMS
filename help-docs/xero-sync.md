@@ -2367,12 +2367,22 @@ Three things about those rows:
   A claim never times out, on purpose: one that lapsed on a timer would re-open exactly the interval it
   closes, leaving an operator in the ledger with IMS free to queue the posting again. So a claim ends only
   when somebody confirms the posting or releases it, and that is only safe if every claim can be found. That
-  section lists **all** of them — with who holds each one, how long it has been held, and how many postings
-  IMS has declined to queue behind it — independently of the refusal list below, which shows the *oldest 50
-  debts* and would otherwise hide a newer claim behind unrelated work. Anything held far longer than a hand
-  posting takes is flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
+  section is independent of the refusal list below, which shows the *oldest 50 debts* and would otherwise
+  hide a newer claim behind unrelated work. Each row shows who holds it, how long it has been held, and how
+  many postings IMS has declined to queue behind it. Anything held far longer than a hand posting takes is
+  flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
+
+  **Reaching a claim does not depend on how many there are.** The section shows a *page* of claims, oldest
+  claim first, and **Show more claims** walks to the end — it is a page, not a limit, and the heading states
+  the true total throughout. If you know the document, do not walk: the **Find** box goes straight to it. It
+  searches the **reference id** (an order or PO number), the **reference type**, the **posting type** and the
+  **refusal id** — it does **not** search the holder's name, so an empty result there is not evidence that
+  nobody holds the posting. Clearing the box returns to the first page.
+
   **Anybody with sync access may release anybody's claim**, which is the answer rather than an oversight: if
-  only the holder could, a claim taken by somebody who has left would suppress that posting for ever.
+  only the holder could, a claim taken by somebody who has left would suppress that posting for ever. The
+  Release control is on **every** row of that section, not only on your own, and each release is recorded as
+  a warning naming who released whose.
 
   **If the document is saved again while you hold it, the row does not close.** While your claim is held IMS
   declines to queue that posting — including a *later version* of the same document, on the entries where

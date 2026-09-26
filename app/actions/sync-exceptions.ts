@@ -1,5 +1,6 @@
 'use server'
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -147,21 +148,59 @@ const SECTION_LIMIT = 50
  * 50 older refusals standing, a holder who leaves could leave a NEWER claim outside the actionable UI
  * indefinitely — IMS goes on declining that posting and the inbox shows only an aggregate count.
  *
- * So the claims are their OWN section, with their own query, their own predicate and their own cap:
+ * So the claims are their OWN section, with their own query and their own predicate:
  *
  *   · the predicate is the claim (`handPostClaimedAt: { not: null }`), not the debt's age;
  *   · the ordering is OLDEST CLAIM FIRST, because a claim is stale by how long it has been held and
  *     `firstRefusedAt` says nothing about when it was taken;
- *   · the cap is {@link HAND_POST_CLAIM_LIMIT}, far above the refusal section's, and the page states the
- *     true total whenever it bites — so a claim cannot be hidden by the number of unrelated debts;
  *   · every row carries its holder, its AGE and a STALE flag, which is the only signal a claim without an
  *     expiry can have;
  *   · the Release control is offered on every one of them, whoever holds it. WHO MAY RELEASE ANOTHER
  *     OPERATOR'S CLAIM: ANYBODY WITH THE `sync` PERMISSION, and that is the answer rather than an omission.
  *     Restricting it to the holder would make a departed holder's claim a permanent suppression, which is the
  *     very failure this section exists to end. The release is logged at WARNING naming who released whose.
+ *
+ * ── o3d-j625 r20 (Codex round 19, HIGH) — AND A CAP IS A REACHABILITY LIMIT, WHATEVER ITS SIZE ──
+ *
+ * r18 gave the section a cap of its own — 500, against the refusal list's 50 — and argued that a number far
+ * above the other section's could not hide a claim. Round 19 took that apart in one sentence: with 500 older
+ * claims AND enough older refusals, a newer claim is in neither list, its holder can leave, the claim never
+ * expires, and the aggregate count gives nobody a way to act on it. The defect r18 fixed at 50 was
+ * reproduced at 500. RAISING THE NUMBER AGAIN IS NOT THE ANSWER — 5000 has the same shape and would be round
+ * 21's finding. What was wrong is that reachability was bounded at all.
+ *
+ * TWO ROUTES, and both are here because they answer different questions:
+ *
+ *   1. PAGINATION IS THE COMPLETENESS GUARANTEE. {@link HAND_POST_CLAIM_PAGE} is now a PAGE, not a cap:
+ *      every page carries a cursor to the next, so every active claim lies on exactly one page and every
+ *      page is reachable by walking. That makes "no claim is unreachable" a property of the ordering rather
+ *      than a claim about a number.
+ *
+ *      A KEYSET CURSOR OVER `(handPostClaimedAt, id)`, NOT `skip`/`take` AND NOT PRISMA'S `cursor`, and both
+ *      exclusions are load-bearing:
+ *        · OFFSET SHIFTS UNDER THE WALK. Release a claim on page 1 and every later row moves up one, so the
+ *          first row of page 2 is never returned — a claim made unreachable by the very act this section
+ *          exists to perform.
+ *        · PRISMA'S `cursor` REQUIRES THE CURSOR ROW TO STILL MATCH. It is positional within the filtered
+ *          result, so if the row the cursor names is RELEASED between pages it no longer satisfies
+ *          `handPostClaimedAt: { not: null }`, the cursor matches nothing, and the walk ends early with
+ *          every later claim unvisited. The keyset predicate compares VALUES, so it needs no surviving row.
+ *        · `id` IS IN THE SORT KEY AND IN THE CURSOR because `handPostClaimedAt` is not unique — two claims
+ *          taken in the same millisecond are ordered arbitrarily without it, and one of them can straddle a
+ *          page boundary and be skipped. A total order is what makes "exactly one page" true.
+ *
+ *   2. LOOKUP IS THE USABILITY GUARANTEE, and it is not decoration. Walking 50-row pages to find one
+ *      document is reachable in principle and unusable in practice, and an operator who has to release a
+ *      colleague's claim knows the ORDER or BILL, not its position in a queue. A lookup also does not depend
+ *      on the claim's place in ANY ordering, so it survives a re-ordering or a page-size change that
+ *      pagination alone would not. It matches the reference id, the posting type, the reference type and the
+ *      refusal id — {@link ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT} says exactly that on the page,
+ *      because a search box that does not say what it searches is one an operator cannot trust.
+ *
+ * WHAT IS STILL BOUNDED, said plainly: the number of rows rendered AT ONCE. Nothing is unreachable, which is
+ * the property; the first page being 50 rather than 500 is not.
  */
-const HAND_POST_CLAIM_LIMIT = 500
+const HAND_POST_CLAIM_PAGE = 50
 
 /**
  * When a held claim starts reading as STALE. Not an expiry and nothing acts on it: it is the age at which the
@@ -698,6 +737,11 @@ export type ExceptionInboxData = {
   accountingPostingRefusalsResolved: ResolvedAccountingPostingRefusalRow[]
   /** o3d-j625 r18 (Codex round 17, HIGH 2): every active hand-posting claim, independent of the list above. */
   accountingHandPostClaims: AccountingHandPostClaimRow[]
+  /**
+   * o3d-j625 r20 (Codex round 19, HIGH): the cursor to the NEXT page of claims, or `null` when this is the
+   * last. Its presence is what makes the section a WALK rather than a cap — see HAND_POST_CLAIM_PAGE.
+   */
+  accountingHandPostClaimsNextCursor: string | null
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -1073,7 +1117,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // threaded through, because the two loads are independent reads and a cutoff a few milliseconds
   // apart cannot change which side of a five-minute grace a row falls on.
   const followUpDatabaseNow = await readFollowUpObligationDatabaseNow(db)
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows, handPostClaimRows] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents, followUpObligationRows, postingRefusalRows] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
@@ -1218,22 +1262,6 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         handPostClaimedBy: true,
         // o3d-j625 r18: how many postings IMS has declined to queue behind this claim.
         handPostDeferredCount: true,
-      },
-    }),
-    /**
-     * o3d-j625 r18 (Codex round 17, HIGH 2) — THE ACTIVE CLAIMS, AS THEIR OWN QUERY.
-     *
-     * Its own predicate (the claim, not the debt's age), its own ordering (OLDEST CLAIM FIRST — a claim is
-     * stale by how long it has been held) and its own cap. Sharing the refusal list's query is the finding
-     * itself: a claim behind 50 older debts was unreachable, with no expiry to end it.
-     */
-    db.accountingPostingRefusal.findMany({
-      where: { resolvedAt: null, handPostClaimedAt: { not: null } },
-      orderBy: { handPostClaimedAt: 'asc' },
-      take: HAND_POST_CLAIM_LIMIT,
-      select: {
-        id: true, type: true, referenceType: true, referenceId: true, kind: true,
-        handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
       },
     }),
   ])
@@ -1451,6 +1479,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     )
   }
 
+  // o3d-j625 r20 (Codex round 19, HIGH): the first page of the active hand-post claims, through the SAME
+  // loader the page's "Show more" and its lookup call. Read before the object below so the object stays a
+  // projection and the walk's ordering lives in exactly one place.
+  const handPostClaimPage = await loadHandPostClaimPage({ viewerId })
   const data: Omit<ExceptionInboxData, 'summary' | 'maintenanceRecovery'> = {
     // o3d-2k5r r5: every field including the affordance comes from the shared rule — the client
     // receives the action's own answer rather than deriving one from `state`.
@@ -1597,33 +1629,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     /**
      * o3d-j625 r18 (Codex round 17, HIGH 2) — EVERY ACTIVE CLAIM, whether or not its refusal is on the page.
      *
-     * The age is computed here from the stored stamp rather than in the browser, so the STALE verdict the
-     * page shows and the number an operator reads cannot disagree with each other.
+     * o3d-j625 r20 (Codex round 19, HIGH): the FIRST PAGE of them, through the same loader the page's own
+     * "Show more" and lookup use, so the initial render and every later one cannot disagree about the
+     * ordering, the age or what a row carries — one query shape, three callers.
      */
-    accountingHandPostClaims: await (async () => {
-      const holders = await namesOfUsers(handPostClaimRows.map((row) => row.handPostClaimedBy))
-      const now = Date.now()
-      return handPostClaimRows.flatMap((row) => {
-        // The predicate above guarantees it; narrowed rather than asserted, so a widened query cannot ship a
-        // claim row with no claim time and an age of "now".
-        if (!row.handPostClaimedAt) return []
-        const heldForHours = (now - row.handPostClaimedAt.getTime()) / 3_600_000
-        return [{
-          refusalId: row.id,
-          type: row.type,
-          referenceType: row.referenceType,
-          referenceId: row.referenceId,
-          kind: row.kind,
-          at: row.handPostClaimedAt.toISOString(),
-          by: row.handPostClaimedBy,
-          byName: row.handPostClaimedBy ? (holders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
-          mine: row.handPostClaimedBy === viewerId,
-          heldForHours: Math.round(heldForHours * 10) / 10,
-          stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
-          deferredEdits: row.handPostDeferredCount,
-        }]
-      })
-    })(),
+    accountingHandPostClaims: handPostClaimPage.claims,
+    accountingHandPostClaimsNextCursor: handPostClaimPage.nextCursor,
   }
 
   return {
@@ -1836,6 +1847,166 @@ async function namesOfUsers(ids: Array<string | null>): Promise<Map<string, stri
  * and how: `queued` when IMS cleared the row by queueing the posting, `handled_manually` when someone marked
  * a MANUAL-ONLY row handled after posting it by hand.
  */
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r20 (Codex round 19, HIGH) — ONE PAGE OF ACTIVE HAND-POST CLAIMS, AND A WAY TO THE NEXT
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * The one query behind three callers — the inbox's first render, the page's "Show more", and the lookup —
+ * so the ordering the walk depends on, the age the STALE verdict is computed from and the fields the Release
+ * control needs cannot differ between them. See the block at {@link HAND_POST_CLAIM_PAGE} for why the cursor
+ * is a KEYSET over `(handPostClaimedAt, id)` rather than an offset or Prisma's own `cursor`, and why `id` is
+ * in the sort key.
+ */
+const HAND_POST_CLAIM_CURSOR_SEPARATOR = '|'
+
+/**
+ * `<ISO claim time>|<refusal id>`. Opaque to the client, which only ever hands back what it was given.
+ *
+ * An unparseable or unknown cursor is treated as NO cursor — the walk restarts at the oldest claim rather
+ * than returning nothing. Returning nothing would make every claim after a mangled cursor unreachable,
+ * which is this round's finding arriving through its own remedy.
+ */
+function decodeHandPostClaimCursor(cursor: string | null | undefined): { at: Date; id: string } | null {
+  if (typeof cursor !== 'string' || cursor === '') return null
+  const separator = cursor.indexOf(HAND_POST_CLAIM_CURSOR_SEPARATOR)
+  if (separator <= 0) return null
+  const at = new Date(cursor.slice(0, separator))
+  const id = cursor.slice(separator + 1)
+  if (Number.isNaN(at.getTime()) || id === '') return null
+  return { at, id }
+}
+
+function encodeHandPostClaimCursor(row: { handPostClaimedAt: Date; id: string }): string {
+  return `${row.handPostClaimedAt.toISOString()}${HAND_POST_CLAIM_CURSOR_SEPARATOR}${row.id}`
+}
+
+/**
+ * WHAT THE LOOKUP MATCHES. Stated here, rendered on the page verbatim
+ * ({@link ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT}), and asserted by a test — a search box that does
+ * not say what it searches is one an operator cannot trust, and "I searched and it was not there" must never
+ * be evidence that a claim does not exist.
+ *
+ * Deliberately NOT the holder's NAME: the name is resolved from the user table AFTER the rows are read, so
+ * matching on it here would search the ids and silently miss every claim whose holder was searched for by
+ * name. A holder-scoped view is a different feature and is not pretended to exist.
+ */
+function handPostClaimSearchWhere(search: string): Prisma.AccountingPostingRefusalWhereInput {
+  return {
+    OR: [
+      { id: search },
+      { referenceId: { contains: search, mode: 'insensitive' } },
+      { referenceType: { contains: search, mode: 'insensitive' } },
+      { type: { contains: search, mode: 'insensitive' } },
+    ],
+  }
+}
+
+export type AccountingHandPostClaimPage = {
+  claims: AccountingHandPostClaimRow[]
+  /** `null` when this page is the last one. Handed back verbatim to get the next. */
+  nextCursor: string | null
+  /** Every active claim, unfiltered — so the section can say how many exist, not how many it drew. */
+  total: number
+  /** How many match the lookup, or `null` when there was none. */
+  matched: number | null
+}
+
+async function loadHandPostClaimPage(params: {
+  viewerId: string
+  cursor?: string | null
+  search?: string | null
+  now?: Date
+}): Promise<AccountingHandPostClaimPage> {
+  const search = typeof params.search === 'string' ? params.search.trim() : ''
+  const after = decodeHandPostClaimCursor(params.cursor)
+  const active: Prisma.AccountingPostingRefusalWhereInput = { resolvedAt: null, handPostClaimedAt: { not: null } }
+  const filtered: Prisma.AccountingPostingRefusalWhereInput = search === ''
+    ? active
+    : { AND: [active, handPostClaimSearchWhere(search)] }
+  /**
+   * THE KEYSET PREDICATE. Strictly after `(at, id)` in the same total order the rows are sorted by, so it
+   * names a POSITION IN THE ORDER rather than a row that has to still be there: a claim released between two
+   * pages cannot end the walk, and nothing is skipped when the set shrinks under it.
+   */
+  const where: Prisma.AccountingPostingRefusalWhereInput = after === null
+    ? filtered
+    : {
+        AND: [
+          filtered,
+          { OR: [{ handPostClaimedAt: { gt: after.at } }, { handPostClaimedAt: after.at, id: { gt: after.id } }] },
+        ],
+      }
+  const [rows, total, matched] = await Promise.all([
+    db.accountingPostingRefusal.findMany({
+      where,
+      // BOTH keys, in this order: `handPostClaimedAt` is not unique, and without `id` two claims taken in the
+      // same millisecond are ordered arbitrarily — enough for one of them to straddle a page boundary and
+      // never be returned. A total order is what makes "every claim is on exactly one page" true.
+      orderBy: [{ handPostClaimedAt: 'asc' }, { id: 'asc' }],
+      // One more than the page, so "is there a next page" is answered by what was read rather than by
+      // comparing a count taken at another instant.
+      take: HAND_POST_CLAIM_PAGE + 1,
+      select: {
+        id: true, type: true, referenceType: true, referenceId: true, kind: true,
+        handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
+      },
+    }),
+    db.accountingPostingRefusal.count({ where: active }),
+    search === '' ? Promise.resolve(null) : db.accountingPostingRefusal.count({ where: filtered }),
+  ])
+  const page = rows.slice(0, HAND_POST_CLAIM_PAGE)
+  const last = page.length > 0 ? page[page.length - 1] : null
+  const holders = await namesOfUsers(page.map((row) => row.handPostClaimedBy))
+  const now = (params.now ?? new Date()).getTime()
+  return {
+    claims: page.flatMap((row) => {
+      // The predicate guarantees it; narrowed rather than asserted, so a widened query cannot ship a claim
+      // row with no claim time and an age of "now".
+      if (!row.handPostClaimedAt) return []
+      const heldForHours = (now - row.handPostClaimedAt.getTime()) / 3_600_000
+      return [{
+        refusalId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        kind: row.kind,
+        at: row.handPostClaimedAt.toISOString(),
+        by: row.handPostClaimedBy,
+        byName: row.handPostClaimedBy ? (holders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
+        mine: row.handPostClaimedBy === params.viewerId,
+        heldForHours: Math.round(heldForHours * 10) / 10,
+        stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
+        deferredEdits: row.handPostDeferredCount,
+      }]
+    }),
+    // A next cursor EXACTLY when a row beyond this page was read. Never derived from `total`, which is
+    // counted in another statement and would advertise a page that is not there (or hide one that is).
+    nextCursor: rows.length > page.length && last?.handPostClaimedAt ? encodeHandPostClaimCursor({ handPostClaimedAt: last.handPostClaimedAt, id: last.id }) : null,
+    total,
+    matched,
+  }
+}
+
+/**
+ * o3d-j625 r20 (Codex round 19, HIGH) — WALK THE ACTIVE CLAIMS, OR LOOK ONE UP.
+ *
+ * `requirePermission('sync')`, not `requireFreshPermission`: this is the same READ the page already performs
+ * on load, and demanding a re-authentication to turn a page would make the far side of the walk harder to
+ * reach — the opposite of what this round is for. The Release it leads to is the write, and that one is
+ * fresh-gated as it always was.
+ */
+export async function listAccountingHandPostClaimsAction(
+  params?: { cursor?: string | null; search?: string | null },
+): Promise<AccountingHandPostClaimPage> {
+  const viewer = await requirePermission('sync')
+  return await loadHandPostClaimPage({
+    viewerId: viewer.user.id,
+    cursor: typeof params?.cursor === 'string' ? params.cursor : null,
+    search: typeof params?.search === 'string' ? params.search : null,
+  })
+}
+
 async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingRefusalRow[]> {
   const rows = await db.accountingPostingRefusal.findMany({
     where: { resolvedAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } },

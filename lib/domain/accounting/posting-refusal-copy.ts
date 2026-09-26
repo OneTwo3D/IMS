@@ -104,9 +104,21 @@ export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL =
   'Postings an operator has taken to settle BY HAND. While a posting is held here IMS will not queue it — that '
   + 'is what stops it reaching the ledger twice — and a claim never expires, so it ends only when somebody '
-  + 'confirms the posting or releases it. Every active claim is listed here whatever its refusal\'s age, with '
-  + 'how long it has been held. ANYBODY with sync access may release ANYBODY\'s claim, deliberately: otherwise '
-  + 'a claim taken by someone who has left would suppress that posting for ever. Releases are recorded.'
+  + 'confirms the posting or releases it. EVERY active claim is reachable from here, oldest claim first: this '
+  + 'is a page, not a limit — "Show more" walks to the end, and the lookup goes straight to one. ANYBODY with '
+  + 'sync access may release ANYBODY\'s claim, deliberately: otherwise a claim taken by someone who has left '
+  + 'would suppress that posting for ever. Releases are recorded.'
+
+/**
+ * o3d-j625 r20 (Codex round 19, HIGH) — WHAT THE LOOKUP SEARCHES, said on the page.
+ *
+ * A search box that does not say what it searches is one an operator cannot trust, and "I searched and it was
+ * not there" must never be evidence that a claim does not exist. It is the same list
+ * `handPostClaimSearchWhere` builds, and a test holds the two together.
+ */
+export const ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT =
+  'Find a claim by the document it is for — the reference id (an order or PO number), the reference type, the '
+  + 'posting type, or the refusal id. NOT the holder\'s name. Clearing the box returns to the first page.'
 
 /** What "held a long time" means on the section above — a signal to look, never an expiry that acts. */
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE =
