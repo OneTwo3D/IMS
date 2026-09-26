@@ -123,6 +123,26 @@ proof the database is disposable (see "WHAT A MARKER PROVES" below). All of thes
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
+**THE SAME STAMP GATES THE ONE PRODUCTION SWEEP THIS TIER DRIVES (o3d-1q28).** Some lanes have to run
+a real production function that is a SWEEP over the globally oldest rows rather than over the caller's
+fixtures, and `purgeExpiredActivityLogs` (`lib/activity-log-cleanup.ts`) takes no client and no
+predicate at all: it is an unbounded oldest-first `DELETE FROM activity_logs` loop. Two things stop it
+reaching a real database:
+
+* `tests/concurrency/withheld-marker-durability.concurrent.test.ts` PROVISIONS ITS OWN DATABASE
+  (`tests/helpers/throwaway-database.ts`), stamps it, points `DATABASE_URL` at it before `@/lib/db` is
+  first imported, and drops it in a `finally` — so the sweep's "globally oldest rows" are the lane's own
+  fixtures and nothing else; AND
+* the sweep itself REFUSES, naming the database, when `RUN_DB_CONCURRENCY_TESTS=1` and the database it
+  reached does not carry the stamp. Pointing a lane at its own database is configuration, and
+  configuration being wrong was the whole defect. With the tier flag unset the check is one
+  `process.env` comparison and no round trip, so a production retention cron is unaffected — a real
+  database is never stamped, and a sweep that refused to run against production would be a worse
+  defect than the one this closes.
+
+The stamp text has ONE definition, `lib/disposable-database-marker.ts`, which the tier guard above and
+the sweep both read.
+
 **WHAT A MARKER PROVES, AND NOTHING MORE:** a marker is evidence that someone who owns the database
 deliberately wrote this exact sentence naming this exact database — not that the stamper ran, and not
 that the database was empty. The guard compares one string, the text is a constant in this repository,
