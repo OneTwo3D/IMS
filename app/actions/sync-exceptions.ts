@@ -1504,9 +1504,25 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
       action: 'accounting_posting_refusal_marked_handled',
       level: 'INFO',
       description:
-        `Marked a refused ${result.kind} posting as handled — posted by hand in the ledger. IMS will not post it`
+        `Marked a refused ${result.kind} posting as handled — posted by hand in the ledger. `
+        // o3d-j625 r13 (independent review, HIGH) — SAY WHICH OF THE TWO THIS WAS.
+        //
+        // "IMS will not post it" was written for a suppression that covers ONE posting for ever, and it
+        // was the only sentence an operator ever saw. On a REUSED posting key (an invoice or bill update,
+        // a bill payment) it was also false about the future: the same sentence covered every LATER edit
+        // of that document, silently. Those kinds no longer suppress at all, so the copy now states which
+        // of the two happened rather than implying the stronger one.
+        + (result.suppressed
+          ? 'IMS will not post this posting again'
+          : 'IMS will not re-post this edit, and a LATER edit of this document will be queued as usual — '
+            + 'this posting key is one successive edits share')
         + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.'),
-      metadata: { refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed, cancelledSyncRows: result.cancelledSyncRows },
+      metadata: {
+        refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed,
+        cancelledSyncRows: result.cancelledSyncRows,
+        // The machine-readable half of the sentence above: whether a permanent suppression was written.
+        suppressed: result.suppressed,
+      },
       resolveUser: false,
     })
     revalidatePath('/sync/exceptions')

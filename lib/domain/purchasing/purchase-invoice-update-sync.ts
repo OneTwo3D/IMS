@@ -52,6 +52,15 @@ type QueueAccountingSyncTxParams = {
    * so omitting it would let the real parameter be satisfied by an `undefined` that type-checks.
    */
   documentConnector: StoredAccountingConnector | null
+  /**
+   * o3d-j625 r13 (independent review, HIGH) — THE REASON, not just the boolean.
+   *
+   * `queueAccountingSyncTx` answers `true` for `handled-by-hand` as well as for a row it wrote, and both
+   * are correct answers to "does a GL counterpart exist" — one because IMS queued it, one because a human
+   * posted it. They are NOT the same answer to "did IMS write a row", and the transit-subledger movement
+   * below is keyed to a row. Declared here so the injected enqueue is checked against it too.
+   */
+  reportOutcome?: (outcome: { queued: boolean; reason?: string }) => void
 }
 
 // 6oyu.4 (khdw): a bill edit reposts to Xero, changing the NET (transit) leg from the
@@ -217,6 +226,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   if (verdict.verdict === 'chart-retired') return 'refused-chart-retired'
   if (verdict.verdict !== 'post') return 'skipped-disabled'
 
+  const enqueued: { reason?: string } = {}
   const queued = await params.deps.queueAccountingSyncTx(params.tx, {
     ...purchaseInvoiceUpdateEnqueueIdentity({
       poId: params.poId,
@@ -228,6 +238,9 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
     chartConnector: params.chartConnector,
     // o3d-j625 r3 (Codex HIGH 2): and whose bill the payload's `accountingInvoiceId` is.
     documentConnector: params.documentConnector,
+    // o3d-j625 r13: read the WHOLE answer, so the subledger below can tell "IMS queued it" from "a human
+    // posted it". An enqueue that answers `handled-by-hand` wrote no row.
+    reportOutcome: (outcome) => { enqueued.reason = outcome.reason },
   })
   // 6oyu.4 (khdw): the Xero update REPLACES the bill, so the transit GL debit moves
   // from the old net subtotal to the new one — record the signed delta (new − old).
@@ -236,7 +249,19 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   // number changed) is skipped by the recorder. The journal posts on the bill date.
   // Record on the queue's OWN decision (bcz9.4): only when it actually queued, so a
   // disabled type can't write a subledger row with no GL counterpart.
-  if (queued) {
+  //
+  // o3d-j625 r13 (independent review, HIGH) — AND `queued` IS NOT ENOUGH, BECAUSE ONE OF ITS TRUE VALUES
+  // MEANS "IMS WROTE NOTHING".
+  //
+  // `handled-by-hand` answers `queued: true` deliberately — a counterpart exists, a human posted it — and
+  // `postingIsOwed` is right to read it that way. It is the wrong answer to the question THIS write asks,
+  // which is "is there a GL journal for the movement I am about to record". The review's chain ended here:
+  // a suppressed posting answered `queued: true`, this recorded a transit movement of (new − previous), and
+  // the subledger then claimed a movement the GL never received, with `purchaseInvoiceUpdateIsOwed('queued')`
+  // false so nothing was recorded outstanding either. The scoping fix in posting-mark-handled.ts makes
+  // `handled-by-hand` unreachable for this type; this guard is what makes the shape unreachable whatever a
+  // later change does to that, because it asks about the row rather than about the counterpart.
+  if (queued && enqueued.reason !== 'handled-by-hand') {
     await params.deps.recordTransitSubledgerMovement(params.tx, {
       sourceType: 'PURCHASE_BILL_UPDATE',
       sourceRef: params.poId,

@@ -77,6 +77,44 @@ function payloadString(params: PostingKeyParams, field: string): string | null {
   return typeof value === 'string' && value !== '' ? value : null
 }
 
+/**
+ * ── o3d-j625 r13 (independent review, HIGH) — THE TYPES WHOSE POSTING KEY IS REUSED BY SUCCESSIVE,
+ *    DISTINCT POSTINGS ──
+ *
+ * For nearly every type the posting key names ONE posting for ever: one manufacturing journal per
+ * production order, one invoice per order, one realised-FX journal per bill payment. Three types are
+ * different BY DESIGN — the scope rules below say so in words — and on those the key is a name for an
+ * OBLIGATION ("the ledger holds the current version of this document") that successive postings
+ * discharge in turn.
+ *
+ * WHY THAT NEEDED A DECLARED SET RATHER THAN A COMMENT. `AccountingPostingRefusal.suppressedAt` is
+ * written once by `markPostingHandled` and cleared nowhere, and it is keyed on the POSTING KEY. On a
+ * reused key that is a one-way door across every FUTURE posting: an operator marks one refusal handled,
+ * the cause later clears, the document is edited again — and the new edit is silently suppressed, the
+ * enqueue answers `handled-by-hand`, and nothing is recorded as owed. IMS then holds edit n while the
+ * ledger holds edit 1, with no inbox row and no trace. The fact that made it possible lived only in prose
+ * here; it is data now, and `postingKeyIsReusedAcrossPostings` is what the mark asks.
+ *
+ * MEMBERSHIP IS A NECESSARY CONDITION THAT IS CHECKED (tests/accounting/posting-refusal-key.test.ts): a
+ * member's scope must be stable across two different payload contents, because a scope that varies with
+ * the content already distinguishes successive postings and cannot be reused by them. The converse —
+ * that no type outside this set is reused — is a statement about what each posting MEANS and is carried
+ * by the scope rules' own comments, one per type; it is enumerated, not inferred.
+ */
+export const REUSED_POSTING_KEY_TYPES: ReadonlySet<string> = new Set<AccountingSyncType>([
+  // "Successive edits of ONE invoice", below.
+  'SALES_INVOICE_UPDATE',
+  // "successive edits of one bill → one key", below.
+  'PURCHASE_INVOICE_UPDATE',
+  // "A bill is paid once; a reversed-then-repaid bill is the same obligation", below.
+  'BILL_PAYMENT',
+])
+
+/** Does this posting type's key name an obligation that successive DISTINCT postings discharge in turn? */
+export function postingKeyIsReusedAcrossPostings(type: AccountingSyncType | string): boolean {
+  return REUSED_POSTING_KEY_TYPES.has(String(type))
+}
+
 const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
   // One invoice per sales order. A retry is the same order → same key.
   SALES_INVOICE: DOCUMENT,

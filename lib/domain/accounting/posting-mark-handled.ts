@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
+import { accountingPostingKeyForRow, postingKeyIsReusedAcrossPostings } from '@/lib/accounting/posting-key'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
@@ -51,7 +51,13 @@ export type MarkHandledClient = PostingSuppressionClient & {
 }
 
 export type MarkHandledResult =
-  | { ok: true; cancelledSyncRows: string[]; kind: PostingRefusalKind }
+  /**
+   * o3d-j625 r13: `suppressed` says whether IMS will refuse this posting FOR EVER (the ordinary case) or
+   * only stop retrying the edit just posted by hand (a reused posting key — see the note at the write).
+   * Returned rather than inferred, because the operator-facing sentence differs and a caller cannot
+   * re-derive it without re-implementing the rule.
+   */
+  | { ok: true; cancelledSyncRows: string[]; kind: PostingRefusalKind; suppressed: boolean }
   | { ok: false; code: 'not_found' | 'already_resolved' | 'not_markable' | 'may_be_posted'; message: string }
 
 /**
@@ -134,6 +140,37 @@ export async function markPostingHandled(
     }
   }
   const markableKinds = (Object.keys(POSTING_REFUSAL_KINDS) as PostingRefusalKind[]).filter((kind) => postingRefusalMarkable(kind))
+  /**
+   * ── o3d-j625 r13 (independent review, HIGH) — THE SUPPRESSION IS NOT WRITTEN ON A REUSED POSTING KEY ──
+   *
+   * `suppressedAt` is written here and cleared NOWHERE (the migration says so: "set once by the mark,
+   * never cleared"), and it is keyed on the POSTING KEY. For nearly every type that key names one posting
+   * for ever, so "IMS will never post this" is exactly the operator's assertion made durable.
+   *
+   * For the three types whose key is REUSED by successive distinct postings
+   * (`postingKeyIsReusedAcrossPostings` — SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT) it
+   * is a one-way door across every FUTURE posting. The review executed it: mark one refusal handled, let
+   * the cause clear, edit the bill again — the new edit is suppressed silently, the enqueue answers
+   * `handled-by-hand`, `purchaseInvoiceUpdateIsOwed('queued')` is false, and a transit-subledger movement
+   * is written for a GL journal that was never queued. IMS holds edit n, the ledger holds edit 1, and
+   * nothing anywhere says so. That is the divergence enqueue-outcome.ts calls the worst outcome in the
+   * issue, reached through the remedy for it.
+   *
+   * WHY NOT-SUPPRESSING IS SAFE FOR EXACTLY THESE TYPES, which is what makes this the fix rather than a
+   * trade. Suppression exists to stop IMS posting a SECOND ledger entry beside the one a human made. All
+   * three of these postings OVERWRITE a document the ledger already holds — the Xero bill update replaces
+   * the bill (see the transit note in purchase-invoice-update-sync.ts), the invoice update replaces the
+   * invoice, and a bill payment settles an already-settled bill — so applying one again writes the same
+   * state rather than a second entry. The harm suppression prevents cannot arise; the harm it causes is
+   * real, silent and permanent. Every other markable kind is CREATE-shaped and still suppresses.
+   *
+   * THE ROW IS STILL RESOLVED, and the pending row is still cancelled: the operator's assertion is
+   * recorded, the debt is closed, and IMS does not re-post the edit they just posted by hand. What changes
+   * is only that a LATER, DIFFERENT posting on the same key is queued as usual — which is what the ledger
+   * needs, and what `clearing: 'retried'` already promises for these kinds ("Re-saving the bill queues the
+   * update again").
+   */
+  const keyIsReused = postingKeyIsReusedAcrossPostings(row.type)
   const resolved = await tx.accountingPostingRefusal.updateMany({
     where: { id: row.id, resolvedAt: null, kind: { in: markableKinds } },
     data: {
@@ -141,9 +178,9 @@ export async function markPostingHandled(
       resolution: 'handled_manually',
       resolvedBy: params.userId,
       resolutionNote: params.note,
-      suppressedAt: now,
+      ...(keyIsReused ? {} : { suppressedAt: now }),
     },
   })
   if (resolved.count === 0) throw new MarkHandledRaceError()
-  return { ok: true, cancelledSyncRows: cancelIds, kind: row.kind as PostingRefusalKind }
+  return { ok: true, cancelledSyncRows: cancelIds, kind: row.kind as PostingRefusalKind, suppressed: !keyIsReused }
 }
