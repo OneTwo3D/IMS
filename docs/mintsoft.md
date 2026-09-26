@@ -186,11 +186,17 @@ per-item `receivedQuantity`/`bookedQuantity` a seed can set, so an ASN that has 
 in is expressible. It previously served an invented `AsnId`/`Reference`/`Status`/`Lines` shape that
 agreed with the equally invented reader, which is how every e2e run passed.
 
-**A purchase-backed book-in that adds stock still fails at commit (o3d-gles):** the service writes its
-`PURCHASE_RECEIPT` movement with `referenceType: 'WmsAsnMap'` and
-`stock_movements_reporting_evidence_guard` accepts only `'PurchaseOrder'`. o3d-btiw was masking that —
-with every received quantity reading zero, the movement was never inserted. Transfer-backed book-ins
-write `TRANSFER_IN`, which the guard does not cover, and work.
+**A purchase-backed book-in commits, as of o3d-gles (#703).** It used to fail at commit: the service
+wrote its `PURCHASE_RECEIPT` movement with `referenceType: 'WmsAsnMap'` while
+`stock_movements_reporting_evidence_guard` accepts only `'PurchaseOrder'`, and o3d-btiw was masking
+that — with every received quantity reading zero, the movement was never inserted. The service now
+names the purchase order, so the guard's evidence join is satisfied by the cost layer the same
+transaction lays. Transfer-backed book-ins write `TRANSFER_IN`, which the guard does not cover.
+
+What a PO-backed book-in does NOT yet do is post the accounting: it writes no `STOCK_RECEIPT` journal
+and no transit subledger row, where the manual receipt path writes both. So stock and cost layers land
+while the transit account never drains. Tracked as **o3d-8f0p6** — until it lands, a PO-backed WMS
+book-in is correct in stock terms and incomplete in ledger terms.
 
 ### Purchase-order ASN lines are not landed-quantity aware yet
 
