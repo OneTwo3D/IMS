@@ -43,6 +43,8 @@ type FakeBill = {
   accountingInvoiceId: string | null
   /** o3d-wf86: how the link above was made. Undefined = never recorded (a pre-provenance row). */
   accountingInvoiceIdSource?: AccountingLinkSource | null
+  /** o3d-j625 r3: WHICH connector's bill the id is. Undefined = never recorded. */
+  accountingInvoiceConnector?: string | null
   createdAt: number
 }
 /** A competing PURCHASE_INVOICE sync row for the PO. Counted, not canned (see below). */
@@ -2267,15 +2269,16 @@ test('[o3d-9kek r8 f1] a non-transactional client is refused outright, not run u
 test('[o3d-9kek r7 f1] the holder table is derived from BACK_REFERENCE_PAIRS, not restated', () => {
   // r6 finding 2 was a restated list that silently dropped a document type. A second restated list
   // would be the same defect with a new name, so the (model, column) facts live on the pairs table.
-  assert.deepEqual(backReferenceHolder('SALES_INVOICE', 'SalesOrder'), { model: 'SalesOrder', column: 'accountingInvoiceId' })
-  assert.deepEqual(backReferenceHolder('CREDIT_NOTE', 'SalesOrderRefund'), { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' })
+  // o3d-j625 r3: and WHICH CONNECTOR'S document the id is, on every arm — see ExternalDocumentIdHolder.
+  assert.deepEqual(backReferenceHolder('SALES_INVOICE', 'SalesOrder'), { model: 'SalesOrder', column: 'accountingInvoiceId', connectorColumn: 'accountingInvoiceConnector' })
+  assert.deepEqual(backReferenceHolder('CREDIT_NOTE', 'SalesOrderRefund'), { model: 'SalesOrderRefund', column: 'accountingCreditNoteId', connectorColumn: 'accountingCreditNoteConnector' })
   // o3d-wf86: the PROVENANCE column rides on the same table, so the release path can clear the link
   // and the record of how it was made in one statement without a second per-model list. Only the
   // bill has one — it is the only document an id can be attributed to by DEDUCTION.
-  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseInvoice'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseInvoice'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', connectorColumn: 'accountingInvoiceConnector', sourceColumn: 'accountingInvoiceIdSource' })
   // A PO-keyed row names the ORDER; the id still lands on one of its bills.
-  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseOrder'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' })
-  assert.deepEqual(backReferenceHolder('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseOrder'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', connectorColumn: 'accountingInvoiceConnector', sourceColumn: 'accountingInvoiceIdSource' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), { model: 'SupplierCreditNote', column: 'accountingCreditNoteId', connectorColumn: 'accountingCreditNoteConnector' })
   assert.equal(backReferenceHolder('COGS_JOURNAL', 'Shipment'), null)
 })
 
@@ -2364,4 +2367,62 @@ test('[o3d-wf86] an operator relink records MANUAL, and the loser keeps no recor
     'a human comparing two documents is the strongest provenance there is, and recording it as a sync would lose it')
   assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceIdSource, null,
     'a bill with no link must not keep a record of how it acquired one — the next conflict report would read it as a claim')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — every link records WHOSE document it is, in the same statement.
+//
+// A connector-native document id survives a connector switch. Its connector is recorded beside it so a
+// later payment or update can ESTABLISH which ledger holds the document rather than infer it from the
+// active connector — and the enqueue refuses a payload whose provenance is missing or disagrees.
+// ---------------------------------------------------------------------------
+
+for (const connector of ['xero', 'quickbooks'] as const) {
+  test(`[o3d-j625 r3] every back-reference write records ${connector} as the document's connector, in the SAME data as the id`, async () => {
+    const cases = [
+      { type: 'SALES_INVOICE', referenceType: 'SalesOrder', idField: 'accountingInvoiceId', connectorField: 'accountingInvoiceConnector' },
+      { type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund', idField: 'accountingCreditNoteId', connectorField: 'accountingCreditNoteConnector' },
+      { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', idField: 'accountingInvoiceId', connectorField: 'accountingInvoiceConnector' },
+      { type: 'PURCHASE_CREDIT_NOTE', referenceType: 'SupplierCreditNote', idField: 'accountingCreditNoteId', connectorField: 'accountingCreditNoteConnector' },
+    ] as const
+    let examined = 0
+    for (const c of cases) {
+      const { deps, calls } = makeDeps({ bills: [{ id: 'doc-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }] })
+      const applied = await applyBackReference(deps, { connector, type: c.type, referenceType: c.referenceType, referenceId: 'doc-1', externalId: 'EXT-1' })
+      assert.equal(applied.outcome, 'applied', `PRECONDITION ${c.type}: the write happened`)
+      assert.equal(calls.lastUpdateData?.[c.idField], 'EXT-1', `PRECONDITION ${c.type}: this data is the id write`)
+      assert.equal(calls.lastUpdateData?.[c.connectorField], connector, `${c.type}: the connector is written with the id`)
+      examined++
+    }
+    assert.equal(examined, 4, 'all four holder models were examined')
+  })
+}
+
+test('[o3d-j625 r3] the PO-keyed repair records the connector too, in the compare-and-swap that writes the id', async () => {
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [{ id: 'log-1', connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'QBILL-1' }],
+  })
+  const applied = await applyBackReference(deps, { connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'QBILL-1' })
+  assert.equal(applied.outcome, 'applied')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceId, 'QBILL-1')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceConnector, 'quickbooks')
+})
+
+test('[o3d-j625 r3] a released claim does not keep the connector of a link it no longer holds', async () => {
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', accountingInvoiceConnector: 'xero', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }, recordRelease)
+
+  assert.equal(result.outcome, 'relinked', 'PRECONDITION: the release and relink ran')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null, 'PRECONDITION: the id was released')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceConnector, null,
+    'the enqueue reads this column as provenance, so a stale value on an unlinked bill would be believed')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceConnector, RELEASE_PARAMS.connector,
+    'and the relinked bill records the connector of the document it now holds')
 })

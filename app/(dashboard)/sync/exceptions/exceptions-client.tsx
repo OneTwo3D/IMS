@@ -1,6 +1,15 @@
 'use client'
 
 import { Fragment, useState, useTransition } from 'react'
+import {
+  ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING,
+  ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
+  ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
+  ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
+  ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
+  ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
+} from '@/lib/domain/accounting/posting-refusal-copy'
+import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
@@ -25,6 +34,9 @@ import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
   dismissWithdrawnDispatch,
+  claimAccountingPostingRefusalForHandPostingAction,
+  markAccountingPostingRefusalHandledAction,
+  releaseAccountingPostingRefusalHandPostClaimAction,
   endHeldMaintenanceWindow,
   recordWithdrawnDespatch,
   runPostMaintenanceRecheckNow,
@@ -75,6 +87,15 @@ export function ExceptionsClient({ data }: Props) {
   const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
   const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
+  // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
+  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [markingNote, setMarkingNote] = useState('')
+  /**
+   * o3d-j625 r16 (Codex round 15, HIGH 1): the two halves of settling a posting by hand that are NOT the
+   * acknowledgement — taking it (which is what stops IMS queueing it) and giving it back.
+   */
+  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string } | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -110,6 +131,98 @@ export function ExceptionsClient({ data }: Props) {
   return (
     <div className="space-y-4">
       {stepUpDialog}
+      {claimingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setClaimingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Take {claimingRefusal.label} for hand posting</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING}</p>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setClaimingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                disabled={isPending}
+                onClick={() => {
+                  const target = claimingRefusal
+                  runAction(
+                    () => claimAccountingPostingRefusalForHandPostingAction(target.id),
+                    'Taken for hand posting — IMS will not queue this posting while you hold it.',
+                  )
+                  setClaimingRefusal(null)
+                }}
+              >
+                <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+      {releasingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setReleasingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Release {releasingRefusal.label}</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING}</p>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setReleasingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isPending}
+                onClick={() => {
+                  const target = releasingRefusal
+                  runAction(
+                    () => releaseAccountingPostingRefusalHandPostClaimAction(target.id),
+                    'Released — IMS may queue this posting again.',
+                  )
+                  setReleasingRefusal(null)
+                }}
+              >
+                <XCircle className="h-3 w-3 mr-1" />Release
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+      {markingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setMarkingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Mark {markingRefusal.label} as handled</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING}</p>
+            <div className="space-y-1">
+              <Label htmlFor="refusal-handled-note">Note (optional) — e.g. the ledger journal number</Label>
+              <Input
+                id="refusal-handled-note"
+                value={markingNote}
+                maxLength={POSTING_REFUSAL_NOTE_MAX_LENGTH}
+                onChange={(event) => setMarkingNote(event.target.value)}
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setMarkingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                disabled={isPending}
+                onClick={() => {
+                  const target = markingRefusal
+                  runAction(
+                    () => markAccountingPostingRefusalHandledAction(target.id, markingNote),
+                    'Marked as handled.',
+                  )
+                  setMarkingRefusal(null)
+                  setMarkingNote('')
+                }}
+              >
+                <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {recordingPark ? (
         <RecordRefundManuallyDialog
           row={recordingPark}
@@ -890,6 +1003,146 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
                   <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.accountingPostingRefusals.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`Accounting postings IMS refused to queue (${data.summary.accountingPostingRefusals})`}
+            /*
+             * o3d-j625 r4/r5. Every sentence a refusal shows below is the REFUSING SITE's own — the reason,
+             * what stands in IMS and the remedy are columns on the row, so this page cannot drift into a
+             * second account of the same event. What is true of EVERY row in the section is the one exported
+             * string below (review M-6: r4 wrote it as a literal here, which is the shape the sibling
+             * section's guard bans, and for the same reason).
+             */
+            detail={ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL}
+            shown={data.accountingPostingRefusals.length}
+            total={data.summary.accountingPostingRefusals}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>Built for / active now</TableHead>
+                <TableHead>Owed since</TableHead>
+                <TableHead>What stands in IMS</TableHead>
+                <TableHead>What to do</TableHead>
+                <TableHead>How it clears</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingPostingRefusals.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">
+                    {row.type} <span className="text-muted-foreground">({row.reason})</span>
+                    {/* o3d-j625 r10: a provisional claim is not yet an established debt, and the row has to say so
+                        where the operator reads it, not only in the remedy column. */}
+                    {row.unconfirmed ? <div className="text-muted-foreground">Unconfirmed — not yet known to be owed</div> : null}
+                  </TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs">{row.chartConnector ?? 'none'} → {row.activeConnector ?? 'none'}</TableCell>
+                  <TableCell className="text-xs">
+                    {new Date(row.firstRefusedAt).toLocaleString()}
+                    {row.refusedCount > 1 ? <span className="text-muted-foreground"> ({row.refusedCount} attempts)</span> : null}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{row.committed}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground space-y-1">
+                    {/* o3d-j625 r16: WHAT TO DO FIRST, above the refusing site's own remedy — which is now
+                        rendered verbatim in every case (r14 used to rewrite it for a live row). The order is
+                        what carries the safety argument; the site's sentence says what the refusal was. */}
+                    {row.handPostOrder ? <div className="font-medium text-foreground">{row.handPostOrder}</div> : null}
+                    <div>{row.remedy}</div>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground space-y-1">
+                    {/* o3d-j625 r6 (review H4): the action exists ONLY on MANUAL-ONLY rows; the server refuses it on any other. */}
+                    <div>{row.clearing ? ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL[row.clearing] : ''}{row.clearingNote ?? 'Unclassified.'}</div>
+                    {/* o3d-j625 r16: settling by hand is a two-step ACT. Until the posting is taken there is
+                        no Mark-as-handled to press — the server refuses one without a claim, and offering a
+                        button that always refuses is the "instruction that ends in a refusal" r14 banned. */}
+                    {(row.clearing === 'manual' || row.clearing === 'retried') && row.handPostClaim === null ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                      >
+                        <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
+                      </Button>
+                    ) : null}
+                    {row.handPostClaim && !row.handPostClaim.mine ? (
+                      <div className="text-foreground">
+                        Being settled by hand by {row.handPostClaim.byName ?? 'another operator'} since {formatDateTime(row.handPostClaim.at)}.
+                      </div>
+                    ) : null}
+                    {row.handPostClaim?.mine ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` }) }}
+                      >
+                        <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
+                      </Button>
+                    ) : null}
+                    {row.handPostClaim ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                      >
+                        <XCircle className="h-3 w-3 mr-1" />Release
+                      </Button>
+                    ) : null}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.accountingPostingRefusalsResolved.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title="Refused postings resolved in the last 30 days"
+            detail={ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL}
+            shown={data.accountingPostingRefusalsResolved.length}
+            total={data.accountingPostingRefusalsResolved.length}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Document</TableHead>
+                <TableHead>Reference</TableHead>
+                <TableHead>Resolved</TableHead>
+                <TableHead>How</TableHead>
+                <TableHead>Note</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.accountingPostingRefusalsResolved.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell className="text-xs">{row.type}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
+                  <TableCell className="text-xs">{new Date(row.resolvedAt).toLocaleString()}</TableCell>
+                  <TableCell className="text-xs">
+                    {row.resolution === 'handled_manually'
+                      ? `Marked handled${row.resolvedByName ? ` by ${row.resolvedByName}` : ''}`
+                      : row.resolution === 'queued' ? 'Queued by IMS' : 'Resolved'}
+                  </TableCell>
+                  {/* Rendered as a text node, so React escapes it — the note is operator input. */}
+                  <TableCell className="text-xs text-muted-foreground">{row.resolutionNote ?? '—'}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

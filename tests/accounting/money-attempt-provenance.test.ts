@@ -225,11 +225,17 @@ test('every accounting sync row this codebase creates is created INSIDE custody 
   let sites = 0
   for (const file of files) {
     const text = await source(file)
-    for (const match of text.matchAll(/accountingSyncLog\.create\(\{/g)) {
+    // o3d-j625 r6 (review H3): every row is now created through `createAccountingSyncLogRow(client, data)`
+    // (lib/domain/accounting/sync-log-row.ts, which holds the one `accountingSyncLog.create` and passes
+    // `data` through untouched). So the DATA each caller hands it is what must carry custody; a direct
+    // create anywhere else is an offender outright (and fails tests/accounting/sync-log-row-primitive.test.ts).
+    if (file === 'lib/domain/accounting/sync-log-row.ts') continue
+    for (const match of text.matchAll(/createAccountingSyncLogRow\(\w+, \{/g)) {
       sites++
       const block = text.slice(match.index, text.indexOf('})', match.index))
       if (!block.includes('stampingCustodyOnCreate()')) offenders.push(`${file}:${match.index}`)
     }
+    for (const match of text.matchAll(/accountingSyncLog\.create\(\{/g)) offenders.push(`${file}:${match.index} (direct create)`)
   }
   assert.ok(sites >= 4, `expected the known creation sites, found ${sites}`)
   assert.deepEqual(offenders, [], 'every accountingSyncLog.create must spread stampingCustodyOnCreate()')

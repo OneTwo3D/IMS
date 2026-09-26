@@ -13,6 +13,7 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
+import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
@@ -419,8 +420,7 @@ async function createPendingSyncLog(
     params.payload,
     await activeAccountingIdProvenance(XERO_CONNECTOR),
   )
-  const log = await tx.accountingSyncLog.create({
-    data: {
+  const created = await createAccountingSyncLogRow(tx, {
       connector: XERO_CONNECTOR,
       type: params.type,
       status: 'PENDING',
@@ -440,8 +440,12 @@ async function createPendingSyncLog(
       // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
       // money-attempt-provenance.ts. A row created without it is never recycled again.
       ...stampingCustodyOnCreate(),
-    },
-  })
+    })
+  // o3d-j625 r7: a daily-batch journal has no refusal kind, so nothing can mark it handled and the
+  // primitive cannot suppress it. If that ever changes, this must decide what a suppressed batch means
+  // rather than carry on without a row.
+  if (!created) throw new Error(`Daily-batch journal ${params.type} ${params.referenceId} was suppressed as handled by hand, which no daily-batch posting can be.`)
+  const log = created
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
   })

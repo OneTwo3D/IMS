@@ -1,5 +1,6 @@
 'use server'
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import type { WmsOrderStatusView } from '@/app/actions/wms-order-status'
@@ -53,12 +54,15 @@ import {
   queueAccountingSync,
   queueAccountingSyncTxWithOutcome,
   getAccountingSettings,
+  getAccountingSettingsFor,
   getActiveAccountingConnectorInfo,
-  isAccountingSyncTypeEnabled,
   isAccountingSyncTypeEnabledFor,
   type AccountingEnqueueOutcome,
   type AccountingSettings,
+  asRoutableAccountingConnector,
 } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import {
   openRefundAccountingObligationLedger,
   type RefundAccountingObligation,
@@ -833,7 +837,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     // The TYPE's own posting mode, not just the connector flag: an installation that has payment sync
     // switched off expects no payment to post, and calling that a discrepancy would paint every paid
     // order permanently red for a setting someone chose on purpose.
-    isAccountingSyncTypeEnabled('INVOICE_PAYMENT').catch(() => false),
+    // o3d-j625 r4 (SWEEP 1): asked OF the connector read on the line above, not re-resolved — otherwise the
+    // verdict and the rows it is judged against could be two different connectors'.
+    (activeConnector ? isAccountingSyncTypeEnabledFor(activeConnector.id, 'INVOICE_PAYMENT') : Promise.resolve(false)).catch(() => false),
     loadInvoicePaymentSyncRows(so.id, activeConnector?.id ?? null, so.currency),
   ])
   const claimedForeign = claimedReceivedForeign(so)
@@ -1339,6 +1345,9 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       pricesIncludeVat: true,
       discountAmount: true,
       accountingInvoiceId: true,
+      // o3d-j625 r3 (Codex HIGH 2): and whose invoice it is, for the UPDATE arm below — the id survives a
+      // connector switch and the chart cannot speak for it.
+      accountingInvoiceConnector: true,
       invoiceNumber: true,
       lines: {
         select: {
@@ -1462,30 +1471,73 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       accountingInvoiceId: so.accountingInvoiceId,
     }
     const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
-    const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
-    const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled } = await import('@/lib/accounting')
+    // o3d-j625 r4 (Codex HIGH 4): the facade, not `queueXeroSync` — see sales-invoice-update-sync.ts.
+    const { getActiveAccountingConnectorInfo, queueAccountingSync: queueUpdate } = await import('@/lib/accounting')
     await queueSalesInvoiceUpdateForExistingAccountingInvoice({
       salesOrderId: so.id,
       orderNumber,
       accountingInvoiceId: so.accountingInvoiceId,
       payload: updatePayload,
       idempotencyKey,
+      // o3d-j625: the chart these account codes came from, so this helper's own resolution of the
+      // active connector cannot silently disagree with the one that produced them.
+      chartConnector: settings.connector,
+      // o3d-j625 r3 (Codex HIGH 2): and whose invoice `so.accountingInvoiceId` — the document this update
+      // is posted AGAINST — actually is. The chart cannot answer that: the id survives a switch.
+      documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
     }, {
       getActiveAccountingConnectorInfo,
-      isAccountingSyncTypeEnabled,
-      queueXeroSync,
+      queueAccountingSync: queueUpdate,
       logActivity,
+      // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
+      // r10: the outcome is deliberately dropped here — this site reports the refusal and has nothing
+      // to retry with, unlike the reconciler, which is the caller the return value exists for.
+      recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
     })
     return
   }
 
-  await queueAccountingSync({
+  // o3d-j625: `chartConnector` closes the window between the `getAccountingSettings()` above — which
+  // resolved the active connector and returned THAT connector's chart — and this enqueue, which used to
+  // resolve it again. Everything in `payload` between the two (`salesAccount` on every line,
+  // `shippingAccountCode`, `discountAccountCode`) is the first read's; the row used to be the last
+  // read's. It is not a lock: the row is now ROUTED by the same resolution the codes came from, so no
+  // window remains for them to disagree across. A chart whose connector has since been retired is
+  // refused and recorded by the facade (accounting_enqueue_refused_retired_chart) rather than posted to
+  // the wrong books; the invoice is re-queued by finalising the order again.
+  const invoiceEnqueued = await queueAccountingSync({
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: so.id,
     payload,
     idempotencyKey: accountingPayloadKey(`sales-invoice:${so.id}`, payload),
+    chartConnector: settings.connector,
   })
+  // o3d-j625 r3 (Codex HIGH 1 family) — AND THE ANSWER IS READ.
+  //
+  // This function returns `void`, and both callers go straight on to report the order created or
+  // finalised. A refusal — the chart was retired between the settings read above and this line — left
+  // the order finalised with no invoice queued, no warning, and nothing that retries: the enqueue
+  // RETURNS a refusal rather than throwing, so the callers' `catch` never saw it.
+  //
+  // Reported rather than thrown: finalising the order is a local decision the operator made and is not
+  // wrong; what is wrong is nobody being told the invoice did not go.
+  if (postingIsOwed(invoiceEnqueued)) {
+    await reportPostingNotQueued({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_not_queued',
+      // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+      kind: 'sales_invoice_order',
+      posting: `the sales invoice for ${orderNumber}`,
+      committed: 'the order is invoiced in IMS',
+      remedy:
+        // o3d-j625 r6 (review H4): a finalised order cannot be finalised again, so nothing raises this invoice again.
+        'Raise the invoice by hand in the books it belongs to.',
+      outcome: invoiceEnqueued,
+      metadata: { orderNumber, chartConnector: settings.connector },
+    })
+  }
 }
 
 export async function updateSalesOrderStatus(
@@ -1991,7 +2043,17 @@ async function queueRefundAccountingActions(input: {
     referenceId: input.refundId,
   }
   const ledger = await openRefundAccountingObligationLedger([creditNote, ...input.accountingSyncs], {
-    activeConnector: async () => (await getActiveAccountingConnectorInfo())?.id ?? null,
+    // o3d-j625 — THE LEDGER'S PIN IS THE CHART'S CONNECTOR, NOT A THIRD READ OF THE SAME QUESTION.
+    //
+    // This used to call `getActiveAccountingConnectorInfo()`, which made the hand-off resolve the active
+    // connector THREE times: once inside the `getAccountingSettings()` above (which is where every
+    // account code on the credit note comes from), once here, and once inside each `queueAccountingSync`.
+    // The ledger's r8 connector check compares the LAST two, so a switch committing between the chart
+    // read and this pin left both of them agreeing on the NEW connector — the credit note was written
+    // under it carrying the OLD connector's `salesAccount`/`shippingAccount`/`discountAccount`, and
+    // `settle()` cleared `accountingRetryRequired` over it. Pinning to the chart's own connector makes
+    // that agreement mean what the ledger claims it means.
+    activeConnector: async () => settings.connector,
     // r9: the EXPLICIT-CONNECTOR verdict. `isAccountingSyncTypeEnabled` resolves the active connector
     // for itself, so it cannot answer about the one this hand-off just pinned.
     isTypeEnabledFor: isAccountingSyncTypeEnabledFor,
@@ -2000,6 +2062,11 @@ async function queueRefundAccountingActions(input: {
   ledger.account(creditNote, await queueAccountingSync({
     ...creditNote,
     idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+    // o3d-j625: every `accountCode` below is `settings.*`, so the row is routed by the same resolution
+    // those codes came from. Where the chart's connector has since been retired the enqueue refuses,
+    // which the ledger records as an unmet obligation — `accountingRetryRequired` stays set and the
+    // caller reports the warning — instead of committing a credit note to books it does not describe.
+    chartConnector: settings.connector,
     payload: {
       creditNoteNumber: input.creditNoteNumber ?? undefined,
       contactName: cnContactName,
@@ -2032,6 +2099,40 @@ async function queueRefundAccountingActions(input: {
   }))
 
   for (const sync of input.accountingSyncs) {
+    // o3d-j625 r2 (Codex HIGH 2) — A REQUEST THAT CANNOT NAME ITS CHART IS REFUSED HERE, NOT ROUTED.
+    //
+    // Every request THIS build stages carries `chartConnector` — an id, or `null` for "nothing was
+    // switched on when the codes were read". Absent is the third state and it means only one thing: the
+    // request was persisted to `accountingRetrySyncs` before the field existed, so nothing knows which
+    // connector's account codes are in its payload. Both substitutes are wrong — resolving the active
+    // connector is the defect o3d-j625 closes, and `null` would claim the codes were the empty defaults
+    // when they were not (and `not-configured` is the one no-op the obligation ledger may settle with).
+    //
+    // So it is accounted as REFUSED without being handed to an enqueue: nothing is written, the
+    // obligation stays unmet, `ledger.settle()` throws, `accountingRetryRequired` stays set, and the
+    // record below tells an operator what has to be decided by hand.
+    if (sync.chartConnector === undefined) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: input.orderId,
+        action: 'refund_accounting_replay_unchartered',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `NOTHING WAS QUEUED. The staged ${sync.type} for refund ${input.refundId} was persisted before `
+          + 'IMS recorded which accounting connector a staged journal’s account codes came from, so its '
+          + 'chart cannot be established and routing it by whatever connector is active now could post '
+          + 'one ledger’s codes into the other’s books. This posting is still OUTSTANDING: check '
+          + 'whether it already posted, and if not raise it by hand from the refund’s own snapshots.',
+        metadata: { refundId: input.refundId, type: sync.type, referenceId: sync.referenceId },
+      }).catch(() => { /* the refusal below is what the ledger acts on; logging must not throw */ })
+      ledger.account(sync, { queued: false, reason: 'refused', connector: null })
+      continue
+    }
+    // Bound OUTSIDE the transaction callback below: TypeScript discards the narrowing above once the
+    // property is read inside a closure, and the point of the guard is that the three states are
+    // distinguished exactly once.
+    const chartConnector: AccountingConnectorId | null = sync.chartConnector
     if (sync.type === 'COGS_REVERSAL') {
       // r8: the WHOLE answer, not a bare boolean — see queueAccountingSyncTxWithOutcome. The default
       // is a refusal because an obligation whose enqueue never answered is owed, not settled; it is
@@ -2056,13 +2157,23 @@ async function queueRefundAccountingActions(input: {
         // row is written under — so the ledger can apply the same pinned-connector check it applies
         // to every facade answer. `queued` is the identical boolean the other call sites read, so the
         // COGS subledger row is still recorded on the queue's OWN decision.
-        const outcome = await queueAccountingSyncTxWithOutcome(tx, sync)
+        // o3d-j625 r2: `chartConnector` restated rather than left inside the spread — the staged
+        // request's own value (staging's chart read, possibly days old), never this hand-off's
+        // `settings.connector`. Named as an own property so the o3d-j625 census can see this site.
+        const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+          ...sync,
+          chartConnector,
+        })
         outcomeInTx = outcome
         await recordRefundCogsReversalFromSync(tx, sync, outcome.queued)
       })
       ledger.accountInTransaction(sync, outcomeInTx)
     } else {
-      ledger.account(sync, await queueAccountingSync(sync))
+      // o3d-j625: the staged request carries the chart ITS account codes were taken from — staging's
+      // own `accountingSettings` read, which is a different read from this hand-off's and may be days
+      // older on a retry. `sync.chartConnector`, never `settings.connector`: this journal's lines were
+      // not built from the chart read at the top of this function.
+      ledger.account(sync, await queueAccountingSync({ ...sync, chartConnector }))
     }
   }
 
@@ -2246,13 +2357,30 @@ export async function createRefund(
       // scjz.70: revenue-only chargeback (credit note reverses recognised revenue,
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
-      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-j625: derived from the chart read above, NOT resolved a second time. Staging stamps this
+      // value onto the allocation pin (`allocationProvedOnConnector`) and stamps the chart's own
+      // connector onto every staged request; two independent reads could make those two disagree for
+      // one refund, and the hand-off would then refuse a journal whose pin and account codes are in
+      // fact both Xero's. One read, one answer.
+      activeAccountingConnector: accountingSettings?.connector ?? undefined,
       // o3d-w00 (Codex r8 #6): the posted-VAT fence is gated on a credit note ACTUALLY being posted,
       // which is not the same as an accounting plugin being enabled — both connector queues no-op when
       // the connector's sync is off or its CREDIT_NOTE type is set to `off`. Gating on plugin
       // activation refused (and quarantined) refunds on stores that had deliberately turned
       // credit-note posting off, over a ledger entry nobody was going to write.
-      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
+      // o3d-j625: asked of the CHART'S connector, not of whichever is active by now —
+      // `isAccountingSyncTypeEnabled` resolves the connector for itself, which is the same second
+      // resolution one layer down, and this verdict gates the posted-VAT fence on a document whose
+      // account codes are already fixed.
+      creditNotePostingEnabled: accountingSettings
+        ? (accountingSettings.connector
+            ? await isAccountingSyncTypeEnabledFor(accountingSettings.connector, 'CREDIT_NOTE')
+            : false)
+        // The chart read above FAILED (`.catch(() => null)`), and "we could not find out" is not
+        // evidence that nothing posts — this boolean ARMS a money fence, so it stays armed. o3d-j625 is
+        // about removing a second resolution, not about relaxing this gate, and `false` here would have
+        // disarmed the posted-VAT fence on exactly the runs where least is known.
+        : true,
       enforcePerTargetBalances,
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
@@ -2886,11 +3014,16 @@ export async function retryRefundAccounting(
     const result = await retrySalesOrderRefundAccounting(db, {
       refundId,
       accountingSettings,
-      activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-j625: both of these come from the ONE chart read above. They used to be two further
+      // independent resolutions of "which connector is active", taken after the chart whose account
+      // codes this retry is about to re-post.
+      activeAccountingConnector: accountingSettings.connector ?? undefined,
       // o3d-w00 (Codex r8 #4): the retry is a route into a credit note in its own right, so it re-asks
       // both questions — will one post at all, and is the identity each line snapshotted still worth
       // the VAT the money bore — against the tax table as it stands now.
-      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
+      creditNotePostingEnabled: accountingSettings.connector
+        ? await isAccountingSyncTypeEnabledFor(accountingSettings.connector, 'CREDIT_NOTE')
+        : false,
     })
     if (!result.success) {
       const auditContext = await loadRefundAuditContext(refundId)
@@ -3657,8 +3790,10 @@ export async function addPayment(input: {
       metadata: { orderNumber: getSalesOrderReference(txResult.so), amount: input.amount, currency: input.currency, method: input.method },
     })
 
+    // o3d-j625 r5 (review M-12): which books the receipt was registered in, for the FX journal below.
+    const registeredFor: { connector: AccountingConnectorId | null } = { connector: null }
     if (!input.refundId) {
-      await registerInvoicePaymentWithLedger({
+      registeredFor.connector = await registerInvoicePaymentWithLedger({
         orderId: input.orderId,
         orderReference: getSalesOrderReference(txResult.so),
         paymentId: txResult.paymentId,
@@ -3675,7 +3810,15 @@ export async function addPayment(input: {
 
     if (!input.refundId) {
       try {
-        const accountingSettings = await getAccountingSettings()
+
+        // o3d-j625 r5 (review M-12): FOR THE CONNECTOR THE PAYMENT WAS REGISTERED UNDER, not a second
+        // resolution. r4 deferred this as "routed by its own chart, so internally consistent" — a proof of
+        // an adjacent property: internally consistent is not "in the same books as the settlement it is
+        // about", and the symmetric case (markBillPaid) was fixed in r4. `null` = nothing was registered,
+        // and the FX journal then follows the active connector exactly as before.
+        const accountingSettings = registeredFor.connector
+          ? await getAccountingSettingsFor(registeredFor.connector)
+          : await getAccountingSettings()
         const accounts = getRealisedFxAccounts(accountingSettings, 'receivable')
         if (accountingSettings.syncEnabled && accounts && txResult.so.currency !== txResult.baseCurrency) {
           const realised = computeRealisedFx({
@@ -3698,7 +3841,7 @@ export async function addPayment(input: {
             description: `Realised FX ${realised.outcome} on payment for ${getSalesOrderReference(txResult.so)}`,
           })
           if (lines.length > 0) {
-            await queueAccountingSync({
+            const fxEnqueued = await queueAccountingSync({
               type: 'REALISED_FX_JOURNAL',
               referenceType: 'Payment',
               referenceId: txResult.paymentId,
@@ -3717,7 +3860,33 @@ export async function addPayment(input: {
                 gainLossBase: realised.gainLossBase,
               },
               idempotencyKey: `realised-fx:payment:${txResult.paymentId}`,
+              // o3d-j625: `lines` carries `accounts.controlAccount` and `accounts.fxGainLossAccount`,
+              // both read off `accountingSettings` above. The window here is two statements of
+              // arithmetic rather than a payload build, and `isFxGainLossJournalSuppressed` re-decides
+              // at the enqueue — so the realistic outcome of a flip was "nothing written" rather than a
+              // mis-posting. Threaded anyway: it costs one field, and "not currently reachable" is what
+              // o3d-i0o6 round 7's check was before it was reached.
+              chartConnector: accountingSettings.connector,
             })
+            // o3d-j625 r3 (Codex HIGH 1 family): the surrounding `catch` swallows THROWS so a journal
+            // problem cannot block a captured payment — which is right, and which is exactly why the
+            // RETURNED refusal had to be read here. A refused realised-FX journal produced no throw, no
+            // warning and no row: the gain or loss on this payment simply vanished from the books.
+            if (postingIsOwed(fxEnqueued)) {
+              await reportPostingNotQueued({
+                entityType: 'SALES_ORDER',
+                entityId: input.orderId,
+                action: 'realised_fx_journal_not_queued',
+                // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+                kind: 'realised_fx_receipt',
+                posting: `the realised FX journal for the payment on ${getSalesOrderReference(txResult.so)}`,
+                committed: 'the payment is recorded in IMS',
+                remedy:
+                  'The realised gain/loss on this settlement is NOT in the ledger. Raise it by hand.',
+                outcome: fxEnqueued,
+                metadata: { paymentId: txResult.paymentId, chartConnector: accountingSettings.connector },
+              })
+            }
           }
         }
       } catch {

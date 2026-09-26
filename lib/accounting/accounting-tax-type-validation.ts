@@ -11,6 +11,8 @@
  * not cached), so it is the only connector where a stale display can drive a bad write.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+
 export type TaxTypeValidation = { ok: true } | { ok: false; error: string }
 
 /**
@@ -45,9 +47,22 @@ export function classifyXeroTaxType(
  * the reference cache). A no-op { ok: true } when the active connector is not Xero (QuickBooks codes are
  * not cached, so no stale-display risk) or when there is no active connector.
  */
-export async function validateAccountingTaxTypeForWrite(taxType: string): Promise<TaxTypeValidation> {
+/**
+ * o3d-j625 r5 (review L-11) — THE CONNECTOR IS AN ARGUMENT, BECAUSE THIS GATES A WRITE.
+ *
+ * This validates a tax type against the LIVE chart and its answer decides whether a tax rate may be saved.
+ * Resolving the active connector inside it made the validation and whatever the caller does next two
+ * independent answers to "which connector" — the shape this issue is about — and it was outside r4's
+ * declared resolver set for the same reason it was easy to miss: it reads as a pure validator. Callers that
+ * have already fixed a connector pass it; `undefined` keeps the old behaviour for callers that have not,
+ * and that resolution is now visible at the call rather than hidden here.
+ */
+export async function validateAccountingTaxTypeForWrite(
+  taxType: string,
+  connector?: AccountingConnectorId | null,
+): Promise<TaxTypeValidation> {
   const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
-  const active = await getActiveAccountingConnectorInfo()
+  const active = connector === undefined ? await getActiveAccountingConnectorInfo() : (connector ? { id: connector } : null)
   if (active?.id !== 'xero') return { ok: true }
   const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
   const live = await getXeroTaxRates() // LIVE — no allowCache

@@ -30,11 +30,17 @@ type HeldRow = {
 type Order = { id: string; invoiceNumber: string | null; accountingInvoiceId: string | null }
 
 const state = {
+  /** o3d-j625 r4: the exception inbox's refusal table, as rows rather than as calls. */
+  refusals: [] as Array<Record<string, unknown>>,
   held: [] as HeldRow[],
   orders: [] as Order[],
   queued: [] as { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }[],
   /** The connector being off: queueAccountingSync returns silently and writes nothing. */
   enqueueNoOps: false,
+  // o3d-j625 r5: the facade's own refusal — it records the row (specific reason, both connectors) and says so.
+  enqueueRefusesAndRecords: false,
+  // o3d-j625 r6: every enqueue's params, so a later sweep's posting key can be compared with a refused one's.
+  asked: [] as Array<Record<string, unknown>>,
   activity: [] as { action: string; description: string }[],
 }
 
@@ -59,6 +65,9 @@ function heldRow(overrides: Partial<HeldRow> & { id: string; entityId: string })
       orderNumber: 'WC-164981',
       metaKey: '_wcpdf_invoice_number',
       accountingPayload: { contactName: 'A Customer', date: '2026-08-01', currency: 'GBP', lines: [] },
+      // o3d-j625: whose chart the frozen account codes are. Present on every hold this build parks, and
+      // the release REFUSES a hold that cannot name one (o3d-j625 r2) — see the legacy-hold test below.
+      chartConnector: 'xero',
     },
     ...overrides,
   }
@@ -75,6 +84,18 @@ function matchesHeld(row: HeldRow, where: Record<string, unknown>): boolean {
   if (where.entityId !== undefined && row.entityId !== where.entityId) return false
   const reason = (row.payload as { reason?: string } | null)?.reason
   return reason === payload?.equals
+}
+
+const applyRefusalUpdate = (row: Record<string, unknown>, update: Record<string, unknown>): void => {
+  for (const [key, value] of Object.entries(update)) {
+    // Prisma's atomic increment, modelled — the row's attempt count is an assertion below, and a double
+    // that stored the operator object instead of applying it would make that assertion meaningless.
+    if (value && typeof value === 'object' && 'increment' in (value as object)) {
+      row[key] = Number(row[key] ?? 0) + Number((value as { increment: number }).increment)
+    } else {
+      row[key] = value
+    }
+  }
 }
 
 mock.module('@/lib/db', {
@@ -97,6 +118,34 @@ mock.module('@/lib/db', {
         findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
           state.orders.filter((o) => where.id.in.includes(o.id)),
       },
+      // o3d-j625 r4: the exception inbox's own table. Modelled (upsert semantics, not a spy) because the
+      // assertion below is that a refusal is SELECTABLE as outstanding work, which is a property of the
+      // stored row, not of a call having been made.
+      accountingPostingRefusal: {
+        // o3d-j625 r5: the r5 key — four columns, `scope` included — and `updateMany` honouring the
+        // `resolvedAt` predicate it is given. r4's double matched `resolvedAt === null` whatever it was asked,
+        // so the episode reset (`resolvedAt: { not: null }`) zeroed an OPEN row's count on every attempt.
+        upsert: async ({ where, create, update }: { where: { type_referenceType_referenceId_scope: { type: string; referenceType: string; referenceId: string; scope: string } }; create: Record<string, unknown>; update: Record<string, unknown> }) => {
+          const key = where.type_referenceType_referenceId_scope
+          const existing = state.refusals.find((r) => r.type === key.type && r.referenceType === key.referenceType && r.referenceId === key.referenceId && ((r as { scope?: string }).scope ?? '') === key.scope)
+          if (existing) { applyRefusalUpdate(existing, { ...update, resolvedAt: null }); return existing }
+          const row = { refusedCount: 1, ...create, resolvedAt: null } as Record<string, unknown>
+          state.refusals.push(row as never)
+          return row
+        },
+        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+          // o3d-j625 r9: three predicates now, and an ABSENT one constrains nothing — the record's own
+          // update names neither `resolvedAt` nor an id, and carries `suppressedAt: null`.
+          const wantResolved = where.resolvedAt !== null && typeof where.resolvedAt === 'object'
+          const hits = state.refusals.filter((r) =>
+            r.type === where.type && r.referenceType === where.referenceType && r.referenceId === where.referenceId
+            && ((r as { scope?: string }).scope ?? '') === (where.scope ?? '')
+            && (where.resolvedAt === undefined ? true : wantResolved ? r.resolvedAt !== null : r.resolvedAt === null)
+            && (where.suppressedAt === undefined ? true : ((r as { suppressedAt?: unknown }).suppressedAt ?? null) === null))
+          for (const hit of hits) applyRefusalUpdate(hit as unknown as Record<string, unknown>, data)
+          return { count: hits.length }
+        },
+      },
       accountingSyncLog: {
         findFirst: async ({ where }: { where: Record<string, unknown> }) => {
           const key = (where.payload as { path: string[]; equals: string }).equals
@@ -117,9 +166,17 @@ mock.module('@/lib/activity-log', {
 mock.module('@/lib/accounting', {
   namedExports: {
     queueAccountingSync: async (params: { referenceId: string; idempotencyKey: string; payload: Record<string, unknown> }) => {
+      state.asked.push(params as unknown as Record<string, unknown>)
       // Returns void and returns EARLY — silently — when the connector is off. That is the state
       // the whole sweep exists for.
       if (state.enqueueNoOps) return
+      if (state.enqueueRefusesAndRecords) {
+        const posting = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: params.referenceId, scope: '' }
+        const existing = state.refusals.find((r) => r.referenceId === params.referenceId && r.resolvedAt === null)
+        if (existing) existing.refusedCount = Number(existing.refusedCount) + 1
+        else state.refusals.push({ ...posting, chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'chart_retired', refusedCount: 1, resolvedAt: null })
+        return { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks', refusalRecorded: true, posting }
+      }
       state.queued.push({ referenceId: params.referenceId, idempotencyKey: params.idempotencyKey, payload: params.payload })
     },
   },
@@ -132,11 +189,19 @@ async function sweep(...args: Parameters<Sweep>): ReturnType<Sweep> {
   return mod.retryHeldWcSalesInvoiceReleases(...args)
 }
 
+/** The inbox's own predicate: an OPEN refusal is one with no resolvedAt. */
+function outstanding(): Array<Record<string, unknown>> {
+  return state.refusals.filter((row) => row.resolvedAt === null)
+}
+
 function reset() {
+  state.refusals = []
   state.held = []
   state.orders = []
   state.queued = []
   state.enqueueNoOps = false
+  state.enqueueRefusesAndRecords = false
+  state.asked = []
   state.activity = []
 }
 
@@ -178,6 +243,45 @@ test('the failure that has no other driver — connector off — is retried on t
   assert.equal(second.released, 1)
   assert.equal(state.held[0].status, 'SYNCED')
   assert.equal(state.queued.length, 1, 'the deterministic key means the retry adds one row, not two')
+})
+
+/**
+ * o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
+ *
+ * The gap between parking a hold and releasing it is not a race: it is however long WooCommerce takes
+ * to number the order, which can be days. A hold parked before `chartConnector` was recorded has REAL
+ * account codes frozen in it and no way to say whose they are, so both substitutes are wrong —
+ * resolving the active connector at release time is the o3d-j625 defect across a days-wide window, and
+ * `null` would claim the codes were the empty defaults. Nothing is queued and the reason is recorded.
+ */
+test('o3d-j625 r2: a LEGACY hold that cannot name its chart is NOT released, and says why', async () => {
+  reset()
+  const row = heldRow({ id: 'hold-legacy', entityId: 'so-1' })
+  delete (row.payload as { chartConnector?: unknown }).chartConnector
+  state.held.push(row)
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+
+  const result = await sweep()
+
+  assert.equal(state.queued.length, 0, 'NOTHING may be queued for a payload whose chart nobody recorded')
+  assert.equal(result.released, 0)
+  assert.equal(result.stillStuck, 1, 'it is owed, and must be counted as owed')
+  assert.equal(state.held[0].status, 'PENDING', 'left PENDING \u2014 not silently marked released')
+  assert.match(
+    state.held[0].errorMessage ?? '',
+    /which accounting connector its frozen account codes came from/,
+    `the row must say what is undecidable about it. Got: ${state.held[0].errorMessage}`,
+  )
+  assert.match(state.held[0].errorMessage ?? '', /queue the\s+sales invoice from the order instead/)
+
+  // THE CONTROL: the same row WITH a chart releases. Without it this test would pass for a sweep that
+  // released nothing at all.
+  reset()
+  state.held.push(heldRow({ id: 'hold-chartered', entityId: 'so-1' }))
+  state.orders.push({ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null })
+  const control = await sweep()
+  assert.equal(control.released, 1, 'the control: a hold that DOES name its chart is released')
+  assert.equal(state.queued.length, 1)
 })
 
 test('a stuck hold raises ONE warning naming the total, not one per order per run', async () => {
@@ -264,4 +368,93 @@ test('the sweep is WIRED to the reconcile cron — an unreached sweep is not a d
   assert.ok(call > 0 && (reconcileDue < 0 || call > body.indexOf('results.orders')), 'the sweep must run on its own')
   const route = withoutComments(readFileSync('app/api/cron/wc-reconcile/route.ts', 'utf8'))
   assert.match(route, /runWcReconcile\(\)/, 'and the cron route must be what runs it')
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r4 — THE CASE THAT SETTLED "A REFUSAL IS OUTSTANDING WORK, NOT A LOG LINE".
+//
+// This release runs on a sweep, days after the order imported, with nobody watching. Before r4 the only
+// record of a refusal was an Activity line and a PENDING hold. Now it is a row the exception inbox
+// selects — carrying the chart it was built for, the connector active when it was refused, and what to do.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] a release that queues NOTHING becomes OUTSTANDING work in the exception inbox', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+
+  await sweep()
+
+  assert.equal(state.queued.length, 0, 'PRECONDITION: nothing was queued, which is the state under test')
+  const rows = outstanding()
+  assert.equal(rows.length, 1, `the refusal is selectable as outstanding work. Rows: ${JSON.stringify(state.refusals)}`)
+  assert.equal(rows[0].type, 'SALES_INVOICE')
+  assert.equal(rows[0].referenceType, 'SalesOrder')
+  assert.equal(rows[0].referenceId, 'so-1')
+  assert.equal(rows[0].chartConnector, 'xero', 'the chart the frozen payload was built from')
+  assert.ok(String(rows[0].remedy).length > 0, 'and what the operator must do')
+  assert.ok(String(rows[0].committed).includes('imported'), 'and what stands in IMS regardless')
+})
+
+test('[o3d-j625 r4] the refusal is ONE row however many times the sweep retries it', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+
+  await sweep()
+  await sweep()
+  await sweep()
+
+  const rows = outstanding()
+  assert.equal(rows.length, 1, 'a five-minute sweep must not fill the inbox with one row per attempt')
+  assert.equal(rows[0].refusedCount, 3, 'and the row counts every attempt')
+})
+
+test('[o3d-j625 r4] CONTROL: a release that DOES queue records nothing outstanding', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+
+  await sweep()
+
+  assert.equal(state.queued.length, 1, 'PRECONDITION: the invoice was queued')
+  assert.deepEqual(outstanding(), [], 'nothing is owed, so nothing is outstanding')
+})
+
+test('[o3d-j625 r5 M-4/M-5] a refusal the FACADE already recorded is merged by the release — not recounted, not re-reasoned', async () => {
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueRefusesAndRecords = true
+
+  await sweep()
+
+  const rows = outstanding()
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].refusedCount, 1, 'one refusal is one attempt, however many writers describe it')
+  assert.equal(rows[0].reason, 'chart_retired', 'the facade\'s SPECIFIC reason survives the release\'s generic one')
+  assert.equal(rows[0].activeConnector, 'quickbooks', 'and the ACTIVE connector is not overwritten with the chart\'s')
+  assert.ok(String(rows[0].committed).includes('imported'), 'while what only the release knows is added')
+})
+
+// o3d-j625 r6 (review H4) — `sales_invoice_held_release` IS AN AUTO KIND because of THIS: the next sweep
+// raises the SAME posting (same key) the refused release asked for, and the row it creates clears the
+// refusal (createAccountingSyncLogRow). Driven through the real sweep twice.
+test('[o3d-j625 r6 H4] a refused held release is raised again, under the SAME posting key, by the next sweep', async () => {
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  reset()
+  state.held = [heldRow({ id: 'hold-1', entityId: 'so-1' })]
+  state.orders = [{ id: 'so-1', invoiceNumber: '164981', accountingInvoiceId: null }]
+  state.enqueueNoOps = true
+  await sweep()
+  assert.equal(state.asked.length, 1, 'PRECONDITION: the release asked, and nothing was queued')
+  const refused = state.asked[0]!
+
+  state.enqueueNoOps = false
+  await sweep()
+  assert.equal(state.queued.length, 1, 'PRECONDITION: the next sweep queued it')
+  assert.deepEqual(accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...state.asked[1] } as never),
+    accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', ...refused } as never))
 })

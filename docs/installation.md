@@ -1258,7 +1258,10 @@ Verify each scheduled job is registered with your cron daemon and has run succes
 - [ ] `/api/cron/fx-rates` — daily
 - [ ] `/api/cron/wc-reconcile` — daily (if WooCommerce connected)
 - [ ] `/api/cron/accounting-daily-batch` — daily at midnight (if Xero connected)
-- [ ] `/api/cron/accounting-sync` — every 5 min (if accounting connected)
+- [ ] `/api/cron/accounting-sync` — every 5 min. Schedule it even with no accounting connector connected: the
+      first thing it does, before any connector gate, is settle accounting posting refusals that a business
+      transaction had to hold because another job held the same posting's lock. Leave it unscheduled and those
+      sit in **Sync → Exceptions** marked *Unconfirmed* instead of being settled.
 - [ ] `/api/cron/accounting-payment-poll` — every 15 min (if accounting connected)
 - [ ] `/api/cron/accounting-fx-revaluation` — daily (if accounting connected)
 - [ ] `/api/cron/account-balance-snapshot` — daily (if accounting connected)

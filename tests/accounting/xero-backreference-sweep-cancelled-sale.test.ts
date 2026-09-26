@@ -1,3 +1,4 @@
+import { ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -133,7 +134,12 @@ const dbStub = {
     upsert: async () => ({}),
   },
   // lockSalesOrder issues `SELECT id FROM "sales_orders" WHERE id = $1 FOR UPDATE`.
-  $queryRaw: async (query: { values?: unknown[] }) => {
+  $queryRaw: async (query: { values?: unknown[]; sql?: string; text?: string; strings?: string[] }) => {
+    // o3d-j625 r9: the SALES-ORDER lock is this one statement. Other mechanisms run raw SELECTs on this
+    // client too (the posting-key lock's `pg_try_advisory_xact_lock`), and journalling those as a row
+    // lock would put entries in the ORDER this test pins that are not sales-order locks at all.
+    const text = query?.sql ?? query?.text ?? (query?.strings ?? (Array.isArray(query) ? query as string[] : [])).join('?')
+    if (!/FOR UPDATE/i.test(String(text))) return []
     journal.push(`lock:${String(query?.values?.[0] ?? '')}`)
     if (lockFailures > 0) {
       lockFailures -= 1
@@ -145,8 +151,10 @@ const dbStub = {
   // before it writes, for money-moving types. Recorded like the row lock above so the ORDER of the
   // two stays visible; without the delegate the enqueue throws and the sweep silently produces no
   // follow-ups at all, which reads here as "the repair did not happen".
-  $executeRaw: async () => {
-    journal.push('scope-lock')
+  $executeRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+    // o3d-j625 r7: the row-creating primitive's per-POSTING-KEY lock is a different lock from the
+    // follow-up scope lock, taken right before the create; recorded under its own name.
+    journal.push(values[0] === ACCOUNTING_POSTING_SUPPRESSION_LOCK_NAMESPACE ? 'posting-key-lock' : 'scope-lock')
     return 1
   },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(dbStub),
@@ -194,8 +202,11 @@ mock.module('@/lib/connectors/xero/outbox', {
 // asserting the absence of a row that was never going to be created.
 mock.module('@/lib/accounting', {
   namedExports: {
-    getPaymentAccountMap: async () => ({ card: 'BANK-1' }),
+    getPaymentAccountMap: async () => JSON.stringify({ 'card:GBP': 'BANK-1' }), // o3d-j625 r5: production returns the setting's JSON STRING
     lookupPaymentAccount: () => 'BANK-1',
+    // o3d-j625 r3: the mapped bank account IS one of the target connector's own accounts. The refusal
+    // when it is not is covered by tests/accounting/invoice-payment-document-provenance.test.ts.
+    accountingBankAccountBelongsTo: async () => true,
   },
 })
 mock.module('@/lib/connectors/xero/auth', { namedExports: { getGrantedScopes: async () => null } })
@@ -355,7 +366,9 @@ test('o3d-e2mz r8: the sale is read UNDER ITS ROW LOCK, after the probe and befo
     //     the back-reference write, which is the point: it guards the follow-up rows, not the sale.
     //   • the trailing probe — the shared sweep's own post-write verification (o3d-9kek).
     // What this pins is the PREFIX: nothing is written before the lock and the status read behind it.
-    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'scope-lock', 'probe:order-1'],
+    //   • `posting-key-lock` ×2 — o3d-j625 r7: the row-creating primitive's lock on the posting key, taken
+    //     before it reads whether the posting was marked handled — once per follow-up row it creates.
+    ['probe:order-1', 'lock:order-1', 'read-status:order-1', 'order-update:order-1', 'scope-lock', 'posting-key-lock', 'posting-key-lock', 'probe:order-1'],
     'probe, then LOCK, then the status read, and only then the first write',
   )
 })

@@ -1410,6 +1410,8 @@ The IMS maps payment methods to Xero bank accounts using a composite key of `{me
 
 Configure this mapping in **Integrations → Xero → Payment Account Mapping**.
 
+The mapping is **shared by every accounting connector**, but its values are one connector's own bank-account IDs. A payment is only queued when the mapped account exists in the active connector's synced chart of accounts — see *Payments and updates refused because IMS cannot tell which connector holds the document* below.
+
 ## Settlement: is the payment actually in the ledger?
 
 Marking something paid in the IMS and the ledger agreeing are two different facts. Registering the payment is a separate sync (`INVOICE_PAYMENT` for a customer receipt, `BILL_PAYMENT` for a supplier payment) that can fail, be cancelled, or never be queued — so a green **Paid** badge on its own only means the IMS was told the money arrived.
@@ -1850,7 +1852,7 @@ settles expire normally.
 
 | Endpoint | Schedule | Purpose |
 |---|---|---|
-| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then — for Xero only — run the back-reference repair sweep |
+| `/api/cron/accounting-sync` | Every 5 min | Settle any held ("unconfirmed") posting refusals — which happens on every run, whether or not an accounting connector is enabled — then process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then, for Xero only, run the back-reference repair sweep |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
@@ -2165,6 +2167,288 @@ in the Activity log with the action `xero_sync_post_fenced_out`, which:
 
 So if you settled a row as "it did NOT post" and it turns out it did, you are told, with the id and
 with the right remedy, rather than the assertion being quietly believed.
+
+### Postings refused because they were built for the connector you switched away from
+
+Switching the active accounting connector while IMS is composing a document is the one moment the
+document's own account numbers can stop describing the ledger it is about to be written to. Every
+account code IMS sends — the sales account on each invoice line, the shipping and discount accounts,
+the inventory, COGS, unearned-revenue, allocated-inventory and FX accounts on a journal — is read from
+**one** connector's chart of accounts. The row is written a moment later. If the selection moves in
+between, the document would land in the other connector's queue still carrying the first connector's
+account numbers: it is then either rejected by that accounting system, or posted against whatever
+those numbers happen to mean in its own chart.
+
+IMS no longer writes such a row. The posting is **refused** and recorded in the activity log as
+`accounting_enqueue_refused_retired_chart` (or, for an edit to an invoice that has already posted,
+`sales_invoice_update_refused_retired_chart`), naming the document type, the order or refund it was
+for, the connector whose chart it was built from and the one that is active now. The message says
+plainly that **nothing was queued** and that the posting is **still outstanding**.
+
+**What to do.** Nothing is lost and nothing partial was written — there is no row to find, no document
+to reverse, no half-posted invoice. Once the connector selection has settled, queue the posting again
+from its source: re-save or re-finalise the sales order for an invoice, press **Retry accounting** on
+the refund for a credit note and its reversals, re-run the revaluation for an FX journal. A refund
+whose credit note was refused keeps its **accounting retry required** flag and its warning, so it
+stays on the list of refunds owing accounting rather than looking settled.
+
+This is a refusal, not a retry: IMS does not re-resolve the connector and try again on its own,
+because "which books does this belong in" is not a question it can answer for you in the middle of a
+switch.
+
+**It is a narrow window, not a general refusal.** A posting is refused only when the selection actually
+changed while that one document was being built. Ordinary posting, including posting to a connector you
+switched to hours ago, is unaffected — the document is built and written under the same connector, as
+before. A refund or order posted while no accounting connector was enabled at all is unchanged too: as
+before, nothing is queued, because there is nothing for it to post to.
+
+**Which postings this covers.** All of them. The rule applies to every accounting document IMS queues,
+not only to the sales invoice and credit note: stock receipts and supplier returns, purchase bills and
+bill edits, supplier credit notes, bill payments and invoice payments, manufacturing overhead and
+manufacturing reclass journals, landed-cost reclass and COGS journals, shipment COGS revaluations,
+inventory adjustments, allocation and unearned-revenue reversals, tax-rate syncs and the unrealised FX
+revaluation. Every one of them now records which connector's chart of accounts it was built from, and
+every one of them is refused rather than mis-routed.
+
+**Three postings behave slightly differently, and it is worth knowing why.**
+
+* **Reversing a previous FX revaluation.** The reversal's account numbers are copied from the journal it
+  reverses, which may have been posted under the *other* connector. So the reversal is routed by the
+  connector that journal was posted under — not by whichever is active now — and it is refused if that
+  connector is no longer the active one. You cannot reverse a QuickBooks journal by posting to Xero: if
+  the unrealised FX from an earlier period needs unwinding after a connector switch, it has to be
+  unwound in the accounting system that holds it.
+* **A sales invoice held waiting for a WooCommerce invoice number.** These holds can sit for days, and
+  the account numbers are frozen when the order is imported. A hold parked by an older version of IMS,
+  before it recorded which connector those numbers came from, cannot be released automatically: the
+  hold stays PENDING, the reason is shown on the row and in the activity log
+  (`sales_invoice_release_failed`), and the remedy is to queue the sales invoice from the order.
+* **Retrying a refund's accounting.** A refund whose reversals were staged by an older version of IMS,
+  before it recorded the chart, cannot be replayed automatically either. **Retry accounting** reports
+  the refund as still owing, logs `refund_accounting_replay_unchartered`, and leaves the flag set —
+  check whether the reversal already posted and, if not, raise it by hand from the refund's own cost
+  snapshots.
+
+### Payments and updates refused because IMS cannot tell which connector holds the document
+
+Some postings carry more than account numbers. A **customer payment** and a **supplier bill payment**
+name the invoice or bill they settle and the bank account the money moves through; a **bill edit** and a
+**sales invoice edit** name the document they overwrite; a **supplier credit note** names the bill it is
+allocated against. Those are the accounting system's own document and account IDs — and IMS keeps an
+invoice's ID when you change the accounting connector, because the invoice still exists in the books it
+was posted to. So "this payment's account numbers are the active connector's" says nothing about whether
+the invoice it pays is in that connector at all.
+
+**IMS now records which connector each posted document belongs to**, at the moment the ID is written
+back (sales invoices, credit notes, purchase bills and supplier credit notes). A payment, edit or
+allocation is only queued when that recorded connector is the one it would post to. Otherwise it is
+**refused**, nothing is queued, and it is reported:
+
+* customer payments: `invoice_payment_not_registered` with refusal **DOCUMENT_PROVENANCE_UNPROVEN**;
+* bill payments: the bill is **not** marked paid and `bill_payment_enqueue_declined` says the payment was
+  *refused* (not that posting is switched off);
+* bill edits: the edit is saved in IMS and `purchase_invoice_update_not_queued` (ERROR) says the ledger
+  still holds the previous version;
+* sales invoice edits: `sales_invoice_update_refused_unattributable_document`;
+* supplier credit notes: the credit note stays **draft** and `supplier_credit_note_not_posted` explains why;
+* anything else carrying a document ID: `accounting_enqueue_refused_unattributable_document_id`.
+
+**Documents posted before this version have no recorded connector, and are refused too.** This is
+deliberate and is *not* a narrow window like the chart refusal above: IMS does not guess which ledger holds
+an older invoice, because guessing is the mistake being prevented. To pay or edit such a document through
+IMS, re-post it so the document and its connector are recorded together. For a customer payment, follow
+the remedy in the refusal message itself: it says whether settling by hand is safe, because a deferred
+re-drive may still register the receipt.
+
+**The payment account mapping is shared by every accounting connector.** Its keys (`method:currency`)
+are connector-neutral, but each value is one connector's own bank-account ID. A customer payment is
+therefore only queued when the mapped account is an active bank account in the connector's synced chart
+of accounts; otherwise it is refused with **PAYMENT_ACCOUNT_NOT_IN_LEDGER**. After switching connector,
+sync the chart of accounts and re-map each method against the new connector.
+
+The same check applies to payments registered for **imported (WooCommerce) orders**, whose bank account is
+chosen when the sales invoice posts rather than when the receipt is recorded. If the mapped account is not
+one of the posting connector's own bank accounts, the payment is not queued and `xero_payment_skipped` /
+`quickbooks_payment_skipped` names the mapped account; the retry picks it up once the mapping is fixed. The
+account that passes the check is the one written into the payment, so a later edit to the mapping does not
+redirect a payment that is already queued.
+
+**"Posting is switched off" and "the connector changed" are no longer the same answer.** A supplier credit
+note, a bill edit, a manufacturing journal or reclass, and a sales invoice edit each check whether the
+connector their account codes came from is still the active one. If it is and that posting type is off,
+nothing is expected, as before (a credit note posts locally). If the connector has changed, the posting is
+**refused** and reported instead — a credit note stays draft (`supplier_credit_note_not_posted`), a bill
+edit logs `purchase_invoice_update_not_queued`, a sales invoice edit whose update the queue declines logs
+`sales_invoice_update_not_queued` — rather than being silently treated as switched off.
+
+### Refused postings appear in the exception inbox as outstanding work
+
+A posting IMS refuses is **not** only an activity-log line. Each refusal is recorded as a row on
+**Sync → Exceptions**, in the section *"Accounting postings IMS refused to queue"*, beside the accounting
+follow-ups that page already lists. Each row names the document and its reference, the chart of accounts
+the payload was built from **and** the connector that was active when it was refused, how long it has been
+owed (and how many attempts), what still stands in IMS, and what to do about it.
+
+Three things about those rows:
+
+* **How a row is closed depends on the place that refused it**, not on its text, and the page says which on
+  every row. The classification, generated from the code:
+
+<!-- posting-refusal-kinds:begin (generated from lib/domain/accounting/posting-refusal-kinds.ts; do not edit by hand) -->
+
+**Clears itself** — IMS queues the same posting again and nothing can make it refuse for ever. No action is offered.
+
+| Refused posting | Why |
+| --- | --- |
+| `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
+
+**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then post it by hand, then *Mark as handled*.
+
+| Refused posting | Why |
+| --- | --- |
+| `sales_invoice_held_release` (SALES_INVOICE / SalesOrder) | The WooCommerce reconcile sweep retries the held invoice, but always for the connector it was built for — after a permanent connector switch it is refused on every run. |
+| `sales_invoice_update` (SALES_INVOICE_UPDATE / SalesOrder) | Re-saving the order queues the update again, but it is refused for as long as the invoice belongs to a connector that is no longer active. |
+| `purchase_invoice_update` (PURCHASE_INVOICE_UPDATE / PurchaseOrder) | Re-saving the bill queues the update again, but it is refused for as long as the bill belongs to a connector that is no longer active. |
+| `invoice_payment_receipt` (INVOICE_PAYMENT / SalesOrder) | The receipt is registered again only when the invoice's deferred-receipt recovery runs, which does not happen for every invoice. |
+| `credit_note_allocation` (PURCHASE_CREDIT_NOTE_ALLOCATION / SupplierCreditNote) | The credit-note allocation sweep retries it, but refuses on every run until both documents are recorded as belonging to the active connector. |
+| `unrealised_fx_journal` (UNREALISED_FX_JOURNAL / FxRevaluation) | The FX revaluation raises this journal only for the date it runs for; the daily run values today, so a refused journal for an earlier date is not raised again unless that date is re-run. |
+| `landed_cost_cogs_journal` (COGS_JOURNAL / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
+| `landed_cost_transit_journal` (STOCK_IN_TRANSIT / PurchaseOrder) | The landed-cost journal outbox retries it, but gives up after a fixed number of attempts. |
+| `refund_credit_note` (CREDIT_NOTE / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+| `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
+
+**Nothing in IMS posts it again** — press *Take for hand posting* first, then post it by hand, then *Mark as handled* (which also stops IMS ever posting it).
+
+| Refused posting | Why |
+| --- | --- |
+| `sales_invoice_order` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the order is created or finalised, and nothing queues it again. |
+| `sales_invoice_import` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the WooCommerce order is imported, and nothing queues it again. |
+| `stock_adjustment_journal` (INVENTORY_ADJUSTMENT / StockMovement) | The journal is queued once, with the stock movement; nothing queues it again for that movement. |
+| `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | The reversal is queued once, when the purchase order is cancelled, which cannot happen twice. |
+| `supplier_return_reversal` (INVENTORY_ADJUSTMENT / PurchaseReturn) | The reversal is queued once, with the return; raising the return again would be a second return. |
+| `stock_receipt_journal` (STOCK_RECEIPT / PurchaseOrder) | The journal is queued once, with the receipt; receiving again is a different receipt. |
+| `purchase_invoice` (PURCHASE_INVOICE / PurchaseInvoice) | The bill is queued once, when it is created; creating it again would be a second bill. |
+| `realised_fx_bill_payment` (REALISED_FX_JOURNAL / PurchaseInvoice) | The realised gain/loss is queued once, when the bill is paid; the FX revaluation raises unrealised journals, not this one. |
+| `realised_fx_receipt` (REALISED_FX_JOURNAL / Payment) | The realised gain/loss is queued once, when the receipt settles; the FX revaluation raises unrealised journals, not this one. |
+| `manufacturing_journal` (MANUFACTURING_JOURNAL / ProductionOrder) | The journal is queued once, when the production order completes, which cannot happen twice. |
+| `manufacturing_reclass` (MANUFACTURING_RECLASS / ProductionOrder) | The reclass is queued once for this cost change; a later cost change is a different reclass. |
+| `allocation_reversal` (ALLOCATION_REVERSAL / SalesOrder) | Each reversal belongs to one trim of the order's allocations and is never raised again. |
+
+<!-- posting-refusal-kinds:end -->
+
+  **Settling a posting by hand is two steps, and the first one is not optional.**
+
+  **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
+  queued attempt at that exact posting (if nothing has picked it up yet) and then refuses to queue that
+  posting at all for as long as you hold it — not on a sweep, not because somebody else saved the document.
+  Each refused attempt is logged as `accounting_posting_suppressed_hand_post_claimed`. That is what makes it
+  safe to spend twenty minutes in the ledger: nothing can post it behind you. If a sync row for it may
+  ALREADY have been sent (it is being processed, has failed, or carries a document id) you are refused here
+  and nothing is changed — check the ledger and settle that sync row first. While you hold it the row stays
+  on this list, marked as being settled by you; another operator who opens the page is told you have it and
+  is not offered the action, so two people cannot post the same thing.
+
+  **2. Mark as handled** means: *"I posted this by hand; IMS will not post it."* It asks for an optional note
+  (for example the ledger journal number) and records who marked it and when. From then on IMS refuses every
+  automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is
+  logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. It is
+  refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
+  wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
+  row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
+  is queued — by any path. Resolved rows from the last 30 days are listed underneath with how each was closed.
+
+  **Release** gives the posting back if you are not going to post it. IMS may queue and post it again from
+  that moment, and the refusal stays on the list, so do **not** release it if you have already posted it by
+  hand — press *Mark as handled* instead, or the ledger can get it twice. Releasing somebody else's claim is
+  allowed (otherwise a posting nobody can settle would be stuck for ever) and is recorded as a **warning**.
+
+  **An earlier version of the same document does not block you.** For the postings where successive versions
+  share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
+  *previous* version. IMS names that document on the row and tells you your hand posting **replaces** it;
+  it does not stop you taking the posting, because that entry has already been made and is never going to be
+  made again. Edit the document the ledger holds; do not raise a second one.
+* **A posting marked handled stays handled.** If the same posting is refused again later it is logged
+  (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
+  IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
+* **And that holds when the two happen at the same moment.** Marking a posting handled, queueing it, and
+  recording a refusal of it all take the same lock on that one posting, so a refusal cannot land in the gap
+  between your *Mark as handled* and its save and put the row back on the list — which would have asked you
+  to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being
+  queued is logged (`accounting_posting_refused_after_queued`) and not listed, because the posting is in the
+  accounting sync log. A refusal raised from inside a piece of work that cannot wait for that lock is not
+  lost either: it is held with that work — it commits or rolls back with it — and the next **accounting
+  sync** run settles it under the posting's lock, which is the wait the original job was not allowed to
+  make. If the job holding the lock queued the posting, nothing is owed and the claim disappears; if that
+  job rolled back or never queued it, the refusal becomes an ordinary row on this list. "Queued" here means
+  a posting IMS **watched appear** while the refusal was waiting — an **earlier** entry for the same
+  document (successive edits of one invoice, successive payments of one bill) does not settle it, because
+  the ledger would still be holding the earlier version; nor does an entry that was later **cancelled**,
+  because a cancelled entry is never going to reach the ledger; nor does an entry released back to the
+  connector from cancelled, because that is the same entry going round again rather than a new one. It is
+  logged as `accounting_posting_refusal_not_recorded_contended` at the moment it is held, and the refusal
+  itself is in the accounting activity log as always.
+* **When IMS cannot tell whether a posting beat a refusal, it lists the refusal.** Outside the window
+  above — a refusal that was never made to wait for anything — IMS has no way to know whether an entry
+  already in the sync log was queued before or after the refusal was decided: the two timestamps may have
+  been written by different IMS processes, and comparing clocks is not the same as knowing which of two
+  events happened first. So
+  such a refusal is listed. If you find a row here whose posting is in fact sitting in the accounting sync
+  log, that is this choice: look at the sync log entry and settle it there, and note that *Take for hand
+  posting* will refuse the row while IMS may already have posted it, and tell you so.
+* **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not
+  settled one of those held refusals within about 15 minutes, it is listed in this section marked
+  **Unconfirmed — not yet known to be owed**, so a reconciler that has stopped running is visible instead
+  of silent. An unconfirmed row offers no *Take for hand posting* action and **must not be posted by hand**:
+  until it is settled the posting may still belong to the job that held the lock, and posting it by hand
+  in that window is exactly how a journal reaches the ledger twice. The usual cause of a row sitting here
+  is that `/api/cron/accounting-sync` is not running — check that before anything else. A claim the run
+  keeps failing to settle eventually stops being retried and moves to the **integration outbox failures**
+  section instead, so it is in one place at a time.
+* **If IMS cannot tell whether a posting was marked handled, it does not post it.** The check runs before
+  every accounting entry is queued. When the check itself cannot be made — the database is unreachable, the
+  query times out, the transaction is cancelled — IMS refuses the enqueue rather than reading "cannot tell"
+  as "nothing was marked": **nothing is written**, the whole operation that would have queued it is rolled
+  back and retried (by a sweep, the outbox, or by you re-running it), and an **ERROR**
+  (`accounting_posting_suppression_unreadable`) names the posting and the cause. An unreadable state is
+  never permission to post.
+* **One row per posting**, and a posting means the thing that is owed rather than the document it belongs
+  to: a customer payment is one **receipt** against one invoice, a stock receipt is one delivery against a
+  purchase order, a landed-cost journal is one recalculation, a bill update is one **bill** (a purchase
+  order can hold several), and an allocation reversal is one trim of an order's allocations. A sweep that
+  refuses the same work every few minutes updates that row and counts the attempts rather than filling the
+  page.
+
+This is what makes the WooCommerce **held invoice release** safe to leave to the sweep: it can refuse for
+days with nobody watching, and the debt is on the exceptions page the whole time.
+
+### Postings that were not queued are now reported where they happen
+
+Every place in IMS that queues an accounting posting now reads the answer. When a posting is refused or
+cannot be queued, the IMS action still completes where that is the right thing to do (a stock receipt is
+still received, a bill is still recorded), but the posting is listed as outstanding on **Sync →
+Exceptions** (above) and an **ERROR** is written to the activity log naming what
+stands in IMS, what the ledger is missing, and what to do — for example `stock_receipt_journal_not_queued`,
+`purchase_invoice_not_queued`, `supplier_return_journal_not_queued`, `purchase_order_cancel_journal_not_queued`,
+`landed_cost_reclass_not_queued`, `landed_cost_cogs_journal_not_queued`, `manufacturing_journal_not_queued`,
+`manufacturing_reclass_not_queued`, `inventory_adjustment_journal_not_queued`, `sales_invoice_not_queued`,
+`realised_fx_journal_not_queued` and `tax_rate_sync_not_queued`. Where marking something done would be
+untrue without the posting, it is rolled back instead: a bill is not marked paid, a supplier credit note
+stays draft.
+
+Two consequences worth knowing:
+
+* **Landed-cost changes on already-journaled shipments.** If the COGS reversal for a shipment cannot be
+  queued, IMS no longer records it in the COGS subledger and no longer removes that amount from the
+  retrospective landed-cost COGS journal — so the adjustment still reaches the ledger through that
+  journal instead of disappearing from both.
+* **The landed-cost journal backstop.** When a landed-cost recalculation's journals cannot be queued, its
+  background retry job is kept retrying (and fails visibly once its attempts are spent) instead of being
+  marked done.
+* **Unrealised FX revaluation.** The run's result now includes `refused` — journals it owed and could not
+  queue — and those are no longer counted in `reversed` or `revalued`. A run with refusals is never
+  reported as "already queued for this date". The "already revalued today" check is also per connector: a
+  revaluation posted to Xero earlier the same day no longer stops the QuickBooks revaluation after a switch.
 
 ### Rows stranded on a connector you switched away from
 

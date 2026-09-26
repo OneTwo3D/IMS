@@ -198,6 +198,17 @@ const TX_REQUEST = {
   referenceId: 'order-1',
   payload: { lines: [{ accountCode: '630', debit: 16 }, { accountCode: '631', credit: 16 }] },
   unlockedOrderScopeReason: 'test harness: the order guard is doubled to a non-order scope',
+  // o3d-j625 r2: `chartConnector` is now REQUIRED on both enqueues, so every request carries one. It
+  // names the SAME ledger as the pin in the pinned tests below, which is the only combination a
+  // pinned enqueue can have — `refuseUnattributableChart` refuses a pin and a chart that disagree.
+  //
+  // THIS DOES NOT MAKE THE FENCE TESTS VACUOUS, and that is worth stating because it nearly does. The
+  // chart check is POOLED, so in the window tests below (`stalePooledSelection`) it sees the stale
+  // 'xero is active' and PASSES — which is exactly the production shape — and the refusal that follows
+  // can only have come from the LOCKED read the fence takes. Were the chart check to refuse first,
+  // these tests would be about the chart check; the stale pooled fixture is what keeps them about the
+  // fence.
+  chartConnector: 'xero' as const,
 }
 
 /** An id the accounting union does not contain — see the pin case below. */
@@ -208,6 +219,8 @@ const FACADE_REQUEST = {
   referenceType: 'SalesOrderRefund',
   referenceId: 'refund-1',
   payload: { lines: [{ accountCode: '630', debit: 20 }, { accountCode: '631', credit: 20 }] },
+  // o3d-j625 r2 — see the note on TX_REQUEST above.
+  chartConnector: 'xero' as const,
 }
 
 /**
@@ -276,19 +289,44 @@ test('[o3d-i0o6 r8] the in-transaction enqueue refuses on the LOCKED read, even 
   assert.equal(answered.outcome.connector, 'xero', 'and the answer is about the PROVED ledger')
 })
 
-test('[o3d-i0o6 r8] an UNPINNED in-transaction enqueue takes no selection lock at all', async () => {
-  // The guarantee that makes the fence safe to add: every existing caller keeps the active-connector
-  // resolution by not passing a pin, and pays nothing — no advisory lock, no row locks, no new
-  // serialisation on the ordinary queue traffic.
+/**
+ * o3d-j625 r13 (Codex on the merged head, HIGH) — THIS ASSERTED THE GUARANTEE THAT WAS THE DEFECT, TWICE
+ * (here and on the facade below), AND BOTH ARE INVERTED.
+ *
+ * r8 wrote: "every existing caller keeps the active-connector resolution by not passing a pin, and pays
+ * nothing — no advisory lock, no row locks, no new serialisation on the ordinary queue traffic". Codex
+ * executed what that buys: an unpinned enqueue whose connector is deactivated between the unlocked chart
+ * read and the insert writes a row nothing will ever process AND clears the outstanding refusal, so the
+ * identity rule this branch spent four rounds building is handed false evidence.
+ *
+ * WHAT IT COSTS, stated rather than discovered later, because r8 named this cost as its reason not to do
+ * it: EVERY accounting enqueue now takes the plugin-selection advisory lock and holds it to its caller's
+ * COMMIT. Two enqueues in different transactions therefore serialise on it, and a long caller transaction
+ * holds it for its whole life. The lock ORDER is unchanged — sales-order row lock, then this, then the
+ * follow-up scope lock, and no plugin-selection writer takes an order lock — so nothing new can deadlock;
+ * what is new is contention. That is the price of the guarantee, and it is the right way round: the
+ * alternative is a debt discharged by a row nothing will process.
+ */
+test('[o3d-j625 r13] an UNPINNED in-transaction enqueue takes the selection lock too, in the same position', async () => {
   reset({ xero: true })
   const { queueAccountingSyncTx } = await import('@/lib/accounting')
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, TX_REQUEST)
 
-  assert.equal(queued, true)
+  assert.equal(queued, true, 'and it still queues: the chart IS the active connector here')
   assert.equal(created.length, 1)
-  assert.ok(!trace.includes('plugin-selection-advisory-lock'),
-    `an unpinned enqueue must not take the selection lock: ${trace.join(' -> ')}`)
+  assert.ok(trace.includes('plugin-selection-advisory-lock'),
+    `an unpinned enqueue must take the selection lock — that is the r13 fix: ${trace.join(' -> ')}`)
+  // THE ORDER, not merely the presence: the fence must sit before the insert it fences, and before the
+  // follow-up scope lock, so the documented lock order is unchanged by making it unconditional.
+  const lockAt = trace.indexOf('plugin-selection-advisory-lock')
+  const readAt = trace.indexOf('locked-plugin-read')
+  const scopeAt = trace.indexOf('follow-up-scope-lock')
+  const insertAt = trace.indexOf('insert-accounting-sync-log')
+  assert.ok(lockAt >= 0 && readAt > lockAt && insertAt > readAt,
+    `the lock, then the locked read, then the insert: ${trace.join(' -> ')}`)
+  assert.ok(scopeAt === -1 || scopeAt > lockAt,
+    `the selection lock precedes the follow-up scope lock, as the documented order requires: ${trace.join(' -> ')}`)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -330,16 +368,20 @@ test('[o3d-i0o6 r8] the facade path refuses inside the queue transaction when th
   assert.equal(outcome.connector, 'xero')
 })
 
-test('[o3d-i0o6 r8] an UNPINNED facade enqueue takes no selection lock', async () => {
+test('[o3d-j625 r13] an UNPINNED facade enqueue takes the selection lock too — inside the queue\'s own transaction', async () => {
+  // The facade half of the same inversion. The lock belongs to the transaction that INSERTS, which for
+  // the facade is the connector queue's own — the facade's pooled check is not and never was a fence.
   reset({ xero: true })
   const { queueAccountingSync } = await import('@/lib/accounting')
 
   const outcome = await queueAccountingSync(FACADE_REQUEST)
 
-  assert.equal(outcome.queued, true)
+  assert.equal(outcome.queued, true, 'and it still queues: the chart IS the active connector here')
   assert.deepEqual(created, [{ connector: 'xero', type: 'UNEARNED_REV_REVERSAL' }])
-  assert.ok(!trace.includes('plugin-selection-advisory-lock'),
-    `unpinned traffic must be untouched: ${trace.join(' -> ')}`)
+  assert.ok(trace.includes('plugin-selection-advisory-lock'),
+    `an unpinned facade enqueue must be fenced too (o3d-j625 r13): ${trace.join(' -> ')}`)
+  assert.ok(trace.indexOf('plugin-selection-advisory-lock') < trace.indexOf('insert-accounting-sync-log'),
+    `and the fence must precede the insert: ${trace.join(' -> ')}`)
 })
 
 test('[o3d-i0o6 r8] a pin naming another ledger cannot get a row out of this queue', async () => {

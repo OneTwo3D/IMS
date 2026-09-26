@@ -145,17 +145,38 @@ async function seed(label: string) {
 }
 
 /** Wait until some backend in this database is blocked on a lock. Returns the statement it is waiting in. */
-async function waitForLockWait(): Promise<string> {
+/**
+ * The statement THIS test's revaluation is blocked on.
+ *
+ * o3d-j625 r12 — SCOPED TO THE WAIT IT MEANS. `pg_stat_activity` is DATABASE-WIDE and the concurrency tier
+ * runs its files CONCURRENTLY against one scratch database, so "the first backend waiting on a Lock" is
+ * whatever any other file happens to be doing. Measured: this returned
+ * `SELECT pg_advisory_xact_lock($1, $2)` from tests/concurrency/posting-refusal-record-race, which holds
+ * posting keys for 500ms on purpose, and the assertion below then failed about the wrong transaction.
+ *
+ * `want` is the statement the caller is about to assert about, so the poll keeps going until the wait it
+ * is looking for appears. It is NOT weaker than the original: if nothing ever blocks on that statement the
+ * loop still exhausts and throws, so an ordering that was never exercised still fails — and it now fails
+ * for its own reason rather than another file's.
+ */
+async function waitForLockWait(want: RegExp): Promise<string> {
   const { db } = await import('@/lib/db')
+  const seen = new Set<string>()
   for (let attempt = 0; attempt < 600; attempt++) {
     const rows = await db.$queryRawUnsafe<Array<{ query: string }>>(
       `SELECT query FROM pg_stat_activity
        WHERE datname = current_database() AND wait_event_type = 'Lock' AND state = 'active'`,
     )
-    if (rows.length > 0) return rows[0].query
+    for (const row of rows) {
+      seen.add(row.query)
+      if (want.test(row.query)) return row.query
+    }
     await new Promise((resolve) => setTimeout(resolve, 50))
   }
-  throw new Error('PRECONDITION FAILED: nothing ever blocked on a lock, so no ordering was exercised')
+  throw new Error(
+    `PRECONDITION FAILED: nothing ever blocked on ${want}, so no ordering was exercised. Lock waits seen `
+    + `in this database meanwhile: ${JSON.stringify([...seen])}`,
+  )
 }
 
 const recalcLinked = async (tx: unknown, freightPoId: string) => {
@@ -218,7 +239,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
       return Number(shipments[0].cogsBatchAmount)
     }, TX)
 
-    lockWaitStatement = await waitForLockWait()
+    lockWaitStatement = await waitForLockWait(/cost_layers/)
     releaseRevaluation.resolve()
     const reloadedCogs = await batch
     await revaluation
@@ -264,7 +285,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
     const revaluation = db.$transaction((tx) => recalcLinked(tx, fixture.freight.id), TX)
       .catch((error) => { refusal = error })
 
-    const lockWaitStatement = await waitForLockWait()
+    const lockWaitStatement = await waitForLockWait(/cost_layers|shipments/)
     releaseBatch.resolve()
     await batch
     await revaluation

@@ -346,6 +346,42 @@ export type RefundAccountingSyncRequest = {
    * resolution they have always had.
    */
   connector?: AccountingConnectorId
+  /**
+   * o3d-j625 — THE CONNECTOR WHOSE CHART THE ACCOUNT CODES IN `payload` CAME FROM.
+   *
+   * A DIFFERENT FACT FROM `connector` ABOVE, and the two are not interchangeable. `connector` is a
+   * PROOF: this credit reverses a debit that was established to stand in those books, and it buys the
+   * o3d-i0o6 r8 lock-held fence. This is a statement about the PAYLOAD: `settings.inventoryAccount`,
+   * `settings.cogsAccount`, `settings.unearnedRevenueAccount` and `settings.allocatedInventoryAccount`
+   * on the journal lines below are ONE connector's codes, read once at staging.
+   *
+   * Carried on the request for the same reason the pin is: the request is the only thing that crosses
+   * the gap to the hand-off, and it is persisted to `accountingRetrySyncs` and replayed by the retry —
+   * so a journal staged against one chart and retried a week later must still be routed to that
+   * connector's queue, or refused, rather than written into whatever is active when someone presses
+   * retry.
+   *
+   * THREE STATES, AND ALL THREE ARE DISTINCT (o3d-j625 r2, Codex HIGH 2):
+   *
+   *   an `AccountingConnectorId`  the chart these codes came from. Route the row through that
+   *                          connector. (One id is registered today — o3d-remove-parked-connectors —
+   *                          and a request persisted before that names an archived one, which is
+   *                          exactly why this is a stored value and not a re-resolution.)
+   *   `null`                 NOTHING WAS SWITCHED ON WHEN THE CODES WERE READ, so they are the
+   *                          empty-string defaults. Write nothing — `not-configured`. This is a
+   *                          POSITIVE STATEMENT and must survive the round trip through
+   *                          `accountingRetrySyncs` as itself; collapsing it into the case below is
+   *                          exactly the bug Codex HIGH 2 found, and its consequence is a row of empty
+   *                          account codes queued to a connector that came on afterwards, with the
+   *                          obligation ledger free to settle over it.
+   *   absent                 a request PERSISTED BEFORE THIS FIELD EXISTED. Nothing here knows which
+   *                          chart it was staged from, and both alternatives are wrong — resolving the
+   *                          active connector is the original defect, and `null` claims the codes were
+   *                          empty when they were not. The hand-off therefore REFUSES it, leaves the
+   *                          obligation unmet, and says why (see `queueRefundAccountingActions`). It is
+   *                          the only state that does not reach an enqueue at all.
+   */
+  chartConnector?: AccountingConnectorId | null
 }
 
 /**
@@ -2761,6 +2797,9 @@ async function stageRefundAccountingReversals(
       referenceType: 'SalesOrderRefund',
       referenceId: params.refundId,
       idempotencyKey: `sales-order-refund:${params.refundId}:cogs-reversal`,
+      // o3d-j625: the two `accountCode`s below are `settings.*` — this staging's own chart read. Named
+      // here so the hand-off (and a retry days later) writes the row under the same connector.
+      chartConnector: settings.connector,
       payload: {
         date: cogsReversalJournalDate,
         reference: `COGS reversal: ${params.orderRef}`,
@@ -2852,6 +2891,12 @@ async function stageRefundAccountingReversals(
       ...(reversalAmounts.allocationReversal > 0 && reversalAmounts.allocationProvedOnConnector
         ? { connector: reversalAmounts.allocationProvedOnConnector }
         : {}),
+      // o3d-j625: and, separately from the pin above, whose chart `journalLines` was built from —
+      // `settings.unearnedRevenueAccount`, `settings.salesAccount`, `settings.inventoryAccount`,
+      // `settings.allocatedInventoryAccount`. The pin is about where the DEBIT stood; this is about
+      // whose account numbers are on the page. An unpinned unearned-only reversal has no proof behind
+      // it and previously had nothing at all naming its chart.
+      chartConnector: settings.connector,
       payload: {
         date: new Date().toISOString().slice(0, 10),
         reference: hasUnearnedReversal
@@ -2980,6 +3025,36 @@ function parseRefundAccountingRetrySyncs(
       // somewhere else".
       ...(isRegisteredAccountingConnector(entry.connector)
         ? { connector: entry.connector }
+        : {}),
+      // o3d-j625: AND THE CHART SURVIVES THE ROUND TRIP, for exactly the reason above — this parser
+      // rebuilds the request field by field and drops anything it does not name, so a `chartConnector`
+      // written at staging and not read back here would leave the RETRY routing the journal by a fresh
+      // resolution while its account codes stayed the staged connector's.
+      //
+      // o3d-j625 r2 (Codex HIGH 2) — AND `null` SURVIVES AS `null`, BECAUSE `null` AND ABSENT MEAN
+      // DIFFERENT THINGS HERE.
+      //
+      // r1 narrowed to the two known ids only, on the argument that "a request staged with no connector
+      // at all staged no account codes worth routing". That reasoning is right about the CODES and wrong
+      // about the ROUND TRIP: staging with no active connector persists `chartConnector: null`, r1's
+      // parser turned that into an absent property, and absent was "unchartered" — the original defect.
+      // So if the first hand-off failed and a connector was switched ON before the retry, the replay
+      // resolved that new connector and queued the stored EMPTY account codes into its books; the
+      // obligation ledger then had a real queued row to settle against, and `accountingRetryRequired`
+      // was cleared over a document that can never post. `null` is a statement ("nothing was on when I
+      // read the chart") and it is carried as one, where it answers `not-configured` and writes nothing.
+      //
+      // Still a SPREAD, and the third state is still meaningful: a key MISSING from the stored JSON is a
+      // request staged before this field existed, which nothing here can attribute. It stays absent and
+      // the hand-off refuses it rather than inventing either of the other two answers.
+      // REGISTRY-CHECKED (o3d-j625 r12, merging o3d-remove-parked-connectors), and the direction is
+      // the opposite of the `connector` pin above for a reason. A pin this build cannot route must be
+      // KEPT, because dropping it means "resolve the active connector" and would post a QuickBooks-proved
+      // reversal into Xero's books. An unroutable CHART must be DROPPED, because absent means "staged
+      // before this field existed", which the hand-off REFUSES — leaving the obligation owed and saying
+      // so, which is the right answer for account codes this build cannot attribute to a routable ledger.
+      ...(isRegisteredAccountingConnector(entry.chartConnector) || entry.chartConnector === null
+        ? { chartConnector: entry.chartConnector }
         : {}),
     }]
   })

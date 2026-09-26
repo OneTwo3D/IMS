@@ -814,8 +814,20 @@ export class BillPaymentSupersessionRollback extends Error {
  * transaction back for the same reason all the same.
  */
 export class BillPaymentEnqueueDeclined extends Error {
-  constructor(readonly accountingInvoiceId: string) {
-    super(`The accounting queue declined a BILL_PAYMENT for ledger invoice ${accountingInvoiceId}`)
+  /**
+   * o3d-j625 r3 (Codex HIGH 2) — WHY IT DECLINED, because the two reasons need different words.
+   *
+   * r2 read only the boolean, so both reasons were reported with the `not-configured` wording ("posting
+   * for this sync type is switched off"). A REFUSAL is a different event with a different remedy — the
+   * chart's connector has been retired, or the bill's own invoice id cannot be shown to belong to the
+   * connector this payment would post to — and sending an operator to turn a setting back on is a
+   * remedy that cannot work. `null` where the enqueue reported nothing at all.
+   */
+  constructor(
+    readonly accountingInvoiceId: string,
+    readonly reason: 'not-configured' | 'refused' | 'already-queued' | 'handled-by-hand' | null = null,
+  ) {
+    super(`The accounting queue declined a BILL_PAYMENT for ledger invoice ${accountingInvoiceId} (${reason ?? 'no reason reported'})`)
     this.name = 'BillPaymentEnqueueDeclined'
   }
 }
@@ -826,6 +838,25 @@ export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
   + 'Marking the bill paid now would leave the ledger showing it outstanding with nothing queued to '
   + 'correct that, so nothing was changed. Turn bill-payment posting back on and try again, or record '
   + 'the payment in the ledger by hand.'
+
+/**
+ * o3d-j625 r3 (Codex HIGH 2) — the message for a REFUSED bill payment, as opposed to an unconfigured
+ * one. Nothing here is a setting to switch on: the connector selection and the bill's recorded
+ * provenance have to agree before this payment can be routed at all.
+ */
+export const BILL_PAYMENT_ENQUEUE_REFUSED_MESSAGE =
+  'This bill has already been posted to an accounting connector, and IMS cannot establish that the '
+  + 'connector now selected is the one holding it. An accounting invoice id is a document id in the '
+  + 'accounting system\'s own database and IMS keeps it when the connector selection changes, so paying '
+  + 'against the wrong one would either fail or settle an unrelated document. Nothing was changed and '
+  + 'the bill is NOT marked paid. Either switch back to the connector that holds this bill, or re-post '
+  + 'the bill to the connector now in use so the document and its connector are recorded together — or '
+  + 'settle it by hand in the books that hold it.'
+
+/** Which of the two messages a decline warrants. */
+export function billPaymentEnqueueDeclinedMessage(reason: BillPaymentEnqueueDeclined['reason']): string {
+  return reason === 'refused' ? BILL_PAYMENT_ENQUEUE_REFUSED_MESSAGE : BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE
+}
 
 /** What an operator has to do about each refusal, in the words they will see. */
 export function billPaymentRefusalMessage(refusal: BillPaymentSupersessionRefusal): string {

@@ -1472,6 +1472,24 @@ model PurchaseInvoice {
   // Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
   // bills that HAVE an external id: any number of bills may be unlinked.
   accountingInvoiceId String?  @unique @map("accounting_invoice_id")
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingInvoiceConnector String? @map("accounting_invoice_connector")
   // o3d-wf86: HOW this bill acquired that id. NULL means "nobody recorded it" — every row written
   // before this column existed, and that unknown is exactly the state that makes a conflict
   // unadjudicable, so it is left honest rather than backfilled with a guess.
@@ -1589,6 +1607,24 @@ model SupplierCreditNote {
   // id. Without this index that lands as two local rows pointing at one ledger document; with it,
   // the second link is refused loudly. The number-collision defect itself is o3d-tfri.
   accountingCreditNoteId String?                 @unique @map("accounting_credit_note_id")
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingCreditNoteConnector String?         @map("accounting_credit_note_connector")
   recordedAt            DateTime                 @default(now())
   postedAt              DateTime?
   createdBy             String?
@@ -1751,6 +1787,24 @@ model SalesOrder {
   // Global and on the VALUE alone, deliberately — see PurchaseInvoice.accountingInvoiceId. NULLs are
   // not equal in Postgres, so any number of orders may be unlinked.
   accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingInvoiceConnector String? @map("accounting_invoice_connector")
   paidAt            DateTime?
   /// o3d-psrx r2 — THE PAID FLAG BESIDE IT WAS SET FROM EVIDENCE THE LEDGER WAS NEVER GIVEN.
   ///
@@ -2004,6 +2058,24 @@ model SalesOrderRefund {
   // replay paths return the EXISTING refund rather than creating a second one — so no split or
   // partial refund legitimately shares a credit note. Global, on the value alone, NULLs unconstrained.
   accountingCreditNoteId String?   @unique @map("accounting_credit_note_id") // Accounting credit note ID after sync
+  /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
+  ///
+  /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
+  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
+  /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
+  /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
+  /// wrong connector's invoice id either fails or settles an unrelated document.
+  ///
+  /// NULL means NOBODY RECORDED IT — every row written before this column existed. It is deliberately
+  /// NOT backfilled: a guess about which ledger holds a document is the mistake being corrected, and
+  /// the enqueue guard reads NULL as "provenance cannot be established" and REFUSES, leaving the
+  /// posting owed and reported. Fail-closed, never assumed-active.
+  ///
+  /// Written in the SAME statement as the id (lib/domain/accounting/back-reference.ts) so a linked row
+  /// can never be provenance-less, and cleared in the same statement when the claim is released.
+  accountingCreditNoteConnector String? @map("accounting_credit_note_connector")
   externalRefundId Int?
   returnWarehouseId String?
   reason          String?
@@ -2883,6 +2955,99 @@ model AccountingReconciliationFinding {
   @@index([code, status])
   @@index([entityType, entityId])
   @@map("accounting_reconciliation_findings")
+}
+
+/// o3d-j625 r4 — A POSTING IMS REFUSED TO QUEUE, AS DURABLE, QUERYABLE WORK.
+///
+/// Rounds 2-4 gave the accounting enqueues the ability to REFUSE — a chart whose connector has been
+/// retired, a document id that cannot be shown to belong to the connector the row would post to, a
+/// payment-account mapping holding another connector's account — and reported every one of them as an
+/// Activity-log line. An Activity line is a thing somebody has to already be looking for. The refusals
+/// this table records are precisely the ones NOBODY is watching: the WooCommerce held-invoice release
+/// refuses days after the order imported, and nothing retries it.
+///
+/// So a refusal is recorded as OUTSTANDING WORK, in the shape the exception inbox already uses: what
+/// was owed, to which books, what IMS did instead, and what the operator must do. It carries BOTH
+/// connectors — the chart's and the one active at the moment of refusal — because round 2's warning
+/// named only the chart, which tells an operator what went wrong and not what to switch back to.
+///
+/// ONE OPEN ROW PER POSTING. The natural key is the posting itself (type + reference), so a sweep that
+/// refuses the same release every five minutes updates one row rather than filling the inbox; `count`
+/// says how many times, and `lastRefusedAt` when it last tried.
+///
+/// CLEARED BY THE POSTING BEING MADE, never by a timer: `resolvedAt` is stamped by the enqueue that
+/// finally writes the row for the same posting (see clearAccountingPostingRefusal). A resolved row is
+/// kept as the record that the gap existed and for how long.
+model AccountingPostingRefusal {
+  id              String    @id @default(cuid())
+  /// The accounting document that was not queued (AccountingSyncType, as the string the sync rows use).
+  type            String
+  referenceType   String
+  referenceId     String
+  /// o3d-j625 r5 (review HIGH 3) — THE OBLIGATION WITHIN THE DOCUMENT, or `''` when the document IS the
+  /// obligation. An INVOICE_PAYMENT is one RECEIPT against one document, a stock receipt is one receipt of
+  /// a purchase order, a landed-cost journal is one adjustment run: keyed on the document alone, a refused
+  /// deposit's row was resolved by a later balance succeeding. Derived by `accountingPostingKey` from the
+  /// ENQUEUE's own params, never re-typed beside them.
+  scope           String    @default("")
+  /// Whose chart of accounts the refused payload was built from. NULL = nothing was switched on.
+  chartConnector  String?
+  /// The connector that was active when the refusal happened — the half round 2 omitted.
+  activeConnector String?
+  /// A machine code for what was refused, e.g. `retired_chart`, `unattributable_document_id`.
+  reason          String
+  /// What stands in IMS regardless, in the operator's words.
+  committed       String
+  /// What the operator has to do. Most wait for it; a few are retried by a sweep (see posting-refusal-copy.ts).
+  remedy          String
+  detail          Json?
+  refusedCount    Int       @default(1)
+  firstRefusedAt  DateTime  @default(now())
+  lastRefusedAt   DateTime  @default(now())
+  /// Stamped when the row stops being outstanding: the posting was queued (resolution `queued`), or — for a
+  /// MANUAL-ONLY kind — someone marked it handled after posting it by hand (`handled_manually`). NULL = still
+  /// outstanding. A later refusal of the same posting reopens the row as a new episode and clears all four.
+  resolvedAt      DateTime?
+  /// o3d-j625 r6 (review H4): WHICH SITE refused, as a key of POSTING_REFUSAL_KINDS
+  /// (lib/domain/accounting/posting-refusal-kinds.ts). It decides whether the row may be marked handled.
+  /// NULL = a row written before the column — never markable.
+  kind            String?
+  /// How the row was resolved: `queued` (IMS cleared it) or `handled_manually`. NULL while outstanding.
+  resolution      String?
+  /// The user who marked it handled. NULL for an automatic clear.
+  resolvedBy      String?
+  /// The operator's note when marking it handled (e.g. the ledger journal number). Plain text, length-limited.
+  resolutionNote  String?
+  /// o3d-j625 r7 (owner decision 2026-09-19, "Handled + stop retry"): when someone marked this posting
+  /// handled — i.e. asserted they posted it BY HAND. From then on IMS never posts this exact posting key:
+  /// every automatic enqueue of it is refused as already handled (createAccountingSyncLogRow). Never
+  /// cleared by any writer; a later refusal of the same key does not reopen the row. NULL = not suppressed.
+  suppressedAt    DateTime?
+  /// o3d-j625 r16 (Codex round 15, HIGH 1) — WHO IS SETTLING THIS POSTING BY HAND, RIGHT NOW, AND SINCE WHEN.
+  ///
+  /// r14 answered "the inbox must not tell an operator to post by hand while a row that can post exists" by
+  /// rewriting the INSTRUCTION. Round 15's finding is that an instruction cannot be made safe at all: the
+  /// operator's ledger write happens outside every transaction IMS holds, so between the page they read and
+  /// the posting they make, anything may queue the same posting and the worker may send it. Narrowing that
+  /// window is not closing it.
+  ///
+  /// So settling by hand is now an ACT with a beginning. Taking the claim cancels every provably-unsent row
+  /// for the posting key and refuses if any row may already have been sent — in ONE transaction, under the
+  /// key's advisory lock — and from then on `readPostingSuppression` reports the key as one IMS must not
+  /// queue, exactly as a completed hand posting is reported. Two operators cannot hold it: the claim is
+  /// written conditionally on this column being NULL. It is RELEASABLE (the row stays outstanding and
+  /// listed, saying who holds it) and it is CLEARED when the posting is marked handled — which, on a REUSED
+  /// posting key, is the only thing that unblocks a LATER edit, so it must never be left set.
+  handPostClaimedAt DateTime?
+  /// The user id holding the claim above. NULL exactly when `handPostClaimedAt` is NULL.
+  handPostClaimedBy String?
+
+  /// o3d-j625 r6 (review H1): named explicitly. The default name is 68 characters; Postgres truncates it to
+  /// 63 and Prisma truncates it DIFFERENTLY, so the migration's index and the schema's never matched and the
+  /// drift check failed every deploy.
+  @@unique([type, referenceType, referenceId, scope], map: "accounting_posting_refusals_posting_key")
+  @@index([resolvedAt, firstRefusedAt])
+  @@map("accounting_posting_refusals")
 }
 
 model AccountingToken {

@@ -1,0 +1,86 @@
+import type { Prisma } from '@/app/generated/prisma/client'
+import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
+import { withSavepoint } from '@/lib/db/savepoint'
+import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { lockPostingKey, readPostingSuppression, reportSuppressedPosting, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
+
+/**
+ * o3d-j625 r6 (review H3) — THE ONE PLACE AN ACCOUNTING SYNC ROW IS CREATED, AND THEREFORE THE ONE PLACE A
+ * REFUSED POSTING IS CLEARED.
+ *
+ * r5 cleared an outstanding refusal from the two facade enqueues only. Rows are also written by the
+ * connector queues, the daily batches and — the finding — the follow-up enqueues in both sync processors.
+ * The supplier-credit-note allocation sweep recorded a refusal "keyed exactly as the allocation's own
+ * enqueue", and that enqueue is `enqueueFollowUpSyncLog`, which never cleared anything: a row that could
+ * not clear, under inbox copy saying it would.
+ *
+ * So the clear moved to the write. Every `accountingSyncLog.create` in app/ and lib/ goes through this
+ * function (tests/accounting/sync-log-row-primitive.test.ts fails on one that does not), and this function
+ * clears the refusal whose key the new row carries — derived from the row's own fields by
+ * `accountingPostingKeyForRow`, which equals the key the enqueue's params produce. Whatever path queues a
+ * posting, its outstanding row clears, and a row that is unclearable by construction cannot recur.
+ *
+ * IN THE SAME CLIENT, UNDER A SAVEPOINT. The clear commits or rolls back with the row it is about (a clear
+ * that survived a rolled-back create would mark the debt paid over a posting never written), and a failure
+ * in it cannot abort the caller's transaction (25P02) — see posting-refusal-inbox.ts. On an autocommit
+ * client the savepoint helper simply runs the statement.
+ */
+export type SyncLogRowClient = {
+  accountingSyncLog: { create(args: { data: Prisma.AccountingSyncLogUncheckedCreateInput }): Promise<{ id: string }> }
+}
+
+/**
+ * Returns the created row, or `null` when the posting was MARKED HANDLED — posted by hand — in which case
+ * nothing is written and the refusal is reported (o3d-j625 r7). The `null` is in the return type so that
+ * every caller has to decide what "already posted by hand" means for it; none can post around it.
+ *
+ * o3d-j625 r16 (Codex round 15, HIGH 1): `null` ALSO means an operator is posting it by hand RIGHT NOW —
+ * they took the refusal for hand posting (`claimPostingForHandPosting`) before going to the ledger, and the
+ * claim is read through the same suppression channel under this same lock. That is what makes "the worker
+ * cannot post it while they are typing it" a property of this function rather than of a sentence in the
+ * exception inbox. The two are told apart by `PostingSuppression.basis` and reported differently; they are
+ * NOT told apart here, because the answer this function has to give is identical: write nothing.
+ *
+ * THROWS `PostingSuppressionUnreadableError` when whether it was marked handled cannot be READ (o3d-j625
+ * r8). That is a third answer, not a `null`: `null` asserts a counterpart exists in the ledger, and an
+ * unreadable state asserts nothing at all. Nothing is written, so the caller may retry.
+ */
+export async function createAccountingSyncLogRow<T extends { id: string }>(
+  client: SyncLogRowClient,
+  data: Prisma.AccountingSyncLogUncheckedCreateInput,
+  options?: {
+    /**
+     * Wrap the INSERT itself in a savepoint — for a caller that expects a unique-index collision and handles
+     * it (the in-transaction enqueue does). The clear always runs in its own.
+     */
+    createInSavepoint?: boolean
+  },
+): Promise<T | null> {
+  const key = accountingPostingKeyForRow({
+    type: String(data.type),
+    referenceType: data.referenceType,
+    referenceId: data.referenceId,
+    payload: data.payload,
+  })
+  // o3d-j625 r7: the mark-handled suppression, read under the same per-key lock the mark takes.
+  //
+  // o3d-j625 r8 (Codex HIGH): and a read that CANNOT be made throws out of here, before the create —
+  // deliberately not caught. r7 let an unreadable suppression mean "not suppressed", so a lookup that
+  // failed after the posting was marked handled wrote a PENDING row for it and the connector posted it a
+  // second time. The caller's transaction rolls back and the operation is retried; see the reasoning in
+  // posting-suppression.ts, including why refusing just this enqueue was the worse of the two answers.
+  await lockPostingKey(client as unknown as PostingSuppressionClient, key)
+  const suppression = await readPostingSuppression(client as unknown as PostingSuppressionClient, key)
+  if (suppression.suppressed) {
+    await reportSuppressedPosting(key, suppression)
+    return null
+  }
+  const create = () => client.accountingSyncLog.create({ data }) as Promise<T>
+  const row = options?.createInSavepoint ? await withSavepoint(client, create) : await create()
+  await clearAccountingPostingRefusal(
+    client as unknown as PostingRefusalClient,
+    key,
+    { withSavepoint: <R,>(fn: () => Promise<R>) => withSavepoint(client, fn) },
+  )
+  return row
+}

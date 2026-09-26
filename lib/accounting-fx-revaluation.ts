@@ -1,5 +1,7 @@
+import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
-import { getAccountingSettings, queueAccountingSync } from '@/lib/accounting'
+import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
+import { postingIsOwed } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   buildRealisedFxJournal,
   computeRealisedFx,
@@ -37,6 +39,23 @@ type OpenBalance = {
 
 type PriorRevaluation = {
   id: string
+  /**
+   * o3d-j625 r2 (Codex MEDIUM 1) — THE CONNECTOR THE SOURCE ROW WAS WRITTEN UNDER.
+   *
+   * The reversal below is built from `prior.lines`, which are the ACCOUNT CODES OF A HISTORIC JOURNAL
+   * read back out of `AccountingSyncLog.payload`. r1 attributed that reversal to `settings.connector`
+   * — this run's chart — which is a statement about a different read entirely: `getPriorRevaluations`
+   * neither selected nor filtered the source row's connector, so a revaluation posted under
+   * QuickBooks before a switch to Xero would have had its reversal routed to XERO carrying
+   * QuickBooks's AR/AP control and unrealised-FX codes. That is the very mis-attribution o3d-j625 is
+   * about, arrived at through the one site whose codes do not come from the settings object beside it.
+   *
+   * Carried off the row, therefore, and used as the reversal's `chartConnector`. Kept as a raw
+   * `string` because the column is a plain string with a default and a build that does not know the
+   * value must NOT guess: an unroutable connector is refused (see the reversal loop), never narrowed
+   * to whatever this build happens to support.
+   */
+  connector: string
   valuationDate: string
   side: FxSettlementSide
   lines: JournalLine[]
@@ -59,6 +78,16 @@ export type FxRevaluationResult = {
   reversed: number
   revalued: number
   documents: number
+  /**
+   * o3d-j625 r3 (Codex MEDIUM) — ENQUEUES THIS RUN OWES AND DID NOT MAKE.
+   *
+   * `reversed` and `revalued` were incremented unconditionally after a `queueAccountingSync` whose
+   * result was discarded, so a refusal — a source row written under a connector that is no longer
+   * active — was counted and reported as a completed reversal. Worse than a wrong number: the next
+   * run's `alreadyRevaluedForDate` read agreed with it, so nothing ever went back for it. The counts
+   * now only count rows that were queued, and what was NOT is stated here instead of vanishing.
+   */
+  refused: number
 }
 
 function asDateOnly(input?: Date | string): string {
@@ -100,7 +129,7 @@ function parseJournalLines(value: unknown): JournalLine[] {
  * unique index is partial on active statuses.
  */
 export function selectPriorRevaluationsToReverse(
-  logs: Array<{ id: string; payload: unknown }>,
+  logs: Array<{ id: string; connector: string; payload: unknown }>,
   valuationDate: string,
 ): PriorRevaluation[] {
   const reversalSources = new Set<string>()
@@ -120,6 +149,9 @@ export function selectPriorRevaluationsToReverse(
     if (payload.side !== 'receivable' && payload.side !== 'payable') continue
     prior.push({
       id: log.id,
+      // o3d-j625 r2: off the ROW, so the reversal is attributed to the books its codes came out of
+      // rather than to whichever connector is active when the reversal is raised.
+      connector: log.connector,
       valuationDate: payload.valuationDate,
       side: payload.side,
       lines: parseJournalLines(payload.lines),
@@ -136,16 +168,53 @@ async function getPriorRevaluations(valuationDate: string): Promise<PriorRevalua
       status: { in: [...ACTIVE_SYNC_STATUSES] },
     },
     orderBy: { createdAt: 'asc' },
-    select: { id: true, payload: true },
+    // o3d-j625 r2 (Codex MEDIUM 1): `connector` is SELECTED. Without it the reversal had no way to say
+    // whose chart of accounts its lines were, and attributed them to the current settings object.
+    select: { id: true, connector: true, payload: true },
   })
   return selectPriorRevaluationsToReverse(logs, valuationDate)
 }
 
-async function hasRevaluationForDate(valuationDate: string): Promise<boolean> {
+/**
+ * o3d-j625 r3 (Codex HIGH 4) — "ALREADY REVALUED TODAY" IS A QUESTION ABOUT ONE CONNECTOR'S BOOKS,
+ * AND IT WAS BEING ASKED OF EVERY CONNECTOR'S AT ONCE.
+ *
+ * This decides whether to SKIP the fresh revaluation. r2 declared that out of scope and unproven on the
+ * grounds that it "only decides whether to skip work" — which is the defect, not the defence: the work
+ * it skips is the writing of a journal, so a wrong `true` here is a journal silently not written. Xero
+ * revalues on the 9th; the operator switches to QuickBooks that afternoon; the run reads Xero's row,
+ * answers `true`, and QuickBooks' revaluation — whose lines come from QuickBooks' own AR/AP control and
+ * unrealised-FX accounts, and which no Xero row can stand in for — never happens. Nothing reports it,
+ * because skipping is the designed behaviour when the answer is `true`.
+ *
+ * Scoped to the connector whose chart this run is about, therefore. The idempotency keys the
+ * revaluation enqueue uses (`unrealised-fx:revaluation:<date>:<side>`) are NOT connector-scoped either,
+ * but they do not need to be for this: `queueAccountingSync` routes by `chartConnector` and each
+ * connector queue applies its own already-present check, so the enqueue is per-connector even though
+ * the key string is shared. This read is what had to learn the same scoping.
+ *
+ * DELIBERATELY NOT applied to `getPriorRevaluations`: that loop must see EVERY connector's live rows,
+ * because a revaluation posted under a connector that has since been retired still has to be reversed,
+ * and the reversal is routed by the SOURCE row's connector (see the loop). Narrowing that read to the
+ * active connector would strand exactly the rows the r2 work exists to reverse.
+ *
+ * `null` — no connector switched on — answers `false`. Unreachable from `runArApFxRevaluation`, whose
+ * `settings.syncEnabled` gate is `false` whenever the connector is `null`, and answered rather than
+ * asserted because `false` is the safe direction: it means "do not skip", and the revaluation enqueue
+ * then refuses on its own `chartConnector: null` and writes nothing.
+ */
+async function hasRevaluationForDate(
+  valuationDate: string,
+  connector: AccountingSettings['connector'],
+): Promise<boolean> {
+  if (connector === null) return false
   const logs = await db.accountingSyncLog.findMany({
     where: {
       type: 'UNREALISED_FX_JOURNAL',
       status: { in: [...ACTIVE_SYNC_STATUSES] },
+      // o3d-j625 r3 (Codex HIGH 4): the whole point — another connector's revaluation for this date
+      // does not relieve this connector of writing its own.
+      connector,
     },
     select: { payload: true },
   })
@@ -291,29 +360,63 @@ export async function runArApFxRevaluation(input?: {
   ])
 
   if (!settings.syncEnabled) {
-    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0 }
+    return { success: true, skipped: true, reason: 'Accounting sync disabled', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
   }
   if (!settings.unrealisedFxGainLossAccount) {
-    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0 }
+    return { success: false, error: 'Configure an unrealised FX gain/loss account before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
   }
   const receivableAccounts = getUnrealisedFxAccounts(settings, 'receivable')
   const payableAccounts = getUnrealisedFxAccounts(settings, 'payable')
   if (!receivableAccounts || !payableAccounts) {
-    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0 }
+    return { success: false, error: 'Configure AR, AP, and unrealised FX accounts before running revaluation.', valuationDate, reversed: 0, revalued: 0, documents: 0, refused: 0 }
   }
 
   // Don't bail the whole run when today's revaluation already exists: the
   // reversal-retry loop below must still run so a prior reversal that failed (or
   // never queued) gets retried instead of being stranded (scjz.39). Only the
   // fresh revaluation step is skipped when it has already been queued today.
-  const alreadyRevaluedForDate = await hasRevaluationForDate(valuationDate)
+  const alreadyRevaluedForDate = await hasRevaluationForDate(valuationDate, settings.connector)
 
   let reversed = 0
+  // o3d-j625 r3 (Codex MEDIUM): enqueues that declined and left the posting owed. Counted apart from
+  // `reversed`/`revalued`, which now count only what was actually queued.
+  let refused = 0
   const priorRevaluations = await getPriorRevaluations(valuationDate)
   for (const prior of priorRevaluations) {
     const lines = reverseJournalLines(prior.lines, `(reversal for ${prior.valuationDate})`)
     if (lines.length === 0) continue
-    await queueAccountingSync({
+    // o3d-j625 r2 (Codex MEDIUM 1) — A CONNECTOR THIS BUILD CANNOT ROUTE IS REFUSED, NOT GUESSED AT.
+    //
+    // `prior.connector` is a raw column value. Every row this build writes carries 'xero' or
+    // 'quickbooks', but a row written by another build (or a connector since removed — see the
+    // ShipHero removal in #680) can carry something else, and there is no safe substitute for it:
+    // naming this run's connector is the mis-attribution being fixed, and `null` would answer
+    // `not-configured`, which is the one no-op an obligation ledger is allowed to settle with. So the
+    // reversal is left OUTSTANDING and said to be outstanding.
+    const chartConnector = isRegisteredAccountingConnector(prior.connector) ? prior.connector : null
+    if (chartConnector === null) {
+      const { logActivity } = await import('@/lib/activity-log')
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'unrealised_fx_reversal_unroutable_source_connector',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `NOTHING WAS QUEUED. The unrealised FX revaluation of ${prior.valuationDate} (sync log `
+          + `${prior.id}) was posted under accounting connector '${prior.connector}', which this build `
+          + 'cannot route, so its reversal cannot be raised in the books its account codes belong to. '
+          + 'This reversal is still OUTSTANDING and the unrealised FX from that date is still carried: '
+          + 'reverse it by hand in that connector, or cancel the source row if it never posted.',
+        metadata: {
+          sourceEntryId: prior.id,
+          sourceConnector: prior.connector,
+          sourceValuationDate: prior.valuationDate,
+          valuationDate,
+        },
+      }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+      continue
+    }
+    const reversalEnqueued = await queueAccountingSync({
       type: 'UNREALISED_FX_JOURNAL',
       referenceType: 'FxRevaluation',
       referenceId: valuationDate,
@@ -329,8 +432,34 @@ export async function runArApFxRevaluation(input?: {
         lines,
       },
       idempotencyKey: `unrealised-fx:reversal:${valuationDate}:${prior.id}`,
+      // o3d-j625 r2 (Codex MEDIUM 1) — THE SOURCE ROW'S CONNECTOR, NOT THIS RUN'S SETTINGS OBJECT.
+      //
+      // `lines` is `reverseJournalLines(prior.lines, …)`: every account code on this journal was read
+      // out of a HISTORIC `AccountingSyncLog.payload`, not off the `settings` read at the top of this
+      // function. r1 wrote `settings.connector` here and argued that "every account code reachable from
+      // here came from the single getAccountingSettings()" — which is true of the REVALUATION enqueue
+      // below and false of this one. Attributing a QuickBooks-era journal's codes to a now-active Xero
+      // chart is the mis-routing of an existing cross-connector row, so it is routed by the row.
+      //
+      // A prior whose connector is no longer the active one is therefore REFUSED by the facade (and
+      // recorded as owed) instead of being reversed into the wrong books — which is the correct answer:
+      // you cannot reverse a QuickBooks journal by posting to Xero.
+      chartConnector,
     })
-    reversed += 1
+    // o3d-j625 r3 (Codex MEDIUM) — THE ANSWER IS READ, AND A REFUSAL IS NOT A REVERSAL.
+    //
+    // `reversed += 1` ran unconditionally. A prior written under a connector that is KNOWN but no
+    // longer active reaches the facade, is refused there (the chart cannot be honoured), and this loop
+    // counted it anyway — reporting a reversal with no reversal row, which makes the unrealised FX from
+    // that date look backed out when it is still carried. The facade writes its own
+    // `accounting_enqueue_refused_retired_chart` WARNING naming both connectors, so the report here is
+    // the count: what the run owes.
+    //
+    // `not-configured` is not counted as owed either way — it means this connector does not post FX
+    // journals at all (Xero, by design: see isFxGainLossJournalSuppressed), so there is no reversal
+    // outstanding to chase.
+    if (reversalEnqueued.queued) reversed += 1
+    else if (postingIsOwed(reversalEnqueued)) refused += 1
   }
 
   let revalued = 0
@@ -358,7 +487,7 @@ export async function runArApFxRevaluation(input?: {
       documents += built.documents
       if (built.lines.length === 0) continue
 
-      await queueAccountingSync({
+      const revaluationEnqueued = await queueAccountingSync({
         type: 'UNREALISED_FX_JOURNAL',
         referenceType: 'FxRevaluation',
         referenceId: valuationDate,
@@ -373,20 +502,42 @@ export async function runArApFxRevaluation(input?: {
           documentCount: built.documents,
         },
         idempotencyKey: `unrealised-fx:revaluation:${valuationDate}:${side}`,
+        // o3d-j625: `accounts.controlAccount` / `accounts.fxGainLossAccount` are this run's chart.
+        chartConnector: settings.connector,
       })
-      revalued += 1
+      // o3d-j625 r3 (Codex MEDIUM): the same defect on the same function's other enqueue. The reviewer
+      // named the reversal; this one is identical and is fixed with it — a revaluation counted as done
+      // is worse here, because `hasRevaluationForDate` would then read a row that does not exist... or,
+      // the case that actually bit, read ANOTHER connector's row (Codex HIGH 4) and skip the run.
+      if (revaluationEnqueued.queued) revalued += 1
+      else if (postingIsOwed(revaluationEnqueued)) refused += 1
     }
   }
 
   // Report skipped only when nothing happened this run (revaluation already
   // existed and no reversal needed retrying), preserving the prior signal.
-  const noop = alreadyRevaluedForDate && reversed === 0 && revalued === 0
+  //
+  // o3d-j625 r3 (Codex MEDIUM): AND A REFUSAL IS NOT NOTHING HAPPENING. `reversed === 0 && revalued === 0`
+  // used to be reachable with several refused enqueues behind it, and the run then announced itself as
+  // a no-op — the most reassuring message available for the state where postings are owed.
+  const noop = alreadyRevaluedForDate && reversed === 0 && revalued === 0 && refused === 0
   return {
     success: true,
     valuationDate,
     reversed,
     revalued,
     documents,
+    refused,
     ...(noop ? { skipped: true, reason: 'Revaluation already queued for this date' } : {}),
+    // Surfaced in the cron route's JSON body, beside the per-refusal WARNING the facade writes to the
+    // activity log. Not `success: false`: the run did everything it could, and failing it would make the
+    // cron retry a refusal that a retry cannot fix.
+    ...(refused > 0
+      ? {
+          reason:
+            `${refused} unrealised-FX journal${refused === 1 ? '' : 's'} could not be queued and `
+            + 'remain OUTSTANDING — see the accounting activity log for which, and why.',
+        }
+      : {}),
   }
 }

@@ -64,6 +64,62 @@ const LandedCostAdjustmentEntrySchema = z.object({
   eventKey: z.string(),
   totalDelta: z.number().finite(),
 })
+/**
+ * o3d-j625 r10 (Codex round 9, HIGH) — A REFUSAL THAT COULD NOT TAKE THE POSTING KEY, PERSISTED IN THE
+ * CALLER'S OWN TRANSACTION SO THE CALLER MAY STILL COMMIT.
+ *
+ * An in-transaction refusal must never WAIT for the posting key's lock (that transaction may already hold
+ * stock-level or sales-order locks, so waiting is where a deadlock comes from — see
+ * lib/domain/accounting/posting-suppression.ts). Until r10 it therefore recorded NOTHING when the key was
+ * busy, and the caller committed anyway: if the competing transaction then rolled back, an OWED posting
+ * was absent from the exception inbox with only an activity-log WARNING behind it.
+ *
+ * So the refusal is written HERE instead — one INSERT, in the caller's transaction, into a table no
+ * competing transaction is touching, so it commits atomically with the business writes and blocks on
+ * nothing. `reconcileProvisionalPostingRefusals` replays it from the pool, where waiting for the key IS
+ * allowed, and the replay asks exactly the questions the in-transaction call was not able to.
+ *
+ * The payload is the deferred CALL: the posting key, the record, when the refusal was DECIDED (never when
+ * it is replayed — the staleness checks are all relative to that moment) and the merge shape.
+ */
+export const AccountingPostingRefusalProvisionalPayloadSchema = z.object({
+  key: z.object({
+    type: nonEmptyString,
+    referenceType: nonEmptyString,
+    referenceId: nonEmptyString,
+    // `''` is the ordinary value: "the document IS the obligation" (lib/accounting/posting-key.ts).
+    scope: z.string(),
+  }),
+  record: z.object({
+    kind: z.string().nullable(),
+    chartConnector: z.string().nullable(),
+    activeConnector: z.string().nullable(),
+    reason: nonEmptyString,
+    committed: z.string(),
+    remedy: z.string(),
+    detail: z.unknown().optional(),
+  }),
+  /** ISO-8601. Required, not defaulted: a claim with no decision moment cannot be aged or compared. */
+  decidedAt: z.string().min(1),
+  mergeOnly: z.boolean(),
+  /**
+   * o3d-j625 r11 (Codex round 10, HIGH 1) — THE POSTINGS ALREADY QUEUED WHEN THE REFUSAL WAS SHUT OUT OF
+   * ITS KEY: the accounting-sync-log row ids, and whether that list is the whole set.
+   *
+   * OPTIONAL AND NULLABLE, and the three states are three different facts, which is why neither a default
+   * nor a required field would do. `undefined` = a claim written before this field existed. `null` = the
+   * deferring call was shut out and could not make the observation. An object = the baseline. Only the
+   * third licenses the replay to conclude that the transaction which held the key queued this posting; on
+   * the other two nothing discharges the refusal and the debt is kept (o3d-j625 r12 — there is no clock
+   * comparison left to fall back to, because a clock does not order two processes' events).
+   */
+  queuedWhenShutOut: z.object({
+    ids: z.array(nonEmptyString),
+    /** `false` = there were more live rows than a claim may carry, so `ids` is NOT the whole set. */
+    complete: z.boolean(),
+  }).nullable().optional(),
+})
+
 export const LandedCostJournalOutboxPayloadSchema = z.object({
   // Required (not defaulted): the scheduler only ever enqueues a fully-formed
   // result with both arrays, so a missing array is a malformed payload that must
@@ -414,6 +470,21 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
       effects: ONE_EFFECT,
       replay: 'local-only-guarded',
     },
+    // o3d-j625 r10 (Codex round 9, HIGH). The drain re-runs `recordAccountingPostingRefusal` from the
+    // POOL, which writes nothing anywhere but `accounting_posting_refusals` — no connector call, no
+    // accounting sync row. THE NAMED GUARD, and it sits between the resume and the effect rather than at
+    // the top of the job: every write that function makes happens while holding this posting key's
+    // transaction-scoped advisory lock (`runUnderPostingKeyLock`), and under that lock it re-reads the
+    // suppression and the resolution before writing. A worker that wakes after a reclaim therefore
+    // queues for the same lock and re-asks the same questions; it cannot carry a stale decision past
+    // them. The effect is also not an assignment: it is "reopen this posting's row if it is owed", which
+    // two executions leave in the same state whichever order they land in.
+    'posting-refusal.provisional': {
+      name: 'reconcileProvisionalPostingRefusal',
+      schema: AccountingPostingRefusalProvisionalPayloadSchema,
+      effects: ONE_EFFECT,
+      replay: 'local-only-guarded',
+    },
   },
   sales: {
     // Local only, and the guard is NOT that allocation is idempotent — it is not (o3d-67y r12 says
@@ -477,6 +548,7 @@ export const INTEGRATION_OUTBOX_OPERATIONS = buildOperationConstants(INTEGRATION
 export type RegisteredOutboxConnector = keyof typeof INTEGRATION_OUTBOX_REGISTRY
 
 export type LandedCostJournalOutboxPayload = z.infer<typeof LandedCostJournalOutboxPayloadSchema>
+export type AccountingPostingRefusalProvisionalPayload = z.infer<typeof AccountingPostingRefusalProvisionalPayloadSchema>
 export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRefundReservationReleaseOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>

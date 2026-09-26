@@ -36,11 +36,15 @@ function makeJob(payloadJson: unknown) {
   return { id: 'job-1', connector: 'accounting', operation: 'landed-cost.adjustment-journal', idempotencyKey: 'k', payloadJson, status: 'PROCESSING', attempts: 0, nextAttemptAt: null, lastError: null, lockedAt: new Date('2026-06-13T00:00:00Z'), lockedBy: 'w', createdAt: new Date('2026-06-13T00:00:00Z'), updatedAt: new Date('2026-06-13T00:00:00Z') }
 }
 
-function makeDeps(over: Partial<LandedCostOutboxDrainDeps> & { jobs?: ReturnType<typeof makeJob>[]; throwOnQueue?: boolean }) {
+function makeDeps(over: Partial<LandedCostOutboxDrainDeps> & { jobs?: ReturnType<typeof makeJob>[]; throwOnQueue?: boolean; owed?: number }) {
   const calls = { queued: 0, success: 0, retry: 0 }
   const deps: LandedCostOutboxDrainDeps = {
     claimWork: async () => (over.jobs ?? []) as never,
-    queueJournals: async () => { calls.queued++; if (over.throwOnQueue) throw new Error('queue failed') },
+    queueJournals: async () => {
+      calls.queued++
+      if (over.throwOnQueue) throw new Error('queue failed')
+      return { owed: over.owed ?? 0 }
+    },
     markSuccess: async () => { calls.success++ },
     markRetry: async () => { calls.retry++ },
   }
@@ -80,6 +84,16 @@ test('drain: a payload missing the adjustment arrays is malformed → retry, not
   assert.equal(res.failed, 1)
   assert.equal(calls.retry, 1)
   assert.equal(calls.queued, 0)
+})
+
+// o3d-j625 r4 (SWEEP 1): a run whose journals were REFUSED is not a succeeded job.
+test('[o3d-j625 r4] drain: a run that leaves journals OWED marks the job retryable, not succeeded', async () => {
+  const { deps, calls } = makeDeps({ jobs: [makeJob({ inventoryTransitAdjustments: [adj(5)], cogsAdjustments: [] })], owed: 2 })
+  const res = await processLandedCostJournalOutbox(deps)
+  assert.equal(calls.queued, 1, 'PRECONDITION: the journals were attempted')
+  assert.equal(calls.success, 0, 'the backstop must not stop caring about journals it could not queue')
+  assert.equal(calls.retry, 1)
+  assert.deepEqual(res, { claimed: 1, succeeded: 0, failed: 1 })
 })
 
 test('drain: no jobs → nothing happens', async () => {
@@ -123,4 +137,19 @@ test('scheduleLandedCostJournalOutbox is a no-op for a zero-delta recalc', async
   const tx = { integrationOutbox: { create: async () => { createCalls++; return {} }, findUnique: async () => null } } as never
   await scheduleLandedCostJournalOutbox(tx, { inventoryTransitAdjustments: [adj(0)], cogsAdjustments: [], auditRunIds: ['r'] })
   assert.equal(createCalls, 0)
+})
+
+// o3d-j625 r6/r7 — the outbox retry re-runs the SAME recalculation result, and each journal's key is a
+// function of the adjustment alone: so a journal refused by ANY caller (the direct ones schedule the outbox
+// too) is raised again by the outbox under the same key — which is why r7 made these `retried` kinds whose
+// mark-handled suppresses exactly that key (review H-B).
+test('[o3d-j625 r6 H4] the outbox retry raises the SAME landed-cost postings', async () => {
+  const { landedCostAdjustmentIdempotencyKey } = await import('@/lib/domain/purchasing/landed-cost-service')
+  const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
+  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'recalc-1', totalDelta: 12.5 } as never
+  for (const [kind, type] of [['cogs', 'COGS_JOURNAL'], ['inventory', 'STOCK_IN_TRANSIT']] as const) {
+    const first = accountingPostingKey({ type, referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: landedCostAdjustmentIdempotencyKey(kind, adj) })
+    const retry = accountingPostingKey({ type, referenceType: 'PurchaseOrder', referenceId: 'po-1', idempotencyKey: landedCostAdjustmentIdempotencyKey(kind, adj) })
+    assert.deepEqual(retry, first, `${type}: a retry of the same adjustment is the same posting`)
+  }
 })

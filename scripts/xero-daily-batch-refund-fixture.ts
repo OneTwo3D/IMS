@@ -193,6 +193,7 @@ async function seed() {
       invoiceNumber: `INV-E2E-XERO-${suffix}`,
       invoicedAt: now,
       accountingInvoiceId: `xero-invoice-${suffix}`,
+      accountingInvoiceConnector: 'xero', // o3d-j625 r3: whose document the id is
       paidAt: now,
       lines: {
         create: [

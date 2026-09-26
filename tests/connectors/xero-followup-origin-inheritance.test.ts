@@ -52,7 +52,7 @@ const state = {
   created: [] as Array<{ type: string; referenceType: string; referenceId: string; payload: Record<string, unknown> }>,
   activities: [] as Array<{ action: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   /** Candidates for the credit-note allocation sweep. */
-  creditNotes: [] as Array<{ id: string; accountingCreditNoteId: string | null; amountForeign: number; purchaseInvoice: { accountingInvoiceId: string | null } | null }>,
+  creditNotes: [] as Array<{ id: string; accountingCreditNoteId: string | null; accountingCreditNoteConnector?: string | null; amountForeign: number; purchaseInvoice: { accountingInvoiceId: string | null; accountingInvoiceConnector?: string | null } | null }>,
   /**
    * The PURCHASE_CREDIT_NOTE rows that survive for those credit notes. `externalTransactionId` is the
    * DOCUMENT each one's post actually issued — the column round 3's lookup never read, and the whole of
@@ -100,7 +100,33 @@ type FindManyArgs = {
   }
 }
 
+/**
+ * o3d-j625 r6 (review H3) — THE EXCEPTION INBOX'S REFUSAL TABLE, with upsert/updateMany semantics over the
+ * four-column key, so "the refusal row is cleared" is a property of stored rows and not of a call made.
+ */
+const refusals: Array<Record<string, unknown>> = []
+const refusalKeyMatches = (row: Record<string, unknown>, key: Record<string, unknown>): boolean =>
+  row.type === key.type && row.referenceType === key.referenceType && row.referenceId === key.referenceId
+  && (row.scope ?? '') === (key.scope ?? '')
+
 const db = {
+  accountingPostingRefusal: {
+    async upsert(args: { where: { type_referenceType_referenceId_scope: Record<string, unknown> }; create: Record<string, unknown>; update: Record<string, unknown> }) {
+      const key = args.where.type_referenceType_referenceId_scope
+      const existing = refusals.find((row) => refusalKeyMatches(row, key))
+      if (existing) { Object.assign(existing, args.update, { resolvedAt: null }); return existing }
+      const row = { ...args.create, resolvedAt: null }
+      refusals.push(row)
+      return row
+    },
+    async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+      const wantResolved = args.where.resolvedAt !== null && typeof args.where.resolvedAt === 'object'
+      const hits = refusals.filter((row) => refusalKeyMatches(row, args.where)
+        && (wantResolved ? row.resolvedAt !== null : row.resolvedAt === null))
+      for (const hit of hits) Object.assign(hit, args.data)
+      return { count: hits.length }
+    },
+  },
   accountingSyncLog: {
     async findMany(args: FindManyArgs) {
       const where = args?.where ?? {}
@@ -226,6 +252,7 @@ function reset() {
   state.creditNotes = []
   state.creditNotePosts = []
   sent.length = 0
+  refusals.length = 0
 }
 
 async function runXeroSync() {
@@ -326,8 +353,9 @@ test('audit-w77e: the allocation sweep inherits the credit note post\'s organisa
   state.creditNotes = [{
     id: 'cn-1',
     accountingCreditNoteId: 'XCN-ISSUED-BY-A',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-1' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-1', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [{
     referenceId: 'cn-1',
@@ -355,8 +383,9 @@ test('audit-w77e: with no surviving post to inherit from, the sweep records noth
   state.creditNotes = [{
     id: 'cn-2',
     accountingCreditNoteId: 'XCN-ORIGIN-LOST',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-2' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-2', accountingInvoiceConnector: 'xero' },
   }]
   // Retention took the row that would have known. Nothing here observed the post.
   state.creditNotePosts = []
@@ -399,8 +428,9 @@ function twoPostsOfOneCreditNote() {
     id: 'cn-9',
     // The id the allocation will carry. Issued by organisation A.
     accountingCreditNoteId: 'XCN-FIRST',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-9' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-9', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -470,8 +500,9 @@ test('r4: a FAILED row that NAMES the document is still the issuing post — sta
   state.creditNotes = [{
     id: 'cn-10',
     accountingCreditNoteId: 'XCN-POSTED-THEN-FAILED',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 25,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-10' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-10', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -508,8 +539,9 @@ test('r4: when NO row names the document it carries, the sweep records nothing r
   state.creditNotes = [{
     id: 'cn-11',
     accountingCreditNoteId: 'XCN-ISSUER-GONE',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-11' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-11', accountingInvoiceConnector: 'xero' },
   }]
   // Retention took the row that posted XCN-ISSUER-GONE. A LATER post of the same credit note survives,
   // and it is not evidence about XCN-ISSUER-GONE.
@@ -546,8 +578,9 @@ test('r4: two rows claiming ONE document against different organisations resolve
   state.creditNotes = [{
     id: 'cn-12',
     accountingCreditNoteId: 'XCN-CONTESTED',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-12' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-12', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = [
     {
@@ -587,8 +620,9 @@ test('r4: the warning for an unestablishable origin names a remedy that can actu
   state.creditNotes = [{
     id: 'cn-13',
     accountingCreditNoteId: 'XCN-NO-ORIGIN',
+    accountingCreditNoteConnector: 'xero',
     amountForeign: 15,
-    purchaseInvoice: { accountingInvoiceId: 'XBILL-13' },
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-13', accountingInvoiceConnector: 'xero' },
   }]
   state.creditNotePosts = []
   state.tokenTenantId = 'tenant-C'
@@ -609,4 +643,75 @@ test('r4: the warning for an unestablishable origin names a remedy that can actu
   // What the row does in the meantime, so "leave it" is a decision rather than an oversight.
   assert.match(description, /sits FAILED in the sync log/)
   assert.doesNotMatch(description, /Re-queue the allocation from the credit note itself/)
+})
+
+// o3d-j625 r4 (SWEEP 2) — the sweep carries two document ids it reads off the tables into a XERO
+// allocation, so both must be recorded as Xero's. Fail closed on an unrecorded connector.
+for (const [label, cn, bill] of [
+  ['the BILL is recorded as QuickBooks\'', 'xero', 'quickbooks'],
+  ['the bill has NO recorded connector', 'xero', null],
+  ['the CREDIT NOTE has no recorded connector', null, 'xero'],
+] as const) {
+  test(`o3d-j625 r4: the allocation sweep REFUSES when ${label}, and says so`, async () => {
+    reset()
+    state.creditNotes = [{
+      id: 'cn-p',
+      accountingCreditNoteId: 'XCN-P',
+      accountingCreditNoteConnector: cn,
+      amountForeign: 40,
+      purchaseInvoice: { accountingInvoiceId: 'BILL-P', accountingInvoiceConnector: bill },
+    }]
+    state.creditNotePosts = [{
+      referenceId: 'cn-p', externalTransactionId: 'XCN-P', status: 'SYNCED',
+      syncedAt: new Date('2026-01-01T00:00:00Z'), payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    }]
+    state.tokenTenantId = 'tenant-A'
+
+    const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+    const result = await reenqueueMissingCreditNoteAllocations()
+
+    assert.equal(result.checked, 1, 'PRECONDITION: the candidate was examined')
+    assert.equal(state.created.length, 0, 'no allocation carrying a non-Xero document id is created')
+    assert.equal(result.failed, 1)
+    assert.equal(result.enqueued, 0)
+    const refusal = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_refused_unattributable_document')
+    assert.ok(refusal, 'the refusal is recorded')
+  })
+}
+
+// o3d-j625 r6 (review H3) — THE REFUSAL ROW THIS SWEEP WRITES MUST BE CLEARABLE, AND BY THIS SWEEP.
+//
+// r5 recorded it "keyed exactly as the allocation's own enqueue", but that enqueue is
+// `enqueueFollowUpSyncLog`, which created its row directly and cleared nothing — so the row could never
+// leave the inbox. Since r6 every row is created through `createAccountingSyncLogRow`, which clears the
+// refusal the row discharges. Driven end to end: refuse, repair the cause, sweep again.
+test('o3d-j625 r6 H3: a refused allocation leaves the inbox when a later sweep queues it', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-h3',
+    accountingCreditNoteId: 'XCN-H3',
+    accountingCreditNoteConnector: 'xero',
+    amountForeign: 40,
+    purchaseInvoice: { accountingInvoiceId: 'BILL-H3', accountingInvoiceConnector: 'quickbooks' },
+  }]
+  state.creditNotePosts = [{
+    referenceId: 'cn-h3', externalTransactionId: 'XCN-H3', status: 'SYNCED',
+    syncedAt: new Date('2026-01-01T00:00:00Z'), payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+  }]
+  state.tokenTenantId = 'tenant-A'
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+
+  await reenqueueMissingCreditNoteAllocations()
+  const open = () => refusals.filter((row) => row.resolvedAt === null)
+  assert.equal(state.created.length, 0, 'PRECONDITION: refused, nothing created')
+  assert.equal(open().length, 1, 'PRECONDITION: the refusal is outstanding')
+  assert.equal(open()[0]!.type, 'PURCHASE_CREDIT_NOTE_ALLOCATION')
+
+  // The bill is re-posted to Xero, so its connector is recorded, and the sweep runs again.
+  state.creditNotes[0]!.purchaseInvoice!.accountingInvoiceConnector = 'xero'
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created.length, 1, 'PRECONDITION: this time the allocation row was created')
+  assert.deepEqual(open(), [], 'and the refusal row it discharges is no longer outstanding')
+  assert.ok(refusals[0]!.resolvedAt, 'resolved, and kept as a record')
 })
