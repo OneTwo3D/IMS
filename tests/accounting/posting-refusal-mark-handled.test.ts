@@ -13,6 +13,8 @@ type Refusal = {
   id: string; type: string; referenceType: string; referenceId: string; scope: string; kind: string | null
   resolvedAt: Date | null; resolution: string | null; resolvedBy: string | null; resolutionNote: string | null
   suppressedAt: Date | null; firstRefusedAt: Date; refusedCount: number; detail: unknown; reason?: string
+  /** o3d-j625 r16: the hand-posting claim's two columns, NULL as the migration leaves every existing row. */
+  handPostClaimedAt: Date | null; handPostClaimedBy: string | null
 }
 type SyncRow = {
   id: string; connector: string; type: string; referenceType: string; referenceId: string; status: string
@@ -71,8 +73,19 @@ const refusalTable = {
     return create
   },
 }
+/**
+ * o3d-j625 r16: fired when the posting's sync rows are READ, which is AFTER the refusal row has been
+ * re-read under the lock and found markable and BEFORE the resolve. That is the only moment at which the
+ * resolve's own `kind` predicate is the thing being tested: `loadRefusalUnderItsKey` now re-reads under the
+ * lock, so a kind that changes at lock time is caught there instead, and a test that injected at lock time
+ * would leave the resolve's restatement unexamined.
+ */
+let onSyncRead: (() => void) | null = null
 const syncTable = {
-  findMany: async ({ where }: { where: Record<string, unknown> }) => syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where)),
+  findMany: async ({ where }: { where: Record<string, unknown> }) => {
+    onSyncRead?.()
+    return syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
+  },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
     for (const hit of hits) Object.assign(hit, data)
@@ -127,6 +140,7 @@ function refusal(id: string, kind: string | null, overrides: Partial<Refusal> = 
   return {
     id, type: 'STOCK_RECEIPT', referenceType: 'PurchaseOrder', referenceId: `po-${id}`, scope: `k-${id}`, kind,
     resolvedAt: null, resolution: null, resolvedBy: null, resolutionNote: null, suppressedAt: null,
+    handPostClaimedAt: null, handPostClaimedBy: null,
     firstRefusedAt: new Date('2026-09-01T00:00:00Z'), refusedCount: 1, detail: null, ...overrides,
   }
 }
@@ -146,9 +160,30 @@ test.beforeEach(() => {
   mirrorWrites.length = 0
   denyFresh = false
   onLock = null
+  onSyncRead = null
 })
 
+/**
+ * o3d-j625 r16 (Codex round 15, HIGH 1) — SETTLING A POSTING BY HAND IS *TAKE*, THEN CONFIRM, AND THE
+ * HELPER DOES BOTH BECAUSE THAT IS WHAT THE INBOX OFFERS.
+ *
+ * The mark refuses without the claim: the claim is the only thing that establishes IMS was standing back
+ * while the operator wrote to the ledger, and until r16 the ordering was an instruction they could read
+ * late or not at all. Every refusal these tests assert is now raised by whichever of the two steps reaches
+ * it first — and the wording is the same, because both call the same refusal helpers in
+ * posting-mark-handled.ts. The FIRST failure is returned, so a test that expected "the mark refused with X"
+ * still reads X.
+ */
 async function mark(id: string, note = '') {
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } =
+    await import('@/app/actions/sync-exceptions')
+  const taken = await claimAccountingPostingRefusalForHandPostingAction(id)
+  if (!(taken as { success: boolean }).success) return taken
+  return markAccountingPostingRefusalHandledAction(id, note)
+}
+
+/** The CONFIRM step alone, for the tests that are about what the mark itself does with a claim held. */
+async function markOnly(id: string, note = '') {
   const { markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
   return markAccountingPostingRefusalHandledAction(id, note)
 }
@@ -165,7 +200,10 @@ test('[o3d-j625 r6 H4] a MANUAL row is marked handled — who, when, how, the no
   assert.ok(refusals[0]!.suppressedAt instanceof Date, 'r7: the posting key is suppressed from then on')
   assert.ok(permissionsAsked.includes('fresh:sync'), 'behind a FRESH sign-in with the inbox\'s own permission')
   assert.ok(activity.some((entry) => entry.action === 'accounting_posting_refusal_marked_handled'))
-  assert.equal(locks.length, 1, 'under the per-posting-key lock the row-creating primitive takes')
+  assert.equal(locks.length, 2,
+    'under the per-posting-key lock the row-creating primitive takes — TWICE now (o3d-j625 r16): taking the '
+    + 'posting for hand posting and confirming it are two transactions, and each has to hold the key, '
+    + 'because between them the operator is in the ledger and nothing else may queue this posting')
 })
 
 test('[o3d-j625 r7 H-A] a row IMS RETRIES (but can get stuck) is markable, and its unsent queued row is CANCELLED', async () => {
@@ -329,12 +367,21 @@ for (const [kind, type, referenceType, why] of [
  * covered; the kind was not, because against the real map the earlier check already caught it.
  */
 test('[o3d-j625 r7] the resolve restates the KIND too: a row that stops being markable under the lock is refused, not resolved', async () => {
-  refusals.push(refusal('r12', 'stock_receipt_journal'))
-  onLock = () => { refusals[0]!.kind = 'tax_rate_sync'; onLock = null }
+  /**
+   * o3d-j625 r16: driven through the CONFIRM step alone, with the claim already held. The assertion is about
+   * the resolve's own `kind` predicate — that it restates under the lock what the read decided before it —
+   * and routing through the claim first would move the kind before the claim's own check and refuse there
+   * instead, which is a different (also correct) refusal and would leave this predicate unexamined.
+   */
+  refusals.push(refusal('r12', 'stock_receipt_journal', {
+    handPostClaimedAt: new Date('2026-09-26T09:00:00Z'), handPostClaimedBy: 'user-1',
+  }))
+  onSyncRead = () => { refusals[0]!.kind = 'tax_rate_sync'; onSyncRead = null }
 
-  const result = await mark('r12', 'posted by hand as MJ-12')
+  const result = await markOnly('r12', 'posted by hand as MJ-12')
 
   assert.equal(locks.length > 0, true, 'PRECONDITION: the lock was taken, so the row moved at the only moment it could')
+  assert.equal(onSyncRead, null, 'PRECONDITION: the injection point was REACHED — the kind really did move')
   assert.equal(refusals[0]!.kind, 'tax_rate_sync', 'PRECONDITION: the row is no longer of a markable kind')
   assert.equal(ok(result), false, `it must not resolve: ${JSON.stringify(result)}`)
   assert.match(errorOf(result), /changed while it was being marked/)

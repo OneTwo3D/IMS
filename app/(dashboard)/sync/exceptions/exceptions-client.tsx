@@ -2,8 +2,10 @@
 
 import { Fragment, useState, useTransition } from 'react'
 import {
+  ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING,
   ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
   ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
+  ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
   ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
 } from '@/lib/domain/accounting/posting-refusal-copy'
@@ -32,7 +34,9 @@ import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
   dismissWithdrawnDispatch,
+  claimAccountingPostingRefusalForHandPostingAction,
   markAccountingPostingRefusalHandledAction,
+  releaseAccountingPostingRefusalHandPostClaimAction,
   endHeldMaintenanceWindow,
   recordWithdrawnDespatch,
   runPostMaintenanceRecheckNow,
@@ -86,6 +90,12 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
   const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string } | null>(null)
   const [markingNote, setMarkingNote] = useState('')
+  /**
+   * o3d-j625 r16 (Codex round 15, HIGH 1): the two halves of settling a posting by hand that are NOT the
+   * acknowledgement — taking it (which is what stops IMS queueing it) and giving it back.
+   */
+  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string } | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -121,6 +131,61 @@ export function ExceptionsClient({ data }: Props) {
   return (
     <div className="space-y-4">
       {stepUpDialog}
+      {claimingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setClaimingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Take {claimingRefusal.label} for hand posting</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING}</p>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setClaimingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                disabled={isPending}
+                onClick={() => {
+                  const target = claimingRefusal
+                  runAction(
+                    () => claimAccountingPostingRefusalForHandPostingAction(target.id),
+                    'Taken for hand posting — IMS will not queue this posting while you hold it.',
+                  )
+                  setClaimingRefusal(null)
+                }}
+              >
+                <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+      {releasingRefusal ? (
+        <Dialog open onOpenChange={() => { if (!isPending) setReleasingRefusal(null) }}>
+          <DialogContent showCloseButton={false} className="max-w-lg">
+            <DialogHeader>
+              <DialogTitle>Release {releasingRefusal.label}</DialogTitle>
+            </DialogHeader>
+            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING}</p>
+            <DialogFooter>
+              <Button type="button" variant="outline" disabled={isPending} onClick={() => setReleasingRefusal(null)}>Cancel</Button>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={isPending}
+                onClick={() => {
+                  const target = releasingRefusal
+                  runAction(
+                    () => releaseAccountingPostingRefusalHandPostClaimAction(target.id),
+                    'Released — IMS may queue this posting again.',
+                  )
+                  setReleasingRefusal(null)
+                }}
+              >
+                <XCircle className="h-3 w-3 mr-1" />Release
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
       {markingRefusal ? (
         <Dialog open onOpenChange={() => { if (!isPending) setMarkingRefusal(null) }}>
           <DialogContent showCloseButton={false} className="max-w-lg">
@@ -988,11 +1053,36 @@ export function ExceptionsClient({ data }: Props) {
                     {row.refusedCount > 1 ? <span className="text-muted-foreground"> ({row.refusedCount} attempts)</span> : null}
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.committed}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{row.remedy}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground space-y-1">
+                    {/* o3d-j625 r16: WHAT TO DO FIRST, above the refusing site's own remedy — which is now
+                        rendered verbatim in every case (r14 used to rewrite it for a live row). The order is
+                        what carries the safety argument; the site's sentence says what the refusal was. */}
+                    {row.handPostOrder ? <div className="font-medium text-foreground">{row.handPostOrder}</div> : null}
+                    <div>{row.remedy}</div>
+                  </TableCell>
                   <TableCell className="text-xs text-muted-foreground space-y-1">
                     {/* o3d-j625 r6 (review H4): the action exists ONLY on MANUAL-ONLY rows; the server refuses it on any other. */}
                     <div>{row.clearing ? ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL[row.clearing] : ''}{row.clearingNote ?? 'Unclassified.'}</div>
-                    {row.clearing === 'manual' || row.clearing === 'retried' ? (
+                    {/* o3d-j625 r16: settling by hand is a two-step ACT. Until the posting is taken there is
+                        no Mark-as-handled to press — the server refuses one without a claim, and offering a
+                        button that always refuses is the "instruction that ends in a refusal" r14 banned. */}
+                    {(row.clearing === 'manual' || row.clearing === 'retried') && row.handPostClaim === null ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                      >
+                        <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
+                      </Button>
+                    ) : null}
+                    {row.handPostClaim && !row.handPostClaim.mine ? (
+                      <div className="text-foreground">
+                        Being settled by hand by {row.handPostClaim.byName ?? 'another operator'} since {formatDateTime(row.handPostClaim.at)}.
+                      </div>
+                    ) : null}
+                    {row.handPostClaim?.mine ? (
                       <Button
                         type="button"
                         variant="outline"
@@ -1001,6 +1091,17 @@ export function ExceptionsClient({ data }: Props) {
                         onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` }) }}
                       >
                         <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
+                      </Button>
+                    ) : null}
+                    {row.handPostClaim ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                      >
+                        <XCircle className="h-3 w-3 mr-1" />Release
                       </Button>
                     ) : null}
                   </TableCell>

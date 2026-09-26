@@ -47,7 +47,18 @@ import {
   ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON,
   ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY,
 } from '@/lib/domain/accounting/posting-refusal-copy'
-import { accountingSyncRowIsProvablyUnsent, markPostingHandled, MarkHandledRaceError, type MarkHandledClient, type MarkHandledResult } from '@/lib/domain/accounting/posting-mark-handled'
+import {
+  accountingSyncRowIsProvablyUnsent,
+  accountingSyncRowPostedAnEarlierPosting,
+  claimPostingForHandPosting,
+  markPostingHandled,
+  MarkHandledRaceError,
+  releasePostingHandPostClaim,
+  type HandPostClaimResult,
+  type HandPostReleaseResult,
+  type MarkHandledClient,
+  type MarkHandledResult,
+} from '@/lib/domain/accounting/posting-mark-handled'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -513,6 +524,34 @@ export type AccountingPostingRefusalRow = {
    * leaves this list; when it is cancelled, the next render says `null` and the ordinary remedy comes back.
    */
   queuedRow: 'unsent' | 'may-be-sent' | null
+  /**
+   * o3d-j625 r16 (Codex round 15, HIGH 2) — WHAT THE LEDGER ALREADY HOLDS UNDER THIS OBLIGATION.
+   *
+   * Only ever non-empty on the three types whose posting key successive DISTINCT postings share
+   * (`postingKeyIsReusedAcrossPostings`). Those rows are COMPLETED postings of an EARLIER edit: they can
+   * never post again, and they are not this refusal's posting, so they no longer make it `may-be-sent` —
+   * which is what used to leave a newly refused edit with no remedy at all. They are not hidden either:
+   * the operator is told which document the ledger holds, because the posting they are about to make by
+   * hand REPLACES it rather than joining it.
+   */
+  earlierPostings: string[]
+  /**
+   * o3d-j625 r16 (Codex round 15, HIGH 1) — WHO IS SETTLING THIS BY HAND, if anybody.
+   *
+   * `mine` is what the page uses to decide whether to offer the confirm/release actions or to say "another
+   * operator is settling this" — the server decides both again from the stored row, never from this.
+   */
+  handPostClaim: { at: string; by: string | null; byName: string | null; mine: boolean } | null
+  /**
+   * o3d-j625 r16 — THE ORDER OF OPERATIONS, when this refusal is one a person can close by hand.
+   *
+   * `null` for a row nothing offers Mark-as-handled on (an `auto` kind, an unconfirmed claim). Otherwise it
+   * is the sentence that says what to do FIRST — take the posting for hand posting, or settle a sync row,
+   * or that somebody else holds it — and it is rendered ABOVE `remedy`, which stays the refusing site's own
+   * words verbatim in every case. r14 rewrote `remedy` itself for a live row; round 12's property is
+   * cleaner if the site's sentence is never rewritten at all, so the two sentences are now two fields.
+   */
+  handPostOrder: string | null
 }
 
 /** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
@@ -938,7 +977,11 @@ function readParkedRefundedQuantities(payload: unknown): Map<number, number> {
 }
 
 export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
-  await requirePermission('sync')
+  // o3d-j625 r16: the session is kept now — a hand-post claim has to be rendered as MINE or SOMEBODY
+  // ELSE'S, and which of the two it is decides which actions the page offers. The server re-decides both
+  // from the stored row when an action is submitted; this only affects what is shown.
+  const viewer = await requirePermission('sync')
+  const viewerId = viewer.user.id
 
   const counts = await loadExceptionCounts()
   // The same database-clock reading rule as the counts above (o3d-0bfh r8). Taken again rather than
@@ -1084,6 +1127,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         firstRefusedAt: true,
         lastRefusedAt: true,
         kind: true,
+        // o3d-j625 r16: who is settling this posting by hand right now. The page has to say so — an
+        // operator who cannot see that somebody else holds it will post it as well.
+        handPostClaimedAt: true,
+        handPostClaimedBy: true,
       },
     }),
   ])
@@ -1401,11 +1448,24 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       ...await (async () => {
         // o3d-j625 r14: ONE query for the whole section, then per-row. See classifyQueuedRowsForRefusals.
         const queuedRows = await classifyQueuedRowsForRefusals(postingRefusalRows)
+        // o3d-j625 r16: and ONE lookup for the operators holding hand-post claims, same shape as the
+        // resolved list's — a user id in an instruction is not something an operator can act on.
+        const claimHolders = await namesOfUsers(postingRefusalRows.map((row) => row.handPostClaimedBy))
         return postingRefusalRows.map((row) => {
           const clearing = postingRefusalClearing(row.kind)
-          const queuedRow = queuedRows.get(
+          const classified = queuedRows.get(
             `${row.type}\u0000${row.referenceType}\u0000${row.referenceId}\u0000${row.scope}`,
-          ) ?? null
+          )
+          const queuedRow = classified?.queuedRow ?? null
+          const earlierPostings = classified?.earlierPostings ?? []
+          const handPostClaim = row.handPostClaimedAt
+            ? {
+                at: row.handPostClaimedAt.toISOString(),
+                by: row.handPostClaimedBy,
+                byName: row.handPostClaimedBy ? (claimHolders.get(row.handPostClaimedBy) ?? row.handPostClaimedBy) : null,
+                mine: row.handPostClaimedBy === viewerId,
+              }
+            : null
           return {
             ...row,
             firstRefusedAt: row.firstRefusedAt.toISOString(),
@@ -1414,9 +1474,14 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
             unconfirmed: false,
             queuedRow,
-            // The refusing site's remedy stands unless a row that can post exists — see queuedRowRemedy for
-            // why the replacement instruction is an ORDER (mark first, then post) rather than a warning.
-            remedy: queuedRow ? queuedRowRemedy(queuedRow, row.remedy) : row.remedy,
+            earlierPostings,
+            handPostClaim,
+            // o3d-j625 r16: the site's own remedy, VERBATIM, in every case — round 12's property with the
+            // exception r14 introduced removed again. What to do FIRST is its own field.
+            remedy: row.remedy,
+            handPostOrder: clearing === null || clearing === 'auto'
+              ? null
+              : handPostOrderFor({ queuedRow, earlierPostings, claim: handPostClaim }),
           }
         })
       })(),
@@ -1473,6 +1538,12 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     // the same instruction this round adds for the established rows that have a live row). `null` here
     // means "not classified", and the remedy it ships with is the unconfirmed one, not a site remedy.
     queuedRow: null,
+    // o3d-j625 r16: and for the same reason there is nothing to say about what the ledger holds, nothing to
+    // claim (a provisional claim is not yet known to be owed, so it may not be settled by hand at all), and
+    // therefore no order of operations. Its own remedy is the whole of what it can say.
+    earlierPostings: [],
+    handPostClaim: null,
+    handPostOrder: null,
   }))
 }
 
@@ -1501,10 +1572,12 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
  * the same function the row-creating primitive keys its clear on — decides whether a row belongs to this
  * refusal's posting or to a different one sharing the reference.
  */
+type QueuedRowClassification = { queuedRow: 'unsent' | 'may-be-sent' | null; earlierPostings: string[] }
+
 async function classifyQueuedRowsForRefusals(
   refusals: Array<{ type: string; referenceType: string; referenceId: string; scope: string }>,
-): Promise<Map<string, 'unsent' | 'may-be-sent'>> {
-  const classification = new Map<string, 'unsent' | 'may-be-sent'>()
+): Promise<Map<string, QueuedRowClassification>> {
+  const classification = new Map<string, QueuedRowClassification>()
   if (refusals.length === 0) return classification
   const live = await db.accountingSyncLog.findMany({
     where: {
@@ -1523,26 +1596,94 @@ async function classifyQueuedRowsForRefusals(
   for (const row of live) {
     const key = accountingPostingKeyForRow(row)
     const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
+    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [] }
+    classification.set(id, at)
+    /**
+     * o3d-j625 r16 (Codex round 15, HIGH 2) — A COMPLETED POSTING OF AN EARLIER EDIT IS NOT A ROW THAT
+     * COULD POST THIS REFUSAL, and it must stop making the remedy unreachable.
+     *
+     * The predicate is `accountingSyncRowPostedAnEarlierPosting`, EXPORTED from posting-mark-handled.ts
+     * and shared with the mark for the r14 reason: the sentence an operator reads and the guard that runs
+     * must not be two spellings of one rule. It is true only when the row can never post again AND the
+     * type's key is one successive postings share, so on every other key a SYNCED row still blocks.
+     *
+     * NOT SILENTLY DROPPED: the document it put in the ledger is carried into `earlierPostings`, and the
+     * order of operations says the hand posting REPLACES it. Dropping it would be the same mistake in the
+     * other direction — an operator creating a second document for an obligation that already has one.
+     */
+    if (accountingSyncRowPostedAnEarlierPosting(row)) {
+      at.earlierPostings.push(row.externalTransactionId ?? `${row.status} row`)
+      continue
+    }
     // 'may-be-sent' WINS over 'unsent' when a key has both: the instruction has to be safe for the worst
     // row under it, and "mark it" would be refused by the mark anyway while the operator had been told to.
-    if (classification.get(id) === 'may-be-sent') continue
-    classification.set(id, accountingSyncRowIsProvablyUnsent(row) ? 'unsent' : 'may-be-sent')
+    if (at.queuedRow === 'may-be-sent') continue
+    at.queuedRow = accountingSyncRowIsProvablyUnsent(row) ? 'unsent' : 'may-be-sent'
   }
   return classification
 }
 
-/** What the operator is told INSTEAD of the refusing site's remedy, when a row that can post exists. */
-function queuedRowRemedy(state: 'unsent' | 'may-be-sent', siteRemedy: string): string {
-  return state === 'unsent'
-    ? 'DO NOT POST THIS BY HAND YET. IMS has a queued row for this posting that nothing has picked up, so '
-      + 'the accounting sync can still post it — and if you post by hand first, the worker can post it too '
-      + 'and the ledger gets it twice. Either leave it for the next accounting sync run, or, if you mean to '
-      + 'post it by hand, press Mark as handled FIRST: that cancels the queued row (it refuses if the row '
-      + `may already have been sent), and then post it. The refusing site's own remedy was: ${siteRemedy}`
-    : 'DO NOT POST THIS BY HAND. IMS may ALREADY have posted this — its accounting sync row is in flight, '
-      + 'has been claimed by a processor, or carries a document id — so posting it now is how the ledger '
-      + 'gets it twice. Find this posting in the accounting sync log and settle THAT row first; Mark as '
-      + `handled will refuse until you do. The refusing site's own remedy was: ${siteRemedy}`
+/**
+ * ── o3d-j625 r16 — WHAT TO DO *FIRST*, for a refusal a person can close by hand ──
+ *
+ * The refusing site's own remedy is rendered verbatim beside this, always; this is the ORDER, and it exists
+ * because the order is the whole of the safety argument. r14 wrote it by rewriting the site's remedy, which
+ * cost round 12's property its exactness for no gain — the two sentences answer different questions and are
+ * now two fields.
+ *
+ * Every branch names an ACT, not a caution, because the act is what closes the interval: taking the posting
+ * for hand posting is a transaction that cancels the unsent rows and stops IMS queueing it, so an operator
+ * who takes it and then spends twenty minutes in the ledger cannot be overtaken.
+ */
+function handPostOrderFor(state: {
+  queuedRow: 'unsent' | 'may-be-sent' | null
+  earlierPostings: string[]
+  claim: { at: string; byName: string | null; mine: boolean } | null
+}): string {
+  const earlier = state.earlierPostings.length > 0
+    ? ' The ledger ALREADY holds '
+      + `${state.earlierPostings.join(', ')} for this obligation, from an earlier version of this document — `
+      + 'your hand posting REPLACES that document; do not raise a second one.'
+    : ''
+  if (state.claim?.mine) {
+    return 'YOU are settling this by hand. IMS will not queue this posting while you hold it, so take your '
+      + 'time: post it in the ledger now, then press "Mark as handled" to confirm it and close this row. If '
+      + 'you are not going to post it, press "Release" — IMS may then queue it again.'
+      + earlier
+  }
+  if (state.claim) {
+    return `${state.claim.byName ?? 'Another operator'} is settling this by hand (taken ${state.claim.at}). `
+      + 'Do NOT post it as well. IMS will not queue it while they hold it, and the row closes when they '
+      + 'confirm. If they are not going to finish, release their claim first.'
+      + earlier
+  }
+  if (state.queuedRow === 'may-be-sent') {
+    return 'DO NOT POST THIS BY HAND. IMS may ALREADY have posted this — its accounting sync row is in '
+      + 'flight, has been claimed by a processor, or carries a document id — so posting it now is how the '
+      + 'ledger gets it twice. Find this posting in the accounting sync log and settle THAT row first; '
+      + 'taking it for hand posting will refuse until you do.'
+      + earlier
+  }
+  return 'DO NOT POST THIS BY HAND YET. Press "Take for hand posting" FIRST. That is one transaction which '
+    + (state.queuedRow === 'unsent'
+      ? 'cancels the queued row IMS is holding for this posting (nothing has picked it up yet), refuses if '
+        + 'any row may already have been sent, '
+      : 'refuses if any row for this posting may already have been sent, cancels any that provably has not, ')
+    + 'and stops IMS queueing this posting at all while you hold it — so nothing can post it behind you '
+    + 'while you are in the ledger. Then post it, then press "Mark as handled".'
+    + earlier
+}
+
+/**
+ * o3d-j625 r16: user id → display name, for the two places a refusal names a person (who resolved it, and
+ * who is settling it by hand). ONE function so the claim's holder is named the same way the resolver is —
+ * a raw cuid in an instruction is not something an operator can act on.
+ */
+async function namesOfUsers(ids: Array<string | null>): Promise<Map<string, string | null>> {
+  const unique = [...new Set(ids.filter((id): id is string => Boolean(id)))]
+  if (unique.length === 0) return new Map()
+  const users = await db.user.findMany({ where: { id: { in: unique } }, select: { id: true, name: true } })
+  return new Map(users.map((user) => [user.id, user.name]))
 }
 
 /**
@@ -1560,11 +1701,7 @@ async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingR
       resolvedAt: true, resolution: true, resolvedBy: true, resolutionNote: true,
     },
   })
-  const userIds = [...new Set(rows.map((row) => row.resolvedBy).filter((id): id is string => Boolean(id)))]
-  const users = userIds.length === 0
-    ? []
-    : await db.user.findMany({ where: { id: { in: userIds } }, select: { id: true, name: true } })
-  const nameOf = new Map(users.map((user) => [user.id, user.name]))
+  const nameOf = await namesOfUsers(rows.map((row) => row.resolvedBy))
   return rows.map((row) => ({
     id: row.id,
     type: row.type,
@@ -1578,6 +1715,120 @@ async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingR
 }
 
 /**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r16 (Codex round 15, HIGH 1) — TAKE A REFUSED POSTING FOR HAND POSTING, BEFORE GOING TO THE
+ * LEDGER
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * This is the act that replaces "post it by hand, then mark it handled" as the first step. Three rounds
+ * tried to make that instruction safe — r12 kept the debt, r14 inverted the order and classified the live
+ * rows at render time — and round 15's finding is that no instruction can be: the operator's ledger write
+ * happens outside every transaction IMS holds, so between the page and the posting anything may queue the
+ * same posting and the worker may send it. The mark's guard fires when they come back, after the duplicate.
+ *
+ * `claimPostingForHandPosting` does the cancel-or-refuse and the claim in ONE transaction under the posting
+ * key's advisory lock, and the claim is read by every creation of an accounting sync row through the same
+ * suppression channel a completed hand posting uses. So while it is held, nothing queues the posting: a
+ * second operator is refused the claim by name rather than racing for it, and a stale page can produce a
+ * refusal but never a duplicate. See the module for the window that remains (releasing it) and why there is
+ * no expiry.
+ */
+export async function claimAccountingPostingRefusalForHandPostingAction(id: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    if (typeof id !== 'string' || id === '') return { success: false, error: 'No refused posting was named.' }
+    let result: HandPostClaimResult
+    try {
+      result = await db.$transaction(
+        (tx) => claimPostingForHandPosting(tx as unknown as MarkHandledClient, { id, userId: session.user.id }),
+        { maxWait: 5000, timeout: 20000 },
+      )
+    } catch (error) {
+      if (error instanceof MarkHandledRaceError) return { success: false, error: error.message }
+      throw error
+    }
+    if (!result.ok) return { success: false, error: result.message }
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'accounting',
+      action: 'accounting_posting_refusal_claimed_for_hand_posting',
+      level: 'INFO',
+      description:
+        'Took a refused accounting posting to settle it by hand. IMS will refuse to queue this posting while '
+        + 'the claim is held, so it cannot be posted twice while the operator is in the ledger'
+        + (result.cancelledSyncRows.length > 0
+          ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.`
+          : '.')
+        + (result.earlierPostings.length > 0
+          ? ` The ledger already holds ${result.earlierPostings.join(', ')} for this obligation from an earlier `
+            + 'version of the document; the hand posting replaces it.'
+          : ''),
+      metadata: {
+        refusalId: id, userId: session.user.id,
+        cancelledSyncRows: result.cancelledSyncRows,
+        earlierPostings: result.earlierPostings,
+        claimedAt: result.claimedAt.toISOString(),
+      },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-j625 r16 — GIVE THE CLAIM BACK. The refusal stays outstanding and IMS may queue the posting again
+ * from here on, so this is the one act that re-opens the interval the claim closed. Logged at WARNING for
+ * exactly that reason: if the holder DID post it by hand and released instead of confirming, the ledger can
+ * now get it twice, and that has to be findable afterwards.
+ *
+ * Anybody with the permission may release anybody's claim — the alternative is an outstanding posting that
+ * nobody can ever settle because the person who took it has gone.
+ */
+export async function releaseAccountingPostingRefusalHandPostClaimAction(id: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    if (typeof id !== 'string' || id === '') return { success: false, error: 'No refused posting was named.' }
+    let result: HandPostReleaseResult
+    try {
+      result = await db.$transaction(
+        (tx) => releasePostingHandPostClaim(tx as unknown as MarkHandledClient, { id }),
+        { maxWait: 5000, timeout: 20000 },
+      )
+    } catch (error) {
+      if (error instanceof MarkHandledRaceError) return { success: false, error: error.message }
+      throw error
+    }
+    if (!result.ok) return { success: false, error: result.message }
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'accounting',
+      action: 'accounting_posting_refusal_hand_post_claim_released',
+      level: 'WARNING',
+      description:
+        'Released the hand-posting claim on a refused accounting posting. IMS may queue and post it again '
+        + 'from now on — if it was already posted by hand and not confirmed here, the ledger can get it '
+        + 'twice. The refusal is still outstanding in the exception inbox.',
+      metadata: {
+        refusalId: id, releasedBy: session.user.id,
+        heldBy: result.releasedFrom, heldSince: result.heldSince.toISOString(),
+      },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
  * o3d-j625 r6/r7 (owner decisions 2026-09-18 and 2026-09-19, "Handled + stop retry") — MARK A REFUSED
  * POSTING HANDLED: the operator asserts they posted it BY HAND, and IMS will then never post it itself.
  *
@@ -1586,6 +1837,12 @@ async function loadResolvedPostingRefusals(): Promise<ResolvedAccountingPostingR
  * any provably-unsent sync row for the key, resolving the row and setting the suppression that every
  * row-creating path reads — is one transaction in lib/domain/accounting/posting-mark-handled.ts, under the
  * per-key lock those paths take, so a retry cannot slip a row in between.
+ *
+ * o3d-j625 r16 (Codex round 15, HIGH 1) — AND IT IS NOW THE SECOND HALF OF AN ACT. The mark refuses unless
+ * the operator holds the hand-posting claim (`claimAccountingPostingRefusalForHandPostingAction`), because
+ * that claim is the only thing that establishes IMS was standing back WHILE the ledger was written. Without
+ * it the ordering was an instruction an operator could read late or not at all; with it there is no path on
+ * which a hand posting is recorded over an interval IMS was free to post in.
  */
 export async function markAccountingPostingRefusalHandledAction(id: string, note: string): Promise<MutationResult> {
   try {

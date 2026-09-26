@@ -346,23 +346,35 @@ test('[o3d-j625 r14] a refusal whose posting has an UNSENT queued row is told to
     + 'failure this table exists to end. A fix that hid it would be worse than the bug.')
   assert.equal(row.queuedRow, 'unsent',
     'classified at render time from the row a processor has not claimed')
-  console.log(`[r14 unsent] queuedRow=${row.queuedRow} remedy=${JSON.stringify(row.remedy)}`)
+  console.log(`[r14/r16 unsent] queuedRow=${row.queuedRow} order=${JSON.stringify(row.handPostOrder)}`)
 
-  // THE FINDING, in one assertion: the instruction must not be "post it by hand".
-  assert.match(row.remedy, /DO NOT POST THIS BY HAND YET/,
-    'THE FINDING: with a row that can still post, telling the operator to post by hand is an instruction '
+  /**
+   * o3d-j625 r16 (Codex round 15) — THE ASSERTIONS MOVED FROM `remedy` TO `handPostOrder`, AND THE ORDER
+   * ITSELF CHANGED.
+   *
+   * r14 rewrote the refusing site's own remedy when a live row existed. Round 15 made the order a MECHANISM
+   * rather than a sentence, and the site's remedy is now never rewritten at all — round 12's property
+   * without r14's exception (the CONTROL below asserts byte equality for the ordinary case, and it does so
+   * for THIS case too). What to do first is its own field.
+   *
+   * And the first step is no longer "Mark as handled": the mark is the acknowledgement, and it refuses
+   * without a claim. The act that stops IMS posting is TAKING the posting.
+   */
+  assert.equal(row.remedy, refusalRows[0].remedy,
+    'the refusing site\'s own remedy is verbatim even here — it is not the page\'s job to rewrite it')
+  assert.ok(row.handPostOrder, 'and the ORDER of operations is its own field')
+  assert.match(row.handPostOrder, /DO NOT POST THIS BY HAND YET/,
+    'THE r14 FINDING: with a row that can still post, telling the operator to post by hand is an instruction '
     + 'to duplicate the posting — the worker can post the PENDING row while they are in the ledger')
-  assert.match(row.remedy, /Mark as handled FIRST/,
-    'and the order is INVERTED: the mark cancels the unsent row, so the guard runs BEFORE the ledger write '
-    + 'instead of after it')
-  assert.ok(!/^Re-queue/.test(row.remedy),
-    'the site remedy no longer leads — it is quoted at the end so nothing is lost')
-  assert.match(row.remedy, new RegExp(refusalRows[0].remedy.slice(0, 24).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
-    'and the refusing site\'s own remedy is still carried, so the page and the accounting log do not tell '
-    + 'two stories about what the refusal was')
-  // Mark-as-handled must STILL be offered: it is the safe first step now, so removing the affordance would
-  // leave the operator with the unsafe one.
-  assert.equal(row.clearing, 'retried', 'and the Mark-as-handled affordance is still offered')
+  assert.match(row.handPostOrder, /Take for hand posting" FIRST/,
+    'THE r16 FINDING: and the first step is the ACT that stops IMS queueing it, not an acknowledgement the '
+    + 'operator gives afterwards — an instruction cannot cover the interval they are in the ledger')
+  assert.match(row.handPostOrder, /cancels the queued row/,
+    'and it says what taking it does to the unsent row, because that is why the order is safe')
+  assert.equal(row.handPostClaim, null, 'nobody is settling it yet')
+  // The affordance must STILL be offered: it is the safe first step now, so removing it would leave the
+  // operator with the unsafe one.
+  assert.equal(row.clearing, 'retried', 'and the hand-posting affordance is still offered')
 })
 
 test('[o3d-j625 r14] a refusal whose queued row MAY ALREADY HAVE POSTED is sent to the sync log, not to the ledger', async () => {
@@ -377,14 +389,16 @@ test('[o3d-j625 r14] a refusal whose queued row MAY ALREADY HAVE POSTED is sent 
 
   assert.ok(row, 'still listed')
   assert.equal(row.queuedRow, 'may-be-sent')
-  console.log(`[r14 may-be-sent] queuedRow=${row.queuedRow} remedy=${JSON.stringify(row.remedy)}`)
-  assert.match(row.remedy, /DO NOT POST THIS BY HAND\./)
-  assert.match(row.remedy, /settle THAT row first/,
-    'the operator is sent to the surface that owns the ambiguity, and told the mark will refuse until they '
+  console.log(`[r14/r16 may-be-sent] queuedRow=${row.queuedRow} order=${JSON.stringify(row.handPostOrder)}`)
+  assert.equal(row.remedy, refusalRows[0].remedy, 'the site\'s own remedy, verbatim (r16)')
+  assert.ok(row.handPostOrder)
+  assert.match(row.handPostOrder, /DO NOT POST THIS BY HAND\./)
+  assert.match(row.handPostOrder, /settle THAT row first/,
+    'the operator is sent to the surface that owns the ambiguity, and told the claim will refuse until they '
     + 'have been')
-  assert.ok(!/Mark as handled FIRST/.test(row.remedy),
-    'and NOT told to mark first, because the mark refuses a row that may have been sent — an instruction '
-    + 'that ends in a refusal is not a remedy')
+  assert.ok(!/Take for hand posting" FIRST/.test(row.handPostOrder),
+    'and NOT told to take it first, because taking it refuses a row that may have been sent — an '
+    + 'instruction that ends in a refusal is not a remedy')
 })
 
 test('[o3d-j625 r14] CONTROL — with NO live row the refusing site\'s own remedy stands, and post-by-hand is what it says', async () => {
@@ -443,4 +457,144 @@ test('[o3d-j625 r14] receipt A\'s queued row does not rewrite receipt B\'s remed
   // And the SALES_INVOICE refusal is untouched too: a different type is also a different posting.
   assert.equal(receiptA?.queuedRow, null)
   assert.equal(receiptA?.remedy, refusalRows[0].remedy)
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r16 (Codex round 15, HIGH 2) — A COMPLETED POSTING OF AN EARLIER EDIT IS NOT A ROW THAT COULD
+ * POST *THIS* REFUSAL
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * SALES_INVOICE_UPDATE and PURCHASE_INVOICE_UPDATE share one posting key across successive edits by design.
+ * r14 asked only "is this row provably unsent?", so edit 1's SYNCED row classified edit 2's refusal as
+ * `may-be-sent` — and the remedy then refuses for ever, sending the operator to settle a row that succeeded.
+ * The discriminator is the pair of predicates that already existed: `isPostableAccountingSyncStatus` (can it
+ * still post?) and `postingKeyIsReusedAcrossPostings` (is it a different posting?).
+ */
+const invoiceUpdateRefusal = {
+  id: 'refusal-invoice-update',
+  type: 'SALES_INVOICE_UPDATE',
+  referenceType: 'SalesOrder',
+  referenceId: 'so-2',
+  scope: '',
+  kind: 'sales_invoice_update',
+  chartConnector: 'xero',
+  activeConnector: 'quickbooks',
+  reason: 'retired_chart',
+  committed: 'the order SO-1002 holds edit 2 in IMS and the ledger holds edit 1',
+  remedy: 'Re-save the order once the accounting connector selection has settled.',
+  refusedCount: 1,
+  firstRefusedAt: new Date('2026-09-12T08:00:00.000Z'),
+  lastRefusedAt: new Date('2026-09-12T08:00:00.000Z'),
+}
+
+test('[o3d-j625 r16 HIGH 2] an EARLIER edit\'s completed row leaves the newly refused edit with a usable remedy', async (t) => {
+  liveSyncRows.length = 0
+  liveSyncRows.push({
+    type: 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-2',
+    payload: {},
+    status: 'SYNCED',
+    attemptRevision: 1,
+    externalTransactionId: 'INV-EDIT-1',
+  })
+  allRows.push({ ...invoiceUpdateRefusal, resolvedAt: null })
+  t.after(() => {
+    allRows.splice(allRows.findIndex((row) => row.id === invoiceUpdateRefusal.id), 1)
+    liveSyncRows.length = 0
+  })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === invoiceUpdateRefusal.id)
+
+  assert.ok(row, 'PRECONDITION: the debt is listed — the ledger holds a stale invoice, which is real work')
+  console.log(`[r16 HIGH-2 surface] queuedRow=${row.queuedRow} earlier=${JSON.stringify(row.earlierPostings)} order=${JSON.stringify(row.handPostOrder)}`)
+
+  assert.equal(row.queuedRow, null,
+    'THE FINDING: the only row for this posting key POSTED AN EARLIER EDIT. It can never post again and it '
+    + 'is not this refusal\'s posting, so classifying this refusal as "may already have been sent" leaves '
+    + 'the current ledger update with no remedy at all.')
+  assert.deepEqual(row.earlierPostings, ['INV-EDIT-1'],
+    'and it is NOT silently ignored: the document the ledger already holds is named, because the hand '
+    + 'posting replaces it rather than joining it')
+  assert.ok(row.handPostOrder)
+  assert.match(row.handPostOrder, /Take for hand posting" FIRST/,
+    'so the way forward is the ordinary one — take it, post it, confirm it')
+  assert.match(row.handPostOrder, /ALREADY holds INV-EDIT-1/,
+    'with what the ledger holds stated, so the operator edits that document instead of raising a second one')
+  assert.equal(row.remedy, invoiceUpdateRefusal.remedy, 'and the site\'s own remedy is verbatim')
+})
+
+test('[o3d-j625 r16 HIGH 2 CONTROL] on a key that names ONE posting for ever, a completed row STILL blocks', async (t) => {
+  /**
+   * WHAT WOULD STILL PASS THE TEST ABOVE WITHOUT THIS ONE: ignoring every completed row, whatever its type.
+   * That re-opens HIGH 1 — on a key that is not reused, a SYNCED row may be this very posting (a false debt
+   * round 12 deliberately keeps), and telling the operator to post it by hand would duplicate it. refusal-1
+   * is SALES_INVOICE, which is NOT in REUSED_POSTING_KEY_TYPES, and the same row shape must block there.
+   */
+  liveSyncRows.length = 0
+  liveSyncRows.push(liveRowFor({ status: 'SYNCED', attemptRevision: 1, externalTransactionId: 'INV-ALREADY' }))
+  t.after(() => { liveSyncRows.length = 0 })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+  assert.ok(row)
+  console.log(`[r16 HIGH-2 control] queuedRow=${row.queuedRow} earlier=${JSON.stringify(row.earlierPostings)}`)
+  assert.equal(row.queuedRow, 'may-be-sent',
+    'a completed row on a key that names one posting for ever may BE this posting, so it still blocks')
+  assert.deepEqual(row.earlierPostings, [], 'and it is not an earlier edit — this key has no successive edits')
+})
+
+/**
+ * o3d-j625 r16 (Codex round 15, HIGH 1) — WHO IS SETTLING IT, ON THE PAGE.
+ *
+ * The claim is what closes the interval, so the page has to show it: an operator who cannot see that
+ * somebody else is in the ledger with this posting will go there too, and the claim would have bought
+ * nothing at the only place it is read by a person.
+ */
+test('[o3d-j625 r16 HIGH 1] a claim held by ANOTHER operator is rendered as theirs, and offers no confirm', async (t) => {
+  liveSyncRows.length = 0
+  const target = allRows.find((row) => row.id === 'refusal-1')!
+  target.handPostClaimedAt = new Date('2026-09-26T09:00:00.000Z')
+  target.handPostClaimedBy = 'u2'
+  t.after(() => { target.handPostClaimedAt = null; target.handPostClaimedBy = null })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+  assert.ok(row)
+  console.log(`[r16 claim other] claim=${JSON.stringify(row.handPostClaim)} order=${JSON.stringify(row.handPostOrder)}`)
+  assert.ok(row.handPostClaim)
+  assert.equal(row.handPostClaim.mine, false, 'the viewer is u1 and the holder is u2')
+  assert.equal(row.handPostClaim.at, '2026-09-26T09:00:00.000Z')
+  assert.ok(row.handPostOrder)
+  assert.match(row.handPostOrder, /Do NOT post it as well/,
+    'THE POINT: a second operator must be told somebody is in the ledger with this posting')
+  assert.ok(!/Take for hand posting" FIRST/.test(row.handPostOrder),
+    'and not invited to take it — the claim is held, so taking it would be refused')
+  assert.equal(row.remedy, refusalRows[0].remedy, 'the site\'s own remedy, verbatim, still')
+})
+
+test('[o3d-j625 r16 HIGH 1] a claim held by the VIEWER says post it now, then confirm', async (t) => {
+  liveSyncRows.length = 0
+  const target = allRows.find((row) => row.id === 'refusal-1')!
+  target.handPostClaimedAt = new Date('2026-09-26T09:30:00.000Z')
+  target.handPostClaimedBy = 'u1'
+  t.after(() => { target.handPostClaimedAt = null; target.handPostClaimedBy = null })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+  assert.ok(row)
+  console.log(`[r16 claim mine] claim=${JSON.stringify(row.handPostClaim)} order=${JSON.stringify(row.handPostOrder)}`)
+  assert.ok(row.handPostClaim)
+  assert.equal(row.handPostClaim.mine, true)
+  assert.ok(row.handPostOrder)
+  assert.match(row.handPostOrder, /YOU are settling this by hand/)
+  assert.match(row.handPostOrder, /IMS will not queue this posting while you hold it/,
+    'which is the promise the claim actually makes, and the reason the order is safe')
+  assert.match(row.handPostOrder, /"Mark as handled"/, 'and the acknowledgement is the SECOND step')
 })

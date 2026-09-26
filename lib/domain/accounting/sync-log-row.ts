@@ -34,6 +34,13 @@ export type SyncLogRowClient = {
  * nothing is written and the refusal is reported (o3d-j625 r7). The `null` is in the return type so that
  * every caller has to decide what "already posted by hand" means for it; none can post around it.
  *
+ * o3d-j625 r16 (Codex round 15, HIGH 1): `null` ALSO means an operator is posting it by hand RIGHT NOW —
+ * they took the refusal for hand posting (`claimPostingForHandPosting`) before going to the ledger, and the
+ * claim is read through the same suppression channel under this same lock. That is what makes "the worker
+ * cannot post it while they are typing it" a property of this function rather than of a sentence in the
+ * exception inbox. The two are told apart by `PostingSuppression.basis` and reported differently; they are
+ * NOT told apart here, because the answer this function has to give is identical: write nothing.
+ *
  * THROWS `PostingSuppressionUnreadableError` when whether it was marked handled cannot be READ (o3d-j625
  * r8). That is a third answer, not a `null`: `null` asserts a counterpart exists in the ledger, and an
  * unreadable state asserts nothing at all. Nothing is written, so the caller may retry.

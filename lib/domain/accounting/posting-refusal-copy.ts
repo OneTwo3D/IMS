@@ -69,6 +69,26 @@ export const ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING =
   + 'IMS will not post it." IMS cancels its own retry of this posting and will refuse to post it from then on, so '
   + 'it cannot reach the ledger twice. If IMS may already have posted it, you will be told, and nothing is changed.'
 
+/**
+ * o3d-j625 r16 (Codex round 15, HIGH 1): what "Take for hand posting" tells the operator before they take it.
+ *
+ * It is the FIRST step now, not the second, and the dialog says why in the operator's own terms: until they
+ * take it, IMS is free to queue and post this posting while they are in the ledger typing it, and no wording
+ * on the page can change that.
+ */
+export const ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING =
+  'Take this posting to settle it by hand. From the moment you do, IMS will NOT queue it — not on a sweep, not '
+  + 'from another operator saving the document — so nothing can post it while you are in the ledger. Any queued '
+  + 'row nothing has picked up is cancelled now; if a row may ALREADY have been sent you will be told instead and '
+  + 'nothing is changed. Then post it in the ledger and press "Mark as handled". If you decide not to post it, '
+  + 'press "Release" so IMS can queue it again.'
+
+/** o3d-j625 r16: what Release tells the operator, because it is the one act that re-opens the window. */
+export const ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING =
+  'Release this posting. IMS may queue and post it again from now on, and the refusal stays outstanding. Do NOT '
+  + 'release it if you have already posted it by hand — press "Mark as handled" instead, or the ledger can get it '
+  + 'twice. Releasing somebody else\'s claim is allowed, and recorded.'
+
 /** o3d-j625 r6 (review H4): the heading detail of the recently-resolved list. */
 export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
   'How each refused posting left the list: queued by IMS, or marked handled by a person after posting it by hand.'

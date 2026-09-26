@@ -66,11 +66,29 @@ async function loadDeps() {
     recordAccountingPostingRefusal: inbox.recordAccountingPostingRefusal,
     clearAccountingPostingRefusal: inbox.clearAccountingPostingRefusal,
     markPostingHandled: mark.markPostingHandled,
+    // o3d-j625 r16: the mark is the SECOND half of settling by hand. The claim is what stops IMS queueing
+    // the posting while the operator is in the ledger, and the mark refuses without it, so every test that
+    // marks a posting handled now takes it first — which is what an operator does.
+    claimPostingForHandPosting: mark.claimPostingForHandPosting,
     createAccountingSyncLogRow: row.createAccountingSyncLogRow,
   }
 }
 
 type Db = Awaited<ReturnType<typeof loadDeps>>['db']
+
+/** o3d-j625 r16: take the refusal for hand posting, as the inbox's first step does, and insist it worked. */
+async function takeForHandPosting(
+  deps: Awaited<ReturnType<typeof loadDeps>>,
+  refusalId: string,
+  userId: string,
+): Promise<void> {
+  const claimed = await deps.db.$transaction(
+    async (tx) => deps.claimPostingForHandPosting(tx as never, { id: refusalId, userId }),
+    TX,
+  )
+  assert.equal((claimed as { ok: boolean }).ok, true,
+    `PRECONDITION: ${userId} took the posting for hand posting: ${JSON.stringify(claimed)}`)
+}
 
 /**
  * MANUFACTURING_JOURNAL / ProductionOrder — a DOCUMENT-scoped posting whose refusal kind
@@ -156,10 +174,12 @@ test(
   '[o3d-j625 r9] a refusal racing MARK-HANDLED cannot reopen the row an operator posted by hand',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { db, recordAccountingPostingRefusal, markPostingHandled } = await loadDeps()
+    const deps = await loadDeps()
+    const { db, recordAccountingPostingRefusal, markPostingHandled } = deps
     const referenceId = probeId('mark')
     t.after(cleanup(db, referenceId))
     const refusalId = await seedOutstandingRefusal(db, referenceId)
+    await takeForHandPosting(deps, refusalId, 'j625r9-operator')
 
     let marked: unknown = null
     const signal: { fire?: () => void } = {}
@@ -347,10 +367,12 @@ test(
   '[o3d-j625 r9] a suppressed row is not updated even when the read says it is not suppressed',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { db, recordAccountingPostingRefusal, markPostingHandled } = await loadDeps()
+    const deps = await loadDeps()
+    const { db, recordAccountingPostingRefusal, markPostingHandled } = deps
     const referenceId = probeId('write-fence')
     t.after(cleanup(db, referenceId))
     const refusalId = await seedOutstandingRefusal(db, referenceId)
+    await takeForHandPosting(deps, refusalId, 'j625r9-operator')
     const marked = await db.$transaction(async (tx) => markPostingHandled(tx as never, {
       id: refusalId, userId: 'j625r9-operator', note: 'posted by hand',
     }), TX)
@@ -1894,7 +1916,8 @@ test(
   '[o3d-j625 r13] marking a BILL UPDATE handled does not suppress the NEXT edit of that bill',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { db, markPostingHandled, createAccountingSyncLogRow } = await loadDeps()
+    const deps = await loadDeps()
+    const { db, markPostingHandled, createAccountingSyncLogRow } = deps
     const poId = probeId('r13-bill-update')
     const billId = `BILL-${poId}`
     const key = billUpdateKey(poId, billId)
@@ -1917,6 +1940,7 @@ test(
       },
       select: { id: true },
     })
+    await takeForHandPosting(deps, refusal.id, 'j625r13-operator')
     const marked = await db.$transaction(async (tx) => markPostingHandled(tx as never, {
       id: refusal.id, userId: 'j625r13-operator', note: 'corrected bill by hand',
     }), TX)
@@ -1965,11 +1989,13 @@ test(
      * there is exactly one completion journal per production order, so a later posting on that key is the
      * SAME posting and must stay suppressed for ever.
      */
-    const { db, markPostingHandled, createAccountingSyncLogRow } = await loadDeps()
+    const deps = await loadDeps()
+    const { db, markPostingHandled, createAccountingSyncLogRow } = deps
     const referenceId = probeId('r13-suppress-control')
     t.after(cleanup(db, referenceId))
     const refusalId = await seedOutstandingRefusal(db, referenceId)
 
+    await takeForHandPosting(deps, refusalId, 'j625r13-operator')
     const marked = await db.$transaction(async (tx) => markPostingHandled(tx as never, {
       id: refusalId, userId: 'j625r13-operator', note: 'posted by hand as journal MJ-9',
     }), TX)

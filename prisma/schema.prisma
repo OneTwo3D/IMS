@@ -3023,6 +3023,24 @@ model AccountingPostingRefusal {
   /// every automatic enqueue of it is refused as already handled (createAccountingSyncLogRow). Never
   /// cleared by any writer; a later refusal of the same key does not reopen the row. NULL = not suppressed.
   suppressedAt    DateTime?
+  /// o3d-j625 r16 (Codex round 15, HIGH 1) — WHO IS SETTLING THIS POSTING BY HAND, RIGHT NOW, AND SINCE WHEN.
+  ///
+  /// r14 answered "the inbox must not tell an operator to post by hand while a row that can post exists" by
+  /// rewriting the INSTRUCTION. Round 15's finding is that an instruction cannot be made safe at all: the
+  /// operator's ledger write happens outside every transaction IMS holds, so between the page they read and
+  /// the posting they make, anything may queue the same posting and the worker may send it. Narrowing that
+  /// window is not closing it.
+  ///
+  /// So settling by hand is now an ACT with a beginning. Taking the claim cancels every provably-unsent row
+  /// for the posting key and refuses if any row may already have been sent — in ONE transaction, under the
+  /// key's advisory lock — and from then on `readPostingSuppression` reports the key as one IMS must not
+  /// queue, exactly as a completed hand posting is reported. Two operators cannot hold it: the claim is
+  /// written conditionally on this column being NULL. It is RELEASABLE (the row stays outstanding and
+  /// listed, saying who holds it) and it is CLEARED when the posting is marked handled — which, on a REUSED
+  /// posting key, is the only thing that unblocks a LATER edit, so it must never be left set.
+  handPostClaimedAt DateTime?
+  /// The user id holding the claim above. NULL exactly when `handPostClaimedAt` is NULL.
+  handPostClaimedBy String?
 
   /// o3d-j625 r6 (review H1): named explicitly. The default name is 68 characters; Postgres truncates it to
   /// 63 and Prisma truncates it DIFFERENTLY, so the migration's index and the schema's never matched and the

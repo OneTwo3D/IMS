@@ -784,6 +784,11 @@ export async function queueAccountingSync(params: {
   // rather than reopening a row nobody owes (posting-refusal-inbox.ts).
   const decidedAt = new Date()
   const posting = accountingPostingKey(params)
+  // o3d-j625 r16 — AND THE SAME IS TRUE WHILE AN OPERATOR IS POSTING IT BY HAND. The claim they took
+  // before going to the ledger (claimPostingForHandPosting) is read through this same channel, so this
+  // enqueue declines for the duration rather than racing them; the refusal row stays OUTSTANDING and
+  // listed, naming who holds it, which is what keeps the debt visible while nothing is queued.
+  //
   // o3d-j625 r7 — A POSTING MARKED HANDLED IS NEVER POSTED OR RE-REFUSED. Asked FIRST, before any check
   // that could refuse it and record a refusal over a posting someone has already made by hand. The
   // row-creating primitive asks again under the per-key lock, which is the check that cannot be raced.

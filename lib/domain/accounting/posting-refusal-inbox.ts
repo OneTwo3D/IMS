@@ -289,9 +289,16 @@ async function guarded(
  * answer to "I cannot tell" is the one the rest of this module already gives: KEEP THE DEBT. The inbox's
  * failure mode is SILENCE, so a debt listed that was in fact discharged is a row an operator can read and
  * close, while a debt discharged that was owed is a posting nobody will ever make. And the false-debt
- * direction is not unguarded: `markPostingHandled` refuses to mark a posting whose sync row is SYNCED,
- * PROCESSING, claimed or carries a document id, and tells the operator to settle that row first — so the
- * remedy an operator reaches for cannot post a second time behind IMS's back.
+ * direction is not unguarded, and o3d-j625 r16 is where that guarding actually became true. Two things
+ * stand between a kept false debt and a second ledger entry:
+ *   · the remedy is an ACT, not a sentence. An operator TAKES the posting for hand posting
+ *     (`claimPostingForHandPosting`) before going to the ledger; that transaction cancels every provably
+ *     unsent row under the key, refuses if any row may already have been sent, and makes every enqueue of
+ *     the posting refuse for as long as the claim is held. Round 15's HIGH 1 was that the previous answer —
+ *     an inverted INSTRUCTION — left the whole interval between reading the page and posting unguarded.
+ *   · a row that could not post THIS posting no longer blocks it. On the three types whose key successive
+ *     postings share, a COMPLETED row posted an earlier edit; round 15's HIGH 2 was that it made the remedy
+ *     refuse for ever, so the debt was kept AND unclosable. See `accountingSyncRowPostedAnEarlierPosting`.
  *
  * WHAT IS DELIBERATELY *NOT* EVIDENCE, and the "what would still pass it" question for each:
  *   • a live sync row on its own — several types share one key across successive postings by design

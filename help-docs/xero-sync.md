@@ -2302,7 +2302,7 @@ Three things about those rows:
 | --- | --- |
 | `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
 
-**IMS retries it, but the retry can get stuck** — *Mark as handled* is offered: post it by hand, then mark it; IMS cancels its own retry and will never post it.
+**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then post it by hand, then *Mark as handled*.
 
 | Refused posting | Why |
 | --- | --- |
@@ -2318,7 +2318,7 @@ Three things about those rows:
 | `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 | `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 
-**Nothing in IMS posts it again** — post it by hand, then *Mark as handled* (which also stops IMS ever posting it).
+**Nothing in IMS posts it again** — press *Take for hand posting* first, then post it by hand, then *Mark as handled* (which also stops IMS ever posting it).
 
 | Refused posting | Why |
 | --- | --- |
@@ -2337,16 +2337,37 @@ Three things about those rows:
 
 <!-- posting-refusal-kinds:end -->
 
-  **Mark as handled** means: *"I posted this by hand; IMS will not post it."* It asks for an optional note
-  (for example the ledger journal number) and records who marked it and when. In the same step IMS cancels
-  its own queued attempt at that exact posting and, from then on, refuses every automatic attempt to post it
-  (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is logged as
-  `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. If IMS may already
-  have posted it, or is posting it now (its accounting sync row is being processed, has failed, or carries a
-  document id), the mark is refused and nothing changes: check the ledger and settle that sync row first.
-  IMS refuses the mark on a row that clears itself, whatever the page showed. A row that clears itself leaves
-  the list when the posting is queued — by any path. Resolved rows from the last 30 days are listed underneath
-  with how each was closed.
+  **Settling a posting by hand is two steps, and the first one is not optional.**
+
+  **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
+  queued attempt at that exact posting (if nothing has picked it up yet) and then refuses to queue that
+  posting at all for as long as you hold it — not on a sweep, not because somebody else saved the document.
+  Each refused attempt is logged as `accounting_posting_suppressed_hand_post_claimed`. That is what makes it
+  safe to spend twenty minutes in the ledger: nothing can post it behind you. If a sync row for it may
+  ALREADY have been sent (it is being processed, has failed, or carries a document id) you are refused here
+  and nothing is changed — check the ledger and settle that sync row first. While you hold it the row stays
+  on this list, marked as being settled by you; another operator who opens the page is told you have it and
+  is not offered the action, so two people cannot post the same thing.
+
+  **2. Mark as handled** means: *"I posted this by hand; IMS will not post it."* It asks for an optional note
+  (for example the ledger journal number) and records who marked it and when. From then on IMS refuses every
+  automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is
+  logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. It is
+  refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
+  wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
+  row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
+  is queued — by any path. Resolved rows from the last 30 days are listed underneath with how each was closed.
+
+  **Release** gives the posting back if you are not going to post it. IMS may queue and post it again from
+  that moment, and the refusal stays on the list, so do **not** release it if you have already posted it by
+  hand — press *Mark as handled* instead, or the ledger can get it twice. Releasing somebody else's claim is
+  allowed (otherwise a posting nobody can settle would be stuck for ever) and is recorded as a **warning**.
+
+  **An earlier version of the same document does not block you.** For the postings where successive versions
+  share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
+  *previous* version. IMS names that document on the row and tells you your hand posting **replaces** it;
+  it does not stop you taking the posting, because that entry has already been made and is never going to be
+  made again. Edit the document the ledger holds; do not raise a second one.
 * **A posting marked handled stays handled.** If the same posting is refused again later it is logged
   (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
   IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
@@ -2373,12 +2394,12 @@ Three things about those rows:
   been written by different IMS processes, and comparing clocks is not the same as knowing which of two
   events happened first. So
   such a refusal is listed. If you find a row here whose posting is in fact sitting in the accounting sync
-  log, that is this choice: look at the sync log entry and settle it there, and note that *Mark as handled*
-  will refuse the row while IMS may already have posted it, and tell you so.
+  log, that is this choice: look at the sync log entry and settle it there, and note that *Take for hand
+  posting* will refuse the row while IMS may already have posted it, and tell you so.
 * **A claim that nothing has settled shows up as "Unconfirmed".** If the accounting sync run has not
   settled one of those held refusals within about 15 minutes, it is listed in this section marked
   **Unconfirmed — not yet known to be owed**, so a reconciler that has stopped running is visible instead
-  of silent. An unconfirmed row offers no *Mark as handled* action and **must not be posted by hand**:
+  of silent. An unconfirmed row offers no *Take for hand posting* action and **must not be posted by hand**:
   until it is settled the posting may still belong to the job that held the lock, and posting it by hand
   in that window is exactly how a journal reaches the ledger twice. The usual cause of a row sitting here
   is that `/api/cron/accounting-sync` is not running — check that before anything else. A claim the run

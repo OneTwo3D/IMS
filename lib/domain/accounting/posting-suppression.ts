@@ -66,8 +66,12 @@ export type PostingSuppressionClient = {
   accountingPostingRefusal?: {
     findUnique(args: {
       where: { type_referenceType_referenceId_scope: PostingRefusalKey }
-      select: { suppressedAt: true; resolvedBy: true }
-    }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null } | null>
+      select: { suppressedAt: true; resolvedBy: true; handPostClaimedAt: true; handPostClaimedBy: true }
+    }): Promise<{
+      suppressedAt: Date | null; resolvedBy: string | null
+      /** o3d-j625 r16: an operator is in the ledger posting this BY HAND right now. See the type below. */
+      handPostClaimedAt: Date | null; handPostClaimedBy: string | null
+    } | null>
   }
 }
 
@@ -329,7 +333,25 @@ export async function runUnderPostingKeyLock<T, O = never>(
   }, POOLED_TRANSACTION) as T
 }
 
-export type PostingSuppression = { suppressed: false } | { suppressed: true; at: Date; by: string | null }
+/**
+ * ── o3d-j625 r16 (Codex round 15, HIGH 1) — TWO STATES IN WHICH IMS MUST NOT QUEUE THIS POSTING ──
+ *
+ * `handled_by_hand`   somebody asserted they POSTED it, and on a key that names one posting for ever that
+ *                     assertion is permanent (`suppressedAt`, set once, cleared nowhere).
+ * `hand_post_claim`   somebody is posting it BY HAND RIGHT NOW. r14 tried to make that interval safe with
+ *                     an instruction; round 15's finding is that the operator acts outside every
+ *                     transaction IMS holds, so only a claim taken BEFORE they go to the ledger can stop
+ *                     the posting being queued behind them. It is temporary and releasable, and while it
+ *                     is held it refuses the enqueue exactly as a completed hand posting does.
+ *
+ * ONE CHANNEL, DELIBERATELY. Every writer of an accounting sync row already asks this question under this
+ * key's lock, and a second channel would be a second set of callers to get right. What the two states must
+ * not share is the SENTENCE an operator reads, so the basis is returned and `reportSuppressedPosting`
+ * branches on it rather than describing a claim as a completed posting.
+ */
+export type PostingSuppression =
+  | { suppressed: false }
+  | { suppressed: true; basis: 'handled_by_hand' | 'hand_post_claim'; at: Date; by: string | null }
 
 export async function readPostingSuppression(
   client: PostingSuppressionClient,
@@ -344,9 +366,16 @@ export async function readPostingSuppression(
     // REPORTABLE; it is not permission to carry on past it.
     const row = await withSavepoint(client, () => table.findUnique({
       where: { type_referenceType_referenceId_scope: key },
-      select: { suppressedAt: true, resolvedBy: true },
+      select: { suppressedAt: true, resolvedBy: true, handPostClaimedAt: true, handPostClaimedBy: true },
     }))
-    return row?.suppressedAt ? { suppressed: true, at: row.suppressedAt, by: row.resolvedBy } : { suppressed: false }
+    // A completed hand posting is checked first: it is permanent, so it is the stronger of the two answers
+    // and the only one that survives the row being resolved.
+    if (row?.suppressedAt) return { suppressed: true, basis: 'handled_by_hand', at: row.suppressedAt, by: row.resolvedBy }
+    // o3d-j625 r16: and an operator who is IN the ledger posting this by hand stops it just as firmly,
+    // for as long as they hold the claim. `markPostingHandled` clears the claim when it resolves the row,
+    // so this answer never outlives the act; `releasePostingHandPostClaim` gives it back deliberately.
+    if (row?.handPostClaimedAt) return { suppressed: true, basis: 'hand_post_claim', at: row.handPostClaimedAt, by: row.handPostClaimedBy }
+    return { suppressed: false }
   } catch (error) {
     const { logActivity } = await import('@/lib/activity-log')
     await logActivity({
@@ -364,17 +393,28 @@ export async function readPostingSuppression(
   }
 }
 
-/** The activity entry every refused automatic enqueue of a hand-posted posting writes. */
+/**
+ * The activity entry every refused automatic enqueue of a hand-posted posting writes.
+ *
+ * o3d-j625 r16: and of one an operator is posting by hand RIGHT NOW, which is a different fact and says so.
+ * The `handled_by_hand` action name is unchanged, so anything reading the log for it keeps working; the
+ * claim gets its own action rather than being reported as a posting that has already been made.
+ */
 export async function reportSuppressedPosting(key: PostingRefusalKey, suppression: Extract<PostingSuppression, { suppressed: true }>): Promise<void> {
   const { logActivity } = await import('@/lib/activity-log')
+  const claimed = suppression.basis === 'hand_post_claim'
   await logActivity({
     entityType: 'SYSTEM',
-    action: 'accounting_posting_suppressed_handled_by_hand',
+    action: claimed ? 'accounting_posting_suppressed_hand_post_claimed' : 'accounting_posting_suppressed_handled_by_hand',
     tag: 'accounting',
     level: 'INFO',
-    description:
-      `IMS did NOT post ${key.type} for ${key.referenceType} ${key.referenceId}: it was marked handled — posted `
-      + `by hand in the ledger — on ${suppression.at.toISOString()}, so posting it again would post it twice.`,
-    metadata: { ...key, suppressedAt: suppression.at.toISOString(), markedBy: suppression.by },
+    description: claimed
+      ? `IMS did NOT queue ${key.type} for ${key.referenceType} ${key.referenceId}: an operator took it to `
+        + `settle by hand at ${suppression.at.toISOString()} and still holds it, so queueing it now is how the `
+        + 'ledger would get it twice. It stays outstanding in the exception inbox until they confirm it or '
+        + 'release the claim.'
+      : `IMS did NOT post ${key.type} for ${key.referenceType} ${key.referenceId}: it was marked handled — posted `
+        + `by hand in the ledger — on ${suppression.at.toISOString()}, so posting it again would post it twice.`,
+    metadata: { ...key, basis: suppression.basis, suppressedAt: suppression.at.toISOString(), markedBy: suppression.by },
   }).catch(() => { /* a report that cannot be written must not turn a suppression into a post */ })
 }

@@ -1021,7 +1021,7 @@ test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const { landedCostAdjustmentIdempotencyKey } = await import('@/lib/domain/purchasing/landed-cost-service')
   const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
-  const { markPostingHandled } = await import('@/lib/domain/accounting/posting-mark-handled')
+  const { claimPostingForHandPosting, markPostingHandled } = await import('@/lib/domain/accounting/posting-mark-handled')
   const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
   const settings = await getAccountingSettings()
   const adjustment = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'recalc-1', totalDelta: 12.5 }
@@ -1044,7 +1044,10 @@ test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT
   const row = outstandingRefusals()[0]!
   assert.equal(row.kind, 'landed_cost_cogs_journal', 'PRECONDITION: recorded as outstanding')
 
-  // 2. Posted by hand, and marked handled.
+  // 2. TAKEN for hand posting (o3d-j625 r16: the mark refuses without the claim, because the claim is what
+  //    stops IMS queueing the posting while the operator is in the ledger), posted by hand, then marked.
+  const claimed = await claimPostingForHandPosting(transactionDouble() as never, { id: String(row.id), userId: 'user-1' })
+  assert.equal(claimed.ok, true, `PRECONDITION: the posting was taken for hand posting (${JSON.stringify(claimed)})`)
   const marked = await markPostingHandled(transactionDouble() as never, { id: String(row.id), userId: 'user-1', note: 'MJ-77' })
   assert.equal(marked.ok, true, `PRECONDITION: the mark succeeded (${JSON.stringify(marked)})`)
 
