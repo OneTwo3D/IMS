@@ -6197,9 +6197,21 @@ test('[o3d-n8xx] the shipped call site walks by descriptor, prunes by single com
     `the staging prune is a SHAPE and not a name; the call site may not pass one:\n${call}`)
 
   // AND THE ONE FACT THAT COULD SILENTLY UNDO THE PRUNE is checked in the script rather than
-  // assumed: the lock directory's PATH and its NAME have to compose.
-  const guard = code.find((line) => line.includes('"${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}"'))
-  assert.ok(guard, `the composition of ${'${CRONTAB_LOCK_DIR}'} must be asserted before it is relied on:\n${code.join('\n').slice(-2000)}`)
+  // assumed: the pruned directory's PATH and its NAME have to compose.
+  //
+  // o3d-txoe: what is pruned is the PRE-RELOCATION lock directory. The canonical lock moved out of
+  // ${DATA_DIR} entirely, and the prune stays because the old name must remain root-owned for the
+  // rollout bridge to a predecessor build to mean anything. So the guard is about
+  // ${CRONTAB_LEGACY_LOCK_DIR} now — and a SECOND one keeps the canonical lock out of this tree,
+  // because a future edit that composed it back under ${DATA_DIR} would be reintroducing the
+  // finding itself.
+  const guard = code.find((line) => line.includes('"${CRONTAB_LEGACY_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}"'))
+  assert.ok(guard, `the composition of ${'${CRONTAB_LEGACY_LOCK_DIR}'} must be asserted before it is relied on:\n${code.join('\n').slice(-2000)}`)
+  const outside = code.find((line) => line.includes('"${CRONTAB_LOCK_DIR}" != "${DATA_DIR%/}/"*'))
+  assert.ok(outside,
+    'and the CANONICAL lock must be asserted to live OUTSIDE ${DATA_DIR}: that directory belongs to '
+    + '${APP_USER}, which can rename a root-owned subdirectory aside within it, and the two writers '
+    + 'would then lock different inodes while both reported exclusion (o3d-txoe)')
 
   // AND THE WALK IT CALLS IS DESCRIPTOR-RELATIVE, which is the property the whole finding is about.
   const walker = readFileSync(CHOWN_TREE, 'utf8')
@@ -6942,10 +6954,12 @@ test('[o3d-secops] an ordinary install still runs: real roots pass, and a first 
   assert.ok(refused.stderr.includes(`${freshApp} — the application directory — is a`), refused.stderr)
 })
 
-/** Section 8's ${DATA_DIR} ownership change, lifted whole: the guard that holds the lock PATH to the
- *  lock NAME, and the descriptor walk it protects. */
+/** Section 8's ${DATA_DIR} ownership change, lifted whole: the two guards that hold the pruned PATH
+ *  to the pruned NAME and keep the CANONICAL lock out of this tree altogether (o3d-txoe), and the
+ *  descriptor walk they protect. */
 const SECTION8_DATA_CHOWN = [
-  shippedStatement('[[ "${CRONTAB_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \\'),
+  shippedStatement('[[ "${CRONTAB_LEGACY_LOCK_DIR}" == "${DATA_DIR%/}/${CRONTAB_LOCK_DIRNAME}" ]] || die \\'),
+  shippedStatement('[[ "${CRONTAB_LOCK_DIR}" != "${DATA_DIR%/}/"* ]] || die \\'),
   shippedStatement('chown_state_tree "${DATA_DIR}" "${APP_USER}" "${CRONTAB_LOCK_DIRNAME}" "the state directory"'),
 ].join('\n')
 
@@ -6985,7 +6999,12 @@ test('[o3d-n8xx] an ordinary install and the upgrade after it both complete thro
     // gid with `id`, which is the shipped behaviour; only the name differs from a real install.
     'APP_USER="$(id -un)"',
     `IMS_CHOWN_TREE_HELPER=${q(CHOWN_TREE)}`,
-    'crontab_lock_paths "${DATA_DIR}"',
+    // o3d-txoe: the FIRST argument is the ROOT-OWNED cutover namespace the lock moved to, and the
+    // directory the section-8 walk prunes is the SECOND — the PRE-RELOCATION location, kept
+    // root-owned so the rollout bridge to a predecessor build still means something. This rig is
+    // about the prune, so it is the second argument that matters here.
+    `CUTOVER_ROOT_DIR=${q(join(base, 'cutover-namespace'))}`,
+    'crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${DATA_DIR}"',
   ].join('\n')
   const section8 = [
     GATE_DATA, GATE_LOG,
@@ -7045,9 +7064,9 @@ test('[o3d-n8xx] an ordinary install and the upgrade after it both complete thro
   // ${DATA_DIR}/${CRONTAB_LOCK_DIRNAME} removed, and the lock path composed from a name the walk is
   // not told to prune — which is what a rename of one constant without the other produces. The lock
   // directory is then handed to the service account, and with the guard it is a refused run instead.
-  const composed = 'crontab_lock_paths "${DATA_DIR}"'
+  const composed = 'crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${DATA_DIR}"'
   assert.ok(vars.includes(composed), 'precondition: the rig must compose the lock path the way the entrypoints do')
-  const drifted = vars.replace(composed, `${composed}\nCRONTAB_LOCK_DIR="\${DATA_DIR}/locks-renamed"`)
+  const drifted = vars.replace(composed, `${composed}\nCRONTAB_LEGACY_LOCK_DIR="\${DATA_DIR}/locks-renamed"`)
   assert.notEqual(drifted, vars, 'the mutation must move the lock PATH without moving the lock NAME')
   const mutated = runBash(rig([...ROOT_ENTER, ...SUBDIR_WALK, 'chown_state_tree'], section8, drifted))
   assert.equal(mutated.status, 1, `a lock path that no longer composes must end the run: ${mutated.stderr}`)
@@ -7233,8 +7252,9 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
     + 'a gate that stands after any use of these names is the defect this round fixed')
 
   // AND NOTHING ABOVE THE PRIVILEGE CHECK ACTS ON THEM. The top-level lines up there compose paths
-  // and nothing else; crontab_lock_paths() assigns two variables and validates that its argument is
-  // absolute. Stated as an exact set, so a filesystem operation added above the gate fails here.
+  // and nothing else; crontab_lock_paths() assigns four variables and validates that both of its
+  // arguments are absolute. Stated as an exact set, so a filesystem operation added above the gate
+  // fails here.
   const before = lines
     .slice(0, privilegeCheck)
     .filter((line) => names.test(line) && /^[A-Za-z_]/.test(line))
@@ -7244,7 +7264,7 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
     'PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"',
     'readonly DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"',
     'DB_FENCE_SCRIPT="${APP_DIR}/scripts/fence-db-connections.mjs"',
-    'crontab_lock_paths "${DATA_DIR}"',
+    'crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${DATA_DIR}"',
     'DB_OBJECT_ACCESS_SCRIPT="${APP_DIR}/scripts/check-app-db-object-access.mjs"',
   ], 'every top-level statement above the gate that names a root must be a string composition')
 

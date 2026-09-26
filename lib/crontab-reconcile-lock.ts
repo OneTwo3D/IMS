@@ -1,5 +1,5 @@
 import { spawn } from 'child_process'
-import { closeSync, fstatSync, mkdirSync, openSync, statSync } from 'fs'
+import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, statSync } from 'fs'
 import path from 'path'
 
 /**
@@ -99,27 +99,82 @@ import path from 'path'
  * better: `scripts/install.sh` did not read it, so an operator who set it gave the two writers two
  * different locks — the exact "looks locked, excludes nothing" state this protocol exists to remove.
  *
- * The lock now lives under the service's systemd **StateDirectory**, and both writers derive it
- * from that ONE source:
- *
- *   • the application reads `$STATE_DIRECTORY`, which systemd itself sets in the service's
- *     environment from the unit's `StateDirectory=`. Nothing has to be configured for the app and
- *     the unit to agree — systemd is the one telling it.
- *   • `scripts/install.sh` writes `StateDirectory=${APP_NAME}` into the unit it generates and locks
- *     `${DATA_DIR}/locks/.crontab-reconcile.lock`, where `DATA_DIR=/var/lib/${APP_NAME}` is exactly
- *     the path systemd will hand the app in `$STATE_DIRECTORY` (the `locks` component is r24's, and
- *     is explained below).
- *   • `deploy/systemd/ims-stage.service` already declared `StateDirectory=onetwoinventory` for its
- *     backups, so the hardened unit needs no new directory and no new `ReadWritePaths=` entry:
- *     systemd creates a StateDirectory, owns it to the service user at `StateDirectoryMode=`, and
- *     implicitly adds it to `ReadWritePaths=`, so it survives `ProtectSystem=strict` by construction.
- *     `ProtectHome=` does not reach `/var/lib`, and `PrivateTmp=` does not either.
- *
- * The resolved-path agreement between the two writers is asserted — by RESOLVING both, not by
- * comparing basenames — in tests/settings/crontab-reconcile-serialization.test.ts.
+ * Round 23 moved the lock under the service's systemd **StateDirectory**, and o3d-txoe moved it
+ * again, out of it; both steps are kept here because the second is only legible beside the first.
  *
  * ============================================================================================
- * AND WHY IT IS IN A SUBDIRECTORY OF IT THAT ROOT OWNS (r24 CRITICAL).
+ * AND WHY IT IS NO LONGER THE StateDirectory EITHER — THE TWO PARTIES MUST SHARE AN IDENTITY
+ * (o3d-txoe, Codex HIGH).
+ *
+ * A MUTUAL-EXCLUSION PRIMITIVE HAS TWO PARTIES, AND THE ONLY PROPERTY THAT MATTERS IS THAT THEY
+ * NAME THE SAME INODE. `$STATE_DIRECTORY` is created by systemd **owned by the service user**, and
+ * it has to be — that is what made the lock reachable under the hardened unit at all. `rename(2)`
+ * asks for write permission on the PARENT and asks nothing whatever about the directory being
+ * moved, so the account this application runs as could do
+ *
+ *     mv  $STATE_DIRECTORY/locks  $STATE_DIRECTORY/locks-aside
+ *     mkdir $STATE_DIRECTORY/locks && : > $STATE_DIRECTORY/locks/.crontab-reconcile.lock
+ *
+ * and the two parties then locked whatever inode each of them found at the name when it opened it.
+ * Measured: the shell entered on one inode while `acquireCrontabFileLock` below entered on another,
+ * BOTH reported exclusion, and the application's committed schedule was discarded by the shell's
+ * write of a snapshot taken before it. `fdStillMatchesPath` did not catch it and could not — the
+ * descriptor DID match the pathname; the pathname was the thing that had changed meaning.
+ *
+ * AND IT COULD NOT BE CLOSED ON ONE SIDE. Pinning the shell's descriptor alone made the split
+ * PERSIST for a whole run instead of converging on its next acquisition, which is why that attempt
+ * was reverted in full. The remedy is a RELOCATION taken by both parties in one change.
+ *
+ * SO THE LOCK LIVES BENEATH A PARENT THE SERVICE ACCOUNT CANNOT RENAME WITHIN:
+ *
+ *     /                                  root-owned
+ *     /etc                               root-owned, 0755
+ *     /etc/ims-cutover-state             root-owned, 0711   CRONTAB_RECONCILE_LOCK_ROOT
+ *       └── locks/                       root-owned, 0755
+ *             └── .crontab-reconcile.lock  root-owned, 0644, never written
+ *
+ * and BOTH writers derive it from the same three pieces:
+ *
+ *   • this module joins `CRONTAB_RECONCILE_LOCK_ROOT` + `CRONTAB_RECONCILE_LOCK_DIRNAME` +
+ *     `CRONTAB_RECONCILE_LOCK_FILENAME`;
+ *   • `scripts/install.sh`, `scripts/deploy.sh` and `scripts/update.sh` each declare
+ *     `readonly CUTOVER_ROOT_DIR="/etc/ims-cutover-state"` — the root-owned cutover namespace that
+ *     already holds the shared cutover lock and the connection-fence authority — and hand it to
+ *     `crontab_lock_paths()` in `scripts/lib/crontab-lock.sh`, which joins the same two components.
+ *
+ * WHAT IS A KERNEL GUARANTEE AND WHAT IS ONLY AN AGREEMENT, because they are not the same and the
+ * distinction is the whole point of this round:
+ *
+ *   • KERNEL. No account but root can create, rename or unlink any component of that pathname, so
+ *     the pathname resolves to ONE inode for every party that utters it. It does not matter that
+ *     this module re-resolves the name on every acquisition while the shell holds a pinned
+ *     descriptor: there is nothing any other account can do to make those two answers differ. A
+ *     rename attempted by the service account fails with EACCES.
+ *   • AGREEMENT. That the two sides COMPOSE the same pathname. That is a property of two source
+ *     files, and it is asserted by RESOLVING both — bash evaluating the entrypoint's own
+ *     declaration, this module's own function asked for its own answer — in
+ *     tests/settings/crontab-reconcile-serialization.test.ts, never by comparing basenames.
+ *
+ * IT IS STILL REACHABLE UNDER THE HARDENED UNIT, which is the property r23 moved the lock for.
+ * `ProtectSystem=strict` makes `/etc` read-ONLY for the service, not invisible, and `flock(2)` needs
+ * no write access at all: the read-only fallback in `openLockFile` below is the normal path on an
+ * installed host anyway, because the lock file is root-owned. `ProtectHome=` and `PrivateTmp=` do
+ * not reach `/etc` either. Section 10 of the serialization test checks this against every
+ * write-constraining directive the shipped unit actually names.
+ *
+ * WHAT THIS MODULE DOES NOT ASSERT, SAID PLAINLY. It does not check that the lock's ancestry is
+ * root-OWNED. It could read the owner, and refusing on the answer would buy nothing: the
+ * application runs as the unprivileged service account, it has no safe alternative location to
+ * offer, and a lock directory that is not root-owned is a state only a privileged run can repair.
+ * The party that CAN assert it does: `ensure_cutover_root_dir()` refuses a namespace root that is a
+ * symlink, that is not owned by the run, or that is group- or other-writable, and
+ * `prepare_crontab_lock()` refuses a lock directory that is group- or other-writable — on every
+ * install, deploy and update. What this module asserts is the question it can answer on its own and
+ * must not get wrong: whether the shared location is THERE, and a refusal for every answer that is
+ * neither "it is" nor "it genuinely is not" (see `crontabReconcileLockPath`).
+ *
+ * ============================================================================================
+ * AND WHY THE LOCK IS IN A SUBDIRECTORY THAT ROOT OWNS (r24 CRITICAL).
  *
  * Round 23 put the lock file directly in the state directory and had `scripts/install.sh` `touch`,
  * `chown` and `chmod` it as root on every install and upgrade. The state directory is writable by
@@ -142,9 +197,10 @@ import path from 'path'
  *
  * So on an installed host the application opens the lock file READ-ONLY, via the fallback below,
  * and locks it exactly as before. Outside an install — `next dev`, or a unit deployed by hand —
- * there is no root writer to be protected from and nothing has created the directory, so
- * `openLockFile` creates it and the lock file itself as the service user. Both cases resolve the
- * SAME path, which is the property that makes this one exclusion rather than two.
+ * there is no root writer to be protected from and nothing has created the shared namespace, so
+ * `crontabReconcileLockPath` falls back to a location the service user can bootstrap and
+ * `openLockFile` creates it. In each case BOTH writers resolve the same path, which is the property
+ * that makes this one exclusion rather than two.
  *
  * IF THE PATH IS UNWRITABLE ANYWAY, THE RECONCILIATION REFUSES. `acquireCrontabFileLock` returns a
  * failure, `reconcileCrontab` returns `{ success: false, error }` WITHOUT running the
@@ -169,6 +225,23 @@ export const CRONTAB_RECONCILE_LOCK_FILENAME = '.crontab-reconcile.lock'
  * aimable at another path. `scripts/install.sh` creates both, and asserts both, in section 8.
  */
 export const CRONTAB_RECONCILE_LOCK_DIRNAME = 'locks'
+
+/**
+ * The root-owned parent the lock directory sits in — the cutover namespace (o3d-txoe).
+ *
+ * THE SAME LITERAL THE THREE ENTRYPOINTS DECLARE as `readonly CUTOVER_ROOT_DIR=`. It is a literal
+ * on both sides on purpose and reads no environment variable: a lock location an operator could
+ * move on one side and not the other is two locks pretending to be one, which is the state
+ * `OTI_CRONTAB_LOCK_PATH` was already scoped down to prevent.
+ *
+ * WHY THIS DIRECTORY AND NOT A NEW ONE. It already exists for exactly this class of problem — it
+ * holds the shared cutover lock and the connection-fence authority — and
+ * `ensure_cutover_root_dir()` in scripts/lib/cutover-namespace.sh already creates it root-owned
+ * 0711, refuses a symlink at it before and after the `mkdir -p`, and reads the owner and the mode
+ * back off the descriptor it stepped into. 0711 is TRAVERSABLE and not listable, which is exactly
+ * what this module needs: it opens a compiled-in name beneath it and never lists anything.
+ */
+export const CRONTAB_RECONCILE_LOCK_ROOT = '/etc/ims-cutover-state'
 
 /**
  * How long a queued reconciliation waits before giving up.
@@ -216,39 +289,150 @@ function systemdStateDirectory(): string | null {
 }
 
 /**
- * Where the lock file is.
+ * The cutover namespace root this process derives the shared lock from.
+ *
+ * `OTI_CUTOVER_STATE_ROOT` is a TEST-ONLY override, scoped exactly like `OTI_CRONTAB_LOCK_PATH`:
+ * REFUSED outright under `NODE_ENV=production`, with the reason on stderr, because a root an
+ * operator could move on this side and not in the entrypoints is the "two locks pretending to be
+ * one" state this module exists to prevent. It exists because the accept case of the shared
+ * derivation is otherwise unreachable from a test: a harness cannot create `/etc/ims-cutover-state`,
+ * so without it every test would exercise the fallback and the branch that matters would be
+ * exercised by nothing. Only the ANCHOR moves; the derivation under test is the shipped one.
+ */
+function cutoverNamespaceRoot(): string {
+  const override = process.env.OTI_CUTOVER_STATE_ROOT?.trim()
+  if (override && path.isAbsolute(override)) {
+    if (process.env.NODE_ENV !== 'production') return override
+    console.warn(
+      `OTI_CUTOVER_STATE_ROOT=${override} was IGNORED: it is a test-only override, and honouring it `
+      + 'in production would give the application and the shell entrypoints two different crontab '
+      + 'locks. The root-owned cutover namespace is a literal on both sides and is not configurable.',
+    )
+  }
+  return CRONTAB_RECONCILE_LOCK_ROOT
+}
+
+export type CrontabReconcileLockLocation =
+  | { ok: true; path: string; source: 'shared' | 'state-directory' | 'override' | 'working-directory' }
+  | { ok: false; error: string }
+
+/**
+ * Where the lock file is — or a REFUSAL, which is an answer this function did not used to have.
  *
  * ONE source, in this order:
  *
- *   1. `$STATE_DIRECTORY` — systemd's own answer, and the only one a supported deployment uses. It
- *      is the same directory `scripts/install.sh` locks, because the installer writes the
- *      `StateDirectory=` that produces it. Nothing can be configured to make those two disagree.
- *   2. `OTI_CRONTAB_LOCK_PATH` — TESTS ONLY, and scoped so it cannot become a second protocol on a
- *      real install: systemd's answer above always wins over it, and it is REFUSED outright when
+ *   1. `CRONTAB_RECONCILE_LOCK_ROOT` + the two components — the ROOT-OWNED cutover namespace, and
+ *      the only location a host that has been through an installer of this build ever uses. The
+ *      three entrypoints derive the identical path from their own `CUTOVER_ROOT_DIR` literal, and
+ *      no account but root can change what any component of it names (o3d-txoe). It is chosen when
+ *      the lock DIRECTORY beneath that root is there, and it outranks everything below, including
+ *      `$STATE_DIRECTORY`: the whole finding was that the StateDirectory is renameable by this very
+ *      account.
+ *   2. `$STATE_DIRECTORY` — where the lock USED to be. Reached only on a host where the shared
+ *      namespace has no lock directory in it, which means no entrypoint of this build has run here
+ *      yet. Keeping it is what makes the rollout window one-sided rather than two: an application on
+ *      this build and an entrypoint of the PREVIOUS build then still agree, and
+ *      `prepare_legacy_crontab_lock()` covers the mirror case.
+ *   3. `OTI_CRONTAB_LOCK_PATH` — TESTS ONLY, and scoped so it cannot become a second protocol on a
+ *      real install: both answers above win over it, and it is REFUSED outright when
  *      `NODE_ENV=production`. An override that can split the exclusion is worse than no override,
  *      which is the same argument this module already makes about the lock file's inode. A
  *      production process that sets it is told, on stderr, that it was ignored — rather than
  *      quietly locking a file no other writer will ever open.
- *   3. the working directory — a developer running `next dev` outside systemd, where there is no
+ *   4. the working directory — a developer running `next dev` outside systemd, where there is no
  *      installer and no second writer to agree with. On a hardened unit this is unwritable, and the
  *      reconciliation then REFUSES rather than proceeding unserialised (see `openLockFile`).
+ *
+ * AND AN ABSENCE IS ONLY READ AS AN ANSWER WHERE IT IS ONE. Deciding between 1 and 2 on "is the
+ * shared lock directory there?" is only sound if the two possible answers cannot be forged and
+ * cannot be confused with a third. Both halves hold, and neither is an accident of this code:
+ *
+ *   • ABSENCE IS NOT FORGEABLE. Creating or unlinking a name inside `/etc` needs root, and so does
+ *     creating or unlinking one inside a root-owned 0711 directory beneath it. The account this
+ *     process runs as can neither make the shared location appear nor make it disappear, so "it is
+ *     not there" genuinely means "no privileged run has put it there". That is exactly what was
+ *     NOT true of `$STATE_DIRECTORY`, where this account owns the parent and every answer about a
+ *     name inside it is forgeable — which is the finding.
+ *   • AND EVERY OTHER ANSWER IS A REFUSAL, not a fallback. `lstatSync` is used, not `statSync` or
+ *     `existsSync`: a symbolic link at the lock directory reports as a link and is refused instead
+ *     of being followed, a non-directory is refused, and any errno that is not `ENOENT` — `EACCES`
+ *     on a component, `ENOTDIR`, `ELOOP`, `EIO` — is refused as well. An unstattable path is not
+ *     permission to lock somewhere else: falling back on it is how a process ends up holding an
+ *     exclusion nothing else will ever contend for, which is the defect class this whole module is
+ *     about. `existsSync` would have collapsed all of those into `false`.
  */
-export function crontabReconcileLockPath(): string {
+export function crontabReconcileLockPath(): CrontabReconcileLockLocation {
+  const root = cutoverNamespaceRoot()
+  const sharedDir = path.join(root, CRONTAB_RECONCILE_LOCK_DIRNAME)
+  let shared: ReturnType<typeof lstatSync> | null = null
+  try {
+    shared = lstatSync(sharedDir)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException)?.code
+    if (code !== 'ENOENT') {
+      return {
+        ok: false,
+        error: `The crontab reconciliation lock directory ${sharedDir} could not be inspected (${code ?? 'unknown error'}). `
+          + 'It is the root-owned location the installer, deploy and update scripts derive the same '
+          + 'lock from, and an unstattable path is not an answer about whether it is there: '
+          + 'reconciling against some other file would be an exclusion no other writer contends '
+          + 'for, so the crontab was NOT changed. Check that '
+          + `${root} exists, is a directory and is traversable by the service user.`,
+      }
+    }
+  }
+  if (shared) {
+    if (!shared.isDirectory()) {
+      return {
+        ok: false,
+        error: `The crontab reconciliation lock directory ${sharedDir} is not a directory `
+          + `(it is a ${describeStatType(shared)}). Only root can create or replace a name inside `
+          + `${root}, so this is a privileged mistake and not something the service can work around `
+          + '— and following it would put this reconciliation on a file the installer, deploy and '
+          + 'update scripts never lock. The crontab was NOT changed.',
+      }
+    }
+    return {
+      ok: true,
+      source: 'shared',
+      path: path.join(sharedDir, CRONTAB_RECONCILE_LOCK_FILENAME),
+    }
+  }
+
   const stateDir = systemdStateDirectory()
   if (stateDir) {
-    return path.join(stateDir, CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME)
+    return {
+      ok: true,
+      source: 'state-directory',
+      path: path.join(stateDir, CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME),
+    }
   }
 
   const override = process.env.OTI_CRONTAB_LOCK_PATH?.trim()
   if (override) {
-    if (process.env.NODE_ENV !== 'production') return override
+    if (process.env.NODE_ENV !== 'production') return { ok: true, source: 'override', path: override }
     console.warn(
       `OTI_CRONTAB_LOCK_PATH=${override} was IGNORED: it is a test-only override, and honouring it in `
       + 'production would give the application and scripts/install.sh two different crontab locks. '
       + 'Set StateDirectory= in the systemd unit instead.',
     )
   }
-  return path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME)
+  return {
+    ok: true,
+    source: 'working-directory',
+    path: path.join(process.cwd(), CRONTAB_RECONCILE_LOCK_DIRNAME, CRONTAB_RECONCILE_LOCK_FILENAME),
+  }
+}
+
+/** What an unexpected entry at the lock directory IS, for the refusal message. */
+function describeStatType(stat: NonNullable<ReturnType<typeof lstatSync>>): string {
+  if (stat.isSymbolicLink()) return 'symbolic link'
+  if (stat.isFile()) return 'regular file'
+  if (stat.isFIFO()) return 'named pipe'
+  if (stat.isSocket()) return 'socket'
+  if (stat.isBlockDevice()) return 'block device'
+  if (stat.isCharacterDevice()) return 'character device'
+  return 'entry of an unexpected type'
 }
 
 /**
@@ -362,7 +546,15 @@ function fdStillMatchesPath(fd: number, lockPath: string): boolean {
 type AcquireOutcome = { ok: true; fd: number } | { ok: false; error: string }
 
 async function acquireCrontabFileLock(timeoutMs: number): Promise<AcquireOutcome> {
-  const lockPath = crontabReconcileLockPath()
+  // AND A LOCATION THAT COULD NOT BE ESTABLISHED IS A REFUSAL, NOT A FALLBACK (o3d-txoe). This used
+  // to be a function that could only return a string, so every unanswerable state — a symlink at the
+  // lock directory, an EACCES on a component, a non-directory — had to be collapsed into some path
+  // and locked anyway. Reconciling behind an exclusion nothing else contends for is the defect this
+  // module exists to prevent, so the refusal channel that already existed for an unopenable lock
+  // file carries this too, and the crontab is left alone.
+  const located = crontabReconcileLockPath()
+  if (!located.ok) return { ok: false, error: located.error }
+  const lockPath = located.path
   const deadline = Date.now() + timeoutMs
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let fd: number
@@ -374,11 +566,12 @@ async function acquireCrontabFileLock(timeoutMs: number): Promise<AcquireOutcome
         error: `Could not open the crontab reconciliation lock file ${lockPath}: `
           + `${error instanceof Error ? error.message : String(error)}. `
           + 'The crontab was NOT changed, because a reconciliation that cannot be serialized can '
-          + 'silently discard another writer\'s block. This path is the service\'s systemd '
-          + 'StateDirectory plus the lock directory scripts/install.sh creates inside it: check the '
-          + `unit declares StateDirectory=, and that ${path.dirname(lockPath)} exists and is `
-          + 'readable by the service user (the installer makes it root-owned on purpose, so the '
-          + 'file is opened read-only — flock does not need write access).',
+          + `silently discard another writer's block. This path was derived from the ${located.source} `
+          + 'source, and scripts/install.sh, scripts/deploy.sh and scripts/update.sh derive the same '
+          + 'one and create it root-owned before the service is started: check that '
+          + `${path.dirname(lockPath)} exists and is traversable by the service user (the `
+          + 'installer makes it root-owned on purpose, so the file is opened read-only — flock does '
+          + 'not need write access).',
       }
     }
     const remaining = Math.max(1, deadline - Date.now())

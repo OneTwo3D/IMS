@@ -35,6 +35,13 @@ import { createTempDirSync } from './temp-dir.ts'
 // header comment cannot satisfy an assertion about what the script actually does.
 
 const LOCK_LIB = join(process.cwd(), 'scripts/lib/crontab-lock.sh')
+/**
+ * o3d-txoe — the crontab lock is composed from the ROOT-OWNED cutover namespace and the
+ * acquisition is taken on a pinned descriptor, and `with_crontab_lock` asks `verify_held_lock`
+ * (in this library) whether that descriptor is still what the pathname means. Every harness that
+ * reaches a crontab read-modify-write therefore sources both files, as the three entrypoints do.
+ */
+const NS_LIB = join(process.cwd(), 'scripts/lib/cutover-namespace.sh')
 
 /** THE CUTOVER NAMESPACE LIBRARY (o3d-secops r22, Codex CRITICAL x2). The shared cutover lock, the
  *  app-writable connection-fence directory and the walk that creates either of them are ONE
@@ -774,12 +781,20 @@ const MARKER_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -830,12 +845,20 @@ die() { echo "die: $*" >&2; exit 1; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -884,12 +907,20 @@ die() { echo "die: $*" >&2; exit 1; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -1267,12 +1298,20 @@ const FENCE_HARNESS = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1352,12 +1391,20 @@ chown() { :; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
@@ -1453,12 +1500,20 @@ chown() { :; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 APP_USER="$(id -un)"
 APP_DIR='${dir}'
@@ -2187,12 +2242,20 @@ const FENCE_INSTALL_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -2250,12 +2313,20 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -2313,12 +2384,20 @@ systemctl() { [ "$1" = daemon-reload ] && return 1; return 0; }
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 FENCE_FILE="\${CUTOVER_STATE_DIR}/DEPLOY-FENCED"
@@ -2965,12 +3044,20 @@ const ARMING_TRAP_CASES = [
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 STATE_DIR='${dir}'
@@ -3031,12 +3118,20 @@ DB_IDENTITY_DRIFT_REASON=''
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DRY_RUN=false
 BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 DATA_DIR='${dir}'
@@ -3095,12 +3190,20 @@ DB_IDENTITY_DRIFT_REASON=''
 # THE REAL CRONTAB EXCLUSION, SOURCED RATHER THAN STUBBED (o3d-p9dq). Every fence, unfence,
 # adoption and unwind lifted into these harnesses performs its read-modify-write through
 # with_crontab_lock, so a harness that stubbed it out would be measuring an ordering the shipped
-# code no longer has. The lock file is created directly because prepare_crontab_lock needs root;
-# its preparation is exercised in tests/settings/crontab-reconcile-serialization.test.ts.
+# code no longer has.
+#
+# o3d-txoe: the lock is composed from the ROOT-OWNED cutover namespace, and the acquisition is taken
+# on the descriptor prepare_crontab_lock PINS — so a harness that only created the file would now be
+# REFUSED, which is the point of that change. The file and the descriptor are established directly
+# here because the shipped preparation needs root and reaches into /etc; it is exercised for real in
+# tests/settings/crontab-reconcile-serialization.test.ts. cutover-namespace.sh is sourced because
+# with_crontab_lock asks verify_held_lock whether the pinned descriptor is still what the name means.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 DATA_DIR='${dir}'
 CUTOVER_STATE_DIR='${dir}'
 APP_USER=appuser
@@ -4214,12 +4317,16 @@ BLUE=''; GREEN=''; YELLOW=''; RED=''; BOLD=''; RESET=''
 # THE REAL CRONTAB EXCLUSION, sourced rather than stubbed (o3d-p9dq): fence_cron and its siblings
 # perform their read-modify-write through with_crontab_lock, so a harness without it would be
 # measuring an ordering the shipped code no longer has. The lock file is created directly because
-# prepare_crontab_lock needs root; its preparation is exercised in
-# tests/settings/crontab-reconcile-serialization.test.ts.
+# prepare_crontab_lock needs root and reaches into /etc; its preparation is exercised in
+# tests/settings/crontab-reconcile-serialization.test.ts. o3d-txoe: the acquisition is taken on the
+# descriptor the preparation PINS, so the descriptor is established here too, and
+# cutover-namespace.sh is sourced for the verify_held_lock with_crontab_lock now calls.
 source '${LOCK_LIB}'
-crontab_lock_paths '${dir}'
+source '${NS_LIB}'
+crontab_lock_paths '${dir}/cutover-namespace' '${dir}'
 mkdir -p "\${CRONTAB_LOCK_DIR}"
 : > "\${CRONTAB_LOCK_FILE}"
+exec {CRONTAB_LOCK_FD}<"\${CRONTAB_LOCK_FILE}"
 CUTOVER_STATE_DIR='${dir}'
 STATE_DIR='${dir}'
 DATA_DIR='${dir}'
