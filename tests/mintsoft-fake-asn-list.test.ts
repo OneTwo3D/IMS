@@ -27,7 +27,17 @@ function asns(count: number): FakeAsn[] {
     statusId: 1,
     status: 'OPEN',
     createdAt: '2026-09-18T00:00:00.000Z',
-    lines: [{ id: `L${index}`, sourceLineId: `line-${index}`, productId: '7', sku: 'SKU-7', quantity: 3 }],
+    // o3d-btiw: an ASN item carries three quantities, and these rows describe ones nothing has been
+    // booked in against yet — which is what the list contract under test is about.
+    lines: [{
+      id: `L${index}`,
+      sourceLineId: `line-${index}`,
+      productId: '7',
+      sku: 'SKU-7',
+      quantity: 3,
+      receivedQuantity: 0,
+      bookedQuantity: 0,
+    }],
   }))
 }
 

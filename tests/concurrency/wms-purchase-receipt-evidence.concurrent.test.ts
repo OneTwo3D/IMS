@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import { Client } from 'pg'
+import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 
 /**
  * ══════════════════════════════════════════════════════════════════════════════
@@ -235,20 +236,20 @@ async function runBookedIn(seeded: SeededPurchaseAsn) {
     },
     select: { id: true },
   })
+  // o3d-btiw: THE LINE COMES THROUGH THE REAL WIRE NORMALIZER, from a live-shaped ASNItem, rather
+  // than being fabricated field by field. A hand-built line is how the received quantity went unread
+  // for every live ASN while tests like this one passed. The STATUS is still the one this test chose,
+  // so what it is measuring is unchanged.
+  const remote = liveMintsoftBookedInAsnRef({
+    externalAsnId: seeded.tag,
+    externalLineId: seeded.externalAsnLineId,
+    sourceLineId: seeded.poLineId,
+    sku: seeded.tag,
+    expectedQty: seeded.qty,
+    bookedQty: seeded.qty,
+  })
   return processBookedInEvent(event.id, {
-    fetchRemoteAsn: async () => ({
-      externalAsnId: seeded.tag,
-      status: 'RECEIVED',
-      lines: [{
-        externalLineId: seeded.externalAsnLineId,
-        sourceLineId: seeded.poLineId,
-        externalProductId: null,
-        sku: seeded.tag,
-        quantity: seeded.qty,
-        raw: null,
-      }],
-      raw: null,
-    }),
+    fetchRemoteAsn: async () => ({ ...remote, status: 'RECEIVED', raw: null }),
   })
 }
 

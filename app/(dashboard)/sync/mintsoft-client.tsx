@@ -57,14 +57,21 @@ type Props = {
 const RECEIPT_REVIEW_WARNING_LABELS: Record<string, string> = {
   cost_layer_snapshot_missing: 'Cost-layer snapshot missing',
   missing_local_line: 'IMS line missing',
+  // o3d-btiw: the ASN line exists in IMS but the warehouse returned no item for it.
+  missing_remote_line: 'Mintsoft line missing',
   received_over_expected: 'Over-received',
   remote_regression: 'Mintsoft quantity decreased',
+  // o3d-btiw: Mintsoft served no usable QuantityBooked, so how much was booked in is UNKNOWN. It is
+  // not zero, and it cannot be approved away — the warehouse has to answer.
+  remote_quantity_unreadable: 'Mintsoft quantity unreadable',
   unsupported_source_type: 'Unsupported source line',
 }
 
 const RECEIPT_REVIEW_BLOCKING_WARNINGS = new Set([
   'cost_layer_snapshot_missing',
   'missing_local_line',
+  'missing_remote_line',
+  'remote_quantity_unreadable',
   'remote_regression',
   'unsupported_source_type',
 ])
