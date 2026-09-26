@@ -1,6 +1,7 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { randomUUID } from 'node:crypto'
 import { config } from 'dotenv'
 
 /**
@@ -63,6 +64,119 @@ const UNIT_COST = 5
 const LANDED_COST_DELTA_PER_UNIT = 1
 
 /**
+ * THE FIXTURE'S IDENTITY (o3d-kx1uy). `warehouses.code` is UNIQUE — and in the schema it is
+ * plain TEXT (`prisma/schema.prisma` `code String @unique`, `CREATE TABLE "warehouses" ... "code"
+ * TEXT NOT NULL`), so there is NO width the fixture has to fit and nothing to truncate to.
+ *
+ * WHAT WAS WRONG. The codes were `${tag.slice(0, 16)}S` / `...D` over
+ * `tag = R6DC-${label}-${process.pid}-${Date.now()}`. Measured, with pid 934827:
+ *
+ *     tag              = R6DC-nothing-934827-1790446129914
+ *     tag.slice(0, 16) = R6DC-nothing-934          <-- Date.now() gone; 3 pid digits left
+ *     codes            = R6DC-nothing-934S / R6DC-nothing-934D
+ *
+ * `R6DC-` plus the longest label plus its hyphens already spends 13 of the 16 characters, so the
+ * timestamp NEVER survived and most of the pid did not either: the code was effectively
+ * `R6DC-<label>-<floor(pid/1000)>`. These fixtures are never deleted, so a second tier run against
+ * the same scratch database whose pid merely shares its leading digits asks for a code that is
+ * already there and `db.warehouse.create()` fails with
+ * `Unique constraint failed on the fields: (code)`. Two agents hit it in 1 of 5 full-tier runs
+ * each. The sibling file `transfer-cost-layer-recreation-context.concurrent.test.ts` carries the
+ * same finding in its own words after the same failure.
+ *
+ * WHAT IS DIFFERENT NOW. The identity comes from `randomUUID()` — unique by construction, not by
+ * a clock and not by a pid — it is NOT truncated, and it is placed at the START of the code, so a
+ * future truncation removes the human-readable label rather than the entropy. `fixtureCodes()` is
+ * the only place a code is built, and `the fixture identities are unique by construction` below
+ * asserts both properties, so re-introducing a `.slice()` reds a test instead of producing an
+ * intermittent CI failure.
+ */
+function fixtureCodes(label: string) {
+  // 32 lowercase hex characters, no hyphens: unique by construction, and entropy-FIRST so that
+  // every prefix of the identifier is still unique. Nothing here may be truncated or re-ordered.
+  // Each identifier gets its OWN uid: sharing one would mean a truncation that keeps only the uid
+  // still collapses the source and destination codes into each other.
+  const uid = () => randomUUID().replace(/-/g, '')
+  return {
+    tag: `${uid()}-R6DC-${label}`,
+    sourceCode: `${uid()}-R6DC-${label}-S`,
+    destinationCode: `${uid()}-R6DC-${label}-D`,
+  }
+}
+
+const FIXTURE_LABELS = ['inputs', 'money', 'nothing', 'manual'] as const
+
+/**
+ * THE REGRESSION GUARD for o3d-kx1uy. It needs no database, so it runs in `test:unit` too — a
+ * truncation re-introduced into `fixtureCodes()` reds this test in the cheap tier instead of
+ * failing one tier run in five with `Unique constraint failed on the fields: (code)`.
+ *
+ * It holds the CLOCK STILL and keeps the pid, which is what the old code depended on: with
+ * `Date.now()` frozen and one process, the old `R6DC-${label}-${pid}-${Date.now()}`.slice(0, 16)
+ * produced ONE code per label, forever. Uniqueness must survive that.
+ *
+ * WHAT WOULD STILL PASS IT, stated so nobody mistakes it for more than it is:
+ *   · a `fixtureCodes()` that is unique and entropy-first but that `seedAlignedInTransitTransfer`
+ *     stops using — the assertions are about the builder, not about the `create()` call sites. The
+ *     seed helper therefore takes its codes from `fixtureCodes()` and builds none of its own; that
+ *     coupling is reviewed, not asserted.
+ *   · truncation applied to a code AFTER this function returns it (at the call site).
+ *   · a different entropy source that is also 32 lowercase hex characters and also unique — which
+ *     is the point: the properties are pinned, not the implementation.
+ * It would NOT pass if the entropy were truncated, moved off the front, or replaced by anything
+ * derived from the clock or the pid.
+ */
+test('the fixture identities are unique by construction, entropy first (o3d-kx1uy)', () => {
+  const ROUNDS = 500
+  const realNow = Date.now
+  const codes: string[] = []
+  try {
+    Date.now = () => 1790446129914 // frozen: the old tag's only entropy, held still
+    for (let i = 0; i < ROUNDS; i += 1) {
+      for (const label of FIXTURE_LABELS) {
+        const { sourceCode, destinationCode } = fixtureCodes(label)
+        codes.push(sourceCode, destinationCode)
+      }
+    }
+  } finally {
+    Date.now = realNow
+  }
+
+  // The precondition, printed so a vacuous run is visible: the loop really generated codes.
+  const expected = ROUNDS * FIXTURE_LABELS.length * 2
+  assert.equal(codes.length, expected, `generated ${codes.length} codes, expected ${expected}`)
+  console.log(`# o3d-kx1uy guard: examined ${codes.length} generated warehouse codes`)
+
+  // 1. Unique, with the clock frozen and the pid fixed.
+  assert.equal(
+    new Set(codes).size,
+    expected,
+    'two fixture warehouse codes collided with the clock frozen — the identity depends on time or pid again',
+  )
+
+  // 2. Entropy FIRST and NOT truncated: 32 hex characters, then the human-readable part. A
+  //    `.slice()` anywhere in fixtureCodes() breaks this for every code at once.
+  for (const code of codes) {
+    assert.match(
+      code,
+      /^[0-9a-f]{32}-R6DC-(inputs|money|nothing|manual)-[SD]$/,
+      `fixture warehouse code "${code}" must start with 32 untruncated hex characters of entropy`,
+    )
+  }
+
+  // 3. The property the old code lacked: the uniqueness lives in the PREFIX, so truncating the
+  //    code from the right — which is what `.slice(0, n)` does — cannot remove it. Checked at the
+  //    narrowest prefix that still carries the whole identity, and at a few shorter ones.
+  for (const width of [32, 33, 40]) {
+    assert.equal(
+      new Set(codes.map((code) => code.slice(0, width))).size,
+      expected,
+      `truncating every fixture code to ${width} characters collapsed it — entropy is not at the front`,
+    )
+  }
+})
+
+/**
  * Build the state the WMS stock-sync alignment leaves behind for a fully-aligned,
  * still-IN_TRANSIT transfer line.
  *
@@ -78,17 +192,17 @@ async function seedAlignedInTransitTransfer(label: string) {
   const { recreateTransferCostLayersFromSnapshotSlice } =
     await import('@/lib/domain/inventory/transfer-cost-layer-recreation')
 
-  const tag = `R6DC-${label}-${process.pid}-${Date.now()}`
+  const { tag, sourceCode, destinationCode } = fixtureCodes(label)
   const product = await db.product.create({
     data: { sku: tag, name: `r6 double-count ${label}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
     select: { id: true },
   })
   const source = await db.warehouse.create({
-    data: { code: `${tag.slice(0, 16)}S`, name: `${tag} source`, type: 'STANDARD' },
+    data: { code: sourceCode, name: `${tag} source`, type: 'STANDARD' },
     select: { id: true },
   })
   const destination = await db.warehouse.create({
-    data: { code: `${tag.slice(0, 16)}D`, name: `${tag} dest`, type: 'STANDARD' },
+    data: { code: destinationCode, name: `${tag} dest`, type: 'STANDARD' },
     select: { id: true },
   })
 

@@ -343,7 +343,39 @@ test(
 
     // A REGISTRATION COMPLETES UNDER THE FIRST EPISODE, and is what a stale fence would hand to the
     // second one. Its instant is a reading of the same clock, taken after the fence.
+    //
+    // WHY THE WAIT, AND WHY IT IS NOT A GUESS AT HOW FAST A RUNNER IS (o3d-ku32f). The CONTROL at the
+    // foot of this test asks `registrationBindsToPaidState`, and that function compares two JS
+    // `Date`s — MILLISECOND resolution — because that is the comparison production makes. The fence
+    // it compares against lives in `unregistered_paid_at`, which is `timestamp(3)`, and Postgres
+    // ROUNDS on store: a fence minted from `clock_timestamp()` can be stored up to 500us AHEAD of the
+    // instant it was minted at, while `new Date()` TRUNCATES the completion reading down to the
+    // millisecond. A reading taken microseconds after the mint is therefore routinely BELOW the
+    // stored fence, and the control failed 200/200 when the two were taken in one round trip. On this
+    // box the natural round-trip gap is p50 1.6ms / min 1.0ms, so the control passed almost always —
+    // and failed on a fast CI runner (PR #709, fresh-db-drift, run 36247748445), in the control, not
+    // in the subject.
+    //
+    // The sibling r5 assertions dodge this by comparing ISO-8601 MICROSECOND STRINGS. That route is
+    // not open here: the subject of this assertion IS `registrationBindsToPaidState`, so comparing
+    // strings instead would stop exercising the function and prove an adjacent property. The
+    // resolution mismatch is intrinsic, so the gap has to exceed it — and the precondition below says
+    // so out loud, rather than leaving the control to fail with a message about a different thing.
+    //
+    // `pg_sleep` is a LOWER BOUND on elapsed database-clock time, and the property needed here is
+    // monotone in elapsed time: a slow or loaded runner only makes it more true, which is the
+    // opposite of the usual timing-test failure mode. The one runner behaviour that would still break
+    // it is the wall clock stepping BACKWARDS between the mint and the reading (an NTP step, a VM
+    // snapshot restore) — `clock_timestamp()` is not monotonic. That is what the precondition names.
+    await db.$executeRawUnsafe('SELECT pg_sleep(0.002)')
     const firstEpisodeCompletion = new Date(await databaseNow(db))
+    assert.ok(
+      firstEpisodeCompletion.getTime() > new Date(firstFence).getTime(),
+      'PRECONDITION: the completion instant must order strictly after the episode fence AT THE '
+      + 'MILLISECOND RESOLUTION registrationBindsToPaidState compares at. unregistered_paid_at is '
+      + 'timestamp(3) and Postgres ROUNDS on store, so a sub-millisecond gap can leave the stored '
+      + 'fence AHEAD of a reading taken after it.',
+    )
 
     // THE WRITER THE TRIGGER EXISTS FOR: a repair script, a seed, a previous release. It names
     // `paidAt` and nothing else, because it does not know this column exists.
@@ -495,6 +527,14 @@ test(
     await createOrder(db, id, new Date('2026-08-01T09:00:00.000Z'))
     const deadFence = await storedEpisode(db, id)
     assert.ok(deadFence, 'PRECONDITION: an episode is under way')
+    // DELIBERATELY NOT GIVEN THE WAIT THE r7 TEST ABOVE NEEDS (o3d-ku32f). This reading is compared
+    // against `newFence`, which is minted LATER, and the assertion at the foot expects FALSE. Both
+    // distortions push that way: `new Date()` truncates this reading DOWN, and `timestamp(3)` rounds
+    // the fence — floor(completion) <= floor(newFence_real) <= round(newFence_real) for every pair,
+    // so rounding can only make the assertion MORE true and can never turn it red. It is not vacuous
+    // either: the mutation it is here for (the preserve arm writing the DEAD fence back) makes
+    // `newFence` equal `deadFence`, which precedes this reading by several round trips and a run of
+    // DDL, so the binding flips to true and the test goes red. Nothing to fix here.
     const firstEpisodeCompletion = new Date(await databaseNow(db))
 
     // MANUFACTURE THE STATE NEITHER MECHANISM ALLOWS: marker standing over an unpaid order.
