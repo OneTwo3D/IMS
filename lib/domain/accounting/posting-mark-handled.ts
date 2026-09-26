@@ -72,6 +72,36 @@ export class MarkHandledRaceError extends Error {
   }
 }
 
+/**
+ * ── IS THIS SYNC ROW PROVABLY UNSENT? ──
+ *
+ * PENDING, never claimed by a processor (revision 0) and carrying no external id. Anything else may
+ * already be in the ledger — SYNCED and FAILED both mean a call was made, PROCESSING means one is in
+ * flight, a claimed PENDING row may have been sent and put back for a retry — and the mark refuses those
+ * rather than guessing, because guessing is how a posting reaches the ledger twice.
+ *
+ * o3d-j625 r14 (Codex, HIGH) — EXPORTED, because the EXCEPTION INBOX now has to ask the same question.
+ *
+ * The inbox lists a refusal whose posting key has a live row (r12 keeps the debt when it cannot prove the
+ * posting was queued after the refusal), and it used to render the refusing site's "post it by hand"
+ * remedy for it. Codex's finding is that the remedy instructs the operator into a duplicate: the worker
+ * can post the PENDING row while they are in the ledger posting it by hand, and the mark's guard — this
+ * predicate — only fires when they come BACK to mark, which is after the damage. So the inbox has to
+ * classify the row before it writes an instruction, and it must classify it with THIS predicate rather
+ * than a second copy: "provably unsent" decides whether the safe order is "mark first, then post" (the
+ * mark cancels it) or "settle the sync log first" (the mark will refuse), and two spellings of that rule
+ * would eventually disagree about which instruction an operator is given.
+ */
+export function accountingSyncRowIsProvablyUnsent(sync: {
+  status: string
+  attemptRevision: number | null
+  externalTransactionId: string | null
+}): boolean {
+  return sync.status === 'PENDING'
+    && sync.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
+    && !sync.externalTransactionId
+}
+
 export async function markPostingHandled(
   tx: MarkHandledClient,
   params: { id: string; userId: string; note: string | null; now?: Date },
@@ -100,9 +130,7 @@ export async function markPostingHandled(
     select: { id: true, connector: true, status: true, attemptRevision: true, externalTransactionId: true, payload: true },
   })).filter((sync) => accountingPostingKeyForRow({ ...key, payload: sync.payload }).scope === key.scope)
 
-  const provablyUnsent = (sync: (typeof candidates)[number]) =>
-    sync.status === 'PENDING' && sync.attemptRevision === UNCLAIMED_ATTEMPT_REVISION && !sync.externalTransactionId
-  const blocking = candidates.filter((sync) => !provablyUnsent(sync))
+  const blocking = candidates.filter((sync) => !accountingSyncRowIsProvablyUnsent(sync))
   if (blocking.length > 0) {
     return {
       ok: false,

@@ -1,5 +1,6 @@
 'use server'
 
+import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
@@ -46,7 +47,7 @@ import {
   ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON,
   ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY,
 } from '@/lib/domain/accounting/posting-refusal-copy'
-import { markPostingHandled, MarkHandledRaceError, type MarkHandledClient, type MarkHandledResult } from '@/lib/domain/accounting/posting-mark-handled'
+import { accountingSyncRowIsProvablyUnsent, markPostingHandled, MarkHandledRaceError, type MarkHandledClient, type MarkHandledResult } from '@/lib/domain/accounting/posting-mark-handled'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -494,6 +495,24 @@ export type AccountingPostingRefusalRow = {
    * `kind` is null on these, so `clearing` is null and nothing offers Mark-as-handled.
    */
   unconfirmed: boolean
+  /**
+   * o3d-j625 r14 (Codex, HIGH) — IS THERE A ROW THAT CAN STILL POST THIS, RIGHT NOW?
+   *
+   * `null` = nothing live for this posting key, so the refusing site's own remedy stands and posting by
+   * hand is safe. Otherwise the refusal is STILL LISTED (r12 keeps the debt, and a debt nobody can see is
+   * the failure this table exists to end) but with a remedy that does NOT tell the operator to post:
+   *
+   *   'unsent'      a PENDING row nothing has claimed. `markPostingHandled` will CANCEL it, so the safe
+   *                 order is MARK FIRST, THEN POST — which is the same guard, run before the ledger write
+   *                 instead of after it.
+   *   'may-be-sent' SYNCED / PROCESSING / claimed / carrying a document id. The mark will refuse this, and
+   *                 rightly: settle the row in the accounting sync log first.
+   *
+   * Computed at RENDER time, deliberately, so the classification tracks the row rather than freezing at
+   * the moment of refusal: when the queued row posts, the enqueue's own clear resolves the refusal and it
+   * leaves this list; when it is cancelled, the next render says `null` and the ordinary remedy comes back.
+   */
+  queuedRow: 'unsent' | 'may-be-sent' | null
 }
 
 /** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
@@ -1052,6 +1071,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         type: true,
         referenceType: true,
         referenceId: true,
+        // o3d-j625 r14: the fourth part of the posting key. Without it the live-row classification below
+        // would be about the DOCUMENT rather than the POSTING, and one receipt's queued row would rewrite
+        // another receipt's remedy — the o3d-j625 r5 HIGH 3 mistake, in the instruction instead of the row.
+        scope: true,
         chartConnector: true,
         activeConnector: true,
         reason: true,
@@ -1375,17 +1398,28 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // o3d-j625 r4: rendered from the columns the refusal itself wrote — the remedy an operator reads is
     // the one the refusing site stated, so the page and the accounting log cannot tell two stories.
     accountingPostingRefusals: [
-      ...postingRefusalRows.map((row) => {
-        const clearing = postingRefusalClearing(row.kind)
-        return {
-          ...row,
-          firstRefusedAt: row.firstRefusedAt.toISOString(),
-          lastRefusedAt: row.lastRefusedAt.toISOString(),
-          clearing,
-          clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
-          unconfirmed: false,
-        }
-      }),
+      ...await (async () => {
+        // o3d-j625 r14: ONE query for the whole section, then per-row. See classifyQueuedRowsForRefusals.
+        const queuedRows = await classifyQueuedRowsForRefusals(postingRefusalRows)
+        return postingRefusalRows.map((row) => {
+          const clearing = postingRefusalClearing(row.kind)
+          const queuedRow = queuedRows.get(
+            `${row.type}\u0000${row.referenceType}\u0000${row.referenceId}\u0000${row.scope}`,
+          ) ?? null
+          return {
+            ...row,
+            firstRefusedAt: row.firstRefusedAt.toISOString(),
+            lastRefusedAt: row.lastRefusedAt.toISOString(),
+            clearing,
+            clearingNote: clearing ? POSTING_REFUSAL_KINDS[row.kind as PostingRefusalKind].how : null,
+            unconfirmed: false,
+            queuedRow,
+            // The refusing site's remedy stands unless a row that can post exists — see queuedRowRemedy for
+            // why the replacement instruction is an ORDER (mark first, then post) rather than a warning.
+            remedy: queuedRow ? queuedRowRemedy(queuedRow, row.remedy) : row.remedy,
+          }
+        })
+      })(),
       // o3d-j625 r10 (Codex round 9, HIGH): the provisional claims, AFTER the established debts — they
       // are the ones an operator can act on, and an unconfirmed claim is explicitly not yet actionable.
       ...await loadUnconfirmedPostingRefusals(),
@@ -1434,7 +1468,81 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     clearing: null,
     clearingNote: ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_CLEARING_NOTE,
     unconfirmed: true,
+    // o3d-j625 r14: an unconfirmed CLAIM has no established posting key state to classify — it is not yet
+    // known to be owed at all, and its remedy already tells the operator not to post it by hand (which is
+    // the same instruction this round adds for the established rows that have a live row). `null` here
+    // means "not classified", and the remedy it ships with is the unconfirmed one, not a site remedy.
+    queuedRow: null,
   }))
+}
+
+/**
+ * ── o3d-j625 r14 (Codex, HIGH) — A KEPT DEBT WHOSE POSTING KEY HAS A LIVE ROW MUST NOT SAY "POST IT BY
+ *    HAND" ──
+ *
+ * r12 chose to KEEP a debt it cannot prove was discharged, and defended the false-debt direction on the
+ * grounds that `markPostingHandled` refuses to mark a posting that may already be in the ledger. Codex
+ * accepted the guard and pointed at its POSITION: it fires when the operator comes back to MARK, which is
+ * after they have posted by hand. Between the inbox saying "post this" and their return, the worker can
+ * post the PENDING row. Two ledger entries, and the mark then correctly refuses — after the damage.
+ *
+ * So the fix is to the INSTRUCTION, not the guard. Three options were on the table:
+ *   (a) do not LIST such a refusal. Rejected: it makes a kept debt invisible, which is worse than the bug
+ *       and is the property r12 exists to protect. A row that then gets cancelled would be owed and unseen.
+ *   (b) list it with a remedy that INVERTS THE ORDER — mark first (which runs the guard and cancels an
+ *       unsent row), then post. CHOSEN, because it is the same guard moved in front of the ledger write
+ *       rather than a new one, and because it keeps the debt visible and actionable.
+ *   (c) classify at render and re-check at click. ALSO DONE, and not as an alternative: (b) needs the
+ *       render-time classification to write the right sentence, and the click-time re-check is
+ *       `markPostingHandled`'s own transaction, which already re-reads the rows under the posting key's
+ *       lock. The two together are what make the instruction safe rather than merely better worded.
+ *
+ * Keyed on the POSTING, not the document: the indexed columns narrow it and `accountingPostingKeyForRow` —
+ * the same function the row-creating primitive keys its clear on — decides whether a row belongs to this
+ * refusal's posting or to a different one sharing the reference.
+ */
+async function classifyQueuedRowsForRefusals(
+  refusals: Array<{ type: string; referenceType: string; referenceId: string; scope: string }>,
+): Promise<Map<string, 'unsent' | 'may-be-sent'>> {
+  const classification = new Map<string, 'unsent' | 'may-be-sent'>()
+  if (refusals.length === 0) return classification
+  const live = await db.accountingSyncLog.findMany({
+    where: {
+      status: { not: 'CANCELLED' },
+      OR: refusals.map((refusal) => ({
+        type: refusal.type as never,
+        referenceType: refusal.referenceType,
+        referenceId: refusal.referenceId,
+      })),
+    },
+    select: {
+      type: true, referenceType: true, referenceId: true, payload: true,
+      status: true, attemptRevision: true, externalTransactionId: true,
+    },
+  })
+  for (const row of live) {
+    const key = accountingPostingKeyForRow(row)
+    const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
+    // 'may-be-sent' WINS over 'unsent' when a key has both: the instruction has to be safe for the worst
+    // row under it, and "mark it" would be refused by the mark anyway while the operator had been told to.
+    if (classification.get(id) === 'may-be-sent') continue
+    classification.set(id, accountingSyncRowIsProvablyUnsent(row) ? 'unsent' : 'may-be-sent')
+  }
+  return classification
+}
+
+/** What the operator is told INSTEAD of the refusing site's remedy, when a row that can post exists. */
+function queuedRowRemedy(state: 'unsent' | 'may-be-sent', siteRemedy: string): string {
+  return state === 'unsent'
+    ? 'DO NOT POST THIS BY HAND YET. IMS has a queued row for this posting that nothing has picked up, so '
+      + 'the accounting sync can still post it — and if you post by hand first, the worker can post it too '
+      + 'and the ledger gets it twice. Either leave it for the next accounting sync run, or, if you mean to '
+      + 'post it by hand, press Mark as handled FIRST: that cancels the queued row (it refuses if the row '
+      + `may already have been sent), and then post it. The refusing site's own remedy was: ${siteRemedy}`
+    : 'DO NOT POST THIS BY HAND. IMS may ALREADY have posted this — its accounting sync row is in flight, '
+      + 'has been claimed by a processor, or carries a document id — so posting it now is how the ledger '
+      + 'gets it twice. Find this posting in the accounting sync log and settle THAT row first; Mark as '
+      + `handled will refuse until you do. The refusing site's own remedy was: ${siteRemedy}`
 }
 
 /**

@@ -20,6 +20,13 @@ const refusalRows = [
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: 'so-1',
+    // o3d-j625 r14: the fourth part of the posting key. The listing selects it so the live-row
+    // classification is about the POSTING and not the document.
+    scope: '',
+    // o3d-j625 r14: and a KIND, so `clearing` is non-null and the Mark-as-handled affordance is actually
+    // offered on this row. The r14 fix makes the mark the SAFE FIRST STEP when a queued row exists, so a
+    // fixture with no kind could not tell an affordance that is still offered from one that was removed.
+    kind: 'sales_invoice_held_release',
     chartConnector: 'xero',
     activeConnector: 'quickbooks',
     reason: 'retired_chart',
@@ -43,6 +50,7 @@ const resolvedRow = {
   type: 'CREDIT_NOTE',
   referenceType: 'SalesOrderRefund',
   referenceId: 'refund-9',
+  scope: '',
   chartConnector: 'xero',
   activeConnector: 'xero',
   reason: 'retired_chart',
@@ -52,6 +60,31 @@ const resolvedRow = {
   firstRefusedAt: new Date('2026-09-01T08:00:00.000Z'),
   lastRefusedAt: new Date('2026-09-01T08:00:00.000Z'),
   resolvedAt: new Date('2026-09-02T08:00:00.000Z'),
+}
+
+/**
+ * o3d-j625 r14 — RECEIPT B's REFUSAL, whose posting key differs from receipt A's ONLY IN `scope`.
+ *
+ * Added because a mutation proved the first version of the scope test examined nothing: it used a live row
+ * of a different TYPE, so the classification's map key already differed in `type` and dropping `scope` from
+ * it changed no outcome. An INVOICE_PAYMENT is one RECEIPT against one document (o3d-j625 r5 HIGH 3), so
+ * two receipts on one order are two postings that differ in exactly the component under test.
+ */
+const receiptBRefusal = {
+  id: 'refusal-receipt-b',
+  type: 'INVOICE_PAYMENT',
+  referenceType: 'SalesOrder',
+  referenceId: 'so-1',
+  scope: 'payment:pay-B',
+  kind: 'invoice_payment_receipt',
+  chartConnector: 'xero',
+  activeConnector: null,
+  reason: 'payment_account_not_in_ledger',
+  committed: 'the receipt is recorded against the order in IMS',
+  remedy: 'Re-map the payment method against the connector now in use.',
+  refusedCount: 1,
+  firstRefusedAt: new Date('2026-09-11T08:00:00.000Z'),
+  lastRefusedAt: new Date('2026-09-11T08:00:00.000Z'),
 }
 
 function matchesRefusalWhere(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
@@ -87,7 +120,26 @@ const provisionalClaims: Array<Record<string, unknown>> = []
 const PROVISIONAL_OPERATION = 'posting-refusal.provisional'
 const isProvisionalRead = (where: Record<string, unknown> | undefined) => where?.operation === PROVISIONAL_OPERATION
 
+/**
+ * o3d-j625 r14 (Codex, HIGH) — THE LIVE ACCOUNTING SYNC ROWS, which now decide what the remedy SAYS.
+ *
+ * Empty by default, so every existing test in this file keeps rendering the refusing site's own remedy —
+ * which is the control for the new behaviour rather than an accident: with nothing queued, posting by hand
+ * is safe and the instruction is unchanged.
+ */
+const liveSyncRows: Array<Record<string, unknown>> = []
+
 const db = new Proxy({
+  accountingSyncLog: {
+    ...emptyModel,
+    findMany: async ({ where }: { where?: Record<string, unknown> } = {}) => (
+      // Only the classification's read is answered: it is the one that excludes CANCELLED rows. Every
+      // other read of this table in the inbox stays empty, so each section's count stays attributable.
+      where && typeof where.status === 'object' && where.status !== null && 'not' in (where.status as object)
+        ? liveSyncRows
+        : []
+    ),
+  },
   integrationOutbox: {
     ...emptyModel,
     count: async ({ where }: { where: Record<string, unknown> }) => (isProvisionalRead(where) ? provisionalClaims.length : 0),
@@ -121,7 +173,18 @@ const db = new Proxy({
   get: (target, key: string) => (key in target ? target[key] : emptyModel),
 })
 
-const allRows = [...refusalRows.map((row) => ({ ...row, resolvedAt: null })), resolvedRow]
+/**
+ * MUTABLE, so one test can add a row without moving every count in this file.
+ *
+ * o3d-j625 r14: receipt B's refusal is pushed by the scope test alone and removed after it. The first
+ * attempt put it here, which changed `summary.accountingPostingRefusals` and `summary.total` and turned
+ * three existing tests red at baseline — a fixture change that moves other tests' numbers is not a fixture
+ * change, it is a rewrite of what they assert.
+ */
+const allRows: Array<Record<string, unknown>> = [
+  ...refusalRows.map((row) => ({ ...row, resolvedAt: null })),
+  resolvedRow,
+]
 
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/auth', {
@@ -234,4 +297,150 @@ test('[o3d-j625 r10] an unreconciled provisional claim is LISTED and counted, ma
   assert.equal(debt.unconfirmed, false)
   assert.equal(debt.remedy, refusalRows[0].remedy)
   provisionalClaims.length = 0
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r14 (Codex, HIGH) — A KEPT DEBT MUST NOT INSTRUCT AN OPERATOR TO DUPLICATE A QUEUED POSTING
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * THE CHAIN Codex executed. r12 keeps a debt it cannot prove was discharged — an enqueue that commits
+ * between a refusal's decision and its UNCONTENDED lock acquisition leaves a PENDING sync row and the
+ * refusal is still recorded (tests/concurrency/posting-refusal-record-race, "an UNCONTENDED refusal with a
+ * posting queued after it IS recorded"). The inbox then rendered the refusing site's own remedy for it:
+ * "post it by hand and mark this row handled". `markPostingHandled` does refuse a posting that may already
+ * be in the ledger — r12's defence — but it refuses when the operator comes BACK TO MARK, which is after
+ * they have posted. In between, the worker can post the PENDING row. Two ledger entries; the mark then
+ * correctly refuses, after the damage.
+ *
+ * WHY THE FIX IS THE INSTRUCTION AND NOT THE GUARD, and why the debt is still listed: see
+ * `classifyQueuedRowsForRefusals` in app/actions/sync-exceptions.ts. The guard is the same one, moved in
+ * front of the ledger write by inverting the order the operator is given.
+ *
+ * o3d-lkh4 is absorbed here: it filed exactly this shape as a MEDIUM before Codex graded it HIGH.
+ */
+
+/** A live sync row for refusal-1's posting (SALES_INVOICE / SalesOrder / so-1, document scope). */
+function liveRowFor(overrides: Record<string, unknown>) {
+  return {
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    payload: {},
+    status: 'PENDING',
+    attemptRevision: 0,
+    externalTransactionId: null,
+    ...overrides,
+  }
+}
+
+test('[o3d-j625 r14] a refusal whose posting has an UNSENT queued row is told to mark FIRST, never to post first', async () => {
+  liveSyncRows.length = 0
+  liveSyncRows.push(liveRowFor({}))
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+
+  assert.ok(row, 'PRECONDITION: the debt is STILL LISTED — r12 keeps it, and a debt nobody can see is the '
+    + 'failure this table exists to end. A fix that hid it would be worse than the bug.')
+  assert.equal(row.queuedRow, 'unsent',
+    'classified at render time from the row a processor has not claimed')
+  console.log(`[r14 unsent] queuedRow=${row.queuedRow} remedy=${JSON.stringify(row.remedy)}`)
+
+  // THE FINDING, in one assertion: the instruction must not be "post it by hand".
+  assert.match(row.remedy, /DO NOT POST THIS BY HAND YET/,
+    'THE FINDING: with a row that can still post, telling the operator to post by hand is an instruction '
+    + 'to duplicate the posting — the worker can post the PENDING row while they are in the ledger')
+  assert.match(row.remedy, /Mark as handled FIRST/,
+    'and the order is INVERTED: the mark cancels the unsent row, so the guard runs BEFORE the ledger write '
+    + 'instead of after it')
+  assert.ok(!/^Re-queue/.test(row.remedy),
+    'the site remedy no longer leads — it is quoted at the end so nothing is lost')
+  assert.match(row.remedy, new RegExp(refusalRows[0].remedy.slice(0, 24).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+    'and the refusing site\'s own remedy is still carried, so the page and the accounting log do not tell '
+    + 'two stories about what the refusal was')
+  // Mark-as-handled must STILL be offered: it is the safe first step now, so removing the affordance would
+  // leave the operator with the unsafe one.
+  assert.equal(row.clearing, 'retried', 'and the Mark-as-handled affordance is still offered')
+})
+
+test('[o3d-j625 r14] a refusal whose queued row MAY ALREADY HAVE POSTED is sent to the sync log, not to the ledger', async () => {
+  liveSyncRows.length = 0
+  // Claimed by a processor: it may have been sent and put back for a retry. `markPostingHandled` refuses
+  // this, so "mark first" would be a dead end and the honest instruction is different.
+  liveSyncRows.push(liveRowFor({ attemptRevision: 3 }))
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+
+  assert.ok(row, 'still listed')
+  assert.equal(row.queuedRow, 'may-be-sent')
+  console.log(`[r14 may-be-sent] queuedRow=${row.queuedRow} remedy=${JSON.stringify(row.remedy)}`)
+  assert.match(row.remedy, /DO NOT POST THIS BY HAND\./)
+  assert.match(row.remedy, /settle THAT row first/,
+    'the operator is sent to the surface that owns the ambiguity, and told the mark will refuse until they '
+    + 'have been')
+  assert.ok(!/Mark as handled FIRST/.test(row.remedy),
+    'and NOT told to mark first, because the mark refuses a row that may have been sent — an instruction '
+    + 'that ends in a refusal is not a remedy')
+})
+
+test('[o3d-j625 r14] CONTROL — with NO live row the refusing site\'s own remedy stands, and post-by-hand is what it says', async () => {
+  /**
+   * Round 12's property, unchanged: a genuinely owed posting reaches the inbox with the instruction the
+   * refusing site wrote. Without this control the two tests above are satisfied by rewriting EVERY
+   * refusal's remedy, which would bury the one instruction that is correct when nothing can post.
+   */
+  liveSyncRows.length = 0
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+
+  assert.ok(row, 'listed')
+  assert.equal(row.queuedRow, null, 'nothing live for this posting key')
+  assert.equal(row.remedy, refusalRows[0].remedy,
+    'so the remedy is the refusing site\'s own, verbatim — this is the ordinary case and it must not be '
+    + 'rewritten')
+  console.log(`[r14 control] queuedRow=${row.queuedRow} remedy=${JSON.stringify(row.remedy)}`)
+})
+
+test('[o3d-j625 r14] receipt A\'s queued row does not rewrite receipt B\'s remedy — the key is the POSTING, not the document', async (t) => {
+  /**
+   * o3d-j625 r5 HIGH 3, re-asked of the INSTRUCTION. An INVOICE_PAYMENT is one RECEIPT against one
+   * document, so receipt A's queued row says nothing about receipt B's refusal — and a classification keyed
+   * on the three indexed columns alone would rewrite B's remedy from A's row, which is the old
+   * document-scoped sync-log mistake moved into the operator's instructions.
+   *
+   * THIS TEST EXISTS IN THIS SHAPE BECAUSE A MUTATION FOUND THE FIRST ONE VACUOUS. That version used a live
+   * row of a different TYPE, so the map key already differed without `scope` and dropping `scope`
+   * (mutation z5) changed nothing — the test passed while examining nothing. Receipt A and receipt B differ
+   * in EXACTLY `scope`, so the mutation now fails, which is the only thing that makes this assertion
+   * evidence about the key rather than about the type.
+   */
+  liveSyncRows.length = 0
+  liveSyncRows.push(liveRowFor({
+    type: 'INVOICE_PAYMENT',
+    payload: { paymentId: 'pay-A', _idempotencyKey: 'invoice-payment:so-1:pay-A' },
+  }))
+  allRows.push({ ...receiptBRefusal, resolvedAt: null })
+  t.after(() => { allRows.splice(allRows.findIndex((row) => row.id === receiptBRefusal.id), 1) })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+
+  const data = await getExceptionInboxData()
+  const receiptA = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+  const receiptB = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-receipt-b')
+
+  assert.ok(receiptB, 'PRECONDITION: receipt B\'s refusal is listed — without it this test examines nothing')
+  console.log(`[r14 scope] receiptB.queuedRow=${receiptB.queuedRow} receiptB.remedy=${JSON.stringify(receiptB.remedy)}`)
+  assert.equal(receiptB.queuedRow, null,
+    'receipt A is queued; receipt B is a DIFFERENT posting on the same document and nothing is queued for it')
+  assert.equal(receiptB.remedy, receiptBRefusal.remedy,
+    'so B keeps its own remedy. Keyed on the document instead of the posting, B would be told not to post a '
+    + 'receipt nothing has queued — and the receipt that IS owed would never be entered')
+  // And the SALES_INVOICE refusal is untouched too: a different type is also a different posting.
+  assert.equal(receiptA?.queuedRow, null)
+  assert.equal(receiptA?.remedy, refusalRows[0].remedy)
 })

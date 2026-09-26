@@ -858,6 +858,29 @@ test(
       'this refusal was never shut out of the key, so it observed nothing and has no evidence that the '
       + 'posting was queued after it was decided — only two clocks, which are not evidence. The debt is '
       + `kept. ${describe(rows)}`)
+
+    // ── o3d-j625 r14 (Codex, HIGH) — AND THIS IS THE STATE THE INBOX MUST NOT SAY "POST BY HAND" ABOUT.
+    //
+    // The kept debt is right; what was wrong was the instruction rendered beside it. Asserted HERE, at the
+    // recording end, because this is the only place the interleaving that produces the state is real: a
+    // PENDING row nothing has claimed, for the same posting key, alongside an outstanding refusal. What the
+    // inbox then DOES with it is `classifyQueuedRowsForRefusals`, pinned in
+    // tests/accounting/posting-refusal-inbox-surface.test.ts — the two halves are tested where each can be
+    // tested honestly, and this assertion is what says the surface test's fixture is a state that occurs.
+    const liveForKey = await db.accountingSyncLog.findMany({
+      where: { referenceId, status: { not: 'CANCELLED' } },
+      select: { status: true, attemptRevision: true, externalTransactionId: true },
+    })
+    console.log(`[r14 state] outstanding=${rows.length} liveRows=${JSON.stringify(liveForKey)}`)
+    assert.equal(liveForKey.length, 1,
+      'THE STATE: the debt is kept WHILE a live row for the same posting key exists. An inbox that renders '
+      + 'the refusing site\'s "post it by hand" remedy here is instructing the operator to duplicate it — '
+      + 'the worker can post this row while they are in the ledger, and markPostingHandled\'s guard only '
+      + 'fires when they come back to mark.')
+    assert.equal(liveForKey[0]!.status, 'PENDING')
+    assert.equal(liveForKey[0]!.attemptRevision, 0, 'and NOTHING has claimed it — so the mark can still '
+      + 'cancel it, which is what makes "mark first, then post" the safe order')
+    assert.equal(liveForKey[0]!.externalTransactionId, null)
     assert.equal(
       await db.activityLog.count({ where: { action: 'accounting_posting_refused_after_queued', description: { contains: referenceId } } }),
       0, 'and nothing is reported as "queued while this was being decided", because nothing established that')

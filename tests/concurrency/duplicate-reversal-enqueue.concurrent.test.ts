@@ -1,3 +1,4 @@
+import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
@@ -60,7 +61,20 @@ async function loadDeps() {
  */
 async function enableXeroCogsReversal(db: Db): Promise<void> {
   const settings: Array<[string, string]> = [
-    ['integration_plugin_xero_enabled', 'true'],
+    // o3d-j625 r13/r14 — THE KEY, FROM ITS CANONICAL SOURCE. This was the hand-typed string
+    // 'integration_plugin_xero_enabled', which NOTHING READS: the real key is `plugin_<id>_enabled`
+    // (`integrationPluginSettingKey`). It was inert and invisible for as long as this path took no
+    // selection fence — the unpinned enqueue did not, until r13 made the fence unconditional. Then the
+    // locked read found no plugin row, resolved to NO active connector, and refused; the four racers were
+    // told `queued: false` and this file's two control tests went red in CI.
+    //
+    // WHY IT WAS GREEN LOCALLY, which is the part worth keeping: the concurrency tier runs its files
+    // CONCURRENTLY against ONE scratch database, and `settings` is global to it. Another file
+    // (pinned-ledger-fence's `startFromXeroActive`) writes the CORRECT key, so on a re-used local database
+    // this fixture was riding on that row. CI's database is fresh and its file ordering differs, so the
+    // mistake surfaced there and only there. Taking the key from `INTEGRATION_PLUGIN_SETTING_KEYS` is what
+    // stops a fourth spelling of it existing at all.
+    [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'],
     ['xero_sync_enabled', 'true'],
     ['xero_sync_cogs_reversal', 'submitted'],
   ]
