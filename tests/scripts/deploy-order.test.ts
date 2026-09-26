@@ -2706,24 +2706,189 @@ for (const [name, lines, startPattern] of [
   })
 }
 
-test('the CI path filter covers the object-access check, not only its three siblings', () => {
-  // The workflow re-runs the schema guardrails when a deploy script or one of its helpers
-  // changes. It listed check-db-writers, fence-db-connections and run-migration-verifications
-  // — and not the one that closes the CRITICAL, so a change to it ran no guardrail at all.
-  const workflow = readFileSync(join(process.cwd(), '.github/workflows/schema-guardrails.yml'), 'utf8')
-  const filters = [...workflow.matchAll(/^\s+- "(scripts\/[^"]+)"$/gm)].map((match) => match[1])
-  const siblings = filters.filter((path) => path === 'scripts/check-db-writers.mjs').length
-  assert.ok(siblings >= 2, 'the pull_request and push filters both list the sibling scripts')
-  assert.equal(
-    filters.filter((path) => path === 'scripts/check-app-db-object-access.mjs').length,
-    siblings,
-    'the object-access check must be listed wherever its siblings are',
+// ---------------------------------------------------------------------------
+// o3d-fuls0 — RETIRED: 'the CI path filter covers the object-access check, not only its three
+// siblings'. Its subject no longer exists; the one property it really established is re-anchored
+// below, and the trigger that replaced the filter is asserted after it.
+//
+// WHAT IT GUARANTEED. `.github/workflows/schema-guardrails.yml` was triggered by a `paths:`
+// ALLOWLIST, and that allowlist named three of the four deploy-pipeline helper scripts. A change to
+// `scripts/check-app-db-object-access.mjs` alone therefore ran no guardrail at all while a change to
+// any of its siblings ran all of them. The test counted the allowlist's `scripts/...` entries and
+// required the object-access script to appear as often as `scripts/check-db-writers.mjs` did — which
+// also encoded "in both triggers", because `pull_request` and `push` each carried their own copy of
+// the list and an entry added to one and forgotten in the other is the obvious edit.
+//
+// WHY IT IS VACUOUS NOW, RATHER THAN BROKEN BY THIS BRANCH. Both triggers are
+// `paths-ignore: ["**/*.md"]`. The workflow runs for every change that is not documentation-only, so
+// there is no allowlist for a path to be absent from and no second copy to fall out of step with.
+// `filters` is the empty array and `siblings` is 0, so `assert.ok(siblings >= 2)` fails — and the
+// repairs available are all fake: `>= 0` admits everything, and `assert.equal(0, 0)` compares two
+// counts of nothing. A test that examines nothing while reporting enforcement is worse than no test,
+// so the guarantee is retired with its reason rather than weakened or deleted quietly.
+//
+// THE THIRD ASSERTION WAS PROOF OF AN ADJACENT PROPERTY, and that is why it is not simply carried
+// over. `assert.match(workflow, /check-app-db-object-access\.mjs/)` claimed "CI must actually run it
+// against the migrated database, not merely watch the file" — but the only occurrence of that string
+// in the workflow WAS the allowlist entry, which is precisely "merely watch the file". The way CI
+// runs the check is by executing `tests/scripts/app-db-object-access.test.ts`, which imports it.
+// That property is real, it is worth keeping, and the test below asserts it against the step that
+// does it.
+// ---------------------------------------------------------------------------
+
+const GUARDRAILS_WORKFLOW = join(process.cwd(), '.github/workflows/schema-guardrails.yml')
+
+test('CI executes the object-access check against a migrated database, by running its suite', () => {
+  const workflow = readFileSync(GUARDRAILS_WORKFLOW, 'utf8')
+
+  // A STEP, NOT A MENTION. The suite is named on a `run:` line, and the gate the suite reads is set
+  // in that same step's `env:`. Without the variable every live test in the file reports `# SKIP`
+  // and the job is green having asked the database nothing — the RUN_DB_RETENTION_TESTS shape, one
+  // file over. Both halves must therefore be present, and adjacent.
+  const step = workflow.match(
+    /RUN_DB_OBJECT_ACCESS_TEST:\s*"1"[\s\S]{0,400}?^\s+run:.*tests\/scripts\/app-db-object-access\.test\.ts/m,
   )
+  assert.ok(
+    step,
+    'no step sets RUN_DB_OBJECT_ACCESS_TEST=1 and then runs tests/scripts/app-db-object-access.test.ts, ' +
+      'so nothing CI runs asks the database about the APPLICATION role',
+  )
+
+  // …and the suite that step runs is what reaches the script. Both links are needed: a step running
+  // a suite that no longer imports the check proves nothing about the check.
+  const suite = readFileSync(join(process.cwd(), 'tests/scripts/app-db-object-access.test.ts'), 'utf8')
   assert.match(
-    workflow,
-    /check-app-db-object-access\.mjs/,
-    'and CI must actually run it against the migrated database, not merely watch the file',
+    suite,
+    /from '@\/scripts\/check-app-db-object-access\.mjs'/,
+    'the suite CI runs must import the check it is supposed to exercise',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-fuls0 — WHAT REPLACED THE ALLOWLIST, ASSERTED RATHER THAN DESCRIBED.
+//
+// Why the allowlist went is argued in the workflow itself. What must hold HERE is the SHAPE, because
+// getting it wrong fails silently in the worst direction: GitHub Actions REFUSES an event configured
+// with both `paths` and `paths-ignore`, and a workflow it refuses does not run at all. The database
+// tiers would simply stop running, with no red job anywhere to say so. A half-reverted edit that
+// re-adds an allowlist beside the ignore list is the mutation these two tests exist to catch.
+// ---------------------------------------------------------------------------
+
+/**
+ * The `on:` block, parsed by indentation into trigger -> setting -> values.
+ *
+ * A shape this parse does not recognise THROWS. That is deliberate: the alternative is to skip the
+ * line, and a skipped line is how an `on:` block grows a form these tests cannot read while they go
+ * on reporting green.
+ */
+function guardrailTriggers(source: string): Map<string, Map<string, string[]>> {
+  const lines = source.split('\n')
+  const start = lines.findIndex((line) => /^on:\s*$/.test(line))
+  assert.notEqual(start, -1, 'the workflow must have a top-level `on:` block')
+
+  const triggers = new Map<string, Map<string, string[]>>()
+  let trigger: Map<string, string[]> | null = null
+  let values: string[] | null = null
+
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index]
+    if (line.trim() === '' || /^\s*#/.test(line)) continue
+    // Back to column 0: the `on:` block has ended.
+    if (/^\S/.test(line)) break
+
+    const indent = line.length - line.trimStart().length
+    const text = line.trim()
+
+    if (indent === 2 || indent === 4) {
+      const key = /^([A-Za-z_][\w-]*):$/.exec(text)
+      assert.ok(key, `unreadable key in the \`on:\` block at line ${index + 1}: ${line}`)
+      if (indent === 2) {
+        trigger = new Map<string, string[]>()
+        values = null
+        triggers.set(key[1], trigger)
+      } else {
+        assert.ok(trigger, `a setting appeared before any trigger at line ${index + 1}: ${line}`)
+        values = []
+        trigger.set(key[1], values)
+      }
+      continue
+    }
+
+    if (indent === 6) {
+      const item = /^- "?([^"]+?)"?$/.exec(text)
+      assert.ok(item, `unreadable list item in the \`on:\` block at line ${index + 1}: ${line}`)
+      assert.ok(values, `a list item appeared before any setting at line ${index + 1}: ${line}`)
+      values.push(item[1])
+      continue
+    }
+
+    assert.fail(`unexpected indentation in the \`on:\` block at line ${index + 1}: ${line}`)
+  }
+
+  return triggers
+}
+
+test('the schema-guardrails workflow runs on everything except a documentation-only change', () => {
+  const triggers = guardrailTriggers(readFileSync(GUARDRAILS_WORKFLOW, 'utf8'))
+
+  // THE PRECONDITION, PRINTED. An `on:` block this parse walked without finding the two triggers
+  // would satisfy the loop below by iterating zero times.
+  console.log(
+    `schema-guardrails \`on:\` block parsed: ${triggers.size} trigger(s) — ${[...triggers.keys()].join(', ')}`,
+  )
+  assert.deepEqual(
+    [...triggers.keys()],
+    ['pull_request', 'push'],
+    'both the pull_request and the push trigger must still be there; a tier that runs on one of the two is half a gate',
+  )
+
+  for (const [name, settings] of triggers) {
+    assert.deepEqual(
+      settings.get('paths-ignore'),
+      ['**/*.md'],
+      `${name} must be filtered by \`paths-ignore\`, and by exactly the Markdown glob: anything narrower ` +
+        `stops the database tiers running for some code change, and anything wider skips a code change ` +
+        `as though it were a doc (o3d-fuls0). Found: ${JSON.stringify(settings.get('paths-ignore'))}`,
+    )
+  }
+})
+
+test('no `paths:` allowlist survives beside the ignore list, which GitHub Actions would refuse', () => {
+  const source = readFileSync(GUARDRAILS_WORKFLOW, 'utf8')
+  const triggers = guardrailTriggers(source)
+  assert.equal(
+    triggers.size,
+    2,
+    'the parse must have reached both triggers before an absence of `paths:` under them means anything',
+  )
+
+  for (const [name, settings] of triggers) {
+    assert.ok(
+      !settings.has('paths'),
+      `${name} carries a \`paths:\` allowlist as well as \`paths-ignore:\`. GitHub Actions refuses an event ` +
+        `configured with both, so the workflow would not run at all and the concurrency and tests/db tiers ` +
+        `would stop running with nothing red to say so (o3d-fuls0). Allowlist: ` +
+        `${JSON.stringify(settings.get('paths'))}`,
+    )
+  }
+
+  // A UNIVERSAL check over the same text, because the parse above is only as good as the shapes it
+  // recognises, and because an absence check does not have the hole a whole-file `includes` has. Any
+  // `paths:` key at any depth inside the `on:` block is the defect, whatever it is nested under.
+  // Scoped to that block, so a legitimate `paths:` in some future step's `with:` stays legal.
+  const lines = source.split('\n')
+  const start = lines.findIndex((line) => /^on:\s*$/.test(line))
+  assert.notEqual(start, -1)
+  let end = start + 1
+  while (end < lines.length && !/^\S/.test(lines[end])) end += 1
+  const scanned = end - (start + 1)
+  assert.ok(scanned > 0, 'the `on:` block scan must have covered at least one line')
+  console.log(`scanned ${scanned} line(s) of the \`on:\` block for a surviving \`paths:\` key`)
+  const offenders = lines
+    .slice(start + 1, end)
+    .map((line, offset) => ({ line: start + 2 + offset, text: line }))
+    .filter((entry) => /^\s+paths:(\s|$)/.test(entry.text))
+  assert.deepEqual(offenders, [], `\`paths:\` keys left in the \`on:\` block: ${JSON.stringify(offenders)}`)
 })
 
 // ---------------------------------------------------------------------------

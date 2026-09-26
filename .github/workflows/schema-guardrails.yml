@@ -2,87 +2,42 @@ name: Schema Guardrails
 
 on:
   pull_request:
-    paths:
-      - ".github/workflows/schema-guardrails.yml"
-      - ".github/pull_request_template.md"
-      - "docs/development.md"
-      - "package.json"
-      - "prisma/**"
-      - "scripts/validate-db.sh"
-      - "scripts/check-prisma-drift.mjs"
-      - "scripts/check-prisma-schema-scope.mjs"
-      - "tests/concurrency/**"
-      - "scripts/deploy.sh"
-      - "scripts/install.sh"
-      - "scripts/update.sh"
-      - "scripts/check-db-writers.mjs"
-      - "scripts/fence-db-connections.mjs"
-      - "scripts/run-migration-verifications.mjs"
-      - "scripts/check-app-db-object-access.mjs"
-      - "tests/db/**"
-      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
-      # through. A change to it changes what happens to a failing assertion in that suite.
-      - "tests/helpers/with-cleanup.ts"
-      - "lib/db/**"
-      # The two modules that BUILD the shopping-inbox compaction predicate, which
-      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
-      # them a change to the predicate could not reach the only job that runs that evidence.
-      - "lib/connectors/shopping-webhook-retention.ts"
-      - "lib/connectors/shopping-webhook-inbox.ts"
-      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
-      # account: the SQL that asks the database for the contradictions, and the two builders whose
-      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
-      # them a change to either side of that equality could not reach the only job that runs it.
-      # reconciliation.ts also holds the unmirrored-sync-row statement that
-      # tests/db/reconciliation-unmirrored-sync-logs.test.ts proves (o3d-bnp6).
-      - "lib/domain/accounting/reconciliation.ts"
-      - "lib/domain/accounting/accounting-event-builder.ts"
-      - "lib/domain/accounting/accounting-event-mirror.ts"
-      # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
-      # and the unmirrored-sync-row question.
-      - "lib/domain/accounting/mirrored-sync-types.ts"
+    # o3d-fuls0: RUN ON EVERYTHING EXCEPT DOCUMENTATION, because an ALLOWLIST OF SUBJECTS CANNOT BE
+    # KEPT COMPLETE. This was a `paths:` list naming the tests (`tests/concurrency/**`,
+    # `tests/db/**`) and a hand-picked seven of their subjects (`lib/db/**` plus six named files).
+    # The two sets drifted, silently and by construction:
+    #   * `lib/settings-store.ts` was not listed, and 22 of the 38 concurrency files import it;
+    #   * `lib/domain/wms/booked-in-service.ts` was not listed, and three concurrency files exist
+    #     only to pin it — o3d-h66s was covered solely because it happened to ADD a file under
+    #     `tests/concurrency/`, which is an accident of a branch's shape, not a policy;
+    #   * `lib/domain/accounting/posting-refusal-inbox.ts` was not listed, and o3d-j625's entire
+    #     discharge rule lives there.
+    # So the tier that pins locks and races did not run for changes to most of what it pins, and a
+    # later edit reintroducing o3d-h66s or o3d-btiw would have been caught by nothing CI runs.
+    #
+    # ADDING THE MISSING PATHS IS THE OPTION THAT PRODUCED THIS STATE. Every new subject would have
+    # to be remembered by whoever writes it, and a filter that is 90% complete reads exactly like one
+    # that is complete. Deriving the list from the tests' import closure was the other candidate; it
+    # spends a new generator and a new check — themselves things that rot — to save what the measured
+    # cost below shows is not worth saving.
+    #
+    # THE COST, MEASURED RATHER THAN ESTIMATED: on a successful run these jobs take 3m20s
+    # (fresh-db-drift) and 3m46s (db-backed-regressions), in parallel. Four minutes of CI on a PR is
+    # less than one missed lock regression.
+    #
+    # WHY DOCUMENTATION IS STILL EXCLUDED: a Markdown-only change cannot alter what any of these
+    # tests execute. `paths-ignore` skips the run only when EVERY changed file matches, so a PR that
+    # touches a doc AND a line of code still runs — which is the behaviour that matters.
+    paths-ignore:
+      - "**/*.md"
   push:
     branches:
       - main
       - development
-    paths:
-      - ".github/workflows/schema-guardrails.yml"
-      - "docs/development.md"
-      - "package.json"
-      - "prisma/**"
-      - "scripts/validate-db.sh"
-      - "scripts/check-prisma-drift.mjs"
-      - "scripts/check-prisma-schema-scope.mjs"
-      - "tests/concurrency/**"
-      - "scripts/deploy.sh"
-      - "scripts/install.sh"
-      - "scripts/update.sh"
-      - "scripts/check-db-writers.mjs"
-      - "scripts/fence-db-connections.mjs"
-      - "scripts/run-migration-verifications.mjs"
-      - "scripts/check-app-db-object-access.mjs"
-      - "tests/db/**"
-      # The cleanup wrapper tests/db/shopping-webhook-retention-evidence.test.ts runs its probe rows
-      # through. A change to it changes what happens to a failing assertion in that suite.
-      - "tests/helpers/with-cleanup.ts"
-      - "lib/db/**"
-      # The two modules that BUILD the shopping-inbox compaction predicate, which
-      # tests/db/shopping-webhook-retention-evidence.test.ts executes against a real Postgres. Without
-      # them a change to the predicate could not reach the only job that runs that evidence.
-      - "lib/connectors/shopping-webhook-retention.ts"
-      - "lib/connectors/shopping-webhook-inbox.ts"
-      # The three modules tests/db/reconciliation-void-mirror-contradictions.test.ts holds to
-      # account: the SQL that asks the database for the contradictions, and the two builders whose
-      # TypeScript mirror-key derivation that SQL is asserted to reproduce branch for branch. Without
-      # them a change to either side of that equality could not reach the only job that runs it.
-      # reconciliation.ts also holds the unmirrored-sync-row statement that
-      # tests/db/reconciliation-unmirrored-sync-logs.test.ts proves (o3d-bnp6).
-      - "lib/domain/accounting/reconciliation.ts"
-      - "lib/domain/accounting/accounting-event-builder.ts"
-      - "lib/domain/accounting/accounting-event-mirror.ts"
-      # The list BOTH reconciliation statements filter on (`type = ANY(...)`): the contradiction join
-      # and the unmirrored-sync-row question.
-      - "lib/domain/accounting/mirrored-sync-types.ts"
+    # Same policy as the pull_request trigger above, and for the same reason — the rationale is
+    # written out there rather than twice here.
+    paths-ignore:
+      - "**/*.md"
 
 jobs:
   migration-scope:
