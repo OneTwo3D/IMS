@@ -92,6 +92,9 @@ run_step 'workflow docs'                  npm run docs:workflows:check
 # o3d-bddq: archive/ is excluded from tsconfig, eslint, the test glob and every check:* SCAN_ROOT, so
 # a rename heuristic can merge a branch's edits into an archived file with NO conflict marker and
 # nothing else here can see it. It happened twice in one day. This step is the only gate that looks.
+# It reads the INDEX and the WORKING TREE, not HEAD: during an in-progress merge HEAD is still the
+# PRE-merge commit, which is how the first version of the check was blind to the very thing it was
+# written to catch. Pass ARCHIVE_SEAL_REF only when you deliberately mean a committed tree.
 run_step 'archive sealed'                 npm run check:archive-sealed
 run_step 'prisma schema scope'            npm run db:schema:scope -- "${schema_scope_base_ref}" "${schema_scope_head_ref}"
 
