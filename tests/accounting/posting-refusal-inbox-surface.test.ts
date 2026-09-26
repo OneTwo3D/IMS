@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
 /**
@@ -926,21 +927,22 @@ test('[o3d-j625 r22 HIGH] the inbox ships the longest-held head, and the page dr
     const head = (data as unknown as { accountingHandPostClaimsLongestHeld?: Array<{ refusalId: string; stale: boolean }> })
       .accountingHandPostClaimsLongestHeld
     console.log(`[r22 surface head] ${JSON.stringify(head?.map((claim) => claim.refusalId))} `
-      + `revision=${(data as unknown as { accountingHandPostClaimsRevision?: number }).accountingHandPostClaimsRevision}`)
+      + `walkCursor=${(data as unknown as { accountingHandPostClaimsNextCursor?: string | null }).accountingHandPostClaimsNextCursor}`)
     assert.ok(Array.isArray(head), 'the inbox payload carries it')
     assert.deepEqual(head.map((claim) => claim.refusalId), ['lh-ancient', 'lh-recent'], 'held longest FIRST')
     assert.equal(head[0]!.stale, true, 'and the longest-held one is flagged')
-    // o3d-j625 r24: the payload carries the claim-set REVISION, not a count for the page to compare — round 23
-    // showed a count cannot carry a completeness claim. `0` here because nothing has been taken or released
-    // through the app in this fixture; what matters is that the field is present and a number.
-    assert.equal(
-      typeof (data as unknown as { accountingHandPostClaimsRevision?: unknown }).accountingHandPostClaimsRevision,
-      'number',
-      'the inbox payload carries the claim-set revision the walk compares against')
+    /**
+     * o3d-j625 r26 (owner decision) — NOTHING IN THE PAYLOAD SUPPORTS A COMPLETENESS CLAIM ANY MORE.
+     *
+     * r22 sent `totalAtEnd`; r24 replaced it with `claimSetRevision`. Both are gone with the sentence they
+     * existed for. Asserted as an ABSENCE — a universal check — because leaving either field in the contract
+     * is how a later change starts consulting it again, and the whole point of the scope decision is that
+     * there is no longer anything to consult.
+     */
     assert.equal((data as unknown as { accountingHandPostClaimsTotalAtEnd?: unknown }).accountingHandPostClaimsTotalAtEnd,
-      undefined,
-      'and r22\'s count is GONE from the payload, not merely unread — leaving it would invite a later change to '
-      + 'consult it again, which is the defect round 23 found')
+      undefined, 'r22\'s count is gone from the payload')
+    assert.equal((data as unknown as { accountingHandPostClaimsRevision?: unknown }).accountingHandPostClaimsRevision,
+      undefined, 'and so is r24\'s revision')
 
     const { readFile } = await import('node:fs/promises')
     const path = await import('node:path')
@@ -973,103 +975,193 @@ test('[o3d-j625 r22 HIGH] the inbox ships the longest-held head, and the page dr
 
 /**
  * ══════════════════════════════════════════════════════════════════════════════════════════════════════
- * o3d-j625 r24 (Codex round 23, HIGH) — THE PAGE DISTINGUISHES THREE STATES, AND NOT BY COUNTING
+ * o3d-j625 r26 (owner decision, after Codex rounds 19/21/23/25) — THE COMPLETENESS SENTENCE IS ABSENT
  * ══════════════════════════════════════════════════════════════════════════════════════════════════════
  *
- * r22 guarded "that is every active claim" with a count and round 23 defeated it with two CANCELLING changes.
- * The behavioural half of the replacement — that a take, a release and a mark each move a strictly increasing
- * revision, and that the reviewer's 51-claim scenario is caught — is proven in
- * tests/accounting/posting-refusal-mark-handled. What is left is a fact about the component: which of the
- * three states it prints, and on what.
+ * Four rounds and eight HIGHs went to one property: "that is every active claim". r20 answered a cap with a
+ * walk, r22 answered a rewritable key with the row's id and a count, r24 answered the count with a strictly
+ * increasing revision, and r25 still found two more ways the assertion was wrong plus a clear that orphaned a
+ * claim outright. The owner's decision is to remove the claim rather than defend it a fifth time.
  *
- * DISCLOSED, from r22: the first version of this assertion was existential (`match(/claimsTotalAtEnd/)`) and
- * the harness found it green, because the identifier survived inside the branch it guarded. The rule here is
- * therefore about the deciding COMPARISON and the `?` it decides, and about the ABSENCE of any count in it.
+ * This test is the ratchet. It is an ABSENCE check — universal, so unlike an `includes` it has no room for a
+ * correcting line sitting beside a stale one — and it bans the hedges as well as the sentence, because
+ * "probably everything" is the same defect with a qualifier.
  *
- * WHAT WOULD STILL PASS THIS: wording an operator might misread, and a comparison written with the operands
- * swapped (`!==` is symmetric, so there is nothing to get backwards — which is part of why a revision is a
- * better guard than an inequality between two counts). What it establishes is that the claim of completeness
- * is conditional on the revision and on nothing else.
+ * WHAT WOULD STILL PASS THIS: a completeness claim phrased in words nobody has thought of (the list below is
+ * finite), and a claim made somewhere other than this component — the server no longer ships anything that
+ * could support one, which the payload-absence assertions above cover. What it does establish is that the
+ * specific sentence and its known weakenings cannot come back unnoticed.
  */
-test('[o3d-j625 r24] the page claims completeness only when the claim-set REVISION did not move', async () => {
+test('[o3d-j625 r26] the claims section makes NO completeness claim, and no hedged version of one', async () => {
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
-  const source = await readFile(
+  const client = await readFile(
     path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
     'utf8',
   )
-  const at = source.indexOf('That is every active claim.')
-  assert.ok(at >= 0, 'the sentence must still be in the page, or this test asserts nothing')
-  const decision = source.slice(source.lastIndexOf('{claimsMatched', 0 + at), at)
-  console.log(`[r24 sentence] deciding expression = ${decision.replace(/\s+/g, ' ').slice(0, 220)}`)
+  const actions = await readFile(path.join(process.cwd(), 'app', 'actions', 'sync-exceptions.ts'), 'utf8')
 
-  assert.match(decision, /claimsRevisionNow !== claimsRevisionAtStart\s*\?/,
-    'THE GUARD: completeness is conditional on the revision of the active claim set being unchanged between the '
-    + 'start of the walk and its last page. Two cancelling changes move it by 2, so they cannot look like an '
-    + 'unchanged set — which is exactly what a count could not tell.')
+  // The rendered strings only: a comment may (and does) explain what was removed and why.
+  const rendered = client.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const banned: Array<[RegExp, string]> = [
+    [/every active claim/i, 'the sentence itself'],
+    [/that is (all|every)/i, 'its shorter forms'],
+    [/all (of them|the claims)/i, 'and its paraphrases'],
+    [/(probably|likely|should be) (everything|complete|all)/i, 'a HEDGED claim, which is the same defect with a qualifier'],
+    [/nothing (else|more) (is|was) held/i, 'a claim made by denying the complement'],
+    [/(list|walk) is complete/i, 'a claim about the list rather than the claims'],
+  ]
+  for (const [pattern, why] of banned) {
+    assert.doesNotMatch(rendered, pattern, `the page must not claim completeness — ${why}`)
+  }
 
-  /**
-   * AND NO COUNT IS CONSULTED. This is the round-23 finding stated as an ABSENCE, which is a universal check
-   * and therefore has no room for a correcting line beside a stale one: neither the rows shown nor any total
-   * may appear in the expression that decides completeness.
+  // AND THE MACHINERY IS GONE, not merely unread: a field nothing consults is how a later change starts
+  // consulting it. Both of the supports the removed sentence had are absent from the server contract.
+  /*
+   * The identifiers as CODE — declared, assigned or read — rather than anywhere in the text. Both modules
+   * explain at length what was removed and why, and naming a deleted field in a comment is the opposite of
+   * shipping it; stripping comments first was tried and is fragile, because a string literal containing a
+   * comment delimiter shifts the pairing.
    */
-  assert.doesNotMatch(decision, /claims\.length/, 'the number of rows shown is not part of the decision')
-  assert.doesNotMatch(decision, /claimsTotal/, 'nor is any total')
-  assert.doesNotMatch(decision, /totalAtEnd/, 'nor r22\'s total-as-of-the-last-page')
+  for (const [source, name, label] of [
+    [actions, 'totalAtEnd', 'r22\'s count is gone from the page contract'],
+    [actions, 'claimSetRevision', 'and r24\'s revision is gone from it too'],
+    [client, 'claimsRevisionAtStart', 'with no client state left to compare against'],
+    [client, 'claimsRevisionNow', 'and none to compare'],
+  ] as Array<[string, string, string]>) {
+    assert.doesNotMatch(source, new RegExp(`\\b${name}\\s*:`), `${label} (no declaration or assignment)`)
+    assert.doesNotMatch(source, new RegExp(`\\.${name}\\b`), `${label} (no read)`)
+    assert.doesNotMatch(source, new RegExp(`\\b${name}\\s*[!=<>]`), `${label} (no comparison)`)
+  }
 
-  // THE THIRD STATE, and it says what to do. "More pages" is the Show-more branch; this is the middle one.
-  const incomplete = source.slice(at - 700, at)
-  assert.match(incomplete, /may be INCOMPLETE/, 'the middle state says the list may be incomplete, in those words')
-  assert.match(incomplete, /\$\{claimsRevisionNow - claimsRevisionAtStart\}/,
-    'and says HOW MANY acts moved the set, which is what the revision can honestly report')
-  assert.match(incomplete, /Reload to start again/, 'with something the operator can do about it')
-
-  // NON-VACUITY: all three states live in this one expression, so "the decision is the revision" is a fact
-  // about a branch that exists rather than about a string that happens not to appear.
-  assert.match(decision, /claimsMatched !== null/, 'the lookup state is the first branch')
-  assert.ok(source.indexOf('Show more claims') > 0, 'and the more-pages state is its own control')
+  // NON-VACUITY: the section still EXISTS and still says what it is for, so this is an absence inside a
+  // living surface rather than a test that passes because the whole feature was deleted.
+  assert.match(rendered, /Postings being settled by hand/, 'the section is still there')
+  assert.match(rendered, /Show more claims/, 'with paging as navigation')
+  assert.match(rendered, /Release/, 'and Release on its rows')
+  console.log('[r26 absence] section present, completeness claim and both of its supports absent')
 })
 
 /**
- * o3d-j625 r24 — AND THE TWO NUMBERS THE PAGE COMPARES ARE THE RIGHT TWO.
+ * o3d-j625 r26 — AND THE COPY SAYS WHAT THE SECTION *DOES* MEAN, since it no longer says what it used to.
  *
- * FOUND BY THE MUTATION HARNESS, NOT BY A TEST. The test above asserts the DECISION is the revision; it says
- * nothing about where the two operands come from, and two mutations exploited exactly that gap:
- *
- *   · report page one's revision as the current one, so the comparison can never fire;
- *   · re-base the start revision on every APPEND, so the comparison spans one page instead of the walk.
- *
- * Both leave the decision's grammar intact and every other test green. The state updates in `loadClaims` are
- * therefore asserted directly — the operands, not just the operator.
- *
- * WHAT WOULD STILL PASS THIS: a `loadClaims` that never runs (the button could be unwired — the walk's
- * behaviour is proven server-side in posting-refusal-mark-handled, and the Show-more control's existence is
- * asserted by the test above), and a rename of either state variable that keeps both roles. What it
- * establishes is that the CURRENT revision tracks the latest page and the START revision does not.
+ * WHAT WOULD STILL PASS THIS: copy that is accurate but unhelpful. It establishes that the three things that
+ * actually make a stranded claim actionable are described to the operator rather than left to be discovered.
  */
-test('[o3d-j625 r24] the walk compares the LATEST page against the walk\'s START, and an append does not re-base', async () => {
+test('[o3d-j625 r26] the section copy describes finding a claim, not having seen them all', async () => {
+  const copy = await import('@/lib/domain/accounting/posting-refusal-copy')
+  const detail = copy.ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL
+  console.log(`[r26 copy] ${detail.slice(0, 160)}…`)
+  assert.doesNotMatch(detail, /every active claim is reachable/i,
+    'the heading detail no longer promises reachability as a property — that promise is what four rounds of '
+    + 'findings were about')
+  assert.match(detail, /oldest|longest/i, 'it says the longest-held come first')
+  assert.match(detail, /search|find|look/i, 'it points at the lookup for a specific document')
+  assert.match(detail, /anybody with sync access may release/i, 'and it still states who may release a claim')
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r26 (Codex round 25, HIGH 1) — EVERY WRITER TO A REFUSAL ROW, AND WHETHER IT CONSIDERS THE CLAIM
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * Round 25's HIGH 1 was one unguarded writer. The question it raises is the census: are there OTHERS? A
+ * second unguarded writer is round 27, so this enumerates them from the SOURCE and requires each to be
+ * accounted for, in the shape this repository already uses for the sync-log-row primitive census.
+ *
+ * THE FINDINGS OF THE CENSUS, and each is asserted below rather than asserted in prose:
+ *
+ *   posting-mark-handled.ts   the CLAIM write        — predicate `handPostClaimedAt: null` (only one claimant)
+ *                             the RELEASE            — predicate `handPostClaimedAt: { not: null }`
+ *                             the KEEP-OUTSTANDING   — reached only with the claim held and clears it
+ *                             the RESOLVE            — reached only with the claim held and clears it
+ *   posting-refusal-inbox.ts  the CLEAR              — predicate `handPostClaimedAt: null` (r26's fix)
+ *                             the REOPEN reset       — `resolvedAt: { not: null }`, so never a claimed row:
+ *                                                      a resolved row cannot hold a claim, because both mark
+ *                                                      exits clear it
+ *                             the RECORD update      — sets `resolvedAt: null`; it REOPENS rather than ending
+ *                                                      a life, and r18 depends on it reaching a claimed row so
+ *                                                      a postponed edit becomes visible debt
+ *                             the RECORD upsert      — creates a row that by construction has no claim
+ *   posting-suppression.ts    the DEFERRAL bump      — requires `handPostClaimedAt: { not: null }`: it exists
+ *                                                      only to record what a live claim postponed
+ *
+ * NOTHING ELSE WRITES THE TABLE. No production path deletes a refusal row, and no other module reaches it.
+ *
+ * WHAT WOULD STILL PASS THIS: a writer added through a differently-named local alias (the walk looks for
+ * `accountingPostingRefusal.<verb>` and the inbox's own `table.<verb>`), and a writer in a file not on the
+ * list below. The list is derived from a repo-wide grep asserted here to find exactly these three files, so a
+ * fourth file gaining a writer fails the file-set assertion rather than slipping past the per-site one.
+ */
+test('[o3d-j625 r26] every writer to a refusal row accounts for the hand-post claim', async () => {
   const { readFile } = await import('node:fs/promises')
+  const { execFileSync } = await import('node:child_process')
   const path = await import('node:path')
-  const source = await readFile(
-    path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
-    'utf8',
-  )
-  const start = source.indexOf('function loadClaims(')
-  assert.ok(start >= 0, 'the loader must still be a named function, or this test asserts nothing')
-  const block = source.slice(start, source.indexOf('\n  }', start))
-  console.log(`[r24 operands] loadClaims block = ${block.length} chars`)
+  const root = process.cwd()
 
-  assert.match(block, /setClaimsRevisionNow\(page\.claimSetRevision\)/,
-    'the CURRENT revision comes from the page just read — reporting the walk\'s starting value here would make '
-    + 'the comparison unable to fire at all')
-  assert.doesNotMatch(block, /setClaimsRevisionNow\(claimsRevisionAtStart\)/,
-    'and never from the start value, which is the operand it is compared against')
-  assert.match(block, /if \(!options\.append\) setClaimsRevisionAtStart\(page\.claimSetRevision\)/,
-    'the START revision is re-based only when the walk RESTARTS (a lookup, or a fresh first page). Re-basing on '
-    + 'an append would forgive every change that happened before the latest page, so the comparison would span '
-    + 'one page rather than the whole walk — which is the defect round 23 found, at a different scale.')
+  // THE FILE SET, from the repository rather than from this list — so a writer in a new file is a failure
+  // here and not an omission nobody notices.
+  const grep = execFileSync('grep', [
+    '-rlE', String.raw`(accountingPostingRefusal|\btable)\.(update|updateMany|upsert|delete|deleteMany|create)\(`,
+    'lib', 'app', 'scripts',
+  ], { cwd: root, encoding: 'utf8' })
+  const files = grep.split('\n').filter((line) => line && !line.startsWith('app/generated/'))
+    .filter((f) => /posting-refusal-inbox|posting-mark-handled|posting-suppression/.test(f)
+      || /accountingPostingRefusal\.(update|updateMany|upsert|delete|deleteMany|create)\(/.test(readFileSync(path.join(root, f), 'utf8')))
+  console.log(`[r26 census] files with refusal-row writers: ${JSON.stringify(files)}`)
 
-  // NON-VACUITY: the block really does contain unconditional setters, so "this one is conditional" is a fact
-  // about a guard that exists rather than about a pattern absent from the whole file.
-  assert.match(block, /setClaimsCursor\(page\.nextCursor\)/, 'the block does set other state unconditionally')
+
+  const expected = [
+    'lib/domain/accounting/posting-mark-handled.ts',
+    'lib/domain/accounting/posting-refusal-inbox.ts',
+    'lib/domain/accounting/posting-suppression.ts',
+  ]
+  for (const file of expected) {
+    assert.ok(files.includes(file), `PRECONDITION: the walk must reach ${file}, or this census asserts nothing`)
+  }
+  const unexpected = files.filter((f) => !expected.includes(f))
+  assert.deepEqual(unexpected, [],
+    'a NEW file writes accounting_posting_refusals. Add it to this census and say, for its every write, whether '
+    + 'it can reach a row somebody is settling by hand — an unguarded writer is a permanent stuck suppression')
+
+  // THE CLEAR carries the claim predicate. This is round 25's HIGH 1, asserted where it lives.
+  const inbox = await readFile(path.join(root, 'lib/domain/accounting/posting-refusal-inbox.ts'), 'utf8')
+  const clear = inbox.slice(inbox.indexOf('export async function clearAccountingPostingRefusal'))
+  const clearBody = clear.slice(0, clear.indexOf('\n}\n'))
+  assert.match(clearBody, /where: \{ \.\.\.key, resolvedAt: null, handPostClaimedAt: null \}/,
+    'THE FIX: the clear can only close a row nobody is settling by hand. As a PREDICATE, so a claim taken '
+    + 'between a read and this write cannot slip through')
+  assert.match(clearBody, /reportClearDeclinedForHandPostClaim/,
+    'and a clear that matched nothing is handled explicitly rather than as a silent no-op')
+  assert.doesNotMatch(clearBody, /handPostClaimedAt: null,\s*handPostClaimedBy: null/,
+    'and it NEVER clears the claim to make its own write succeed — taking it from an operator in the ledger is '
+    + 'the duplicate-posting window r16 closed')
+
+  // THE REOPEN RESET is safe by a different argument: a resolved row cannot hold a claim.
+  assert.match(inbox, /where: \{ \.\.\.key, resolvedAt: \{ not: null \}, suppressedAt: null \}/,
+    'the reopen reset only touches RESOLVED rows, and both mark exits clear the claim before resolving')
+
+  // THE MARK's four writes.
+  const mark = await readFile(path.join(root, 'lib/domain/accounting/posting-mark-handled.ts'), 'utf8')
+  assert.match(mark, /where: \{ id: row\.id, resolvedAt: null, handPostClaimedAt: null \}/, 'the claim write admits one claimant')
+  assert.match(mark, /where: \{ id: row\.id, resolvedAt: null, handPostClaimedAt: \{ not: null \} \}/, 'the release requires a claim')
+  /**
+   * THREE writes give the claim back, and each is reached only with a claim held: the RELEASE (whose predicate
+   * demands `{ not: null }`) and the mark's TWO exits (both reached only after the mark has established that
+   * the caller holds it). Counted, so a FOURTH place learning to clear a claim — which is how an operator loses
+   * one from under themselves — fails here.
+   */
+  assert.equal((mark.match(/handPostClaimedAt: null,\n\s+handPostClaimedBy: null,/g) ?? []).length, 3,
+    'exactly three writes give the claim back: the release and the mark\'s two exits')
+
+  // THE DEFERRAL bump requires a live claim by construction.
+  const suppression = await readFile(path.join(root, 'lib/domain/accounting/posting-suppression.ts'), 'utf8')
+  assert.match(suppression, /where: \{ \.\.\.key, resolvedAt: null, handPostClaimedAt: \{ not: null \} \}/,
+    'the deferral record only fires while a claim is held, which is the whole of what it records')
+
+  // AND NOTHING DELETES A REFUSAL ROW in production, which is what lets the census reason about lifecycles.
+  for (const file of expected) {
+    const source = await readFile(path.join(root, file), 'utf8')
+    assert.doesNotMatch(source, /accountingPostingRefusal\.delete/, `${file} must not delete refusal rows`)
+  }
 })

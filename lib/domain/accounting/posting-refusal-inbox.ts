@@ -84,8 +84,15 @@ export type PostingRefusalClient = {
      */
     findUnique?(args: {
       where: { type_referenceType_referenceId_scope: PostingRefusalKey }
-      select: { suppressedAt: true; resolvedBy: true; resolvedAt?: true; resolution?: true }
-    }): Promise<{ suppressedAt: Date | null; resolvedBy: string | null; resolvedAt?: Date | null; resolution?: string | null } | null>
+      /**
+       * o3d-j625 r26: and WHO IS SETTLING IT BY HAND, for the clear's decline path. Optional like the two
+       * above, so a structural double that selects only what it needs keeps compiling.
+       */
+      select: { suppressedAt: true; resolvedBy: true; resolvedAt?: true; resolution?: true; handPostClaimedAt?: true; handPostClaimedBy?: true }
+    }): Promise<{
+      suppressedAt: Date | null; resolvedBy: string | null; resolvedAt?: Date | null; resolution?: string | null
+      handPostClaimedAt?: Date | null; handPostClaimedBy?: string | null
+    } | null>
   }
   /**
    * o3d-j625 r9 — THE ACCOUNTING SYNC LOG, the only durable trace a FIRST enqueue of a posting leaves.
@@ -792,6 +799,36 @@ export async function recordAccountingPostingRefusal(
  * read a row that is about to change. A clear that cannot take the key still runs: it is a monotone
  * CAS — it only ever closes a row that is open — so the worst it can do is settle a debt the posting has
  * in fact discharged, and skipping it would leave the false debt this round exists to remove.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r26 (Codex round 25, HIGH 1) — AND IT MUST NOT CLOSE A ROW SOMEBODY IS SETTLING BY HAND
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * THE INTERLEAVING. The Xero queue commits the PENDING sync row and the facade clears the refusal in a
+ * SEPARATE step. Between the two, an operator can take that refusal for hand posting — and taking it
+ * CANCELS the provably-unsent row it was about (`claimPostingForHandPosting`). This clear then arrived at a
+ * claimed row, matched it on `resolvedAt: null` alone, and resolved it: `resolution: 'queued'` over a
+ * posting whose row had just been cancelled, with the claim stamp left in place.
+ *
+ * WHAT THAT COSTS, and it is the exact failure round 18's discoverability work exists to prevent, arriving
+ * through a different door: the refusal is resolved, so it leaves the outstanding list AND the active-claims
+ * list (both select `resolvedAt: null`). It can no longer be released and no longer be marked handled — both
+ * refuse an already-resolved row. But `handPostClaimedAt` is still set, so `readPostingSuppression` goes on
+ * reporting the key as one IMS must not queue, FOR EVER. A permanent stuck suppression that nothing lists
+ * and no human can end.
+ *
+ * SO THE CLEAR IS CONDITIONAL ON THERE BEING NO CLAIM, and a clear that matches nothing is handled
+ * EXPLICITLY rather than as a silent no-op:
+ *
+ *   · `handPostClaimedAt: null` joins the predicate. The property is a fact about the STATEMENT, not about a
+ *     read that preceded it, so a claim taken between a check and this write cannot slip through.
+ *   · When nothing matched, the row is re-read UNDER THE SAME LOCK. If it is claimed, the clear DECLINES and
+ *     says so at WARNING, naming the holder — the refusal stays outstanding, the claim stays theirs, and the
+ *     operator settles it by hand. That is the right answer on the merits too: the row this clear was about
+ *     has been cancelled, so "the posting has now been queued" is false.
+ *   · It NEVER clears the claim to make its own write succeed. Taking the claim out from under an operator
+ *     who is in the ledger is the duplicate-posting window r16 closed.
+ *   · A row that was simply already resolved (no claim) is the ordinary idempotent case and stays silent.
  */
 export async function clearAccountingPostingRefusal(
   client: PostingRefusalClient,
@@ -804,11 +841,52 @@ export async function clearAccountingPostingRefusal(
       key,
       { callerTransaction: Boolean(options?.withSavepoint) },
       async (locked) => {
-        await (locked as unknown as PostingRefusalClient).accountingPostingRefusal.updateMany({
-          where: { ...key, resolvedAt: null },
+        const table = (locked as unknown as PostingRefusalClient).accountingPostingRefusal
+        const { count } = await table.updateMany({
+          // o3d-j625 r26: `handPostClaimedAt: null` is the whole fix. See the block above.
+          where: { ...key, resolvedAt: null, handPostClaimedAt: null },
           data: { resolvedAt: new Date(), resolution: 'queued' },
         })
+        if (count > 0) return
+        // Nothing matched. Two states can produce that, and only one of them is worth saying anything about.
+        const standing = typeof table.findUnique === 'function'
+          ? await table.findUnique({
+            where: { type_referenceType_referenceId_scope: key },
+            select: { suppressedAt: true, resolvedBy: true, resolvedAt: true, resolution: true, handPostClaimedAt: true, handPostClaimedBy: true },
+          })
+          : null
+        if (!standing?.handPostClaimedAt) return
+        await reportClearDeclinedForHandPostClaim(key, standing.handPostClaimedAt, standing.handPostClaimedBy ?? null)
       },
     )
   })
+}
+
+/**
+ * o3d-j625 r26 — THE CLEAR DECLINED, AND A DECLINE THAT NOBODY CAN SEE IS THE DEFECT ONE LAYER DOWN.
+ *
+ * WARNING rather than INFO: the interleaving that produces it means a sync row was written and then
+ * cancelled by the claim, so somebody should be able to find out afterwards why a posting the queue thought
+ * it had written is being settled by hand instead. Never throws — this runs inside the enqueue's own
+ * transaction on the path that matters, and a failed audit line must not roll back a posting.
+ */
+async function reportClearDeclinedForHandPostClaim(
+  key: PostingRefusalKey,
+  claimedAt: Date,
+  claimedBy: string | null,
+): Promise<void> {
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'accounting_posting_refusal_clear_declined_hand_post_claim',
+    tag: 'accounting',
+    level: 'WARNING',
+    description:
+      `A queued ${key.type} for ${key.referenceType} ${key.referenceId} did NOT close its refused-posting row: `
+      + `an operator took it to settle by hand at ${claimedAt.toISOString()} and still holds it, which cancelled `
+      + 'the queued row this clear was about. The refusal stays OUTSTANDING and the claim stays theirs — '
+      + 'clearing it would hide a posting nobody could then release or mark handled, while its claim went on '
+      + 'stopping IMS queueing it.',
+    metadata: { ...key, handPostClaimedAt: claimedAt.toISOString(), handPostClaimedBy: claimedBy },
+  }).catch(() => { /* an audit line that cannot be written must not fail the enqueue it describes */ })
 }

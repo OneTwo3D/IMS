@@ -120,25 +120,36 @@ export function ExceptionsClient({ data }: Props) {
   const [claimsMatched, setClaimsMatched] = useState<number | null>(null)
   const [claimSearch, setClaimSearch] = useState('')
   /**
-   * o3d-j625 r24 (Codex round 23, HIGH) — THE REVISION OF THE ACTIVE CLAIM SET, AT THE START OF THIS WALK AND
-   * AS OF ITS LATEST PAGE.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   * o3d-j625 r26 (owner decision, after Codex rounds 19/21/23/25) — THIS SECTION NO LONGER CLAIMS TO HAVE
+   * SHOWN YOU EVERY ACTIVE CLAIM, AND THERE IS NO WEAKER VERSION OF THAT SENTENCE EITHER
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
    *
-   * r22 compared COUNTS and round 23 defeated that with two cancelling changes: a take of a pre-existing
-   * refusal (whose id sorts before the cursor, because taking a claim creates no row) against a release of a
-   * claim already shown. Same total, different set, "that is every active claim" printed over a posting that
-   * was never listed. So the page compares a strictly increasing revision instead, and a count is not
-   * consulted for completeness at all.
+   * FOUR ROUNDS, EIGHT HIGHs, ONE PROPERTY. r19 found a cap hiding a claim; r20 answered with a walk. r21
+   * found the walk's key was rewritable; r22 answered with the row's id and guarded the sentence with a
+   * COUNT. r23 defeated the count with two cancelling changes; r24 answered with a strictly increasing
+   * revision. r25 then found three more ways the assertion was wrong — an unsynchronised revision read on
+   * page one, a filtered walk that skipped the check entirely, and a clear that orphaned a claim outright.
+   * Every fix was correct, and every fix added the surface that produced the next finding.
+   *
+   * So the CLAIM is gone rather than defended again. "I have shown you every active claim" is not something
+   * a non-snapshot walk over a set three concurrent human actions can change is able to say, and each
+   * attempt to say it anyway cost a round. Nothing here prints it, nothing computes it, and the revision
+   * table that existed only to support it is deleted along with its migration.
+   *
+   * WHAT REPLACES IT IS WHAT THE REQUIREMENT ACTUALLY WAS — a human must be able to FIND a stranded claim
+   * and RELEASE it without knowing where it sits in a queue:
+   *   · the longest-held block at the top, age-ordered, with the stale flag as a prompt;
+   *   · the lookup by document / reference / posting type / refusal id;
+   *   · Release on EVERY row, including another operator's;
+   *   · "Show more", which is NAVIGATION over a stable order — it is not a proof and no longer pretends to be.
    */
-  const [claimsRevisionAtStart, setClaimsRevisionAtStart] = useState(data.accountingHandPostClaimsRevision)
-  const [claimsRevisionNow, setClaimsRevisionNow] = useState(data.accountingHandPostClaimsRevision)
   if (claimsBase !== data.accountingHandPostClaims) {
     setClaimsBase(data.accountingHandPostClaims)
     setClaims(data.accountingHandPostClaims)
     setClaimsCursor(data.accountingHandPostClaimsNextCursor)
     setClaimsTotal(data.summary.accountingHandPostClaims)
     setClaimsMatched(null)
-    setClaimsRevisionAtStart(data.accountingHandPostClaimsRevision)
-    setClaimsRevisionNow(data.accountingHandPostClaimsRevision)
     setClaimSearch('')
   }
 
@@ -151,11 +162,6 @@ export function ExceptionsClient({ data }: Props) {
       setClaimsCursor(page.nextCursor)
       setClaimsTotal(page.total)
       setClaimsMatched(page.matched)
-      setClaimsRevisionNow(page.claimSetRevision)
-      // A NEW walk (a lookup, or restarting) re-bases what "unchanged since the start" means; an APPEND must
-      // not, or every page would forgive the changes that happened before it and the comparison would only
-      // ever span one page.
-      if (!options.append) setClaimsRevisionAtStart(page.claimSetRevision)
     })
   }
 
@@ -1192,8 +1198,10 @@ export function ExceptionsClient({ data }: Props) {
               ))}
             </TableBody>
           </Table>
-          {/* o3d-j625 r20: the walk. Present EXACTLY when the server said a row beyond this page was read,
-              so an operator can always get to the far end — which is what makes the section's cap a page. */}
+          {/* o3d-j625 r20, narrowed by r26: the walk. Present EXACTLY when the server said a row beyond this
+              page was read, so an operator can always get to the far end. It is NAVIGATION over a stable
+              order and nothing more — when it is gone there is no sentence, because "you have now seen them
+              all" is the claim four rounds of findings removed. */}
           {claimsCursor ? (
             <Button
               type="button"
@@ -1204,29 +1212,7 @@ export function ExceptionsClient({ data }: Props) {
             >
               Show more claims
             </Button>
-          ) : (
-            /*
-             * o3d-j625 r24 (Codex round 23, HIGH): THREE STATES, AND NOT A COUNT AMONG THEM.
-             *
-             * "more pages" is the branch above (the Show-more button). Here the walk has reached its end, and
-             * it is either COMPLETE or INCOMPLETE-BECAUSE-THE-SET-MOVED. r22 decided that by comparing the
-             * total with how many rows had been shown, and round 23 defeated it with two CANCELLING changes —
-             * a take of a pre-existing refusal (whose id sorts before the cursor, since taking a claim creates
-             * no row) against a release of a claim already shown: 51 shown, 51 total, completeness printed
-             * over a posting never listed. Two releases against one take made `shown > total`, which fell
-             * through to the same sentence.
-             *
-             * The revision only ever goes UP, so those two changes are +2 and cannot cancel. A count is not
-             * consulted for completeness anywhere on this page.
-             */
-            <p className="text-xs text-muted-foreground">
-              {claimsMatched !== null
-                ? `That is every active claim matching "${claimSearch}".`
-                : claimsRevisionNow !== claimsRevisionAtStart
-                  ? `This list may be INCOMPLETE: ${claimsRevisionNow - claimsRevisionAtStart} posting(s) were taken for hand posting, released or confirmed while you were paging, so one may never have been shown. Reload to start again.`
-                  : 'That is every active claim.'}
-            </p>
-          )}
+          ) : null}
         </Card>
       ) : null}
 

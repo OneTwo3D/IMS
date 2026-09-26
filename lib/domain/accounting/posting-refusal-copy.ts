@@ -104,10 +104,11 @@ export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL =
   'Postings an operator has taken to settle BY HAND. While a posting is held here IMS will not queue it — that '
   + 'is what stops it reaching the ledger twice — and a claim never expires, so it ends only when somebody '
-  + 'confirms the posting or releases it. EVERY active claim is reachable from here, oldest claim first: this '
-  + 'is a page, not a limit — "Show more" walks to the end, and the lookup goes straight to one. ANYBODY with '
-  + 'sync access may release ANYBODY\'s claim, deliberately: otherwise a claim taken by someone who has left '
-  + 'would suppress that posting for ever. Releases are recorded.'
+  + 'confirms the posting or releases it. The ones held LONGEST are listed first, above; below them is the rest '
+  + 'of the list, which you can page through. To reach a specific posting, SEARCH for its document rather than '
+  + 'paging: postings are taken and given back while you read, so this list is a view of what is held and not '
+  + 'a roll-call. ANYBODY with sync access may release ANYBODY\'s claim, deliberately: otherwise a claim taken '
+  + 'by someone who has left would suppress that posting for ever. Releases are recorded.'
 
 /**
  * o3d-j625 r20 (Codex round 19, HIGH) — WHAT THE LOOKUP SEARCHES, said on the page.
@@ -135,18 +136,6 @@ export const ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE =
  */
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL =
   'Held longest first — the ones most likely to have been forgotten. The full list below is in no particular '
-  + 'order (it is ordered so that paging through it cannot miss anything), so start here.'
+  + 'order an operator should read anything into, so start here, and search by document for a specific one.'
 
-/**
- * o3d-j625 r24 (Codex round 23, HIGH) — WHY THE LIST CAN SAY IT MIGHT BE INCOMPLETE.
- *
- * Paging cannot be a snapshot, so somebody taking or releasing a posting while an operator is paging can
- * change the set underneath them — and because taking a claim creates no row (it stamps a refusal that may be
- * months old), the newly held posting can sort before the page they have already passed. r22 tried to detect
- * that by comparing counts; round 23 showed two changes cancel. A strictly increasing revision of the set
- * cannot cancel, so the page now says plainly when it cannot promise the list is whole.
- */
-export const ACCOUNTING_POSTING_HAND_POST_CLAIM_INCOMPLETE_NOTE =
-  'Postings can be taken or given back while you are paging through this list, and one taken after you passed '
-  + 'its place will not appear. The list says so when that happens — reload and start again rather than reading '
-  + 'it as complete.'
+

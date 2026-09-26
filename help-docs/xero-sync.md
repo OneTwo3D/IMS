@@ -2372,22 +2372,17 @@ Three things about those rows:
   many postings IMS has declined to queue behind it. Anything held far longer than a hand posting takes is
   flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
 
-  **Reaching a claim does not depend on how many there are.** The section shows a *page* of claims and
-  **Show more claims** walks to the end — it is a page, not a limit, and the heading states the true total
-  throughout. **The full list is in no particular order**, deliberately: paging through it is ordered by each
-  row's own identity, which never changes, so releasing and re-taking a claim while you are paging cannot move
-  it past you or show it to you twice. What that ordering gives up is "oldest first", so the longest-held
-  claims are listed *separately at the top* — start there, because those are the ones most likely to have been
-  forgotten, and each of them has its own Release.
+  **This list is a view of what is being held, not a roll-call.** The longest-held claims are listed
+  *separately at the top* — start there, because those are the ones most likely to have been forgotten, and
+  each of them has its own Release. Below them is the rest of the list, and **Show more claims** pages through
+  it. That paging is navigation, nothing more: the page does **not** tell you when you have seen them all,
+  because it cannot. Postings are taken and given back while you read, and taking one does not create anything
+  new — it marks a refusal that may be months old — so a posting taken after you have paged past its place
+  simply will not appear. Earlier versions of this page tried to say "that is every active claim" and were
+  wrong four times in four different ways; the sentence is gone rather than hedged.
 
-  When the walk reaches the end it says so — and it says it only when **nothing was taken, released or
-  confirmed while you were paging**. That is tracked by a counter that only ever goes up, not by comparing how
-  many rows you were shown with how many exist: two changes that cancel (somebody takes one posting while
-  somebody else gives another back) leave those numbers identical and the set different. Taking a posting for
-  hand posting does not create anything new — it marks a refusal that may be months old — so a posting taken
-  after you have paged past its place will not appear in your list at all. When that happens the page says
-  **"this list may be INCOMPLETE: N posting(s) were taken for hand posting, released or confirmed while you
-  were paging"** and tells you to reload, instead of claiming to have shown you everything.
+  **So to reach a specific posting, SEARCH for its document instead of paging.** The Find box goes straight to
+  it, and it is the only route that does not depend on where a claim sits in a list.
 
   If you know the document, do not walk: the **Find** box goes straight to it. It searches the **reference
   id** (an order or PO number), the **reference type**, the **posting type** and the **refusal id** — it does

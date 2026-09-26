@@ -4,7 +4,6 @@ import { isPostableAccountingSyncStatus } from '@/lib/domain/accounting/postable
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
-import { bumpHandPostClaimRevision, type HandPostClaimRevisionClient } from '@/lib/domain/accounting/hand-post-claim-revision'
 import { lockPostingKey, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import { settlementMirrorGuard } from '@/lib/domain/accounting/sync-row-settlement'
@@ -35,7 +34,7 @@ import { settlementMirrorGuard } from '@/lib/domain/accounting/sync-row-settleme
  * recorded (recordAccountingPostingRefusal), and every later automatic enqueue of it is refused as already
  * handled by hand, so there is no second debt to reopen.
  */
-export type MarkHandledClient = PostingSuppressionClient & HandPostClaimRevisionClient & {
+export type MarkHandledClient = PostingSuppressionClient & {
   accountingPostingRefusal: {
     findUnique(args: { where: { id: string }; select: Record<string, true> }): Promise<{
       id: string; type: string; referenceType: string; referenceId: string; scope: string
@@ -392,15 +391,6 @@ export async function claimPostingForHandPosting(
   // Not a `claimed_by_other`: the row was unclaimed under this lock a statement ago, so a zero count means
   // the row moved in a way this transaction cannot describe. Thrown, so the cancellations roll back with it.
   if (claimed.count === 0) throw new MarkHandledRaceError()
-  /**
-   * o3d-j625 r24 (Codex round 23, HIGH) — THE SET OF HELD POSTINGS JUST CHANGED, AND THE WALK HAS TO KNOW.
-   *
-   * Taking a claim CREATES NO ROW: it stamps a refusal that may be months old, whose id therefore sorts
-   * before the cursor of any walk in flight. r22's count could not see that — a take and a release cancel —
-   * so the claims section now compares a strictly increasing revision instead. Bumped inside this
-   * transaction, so a claim that rolls back does not move it.
-   */
-  await bumpHandPostClaimRevision(tx)
   return {
     ok: true,
     cancelledSyncRows,
@@ -467,9 +457,6 @@ export async function releasePostingHandPostClaim(
     },
   })
   if (released.count === 0) throw new MarkHandledRaceError()
-  // o3d-j625 r24: a posting stopped being held, which is the other half of the cancelling pair round 23 used
-  // to defeat a count. Strictly increasing, so a take and a release are +2 rather than 0.
-  await bumpHandPostClaimRevision(tx)
   return { ok: true, releasedFrom: row.handPostClaimedBy ?? null, heldSince: row.handPostClaimedAt, deferredEdits }
 }
 
@@ -593,9 +580,6 @@ export async function markPostingHandled(
       },
     })
     if (kept.count === 0) throw new MarkHandledRaceError()
-    // o3d-j625 r24: the mark ends a claim too, on BOTH its exits — this one gives the claim back and leaves
-    // the refusal outstanding. A walk in flight must be told the set moved whichever way the act ended.
-    await bumpHandPostClaimRevision(tx)
     return {
       ok: true,
       cancelledSyncRows: cancelIds,
@@ -630,8 +614,6 @@ export async function markPostingHandled(
     },
   })
   if (resolved.count === 0) throw new MarkHandledRaceError()
-  // o3d-j625 r24: and this exit clears the claim as well (the row resolves), so the set moved here too.
-  await bumpHandPostClaimRevision(tx)
   return {
     ok: true,
     cancelledSyncRows: cancelIds,

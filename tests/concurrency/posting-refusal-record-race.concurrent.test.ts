@@ -2029,3 +2029,136 @@ test(
       + 'would put a second one in the ledger')
   },
 )
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r26 (Codex round 25, HIGH 1) — THE ENQUEUE CLEAR MUST NOT CLOSE A ROW SOMEBODY IS SETTLING BY HAND
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// THE INTERLEAVING, and every step of it is a legitimate act:
+//   1. the Xero queue COMMITS a PENDING sync row for the posting;
+//   2. before the facade's separate clear runs, an operator TAKES that refusal for hand posting — which
+//      CANCELS the provably-unsent row it was about (claimPostingForHandPosting);
+//   3. the facade's clear then arrives and matches the claimed row on `resolvedAt: null` alone.
+//
+// PRE-FIX the clear resolved it: `resolution: 'queued'` over a posting whose row had just been cancelled,
+// with `handPostClaimedAt` left in place. The refusal then leaves BOTH lists (outstanding and active claims
+// select `resolvedAt: null`), so it can neither be released nor marked — both refuse a resolved row — while
+// the claim stamp goes on telling every enqueue not to queue the posting. A permanent stuck suppression that
+// nothing lists and no human can end: exactly what round 18's discoverability work exists to prevent,
+// arriving through a different door.
+//
+// Driven against a real PostgreSQL database, in the order above, with no reliance on timing.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+test(
+  '[o3d-j625 r26 HIGH] the enqueue clear DECLINES a refusal an operator is settling by hand, and says so',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const deps = await loadDeps()
+    const { db, clearAccountingPostingRefusal, createAccountingSyncLogRow } = deps
+    const referenceId = probeId('r26-clear-vs-claim')
+    t.after(cleanup(db, referenceId))
+    const refusalId = await seedOutstandingRefusal(db, referenceId)
+
+    // 1. THE QUEUE COMMITS THE PENDING ROW. Through the production primitive, in its own transaction, which
+    //    is what makes the clear a SEPARATE step on the facade path.
+    const queued = await db.$transaction(async (tx) => createAccountingSyncLogRow<{ id: string }>(tx, {
+      connector: 'xero', type: TYPE as never, status: 'PENDING',
+      referenceType: REFERENCE_TYPE, referenceId,
+      payload: { narration: `o3d-j625 r26 queued row ${referenceId}` },
+    }), TX)
+    assert.ok(queued.row, 'PRECONDITION: the queue wrote a PENDING row')
+    // The primitive's own clear already ran inside that transaction, so re-open the debt to model the facade
+    // path, where the row is committed and the clear is issued afterwards by a different statement.
+    await db.accountingPostingRefusal.update({
+      where: { id: refusalId }, data: { resolvedAt: null, resolution: null, resolvedBy: null },
+    })
+
+    // 2. THE OPERATOR TAKES IT. This cancels the provably-unsent row — assert that, because it is what makes
+    //    "the posting has now been queued" false by the time the clear arrives.
+    await takeForHandPosting(deps, refusalId, 'operator-A')
+    const cancelled = await db.accountingSyncLog.findUniqueOrThrow({ where: { id: queued.row.id }, select: { status: true } })
+    assert.equal(cancelled.status, 'CANCELLED',
+      'PRECONDITION: taking the claim cancelled the queued row, so nothing is queued any more')
+
+    // 3. THE FACADE'S CLEAR RUNS, believing it is closing a debt the queue discharged.
+    await clearAccountingPostingRefusal(db as never, keyFor(referenceId))
+
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, resolution: true, handPostClaimedAt: true, handPostClaimedBy: true },
+    })
+    console.log(`[r26 clear] after=${JSON.stringify(after)}`)
+    assert.equal(after.resolvedAt, null,
+      'THE FINDING: the clear resolved a row whose claim was still held. Resolved, it leaves the outstanding '
+      + 'list AND the active-claims list (both select resolvedAt: null), so nobody can release or mark it — '
+      + 'and handPostClaimedAt still stops every enqueue. A permanent stuck suppression nothing lists.')
+    assert.equal(after.resolution, null, 'and it is certainly not "queued": the queued row was cancelled')
+    assert.ok(after.handPostClaimedAt, 'the claim is untouched — the clear must never take it from the operator')
+    assert.equal(after.handPostClaimedBy, 'operator-A')
+
+    // AND THE DECLINE IS VISIBLE, because a decline nobody can see is the defect one layer down.
+    const logged = await db.activityLog.findFirst({
+      where: { action: 'accounting_posting_refusal_clear_declined_hand_post_claim', description: { contains: referenceId } },
+      select: { level: true, description: true },
+    })
+    console.log(`[r26 clear] activity=${JSON.stringify(logged)}`)
+    assert.ok(logged, 'the declined clear is recorded')
+    assert.equal(logged.level, 'WARNING',
+      'at WARNING: a row was written and then cancelled, and somebody should be able to find out afterwards '
+      + 'why the queue thinks it posted something an operator is doing by hand')
+
+    // AND THE OPERATOR CAN STILL FINISH. This is the whole point of declining rather than clearing.
+    const stillListed = await db.accountingPostingRefusal.count({
+      where: { id: refusalId, resolvedAt: null, handPostClaimedAt: { not: null } },
+    })
+    assert.equal(stillListed, 1, 'it is still in the active-claims list, so it is still releasable')
+    const marked = await db.$transaction((tx) => deps.markPostingHandled(tx as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted by hand after the queue was cancelled',
+    }), TX)
+    console.log(`[r26 clear] mark=${JSON.stringify(marked)}`)
+    assert.equal(marked.ok, true, 'and the operator can still mark it handled, which a resolved row refuses')
+  },
+)
+
+test(
+  '[o3d-j625 r26 CONTROL] with NO claim held, the clear still closes the row exactly as before',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const deps = await loadDeps()
+    const { db, clearAccountingPostingRefusal } = deps
+    const referenceId = probeId('r26-clear-control')
+    t.after(cleanup(db, referenceId))
+    const refusalId = await seedOutstandingRefusal(db, referenceId)
+
+    await clearAccountingPostingRefusal(db as never, keyFor(referenceId))
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
+    })
+    console.log(`[r26 control] after=${JSON.stringify(after)}`)
+    assert.ok(after.resolvedAt,
+      'CONTROL: the clear still does its job on an unclaimed row. Without this the fix could pass by never '
+      + 'clearing anything, which would restore the false debt r6 removed.')
+    assert.equal(after.resolution, 'queued')
+
+    // AND AN ALREADY-RESOLVED ROW IS SILENT: the ordinary idempotent case must not produce a decline warning.
+    // o3d-j625 r26: this counts activity of EVERY action, not just the decline. Counting only the decline
+    // action passed vacuously under the mutation that makes the decline unconditional (r26d): with no claim
+    // to name, the reporter threw on the null stamp and `guarded` swallowed it into an ERROR row of a
+    // DIFFERENT action, so the narrow count stayed at zero while the ordinary path had in fact become noisy
+    // AND lossy. "Silent" has to mean silent, or the assertion measures the wrong absence.
+    // Measured as a BEFORE/AFTER set on the same query rather than by a timestamp window, because r12
+    // removed this issue's last piece of evidence that compared two application clocks.
+    const activityFor = async () => (await db.activityLog.findMany({
+      where: { description: { contains: referenceId } },
+      select: { id: true, action: true, level: true },
+      orderBy: { id: 'asc' },
+    }))
+    const beforeSecondClear = await activityFor()
+    await clearAccountingPostingRefusal(db as never, keyFor(referenceId))
+    const noise = (await activityFor()).slice(beforeSecondClear.length).map((r) => ({ action: r.action, level: r.level }))
+    assert.deepEqual(noise, [],
+      'a second clear of an already-closed row says NOTHING AT ALL — only a live claim is worth reporting, and '
+      + 'a decline that cannot name a holder is a bug, not a report')
+  },
+)
