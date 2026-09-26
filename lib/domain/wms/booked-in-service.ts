@@ -512,24 +512,44 @@ export async function processBookedInEvent(
       const actionableLines = candidateLines
         .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
 
-      // NOT WIDENED HERE, DELIBERATELY (o3d-h66s, filed 2026-09-25). These two reads feed
-      // `localLineExists`, and because they are restricted to lines with a POSITIVE delta, a line with
-      // NO delta reports its IMS line as MISSING — an approval-blocked `missing_local_line` about a
-      // line that exists and is healthy. o3d-btiw makes that the COMMON case rather than an edge one:
-      // a DELIVERED ASN with nothing booked in yet is exactly a zero delta, and the o3d-bhvu round-8
-      // recovery enqueues a recheck for precisely those. It moves NO stock and corrupts NO figure, so
-      // under the 2026-09-25 scope rule — fix only deploy-blocking faults, file the rest — it is filed
-      // as o3d-h66s and NOT fixed on this branch. The concurrency test "a readable zero is a
-      // MEASUREMENT" pins the present behaviour and carries the instruction to flip it when o3d-h66s
-      // lands.
-      const purchaseActionableLines = actionableLines.filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
-      const transferActionableLines = actionableLines.filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
+      // o3d-h66s — EVERY CANDIDATE LINE, NOT JUST THE ACTIONABLE ONES: THE READ'S SCOPE MUST EQUAL
+      // THE JUDGEMENT'S SCOPE.
+      //
+      // These two reads feed `localLineExists`, which `buildBookedInDryRun` turns into
+      // `missing_local_line` — an APPROVAL-BLOCKED warning rendering to the operator as "IMS line
+      // missing". While they were filtered to `actionableLines` (a POSITIVE delta), a line with
+      // nothing new to credit was never looked up, so `purchaseLine`/`transferLine` came back
+      // undefined and the dry run said a healthy line did not exist. "I did not read this row"
+      // rendered as "this row does not exist".
+      //
+      // AND THE WARNING IS AGGREGATE, which is what made it a P1 rather than a misnomer:
+      // `dryRun.warnings` is the union over the lines, so ONE zero-delta line sent the WHOLE receipt
+      // event to a review nobody could approve and its SIBLING lines — the ones with real units —
+      // applied nothing. After o3d-btiw (#704) made the live Mintsoft quantities readable that is the
+      // ordinary case: every partially-booked ASN, every recheck of a settled ASN (o3d-bhvu's round-8
+      // recovery enqueues exactly those), and any line whose `QuantityBooked` is a readable 0.
+      //
+      // A ZERO-DELTA LINE IS NOT AN UNKNOWN LINE, and the distinction is kept: a `sourceLineId` that
+      // names no `purchase_order_lines` / `stock_transfer_lines` row is STILL absent from these reads
+      // and still raises `missing_local_line`, with or without a delta. There is no foreign key on
+      // `wms_asn_line_maps.sourceLineId`, so that case is real, and
+      // tests/concurrency/wms-booked-in-zero-delta-local-line.concurrent.test.ts proves it still
+      // blocks — including the zero-delta shape a "do not warn when there is no delta" shortcut would
+      // have waved through.
+      //
+      // LOCK-SAFE, and strictly MORE so than before. Step 2 above locks the parents of EVERY line this
+      // ASN reaches (its discovery read is unfiltered, deliberately), so widening to the candidate set
+      // cannot name a parent that step 2 did not lock — and `assertParentsWereLocked` below now
+      // CHECKS the whole set rather than the actionable subset, which is what its own comment always
+      // claimed.
+      const purchaseCandidateLines = candidateLines.filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
+      const transferCandidateLines = candidateLines.filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
 
-      const purchaseOrderLines = purchaseActionableLines.length > 0
+      const purchaseOrderLines = purchaseCandidateLines.length > 0
         ? await tx.purchaseOrderLine.findMany({
             where: {
               id: {
-                in: purchaseActionableLines.map((line) => line.sourceLineId),
+                in: purchaseCandidateLines.map((line) => line.sourceLineId),
               },
             },
             select: {
@@ -551,11 +571,11 @@ export async function processBookedInEvent(
           })
         : []
 
-      const transferLines = transferActionableLines.length > 0
+      const transferLines = transferCandidateLines.length > 0
         ? await tx.stockTransferLine.findMany({
             where: {
               id: {
-                in: transferActionableLines.map((line) => line.sourceLineId),
+                in: transferCandidateLines.map((line) => line.sourceLineId),
               },
             },
             select: {
@@ -572,6 +592,8 @@ export async function processBookedInEvent(
       // The step-2 locks were taken from a read that ran BEFORE them. This is the
       // re-read, and every parent it names must be one of those locks — otherwise
       // this transaction would go on to write a transfer or a PO it does not hold.
+      // Since o3d-h66s the re-read covers EVERY candidate line, so this assertion now
+      // spans the same set step 2 locked instead of only the actionable subset.
       // Locking it now is the one thing that must not happen: it is a step-2 lock
       // taken at step 4, which is the inversion the whole order exists to prevent
       // (6oyu.19, Codex round-9 MEDIUM-1).

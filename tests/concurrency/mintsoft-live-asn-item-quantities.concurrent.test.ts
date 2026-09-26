@@ -318,7 +318,7 @@ test(
 )
 
 test(
-  'NOT VACUOUS: a readable zero is a MEASUREMENT, not a refusal (and o3d-h66s is what it hits next)',
+  'NOT VACUOUS: a readable zero is a MEASUREMENT, not a refusal, and processes cleanly',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
     /**
@@ -327,17 +327,18 @@ test(
      * MEASUREMENT — the warehouse booked nothing in — and it must NOT come back as
      * `remote_quantity_unreadable`.
      *
-     * WHY IT ASSERTS `requires_review` RATHER THAN `processed`, WHICH IS NOT o3d-btiw's DOING:
-     * `localLineExists` is computed from a read restricted to ACTIONABLE lines, so a line with no
-     * delta reports its IMS line as MISSING and the event is held with an approval-blocked
-     * `missing_local_line` about a line that exists. That is o3d-h66s — a separate, pre-existing
-     * defect, filed and deliberately NOT fixed here under the 2026-09-25 scope rule. It moves no stock
-     * and corrupts no figure.
+     * FLIPPED FOR o3d-h66s, as this test's previous body instructed. It used to assert
+     * `requires_review` whose only warning was `missing_local_line`, because `localLineExists` was
+     * computed from a read restricted to ACTIONABLE lines and a line with no delta therefore reported
+     * its own healthy IMS line as missing. o3d-h66s widened that read to every CANDIDATE line, so a
+     * readable zero now processes cleanly — which is a STRICTLY STRONGER statement of the property
+     * o3d-btiw owns: a refusal of any kind would come back `requires_review`, so `processed` proves
+     * no refusal was raised at all, and the zero was read as a quantity.
      *
-     * WHEN o3d-h66s LANDS THIS TEST MUST BE FLIPPED to expect `processed` with no warnings at all; a
-     * red here is the signal that it has. What the assertions below pin either way is the property
-     * o3d-btiw owns: the ONLY warning is `missing_local_line`, so the zero was read as a quantity and
-     * no refusal was raised.
+     * NON-VACUITY, restated for the new shape: `processed` alone could in principle be reached without
+     * the line being looked at, so the ASN line's `lastCallbackAt` (written only by the
+     * no-actionable-lines branch) and the ASN header's `PARTIALLY_BOOKED_IN` status are asserted too.
+     * Together they say the run reached this line, measured zero, and closed nothing.
      */
     loadEnv()
     const seeded = await seedMappedAsn('zero')
@@ -348,17 +349,31 @@ test(
         tag: seeded.tag, sourceLineId: seeded.sourceLineId, sku: seeded.tag, booked: 0, received: 0,
       }),
     })
-    assert.equal(outcome.status, 'requires_review', JSON.stringify(outcome))
-    assert.ok(outcome.status === 'requires_review')
-    // THE o3d-btiw PROPERTY: a readable zero raises NO refusal. Asserted as an exact set so a refusal
-    // appearing later cannot hide behind `missing_local_line`.
-    assert.deepEqual(outcome.dryRun.warnings, ['missing_local_line'])
-    const line = outcome.dryRun.lines[0]!
-    assert.equal(line.remoteQuantityRefusal, null, 'zero booked is a measurement, not a refusal')
-    assert.equal(line.currentRemoteReceivedQty, 0)
-    assert.equal(line.remoteArrivedQty, 0)
+    assert.equal(outcome.status, 'processed', JSON.stringify(outcome))
+    const event = await seeded.db.wmsInboundReceiptEvent.findUniqueOrThrow({
+      where: { id: seeded.event.id },
+      select: { processingStatus: true, lastError: true, reviewDetails: true, processedAt: true },
+    })
+    assert.equal(event.processingStatus, 'PROCESSED')
+    // THE o3d-btiw PROPERTY: a readable zero raises NO refusal and NO review of any kind.
+    assert.equal(event.lastError, null, JSON.stringify(event))
+    assert.equal(event.reviewDetails, null, JSON.stringify(event))
+    assert.ok(event.processedAt)
+    // AND IT CREDITS NOTHING: zero booked means zero units of stock.
     const after = await stockAndLayers(seeded.db, seeded.product.id, seeded.warehouse.id)
     assert.deepEqual(after, { stockQty: 0, layerQty: 0 })
+    const asnLine = await seeded.db.wmsAsnLineMap.findUniqueOrThrow({
+      where: { id: seeded.asnLineMapId },
+      select: { lastProcessedReceivedQty: true, lastCallbackAt: true },
+    })
+    assert.equal(Number(asnLine.lastProcessedReceivedQty), 0)
+    assert.ok(asnLine.lastCallbackAt, 'the run must have reached this line and recorded the callback')
+    const asnMap = await seeded.db.wmsAsnMap.findUniqueOrThrow({
+      where: { id: seeded.asn.id },
+      select: { status: true, closedAt: true },
+    })
+    assert.equal(asnMap.status, 'PARTIALLY_BOOKED_IN', 'nothing booked in must not close the ASN')
+    assert.equal(asnMap.closedAt, null)
   },
 )
 
