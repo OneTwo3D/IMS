@@ -1,3 +1,4 @@
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../helpers/plugin-selection-double.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -76,7 +77,13 @@ function tx() {
     },
     activityLog: { create: async () => ({ id: 'act-1' }) },
     $executeRaw: async () => 1,
-    $queryRaw: async () => [],
+    // o3d-j625 r13: the selection FENCE now runs on every enqueue, so the double answers its locked read
+    // (tests/helpers/plugin-selection-double.ts). Xero enabled, which is this fixture's premise — an empty
+    // answer reports every plugin disabled and the enqueue then refuses for a reason these tests are not
+    // about.
+    $queryRaw: async (query: TemplateStringsArray) => (
+      isLockedPluginSelectionRead(query) ? lockedPluginSelectionRows(['xero']) : []
+    ),
   }
 }
 

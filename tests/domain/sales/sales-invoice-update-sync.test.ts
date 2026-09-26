@@ -91,6 +91,10 @@ test('queueSalesInvoiceUpdateForExistingAccountingInvoice queues Xero update wit
       orderNumber: 'SO-1001',
       idempotencyKey: baseParams.idempotencyKey,
       alreadyQueued: false,
+      // o3d-j625 r13 (independent review, HIGH): the record has to distinguish "IMS queued it" from
+      // "a human posted it and IMS did not" — `queued: true` is the answer to a different question
+      // (does a counterpart exist). `false` here, and the `handled-by-hand` case is its own test.
+      handledByHand: false,
     },
   })
 })
