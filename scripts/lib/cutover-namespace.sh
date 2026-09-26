@@ -1231,8 +1231,9 @@ ensure_cutover_root_dir() {
 # gave it back — see THE BRIDGE r22 SHIPPED below — and r24 re-allocates it for the replacement.
 # Nothing in this file opens a name inside a directory the service account can write.)
 #
-# (7 is the crontab reconciliation lock; see lib/crontab-lock.sh, which explains why it is not
-# one of these and why none of these may be re-`exec`ed while a run is in flight.)
+# (the crontab reconciliation lock is on a number bash allocates, above 10; see lib/crontab-lock.sh,
+# which explains why it is not one of these and why none of these may be re-`exec`ed while a run is
+# in flight.)
 acquire_cutover_lock() {
   # INITIALISED, not merely declared: `local name` leaves the name UNSET, and every one of these
   # scripts runs under `set -u`, so a path that reached the gate below without passing through the

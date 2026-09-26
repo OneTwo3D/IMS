@@ -805,11 +805,22 @@ if ! $DRY_RUN; then
 else
   IMS_DRIVER_PUBLISH_NOTE="this run is a write-nothing mode (--dry-run) and published no root-owned snapshot, so it may execute no helper as root"
 fi
-# The lock lives inside the service's systemd StateDirectory, which is the same directory this
-# script already resolves as its cutover state directory — and the same one the application is
-# handed as $STATE_DIRECTORY. The two components come from the library, so no entrypoint has a path
-# of its own to get wrong.
-crontab_lock_paths "${CUTOVER_STATE_DIR}"
+# WHERE THE CRONTAB RECONCILIATION LOCK LIVES, AND WHY IT IS NOT THE STATE DIRECTORY (o3d-txoe).
+#
+# FIRST ARGUMENT: ${CUTOVER_ROOT_DIR}, the root-owned cutover namespace. Every component of it is
+# root-owned and writable by nobody else, so ${APP_USER} cannot rename any of them and the pathname
+# therefore resolves to ONE inode for this script and for lib/crontab-reconcile-lock.ts alike. It
+# used to be the StateDirectory, which systemd creates OWNED BY ${APP_USER} — and `rename(2)` needs
+# write permission on the PARENT and nothing at all on what it moves, so that account could put the
+# root-owned lock directory aside and leave its own at the name. Both writers then reported an
+# exclusion neither had.
+#
+# SECOND ARGUMENT: where the lock USED TO BE, so that a predecessor build — which still resolves it
+# there — is excluded during the one rollout window in which the two builds disagree. The bridge is
+# conditional on a precondition the library checks and says out loud when it declines; see
+# prepare_legacy_crontab_lock() in scripts/lib/crontab-lock.sh. The two components come from the
+# library, so no entrypoint has a path of its own to get wrong.
+crontab_lock_paths "${CUTOVER_ROOT_DIR}" "${CUTOVER_STATE_DIR}"
 # --dry-run is documented to work unprivileged, and every crontab body it reaches returns after
 # printing what it would do and before any write. See the library for why that is the one path
 # through with_crontab_lock that does not hold the lock.
