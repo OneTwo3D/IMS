@@ -521,6 +521,59 @@ Prisma 7 schema-engine commands such as `migrate status`, `migrate diff`, `db pu
 
 If `psql` and `prisma migrate deploy` work but `migrate status` or `db pull` report `P1001`, treat that as an execution-environment problem first, not a database outage. Run the helper script from a normal shell, or run the Prisma command outside the sandbox.
 
+## Archive Seal
+
+`archive/` holds retired connectors (QuickBooks, Shopify, ShipHero) that #698 removed by *renaming*
+their files under `archive/`. It is deliberately outside every other gate: excluded from
+`tsconfig.json`, from `eslint.config.mjs`, from the `tests/**/*.test.ts` glob and from all four
+`check:*` SCAN_ROOTS. That is what archiving means here, and it is also why a change to an archived
+file is invisible to `tsc`, lint, every test tier and `npm run validate`.
+
+Git's rename detection will merge a branch's edits to the *old* path into the *archived* copy with no
+conflict marker. It happened twice in one day (o3d-c08y: +5/-10 in one file; o3d-j625: +178/-42 across
+nine). `npm run check:archive-sealed` is the only gate that can see it.
+
+**What it catches, and what it does not.** It catches an *accidental* re-hybridisation of `archive/` —
+principally that silent rename-merge, and equally a stray edit, a stray file or an unresolved conflict
+left inside `archive/`. It does **not** prevent a deliberate, committed modification of `archive/`:
+the manifest of expected hashes (`scripts/archive-sealed-manifest.tsv`) lives in the same repository
+as the files it describes, so a commit that changes an archived file can change the manifest in the
+same breath and the seal will agree with itself. That is inherent to a self-hosted manifest.
+
+**What it does about a deliberate change is make it declare itself.** A diff that changes both
+`scripts/archive-sealed-manifest.tsv` and anything under `archive/` is refused unless a commit message
+in that diff carries the trailer:
+
+```
+Archive-Seal-Rewrite: <what is being archived or unarchived, and why>
+```
+
+Two loci are examined: the tip commit (combined diff, so a merge is judged on what it contributed
+rather than on everything it brought in) and the whole branch against its base
+(`ARCHIVE_SEAL_BASE_REF`, default `origin/development` then `development`), which catches the same
+change split across two commits. If no base resolves — a shallow clone — the branch locus prints a
+`NOTICE: the BRANCH co-change locus did NOT RUN` rather than being silently absent.
+
+**Subjects.** Every problem line names where it was found: `HEAD` (the committed tree), `INDEX`
+(staged), `WORKTREE` (edited, not staged), `UNTRACKED`, `CONFLICT` (index stages 1/2/3), or `BRANCH`.
+All are compared; HEAD alone is blind mid-merge (HEAD is still the pre-merge commit), and the index
+alone is blind to a change that was committed and then restored there. `ARCHIVE_SEAL_REF` substitutes
+another commit-ish for `HEAD` and does not switch the other subjects off.
+
+**Regenerating the manifest** is an explicit act and never a side effect:
+
+```bash
+ARCHIVE_SEAL_REWRITE=1 node scripts/check-archive-sealed.mjs --write > scripts/archive-sealed-manifest.tsv
+```
+
+**Where it runs.** In `npm run check:all`, in `npm run validate`, and — unconditionally — in
+`.github/workflows/archive-seal.yml`. That workflow has no `paths:` filter, no `paths-ignore:`, no
+`needs:` and no job-level `if:`, because the Production Readiness change classifier marks a diff cheap
+when every changed path matches `*.md`, `docs/*`, `.gitignore` or `CHANGELOG.md` and skips the
+`validate` job — and `archive/` contains Markdown, so a diff that changed nothing but archived
+Markdown skipped the seal entirely. `paths-ignore: ["**/*.md"]` is deliberately *not* used here for
+the same reason.
+
 ## Guardrails
 
 The repo now enforces six rules:
