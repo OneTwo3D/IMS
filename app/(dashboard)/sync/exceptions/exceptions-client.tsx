@@ -120,18 +120,25 @@ export function ExceptionsClient({ data }: Props) {
   const [claimsMatched, setClaimsMatched] = useState<number | null>(null)
   const [claimSearch, setClaimSearch] = useState('')
   /**
-   * o3d-j625 r22 (Codex round 21, HIGH) — WHAT THE WALK HAS ACCOUNTED FOR, so the completeness sentence is a
-   * MEASUREMENT. `null` while the walk continues; on the last page it is the total the server counted at that
-   * moment, and the page says "that is every active claim" only when what it has shown accounts for it.
+   * o3d-j625 r24 (Codex round 23, HIGH) — THE REVISION OF THE ACTIVE CLAIM SET, AT THE START OF THIS WALK AND
+   * AS OF ITS LATEST PAGE.
+   *
+   * r22 compared COUNTS and round 23 defeated that with two cancelling changes: a take of a pre-existing
+   * refusal (whose id sorts before the cursor, because taking a claim creates no row) against a release of a
+   * claim already shown. Same total, different set, "that is every active claim" printed over a posting that
+   * was never listed. So the page compares a strictly increasing revision instead, and a count is not
+   * consulted for completeness at all.
    */
-  const [claimsTotalAtEnd, setClaimsTotalAtEnd] = useState<number | null>(data.accountingHandPostClaimsTotalAtEnd)
+  const [claimsRevisionAtStart, setClaimsRevisionAtStart] = useState(data.accountingHandPostClaimsRevision)
+  const [claimsRevisionNow, setClaimsRevisionNow] = useState(data.accountingHandPostClaimsRevision)
   if (claimsBase !== data.accountingHandPostClaims) {
     setClaimsBase(data.accountingHandPostClaims)
     setClaims(data.accountingHandPostClaims)
     setClaimsCursor(data.accountingHandPostClaimsNextCursor)
     setClaimsTotal(data.summary.accountingHandPostClaims)
     setClaimsMatched(null)
-    setClaimsTotalAtEnd(data.accountingHandPostClaimsTotalAtEnd)
+    setClaimsRevisionAtStart(data.accountingHandPostClaimsRevision)
+    setClaimsRevisionNow(data.accountingHandPostClaimsRevision)
     setClaimSearch('')
   }
 
@@ -144,7 +151,11 @@ export function ExceptionsClient({ data }: Props) {
       setClaimsCursor(page.nextCursor)
       setClaimsTotal(page.total)
       setClaimsMatched(page.matched)
-      setClaimsTotalAtEnd(page.totalAtEnd)
+      setClaimsRevisionNow(page.claimSetRevision)
+      // A NEW walk (a lookup, or restarting) re-bases what "unchanged since the start" means; an APPEND must
+      // not, or every page would forgive the changes that happened before it and the comparison would only
+      // ever span one page.
+      if (!options.append) setClaimsRevisionAtStart(page.claimSetRevision)
     })
   }
 
@@ -1195,17 +1206,24 @@ export function ExceptionsClient({ data }: Props) {
             </Button>
           ) : (
             /*
-             * o3d-j625 r22 (Codex round 21, HIGH): the sentence is EARNED. Identity ordering stops a re-take
-             * moving a row across an issued cursor, but it cannot make a claim TAKEN during the walk appear
-             * after the cursor — no non-snapshot pagination can, and claiming otherwise is how a completeness
-             * statement becomes a lie. So the server sends the total as of the last page and this compares it
-             * with what was actually shown.
+             * o3d-j625 r24 (Codex round 23, HIGH): THREE STATES, AND NOT A COUNT AMONG THEM.
+             *
+             * "more pages" is the branch above (the Show-more button). Here the walk has reached its end, and
+             * it is either COMPLETE or INCOMPLETE-BECAUSE-THE-SET-MOVED. r22 decided that by comparing the
+             * total with how many rows had been shown, and round 23 defeated it with two CANCELLING changes —
+             * a take of a pre-existing refusal (whose id sorts before the cursor, since taking a claim creates
+             * no row) against a release of a claim already shown: 51 shown, 51 total, completeness printed
+             * over a posting never listed. Two releases against one take made `shown > total`, which fell
+             * through to the same sentence.
+             *
+             * The revision only ever goes UP, so those two changes are +2 and cannot cancel. A count is not
+             * consulted for completeness anywhere on this page.
              */
             <p className="text-xs text-muted-foreground">
               {claimsMatched !== null
                 ? `That is every active claim matching "${claimSearch}".`
-                : claimsTotalAtEnd !== null && claims.length < claimsTotalAtEnd
-                  ? `Showing ${claims.length} of ${claimsTotalAtEnd} — ${claimsTotalAtEnd - claims.length} posting(s) were taken for hand posting while you were looking. Reload to see them.`
+                : claimsRevisionNow !== claimsRevisionAtStart
+                  ? `This list may be INCOMPLETE: ${claimsRevisionNow - claimsRevisionAtStart} posting(s) were taken for hand posting, released or confirmed while you were paging, so one may never have been shown. Reload to start again.`
                   : 'That is every active claim.'}
             </p>
           )}

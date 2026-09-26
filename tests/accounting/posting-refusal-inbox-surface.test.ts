@@ -926,14 +926,21 @@ test('[o3d-j625 r22 HIGH] the inbox ships the longest-held head, and the page dr
     const head = (data as unknown as { accountingHandPostClaimsLongestHeld?: Array<{ refusalId: string; stale: boolean }> })
       .accountingHandPostClaimsLongestHeld
     console.log(`[r22 surface head] ${JSON.stringify(head?.map((claim) => claim.refusalId))} `
-      + `totalAtEnd=${(data as unknown as { accountingHandPostClaimsTotalAtEnd?: number | null }).accountingHandPostClaimsTotalAtEnd}`)
+      + `revision=${(data as unknown as { accountingHandPostClaimsRevision?: number }).accountingHandPostClaimsRevision}`)
     assert.ok(Array.isArray(head), 'the inbox payload carries it')
     assert.deepEqual(head.map((claim) => claim.refusalId), ['lh-ancient', 'lh-recent'], 'held longest FIRST')
     assert.equal(head[0]!.stale, true, 'and the longest-held one is flagged')
+    // o3d-j625 r24: the payload carries the claim-set REVISION, not a count for the page to compare — round 23
+    // showed a count cannot carry a completeness claim. `0` here because nothing has been taken or released
+    // through the app in this fixture; what matters is that the field is present and a number.
     assert.equal(
-      (data as unknown as { accountingHandPostClaimsTotalAtEnd?: number | null }).accountingHandPostClaimsTotalAtEnd,
-      2,
-      'and the last page of the walk carries the total AS OF THEN, so the completeness sentence is measured')
+      typeof (data as unknown as { accountingHandPostClaimsRevision?: unknown }).accountingHandPostClaimsRevision,
+      'number',
+      'the inbox payload carries the claim-set revision the walk compares against')
+    assert.equal((data as unknown as { accountingHandPostClaimsTotalAtEnd?: unknown }).accountingHandPostClaimsTotalAtEnd,
+      undefined,
+      'and r22\'s count is GONE from the payload, not merely unread — leaving it would invite a later change to '
+      + 'consult it again, which is the defect round 23 found')
 
     const { readFile } = await import('node:fs/promises')
     const path = await import('node:path')
@@ -965,18 +972,26 @@ test('[o3d-j625 r22 HIGH] the inbox ships the longest-held head, and the page dr
 })
 
 /**
- * o3d-j625 r22 — THE COMPLETENESS SENTENCE IS GUARDED BY THE MEASUREMENT, in the component that prints it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r24 (Codex round 23, HIGH) — THE PAGE DISTINGUISHES THREE STATES, AND NOT BY COUNTING
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
  *
- * FOUND BY THE MUTATION HARNESS, NOT BY A TEST: `totalAtEnd` is asserted on the server side, and the page
- * compares it with what it showed — but nothing examined that comparison, so removing it left every test
- * green. "That is every active claim" is the one sentence in this section that can be false, and a sentence
- * nobody checks is how r20's cap read as complete for two rounds.
+ * r22 guarded "that is every active claim" with a count and round 23 defeated it with two CANCELLING changes.
+ * The behavioural half of the replacement — that a take, a release and a mark each move a strictly increasing
+ * revision, and that the reviewer's 51-claim scenario is caught — is proven in
+ * tests/accounting/posting-refusal-mark-handled. What is left is a fact about the component: which of the
+ * three states it prints, and on what.
  *
- * WHAT WOULD STILL PASS THIS: a comparison written with the operands swapped (it asserts the operands appear,
- * not the inequality's direction — the behaviour of the number itself is asserted server-side), and wording
- * an operator might misread. It does establish that the claim of completeness is conditional on the count.
+ * DISCLOSED, from r22: the first version of this assertion was existential (`match(/claimsTotalAtEnd/)`) and
+ * the harness found it green, because the identifier survived inside the branch it guarded. The rule here is
+ * therefore about the deciding COMPARISON and the `?` it decides, and about the ABSENCE of any count in it.
+ *
+ * WHAT WOULD STILL PASS THIS: wording an operator might misread, and a comparison written with the operands
+ * swapped (`!==` is symmetric, so there is nothing to get backwards — which is part of why a revision is a
+ * better guard than an inequality between two counts). What it establishes is that the claim of completeness
+ * is conditional on the revision and on nothing else.
  */
-test('[o3d-j625 r22] the page prints "every active claim" only when the measurement accounts for it', async () => {
+test('[o3d-j625 r24] the page claims completeness only when the claim-set REVISION did not move', async () => {
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(
@@ -985,22 +1000,76 @@ test('[o3d-j625 r22] the page prints "every active claim" only when the measurem
   )
   const at = source.indexOf('That is every active claim.')
   assert.ok(at >= 0, 'the sentence must still be in the page, or this test asserts nothing')
-  // The ternary that decides it: from the enclosing `{` of the expression to the sentence itself.
   const decision = source.slice(source.lastIndexOf('{claimsMatched', 0 + at), at)
-  console.log(`[r22 sentence] deciding expression = ${decision.replace(/\s+/g, ' ').slice(0, 200)}`)
+  console.log(`[r24 sentence] deciding expression = ${decision.replace(/\s+/g, ' ').slice(0, 220)}`)
+
+  assert.match(decision, /claimsRevisionNow !== claimsRevisionAtStart\s*\?/,
+    'THE GUARD: completeness is conditional on the revision of the active claim set being unchanged between the '
+    + 'start of the walk and its last page. Two cancelling changes move it by 2, so they cannot look like an '
+    + 'unchanged set — which is exactly what a count could not tell.')
+
   /**
-   * THE GUARD'S GRAMMAR, not the identifier's presence. DISCLOSED: the first version of this assertion was
-   * `match(decision, /claimsTotalAtEnd/)` and the mutation harness found it GREEN — replacing the deciding
-   * condition with `false` leaves `claimsTotalAtEnd` in the `Showing … of …` message inside the branch it
-   * guards, and an existential check over the whole slice is satisfied by that. What has to be asserted is
-   * the COMPARISON that decides, immediately before the `?` it decides.
+   * AND NO COUNT IS CONSULTED. This is the round-23 finding stated as an ABSENCE, which is a universal check
+   * and therefore has no room for a correcting line beside a stale one: neither the rows shown nor any total
+   * may appear in the expression that decides completeness.
    */
-  assert.match(decision, /claimsTotalAtEnd !== null\s*&&\s*claims\.length < claimsTotalAtEnd\s*\?/,
-    'the completeness sentence must be conditional on the total measured at the END of the walk, compared '
-    + 'against how many rows were actually shown — identity ordering stops a RE-TAKE crossing the cursor, but '
-    + 'a claim TAKEN during the walk can still sort before it, and no non-snapshot pagination can promise '
-    + 'otherwise')
-  assert.match(source.slice(at - 600, at), /Showing \$\{claims\.length\} of \$\{claimsTotalAtEnd\}/,
-    'and the other branch SAYS SO in numbers rather than staying silent')
-  assert.match(source.slice(at - 600, at), /Reload to see them/, 'with something the operator can do about it')
+  assert.doesNotMatch(decision, /claims\.length/, 'the number of rows shown is not part of the decision')
+  assert.doesNotMatch(decision, /claimsTotal/, 'nor is any total')
+  assert.doesNotMatch(decision, /totalAtEnd/, 'nor r22\'s total-as-of-the-last-page')
+
+  // THE THIRD STATE, and it says what to do. "More pages" is the Show-more branch; this is the middle one.
+  const incomplete = source.slice(at - 700, at)
+  assert.match(incomplete, /may be INCOMPLETE/, 'the middle state says the list may be incomplete, in those words')
+  assert.match(incomplete, /\$\{claimsRevisionNow - claimsRevisionAtStart\}/,
+    'and says HOW MANY acts moved the set, which is what the revision can honestly report')
+  assert.match(incomplete, /Reload to start again/, 'with something the operator can do about it')
+
+  // NON-VACUITY: all three states live in this one expression, so "the decision is the revision" is a fact
+  // about a branch that exists rather than about a string that happens not to appear.
+  assert.match(decision, /claimsMatched !== null/, 'the lookup state is the first branch')
+  assert.ok(source.indexOf('Show more claims') > 0, 'and the more-pages state is its own control')
+})
+
+/**
+ * o3d-j625 r24 — AND THE TWO NUMBERS THE PAGE COMPARES ARE THE RIGHT TWO.
+ *
+ * FOUND BY THE MUTATION HARNESS, NOT BY A TEST. The test above asserts the DECISION is the revision; it says
+ * nothing about where the two operands come from, and two mutations exploited exactly that gap:
+ *
+ *   · report page one's revision as the current one, so the comparison can never fire;
+ *   · re-base the start revision on every APPEND, so the comparison spans one page instead of the walk.
+ *
+ * Both leave the decision's grammar intact and every other test green. The state updates in `loadClaims` are
+ * therefore asserted directly — the operands, not just the operator.
+ *
+ * WHAT WOULD STILL PASS THIS: a `loadClaims` that never runs (the button could be unwired — the walk's
+ * behaviour is proven server-side in posting-refusal-mark-handled, and the Show-more control's existence is
+ * asserted by the test above), and a rename of either state variable that keeps both roles. What it
+ * establishes is that the CURRENT revision tracks the latest page and the START revision does not.
+ */
+test('[o3d-j625 r24] the walk compares the LATEST page against the walk\'s START, and an append does not re-base', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(
+    path.join(process.cwd(), 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'),
+    'utf8',
+  )
+  const start = source.indexOf('function loadClaims(')
+  assert.ok(start >= 0, 'the loader must still be a named function, or this test asserts nothing')
+  const block = source.slice(start, source.indexOf('\n  }', start))
+  console.log(`[r24 operands] loadClaims block = ${block.length} chars`)
+
+  assert.match(block, /setClaimsRevisionNow\(page\.claimSetRevision\)/,
+    'the CURRENT revision comes from the page just read — reporting the walk\'s starting value here would make '
+    + 'the comparison unable to fire at all')
+  assert.doesNotMatch(block, /setClaimsRevisionNow\(claimsRevisionAtStart\)/,
+    'and never from the start value, which is the operand it is compared against')
+  assert.match(block, /if \(!options\.append\) setClaimsRevisionAtStart\(page\.claimSetRevision\)/,
+    'the START revision is re-based only when the walk RESTARTS (a lookup, or a fresh first page). Re-basing on '
+    + 'an append would forgive every change that happened before the latest page, so the comparison would span '
+    + 'one page rather than the whole walk — which is the defect round 23 found, at a different scale.')
+
+  // NON-VACUITY: the block really does contain unconditional setters, so "this one is conditional" is a fact
+  // about a guard that exists rather than about a pattern absent from the whole file.
+  assert.match(block, /setClaimsCursor\(page\.nextCursor\)/, 'the block does set other state unconditionally')
 })

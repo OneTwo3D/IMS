@@ -2380,10 +2380,14 @@ Three things about those rows:
   claims are listed *separately at the top* — start there, because those are the ones most likely to have been
   forgotten, and each of them has its own Release.
 
-  When the walk reaches the end it says so — and it says it only when the number of claims it showed you
-  accounts for the number that existed at that moment. If somebody took a posting for hand posting while you
-  were paging, it says **"showing N of M — reload to see them"** instead of claiming to have shown you
-  everything.
+  When the walk reaches the end it says so — and it says it only when **nothing was taken, released or
+  confirmed while you were paging**. That is tracked by a counter that only ever goes up, not by comparing how
+  many rows you were shown with how many exist: two changes that cancel (somebody takes one posting while
+  somebody else gives another back) leave those numbers identical and the set different. Taking a posting for
+  hand posting does not create anything new — it marks a refusal that may be months old — so a posting taken
+  after you have paged past its place will not appear in your list at all. When that happens the page says
+  **"this list may be INCOMPLETE: N posting(s) were taken for hand posting, released or confirmed while you
+  were paging"** and tells you to reload, instead of claiming to have shown you everything.
 
   If you know the document, do not walk: the **Find** box goes straight to it. It searches the **reference
   id** (an order or PO number), the **reference type**, the **posting type** and the **refusal id** — it does

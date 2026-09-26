@@ -168,8 +168,24 @@ const syncTable = {
 }
 /** o3d-j625 r7: fired when the per-key lock is taken — the moment another transaction's commit becomes visible. */
 let onLock: (() => void) | null = null
+/**
+ * o3d-j625 r24 (Codex round 23, HIGH): the ACTIVE-CLAIM-SET REVISION, a counter that only goes up. Modelled
+ * rather than stubbed to 0, because the property under test is that a take and a release BOTH move it — a
+ * double that returned a constant would make the reviewer's cancelling scenario look fixed while it was not.
+ */
+const claimRevision = { revision: BigInt(0) }
+const claimRevisionTable = {
+  findUnique: async ({ where }: { where: { id: string } }) =>
+    (where.id === 'global' ? { revision: claimRevision.revision } : null),
+  upsert: async ({ where, update }: { where: { id: string }; create: unknown; update: { revision: { increment: number } } }) => {
+    if (where.id !== 'global') throw new Error(`unexpected revision row ${where.id}`)
+    claimRevision.revision += BigInt(update.revision.increment)
+    return { revision: claimRevision.revision }
+  },
+}
 const tx = {
   accountingPostingRefusal: refusalTable,
+  accountingHandPostClaimRevision: claimRevisionTable,
   accountingSyncLog: syncTable,
   $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
     locks.push(`${strings.join('?')}:${values.join(',')}`)
@@ -187,6 +203,7 @@ mock.module('@/lib/db', {
     db: {
       ...tx,
       user: { findMany: async ({ where }: { where: { id: { in: string[] } } }) => users.filter((u) => where.id.in.includes(u.id)) },
+      accountingHandPostClaimRevision: claimRevisionTable,
       $transaction: async <T>(fn: (client: unknown) => Promise<T>) => fn(tx),
     },
   },
@@ -244,6 +261,7 @@ test.beforeEach(() => {
   denyFresh = false
   onLock = null
   onSyncRead = null
+  claimRevision.revision = BigInt(0)
 })
 
 /**
@@ -533,6 +551,12 @@ async function listClaims(params?: { cursor?: string | null; search?: string | n
   return listAccountingHandPostClaimsAction(params)
 }
 
+/** TAKE a refusal for hand posting, through the real server action. */
+async function claimClaim(id: string) {
+  const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+  return claimAccountingPostingRefusalForHandPostingAction(id)
+}
+
 async function releaseClaim(id: string) {
   const { releaseAccountingPostingRefusalHandPostClaimAction } = await import('@/app/actions/sync-exceptions')
   return releaseAccountingPostingRefusalHandPostClaimAction(id)
@@ -735,16 +759,19 @@ test('[o3d-j625 r20] an unreadable cursor RESTARTS the walk rather than returnin
     'a cursor whose row has been released still names its position — the walk neither ends nor restarts')
   /**
    * AND A CURSOR NOBODY ISSUED CANNOT SILENTLY END THE WALK EARLY. An identity cursor is a bare string, so a
-   * mangled one can sort past every row and return nothing — which is why the completeness sentence is a
-   * MEASUREMENT (`totalAtEnd`) and not an inference from an empty page. Asserted, because "it cannot happen"
-   * was the shape of r20's cap argument.
+   * mangled one can sort past every row and return nothing.
+   *
+   * o3d-j625 r24 — WHAT SAVES THAT CASE IS NOT THE ONE r22 NAMED. r22 pointed at `totalAtEnd` and said the
+   * page would print "showing 0 of N"; round 23 showed a count cannot carry a completeness claim at all, so
+   * what is asserted now is that such a page still reports the TRUE TOTAL for its heading and a revision the
+   * client can compare — the page's own three-state decision is asserted against the component in
+   * posting-refusal-inbox-surface.
    */
   const past = await listClaims({ cursor: 'zzzzzzzz' })
-  console.log(`[r20 bad cursor] beyond-every-id -> ${past.claims.length} claims, totalAtEnd=${past.totalAtEnd}`)
+  console.log(`[r20 bad cursor] beyond-every-id -> ${past.claims.length} claims, total=${past.total} revision=${past.claimSetRevision}`)
   assert.equal(past.claims.length, 0, 'it returns nothing, as any position past the end would')
-  assert.ok((past.totalAtEnd ?? 0) > 0,
-    'but it reports the true total AS OF THEN, so the page says "showing 0 of N" rather than "that is every '
-    + 'active claim" — the sentence is earned even when the cursor was never ours')
+  assert.ok(past.total > 0,
+    'but it still reports the true total for the heading, so an empty page cannot read as an empty queue')
   assert.equal(ok(await releaseClaim('m-4')), true, 'and what the walk reaches is releasable')
 })
 
@@ -903,36 +930,48 @@ test('[o3d-j625 r22] the walk visits every claim exactly once while claims are r
 })
 
 /**
- * o3d-j625 r22 — AND THE COMPLETENESS SENTENCE IS A MEASUREMENT.
+ * o3d-j625 r24 (Codex round 23, HIGH) — THE COMPLETENESS SIGNAL IS A STRICTLY INCREASING REVISION, NOT A COUNT.
  *
- * Identity ordering stops a RE-TAKE moving a row across an issued cursor. It cannot make a claim TAKEN during
- * the walk appear after the cursor — no non-snapshot pagination can — so "that is every active claim" must be
- * checked rather than assumed. The server sends the total as of the LAST page and the page compares it with
- * what it actually showed. Asserted here because a sentence nobody checks is how r20's cap read as complete.
+ * This test was r22's, and r22 asserted the wrong thing: that the last page carries the TOTAL as of then, so
+ * the page could compare it with how many rows it had shown. Round 23 defeated that with two CANCELLING
+ * changes, and the replacement is asserted here — every page carries the revision of the active claim set, and
+ * a take, a release and a mark each move it upward.
  */
-test('[o3d-j625 r22] the last page carries the total AS OF THEN, and only the last page', async () => {
+test('[o3d-j625 r24] every page carries the claim-set REVISION, and every act that changes the set moves it UP', async () => {
   for (let index = 0; index < CLAIM_PAGE + 3; index += 1) {
     refusals.push(claimed(`t-${String(index).padStart(3, '0')}`, `2026-09-16T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
   }
   const first = await listClaims()
-  assert.equal(first.totalAtEnd, null, 'a mid-walk total says nothing about the end of the walk, so it is withheld')
-  assert.ok(first.nextCursor)
+  assert.equal(first.claimSetRevision, 0, 'nothing has been taken or released through the app yet')
+  assert.ok(first.nextCursor, 'PRECONDITION: the walk continues')
+  assert.equal((first as unknown as { totalAtEnd?: unknown }).totalAtEnd, undefined,
+    'and the count r22 used for completeness is GONE from the contract, not merely unread — leaving it there '
+    + 'is how a later change would quietly start consulting it again')
 
-  // A claim TAKEN while the operator is walking, on a row whose id sorts BEFORE the cursor page one issued —
-  // the case identity ordering cannot and does not cover, and no non-snapshot pagination can.
-  refusals.push(claimed('a-late-arrival', '2026-09-16T12:00:00.000Z'))
+  // A claim TAKEN mid-walk, on a PRE-EXISTING refusal — which is the ordinary case, not an edge: taking a
+  // claim creates no row, so the refusal's id is whatever it always was and sorts before the cursor.
+  refusals.push(refusal('a-late-arrival', 'stock_receipt_journal'))
+  const took = await claimClaim('a-late-arrival')
+  assert.equal(ok(took), true, `PRECONDITION: it was taken (${JSON.stringify(took)})`)
+
   const last = await listClaims({ cursor: first.nextCursor })
-  console.log(`[r22 earned] page1=${first.claims.length} page2=${last.claims.length} totalAtEnd=${last.totalAtEnd}`)
+  console.log(`[r24 revision] page1=${first.claims.length}/rev ${first.claimSetRevision} `
+    + `page2=${last.claims.length}/rev ${last.claimSetRevision}`)
   assert.equal(last.nextCursor, null, 'PRECONDITION: this is the last page')
-  assert.equal(last.totalAtEnd, CLAIM_PAGE + 4,
-    'and it reports the total AS OF THEN — including the claim taken mid-walk, which is what lets the page say '
-    + '"showing N of M" instead of claiming completeness it cannot have')
   assert.equal(last.claims.some((claim) => claim.refusalId === 'a-late-arrival'), false,
-    'PRECONDITION: the mid-walk arrival sorts BEFORE the cursor, so this walk never sees it — which is the '
-    + 'residual identity ordering does not close and must therefore not be called complete')
-  assert.ok(first.claims.length + last.claims.length < (last.totalAtEnd ?? 0),
-    `the walk showed ${first.claims.length + last.claims.length} of ${last.totalAtEnd}: FEWER than the total, `
-    + 'which is exactly the state the page must report as "showing N of M" rather than as complete')
+    'PRECONDITION: the mid-walk take sorts BEFORE the cursor, so this walk never sees it')
+  assert.ok(last.claimSetRevision > first.claimSetRevision,
+    'THE SIGNAL: the revision MOVED, so the page can say the list may be incomplete instead of claiming it is '
+    + 'complete — which is what a count could not do once two changes cancelled')
+
+  // AND EVERY ACT MOVES IT, upward, one per act. A release and a mark end a claim just as a take starts one.
+  const beforeRelease = (await listClaims()).claimSetRevision
+  assert.equal(ok(await releaseClaim('t-000')), true)
+  const afterRelease = (await listClaims()).claimSetRevision
+  assert.equal(afterRelease, beforeRelease + 1, 'a release moves it')
+  assert.equal(ok(await markOnly('a-late-arrival', 'posted by hand')), true)
+  const afterMark = (await listClaims()).claimSetRevision
+  assert.equal(afterMark, afterRelease + 1, 'and so does a mark, which ends a claim too')
 })
 
 test('[o3d-j625 r22] the LONGEST-HELD head is age-ordered, bounded, and only on the first unfiltered page', async () => {
@@ -964,4 +1003,135 @@ test('[o3d-j625 r22] the LONGEST-HELD head is age-ordered, bounded, and only on 
   // CONTROL: it IS non-empty on the first unfiltered page, so the two assertions above are about the
   // condition and not about a field that is always empty.
   assert.ok(paged.longestHeld.length > 0, 'CONTROL: the first unfiltered page does carry it')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r24 (Codex round 23, HIGH) — TWO CANCELLING CHANGES MUST NOT LOOK LIKE AN UNCHANGED SET
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// r22 guarded "that is every active claim" with a COUNT: the total as of the last page against how many rows
+// had been shown. Round 23's counter-example, reproduced below exactly as written:
+//
+//   51 active claims. Page one shows 50. Before page two, one operator TAKES an older, previously unclaimed
+//   refusal whose id sorts before the cursor, while another RELEASES a claim page one already showed. Page two
+//   returns the one remaining original claim, so 51 rows have been shown and the total is 51 — and the page
+//   prints completeness although the newly held posting was never shown. If TWO shown claims are released for
+//   one such take, `shown > totalAtEnd`, which fell through to the same sentence.
+//
+// AND THE TAKE IS NOT AN EDGE CASE. Taking a claim CREATES NO ROW: it stamps `handPostClaimedAt` on a refusal
+// that may be months old, so its id is whatever it always was and sorts before the cursor of any walk in
+// flight. r22's report called this a rare tail the id's time prefix mostly covered; it is the ordinary case
+// whenever somebody takes a claim while a colleague is paging, and these tests use a refusal created BEFORE
+// the walk's rows to say so.
+//
+// The concurrent acts are driven through the real server actions between the real page reads, so the ordering
+// is explicit and the test is deterministic — nothing here depends on timing.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════════
+
+/** The state round 23 describes: 51 active claims, and one OLDER unclaimed refusal ready to be taken. */
+function seedFiftyOnePlusAnOlderUnclaimed(): { shownOnPageOne: string[]; olderUnclaimedId: string } {
+  // Created FIRST, so its id sorts before every claim below — exactly what a months-old refusal looks like.
+  refusals.push(refusal('a-older-unclaimed', 'stock_receipt_journal'))
+  for (let index = 0; index < 51; index += 1) {
+    refusals.push(claimed(`c-${String(index).padStart(3, '0')}`, `2026-09-18T00:00:${String(index % 60).padStart(2, '0')}.000Z`))
+  }
+  return { shownOnPageOne: [], olderUnclaimedId: 'a-older-unclaimed' }
+}
+
+test('[o3d-j625 r24 HIGH] one take and one release CANCEL in the count — the revision still says the list may be incomplete', async () => {
+  const { olderUnclaimedId } = seedFiftyOnePlusAnOlderUnclaimed()
+
+  const first = await listClaims()
+  const revisionAtStart = first.claimSetRevision
+  console.log(`[r24 cancel] page1=${first.claims.length} total=${first.total} rev=${revisionAtStart}`)
+  assert.equal(first.claims.length, CLAIM_PAGE, 'PRECONDITION: page one shows 50 of the 51')
+  assert.equal(first.total, 51, 'PRECONDITION: and there are 51 active claims')
+  assert.ok(first.nextCursor, 'PRECONDITION: the walk continues')
+
+  // ── THE TWO CONCURRENT ACTS, both entirely legitimate, between page one and page two.
+  assert.equal(ok(await claimClaim(olderUnclaimedId)), true,
+    'one operator TAKES an older, previously unclaimed refusal — no row is created, so its id sorts before the cursor')
+  const alreadyShown = first.claims[0]!.refusalId
+  assert.equal(ok(await releaseClaim(alreadyShown)), true,
+    'another RELEASES a claim page one already showed')
+
+  const last = await listClaims({ cursor: first.nextCursor })
+  const shown = first.claims.length + last.claims.length
+  console.log(`[r24 cancel] page2=${last.claims.length} shown=${shown} total=${last.total} `
+    + `revStart=${revisionAtStart} revNow=${last.claimSetRevision} `
+    + `newlyHeldShown=${[...first.claims, ...last.claims].some((c) => c.refusalId === olderUnclaimedId)}`)
+
+  // ── THE COUNT CANCELS. This is r22's guard, computed here so the reproduction is visible rather than
+  //    asserted about code that no longer exists: 51 shown, 51 active, and it would have printed completeness.
+  assert.equal(last.nextCursor, null, 'PRECONDITION: this is the last page')
+  assert.equal(shown, 51, 'PRECONDITION: the walk showed 51 rows')
+  assert.equal(last.total, 51, 'PRECONDITION: and 51 claims are active — the counts AGREE')
+  assert.equal([...first.claims, ...last.claims].some((claim) => claim.refusalId === olderUnclaimedId), false,
+    'PRECONDITION AND THE DEFECT: the newly held posting was NEVER SHOWN, so the equal counts describe two '
+    + 'different sets of 51 — and r22 would have printed "that is every active claim" over a posting that goes '
+    + 'on suppressing automatic posting')
+
+  // ── THE REVISION DOES NOT CANCEL. Two acts, +2, and the page can only report the list as possibly incomplete.
+  assert.equal(last.claimSetRevision, revisionAtStart + 2,
+    'THE FIX: the revision only ever goes UP, so a take and a release are +2 rather than 0. Any measure of '
+    + 'SIZE — a total, a balance, a net — reproduces round 23\'s defect by construction.')
+  assert.notEqual(last.claimSetRevision, revisionAtStart,
+    'so the page says the list may be INCOMPLETE and offers a reload, instead of claiming completeness')
+})
+
+test('[o3d-j625 r24 HIGH] two releases against one take (shown > total) also report incomplete', async () => {
+  const { olderUnclaimedId } = seedFiftyOnePlusAnOlderUnclaimed()
+  const first = await listClaims()
+  const revisionAtStart = first.claimSetRevision
+  assert.equal(first.claims.length, CLAIM_PAGE, 'PRECONDITION: page one shows 50')
+
+  assert.equal(ok(await claimClaim(olderUnclaimedId)), true, 'one take of an older refusal')
+  assert.equal(ok(await releaseClaim(first.claims[0]!.refusalId)), true, 'and TWO releases of already-shown claims')
+  assert.equal(ok(await releaseClaim(first.claims[1]!.refusalId)), true)
+
+  const last = await listClaims({ cursor: first.nextCursor })
+  const shown = first.claims.length + last.claims.length
+  console.log(`[r24 over] shown=${shown} total=${last.total} revStart=${revisionAtStart} revNow=${last.claimSetRevision}`)
+  assert.equal(last.nextCursor, null, 'PRECONDITION: last page')
+  assert.ok(shown > last.total,
+    `PRECONDITION AND THE SECOND DEFECT: ${shown} shown against ${last.total} active — r22's guard only fired `
+    + 'when shown was FEWER than the total, so this fell straight through to the completeness sentence')
+  assert.equal([...first.claims, ...last.claims].some((claim) => claim.refusalId === olderUnclaimedId), false,
+    'and the newly held posting was still never shown')
+  assert.equal(last.claimSetRevision, revisionAtStart + 3,
+    'THE FIX: three acts, +3. A strictly increasing revision does not care which direction the set moved, '
+    + 'which is why it catches the over-count as well as the cancelling case')
+})
+
+test('[o3d-j625 r24 CONTROL] with NOTHING taken or released mid-walk, the revision is unchanged and the walk IS complete', async () => {
+  seedFiftyOnePlusAnOlderUnclaimed()
+  const first = await listClaims()
+  assert.ok(first.nextCursor, 'PRECONDITION: more than one page')
+  const last = await listClaims({ cursor: first.nextCursor })
+  const shown = first.claims.length + last.claims.length
+  console.log(`[r24 control] shown=${shown} total=${last.total} revStart=${first.claimSetRevision} revNow=${last.claimSetRevision}`)
+  assert.equal(last.nextCursor, null)
+  assert.equal(shown, 51, 'every active claim was shown')
+  assert.equal(last.claimSetRevision, first.claimSetRevision,
+    'CONTROL: the revision did NOT move, so the page prints "that is every active claim". Without this the fix '
+    + 'could pass by calling every walk incomplete, which is a signal an operator learns to ignore.')
+})
+
+test('[o3d-j625 r24] the revision is monotonic across a full take/release cycle — it never returns to a previous value', async () => {
+  refusals.push(refusal('cycle', 'stock_receipt_journal'))
+  const seen: number[] = [(await listClaims()).claimSetRevision]
+  for (let round = 0; round < 3; round += 1) {
+    assert.equal(ok(await claimClaim('cycle')), true)
+    seen.push((await listClaims()).claimSetRevision)
+    assert.equal(ok(await releaseClaim('cycle')), true)
+    seen.push((await listClaims()).claimSetRevision)
+  }
+  console.log(`[r24 monotonic] ${JSON.stringify(seen)}`)
+  // The set of held postings is IDENTICAL at the start and the end of each cycle — which is exactly why a
+  // measure of the set cannot serve as a revision, and why this one is about acts rather than about state.
+  for (let index = 1; index < seen.length; index += 1) {
+    assert.ok(seen[index]! > seen[index - 1]!,
+      `the revision must strictly increase at every step; saw ${seen[index - 1]} then ${seen[index]}`)
+  }
+  assert.equal(new Set(seen).size, seen.length, 'no value is ever seen twice, so no walk can be fooled by a return to it')
 })

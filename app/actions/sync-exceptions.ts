@@ -1,6 +1,7 @@
 'use server'
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { readHandPostClaimRevision } from '@/lib/domain/accounting/hand-post-claim-revision'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -757,8 +758,12 @@ export type ExceptionInboxData = {
    * surfacing that oldest-claim-first bought before the walk moved to identity ordering.
    */
   accountingHandPostClaimsLongestHeld: AccountingHandPostClaimRow[]
-  /** o3d-j625 r22: the total as of the walk's LAST page, or `null` while it continues. See `totalAtEnd`. */
-  accountingHandPostClaimsTotalAtEnd: number | null
+  /**
+   * o3d-j625 r24 (Codex round 23, HIGH): the revision of the ACTIVE CLAIM SET when this page was read. The
+   * page compares the first page's value with the last page's and claims completeness only if it did not
+   * move — a COUNT cannot do this, because two cancelling changes leave it unchanged.
+   */
+  accountingHandPostClaimsRevision: number
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -1653,7 +1658,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     accountingHandPostClaims: handPostClaimPage.claims,
     accountingHandPostClaimsNextCursor: handPostClaimPage.nextCursor,
     accountingHandPostClaimsLongestHeld: handPostClaimPage.longestHeld,
-    accountingHandPostClaimsTotalAtEnd: handPostClaimPage.totalAtEnd,
+    accountingHandPostClaimsRevision: handPostClaimPage.claimSetRevision,
   }
 
   return {
@@ -1959,15 +1964,23 @@ export type AccountingHandPostClaimPage = {
    */
   longestHeld: AccountingHandPostClaimRow[]
   /**
-   * o3d-j625 r22 — WHETHER "that is every active claim" IS EARNED, and it is the server that says so.
+   * ── o3d-j625 r24 (Codex round 23, HIGH) — WHETHER "that is every active claim" IS EARNED, AND IT IS NOT A
+   *    COUNT THAT SAYS SO ──
    *
-   * Identity ordering makes a RE-TAKE unable to move a row across an issued cursor. It cannot make a row that
-   * becomes claimed DURING the walk appear after the cursor — no non-snapshot pagination can, and pretending
-   * otherwise is how a completeness claim becomes a lie. So the walk's last page carries the total counted AT
-   * THAT MOMENT, and the page only says it has shown everything when what it has shown accounts for it;
-   * otherwise it says how many appeared meanwhile. The sentence is a measurement, not an assumption.
+   * r22 sent the total as of the last page and had the page compare it with how many rows it had shown. Round
+   * 23 defeated that with two CANCELLING changes: with 51 claims, page one shows 50; before page two somebody
+   * TAKES a pre-existing refusal (no row is created — it stamps a refusal that may be months old, so its id
+   * sorts before the cursor) and somebody else RELEASES a claim page one already showed. 51 shown, 51 total,
+   * "that is every active claim" — and the newly held posting was never in the walk. Two releases against one
+   * take give `shown > total`, which fell through to the same sentence.
+   *
+   * So the revision of the ACTIVE CLAIM SET travels with every page instead: a counter that only goes up,
+   * bumped by every take, every release and every mark (see hand-post-claim-revision.ts). The page compares
+   * the revision it started the walk with against the one on the last page, and prints completeness only if
+   * it did not move. A COUNT IS NO LONGER CONSULTED FOR COMPLETENESS AT ALL — `total` below is for the
+   * heading, and equal counts have been shown not to mean equal sets.
    */
-  totalAtEnd: number | null
+  claimSetRevision: number
 }
 
 async function loadHandPostClaimPage(params: {
@@ -1998,7 +2011,7 @@ async function loadHandPostClaimPage(params: {
     handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
   } as const
   const wantsLongestHeld = after === null && search === ''
-  const [rows, total, matched, longest] = await Promise.all([
+  const [rows, total, matched, longest, claimSetRevision] = await Promise.all([
     db.accountingPostingRefusal.findMany({
       where,
       // IDENTITY, and only identity. r20 sorted by `[{ handPostClaimedAt }, { id }]` and needed the second key
@@ -2024,6 +2037,9 @@ async function loadHandPostClaimPage(params: {
           select: CLAIM_SELECT,
         })
       : Promise.resolve([]),
+    // o3d-j625 r24: read WITH this page, in the same statement batch, so the revision a page reports is the
+    // one that was true while its rows were read rather than one sampled at another moment.
+    readHandPostClaimRevision(db),
   ])
   const page = rows.slice(0, HAND_POST_CLAIM_PAGE)
   const last = page.length > 0 ? page[page.length - 1] : null
@@ -2060,11 +2076,11 @@ async function loadHandPostClaimPage(params: {
     matched,
     longestHeld: longest.flatMap(render),
     /**
-     * o3d-j625 r22 — the total AS OF THE LAST PAGE, and only then. The client compares it with how many it has
-     * actually shown before printing "that is every active claim", so the sentence is earned. `null` while the
-     * walk continues: a mid-walk total says nothing about the end of it.
+     * o3d-j625 r24 — sent on EVERY page, not only the last one. The client keeps the revision it started the
+     * walk with and compares it with the one on the last page; a mid-walk value is what makes that comparison
+     * possible, and withholding it (as r22 withheld the mid-walk total) would force the client to infer.
      */
-    totalAtEnd: nextCursor === null ? total : null,
+    claimSetRevision,
   }
 }
 

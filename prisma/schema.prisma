@@ -3066,6 +3066,32 @@ model AccountingPostingRefusal {
   @@map("accounting_posting_refusals")
 }
 
+/// o3d-j625 r24 (Codex round 23, HIGH) — THE REVISION OF THE ACTIVE HAND-POST CLAIM SET.
+///
+/// ONE row (`id = 'global'`), holding a counter that only ever goes UP. Every act that changes which
+/// postings are being settled by hand bumps it: taking a claim, releasing one, and marking one handled
+/// (which ends a claim as well). The claims walk reads it with its first page and again with its last, and
+/// the page says "that is every active claim" only if it did not move.
+///
+/// WHY NOT A COUNT, which is what r22 used. Round 23's counter-example: page one shows 50 of 51 claims;
+/// before page two somebody TAKES a pre-existing refusal (whose id sorts before the cursor, because taking a
+/// claim creates no row — it stamps a refusal that may be months old) and somebody else RELEASES a claim
+/// page one already showed. 51 shown, 51 total, "that is every active claim" — and the newly held posting
+/// was never in the walk. Two cancelling changes defeat any measure of SIZE, so the revision is strictly
+/// increasing: a take plus a release is +2, never 0.
+///
+/// WHY NOT A SEQUENCE. `nextval` is not transactional, so a claim whose transaction rolled back would still
+/// have moved the revision and every walk in flight would report itself incomplete for something that never
+/// happened. This is an UPDATE inside the act's own transaction, so it commits or rolls back with it.
+model AccountingHandPostClaimRevision {
+  /// Always `'global'`. A primary key rather than a bare singleton so the row is addressable by upsert.
+  id       String @id
+  /// Monotonic. Only ever incremented, never reset, never decremented — see the model comment.
+  revision BigInt @default(0)
+
+  @@map("accounting_hand_post_claim_revisions")
+}
+
 model AccountingToken {
   id           String   @id @default(cuid())
   connector    String   @default("xero")
