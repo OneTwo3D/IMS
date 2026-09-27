@@ -667,7 +667,7 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | Sales Invoices | Push invoices to Xero when an order is created |
 | Credit Notes | Push credit notes on refund |
 | Purchase Bills | Push supplier bills when a PO is invoiced |
-| Stock Receipts | Journal: DR Inventory / CR Stock in Transit on goods received |
+| Stock Receipts | Journal: DR Inventory / CR Stock in Transit on goods received — raised by a receipt entered in IMS **and** by a WMS stock-sync *align-up* correction that absorbs the units into an open purchase-order ASN line (o3d-6nd55), each for the value it actually brought into stock (the goods cost plus that line's share of the order's additional costs). A warehouse-to-warehouse stock transfer raises none: its value never left inventory, and neither does a free-of-charge line, which has no value to move. |
 | COGS Reversals | Reverse COGS on stock returns |
 | Inventory Adjustments | Journal for manual stock adjustments |
 | Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |

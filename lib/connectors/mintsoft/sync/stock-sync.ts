@@ -38,8 +38,21 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { lockStockTransfers, lockWmsAsnLineMaps, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
-import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { enqueueStockSync } from '@/lib/shopping'
+// o3d-6nd55: the align-up path credits PO-backed stock and lays a FIFO cost layer, so it is a
+// RECEIPT writer and owes the same journal, the same transit subledger row and — above all — the
+// same COST DEFINITION as the other two (the manual receipt in app/actions/purchase-orders.ts and
+// the WMS book-in in lib/domain/wms/booked-in-service.ts).
+import {
+  getAccountingSettingsFor,
+  getActiveAccountingConnectorId,
+  queueAccountingSyncTx,
+  readStockReceiptAccountsTx,
+} from '@/lib/accounting'
+import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
 
 /**
  * Codex P2 (6oyu.1): an applied alignment changes IMS on-hand, so the storefront
@@ -1025,6 +1038,154 @@ async function lockStockLevelForAlignment(
 }
 
 /**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-6nd55: WHAT DID THESE UNITS COST — ONE DEFINITION, SHARED WITH THE OTHER TWO RECEIPTS.
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * THE DEFECT THIS REPLACES was `Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)`, read
+ * inline in the align-up loop. `landedUnitCostBase` is `Decimal @db.Decimal(18, 6) @default(0)`
+ * and NOT NULL (prisma/schema.prisma:1319), and `createPurchaseOrder` never writes it — so the
+ * `??` could NEVER fall through. An ordinary purchase order aligned up at a unit cost of ZERO: a
+ * zero-cost FIFO layer and a zero-value stock movement for goods that cost real money. That is a
+ * live inventory-value defect on its own, independent of any journal: a wrong cost layer is wrong
+ * stock value, and no journal repairs it. It also bears on the switchover, where the `[firstload]`
+ * reconciliation compares IMS inventory valuation against Qoblex within ±£1 per warehouse — a
+ * zero-cost layer fails that in a way that reads as a migration error rather than a product
+ * defect.
+ *
+ * WHY THE GROSS COST, AND WHY THE SHARED HELPER. `computeGrossUnitCostBaseByLine` is what the
+ * MANUAL receipt uses (app/actions/purchase-orders.ts:1881) and what the WMS book-in was changed
+ * to use (o3d-8f0p6): goods `unitCostBase` plus this line's share of the PO's own and its linked
+ * freight POs' cost lines. It does not read `landedUnitCostBase` at all. Routing the third writer
+ * through it means all three answer this question with ONE definition rather than three, and it is
+ * never worse than the old expression — once landed cost HAS been allocated the recalc writes
+ * `landedUnitCostBase = grossUnitCostBase` (landed-cost-service.ts:1159, :1514) so the two
+ * coincide, and before allocation the old expression was simply 0.
+ *
+ * SO THERE IS NO NULL-VS-ZERO QUESTION AND NO MIGRATION. The column keeps its NOT NULL zero
+ * default, because receipt time stops reading it. A GENUINELY free line — a free-of-charge sample,
+ * a warranty replacement — has `unitCostBase` 0 and no freight share, so the gross cost is 0, no
+ * value enters inventory and nothing is posted. That is correct, and it is distinguishable from
+ * the defect, which had a POSITIVE goods cost and still produced 0.
+ *
+ * WHY THE WHOLE PURCHASE ORDER IS LOADED for one line: freight distribution is a property of the
+ * ORDER (`BY_VALUE`, `BY_QTY`, `BY_WEIGHT` all divide one amount across every eligible line), so a
+ * line's share cannot be computed from the line alone. The align-up loop had the PO LINE in hand
+ * and not the PO, which is why it could not have used this helper without this widening.
+ *
+ * CACHED PER PURCHASE ORDER within one alignment transaction: several allocations of one sweep can
+ * land on ASN lines of the same order, and recomputing the distribution per allocation would issue
+ * the same query repeatedly AND risk two allocations of one order disagreeing about a cost if the
+ * inputs moved between reads. They cannot move — everything is inside the transaction — but one
+ * read is both cheaper and the stronger statement.
+ */
+type AlignmentPurchaseLineCost = {
+  poId: string
+  poReference: string
+  productId: string
+  /** Goods `unitCostBase` alone, kept only so the fallback below can be seen to be a fallback. */
+  goodsUnitCostBase: number
+  /** THE value: goods plus this line's freight share. Movement, layer and journal all use it. */
+  grossUnitCostBase: number
+}
+
+async function loadAlignmentPurchaseLineCost(
+  tx: Prisma.TransactionClient,
+  poLineId: string,
+  cache: Map<string, AlignmentPurchaseLineCost>,
+): Promise<AlignmentPurchaseLineCost> {
+  const cached = cache.get(poLineId)
+  if (cached) return cached
+
+  const poLine = await tx.purchaseOrderLine.findUnique({
+    where: { id: poLineId },
+    select: {
+      id: true,
+      productId: true,
+      unitCostBase: true,
+      po: {
+        select: {
+          id: true,
+          reference: true,
+          lines: {
+            select: {
+              id: true,
+              productId: true,
+              qty: true,
+              unitCostBase: true,
+              totalBase: true,
+              landedUnitCostBase: true,
+              product: { select: { weight: true } },
+            },
+          },
+          freightCostLines: {
+            select: { amountBase: true, distributionMethod: true },
+          },
+          landedCostLinks: {
+            select: {
+              freightPO: {
+                select: {
+                  freightCostLines: {
+                    select: { amountBase: true, distributionMethod: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+  if (!poLine) {
+    throw new Error(`Purchase order line ${poLineId} is missing for alignment.`)
+  }
+
+  const grossByLine = computeGrossUnitCostBaseByLine({
+    lines: poLine.po.lines.map((line) => ({
+      id: line.id,
+      qty: line.qty,
+      unitCostBase: line.unitCostBase,
+      totalBase: line.totalBase,
+      landedUnitCostBase: line.landedUnitCostBase,
+      weight: line.product?.weight ?? null,
+    })),
+    directCostLines: poLine.po.freightCostLines.map((costLine) => ({
+      amountBase: costLine.amountBase,
+      distributionMethod: costLine.distributionMethod,
+    })),
+    linkedCostLines: poLine.po.landedCostLinks.flatMap((link) => (
+      link.freightPO.freightCostLines.map((costLine) => ({
+        amountBase: costLine.amountBase,
+        distributionMethod: costLine.distributionMethod,
+      }))
+    )),
+  })
+
+  // Every line of the order is cached, not just the one asked for: the helper computed them all,
+  // and a sibling allocation in this same sweep would otherwise re-read the order to get a number
+  // that is already in hand.
+  let requested: AlignmentPurchaseLineCost | null = null
+  for (const line of poLine.po.lines) {
+    const entry: AlignmentPurchaseLineCost = {
+      poId: poLine.po.id,
+      poReference: poLine.po.reference,
+      productId: line.productId,
+      goodsUnitCostBase: Number(line.unitCostBase),
+      // The fallback is the GOODS cost, reached only when the helper declined the line — it skips a
+      // line whose `qty` is not greater than zero, and such a line cannot be the subject of an
+      // alignment allocation of positive quantity. It is deliberately NOT `landedUnitCostBase`.
+      grossUnitCostBase: grossByLine.get(line.id) ?? Number(line.unitCostBase),
+    }
+    cache.set(line.id, entry)
+    if (line.id === poLine.id) requested = entry
+  }
+  if (!requested) {
+    throw new Error(`Purchase order line ${poLineId} is not a line of its own purchase order ${poLine.po.id}.`)
+  }
+  return requested
+}
+
+/**
  * Apply a positive Mintsoft delta by absorbing it into open ASN lines.
  *
  * EXPORTED FOR THE DB-BACKED PROOFS in
@@ -1067,6 +1228,22 @@ export async function applyMintsoftAlignmentForProduct(params: {
       reason: 'Align To WMS only auto-corrects when Mintsoft is higher than IMS; align-down remains manual.',
     }
   }
+  // o3d-6nd55: WHICH LEDGER a PO-backed allocation would post to, and whether it posts at all.
+  // Resolved ONCE, here, and carried into the transaction as a PIN — `queueAccountingSyncTx` re-asks
+  // under the plugin-selection lock and refuses outright if this connector stopped being the
+  // serviced one, so a row can never be written against a ledger this decision was not about.
+  //
+  // THE ACCOUNT CODES ARE DELIBERATELY NOT TAKEN FROM HERE: they are read inside the transaction and
+  // asserted again after the enqueue, for the reason spelled out at the enqueue. `syncEnabled` is
+  // read here because it only decides whether to do any of this at all, and a flip of THAT is
+  // answered by the enqueue's own fence.
+  //
+  // A DRY RUN pays these two pooled reads and uses neither. That is the cost of resolving the pin
+  // before the transaction opens, which is what o3d-8f0p6 established for the book-in; a dry run is
+  // an operator-triggered preview, not a sweep hot path.
+  const accountingConnector = await getActiveAccountingConnectorId()
+  const accountingSettings = await getAccountingSettingsFor(accountingConnector)
+
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
     //
@@ -1344,6 +1521,12 @@ export async function applyMintsoftAlignmentForProduct(params: {
       }
     }
 
+    // o3d-6nd55: ONE clock and ONE cost reading for the whole alignment. The journal date must not
+    // drift between two allocations of one sweep (they are one unit of work and belong to one GL
+    // day), and the per-order cost distribution is read once — see `loadAlignmentPurchaseLineCost`.
+    const now = new Date()
+    const purchaseLineCostCache = new Map<string, AlignmentPurchaseLineCost>()
+
     for (const allocation of plan.allocations) {
       const candidate = candidateById.get(allocation.asnLineMapId)
       if (!candidate) {
@@ -1366,33 +1549,169 @@ export async function applyMintsoftAlignmentForProduct(params: {
       })
 
       if (candidate.sourceType === 'PURCHASE_ORDER_LINE') {
-        const poLine = await tx.purchaseOrderLine.findUnique({
-          where: { id: candidate.sourceLineId },
-          select: {
-            id: true,
-            productId: true,
-            unitCostBase: true,
-            landedUnitCostBase: true,
-          },
-        })
-        if (!poLine) {
-          throw new Error(`Purchase order line ${candidate.sourceLineId} is missing for alignment.`)
-        }
-        const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
+        // o3d-6nd55: ONE value, read once, used by all three consumers below — the movement's value
+        // fields, the cost layer's `unitCostBase` and the journal's amount. Three consumers
+        // disagreeing about the cost of the same units would be a worse defect than the missing
+        // journal. See `loadAlignmentPurchaseLineCost` for why this is the gross cost and why the
+        // `landedUnitCostBase ?? unitCostBase` expression it replaces could never be anything but 0.
+        const purchaseCost = await loadAlignmentPurchaseLineCost(
+          tx,
+          candidate.sourceLineId,
+          purchaseLineCostCache,
+        )
+        const unitCostBase = purchaseCost.grossUnitCostBase
         await tx.stockMovement.update({
           where: { id: movement.id },
           data: buildStockMovementValueFields({ qty: allocation.qty, unitCostBase }),
         })
 
         await createCostLayer(tx, {
-          productId: poLine.productId,
+          productId: purchaseCost.productId,
           warehouseId: params.binding.warehouseId,
           qty: allocation.qty,
           unitCostBase,
-          poLineId: poLine.id,
+          poLineId: candidate.sourceLineId,
           adjustmentMovementId: movement.id,
         })
+
+        // ─── o3d-6nd55: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
+        //
+        // THE DEFECT THIS CLOSES. This path is the THIRD writer of inventory value from a purchase
+        // order, and it queued NOTHING: no STOCK_RECEIPT journal and no transit subledger row.
+        // `grep -n 'queueAccountingSync|STOCK_RECEIPT|recordTransitSubledger'` over this file
+        // returned nothing at all. The manual receipt (app/actions/purchase-orders.ts:2064-2095) and
+        // — since o3d-8f0p6 — the WMS book-in (lib/domain/wms/booked-in-service.ts) both post, so
+        // the same physical arrival produced different books depending on the route it took. On the
+        // live 3PL route this is not an edge: alignment snapshot credits are how an upward
+        // Mintsoft/IMS delta is absorbed into an open ASN line (docs/mintsoft.md), i.e. a normal way
+        // for purchased units to arrive.
+        //
+        // WHY NOTHING PICKS IT UP LATER, established for o3d-8f0p6 and unchanged here: the Xero
+        // daily batch does not read `stock_movements` at all; its inventory reconciliation posts
+        // Inventory ↔ Rounding difference and ONLY for an `action === 'sweep'` gap
+        // (account-gl-reconciliation.ts:102 returns null otherwise, and the limit is 1 unit so a
+        // receipt-sized gap is `flag` — surfaced, never posted); and the transit reconciliation
+        // aggregates `transit_subledger_movements`, which are written AT POST TIME, so a posting
+        // that never happened is absent from BOTH sides and the window TIES OUT EXACTLY. That last
+        // point is why shipping o3d-8f0p6 alone did not make the transit account auditable: the
+        // reconciliation that should have caught this hid it (the trap written down at
+        // lib/domain/inventory/movement-cogs-relevance.ts:291-295).
+        //
+        // AND WHY INSIDE THE TRANSACTION. Stock and layers commit here; a journal queued after the
+        // commit, or best-effort around it, is the same defect in a new costume — inventory value
+        // raised with the ledger not told. Both live or neither.
+        //
+        // NO DOUBLE-POST AGAINST THE BOOK-IN, IN EITHER DIRECTION, and this is the exclusion that
+        // makes the two fixes compose:
+        //   · THIS path journals `allocation.qty` and, in this same transaction, increments
+        //     `wms_asn_line_maps.qtyAccountedViaSnapshot` by it. A later book-in journals
+        //     `stockQtyToAdd`, which is `qtyReceived − coveredBySnapshotQty`, and
+        //     `coveredBySnapshotQty` is derived from exactly that column
+        //     (asn-reconciliation.ts:203-205). So the units this path posts are the units the
+        //     book-in deliberately excludes — pinned by arm 6 of
+        //     tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts on the o3d-8f0p6
+        //     branch, and from this side by the composition arms of
+        //     tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts.
+        //   · THE REVERSE is `resolveWmsAsnLineResidualQty`, which caps this path's allocation at
+        //     `expectedQty − max(qtyAccountedViaSnapshot, lastProcessedReceivedQty)`. Units a
+        //     book-in already landed raised `lastProcessedReceivedQty`, so they are outside every
+        //     allocation this path can make and cannot be journalled here a second time.
+        // The key carries the ASN LINE and this MOVEMENT, so it can collide with neither
+        // `wms-purchase-receipt:<poId>:<eventId>` nor `purchase-receipt:<poId>:<receiptRef>`; and
+        // because the movement id is fresh per allocation, one sweep crediting two ASN lines of one
+        // order posts two journals for two disjoint quantities rather than one merged amount.
+        const receiptValueBase = multiplyMoney(toDecimal(allocation.qty), toDecimal(unitCostBase))
+        if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
+          const amount = roundQuantity(receiptValueBase, 2).toNumber()
+          // THE ACCOUNT CODES COME FROM THIS TRANSACTION, pinned to the SAME connector the enqueue
+          // is pinned to (o3d-8f0p6 r2's round-1 HIGH 2, copied deliberately rather than reinvented).
+          // A code read over the POOL before this transaction opened is a code an operator can remap
+          // before it commits, and the enqueue's own fence does not cover it:
+          // `pinnedLedgerIsServicedUnderLock` locks the `plugin_*` rows only
+          // (lib/integration-plugin-selection-lock.ts:66-78), which is a different question from
+          // "are these still the right account codes".
+          const accounts = await readStockReceiptAccountsTx(tx, accountingConnector)
+          const payload = {
+            date: now.toISOString().slice(0, 10),
+            reference: `Receipt: ${purchaseCost.poReference}`,
+            narration: `Stock receipt for PO ${purchaseCost.poReference} via Mintsoft alignment against ASN `
+              + `${candidate.asn.externalAsnId}`,
+            lines: [
+              {
+                accountCode: accounts.inventoryAccount,
+                description: `Stock receipt: ${purchaseCost.poReference}`,
+                debit: amount,
+              },
+              {
+                accountCode: accounts.transitAccount,
+                description: `Stock receipt: ${purchaseCost.poReference}`,
+                credit: amount,
+              },
+            ],
+          }
+          const receiptIdempotencyKey = accountingPayloadKey(
+            `wms-align-up:${candidate.id}:${movement.id}`,
+            payload,
+          )
+          const queued = await queueAccountingSyncTx(tx, {
+            type: 'STOCK_RECEIPT',
+            referenceType: 'PurchaseOrder',
+            referenceId: purchaseCost.poId,
+            payload,
+            idempotencyKey: receiptIdempotencyKey,
+            // PIN THE LEDGER: the enqueue re-asks under the plugin-selection lock and refuses rather
+            // than writing this row against a connector other than the one whose accounts are in the
+            // payload above.
+            connector: accountingConnector,
+          })
+          // REFUSE IF THE MAPPING MOVED. Under READ COMMITTED this re-read takes a FRESH snapshot,
+          // so it observes an account remap that managed to commit between the read above and now —
+          // which is what makes it a usable assertion that none did. Throwing rolls the whole
+          // alignment back: no movement, no layer, no stock, no journal, and the next sweep measures
+          // both sides afresh and posts against the NEW mapping. Committing instead would leave a
+          // journal on codes no later reconciliation uses, unrecoverable without a manual
+          // correction. Deliberately a refusal and not a lock: locking arbitrary `settings` rows
+          // from here would invent a second lock order over a table the enqueue already locks
+          // `plugin_*`-first.
+          const accountsAfterEnqueue = await readStockReceiptAccountsTx(tx, accountingConnector)
+          if (
+            accountsAfterEnqueue.inventoryAccount !== accounts.inventoryAccount
+            || accountsAfterEnqueue.transitAccount !== accounts.transitAccount
+          ) {
+            throw new Error(
+              `Accounting account mapping changed while aligning ${params.sku} up against ASN `
+              + `${candidate.asn.externalAsnId} for PO ${purchaseCost.poReference}: inventory `
+              + `${accounts.inventoryAccount || '(unset)'} -> `
+              + `${accountsAfterEnqueue.inventoryAccount || '(unset)'}, transit `
+              + `${accounts.transitAccount || '(unset)'} -> `
+              + `${accountsAfterEnqueue.transitAccount || '(unset)'}. `
+              + 'Refusing so the next sweep aligns against the current mapping (o3d-6nd55).',
+            )
+          }
+          // 6oyu.4 (khdw): a receipt CREDITS the transit clearing account, draining goods-in-transit
+          // into inventory, so the signed subledger delta is −amount. Recorded on the QUEUE'S OWN
+          // decision (bcz9.4) rather than a second settings read, so the two can never disagree: a
+          // journal that was not queued must not be mirrored, or the transit reconciliation would
+          // report a GL/subledger gap that is really an artefact of this line.
+          if (queued) {
+            await recordTransitSubledgerMovement(tx, {
+              sourceType: 'STOCK_RECEIPT',
+              sourceRef: purchaseCost.poId,
+              idempotencyKey: receiptIdempotencyKey,
+              baseDelta: -amount,
+              journalDate: payload.date,
+            })
+          }
+        }
       } else {
+        // TRANSFER-BACKED ALLOCATIONS GET NO JOURNAL, DELIBERATELY (o3d-6nd55). A transfer moves
+        // units the business already owns between its own warehouses: their value never left
+        // inventory and never entered PURCHASE goods-in-transit, whose sources are listed at
+        // lib/domain/accounting/transit-subledger-movement.ts:20-35 and include no transfer. The
+        // manual transfer receipt agrees — app/actions/transfers.ts queues no accounting sync at all
+        // — and so does the WMS book-in's transfer loop, so posting nothing here is parity rather
+        // than a second hole. The layers recreated below carry the DISPATCH snapshot's costs, which
+        // are the costs inventory already holds.
         const transferLine = await tx.stockTransferLine.findUnique({
           where: { id: candidate.sourceLineId },
           select: {
