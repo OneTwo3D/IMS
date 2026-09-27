@@ -97,12 +97,37 @@ landed are outside every allocation align-up can make.
 business already owns between its own warehouses, so their value never left inventory and never
 entered *purchase* goods-in-transit. `app/actions/transfers.ts` queues no accounting sync either.
 
-The **account codes are read inside the alignment transaction** and asserted again after the enqueue.
-Reading them over the pool beforehand bound nothing: an operator remapping the inventory or transit
-account in that window got a committed journal on the old codes while every later reconciliation used
-the new ones, and the enqueue's own fence locks the `plugin_*` rows only. A remap detected mid-flight
-**refuses the whole alignment** — no movement, no layer, no stock, no journal — and the next sweep
-measures both sides afresh against the current mapping.
+**The cost inputs are LOCKED, and so is the account mapping (o3d-6nd55 r2).** Round 1 read both with
+no lock and tried to defend itself by re-reading and refusing on a difference, which holds nothing: a
+re-read sees only a change that has *already* committed, so a change landing after it still ends up in
+committed books. Both are now locks held to commit:
+
+- **the cost rows** — `purchase_orders`, then `purchase_order_lines`, then `freight_cost_lines`, for
+  the primary order *and* every linked freight order — taken at step 2 of the global row-lock order
+  (`lib/domain/wms/transfer-asn-lock-order.ts`). That sub-order is not new: it is the one
+  `app/actions/purchase-orders.ts` already uses in both of its invoicing transactions. A landed-cost
+  or freight edit therefore cannot commit between the moment the alignment reads a cost and the moment
+  it commits the layer and the journal for it. A PO-backed ASN line whose order appeared *after* those
+  locks were taken is refused as a raced row and left to the next sweep, exactly as a raced transfer
+  is. Every cost is then read in one pass **before** any movement, layer, journal or stock row is
+  written, so the read-then-write order is structural rather than something a reader has to verify;
+- **the two account codes** — through `lockAccountingMappingSelection`, which is the *existing*
+  accounting-selection lock (the same advisory key `queueAccountingSyncTx` already takes) with the two
+  mapping rows added to its row set, so there is one lock and one order rather than a second one. It is
+  read once per alignment and reused, so an alignment spanning several purchase orders cannot put
+  earlier orders on the old mapping and later ones on the new one. A remap is **serialised**, not
+  refused: it waits and lands once the alignment commits.
+
+**A CANCELLED linked freight order contributes nothing (o3d-6nd55 r2).** Cancellation leaves the link
+row in place, marks the freight order `CANCELLED` and the link unallocated, and both landed-cost
+recalculation paths already exclude it — so including it here would have added freight the business had
+cancelled into the cost layer, the movement and the journal, and disagreed with what recalculation
+computes for the same units. The predicate has one definition,
+`CONTRIBUTING_LANDED_COST_LINK_WHERE` in `lib/domain/purchasing/landed-cost-service.ts`, which all
+three readers derive from. It filters on the freight order's **status** and deliberately not on
+`LandedCostLink.allocated`: `allocated` records whether the uplift has been written to
+`landedUnitCostBase` yet, and valuing a receipt whose freight is not yet allocated is the whole purpose
+of the shared gross-cost helper.
 
 Why this had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
 journal from a stock movement, and the reconciliation that should have caught the omission **hid** it.

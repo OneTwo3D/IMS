@@ -9,7 +9,7 @@ import {
   type AccountingConnectorId,
 } from '@/lib/connectors/accounting-registry'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
+import { ACCOUNTING_MAPPING_SETTING_KEYS, pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
 import { getSettingValues, type SettingValueReadClient } from '@/lib/settings-store'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -833,13 +833,11 @@ export type StockReceiptAccounts = {
 }
 
 /**
- * The settings keys holding those two codes, per connector. Keyed by connector id rather than
- * written as Xero literals, so a second accounting connector is a registration here and not a
- * branch at the call site — the same rule the rest of this module follows.
+ * The settings keys holding those two codes live in ONE place —
+ * `ACCOUNTING_MAPPING_SETTING_KEYS` in lib/integration-plugin-selection-lock.ts — because the lock
+ * that protects them has to name the same rows this reader reads. Two spellings of one fact is how a
+ * lock ends up guarding a key the reader does not use.
  */
-const STOCK_RECEIPT_ACCOUNT_KEYS: Record<AccountingConnectorInfo['id'], { inventory: string; transit: string }> = {
-  xero: { inventory: 'xero_inventory_account', transit: 'xero_transit_account' },
-}
 
 /**
  * READ THE RECEIPT'S TWO ACCOUNT CODES THROUGH A TRANSACTION (o3d-8f0p6 r2).
@@ -868,7 +866,7 @@ export async function readStockReceiptAccountsTx(
   tx: SettingValueReadClient,
   connector: AccountingConnectorInfo['id'],
 ): Promise<StockReceiptAccounts> {
-  const keys = STOCK_RECEIPT_ACCOUNT_KEYS[connector]
+  const keys = ACCOUNTING_MAPPING_SETTING_KEYS[connector]
   const values = await getSettingValues([keys.inventory, keys.transit], tx)
   return {
     inventoryAccount: values.get(keys.inventory)?.trim() ?? '',

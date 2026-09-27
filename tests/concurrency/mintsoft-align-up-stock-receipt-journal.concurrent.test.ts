@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import * as realAccountingNs from '@/lib/accounting'
+import * as realTransitNs from '@/lib/domain/accounting/transit-subledger-movement'
 import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 
 /**
@@ -53,6 +54,10 @@ mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
     requireInternalUser: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    // `requireRole` is here because o3d-8f0p6 r4 found its absence made an arm VACUOUS: the writer
+    // action's own catch turned the missing mock into a silent `{ success: false }` and the arm passed
+    // having remapped nothing. Arm 11 asserts the writer ACCEPTED the remap for the same reason.
+    requireRole: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
   },
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
@@ -73,7 +78,6 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
  * reach.
  */
 let injectEnqueueFailure = false
-let remapInventoryAccountOnNextEnqueue: (() => Promise<void>) | null = null
 const INJECTED_ENQUEUE_FAILURE = 'o3d-6nd55 injected STOCK_RECEIPT enqueue failure'
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -84,12 +88,35 @@ mock.module('@/lib/accounting', {
       if (injectEnqueueFailure && args[1]?.type === 'STOCK_RECEIPT') {
         throw new Error(INJECTED_ENQUEUE_FAILURE)
       }
-      if (remapInventoryAccountOnNextEnqueue && args[1]?.type === 'STOCK_RECEIPT') {
-        const hook = remapInventoryAccountOnNextEnqueue
-        remapInventoryAccountOnNextEnqueue = null
+      return realAccountingNs.queueAccountingSyncTx(...args)
+    },
+  },
+})
+
+/**
+ * THE SECOND SEAM, fired ONCE from inside the alignment transaction AFTER the journal has been
+ * enqueued and the transit row written (r2 arms 8 and 10).
+ *
+ * WHY HERE AND NOT AT THE ENQUEUE. Round 1's hook fired at the enqueue, so it only ever exercised a
+ * writer racing the code read — which the deleted re-read could see. The window Codex round 2 named is
+ * the one AFTER every account read, while the transaction walks on through the remaining allocations,
+ * the stock-level updates and the ASN updates. A hook at the last accounting write is inside that
+ * window, which is exactly why it is the one worth having.
+ */
+let afterTransitWriteHook: (() => Promise<void>) | null = null
+mock.module('@/lib/domain/accounting/transit-subledger-movement', {
+  namedExports: {
+    ...realTransitNs,
+    recordTransitSubledgerMovement: async (
+      ...args: Parameters<typeof realTransitNs.recordTransitSubledgerMovement>
+    ) => {
+      const result = await realTransitNs.recordTransitSubledgerMovement(...args)
+      if (afterTransitWriteHook) {
+        const hook = afterTransitWriteHook
+        afterTransitWriteHook = null
         await hook()
       }
-      return realAccountingNs.queueAccountingSyncTx(...args)
+      return result
     },
   },
 })
@@ -263,6 +290,122 @@ async function seedAlignmentTarget(
       warehouse,
     },
   }
+}
+
+/**
+ * A LINKED FREIGHT PURCHASE ORDER with one cost line, linked to `primary` (r2 arm 9).
+ *
+ * `status` and `allocated` are set explicitly because the state this arm is about is precisely the one
+ * cancellation leaves behind: the link row still present, the freight order CANCELLED, the link
+ * unallocated. The freight order's own rows are seeded directly rather than through a cancellation
+ * action — the SUBJECT here is which links the cost read counts, not how an order comes to be
+ * cancelled, and driving a cancellation would also run landed-cost recalculation and write cost
+ * columns this file must never write.
+ */
+async function seedLinkedFreightPo(
+  primary: SeededAlignmentTarget,
+  label: string,
+  amount: number,
+  status: 'PO_SENT' | 'CANCELLED',
+  allocated: boolean,
+): Promise<{ poId: string }> {
+  const { db } = await import('@/lib/db')
+  const tag = uniqueTag(`FR${label}`)
+  const supplier = await db.supplier.create({
+    data: { name: `${tag} freight supplier`, currency: 'GBP' },
+    select: { id: true },
+  })
+  const freightPo = await db.purchaseOrder.create({
+    data: {
+      reference: tag,
+      supplierId: supplier.id,
+      status,
+      currency: 'GBP',
+      fxRateToBase: '1',
+      subtotalForeign: amount,
+      subtotalBase: amount,
+      totalForeign: amount,
+      totalBase: amount,
+      freightCostLines: {
+        create: [{
+          description: `${label} freight`,
+          amountForeign: `${amount}.0000`,
+          amountBase: `${amount}.0000`,
+          vatable: false,
+          distributionMethod: 'BY_VALUE',
+        }],
+      },
+    },
+    select: { id: true },
+  })
+  await db.landedCostLink.create({
+    data: { primaryPoId: primary.poId, freightPoId: freightPo.id, method: 'BY_VALUE', allocated },
+    select: { id: true },
+  })
+  return { poId: freightPo.id }
+}
+
+/**
+ * A SECOND purchase order and open ASN for the SAME product in the SAME warehouse (r2 arm 11), at a
+ * DIFFERENT unit cost, so one alignment plan spans two orders and the two costs are distinguishable.
+ * Built by the same real creation path, so no cost column is written by hand here either.
+ */
+async function seedSecondOrderForSameProduct(
+  first: SeededAlignmentTarget,
+  qty: number,
+  unitCost: number,
+): Promise<{ poId: string; poLineId: string; qty: number; unitCost: number; asnLineMapId: string }> {
+  const { db } = await import('@/lib/db')
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const tag = uniqueTag('Q')
+  const supplier = await db.supplier.create({
+    data: { name: `${tag} supplier`, currency: 'GBP' },
+    select: { id: true },
+  })
+  const created = await createPurchaseOrder({
+    reference: tag,
+    supplierId: supplier.id,
+    currency: 'GBP',
+    fxRateToBase: 1,
+    destinationWarehouseId: first.warehouseId,
+    pricesIncludeVat: false,
+    taxRateValue: 0,
+    lines: [{
+      productId: first.productId,
+      sku: first.tag,
+      productName: `o3d-6nd55 second order`,
+      qty,
+      unitCostForeign: unitCost,
+    }],
+  })
+  assert.equal(created.success, true, `PRECONDITION: the second createPurchaseOrder must succeed: ${created.error}`)
+  const po = await db.purchaseOrder.findUniqueOrThrow({
+    where: { reference: tag },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: o3d-6nd55: a test fixture row, not a core flow branch
+      externalAsnId: tag,
+      sourceType: 'PURCHASE_ORDER',
+      sourceId: po.id,
+      warehouseId: first.warehouseId,
+      status: 'OPEN',
+      lines: {
+        create: [{
+          externalAsnLineId: `${tag}-1`,
+          sourceType: 'PURCHASE_ORDER_LINE',
+          sourceLineId: po.lines[0]!.id,
+          productId: first.productId,
+          sku: first.tag,
+          expectedQty: `${qty}.0000`,
+        }],
+      },
+    },
+    select: { lines: { select: { id: true } } },
+  })
+  return { poId: po.id, poLineId: po.lines[0]!.id, qty, unitCost, asnLineMapId: asn.lines[0]!.id }
 }
 
 /** The real align-up, at the deepest seam below the live Mintsoft API (production's only caller is this file's sweep). */
@@ -812,60 +955,519 @@ test('o3d-6nd55: align-up journals only the units a prior book-in did not', SKIP
 })
 
 /**
- * ARM 8 — THE ACCOUNT MAPPING MUST NOT MOVE UNDER THE POSTING.
+ * ARM 8 — THE MAPPING LOCK MUST BLOCK A REMAP THAT COMMITS AFTER THE FINAL ACCOUNT READ.
  *
- * Copied deliberately from o3d-8f0p6's round-1 HIGH 2 rather than reinvented: codes read over the
- * POOL before the transaction opened, with nothing rechecking them, mean an operator remapping the
- * inventory or transit account in that window gets a committed journal on the OLD codes while every
- * later reconciliation uses the NEW ones. The enqueue's own fence does not cover it —
- * `pinnedLedgerIsServicedUnderLock` locks the `plugin_*` rows only.
+ * WHAT ROUND 1 GOT WRONG, AND WHY THIS ARM REPLACES ITS PREDECESSOR. Round 1 read the codes inside the
+ * transaction and re-read them after the enqueue, refusing on a difference, and its arm fired the
+ * remap AT the enqueue. Under READ COMMITTED that re-read can only see a remap that had ALREADY
+ * committed; it holds nothing, so a remap committing AFTER it — while the alignment walks on through
+ * the remaining allocations, the stock-level updates and the ASN updates — still ends with a journal
+ * committed on stale codes. The old arm passed because it tested the one ordering the re-read could
+ * see. Refusal was the wrong instrument.
  *
- * This arm commits a remap from a SEPARATE pooled connection while the alignment is mid-flight, so
- * the post-enqueue re-read sees it, and asserts the WHOLE alignment refused: no journal AND no stock.
+ * SO THIS MEASURES THE LOCK. The remap is fired from a separate pooled connection AFTER the transit
+ * write — inside the undefended window — and deliberately NOT awaited, because a transaction that
+ * waits for a writer it is itself blocking would deadlock. What is asserted is that the remap DID NOT
+ * GET THROUGH: after a generous wait, a THIRD connection still reads the OLD code. Both facts are
+ * snapshotted INSIDE the hook, because the `finally` awaits the remap and a flag read afterwards would
+ * say nothing about what was true during the transaction.
  *
- * WHAT WOULD STILL PASS THIS ARM: binding by a lock instead of a refusal (also correct, and
- * stronger); and a fix that refuses on ANY enqueue, which arms 2, 3, 6 and 7 refuse. It establishes
- * nothing about a remap that commits after this transaction does — that is a different posting,
- * correctly on the new codes.
+ * AND THE OUTCOME IS NOW SERIALISATION, NOT REFUSAL: the alignment must SUCCEED on codes that were
+ * current for the whole of it, and the remap must land once the lock is released.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: holding the lock longer than necessary; and any fix that serialises
+ * by a different lock, which is also correct. It does NOT establish that two purchase orders in one
+ * alignment share one mapping — that is arm 11, on a different mechanism — and it says nothing about a
+ * remap that commits after this transaction does, which is a different posting, correctly on the new
+ * codes.
  */
-test('o3d-6nd55: an account remap mid-alignment refuses the whole alignment', SKIP, async () => {
+test('o3d-6nd55 r2: a remap after the final account read is blocked until the alignment commits', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')
   await enableStockReceiptPosting()
-  const seeded = await seedAlignmentTarget('M', 2, 11)
+  const seeded = await seedAlignmentTarget('L', 2, 11)
+  const REMAPPED = '699'
 
-  remapInventoryAccountOnNextEnqueue = async () => {
-    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: '699' } })
+  type RemapOutcome = 'pending' | 'committed' | 'failed'
+  let remapSettled: RemapOutcome = 'pending'
+  let remapError: string | null = null
+  let observedDuringTransaction: string | null = null
+  let settledDuringTransaction: RemapOutcome = 'pending'
+  let remapPromise: Promise<unknown> = Promise.resolve()
+
+  afterTransitWriteHook = async () => {
+    remapPromise = db.setting
+      .update({ where: { key: 'xero_inventory_account' }, data: { value: REMAPPED } })
+      .then(() => { remapSettled = 'committed' })
+      .catch((error: unknown) => { remapSettled = 'failed'; remapError = String(error).slice(0, 200) })
+    // A generous window for a single-row update, so "it simply had not run yet" is not a plausible
+    // explanation for a pass.
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    // A THIRD connection, reading what is COMMITTED right now. A plain SELECT is not blocked by the
+    // FOR UPDATE, so this reports the row's committed value rather than waiting for the lock.
+    const row = await db.setting.findUniqueOrThrow({
+      where: { key: 'xero_inventory_account' },
+      select: { value: true },
+    })
+    observedDuringTransaction = row.value
+    settledDuringTransaction = remapSettled
   }
-  let threw: unknown = null
-  let applied: boolean | null = null
+
+  let applied: boolean
   try {
-    applied = (await alignUp(seeded, { delta: seeded.qty, imsQty: 0 })).applied
-  } catch (error) {
-    threw = error
+    ;({ applied } = await alignUp(seeded, { delta: seeded.qty, imsQty: 0 }))
+    // Let the queued remap through now the lock is released, so the arm can prove it was SERIALISED
+    // rather than rejected.
+    await remapPromise.catch(() => {})
   } finally {
-    remapInventoryAccountOnNextEnqueue = null
-    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+    afterTransitWriteHook = null
   }
-  const message = threw instanceof Error ? threw.message : String(threw)
-  console.log(`[arm8] alignment with the mapping remapped mid-flight => threw=${message} applied=${String(applied)}`)
-  assert.notEqual(applied, true, 'an alignment whose account mapping moved must not report success')
-  assert.match(
-    message,
-    /mapping changed/i,
-    'and it must say WHY, or an operator cannot tell this from any other failure',
+  const afterRelease = await db.setting.findUniqueOrThrow({
+    where: { key: 'xero_inventory_account' },
+    select: { value: true },
+  })
+  await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+
+  console.log(`[arm8] applied=${String(applied)}; mid-transaction: code=${String(observedDuringTransaction)} remap=${settledDuringTransaction}${remapError ? ` (${remapError})` : ''}; after release: code=${afterRelease.value} remap=${remapSettled}`)
+  assert.equal(
+    observedDuringTransaction,
+    INVENTORY_ACCOUNT,
+    'THE POINT OF THIS ARM: while the alignment held the mapping lock, a remap fired AFTER its final '
+    + `account read must not have committed — the committed code should still have been `
+    + `${INVENTORY_ACCOUNT}, was ${String(observedDuringTransaction)}. A new value here is the `
+    + 'stale-mapping window, reopened.',
+  )
+  assert.equal(
+    settledDuringTransaction,
+    'pending',
+    'and the remap must still have been WAITING at that moment, not already finished',
+  )
+  // NOT VACUOUS: the remap must land once the lock is released. If it had failed for an unrelated
+  // reason, "it did not commit" would be true for the wrong reason, and this is what catches that.
+  assert.equal(
+    remapSettled,
+    'committed',
+    `the remap must succeed once the alignment released the lock — serialised, not rejected${remapError ? `; it failed instead: ${remapError}` : ''}`,
+  )
+  assert.equal(afterRelease.value, REMAPPED, 'and its value must be the one it wrote')
+
+  assert.equal(applied, true, 'serialising must let the alignment through, not refuse it')
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  const lines = payloadLines(logs[0]!.payload)
+  assert.equal(lines.find((l) => typeof l.debit === 'number')?.accountCode, INVENTORY_ACCOUNT)
+  assert.equal(lines.find((l) => typeof l.credit === 'number')?.accountCode, TRANSIT_ACCOUNT)
+})
+
+/**
+ * ARM 9 — A CANCELLED LINKED FREIGHT ORDER MUST NOT REACH THE LAYER, THE MOVEMENT OR THE JOURNAL.
+ *
+ * CODEX ROUND-2 HIGH-1. Round 1's cost query selected EVERY `landedCostLinks` row. Cancelling a
+ * freight order leaves the link row in place, marks the freight order CANCELLED and the link
+ * unallocated — so a later align-up added the cancelled freight back into its cost layer, its stock
+ * movement and its STOCK_RECEIPT journal. That overstates inventory by freight the business cancelled,
+ * and disagrees with what landed-cost recalculation computes for the very same units: both recalc
+ * paths exclude a CANCELLED freight order (landed-cost-service.ts, audit-C3 and audit-izrf).
+ *
+ * THE FIXTURE IS THE STATE THE REVIEWER DESCRIBED: a live linked freight order with a cost line, a
+ * SECOND cancelled one with a cost line, and both links present. So the arm distinguishes "excludes
+ * cancelled freight" from "ignores linked freight altogether" — the live one must still be included.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that filters on `LandedCostLink.allocated` instead of on the
+ * freight order's status. That would ALSO exclude the cancelled link here, but it would wrongly zero
+ * live-but-not-yet-allocated freight, which is the ordinary state at receipt time and is exactly what
+ * the live half of this arm asserts is included. It also says nothing about a freight order cancelled
+ * AFTER this read, which is arm 10's lock.
+ */
+test('o3d-6nd55 r2: a cancelled linked freight order contributes nothing to the align-up cost', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const LIVE_FREIGHT = 20
+  const CANCELLED_FREIGHT = 400
+  const seeded = await seedAlignmentTarget('K', QTY, GOODS_UNIT)
+  await assertUntouchedLandedCost(seeded.poLineId, GOODS_UNIT)
+
+  const liveFreight = await seedLinkedFreightPo(seeded, 'live', LIVE_FREIGHT, 'PO_SENT', true)
+  const cancelledFreight = await seedLinkedFreightPo(seeded, 'dead', CANCELLED_FREIGHT, 'CANCELLED', false)
+
+  // PRECONDITION: both links really exist and point at this primary, or the arm would be asserting
+  // the absence of something that was never there.
+  const links = await db.landedCostLink.findMany({
+    where: { primaryPoId: seeded.poId },
+    select: { freightPoId: true, allocated: true, freightPO: { select: { status: true } } },
+  })
+  console.log(`[arm9] examined ${links.length} landed-cost link(s): ${JSON.stringify(links)}`)
+  assert.equal(links.length, 2, 'PRECONDITION: both freight links must exist on the primary order')
+  assert.equal(
+    links.filter((l) => l.freightPO.status === 'CANCELLED').length,
+    1,
+    'PRECONDITION: exactly one of them must be CANCELLED — that is the one whose cost must vanish',
+  )
+  assert.ok(liveFreight.poId !== cancelledFreight.poId)
+
+  const expectedUnitCost = GOODS_UNIT + LIVE_FREIGHT / QTY
+  const expectedAmount = QTY * expectedUnitCost
+  const wrongUnitCost = GOODS_UNIT + (LIVE_FREIGHT + CANCELLED_FREIGHT) / QTY
+
+  const result = await alignUp(seeded, { delta: QTY, imsQty: 0 })
+  assert.equal(result.applied, true, `PRECONDITION: the alignment must apply: ${result.reason}`)
+
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'WMS_RECEIPT_RECONCILIATION', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const debit = payloadLines(logs[0]?.payload ?? null).find((l) => typeof l.debit === 'number')
+  console.log(`[arm9] goods ${GOODS_UNIT} + LIVE freight ${LIVE_FREIGHT}/${QTY} => expected unit ${expectedUnitCost}; including the cancelled ${CANCELLED_FREIGHT} would give ${wrongUnitCost}; layer=${JSON.stringify(layer)} movement=${JSON.stringify(movement)} debit=${String(debit?.debit)}`)
+
+  assert.notEqual(expectedUnitCost, wrongUnitCost, 'PRECONDITION: the two answers must be distinguishable')
+  assert.equal(
+    Number(layer.unitCostBase),
+    expectedUnitCost,
+    `the cost layer must carry the LIVE freight only (${expectedUnitCost}); ${wrongUnitCost} means the `
+    + 'cancelled freight order was added back in, overstating inventory',
+  )
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so must the movement')
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  assert.equal(debit?.debit, expectedAmount, `and the journal debit must be ${expectedAmount}`)
+  assert.equal(Number(movement.totalValueBase), debit?.debit, 'movement value == journal debit')
+  assert.equal(Number(layer.unitCostBase) * Number(layer.receivedQty), debit?.debit, 'layer value == journal debit')
+
+  // AND THE LIVE FREIGHT REALLY IS IN: this is what separates the fix from "ignore linked freight".
+  assert.ok(
+    expectedUnitCost > GOODS_UNIT,
+    'PRECONDITION: the live freight must move the unit cost above the goods cost, or this arm would '
+    + 'also pass for a fix that dropped linked freight altogether',
+  )
+})
+
+/**
+ * ARM 10 — A COST EDIT MUST NOT OVERTAKE THE ALIGNMENT.
+ *
+ * CODEX ROUND-2 HIGH-2. Round 1 read the cost rows with NO lock and cached the answer for the rest of
+ * the transaction, so a landed-cost change committing while the allocation loop ran left later
+ * allocations on the older cost — and the concurrent recalculation could not revalue layers the
+ * alignment had not committed yet, so neither side ended up right. Round 1's own comment claimed the
+ * inputs "cannot move — everything is inside the transaction", which confuses isolation from
+ * UNCOMMITTED work with exclusion of COMMITTED work.
+ *
+ * SO THIS MEASURES THE COST-ROW LOCK, the same way arm 8 measures the mapping lock: a `freight_cost_lines`
+ * UPDATE is fired from a separate pooled connection while the alignment is mid-flight and is NOT
+ * awaited; a third connection then shows the committed amount is still the ORIGINAL one; and the
+ * alignment's layer, movement and journal all carry the pre-edit gross cost. The edit must then land
+ * once the lock is released — serialised, not rejected.
+ *
+ * WHY `freight_cost_lines` AND NOT `purchase_order_lines`. Both are locked (steps 2c and 2d), and the
+ * freight amount is the input a landed-cost edit actually changes; `purchase_order_lines.landedUnitCostBase`
+ * is what recalculation WRITES, and this path no longer reads that column at all.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: any fix that serialises by a different lock, or one that holds the
+ * lock longer than needed. It does NOT establish that two concurrent RECALCULATIONS order themselves —
+ * they take no locks of their own, so they are blocked by this one rather than cooperating with it, and
+ * that gap is recorded in lib/domain/wms/transfer-asn-lock-order.ts and filed separately.
+ */
+test('o3d-6nd55 r2: a freight-cost edit mid-alignment is blocked, and the posted cost is the one read', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const FREIGHT_TOTAL = 20
+  const BUMPED_FREIGHT = 200
+  const seeded = await seedAlignmentTarget('E', QTY, GOODS_UNIT, FREIGHT_TOTAL)
+  await assertUntouchedLandedCost(seeded.poLineId, GOODS_UNIT)
+
+  const costLine = await db.freightCostLine.findFirstOrThrow({
+    where: { poId: seeded.poId },
+    select: { id: true, amountBase: true },
+  })
+  assert.equal(
+    Number(costLine.amountBase),
+    FREIGHT_TOTAL,
+    'PRECONDITION: createPurchaseOrder must have written the freight cost line this arm edits',
   )
 
-  const movements = await db.stockMovement.count({ where: { productId: seeded.productId } })
-  const layers = await db.costLayer.count({ where: { poLineId: seeded.poLineId } })
-  const logs = await stockReceiptLogsFor(seeded.poId)
-  const level = await db.stockLevel.findUniqueOrThrow({
-    where: { productId_warehouseId: { productId: seeded.productId, warehouseId: seeded.warehouseId } },
-    select: { quantity: true },
+  const expectedUnitCost = GOODS_UNIT + FREIGHT_TOTAL / QTY
+  const expectedAmount = QTY * expectedUnitCost
+  const bumpedUnitCost = GOODS_UNIT + BUMPED_FREIGHT / QTY
+
+  type EditOutcome = 'pending' | 'committed' | 'failed'
+  let editSettled: EditOutcome = 'pending'
+  let editError: string | null = null
+  let observedDuringTransaction: number | null = null
+  let settledDuringTransaction: EditOutcome = 'pending'
+  let editPromise: Promise<unknown> = Promise.resolve()
+
+  afterTransitWriteHook = async () => {
+    editPromise = db.freightCostLine
+      .update({ where: { id: costLine.id }, data: { amountBase: `${BUMPED_FREIGHT}.0000`, amountForeign: `${BUMPED_FREIGHT}.0000` } })
+      .then(() => { editSettled = 'committed' })
+      .catch((error: unknown) => { editSettled = 'failed'; editError = String(error).slice(0, 200) })
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    const row = await db.freightCostLine.findUniqueOrThrow({
+      where: { id: costLine.id },
+      select: { amountBase: true },
+    })
+    observedDuringTransaction = Number(row.amountBase)
+    settledDuringTransaction = editSettled
+  }
+
+  let applied: boolean
+  try {
+    ;({ applied } = await alignUp(seeded, { delta: QTY, imsQty: 0 }))
+    await editPromise.catch(() => {})
+  } finally {
+    afterTransitWriteHook = null
+  }
+
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
   })
-  console.log(`[arm8] examined ${movements} movement(s), ${layers} layer(s), ${logs.length} log(s), stock=${String(level.quantity)}`)
-  assert.equal(movements, 0, 'the stock movement must have rolled back with the refused journal')
-  assert.equal(layers, 0, 'and the cost layer')
-  assert.equal(Number(level.quantity), 0, 'and the stock level')
-  assert.equal(logs.length, 0, 'and no journal may survive on the stale codes')
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'WMS_RECEIPT_RECONCILIATION', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const debit = payloadLines(logs[0]?.payload ?? null).find((l) => typeof l.debit === 'number')
+  const afterRelease = await db.freightCostLine.findUniqueOrThrow({
+    where: { id: costLine.id },
+    select: { amountBase: true },
+  })
+  console.log(`[arm10] applied=${String(applied)}; mid-transaction: freight=${String(observedDuringTransaction)} edit=${settledDuringTransaction}${editError ? ` (${editError})` : ''}; after release: freight=${String(afterRelease.amountBase)} edit=${editSettled}; layer=${JSON.stringify(layer)} debit=${String(debit?.debit)}`)
+
+  assert.equal(
+    observedDuringTransaction,
+    FREIGHT_TOTAL,
+    'THE POINT OF THIS ARM: while the alignment held the cost-row locks, a freight edit fired '
+    + `mid-transaction must not have committed — the committed amount should still have been `
+    + `${FREIGHT_TOTAL}, was ${String(observedDuringTransaction)}. A new value here is round 1's `
+    + 'unlocked cost read, reopened.',
+  )
+  assert.equal(
+    settledDuringTransaction,
+    'pending',
+    'and the edit must still have been WAITING at that moment, not already finished',
+  )
+  // NOT VACUOUS: it must land once the lock releases, or "it did not commit" is true for the wrong reason.
+  assert.equal(
+    editSettled,
+    'committed',
+    `the edit must succeed once the alignment released the lock — serialised, not rejected${editError ? `; it failed instead: ${editError}` : ''}`,
+  )
+  assert.equal(Number(afterRelease.amountBase), BUMPED_FREIGHT, 'and its value must be the one it wrote')
+
+  assert.equal(applied, true, 'serialising must let the alignment through, not refuse it')
+  assert.notEqual(expectedUnitCost, bumpedUnitCost, 'PRECONDITION: the two costs must be distinguishable')
+  assert.equal(
+    Number(layer.unitCostBase),
+    expectedUnitCost,
+    `the layer must carry the cost that was READ under the lock (${expectedUnitCost}), not the edited `
+    + `one (${bumpedUnitCost})`,
+  )
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so must the movement')
+  assert.equal(debit?.debit, expectedAmount, 'and so must the journal debit')
+  assert.equal(Number(movement.totalValueBase), debit?.debit, 'movement value == journal debit')
+  assert.equal(Number(layer.unitCostBase) * Number(layer.receivedQty), debit?.debit, 'layer value == journal debit')
+})
+
+/**
+ * ARM 11 — EVERY PURCHASE ORDER IN ONE ALIGNMENT POSTS ON ONE MAPPING, AND AT ITS OWN COST.
+ *
+ * The second half of Codex round-2 HIGH-3: one alignment can absorb its delta into ASN lines of
+ * SEVERAL purchase orders, so per-order account reads could straddle a remap and put earlier orders on
+ * the old mapping and later ones on the new one inside a single alignment. Two contradictory journals
+ * for one correction is not a variance anything reconciles.
+ *
+ * WHAT THIS ARM PINS, AND — MEASURED, NOT ASSUMED — WHAT IT DOES NOT. It pins that the PRODUCTION
+ * writer is serialised and that the two orders keep their OWN costs, which is what the per-order cost
+ * cache is for.
+ *
+ * IT DOES NOT PIN THE MEMOISATION, and the mutation campaign is how that was found rather than
+ * argued: the mutation that makes the account read PER-ALLOCATION and removes the reader's lock
+ * (`M12-per-allocation-accounts-no-lock`) leaves this arm GREEN. The reason is that
+ * `saveXeroSettings` is a COOPERATIVE writer — it takes the accounting-selection advisory lock — and
+ * `queueAccountingSyncTx` has always taken that same advisory lock through
+ * `pinnedLedgerIsServicedUnderLock` and holds it to commit. So from the FIRST enqueue onwards the
+ * real writer is blocked by a lock that predates this change, whatever this path does. Claiming this
+ * arm proved the memoisation would have been the proof-of-an-adjacent-property trap exactly.
+ *
+ * ARM 12 IS THEREFORE THE ONE THAT PINS THE MULTI-ORDER CASE, using an UNCOOPERATIVE writer that the
+ * advisory lock cannot stop.
+ *
+ * The remap goes through the REAL `saveXeroSettings`, and the arm asserts the writer ACCEPTED it and
+ * that the new value landed — because o3d-8f0p6 r4 found the equivalent arm passing VACUOUSLY when a
+ * missing auth mock turned the remap into a silent failure.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that reads per-order but under a lock (also correct); one
+ * that posts nothing at all, which arms 2, 3, 9 and 10 refuse; and — as measured above — a fix with no
+ * mapping lock and no memoisation at all, because the enqueue's own advisory lock covers the window
+ * this arm can reach.
+ */
+test('o3d-6nd55 r2: two purchase orders in one alignment post on the same mapping, at their own costs', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const first = await seedAlignmentTarget('P', 3, 5)
+  // A SECOND purchase order and a second open ASN for the SAME product in the SAME warehouse, so one
+  // alignment plan spans both. Seeded through the same real creation path.
+  const second = await seedSecondOrderForSameProduct(first, 2, 8)
+
+  const REMAPPED = '699'
+  let remapAccepted: { success: boolean; error?: string } | null = null
+  let remapPromise: Promise<unknown> = Promise.resolve()
+  afterTransitWriteHook = async () => {
+    // THROUGH THE REAL WRITER, not a raw row update: `saveXeroSettings` is the only code that remaps
+    // these accounts in production, and it is the other half of the lock order this change adopts.
+    // (Arms 8 and 10 use RAW updates deliberately — blocking an UNCOOPERATIVE writer is the stronger
+    // claim; this arm exercises the production path at least once.)
+    //
+    // Fired between the first order's posting and the second's, and NOT awaited: under the lock it
+    // cannot commit until the whole alignment does, so awaiting it here would deadlock the very
+    // transaction it is waiting for.
+    const { saveXeroSettings } = await import('@/app/actions/xero-sync')
+    remapPromise = saveXeroSettings({ xero_inventory_account: REMAPPED })
+      .then((result) => { remapAccepted = result })
+      .catch((error: unknown) => { remapAccepted = { success: false, error: String(error).slice(0, 200) } })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  }
+
+  let applied: boolean
+  let reason: string
+  try {
+    ;({ applied, reason } = await alignUp(first, { delta: first.qty + second.qty, imsQty: 0 }))
+  } finally {
+    afterTransitWriteHook = null
+    await remapPromise.catch(() => {})
+  }
+  const mappingNow = await db.setting.findUniqueOrThrow({
+    where: { key: 'xero_inventory_account' },
+    select: { value: true },
+  })
+  await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+
+  assert.equal(applied, true, `PRECONDITION: the alignment must apply across both orders: ${reason}`)
+  const firstLogs = await stockReceiptLogsFor(first.poId)
+  const secondLogs = await stockReceiptLogsFor(second.poId)
+  const codeOf = (payload: unknown) => payloadLines(payload).find((l) => typeof l.debit === 'number')?.accountCode
+  const debitOf = (payload: unknown) => payloadLines(payload).find((l) => typeof l.debit === 'number')?.debit
+  console.log(`[arm11] first PO log(s)=${firstLogs.length} code=${String(codeOf(firstLogs[0]?.payload ?? null))} debit=${String(debitOf(firstLogs[0]?.payload ?? null))}; second PO log(s)=${secondLogs.length} code=${String(codeOf(secondLogs[0]?.payload ?? null))} debit=${String(debitOf(secondLogs[0]?.payload ?? null))}; remap=${JSON.stringify(remapAccepted)} mappingNow=${mappingNow.value}`)
+
+  // PRECONDITION, and the lesson of o3d-8f0p6 r4: the writer must really have accepted the remap, or
+  // this arm proves nothing about straddling one.
+  assert.deepEqual(
+    remapAccepted,
+    { success: true },
+    `PRECONDITION: the REAL saveXeroSettings must accept the remap, or nothing was remapped: ${JSON.stringify(remapAccepted)}`,
+  )
+  assert.equal(
+    mappingNow.value,
+    REMAPPED,
+    'PRECONDITION: and the remap must actually have LANDED once the alignment released the lock — '
+    + 'otherwise "both orders agree" would be true because nothing ever tried to change it',
+  )
+
+  assert.equal(firstLogs.length, 1, `the first order must post exactly one journal; found ${firstLogs.length}`)
+  assert.equal(secondLogs.length, 1, `and the second exactly one; found ${secondLogs.length}`)
+  assert.equal(
+    codeOf(firstLogs[0]!.payload),
+    codeOf(secondLogs[0]!.payload),
+    'both orders in ONE alignment must post to the SAME inventory account — a per-order read that '
+    + 'straddled the remap would give two different codes for one correction',
+  )
+  assert.equal(codeOf(firstLogs[0]!.payload), INVENTORY_ACCOUNT, 'and it must be the code the alignment read under its lock')
+  // AND each order keeps its OWN cost — the cache is per order, not one cost for the alignment.
+  assert.equal(debitOf(firstLogs[0]!.payload), first.qty * first.unitCost, 'the first order posts its own cost')
+  assert.equal(debitOf(secondLogs[0]!.payload), second.qty * second.unitCost, 'the second order posts its own, different, cost')
+  assert.notEqual(first.unitCost, second.unitCost, 'PRECONDITION: the two costs must differ, or the last assertion is vacuous')
+})
+
+/**
+ * ARM 12 — THE MULTI-ORDER AGREEMENT, AGAINST A WRITER THE ADVISORY LOCK CANNOT STOP.
+ *
+ * WHY THIS EXISTS AND ARM 11 WAS NOT ENOUGH. Arm 11 remaps through the real `saveXeroSettings`, which
+ * takes the accounting-selection advisory lock — the same one `queueAccountingSyncTx` has always taken
+ * and held to commit. So from the first enqueue onwards arm 11's writer is blocked by a pre-existing
+ * lock, and the mutation that removes BOTH this change's mapping lock and its memoisation left arm 11
+ * green. That is measured, not supposed: see `M12-per-allocation-accounts-no-lock`.
+ *
+ * SO THIS ARM USES A RAW `settings` UPDATE, which no advisory lock can block — only the row-level
+ * `FOR UPDATE` this change's `lockAccountingMappingSelection` takes over the two mapping rows. The
+ * update is fired between the first order's posting and the second's and is NOT awaited. Both orders
+ * must still post on the SAME inventory account.
+ *
+ * WHAT IT ESTABLISHES, EXACTLY: an alignment spanning two purchase orders cannot straddle an
+ * uncooperative remap. Remove the lock and the second order reads the new code while the first is
+ * already committed to the old one — two contradictory journals for one correction.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: memoising WITHOUT a lock would also make the two agree — both orders
+ * would use the first (stale) read — so this arm alone does not distinguish "one locked read" from
+ * "one unlocked read". Arm 8 is what refuses the unlocked version, by asserting the writer could not
+ * commit at all. The two together are what the pair of mechanisms needs.
+ */
+test('o3d-6nd55 r2: two orders in one alignment agree even against an uncooperative remap', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const first = await seedAlignmentTarget('U', 3, 5)
+  const second = await seedSecondOrderForSameProduct(first, 2, 8)
+  const REMAPPED = '699'
+
+  let rawSettled: 'pending' | 'committed' | 'failed' = 'pending'
+  let rawPromise: Promise<unknown> = Promise.resolve()
+  afterTransitWriteHook = async () => {
+    // A RAW row update — no advisory lock, so only this change's FOR UPDATE on the mapping rows can
+    // stop it. Not awaited: under that lock it cannot commit until the alignment does.
+    rawPromise = db.setting
+      .update({ where: { key: 'xero_inventory_account' }, data: { value: REMAPPED } })
+      .then(() => { rawSettled = 'committed' })
+      .catch(() => { rawSettled = 'failed' })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  }
+
+  let applied: boolean
+  let reason: string
+  try {
+    ;({ applied, reason } = await alignUp(first, { delta: first.qty + second.qty, imsQty: 0 }))
+  } finally {
+    afterTransitWriteHook = null
+    await rawPromise.catch(() => {})
+  }
+  const mappingNow = await db.setting.findUniqueOrThrow({
+    where: { key: 'xero_inventory_account' },
+    select: { value: true },
+  })
+  await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+
+  const firstLogs = await stockReceiptLogsFor(first.poId)
+  const secondLogs = await stockReceiptLogsFor(second.poId)
+  const codeOf = (payload: unknown) => payloadLines(payload).find((l) => typeof l.debit === 'number')?.accountCode
+  console.log(`[arm12] applied=${String(applied)}; raw remap=${rawSettled}; mappingNow=${mappingNow.value}; first code=${String(codeOf(firstLogs[0]?.payload ?? null))} second code=${String(codeOf(secondLogs[0]?.payload ?? null))}`)
+
+  assert.equal(applied, true, `PRECONDITION: the alignment must apply across both orders: ${reason}`)
+  assert.equal(firstLogs.length, 1, `PRECONDITION: the first order must have posted; found ${firstLogs.length}`)
+  assert.equal(secondLogs.length, 1, `PRECONDITION: the second must have posted too, or there is nothing to compare; found ${secondLogs.length}`)
+  // NOT VACUOUS: the remap must really have landed in the end, or "they agree" is true because nothing
+  // ever tried to change the mapping.
+  assert.equal(rawSettled, 'committed', 'PRECONDITION: the remap must land once the lock releases — serialised, not rejected')
+  assert.equal(mappingNow.value, REMAPPED, 'PRECONDITION: and its value must be the one it wrote')
+
+  assert.equal(
+    codeOf(firstLogs[0]!.payload),
+    codeOf(secondLogs[0]!.payload),
+    'both orders in ONE alignment must post to the SAME inventory account; different codes here are one '
+    + 'correction split across two mappings, which nothing reconciles',
+  )
+  assert.equal(
+    codeOf(firstLogs[0]!.payload),
+    INVENTORY_ACCOUNT,
+    'and it must be the code that was current when the alignment took its lock, not the remapped one',
+  )
 })

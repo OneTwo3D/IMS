@@ -1786,7 +1786,7 @@ test(
 // ---------------------------------------------------------------------------
 
 test(
-  'ALIGNMENT holds wms_asn_maps, so a real book-in cannot close the header under it (Codex r11 MEDIUM-1)',
+  'ALIGNMENT holds the parent and the header, so a real book-in cannot close the header under it (Codex r11 MEDIUM-1; row watched moved to purchase_orders in o3d-6nd55 r2)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
     // WHAT ROUND 10 ASSERTED AND WHY IT WAS WRONG. The candidate query selects on
@@ -1805,9 +1805,31 @@ test(
     //
     // THE EVIDENCE, and it is a fact about locks rather than about source text: the
     // REAL webhook book-in — the code at booked-in-service.ts:1208 that does the
-    // closing — is observed blocked on `wms_asn_maps`, with alignment named as the
-    // blocking backend, while alignment's plan is already made. And while it is
-    // blocked, a third session reads the header and sees `closedAt` still NULL.
+    // closing — is observed BLOCKED, with alignment named as the blocking backend,
+    // while alignment's plan is already made. And while it is blocked, a third session
+    // reads the header and sees `closedAt` still NULL.
+    //
+    // WHICH ROW IT BLOCKS ON CHANGED IN o3d-6nd55 r2, AND IT MOVED EARLIER, NOT LATER.
+    // This arm used to watch for `wms_asn_maps`, alignment's step-3 lock. Align-up now
+    // also locks its PO-backed parents and their cost rows at step 2b-2d, because the
+    // cost it turns into a cost layer and a STOCK_RECEIPT journal is read from those
+    // rows and used to be read unlocked (Codex round-2 HIGH-2). A PO-backed book-in
+    // takes `purchase_orders` at step 2 BEFORE it reaches the header at step 3, so it
+    // is now stopped one step sooner, by a lock taken in the documented order — which
+    // is strictly stronger serialisation, not weaker, and cannot cycle because both
+    // paths take step 2 before step 3.
+    //
+    // SO THE TRIPWIRE WATCHES `purchase_orders`, AND IT IS NOW A TRIPWIRE FOR BOTH
+    // LOCKS. If alignment stopped holding the parent order the wait would exhaust its
+    // budget here (the book-in would sail past step 2 and block on the header
+    // instead), and if alignment stopped holding the header as well the book-in would
+    // close it immediately and `closedAtWhileBlocked` below would be non-null. The
+    // consequence assertion is unchanged and is still the one that matters.
+    //
+    // THE HEADER LOCK IS NOT REDUNDANT, even though this arm no longer observes it: a
+    // TRANSFER-backed alignment holds no `purchase_orders` row at all, so for that
+    // route step 3 is still the first row a closer meets. Removing it because a
+    // PO-backed arm stopped seeing it would be the adjacent-property trap.
     //
     // WHICH BRANCH THIS ARM EXERCISES: the APPLIED branch. Alignment plans, reaches
     // its stock-level lock and writes — no refusal of any kind is involved. That is
@@ -1865,12 +1887,14 @@ test(
         (error) => { bookedInError = error },
       )
 
-      // THE PROOF. Without the step-3 lock this wait exhausts its budget and fails:
-      // the book-in closes the header immediately and is never blocked at all.
+      // THE PROOF. Without alignment's step-2b parent lock this wait exhausts its
+      // budget and fails; without the step-3 header lock as well the book-in closes
+      // the header immediately and is never blocked at all, which the `closedAt` read
+      // below catches. See the note above for why the row watched here moved.
       await waitForBlockedBackend(probe, {
         blockedBy: [alignmentBackend.pid],
-        waitingOn: /wms_asn_maps/i,
-        describe: 'the book-in blocked on the ASN header that alignment holds',
+        waitingOn: /purchase_orders/i,
+        describe: 'the book-in blocked on the purchase order that alignment holds at step 2b',
       })
 
       // AND THE CONSEQUENCE, not just the lock: while the closer is queued, the
@@ -1892,7 +1916,7 @@ test(
       closedAtWhileBlocked,
       null,
       'the ASN header was closed while alignment was mid-transaction — the closedAt predicate the plan '
-      + 'rests on moved under it, which is exactly what the step-3 lock exists to stop',
+      + 'rests on moved under it, which is exactly what the step-2b and step-3 locks exist to stop',
     )
     // NOT VACUOUS: alignment must actually have gone through to its write, or the
     // header lock was never held across a plan that mattered.

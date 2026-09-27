@@ -6,7 +6,8 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *
  * ══════════════════════════════════════════════════════════════════════════════
  *   1. wms_inbound_receipt_events   (the webhook claim row)
- *   2. stock_transfers, then purchase_orders
+ *   2. stock_transfers, then purchase_orders,
+ *                       then purchase_order_lines, then freight_cost_lines
  *   3. wms_asn_maps
  *   4. wms_asn_line_maps
  *   5. stock_levels
@@ -60,6 +61,28 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * transfer/ASN pair alone would have left {stock_levels, wms_asn_line_maps} crossed
  * in exactly the same way. Both receipt paths therefore take their ASN row locks
  * BEFORE their stock-level locks, via `lockWmsAsnLineMapsForTransferLines` below.
+ *
+ * THE TWO COST-ROW TABLES AT STEP 2 ARE NOT A NEW ORDER — THEY ARE AN EXISTING ONE, WRITTEN DOWN
+ * (o3d-6nd55 r2). `app/actions/purchase-orders.ts` already locks exactly
+ * `purchase_orders` → `purchase_order_lines` → `freight_cost_lines`, in that sequence, in both of its
+ * invoicing transactions (:2919-2921 and :3305-3308). Recording it here rather than inventing a
+ * different one is the whole point: a fifth path claiming an order the existing four do not obey is
+ * the failure mode this module exists to prevent.
+ *
+ * WHAT LOCKING THEM BUYS, precisely. `computeGrossUnitCostBaseByLine` — the one definition of what a
+ * receipt's units cost — reads `purchase_order_lines` (goods cost, qty, totalBase) and the
+ * `freight_cost_lines` of the order and of every linked freight order. Those are the rows landed-cost
+ * recalculation WRITES. Locking them means a cost edit cannot commit between the moment a receipt
+ * reads the cost and the moment that receipt commits its layer and its journal, so the layer, the
+ * movement and the journal cannot be a cost the order no longer has.
+ *
+ * WHAT IT DOES NOT BUY, stated because the gap is the interesting part: `recalculateLandedCosts` and
+ * `recalculateDirectLandedCosts` take NO row locks of their own (checked 2026-09-27 —
+ * lib/domain/purchasing/landed-cost-service.ts contains no `FOR UPDATE`). They are therefore
+ * BLOCKED by these locks rather than cooperating with them, which is enough for mutual exclusion in
+ * one direction but means two concurrent recalculations still order themselves on nothing. Making the
+ * recalc paths take this lock is filed separately; it is a change to four call sites and not to a
+ * receipt.
  *
  * `wms_asn_maps` IS IN THE ORDER because booked-in-service updates the ASN header
  * after its line rows while the transfer-ASN `finalizePendingAsn`
@@ -119,6 +142,45 @@ export async function lockPurchaseOrders(
   const ids = sortedUnique(purchaseOrderIds)
   if (ids.length === 0) return ids
   await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
+  return ids
+}
+
+/**
+ * STEPS 2c and 2d — `purchase_order_lines`, then `freight_cost_lines`, for the named orders.
+ *
+ * TAKE THIS WHENEVER A COST READ WILL BECOME A COST LAYER OR A JOURNAL (o3d-6nd55 r2). The rows it
+ * locks are exactly the inputs of `computeGrossUnitCostBaseByLine`: the goods lines of the order and
+ * the freight cost lines of the order and of every freight order linked to it. Pass the PRIMARY order
+ * ids AND the linked freight order ids — a freight order's cost lines hang off the freight order, so
+ * an unlocked freight order is an unlocked input.
+ *
+ * `lockPurchaseOrders` (step 2b) must already have been taken over the same id set: this is the
+ * sub-order `app/actions/purchase-orders.ts` uses in both invoicing transactions (:2919-2921,
+ * :3305-3308), and the assertion below is what stops a caller taking the children first.
+ *
+ * Locked by `"poId"` rather than by row id, because the point is to cover every cost row the orders
+ * HAVE, including one inserted after the caller read them — a row-id list read beforehand could not
+ * name an insert. Ordered by id within each statement so two callers at this step queue rather than
+ * cross.
+ */
+export async function lockPurchaseOrderCostRows(
+  tx: LockClient,
+  purchaseOrderIds: ReadonlyArray<string>,
+  lockedPurchaseOrderIds: ReadonlySet<string>,
+): Promise<string[]> {
+  const ids = sortedUnique(purchaseOrderIds)
+  if (ids.length === 0) return ids
+  const unlocked = ids.filter((id) => !lockedPurchaseOrderIds.has(id))
+  if (unlocked.length > 0) {
+    throw new Error(
+      'lockPurchaseOrderCostRows: step 2c/2d was reached for purchase order'
+      + `${unlocked.length === 1 ? '' : 's'} ${unlocked.join(', ')} without step 2b. Take `
+      + 'lockPurchaseOrders over the same id set first — the parent before its cost rows is the order '
+      + 'app/actions/purchase-orders.ts already uses (o3d-6nd55).',
+    )
+  }
+  await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
+  await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
   return ids
 }
 

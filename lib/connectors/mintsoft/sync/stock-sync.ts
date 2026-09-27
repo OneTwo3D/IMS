@@ -37,7 +37,13 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
-import { lockStockTransfers, lockWmsAsnLineMaps, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import {
+  lockPurchaseOrderCostRows,
+  lockPurchaseOrders,
+  lockStockTransfers,
+  lockWmsAsnLineMaps,
+  lockWmsAsnMaps,
+} from '@/lib/domain/wms/transfer-asn-lock-order'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { enqueueStockSync } from '@/lib/shopping'
 // o3d-6nd55: the align-up path credits PO-backed stock and lays a FIFO cost layer, so it is a
@@ -49,10 +55,15 @@ import {
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
   readStockReceiptAccountsTx,
+  type StockReceiptAccounts,
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
-import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
+import {
+  CONTRIBUTING_LANDED_COST_LINK_WHERE,
+  computeGrossUnitCostBaseByLine,
+} from '@/lib/domain/purchasing/landed-cost-service'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 
 /**
  * Codex P2 (6oyu.1): an applied alignment changes IMS on-hand, so the storefront
@@ -568,6 +579,13 @@ type AlignmentCandidateLine = {
   asnResidualQty: WmsAsnLineResidualQty
   /** Parent transfer id for a STOCK_TRANSFER_LINE candidate; null for a PO line. */
   transferId: string | null
+  /**
+   * Parent purchase-order id for a PURCHASE_ORDER_LINE candidate; null for a transfer line
+   * (o3d-6nd55 r2). Carried on the candidate so the cost read can be taken under a lock on that
+   * order's cost rows instead of discovering the parent from inside the allocation loop, which is
+   * after every lock has been taken and too late to add one.
+   */
+  purchaseOrderId: string | null
   asn: {
     externalAsnId: string
     createdAt: Date
@@ -606,6 +624,17 @@ type RefusedAlignmentCandidate = {
 type AlignmentLockSet = {
   /** `stock_transfers` rows held FOR UPDATE (step 2a of the global order). */
   transferIds: ReadonlySet<string>
+  /**
+   * `purchase_orders` rows held FOR UPDATE (step 2b), together with their
+   * `purchase_order_lines` and `freight_cost_lines` (steps 2c/2d) — o3d-6nd55 r2.
+   *
+   * A PO-backed candidate whose parent is absent here is refused as `raced`, exactly as a
+   * transfer-backed candidate whose parent transfer is absent is. The reason is the same and it is not
+   * about status: the cost this path is about to turn into a cost layer and a journal is read from
+   * that order's rows, so an order this transaction does not hold is an order whose costs are still
+   * moving. Round 1 of this issue read them with no lock at all.
+   */
+  purchaseOrderIds: ReadonlySet<string>
   /**
    * `wms_asn_line_maps` rows held FOR UPDATE (step 4 of the global order).
    *
@@ -647,6 +676,24 @@ type AlignmentCandidateSet = {
    * choose the lock set from the answer the lock is meant to produce.
    */
   parentTransferIds: string[]
+  /**
+   * Every parent purchase order of every PO-backed ASN row seen — INCLUDING the refused ones, for the
+   * same reason `parentTransferIds` includes them — so the caller can take steps 2b-2d before it
+   * re-reads (o3d-6nd55 r2).
+   */
+  parentPurchaseOrderIds: string[]
+  /**
+   * Every FREIGHT purchase order linked to one of those parents, so steps 2c/2d cover the freight
+   * cost lines too (o3d-6nd55 r2). A freight order's `freight_cost_lines` hang off the FREIGHT order,
+   * so locking only the primary would leave half of `computeGrossUnitCostBaseByLine`'s inputs
+   * unlocked.
+   *
+   * Collected through `CONTRIBUTING_LANDED_COST_LINK_WHERE`, the same predicate the cost read uses, so
+   * the set of orders locked and the set of orders read are one decision. A CANCELLED freight order
+   * contributes nothing, so it is neither read nor locked; what stops it being cancelled *after* this
+   * read is the lock on the PRIMARY order's row, which cancellation updates.
+   */
+  linkedFreightPurchaseOrderIds: string[]
   /**
    * Every `wms_asn_maps` header the discovered rows sit on, so the caller can take
    * step 3 of the global lock order before it re-reads (6oyu.19, Codex round-11
@@ -814,6 +861,39 @@ async function getAlignmentCandidateLines(
       },
     })
   const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
+
+  // o3d-6nd55 r2: THE PO-BACKED PARENTS, resolved HERE because the caller has to lock them at step 2b
+  // and this is the only read that happens before step 2. One query for the whole candidate set, the
+  // mirror of the transfer query above. `linkedFreightPurchaseOrderIds` uses the SAME predicate the
+  // cost read uses (CONTRIBUTING_LANDED_COST_LINK_WHERE), so the orders locked and the orders read are
+  // one decision rather than two.
+  const purchaseLineIds = [...new Set(lines
+    .filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
+    .map((line) => line.sourceLineId))]
+  const purchaseLines = purchaseLineIds.length === 0
+    ? []
+    : await tx.purchaseOrderLine.findMany({
+      where: { id: { in: purchaseLineIds } },
+      select: {
+        id: true,
+        poId: true,
+        po: {
+          select: {
+            landedCostLinks: {
+              where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
+              select: { freightPoId: true },
+            },
+          },
+        },
+      },
+    })
+  const purchaseOrderIdByLineId = new Map(purchaseLines.map((line) => [line.id, line.poId]))
+  const parentPurchaseOrderIds = new Set<string>()
+  const linkedFreightPurchaseOrderIds = new Set<string>()
+  for (const line of purchaseLines) {
+    parentPurchaseOrderIds.add(line.poId)
+    for (const link of line.po.landedCostLinks) linkedFreightPurchaseOrderIds.add(link.freightPoId)
+  }
   // 6oyu.19 (Codex r6): capacity must count what has LANDED on the transfer line by
   // ANY route — a manual receipt moves stock_transfer_lines.qtyReceived and touches
   // neither ASN column. One query for the whole candidate set.
@@ -862,6 +942,31 @@ async function getAlignmentCandidateLines(
     })
 
     if (line.sourceType !== 'STOCK_TRANSFER_LINE') {
+      // o3d-6nd55 r2: THE PO-BACKED MIRROR OF THE TRANSFER PARENT CHECK BELOW. A candidate whose
+      // parent order this transaction does not hold is refused as `raced` rather than planned against,
+      // because the cost that is about to become a cost layer and a STOCK_RECEIPT journal is read from
+      // that order's rows. Locking it now would invert the global order (step 2 is behind us by the
+      // time the re-read runs), so it waits for the next sweep — the same one-sweep deferral a raced
+      // transfer gets.
+      const purchaseOrderId = purchaseOrderIdByLineId.get(line.sourceLineId)
+      if (!purchaseOrderId) {
+        refused.push({
+          asnLineMapId: line.id,
+          externalAsnId: line.asn.externalAsnId,
+          reason: `purchase order line ${line.sourceLineId} no longer exists`,
+          kind: 'unusable',
+        })
+        continue
+      }
+      if (locks && !locks.purchaseOrderIds.has(purchaseOrderId)) {
+        refused.push({
+          asnLineMapId: line.id,
+          externalAsnId: line.asn.externalAsnId,
+          reason: 'its purchase order appeared after this run took its cost-row locks',
+          kind: 'raced',
+        })
+        continue
+      }
       candidates.push({
         id: line.id,
         sourceType: 'PURCHASE_ORDER_LINE',
@@ -870,6 +975,7 @@ async function getAlignmentCandidateLines(
         sku: line.sku,
         asnResidualQty,
         transferId: null,
+        purchaseOrderId,
         asn: line.asn,
       })
       continue
@@ -948,6 +1054,7 @@ async function getAlignmentCandidateLines(
       sku: line.sku,
       asnResidualQty,
       transferId: transferLine.transferId,
+      purchaseOrderId: null,
       asn: line.asn,
     })
   }
@@ -956,6 +1063,8 @@ async function getAlignmentCandidateLines(
     candidates,
     transferLineResiduals,
     parentTransferIds: [...parentTransferIds],
+    parentPurchaseOrderIds: [...parentPurchaseOrderIds],
+    linkedFreightPurchaseOrderIds: [...linkedFreightPurchaseOrderIds],
     asnMapIds: [...asnMapIds],
     discoveredLineIds: lines.map((line) => line.id),
     refused,
@@ -1073,11 +1182,18 @@ async function lockStockLevelForAlignment(
  * line's share cannot be computed from the line alone. The align-up loop had the PO LINE in hand
  * and not the PO, which is why it could not have used this helper without this widening.
  *
- * CACHED PER PURCHASE ORDER within one alignment transaction: several allocations of one sweep can
- * land on ASN lines of the same order, and recomputing the distribution per allocation would issue
- * the same query repeatedly AND risk two allocations of one order disagreeing about a cost if the
- * inputs moved between reads. They cannot move — everything is inside the transaction — but one
- * read is both cheaper and the stronger statement.
+ * WHAT MAKES THE CACHE SAFE, AND IT IS NOT THE TRANSACTION (o3d-6nd55 r2, Codex round-2 HIGH-2).
+ * Round 1's version of this paragraph said the inputs "cannot move — everything is inside the
+ * transaction". That was wrong, and it is the exact shape of error this repository keeps recording: a
+ * transaction gives a caller ISOLATION from uncommitted work, not exclusion of committed work, so
+ * under READ COMMITTED a landed-cost change committing mid-loop was visible to the next read and the
+ * first allocation's cached cost and the second allocation's fresh cost could differ inside one
+ * alignment. What makes it safe is the LOCK: `applyMintsoftAlignmentForProduct` takes
+ * `lockPurchaseOrders` then `lockPurchaseOrderCostRows` over the primary and linked freight orders at
+ * step 2, BEFORE this function runs, so the rows this reads cannot be updated until the alignment
+ * commits. The cache is then a saved query, not a correctness claim — and every cost is read in ONE
+ * up-front pass before any movement, layer, journal or stock row is written, so there is no window
+ * between "what these units cost" and "what was posted for them" even to reason about.
  */
 type AlignmentPurchaseLineCost = {
   poId: string
@@ -1087,6 +1203,29 @@ type AlignmentPurchaseLineCost = {
   goodsUnitCostBase: number
   /** THE value: goods plus this line's freight share. Movement, layer and journal all use it. */
   grossUnitCostBase: number
+}
+
+/**
+ * THE ONE CASE THE RE-READ CANNOT SETTLE (o3d-6nd55 r2), mirroring `assertParentsWereLocked` in
+ * lib/domain/wms/transfer-asn-lock-order.ts.
+ *
+ * `getAlignmentCandidateLines` refuses a PO-backed candidate whose parent order is not in the locked
+ * set, so by the time a candidate reaches the cost pass its parent IS held. This asserts that rather
+ * than assuming it: if the two ever drift apart, the failure mode without this line is a cost read
+ * from an unlocked order — silently the exact defect round 2 found — instead of a loud abort before
+ * any stock moves.
+ */
+function assertPurchaseOrderWasLocked(
+  candidate: AlignmentCandidateLine,
+  lockedPurchaseOrderIds: ReadonlySet<string>,
+): void {
+  if (!candidate.purchaseOrderId || !lockedPurchaseOrderIds.has(candidate.purchaseOrderId)) {
+    throw new Error(
+      `Alignment reached the cost read for ASN line ${candidate.id} without holding its purchase order `
+      + `(${candidate.purchaseOrderId ?? 'unknown'}). Refusing rather than reading a cost this `
+      + 'transaction does not hold (o3d-6nd55).',
+    )
+  }
 }
 
 async function loadAlignmentPurchaseLineCost(
@@ -1122,6 +1261,16 @@ async function loadAlignmentPurchaseLineCost(
             select: { amountBase: true, distributionMethod: true },
           },
           landedCostLinks: {
+            // o3d-6nd55 r2 (Codex round-2 HIGH-1): a CANCELLED freight order must NOT contribute.
+            // Round 1 selected every link, so cancelling a freight order — which leaves the link row
+            // in place, marks the freight order CANCELLED and the link unallocated — still fed its
+            // cost lines into this layer, this movement and this journal, overstating inventory by
+            // freight the business had cancelled and disagreeing with what landed-cost recalculation
+            // computes for the very same units. The predicate is not written out here: it is
+            // CONTRIBUTING_LANDED_COST_LINK_WHERE, the one both recalc paths use
+            // (landed-cost-service.ts audit-C3 and audit-izrf), so a fourth reader cannot invent a
+            // fourth answer.
+            where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
             select: {
               freightPO: {
                 select: {
@@ -1289,6 +1438,23 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // hold. It holds it now, from before the re-read that evaluates the predicate
     // until commit.
     const lockedTransferIds = new Set(await lockStockTransfers(tx, discovery.parentTransferIds))
+    // STEPS 2b, 2c AND 2d — the PO-backed parents and their COST ROWS (o3d-6nd55 r2, Codex round-2
+    // HIGH-2). Round 1 read `purchase_order_lines` and `freight_cost_lines` inside the allocation
+    // loop with no lock at all, and cached the result for the rest of the transaction: a landed-cost
+    // change committing while the loop ran left later allocations on the older cost, and the
+    // concurrent recalculation could not revalue layers this transaction had not committed yet. The
+    // rows locked here are exactly `computeGrossUnitCostBaseByLine`'s inputs, the primary orders' and
+    // the linked freight orders' alike, in the sub-order
+    // app/actions/purchase-orders.ts:2919-2921 already uses.
+    const lockedPurchaseOrderIds = new Set(await lockPurchaseOrders(tx, [
+      ...discovery.parentPurchaseOrderIds,
+      ...discovery.linkedFreightPurchaseOrderIds,
+    ]))
+    await lockPurchaseOrderCostRows(
+      tx,
+      [...discovery.parentPurchaseOrderIds, ...discovery.linkedFreightPurchaseOrderIds],
+      lockedPurchaseOrderIds,
+    )
     await lockWmsAsnMaps(tx, discovery.asnMapIds)
     // STEP 4 COVERS EVERY ROW DISCOVERY SAW, NOT JUST THE USABLE ONES (6oyu.19,
     // Codex round-13 MEDIUM-1). Rounds 10-12 locked `discovery.candidates`, and the
@@ -1323,6 +1489,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // takes its open findings with it — this is the one that had to travel.
     const candidateSet = await getAlignmentCandidateLines(tx, params.binding, params.productId, {
       transferIds: lockedTransferIds,
+      purchaseOrderIds: lockedPurchaseOrderIds,
       asnLineMapIds: lockedAsnLineMapIds,
     })
     const candidates = candidateSet.candidates
@@ -1521,11 +1688,68 @@ export async function applyMintsoftAlignmentForProduct(params: {
       }
     }
 
-    // o3d-6nd55: ONE clock and ONE cost reading for the whole alignment. The journal date must not
-    // drift between two allocations of one sweep (they are one unit of work and belong to one GL
-    // day), and the per-order cost distribution is read once — see `loadAlignmentPurchaseLineCost`.
+    // o3d-6nd55: ONE clock for the whole alignment. The journal date must not drift between two
+    // allocations of one sweep — they are one unit of work and belong to one GL day.
     const now = new Date()
+
+    // ─── EVERY COST, READ UP FRONT, UNDER THE STEP-2 LOCKS, BEFORE ANYTHING IS WRITTEN ───
+    //
+    // o3d-6nd55 r2 (Codex round-2 HIGH-2). Round 1 read each allocation's cost inside the loop below,
+    // interleaved with the movement, layer and stock writes it fed. Two things were wrong with that,
+    // and the lock fixes one while this pass fixes the other:
+    //   · the rows were unlocked, so a landed-cost change could commit mid-loop — closed by
+    //     `lockPurchaseOrders` + `lockPurchaseOrderCostRows` at step 2;
+    //   · even locked, reading interleaved with writing leaves the ORDER of the two as the thing a
+    //     reader has to verify. Reading every cost first makes "the cost that was posted is the cost
+    //     that was read" true by construction rather than by inspection, and it is the shape the
+    //     manual receipt already has (app/actions/purchase-orders.ts computes
+    //     `grossUnitCostBaseByLine` for the whole order before its receipt loop).
+    // It also fails EARLY: a missing purchase-order line aborts before any stock has been credited.
     const purchaseLineCostCache = new Map<string, AlignmentPurchaseLineCost>()
+    const costByAsnLineMapId = new Map<string, AlignmentPurchaseLineCost>()
+    for (const allocation of plan.allocations) {
+      const candidate = candidateById.get(allocation.asnLineMapId)
+      if (!candidate) {
+        throw new Error(`Missing ASN line ${allocation.asnLineMapId} during alignment.`)
+      }
+      if (candidate.sourceType !== 'PURCHASE_ORDER_LINE') continue
+      // The parent is in the locked set — `getAlignmentCandidateLines` refused the candidate
+      // otherwise — so this read is covered by steps 2b-2d for the rest of this transaction.
+      assertPurchaseOrderWasLocked(candidate, lockedPurchaseOrderIds)
+      costByAsnLineMapId.set(
+        candidate.id,
+        await loadAlignmentPurchaseLineCost(tx, candidate.sourceLineId, purchaseLineCostCache),
+      )
+    }
+
+    // ─── THE ACCOUNT MAPPING, LOCKED ONCE FOR THE WHOLE ALIGNMENT (o3d-6nd55 r2) ───
+    //
+    // ADOPTED FROM o3d-8f0p6 r4, NOT REINVENTED, and the key names are not copied: they live once in
+    // `ACCOUNTING_MAPPING_SETTING_KEYS` inside the lock module, which `readStockReceiptAccountsTx`
+    // derives from, because a lock that names different rows from its reader is not a lock.
+    //
+    // WHAT ROUND 1 GOT WRONG HERE (Codex round-2 HIGH-3). It read the codes inside the transaction and
+    // re-read them after the enqueue, refusing on a difference. That re-read holds NOTHING: under READ
+    // COMMITTED it sees a remap that had already committed, but a remap committing AFTER it — while
+    // this transaction walks on through the remaining allocations, the stock-level updates and the ASN
+    // updates — still ends with a journal committed on stale codes. Refusal was the wrong instrument;
+    // the fix is a lock held to COMMIT, and it is the SAME advisory key `queueAccountingSyncTx`
+    // already takes through `pinnedLedgerIsServicedUnderLock`, with the two mapping rows added to its
+    // row set. One lock, one order, and the enqueue's later acquisition is a no-op re-entry.
+    //
+    // MEMOISED, so an alignment spanning several purchase orders cannot straddle a remap and put
+    // earlier orders on the old mapping and later ones on the new one: whichever allocation first
+    // needs the codes takes the lock and reads them, and every later one reuses that answer. LAZY, so
+    // an alignment that posts nothing — a transfer-only plan, or a genuinely free line — takes no
+    // accounting lock at all.
+    let lockedAccounts: StockReceiptAccounts | null = null
+    const accountsForPosting = async (connector: NonNullable<typeof accountingConnector>) => {
+      if (!lockedAccounts) {
+        await lockAccountingMappingSelection(tx, connector)
+        lockedAccounts = await readStockReceiptAccountsTx(tx, connector)
+      }
+      return lockedAccounts
+    }
 
     for (const allocation of plan.allocations) {
       const candidate = candidateById.get(allocation.asnLineMapId)
@@ -1554,11 +1778,15 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // disagreeing about the cost of the same units would be a worse defect than the missing
         // journal. See `loadAlignmentPurchaseLineCost` for why this is the gross cost and why the
         // `landedUnitCostBase ?? unitCostBase` expression it replaces could never be anything but 0.
-        const purchaseCost = await loadAlignmentPurchaseLineCost(
-          tx,
-          candidate.sourceLineId,
-          purchaseLineCostCache,
-        )
+        // Read in the up-front pass above, under the step-2 cost-row locks, before anything was
+        // written — NOT here. See that pass for why the order of the two matters.
+        const purchaseCost = costByAsnLineMapId.get(candidate.id)
+        if (!purchaseCost) {
+          throw new Error(
+            `Alignment has no pre-read cost for ASN line ${candidate.id}. The cost pass and the `
+            + 'allocation loop must walk the same plan (o3d-6nd55).',
+          )
+        }
         const unitCostBase = purchaseCost.grossUnitCostBase
         await tx.stockMovement.update({
           where: { id: movement.id },
@@ -1630,7 +1858,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
           // `pinnedLedgerIsServicedUnderLock` locks the `plugin_*` rows only
           // (lib/integration-plugin-selection-lock.ts:66-78), which is a different question from
           // "are these still the right account codes".
-          const accounts = await readStockReceiptAccountsTx(tx, accountingConnector)
+          const accounts = await accountsForPosting(accountingConnector)
           const payload = {
             date: now.toISOString().slice(0, 10),
             reference: `Receipt: ${purchaseCost.poReference}`,
@@ -1664,30 +1892,13 @@ export async function applyMintsoftAlignmentForProduct(params: {
             // payload above.
             connector: accountingConnector,
           })
-          // REFUSE IF THE MAPPING MOVED. Under READ COMMITTED this re-read takes a FRESH snapshot,
-          // so it observes an account remap that managed to commit between the read above and now —
-          // which is what makes it a usable assertion that none did. Throwing rolls the whole
-          // alignment back: no movement, no layer, no stock, no journal, and the next sweep measures
-          // both sides afresh and posts against the NEW mapping. Committing instead would leave a
-          // journal on codes no later reconciliation uses, unrecoverable without a manual
-          // correction. Deliberately a refusal and not a lock: locking arbitrary `settings` rows
-          // from here would invent a second lock order over a table the enqueue already locks
-          // `plugin_*`-first.
-          const accountsAfterEnqueue = await readStockReceiptAccountsTx(tx, accountingConnector)
-          if (
-            accountsAfterEnqueue.inventoryAccount !== accounts.inventoryAccount
-            || accountsAfterEnqueue.transitAccount !== accounts.transitAccount
-          ) {
-            throw new Error(
-              `Accounting account mapping changed while aligning ${params.sku} up against ASN `
-              + `${candidate.asn.externalAsnId} for PO ${purchaseCost.poReference}: inventory `
-              + `${accounts.inventoryAccount || '(unset)'} -> `
-              + `${accountsAfterEnqueue.inventoryAccount || '(unset)'}, transit `
-              + `${accounts.transitAccount || '(unset)'} -> `
-              + `${accountsAfterEnqueue.transitAccount || '(unset)'}. `
-              + 'Refusing so the next sweep aligns against the current mapping (o3d-6nd55).',
-            )
-          }
+          // NO POST-ENQUEUE RE-READ, and the reason is measured rather than argued (o3d-6nd55 r2,
+          // following o3d-8f0p6 r4 to the same conclusion on the same evidence). Round 1 put one here
+          // and refused on a difference. Codex round 2 showed refusal was the wrong instrument — it
+          // sees only a remap that ALREADY committed — and the lock above replaced it. The re-read was
+          // then re-run as a mutation: DELETING it turned no arm red, while deleting the LOCK is caught
+          // by the mapping arm on its own. A check that cannot fail is not a guarantee, so it is gone
+          // rather than believed. The lock is the guarantee.
           // 6oyu.4 (khdw): a receipt CREDITS the transit clearing account, draining goods-in-transit
           // into inventory, so the signed subledger delta is −amount. Recorded on the QUEUE'S OWN
           // decision (bcz9.4) rather than a second settings read, so the two can never disagree: a
