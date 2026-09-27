@@ -148,6 +148,10 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
         const bom = boms.find((entry) => entry.productId === where.productId)
         return bom ? { ...bom, active: (bom as { active?: boolean }).active ?? true } : null
       },
+      // No ACTIVE duplicate Boms (round 8): these cases are about the claimed recipe, and an empty
+      // result is the "nothing else is active for this parent" state they all assume. The refusal that
+      // reads this is exercised for real in tests/concurrency/bom-recipe-import.concurrent.test.ts.
+      findMany: async () => [],
       findFirst: async ({ where }: { where: { productId: null; items: { some: { parentProductId: string } } } }) => {
         calls.push('bom.findFirst')
         const parent = where.items.some.parentProductId
@@ -594,6 +598,79 @@ test('[o3d-zjsb5.9 r2] the editor ROLLS BACK the ProductComponent write when the
   )
 })
 
+test('[o3d-zjsb5.9 r8] the production order is INSERTED inside the locked transaction', async () => {
+  /**
+   * WHY THIS IS A SOURCE-SHAPE TEST and not a behavioural one, stated because the honest answer is less
+   * flattering than a green concurrency test. The defect was the INSERT landing after the transaction
+   * committed and the graph lock released, so a conversion in that gap produced an order against a
+   * retired recipe. The window is between this function's own commit and its own next statement -- there
+   * is no point at which another connection can be made to act inside it on demand.
+   *
+   * The concurrency test that attacks the surrounding boundary
+   * ('a conversion after the recipe sync but before the insert creates NO order') passes either way:
+   * with the insert outside, round 4's locked read ALREADY refuses that interleaving, so it cannot
+   * distinguish the two. I verified that by mutation -- moving the insert back out left it green. Rather
+   * than report a mutation-proof test I do not have, the property is pinned here structurally.
+   *
+   * WHAT WOULD STILL PASS THIS: an insert inside the transaction that uses the wrong bomId, or a second
+   * insert added outside that this does not name. It pins placement, not correctness.
+   */
+  const src = await readFile(path.join(process.cwd(), 'app/actions/manufacturing.ts'), 'utf8')
+  const start = src.indexOf('export async function createManufacturingOrder')
+  assert.ok(start !== -1, 'createManufacturingOrder must exist')
+  const body = src.slice(start, src.indexOf('\nexport ', start + 1))
+
+  const txAt = body.indexOf('await db.$transaction(')
+  const insertAt = body.indexOf('productionOrder.create(')
+  assert.ok(txAt !== -1, 'it must still do its work in a transaction')
+  assert.ok(insertAt !== -1, 'it must still create a production order')
+  assert.ok(
+    insertAt > txAt,
+    'the insert must be INSIDE the transaction. Creating it afterwards means the graph lock that '
+    + 'validated the recipe has already been released, and a BOM -> SIMPLE conversion in that gap leaves '
+    + 'an order against a retired recipe whose start snapshots an empty component list',
+  )
+  assert.equal(
+    body.slice(insertAt - 3, insertAt), 'tx.',
+    'and it must use the TRANSACTION client -- `db.productionOrder.create` inside the callback would '
+    + 'run on a separate connection outside the transaction, which is the same defect wearing the right '
+    + 'indentation',
+  )
+  // The lock must be taken before the insert, not merely somewhere in the same function.
+  const lockAt = body.indexOf('pg_advisory_xact_lock')
+  assert.ok(lockAt !== -1 && lockAt < insertAt, 'the graph lock must be held when the insert runs')
+})
+
+test('[o3d-zjsb5.9 r8] STARTING an order revalidates eligibility before it reserves anything', async () => {
+  // The order of these three is the property: both checks must precede the reservation, or the refusal
+  // happens after stock has already been committed to an order that is about to be refused.
+  const src = await readFile(path.join(process.cwd(), 'app/actions/manufacturing.ts'), 'utf8')
+  const start = src.indexOf("} else if (status === 'IN_PROGRESS') {")
+  assert.ok(start !== -1, 'the start branch must exist')
+  const body = src.slice(start, src.indexOf('} else if (status', start + 10))
+
+  const typeAt = body.indexOf("lockedProduct.type !== 'BOM'")
+  const emptyAt = body.indexOf('componentSnapshot.length === 0')
+  const reserveAt = body.indexOf('reserveAvailableStock(')
+  const lockAt = body.indexOf('pg_advisory_xact_lock')
+  assert.ok(typeAt !== -1, 'starting must revalidate that the product is still BOM-typed')
+  assert.ok(emptyAt !== -1, 'starting must refuse an empty component list')
+  assert.ok(reserveAt !== -1, 'the start branch must still reserve stock')
+  assert.ok(lockAt !== -1 && lockAt < typeAt, 'and must hold the component-graph lock while it revalidates')
+  assert.ok(typeAt < reserveAt, 'the type check must come BEFORE any reservation')
+  assert.ok(emptyAt < reserveAt, 'the empty-recipe check must come BEFORE any reservation')
+
+  // The graph lock must be taken BEFORE the order row lock. Two paths that disagree about lock order
+  // deadlock under exactly the concurrency they were added to survive (#715 r3).
+  const rowLockAt = body.indexOf('FOR UPDATE')
+  assert.ok(rowLockAt !== -1, 'the start branch must still lock the order row')
+  assert.ok(
+    lockAt < rowLockAt,
+    'the component-graph lock must be acquired BEFORE the order row lock, matching import.ts and '
+    + 'products.ts; the reverse order is a deadlock pair',
+  )
+})
+
 test('[o3d-zjsb5.9 r6] every BomItem cycle walk uses the ONE shared graph definition', async () => {
   // Round 5's finding 2 was two walks disagreeing about what the graph is: the write paths scoped to
   // active BOMs, the drift check scoped to nothing, so a retirement plus a reverse edge was a cycle to
@@ -733,6 +810,7 @@ test('[o3d-zjsb5.9 r2] adoption is a compare-and-set: the loser is REFUSED, not 
     bom: {
       // Snapshot read: both callers see the row as it was BEFORE either claim.
       findUnique: async () => null,
+      findMany: async () => [],
       findFirst: async () => ({ id: 'legacy' }),
       update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         const bom = live.find((entry) => entry.id === where.id)!

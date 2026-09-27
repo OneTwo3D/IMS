@@ -213,6 +213,14 @@ export const PLANNING_REACHABLE_BOM_EDGES = {
 
 export type BomRecipeSyncOutcome =
   | { kind: 'written'; bomId: string; claimed: 'created' | 'adopted' | 'already' }
+  /**
+   * Another ACTIVE Bom holds items for this same parent, so planning would read both (round 8).
+   * Refused rather than written: `replenishment-reports.ts` selects every active BomItem whose parent
+   * is BOM-typed, with no "the claimed one wins" rule, so two active recipes for one product means
+   * component demand is the SUM of both. The import succeeding there would produce a silently wrong
+   * plan, and the drift check reporting it afterwards does not stop the number being used.
+   */
+  | { kind: 'active-duplicates'; bomId: string; duplicateBomIds: string[] }
   | { kind: 'cycle'; path: string[] }
   /**
    * The adoption lost a race: the row this call chose was claimed by another writer between the
@@ -303,6 +311,36 @@ export async function syncBomRecipeFromProductComponents(
     claimKind = 'created'
   }
 
+  // ACTIVE DUPLICATES ARE REFUSED, not adopted around (round 8, finding 2).
+  //
+  // Items for this parent living in some OTHER Bom are deliberately kept (a completed ProductionOrder
+  // is valued through them), and while those Boms are INACTIVE that is harmless: no planning reader can
+  // traverse them, which is what PLANNING_REACHABLE_BOM_EDGES encodes. But an ACTIVE one is read
+  // alongside the claimed recipe and its quantities are ADDED, because the planning explosion has no
+  // "the claimed Bom wins" rule -- so the import would succeed while every plan for this product
+  // double-counted. Reporting that as drift afterwards does not prevent the wrong number being used.
+  //
+  // REFUSING, rather than deactivating them here: silently deactivating another Bom is a data change
+  // nobody asked for and could be somebody's live recipe for a different parent -- these rows are
+  // shared. A loud refusal naming the rows is resolvable at source, which is where catalogue problems
+  // belong. The reader-side fix (teach planning to prefer the claimed recipe) stays in o3d-zjsb5.30.
+  const activeDuplicates = await client.bom.findMany({
+    where: {
+      id: { not: bomId },
+      active: true,
+      items: { some: { parentProductId: productId } },
+    },
+    select: { id: true },
+    orderBy: { id: 'asc' },
+  })
+  if (activeDuplicates.length > 0) {
+    return {
+      kind: 'active-duplicates',
+      bomId,
+      duplicateBomIds: activeDuplicates.map((duplicate) => duplicate.id),
+    }
+  }
+
   // Replace, never merge: the component list is the whole recipe, so a component the CSV dropped
   // must leave the BomItem side too or the two representations diverge in the direction planning
   // over-orders.
@@ -371,6 +409,7 @@ export type BomRecipeReconcileOutcome =
   | { kind: 'retired'; retiredBomId: string | null }
   | { kind: 'cycle'; path: string[] }
   | { kind: 'claim-contended'; bomId: string }
+  | { kind: 'active-duplicates'; bomId: string; duplicateBomIds: string[] }
 
 type BomReconcileClient = BomSyncClient & Pick<Prisma.TransactionClient, 'productComponent'>
 
@@ -412,7 +451,9 @@ export async function reconcileBomRecipeForProductType(
       qty: Number(component.qty),
     })),
   })
-  if (outcome.kind === 'cycle' || outcome.kind === 'claim-contended') return outcome
+  // EXHAUSTIVE, for the same reason the call sites are (round 6): a new refusal kind must reach the
+  // caller and abort, not fall through into a 'synced' result that claims a recipe was written.
+  if (outcome.kind !== 'written') return outcome
   return { kind: 'synced', bomId: outcome.bomId, claimed: outcome.claimed }
 }
 
@@ -655,8 +696,17 @@ export class BomRecipeRefusedError extends Error {
 
 /** The operator-facing message for a refused recipe write, shared by every caller. */
 export function describeBomRecipeRefusal(
-  outcome: { kind: 'cycle'; path: string[] } | { kind: 'claim-contended'; bomId: string },
+  outcome:
+    | { kind: 'cycle'; path: string[] }
+    | { kind: 'claim-contended'; bomId: string }
+    | { kind: 'active-duplicates'; bomId: string; duplicateBomIds: string[] },
 ): string {
+  if (outcome.kind === 'active-duplicates') {
+    return 'This product has more than one ACTIVE manufacturing recipe — nothing was saved. Planning '
+      + 'adds up the components of every active recipe, so it would over-order for this product. '
+      + `Deactivate the duplicate BOM(s) ${outcome.duplicateBomIds.join(', ')} (keep them, so past build `
+      + `orders still report correctly) and leave ${outcome.bomId} as the live one, then re-run`
+  }
   if (outcome.kind === 'cycle') {
     return 'Circular reference detected in the manufacturing BOM graph ('
       + `${outcome.path.join(' -> ')}) — nothing was saved. An older BOM recipe for a different product may still `

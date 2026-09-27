@@ -108,6 +108,12 @@ is an explicit check:
 - `npm run check:bom-recipes` — the same check from the command line. It exits non-zero when
   anything disagrees, so it can gate a data load.
 
+**Two active recipes stops an import.** If a product somehow has more than one *active* manufacturing
+recipe — usually a legacy recipe left by an older data load — importing it is refused, and the message
+names the duplicate recipes. This is deliberate: planning adds up the components of every active recipe,
+so it would over-order for that product. Deactivate the duplicates (keep them, so past build orders
+still report correctly), leave one as the live recipe, and re-run the import.
+
 **A retired recipe is not a disagreement.** The check only reports a circular recipe that *planning
 can actually reach* — an active recipe whose product is still a BOM. Retiring a recipe keeps its lines
 on purpose (see **Changing a product's type** below), so a retired line pointing back at a product

@@ -451,7 +451,34 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       if (synced.kind !== 'written') {
         throw new BomRecipeRefusedError(describeBomRecipeRefusal(synced))
       }
-      return { ...synced, sku: locked.sku, name: locked.name }
+
+      // THE ORDER IS CREATED IN HERE, under the lock that validated it (round 8, finding 1).
+      // Creating it after this transaction committed left a gap: the lock was released, and a
+      // concurrent BOM -> SIMPLE conversion could retire the Bom and clear ProductComponent before the
+      // insert landed. The order was still created against the retired recipe, and STARTING it then
+      // snapshotted the now-empty component list -- assembly with nothing reserved, which is the
+      // consequence that actually costs stock.
+      //
+      // Same boundary as round 4, other side of it. Round 4 moved the READ inside the lock because a
+      // snapshot older than the lock describes a state the lock is not protecting; this moves the WRITE
+      // inside for the mirror-image reason -- a write landing after the lock is a write nothing
+      // protected. Validating under a lock and then acting outside it is not serialization.
+      const reference = makeReference()
+      const created = await tx.productionOrder.create({
+        data: {
+          reference,
+          orderType: input.orderType,
+          bomId: synced.bomId,
+          outputProductId: input.productId,
+          warehouseId: input.warehouseId,
+          manufacturerId: input.manufacturerId || null,
+          qtyPlanned: input.qtyPlanned,
+          scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
+          notes: input.notes || null,
+        },
+        select: { id: true },
+      })
+      return { ...synced, sku: locked.sku, name: locked.name, orderId: created.id, reference }
     })
     if (claim.kind === 'gone') {
       return { success: false, error: 'Product not found.' }
@@ -470,26 +497,11 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
           + 'Nothing was created.',
       }
     }
-    const bom = { id: claim.bomId }
-
-    const reference = makeReference()
-    const order = await db.productionOrder.create({
-      data: {
-        reference,
-        orderType: input.orderType,
-        bomId: bom.id,
-        outputProductId: input.productId,
-        warehouseId: input.warehouseId,
-        manufacturerId: input.manufacturerId || null,
-        qtyPlanned: input.qtyPlanned,
-        scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
-        notes: input.notes || null,
-      },
-    })
+    const { orderId, reference } = claim
 
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
-      entityId: order.id,
+      entityId: orderId,
       tag: 'manufacturing',
       action: 'created',
       // From the LOCKED read, not the preflight: the activity log must describe the product as it was
@@ -499,7 +511,7 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     })
 
     revalidatePath('/manufacturing')
-    return { success: true, id: order.id }
+    return { success: true, id: orderId }
   } catch (e) {
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
@@ -1139,6 +1151,19 @@ export async function updateManufacturingOrderStatus(
       let startedComponents: ProductionOrderComponentSnapshot = []
       // Reserve inside the same locked transaction as the status transition.
       await db.$transaction(async (tx) => {
+        // THE GRAPH LOCK FIRST, then the order row (round 8, finding 1, second half).
+        //
+        // The order row lock alone does not stop an editor or an import changing the recipe while this
+        // start runs, and STARTING is where the damage lands: the snapshot frozen here is what
+        // completion consumes, so an empty one means an assembly that reserves nothing and then
+        // consumes nothing while producing output. Taking the same lock the recipe writers take is what
+        // makes the read below authoritative rather than merely fresh.
+        //
+        // ORDER MATTERS: graph lock OUTERMOST, then row locks -- the same order `import.ts` and
+        // `products.ts` use. Acquiring the row first and the graph lock second would make this the
+        // reverse-order pair that #715 r3 was raised for, and two paths that disagree about lock order
+        // deadlock under exactly the concurrency they were added to survive.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
         await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
         const lockedOrder = await tx.productionOrder.findUnique({
           where: { id },
@@ -1158,6 +1183,30 @@ export async function updateManufacturingOrderStatus(
         const componentSnapshot: ProductionOrderComponentSnapshot = liveComponents.map(
           (comp) => ({ componentId: comp.componentId, qty: Number(comp.qty) }),
         )
+
+        // STILL ELIGIBLE? Creation validated this, but starting is a SEPARATE act with its own gap, and
+        // a build order can sit in DRAFT for days while the catalogue changes underneath it. Refusing
+        // here fails closed and is recoverable -- fix the recipe, start again -- whereas proceeding
+        // freezes an empty snapshot onto the order and every later step trusts it.
+        const lockedProduct = await tx.product.findUnique({
+          where: { id: orderPreview.outputProductId },
+          select: { type: true, sku: true },
+        })
+        if (!lockedProduct) throw new Error('The product this order builds no longer exists.')
+        if (lockedProduct.type !== 'BOM') {
+          throw new Error(
+            `${lockedProduct.sku} is no longer a manufactured (BOM) product — it is now `
+            + `${lockedProduct.type}, so it has no recipe to build. Nothing was reserved and the order `
+            + 'was not started.',
+          )
+        }
+        if (componentSnapshot.length === 0) {
+          throw new Error(
+            `${lockedProduct.sku} has no components, so starting this order would reserve nothing and `
+            + 'then assemble from an empty recipe. Restore its components and start the order again. '
+            + 'Nothing was reserved.',
+          )
+        }
         startedComponents = componentSnapshot
 
         if (isAssembly) {

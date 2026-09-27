@@ -1088,7 +1088,9 @@ export async function updateProduct(
     // THROWN for the same reason as in `saveProductComponents`: the type write and the component
     // delete above are already in this transaction, so a return would commit them while refusing
     // the recipe half.
-    if (bomReconcile.kind === 'cycle' || bomReconcile.kind === 'claim-contended') {
+    // EXHAUSTIVE (round 8): listing the kinds meant round 8's new `active-duplicates` would have
+    // fallen straight through and committed. `synced`/`retired` are the only non-refusals.
+    if (bomReconcile.kind !== 'synced' && bomReconcile.kind !== 'retired') {
       throw new BomRecipeRefusedError(describeBomRecipeRefusal(bomReconcile))
     }
 

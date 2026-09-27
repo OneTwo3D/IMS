@@ -611,6 +611,14 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 + 'was running — the row was not written, re-run to pick it up',
               )
             }
+            // EXHAUSTIVE (round 8), for the same reason as the component pass: this listed the kinds it
+            // knew, so round 8's `active-duplicates` would have fallen through and committed the type
+            // write with a recipe planning double-counts. Anything that is not a success refuses.
+            if (importReconcile.kind !== 'synced' && importReconcile.kind !== 'retired') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): ${describeBomRecipeRefusal(importReconcile)}`,
+              )
+            }
             // The structure this row ACTUALLY committed, for the in-run cache below. The
             // locked defaults can preserve a concurrent type/parent, so the pre-lock values
             // no longer describe the row (Codex review, r3).

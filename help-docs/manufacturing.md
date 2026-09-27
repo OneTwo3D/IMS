@@ -39,6 +39,11 @@ written** — you are told which of these happened:
 In every case no build order is created and the recipe is left exactly as it was. A refusal never
 leaves a half-applied change behind.
 
+**Starting an order re-checks it too.** A build order can sit in draft for days, so the recipe is
+checked again at the moment you start it — before any stock is reserved. Starting is refused if the
+product is no longer a manufactured (BOM) product, or if its components have been removed. Nothing is
+reserved and the order stays in draft, so you can fix the recipe and start it again.
+
 ## Lifecycle status and manufacturing
 
 The BOM product's [lifecycle status](glossary.md#lifecycle-status) controls which manufacturing operations are allowed:

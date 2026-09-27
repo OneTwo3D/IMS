@@ -459,6 +459,220 @@ test(
 )
 
 test(
+  '[o3d-zjsb5.9 r8] a conversion after the recipe sync but before the insert creates NO order',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 7, FINDING 1 -- the same boundary as round 4, from the other side. Round 4 moved the READ
+     * inside the graph lock. The order INSERT was still outside it: the transaction validated the
+     * product, synced the recipe, COMMITTED, and only then created the production order. A BOM -> SIMPLE
+     * conversion in that gap retired the Bom and cleared ProductComponent, and the order was created
+     * anyway -- against a retired recipe, which STARTING would then snapshot as empty.
+     *
+     * The window is between the sync and the insert, both of which are now in one transaction, so it
+     * cannot be entered from outside any more -- which is the point, and also why this test attacks the
+     * boundary rather than that interior gap: it holds the graph lock, lets the whole create block on it,
+     * converts the product, and releases. If the insert is inside the lock the conversion is seen and the
+     * order is refused; if it is outside, the order lands against the retired recipe.
+     */
+    const deps = await loadDeps()
+    const NS = 'H'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      await awaitAdvisoryLockWaiter(deps)
+      // A type conversion, exactly as updateProduct performs one: type away from BOM, components
+      // cleared, recipe retired with its items kept.
+      await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+      await deps.db.$executeRaw`UPDATE products SET type = 'SIMPLE' WHERE id = ${tableId}`
+      await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE "productId" = ${tableId}`
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.equal(created.success, false, 'the build order must be REFUSED, not raised against a retired recipe')
+    // THE DATABASE, not the return value: the finding is precisely that the action could report one
+    // thing while the insert landed anyway.
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'NO production order may exist for a product that stopped being a BOM before the insert',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r8] STARTING an order revalidates the recipe and reserves nothing when it is gone',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * THE SECOND HALF of round 7's finding 1, and the half that actually costs stock. Creation is not the
+     * only gap: an order can sit in DRAFT while the catalogue changes, and STARTING it froze
+     * `componentSnapshot` from a live read with no eligibility check. An emptied recipe therefore froze
+     * `[]`, the ASSEMBLY reservation loop ran zero times, and completion produced finished goods while
+     * consuming and reserving NOTHING -- stock invented from an empty recipe.
+     *
+     * Asserted on the reservations, not just the refusal, because "reserved nothing" is the damage.
+     */
+    const deps = await loadDeps()
+    const NS = 'I'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+    assert.deepEqual(errorsOf(await deps.importOpeningStockCsv(csv([
+      'sku,warehouseCode,qty,unitCostBase',
+      `${sku(NS, 'RAW')},${warehouse.code},500,1`,
+      `${sku(NS, 'LEG')},${warehouse.code},500,2`,
+    ]))), [], 'opening stock must load')
+
+    const created = await deps.createManufacturingOrder({
+      productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 2,
+    })
+    assert.ok(created.success && created.id, `order create failed: ${JSON.stringify(created)}`)
+
+    // Now the recipe goes away while the order sits in DRAFT -- no race needed; this is a Tuesday.
+    await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+    const reservedBefore = await deps.db.stockLevel.findMany({
+      where: { warehouseId: warehouse.id }, select: { productId: true, reservedQty: true },
+      orderBy: { productId: 'asc' },
+    })
+
+    const started = await deps.updateManufacturingOrderStatus(created.id, 'IN_PROGRESS')
+    assert.equal(started.success, false, 'starting an order whose recipe was emptied must be REFUSED')
+
+    const after = await deps.db.productionOrder.findUniqueOrThrow({
+      where: { id: created.id }, select: { status: true, componentSnapshot: true, startedAt: true },
+    })
+    assert.equal(after.status, 'DRAFT', 'the order must not have moved to IN_PROGRESS')
+    assert.equal(after.startedAt, null, 'and must not have been stamped as started')
+    assert.notDeepEqual(after.componentSnapshot, [],
+      'and must NOT have frozen an empty component snapshot -- that snapshot is what completion consumes')
+    assert.deepEqual(
+      await deps.db.stockLevel.findMany({
+        where: { warehouseId: warehouse.id }, select: { productId: true, reservedQty: true },
+        orderBy: { productId: 'asc' },
+      }),
+      reservedBefore,
+      'and NOTHING may be reserved -- an assembly that reserves nothing is the loss this prevents',
+    )
+
+    // AND THE TYPE ARM: still refused when the product stops being a BOM, components intact.
+    const NS2 = 'J'
+    const second = await seedCatalogue(deps, NS2)
+    const warehouse2 = await ownWarehouse(deps, NS2)
+    // STOCK, so the refusal below can only be about the TYPE. Without it this arm refused for want of
+    // stock and passed with the type check deleted -- a mutation survived and said so.
+    assert.deepEqual(errorsOf(await deps.importOpeningStockCsv(csv([
+      'sku,warehouseCode,qty,unitCostBase',
+      `${sku(NS2, 'RAW')},${warehouse2.code},500,1`,
+      `${sku(NS2, 'LEG')},${warehouse2.code},500,2`,
+    ]))), [], 'opening stock must load for the type arm')
+    const order2 = await deps.createManufacturingOrder({
+      productId: second.tableId, warehouseId: warehouse2.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+    })
+    assert.ok(order2.success && order2.id, `second order create failed: ${JSON.stringify(order2)}`)
+    await deps.db.$executeRaw`UPDATE products SET type = 'SIMPLE' WHERE id = ${second.tableId}`
+    const started2 = await deps.updateManufacturingOrderStatus(order2.id, 'IN_PROGRESS')
+    assert.equal(started2.success, false, 'starting an order whose product is no longer a BOM must be REFUSED')
+    assert.match(
+      String(started2.error), /no longer a manufactured \(BOM\) product|no recipe to build/i,
+      `and refused FOR THE TYPE, not incidentally for want of stock, got: ${started2.error}`,
+    )
+    assert.equal(
+      (await deps.db.productionOrder.findUniqueOrThrow({
+        where: { id: order2.id }, select: { status: true },
+      })).status,
+      'DRAFT',
+      'and it must stay in DRAFT',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r8] an import is REFUSED while another ACTIVE Bom holds items for the same parent',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 7, FINDING 2 -- a deferral reversed, because the adoption path CREATES the situation the
+     * deferral assumed away. Adoption rewrites one Bom and leaves the others in place; while they are
+     * inactive that is harmless, but `replenishment-reports.ts` selects every ACTIVE BomItem whose parent
+     * is BOM-typed and has no "the claimed Bom wins" rule, so two active recipes for one product means
+     * component demand is the SUM of both. The import used to succeed and every plan double-counted,
+     * with the drift check reporting it afterwards -- observing a wrong number while it is used.
+     *
+     * Refused at the import, not fixed in the readers: that keeps the reader-side change in
+     * o3d-zjsb5.30 and makes this fail closed, loudly, where a PREP phase can resolve it at source.
+     */
+    const deps = await loadDeps()
+    const NS = 'K'
+    const { tableId, legId, rawId } = await seedCatalogue(deps, NS)
+    const claimed = await deps.db.bom.findUniqueOrThrow({ where: { productId: tableId }, select: { id: true } })
+
+    // A second ACTIVE Bom holding items for the SAME parent -- what a legacy load or an older snapshot
+    // leaves behind. Unclaimed, so it does not collide with the productId unique index.
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // PRECONDITION: planning really does read BOTH, so the refusal is preventing a real wrong number and
+    // not guarding a hypothetical. This is the reader's own predicate.
+    const visibleToPlanning = await deps.db.bomItem.findMany({
+      where: { bom: { active: true }, parentProduct: { id: tableId, type: 'BOM' } },
+      select: { bomId: true },
+    })
+    assert.ok(
+      new Set(visibleToPlanning.map((item) => item.bomId)).size > 1,
+      'precondition: planning must be able to see items for this parent in MORE THAN ONE active Bom, '
+      + 'or this test is not about double-counting at all',
+    )
+
+    const before = await snapshotRecipe(deps, tableId, claimed.id)
+    const result = await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'LEG')}:7;${sku(NS, 'RAW')}:2,each`,
+    ]))
+    const errors = errorsOf(result)
+    assert.ok(
+      errors.some((line) => /more than one ACTIVE manufacturing recipe/i.test(line)),
+      `the import must be REFUSED while active duplicates exist, got: ${JSON.stringify(errors)}`,
+    )
+    assert.ok(
+      errors.some((line) => line.includes(duplicate.id)),
+      `and the refusal must NAME the duplicate so it can be resolved, got: ${JSON.stringify(errors)}`,
+    )
+    // Neither representation may have moved: the qty 7 the CSV asked for must not be anywhere.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, claimed.id), before,
+      'the refused import must leave the claimed recipe exactly as it was')
+    assert.deepEqual(
+      (await deps.db.productComponent.findMany({
+        where: { productId: tableId, componentId: legId }, select: { qty: true },
+      })).map((row) => String(row.qty)).map((qty) => qty.split('.')[0]),
+      ['4'],
+      'and must not have committed the new ProductComponent qty either',
+    )
+
+    // AND IT CLEARS: deactivating the duplicate (keeping its rows) lets the same import through.
+    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'LEG')}:7;${sku(NS, 'RAW')}:2,each`,
+    ]))), [], 'once the duplicate is deactivated the same import must succeed')
+    assert.ok(
+      (await deps.db.bomItem.findMany({ where: { bomId: duplicate.id } })).length > 0,
+      'and the duplicate\'s ROWS must still be there -- deactivate, never delete, so history resolves',
+    )
+    void rawId
+  },
+)
+
+test(
   '[o3d-zjsb5.9 r6] components cleared while a build order waits for the lock is REFUSED, and nothing is written',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
