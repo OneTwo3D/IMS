@@ -147,3 +147,99 @@ export function productionSources(): Array<[string, string]> {
   assert.ok(files.length > 500, `expected to scan the whole of app/ and lib/, saw ${files.length} files`)
   return files.map((f) => [path.relative(ROOT, f), readFileSync(f, 'utf8')])
 }
+
+/**
+ * The value of an OWN top-level property `key` of the object literal `objectText`, or null.
+ *
+ * NOT the shared scanner's `topLevelProperty`, and the difference is a hole this census actually fell
+ * into. That helper treats any occurrence of the key at brace depth 1 whose preceding character is not
+ * a word character as a property — so in
+ *
+ *     queueAccountingSync({ type: 'SALES_INVOICE', payload, chartConnector: settings.connector })
+ *
+ * it reads the `connector` of `settings.connector` as a SHORTHAND `connector` property of the enqueue
+ * itself, i.e. as a PIN. Every chartered site therefore also scored as pinned, which means the "or pins
+ * the ledger" arm of the rule was satisfiable by an accidental member access — and the mutation that
+ * removed `chartConnector: settings.connector` from a site could have gone red for the wrong reason,
+ * because it removed the decoy member access in the same stroke. A `.` before the key disqualifies it
+ * here, so a member access is never a property, and the M5b mutation below keeps that honest: it leaves
+ * the member access in place and removes only the property.
+ *
+ * Shorthand still counts — `{ ...request, chartConnector }` is the same attribution with the colon left
+ * off — reported as the shared scanner's SHORTHAND sentinel so the two agree on that much.
+ */
+export function ownProperty(objectText: string, key: string): string | null {
+  let depth = 0
+  for (let i = 0; i < objectText.length; i++) {
+    const ch = objectText[i]
+    if (ch === '{' || ch === '[' || ch === '(') { depth++; continue }
+    if (ch === '}' || ch === ']' || ch === ')') { depth--; continue }
+    if (depth !== 1) continue
+    if (!objectText.startsWith(key, i)) continue
+    // `.` as well as the word characters: `settings.connector` is a member access, not a property.
+    if (i > 0 && /[\w$.]/.test(objectText[i - 1])) continue
+    const rest = objectText.slice(i + key.length)
+    // And the key must END here, so `connector` is not matched inside `connectorSomething`.
+    if (/^[\w$]/.test(rest)) continue
+    if (/^\s*[,}]/.test(rest)) return SHORTHAND
+    const colon = rest.match(/^\s*:/)
+    if (!colon) continue
+    let j = i + key.length + colon[0].length
+    while (j < objectText.length && /\s/.test(objectText[j])) j++
+    if ('({['.includes(objectText[j])) return balancedFrom(objectText, j)
+    let k = j
+    let d = 0
+    while (k < objectText.length) {
+      const c = objectText[k]
+      if ('({['.includes(c)) d++
+      else if (')}]'.includes(c)) { if (d === 0) break; d-- }
+      else if (c === ',' && d === 0) break
+      k++
+    }
+    return objectText.slice(j, k).trim()
+  }
+  return null
+}
+
+/**
+ * o3d-j625 r5 (review M-9) — AN ALIAS IS THE SAME CALL.
+ *
+ * `app/actions/sales.ts` already writes `const { queueAccountingSync: queueUpdate } = await import(…)`, so
+ * a census that matches only the declared names is one rename away from seeing nothing. Aliases are read
+ * out of the file's own destructures, imports and `const` re-bindings and counted as their target.
+ * (A higher-order WRAPPER is not an alias and is not recognised; see the census that uses this.)
+ */
+export function aliasesOf(code: string, callee: string): string[] {
+  const out: string[] = []
+  const patterns = [
+    new RegExp(`\\b${callee}\\s*:\\s*([A-Za-z_$][\\w$]*)`, 'g'),   // { queueAccountingSync: queueUpdate }
+    new RegExp(`\\b${callee}\\s+as\\s+([A-Za-z_$][\\w$]*)`, 'g'),  // import { x as y }
+    // const enqueue = queueAccountingSync / = deps.queueAccountingSync — a re-binding, not a call.
+    new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*(?:[\\w$]+\\.)*${callee}(?![\\w$])(?!\\s*(?:\\?\\.\\s*)?\\()`, 'g'),
+  ]
+  for (const pattern of patterns) {
+    for (let m = pattern.exec(code); m; m = pattern.exec(code)) {
+      const alias = m[1]!
+      // `{ queueAccountingSync: async () => … }` in a double declares a PROPERTY, not an alias.
+      if (alias !== callee && !/^(async|function|await|typeof)$/.test(alias)) out.push(alias)
+    }
+  }
+  return [...new Set(out)]
+}
+
+/**
+ * o3d-j625 r5 (review M-9) — EVERY CALL OF `names`, IN EVERY SPELLING THE LANGUAGE ALLOWS FOR A DIRECT CALL.
+ *
+ * Whole identifier only, then optional whitespace, an optional `?.` (an optional member call — the
+ * injected enqueues in lib/cost-layers.ts are declared optional), and the `(`. Returns the identifier's
+ * index and the index of its open paren. `code` must already be `blankNonCode`d.
+ */
+export function callOpens(code: string, names: readonly string[]): Array<{ at: number; open: number; name: string }> {
+  const out: Array<{ at: number; open: number; name: string }> = []
+  for (const name of names) {
+    const escaped = name.replace(/\$/g, '\\$')
+    const re = new RegExp(`(?<![\\w$])${escaped}\\s*(?:\\?\\.\\s*)?\\(`, 'g')
+    for (let m = re.exec(code); m; m = re.exec(code)) out.push({ at: m.index, open: m.index + m[0].length - 1, name })
+  }
+  return out.sort((a, b) => a.at - b.at)
+}

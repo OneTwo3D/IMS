@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { getAccountingSettings, getActiveAccountingConnectorInfo } from '@/lib/accounting'
+import { getAccountingSettings, getActiveAccountingConnectorInfo, getAccountingSettingsFor } from '@/lib/accounting'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   balanceDateString,
@@ -103,7 +103,10 @@ export async function loadTransitGlReconciliation(options?: {
   const connectorInfo = await getActiveAccountingConnectorInfo()
   if (!connectorInfo) return { available: false, reason: 'no_account_configured' }
   const connector = connectorInfo.id
-  const settings = await getAccountingSettings()
+  // o3d-j625 r5 (review L-10): ONE resolution. The connector above and the chart below were two independent
+  // reads, so a switch between them paired one connector's account codes with the other's snapshots — and
+  // this report's verdict feeds the accounting invariant run. Read FOR the connector already resolved.
+  const settings = await getAccountingSettingsFor(connectorInfo?.id ?? null)
   const transitAccount = settings.transitAccount?.trim()
   if (!transitAccount) return { available: false, reason: 'no_account_configured' }
 

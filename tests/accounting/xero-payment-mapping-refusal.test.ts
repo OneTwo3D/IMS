@@ -145,14 +145,31 @@ mock.module('@/lib/connectors/xero/outbox', {
  * than a canned answer, so "no map at all" and "a map that does not name this method" are two
  * different states of one fixture instead of two different stubs.
  */
+
+/**
+ * o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — WHICH ACCOUNT IDS THE CONNECTOR'S OWN SYNCED CHART HOLDS.
+ * The processor confirms the mapped id against it before carrying it into INVOICE_PAYMENT. Every id is
+ * "held" by default, so every pre-existing test keeps testing what it tested; the r4 tests narrow it.
+ */
+let chartBankAccounts: Set<string> | 'all' = 'all'
+const belongsCalls: Array<{ connector: string; id: string }> = []
 mock.module('@/lib/accounting', {
   namedExports: {
-    getPaymentAccountMap: async () => paymentMap,
+    accountingBankAccountBelongsTo: async (connector: string, id: string) => {
+      belongsCalls.push({ connector, id })
+      return chartBankAccounts === 'all' || chartBankAccounts.has(id)
+    },
+    // o3d-j625 r5 (review L-9): the REAL `getPaymentAccountMap` returns the setting's JSON STRING. This
+    // fixture handed back an object, which is why the processors' "no map configured at all" arm — asked as
+    // `Object.keys(mapJson)` — was dead in production and alive here. Modelled as production produces it.
+    getPaymentAccountMap: async () => (paymentMap === null ? '{}' : JSON.stringify(paymentMap)),
     // KEYED THE WAY THE REAL ONE IS (o3d-batch-ret r11): `method:currency`, then the `method:*`
     // wildcard. A currency-blind stub would have made every assertion about WHICH account the money
     // reached vacuous — which is the whole of this round's finding.
-    lookupPaymentAccount: (map: Record<string, string> | null, method: string, currency: string) =>
-      map?.[`${method}:${currency}`] ?? map?.[`${method}:*`] ?? null,
+    lookupPaymentAccount: (mapJson: string, method: string, currency: string) => {
+      const map = ((): Record<string, string> => { try { return JSON.parse(mapJson) as Record<string, string> } catch { return {} } })()
+      return map[`${method}:${currency}`] ?? map[`${method}:*`] ?? null
+    },
     isAccountingSyncTypeEnabled: async () => true,
     // The re-drive asks whether the PINNED connector posts payments at all. `false` would end the
     // call before the fence, so the fixture must say yes or it would prove nothing.
@@ -202,6 +219,8 @@ function reset(map: Record<string, string> | null) {
   store = createSyncLogStore([syncLogRow(SALES_CANDIDATE)])
   activity.length = 0
   paymentMap = map
+  chartBankAccounts = 'all'
+  belongsCalls.length = 0
   salesOrders = new Map([['order-1', { id: 'order-1', status: 'PROCESSING', accountingInvoiceId: null }]])
 }
 
@@ -1320,4 +1339,38 @@ test('[o3d-batch-ret r12] the absent-currency refusal does not consult the IMS b
       + 'reads as blank, or will not read at all. Three different sentences would mean the decision '
       + `still depends on a value that says nothing about the ledger — got ${JSON.stringify([...new Set(sentences)])}`,
   )
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-j625 r4 (Codex HIGH 1, was o3d-l9ok) — the mapped account is confirmed as Xero's before it is carried.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-j625 r4] a mapped bank account that is NOT in Xero\'s synced chart is REFUSED, and no payment row is created', async () => {
+  // The shared map was filled in under the other connector: `card:GBP` resolves to an id this
+  // connector's chart does not hold.
+  reset({ 'card:GBP': 'OTHER-CONNECTOR-BANK' })
+  chartBankAccounts = new Set(['BANK-1'])
+
+  await (await loadSweep())()
+
+  assert.deepEqual(belongsCalls, [{ connector: 'xero', id: 'OTHER-CONNECTOR-BANK' }], 'PRECONDITION: the mapped id was checked against THIS connector')
+  assert.equal(followUpTypes().includes('INVOICE_PAYMENT'), false, 'no payment may be queued naming an account the ledger does not hold')
+  const refusal = paymentRefusals()
+  assert.equal(refusal.length, 1, 'the operator is told')
+  assert.equal(refusal[0].metadata?.reason, 'payment_account_unmapped', 'the remedy is a setting, as for an unmapped method')
+  assert.equal(refusal[0].metadata?.paymentAccountRefusal, 'not_in_connector_chart')
+  assert.equal(refusal[0].metadata?.mappedBankAccountId, 'OTHER-CONNECTOR-BANK')
+  assert.match(String(refusal[0].description), /shared by every accounting connector/)
+})
+
+test('[o3d-j625 r4] CONTROL: a mapped account that IS in the chart is carried into INVOICE_PAYMENT verbatim', async () => {
+  reset({ 'card:GBP': 'BANK-1' })
+  chartBankAccounts = new Set(['BANK-1'])
+
+  await (await loadSweep())()
+
+  const payment = store.rows.find((row) => row.type === 'INVOICE_PAYMENT')
+  assert.ok(payment, 'the payment is queued')
+  assert.equal((payment.payload as Record<string, unknown>).bankAccountId, 'BANK-1', 'the CONFIRMED id is the one the poster will send')
+  assert.deepEqual(paymentRefusals(), [])
 })

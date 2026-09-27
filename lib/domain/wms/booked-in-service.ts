@@ -1251,6 +1251,13 @@ export async function processBookedInEvent(
             // than writing this row against a connector other than the one whose accounts are in the
             // payload above.
             connector: accountingConnector,
+            // o3d-j625 r32 (merge with o3d-8f0p6 #713) — THE CHART THE CODES ABOVE CAME FROM.
+            //
+            // o3d-j625 r2 made `chartConnector` REQUIRED on every enqueue, so this call site had to name it
+            // when the two branches met. It is `accountingConnector` because that is literally the argument
+            // `accountsForPosting()` was given when this payload's account codes were read, a few lines up —
+            // not a second resolution taken here, which is the divergence the requirement exists to close.
+            chartConnector: accountingConnector,
           })
           // NO POST-ENQUEUE RE-READ ANY MORE, and the reason is measured rather than argued
           // (o3d-8f0p6 r4). r2 put one here and refused on a difference; r3 showed refusal was the

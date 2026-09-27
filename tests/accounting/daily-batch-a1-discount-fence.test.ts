@@ -82,8 +82,14 @@ const tx = {
     // correction after the comparison, which is the whole interleaving this fence exists to close,
     // and a double that just counted calls would report that as locked.
     const statement = (args[0] as { strings?: string[]; sql?: string; text?: string } | undefined) ?? {}
-    world.rawStatements.push(statement.sql ?? statement.text ?? (statement.strings ?? []).join('?'))
-    world.lockedIds.push(ORDER_ID)
+    const text = statement.sql ?? statement.text ?? (statement.strings ?? (Array.isArray(args[0]) ? args[0] as string[] : [])).join('?')
+    // o3d-j625 r9: and it is the FENCE's statement that is recorded, not any raw query at all. Other
+    // mechanisms issue raw SELECTs on this same client (the posting-key lock does), and counting those
+    // as "the member rows were locked" is the very thing the paragraph above says a double must not do.
+    if (/FOR UPDATE/i.test(text)) {
+      world.rawStatements.push(text)
+      world.lockedIds.push(ORDER_ID)
+    }
     return []
   },
   salesOrder: {

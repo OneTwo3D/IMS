@@ -768,7 +768,8 @@ test('the registration re-decides INSIDE the write transaction, under both locks
   // `queued: true` without writing when its idempotency short-circuit finds a live row, and rolling
   // back an empty transaction while telling the operator "nothing was sent" is the one message that
   // stops anyone looking for the row that is still going to post.
-  assert.match(body, /throw new PinnedConnectorMoved\(enqueued\.connector, enqueued\.reason === 'already-queued'\)/,
+  // o3d-j625 r7: `handled-by-hand` is the other no-write `queued: true`, and says so the same way.
+  assert.match(body, /throw new PinnedConnectorMoved\(enqueued\.connector, enqueued\.reason === 'already-queued' \|\| enqueued\.reason === 'handled-by-hand'\)/,
     'and a row written under a connector this call did not pin is rolled back, not reported as queued')
   assert.match(body.slice(decideAt, decideAt + 400), /if \(!underLock\.register\) return \{ refused: underLock \}/,
     'a refused re-decision must abandon the enqueue')

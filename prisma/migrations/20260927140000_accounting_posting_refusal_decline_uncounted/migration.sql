@@ -1,0 +1,20 @@
+-- o3d-j625 r32 (Codex round 31, HIGH 1) — RECORD A POSTPONEMENT THAT HAPPENED AND COULD NOT BE COUNTED.
+--
+-- r30 stopped the clear from publishing a decline whose deferral write had rolled back, and surfaced that case
+-- to the caller as `refused`: owed, reported, recorded as an outstanding row. What it could not do was tell the
+-- MARK. `handPostDeferredCount` is still 0 on that path and the reused-key decision was `count > 0`, so an
+-- operator marking the original hand posting handled resolved the refusal for a LATER edit that has no sync row
+-- anywhere. That is the eleventh appearance of round 17's lost edit, arriving through the edge of round 30's own
+-- remedy.
+--
+-- WHY A COLUMN AND NOT A DERIVATION. The condition to record is "the write that counts postponements failed".
+-- Anything derived inside that same transaction is rolled back by the very failure it would record, and the two
+-- adjacent fields cannot stand in: `refusedCount`/`lastRefusedAt` move on ORDINARY refusals too, so they cannot
+-- distinguish this case from the common one. The activity-log line r30 already writes is outside the
+-- transaction and does survive — but activity logs are purged (o3d-1q28 / PR #712 is literally about purging
+-- them), and a financial decision must not rest on a row somebody may sweep away. So: a column, written through
+-- a connection that is NOT the failed transaction.
+--
+-- NULLABLE WITH NO DEFAULT AND NO BACKFILL, deliberately: NULL means "no uncounted postponement", which is the
+-- correct reading for every row that exists today. Nothing needs rewriting, so this is a metadata-only change.
+ALTER TABLE "accounting_posting_refusals" ADD COLUMN "handPostDeclineUncountedAt" TIMESTAMP(3);
