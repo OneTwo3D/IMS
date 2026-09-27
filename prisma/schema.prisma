@@ -3058,6 +3058,23 @@ model AccountingPostingRefusal {
   /// `handPostDeferredCount` is 0.
   handPostDeferredAt DateTime?
 
+  /// o3d-j625 r32 (Codex round 31, HIGH 1) — A POSTPONEMENT THAT HAPPENED AND COULD NOT BE COUNTED.
+  ///
+  /// r30 stopped the clear publishing a decline whose deferral write had rolled back, and surfaced that case to
+  /// the caller as `refused` — owed, reported, recorded as an outstanding row. What it could not do was tell the
+  /// MARK: `handPostDeferredCount` is still 0 on that path, and the reused-key decision was `count > 0`, so an
+  /// operator marking the original posting handled resolved the refusal for an edit that has no sync row. The
+  /// eleventh appearance of round 17's lost edit, through the edge of round 30's own remedy.
+  ///
+  /// So the fact is persisted separately, and — this is the whole point — it is written OUTSIDE the transaction
+  /// that failed. A marker written inside it would be rolled back by the very failure it exists to record,
+  /// which is why no derivation from the count, `refusedCount` or `lastRefusedAt` can work.
+  ///
+  /// It is a TIMESTAMP rather than a boolean so the operator-facing row can say when, and so "set" and "cleared"
+  /// read the same way as the two fields above. Cleared at the same three points the count is: releasing the
+  /// claim, and both exits of the mark.
+  handPostDeclineUncountedAt DateTime?
+
   /// o3d-j625 r6 (review H1): named explicitly. The default name is 68 characters; Postgres truncates it to
   /// 63 and Prisma truncates it DIFFERENTLY, so the migration's index and the schema's never matched and the
   /// drift check failed every deploy.

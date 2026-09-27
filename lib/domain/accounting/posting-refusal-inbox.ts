@@ -978,11 +978,26 @@ export async function clearAccountingPostingRefusal(
   })
   if (result.outcome === 'cleared' && seen.claim) {
     // A live claim was read and the postponement did not commit. Owed, and explicitly not postponed.
-    await reportDeclineNotRecorded(key, seen.claim.claimedAt, seen.claim.claimedBy)
+    //
+    // o3d-j625 r32 (Codex round 31, HIGH 1) — AND THE MARK HAS TO BE ABLE TO SEE IT.
+    //
+    // r30 told the CALLER, which was necessary and not sufficient: `markPostingHandled` keeps a reused key's
+    // debt outstanding only when `handPostDeferredCount > 0`, and on this path it is 0. So an operator marking
+    // the original posting handled resolved the refusal for a later edit with no sync row — round 17's lost
+    // edit for the eleventh time, through the edge of r30's own remedy.
+    //
+    // THE MARKER IS WRITTEN HERE, OUTSIDE THE FAILED TRANSACTION, and that placement is the fix rather than an
+    // implementation detail: the deferral bump failed inside the lock transaction, so anything written there is
+    // rolled back by the very failure it would record. Best-effort and ordered BEFORE the report, so that when
+    // both are attempted the durable fact lands first.
+    const marked = await markDeclineUncounted(client, key)
+    await reportDeclineNotRecorded(key, seen.claim.claimedAt, seen.claim.claimedBy, marked)
     return {
       outcome: 'declined-hand-post-claim-not-recorded',
       ...seen.claim,
-      because: 'the postponement write or its transaction did not commit',
+      because: marked
+        ? 'the postponement write or its transaction did not commit'
+        : 'the postponement write or its transaction did not commit, AND the uncounted marker could not be stored',
     }
   }
   return result
@@ -996,10 +1011,35 @@ export async function clearAccountingPostingRefusal(
  * arrived, so the row an operator is looking at understates what is owed. Never throws, for the same reason
  * nothing else on this path does.
  */
+/**
+ * o3d-j625 r32 — STAMP "a postponement happened here that nothing counted", through a client that is not the
+ * transaction which just failed.
+ *
+ * Returns whether it landed, because the caller says so out loud either way. A second failure on top of the
+ * first leaves the mark unable to see the uncounted decline — that residual window is stated in the ERROR line
+ * and in the issue notes rather than papered over; what it is not is the COMMON case, which this closes.
+ *
+ * `resolvedAt: null` in the predicate: a refusal that has already been closed is not made outstanding again by
+ * this stamp. The claim is deliberately NOT part of the predicate — the operator may release it between the
+ * failure and this write, and the uncounted edit is owed either way.
+ */
+async function markDeclineUncounted(client: PostingRefusalClient, key: PostingRefusalKey): Promise<boolean> {
+  try {
+    const { count } = await client.accountingPostingRefusal.updateMany({
+      where: { ...key, resolvedAt: null },
+      data: { handPostDeclineUncountedAt: new Date() },
+    })
+    return count > 0
+  } catch {
+    return false
+  }
+}
+
 async function reportDeclineNotRecorded(
   key: PostingRefusalKey,
   claimedAt: Date,
   claimedBy: string | null,
+  marked: boolean,
 ): Promise<void> {
   const { logActivity } = await import('@/lib/activity-log')
   await logActivity({
@@ -1012,8 +1052,15 @@ async function reportDeclineNotRecorded(
       + `has been settling it by hand since ${claimedAt.toISOString()}, but IMS could NOT record the postponement: `
       + 'the write or its transaction did not commit. The posting is reported as still owed, so it will be '
       + 'recorded as outstanding in the usual way, but the "postings declined behind this claim" count does NOT '
-      + 'include this one. Check the ledger for this posting before marking the claim handled.',
-    metadata: { ...key, claimedBy, claimedAt: claimedAt.toISOString() },
+      + 'include this one. '
+      + (marked
+        ? 'The refusal is stamped as carrying an uncounted postponement, so marking the claim handled will KEEP '
+          + 'it outstanding rather than closing it.'
+        : 'AND THE STAMP THAT WOULD KEEP IT OUTSTANDING COULD NOT BE WRITTEN EITHER, so marking this posting '
+          + 'handled WILL close the refusal. Check the ledger holds the current version of this document before '
+          + 'anybody marks it handled.')
+      + ' Check the ledger for this posting before marking the claim handled.',
+    metadata: { ...key, claimedBy, claimedAt: claimedAt.toISOString(), uncountedMarkerStored: marked },
   }).catch(() => { /* a report that cannot be written must not become the caller's exception */ })
 }
 

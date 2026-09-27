@@ -308,7 +308,19 @@ const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
   stock_adjustment_journal: { 'lib/domain/inventory/stock-adjustment-apply.ts': 1 },
   purchase_order_cancellation_reversal: { 'lib/domain/purchasing/cancellation-service.ts': 1 },
   supplier_return_reversal: { 'app/actions/purchase-orders.ts': 1 },
-  stock_receipt_journal: { 'app/actions/purchase-orders.ts': 1 },
+  /**
+   * o3d-j625 r32 (merge with o3d-8f0p6 #713) — A SECOND SITE RAISES THIS POSTING, AND THE KIND STAYS `manual`.
+   *
+   * #713 added the WMS book-in's own STOCK_RECEIPT journal, so two call sites can now refuse
+   * STOCK_RECEIPT/PurchaseOrder for the same PO. This census fired, exactly as designed, and its message asks
+   * the right question: does the new site RAISE THE SAME POSTING AGAIN, which would make the kind `retried`?
+   *
+   * It does not. On a refusal the WMS path books the stock in and moves on — `if (queued)` guards only the
+   * transit subledger mirror, the book-in event is consumed, and nothing re-attempts the journal. So nothing in
+   * IMS will post it later, which is what `manual` means: an operator posts it by hand and marks it handled.
+   * Registered here rather than reclassified, and verified rather than assumed.
+   */
+  stock_receipt_journal: { 'app/actions/purchase-orders.ts': 1, 'lib/domain/wms/booked-in-service.ts': 1 },
   purchase_invoice: { 'app/actions/purchase-orders.ts': 1 },
   realised_fx_bill_payment: { 'app/actions/purchase-orders.ts': 1 },
   realised_fx_receipt: { 'app/actions/sales.ts': 1 },

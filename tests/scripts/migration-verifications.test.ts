@@ -273,6 +273,19 @@ test('o3d-j625 r30: no migration this branch has ever had may be deleted from HE
    * amend or a rebase so that no commit ever carried it. The second only works when it really was never
    * applied anywhere, which is exactly the condition under which it is safe.
    *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   * THE LIMIT OF THIS GUARD, STATED (o3d-j625 r32, Codex round 31 HIGH 2 — strengthening filed as o3d-bm8es)
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * It protects trunk's migrations and those introduced by commits CURRENTLY REACHABLE in `merge-base..HEAD`.
+   * A history rewrite — squash, amend, rebase, force-push — that removes a migration's introducing commit also
+   * removes it from the protected set, and the non-empty precondition below still passes because the branch's
+   * other migrations remain. Closing that needs a record outside rewriteable branch history; this guard does
+   * not have one.
+   *
+   * Said here rather than left to be inferred, because a guard that states its own reach is worth more than one
+   * that implies a reach it lacks (o3d-bddq).
+   *
    * WHAT WOULD STILL PASS IT: adding a migration and deleting it again WITHOUT COMMITTING in between — no
    * commit ever had it, so nothing could have applied it from this branch; changing the BODY of a shipped
    * migration, which is a different defect with a different fix; and any change to a migration's directory

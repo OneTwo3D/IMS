@@ -1281,3 +1281,42 @@ test('[o3d-j625 r30] the clear never publishes a decline assigned from inside it
     + 'the caller a postponement is being tracked when the count says it is not',
   )
 })
+
+/**
+ * o3d-j625 r32 (Codex round 31, HIGH 1) — THE UNCOUNTED-DECLINE STAMP IS DISCHARGED WHEREVER THE COUNT IS.
+ *
+ * `handPostDeclineUncountedAt` keeps a reused key's debt outstanding through the mark. That makes a LEFTOVER
+ * stamp as dangerous as a missing one in the other direction: a row that keeps itself outstanding for ever is
+ * the r6 false debt, and marking handled would stop discharging anything on the three reused kinds. So every
+ * place that resets `handPostDeferredCount` must reset the stamp, and this asserts it by COUNTING both rather
+ * than by looking for one example.
+ *
+ * WHAT WOULD STILL PASS IT: a new discharge point that resets BOTH (which is the point — it is a pairing rule,
+ * not a whitelist); and any change to what the stamp MEANS. The behavioural half is the r32 concurrency pair:
+ * the uncounted decline keeps the debt, and the ordinary case still resolves.
+ */
+test('[o3d-j625 r32] every reset of the deferral count also clears the uncounted-decline stamp', () => {
+  const mark = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/posting-mark-handled.ts'), 'utf8')
+  const resets = (mark.match(/^\s*handPostDeferredCount: 0,$/gm) ?? []).length
+  const cleared = (mark.match(/^\s*handPostDeclineUncountedAt: null,$/gm) ?? []).length
+  assert.ok(resets >= 3,
+    `PRECONDITION: the three discharge points (claim, release, and both mark exits) must be found; saw ${resets}`)
+  assert.equal(cleared, resets,
+    `every reset of handPostDeferredCount must clear handPostDeclineUncountedAt beside it: ${resets} resets but `
+    + `${cleared} clears. A leftover stamp keeps a reused key outstanding for ever, which is the r6 false debt — `
+    + 'the opposite failure to the one r32 fixed, and not a lesser one.')
+
+  // The decision itself must read BOTH signals, and only on a reused key.
+  assert.match(mark, /const keepOutstanding = keyIsReused && \(deferredEdits > 0 \|\| declineUncounted\)/,
+    'the reused-key mark decision must treat an uncounted decline as evidence of a postponement')
+  // ...and the stamp must be written from OUTSIDE the transaction that failed, which is the whole fix.
+  const inbox = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/posting-refusal-inbox.ts'), 'utf8')
+  assert.match(inbox, /const marked = await markDeclineUncounted\(client, key\)/,
+    'the stamp is written with the OUTER client, after guarded returned — a write inside the lock callback '
+    + 'would be rolled back by the very failure it records, which is why no derivation can work')
+  assert.doesNotMatch(
+    inbox.slice(inbox.indexOf('async (locked) => {'), inbox.indexOf('    result = settled')),
+    /handPostDeclineUncountedAt/,
+    'and it is NOT written inside the lock callback',
+  )
+})

@@ -2205,6 +2205,8 @@ async function runSalesInvoiceUpdateThroughFacadeShape(
   r28: Awaited<ReturnType<typeof loadR28Deps>>,
   referenceId: string,
   takeClaim: (() => Promise<void>) | null,
+  /** o3d-j625 r32: the client the post-queue settle runs on — injected in the two failure tests. */
+  settleClient?: Db,
 ) {
   const key = updateKeyFor(referenceId)
   const logged: Array<{ action: string; level: string }> = []
@@ -2242,7 +2244,7 @@ async function runSalesInvoiceUpdateThroughFacadeShape(
         return r28.settleQueuedEnqueueAgainstHandPostClaim(
           { queued: true, connector: 'xero' },
           key,
-          deps.db as never,
+          (settleClient ?? deps.db) as never,
         ) as never
       },
       logActivity: async (params: { action: string; level: string }) => { logged.push({ action: params.action, level: params.level }) },
@@ -2340,6 +2342,63 @@ test(
   },
 )
 
+/**
+ * o3d-j625 r32 — INJECT THE DEFERRAL FAILURE WITHOUT DDL ON A SHARED TABLE.
+ *
+ * r30 injected it with a trigger, which was honest about the failure but took an ACCESS EXCLUSIVE lock on
+ * `accounting_posting_refusals` twice per test. The concurrency tier runs files in parallel, so those two DDL
+ * windows intermittently blocked unrelated tests in sibling files: two of them went red once and passed on a
+ * re-run. A flaky test I introduced is worse than the sharper injection it bought — it reds other people's
+ * gates and teaches everyone to re-run rather than to read.
+ *
+ * So the failure is injected at the CLIENT instead, and only for the ONE statement that increments this
+ * posting's deferral counter. Everything else — the posting-key advisory lock, the refusal reads and writes,
+ * the sync row, the commit — goes to the real database unchanged, and the callback still runs inside a real
+ * Prisma interactive transaction. `'throw'` therefore still produces a REAL ROLLBACK of a real transaction
+ * (Prisma aborts the transaction when the callback throws), which is the half of the scenario a rejected
+ * promise at the facade boundary would not reach; `'norows'` produces a statement that really does affect
+ * nothing, which is the `'no-claim'` answer.
+ *
+ * WHAT THIS GIVES UP, stated: the write no longer fails inside PostgreSQL itself, so a failure mode that only
+ * the server can produce (a constraint, a serialisation failure) is not being exercised — only the two the
+ * code distinguishes. That is the whole of what the assertions depend on.
+ */
+function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norows'): Db {
+  const intercept = (target: Record<string, unknown>): unknown => new Proxy(target, {
+    get(t, prop, recv) {
+      if (prop === 'accountingPostingRefusal') {
+        const table = Reflect.get(t, prop, recv) as Record<string, unknown>
+        return new Proxy(table, {
+          get(tt, p, r) {
+            if (p !== 'updateMany') return Reflect.get(tt, p, r)
+            const real = Reflect.get(tt, p, r) as (args: unknown) => Promise<{ count: number }>
+            return async (args: { where?: Record<string, unknown>; data?: Record<string, unknown> }) => {
+              const bumpsDeferral = args?.data != null
+                && typeof args.data.handPostDeferredCount === 'object'
+                && args.data.handPostDeferredCount !== null
+                && 'increment' in (args.data.handPostDeferredCount as object)
+              const isOurs = args?.where?.referenceId === referenceId
+              if (bumpsDeferral && isOurs) {
+                if (mode === 'throw') throw new Error('o3d-j625 r30/r32 injected: the postponement write fails')
+                return { count: 0 }
+              }
+              return real.call(tt, args)
+            }
+          },
+        })
+      }
+      if (prop === '$transaction') {
+        const real = Reflect.get(t, prop, recv) as (fn: (tx: unknown) => unknown, opts?: unknown) => unknown
+        return (fn: (tx: unknown) => unknown, opts?: unknown) =>
+          real.call(t, (tx: unknown) => fn(intercept(tx as Record<string, unknown>)), opts)
+      }
+      const value = Reflect.get(t, prop, recv)
+      return typeof value === 'function' ? value.bind(t) : value
+    },
+  })
+  return intercept(db as unknown as Record<string, unknown>) as Db
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════════════════════════
 // o3d-j625 r30 (Codex round 29, HIGH 1) — A ROLLED-BACK POSTPONEMENT MUST NOT BE PUBLISHED AS A DECLINE.
 //
@@ -2377,29 +2436,11 @@ test(
       select: { id: true },
     })).id
 
-    // THE INJECTED FAILURE: incrementing THIS posting's deferral counter raises, which aborts the transaction
-    // the clear runs in. Scoped to one referenceId so no other test or row can see it.
-    await db.$executeRawUnsafe(`
-      CREATE OR REPLACE FUNCTION j625r30_block_deferral() RETURNS trigger AS $fn$
-      BEGIN
-        IF NEW."handPostDeferredCount" > OLD."handPostDeferredCount"
-           AND NEW."referenceId" = '${referenceId}' THEN
-          RAISE EXCEPTION 'o3d-j625 r30 injected: the postponement write fails';
-        END IF;
-        RETURN NEW;
-      END;
-      $fn$ LANGUAGE plpgsql`)
-    await db.$executeRawUnsafe(`
-      CREATE TRIGGER j625r30_block_deferral BEFORE UPDATE ON accounting_posting_refusals
-      FOR EACH ROW EXECUTE FUNCTION j625r30_block_deferral()`)
-    t.after(async () => {
-      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS j625r30_block_deferral ON accounting_posting_refusals')
-      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS j625r30_block_deferral()')
-    })
 
     const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
       deps, r28, referenceId,
       () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'throw'),
     )
     console.log(`[r30] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
 
@@ -2474,32 +2515,19 @@ test(
       select: { id: true },
     })).id
 
-    await db.$executeRawUnsafe(`
-      CREATE OR REPLACE FUNCTION j625r30_skip_deferral() RETURNS trigger AS $fn$
-      BEGIN
-        IF NEW."handPostDeferredCount" > OLD."handPostDeferredCount"
-           AND NEW."referenceId" = '${referenceId}' THEN
-          RETURN NULL;  -- skip the row: the UPDATE succeeds and affects nothing
-        END IF;
-        RETURN NEW;
-      END;
-      $fn$ LANGUAGE plpgsql`)
-    await db.$executeRawUnsafe(`
-      CREATE TRIGGER j625r30_skip_deferral BEFORE UPDATE ON accounting_posting_refusals
-      FOR EACH ROW EXECUTE FUNCTION j625r30_skip_deferral()`)
-    t.after(async () => {
-      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS j625r30_skip_deferral ON accounting_posting_refusals')
-      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS j625r30_skip_deferral()')
-    })
 
     const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
       deps, r28, referenceId,
       () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'norows'),
     )
     console.log(`[r30b] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
     const after = await db.accountingPostingRefusal.findUniqueOrThrow({
       where: { id: refusalId },
-      select: { resolvedAt: true, handPostClaimedBy: true, handPostDeferredCount: true },
+      select: {
+        resolvedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
+        handPostDeclineUncountedAt: true,
+      },
     })
     console.log(`[r30b] refusal=${JSON.stringify(after)}`)
 
@@ -2516,5 +2544,104 @@ test(
     assert.ok(!logged.some((l) => l.action === 'sales_invoice_update_queued'), 'and never reported as queued')
     assert.equal(after.resolvedAt, null, 'the refusal is still outstanding')
     assert.equal(after.handPostClaimedBy, 'operator-A', 'and the claim is untouched')
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    // o3d-j625 r32 (Codex round 31, HIGH 1) — AND NOW THE MARK, WHICH IS WHERE r30b STOPPED.
+    //
+    // Round 30 asserted the CALLER's answer and went no further, so it never reached the consequence: the
+    // reused-key decision in markPostingHandled kept the debt only when `handPostDeferredCount > 0`, and on
+    // this path it is 0. An operator marking the original hand posting handled therefore RESOLVED the refusal
+    // for a later edit that has no sync row anywhere. A test that stops before the consequence is why this
+    // reached round 32 instead of ending at 30, so this one continues to the end.
+    // ═══════════════════════════════════════════════════════════════════════════════════════════════
+    assert.ok(after.handPostDeclineUncountedAt,
+      'PRECONDITION: the uncounted postponement must be STAMPED on the row, written outside the transaction '
+      + 'that failed. Without the stamp the mark below has nothing to see and this assertion is the whole fix.')
+    // Read BEFORE the mark, because the contribution below is a DELTA. `refusedCount` is already non-zero here
+    // (the reopen that put this debt back bumped it), so an absolute `>= 1` says nothing — the mutation that
+    // makes the uncounted decline contribute NOTHING was green against exactly that assertion.
+    const refusedBeforeMark = (await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { refusedCount: true },
+    })).refusedCount
+
+    const marked = await deps.markPostingHandled(db as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted the version I had',
+    } as never)
+    console.log(`[r30b] mark=${JSON.stringify(marked)}`)
+    assert.equal(marked.ok, true, 'the mark itself is accepted — the ledger write the operator made is real')
+    assert.equal(marked.stillOutstanding, true,
+      'THE r32 FINDING: marking the original posting handled must NOT discharge the debt for the later edit. '
+      + 'SALES_INVOICE_UPDATE is a REUSED key, so the refusal row means "the ledger does not hold the current '
+      + 'version of this document" — and it does not, because the edit that arrived was never queued.')
+
+    const afterMark = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: {
+        resolvedAt: true, resolution: true, refusedCount: true,
+        handPostClaimedAt: true, handPostDeferredCount: true, handPostDeclineUncountedAt: true,
+      },
+    })
+    console.log(`[r30b] afterMark=${JSON.stringify(afterMark)}`)
+    assert.equal(afterMark.resolvedAt, null, 'the row is STILL outstanding after the mark')
+    assert.equal(afterMark.resolution, null, 'and carries no resolution')
+    assert.equal(afterMark.handPostClaimedAt, null,
+      'the claim IS given back — IMS may queue the current version from now on, which is what discharges this')
+    assert.equal(afterMark.handPostDeclineUncountedAt, null,
+      'and the stamp is discharged, so a later episode of this key does not start already in debt')
+    assert.equal(afterMark.refusedCount, refusedBeforeMark + 1,
+      'and the postponed posting is carried into refusedCount — EXACTLY ONE more than before the mark. Asserted '
+      + 'as a delta, not as a floor: the count is already non-zero when the mark runs, so a floor is satisfied '
+      + 'whether or not the uncounted decline contributed anything, and the row would be kept outstanding with '
+      + 'nothing to show for it.')
+  },
+)
+
+test(
+  '[o3d-j625 r32 CONTROL] the ORDINARY reused-key mark, with nothing declined, still resolves the refusal',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * THE TENSION THE FIX HAD TO RESOLVE, pinned so it cannot be "fixed" by keeping everything outstanding.
+     * "Fail closed where the mark cannot prove no decline happened" must not become "never resolve a reused
+     * key": the ordinary case — claim taken, posting made by hand, nothing declined behind it — has no positive
+     * proof of absence either, and it MUST still resolve, or marking handled stops discharging anything on the
+     * three reused kinds and the inbox fills with debts that do not exist (the r6 false-debt failure).
+     *
+     * WHAT WOULD STILL PASS IT: any rule keyed on POSITIVE evidence of a postponement. What it forbids is
+     * exactly the over-broad fix.
+     */
+    const deps = await loadDeps()
+    const { db } = deps
+    const referenceId = probeId('r32-ordinary-mark')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+    await takeForHandPosting(deps, refusalId, 'operator-A')
+
+    const before = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { handPostDeferredCount: true, handPostDeclineUncountedAt: true },
+    })
+    assert.equal(before.handPostDeferredCount, 0, 'PRECONDITION: nothing was postponed')
+    assert.equal(before.handPostDeclineUncountedAt, null, 'PRECONDITION: and nothing was declined uncounted')
+
+    const marked = await deps.markPostingHandled(db as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted by hand',
+    } as never)
+    console.log(`[r32 control] mark=${JSON.stringify(marked)}`)
+    assert.equal(marked.ok, true)
+    assert.equal(marked.stillOutstanding, false,
+      'CONTROL: with no evidence of any postponement the reused-key mark still DISCHARGES the debt. Without '
+      + 'this the r32 fix could pass by keeping every reused key outstanding for ever, which is a false debt on '
+      + 'every hand-settled invoice update — not a lesser failure than the one being fixed.')
+    const afterMark = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
+    })
+    assert.ok(afterMark.resolvedAt, 'and the row is closed')
+    assert.equal(afterMark.resolution, 'handled_manually')
   },
 )

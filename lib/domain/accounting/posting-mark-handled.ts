@@ -43,6 +43,7 @@ export type MarkHandledClient = PostingSuppressionClient & {
       handPostClaimedAt?: Date | null; handPostClaimedBy?: string | null
       /** o3d-j625 r18: how many postings IMS declined to queue while that claim has been held. */
       handPostDeferredCount?: number | null
+      handPostDeclineUncountedAt?: Date | null
     } | null>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
@@ -250,6 +251,7 @@ const REFUSAL_SELECT = {
   handPostClaimedAt: true, handPostClaimedBy: true,
   // o3d-j625 r18: read by BOTH acts that end a claim, because both have to discharge what was postponed.
   handPostDeferredCount: true,
+  handPostDeclineUncountedAt: true,
 } as const
 
 type LoadedRefusal = NonNullable<Awaited<ReturnType<MarkHandledClient['accountingPostingRefusal']['findUnique']>>>
@@ -386,6 +388,10 @@ export async function claimPostingForHandPosting(
       // keeping this refusal outstanding for ever.
       handPostDeferredCount: 0,
       handPostDeferredAt: null,
+      // o3d-j625 r32: and the uncounted-decline stamp, for the same reason as the count — a NEW act starts with
+      // nothing postponed, and a leftover from an interrupted discharge must not keep this row outstanding for
+      // ever. This is also why the stamp is not written with the claim's predicate: see markDeclineUncounted.
+      handPostDeclineUncountedAt: null,
     },
   })
   // Not a `claimed_by_other`: the row was unclaimed under this lock a statement ago, so a zero count means
@@ -453,7 +459,11 @@ export async function releasePostingHandPostClaim(
       handPostClaimedBy: null,
       handPostDeferredCount: 0,
       handPostDeferredAt: null,
-      ...(deferredEdits > 0 ? { refusedCount: { increment: deferredEdits }, lastRefusedAt: now } : {}),
+      // o3d-j625 r32: released with the count. `refusedCount` carries it below for the same reason.
+      handPostDeclineUncountedAt: null,
+      ...(deferredEdits > 0 || row.handPostDeclineUncountedAt != null
+        ? { refusedCount: { increment: deferredEdits > 0 ? deferredEdits : 1 }, lastRefusedAt: now }
+        : {}),
     },
   })
   if (released.count === 0) throw new MarkHandledRaceError()
@@ -566,7 +576,31 @@ export async function markPostingHandled(
    * DEBT that tells an operator to, and that is what this keeps.
    */
   const deferredEdits = row.handPostDeferredCount ?? 0
-  const keepOutstanding = keyIsReused && deferredEdits > 0
+  /**
+   * o3d-j625 r32 (Codex round 31, HIGH 1) — AND A POSTPONEMENT THAT COULD NOT BE COUNTED KEEPS THE DEBT TOO.
+   *
+   * r30 stopped the clear publishing a decline whose deferral write had rolled back, and told the caller. It
+   * could not tell THIS decision, because the only evidence was a count that is 0 on exactly that path — so an
+   * operator marking the original posting handled resolved the refusal for a later edit with no sync row. The
+   * eleventh appearance of round 17's lost edit, through the edge of r30's remedy.
+   *
+   * `handPostDeclineUncountedAt` is that missing evidence, written outside the transaction that failed.
+   *
+   * FAIL CLOSED, AND WHERE THE TENSION ACTUALLY LIES. "Keep it outstanding whenever we cannot PROVE no decline
+   * happened" cannot mean "keep every reused key outstanding": the ordinary case — a claim taken, the posting
+   * made by hand, nothing declined behind it — has no positive proof of absence either, and it MUST resolve, or
+   * marking handled stops discharging anything on the three reused kinds and the inbox fills with debts that do
+   * not exist. That is the r6 false-debt failure, and it is not a lesser one.
+   *
+   * So the closed direction is drawn at the only place a difference is observable: an uncounted decline is
+   * RECORDED when it happens. Both signals are positive evidence of a postponement (`deferredEdits > 0`, or the
+   * stamp); their absence is the ordinary case and resolves. What remains open is a decline whose count AND
+   * whose stamp both failed to persist — two failures, one of them on a path taken through the pool rather than
+   * the aborted transaction. That residual is stated at the ERROR line the clear writes, which says in plain
+   * words that marking handled WILL close the refusal, and it is the reason that line is ERROR and not WARNING.
+   */
+  const declineUncounted = row.handPostDeclineUncountedAt != null
+  const keepOutstanding = keyIsReused && (deferredEdits > 0 || declineUncounted)
   if (keepOutstanding) {
     const kept = await tx.accountingPostingRefusal.updateMany({
       where: { id: row.id, resolvedAt: null, kind: { in: markableKinds } },
@@ -575,7 +609,13 @@ export async function markPostingHandled(
         handPostClaimedBy: null,
         handPostDeferredCount: 0,
         handPostDeferredAt: null,
-        refusedCount: { increment: deferredEdits },
+        // Cleared with the count, at the same moment and for the same reason: the debt it was holding open has
+        // just been turned into `refusedCount`, so leaving it set would keep this row outstanding for ever.
+        handPostDeclineUncountedAt: null,
+        // o3d-j625 r32: an uncounted decline is still ONE postponed posting as far as the operator's row is
+        // concerned, so it contributes when the count itself did not record it. Without this the row would be
+        // kept outstanding with nothing in `refusedCount` to say why.
+        refusedCount: { increment: deferredEdits > 0 ? deferredEdits : 1 },
         lastRefusedAt: now,
       },
     })
@@ -602,6 +642,11 @@ export async function markPostingHandled(
       // a non-zero count behind would make a LATER episode of the same key start already "in debt".
       handPostDeferredCount: 0,
       handPostDeferredAt: null,
+      // o3d-j625 r32: the uncounted-decline stamp is discharged here too, and reaching this line at all means
+      // it was NOT set (on a reused key a set stamp takes the keep-outstanding exit above, and on a key that is
+      // not reused the postponed enqueues were retries of the posting just made). Cleared rather than assumed,
+      // so a LATER episode of the same key cannot start already "in debt" — the same reason as the count.
+      handPostDeclineUncountedAt: null,
       /**
        * o3d-j625 r16 — AND THE CLAIM IS GIVEN BACK HERE, which matters most on exactly the keys the block
        * above declines to suppress. On a reused key the claim is the ONLY thing standing between IMS and
