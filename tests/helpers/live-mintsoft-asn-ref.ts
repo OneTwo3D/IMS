@@ -48,3 +48,56 @@ export function liveMintsoftBookedInAsnRef(input: {
   }
   return { ...normalized, externalAsnId: input.externalAsnId }
 }
+
+/**
+ * THE SAME THING FOR AN ASN WITH SEVERAL ITEMS (o3d-8f0p6 r4).
+ *
+ * An ASN can cover more than one purchase order, and the book-in posts one journal per PO, so the
+ * multi-PO arm needs a ref whose lines really came through `normalizeMintsoftAsn` rather than being
+ * assembled by hand — the same o3d-btiw discipline as the single-line form above, and for the same
+ * reason: a fabricated line cannot notice a wire-shape defect.
+ */
+export function liveMintsoftBookedInAsnRefMultiLine(input: {
+  externalAsnId: string
+  lines: Array<{
+    externalLineId: string
+    sourceLineId: string
+    sku: string
+    expectedQty: number
+    bookedQty: number
+    arrivedQty?: number
+  }>
+  statusName?: string
+}): WmsAsnRef {
+  const body = liveAsnBody({
+    poReference: input.externalAsnId,
+    statusName: input.statusName ?? 'BOOKEDIN',
+    statusId: 4,
+    items: input.lines.map((line) => liveAsnItem({
+      id: Number.isFinite(Number(line.externalLineId)) ? Number(line.externalLineId) : undefined,
+      sourceLineId: line.sourceLineId,
+      sku: line.sku,
+      expected: line.expectedQty,
+      booked: line.bookedQty,
+      received: line.arrivedQty ?? line.bookedQty,
+      complete: line.bookedQty >= line.expectedQty,
+    })),
+  })
+  // As above: the seeded line maps carry non-numeric external ids, so each item's own `ID` — which is
+  // what the normalizer reads as `externalLineId` — is written verbatim after the fixture builds it.
+  const items = body.Items as Record<string, unknown>[]
+  input.lines.forEach((line, index) => {
+    items[index]!.ID = line.externalLineId
+  })
+  const normalized = normalizeMintsoftAsn(body, { externalAsnIdFallback: input.externalAsnId })
+  if (!normalized) {
+    throw new Error('the live-shaped ASN body did not normalize — the fixture and the normalizer disagree')
+  }
+  if (normalized.lines.length !== input.lines.length) {
+    throw new Error(
+      `the normalizer produced ${normalized.lines.length} line(s) from ${input.lines.length} item(s); `
+      + 'the multi-line fixture and the normalizer disagree',
+    )
+  }
+  return { ...normalized, externalAsnId: input.externalAsnId }
+}
