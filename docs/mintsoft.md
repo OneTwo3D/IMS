@@ -60,6 +60,84 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 
 Upward deltas are absorbed into open ASN lines as provisional goods-in receipts (cost layers from the source PO/transfer line), tracked as alignment snapshot credits that the booked-in webhook later reconciles. A delta no open ASN line can explain stays a manual discrepancy.
 
+**A PO-backed align-up is a receipt writer, and posts like one (o3d-6nd55).** It credits stock and
+lays a purchase-order-linked FIFO cost layer, so it is the third path that raises inventory value from
+a purchase order — beside the receipt entered in IMS and the WMS booked-in webhook. Two things were
+wrong and are fixed together:
+
+- **the cost was always zero.** The branch read `landedUnitCostBase ?? unitCostBase`, and
+  `landedUnitCostBase` is `Decimal @default(0)` and NOT NULL while `createPurchaseOrder` never sets
+  it — so the `??` could never fall through and an ordinary purchase order aligned up at a unit cost
+  of **zero**: a zero-cost cost layer and a zero-value stock movement for goods that cost real money.
+  Inventory was understated for those units for ever, and no journal would have repaired it because
+  the cost itself was wrong. Align-up now calls `computeGrossUnitCostBaseByLine` — the same helper the
+  IMS receipt and (since o3d-8f0p6) the book-in use: the goods cost plus that line's share of the
+  order's own and its linked freight orders' additional cost lines. **One value feeds the movement,
+  the cost layer and the journal.** A genuinely free line (a sample, a warranty replacement) has a
+  zero goods cost, so the gross cost is zero, stock is still credited and nothing is posted — which is
+  correct, and is why no null-vs-zero column change was needed;
+- **it posted nothing.** No `STOCK_RECEIPT` journal and no transit subledger row. It now queues the
+  same two-line journal the IMS receipt does — **DR Inventory / CR Stock in Transit** — plus the
+  signed transit subledger row for −value, **in the same transaction as the movement, the cost layer
+  and the stock level**. All of it lives or none of it does: if the enqueue fails, the alignment
+  credits no stock and the ASN line does not claim to have absorbed the units, so the next sweep tries
+  again.
+
+The journal's idempotency key is `wms-align-up:<asnLineMapId>:<movementId>`, so it can collide with
+neither the webhook's `wms-purchase-receipt:<poId>:<eventId>` nor the IMS receipt's
+`purchase-receipt:<poId>:<receiptRef>`, and one sweep crediting two ASN lines of one order posts two
+journals for two disjoint quantities. **The two WMS paths do not double-post, in either direction:**
+align-up journals the quantity it credits and records it on `wms_asn_line_maps.qtyAccountedViaSnapshot`
+in the same transaction, which is exactly the `coveredBySnapshotQty` a later book-in subtracts before
+journalling; and the reverse is `resolveWmsAsnLineResidualQty`, which caps align-up at
+`expectedQty − max(qtyAccountedViaSnapshot, lastProcessedReceivedQty)`, so units a book-in already
+landed are outside every allocation align-up can make.
+
+**Transfer-backed align-up allocations post nothing, deliberately** — a transfer moves units the
+business already owns between its own warehouses, so their value never left inventory and never
+entered *purchase* goods-in-transit. `app/actions/transfers.ts` queues no accounting sync either.
+
+**The cost inputs are LOCKED, and so is the account mapping (o3d-6nd55 r2).** Round 1 read both with
+no lock and tried to defend itself by re-reading and refusing on a difference, which holds nothing: a
+re-read sees only a change that has *already* committed, so a change landing after it still ends up in
+committed books. Both are now locks held to commit:
+
+- **the cost rows** — `purchase_orders`, then `purchase_order_lines`, then `freight_cost_lines`, for
+  the primary order *and* every linked freight order — taken at step 2 of the global row-lock order
+  (`lib/domain/wms/transfer-asn-lock-order.ts`). That sub-order is not new: it is the one
+  `app/actions/purchase-orders.ts` already uses in both of its invoicing transactions. A landed-cost
+  or freight edit therefore cannot commit between the moment the alignment reads a cost and the moment
+  it commits the layer and the journal for it. A PO-backed ASN line whose order appeared *after* those
+  locks were taken is refused as a raced row and left to the next sweep, exactly as a raced transfer
+  is. Every cost is then read in one pass **before** any movement, layer, journal or stock row is
+  written, so the read-then-write order is structural rather than something a reader has to verify;
+- **the two account codes** — through `lockAccountingMappingSelection`, which is the *existing*
+  accounting-selection lock (the same advisory key `queueAccountingSyncTx` already takes) with the two
+  mapping rows added to its row set, so there is one lock and one order rather than a second one. It is
+  read once per alignment and reused, so an alignment spanning several purchase orders cannot put
+  earlier orders on the old mapping and later ones on the new one. A remap is **serialised**, not
+  refused: it waits and lands once the alignment commits.
+
+**A CANCELLED linked freight order contributes nothing (o3d-6nd55 r2).** Cancellation leaves the link
+row in place, marks the freight order `CANCELLED` and the link unallocated, and both landed-cost
+recalculation paths already exclude it — so including it here would have added freight the business had
+cancelled into the cost layer, the movement and the journal, and disagreed with what recalculation
+computes for the same units. The predicate has one definition,
+`CONTRIBUTING_LANDED_COST_LINK_WHERE` in `lib/domain/purchasing/landed-cost-service.ts`, which all
+three readers derive from. It filters on the freight order's **status** and deliberately not on
+`LandedCostLink.allocated`: `allocated` records whether the uplift has been written to
+`landedUnitCostBase` yet, and valuing a receipt whose freight is not yet allocated is the whole purpose
+of the shared gross-cost helper.
+
+Why this had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
+journal from a stock movement, and the reconciliation that should have caught the omission **hid** it.
+The Xero daily batch does not read `stock_movements` at all; its inventory reconciliation posts
+Inventory ↔ *Rounding difference* and only for a sub-unit `sweep` gap (a receipt-sized gap is `flag`,
+surfaced and never posted); and the transit reconciliation aggregates `transit_subledger_movements`,
+which are written **at post time**, so a posting that never happened is absent from *both* of its sides
+and that window ties out exactly. Proven by
+`tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts`.
+
 ### Align down (Mintsoft holds less — shrinkage / already-shipped)
 
 Downward deltas are auto-corrected by posting a negative stock adjustment (FIFO consumption + inventory GL journal via `applyStockAdjustment`), but only when EVERY gate passes; otherwise the discrepancy stays open carrying the hold reason:
@@ -264,12 +342,14 @@ because it is a real allocation behaviour an operator would not otherwise see. (
 `BY_QUANTITY` are unaffected; and when NO eligible line has a positive basis the helper falls back to
 an equal split and warns.)
 
-> **This does not yet make WMS receipt accounting complete.** Only the purchase-order-backed
-> *webhook* path posts. The WMS stock-sync **align-up** path still credits PO-backed stock and lays
-> cost layers with no journal and no transit row (**o3d-6nd55**), and because it writes to neither
-> ledger the transit reconciliation still ties out and still hides that omission — so the transit
-> account is not auditable until o3d-6nd55 lands too. The honest claim for this change is "the
-> PO-backed webhook path now posts", not "WMS receipts now post".
+> **ALL THREE WMS-side receipt writers now post (o3d-8f0p6 then o3d-6nd55).** This webhook path was
+> the second of three. The WMS stock-sync **align-up** path — which also credits PO-backed stock and
+> lays cost layers — posted nothing either, and because it wrote to *neither* ledger the transit
+> reconciliation tied out and hid the omission, so shipping this change alone did not make the transit
+> account auditable. It does now: align-up queues the same journal and the same transit row, in its own
+> transaction, and the two exclude each other's quantities (see **Align up** above). The caveat this
+> paragraph used to carry — "the PO-backed webhook path now posts", not "WMS receipts now post" — is
+> discharged.
 
 Why it had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
 journal from a stock movement. The Xero daily batch does not read `stock_movements` at all, its

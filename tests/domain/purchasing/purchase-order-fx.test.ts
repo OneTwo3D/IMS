@@ -215,14 +215,40 @@ function cloneRebaseState(state: RebaseTestState): RebaseTestState {
   }
 }
 
+/**
+ * The ORDER in which the transaction touched things, so a test can assert the parent lock came before
+ * any child write (o3d-6nd55 r3). Round 3 of o3d-6nd55 found three writers of `purchase_orders` and its
+ * two cost-row children taking the CHILDREN FIRST, which deadlocks against the WMS alignment's
+ * parent-then-children order. This one — the fx rebase — is fixed by
+ * `lockPurchaseOrdersWithCostRows` inside `rebasePurchaseOrderStoredBaseAmountsWithParentUpdate`, and
+ * this trace is what stops the fix being removed silently.
+ */
 function createTransactionalRebaseDb(
   state: RebaseTestState,
   options: { throwOnParentUpdate?: boolean } = {},
 ) {
+  const trace: string[] = []
   return {
+    trace,
     $transaction: async <T>(fn: (tx: PurchaseOrderFxRebaseTransactionDb<RebaseTestState['purchaseOrder']>) => Promise<T>) => {
       const txState = cloneRebaseState(state)
       const tx: PurchaseOrderFxRebaseTransactionDb<RebaseTestState['purchaseOrder']> = {
+        // The lock statements the helper issues. Recorded, not just accepted: `$queryRaw` became a
+        // REQUIRED member of this type precisely so the lock is taken inside the writing function, and a
+        // double that swallowed it would hide the fix being deleted.
+        $queryRaw: (async (strings: unknown, ...values: unknown[]) => {
+          const sql = Array.isArray(strings) ? (strings as string[]).join('?') : String(strings)
+          const table = /purchase_order_lines/.test(sql)
+            ? 'purchase_order_lines'
+            : /freight_cost_lines/.test(sql)
+              ? 'freight_cost_lines'
+              : /purchase_orders/.test(sql)
+                ? 'purchase_orders'
+                : 'other'
+          trace.push(`lock:${table}`)
+          void values
+          return []
+        }) as PurchaseOrderFxRebaseTransactionDb<RebaseTestState['purchaseOrder']>['$queryRaw'],
         purchaseOrderLine: {
           findMany: async () => txState.lines.map((line) => ({
             id: line.id,
@@ -231,6 +257,7 @@ function createTransactionalRebaseDb(
             taxForeign: line.taxForeign,
           })),
           update: async ({ where, data }) => {
+            trace.push('write:purchase_order_lines')
             const line = txState.lines.find((candidate) => candidate.id === where.id)
             assert.ok(line)
             Object.assign(line, data)
@@ -243,6 +270,7 @@ function createTransactionalRebaseDb(
             amountForeign: line.amountForeign,
           })),
           update: async ({ where, data }) => {
+            trace.push('write:freight_cost_lines')
             const line = txState.freightCostLines.find((candidate) => candidate.id === where.id)
             assert.ok(line)
             Object.assign(line, data)
@@ -251,6 +279,7 @@ function createTransactionalRebaseDb(
         },
         purchaseOrder: {
           update: async ({ data }) => {
+            trace.push('write:purchase_orders')
             if (options.throwOnParentUpdate) {
               throw new Error('parent update failed')
             }
@@ -295,8 +324,9 @@ test('purchase-order FX rebase commits child and parent base updates in one tran
     ],
   }
 
+  const transactionalDb = createTransactionalRebaseDb(state)
   const po = await rebasePurchaseOrderStoredBaseAmountsWithParentUpdate(
-    createTransactionalRebaseDb(state),
+    transactionalDb,
     'po-1',
     {
       subtotalForeign: '120',
@@ -320,6 +350,39 @@ test('purchase-order FX rebase commits child and parent base updates in one tran
   assert.equal(state.lines[0]?.totalBase, 83.3333)
   assert.equal(state.lines[0]?.taxBase, 16.6667)
   assert.equal(state.freightCostLines[0]?.amountBase, 10)
+
+  // ─── o3d-6nd55 r3: THE PARENT IS LOCKED BEFORE ANY CHILD IS WRITTEN ───
+  //
+  // This rebase used to write the lines and the freight cost lines and only then update the parent
+  // order, i.e. it acquired the CHILDREN and then wanted the PARENT. The WMS stock-sync alignment
+  // takes them the other way round — it must, since it has to hold the parent before it can trust
+  // what its cost rows say — so the pair was a deadlock: PostgreSQL aborts one side, failing either an
+  // operator's fx edit or a SKU's alignment. Found by the writer census in
+  // lib/domain/wms/transfer-asn-lock-order.ts, which round 3 required after two examples turned out
+  // not to be every participant.
+  //
+  // WHAT THIS ASSERTS, AND WHAT IT DOES NOT. It asserts the ACQUISITION ORDER inside this function
+  // against a recording double: the three lock statements come first, `purchase_orders` first of all,
+  // and every write follows them. It does NOT prove the absence of a deadlock against a real
+  // PostgreSQL — that is what
+  // tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts's interleaving arm
+  // does, on real row locks, for the freight-cost-edit path. This one is the cheap universal check
+  // that the lock has not simply been deleted.
+  const trace = transactionalDb.trace
+  console.log(`[o3d-6nd55 r3] fx rebase acquisition trace: ${JSON.stringify(trace)}`)
+  const firstWrite = trace.findIndex((entry) => entry.startsWith('write:'))
+  const parentLock = trace.indexOf('lock:purchase_orders')
+  assert.notEqual(parentLock, -1, 'the parent order must be locked at all — the lock statement is absent')
+  assert.notEqual(firstWrite, -1, 'PRECONDITION: the rebase must have written something, or this proves nothing')
+  assert.ok(
+    parentLock < firstWrite,
+    `the parent lock must precede every child write; trace was ${JSON.stringify(trace)}`,
+  )
+  assert.deepEqual(
+    trace.slice(0, 3),
+    ['lock:purchase_orders', 'lock:purchase_order_lines', 'lock:freight_cost_lines'],
+    'and the three locks must be taken in the one documented order, parent first',
+  )
 })
 
 test('purchase-order FX rebase rolls back child base updates when parent update fails', async () => {

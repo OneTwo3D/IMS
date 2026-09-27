@@ -715,6 +715,31 @@ export function landedCostAdjustmentIdempotencyKey(
   )
 }
 
+/**
+ * WHICH LINKED FREIGHT ORDERS STILL CONTRIBUTE LANDED COST — ONE DEFINITION (o3d-6nd55 r2).
+ *
+ * A CANCELLED freight purchase order must no longer contribute: excluding it is exactly what lets
+ * cancellation revert the uplift it had applied. Both landed-cost recalculation paths in this file
+ * have said so for a long time, each with its own inline copy of the predicate and its own audit
+ * reference — `recalculateLandedCosts` (audit-C3) and `recalculateDirectLandedCosts` (audit-izrf).
+ *
+ * WHY IT IS NOW A CONSTANT. Codex round 2 on o3d-6nd55 found the WMS stock-sync align-up path
+ * reading `landedCostLinks` with NO filter, so a cancelled freight order's cost lines were added
+ * back into the align-up cost layer, the stock movement and the STOCK_RECEIPT journal — overstating
+ * inventory by freight the business had cancelled, and disagreeing with what recalculation would
+ * compute for the same units. A third reader of "which links count" was a third chance to get it
+ * wrong, so the predicate has one name and the readers derive it rather than restate it.
+ *
+ * IT FILTERS ON STATUS AND DELIBERATELY NOT ON `LandedCostLink.allocated`. `allocated` records
+ * whether the uplift has been WRITTEN to `landedUnitCostBase` yet; the whole purpose of
+ * `computeGrossUnitCostBaseByLine` is to value a receipt whose freight has NOT been allocated yet, so
+ * filtering on it would zero exactly the case the helper exists for. Cancellation sets both — the
+ * status is the fact about whether the cost still exists, and that is the one both recalc paths test.
+ */
+export const CONTRIBUTING_LANDED_COST_LINK_WHERE = {
+  freightPO: { status: { not: 'CANCELLED' } },
+} as const
+
 export function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
@@ -1061,8 +1086,10 @@ export async function recalculateLandedCosts(
 
     const allLinks = await tx.landedCostLink.findMany({
       // audit-C3: a CANCELLED freight PO must no longer contribute landed cost —
-      // excluding it here is what lets cancellation revert the uplift it applied.
-      where: { primaryPoId, freightPO: { status: { not: 'CANCELLED' } } },
+      // excluding it here is what lets cancellation revert the uplift it applied. The predicate is
+      // CONTRIBUTING_LANDED_COST_LINK_WHERE so this path, the direct recalc below and the WMS
+      // align-up receipt cannot disagree about it (o3d-6nd55 r2).
+      where: { primaryPoId, ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
       select: {
         freightPO: {
           select: {
@@ -1451,7 +1478,8 @@ export async function recalculateDirectLandedCosts(
       landedCostLinks: {
         // audit-izrf: a CANCELLED freight PO must no longer contribute landed
         // cost, mirroring the linked-freight recalc path (recalculateLandedCosts).
-        where: { freightPO: { status: { not: 'CANCELLED' } } },
+        // Shared predicate since o3d-6nd55 r2 — see CONTRIBUTING_LANDED_COST_LINK_WHERE.
+        where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
         select: {
           freightPO: {
             select: {

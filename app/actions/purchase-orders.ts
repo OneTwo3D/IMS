@@ -5,6 +5,12 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+// o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
+// order the WMS alignment relies on. See that module's census of every writer.
+import {
+  lockPurchaseOrders,
+  lockPurchaseOrdersWithCostRows,
+} from '@/lib/domain/wms/transfer-asn-lock-order'
 import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -2372,12 +2378,35 @@ export async function returnPurchaseOrder(
     // being able to say so. A property of an object is re-widened by the intervening call.
     const returnPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     const { overBilling, creditNote, suppressedReturnCredit } = await db.$transaction(async (tx): Promise<{ overBilling: PurchaseOrderOverBillingSummary; creditNote: { id: string; amountForeign: number; invoiceId: string } | null; suppressedReturnCredit: number }> => {
+      // ─── o3d-6nd55 r5 (Codex round-4 HIGH): THE PARENT ORDER, BEFORE THE FIRST STOCK ROW ───
+      //
+      // THE DEADLOCK. This transaction updates the parent order at the end (its status), so it has
+      // always ACQUIRED the parent — just last. The manual receipt takes the parent FIRST (:1828) and
+      // reaches a stock row later (:1994), and so does PO-backed alignment. Receipt holds the parent
+      // and wants the stock row; the return holds the stock row and wants the parent; PostgreSQL aborts
+      // one, failing an operator's return or receipt, or aborting alignment.
+      //
+      // IT IS OLDER THAN THIS BRANCH, and saying so matters for how it is read: the final parent update
+      // gave this transaction the stock→parent order long before o3d-6nd55 existed. What r3 did was take
+      // the parent EXPLICITLY but still below the stock locks, which widened the window rather than
+      // opening it. Either way it is this branch's to fix, because this branch is what makes the
+      // opposite order load-bearing: alignment now holds the parent precisely so it can trust the cost
+      // rows it reads.
+      //
+      // THE PARENT ONLY — NOT `lockPurchaseOrdersWithCostRows`, WHICH IS WHAT R3 GOT WRONG. This path
+      // touches no `freight_cost_lines`, and the combined helper would take `purchase_order_lines` HERE,
+      // above the stock locks — breaking the audit-18s1 agreement immediately below, which exists so the
+      // return and the receipt take {stock_levels, purchase_order_lines} in the SAME order. The gate this
+      // needs is the parent; the line locks stay exactly where audit-18s1 put them.
+      await lockPurchaseOrders(tx, [id])
+
       // audit-18s1: acquire locks in the SAME order the goods-receipt path uses
       // (stock_levels first, then PO lines) to avoid an AB/BA deadlock — receipt
       // locks a stock_levels row then updates the PO line, so a return must not
       // lock them in the opposite order. Lock stock rows in a canonical
       // (productId, warehouseId) order so two concurrent returns touching
       // overlapping rows can't deadlock each other either.
+      // o3d-6nd55 r5: still true, and now reached with the parent already held.
       const stockPairs = Array.from(
         new Map(
           linesWithQty.map((rl) => {
@@ -4687,6 +4716,33 @@ export async function updateFreightPoCosts(
   try {
     const session = await requirePermission('purchasing.create')
     const { reference, landedResult } = await db.$transaction(async (tx) => {
+      // ─── o3d-6nd55 r3 (Codex round-3 HIGH): THE PARENT ORDERS BEFORE THEIR COST ROWS ───
+      //
+      // THE DEADLOCK THIS CLOSES. This transaction used to delete `freight_cost_lines` and only THEN
+      // update the freight `purchase_orders` row — children before parent. The WMS stock-sync
+      // alignment takes the opposite order (parent at step 2b, then the cost rows it reads to value a
+      // receipt), which it must, because it has to hold the parent before it can trust what its cost
+      // rows say. Two orders over one pair of tables is a cycle: each transaction waits for the other
+      // and PostgreSQL aborts one, failing either this operator's edit or that SKU's alignment.
+      //
+      // AND IT LOCKS THE LINKED PRIMARIES TOO, not just the freight order. `recalculateLandedCosts`
+      // below rewrites `purchase_order_lines.landedUnitCostBase` on every primary order linked to this
+      // freight order, so those primaries' children are this transaction's children as well — locking
+      // only the freight order would leave the identical cycle one order over. The link rows are read
+      // first, unlocked, purely to discover WHICH orders to lock; the lock is what makes the reads
+      // after it trustworthy.
+      //
+      // `lockPurchaseOrdersWithCostRows` takes parent-then-children in one call, so this call site
+      // cannot express the order that caused the defect.
+      const linkedPrimaries = await tx.landedCostLink.findMany({
+        where: { freightPoId },
+        select: { primaryPoId: true },
+      })
+      await lockPurchaseOrdersWithCostRows(tx, [
+        freightPoId,
+        ...linkedPrimaries.map((link) => link.primaryPoId),
+      ])
+
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
         select: { id: true, reference: true, type: true, fxRateToBase: true },

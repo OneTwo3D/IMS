@@ -320,7 +320,29 @@ const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
    * IMS will post it later, which is what `manual` means: an operator posts it by hand and marks it handled.
    * Registered here rather than reclassified, and verified rather than assumed.
    */
-  stock_receipt_journal: { 'app/actions/purchase-orders.ts': 1, 'lib/domain/wms/booked-in-service.ts': 1 },
+  /**
+   * o3d-6nd55 r6 (merge with o3d-j625 #700) — A THIRD SITE RAISES THIS POSTING, AND THE KIND STILL STAYS
+   * `manual`.
+   *
+   * o3d-6nd55 adds the WMS stock-sync ALIGN-UP journal, so three call sites can now refuse
+   * STOCK_RECEIPT/PurchaseOrder for the same purchase order. This census fired exactly as designed and asks
+   * the right question: does the new site RAISE THE SAME POSTING AGAIN, which would make the kind `retried`?
+   *
+   * IT DOES NOT, and the reason is specific to how align-up consumes its work rather than inherited from
+   * #713's answer. On a refusal the alignment still commits: the stock level, the cost layer and — crucially
+   * — the `wms_asn_line_maps.qtyAccountedViaSnapshot` increment all land, because `if (queued)` guards only
+   * the transit subledger mirror. That increment is what tells every later sweep the units are already
+   * accounted for, so the next sweep measures no delta for them and never reaches this enqueue again. The
+   * very exclusion that makes align-up and the book-in compose without double-posting is also what makes a
+   * refused journal here final. Nothing in IMS will post it later, which is what `manual` means.
+   *
+   * Registered rather than reclassified, and verified against this path rather than assumed from the last one.
+   */
+  stock_receipt_journal: {
+    'app/actions/purchase-orders.ts': 1,
+    'lib/connectors/mintsoft/sync/stock-sync.ts': 1,
+    'lib/domain/wms/booked-in-service.ts': 1,
+  },
   purchase_invoice: { 'app/actions/purchase-orders.ts': 1 },
   realised_fx_bill_payment: { 'app/actions/purchase-orders.ts': 1 },
   realised_fx_receipt: { 'app/actions/sales.ts': 1 },
