@@ -108,6 +108,16 @@ is an explicit check:
 - `npm run check:bom-recipes` — the same check from the command line. It exits non-zero when
   anything disagrees, so it can gate a data load.
 
+**Editing a recipe after import.** The product page's component editor writes both copies too, in
+one step, so editing an imported BOM keeps them in step — you do not have to re-import to keep
+planning correct.
+
+**Changing a product's type.** Converting a BOM to any non-manufactured type *retires* its
+manufacturing recipe: the recipe is marked inactive and stops being that product's recipe, but its
+lines are kept so past build orders still report correctly. Converting back to BOM re-adopts the same
+recipe and reactivates it — you do not end up with two. Converting a Kit to a BOM gives it a
+manufacturing recipe from the components it already had.
+
 Repair in every case is the same: re-import the affected products through the products CSV.
 
 

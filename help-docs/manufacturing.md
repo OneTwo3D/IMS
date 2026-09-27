@@ -11,8 +11,8 @@ A recipe can be entered on the product page or loaded in bulk through the produc
 
 IMS holds each recipe in two places. One copy is what a build order consumes; the other is what
 **planning** reads — the replenishment report's component-demand explosion, automatic reorder build
-orders, and manufacturing analytics. Both are written together by the product form and by the CSV
-import, so they normally agree.
+orders, and manufacturing analytics. Both are written together by the product form, by the product-type change, and by the CSV import, so
+they normally agree.
 
 They can still fall out of step for recipes created before this was true, or edited directly in the
 database. The symptom is quiet: the product builds fine one order at a time, but the reorder report

@@ -168,6 +168,87 @@ test('3. the drift check goes RED on a deliberate break and green again on resto
   assert.deepEqual(await findBomRecipeDrift(db), [], 'restoring the qty must clear the finding')
 })
 
+test('3b. ROUND 2 finding 1: editing an imported BOM through the PRODUCT EDITOR keeps both halves in step', async () => {
+  // The path people actually use. Before round 2 this wrote only ProductComponent, so an imported
+  // BOM edited here left production consuming the new list and planning reading the old one — and
+  // the drift check would have reported it as a defect the product creates daily.
+  const { saveProductComponents } = await import('../../app/actions/products')
+  const rawOak = await db.product.findUniqueOrThrow({ where: { sku: 'RAW-OAK' }, select: { id: true } })
+
+  // Change a quantity AND drop a component in one edit: 4x LEG + 2x RAW-OAK  ->  9x RAW-OAK only.
+  const saved = await saveProductComponents(tableId, [{ componentId: rawOak.id, qty: '9' }])
+  assert.equal(saved.success, true, `editor save failed: ${JSON.stringify(saved)}`)
+
+  const after = await db.product.findUniqueOrThrow({
+    where: { id: tableId },
+    select: {
+      productComponents: { select: { componentId: true, qty: true } },
+      manufacturingBom: { select: { id: true, active: true, items: { select: { componentProductId: true, qty: true } } } },
+    },
+  })
+  assert.equal(after.productComponents.length, 1, 'the editor wrote the new ProductComponent list')
+  assert.ok(after.manufacturingBom, 'the claimed Bom must still exist')
+  assert.equal(after.manufacturingBom.id, claimedBomId, 'it must be the SAME Bom, not a second one')
+  assert.deepEqual(
+    after.manufacturingBom.items.map((item) => [item.componentProductId, Number(item.qty)]),
+    [[rawOak.id, 9]],
+    'the BomItem side must have followed the edit — dropped component gone, qty updated',
+  )
+  assert.deepEqual(await findBomRecipeDrift(db), [], 'the two representations must agree after an editor edit')
+  console.log('# editor edit: both representations moved together, Bom ' + claimedBomId)
+
+  // Put the original recipe back so the later steps read the fixture they expect.
+  const leg = await db.product.findUniqueOrThrow({ where: { sku: 'LEG-01' }, select: { id: true } })
+  const restored = await saveProductComponents(tableId, [
+    { componentId: leg.id, qty: '4' },
+    { componentId: rawOak.id, qty: '2' },
+  ])
+  assert.equal(restored.success, true, `restore failed: ${JSON.stringify(restored)}`)
+  assert.deepEqual(await findBomRecipeDrift(db), [])
+})
+
+test('3c. ROUND 2 finding 1b: a type conversion RETIRES the recipe, and converting back ADOPTS the same Bom', async () => {
+  // clearComponents deleted ProductComponent and left BomItem behind. Retiring deactivates and
+  // unclaims instead of deleting, so completed-order history keeps resolving while planning stops
+  // reading it — and the drift check stays green through an entirely legitimate conversion.
+  const toSimple = await importProductsCsv(form([
+    'sku,name,type,stockUnit',
+    'TABLE-01,Oak table,SIMPLE,each',
+  ].join('\n')))
+  assert.deepEqual(errorsOf(toSimple), [], 'the conversion row must import cleanly')
+
+  const retired = await db.bom.findUniqueOrThrow({
+    where: { id: claimedBomId },
+    select: { active: true, productId: true, items: { select: { id: true } } },
+  })
+  assert.equal(retired.active, false, 'the Bom must be deactivated — that is what planning filters on')
+  assert.equal(retired.productId, null, 'and unclaimed, so a later conversion can adopt it')
+  assert.ok(retired.items.length > 0, 'its items must SURVIVE — deleting them rewrites completed-order history')
+  assert.equal(
+    await db.productComponent.count({ where: { productId: tableId } }), 0,
+    'precondition: the conversion really did clear ProductComponent',
+  )
+  assert.deepEqual(await findBomRecipeDrift(db), [], 'a retired recipe is history, not drift')
+  console.log('# BOM -> SIMPLE: Bom ' + claimedBomId + ' deactivated + unclaimed, ' + retired.items.length + ' item(s) kept')
+
+  const backToBom = await importProductsCsv(form([
+    'sku,name,type,components,stockUnit',
+    'TABLE-01,Oak table,BOM,LEG-01:4;RAW-OAK:2,each',
+  ].join('\n')))
+  assert.deepEqual(errorsOf(backToBom), [], 'converting back must import cleanly')
+
+  const readopted = await db.product.findUniqueOrThrow({
+    where: { id: tableId },
+    select: { manufacturingBom: { select: { id: true, active: true, items: { select: { componentProductId: true } } } } },
+  })
+  assert.ok(readopted.manufacturingBom, 'it must have a claimed Bom again')
+  assert.equal(readopted.manufacturingBom.id, claimedBomId, 'ADOPTED the retired row rather than adding a second')
+  assert.equal(readopted.manufacturingBom.active, true, 're-activated, or planning still cannot see it')
+  assert.equal(readopted.manufacturingBom.items.length, 2)
+  assert.deepEqual(await findBomRecipeDrift(db), [])
+  console.log('# SIMPLE -> BOM: re-adopted and re-activated the same Bom ' + claimedBomId)
+})
+
 test('4. an unknown component refuses the WHOLE recipe, by row number, writing no partial recipe', async () => {
   const result = await importProductsCsv(form([
     'sku,name,type,components,stockUnit',

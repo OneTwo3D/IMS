@@ -28,6 +28,7 @@ import {
 } from '@/lib/products/component-graph-edit-guard'
 import {
   detectBomItemCycleAfterReplacement,
+  reconcileBomRecipeForProductType,
   syncBomRecipeFromProductComponents,
 } from '@/lib/products/bom-recipe'
 
@@ -487,6 +488,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (!preview) {
           let resolvedCategoryId: string | null = null
           const outcome: RenameOutcome = await db.$transaction(async (tx) => {
+            // o3d-zjsb5.9 round 2: the GRAPH lock FIRST, then the per-SKU locks — the same order
+            // pass 2 and the editor use, which is what keeps the two lock families deadlock-free.
+            // This transaction now reconciles the BOM recipe on a type change, so it is a
+            // component-graph writer and has to join that protocol; taking the per-SKU lock first
+            // and the graph lock afterwards would invert the order against pass 2 and deadlock two
+            // concurrent imports.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
             // o3d-42hw: this row can RENAME an existing product, which frees one sku and
             // claims another, so it belongs in the write protocol exactly as the create does.
             // Both skus are locked; the helper collapses them when the sku is unchanged.
@@ -573,6 +581,34 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             // old version, so commitment and dispatch now refuse it even when the guard above saw an
             // empty blocker set because that allocation's transaction was still open.
             await bumpFulfillmentGraphVersions(tx, existingProduct.id, kitnessMutation)
+
+            // o3d-zjsb5.9 round 2, finding 1b: the clearComponents delete left `BomItem` BEHIND. Placed
+            // AFTER the fulfilment-graph bump deliberately: that bump must stay adjacent to the write it
+            // describes (tests/products/component-graph-edit-guard.test.ts asserts the proximity), and the
+            // manufacturing mirror is separate bookkeeping that depends on neither. Reconciling
+            // on the type this transaction just wrote covers all four directions, which
+            // `clearComponents` alone cannot — it is FALSE for KIT -> BOM, where the components are
+            // kept and the product now needs a claimed Bom or planning has no recipe for it.
+            //
+            // This transaction holds the GRAPH lock (taken first, above) and the per-SKU locks, so
+            // the reconcile runs under the same protection as pass 2's component write.
+            const importReconcile = await reconcileBomRecipeForProductType(tx, {
+              productId: existingProduct.id,
+              sku,
+              type: (updateData.type as string | undefined) ?? current.type,
+            })
+            if (importReconcile.kind === 'cycle') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): changing this product's type would make the manufacturing BOM graph `
+                + `circular (${importReconcile.path.join(' -> ')}) — the row was not written`,
+              )
+            }
+            if (importReconcile.kind === 'claim-contended') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): another writer claimed this product's manufacturing BOM while the import `
+                + 'was running — the row was not written, re-run to pick it up',
+              )
+            }
             // The structure this row ACTUALLY committed, for the in-run cache below. The
             // locked defaults can preserve a concurrent type/parent, so the pre-lock values
             // no longer describe the row (Codex review, r3).

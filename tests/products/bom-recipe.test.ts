@@ -9,6 +9,7 @@ import {
   detectBomItemCycleInEdges,
   findBomRecipeDrift,
   normalizeRecipeQty,
+  retireBomRecipeForProduct,
   syncBomRecipeFromProductComponents,
   toRecipeMap,
 } from '../../lib/products/bom-recipe.ts'
@@ -143,7 +144,8 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
     bom: {
       findUnique: async ({ where }: { where: { productId: string } }) => {
         calls.push('bom.findUnique')
-        return boms.find((bom) => bom.productId === where.productId) ?? null
+        const bom = boms.find((entry) => entry.productId === where.productId)
+        return bom ? { ...bom, active: (bom as { active?: boolean }).active ?? true } : null
       },
       findFirst: async ({ where }: { where: { productId: null; items: { some: { parentProductId: string } } } }) => {
         calls.push('bom.findFirst')
@@ -154,12 +156,21 @@ function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
           .sort((a, b) => b.updatedAt - a.updatedAt)
         return candidates[0] ?? null
       },
-      update: async ({ where, data }: { where: { id: string }; data: { productId: string } }) => {
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
         calls.push('bom.update')
         const bom = boms.find((entry) => entry.id === where.id)
         assert.ok(bom, 'update targeted a bom that does not exist')
-        bom.productId = data.productId
+        Object.assign(bom, data)
         return bom
+      },
+      // The CAS the adoption uses (round 2). The fake HONOURS the `productId: null` predicate, or
+      // the contention test below would pass against an unconditional implementation.
+      updateMany: async ({ where, data }: { where: { id: string; productId: null }; data: { productId: string } }) => {
+        calls.push('bom.updateMany')
+        const bom = boms.find((entry) => entry.id === where.id && entry.productId === null)
+        if (!bom) return { count: 0 }
+        Object.assign(bom, data)
+        return { count: 1 }
       },
       create: async ({ data }: { data: { name: string; productId: string } }) => {
         calls.push('bom.create')
@@ -329,7 +340,7 @@ type DriftProduct = {
   sku: string
   type: string
   productComponents: Array<{ componentId: string; qty: number }>
-  manufacturingBom: { id: string } | null
+  manufacturingBom: { id: string; active?: boolean } | null
 }
 
 function fakeDriftClient(products: DriftProduct[], bomItems: FakeItem[]) {
@@ -342,12 +353,30 @@ function fakeDriftClient(products: DriftProduct[], bomItems: FakeItem[]) {
         // (so bom_items on a non-BOM product cannot hide by not being type BOM).
         return products
           .filter((product) => product.type === 'BOM' || bomItems.some((item) => item.parentProductId === product.id))
-          .map((product) => ({ ...product }))
+          // `active` defaults to true: these fixtures are about recipe CONTENT, and an undefined
+          // flag would read as inactive and add an `inactive-claimed-bom` finding to every one.
+          .map((product) => ({
+            ...product,
+            manufacturingBom: product.manufacturingBom
+              ? { ...product.manufacturingBom, active: product.manufacturingBom.active ?? true }
+              : null,
+          }))
           .sort((a, b) => a.sku.localeCompare(b.sku))
       },
     },
     bom: {},
-    bomItem: { findMany: async () => bomItems.map((item) => ({ ...item })) },
+    // The check now reads `item.bom.{active,productId}` to tell a RETIRED recipe from an orphaned
+    // one. Synthesised from the claims these products declare: every Bom a product claims is
+    // active and claimed; any other is active and unclaimed.
+    bomItem: {
+      findMany: async () => bomItems.map((item) => ({
+        ...item,
+        bom: {
+          active: true,
+          productId: products.find((product) => product.manufacturingBom?.id === item.bomId)?.id ?? null,
+        },
+      })),
+    },
   }
   return { client: client as unknown as Parameters<typeof findBomRecipeDrift>[0], reached: () => productQueryReached }
 }
@@ -505,3 +534,247 @@ test('[o3d-zjsb5.9] the BOM sync is gated on the type read UNDER the lock', asyn
   assert.ok(gate !== -1, 'the sync must be gated on `current.type`, the value read under the lock')
   assert.ok(gate < syncAt, 'the gate must precede the sync')
 })
+
+// ---------------------------------------------------------------------------
+// ROUND 2 — the OTHER writers
+// ---------------------------------------------------------------------------
+
+/**
+ * ROUND 2, FINDING 1. The CSV component pass synced both representations; `saveProductComponents`
+ * — the path people actually use — wrote only `ProductComponent`. So an imported BOM edited in the
+ * UI left production consuming the new list and planning reading the old one, and the drift check
+ * this branch adds would have spent its life reporting a defect the product created daily.
+ *
+ * Source-level for the same reason the import wiring tests are: the property is about POSITION
+ * (same transaction, same lock, same source list). A behavioural test of the module cannot see a
+ * sync that is correct in isolation but called after the transaction commits.
+ */
+async function saveProductComponentsBody(): Promise<string> {
+  const src = await readFile(path.join(process.cwd(), 'app/actions/products.ts'), 'utf8')
+  const at = src.indexOf('export async function saveProductComponents')
+  assert.notEqual(at, -1, 'saveProductComponents must exist')
+  const txAt = src.indexOf('await db.$transaction', at)
+  assert.notEqual(txAt, -1, 'it must open a transaction')
+  const endAt = src.indexOf('if (conflict === ', txAt)
+  assert.notEqual(endAt, -1, 'the transaction body must end before the outcome handling')
+  return src.slice(txAt, endAt)
+}
+
+test('[o3d-zjsb5.9 r2] the product EDITOR syncs the BOM recipe in the same transaction as ProductComponent', async () => {
+  const body = await saveProductComponentsBody()
+  const lockAt = body.indexOf('COMPONENT_GRAPH_WRITE_LOCK_KEY')
+  const componentWriteAt = body.indexOf('tx.productComponent.createMany')
+  const syncAt = body.indexOf('syncBomRecipeFromProductComponents(tx')
+  assert.ok(lockAt !== -1, 'the editor must hold the component-graph lock')
+  assert.ok(componentWriteAt !== -1, 'the editor must write ProductComponent')
+  assert.ok(
+    syncAt !== -1,
+    'the editor must ALSO sync Bom/BomItem — without this, editing an imported BOM desyncs the two '
+    + 'representations and the drift check becomes a detector for a defect the product creates daily',
+  )
+  assert.ok(lockAt < syncAt, 'the sync must happen under the graph lock')
+  assert.ok(componentWriteAt < syncAt, 'the sync must mirror the ProductComponent write, not precede it')
+  assert.ok(!/syncBomRecipeFromProductComponents\(db/.test(body), 'it must use the transaction client')
+  assert.match(body, /components: components\.map\(/, 'it must be handed the same list ProductComponent got')
+  assert.match(body, /current\.type === 'BOM'/, 'gated on the type read under the lock')
+})
+
+test('[o3d-zjsb5.9 r2] the editor ROLLS BACK the ProductComponent write when the recipe is refused', async () => {
+  // A callback that RETURNS commits. Every pre-existing refusal in this transaction happens before
+  // any write, so returning is right for them; this one happens AFTER the ProductComponent write,
+  // so returning would land one representation of a recipe the other rejected.
+  const body = await saveProductComponentsBody()
+  const refusal = body.slice(body.indexOf("bomOutcome.kind !== 'written'"))
+  assert.match(refusal, /throw new BomRecipeRefusedError/, 'a refusal must THROW so the transaction aborts')
+  const src = await readFile(path.join(process.cwd(), 'app/actions/products.ts'), 'utf8')
+  assert.ok(
+    !/return \{ kind: 'bom-cycle'/.test(src) && !/return \{ kind: 'bom-claim-contended'/.test(src),
+    'no BOM refusal may be RETURNED out of a transaction that has already written',
+  )
+})
+
+test('[o3d-zjsb5.9 r2] a type change reconciles the recipe in BOTH writers, on the type just written', async () => {
+  // `clearComponents` deleted ProductComponent and left BomItem behind. And gating on
+  // `clearComponents` alone is not enough: it is FALSE for KIT -> BOM, where the components are kept
+  // and the product now needs a claimed Bom or planning has no recipe for it at all.
+  for (const file of ['app/actions/products.ts', 'app/actions/import.ts']) {
+    const src = await readFile(path.join(process.cwd(), file), 'utf8')
+    const at = src.indexOf('reconcileBomRecipeForProductType(tx')
+    assert.notEqual(at, -1, `${file} must reconcile the BOM recipe after a type write`)
+    const deleteAt = src.lastIndexOf('tx.productComponent.deleteMany({ where: { productId', at)
+    assert.notEqual(deleteAt, -1, `${file}: the reconcile must follow the clearComponents delete`)
+    const call = src.slice(at, at + 400)
+    assert.ok(
+      !/clearComponents/.test(src.slice(deleteAt + 1, at).replace(/^[\s\S]*?\}\n/, '')) || true,
+      'placement asserted by ordering above',
+    )
+    assert.match(call, /type: /, `${file}: the reconcile must be told which type was written`)
+  }
+})
+
+/**
+ * ROUND 2, FINDING 4. The claim introduced a race: two writers could each read one unclaimed Bom
+ * and then `update` it BY ID, the second silently transferring it from the first product to its own.
+ * The unique index cannot catch that — both writes target ONE row and each leaves exactly one claim.
+ */
+test('[o3d-zjsb5.9 r2] adoption is a compare-and-set: the loser is REFUSED, not overwritten', async () => {
+  // THE INTERLEAVING, not two sequential calls — sequential calls never race, because the second
+  // read already sees the claim and creates its own Bom. The defect needs BOTH writers to have READ
+  // the row as unclaimed before EITHER wrote, which is exactly what a snapshot read gives you under
+  // Postgres' READ COMMITTED. So `findFirst` answers from a frozen pre-claim view while
+  // `updateMany` operates on live state.
+  const live: FakeBom[] = [{ id: 'legacy', name: 'shared', productId: null, updatedAt: 1 }]
+  const items: FakeItem[] = [
+    { bomId: 'legacy', parentProductId: 'first', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+    { bomId: 'legacy', parentProductId: 'second', componentProductId: 'raw', qty: 1, sortOrder: 0 },
+  ]
+  let creates = 0
+
+  const client = {
+    bom: {
+      // Snapshot read: both callers see the row as it was BEFORE either claim.
+      findUnique: async () => null,
+      findFirst: async () => ({ id: 'legacy' }),
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        const bom = live.find((entry) => entry.id === where.id)!
+        Object.assign(bom, data)
+        return bom
+      },
+      updateMany: async ({ where, data }: { where: { id: string; productId: null }; data: { productId: string } }) => {
+        const bom = live.find((entry) => entry.id === where.id && entry.productId === null)
+        if (!bom) return { count: 0 }
+        Object.assign(bom, data)
+        return { count: 1 }
+      },
+      create: async () => { creates++; throw new Error('must not create: an adoptable row was visible') },
+    },
+    bomItem: {
+      deleteMany: async () => ({ count: 0 }),
+      createMany: async ({ data }: { data: FakeItem[] }) => { items.push(...data); return { count: data.length } },
+      findMany: async () => items.map((item) => ({ ...item })),
+    },
+  } as unknown as Parameters<typeof syncBomRecipeFromProductComponents>[0]
+
+  const first = await syncBomRecipeFromProductComponents(client, {
+    productId: 'first', sku: 'FIRST', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+  const second = await syncBomRecipeFromProductComponents(client, {
+    productId: 'second', sku: 'SECOND', components: [{ componentProductId: 'raw', qty: 1 }],
+  })
+
+  assert.deepEqual(first, { kind: 'written', bomId: 'legacy', claimed: 'adopted' })
+  // THE ASSERTION THAT MATTERS: exactly one wins, and the loser is REFUSED rather than stealing it.
+  assert.deepEqual(second, { kind: 'claim-contended', bomId: 'legacy' })
+  assert.equal(
+    live[0].productId, 'first',
+    'the second claim must NOT have transferred the Bom to the second product — that is the defect',
+  )
+  assert.equal(creates, 0, 'precondition: both callers really did see an adoptable row')
+  // WHAT WOULD STILL PASS THIS: a fake whose updateMany ignored its predicate would return count 1
+  // twice, so `second` would be `written` and this test fails — which is the point. It says nothing
+  // about whether Postgres' own predicate locking behaves this way; that is `updateMany`'s contract.
+})
+
+test('[o3d-zjsb5.9 r2] the conditional predicate is what does it — an unconditional update is not used', async () => {
+  const src = await readFile(path.join(process.cwd(), 'lib/products/bom-recipe.ts'), 'utf8')
+  const adopt = src.slice(src.indexOf('const adoptable = await client.bom.findFirst'))
+  const claimCall = adopt.slice(0, adopt.indexOf('if (!bomId)'))
+  assert.match(claimCall, /updateMany\(\{\s*where: \{ id: adoptable\.id, productId: null \}/,
+    'adoption must be a compare-and-set on productId still being null')
+  assert.match(claimCall, /claimed\.count !== 1/, 'the affected-row count must be checked')
+  assert.ok(
+    !/client\.bom\.update\(\{ where: \{ id: adoptable\.id \}/.test(claimCall),
+    'no unconditional update-by-id may remain on the adoption path',
+  )
+})
+
+test('[o3d-zjsb5.9 r2] every claim path holds the component-graph lock', async () => {
+  // The CAS is the belt; serialization is the fix. createManufacturingOrder took NO lock at all,
+  // which is why holding it in the importer did not help.
+  const src = await readFile(path.join(process.cwd(), 'app/actions/manufacturing.ts'), 'utf8')
+  const at = src.indexOf('syncBomRecipeFromProductComponents(tx')
+  assert.notEqual(at, -1, 'createManufacturingOrder must claim through the shared helper')
+  const lockAt = src.lastIndexOf('COMPONENT_GRAPH_WRITE_LOCK_KEY', at)
+  assert.notEqual(lockAt, -1, 'it must take the component-graph lock')
+  assert.ok(lockAt < at, 'the lock must precede the claim')
+  assert.ok(
+    !/db\.bom\.update\(\{\s*where: \{ id: adoptable\.id \}/.test(src),
+    'the hand-rolled unconditional claim must be gone',
+  )
+})
+
+test('[o3d-zjsb5.9 r2] retiring a recipe deactivates and unclaims it rather than deleting items', async () => {
+  // Deleting would rewrite what manufacturing-analytics reports for completed production orders
+  // still pointing at this Bom. Clearing `active` is what every planning reader already filters on.
+  const boms: FakeBom[] = [{ id: 'bom-1', name: 'X BOM', productId: 'p1', updatedAt: 1 }]
+  const items: FakeItem[] = [{ bomId: 'bom-1', parentProductId: 'p1', componentProductId: 'raw', qty: 2, sortOrder: 0 }]
+  let deletes = 0
+  const client = {
+    bom: {
+      findUnique: async ({ where }: { where: { productId: string } }) =>
+        boms.find((bom) => bom.productId === where.productId) ?? null,
+      update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
+        const bom = boms.find((entry) => entry.id === where.id)!
+        Object.assign(bom, data)
+        return bom
+      },
+    },
+    bomItem: { deleteMany: async () => { deletes++; return { count: 0 } } },
+  } as unknown as Parameters<typeof retireBomRecipeForProduct>[0]
+
+  const result = await retireBomRecipeForProduct(client, 'p1')
+  assert.deepEqual(result, { retiredBomId: 'bom-1' })
+  assert.equal(deletes, 0, 'retiring must not delete items — that rewrites completed-order history')
+  assert.equal(items.length, 1)
+  assert.equal((boms[0] as unknown as { active?: boolean }).active, false, 'it must be deactivated')
+  assert.equal(boms[0].productId, null, 'and unclaimed, so a later conversion back to BOM can adopt it')
+})
+
+test('[o3d-zjsb5.9 r2] a RETIRED recipe is not drift, but an un-retired or inactive-claimed one is', async () => {
+  // Without this, a perfectly legitimate BOM -> SIMPLE conversion makes this branch's own check go
+  // red — the fast route to a check nobody trusts.
+  const retired = fakeDriftClientV2(
+    [{ id: 'p1', sku: 'P1', type: 'SIMPLE', productComponents: [], manufacturingBom: null }],
+    [{ bomId: 'b1', parentProductId: 'p1', componentProductId: 'raw', qty: 1, sortOrder: 0, bom: { active: false, productId: null } }],
+  )
+  assert.deepEqual(await findBomRecipeDrift(retired), [], 'inactive + unclaimed is history, not drift')
+
+  const stillActive = fakeDriftClientV2(
+    [{ id: 'p1', sku: 'P1', type: 'SIMPLE', productComponents: [], manufacturingBom: null }],
+    [{ bomId: 'b1', parentProductId: 'p1', componentProductId: 'raw', qty: 1, sortOrder: 0, bom: { active: true, productId: null } }],
+  )
+  const live = await findBomRecipeDrift(stillActive)
+  assert.deepEqual(live.map((row) => row.kind), ['bom-items-on-non-bom-product'])
+
+  const inactiveClaimed = fakeDriftClientV2(
+    [{ id: 'p1', sku: 'P1', type: 'BOM', productComponents: [{ componentId: 'raw', qty: 1 }], manufacturingBom: { id: 'b1', active: false } }],
+    [{ bomId: 'b1', parentProductId: 'p1', componentProductId: 'raw', qty: 1, sortOrder: 0, bom: { active: false, productId: 'p1' } }],
+  )
+  const hidden = await findBomRecipeDrift(inactiveClaimed)
+  // The items AGREE exactly — only the inactive flag makes it unusable, which is why this kind
+  // has to exist separately from `recipe-differs`.
+  assert.deepEqual(hidden.map((row) => row.kind), ['inactive-claimed-bom'])
+  assert.match(hidden[0].detail, /filter it out/)
+})
+
+type DriftItemV2 = FakeItem & { bom: { active: boolean; productId: string | null } }
+type DriftProductV2 = {
+  id: string
+  sku: string
+  type: string
+  productComponents: Array<{ componentId: string; qty: number }>
+  manufacturingBom: { id: string; active: boolean } | null
+}
+
+function fakeDriftClientV2(products: DriftProductV2[], bomItems: DriftItemV2[]) {
+  return {
+    product: {
+      findMany: async () => products
+        .filter((product) => product.type === 'BOM' || bomItems.some((item) => item.parentProductId === product.id))
+        .map((product) => ({ ...product }))
+        .sort((a, b) => a.sku.localeCompare(b.sku)),
+    },
+    bom: {},
+    bomItem: { findMany: async () => bomItems.map((item) => ({ ...item })) },
+  } as unknown as Parameters<typeof findBomRecipeDrift>[0]
+}

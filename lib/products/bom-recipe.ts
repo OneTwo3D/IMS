@@ -191,6 +191,13 @@ type BomSyncClient = Pick<Prisma.TransactionClient, 'bom' | 'bomItem'>
 export type BomRecipeSyncOutcome =
   | { kind: 'written'; bomId: string; claimed: 'created' | 'adopted' | 'already' }
   | { kind: 'cycle'; path: string[] }
+  /**
+   * The adoption lost a race: the row this call chose was claimed by another writer between the
+   * read and the conditional update (round 2, finding 4). Refused rather than retried, because
+   * every claim path now holds `COMPONENT_GRAPH_WRITE_LOCK_KEY`, so reaching this means an
+   * unlocked writer exists and guessing would hide it.
+   */
+  | { kind: 'claim-contended'; bomId: string }
 
 /**
  * Bring `Bom`/`BomItem` into line with the component list the caller is writing to
@@ -226,18 +233,39 @@ export async function syncBomRecipeFromProductComponents(
 ): Promise<BomRecipeSyncOutcome> {
   const { productId, sku, components } = args
 
-  const claimed = await client.bom.findUnique({ where: { productId }, select: { id: true } })
-  let bomId = claimed?.id ?? null
+  const existing = await client.bom.findUnique({ where: { productId }, select: { id: true, active: true } })
+  let bomId = existing?.id ?? null
   let claimKind: 'created' | 'adopted' | 'already' = 'already'
 
-  if (!bomId) {
+  if (bomId) {
+    // A CLAIMED Bom that is INACTIVE is a recipe planning cannot see:
+    // `replenishment-reports.ts` filters `bom: { active: true }` and `createReorderMOs` filters
+    // `active: true`. Being the claimed recipe of a BOM-typed product is exactly what "this is the
+    // live recipe" means, so writing it re-activates it. Without this, converting a product away
+    // from BOM and back again would leave it silently unplannable (round 2).
+    if (existing && !existing.active) {
+      await client.bom.update({ where: { id: bomId }, data: { active: true } })
+    }
+  } else {
     const adoptable = await client.bom.findFirst({
       where: { productId: null, items: { some: { parentProductId: productId } } },
       orderBy: { updatedAt: 'desc' },
       select: { id: true },
     })
     if (adoptable) {
-      await client.bom.update({ where: { id: adoptable.id }, data: { productId } })
+      // CONDITIONAL, and the count is checked (round 2, finding 4). `update({ where: { id } })`
+      // was unconditional: two writers could each read the row as unclaimed and then both update
+      // it by id, and the SECOND silently overwrote the first product's claim — transferring a
+      // BOM between products. The unique index cannot stop that, because both writes target ONE
+      // row and each leaves exactly one claim in place.
+      //
+      // `productId: null` in the predicate makes the read-then-write a compare-and-set, so a row
+      // that has been claimed since the read is not touched at all.
+      const claimed = await client.bom.updateMany({
+        where: { id: adoptable.id, productId: null },
+        data: { productId, active: true },
+      })
+      if (claimed.count !== 1) return { kind: 'claim-contended', bomId: adoptable.id }
       bomId = adoptable.id
       claimKind = 'adopted'
     }
@@ -245,7 +273,7 @@ export async function syncBomRecipeFromProductComponents(
 
   if (!bomId) {
     const created = await client.bom.create({
-      data: { name: `${sku} BOM`, description: args.productName ?? null, productId },
+      data: { name: `${sku} BOM`, description: args.productName ?? null, productId, active: true },
       select: { id: true },
     })
     bomId = created.id
@@ -281,6 +309,87 @@ export async function syncBomRecipeFromProductComponents(
   return { kind: 'written', bomId, claimed: claimKind }
 }
 
+/**
+ * RETIRE the manufacturing recipe of a product that is no longer a BOM (round 2, finding 1b).
+ *
+ * `validateProductStructureChange` sets `clearComponents` when a component-bearing type becomes a
+ * non-component one, and both writers then delete `ProductComponent` — leaving `BomItem` behind.
+ *
+ * WHAT THAT ACTUALLY EXPOSED, stated precisely rather than as "planning still reads them", because
+ * two of the three readers do filter: `replenishment-reports.ts:776` requires
+ * `parentProduct: { type: BOM }` and `createReorderMOs` only asks about products it has already
+ * decided are eligible. So the orphan rows are mostly inert TODAY. They are still wrong for two
+ * reasons that do bite: the claimed `Bom` keeps asserting it is the live recipe of a product that
+ * has none, and {@link findBomRecipeDrift} reports `bom-items-on-non-bom-product` — so an entirely
+ * legitimate BOM -> SIMPLE conversion would make this branch's own check go red, which is the fast
+ * route to a check nobody trusts.
+ *
+ * DEACTIVATE AND UNCLAIM, DO NOT DELETE. Deleting the items would rewrite what
+ * `manufacturing-analytics.ts` reports for completed production orders that still point at this
+ * Bom (the deferred round-2 finding 2). Clearing `active` is what every planning reader already
+ * filters on, and clearing `productId` releases the claim so a later conversion back to BOM can
+ * adopt the row rather than add a second one. History keeps resolving; planning stops reading it.
+ */
+export async function retireBomRecipeForProduct(
+  client: BomSyncClient,
+  productId: string,
+): Promise<{ retiredBomId: string | null }> {
+  const claimed = await client.bom.findUnique({ where: { productId }, select: { id: true } })
+  if (!claimed) return { retiredBomId: null }
+  await client.bom.update({ where: { id: claimed.id }, data: { active: false, productId: null } })
+  return { retiredBomId: claimed.id }
+}
+
+export type BomRecipeReconcileOutcome =
+  | { kind: 'synced'; bomId: string; claimed: 'created' | 'adopted' | 'already' }
+  | { kind: 'retired'; retiredBomId: string | null }
+  | { kind: 'cycle'; path: string[] }
+  | { kind: 'claim-contended'; bomId: string }
+
+type BomReconcileClient = BomSyncClient & Pick<Prisma.TransactionClient, 'productComponent'>
+
+/**
+ * RECONCILE the BOM recipe to whatever the product's type NOW says it should be (round 2).
+ *
+ * Called by the two paths that change `Product.type`, after the type write. It reads
+ * `ProductComponent` itself rather than taking a list, because a type change does not come with
+ * one — and all four directions have to be right, not just the one that deletes components:
+ *
+ *   - anything -> BOM (including KIT -> BOM, where `clearComponents` is FALSE and the components
+ *     are kept): the product now needs a claimed Bom mirroring them, or planning has no recipe and
+ *     `createReorderMOs` cannot raise a build for it;
+ *   - BOM -> anything: retire, per {@link retireBomRecipeForProduct};
+ *   - neither before nor after: nothing to do.
+ *
+ * MUST run in the caller's transaction, under `COMPONENT_GRAPH_WRITE_LOCK_KEY`, after the type
+ * write — the same contract as {@link syncBomRecipeFromProductComponents}, and for the same reason.
+ */
+export async function reconcileBomRecipeForProductType(
+  client: BomReconcileClient,
+  args: { productId: string; sku: string; type: string; productName?: string | null },
+): Promise<BomRecipeReconcileOutcome> {
+  if (args.type !== 'BOM') {
+    return { kind: 'retired', ...(await retireBomRecipeForProduct(client, args.productId)) }
+  }
+
+  const components = await client.productComponent.findMany({
+    where: { productId: args.productId },
+    select: { componentId: true, qty: true },
+    orderBy: { sortOrder: 'asc' },
+  })
+  const outcome = await syncBomRecipeFromProductComponents(client, {
+    productId: args.productId,
+    sku: args.sku,
+    productName: args.productName,
+    components: components.map((component) => ({
+      componentProductId: component.componentId,
+      qty: Number(component.qty),
+    })),
+  })
+  if (outcome.kind === 'cycle' || outcome.kind === 'claim-contended') return outcome
+  return { kind: 'synced', bomId: outcome.bomId, claimed: outcome.claimed }
+}
+
 // ---------------------------------------------------------------------------
 // Consistency check
 // ---------------------------------------------------------------------------
@@ -294,8 +403,18 @@ export type BomRecipeDriftKind =
   | 'recipe-differs'
   /** `BomItem` rows for this parent live in a Bom other than the claimed one. */
   | 'duplicate-unclaimed-bom'
-  /** `BomItem` rows exist for a product whose type is not BOM. */
+  /**
+   * `BomItem` rows exist for a product whose type is not BOM, in a Bom that is still ACTIVE or
+   * still CLAIMED — i.e. not properly retired. A retired recipe (inactive AND unclaimed) is
+   * history and is NOT drift: see `retireBomRecipeForProduct`.
+   */
   | 'bom-items-on-non-bom-product'
+  /**
+   * The claimed Bom of a BOM-typed product is INACTIVE, so every planning reader filters it out
+   * (`replenishment-reports.ts` requires `bom: { active: true }`, `createReorderMOs` the same) —
+   * the recipe exists and agrees, and planning still cannot see it. Silent everywhere else.
+   */
+  | 'inactive-claimed-bom'
   /** The `bom_items` graph as a whole is cyclic (reported once, on the first product in it). */
   | 'bom-item-cycle'
 
@@ -330,13 +449,22 @@ export async function findBomRecipeDrift(client: DriftClient): Promise<BomRecipe
       sku: true,
       type: true,
       productComponents: { select: { componentId: true, qty: true } },
-      manufacturingBom: { select: { id: true } },
+      manufacturingBom: { select: { id: true, active: true } },
     },
     orderBy: { sku: 'asc' },
   })
 
   const bomItems = await client.bomItem.findMany({
-    select: { bomId: true, parentProductId: true, componentProductId: true, qty: true },
+    select: {
+      bomId: true,
+      parentProductId: true,
+      componentProductId: true,
+      qty: true,
+      // Needed to tell a RETIRED recipe (inactive + unclaimed) from an orphaned one. Without it
+      // this check goes red on a legitimate BOM -> SIMPLE conversion, which is the fast route to
+      // a check nobody trusts (round 2).
+      bom: { select: { active: true, productId: true } },
+    },
   })
 
   const itemsByParent = new Map<string, typeof bomItems>()
@@ -354,13 +482,19 @@ export async function findBomRecipeDrift(client: DriftClient): Promise<BomRecipe
     const strayBomIds = [...new Set(allItems.filter((item) => item.bomId !== claimedBomId).map((item) => item.bomId))]
 
     if (product.type !== 'BOM') {
-      if (allItems.length > 0) {
+      // A RETIRED recipe is inactive AND unclaimed: no planning reader can reach it and nothing
+      // claims it is this product's live recipe, so it is history, not drift. Anything else is
+      // reported.
+      const liveItems = allItems.filter((item) => item.bom.active || item.bom.productId !== null)
+      if (liveItems.length > 0) {
+        const bomIds = [...new Set(liveItems.map((item) => item.bomId))]
         drift.push({
           productId: product.id,
           sku: product.sku,
           kind: 'bom-items-on-non-bom-product',
-          detail: `${product.sku} is type ${product.type} but has ${allItems.length} bom_items row(s) as parent — `
-            + 'planning will explode component demand for a product no production order can be raised against',
+          detail: `${product.sku} is type ${product.type} but has ${liveItems.length} bom_items row(s) as parent in `
+            + `Bom(s) ${bomIds.join(', ')} that are still active or still claimed — a type conversion left the `
+            + 'manufacturing recipe behind instead of retiring it',
         })
       }
       continue
@@ -375,6 +509,18 @@ export async function findBomRecipeDrift(client: DriftClient): Promise<BomRecipe
           + 'product_components and no claimed Bom — replenishment planning and reorder-MO generation see no recipe',
       })
       continue
+    }
+
+    if (product.manufacturingBom && !product.manufacturingBom.active) {
+      // Reported IN ADDITION to any recipe difference, not instead of it: an inactive Bom whose
+      // items agree perfectly is still invisible to planning, and that is the whole point.
+      drift.push({
+        productId: product.id,
+        sku: product.sku,
+        kind: 'inactive-claimed-bom',
+        detail: `${product.sku}'s claimed Bom (${claimedBomId}) is inactive, so replenishment planning and `
+          + 'reorder-MO generation filter it out — the recipe exists and cannot be used',
+      })
     }
 
     const claimedItems = allItems.filter((item) => item.bomId === claimedBomId)
@@ -440,4 +586,35 @@ export function describeRecipeDifference(sku: string, difference: RecipeDifferen
       return `${sku}: component ${difference.componentProductId} is x${difference.componentQty} in `
         + `product_components and x${difference.bomQty} in bom_items`
   }
+}
+
+/**
+ * A BOM-recipe write the caller must ROLL BACK (round 2).
+ *
+ * WHY AN EXCEPTION AND NOT A RETURN VALUE. Both callers in `app/actions/products.ts` report
+ * failures by returning a discriminated union out of their `db.$transaction` callback — and a
+ * callback that RETURNS commits. That is correct for their existing refusals, which all happen
+ * BEFORE any write. A BOM refusal happens AFTER `ProductComponent` has been written in the same
+ * transaction, so returning it would commit one representation of a recipe the other rejected:
+ * precisely the split this whole change exists to prevent. Throwing is what makes the refusal
+ * atomic.
+ */
+export class BomRecipeRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BomRecipeRefusedError'
+  }
+}
+
+/** The operator-facing message for a refused recipe write, shared by every caller. */
+export function describeBomRecipeRefusal(
+  outcome: { kind: 'cycle'; path: string[] } | { kind: 'claim-contended'; bomId: string },
+): string {
+  if (outcome.kind === 'cycle') {
+    return 'Circular reference detected in the manufacturing BOM graph ('
+      + `${outcome.path.join(' -> ')}) — nothing was saved. An older BOM recipe for a different product may still `
+      + "list this one as its parent; re-save that product's recipe too, or clear it"
+  }
+  return "Another writer claimed this product's manufacturing BOM while saving — nothing was saved. "
+    + 'Reload and try again'
 }

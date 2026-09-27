@@ -56,6 +56,8 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { syncBomRecipeFromProductComponents } from '@/lib/products/bom-recipe'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -376,44 +378,50 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
 
     // Find or create a BOM record for this product.
     //
-    // o3d-zjsb5.9: the CLAIM (`Bom.productId`) is consulted first and set on whatever this path
-    // resolves to. Before the claim existed this was `findFirst` on an unordered, non-unique
-    // predicate, so with two Bom rows listing the same parent this path and `createReorderMOs`
-    // (which orders by `updatedAt desc`) could pick DIFFERENT recipes for the same product.
-    // Claiming here means the lazy create no longer leaves a row the importer would have to guess
-    // about later — the importer adopts a claimable row rather than adding a second one.
-    let bom = await db.bom.findUnique({
-      where: { productId: input.productId },
-      select: { id: true },
-    })
-    if (!bom) {
-      const adoptable = await db.bom.findFirst({
-        where: { productId: null, items: { some: { parentProductId: input.productId } } },
-        orderBy: { updatedAt: 'desc' },
-        select: { id: true },
+    // o3d-zjsb5.9 round 2, finding 4: THIS IS A RACE, and the claim introduced it. The previous
+    // shape read an unclaimed row and then `update`d it BY ID unconditionally, so two concurrent
+    // manufacturing-order requests for DIFFERENT products could both see the same unclaimed row and
+    // both claim it — the second silently transferring that Bom from the first product to itself.
+    // The unique index cannot catch it: both writes target ONE row and each leaves exactly one
+    // claim standing.
+    //
+    // Two things fix it, and both are needed:
+    //   1. every claim path now runs under `COMPONENT_GRAPH_WRITE_LOCK_KEY`, the same lock the CSV
+    //      component pass and the editor take, so claims are serialized instead of interleaved.
+    //      This path took NO lock at all before, which is why holding it elsewhere did not help;
+    //   2. `syncBomRecipeFromProductComponents` makes the adoption a compare-and-set
+    //      (`updateMany` with `productId: null` in the predicate) and refuses if it does not affect
+    //      exactly one row. That is the belt: it holds even if some future caller forgets the lock.
+    //
+    // Calling the shared helper rather than hand-rolling the claim also means this path MIRRORS
+    // `ProductComponent` into the recipe instead of only seeding it on first create, so raising an
+    // order repairs a drifted recipe rather than building against a stale one.
+    const claim = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+      return await syncBomRecipeFromProductComponents(tx, {
+        productId: input.productId,
+        sku: product.sku,
+        productName: product.name,
+        components: product.productComponents.map((component) => ({
+          componentProductId: component.componentId,
+          qty: Number(component.qty),
+        })),
       })
-      bom = adoptable
-        ? await db.bom.update({
-          where: { id: adoptable.id },
-          data: { productId: input.productId },
-          select: { id: true },
-        })
-        : await db.bom.create({
-          data: {
-            name: `${product.sku} BOM`,
-            productId: input.productId,
-            items: {
-              create: product.productComponents.map((c, i) => ({
-                parentProductId: input.productId,
-                componentProductId: c.componentId,
-                qty: c.qty,
-                sortOrder: i,
-              })),
-            },
-          },
-          select: { id: true },
-        })
+    })
+    if (claim.kind === 'cycle') {
+      return {
+        success: false,
+        error: 'This product\'s manufacturing BOM is circular ('
+          + `${claim.path.join(' -> ')}). Fix the recipe before raising a build order.`,
+      }
     }
+    if (claim.kind === 'claim-contended') {
+      return {
+        success: false,
+        error: 'Another writer claimed this product\'s manufacturing BOM at the same moment. Try again.',
+      }
+    }
+    const bom = { id: claim.bomId }
 
     const reference = makeReference()
     const order = await db.productionOrder.create({
