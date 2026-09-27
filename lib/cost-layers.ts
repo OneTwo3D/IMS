@@ -7,8 +7,9 @@
  * in the caller's transaction.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
-import { getAccountingSettings, isAccountingSyncTypeEnabled, isDailyBatchPostingEnabled, queueAccountingSyncTx } from '@/lib/accounting'
+import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabledForChart, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
 import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
@@ -29,6 +30,18 @@ type ShipmentCogsRevaluationSyncOptions = {
   accountingSettings?: {
     inventoryAccount?: string | null
     cogsAccount?: string | null
+    /**
+     * o3d-j625 r2 (Codex HIGH 1) — WHOSE CHART THE TWO ACCOUNTS ABOVE ARE, and REQUIRED even though
+     * they are not.
+     *
+     * This narrow shape exists so a test can inject a chart without a database. The two account fields
+     * are optional because the function's own guard treats a missing one as "cannot post"; the
+     * connector is NOT, because a missing connector is not a missing account code — it is the second
+     * resolution coming back. An injected chart that does not say which connector it is cannot be
+     * routed, and the enqueue is now declared to require an answer. `null` is the answer for "no
+     * connector was switched on", which writes nothing.
+     */
+    connector: AccountingConnectorId | null
   }
   queueAccountingSync?: typeof queueAccountingSyncTx
   /**
@@ -305,7 +318,14 @@ async function queueShipmentCogsRevaluationSync(
   // audit-3aph: only treat this revaluation as posted (so the caller drops it
   // from the COGS journal) when COGS_REVERSAL posting is actually enabled —
   // otherwise the delta must remain in the COGS journal or it would post NOWHERE.
-  const isEnabled = options.isReversalPostingEnabled ?? (() => isAccountingSyncTypeEnabled('COGS_REVERSAL'))
+  // o3d-j625 r4 (SWEEP 1): the default verdict is asked OF `settings.connector`, not of whichever connector
+  // is active by now. `isAccountingSyncTypeEnabled` re-resolved it after the chart read above; a switch in
+  // between could answer about the OTHER connector's toggles. Every non-`post` verdict answers `false`,
+  // which here is the SAFE direction for all of them — "this revaluation did not post here, keep the delta
+  // in the caller's COGS journal" — and a retired chart is then refused, and reported, at that journal's
+  // own enqueue rather than silently absorbed.
+  const isEnabled = options.isReversalPostingEnabled
+    ?? (async () => (await accountingPostingVerdictForChart(settings.connector, 'COGS_REVERSAL')).verdict === 'post')
   if (!(await isEnabled())) return false
 
   // o3d-zpa7: THE PRECONDITION THAT MAKES THE UNLOCKED ENQUEUE SAFE, checked rather than argued.
@@ -352,7 +372,30 @@ async function queueShipmentCogsRevaluationSync(
   }
 
   const revaluationIdempotencyKey = `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}${options.recalcRunId ? `:${options.recalcRunId}` : ''}`
-  await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
+  // o3d-j625 r3 (Codex HIGH 1) — WHAT THE ENQUEUE ANSWERED, READ.
+  //
+  // This return value was DISCARDED, and it is the one place in the whole sweep where discarding it
+  // makes the two ledgers disagree rather than merely losing a posting. On a decline the function went
+  // on to record the COGS subledger movement and return `true`; `true` is how the caller decides the
+  // delta is already posted and DROPS IT from the compensating landed-cost COGS journal. So the GL
+  // received neither the COGS_REVERSAL nor the journal that was supposed to cover its absence, while
+  // the COGS subledger carried a movement claiming it had. Nothing anywhere said so.
+  //
+  // `false` here means the same thing `false` means at every other exit of this function — see
+  // audit-3aph: "this revaluation did NOT post here, so the caller must keep the delta in its own
+  // retrospective COGS journal". That is the correct answer for BOTH shapes of decline, which is why
+  // the boolean is enough and the `WithOutcome` adapter is not reached for:
+  //
+  //   refused          the chart was retired (or the document provenance could not be established).
+  //                    The posting is owed; leaving the delta in the journal is how it still gets made.
+  //   not-configured   the connector stopped posting COGS_REVERSAL between the `isEnabled()` check
+  //                    above and this write. Also "it did not post here" — and the journal, which is
+  //                    gated by the same connector, simply will not post either. No harm, no claim.
+  //
+  // AND THE SUBLEDGER ROW IS NOT WRITTEN. It exists to mirror the GL movement this enqueue makes
+  // (khdw), keyed identically to it; writing it for a journal that was declined is precisely the
+  // subledger-claims-what-the-GL-never-got divergence.
+  const queued = await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
@@ -369,10 +412,26 @@ async function queueShipmentCogsRevaluationSync(
     unlockedOrderScopeReason:
       'landed-cost revaluation discovers affected shipments mid-transaction, after stock locks; the order is '
       + 'provably undeletable (accountingInvoiceId asserted above) so no lock is needed (o3d-zpa7)',
+    // o3d-j625 r2: `payload`'s four lines are `settings.inventoryAccount` and `settings.cogsAccount`,
+    // from the `settings` read at the top of this function — either the injected chart or
+    // `getAccountingSettings()`. This site has the widest window of the transactional family: it runs
+    // inside a landed-cost recalculation that has already locked cost layers and stock rows and is
+    // walking a mid-transaction query of every affected shipment, enqueueing once per shipment. Routing
+    // by the chart is what makes each of those rows describe the books it is written into.
+    chartConnector: settings.connector,
   })
+  if (!queued) {
+    console.warn(
+      `queueShipmentCogsRevaluationSync: the accounting queue DECLINED the COGS_REVERSAL for shipment `
+      + `${input.shipmentId} (cost layer ${input.costLayerId}), so no COGS subledger row was recorded and `
+      + 'the revaluation delta stays in the caller\'s retrospective COGS journal (o3d-j625 r3).',
+    )
+    return false
+  }
   // khdw: record the net COGS-account movement of this revaluation (reverse old +
   // repost new → net debit = newCogs − oldCogs, both 2dp) in the COGS subledger
   // ledger, keyed identically to the sync so it dedupes across retries.
+  // o3d-j625 r3: reached only when the journal was actually queued — see above.
   await recordCogsSubledgerMovement(tx, {
     sourceType: 'SHIPMENT_REVALUATION',
     sourceRef: input.shipmentId,
@@ -1381,6 +1440,22 @@ export async function refreshShipmentCogsForCostLayerChange(
 
   let updated = 0
   let cogsRevaluationDelta = toDecimal(0)
+  // o3d-j625 r4 (SWEEP 1) — ONE CHART FOR THE WHOLE CALL, and every connector question below is asked
+  // OF IT. This used to read `getAccountingSettings()` afresh inside each journaled shipment's revaluation
+  // and ask `isDailyBatchPostingEnabled()` — a separate resolution — for the un-journaled ones, so within
+  // one landed-cost recalculation the COGS_REVERSAL rows and the batch-ownership decision could each be
+  // about a different connector. Resolved lazily (only when a shipment needs it) and at most once.
+  //
+  // o3d-j625 r12 (merging o3d-c08y): declared HERE, after the below-zero refusal rather than before it,
+  // which is where c08y's pre-pass put the counters. That ordering is worth keeping deliberately: the
+  // refusal is a decision about ARITHMETIC and must not depend on an accounting-settings read at all, so
+  // a chart that cannot be read cannot turn a refusal into a post. Nothing between the two touches the
+  // chart, and the first `chartForCall()` below is still the first read.
+  let chart: ShipmentCogsRevaluationSyncOptions['accountingSettings'] | null | undefined = options.accountingSettings
+  const chartForCall = async () => {
+    if (chart === undefined) chart = await getAccountingSettings().catch(() => null)
+    return chart
+  }
   // Resolved lazily on the first un-journaled shipment, then reused, so a
   // settings read happens at most once per call (audit-gbzh).
   let dailyBatchPosts: boolean | null = null
@@ -1398,12 +1473,17 @@ export async function refreshShipmentCogsForCostLayerChange(
       // count it as shipment-owned (so the caller drops it from the COGS journal)
       // if that posting is actually enabled; otherwise leave it for the journal so
       // the delta isn't lost (audit-3aph).
-      const posted = await queueShipmentCogsRevaluationSync(tx, {
-        shipmentId: shipment.id,
-        costLayerId,
-        oldCogsBase: currentShipment.cogsBatchAmount,
-        newCogsBase: cogs,
-      }, options)
+      const callChart = await chartForCall()
+      const posted = callChart
+        ? await queueShipmentCogsRevaluationSync(tx, {
+          shipmentId: shipment.id,
+          costLayerId,
+          oldCogsBase: currentShipment.cogsBatchAmount,
+          newCogsBase: cogs,
+        }, { ...options, accountingSettings: callChart })
+        // No readable chart: exactly what `queueShipmentCogsRevaluationSync` answered for an unreadable
+        // settings read — nothing posted here, so the delta stays in the caller's journal.
+        : false
       if (posted) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     } else {
       // Not yet journaled → the daily batch posts the updated cogsBatchAmount
@@ -1411,7 +1491,9 @@ export async function refreshShipmentCogsForCostLayerChange(
       // batch is actually enabled; otherwise it posts nowhere, so leave the delta
       // in the COGS journal (audit-gbzh).
       if (dailyBatchPosts === null) {
-        dailyBatchPosts = await (options.isDailyBatchPostingEnabled ?? isDailyBatchPostingEnabled)()
+        // o3d-j625 r4 (SWEEP 1): asked of the call's chart, not re-resolved — see isDailyBatchPostingEnabledForChart.
+        dailyBatchPosts = await (options.isDailyBatchPostingEnabled
+          ?? (async () => isDailyBatchPostingEnabledForChart((await chartForCall())?.connector ?? null)))()
       }
       if (dailyBatchPosts) cogsRevaluationDelta = addMoney(cogsRevaluationDelta, shipmentDelta)
     }

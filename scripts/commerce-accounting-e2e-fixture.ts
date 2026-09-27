@@ -1160,6 +1160,7 @@ async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
     where: { id: orderId },
     data: {
       accountingInvoiceId: `xero-invoice-${orderId}`,
+      accountingInvoiceConnector: 'xero', // o3d-j625 r3: whose document the id is
       invoicedAt: new Date(),
     },
   })
@@ -1576,6 +1577,7 @@ async function seedDailyBatchDiscountScenario() {
       taxRatePercent: 0.2,
       paidAt: new Date(),
       accountingInvoiceId: `manual-${suffix}`,
+      accountingInvoiceConnector: 'xero', // o3d-j625 r3: whose document the id is
     },
   })
 
@@ -1601,6 +1603,7 @@ async function seedDailyBatchDiscountScenario() {
       taxRatePercent: 0.2,
       paidAt: new Date(),
       accountingInvoiceId: `wc-${suffix}`,
+      accountingInvoiceConnector: 'xero', // o3d-j625 r3: whose document the id is
       shoppingLinks: {
         create: {
           connector: 'woocommerce',
@@ -1652,6 +1655,7 @@ async function seedUnpaidDailyBatchOrder() {
       taxRatePercent: 0.2,
       paidAt: null,
       accountingInvoiceId: `unpaid-${suffix}`,
+      accountingInvoiceConnector: 'xero', // o3d-j625 r3: whose document the id is
     },
   })
 

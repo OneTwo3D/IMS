@@ -38,6 +38,7 @@
  * row lock would be a real cost for no correctness gain.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { ACCOUNTING_CONNECTORS, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -53,6 +54,27 @@ export type PluginSelectionLockTx = {
   $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>
   $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>
 }
+
+/**
+ * o3d-j625 r13 — THE FENCE IS NOW ON EVERY ACCOUNTING ENQUEUE, SO "A REAL CLIENT CAN ALWAYS SERVE IT" HAS
+ * TO BE CHECKED RATHER THAN ASSUMED.
+ *
+ * Until r13 the locked check ran only for a PINNED enqueue, and the handful of callers that pinned all
+ * passed a Prisma transaction client. Making it unconditional puts it in front of EVERY in-transaction
+ * enqueue, including ones whose caller hands over a narrowed alias — and a client without raw access would
+ * turn a fence into a THROW inside somebody's business transaction. This is the same proof, and the same
+ * shape, as `PrismaClientCanAlwaysReadTheSuppression` in posting-suppression.ts: checked by `tsc`, costing
+ * nothing at runtime. If `Prisma.TransactionClient` ever stops satisfying it, this stops compiling here
+ * instead of failing in a goods receipt.
+ *
+ * (Unit-test doubles are a different matter and are not covered by this: several had to learn to answer the
+ * two statements, which is a fixture catching up with a question the subject now asks — not a client that
+ * cannot answer it.)
+ */
+type AssertTrue<T extends true> = T
+export type PrismaTransactionClientCanAlwaysBeFenced = AssertTrue<
+  Prisma.TransactionClient extends PluginSelectionLockTx ? true : false
+>
 
 /**
  * Acquire the selection lock and read the plugin state through the transaction.

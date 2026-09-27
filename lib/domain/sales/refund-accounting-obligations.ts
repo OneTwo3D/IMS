@@ -28,7 +28,8 @@ import type { AccountingEnqueueOutcome } from '@/lib/accounting'
  *
  * AND BOTH ARMS APPLY THAT CHECK — r8, Codex HIGH. r7 pinned the connector and then checked it in one
  * arm only. The in-transaction arm took a bare `true`, which cannot say WHICH connector produced it,
- * while `queueAccountingSyncTx` resolves the active connector for itself after the pin was taken — so
+ * while `queueAccountingSyncTx` then resolved the active connector for itself after the pin was taken
+ * (o3d-j625 r2 deleted that resolution — the enqueue now routes by the required `chartConnector`) — so
  * a flip mid-hand-off satisfied the ledger with work queued against a connector the obligations were
  * never reckoned against. The transactional enqueue now answers with the same structured outcome the
  * facade does (`queueAccountingSyncTxWithOutcome`, whose connector is read from inside the enqueue

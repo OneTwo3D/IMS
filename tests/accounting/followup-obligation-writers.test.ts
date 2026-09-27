@@ -448,6 +448,9 @@ const db = {
   async $executeRaw(strings: TemplateStringsArray, ...values: unknown[]) {
     const sql = strings.join('?')
     if (/"remoteAttemptedAt" = COALESCE/.test(sql)) return repairOutsideCustody()
+    // o3d-j625 r7: the per-posting-key lock the row-creating primitive takes before it reads the
+    // mark-handled suppression. A lock, not a write: nothing to model beyond answering.
+    if (/pg_advisory_xact_lock/.test(sql)) return 1
     if (!/UPDATE accounting_sync_logs/.test(sql)) throw new Error(`fake db: unexpected raw statement ${sql}`)
     const row = state.syncRows.find((candidate) => candidate.id === values[0])
     if (row) row.syncedAt = new Date()

@@ -1,3 +1,4 @@
+import { isLockedPluginSelectionRead, lockedPluginSelectionRows } from '../helpers/plugin-selection-double.ts'
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
@@ -36,6 +37,14 @@ const tx = {
   async $executeRaw(_strings: TemplateStringsArray, ...values: unknown[]) {
     tx.scopeLocks.push(values)
     return 1
+  },
+  // o3d-j625 r13: `queueXeroSync` now takes the SELECTION FENCE on every enqueue, pinned or not, so this
+  // double has to answer its locked read (tests/helpers/plugin-selection-double.ts). This fixture drives the
+  // Xero queue directly and its whole premise is that Xero is the serviced ledger, so that is what it says —
+  // stated here rather than implied by an empty answer, which would report every plugin disabled and make
+  // the queue refuse for a reason these tests are not about.
+  async $queryRaw(strings: TemplateStringsArray) {
+    return (isLockedPluginSelectionRead(strings) ? lockedPluginSelectionRows(['xero']) : []) as never
   },
   accountingSyncLog: {
     async create(args: { data: Record<string, unknown> }) {
