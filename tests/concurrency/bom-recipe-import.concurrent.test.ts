@@ -994,9 +994,12 @@ test(
     )
 
     // AND THE HONEST LIMIT, asserted so nobody mistakes this for more than it is: where
-    // `system_identifier` is unavailable (it is superuser-restricted), its absence must NOT be read as a
-    // mismatch -- absence of evidence is not evidence -- which is precisely the residual hole. A
-    // PHYSICAL clone copies the identifier too, so on the same address it is indistinguishable here.
+    // `system_identifier` is unavailable its absence must NOT be read as a mismatch -- absence of
+    // evidence is not evidence -- which is precisely the residual hole. That path is DEFENSIVE and rare:
+    // an ordinary role CAN read pg_control_system() on PG17 (verified with a plain LOGIN role holding no
+    // grants), so it only arises where EXECUTE was revoked or a managed provider restricts it. The
+    // standing limit is different and unfixable here: a PHYSICAL clone copies the identifier, so on the
+    // same address it is indistinguishable.
     assert.deepEqual(
       deps.compareServerIdentity(
         { ...live, systemIdentifier: 'unavailable' },

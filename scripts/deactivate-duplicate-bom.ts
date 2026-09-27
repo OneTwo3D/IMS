@@ -64,8 +64,10 @@ async function announceTarget(db: Parameters<typeof readServerIdentity>[0]): Pro
       ? '  This database is STAMPED DISPOSABLE — a scratch database, safe to change.\n'
       : '  This database is NOT stamped disposable. Treat it as REAL DATA.\n')
     + (identity.systemIdentifier === 'unavailable'
-      ? '  NOTE: system_identifier is unavailable to this role (it is superuser-restricted), so a\n'
-        + '  same-name copy on another cluster cannot be distinguished by it.\n'
+      ? '  NOTE: system_identifier could not be read on this connection — unusual, since an ordinary\n'
+        + '  role can normally read it, so EXECUTE may have been revoked or this may be a managed\n'
+        + '  provider that restricts it. A same-name copy on another cluster CANNOT be distinguished\n'
+        + '  by it while that is the case.\n'
       : ''),
   )
   return identity

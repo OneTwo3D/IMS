@@ -149,9 +149,12 @@ The residual limits, stated rather than implied:
 * a **physical** clone (`pg_basebackup`, a streaming replica, a snapshot restore) **copies** the
   `system_identifier`. Same name, same identifier: only host and port distinguish it, and behind a proxy on
   the same address and port, **nothing here distinguishes it**;
-* `pg_control_system()` is superuser-restricted by default. Where the role cannot read it the field reads
-  `unavailable`, the composite degrades to name plus address, and the banner says so. An `unavailable`
-  identifier is never treated as a mismatch — absence of evidence is not evidence.
+* `pg_control_system()` **is readable by an ordinary role** on PostgreSQL 17 — verified with a plain
+  `CREATE ROLE ... LOGIN` holding no grants — so the identifier is normally available and the composite is
+  normally at full strength. The `unavailable` path is **defensive and the exception**, not the expected
+  case: `EXECUTE` can be revoked, and a managed provider may restrict these functions. Where that happens
+  the field reads `unavailable`, the composite degrades to name plus address, and the banner says so. An
+  `unavailable` identifier is never treated as a mismatch — absence of evidence is not evidence.
 
 **Every argument is validated before anything connects.** An unknown flag, a flag missing its value, a
 repeated flag, `--flag=value`, or conflicting modes is a usage error (**exit 1**) raised before the database

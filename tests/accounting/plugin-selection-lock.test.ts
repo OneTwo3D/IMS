@@ -1247,8 +1247,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // alone proved "this database is called X" rather than "this is the server I meant". A LOGICAL restore
   // gets a new system_identifier and IS caught; a PHYSICAL clone (pg_basebackup, replica, snapshot)
   // copies it, so behind a proxy on the same address NOTHING here distinguishes it, and that limit is
-  // documented rather than implied. `pg_control_system()` is superuser-restricted, so where the role
-  // cannot read it the field is `unavailable` and is never treated as a mismatch.
+  // documented rather than implied. `pg_control_system()` IS readable by an ordinary role on PG17
+  // (verified with a plain LOGIN role holding no grants), so the composite is normally at full strength;
+  // the `unavailable` path is defensive for a revoked EXECUTE or a restrictive managed provider, and an
+  // `unavailable` identifier is never treated as a mismatch.
   //
   // A WRITE then requires the operator to name that database — `--expect-db <name>`, or typed at a TTY —
   // and REFUSES (exit 3, writing nothing) with neither, instead of reading consent into the absence of a

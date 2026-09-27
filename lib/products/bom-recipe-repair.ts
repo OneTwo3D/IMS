@@ -68,9 +68,15 @@ type RepairClient = Pick<
  *     cannot close that, and does not claim to.
  *   · A LOGICAL restore — `pg_dump` into a fresh `initdb` — gets a NEW `system_identifier`, so it IS
  *     distinguished. That is the common "someone restored a copy of production" case.
- *   · `pg_control_system()` is superuser-restricted by default. Where the application role cannot read
- *     it the field reads `unavailable`, the composite degrades to name + address, and the refusal says
- *     so rather than silently comparing fewer things.
+ *   · `pg_control_system()` is READABLE BY AN ORDINARY ROLE on PostgreSQL 17 — verified, not assumed: a
+ *     plain `CREATE ROLE ... LOGIN` with no grants reads `system_identifier`, `pg_control_checkpoint()`
+ *     and `pg_is_in_recovery()`. So the identifier is normally AVAILABLE and this composite is normally
+ *     at full strength. (An earlier version of this comment claimed the opposite, which would have led a
+ *     future author to design around a constraint that does not exist.)
+ *     The `unavailable` path below is therefore DEFENSIVE and the exception, not the expected case:
+ *     `EXECUTE` can be revoked, and a managed provider may restrict these functions. Where it happens
+ *     the field reads `unavailable`, the composite degrades to name + address, and the banner says so
+ *     rather than silently comparing fewer things.
  */
 export type ServerIdentity = {
   database: string
