@@ -1227,12 +1227,20 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // defect the refusal it serves exists to prevent. The refusals are the load-bearing part and each is
   // pinned by a mutation in tests/concurrency/bom-recipe-import.concurrent.test.ts.
   //
-  // CAN IT HIT A LIVE DATABASE BY ACCIDENT? It can be POINTED at one — that is its purpose — so it is
-  // loud instead of restricted: before writing it prints the server's own `current_database()`, host,
-  // port and user, and says whether the database carries the disposable-scratch stamp. It reports the
-  // SERVER'S answer rather than echoing `DATABASE_URL`, because the URL is the thing that lies (a
-  // socket-form URL losing its `?host=` retargets the shared cluster). `--dry-run` computes the real
-  // outcome in a transaction and throws it away. The database name also lands in the audit row.
+  // CAN IT HIT A LIVE DATABASE BY ACCIDENT? It can be POINTED at one — that is its purpose — so the
+  // target is DECLARED AND CHECKED rather than merely announced. Before writing it prints the server's
+  // own `current_database()`, host, port and user, and whether the database carries the
+  // disposable-scratch stamp; it reports the SERVER'S answer rather than echoing `DATABASE_URL`, because
+  // the URL is the thing that lies (a socket-form URL losing its `?host=` retargets the shared cluster).
+  //
+  // A WRITE then requires the operator to name that database — `--expect-db <name>`, or typed at a TTY —
+  // and REFUSES (exit 3, writing nothing) with neither, instead of reading consent into the absence of a
+  // human. Round 11: a banner nobody can act on is a log line, not a safeguard, and the BOM id is no
+  // protection either because a CLONE holds the same ids. The expectation is verified AGAIN inside the
+  // mutation transaction against `current_database()`, so a connection that changes between the
+  // pre-flight and the write is caught and the transaction aborts. `--list` and `--dry-run` need no
+  // confirmation because they write nothing; `--dry-run` computes the real outcome and rolls it back.
+  // The database name also lands in the audit row.
   //
   // For THIS test's property: it takes no plugin selection lock and writes no plugin key. It does take
   // COMPONENT_GRAPH_WRITE_LOCK_KEY, the same advisory lock every other writer of that graph takes, so

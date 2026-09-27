@@ -118,8 +118,20 @@ in-application remedy, which is what round 9 of PR #714 caught.
 ```bash
 npm run repair:duplicate-bom -- --list                # what is duplicated, and the id to pass
 npm run repair:duplicate-bom -- --bom <id> --dry-run  # what would happen; writes nothing
-npm run repair:duplicate-bom -- --bom <id>            # deactivate it; recipe LINES ARE KEPT
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name>   # deactivate it; LINES ARE KEPT
 ```
+
+**A write must confirm the target database.** Pass `--expect-db <name>`, or run it on a TTY and type the
+name when prompted. With neither — non-interactive and no flag — it refuses with **exit 3** and writes
+nothing, rather than reading consent into the absence of a human. `--list` and `--dry-run` need no
+confirmation because they write nothing.
+
+That is not belt-and-braces over the banner: a **clone of the database holds the same BOM ids**, so the id
+you pass cannot tell two servers apart, and a `--dry-run` in one shell constrains nothing about where a
+later write lands. The expectation is therefore **checked again inside the mutation transaction**, against
+the server's own `current_database()` — a check made before the transaction can be defeated by anything
+that changes which server the connection reaches in between, and a mismatch there aborts the transaction
+so the write is discarded.
 
 It **deactivates, never deletes** — `manufacturing-analytics.ts` values completed production orders
 through `order.bom.items`, so deleting would rewrite history. It **refuses (exit 2)** when the BOM is

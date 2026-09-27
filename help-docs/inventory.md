@@ -121,8 +121,12 @@ normal use:
 ```
 npm run repair:duplicate-bom -- --list                # shows the duplicates and their ids
 npm run repair:duplicate-bom -- --bom <id> --dry-run  # says what would happen, changes nothing
-npm run repair:duplicate-bom -- --bom <id>            # deactivates it, keeping its recipe lines
+npm run repair:duplicate-bom -- --bom <id> --expect-db <database-name>   # deactivates it
 ```
+
+The last one asks you to confirm which database you are changing — either with `--expect-db`, or by
+typing the database name when it asks. It will not make the change without that, because a copy of the
+database contains the same recipe ids, so the id alone cannot tell a test copy from the real thing.
 
 It will refuse if the recipe it is asked to deactivate is a product's live recipe, or the only active
 recipe another product has — in those cases nothing is changed and it tells you which product is in

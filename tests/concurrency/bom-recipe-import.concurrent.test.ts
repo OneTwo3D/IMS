@@ -70,17 +70,21 @@ type Deps = {
   createManufacturingOrder: typeof import('../../app/actions/manufacturing')['createManufacturingOrder']
   updateManufacturingOrderStatus: typeof import('../../app/actions/manufacturing')['updateManufacturingOrderStatus']
   findBomRecipeDrift: typeof import('../../lib/products/bom-recipe')['findBomRecipeDrift']
+  deactivateDuplicateBomRecipe: typeof import(
+    '../../lib/products/bom-recipe-repair'
+  )['deactivateDuplicateBomRecipe']
   COMPONENT_GRAPH_WRITE_LOCK_KEY: number
 }
 
 async function loadDeps(): Promise<Deps> {
-  const [dbMod, importMod, productsMod, mfgMod, recipeMod, locksMod] = await Promise.all([
+  const [dbMod, importMod, productsMod, mfgMod, recipeMod, locksMod, repairMod] = await Promise.all([
     import('../../lib/db/index'),
     import('../../app/actions/import'),
     import('../../app/actions/products'),
     import('../../app/actions/manufacturing'),
     import('../../lib/products/bom-recipe'),
     import('../../lib/db/advisory-locks'),
+    import('../../lib/products/bom-recipe-repair'),
   ])
   return {
     db: dbMod.db,
@@ -90,6 +94,7 @@ async function loadDeps(): Promise<Deps> {
     createManufacturingOrder: mfgMod.createManufacturingOrder,
     updateManufacturingOrderStatus: mfgMod.updateManufacturingOrderStatus,
     findBomRecipeDrift: recipeMod.findBomRecipeDrift,
+    deactivateDuplicateBomRecipe: repairMod.deactivateDuplicateBomRecipe,
     COMPONENT_GRAPH_WRITE_LOCK_KEY: locksMod.COMPONENT_GRAPH_WRITE_LOCK_KEY,
   }
 }
@@ -724,7 +729,7 @@ test(
       'and a DRY RUN must genuinely not have deactivated it -- otherwise --dry-run is a lie',
     )
 
-    const repair = await runRepairScript(['--bom', duplicate.id])
+    const repair = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
     assert.equal(repair.code, 0, `the repair command must succeed: ${repair.stderr}`)
     assert.match(repair.stdout, /Deactivated BOM/, `and must say what it did, got: ${repair.stdout}`)
     // And the audit row records WHICH database, because "was that done on stage or production?" is the
@@ -745,7 +750,7 @@ test(
     ]))), [], 'and after running the documented remedy the same import must succeed')
 
     // Re-running it is safe: an operator who is not sure whether it worked must not be punished.
-    const again = await runRepairScript(['--bom', duplicate.id])
+    const again = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
     assert.equal(again.code, 0, 'the command must be safe to re-run')
     assert.match(again.stdout, /already inactive/i, 'and should say so rather than pretending to act')
     assert.ok(
@@ -779,7 +784,8 @@ test(
     const claimed = await deps.db.bom.findUniqueOrThrow({
       where: { productId: tableId }, select: { id: true },
     })
-    const claimedRefusal = await runRepairScript(['--bom', claimed.id])
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const claimedRefusal = await runRepairScript(['--bom', claimed.id, '--expect-db', scratchDatabase])
     assert.equal(claimedRefusal.code, 2, `a claimed recipe must be REFUSED, got: ${claimedRefusal.stderr}`)
     assert.match(claimedRefusal.stderr, /live recipe of/i, 'and must say whose recipe it is')
     assert.equal(
@@ -804,7 +810,7 @@ test(
         qty: 1, sortOrder: 0,
       },
     })
-    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id])
+    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase])
     assert.equal(soleRefusal.code, 2, `the sole active recipe of another parent must be REFUSED, got: ${soleRefusal.stderr}`)
     assert.match(soleRefusal.stderr, /only active recipe for/i, 'and must name the product it would strand')
     assert.ok(
@@ -830,7 +836,7 @@ test(
         qty: 1, sortOrder: 0,
       },
     })
-    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id])
+    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase])
     assert.equal(nowAllowed.code, 0,
       `once another active recipe exists the refusal must LIFT, got: ${nowAllowed.stderr}`)
     // And the items are KEPT -- deactivate, never delete, so completed build orders still value.
@@ -850,6 +856,93 @@ test(
     // Tidy up so a live cycle/duplicate is not left for sibling files (the lesson from round 6).
     await deps.db.bom.update({ where: { id: secondForLeg.id }, data: { active: false } })
     await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r12] the repair REFUSES an unconfirmed or MISMATCHED target database, and writes nothing',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 11'S FINDING. The banner printed the server identity and then immediately wrote, so an
+     * operator who discovered that DATABASE_URL had resolved somewhere unexpected could not react -- a
+     * log line, not a safeguard. The sharpest part is that the BOM ID IS NO PROTECTION EITHER: a CLONE
+     * of the database holds the same id, so "the id was there, so I must be on the right server" is
+     * precisely the reasoning that fails. And `--dry-run` constrains nothing about a later write,
+     * because it is a separate invocation.
+     *
+     * Three arms, because there are three distinct ways this can go wrong, and one test per way is what
+     * lets a mutation point at the thing it broke.
+     */
+    const deps = await loadDeps()
+    const NS = 'M'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // ARM 1: NOBODY CONFIRMED ANYTHING. Non-interactive (the test runner gives the child no TTY) and no
+    // --expect-db, so consent must NOT be assumed from the absence of a human.
+    const unconfirmed = await runRepairScript(['--bom', duplicate.id])
+    assert.equal(unconfirmed.code, 3,
+      `an unconfirmed write must be REFUSED, got code ${unconfirmed.code}: ${unconfirmed.stderr}`)
+    assert.match(unconfirmed.stderr, /nobody to confirm|--expect-db/i,
+      `and must say how to confirm it, got: ${unconfirmed.stderr}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and must NOT have deactivated anything',
+    )
+
+    // ARM 2: CONFIRMED THE WRONG DATABASE. The id exists here, which is exactly the clone case -- so the
+    // only thing that can catch it is the name.
+    const wrongName = `${scratchDatabase}_not_this_one`
+    const mismatched = await runRepairScript(['--bom', duplicate.id, '--expect-db', wrongName])
+    assert.equal(mismatched.code, 3,
+      `a mismatched target must be REFUSED, got code ${mismatched.code}: ${mismatched.stderr}`)
+    // The message must name BOTH, or the operator cannot tell which of the two is wrong.
+    assert.ok(
+      mismatched.stderr.includes(wrongName) && mismatched.stderr.includes(scratchDatabase),
+      `the refusal must name what was EXPECTED and what was FOUND, got: ${mismatched.stderr}`,
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and must NOT have deactivated anything',
+    )
+
+    // ARM 3: THE IN-TRANSACTION RE-VERIFICATION, exercised directly.
+    //
+    // The pre-flight check and this one both refuse a mismatch, so a script run cannot show which of the
+    // two caught it -- and I cannot make a connection change server mid-run from out here. So this calls
+    // the mutation itself with a wrong expectation, which is the guard's own contract: asked inside the
+    // transaction that does the writing, a mismatch aborts and the abort discards the write.
+    const inTransaction = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, { bomId: duplicate.id, expectDatabase: 'a-different-database' }))
+    assert.equal(inTransaction.kind, 'wrong-database',
+      `the in-transaction check must refuse, got: ${JSON.stringify(inTransaction)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    assert.equal(
+      (await deps.db.activityLog.findMany({
+        where: { description: { contains: duplicate.id } }, select: { id: true },
+      })).length,
+      0,
+      'and no audit row either -- a refusal is not an act',
+    )
+
+    // AND THE CORRECT NAME STILL WORKS, so none of the above passes by refusing everything.
+    const accepted = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    assert.equal(accepted.code, 0, `the right name must be accepted, got: ${accepted.stderr}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      false, 'and the duplicate must now be deactivated',
+    )
   },
 )
 

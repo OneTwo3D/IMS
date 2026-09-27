@@ -41,7 +41,10 @@ import { PLANNING_REACHABLE_BOM_EDGES } from '@/lib/products/bom-recipe'
  * typed methods (the argument types are contravariant), so it forces an `as never` at the call site
  * and throws away the type checking that would catch a wrong `where`.
  */
-type RepairClient = Pick<Prisma.TransactionClient, '$executeRaw' | 'bom' | 'bomItem' | 'activityLog'>
+type RepairClient = Pick<
+  Prisma.TransactionClient,
+  '$executeRaw' | '$queryRaw' | 'bom' | 'bomItem' | 'activityLog'
+>
 
 export type BomRecipeRepairOutcome =
   /** Deactivated. `items` were KEPT — that is the point. */
@@ -53,6 +56,11 @@ export type BomRecipeRepairOutcome =
   | { kind: 'claimed'; bomId: string; productId: string; sku: string }
   /** Deactivating it would leave another BOM-typed product with no planning-visible recipe. Refused. */
   | { kind: 'sole-recipe-for-other-parent'; bomId: string; blockedBy: Array<{ productId: string; sku: string }> }
+  /**
+   * The connection is not to the database the caller confirmed. Refused, inside the transaction, so the
+   * abort discards anything already written (round 12).
+   */
+  | { kind: 'wrong-database'; expected: string; actual: string }
 
 /**
  * Deactivate one `Bom` by id, keeping its items, refusing when another product depends on it.
@@ -64,10 +72,29 @@ export type BomRecipeRepairOutcome =
  */
 export async function deactivateDuplicateBomRecipe(
   client: RepairClient,
-  args: { bomId: string; actor?: string; database?: string },
+  args: { bomId: string; actor?: string; database?: string; expectDatabase?: string },
 ): Promise<BomRecipeRepairOutcome> {
   const { bomId } = args
   await client.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+
+  // WHICH DATABASE IS THIS, ASKED AGAIN, IN HERE (round 12).
+  //
+  // The caller confirms the target before opening this transaction, and that check is necessary but not
+  // sufficient: it ran on a different statement, and anything that changes which server the connection
+  // reaches between then and now defeats it. That is not hypothetical in this repo -- a socket-form
+  // `DATABASE_URL` losing its `?host=` silently retargets the shared cluster, and a CLONE of the
+  // database holds the same BOM ids, so neither the id nor the earlier banner can tell two servers
+  // apart. Asking the server itself, inside the transaction that does the writing, is what turns the
+  // banner from a greeting into a guard: a mismatch here aborts, and the abort discards the write.
+  if (args.expectDatabase !== undefined) {
+    const identity = await client.$queryRaw<Array<{ database: string }>>`
+      SELECT current_database()::text AS database
+    `
+    const actual = identity[0]?.database ?? 'unknown'
+    if (actual !== args.expectDatabase) {
+      return { kind: 'wrong-database', expected: args.expectDatabase, actual }
+    }
+  }
 
   const bom = await client.bom.findUnique({
     where: { id: bomId },
@@ -154,6 +181,10 @@ export function describeBomRecipeRepair(outcome: BomRecipeRepairOutcome): string
     case 'claimed':
       return `REFUSED: BOM ${outcome.bomId} is the live recipe of ${outcome.sku}. Deactivating it would make `
         + 'that product unplannable. If you meant to retire that product\'s recipe, change its type instead.'
+    case 'wrong-database':
+      return `REFUSED inside the transaction: expected to be connected to "${outcome.expected}" but the `
+        + `server says this is "${outcome.actual}". Nothing was written. Check DATABASE_URL -- a cloned `
+        + 'database holds the same BOM ids, so the id you passed cannot tell them apart.'
     case 'sole-recipe-for-other-parent':
       return `REFUSED: BOM ${outcome.bomId} is the only active recipe for `
         + `${outcome.blockedBy.map((row) => row.sku).join(', ')}. Deactivating it would remove `

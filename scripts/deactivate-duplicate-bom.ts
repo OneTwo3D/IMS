@@ -13,8 +13,11 @@
  *       Show every duplicate the consistency check knows about, with the id to pass below.
  *   tsx scripts/deactivate-duplicate-bom.ts --bom <id> --dry-run
  *       Say what would happen. Writes nothing.
- *   tsx scripts/deactivate-duplicate-bom.ts --bom <id>
+ *   tsx scripts/deactivate-duplicate-bom.ts --bom <id> --expect-db <name>
  *       Deactivate it. The recipe LINES ARE KEPT, so completed build orders still report correctly.
+ *       The target database must be CONFIRMED: pass `--expect-db <name>`, or run it on a TTY and type
+ *       the name when asked. Without either it refuses (exit 3) and writes nothing — a cloned database
+ *       holds the same BOM ids, so the id alone cannot tell two servers apart.
  *
  * It REFUSES (exit 2) when the BOM is a product's live recipe, or when it is the last active recipe
  * of some other BOM-typed product — deactivating in either case would make that product silently
@@ -66,6 +69,62 @@ async function announceTarget(db: {
   return row.database
 }
 
+/**
+ * THE OPERATOR MUST CONFIRM THE TARGET BEFORE A WRITE.
+ *
+ * Printing the database and then immediately writing is a log line, not a safeguard: by the time the
+ * operator reads the name, the transaction has already run. And the BOM id is no protection either --
+ * a CLONE of the database contains the same id, so "the id existed, so I must be on the right server"
+ * is exactly the reasoning that fails here. `--dry-run` does not help, because it is a separate
+ * invocation and constrains nothing about where a later write lands.
+ *
+ * Two shapes, because both uses are real:
+ *   · `--expect-db <name>` for a scripted or logged load-window run, where nobody is at a keyboard;
+ *   · a typed confirmation when there is a TTY and no flag.
+ * With neither available -- non-interactive and no flag -- it REFUSES and writes nothing, rather than
+ * assuming consent from the absence of a human.
+ */
+async function confirmTarget(targetDatabase: string): Promise<boolean> {
+  const expected = argValue('--expect-db')
+  if (expected !== undefined) {
+    if (expected === targetDatabase) return true
+    console.error(
+      `REFUSED: --expect-db said "${expected}" but this connection is to "${targetDatabase}". `
+      + 'Nothing was written. A cloned database holds the same BOM ids, so the id you passed cannot '
+      + 'tell these apart -- check DATABASE_URL before retrying.',
+    )
+    return false
+  }
+
+  if (!process.stdin.isTTY) {
+    console.error(
+      `REFUSED: about to write to "${targetDatabase}", but there is nobody to confirm it and no `
+      + '--expect-db was given. Nothing was written. Re-run with --expect-db '
+      + `${targetDatabase} if that is genuinely the database you mean.`,
+    )
+    return false
+  }
+
+  process.stderr.write(`Type the database name "${targetDatabase}" to proceed, or anything else to abort: `)
+  const typed = await new Promise<string>((resolve) => {
+    let buffer = ''
+    process.stdin.setEncoding('utf8')
+    const onData = (chunk: string) => {
+      buffer += chunk
+      if (buffer.includes('\n')) {
+        process.stdin.off('data', onData)
+        process.stdin.pause()
+        resolve(buffer.slice(0, buffer.indexOf('\n')).trim())
+      }
+    }
+    process.stdin.on('data', onData)
+    process.stdin.resume()
+  })
+  if (typed === targetDatabase) return true
+  console.error(`REFUSED: you typed "${typed}", which is not "${targetDatabase}". Nothing was written.`)
+  return false
+}
+
 function argValue(flag: string): string | undefined {
   const at = process.argv.indexOf(flag)
   return at === -1 ? undefined : process.argv[at + 1]
@@ -100,11 +159,16 @@ async function main() {
     console.error(
       'Usage:\n'
       + '  tsx scripts/deactivate-duplicate-bom.ts --list\n'
-      + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> [--dry-run]',
+      + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --expect-db <name>\n'
+      + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --dry-run',
     )
     return 64
   }
   const dryRun = process.argv.includes('--dry-run')
+
+  // The gate applies to the WRITE only. `--list` returned above and `--dry-run` rolls back, so
+  // demanding confirmation for either would train operators to type past it.
+  if (!dryRun && !(await confirmTarget(targetDatabase))) return 3
 
   // ONE TRANSACTION, so the lock the repair takes actually covers the decision AND the write, and a
   // dry run can compute the real answer and then throw it away rather than asking a different
@@ -117,6 +181,10 @@ async function main() {
         bomId,
         actor: process.env.SUDO_USER || process.env.USER || undefined,
         database: targetDatabase,
+        // RE-CHECKED INSIDE THE TRANSACTION. Everything above happened on a different statement, and
+        // a check before the transaction can be defeated by anything that changes which server the
+        // connection reaches in between -- which is the whole reason this banner exists.
+        expectDatabase: targetDatabase,
       })
       if (dryRun) throw Object.assign(new Error(SENTINEL), { result })
       return result
@@ -125,12 +193,17 @@ async function main() {
     if (error instanceof Error && error.message === SENTINEL) {
       const result = (error as Error & { result: Awaited<ReturnType<typeof deactivateDuplicateBomRecipe>> }).result
       console.log(`DRY RUN — nothing was written.\n${describeBomRecipeRepair(result)}`)
+      if (result.kind === 'wrong-database') return 3
       return result.kind === 'claimed' || result.kind === 'sole-recipe-for-other-parent' ? 2 : 0
     }
     throw error
   }
 
   const line = describeBomRecipeRepair(outcome)
+  if (outcome.kind === 'wrong-database') {
+    console.error(line)
+    return 3
+  }
   if (outcome.kind === 'claimed' || outcome.kind === 'sole-recipe-for-other-parent') {
     console.error(line)
     return 2
