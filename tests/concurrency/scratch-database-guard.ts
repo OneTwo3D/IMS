@@ -129,13 +129,23 @@
  * URL. Call it first in every test, before importing anything that opens the application pool.
  */
 
+import {
+  DISPOSABLE_DATABASE_MARKER_PREFIX,
+  expectedDisposableDatabaseMarker,
+} from '@/lib/disposable-database-marker'
+
 export const SCRATCH_DATABASE_OPT_IN_ENV = 'IMS_CONCURRENCY_SCRATCH_DB'
 
 /**
  * The stamp. Exact-match, and deliberately a sentence no one writes by accident.
  * `scripts/stamp-scratch-database.ts` applies it; docs/development.md tells operators to.
+ *
+ * DEFINED IN `lib/disposable-database-marker.ts` AND RE-EXPORTED HERE (o3d-1q28). The sweep
+ * `purgeExpiredActivityLogs` now reads the same stamp back before it deletes anything under the
+ * concurrency tier, and shipped code may not import from `tests/`. One definition, two readers —
+ * the alternative is the same sentence written twice, which agrees until one copy is edited.
  */
-export const SCRATCH_DATABASE_MARKER_PREFIX = 'ims-scratch-database'
+export const SCRATCH_DATABASE_MARKER_PREFIX = DISPOSABLE_DATABASE_MARKER_PREFIX
 
 /**
  * THE STAMP, BOUND TO THE DATABASE IT WAS ISSUED FOR (o3d-zzgp r7, review MEDIUM-3).
@@ -148,7 +158,7 @@ export const SCRATCH_DATABASE_MARKER_PREFIX = 'ims-scratch-database'
  * recomputes the expected text from `current_database()` and compares exactly.
  */
 export function expectedScratchDatabaseMarker(databaseName: string): string {
-  return `${SCRATCH_DATABASE_MARKER_PREFIX}(${databaseName}): created for a test run and safe to destroy (o3d-zzgp)`
+  return expectedDisposableDatabaseMarker(databaseName)
 }
 
 /**
