@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { expectedDisposableDatabaseMarker } from '@/lib/disposable-database-marker'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
@@ -152,6 +153,104 @@ export type CronRunCleanupClient = {
   }
 }
 
+/**
+ * o3d-1q28 — THE SWEEP REFUSES A DATABASE NOBODY DECLARED DESTROYABLE, WHENEVER THE CONCURRENCY
+ * TIER IS SWITCHED ON.
+ *
+ * WHAT WENT WRONG. `tests/concurrency/withheld-marker-durability.concurrent.test.ts` drives this
+ * sweep — TWICE — to prove the withheld-marker exemption. The sweep takes no client and no
+ * predicate: it imports the module-level `db` and issues an UNBOUNDED oldest-first DELETE loop
+ * over `activity_logs`, one batch of 10,000 per level until a short batch. Nothing in it is tied
+ * to the caller's fixtures. Pointed at a populated database it therefore deletes every real
+ * activity-log row past retention, oldest first, permanently, and the test's own cleanup — which
+ * removes the ids it seeded — cannot put any of it back. On this host `DATABASE_URL` names the
+ * live-served dev database, which is the only populated IMS database in existence.
+ *
+ * WHY THE GUARD IS HERE AND NOT AT THE CALL SITE. There is nothing at the call site to narrow.
+ * `purgeExpiredActivityLogs` is a SWEEP over the globally oldest expired rows, exactly like
+ * `processPendingEmailOutbox` was in o3d-alnk, and three rounds of review there established that
+ * "which rows may this sweep touch" is a claim over an open space. The lane now provisions and
+ * stamps its own database and points `DATABASE_URL` at it before `@/lib/db` is first imported —
+ * but that is CONFIGURATION, and configuration being wrong is the whole of this defect. So the
+ * destructive statement itself asks, on the very connection it is about to delete through, whether
+ * the database it has reached was deliberately declared destroyable, and REFUSES BY NAME if not.
+ *
+ * WHAT IT COSTS PRODUCTION: one `process.env` comparison. The check is reached only when
+ * `RUN_DB_CONCURRENCY_TESTS=1`, which is the flag that switches the tier on in the first place —
+ * with it unset every test in that directory SKIPS, so there is no in-tier caller left for the
+ * guard to miss, and no production deployment sets it. It is deliberately NOT "refuse an unstamped
+ * database always": a real database is never stamped, and a retention cron that refused to run
+ * against production would be a worse defect than the one this closes.
+ *
+ * THE STAMP IS THE SAME ONE THE TIER ALREADY GATES ON (o3d-zzgp): the database's own
+ * `COMMENT ON DATABASE`, naming itself, issued by `npm run db:stamp-scratch`. Reading it through
+ * `db` rather than from a URL is the point — a fact asked of the connection that will do the
+ * deleting cannot be a fact about a different database.
+ */
+export const CONCURRENCY_TIER_ENV = 'RUN_DB_CONCURRENCY_TESTS'
+
+export class ActivityLogPurgeRefusedError extends Error {
+  override readonly name = 'ActivityLogPurgeRefusedError'
+}
+
+/** Everything the refusal rests on. `connectedDatabase` and `databaseComment` come from the server. */
+export type ActivityLogPurgeTargetFacts = {
+  /** `process.env.RUN_DB_CONCURRENCY_TESTS === '1'`. */
+  tierEnabled: boolean
+  /** `current_database()`. */
+  connectedDatabase: string
+  /** `shobj_description(<this database>, 'pg_database')` — null when unstamped. */
+  databaseComment: string | null
+}
+
+/** The pure decision, exported so every branch is provable with no database at all. */
+export function activityLogPurgeTargetVerdict(
+  facts: ActivityLogPurgeTargetFacts,
+): { ok: true } | { ok: false; reason: string } {
+  if (!facts.tierEnabled) return { ok: true }
+  if (!facts.connectedDatabase) {
+    return {
+      ok: false,
+      reason: 'REFUSING to purge activity logs: the server reported no database name, so nothing can be '
+        + 'established about what this DELETE would reach',
+    }
+  }
+  const expected = expectedDisposableDatabaseMarker(facts.connectedDatabase)
+  if (facts.databaseComment !== expected) {
+    return {
+      ok: false,
+      reason: `REFUSING to purge activity logs from "${facts.connectedDatabase}": `
+        + `${CONCURRENCY_TIER_ENV}=1 and that database is not marked disposable for itself — its database `
+        + `comment is ${facts.databaseComment === null ? 'unset' : `"${facts.databaseComment}"`}. `
+        + 'This sweep is an unbounded oldest-first DELETE over activity_logs and it cannot be narrowed to a '
+        + "caller's fixtures, so under the concurrency tier it runs only against a database somebody "
+        + 'declared destroyable (`npm run db:stamp-scratch -- <database-name>`). See docs/development.md, '
+        + '"Database-backed tiers" (o3d-1q28).',
+    }
+  }
+  return { ok: true }
+}
+
+/**
+ * Ask the SERVER, through the client that would issue the DELETE, and throw before any row is read.
+ * A no-op when the concurrency tier is off, and it does not even open a round trip then.
+ */
+async function assertActivityLogPurgeTargetIsDisposable(): Promise<void> {
+  if (process.env[CONCURRENCY_TIER_ENV] !== '1') return
+  const rows = await db.$queryRaw<Array<{ db: string | null; comment: string | null }>>`
+    SELECT current_database()::text AS db,
+           shobj_description(d.oid, 'pg_database') AS comment
+    FROM pg_database d
+    WHERE d.datname = current_database()
+  `
+  const verdict = activityLogPurgeTargetVerdict({
+    tierEnabled: true,
+    connectedDatabase: rows[0]?.db ?? '',
+    databaseComment: rows[0]?.comment ?? null,
+  })
+  if (!verdict.ok) throw new ActivityLogPurgeRefusedError(verdict.reason)
+}
+
 async function getSetting(key: string): Promise<string | null> {
   const row = await db.setting.findUnique({ where: { key } })
   return row?.value ?? null
@@ -164,6 +263,9 @@ async function getSetting(key: string): Promise<string | null> {
  * Call this on a daily schedule (e.g. cron or API route).
  */
 export async function purgeExpiredActivityLogs() {
+  // o3d-1q28 — BEFORE ANY ROW IS READ, let alone deleted. See the block above.
+  await assertActivityLogPurgeTargetIsDisposable()
+
   const [infoVal, warnVal, errorVal] = await Promise.all([
     getSetting('activity_log_retention_info'),
     getSetting('activity_log_retention_warning'),
