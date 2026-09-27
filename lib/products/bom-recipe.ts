@@ -301,6 +301,14 @@ export async function syncBomRecipeFromProductComponents(
   // cycles that the rewrite removes and misses cycles the rewrite creates. The caller aborts its
   // transaction on a cycle, so nothing lands.
   const edges = await client.bomItem.findMany({
+    // SCOPED TO ACTIVE BOMS, and that scope is not cosmetic (o3d-zjsb5.9 round 3 reader audit).
+    // The reader this check protects — `replenishment-reports.ts` explodes component demand from
+    // bom_items — selects `where: { bom: { active: true }, parentProduct: { type: BOM } }`. So the
+    // graph that can actually hurt anyone is the ACTIVE one. Retiring a recipe deliberately KEEPS
+    // its items (deactivated and unclaimed) so completed and in-flight orders still resolve, which
+    // means an unscoped walk counts edges no reader will ever follow and can refuse a perfectly
+    // legitimate re-import. Conservative in the wrong direction is still wrong.
+    where: { bom: { active: true } },
     select: { parentProductId: true, componentProductId: true },
   })
   const cycle = detectBomItemCycleInEdges(edges)

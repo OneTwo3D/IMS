@@ -360,19 +360,17 @@ type CreateInput = {
 export async function createManufacturingOrder(input: CreateInput): Promise<{ success: boolean; error?: string; id?: string }> {
   try {
     await requirePermission('manufacturing')
-    // Validate product has BOM components
-    const product = await db.product.findUnique({
+
+    // PREFLIGHT ONLY. Re-read and re-validated under the graph lock below, and that read is the one
+    // everything downstream uses (o3d-zjsb5.9 round 3). Kept so the ordinary rejections still return
+    // a clean message without opening a transaction at all.
+    const preflight = await db.product.findUnique({
       where: { id: input.productId },
-      select: {
-        sku: true,
-        name: true,
-        type: true,
-        productComponents: { select: { componentId: true, qty: true } },
-      },
+      select: { type: true, productComponents: { select: { componentId: true } } },
     })
-    if (!product) return { success: false, error: 'Product not found.' }
-    if (product.type !== 'BOM') return { success: false, error: 'Product is not a BOM type.' }
-    if (product.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
+    if (!preflight) return { success: false, error: 'Product not found.' }
+    if (preflight.type !== 'BOM') return { success: false, error: 'Product is not a BOM type.' }
+    if (preflight.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
 
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
 
@@ -396,18 +394,65 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     // Calling the shared helper rather than hand-rolling the claim also means this path MIRRORS
     // `ProductComponent` into the recipe instead of only seeding it on first create, so raising an
     // order repairs a drifted recipe rather than building against a stale one.
+    // o3d-zjsb5.9 round 3: THE LOCK SERIALIZED THE WRITE BUT NOT THE DATA IT WROTE. Round 2 took the
+    // graph lock here, which was the right lock — but the product's type and component list were read
+    // BEFORE it, outside any transaction. So while this request waited for the lock, an editor or a
+    // CSV import could change the recipe, and this action would then write the OLD list into BomItem
+    // and raise an order against it; or a type conversion could RETIRE the Bom, and this action would
+    // claim and reactivate it for a product that is no longer BOM-typed.
+    //
+    // Same answer as o3d-8f0p6/#713, which had the same shape with account codes: read and validate
+    // INSIDE the transaction, after acquiring the lock, and use THAT read for everything downstream.
+    // A snapshot older than the lock describes a state the lock is not protecting.
     const claim = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
-      return await syncBomRecipeFromProductComponents(tx, {
+
+      // THE AUTHORITATIVE READ. Everything below uses this one, never the preflight.
+      const locked = await tx.product.findUnique({
+        where: { id: input.productId },
+        select: {
+          sku: true,
+          name: true,
+          type: true,
+          productComponents: { select: { componentId: true, qty: true }, orderBy: { sortOrder: 'asc' } },
+        },
+      })
+      // ABORTED, not adapted. A product that stopped being BOM-typed while we waited must not have
+      // its recipe claimed and reactivated, and one whose components were cleared must not have an
+      // order raised against an empty recipe.
+      if (!locked) return { kind: 'gone' as const }
+      if (locked.type !== 'BOM') return { kind: 'not-bom' as const, type: locked.type }
+      if (locked.productComponents.length === 0) return { kind: 'no-components' as const }
+
+      const synced = await syncBomRecipeFromProductComponents(tx, {
         productId: input.productId,
-        sku: product.sku,
-        productName: product.name,
-        components: product.productComponents.map((component) => ({
+        sku: locked.sku,
+        productName: locked.name,
+        components: locked.productComponents.map((component) => ({
           componentProductId: component.componentId,
           qty: Number(component.qty),
         })),
       })
+      if (synced.kind !== 'written') return synced
+      return { ...synced, sku: locked.sku, name: locked.name }
     })
+    if (claim.kind === 'gone') {
+      return { success: false, error: 'Product not found.' }
+    }
+    if (claim.kind === 'not-bom') {
+      return {
+        success: false,
+        error: `This product changed to ${claim.type} while the build order was being raised, so it no `
+          + 'longer has a manufacturing recipe. Nothing was created.',
+      }
+    }
+    if (claim.kind === 'no-components') {
+      return {
+        success: false,
+        error: 'This product\'s components were cleared while the build order was being raised. '
+          + 'Nothing was created.',
+      }
+    }
     if (claim.kind === 'cycle') {
       return {
         success: false,
@@ -443,8 +488,10 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       entityId: order.id,
       tag: 'manufacturing',
       action: 'created',
-      description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${product.sku} — ${product.name} (${input.qtyPlanned} units)`,
-      metadata: { reference, sku: product.sku, orderType: input.orderType, qty: input.qtyPlanned },
+      // From the LOCKED read, not the preflight: the activity log must describe the product as it was
+      // when the order was actually raised.
+      description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${claim.sku} — ${claim.name} (${input.qtyPlanned} units)`,
+      metadata: { reference, sku: claim.sku, orderType: input.orderType, qty: input.qtyPlanned },
     })
 
     revalidatePath('/manufacturing')

@@ -5,6 +5,11 @@ Manufacturing orders let you assemble finished products from their components or
 BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
 
 ## Where a recipe comes from
+**If the product changes while you are raising a build order**, the order is refused rather than
+raised against stale information: IMS re-reads the product's type and components at the moment it
+takes its lock, so a recipe edited in that instant is used in its *new* form, and a product converted
+away from BOM in that instant is refused with a message saying so. Nothing is part-created.
+
 
 A recipe can be entered on the product page or loaded in bulk through the products CSV's
 `components` column — see [Importing manufacturing recipes](inventory.md#importing-manufacturing-recipes-bom).
