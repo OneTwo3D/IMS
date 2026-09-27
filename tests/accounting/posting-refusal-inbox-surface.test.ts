@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import test, { mock } from 'node:test'
 
 /**
@@ -1095,7 +1097,6 @@ test('[o3d-j625 r26] the section copy describes finding a claim, not having seen
  */
 test('[o3d-j625 r26] every writer to a refusal row accounts for the hand-post claim', async () => {
   const { readFile } = await import('node:fs/promises')
-  const { execFileSync } = await import('node:child_process')
   const path = await import('node:path')
   const root = process.cwd()
 
@@ -1164,4 +1165,68 @@ test('[o3d-j625 r26] every writer to a refusal row accounts for the hand-post cl
     const source = await readFile(path.join(root, file), 'utf8')
     assert.doesNotMatch(source, /accountingPostingRefusal\.delete/, `${file} must not delete refusal rows`)
   }
+})
+
+/**
+ * o3d-j625 r28 (Codex round 27, HIGH 1) — EVERY CONSUMER OF A QUEUED ENQUEUE MUST BE ABLE TO SEE A DECLINE.
+ *
+ * The census above answers "does every WRITER consider the claim". Round 27 asked the same question one
+ * layer out and the answer was no: the facade's post-queue clear declined correctly and then discarded the
+ * fact, so `queued: true` reached every consumer. So this pins the OTHER half — that the decline is carried
+ * in the outcome, by the single function that owns the decision, and that nothing clears a refusal after a
+ * successful enqueue without going through it.
+ *
+ * WHAT WOULD STILL PASS IT: any wording change; a fourth clear call site that is NOT on a post-queue path
+ * (the two in-transaction ones are named here as the exceptions they are, and are safe for a reason the
+ * audit states — the key's lock is `pg_advisory_xact_lock`, held to commit, so no claim can be taken between
+ * the row write and the clear in one transaction). It says nothing about what each consumer DOES with an
+ * unqueued outcome: `postingIsOwed` and the per-site tests cover that.
+ */
+test('[o3d-j625 r28] a post-queue clear goes through the one function that also carries the decline', () => {
+  const root = process.cwd()
+  const read = (p: string) => readFileSync(path.join(root, p), 'utf8')
+
+  const outcome = read('lib/domain/accounting/enqueue-outcome.ts')
+  assert.match(outcome, /export async function settleQueuedEnqueueAgainstHandPostClaim/,
+    'the one function that clears and adjusts together must exist')
+  // The decline must MAP to an unqueued outcome. Asserted as the mapping, not as the presence of the word.
+  assert.match(
+    outcome,
+    /case 'declined-hand-post-claim':\s*\n\s*return \{ \.\.\.outcome, queued: false, reason: 'hand-post-deferred' \}/,
+    'THE FINDING: a declined clear must turn the outcome UNQUEUED. Returning `outcome` unchanged here is '
+    + 'exactly what round 27 found — the refusal stays visible while the caller believes its work was queued.',
+  )
+  // ...and the exhaustiveness that makes a third decline reason a compile error rather than a fall-through.
+  assert.match(outcome, /const unhandledClearOutcome: never = cleared/,
+    'the switch must be exhaustive, so a new decline reason fails to compile instead of reporting queued')
+
+  // The facade must not hand-roll the same decision beside it.
+  const facade = read('lib/accounting.ts')
+  assert.match(facade, /routed = await settleQueuedEnqueueAgainstHandPostClaim\(/,
+    'the facade must route its post-queue clear through that function AND assign the result back')
+
+  // And the clear itself must report the decline rather than swallow it.
+  const inbox = read('lib/domain/accounting/posting-refusal-inbox.ts')
+  assert.match(inbox, /export type PostingRefusalClearResult/,
+    'the clear must return a result a caller can discriminate, not void')
+  assert.match(inbox, /outcome: 'declined-hand-post-claim',/, 'and name the claimed case')
+
+  // NON-VACUITY: every remaining clear call site is one of the two in-transaction ones, which are safe
+  // because the caller's transaction holds the posting key's lock across both statements. A new call site
+  // outside this list is a post-queue path that must use the function above.
+  const callers = execFileSync('grep', [
+    '-rln', 'clearAccountingPostingRefusal(', '--include=*.ts', 'lib', 'app',
+  ], { cwd: root, encoding: 'utf8' }).split('\n').filter(Boolean).filter((f) => !f.startsWith('app/generated/'))
+  assert.deepEqual(callers.sort(), [
+    // the facade: one in-transaction site (queueAccountingSyncTx) plus the settle call it delegates to
+    'lib/accounting.ts',
+    // the function that owns the post-queue decision
+    'lib/domain/accounting/enqueue-outcome.ts',
+    // the clear itself
+    'lib/domain/accounting/posting-refusal-inbox.ts',
+    // the row-creating primitive: same transaction, same lock, and it returns early on a live claim anyway
+    'lib/domain/accounting/sync-log-row.ts',
+  ], 'a NEW file clearing refusals must be judged against the post-queue rule above, not added here silently')
+  assert.match(inbox, /pg_advisory_xact_lock|runUnderPostingKeyLock/,
+    'PRECONDITION: the clear must still take the posting key lock, which is what makes the in-transaction sites safe')
 })

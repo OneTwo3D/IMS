@@ -2162,3 +2162,180 @@ test(
       + 'a decline that cannot name a holder is a bug, not a report')
   },
 )
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r28 (Codex round 27, HIGH 1) — THROUGH THE CALLER, NOT AT THE FACADE BOUNDARY.
+//
+// Rounds 17 and 27 were both found one layer out from where the code was read: r26's clear was correct
+// and its SILENCE was the defect, because the facade went on answering `queued: true` for a posting whose
+// row the claim had cancelled. A test that asserts the facade's return shape would have been satisfied by
+// r26 as it stood; what catches this is asserting what a CONSUMER does with the answer.
+//
+// So this drives `syncSalesInvoiceUpdate` — the site the review named, and the one that chooses between
+// logging `sales_invoice_update_queued` and recording an outstanding debt purely on the strength of this
+// outcome — over a real database, with the real claim, the real clear and the real settle step. The
+// injected `queueAccountingSync` is the facade's own shape: commit a PENDING row, then (in the window the
+// facade cannot close, because the two are separate transactions) the operator takes the refusal, then the
+// real `settleQueuedEnqueueAgainstHandPostClaim` runs. Nothing about the decision is re-implemented here.
+//
+// WHAT WOULD STILL PASS THIS TEST: any change that leaves the outcome unqueued and the caller reporting —
+// it pins the observable consequence, not the reason string's spelling beyond the two it asserts. It says
+// nothing about the OTHER consumers (they are covered by the source census in
+// tests/accounting/enqueue-outcome-consumed.test.ts plus this round's written audit), and nothing about
+// the case where no claim is taken, which is the CONTROL below.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+async function loadR28Deps() {
+  const [outcome, sync] = await Promise.all([
+    import('../../lib/domain/accounting/enqueue-outcome.ts'),
+    import('../../lib/domain/sales/sales-invoice-update-sync.ts'),
+  ])
+  return {
+    settleQueuedEnqueueAgainstHandPostClaim: outcome.settleQueuedEnqueueAgainstHandPostClaim,
+    queueSalesInvoiceUpdate: sync.queueSalesInvoiceUpdateForExistingAccountingInvoice,
+  }
+}
+
+/**
+ * The caller, wired to real production functions. `takeClaim` runs in the window between the queue's
+ * commit and the clear — which is exactly where the operator acts in the interleaving under test.
+ */
+async function runSalesInvoiceUpdateThroughFacadeShape(
+  deps: Awaited<ReturnType<typeof loadDeps>>,
+  r28: Awaited<ReturnType<typeof loadR28Deps>>,
+  referenceId: string,
+  takeClaim: (() => Promise<void>) | null,
+) {
+  const key = updateKeyFor(referenceId)
+  const logged: Array<{ action: string; level: string }> = []
+  const refusalsRecorded: Array<{ reason: string }> = []
+  await r28.queueSalesInvoiceUpdate({
+    salesOrderId: referenceId,
+    orderNumber: `SO-${referenceId.slice(-8)}`,
+    accountingInvoiceId: 'xero-invoice-1',
+    payload: { InvoiceID: 'xero-invoice-1' },
+    chartConnector: 'xero',
+    documentConnector: 'xero',
+    idempotencyKey: `sales-invoice-update:${referenceId}`,
+  }, {
+      getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'Xero' }) as never,
+      // THE FACADE'S SHAPE: the connector queue commits its own transaction and answers `queued: true`...
+      queueAccountingSync: async () => {
+        const created = await deps.createAccountingSyncLogRow(deps.db as never, {
+          connector: 'xero',
+          type: key.type,
+          status: 'PENDING',
+          referenceType: key.referenceType,
+          referenceId,
+          payload: { InvoiceID: 'xero-invoice-1' },
+        } as never)
+        assert.ok(created.row, 'PRECONDITION: the queue must actually commit a sync row, or the window under test does not exist')
+        // The primitive's own clear ran INSIDE that transaction, under the key's lock, so the debt is closed
+        // here. Re-open it through the production recorder, which is how it is open again on the facade path:
+        // a later enqueue of the same posting refused, and `recordAccountingPostingRefusal` reopens a resolved
+        // row rather than writing a second one. Without this the operator has nothing to take and the window
+        // under test does not exist — the first draft of this test failed on exactly that and proved nothing.
+        await deps.recordAccountingPostingRefusal(deps.db as never, key as never, updateRefusal('retired_chart') as never)
+        // ...and HERE is the window the facade cannot close: two transactions, and an operator between them.
+        if (takeClaim) await takeClaim()
+        // ...and this is the real post-queue step, unmodified.
+        return r28.settleQueuedEnqueueAgainstHandPostClaim(
+          { queued: true, connector: 'xero' },
+          key,
+          deps.db as never,
+        ) as never
+      },
+      logActivity: async (params: { action: string; level: string }) => { logged.push({ action: params.action, level: params.level }) },
+      recordPostingRefusal: async (record: { reason: string; posting: unknown }) => {
+        refusalsRecorded.push({ reason: record.reason })
+        await deps.recordAccountingPostingRefusal(deps.db as never, record.posting as never, record as never)
+      },
+    } as never)
+  return { logged, refusalsRecorded }
+}
+
+test(
+  '[o3d-j625 r28 HIGH 1] a claim taken after the queue commits makes the CALLER record the debt, not log "queued"',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r28-caller-decline')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    // A refusal for this posting is already outstanding — that is what an operator can take.
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+    )
+    console.log(`[r28 caller] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+
+    assert.ok(
+      !logged.some((l) => l.action === 'sales_invoice_update_queued'),
+      'THE FINDING: the caller must NOT report the update as queued. Its sync row was cancelled by the claim, '
+      + 'so nothing is queued anywhere — this is the log line r26 left it free to write.',
+    )
+    assert.ok(
+      logged.some((l) => l.action === 'sales_invoice_update_not_queued'),
+      'and it must say so where an operator will see it',
+    )
+    assert.deepEqual(
+      refusalsRecorded.map((r) => r.reason), ['hand_post_claim_held'],
+      'recorded as a HELD CLAIM specifically — the caller already distinguishes this from a plain refusal (r18), '
+      + 'and that distinction is only reachable if the outcome carried `hand-post-deferred` through the facade',
+    )
+
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true },
+    })
+    console.log(`[r28 caller] refusal=${JSON.stringify(after)}`)
+    assert.equal(after.resolvedAt, null, 'the refusal is still outstanding')
+    assert.equal(after.handPostClaimedBy, 'operator-A', 'and still theirs')
+    assert.equal(after.handPostDeferredCount, 1,
+      'and the postponement is COUNTED — r18 made this "edits that arrived while you held this claim", and an '
+      + 'edit that arrived and was cancelled is one. A `hand-post-deferred` answer with no record is the shape '
+      + 'r18 raised HandPostDeferralUnrecordableError over.')
+  },
+)
+
+test(
+  '[o3d-j625 r28 CONTROL] with NO claim taken in the window, the caller still reports the update as queued',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r28-caller-control')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(deps, r28, referenceId, null)
+    console.log(`[r28 control] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+
+    assert.ok(
+      logged.some((l) => l.action === 'sales_invoice_update_queued'),
+      'CONTROL: without a claim the answer is unchanged. Without this the fix could pass by reporting every '
+      + 'update as owed, which would bury the inbox in debts that do not exist.',
+    )
+    assert.deepEqual(refusalsRecorded, [], 'and nothing is recorded as outstanding')
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true, handPostDeferredCount: true },
+    })
+    assert.ok(after.resolvedAt, 'and the outstanding row IS closed by the successful enqueue')
+    assert.equal(after.resolution, 'queued')
+    assert.equal(after.handPostDeferredCount, 0, 'and nothing was counted as postponed')
+  },
+)

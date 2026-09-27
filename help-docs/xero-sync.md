@@ -2369,7 +2369,11 @@ Three things about those rows:
   when somebody confirms the posting or releases it, and that is only safe if every claim can be found. That
   section is independent of the refusal list below, which shows the *oldest 50 debts* and would otherwise
   hide a newer claim behind unrelated work. Each row shows who holds it, how long it has been held, and how
-  many postings IMS has declined to queue behind it. Anything held far longer than a hand posting takes is
+  many postings IMS has declined to queue behind it. **That count includes an attempt that was already
+  queued when you took the posting**: taking it cancels that attempt, so from that moment the posting is
+  owed again — and the document it came from is told so, instead of being left recording that its work was
+  queued. Those are logged as `accounting_posting_refusal_clear_declined_hand_post_claim`, and the posting
+  is recorded as outstanding in the usual way. Anything held far longer than a hand posting takes is
   flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
 
   **This list is a view of what is being held, not a roll-call.** The longest-held claims are listed

@@ -1,6 +1,11 @@
 import type { ActivityEntityType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
-import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import {
+  clearAccountingPostingRefusal,
+  recordAccountingPostingRefusal,
+  type PostingRefusalClient,
+  type PostingRefusalKey,
+} from '@/lib/domain/accounting/posting-refusal-inbox'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
 /**
@@ -207,5 +212,56 @@ export async function activeAccountingConnectorForReport(): Promise<string | nul
     return (await getActiveAccountingConnectorInfo())?.id ?? null
   } catch {
     return null
+  }
+}
+
+
+/**
+ * o3d-j625 r28 (Codex round 27, HIGH 1) — SETTLE THE DEBT FOR A QUEUED ENQUEUE, AND BELIEVE THE ANSWER.
+ *
+ * The step the facade takes after a connector queue has committed. It exists as its own named function for
+ * two reasons, and the second is the important one:
+ *
+ *  1. The clear and the outcome adjustment are ONE decision. r26 fixed the clear and left the outcome
+ *     alone, and the gap between the two is the finding this function closes: a queue committed a PENDING
+ *     row, an operator took the refusal for hand posting in the window before the clear (which CANCELS the
+ *     provably-unsent row), the clear rightly declined — and the facade still answered `queued: true`. The
+ *     sales-invoice-update caller then logged `sales_invoice_update_queued` for a posting with no row
+ *     anywhere. Keeping both halves in one function means a future author cannot do one without the other.
+ *
+ *  2. A REAL CALLER CAN DRIVE IT. Rounds 17 and 27 were both found at a boundary: the code was right where
+ *     it was read and wrong one layer out. A test that exercises the facade's post-queue logic through the
+ *     actual consumer — `syncSalesInvoiceUpdate`, which chooses between "queued" and "owed" on the strength
+ *     of this answer — is the test that would have caught this round, and it needs this step reachable
+ *     without standing up a connector.
+ *
+ * `hand-post-deferred` is r18's existing reason, not a new one: "an operator holds the hand-posting claim,
+ * so IMS declined to queue this WHILE they are in the ledger; nothing exists yet." After the claim cancelled
+ * the row, nothing does. Every consumer already handles it — `postingIsOwed` reads it as owed and the
+ * update-sync sites branch on it by name — so no caller meets an unfamiliar shape, which is the safer
+ * direction than teaching twenty-odd sites a new word.
+ *
+ * The `switch` is exhaustive with a `never` default deliberately: a third way for the clear to decline is a
+ * `tsc` error here rather than a silent fall-through to `queued: true`. That is the same device the
+ * connector switch uses, and the one r18 used when `createAccountingSyncLogRow` began returning
+ * `{ row, suppressed }`.
+ */
+export async function settleQueuedEnqueueAgainstHandPostClaim<T extends { queued: boolean; reason?: EnqueueOutcomeLike['reason'] }>(
+  outcome: T,
+  posting: PostingRefusalKey,
+  client: PostingRefusalClient,
+  options?: { withSavepoint?: <R>(fn: () => Promise<R>) => Promise<R> },
+): Promise<T> {
+  if (!outcome.queued) return outcome
+  const cleared = await clearAccountingPostingRefusal(client, posting, options)
+  switch (cleared.outcome) {
+    case 'cleared':
+      return outcome
+    case 'declined-hand-post-claim':
+      return { ...outcome, queued: false, reason: 'hand-post-deferred' }
+    default: {
+      const unhandledClearOutcome: never = cleared
+      return unhandledClearOutcome
+    }
   }
 }

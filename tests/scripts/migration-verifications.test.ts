@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { execFileSync } from 'node:child_process'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
@@ -213,4 +215,95 @@ test('the migration this repository requires to declare checks now declares them
   assert.deepEqual(coverage.missing, [], 'every required migration must ship a verify.sql')
   assert.deepEqual(coverage.stale, [])
   assert.equal(coverage.satisfied, true, 'node scripts/run-migration-verifications.mjs --strict must be able to pass')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// o3d-j625 r28 (Codex round 27, HIGH 2) — A MIGRATION THAT HAS BEEN APPLIED SOMEWHERE IS FOREVER.
+//
+// r26 removed a table by DELETING its migration. A fresh database never applies the deleted migration,
+// so every tier of a fully green gate passed; a database that HAD applied it was left with a table no
+// migration drops and `db:schema:drift` rejecting the extra table. The upgrade path is the one path CI
+// never walks, which is why this needs a rule in the repo rather than care from the next author.
+//
+// `scripts/check-migration-conventions.mjs` cannot catch it: it diffs with `--diff-filter=ACMR`, which
+// excludes deletions by construction. So the rule lives here.
+//
+// WHAT WOULD STILL PASS THESE TESTS: renaming a migration directory in the same commit that created it
+// (no ref has it yet, so nothing was applied anywhere); editing the BODY of an already-shipped migration,
+// which is a different defect with a different fix; and a table created and dropped by migrations that
+// PRISMA never modelled in the first place. Neither test says anything about column-level changes.
+
+test('o3d-j625 r28: no migration that exists on the trunk has been deleted from this branch', () => {
+  const root = process.cwd()
+  const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+
+  let base: string
+  try {
+    base = git(['merge-base', 'origin/development', 'HEAD'])
+  } catch {
+    // No trunk ref in this checkout (a shallow CI clone). Say so rather than passing quietly.
+    assert.fail('PRECONDITION: origin/development must be fetched for this check to mean anything')
+  }
+
+  const dirsAt = (ref: string) => new Set(
+    git(['ls-tree', '-r', '--name-only', ref, 'prisma/migrations/'])
+      .split('\n')
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+
+  const onTrunk = dirsAt(base)
+  const onBranch = dirsAt('HEAD')
+  assert.ok(onTrunk.size > 50, `PRECONDITION: the walk must actually see the trunk's migrations, saw ${onTrunk.size}`)
+
+  const deleted = [...onTrunk].filter((dir) => !onBranch.has(dir))
+  assert.deepEqual(deleted, [],
+    'A migration on the trunk has been deleted from this branch. Deleting an applied migration does not remove '
+    + 'anything from a database that already ran it: `migrate deploy` then has no step that undoes it and drift '
+    + 'rejects the leftover object. Restore it and add a LATER migration that reverses it (o3d-j625 r28).')
+
+  // AND ON DISK, which is the check that fires BEFORE the deletion is committed. The comparison above reads
+  // `git ls-tree`, so it is blind to a working tree the author has already emptied — the first draft of this
+  // test passed with a trunk migration moved aside, which is precisely the moment an author wants to be told.
+  const missingOnDisk = [...onTrunk].filter(
+    (dir) => !existsSync(join(root, 'prisma', 'migrations', dir, 'migration.sql')),
+  )
+  assert.deepEqual(missingOnDisk, [],
+    'A migration that exists on the trunk is missing from the working tree. Same rule, caught before the '
+    + 'commit: restore it and reverse it with a later migration instead (o3d-j625 r28).')
+})
+
+test('o3d-j625 r28: every table a migration creates is either modelled or dropped by a later migration', () => {
+  const root = process.cwd()
+  const migrationsDir = join(root, 'prisma', 'migrations')
+  const dirs = readdirSync(migrationsDir).filter((d: string) => /^\d{14}_/.test(d)).sort()
+  assert.ok(dirs.length > 50, `PRECONDITION: the walk must reach the migrations, saw ${dirs.length}`)
+
+  const created = new Map<string, string>()
+  const dropped = new Set<string>()
+  for (const dir of dirs) {
+    let sql: string
+    try {
+      sql = readFileSync(join(migrationsDir, dir, 'migration.sql'), 'utf8')
+    } catch {
+      continue
+    }
+    const body = sql.split('\n').filter((line: string) => !line.trimStart().startsWith('--')).join('\n')
+    for (const m of body.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"([^"]+)"/gi)) created.set(m[1], dir)
+    for (const m of body.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([^"]+)"/gi)) dropped.add(m[1])
+  }
+  assert.ok(created.size > 50, `PRECONDITION: CREATE TABLE statements must be found, saw ${created.size}`)
+  assert.ok(dropped.has('accounting_hand_post_claim_revisions'),
+    'PRECONDITION: the r28 drop migration must be among those parsed, or this test is not exercising the case it exists for')
+
+  const schema = readFileSync(join(root, 'prisma', 'schema.prisma'), 'utf8')
+  const modelled = new Set<string>()
+  for (const m of schema.matchAll(/@@map\("([^"]+)"\)/g)) modelled.add(m[1])
+  assert.ok(modelled.size > 50, `PRECONDITION: schema.prisma @@map names must be found, saw ${modelled.size}`)
+
+  const orphans = [...created.keys()].filter((t) => !modelled.has(t) && !dropped.has(t))
+  assert.deepEqual(orphans, [],
+    'These tables are created by a migration, are not in schema.prisma, and no migration drops them. Every '
+    + 'database that ran the migration will fail db:schema:drift. Add a migration that drops the table '
+    + '(o3d-j625 r28).')
 })

@@ -4,7 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { withSavepoint } from '@/lib/db/savepoint'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
-import { runUnderPostingKeyLock, type PostingKeyLockClient } from '@/lib/domain/accounting/posting-suppression'
+import { recordHandPostDeferral, runUnderPostingKeyLock, type PostingKeyLockClient, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { enqueueProvisionalPostingRefusal } from '@/lib/domain/accounting/posting-refusal-provisional'
 import type { IntegrationOutboxClient } from '@/lib/domain/integrations/outbox'
 
@@ -829,12 +829,43 @@ export async function recordAccountingPostingRefusal(
  *   · It NEVER clears the claim to make its own write succeed. Taking the claim out from under an operator
  *     who is in the ledger is the duplicate-posting window r16 closed.
  *   · A row that was simply already resolved (no claim) is the ordinary idempotent case and stays silent.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ * o3d-j625 r28 (Codex round 27, HIGH 1) — AND THE DECLINE IS RETURNED, BECAUSE A SILENT DECLINE IS THE
+ * SAME DEFECT ONE LAYER OUT
+ * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * r26 got the decline right and then dropped it on the floor: this function returned `void`, so the facade
+ * went on returning `queued: true` for a posting whose sync row the claim had just CANCELLED. Callers such
+ * as the sales-invoice update then took their success path — the refusal row stayed visible, but the
+ * caller's own answer said its work was queued, which is round 17's swallowed edit arriving through round
+ * 26's own fix. Ninth finding in this lineage and the first one that is purely a plumbing omission.
+ *
+ * So the result is a DISCRIMINATED UNION, not a boolean and not `void`. `outcome` is a required literal, so
+ * the facade's `switch` over it is exhaustive with a `never` default: a future author who adds a third way
+ * for the clear to decline gets a `tsc` error at every consumer instead of a silent `queued: true`. That is
+ * the same device the connector switch in `lib/accounting.ts` uses, and the same device r18 used when
+ * `createAccountingSyncLogRow` began returning `{ row, suppressed }` so `if (!created)` stopped compiling.
+ *
+ * `'cleared'` covers "closed it" and "there was nothing open to close" TOGETHER, deliberately: both mean the
+ * debt is discharged and no caller has ever had a reason to tell them apart. Only the claimed case is
+ * actionable, so only the claimed case is a separate member.
  */
+export type PostingRefusalClearResult =
+  | { outcome: 'cleared' }
+  | { outcome: 'declined-hand-post-claim'; claimedAt: Date; claimedBy: string | null }
+
 export async function clearAccountingPostingRefusal(
   client: PostingRefusalClient,
   key: PostingRefusalKey,
   options?: RecordRefusalOptions,
-): Promise<void> {
+): Promise<PostingRefusalClearResult> {
+  // o3d-j625 r28: `guarded` swallows a failed write by design (review L-1) — an inbox tidy-up must not
+  // become the posting's exception. A swallowed failure therefore reports `'cleared'`, and that is the
+  // SAFE direction: the alternative is telling the caller an operator holds a claim when the truth is that
+  // we do not know, which would make callers record a debt over a posting that did queue. The claim case is
+  // the only one that changes a caller's answer, and it is only ever reported when it was actually read.
+  let result: PostingRefusalClearResult = { outcome: 'cleared' }
   await guarded('clearing', key, options, async () => {
     await runUnderPostingKeyLock(
       client as unknown as PostingKeyLockClient,
@@ -856,10 +887,28 @@ export async function clearAccountingPostingRefusal(
           })
           : null
         if (!standing?.handPostClaimedAt) return
+        result = {
+          outcome: 'declined-hand-post-claim',
+          claimedAt: standing.handPostClaimedAt,
+          claimedBy: standing.handPostClaimedBy ?? null,
+        }
+        // o3d-j625 r28 — AND IT COUNTS AS A POSTPONEMENT, because that is exactly what it is.
+        //
+        // r18 made `handPostDeferredCount` mean "edits that arrived while you were holding this claim", and
+        // r18 also established the invariant that a `hand-post-deferred` answer is never given without the
+        // postponement being recorded — `HandPostDeferralUnrecordableError` exists because "a `queued: false`
+        // nobody records" is one of the two ways round 17's edit was lost. This path now returns exactly that
+        // reason through the facade, so it owes the same record. The bump happens HERE rather than at the
+        // facade because here it is causal: under this key's lock, on the row we have just read as claimed,
+        // so it cannot increment against a claim that has already been given back. Its own result is
+        // deliberately not inspected — `'no-claim'` is impossible under the lock we hold, and
+        // `'unrecordable'` means a client without the table, which `standing` proves is not the case.
+        await recordHandPostDeferral(locked as unknown as PostingSuppressionClient, key, new Date())
         await reportClearDeclinedForHandPostClaim(key, standing.handPostClaimedAt, standing.handPostClaimedBy ?? null)
       },
     )
   })
+  return result
 }
 
 /**

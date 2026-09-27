@@ -27,6 +27,7 @@ import {
 } from '@/lib/domain/accounting/prior-posting-evidence'
 import { connectorNativePayloadIdKeys, type StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
 import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-registry'
+import { settleQueuedEnqueueAgainstHandPostClaim } from '@/lib/domain/accounting/enqueue-outcome'
 import { clearAccountingPostingRefusal, recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { defaultPostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 
@@ -947,7 +948,24 @@ export async function queueAccountingSync(params: {
   // switch, not inside a case, so a connector wired in later cannot forget it.
   if (routed.queued) {
     const { db } = await import('@/lib/db')
-    await clearAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting)
+    // o3d-j625 r28 (Codex round 27, HIGH 1) — A CLEAR THAT DECLINED MEANS THIS ENQUEUE DID NOT STICK.
+    //
+    // The queue above committed a PENDING sync row and answered `queued: true`. Between that commit and this
+    // clear — two separate transactions, which is irreducible — an operator can take the refusal for hand
+    // posting, and taking it CANCELS the provably-unsent row this enqueue wrote. r26 made the clear decline
+    // in that case and stopped there, so this function went on answering `queued: true` for a posting with no
+    // row anywhere: the sales-invoice-update caller logged `sales_invoice_update_queued`, the sales-invoice
+    // caller skipped `reportPostingNotQueued`, and every consumer of `postingIsOwed` read the posting as
+    // settled. The refusal row stayed visible throughout, which is why nothing looked wrong from the inbox.
+    //
+    // Both halves of that decision now live in ONE function, so a future author cannot do the clear without
+    // the outcome; the exhaustive `never` switch that makes a third decline reason a compile error lives
+    // there too. See settleQueuedEnqueueAgainstHandPostClaim.
+    routed = await settleQueuedEnqueueAgainstHandPostClaim(
+      routed,
+      posting,
+      db as unknown as PostingRefusalClient,
+    )
   }
   return { ...routed, posting }
 }
