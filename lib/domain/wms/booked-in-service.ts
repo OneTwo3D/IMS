@@ -35,7 +35,10 @@ import {
   type StockReceiptAccounts,
 } from '@/lib/accounting'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
-import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
+import {
+  computeGrossUnitCostBaseByLine,
+  CONTRIBUTING_LANDED_COST_LINK_WHERE,
+} from '@/lib/domain/purchasing/landed-cost-service'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -867,6 +870,21 @@ export async function processBookedInEvent(
               select: { amountBase: true, distributionMethod: true },
             },
             landedCostLinks: {
+              // o3d-8m8pe: a CANCELLED freight PO must not contribute to the cost of these units. This
+              // query COPIED the manual receipt's (app/actions/purchase-orders.ts) when o3d-8f0p6 r2
+              // routed the book-in through the shared gross-cost helper, so the unfiltered read travelled
+              // with the fix. Cancellation leaves the link row in place, marks the freight PO CANCELLED
+              // and the link unallocated, and BOTH landed-cost recalculation paths exclude it
+              // (landed-cost-service.ts audit-C3 and audit-izrf) — so without this `where` the book-in's
+              // cost layer, movement value and STOCK_RECEIPT journal all carry freight the business
+              // cancelled. DERIVED from the single definition, never restated inline: a second literal
+              // copy of the rule is how three readers came to disagree about it (o3d-6nd55 r2).
+              //
+              // ON THE STATUS AND NOT ON `allocated`: `allocated` records whether the uplift has been
+              // written to `landedUnitCostBase` yet, and valuing a receipt whose freight is NOT yet
+              // allocated is the entire purpose of `computeGrossUnitCostBaseByLine` below — filtering on
+              // it would zero the ordinary case and swap an overstatement for an understatement.
+              where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
               select: {
                 freightPO: {
                   select: {
