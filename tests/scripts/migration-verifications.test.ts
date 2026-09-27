@@ -250,6 +250,41 @@ export function buildProtectedMigrationSet(input: {
 }
 
 /**
+ * o3d-ec4c0 r2 (adversarial review, HIGH) — THE SAME FACT, DERIVED TWICE, REQUIRED TO AGREE.
+ *
+ * Skipping the contribution assertion when `introducedOnBranch` is empty closed the trunk failure and opened a
+ * quieter hole: an empty set means either "this branch genuinely adds no migration" OR "the git derivation
+ * produced nothing because it is broken", and the skip treats both as fine. r30 treated both as failure, which is
+ * what reddened trunk. Neither behaviour distinguishes them, in opposite directions.
+ *
+ * `onBranch \ onTrunk` is a SECOND, independent derivation of "migrations this branch added" — a set difference
+ * between two `git ls-tree` reads, rather than `--diff-filter=A` over the `merge-base..HEAD` commit RANGE. The
+ * two cannot both be broken by the same mistake, so requiring them to agree turns the disclosure into a check.
+ *
+ * ONE-DIRECTIONAL, DELIBERATELY. Returns the directories the set difference found while the commit range found
+ * nothing — that combination can only mean a broken derivation. The converse is NOT asserted, because
+ * `introducedOnBranch` non-empty with an empty difference is legitimate: a migration this branch added that has
+ * since landed on trunk appears in the range but not in the difference. Asserting set equality would fail on an
+ * ordinary up-to-date branch.
+ *
+ * SHALLOW CLONES ARE NOT THIS FUNCTION'S PROBLEM, and the layering is the point rather than an omission. With no
+ * usable merge base `onTrunk` is empty or tiny, so the difference becomes "every migration in the repo" and this
+ * check would fire with a misleading message. Its CALLER asserts `onTrunk.size > 50` FIRST, so that case is
+ * reported as what it is — a checkout this test cannot reason about — before ever reaching here. Adding a second
+ * guard inside this function would duplicate that precondition and give two different messages for one cause.
+ */
+export function branchMigrationDerivationsDisagree(input: {
+  introducedOnBranch: Iterable<string>
+  onBranch: Iterable<string>
+  onTrunk: Iterable<string>
+}): string[] {
+  // The legitimate asymmetric case, and the ordinary one: the range found something. Nothing to cross-check.
+  if (new Set(input.introducedOnBranch).size > 0) return []
+  const onTrunk = new Set(input.onTrunk)
+  return [...new Set(input.onBranch)].filter((dir) => !onTrunk.has(dir)).sort()
+}
+
+/**
  * o3d-ec4c0 — R29'S FINDING, CARRIED ON EVERY BRANCH INCLUDING TRUNK.
  *
  * The deletion check below can only show this property when the current branch happens to have added a
@@ -285,6 +320,70 @@ test('o3d-ec4c0: the protected set never collapses to trunk-only, nor to branch-
     [...buildProtectedMigrationSet({ onTrunk: [], introducedOnBranch })],
     [...introducedOnBranch],
     'and a branch-only set is still protected, so a shallow clone with no trunk ref cannot silently protect nothing',
+  )
+})
+
+/**
+ * o3d-ec4c0 r2 (adversarial review, HIGH) — THE CROSS-CHECK, DRIVEN DIRECTLY.
+ *
+ * The consistency check can only fire for real on a branch that HAS added a migration, so on trunk — and on this
+ * branch — the live test cannot demonstrate it. Same technique as `buildProtectedMigrationSet`: assert the
+ * function over synthetic inputs so the guarantee holds wherever the suite runs.
+ *
+ * WHAT WOULD STILL PASS IT: any implementation computing the one-directional difference, however written. It says
+ * nothing about `onTrunk` being correctly populated — that is the caller's `onTrunk.size > 50` precondition, and
+ * deliberately not duplicated here.
+ */
+test('o3d-ec4c0: a broken branch-migration derivation is caught by the second derivation', () => {
+  const onTrunk = ['20240101000000_a', '20240102000000_b']
+  const added = '20260401000000_added_here'
+
+  // 1. THE REGRESSION THE REVIEW IS ABOUT: the commit range found nothing, the trees disagree.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [], onBranch: [...onTrunk, added], onTrunk }),
+    [added],
+    'a migration present on HEAD and absent from the merge base, with an EMPTY commit-range derivation, must be '
+    + 'reported: that combination can only mean the derivation is broken, and the skip would otherwise disable '
+    + 'branch-migration protection silently',
+  )
+
+  // 2. THE TRUNK CASE, which must NOT fail — it is what reddened trunk under r30.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [], onBranch: onTrunk, onTrunk }),
+    [],
+    'both derivations empty is a branch that genuinely adds nothing, including trunk itself; this must be silent',
+  )
+
+  // 3. BOTH NON-EMPTY: ordinary branch that added a migration. Nothing to report.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [added], onBranch: [...onTrunk, added], onTrunk }),
+    [],
+    'both derivations agreeing is the ordinary case',
+  )
+
+  // 4. THE LEGITIMATE ASYMMETRY, which is why set equality is NOT asserted: a migration this branch added has
+  //    since landed on trunk, so the commit range still names it while the tree difference no longer does.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [added],
+      onBranch: [...onTrunk, added],
+      onTrunk: [...onTrunk, added],
+    }),
+    [],
+    'a branch migration that has since landed on trunk appears in the commit range but not in the difference. '
+    + 'Asserting equality of the two sets would fail on any up-to-date branch, which is why the implication is '
+    + 'one-directional',
+  )
+
+  // ...and several at once are all reported, sorted, so the message names every directory the difference found.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [],
+      onBranch: ['20260501000000_z', ...onTrunk, '20260402000000_y'],
+      onTrunk,
+    }),
+    ['20260402000000_y', '20260501000000_z'],
+    'every directory the second derivation found is named, in a stable order',
   )
 })
 
@@ -380,6 +479,23 @@ test('o3d-j625 r30: no migration this branch has ever had may be deleted from HE
   // deletion would otherwise go unnoticed. Here, where there is genuinely nothing to exercise, the assertion is
   // SKIPPED rather than failed; where the branch does add a migration it still runs, because a real example is
   // worth having when one exists.
+  //
+  // o3d-ec4c0 r2 (adversarial review, HIGH) — AND THE SKIP IS NOW EARNED RATHER THAN ASSUMED.
+  //
+  // An empty `introducedOnBranch` means either "this branch adds no migration" or "the derivation is broken", and
+  // skipping on it treated both as fine — which stops protecting branch migrations the moment the derivation
+  // regresses. So the same fact is derived a SECOND way, by set difference between the two `ls-tree` reads, and
+  // the two must agree before the skip is allowed. Reached only after `onTrunk.size > 50` above, which is what
+  // covers the shallow-clone case where the difference would be the whole repo.
+  const derivationDisagreement = branchMigrationDerivationsDisagree({ introducedOnBranch, onBranch, onTrunk })
+  assert.deepEqual(derivationDisagreement, [],
+    'THE TWO DERIVATIONS OF "migrations this branch added" DISAGREE. `git log --diff-filter=A` over '
+    + `\`${base}..HEAD\` found NOTHING, while comparing the trees directly found `
+    + `${derivationDisagreement.length} migration(s) present on HEAD and absent from the merge base: `
+    + `${derivationDisagreement.join(', ')}. The commit-range derivation is therefore broken, and with it the `
+    + 'protection of every migration this branch added — silently, which is what this cross-check exists to stop '
+    + '(o3d-ec4c0 round 2).')
+
   if (introducedOnBranch.size > 0) {
     const branchOwnProtected = [...introducedOnBranch].filter((dir) => onBranch.has(dir) && protectedDirs.has(dir))
     assert.ok(branchOwnProtected.length > 0,
