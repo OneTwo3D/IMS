@@ -2222,9 +2222,12 @@ db_application_route_sslmode() {
 # WHY NOT system_identifier, which is the obvious candidate: a pg_basebackup clone INHERITS its
 # origin's system identifier, so a clone and its origin — the two servers most likely to be
 # running side by side on a box being cut over — are indistinguishable by it. It is also
-# superuser-only (pg_control_system), and the endpoint connection is deliberately NOT a
-# superuser, so it could not be compared even if it discriminated. The postmaster start time
-# separates a clone from its origin; every field here is readable by an ordinary login role.
+# indistinguishable by it. (An earlier version of this comment ALSO said pg_control_system() is
+# superuser-only. That is not true on PG17 -- a plain LOGIN role with no grants reads it -- so it is
+# not a reason, and the reason above is doing all the work: a basebackup clone and its origin share
+# the identifier, so it cannot separate the two servers most likely to be side by side on a box being
+# cut over. The conclusion is unchanged.) The postmaster start time separates a clone from its
+# origin; every field here is readable by an ordinary login role.
 #
 # All three are emitted as ONE marked line, so a psql notice or a wrapper's banner cannot be
 # mistaken for the identity.

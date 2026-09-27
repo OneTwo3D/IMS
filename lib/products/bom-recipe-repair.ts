@@ -244,6 +244,13 @@ export async function deactivateDuplicateBomRecipe(
     systemIdentifierReadable?: boolean
     /** True when the operator explicitly accepted the weaker name-only mode. Recorded in the audit row. */
     acceptedNameOnly?: boolean
+    /**
+     * WHICH ROUTE established the target: the cluster identifier, an explicit acknowledgement of the
+     * weaker mode, or a name typed at a TTY. Recorded so the audit row states what was ESTABLISHED rather
+     * than which flags appeared — `acceptedNameOnly: false` must never mean "no acknowledgement was
+     * needed" when in fact nothing independently identified the server (round 18).
+     */
+    identityRoute?: string | null
   },
 ): Promise<BomRecipeRepairOutcome> {
   const { bomId } = args
@@ -349,6 +356,7 @@ export async function deactivateDuplicateBomRecipe(
         // tell a same-name copy from the real server, so a run that accepted that has to be
         // distinguishable later from one that pinned the cluster identity.
         acceptedNameOnly: args.acceptedNameOnly === true,
+        identityRoute: args.identityRoute ?? null,
         pinnedFields: [...(args.pinnedFields ?? [])],
         reason: 'o3d-zjsb5.9 duplicate-recipe repair',
       },

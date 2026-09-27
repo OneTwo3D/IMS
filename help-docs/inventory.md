@@ -125,8 +125,9 @@ npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --accept-name-only
 ```
 
 Confirming only the database *name* is not proof of which server you are on — a copy of the database has
-the same name — so the command makes you say so explicitly with `--accept-name-only`, and records that in
-the activity log. If you know the cluster's id (your installer should have recorded it), pin that instead
+the same name, and it is also reached at the same address and port — so the command makes you say so
+explicitly with `--accept-name-only`, and records that in the activity log. Adding the host or the port
+does not remove the need for it, because a copy matches on those too. If you know the cluster's id (your installer should have recorded it), pin that instead
 and you do not need the acknowledgement:
 
 ```

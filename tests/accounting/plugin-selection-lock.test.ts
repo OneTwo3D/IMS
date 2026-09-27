@@ -1252,8 +1252,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // the `unavailable` path is defensive for a revoked EXECUTE or a restrictive managed provider, and an
   // `unavailable` identifier is never treated as a mismatch.
   //
-  // A name-only confirmation is a DECISION, not a warning: it needs `--accept-name-only`, refuses without
-  // it, and the acknowledgement lands in the audit row. An explicitly PINNED field that cannot be verified
+  // Naming the target database is MANDATORY for a non-interactive write (a usage error before anything
+  // connects), and the write then needs EITHER `--expect-system-id` OR `--accept-name-only`. Name, host and
+  // port are all CLONE-INVARIANT -- a restored copy matches on all three -- so no number of them can
+  // discharge the acknowledgement; only `system_identifier` differs for a logical restore. The audit row
+  // records which route established the target, so it can never assert an acknowledgement was unnecessary
+  // when nothing identified the server (round 18). An explicitly PINNED field that cannot be verified
   // is REFUSED rather than skipped -- the lenient unavailable rule applies only to the unpinned path. And a
   // role denied EXECUTE on pg_control_system() still works, because availability is settled before the
   // mutation transaction and the optional query is savepoint-wrapped (a bare try/catch leaves 25P02).

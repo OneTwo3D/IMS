@@ -904,11 +904,15 @@ test(
 
     // ARM 1: NOBODY CONFIRMED ANYTHING. Non-interactive (the test runner gives the child no TTY) and no
     // --expect-db, so consent must NOT be assumed from the absence of a human.
+    // ROUND 18 MOVED THIS EARLIER, and the exit code changed with it: naming the target database is now
+    // MANDATORY for a non-interactive write, so an unnamed one is a USAGE error (exit 1) refused BEFORE
+    // anything connects, rather than a post-banner refusal (exit 3). Strictly better -- a usage mistake
+    // cannot reach a database at all -- and the assertion is updated rather than the rule relaxed.
     const unconfirmed = await runRepairScript(['--bom', duplicate.id])
-    assert.equal(unconfirmed.code, 3,
-      `an unconfirmed write must be REFUSED, got code ${unconfirmed.code}: ${unconfirmed.stderr}`)
-    assert.match(unconfirmed.stderr, /nobody to confirm|--expect-db/i,
-      `and must say how to confirm it, got: ${unconfirmed.stderr}`)
+    assert.equal(unconfirmed.code, 1,
+      `an unnamed write must be a USAGE error, got code ${unconfirmed.code}: ${unconfirmed.stderr}`)
+    assert.match(unconfirmed.stderr, /name the target database/i,
+      `and must say what is missing, got: ${unconfirmed.stderr}`)
     assert.equal(
       (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
       true, 'and must NOT have deactivated anything',
@@ -1149,7 +1153,9 @@ test(
     // WITHOUT the acknowledgement: refused, nothing written, and told BOTH ways forward.
     const bare = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
     assert.equal(bare.code, 3, `a name-only write must be REFUSED, got ${bare.code}: ${bare.stderr}`)
-    assert.match(bare.stderr, /NAME only/i, `and must say why, got: ${bare.stderr}`)
+    // The message now states the REASON rather than the flag shape: a restored copy shares the name, the
+    // address and the port, which is why no combination of them discharges the acknowledgement (round 18).
+    assert.match(bare.stderr, /restored copy|SAME name/i, `and must say why, got: ${bare.stderr}`)
     assert.match(bare.stderr, /--accept-name-only/, 'and must name the acknowledgement flag')
     assert.match(bare.stderr, /--expect-system-id/, 'and must offer the stronger pin as the better option')
     // The stronger option must point at the RECORDED value, not the one just printed -- otherwise the
@@ -1391,6 +1397,109 @@ test(
       true, 'and nothing may have been written',
     )
     await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r15] CLONE-INVARIANT pins never discharge the acknowledgement, however many are supplied',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 18. The round-16 safeguard asked whether --expect-db was the SOLE pin, which made
+     * `--expect-db X --expect-host <value copied off the banner>` a BYPASS: the write proceeded with no
+     * acknowledgement and the audit row recorded `acceptedNameOnly: false`, actively asserting that none
+     * was needed at a moment when NOTHING had identified the server.
+     *
+     * The principle, and the reason this is not a list of flag combinations: name, host and port are all
+     * CLONE-INVARIANT. A restored copy reached at the same address, same name, same port has identical
+     * values for all three, so none of them distinguishes the clone and "more pins" is not "stronger".
+     * `system_identifier` is the only field in the composite that differs for a logical restore, so it is
+     * the only one whose presence changes what has been established.
+     *
+     * Every case below is therefore derived from that property rather than enumerated: the clone-invariant
+     * combinations refuse, the identifier route is allowed, and the audit row says which happened.
+     */
+    const deps = await loadDeps()
+    const NS = 'S'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const live = await deps.readServerIdentity(deps.db)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.notEqual(live.systemIdentifier, 'unavailable',
+      'precondition: the identifier must be readable, or the allowed-route arms prove nothing')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+
+    // A WRITE MUST ALWAYS NAME THE DATABASE. Pinning only host or port never says WHICH database was
+    // meant, and the in-transaction check compares the server against its own preflight, so it cannot
+    // catch an initially wrong target. Refused as a USAGE error, before anything connects.
+    for (const [what, args] of [
+      ['host only', ['--expect-host', live.host]],
+      ['port only', ['--expect-port', live.port]],
+      ['host and port, still unnamed', ['--expect-host', live.host, '--expect-port', live.port]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScript(['--bom', id, ...args])
+      assert.equal(run.code, 1, `${what} must be a USAGE error (exit 1), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /name the target database/i, `${what} must say why, got: ${run.stderr}`)
+      assert.equal(await active(id), true, `${what} must NOT have written anything`)
+    }
+
+    // CLONE-INVARIANT PINS, NAMED BUT UNACKNOWLEDGED. Each of these passed under the old sole-pin rule.
+    for (const [what, args] of [
+      ['name plus host', ['--expect-db', db, '--expect-host', live.host]],
+      ['name plus port', ['--expect-db', db, '--expect-port', live.port]],
+      ['name plus host plus port (all banner values)',
+        ['--expect-db', db, '--expect-host', live.host, '--expect-port', live.port]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScript(['--bom', id, ...args])
+      assert.equal(run.code, 3, `${what} must be REFUSED (exit 3), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /SAME name, the SAME address and the SAME port|restored copy/i,
+        `${what} must be refused for CLONE-INVARIANCE, not for some incidental reason: ${run.stderr}`)
+      assert.equal(await active(id), true, `${what} must NOT have written anything`)
+    }
+
+    // THE IDENTIFIER ROUTE: allowed with NO acknowledgement, and the audit row says so.
+    const byId = await makeDuplicate('by identifier')
+    const idRun = await runRepairScript([
+      '--bom', byId, '--expect-db', db, '--expect-system-id', live.systemIdentifier,
+    ])
+    assert.equal(idRun.code, 0, `pinning the identifier must be allowed: ${idRun.stderr}`)
+    assert.equal(await active(byId), false, 'and must actually deactivate it')
+    const idAudit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: byId } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal((idAudit.metadata as { identityRoute?: string } | null)?.identityRoute,
+      'system-identifier', 'the audit row must record the identifier route')
+    assert.equal((idAudit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, false,
+      'and acceptedNameOnly may be false ONLY here, where the identifier really established the target')
+
+    // THE ACKNOWLEDGEMENT ROUTE: allowed, and recorded as the weaker one.
+    const byAck = await makeDuplicate('by acknowledgement')
+    const ackRun = await runRepairScript([
+      '--bom', byAck, '--expect-db', db, '--expect-host', live.host, '--accept-name-only',
+    ])
+    assert.equal(ackRun.code, 0, `an acknowledged write must be allowed: ${ackRun.stderr}`)
+    assert.equal(await active(byAck), false, 'and must actually deactivate it')
+    const ackAudit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: byAck } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal((ackAudit.metadata as { identityRoute?: string } | null)?.identityRoute,
+      'name-only-acknowledged', 'the audit row must record the acknowledgement route')
+    assert.equal((ackAudit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, true,
+      'and must NOT claim an acknowledgement was unnecessary -- that was the bug')
   },
 )
 

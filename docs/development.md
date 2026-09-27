@@ -126,11 +126,28 @@ name when prompted. With neither — non-interactive and no flag — it refuses 
 nothing, rather than reading consent into the absence of a human. `--list` and `--dry-run` need no
 confirmation because they write nothing.
 
-**Name-only is a decision, not a warning.** `--expect-db` on its own asserts the NAME, which a restored
-copy also has, so it does not establish which server you are on. A write pinning only the name therefore
-requires `--accept-name-only` and refuses (**exit 3**) without it, and the acknowledgement is recorded in
-the `activity_logs` row so the weaker run is visible afterwards. A warning printed next to the write was
-not a decision point: nothing stopped, and the operator had no moment in which to act.
+**Naming the database is mandatory, and name/host/port cannot establish which server you are on.**
+
+* `--expect-db` is **required** for any non-interactive write. Its absence is a usage error (**exit 1**),
+  raised before anything connects. Pinning only `--expect-host` or `--expect-port` never says *which*
+  database was meant, and the in-transaction check compares the server against its own preflight reading,
+  so it cannot catch an initially wrong target.
+* A write then requires **either** `--expect-system-id` **or** `--accept-name-only`. Nothing else
+  satisfies it.
+
+The reason is that **name, host and port are all clone-invariant**: a restored copy reached at the same
+address, with the same name, on the same port has identical values for all three. So none of them
+distinguishes the clone, and *more* of them is not *stronger* — two clone-invariant pins establish exactly
+what one does. `system_identifier` is the only field in the composite that differs for a logical restore,
+and therefore the only one whose presence changes what has been established.
+
+**Do not "improve" this by accepting host + port as sufficient.** That was the bypass: adding
+`--expect-host` with a value copied off the printed banner discharged the acknowledgement and wrote
+`acceptedNameOnly: false` into the audit row, so the record asserted no acknowledgement was needed at a
+moment when nothing had identified the target.
+
+The audit row records `identityRoute` (`system-identifier`, `name-only-acknowledged` or `typed-at-tty`)
+alongside the pinned field names, so what was actually established is recoverable afterwards.
 
 **A pin that cannot be verified is refused, not skipped.** If you pass `--expect-system-id` and the field
 comes back `unavailable`, the command refuses (**exit 3**) rather than accepting the pin and quietly not

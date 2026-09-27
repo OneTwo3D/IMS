@@ -89,9 +89,40 @@ async function announceTarget(db: Parameters<typeof readServerIdentity>[0]): Pro
  * With neither available -- non-interactive and no flag -- it REFUSES and writes nothing, rather than
  * assuming consent from the absence of a human.
  */
+/**
+ * WHICH ROUTE ESTABLISHED THE TARGET — recorded, because the audit row must state what was actually
+ * established rather than which flags happened to appear (round 18).
+ */
+type IdentityRoute = 'system-identifier' | 'name-only-acknowledged' | 'typed-at-tty'
+
 type Confirmation =
   | { ok: false }
-  | { ok: true; pinnedFields: Array<keyof ServerIdentity>; acceptedNameOnly: boolean }
+  | {
+    ok: true
+    pinnedFields: Array<keyof ServerIdentity>
+    route: IdentityRoute
+    acceptedNameOnly: boolean
+  }
+
+/**
+ * NAME, HOST AND PORT ARE CLONE-INVARIANT, and this is the whole reason the rule below is written in terms
+ * of what is ESTABLISHED rather than which flags were supplied.
+ *
+ * A restored copy reached at the same address, with the same database name, on the same port has IDENTICAL
+ * values for all three. So none of them distinguishes the clone — which was the original finding — and
+ * therefore "more pins" is not "stronger". Two clone-invariant pins establish exactly what one does:
+ * nothing about which server this is.
+ *
+ * `system_identifier` is the ONLY field in the composite that differs for a logical restore, and so the
+ * only one whose presence changes what has been established. (It does NOT differ for a PHYSICAL clone —
+ * pg_basebackup copies it — which is the documented residual in o3d-x23dy and stays documented.)
+ *
+ * DO NOT "IMPROVE" THIS BY ACCEPTING host + port AS SUFFICIENT. That is the bypass this replaced: adding
+ * `--expect-host` with a value copied off the printed banner discharged the acknowledgement and wrote
+ * `acceptedNameOnly: false` into the audit row, so the record actively asserted that no acknowledgement was
+ * needed at a moment when nothing had identified the target at all.
+ */
+const CLONE_INVARIANT_FIELDS: ReadonlyArray<keyof ServerIdentity> = ['database', 'host', 'port']
 
 async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
   // An operator may pin as much of the composite as they can be sure of. `--expect-db` alone is the
@@ -139,17 +170,22 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
       return { ok: false }
     }
 
-    // NAME-ONLY IS A DECISION, NOT A WARNING (round 16, HIGH 1). A run pinning only the name passes on a
-    // restored copy -- same name, same BOM ids -- and the in-transaction re-check compares that server
-    // against its own preflight, so it passes too. A warning printed immediately before the write is not a
-    // decision point: nothing stops and the operator has no moment in which to act. So the weaker mode is
-    // ACCEPTED EXPLICITLY, and the acceptance is recorded in the audit row.
-    const nameOnly = pinnedFields.length === 1 && pinnedFields[0] === 'database'
-    const accepted = process.argv.includes('--accept-name-only')
-    if (nameOnly && !accepted) {
+    // WHAT WAS ESTABLISHED, not which flags appeared (round 18). Only `system_identifier` can discharge
+    // this, because it is the only non-clone-invariant field in the composite — see
+    // CLONE_INVARIANT_FIELDS above. Everything else is either an acknowledgement or a refusal.
+    //
+    // The previous shape asked whether `--expect-db` was the SOLE pin, which made
+    // `--expect-db X --expect-host <value from the banner>` a bypass: two clone-invariant pins, no
+    // acknowledgement demanded, and an audit row claiming none was needed. Enumerating the bad
+    // combinations would have left the next one.
+    const establishedByIdentifier = pinnedFields.includes('systemIdentifier')
+    const acknowledged = process.argv.includes('--accept-name-only')
+    if (!establishedByIdentifier && !acknowledged) {
+      const clonePins = pinnedFields.filter((field) => CLONE_INVARIANT_FIELDS.includes(field))
       console.error(
-        'REFUSED: --expect-db asserts the database NAME only, and a restored copy KEEPS ITS NAME — so it\n'
-        + '  does not establish which server you are on. Nothing was written. Either:\n'
+        `REFUSED: you pinned ${clonePins.join(', ')}, but a restored copy of this database has the SAME\n`
+        + '  name, the SAME address and the SAME port — so none of those establishes which server you are\n'
+        + '  on, however many of them you supply. Nothing was written. Either:\n'
         + `    · pin the cluster:  --expect-system-id ${identity.systemIdentifier}\n`
         + '      using the value RECORDED AT INSTALL, not the one printed above — pasting it back from\n'
         + '      this banner proves only that you can read it;\n'
@@ -158,7 +194,14 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
       )
       return { ok: false }
     }
-    return { ok: true, pinnedFields, acceptedNameOnly: nameOnly && accepted }
+    return {
+      ok: true,
+      pinnedFields,
+      route: establishedByIdentifier ? 'system-identifier' : 'name-only-acknowledged',
+      // NEVER asserts an acknowledgement was unnecessary: it is false ONLY when the identifier actually
+      // established the target.
+      acceptedNameOnly: !establishedByIdentifier,
+    }
   }
 
   if (!process.stdin.isTTY) {
@@ -189,8 +232,9 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
     console.error(`REFUSED: you typed "${typed}", which is not "${identity.database}". Nothing was written.`)
     return { ok: false }
   }
-  // Typing the name is exactly as strong as --expect-db alone, so it carries the same acknowledgement.
-  return { ok: true, pinnedFields: ['database'], acceptedNameOnly: true }
+  // Typing the name is exactly as strong as --expect-db alone -- the name is clone-invariant -- so it
+  // carries the same acknowledgement rather than discharging it.
+  return { ok: true, pinnedFields: ['database'], route: 'typed-at-tty', acceptedNameOnly: true }
 }
 
 const VALUE_FLAGS = ['--bom', '--expect-db', '--expect-host', '--expect-port', '--expect-system-id']
@@ -235,6 +279,23 @@ function validateArgv(argv: string[]): string | null {
   if (seen.has('--list') && seen.has('--bom')) return '--list and --bom are different modes; pick one'
   if (seen.has('--list') && seen.has('--dry-run')) return '--list writes nothing, so --dry-run is meaningless with it'
   if (!seen.has('--list') && !seen.has('--bom')) return 'nothing to do: pass --list or --bom <id>'
+
+  // THE TARGET DATABASE MUST ALWAYS BE NAMED for a non-interactive write (round 18). Without this,
+  // `--expect-host` or `--expect-port` could be supplied ALONE: the run would then never state which
+  // database it meant, and because the in-transaction check compares the server against its own preflight
+  // reading, an initially wrong target is not caught by it at all. A TTY run is exempt because typing the
+  // name at the prompt IS naming it.
+  //
+  // Checked here rather than after connecting, so a usage mistake cannot reach a database.
+  const writing = seen.has('--bom') && !seen.has('--dry-run')
+  const pinsSomething = seen.has('--expect-db') || seen.has('--expect-host')
+    || seen.has('--expect-port') || seen.has('--expect-system-id')
+  if (writing && !process.stdin.isTTY && !seen.has('--expect-db')) {
+    return pinsSomething
+      ? 'a write must always name the target database: add --expect-db <name>. Pinning only --expect-host '
+        + 'or --expect-port never says WHICH database you meant'
+      : 'a write must name the target database: add --expect-db <name>'
+  }
   return null
 }
 
@@ -295,7 +356,9 @@ async function main() {
 
   // The gate applies to the WRITE only. `--list` returned above and `--dry-run` rolls back, so
   // demanding confirmation for either would train operators to type past it.
-  let confirmation: Confirmation = { ok: true, pinnedFields: [], acceptedNameOnly: false }
+  let confirmation: Confirmation = {
+    ok: true, pinnedFields: [], route: 'name-only-acknowledged', acceptedNameOnly: true,
+  }
   if (!dryRun) {
     confirmation = await confirmTarget(identity)
     if (!confirmation.ok) return 3
@@ -318,6 +381,7 @@ async function main() {
         expectIdentity: identity,
         pinnedFields: confirmation.ok ? confirmation.pinnedFields : [],
         acceptedNameOnly: confirmation.ok ? confirmation.acceptedNameOnly : false,
+        identityRoute: confirmation.ok ? confirmation.route : null,
         // Established OUTSIDE this transaction, so the optional query never runs inside one where the role
         // cannot read it (round 16, HIGH 3, preferred shape).
         systemIdentifierReadable: identity.systemIdentifier !== 'unavailable',
