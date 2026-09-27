@@ -1162,6 +1162,13 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // through the app's own client. Rewording the remedy to dodge this scan would delete the only
   // useful part of the message.
   'lib/domain/wms/push-state-schema-gate.ts': 'names-the-tools-only',
+  // o3d-1q28. The disposable-database stamp, defined once so `lib/activity-log-cleanup.ts` and
+  // `tests/concurrency/scratch-database-guard.ts` read the same sentence. It is two constants and a
+  // template literal: no client, no statement, no shell. It appears here only because its prose
+  // explains that `pg_dump -C` and `pg_dumpall` carry a database comment into a restore, which is
+  // the reason the database's own name is inside the marker — the generous half of this scan working
+  // as intended.
+  'lib/disposable-database-marker.ts': 'names-the-tools-only',
   // o3d-2k5r r7 / o3d-1izw. The schema gate's production reader. `$queryRawUnsafe` because the ONE
   // catalogue statement is shared verbatim with the deploy check and the production preflight — a
   // per-gate `$queryRaw` template would be three statements again, which is exactly the common-mode
