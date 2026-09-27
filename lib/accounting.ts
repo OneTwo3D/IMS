@@ -10,6 +10,7 @@ import {
 } from '@/lib/connectors/accounting-registry'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { pinnedLedgerIsServicedUnderLock } from '@/lib/integration-plugin-selection-lock'
+import { getSettingValues, type SettingValueReadClient } from '@/lib/settings-store'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -67,7 +68,7 @@ export type AccountingSettings = {
 // 'Xero' | 'QuickBooks') — a fourth copy of the accounting id union, and a second copy of a label the
 // registry already carries. Both now come from the registry, so registering a connector widens this
 // by construction and its label has ONE source.
-type AccountingConnectorInfo = {
+export type AccountingConnectorInfo = {
   id: AccountingConnectorId
   name: string
 }
@@ -124,7 +125,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
  * lib/integration-plugin-selection-lock.ts) uses, which is what keeps the two one rule over two
  * sources rather than two rules. With one connector registered they are indistinguishable.
  */
-async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
+export async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
   for (const connector of ACCOUNTING_CONNECTORS) {
     if (await isIntegrationPluginEnabled(connector.id)) return connector.id
   }
@@ -823,6 +824,56 @@ export async function queueAccountingSyncTxWithOutcome(
 
 export async function getAccountingSettings(): Promise<AccountingSettings> {
   return getAccountingSettingsFor(await getActiveAccountingConnectorId())
+}
+
+/** The two account codes a stock receipt posts between. */
+export type StockReceiptAccounts = {
+  inventoryAccount: string
+  transitAccount: string
+}
+
+/**
+ * The settings keys holding those two codes, per connector. Keyed by connector id rather than
+ * written as Xero literals, so a second accounting connector is a registration here and not a
+ * branch at the call site — the same rule the rest of this module follows.
+ */
+const STOCK_RECEIPT_ACCOUNT_KEYS: Record<AccountingConnectorInfo['id'], { inventory: string; transit: string }> = {
+  xero: { inventory: 'xero_inventory_account', transit: 'xero_transit_account' },
+}
+
+/**
+ * READ THE RECEIPT'S TWO ACCOUNT CODES THROUGH A TRANSACTION (o3d-8f0p6 r2).
+ *
+ * WHY THIS EXISTS. `getAccountingSettings()` reads over the POOL. A caller that reads the codes
+ * before opening its transaction, and then posts a journal inside it, has bound nothing: an operator
+ * who remaps the inventory or transit account in that window gets a committed journal on the OLD
+ * codes while every later reconciliation uses the NEW ones, and nothing anywhere notices. The
+ * enqueue's own fence does not help — `pinnedLedgerIsServicedUnderLock` locks the `plugin_*` rows
+ * only (lib/integration-plugin-selection-lock.ts:66-78), which is a different question from "are
+ * these still the right account codes".
+ *
+ * So a caller that must not be overtaken reads them HERE, through its own `tx`, as part of the same
+ * unit of work as the journal, and — because READ COMMITTED lets each statement take a fresh
+ * snapshot — can re-read and REFUSE if they moved. That is the same assertion shape
+ * `readLockedPluginSelection` documents for the plugin rows.
+ *
+ * It deliberately does NOT take a lock. Locking arbitrary settings rows from here would invent a
+ * second lock order over the `settings` table, and that table is already locked `plugin_*`-first by
+ * the enqueue; refuse-and-retry costs a redelivery and introduces no cycle.
+ *
+ * `connector` is REQUIRED and is the same value the caller pins the enqueue to, so the codes and the
+ * row cannot come from two independent resolutions of "which connector is active".
+ */
+export async function readStockReceiptAccountsTx(
+  tx: SettingValueReadClient,
+  connector: AccountingConnectorInfo['id'],
+): Promise<StockReceiptAccounts> {
+  const keys = STOCK_RECEIPT_ACCOUNT_KEYS[connector]
+  const values = await getSettingValues([keys.inventory, keys.transit], tx)
+  return {
+    inventoryAccount: values.get(keys.inventory)?.trim() ?? '',
+    transitAccount: values.get(keys.transit)?.trim() ?? '',
+  }
 }
 
 /**

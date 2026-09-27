@@ -75,6 +75,12 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
  * to the stock, and there is no other way to make a correct enqueue fail.
  */
 let injectEnqueueFailure = false
+/**
+ * ARM 10's hook. Fired once, from inside the book-in transaction, AFTER the service has read the
+ * account codes and BEFORE the enqueue returns — which is the exact window round-1 HIGH 2 is about.
+ * It runs a pooled write, so the remap is committed by the time the service re-reads.
+ */
+let remapInventoryAccountOnNextEnqueue: (() => Promise<void>) | null = null
 const INJECTED_ENQUEUE_FAILURE = 'o3d-8f0p6 injected STOCK_RECEIPT enqueue failure'
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -84,6 +90,11 @@ mock.module('@/lib/accounting', {
     ) => {
       if (injectEnqueueFailure && args[1]?.type === 'STOCK_RECEIPT') {
         throw new Error(INJECTED_ENQUEUE_FAILURE)
+      }
+      if (remapInventoryAccountOnNextEnqueue && args[1]?.type === 'STOCK_RECEIPT') {
+        const hook = remapInventoryAccountOnNextEnqueue
+        remapInventoryAccountOnNextEnqueue = null
+        await hook()
       }
       return realAccountingNs.queueAccountingSyncTx(...args)
     },
@@ -237,6 +248,102 @@ async function seedPurchaseBackedAsn(label: string, qty: number, alignmentCredit
   return {
     tag,
     qty,
+    productId: product.id,
+    warehouseId: warehouse.id,
+    poId: po.id,
+    poLineId: po.lines[0]!.id,
+    asnMapId: asn.id,
+    asnLineMapId: asn.lines[0]!.id,
+    externalAsnLineId: asn.lines[0]!.externalAsnLineId,
+  }
+}
+
+/**
+ * THE SAME PO-BACKED ASN, BUT BUILT BY THE REAL CREATION PATH (o3d-8f0p6 r2).
+ *
+ * `createPurchaseOrder` is called with only what an operator supplies — qty and
+ * `unitCostForeign` — so NO cost column is written by hand. That is the point: it never sets
+ * `landedUnitCostBase`, which is `Decimal @default(0)` and NOT NULL, and that zero is what the
+ * book-in used to read as the receipt cost.
+ *
+ * `status` is advanced afterwards because a freshly created PO is DRAFT and an ASN is raised against
+ * a sent order; a status is not a cost, and every cost figure below comes out of the action.
+ */
+async function seedPurchaseBackedAsnViaRealCreate(
+  label: string,
+  qty: number,
+  unitCost: number,
+  freightTotal = 0,
+): Promise<SeededPurchaseAsn & { unitCost: number }> {
+  const { db } = await import('@/lib/db')
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const tag = uniqueTag(label)
+  const product = await db.product.create({
+    data: { sku: tag, name: `o3d-8f0p6 ${label}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
+    select: { id: true },
+  })
+  const warehouse = await db.warehouse.create({
+    data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' },
+    select: { id: true },
+  })
+  await db.stockLevel.create({
+    data: { productId: product.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' },
+    select: { productId: true },
+  })
+  const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
+
+  const created = await createPurchaseOrder({
+    reference: tag,
+    supplierId: supplier.id,
+    currency: 'GBP',
+    fxRateToBase: 1,
+    destinationWarehouseId: warehouse.id,
+    pricesIncludeVat: false,
+    taxRateValue: 0,
+    ...(freightTotal > 0
+      ? { additionalCosts: [{ description: 'Freight', amountForeign: freightTotal, vatable: false, distributionMethod: 'BY_VALUE' }] }
+      : {}),
+    lines: [{
+      productId: product.id,
+      sku: tag,
+      productName: `o3d-8f0p6 ${label}`,
+      qty,
+      unitCostForeign: unitCost,
+    }],
+  })
+  assert.equal(created.success, true, `PRECONDITION: createPurchaseOrder must succeed: ${created.error}`)
+  const po = await db.purchaseOrder.findUniqueOrThrow({
+    where: { reference: tag },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  // An ASN is raised against a SENT order. Status only — no cost column is touched.
+  await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: o3d-8f0p6: a test fixture row, not a core flow branch
+      externalAsnId: tag,
+      sourceType: 'PURCHASE_ORDER',
+      sourceId: po.id,
+      warehouseId: warehouse.id,
+      status: 'OPEN',
+      lines: {
+        create: [{
+          externalAsnLineId: `${tag}-1`,
+          sourceType: 'PURCHASE_ORDER_LINE',
+          sourceLineId: po.lines[0]!.id,
+          productId: product.id,
+          sku: tag,
+          expectedQty: `${qty}.0000`,
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true, externalAsnLineId: true } } },
+  })
+  return {
+    tag,
+    qty,
+    unitCost,
     productId: product.id,
     warehouseId: warehouse.id,
     poId: po.id,
@@ -818,4 +925,277 @@ test('o3d-8f0p6: the journal covers only the quantity this book-in laid layers f
   console.log(`[arm6] examined ${transit.length} transit row(s): ${JSON.stringify(transit.map((r) => String(r.baseDelta)))}`)
   assert.equal(transit.length, 1)
   assert.equal(Number(transit[0]!.baseDelta), -expectedAmount, 'the transit credit must drain only the value just received')
+})
+
+/**
+ * ARM 7 — THE ORDINARY PURCHASE ORDER, BUILT BY THE REAL CREATION PATH.
+ *
+ * ADDED BECAUSE SIX GREEN ARMS STILL DID NOT REACH THE DEFECT. Every arm above seeds
+ * its PO line with `landedUnitCostBase` set by hand. `createPurchaseOrder` never sets
+ * that column, and it is `Decimal @default(0)` and NOT NULL — so on an ordinary PO the
+ * book-in's old `landedUnitCostBase ?? unitCostBase` read a non-null **zero**, laid a
+ * zero-cost layer, wrote a zero-value movement and left `receiptValueBase` at zero, so
+ * a positive-cost purchase order posted NO journal and NO transit row. The fixture was
+ * the only reason the arms passed. This is the same shape as the earlier surviving
+ * mutation: an arm whose fixture makes two values coincide cannot tell them apart.
+ *
+ * SO THIS ARM SETS NO COST FIELD AT ALL. The PO comes out of `createPurchaseOrder`
+ * with only the inputs an operator supplies (qty and `unitCostForeign`). The only
+ * column written by hand afterwards is `status`, which is not a cost and is what an
+ * operator's "send to supplier" would do.
+ *
+ * IT ALSO PINS THE THREE-CONSUMER RULE: the movement's `totalValueBase`, the cost
+ * layer's `unitCostBase` and the journal's debit must all agree, because three
+ * consumers disagreeing about the cost of the same units is a worse defect than a
+ * missing journal.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that reads the goods cost but ignores freight
+ * (this PO has no additional cost lines — freight is covered by arm 8), and any change
+ * confined to the transfer branch.
+ */
+test('o3d-8f0p6 r2: a PO created through the real action posts the journal for its real cost', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('R', 5, 9)
+  const expectedAmount = seeded.qty * seeded.unitCost
+
+  // PRECONDITION, AND THE WHOLE POINT: the real creation path leaves landedUnitCostBase at its
+  // zero default. If this ever stops being true the arm is no longer testing the ordinary path.
+  const line = await db.purchaseOrderLine.findUniqueOrThrow({
+    where: { id: seeded.poLineId },
+    select: { unitCostBase: true, landedUnitCostBase: true },
+  })
+  console.log(`[arm7] PO line as createPurchaseOrder left it: unitCostBase=${String(line.unitCostBase)} landedUnitCostBase=${String(line.landedUnitCostBase)}`)
+  assert.equal(
+    Number(line.landedUnitCostBase),
+    0,
+    'PRECONDITION: createPurchaseOrder must leave landedUnitCostBase at its zero default — that zero '
+    + 'is the defect this arm exists for',
+  )
+  assert.equal(
+    Number(line.unitCostBase),
+    seeded.unitCost,
+    'PRECONDITION: the goods cost must be positive, so a zero journal cannot be explained as a free line',
+  )
+
+  const { status } = await runBookedIn(seeded, seeded.poLineId)
+  assert.equal(status, 'processed')
+
+  const movements = await db.stockMovement.findMany({
+    where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId },
+    select: { qty: true, unitCostBase: true, totalValueBase: true },
+  })
+  console.log(`[arm7] examined ${movements.length} movement(s): ${JSON.stringify(movements)}`)
+  assert.equal(movements.length, 1)
+  assert.equal(
+    Number(movements[0]!.unitCostBase),
+    seeded.unitCost,
+    'the MOVEMENT must carry the real unit cost, not the zero default',
+  )
+  assert.equal(Number(movements[0]!.totalValueBase), expectedAmount)
+
+  const layers = await db.costLayer.findMany({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  console.log(`[arm7] examined ${layers.length} cost layer(s): ${JSON.stringify(layers)}`)
+  assert.equal(layers.length, 1)
+  assert.equal(
+    Number(layers[0]!.unitCostBase),
+    seeded.unitCost,
+    'the COST LAYER must carry the real unit cost — a zero-cost layer understates inventory for ever',
+  )
+
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  console.log(`[arm7] examined ${logs.length} STOCK_RECEIPT log(s): ${JSON.stringify(logs.map((l) => l.payload))}`)
+  assert.equal(
+    logs.length,
+    1,
+    `an ordinary positive-cost purchase order must post its receipt journal; found ${logs.length}. `
+    + 'This is the arm the hand-set landedUnitCostBase fixture was hiding.',
+  )
+  const lines = payloadLines(logs[0]!.payload)
+  const debit = lines.find((l) => typeof l.debit === 'number')
+  const credit = lines.find((l) => typeof l.credit === 'number')
+  assert.ok(debit && credit)
+  assert.equal(debit.accountCode, INVENTORY_ACCOUNT)
+  assert.equal(credit.accountCode, TRANSIT_ACCOUNT)
+  assert.equal(debit.debit, expectedAmount, `the debit must be ${seeded.qty} x ${seeded.unitCost}`)
+
+  // THE THREE CONSUMERS MUST AGREE.
+  assert.equal(
+    Number(movements[0]!.totalValueBase),
+    debit.debit,
+    'the movement value and the journal debit must be the same number',
+  )
+  assert.equal(
+    Number(layers[0]!.unitCostBase) * Number(layers[0]!.receivedQty),
+    debit.debit,
+    'the cost-layer value and the journal debit must be the same number',
+  )
+
+  const transit = await transitRowsFor(seeded.poId)
+  console.log(`[arm7] examined ${transit.length} transit row(s): ${JSON.stringify(transit.map((r) => String(r.baseDelta)))}`)
+  assert.equal(transit.length, 1)
+  assert.equal(Number(transit[0]!.baseDelta), -expectedAmount)
+})
+
+/**
+ * ARM 8 — FREIGHT MUST REACH THE JOURNAL, AND ALL THREE CONSUMERS TOGETHER.
+ *
+ * The cost the manual receipt uses is not the goods cost: it is
+ * `computeGrossUnitCostBaseByLine`, i.e. goods plus this line's share of the PO's
+ * additional cost lines. A fix that read `unitCostBase` alone would pass arm 7 and
+ * still post the wrong amount for any PO carrying freight — and would disagree with
+ * the manual receipt for the same units, which is the asymmetry o3d-8f0p6 is about.
+ *
+ * The PO is again built by `createPurchaseOrder`, freight included, with no cost
+ * column written by hand.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that distributes freight by a different
+ * method than the manual receipt would for a MULTI-line PO. This PO has one line, so
+ * every distribution method gives it the whole amount; the shared helper is what makes
+ * the multi-line case agree, and that is asserted by construction (same function) not
+ * by this arm.
+ */
+test('o3d-8f0p6 r2: freight on the PO reaches the layer, the movement and the journal alike', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const FREIGHT_TOTAL = 20
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('F', QTY, GOODS_UNIT, FREIGHT_TOTAL)
+  // One line, so the whole freight amount lands on it whatever the distribution method.
+  const expectedUnitCost = GOODS_UNIT + FREIGHT_TOTAL / QTY
+  const expectedAmount = QTY * expectedUnitCost
+
+  const { status } = await runBookedIn(seeded, seeded.poLineId)
+  assert.equal(status, 'processed')
+
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  console.log(`[arm8] goods ${GOODS_UNIT} + freight ${FREIGHT_TOTAL}/${QTY} => expected unit ${expectedUnitCost}; movement=${JSON.stringify(movement)} layer=${JSON.stringify(layer)} logs=${logs.length}`)
+
+  // PRECONDITION: freight really is on the PO, so "gross == goods" cannot be true by accident.
+  assert.notEqual(expectedUnitCost, GOODS_UNIT, 'PRECONDITION: the freight share must move the unit cost')
+
+  assert.equal(Number(layer.unitCostBase), expectedUnitCost, 'the cost layer must carry the GROSS (goods + freight) unit cost, as the manual receipt does')
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so must the movement')
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  const debit = payloadLines(logs[0]!.payload).find((l) => typeof l.debit === 'number')
+  assert.ok(debit)
+  assert.equal(debit.debit, expectedAmount, `the journal debit must be the gross value ${expectedAmount}, not the goods-only ${QTY * GOODS_UNIT}`)
+  assert.equal(Number(movement.totalValueBase), debit.debit, 'movement value == journal debit')
+  assert.equal(Number(layer.unitCostBase) * Number(layer.receivedQty), debit.debit, 'layer value == journal debit')
+
+  const transit = await transitRowsFor(seeded.poId)
+  assert.equal(transit.length, 1)
+  assert.equal(Number(transit[0]!.baseDelta), -expectedAmount)
+})
+
+/**
+ * ARM 9 — A FREE-OF-CHARGE LINE IS LEGITIMATELY ZERO, AND MUST POST NOTHING.
+ *
+ * The round-1 review asked whether zero can ever be legitimate. It can: a sample, a
+ * warranty replacement or a free-of-charge line has `unitCostForeign` 0, so the gross
+ * cost is 0 and there is no value to move into inventory. Posting a zero journal would
+ * be noise the ledger would reject.
+ *
+ * This is what makes a NULL-vs-ZERO column change unnecessary: the legitimate case is
+ * distinguished by the GOODS cost being zero, which arm 7 asserts is positive in the
+ * defect case. Receipt time never reads `landedUnitCostBase` at all any more.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that posts nothing for ANY purchase order —
+ * which is the pre-fix behaviour, and is what arms 1, 7 and 8 refuse.
+ */
+test('o3d-8f0p6 r2: a genuinely free line credits stock and posts no journal', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('Z', 3, 0)
+
+  const { status } = await runBookedIn(seeded, seeded.poLineId)
+  assert.equal(status, 'processed')
+
+  const movements = await db.stockMovement.count({ where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId } })
+  const level = await db.stockLevel.findUniqueOrThrow({
+    where: { productId_warehouseId: { productId: seeded.productId, warehouseId: seeded.warehouseId } },
+    select: { quantity: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const transit = await transitRowsFor(seeded.poId)
+  console.log(`[arm9] free line: ${movements} movement(s), stock=${String(level.quantity)}, ${logs.length} log(s), ${transit.length} transit row(s)`)
+  assert.equal(movements, 1, 'PRECONDITION: the units must still be received — free goods are still goods')
+  assert.equal(Number(level.quantity), seeded.qty, 'PRECONDITION: and they must reach stock')
+  assert.equal(logs.length, 0, 'a zero-value receipt must post no journal — there is no value to move into inventory')
+  assert.equal(transit.length, 0, 'and nothing to drain from transit')
+})
+
+/**
+ * ARM 10 — THE ACCOUNT MAPPING MUST NOT MOVE UNDER THE POSTING.
+ *
+ * Round-1 HIGH 2: the codes were read over the POOL before the transaction opened, and
+ * nothing rechecked them. An operator remapping the inventory or transit account in
+ * that window got a committed journal on the OLD codes while every later
+ * reconciliation used the NEW ones. The enqueue's own fence does not cover this — it
+ * locks the `plugin_*` rows only.
+ *
+ * The codes are now read INSIDE the transaction and asserted again after the enqueue.
+ * This arm commits a remap from a SEPARATE connection while the book-in is mid-flight,
+ * so the second read sees it, and asserts the whole receipt refused: no journal AND no
+ * stock, because a receipt that cannot be accounted for must not be half-applied.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: binding by a lock instead of a refusal (also
+ * correct, and stronger); and a fix that refuses on ANY enqueue, which arms 1/7/8
+ * refuse. It does NOT establish anything about a remap that commits after this
+ * transaction does — that is a different posting, correctly on the new codes.
+ */
+test('o3d-8f0p6 r2: an account remap mid-book-in refuses the whole receipt', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('M', 2, 11)
+
+  // Remap the inventory account from a SEPARATE pooled write, fired the moment the book-in has
+  // read the codes. The hook is the enqueue itself: the wrapper below remaps and only then
+  // delegates, so the remap is committed before the post-enqueue assertion re-reads.
+  remapInventoryAccountOnNextEnqueue = async () => {
+    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: '699' } })
+  }
+  let status: string
+  try {
+    ;({ status } = await runBookedIn(seeded, seeded.poLineId))
+  } finally {
+    remapInventoryAccountOnNextEnqueue = null
+    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+  }
+  console.log(`[arm10] book-in with the mapping remapped mid-flight returned status=${status}`)
+  assert.notEqual(status, 'processed', 'a receipt whose account mapping moved must not report success')
+
+  const movements = await db.stockMovement.count({ where: { productId: seeded.productId } })
+  const layers = await db.costLayer.count({ where: { poLineId: seeded.poLineId } })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const event = await db.wmsInboundReceiptEvent.findFirstOrThrow({
+    where: { externalAsnId: seeded.tag },
+    select: { processedAt: true, lastError: true },
+  })
+  console.log(`[arm10] examined ${movements} movement(s), ${layers} layer(s), ${logs.length} log(s); lastError=${String(event.lastError).slice(0, 120)}`)
+  assert.equal(movements, 0, 'the stock must have rolled back with the refused journal')
+  assert.equal(layers, 0, 'and the cost layer')
+  assert.equal(logs.length, 0, 'and no journal may survive on the stale codes')
+  assert.equal(event.processedAt, null, 'the event must stay unprocessed so the webhook retries against the new mapping')
+  assert.match(
+    String(event.lastError),
+    /mapping changed/i,
+    'and the recorded error must say WHY, or an operator cannot tell this from any other failure',
+  )
 })

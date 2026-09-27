@@ -27,7 +27,13 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
-import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
+import {
+  getAccountingSettingsFor,
+  getActiveAccountingConnectorId,
+  queueAccountingSyncTx,
+  readStockReceiptAccountsTx,
+} from '@/lib/accounting'
+import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -327,12 +333,20 @@ export async function processBookedInEvent(
       ? await options.fetchRemoteAsn(event.externalAsnId)
       : null
 
-    // o3d-8f0p6: read OUTSIDE the transaction, like every other receipt path does
-    // (app/actions/purchase-orders.ts:1778) — `getAccountingSettings` opens its own reads on the
-    // pooled client and must not do so from inside a transaction that holds PO and ASN row locks.
-    // The account codes it returns are only USED inside the transaction, where the enqueue re-takes
-    // the plugin-selection lock and refuses if the pinned ledger stopped being the serviced one.
-    const accountingSettings = await getAccountingSettings()
+    // o3d-8f0p6: WHICH LEDGER this receipt would post to, and whether it posts at all. Resolved
+    // ONCE, here, and carried into the transaction as a PIN — `queueAccountingSyncTx` re-asks under
+    // the plugin-selection lock and refuses outright if this connector stopped being the serviced
+    // one, so a row can never be written against a ledger this decision was not about.
+    //
+    // o3d-8f0p6 r2: THE ACCOUNT CODES ARE DELIBERATELY NOT TAKEN FROM HERE. They are read inside the
+    // transaction (`readStockReceiptAccountsTx`) and asserted again after the enqueue, because a
+    // code read over the POOL before the transaction opens is a code an operator can remap before
+    // that transaction commits — and the enqueue's fence locks the `plugin_*` rows only
+    // (lib/integration-plugin-selection-lock.ts:66-78), which is a different question from "are
+    // these still the right accounts". `syncEnabled` is read here because it only decides whether to
+    // do any of this at all, and a flip of THAT is answered by the enqueue's own fence.
+    const accountingConnector = await getActiveAccountingConnectorId()
+    const accountingSettings = await getAccountingSettingsFor(accountingConnector)
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -810,6 +824,25 @@ export async function processBookedInEvent(
                 qtyReceived: true,
                 unitCostBase: true,
                 landedUnitCostBase: true,
+                // o3d-8f0p6 r2: the three extra fields the SHARED gross-cost helper needs. Selected
+                // here so the book-in reads the same inputs the manual receipt reads
+                // (app/actions/purchase-orders.ts:1841-1871), rather than a cheaper approximation.
+                totalBase: true,
+                product: { select: { weight: true } },
+              },
+            },
+            freightCostLines: {
+              select: { amountBase: true, distributionMethod: true },
+            },
+            landedCostLinks: {
+              select: {
+                freightPO: {
+                  select: {
+                    freightCostLines: {
+                      select: { amountBase: true, distributionMethod: true },
+                    },
+                  },
+                },
               },
             },
           },
@@ -818,6 +851,60 @@ export async function processBookedInEvent(
         if (!po) {
           throw new Error(`Purchase order ${poId} not found for ASN ${lockedEvent.externalAsnId}`)
         }
+
+        // ─── o3d-8f0p6 r2: ONE COST FOR THE MOVEMENT, THE LAYER AND THE JOURNAL ───
+        //
+        // THE DEFECT THIS REPLACES was `Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)`.
+        // `landedUnitCostBase` is `Decimal @db.Decimal(18, 6) @default(0)` and NOT NULL
+        // (prisma/schema.prisma:1319), so `??` can NEVER fall through: a purchase order created
+        // through the ordinary action does not set it, the column reads 0, and the book-in laid a
+        // ZERO-COST cost layer, wrote a zero-value movement and — once this branch started queueing
+        // a journal — left `receiptValueBase` at zero, so a positive-cost PO posted nothing at all.
+        // Only the concurrency fixture set the column by hand, which is exactly why six green arms
+        // did not see it.
+        //
+        // WHY THE GROSS COST, AND WHY THE SHARED HELPER. `computeGrossUnitCostBaseByLine` is what the
+        // MANUAL receipt uses (purchase-orders.ts:1881). It is goods `unitCostBase` plus this line's
+        // share of the PO's own and its linked freight POs' cost lines; it does not read
+        // `landedUnitCostBase` at all. Using it here means the two receipt writers answer "what did
+        // these units cost" with ONE definition instead of two — which is the whole point of
+        // o3d-8f0p6 — and it is never worse than the old expression: once landed cost HAS been
+        // allocated the recalc writes `landedUnitCostBase = grossUnitCostBase`
+        // (landed-cost-service.ts:1159, :1514), so the two coincide; before allocation the old
+        // expression was simply 0.
+        //
+        // SO THERE IS NO NULL-VS-ZERO QUESTION TO SETTLE, and no migration. The column stays NOT NULL
+        // with its 0 default, because receipt time stops reading it. A GENUINELY free line — a
+        // free-of-charge sample, a warranty replacement — has `unitCostBase` 0 and no freight share,
+        // so the gross cost is 0, `receiptValueBase` stays 0 and no journal and no transit row are
+        // queued. That is correct: nothing of value entered inventory. It is distinguishable from the
+        // defect above, which had a POSITIVE `unitCostBase` and still produced 0.
+        //
+        // (The five report/analytics readers that do consult the column use
+        // `.gt(0) ? landed : goods` — purchasing-analytics.ts:413, :676 — i.e. they already treat 0 as
+        // "not allocated yet". The remaining `?? ` copy of this bug is in the WMS stock-sync align-up
+        // path, lib/connectors/mintsoft/sync/stock-sync.ts:1375; it is a different path in a different
+        // transaction and is recorded on o3d-6nd55, which fixes that path next.)
+        const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+          lines: po.lines.map((line) => ({
+            id: line.id,
+            qty: line.qty,
+            unitCostBase: line.unitCostBase,
+            totalBase: line.totalBase,
+            landedUnitCostBase: line.landedUnitCostBase,
+            weight: line.product?.weight ?? null,
+          })),
+          directCostLines: po.freightCostLines.map((costLine) => ({
+            amountBase: costLine.amountBase,
+            distributionMethod: costLine.distributionMethod,
+          })),
+          linkedCostLines: po.landedCostLinks.flatMap((link) => (
+            link.freightPO.freightCostLines.map((costLine) => ({
+              amountBase: costLine.amountBase,
+              distributionMethod: costLine.distributionMethod,
+            }))
+          )),
+        })
 
         const lockedLineById = new Map(po.lines.map((line) => [line.id, line]))
         const reconciledLines = receiptLines.map((receiptLine) => {
@@ -890,7 +977,11 @@ export async function processBookedInEvent(
           if (!poLine) continue
 
           if (receiptLine.qtyReceived > 0) {
-            const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
+            // o3d-8f0p6 r2: ONE value, read once, used by all three consumers below — the movement's
+            // value fields, the cost layer's unitCostBase and the journal's amount. Three consumers
+            // disagreeing about the cost of the same units would be a worse defect than the missing
+            // journal. See the block above the loop for why this is the gross cost.
+            const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? Number(poLine.unitCostBase)
             if (receiptLine.stockQtyToAdd > 0) {
               try {
                 // The catch below keeps using `tx`, so the failing insert must not poison it
@@ -1089,15 +1180,20 @@ export async function processBookedInEvent(
         // of that clearing account are listed at transit-subledger-movement.ts:20-35 and none of them
         // is a transfer). The manual transfer receipt agrees — app/actions/transfers.ts queues no
         // accounting sync at all — so posting nothing here is parity, not a second hole.
-        if (accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
+        if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
           const amount = roundQuantity(receiptValueBase, 2).toNumber()
+          // o3d-8f0p6 r2: the codes come from THIS transaction, pinned to the SAME connector the
+          // enqueue below is pinned to, so the mapping and the row are one decision rather than two
+          // independent resolutions. See readStockReceiptAccountsTx for why the pooled read was not
+          // enough, and the assertion after the enqueue for what closes the remaining window.
+          const accounts = await readStockReceiptAccountsTx(tx, accountingConnector)
           const payload = {
             date: now.toISOString().slice(0, 10),
             reference: `Receipt: ${po.reference}`,
             narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}`,
             lines: [
-              { accountCode: accountingSettings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
-              { accountCode: accountingSettings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
+              { accountCode: accounts.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
+              { accountCode: accounts.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
             ],
           }
           // Keyed on the PO and the RECEIPT EVENT. What actually FENCES a replay is one line up:
@@ -1120,7 +1216,33 @@ export async function processBookedInEvent(
             referenceId: poId,
             payload,
             idempotencyKey: receiptIdempotencyKey,
+            // PIN THE LEDGER: the enqueue re-asks under the plugin-selection lock and refuses rather
+            // than writing this row against a connector other than the one whose accounts are in the
+            // payload above.
+            connector: accountingConnector,
           })
+          // REFUSE IF THE MAPPING MOVED (o3d-8f0p6 r2, round-1 HIGH 2). Under READ COMMITTED this
+          // re-read takes a FRESH snapshot, so it observes an account remap that managed to commit
+          // between the read above and now — which is exactly what makes it a usable assertion that
+          // none did. Throwing rolls the whole book-in back: no stock, no layer, no journal, and the
+          // webhook is retried, whereupon it posts against the NEW mapping. Committing instead would
+          // leave a journal on codes that no later reconciliation uses, which is unrecoverable
+          // without a manual correction. This is deliberately a refusal and not a lock: locking
+          // arbitrary `settings` rows from here would invent a second lock order over a table the
+          // enqueue already locks `plugin_*`-first.
+          const accountsAfterEnqueue = await readStockReceiptAccountsTx(tx, accountingConnector)
+          if (
+            accountsAfterEnqueue.inventoryAccount !== accounts.inventoryAccount
+            || accountsAfterEnqueue.transitAccount !== accounts.transitAccount
+          ) {
+            throw new Error(
+              `Accounting account mapping changed while booking in ASN ${lockedEvent.externalAsnId} for PO `
+              + `${po.reference}: inventory ${accounts.inventoryAccount || '(unset)'} -> `
+              + `${accountsAfterEnqueue.inventoryAccount || '(unset)'}, transit `
+              + `${accounts.transitAccount || '(unset)'} -> ${accountsAfterEnqueue.transitAccount || '(unset)'}. `
+              + 'Refusing so the receipt is retried against the current mapping (o3d-8f0p6).',
+            )
+          }
           // 6oyu.4 (khdw): a receipt CREDITS the transit clearing account, draining goods-in-transit
           // into inventory, so the signed subledger delta is −amount. Recorded on the QUEUE'S OWN
           // decision (bcz9.4) rather than a second settings read, so the two can never disagree: a

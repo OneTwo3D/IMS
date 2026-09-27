@@ -201,7 +201,19 @@ receipt does — **DR Inventory / CR Stock in Transit** — plus the signed tran
 −value, **in the same transaction as the movement, the cost layer and the stock level**. All of it
 lives or none of it does: if the enqueue fails, the book-in commits no stock.
 
-Three details are load-bearing:
+Four details are load-bearing:
+
+- **the receipt cost is the SHARED gross cost, not `landedUnitCostBase`** (o3d-8f0p6 r2). That column
+  is `Decimal @default(0)` and NOT NULL, and `createPurchaseOrder` never sets it — so the old
+  `landedUnitCostBase ?? unitCostBase` could never fall through, and an ordinary purchase order was
+  booked in at a unit cost of **zero**: a zero-cost FIFO layer, a zero-value movement and, once this
+  path started queueing a journal, no journal at all. The book-in now calls
+  `computeGrossUnitCostBaseByLine`, the same helper the manual receipt uses, and that one value feeds
+  the movement, the cost layer **and** the journal. It is never worse than the old expression: once
+  landed cost has been allocated the recalc writes `landedUnitCostBase = grossUnitCostBase`, so the two
+  coincide. A genuinely free line (a sample, a warranty replacement) has a zero goods cost, so the
+  gross cost is zero and nothing is posted — which is correct, and is why no null-vs-zero column change
+  was needed;
 
 - **the amount is the value this book-in actually laid layers for**, not the reconciled quantity.
   `qtyReceived` also covers `coveredBySnapshotQty` (units a prior stock-sync alignment already brought
@@ -215,6 +227,21 @@ Three details are load-bearing:
   already owns between its own warehouses: their value never left inventory and never entered
   *purchase* goods-in-transit. The manual transfer receipt (`app/actions/transfers.ts`) queues no
   accounting sync either, so this is parity rather than a second gap.
+
+The **account codes are read inside the book-in transaction** and asserted again after the enqueue
+(o3d-8f0p6 r2). Reading them over the pool beforehand bound nothing: an operator remapping the
+inventory or transit account in that window got a committed journal on the old codes while every later
+reconciliation used the new ones, and the enqueue's own fence locks the `plugin_*` rows only. A remap
+detected mid-receipt now **refuses the whole book-in** — no stock, no layer, no journal — and the
+webhook retries against the current mapping. The connector is resolved once and pinned to the enqueue,
+so the mapping and the queued row cannot come from two independent resolutions of "which ledger".
+
+> **This does not yet make WMS receipt accounting complete.** Only the purchase-order-backed
+> *webhook* path posts. The WMS stock-sync **align-up** path still credits PO-backed stock and lays
+> cost layers with no journal and no transit row (**o3d-6nd55**), and because it writes to neither
+> ledger the transit reconciliation still ties out and still hides that omission — so the transit
+> account is not auditable until o3d-6nd55 lands too. The honest claim for this change is "the
+> PO-backed webhook path now posts", not "WMS receipts now post".
 
 Why it had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
 journal from a stock movement. The Xero daily batch does not read `stock_movements` at all, its
