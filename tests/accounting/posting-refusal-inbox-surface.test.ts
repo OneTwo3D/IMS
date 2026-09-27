@@ -1230,3 +1230,54 @@ test('[o3d-j625 r28] a post-queue clear goes through the one function that also 
   assert.match(inbox, /pg_advisory_xact_lock|runUnderPostingKeyLock/,
     'PRECONDITION: the clear must still take the posting key lock, which is what makes the in-transaction sites safe')
 })
+
+/**
+ * o3d-j625 r30 (Codex round 29, HIGH 1) — THE DECLINE IS PUBLISHED FROM THE LOCK CALLBACK'S RETURN VALUE.
+ *
+ * `guarded` swallows the error and lets the caller proceed, so anything assigned into an outer variable from
+ * inside the transaction survives a rollback and gets published anyway. r10 hit that on the recording path
+ * (an optimistic initializer); r28 hit the other half on the clearing path by assigning the reportable value
+ * before the write that asserts it. This pins the discipline that fixes both: the reportable value comes out
+ * as the callback's RETURN, assigned only after `guarded` has returned.
+ *
+ * WHAT WOULD STILL PASS IT: a rewrite that keeps the shape but breaks the semantics some other way — this is
+ * a structural check, and the behavioural one is the concurrency test that rolls a real deferral write back.
+ * It says nothing about the `recording` path, which r10 pinned with its own pessimistic initializer.
+ */
+test('[o3d-j625 r30] the clear never publishes a decline assigned from inside its transaction', () => {
+  const src = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/posting-refusal-inbox.ts'), 'utf8')
+  const clear = src.slice(
+    src.indexOf('export async function clearAccountingPostingRefusal'),
+    src.indexOf('async function reportDeclineNotRecorded'),
+  )
+  assert.ok(clear.length > 500, 'PRECONDITION: the clear body must be found, or this test reads nothing')
+
+  // The callback RETURNS the decline...
+  assert.match(clear, /return \{ outcome: 'declined-hand-post-claim', \.\.\.claim \}/,
+    'the decline must be the lock callback\'s return value')
+  // ...and the only assignment to the published holder is the one after the lock returns.
+  const assignments = clear.match(/^\s*result = /gm) ?? []
+  assert.equal(assignments.length, 1,
+    `the published result must be assigned EXACTLY once, after the lock transaction committed; found `
+    + `${assignments.length}. An assignment from inside the callback is r28's defect: a rollback does not undo `
+    + 'it and `guarded` swallows the error, so a decline is published for a postponement that never landed.')
+  assert.match(clear, /\/\/ Reached ONLY if the lock callback returned and its transaction committed/,
+    'and the one assignment must be the post-commit one')
+  // The deferral's own result is checked rather than reasoned about.
+  assert.match(clear, /if \(recorded !== 'recorded'\) \{[\s\S]{0,200}throw new Error/,
+    'a postponement that did not record must throw inside the transaction, not be assumed to have worked')
+  // And the non-durable case has its own reported outcome.
+  assert.match(clear, /outcome: 'declined-hand-post-claim-not-recorded'/,
+    'a claim seen without a durable postponement gets its own outcome, so no caller can read it as postponed')
+  assert.match(clear, /await reportDeclineNotRecorded\(/, 'and it is reported at ERROR')
+
+  // NON-VACUITY: the consumer must map that outcome to something that is owed but NOT `hand-post-deferred`,
+  // because r18 made that reason mean "postponed AND counted".
+  const outcome = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/enqueue-outcome.ts'), 'utf8')
+  assert.match(
+    outcome,
+    /case 'declined-hand-post-claim-not-recorded':[\s\S]{0,2000}?return \{ \.\.\.outcome, queued: false, reason: 'refused' \}/,
+    'the unrecorded decline must be answered as owed-but-not-postponed; `hand-post-deferred` there would tell '
+    + 'the caller a postponement is being tracked when the count says it is not',
+  )
+})

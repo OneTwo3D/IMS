@@ -259,6 +259,23 @@ export async function settleQueuedEnqueueAgainstHandPostClaim<T extends { queued
       return outcome
     case 'declined-hand-post-claim':
       return { ...outcome, queued: false, reason: 'hand-post-deferred' }
+    case 'declined-hand-post-claim-not-recorded':
+      /**
+       * o3d-j625 r30 (Codex round 29, HIGH 1) — OWED, AND EXPLICITLY NOT POSTPONED.
+       *
+       * A live claim was read, so the queue's row has been cancelled and the posting is owed — but the
+       * postponement did not commit, so `handPostDeferredCount` does not include this edit. It must therefore
+       * NOT be answered `hand-post-deferred`: r18 made that reason mean "postponed AND counted", and
+       * `HandPostDeferralUnrecordableError` exists precisely because a postponement nobody records is one of
+       * the two ways round 17's edit was lost. Answering it here would re-tell that lie in the one case where
+       * it is false.
+       *
+       * `refused` is the honest answer and needs no new vocabulary at the twenty-odd consumer sites: it is
+       * owed (`postingIsOwed` reads it as owed), it is recorded as an outstanding row by whichever site
+       * reports it, and no site anywhere treats it as a postponement that is being tracked for an operator.
+       * The clear has already logged the condition at ERROR naming the holder.
+       */
+      return { ...outcome, queued: false, reason: 'refused' }
     default: {
       const unhandledClearOutcome: never = cleared
       return unhandledClearOutcome

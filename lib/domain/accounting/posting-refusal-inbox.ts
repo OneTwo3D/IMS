@@ -228,6 +228,28 @@ export type RefusalRecordOutcome =
   | { recorded: false; because: 'contended'; deferred: boolean }
   | { recorded: false; because: 'failed' }
 
+/**
+ * o3d-j625 r30 (Codex round 29, HIGH 1) — READ THIS BEFORE PUBLISHING ANYTHING COMPUTED INSIDE `write`.
+ *
+ * This wrapper SWALLOWS the error and lets the caller carry on. That is deliberate (review L-1): an inbox
+ * tidy-up must not become the posting's exception, and a failure is reported at ERROR instead. But it makes a
+ * specific hazard available to every caller, and that hazard has now been reached TWICE, in two different
+ * shapes:
+ *
+ *   r10, on the `recording` path: the outcome holder started at an OPTIMISTIC value, so a write that threw
+ *        was reported to the caller as `recorded`. Fixed by making the initializer pessimistic (`failed`).
+ *   r30, on the `clearing` path: the holder started SAFE, but the reportable value was assigned into it from
+ *        INSIDE the transaction, before the write it asserts and before the commit. A rollback does not undo a
+ *        JavaScript assignment, and the swallowed error meant nothing else told the caller — so a decline was
+ *        published for a postponement that had rolled back.
+ *
+ * THE RULE BOTH FIXES OBEY, and the one to keep: whatever this function's caller publishes must be the value
+ * `write` RETURNED, taken after `guarded` has returned — never a value assigned into an outer variable from
+ * inside the transaction. Then a throw or a failed commit means nothing was published at all, which is the
+ * only version of this that is safe by construction rather than by inspection.
+ *
+ * AUDITED, r30: those are the only two call sites, and both now obey the rule. There is nothing to file.
+ */
 async function guarded(
   what: string,
   key: PostingRefusalKey,
@@ -854,6 +876,15 @@ export async function recordAccountingPostingRefusal(
 export type PostingRefusalClearResult =
   | { outcome: 'cleared' }
   | { outcome: 'declined-hand-post-claim'; claimedAt: Date; claimedBy: string | null }
+  /**
+   * o3d-j625 r30 (Codex round 29, HIGH 1) — A CLAIM WAS READ, AND THE POSTPONEMENT DID NOT SURVIVE.
+   *
+   * The clear saw a live claim but the transaction that was to record the postponement did not commit. The
+   * posting is therefore OWED — the queue's row was cancelled by the claim — but it is NOT durably postponed,
+   * and a caller must not be able to read it as though it were. This exists as its own member so that the
+   * distinction cannot be lost in a boolean, and so the exhaustive switch forces every consumer to choose.
+   */
+  | { outcome: 'declined-hand-post-claim-not-recorded'; claimedAt: Date; claimedBy: string | null; because: string }
 
 export async function clearAccountingPostingRefusal(
   client: PostingRefusalClient,
@@ -861,13 +892,43 @@ export async function clearAccountingPostingRefusal(
   options?: RecordRefusalOptions,
 ): Promise<PostingRefusalClearResult> {
   // o3d-j625 r28: `guarded` swallows a failed write by design (review L-1) — an inbox tidy-up must not
-  // become the posting's exception. A swallowed failure therefore reports `'cleared'`, and that is the
-  // SAFE direction: the alternative is telling the caller an operator holds a claim when the truth is that
-  // we do not know, which would make callers record a debt over a posting that did queue. The claim case is
-  // the only one that changes a caller's answer, and it is only ever reported when it was actually read.
+  // become the posting's exception. A swallowed failure with nothing observed therefore reports `'cleared'`,
+  // and that is the SAFE direction there: the row stays outstanding and visible, and the posting really was
+  // queued, so nothing is lost.
+  //
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  // o3d-j625 r30 (Codex round 29, HIGH 1) — PUBLISH THE DECLINE ONLY AFTER IT IS TRUE
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  //
+  // r28 assigned `result = { outcome: 'declined-hand-post-claim' }` BEFORE the deferral write and before the
+  // lock transaction committed. `result` is a JavaScript variable, so a rollback does not undo the
+  // assignment, and `guarded` swallows the error — so the decline reached the caller while
+  // `handPostDeferredCount` stayed zero. The caller then recorded the edit as owed with nothing counting it,
+  // and marking a REUSED-KEY posting handled closed the refusal and took the postponed edit with it. That is
+  // round 17's swallowed edit for the tenth time in this lineage, arriving through the ERROR PATH of the fix
+  // that closed it.
+  //
+  // THE SAME WRAPPER, THE SAME HAZARD, ALREADY SEEN ONCE: r10 fixed it on the `recording` path, where the
+  // holder started at an OPTIMISTIC value and `guarded` let it be returned for a row that was never written.
+  // That fix was a pessimistic initializer. This one is the other half of the discipline — publish the lock
+  // callback's RETURN VALUE, so a throw or a failed commit means no publication happened at all, rather than
+  // assigning into an outer variable from inside a transaction that may still roll back.
+  //
+  // WHY A THIRD MEMBER RATHER THAN A THROW: throwing here would let an inbox tidy-up roll back a goods
+  // receipt or a bill edit, which is the denial of service enqueue-outcome.ts refuses to trade for. So the
+  // caller is told, precisely, that the posting is owed and the postponement is NOT recorded.
   let result: PostingRefusalClearResult = { outcome: 'cleared' }
+  // A HOLDER rather than a plain `let`, for the reason the `recording` path gives: TypeScript would narrow
+  // the variable to its initializer and call the branches below unreachable.
+  //
+  // This one is READ-ONLY EVIDENCE and is deliberately allowed to survive a rollback: "we saw a live claim"
+  // stays true whatever happens to the write afterwards, and it is the only way to tell a failed decline from
+  // an ordinary failure. Acting on it is strictly CONSERVATIVE — it can only turn a `'cleared'` into an owed
+  // posting, never the reverse. The cost when the claim is released moments later is a transient debt that the
+  // next enqueue's clear resolves by itself; the cost of the other choice is an edit nobody ever posts.
+  const seen: { claim: { claimedAt: Date; claimedBy: string | null } | null } = { claim: null }
   await guarded('clearing', key, options, async () => {
-    await runUnderPostingKeyLock(
+    const settled = await runUnderPostingKeyLock<PostingRefusalClearResult>(
       client as unknown as PostingKeyLockClient,
       key,
       { callerTransaction: Boolean(options?.withSavepoint) },
@@ -878,7 +939,7 @@ export async function clearAccountingPostingRefusal(
           where: { ...key, resolvedAt: null, handPostClaimedAt: null },
           data: { resolvedAt: new Date(), resolution: 'queued' },
         })
-        if (count > 0) return
+        if (count > 0) return { outcome: 'cleared' }
         // Nothing matched. Two states can produce that, and only one of them is worth saying anything about.
         const standing = typeof table.findUnique === 'function'
           ? await table.findUnique({
@@ -886,29 +947,74 @@ export async function clearAccountingPostingRefusal(
             select: { suppressedAt: true, resolvedBy: true, resolvedAt: true, resolution: true, handPostClaimedAt: true, handPostClaimedBy: true },
           })
           : null
-        if (!standing?.handPostClaimedAt) return
-        result = {
-          outcome: 'declined-hand-post-claim',
-          claimedAt: standing.handPostClaimedAt,
-          claimedBy: standing.handPostClaimedBy ?? null,
-        }
+        if (!standing?.handPostClaimedAt) return { outcome: 'cleared' }
+        const claim = { claimedAt: standing.handPostClaimedAt, claimedBy: standing.handPostClaimedBy ?? null }
+        seen.claim = claim
         // o3d-j625 r28 — AND IT COUNTS AS A POSTPONEMENT, because that is exactly what it is.
         //
         // r18 made `handPostDeferredCount` mean "edits that arrived while you were holding this claim", and
         // r18 also established the invariant that a `hand-post-deferred` answer is never given without the
         // postponement being recorded — `HandPostDeferralUnrecordableError` exists because "a `queued: false`
-        // nobody records" is one of the two ways round 17's edit was lost. This path now returns exactly that
-        // reason through the facade, so it owes the same record. The bump happens HERE rather than at the
-        // facade because here it is causal: under this key's lock, on the row we have just read as claimed,
-        // so it cannot increment against a claim that has already been given back. Its own result is
-        // deliberately not inspected — `'no-claim'` is impossible under the lock we hold, and
-        // `'unrecordable'` means a client without the table, which `standing` proves is not the case.
-        await recordHandPostDeferral(locked as unknown as PostingSuppressionClient, key, new Date())
-        await reportClearDeclinedForHandPostClaim(key, standing.handPostClaimedAt, standing.handPostClaimedBy ?? null)
+        // nobody records" is one of the two ways round 17's edit was lost. This path returns exactly that
+        // reason through the facade, so it owes the same record. The bump happens HERE because here it is
+        // causal: under this key's lock, on the row just read as claimed, so it cannot increment against a
+        // claim that has already been given back.
+        //
+        // o3d-j625 r30: and its result IS inspected now. `'no-claim'` is impossible under the lock we hold and
+        // `'unrecordable'` means a client with no table, which `standing` proves is not the case — but "cannot
+        // happen" is what r28 said about every step between the assignment and the commit. A value that is
+        // announced before the write that makes it true has to be checked, not reasoned about.
+        const recorded = await recordHandPostDeferral(locked as unknown as PostingSuppressionClient, key, new Date())
+        if (recorded !== 'recorded') {
+          throw new Error(`the postponement could not be recorded against the live claim (${recorded})`)
+        }
+        await reportClearDeclinedForHandPostClaim(key, claim.claimedAt, claim.claimedBy)
+        return { outcome: 'declined-hand-post-claim', ...claim }
       },
     )
+    // Reached ONLY if the lock callback returned and its transaction committed. Everything the decline claims
+    // is durable by the time this assignment happens, which is the whole of the fix.
+    result = settled
   })
+  if (result.outcome === 'cleared' && seen.claim) {
+    // A live claim was read and the postponement did not commit. Owed, and explicitly not postponed.
+    await reportDeclineNotRecorded(key, seen.claim.claimedAt, seen.claim.claimedBy)
+    return {
+      outcome: 'declined-hand-post-claim-not-recorded',
+      ...seen.claim,
+      because: 'the postponement write or its transaction did not commit',
+    }
+  }
   return result
+}
+
+/**
+ * o3d-j625 r30 — THE DECLINE THAT COULD NOT BE MADE DURABLE, said out loud.
+ *
+ * ERROR, not WARNING: the ordinary decline (r26) is a WARNING because everything about it is recorded and an
+ * operator will meet it in the inbox. This one means the postponement count does NOT include an edit that
+ * arrived, so the row an operator is looking at understates what is owed. Never throws, for the same reason
+ * nothing else on this path does.
+ */
+async function reportDeclineNotRecorded(
+  key: PostingRefusalKey,
+  claimedAt: Date,
+  claimedBy: string | null,
+): Promise<void> {
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'accounting_posting_refusal_decline_not_recorded',
+    tag: 'accounting',
+    level: 'ERROR',
+    description:
+      `A queued ${key.type} for ${key.referenceType} ${key.referenceId} was declined because ${claimedBy ?? 'an operator'} `
+      + `has been settling it by hand since ${claimedAt.toISOString()}, but IMS could NOT record the postponement: `
+      + 'the write or its transaction did not commit. The posting is reported as still owed, so it will be '
+      + 'recorded as outstanding in the usual way, but the "postings declined behind this claim" count does NOT '
+      + 'include this one. Check the ledger for this posting before marking the claim handled.',
+    metadata: { ...key, claimedBy, claimedAt: claimedAt.toISOString() },
+  }).catch(() => { /* a report that cannot be written must not become the caller's exception */ })
 }
 
 /**

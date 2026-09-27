@@ -2339,3 +2339,182 @@ test(
     assert.equal(after.handPostDeferredCount, 0, 'and nothing was counted as postponed')
   },
 )
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// o3d-j625 r30 (Codex round 29, HIGH 1) — A ROLLED-BACK POSTPONEMENT MUST NOT BE PUBLISHED AS A DECLINE.
+//
+// r28 set the declined result BEFORE the deferral write and before the lock transaction committed. `result`
+// is a JavaScript variable, so a rollback does not undo the assignment, and `guarded` swallows the error —
+// the decline reached the caller while `handPostDeferredCount` stayed zero. The caller recorded the edit as
+// owed with nothing counting it, and marking a REUSED-KEY posting handled then closed the refusal and took
+// the postponed edit with it. Round 17's swallowed edit for the tenth time, through the error path of the fix
+// that closed it.
+//
+// The failure is injected at the DATABASE, not at a double: a trigger raises when this posting's deferral
+// counter is incremented, which aborts the whole transaction exactly as a real failed write would — so the
+// commit fails too, which is the half a mocked rejection would not reach.
+//
+// WHAT WOULD STILL PASS THIS TEST: any answer that leaves the posting OWED and does not claim a recorded
+// postponement — the assertions are on the caller's recorded reason and on the counter, not on the spelling of
+// the outcome member. It says nothing about the case where the deferral write SUCCEEDS (the r28 test above),
+// nor about a failure BEFORE the claim is read (which produces an ordinary `'cleared'` and is correct: the
+// row stays outstanding and the posting really was queued).
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
+test(
+  '[o3d-j625 r30 HIGH 1] a deferral write that ROLLS BACK is not reported to the caller as a postponement',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r30-deferral-rollback')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    // THE INJECTED FAILURE: incrementing THIS posting's deferral counter raises, which aborts the transaction
+    // the clear runs in. Scoped to one referenceId so no other test or row can see it.
+    await db.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION j625r30_block_deferral() RETURNS trigger AS $fn$
+      BEGIN
+        IF NEW."handPostDeferredCount" > OLD."handPostDeferredCount"
+           AND NEW."referenceId" = '${referenceId}' THEN
+          RAISE EXCEPTION 'o3d-j625 r30 injected: the postponement write fails';
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql`)
+    await db.$executeRawUnsafe(`
+      CREATE TRIGGER j625r30_block_deferral BEFORE UPDATE ON accounting_posting_refusals
+      FOR EACH ROW EXECUTE FUNCTION j625r30_block_deferral()`)
+    t.after(async () => {
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS j625r30_block_deferral ON accounting_posting_refusals')
+      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS j625r30_block_deferral()')
+    })
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+    )
+    console.log(`[r30] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+
+    // PRECONDITION: the trigger really did stop the bump. Without this the test could pass for the wrong reason.
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true },
+    })
+    console.log(`[r30] refusal=${JSON.stringify(after)}`)
+    assert.equal(after.handPostDeferredCount, 0,
+      'PRECONDITION: the injected failure must actually have prevented the postponement from being counted')
+
+    // THE FINDING: with the count at zero, the caller must not have recorded this as a tracked postponement.
+    assert.ok(
+      !refusalsRecorded.some((r) => r.reason === 'hand_post_claim_held'),
+      'THE FINDING: the caller recorded the edit as a HELD-CLAIM postponement while handPostDeferredCount was '
+      + 'zero. Nothing then counts the edit, and marking a reused-key posting handled closes the refusal and '
+      + 'takes the edit with it — the ledger ends up behind IMS with no outstanding debt.',
+    )
+    // ...and it must still be OWED, because the claim cancelled the row this enqueue wrote.
+    assert.ok(
+      logged.some((l) => l.action === 'sales_invoice_update_not_queued'),
+      'it is still owed and still reported: the queue\'s row was cancelled by the claim, so nothing is queued',
+    )
+    assert.ok(
+      !logged.some((l) => l.action === 'sales_invoice_update_queued'),
+      'and certainly not reported as queued',
+    )
+    assert.deepEqual(refusalsRecorded.map((r) => r.reason), ['enqueue_refused'],
+      'recorded as a plain refusal — owed, reported, and making no claim about a postponement being tracked')
+
+    assert.equal(after.resolvedAt, null, 'the refusal is still outstanding')
+    assert.equal(after.handPostClaimedBy, 'operator-A', 'and the claim is untouched')
+
+    const shouted = await db.activityLog.count({
+      where: { action: 'accounting_posting_refusal_decline_not_recorded', description: { contains: referenceId } },
+    })
+    assert.equal(shouted, 1,
+      'and the condition is reported at ERROR: the operator\'s row understates what is owed, so somebody has to '
+      + 'be able to find out')
+  },
+)
+
+test(
+  '[o3d-j625 r30 HIGH 1b] a deferral write that matches NO ROWS is not reported to the caller as a postponement',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * WHY THIS SECOND INJECTION EXISTS, disclosed: the first one makes the deferral write RAISE, which aborts
+     * the transaction on its own — so it does not exercise the check on `recordHandPostDeferral`'s RETURN
+     * VALUE at all. The mutation that deletes that check came back GREEN against the first test, which is the
+     * sweep telling me the check was unproven, not that it was unnecessary.
+     *
+     * This injection makes the write SUCCEED AND MATCH NOTHING instead: a BEFORE UPDATE trigger that returns
+     * NULL skips the row, so the UPDATE reports zero rows affected and `recordHandPostDeferral` answers
+     * `'no-claim'` with no error anywhere. r28 called that answer impossible under the lock. Impossible or not,
+     * it is the exact shape in which a postponement silently does not happen, and it is now the reason the
+     * check earns its place.
+     *
+     * WHAT WOULD STILL PASS IT: the same as its sibling — any answer leaving the posting owed and claiming no
+     * recorded postponement.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r30-deferral-norows')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    await db.$executeRawUnsafe(`
+      CREATE OR REPLACE FUNCTION j625r30_skip_deferral() RETURNS trigger AS $fn$
+      BEGIN
+        IF NEW."handPostDeferredCount" > OLD."handPostDeferredCount"
+           AND NEW."referenceId" = '${referenceId}' THEN
+          RETURN NULL;  -- skip the row: the UPDATE succeeds and affects nothing
+        END IF;
+        RETURN NEW;
+      END;
+      $fn$ LANGUAGE plpgsql`)
+    await db.$executeRawUnsafe(`
+      CREATE TRIGGER j625r30_skip_deferral BEFORE UPDATE ON accounting_posting_refusals
+      FOR EACH ROW EXECUTE FUNCTION j625r30_skip_deferral()`)
+    t.after(async () => {
+      await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS j625r30_skip_deferral ON accounting_posting_refusals')
+      await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS j625r30_skip_deferral()')
+    })
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+    )
+    console.log(`[r30b] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostClaimedBy: true, handPostDeferredCount: true },
+    })
+    console.log(`[r30b] refusal=${JSON.stringify(after)}`)
+
+    assert.equal(after.handPostDeferredCount, 0,
+      'PRECONDITION: the skip-row trigger must actually have prevented the postponement from being counted')
+    assert.ok(
+      !refusalsRecorded.some((r) => r.reason === 'hand_post_claim_held'),
+      'THE FINDING, through the answer rather than through an exception: a postponement that matched no rows '
+      + 'must not be reported as a tracked postponement. This is the assertion that makes the check on '
+      + 'recordHandPostDeferral\'s return value non-vacuous.',
+    )
+    assert.deepEqual(refusalsRecorded.map((r) => r.reason), ['enqueue_refused'],
+      'owed and reported, with no claim about a postponement being tracked')
+    assert.ok(!logged.some((l) => l.action === 'sales_invoice_update_queued'), 'and never reported as queued')
+    assert.equal(after.resolvedAt, null, 'the refusal is still outstanding')
+    assert.equal(after.handPostClaimedBy, 'operator-A', 'and the claim is untouched')
+  },
+)
