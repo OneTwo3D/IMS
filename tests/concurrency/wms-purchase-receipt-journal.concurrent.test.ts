@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import * as realAccountingNs from '@/lib/accounting'
+import * as realTransitNs from '@/lib/domain/accounting/transit-subledger-movement'
 import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 
 /**
@@ -53,10 +54,22 @@ import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-re
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const SKIP = { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' } as const
 
+/**
+ * THE AUTH MOCK MUST COVER EVERY GUARD THE ACTIONS UNDER TEST CALL (o3d-8f0p6 r4).
+ *
+ * `requireRole` and `requireFreshPermission` were missing, and `saveXeroSettings` —  which arm 11
+ * drives — calls `requirePermission('sync')` then `requireRole('ADMIN')`. The missing export made that
+ * a TypeError, the action's own catch turned it into `{ success: false }`, and the arm's `.catch()`
+ * swallowed it: the remap NEVER HAPPENED and the arm passed while exercising nothing. It was the
+ * mutation that should have killed it (no lock, per-PO read) staying green that exposed this, which is
+ * the second time this round a green arm turned out to be measuring nothing.
+ */
 mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
     requireInternalUser: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    requireRole: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    requireFreshPermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
   },
 })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
@@ -76,11 +89,22 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
  */
 let injectEnqueueFailure = false
 /**
- * ARM 10's hook. Fired once, from inside the book-in transaction, AFTER the service has read the
- * account codes and BEFORE the enqueue returns — which is the exact window round-1 HIGH 2 is about.
- * It runs a pooled write, so the remap is committed by the time the service re-reads.
+ * THE REMAP HOOKS (o3d-8f0p6 r4). Both fire once, from INSIDE the book-in transaction.
+ *
+ * `onNextEnqueue` fires before the enqueue returns — used by the multi-PO arm, so the remap attempt
+ * lands between the first PO's posting and the second's.
+ *
+ * `afterFinalAccountRead` fires from the transit-subledger write, which the service reaches AFTER its
+ * post-enqueue account re-read. That is the exact window round 3 identified: the re-read has already
+ * happened and holds nothing of its own, so if the mapping is not LOCKED, a remap committing here
+ * still ends with a journal committed on stale codes.
+ *
+ * Neither hook AWAITS the remap, and that is the point rather than an optimisation: while the mapping
+ * lock is held the remap cannot commit, so awaiting it from inside this transaction would deadlock
+ * against ourselves. What the arms assert is precisely that it did NOT get through.
  */
 let remapInventoryAccountOnNextEnqueue: (() => Promise<void>) | null = null
+let remapInventoryAccountAfterFinalAccountRead: (() => Promise<void>) | null = null
 const INJECTED_ENQUEUE_FAILURE = 'o3d-8f0p6 injected STOCK_RECEIPT enqueue failure'
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -97,6 +121,21 @@ mock.module('@/lib/accounting', {
         await hook()
       }
       return realAccountingNs.queueAccountingSyncTx(...args)
+    },
+  },
+})
+mock.module('@/lib/domain/accounting/transit-subledger-movement', {
+  namedExports: {
+    ...realTransitNs,
+    recordTransitSubledgerMovement: async (
+      ...args: Parameters<typeof realTransitNs.recordTransitSubledgerMovement>
+    ) => {
+      if (remapInventoryAccountAfterFinalAccountRead) {
+        const hook = remapInventoryAccountAfterFinalAccountRead
+        remapInventoryAccountAfterFinalAccountRead = null
+        await hook()
+      }
+      return realTransitNs.recordTransitSubledgerMovement(...args)
     },
   },
 })
@@ -352,6 +391,121 @@ async function seedPurchaseBackedAsnViaRealCreate(
     asnLineMapId: asn.lines[0]!.id,
     externalAsnLineId: asn.lines[0]!.externalAsnLineId,
   }
+}
+
+/**
+ * ONE ASN COVERING TWO PURCHASE ORDERS (o3d-8f0p6 r4), both built by the real creation path.
+ *
+ * This is the shape round 3's multi-PO finding is about: `receiptLinesByPoId` groups the event's lines
+ * by purchase order and posts one journal per PO, so an event can queue several journals and a remap
+ * landing between them could split it across two mappings.
+ */
+async function seedTwoPoAsnViaRealCreate(label: string, qtyEach: number, unitCost: number) {
+  const { db } = await import('@/lib/db')
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const tag = uniqueTag(label)
+  const warehouse = await db.warehouse.create({
+    data: { code: tag.slice(-10), name: `${tag} wh`, type: 'STANDARD' },
+    select: { id: true },
+  })
+  const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
+
+  const made: Array<{ poId: string; poLineId: string; productId: string; sku: string }> = []
+  for (const suffix of ['A', 'B']) {
+    const sku = `${tag}${suffix}`.slice(0, 28)
+    const product = await db.product.create({
+      data: { sku, name: `o3d-8f0p6 ${label}${suffix}`, type: 'SIMPLE', countryOfOrigin: 'CN' },
+      select: { id: true },
+    })
+    await db.stockLevel.create({
+      data: { productId: product.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' },
+      select: { productId: true },
+    })
+    const created = await createPurchaseOrder({
+      reference: sku,
+      supplierId: supplier.id,
+      currency: 'GBP',
+      fxRateToBase: 1,
+      destinationWarehouseId: warehouse.id,
+      pricesIncludeVat: false,
+      taxRateValue: 0,
+      lines: [{ productId: product.id, sku, productName: `o3d-8f0p6 ${label}${suffix}`, qty: qtyEach, unitCostForeign: unitCost }],
+    })
+    assert.equal(created.success, true, `PRECONDITION: createPurchaseOrder must succeed: ${created.error}`)
+    const po = await db.purchaseOrder.findUniqueOrThrow({
+      where: { reference: sku },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+    await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+    made.push({ poId: po.id, poLineId: po.lines[0]!.id, productId: product.id, sku })
+  }
+
+  const asn = await db.wmsAsnMap.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: o3d-8f0p6: a test fixture row, not a core flow branch
+      externalAsnId: tag,
+      sourceType: 'PURCHASE_ORDER',
+      sourceId: made[0]!.poId,
+      warehouseId: warehouse.id,
+      status: 'OPEN',
+      lines: {
+        create: made.map((entry, index) => ({
+          externalAsnLineId: `${tag}-${index + 1}`,
+          sourceType: 'PURCHASE_ORDER_LINE',
+          sourceLineId: entry.poLineId,
+          productId: entry.productId,
+          sku: entry.sku,
+          expectedQty: `${qtyEach}.0000`,
+        })),
+      },
+    },
+    select: { id: true, lines: { select: { id: true, externalAsnLineId: true, sourceLineId: true } } },
+  })
+  return {
+    tag,
+    qtyEach,
+    unitCost,
+    warehouseId: warehouse.id,
+    poAId: made[0]!.poId,
+    poBId: made[1]!.poId,
+    lines: asn.lines.map((line) => ({
+      externalAsnLineId: line.externalAsnLineId,
+      sourceLineId: line.sourceLineId,
+      sku: made.find((m) => m.poLineId === line.sourceLineId)!.sku,
+    })),
+  }
+}
+
+/** The real webhook book-in for a two-line, two-PO ASN. */
+async function runBookedInMultiPo(
+  multi: Awaited<ReturnType<typeof seedTwoPoAsnViaRealCreate>>,
+): Promise<{ status: string; eventId: string }> {
+  const { db } = await import('@/lib/db')
+  const { processBookedInEvent } = await import('@/lib/domain/wms/booked-in-service')
+  const { liveMintsoftBookedInAsnRefMultiLine } = await import('@/tests/helpers/live-mintsoft-asn-ref')
+  const event = await db.wmsInboundReceiptEvent.create({
+    data: {
+      connector: 'mintsoft', // wms-connector-boundary-ok: o3d-8f0p6: a test fixture row, not a core flow branch
+      externalEventId: `${multi.tag}-evt-${Math.random().toString(36).slice(2, 10)}`,
+      externalAsnId: multi.tag,
+      payload: { asnId: multi.tag },
+    },
+    select: { id: true },
+  })
+  const remote = liveMintsoftBookedInAsnRefMultiLine({
+    externalAsnId: multi.tag,
+    lines: multi.lines.map((line) => ({
+      externalLineId: line.externalAsnLineId,
+      sourceLineId: line.sourceLineId,
+      sku: line.sku,
+      expectedQty: multi.qtyEach,
+      bookedQty: multi.qtyEach,
+    })),
+  })
+  const result = await processBookedInEvent(event.id, {
+    fetchRemoteAsn: async () => ({ ...remote, status: 'RECEIVED', raw: null }),
+  })
+  return { status: result.status, eventId: event.id }
 }
 
 type SeededTransferAsn = {
@@ -1141,61 +1295,180 @@ test('o3d-8f0p6 r2: a genuinely free line credits stock and posts no journal', S
 })
 
 /**
- * ARM 10 — THE ACCOUNT MAPPING MUST NOT MOVE UNDER THE POSTING.
+ * ARM 10 — THE MAPPING LOCK MUST BLOCK A REMAP THAT COMMITS AFTER THE FINAL READ.
  *
- * Round-1 HIGH 2: the codes were read over the POOL before the transaction opened, and
- * nothing rechecked them. An operator remapping the inventory or transit account in
- * that window got a committed journal on the OLD codes while every later
- * reconciliation used the NEW ones. The enqueue's own fence does not cover this — it
- * locks the `plugin_*` rows only.
+ * ROUND 3'S FINDING, AND WHY r2's ANSWER WAS NOT ENOUGH. r2 read the codes inside the transaction and
+ * re-read them after the enqueue, refusing on a difference. Under READ COMMITTED that re-read sees a
+ * remap that had ALREADY committed — but it holds nothing, so a remap committing AFTER it, while the
+ * book-in walks on through the transfer loop and the ASN updates, still ends with a journal committed
+ * on stale codes. Refusal was the wrong instrument. The fix is the accounting-selection lock, extended
+ * to the two mapping rows and held to COMMIT.
  *
- * The codes are now read INSIDE the transaction and asserted again after the enqueue.
- * This arm commits a remap from a SEPARATE connection while the book-in is mid-flight,
- * so the second read sees it, and asserts the whole receipt refused: no journal AND no
- * stock, because a receipt that cannot be accounted for must not be half-applied.
+ * SO THIS ARM MEASURES THE LOCK, NOT THE REFUSAL. The remap is fired from a separate pooled
+ * connection at the one moment r2 could not defend — from the transit-subledger write, which the
+ * service reaches after its post-enqueue re-read — and is deliberately NOT awaited, because a
+ * transaction that waits for a writer it is itself blocking would deadlock. What is asserted is that
+ * the remap DID NOT GET THROUGH: after a generous wait, a third connection still reads the OLD code.
  *
- * WHAT WOULD STILL PASS THIS ARM: binding by a lock instead of a refusal (also
- * correct, and stronger); and a fix that refuses on ANY enqueue, which arms 1/7/8
- * refuse. It does NOT establish anything about a remap that commits after this
- * transaction does — that is a different posting, correctly on the new codes.
+ * THE FAILURE DIRECTION IS THE SAFE ONE. If the lock were absent the remap would commit inside the
+ * wait and that read would return the new code, so the arm fails. If the remap were merely slow the
+ * arm would pass while proving less — which is why the wait is 2s for a single-row update, and why the
+ * assertion is on the ROW's value rather than on a timer.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: holding the lock for longer than necessary; and any fix that
+ * serialises by a different lock, which is also correct. It does NOT establish that two POs in one
+ * event share a mapping — that is arm 11, and it rests on a different mechanism.
  */
-test('o3d-8f0p6 r2: an account remap mid-book-in refuses the whole receipt', SKIP, async () => {
+test('o3d-8f0p6 r4: a remap committed after the final account read is blocked until the receipt commits', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')
   await enableStockReceiptPosting()
-  const seeded = await seedPurchaseBackedAsnViaRealCreate('M', 2, 11)
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('L', 2, 11)
+  const REMAPPED = '699'
 
-  // Remap the inventory account from a SEPARATE pooled write, fired the moment the book-in has
-  // read the codes. The hook is the enqueue itself: the wrapper below remaps and only then
-  // delegates, so the remap is committed before the post-enqueue assertion re-reads.
-  remapInventoryAccountOnNextEnqueue = async () => {
-    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: '699' } })
+  type RemapOutcome = 'pending' | 'committed' | 'failed'
+  let remapSettled: RemapOutcome = 'pending'
+  let remapError: string | null = null
+  // SNAPSHOTTED INSIDE THE HOOK, not read afterwards. The `finally` below awaits the remap, so by the
+  // time any assertion runs it has long since landed; a flag read there would say nothing about what
+  // was true DURING the transaction, which is the only thing this arm is about.
+  let observedDuringTransaction: string | null = null
+  let settledDuringTransaction: RemapOutcome = 'pending'
+  let remapPromise: Promise<unknown> = Promise.resolve()
+
+  remapInventoryAccountAfterFinalAccountRead = async () => {
+    // Fired from INSIDE the book-in transaction, after its final account read. Not awaited.
+    remapPromise = db.setting
+      .update({ where: { key: 'xero_inventory_account' }, data: { value: REMAPPED } })
+      .then(() => { remapSettled = 'committed' })
+      .catch((error: unknown) => { remapSettled = 'failed'; remapError = String(error).slice(0, 200) })
+    // A generous window for a single-row update, so "it simply had not run yet" is not a plausible
+    // explanation for a pass.
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    // A THIRD connection, reading what is COMMITTED right now. A plain SELECT is not blocked by the
+    // FOR UPDATE, so this reports the row's committed value rather than waiting for the lock.
+    const row = await db.setting.findUniqueOrThrow({ where: { key: 'xero_inventory_account' }, select: { value: true } })
+    observedDuringTransaction = row.value
+    settledDuringTransaction = remapSettled
   }
+
   let status: string
   try {
     ;({ status } = await runBookedIn(seeded, seeded.poLineId))
+    // Let the queued remap through now that the lock is released, so the arm can prove it was
+    // SERIALISED rather than rejected.
+    await remapPromise.catch(() => {})
+  } finally {
+    remapInventoryAccountAfterFinalAccountRead = null
+  }
+  const afterRelease = await db.setting.findUniqueOrThrow({ where: { key: 'xero_inventory_account' }, select: { value: true } })
+  await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+
+  console.log(`[arm10] status=${status}; mid-transaction: code=${String(observedDuringTransaction)} remap=${settledDuringTransaction}${remapError ? ` (${remapError})` : ''}; after release: code=${afterRelease.value} remap=${remapSettled}`)
+  assert.equal(
+    observedDuringTransaction,
+    INVENTORY_ACCOUNT,
+    `THE POINT OF THIS ARM: while the book-in held the mapping lock, a remap fired AFTER its final `
+    + `account read must not have committed — the committed code should still have been `
+    + `${INVENTORY_ACCOUNT}, was ${String(observedDuringTransaction)}. A new value here is round 3's `
+    + 'stale-mapping window, reopened.',
+  )
+  assert.equal(
+    settledDuringTransaction,
+    'pending',
+    'and the remap must still have been WAITING at that moment, not already finished',
+  )
+  // NOT VACUOUS: the remap must land once the lock is released. If it had failed for some unrelated
+  // reason, "it did not commit" would be true for the wrong reason and this is what catches that.
+  assert.equal(remapSettled, 'committed', `the remap must succeed once the receipt released the lock — serialised, not rejected${remapError ? `; it failed instead: ${remapError}` : ''}`)
+  assert.equal(afterRelease.value, REMAPPED, 'and its value must be the one it wrote')
+
+  // The receipt itself must have succeeded, on codes that were current for the whole of it.
+  assert.equal(status, 'processed', 'serialising must let the receipt through, not refuse it')
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  const lines = payloadLines(logs[0]!.payload)
+  assert.equal(lines.find((l) => typeof l.debit === 'number')?.accountCode, INVENTORY_ACCOUNT)
+  assert.equal(lines.find((l) => typeof l.credit === 'number')?.accountCode, TRANSIT_ACCOUNT)
+
+})
+
+/**
+ * ARM 11 — EVERY PURCHASE ORDER IN ONE EVENT POSTS ON ONE MAPPING.
+ *
+ * Round 3's second half: an ASN can cover SEVERAL purchase orders, and per-PO account reads could
+ * straddle a remap, putting earlier POs on the old mapping and later ones on the new one inside a
+ * single event. Two POs on two different account codes for one delivery is not a variance anything
+ * reconciles; it is two contradictory journals.
+ *
+ * WHAT THIS ARM PINS, AND WHAT IT DOES NOT. It pins the MEMOISATION — one locked read per
+ * transaction, reused by every PO — not the lock. With the lock present a remap cannot commit at all,
+ * so the two mechanisms are not separable by observation here, and claiming this arm proves the lock
+ * would be the "proof of an adjacent property" trap. The mutation that makes the read per-PO AND
+ * removes the lock is what turns this red; the lock alone is measured by arm 10.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that reads per-PO but under a lock (also correct); and a fix
+ * that posts nothing at all, which arms 1, 7 and 8 refuse.
+ *
+ * AND WHAT NEITHER ARM CAN SEPARATE, said rather than left implied: the lock the WRITER takes. What
+ * blocks the remap in both arms is the READER's `FOR UPDATE` on the mapping rows, which stops any
+ * UPDATE of them — cooperative or not. `saveXeroSettings` taking the same lock buys two narrower
+ * things: the documented order (so a future second reader cannot invert it), and the fresh-install
+ * race where the row does not exist yet and two participants would otherwise both materialise it.
+ * No arm here distinguishes it, and the mutation that removes it survives.
+ */
+test('o3d-8f0p6 r4: two purchase orders in one ASN post on the same account mapping', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const multi = await seedTwoPoAsnViaRealCreate('N', 2, 13)
+  const REMAPPED = '698'
+
+  let remapPromise: Promise<unknown> = Promise.resolve()
+  let remapOutcome: { success: boolean; error?: string } | null = null
+  remapInventoryAccountOnNextEnqueue = async () => {
+    // THROUGH THE REAL WRITER, not a raw row update: `saveXeroSettings` is the only code that remaps
+    // these accounts in production, and it is the other half of the lock order this change documents.
+    // (Arm 10 uses a RAW update deliberately, because blocking an uncooperative writer is the stronger
+    // claim; this arm uses the real one so the production path is exercised at least once.)
+    // Between the first PO's enqueue and the second PO's posting. Not awaited: under the lock it
+    // cannot commit until the whole event does.
+    const { saveXeroSettings } = await import('@/app/actions/xero-sync')
+    remapPromise = saveXeroSettings({ xero_inventory_account: REMAPPED })
+      .then((result) => { remapOutcome = result })
+      .catch((error: unknown) => { remapOutcome = { success: false, error: String(error).slice(0, 200) } })
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+  }
+
+  let status: string
+  try {
+    ;({ status } = await runBookedInMultiPo(multi))
   } finally {
     remapInventoryAccountOnNextEnqueue = null
-    await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+    await remapPromise.catch(() => {})
   }
-  console.log(`[arm10] book-in with the mapping remapped mid-flight returned status=${status}`)
-  assert.notEqual(status, 'processed', 'a receipt whose account mapping moved must not report success')
+  // PRECONDITION, AND IT IS THE ONE THAT MATTERS: the remap must genuinely have gone through the real
+  // writer and landed. Until this was asserted the arm passed with a remap that had failed on a
+  // missing auth mock, i.e. while exercising nothing at all.
+  const afterRemap = await db.setting.findUniqueOrThrow({ where: { key: 'xero_inventory_account' }, select: { value: true } })
+  await db.setting.update({ where: { key: 'xero_inventory_account' }, data: { value: INVENTORY_ACCOUNT } })
+  console.log(`[arm11] saveXeroSettings outcome=${JSON.stringify(remapOutcome)}; code after the event=${afterRemap.value}`)
+  assert.deepEqual(remapOutcome, { success: true }, 'PRECONDITION: the real writer must have accepted the remap')
+  assert.equal(afterRemap.value, REMAPPED, 'PRECONDITION: and the remap must actually have landed once the event released the lock')
+  assert.equal(status, 'processed')
 
-  const movements = await db.stockMovement.count({ where: { productId: seeded.productId } })
-  const layers = await db.costLayer.count({ where: { poLineId: seeded.poLineId } })
-  const logs = await stockReceiptLogsFor(seeded.poId)
-  const event = await db.wmsInboundReceiptEvent.findFirstOrThrow({
-    where: { externalAsnId: seeded.tag },
-    select: { processedAt: true, lastError: true },
-  })
-  console.log(`[arm10] examined ${movements} movement(s), ${layers} layer(s), ${logs.length} log(s); lastError=${String(event.lastError).slice(0, 120)}`)
-  assert.equal(movements, 0, 'the stock must have rolled back with the refused journal')
-  assert.equal(layers, 0, 'and the cost layer')
-  assert.equal(logs.length, 0, 'and no journal may survive on the stale codes')
-  assert.equal(event.processedAt, null, 'the event must stay unprocessed so the webhook retries against the new mapping')
-  assert.match(
-    String(event.lastError),
-    /mapping changed/i,
-    'and the recorded error must say WHY, or an operator cannot tell this from any other failure',
+  const logsA = await stockReceiptLogsFor(multi.poAId)
+  const logsB = await stockReceiptLogsFor(multi.poBId)
+  const codesA = payloadLines(logsA[0]?.payload).map((l) => l.accountCode)
+  const codesB = payloadLines(logsB[0]?.payload).map((l) => l.accountCode)
+  console.log(`[arm11] PO A codes=${JSON.stringify(codesA)} PO B codes=${JSON.stringify(codesB)}`)
+  assert.equal(logsA.length, 1, 'PRECONDITION: the first purchase order must have posted')
+  assert.equal(logsB.length, 1, 'PRECONDITION: the second purchase order must have posted too — otherwise there is nothing to compare')
+  assert.deepEqual(
+    codesA,
+    codesB,
+    'both purchase orders in one ASN must post on the SAME account mapping; a remap attempted between '
+    + 'them must not split the event across two mappings',
   )
+  assert.deepEqual(codesA, [INVENTORY_ACCOUNT, TRANSIT_ACCOUNT], 'and on the mapping that was current when the event began')
 })

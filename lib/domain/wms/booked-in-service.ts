@@ -32,7 +32,9 @@ import {
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
   readStockReceiptAccountsTx,
+  type StockReceiptAccounts,
 } from '@/lib/accounting'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
@@ -350,6 +352,36 @@ export async function processBookedInEvent(
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
+
+      // ─── o3d-8f0p6 r4: THE ACCOUNT MAPPING, LOCKED ONCE FOR THE WHOLE EVENT ───
+      //
+      // WHAT ROUND 3 FOUND. r2 read the codes inside the transaction and re-read them after the
+      // enqueue, refusing if they had moved. That re-read holds NOTHING: under READ COMMITTED it sees
+      // a remap that had already committed, but a remap committing AFTER it — while this transaction
+      // walks on through the transfer loop and the ASN updates — still ends with a journal committed
+      // on stale codes. Worse, on an ASN spanning several purchase orders the per-PO reads could
+      // straddle a remap and put earlier POs on the old mapping and later ones on the new one inside
+      // one event. Refusal was the wrong instrument; the fix is a lock held to COMMIT.
+      //
+      // IT IS THE EXISTING LOCK, NOT A NEW ONE. `lockAccountingMappingSelection` is the accounting
+      // selection lock — the same advisory key `queueAccountingSyncTx` takes through
+      // `pinnedLedgerIsServicedUnderLock` — with the two mapping rows added to its row set. So there
+      // is one lock, one order (advisory first, then rows in one `ORDER BY key`), and the enqueue's
+      // own later acquisition is a no-op re-entry inside a transaction that already holds it. See
+      // that function for the exhaustive list of who takes it and why it cannot deadlock.
+      //
+      // MEMOISED, so the multi-PO case is structurally impossible rather than accidentally fine:
+      // whichever PO first needs the codes takes the lock and reads them, and every later PO in the
+      // same event reuses that one answer. And LAZY, so an event that posts nothing — a transfer-only
+      // ASN, or one with no value to credit — takes no accounting lock at all.
+      let lockedAccounts: StockReceiptAccounts | null = null
+      const accountsForPosting = async (connector: NonNullable<typeof accountingConnector>) => {
+        if (!lockedAccounts) {
+          await lockAccountingMappingSelection(tx, connector)
+          lockedAccounts = await readStockReceiptAccountsTx(tx, connector)
+        }
+        return lockedAccounts
+      }
 
       const lockedEvent = await tx.wmsInboundReceiptEvent.findUnique({
         where: { id: event.id },
@@ -1182,11 +1214,10 @@ export async function processBookedInEvent(
         // accounting sync at all — so posting nothing here is parity, not a second hole.
         if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
           const amount = roundQuantity(receiptValueBase, 2).toNumber()
-          // o3d-8f0p6 r2: the codes come from THIS transaction, pinned to the SAME connector the
-          // enqueue below is pinned to, so the mapping and the row are one decision rather than two
-          // independent resolutions. See readStockReceiptAccountsTx for why the pooled read was not
-          // enough, and the assertion after the enqueue for what closes the remaining window.
-          const accounts = await readStockReceiptAccountsTx(tx, accountingConnector)
+          // o3d-8f0p6 r2/r4: the codes come from THIS transaction, under the lock taken above, pinned
+          // to the SAME connector the enqueue below is pinned to — so the mapping and the queued row
+          // are one decision, and no remap can commit between this read and this transaction's COMMIT.
+          const accounts = await accountsForPosting(accountingConnector)
           const payload = {
             date: now.toISOString().slice(0, 10),
             reference: `Receipt: ${po.reference}`,
@@ -1221,28 +1252,15 @@ export async function processBookedInEvent(
             // payload above.
             connector: accountingConnector,
           })
-          // REFUSE IF THE MAPPING MOVED (o3d-8f0p6 r2, round-1 HIGH 2). Under READ COMMITTED this
-          // re-read takes a FRESH snapshot, so it observes an account remap that managed to commit
-          // between the read above and now — which is exactly what makes it a usable assertion that
-          // none did. Throwing rolls the whole book-in back: no stock, no layer, no journal, and the
-          // webhook is retried, whereupon it posts against the NEW mapping. Committing instead would
-          // leave a journal on codes that no later reconciliation uses, which is unrecoverable
-          // without a manual correction. This is deliberately a refusal and not a lock: locking
-          // arbitrary `settings` rows from here would invent a second lock order over a table the
-          // enqueue already locks `plugin_*`-first.
-          const accountsAfterEnqueue = await readStockReceiptAccountsTx(tx, accountingConnector)
-          if (
-            accountsAfterEnqueue.inventoryAccount !== accounts.inventoryAccount
-            || accountsAfterEnqueue.transitAccount !== accounts.transitAccount
-          ) {
-            throw new Error(
-              `Accounting account mapping changed while booking in ASN ${lockedEvent.externalAsnId} for PO `
-              + `${po.reference}: inventory ${accounts.inventoryAccount || '(unset)'} -> `
-              + `${accountsAfterEnqueue.inventoryAccount || '(unset)'}, transit `
-              + `${accounts.transitAccount || '(unset)'} -> ${accountsAfterEnqueue.transitAccount || '(unset)'}. `
-              + 'Refusing so the receipt is retried against the current mapping (o3d-8f0p6).',
-            )
-          }
+          // NO POST-ENQUEUE RE-READ ANY MORE, and the reason is measured rather than argued
+          // (o3d-8f0p6 r4). r2 put one here and refused on a difference; r3 showed refusal was the
+          // wrong instrument, and the lock above replaced it. The re-read was then kept for one round
+          // as a "tripwire" that would supposedly fire if the lock were ever removed — and the
+          // mutation that DELETES the re-read turned no arm red, while the mutation that deletes the
+          // LOCK is caught by arm 10 on its own. So the re-read could not fail, was not what caught a
+          // regression, and this repository's rule is that a check which cannot fail is not a
+          // guarantee: it is deleted rather than believed. The lock is the guarantee; arm 10 is what
+          // proves the lock holds.
           // 6oyu.4 (khdw): a receipt CREDITS the transit clearing account, draining goods-in-transit
           // into inventory, so the signed subledger delta is −amount. Recorded on the QUEUE'S OWN
           // decision (bcz9.4) rather than a second settings read, so the two can never disagree: a

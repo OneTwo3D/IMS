@@ -228,13 +228,41 @@ Four details are load-bearing:
   *purchase* goods-in-transit. The manual transfer receipt (`app/actions/transfers.ts`) queues no
   accounting sync either, so this is parity rather than a second gap.
 
-The **account codes are read inside the book-in transaction** and asserted again after the enqueue
-(o3d-8f0p6 r2). Reading them over the pool beforehand bound nothing: an operator remapping the
-inventory or transit account in that window got a committed journal on the old codes while every later
-reconciliation used the new ones, and the enqueue's own fence locks the `plugin_*` rows only. A remap
-detected mid-receipt now **refuses the whole book-in** — no stock, no layer, no journal — and the
-webhook retries against the current mapping. The connector is resolved once and pinned to the enqueue,
-so the mapping and the queued row cannot come from two independent resolutions of "which ledger".
+**The account mapping is LOCKED for the whole receipt** (o3d-8f0p6 r4). Reading the codes over the
+pool bound nothing, and re-reading them inside the transaction was not enough either: a re-read under
+READ COMMITTED sees a remap that has already committed but holds nothing, so a remap committing *after*
+it — while the book-in walks on through the transfer loop and the ASN updates — still ended with a
+journal on stale codes, and on an ASN spanning several purchase orders could put earlier POs on the old
+mapping and later ones on the new one inside one event.
+
+The book-in now takes the **accounting-selection lock** before reading the codes and holds it to
+commit — and nothing else: the re-read-and-refuse was removed once a mutation showed it could no
+longer fail, because a check that cannot fail is not a guarantee. It is the *same* lock `queueAccountingSyncTx` already takes — the same advisory key, with the
+two mapping rows added to its row set — so there is one lock and one order (advisory first, then rows
+in one `ORDER BY key`), and the enqueue's own later acquisition is a no-op re-entry. `saveXeroSettings`,
+the only writer of those rows, takes it too. The read is **memoised per event**, so every purchase order
+in one ASN posts on one mapping by construction. A remap attempted mid-receipt is **serialised**, not
+rejected: it waits and lands once the receipt commits. The connector is resolved once and pinned to the
+enqueue, so the mapping and the queued row cannot come from two independent resolutions of "which
+ledger".
+
+**What happens if a book-in does refuse.** The refusal path is not self-healing and the recovery is
+manual, so it is written down rather than implied. A failed attempt is rescheduled with backoff by the
+internal sweeper, and after **eight** failed attempts (`MAX_FAILED_ATTEMPTS`) the event is
+**dead-lettered**: `processingStatus` becomes the dead state, `nextRetryAt` is cleared and
+`deadLetteredAt` is stamped, and **the sweeper will not pick it up again**. A fresh delivery of the same
+Mintsoft event resets the attempt counter, so a warehouse that re-sends recovers on its own; an event
+that has already dead-lettered needs a **redelivery or a manual replay** (*Re-check* on the ASN, or the
+sync exception inbox) before its stock moves. Nothing else notices on its own.
+
+**Freight allocation and unweighed lines.** The receipt cost uses the same distribution the manual
+receipt uses, which means a `BY_WEIGHT` cost line allocates only across lines that HAVE a weight: a line
+whose product weight is null gets no share of it while a sibling with a positive weight takes the lot,
+so a **partially weighed PO silently allocates freight to only some of its lines**. That is
+pre-existing and consistent between the two receipt writers rather than new here, and it is recorded
+because it is a real allocation behaviour an operator would not otherwise see. (`BY_VALUE` and
+`BY_QUANTITY` are unaffected; and when NO eligible line has a positive basis the helper falls back to
+an equal split and warns.)
 
 > **This does not yet make WMS receipt accounting complete.** Only the purchase-order-backed
 > *webhook* path posts. The WMS stock-sync **align-up** path still credits PO-backed stock and lays
