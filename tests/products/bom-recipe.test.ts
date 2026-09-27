@@ -1,0 +1,507 @@
+import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
+import test from 'node:test'
+
+import {
+  compareRecipes,
+  detectBomItemCycleAfterReplacement,
+  detectBomItemCycleInEdges,
+  findBomRecipeDrift,
+  normalizeRecipeQty,
+  syncBomRecipeFromProductComponents,
+  toRecipeMap,
+} from '../../lib/products/bom-recipe.ts'
+
+/**
+ * o3d-zjsb5.9 — BOM RECIPES HAD NO IMPORT PATH.
+ *
+ * A manufactured product's recipe lives in IMS TWICE: `ProductComponent` (fulfilment and
+ * production-order consumption) and `Bom`/`BomItem` (replenishment planning, reorder-MO
+ * generation, manufacturing analytics). Only the first was ever written by an importer, so a
+ * migrated BOM was sellable and invisible to planning — and no constraint, guard or log said so.
+ *
+ * WHAT THESE TESTS DO AND DO NOT ESTABLISH. They are behavioural against a recording fake client,
+ * so they pin what the sync and the drift check DO with rows. They do not prove the recipe matches
+ * Qoblex (two identically wrong recipes are "consistent"), and they do not prove Postgres accepts
+ * the writes — the unique index on `boms.productId`, the foreign keys and the end-to-end import are
+ * proven on a real throwaway cluster by `scripts/verify-bom-recipe-import.ts`.
+ *
+ * Every assertion here was mutation-verified: see the branch's PR body for which mutation reds
+ * which named test.
+ */
+
+// ---------------------------------------------------------------------------
+// Pure: quantity normalisation and comparison
+// ---------------------------------------------------------------------------
+
+test('[o3d-zjsb5.9] recipe quantities are compared at the stored Decimal(12,4) scale', () => {
+  // Both columns are Decimal(12,4). A Prisma Decimal arrives as an object with toString(); the
+  // CSV side arrives as a JS number. Comparing those two directly is how float noise becomes
+  // "drift" — 0.1 + 0.2 is not 0.3.
+  assert.equal(normalizeRecipeQty(2), '2.0000')
+  assert.equal(normalizeRecipeQty({ toString: () => '2' }), '2.0000')
+  assert.equal(normalizeRecipeQty('2.00000'), '2.0000')
+  assert.equal(normalizeRecipeQty(0.1 + 0.2), normalizeRecipeQty(0.3))
+  // ...and a difference INSIDE the stored scale is still a difference. Rounding to fewer places
+  // would make this pass and hide a real 0.0001 divergence.
+  assert.notEqual(normalizeRecipeQty(1.0001), normalizeRecipeQty(1.0002))
+})
+
+test('[o3d-zjsb5.9] two BomItem rows for one component are summed, not silently deduped', () => {
+  // ProductComponent has @@unique([productId, componentId]) so it can never duplicate; BomItem
+  // has no such constraint. Taking "the last one wins" would report a matching recipe for a BOM
+  // whose planning demand is actually double.
+  assert.deepEqual(
+    [...toRecipeMap([
+      { componentProductId: 'a', qty: 2 },
+      { componentProductId: 'a', qty: 3 },
+    ])],
+    [['a', '5.0000']],
+  )
+})
+
+test('[o3d-zjsb5.9] compareRecipes reports agreement as empty and every kind of disagreement', () => {
+  const components = [{ componentProductId: 'raw-oak', qty: 2 }, { componentProductId: 'leg', qty: 4 }]
+
+  // NON-VACUITY: the agreeing case must be clean, or a blanket "everything differs" would pass
+  // every refusal assertion below while being useless.
+  assert.deepEqual(compareRecipes(components, [...components]), [])
+
+  assert.deepEqual(
+    compareRecipes(components, [{ componentProductId: 'raw-oak', qty: 2 }]),
+    [{ kind: 'missing-from-bom', componentProductId: 'leg', componentQty: '4.0000' }],
+  )
+  assert.deepEqual(
+    compareRecipes([{ componentProductId: 'raw-oak', qty: 2 }], components),
+    [{ kind: 'missing-from-components', componentProductId: 'leg', bomQty: '4.0000' }],
+  )
+  assert.deepEqual(
+    compareRecipes(components, [{ componentProductId: 'raw-oak', qty: 2 }, { componentProductId: 'leg', qty: 5 }]),
+    [{ kind: 'qty-differs', componentProductId: 'leg', componentQty: '4.0000', bomQty: '5.0000' }],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Pure: cycles in the bom_items graph
+// ---------------------------------------------------------------------------
+
+test('[o3d-zjsb5.9] detectBomItemCycleInEdges terminates on a graph that ALREADY contains a cycle', () => {
+  // The reason this must hold: legacy Bom rows were written at different times from different
+  // snapshots of product_components, so a cyclic bom_items graph is reachable TODAY. A detector
+  // that only terminates on acyclic input would hang exactly when it is needed.
+  assert.equal(detectBomItemCycleInEdges([{ parentProductId: 'a', componentProductId: 'b' }]), null)
+  assert.deepEqual(
+    detectBomItemCycleInEdges([
+      { parentProductId: 'a', componentProductId: 'b' },
+      { parentProductId: 'b', componentProductId: 'a' },
+    ]),
+    ['a', 'b', 'a'],
+  )
+  assert.deepEqual(detectBomItemCycleInEdges([{ parentProductId: 'a', componentProductId: 'a' }]), ['a', 'a'])
+  // A diamond is not a cycle. Treating a re-visited node as one would refuse every legitimate
+  // recipe that uses the same raw material at two levels.
+  assert.equal(
+    detectBomItemCycleInEdges([
+      { parentProductId: 'top', componentProductId: 'left' },
+      { parentProductId: 'top', componentProductId: 'right' },
+      { parentProductId: 'left', componentProductId: 'raw' },
+      { parentProductId: 'right', componentProductId: 'raw' },
+    ]),
+    null,
+  )
+})
+
+test('[o3d-zjsb5.9] the dry-run cycle check asks about the graph AFTER the parent is replaced', () => {
+  const edges = [
+    { parentProductId: 'table', componentProductId: 'leg' },
+    { parentProductId: 'leg', componentProductId: 'raw' },
+  ]
+  // Replacing table's recipe with raw removes table -> leg, so the graph is acyclic: a check that
+  // ADDED the proposed edges without removing the old ones would report a cycle here and refuse a
+  // legitimate re-import.
+  assert.equal(detectBomItemCycleAfterReplacement(edges, 'table', ['raw']), null)
+  // Making leg require table closes leg -> table -> leg. The old edges for `leg` are gone, so this
+  // cycle can only be seen by considering the PROPOSED ones.
+  assert.deepEqual(detectBomItemCycleAfterReplacement(edges, 'leg', ['table']), ['table', 'leg', 'table'])
+})
+
+// ---------------------------------------------------------------------------
+// The write path
+// ---------------------------------------------------------------------------
+
+type FakeBom = { id: string; name: string; productId: string | null; updatedAt: number }
+type FakeItem = { bomId: string; parentProductId: string; componentProductId: string; qty: number; sortOrder: number }
+
+function fakeSyncClient(seed?: { boms?: FakeBom[]; items?: FakeItem[] }) {
+  const boms: FakeBom[] = seed?.boms ? [...seed.boms] : []
+  const items: FakeItem[] = seed?.items ? [...seed.items] : []
+  let created = 0
+  const calls: string[] = []
+
+  const client = {
+    bom: {
+      findUnique: async ({ where }: { where: { productId: string } }) => {
+        calls.push('bom.findUnique')
+        return boms.find((bom) => bom.productId === where.productId) ?? null
+      },
+      findFirst: async ({ where }: { where: { productId: null; items: { some: { parentProductId: string } } } }) => {
+        calls.push('bom.findFirst')
+        const parent = where.items.some.parentProductId
+        const candidates = boms
+          .filter((bom) => bom.productId === null)
+          .filter((bom) => items.some((item) => item.bomId === bom.id && item.parentProductId === parent))
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+        return candidates[0] ?? null
+      },
+      update: async ({ where, data }: { where: { id: string }; data: { productId: string } }) => {
+        calls.push('bom.update')
+        const bom = boms.find((entry) => entry.id === where.id)
+        assert.ok(bom, 'update targeted a bom that does not exist')
+        bom.productId = data.productId
+        return bom
+      },
+      create: async ({ data }: { data: { name: string; productId: string } }) => {
+        calls.push('bom.create')
+        const bom: FakeBom = { id: `bom-${++created}`, name: data.name, productId: data.productId, updatedAt: Date.now() }
+        // The real column is UNIQUE. The fake enforces it, or a test could "pass" by creating a
+        // second claimed Bom that Postgres would reject.
+        assert.equal(
+          boms.filter((entry) => entry.productId === data.productId).length, 0,
+          'a second Bom was claimed for the same product — boms_productId_key would reject this',
+        )
+        boms.push(bom)
+        return bom
+      },
+    },
+    bomItem: {
+      deleteMany: async ({ where }: { where: { bomId: string; parentProductId: string } }) => {
+        calls.push('bomItem.deleteMany')
+        const before = items.length
+        for (let i = items.length - 1; i >= 0; i--) {
+          if (items[i].bomId === where.bomId && items[i].parentProductId === where.parentProductId) items.splice(i, 1)
+        }
+        return { count: before - items.length }
+      },
+      createMany: async ({ data }: { data: FakeItem[] }) => {
+        calls.push('bomItem.createMany')
+        items.push(...data)
+        return { count: data.length }
+      },
+      findMany: async () => {
+        calls.push('bomItem.findMany')
+        return items.map((item) => ({ ...item }))
+      },
+    },
+  }
+
+  return { client: client as unknown as Parameters<typeof syncBomRecipeFromProductComponents>[0], boms, items, calls }
+}
+
+test('[o3d-zjsb5.9] a BOM with no Bom at all gets one, claimed, with the component list mirrored', async () => {
+  const fake = fakeSyncClient()
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table',
+    sku: 'TABLE-01',
+    components: [{ componentProductId: 'leg', qty: 4 }, { componentProductId: 'raw-oak', qty: 2 }],
+  })
+
+  assert.deepEqual(outcome, { kind: 'written', bomId: 'bom-1', claimed: 'created' })
+  assert.deepEqual(fake.boms, [{ id: 'bom-1', name: 'TABLE-01 BOM', productId: 'table', updatedAt: fake.boms[0].updatedAt }])
+  assert.deepEqual(
+    fake.items.map(({ parentProductId, componentProductId, qty, sortOrder }) => ({ parentProductId, componentProductId, qty, sortOrder })),
+    [
+      { parentProductId: 'table', componentProductId: 'leg', qty: 4, sortOrder: 0 },
+      { parentProductId: 'table', componentProductId: 'raw-oak', qty: 2, sortOrder: 1 },
+    ],
+  )
+})
+
+test('[o3d-zjsb5.9] an existing UNCLAIMED Bom for the product is adopted, not duplicated', async () => {
+  // createManufacturingOrder used to create a Bom lazily with nothing linking it to the product.
+  // Creating a second one here would leave two recipes, which is exactly the ambiguity
+  // boms.productId was added to end — and would strand the ProductionOrder rows pointing at the
+  // first.
+  const fake = fakeSyncClient({
+    boms: [{ id: 'legacy', name: 'TABLE-01 BOM', productId: null, updatedAt: 1 }],
+    items: [{ bomId: 'legacy', parentProductId: 'table', componentProductId: 'leg', qty: 3, sortOrder: 0 }],
+  })
+
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table',
+    sku: 'TABLE-01',
+    components: [{ componentProductId: 'leg', qty: 4 }],
+  })
+
+  assert.deepEqual(outcome, { kind: 'written', bomId: 'legacy', claimed: 'adopted' })
+  assert.equal(fake.boms.length, 1, 'no second Bom may be created for a product that already has one')
+  assert.equal(fake.boms[0].productId, 'table')
+  // The stale qty 3 is REPLACED, not merged. Merging would leave planning explosion reading a
+  // quantity nothing consumes.
+  assert.deepEqual(fake.items.map((item) => [item.componentProductId, item.qty]), [['leg', 4]])
+})
+
+test('[o3d-zjsb5.9] a component the CSV dropped is removed from BomItem too', async () => {
+  const fake = fakeSyncClient({
+    boms: [{ id: 'bom-x', name: 'TABLE-01 BOM', productId: 'table', updatedAt: 1 }],
+    items: [
+      { bomId: 'bom-x', parentProductId: 'table', componentProductId: 'leg', qty: 4, sortOrder: 0 },
+      { bomId: 'bom-x', parentProductId: 'table', componentProductId: 'glue', qty: 1, sortOrder: 1 },
+    ],
+  })
+
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table',
+    sku: 'TABLE-01',
+    components: [{ componentProductId: 'leg', qty: 4 }],
+  })
+
+  assert.deepEqual(outcome, { kind: 'written', bomId: 'bom-x', claimed: 'already' })
+  assert.deepEqual(fake.items.map((item) => item.componentProductId), ['leg'])
+})
+
+test('[o3d-zjsb5.9] items belonging to OTHER parents in the same Bom are left alone', async () => {
+  // A Bom row may carry items for several parents (the schema allows it). Deleting by bomId alone
+  // would destroy an unrelated product's recipe as a side effect of importing this one.
+  const fake = fakeSyncClient({
+    boms: [{ id: 'bom-x', name: 'shared', productId: 'table', updatedAt: 1 }],
+    items: [
+      { bomId: 'bom-x', parentProductId: 'table', componentProductId: 'leg', qty: 4, sortOrder: 0 },
+      { bomId: 'bom-x', parentProductId: 'shelf', componentProductId: 'raw-oak', qty: 1, sortOrder: 0 },
+    ],
+  })
+
+  await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table',
+    sku: 'TABLE-01',
+    components: [{ componentProductId: 'raw-oak', qty: 9 }],
+  })
+
+  assert.deepEqual(
+    fake.items.filter((item) => item.parentProductId === 'shelf').map((item) => [item.componentProductId, item.qty]),
+    [['raw-oak', 1]],
+  )
+})
+
+test('[o3d-zjsb5.9] a recipe that closes a bom_items cycle is REFUSED', async () => {
+  // Reachable in practice: leg's Bom was written when components said leg -> nothing, and this
+  // import makes table a component of leg while leg is already a component of table.
+  const fake = fakeSyncClient({
+    boms: [
+      { id: 'bom-table', name: 'TABLE-01 BOM', productId: 'table', updatedAt: 1 },
+      { id: 'bom-leg', name: 'LEG-01 BOM', productId: 'leg', updatedAt: 1 },
+    ],
+    items: [{ bomId: 'bom-table', parentProductId: 'table', componentProductId: 'leg', qty: 4, sortOrder: 0 }],
+  })
+
+  const outcome = await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'leg',
+    sku: 'LEG-01',
+    components: [{ componentProductId: 'table', qty: 1 }],
+  })
+
+  assert.equal(outcome.kind, 'cycle')
+  assert.deepEqual(outcome.kind === 'cycle' ? outcome.path : null, ['table', 'leg', 'table'])
+})
+
+test('[o3d-zjsb5.9] the cycle question is asked AFTER the write, on the graph being committed', async () => {
+  // Asked BEFORE the write it would see this parent's OLD edges: it would both invent cycles a
+  // rewrite removes and miss cycles a rewrite creates. The caller aborts its transaction on a
+  // cycle, so asking afterwards costs nothing.
+  const fake = fakeSyncClient()
+  await syncBomRecipeFromProductComponents(fake.client, {
+    productId: 'table',
+    sku: 'TABLE-01',
+    components: [{ componentProductId: 'leg', qty: 1 }],
+  })
+  const writeAt = fake.calls.indexOf('bomItem.createMany')
+  const checkAt = fake.calls.lastIndexOf('bomItem.findMany')
+  assert.ok(writeAt !== -1 && checkAt !== -1, `expected a write and a cycle read, got ${fake.calls.join(',')}`)
+  assert.ok(writeAt < checkAt, `the cycle read must follow the write: ${fake.calls.join(',')}`)
+})
+
+// ---------------------------------------------------------------------------
+// The consistency check
+// ---------------------------------------------------------------------------
+
+type DriftProduct = {
+  id: string
+  sku: string
+  type: string
+  productComponents: Array<{ componentId: string; qty: number }>
+  manufacturingBom: { id: string } | null
+}
+
+function fakeDriftClient(products: DriftProduct[], bomItems: FakeItem[]) {
+  let productQueryReached = 0
+  const client = {
+    product: {
+      findMany: async () => {
+        productQueryReached++
+        // Mirrors the real `where`: BOM-typed products, PLUS any product that is a BomItem parent
+        // (so bom_items on a non-BOM product cannot hide by not being type BOM).
+        return products
+          .filter((product) => product.type === 'BOM' || bomItems.some((item) => item.parentProductId === product.id))
+          .map((product) => ({ ...product }))
+          .sort((a, b) => a.sku.localeCompare(b.sku))
+      },
+    },
+    bom: {},
+    bomItem: { findMany: async () => bomItems.map((item) => ({ ...item })) },
+  }
+  return { client: client as unknown as Parameters<typeof findBomRecipeDrift>[0], reached: () => productQueryReached }
+}
+
+test('[o3d-zjsb5.9] the drift check PASSES when the two representations agree', async () => {
+  const fake = fakeDriftClient(
+    [{
+      id: 'table', sku: 'TABLE-01', type: 'BOM',
+      productComponents: [{ componentId: 'leg', qty: 4 }, { componentId: 'raw-oak', qty: 2 }],
+      manufacturingBom: { id: 'bom-table' },
+    }],
+    [
+      { bomId: 'bom-table', parentProductId: 'table', componentProductId: 'leg', qty: 4, sortOrder: 0 },
+      { bomId: 'bom-table', parentProductId: 'table', componentProductId: 'raw-oak', qty: 2, sortOrder: 1 },
+    ],
+  )
+  const drift = await findBomRecipeDrift(fake.client)
+  // PRECONDITION ASSERTED: a check that examined nothing would also report zero drift.
+  assert.equal(fake.reached(), 1, 'the product query must have run')
+  assert.deepEqual(drift, [], `expected no drift, got ${JSON.stringify(drift)}`)
+})
+
+test('[o3d-zjsb5.9] the drift check REFUSES a BOM with a component recipe and no Bom', async () => {
+  // THE EXACT SHAPE THE MISSING IMPORTER PRODUCED: sellable, buildable one order at a time, and
+  // invisible to replenishment planning and reorder-MO generation.
+  const fake = fakeDriftClient(
+    [{ id: 'table', sku: 'TABLE-01', type: 'BOM', productComponents: [{ componentId: 'leg', qty: 4 }], manufacturingBom: null }],
+    [],
+  )
+  const drift = await findBomRecipeDrift(fake.client)
+  assert.equal(drift.length, 1, `expected exactly one finding, got ${JSON.stringify(drift)}`)
+  assert.equal(drift[0].kind, 'missing-bom')
+  assert.match(drift[0].detail, /TABLE-01/)
+  assert.match(drift[0].detail, /replenishment planning/)
+})
+
+test('[o3d-zjsb5.9] the drift check REFUSES every kind of disagreement it is meant to catch', async () => {
+  const fake = fakeDriftClient(
+    [
+      // qty differs
+      { id: 'a', sku: 'A', type: 'BOM', productComponents: [{ componentId: 'leg', qty: 4 }], manufacturingBom: { id: 'bom-a' } },
+      // component present in components, absent from bom
+      { id: 'b', sku: 'B', type: 'BOM', productComponents: [{ componentId: 'leg', qty: 1 }, { componentId: 'glue', qty: 1 }], manufacturingBom: { id: 'bom-b' } },
+      // claimed bom with no items for it at all
+      { id: 'c', sku: 'C', type: 'BOM', productComponents: [{ componentId: 'leg', qty: 1 }], manufacturingBom: { id: 'bom-c' } },
+      // bom items on a product that is no longer a BOM
+      { id: 'd', sku: 'D', type: 'SIMPLE', productComponents: [], manufacturingBom: null },
+      // recipe duplicated into an unclaimed bom
+      { id: 'e', sku: 'E', type: 'BOM', productComponents: [{ componentId: 'leg', qty: 1 }], manufacturingBom: { id: 'bom-e' } },
+    ],
+    [
+      { bomId: 'bom-a', parentProductId: 'a', componentProductId: 'leg', qty: 5, sortOrder: 0 },
+      { bomId: 'bom-b', parentProductId: 'b', componentProductId: 'leg', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-d', parentProductId: 'd', componentProductId: 'leg', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-e', parentProductId: 'e', componentProductId: 'leg', qty: 1, sortOrder: 0 },
+      { bomId: 'stray', parentProductId: 'e', componentProductId: 'leg', qty: 1, sortOrder: 0 },
+    ],
+  )
+  const drift = await findBomRecipeDrift(fake.client)
+  const byKind = drift.map((row) => `${row.sku}:${row.kind}`).sort()
+  assert.deepEqual(byKind, [
+    'A:recipe-differs',
+    'B:recipe-differs',
+    'C:empty-bom',
+    'D:bom-items-on-non-bom-product',
+    'E:duplicate-unclaimed-bom',
+  ], `unexpected findings: ${JSON.stringify(drift, null, 1)}`)
+  assert.match(drift.find((row) => row.sku === 'A')!.detail, /x4\.0000 in product_components and x5\.0000 in bom_items/)
+  assert.match(drift.find((row) => row.sku === 'B')!.detail, /planning under-orders/)
+})
+
+test('[o3d-zjsb5.9] the drift check reports a cyclic bom_items graph', async () => {
+  const fake = fakeDriftClient(
+    [
+      { id: 'a', sku: 'A', type: 'BOM', productComponents: [{ componentId: 'b', qty: 1 }], manufacturingBom: { id: 'bom-a' } },
+      { id: 'b', sku: 'B', type: 'BOM', productComponents: [{ componentId: 'a', qty: 1 }], manufacturingBom: { id: 'bom-b' } },
+    ],
+    [
+      { bomId: 'bom-a', parentProductId: 'a', componentProductId: 'b', qty: 1, sortOrder: 0 },
+      { bomId: 'bom-b', parentProductId: 'b', componentProductId: 'a', qty: 1, sortOrder: 0 },
+    ],
+  )
+  const drift = await findBomRecipeDrift(fake.client)
+  // Both halves agree with product_components row for row, so nothing but the cycle check can see
+  // this. It is the case the "subset of an acyclic graph is acyclic" argument does NOT cover.
+  assert.deepEqual(drift.map((row) => row.kind), ['bom-item-cycle'])
+  assert.match(drift[0].detail, /a -> b -> a/)
+})
+
+// ---------------------------------------------------------------------------
+// Wiring: WHERE the sync is called from
+// ---------------------------------------------------------------------------
+
+/**
+ * Source-level, because the anti-drift property is entirely about POSITION: the same parsed
+ * component list, the same transaction, the same advisory lock. A sync that is correct in
+ * isolation but called after the transaction commits reintroduces the window it exists to close,
+ * and no behavioural test of the module can see that.
+ */
+async function componentPassBody(): Promise<string> {
+  const src = await readFile(path.join(process.cwd(), 'app/actions/import.ts'), 'utf8')
+  const at = src.indexOf('lockProductSkusForWrite(tx, [cr.sku])')
+  assert.notEqual(at, -1, 'the component pass must take its own lock')
+  const txAt = src.lastIndexOf('await db.$transaction', at)
+  assert.notEqual(txAt, -1, 'it must open its own transaction')
+  const endAt = src.indexOf("if (wrote === 'in-flight-sales')", at)
+  assert.notEqual(endAt, -1, 'the transaction body must end before the outcome handling')
+  return src.slice(txAt, endAt)
+}
+
+test('[o3d-zjsb5.9] the BOM recipe is synced INSIDE the component pass transaction, after the ProductComponent write', async () => {
+  const body = await componentPassBody()
+  const lockAt = body.indexOf('COMPONENT_GRAPH_WRITE_LOCK_KEY')
+  const componentWriteAt = body.indexOf('tx.productComponent.createMany')
+  const bomSyncAt = body.indexOf('syncBomRecipeFromProductComponents(tx')
+  assert.ok(lockAt !== -1, 'the pass must hold the component-graph lock')
+  assert.ok(componentWriteAt !== -1, 'the pass must write ProductComponent')
+  assert.ok(bomSyncAt !== -1, 'the pass must sync the BOM recipe — this is the import path that did not exist')
+  assert.ok(lockAt < bomSyncAt, 'the BOM sync must happen under the graph lock')
+  assert.ok(componentWriteAt < bomSyncAt, 'the BOM sync must mirror the ProductComponent write, not precede it')
+  // `tx`, never `db`: through `db` it would write on a different connection, outside this
+  // transaction and outside the lock, so a rolled-back import would leave the BOM half behind.
+  assert.ok(
+    !/syncBomRecipeFromProductComponents\(db/.test(body),
+    'the sync must run on the transaction client, never the module-level db',
+  )
+})
+
+test('[o3d-zjsb5.9] the sync is fed the SAME parsed component list as ProductComponent', async () => {
+  // The whole anti-drift argument is "one source cell, two writes". A sync given its own parse,
+  // its own column or its own file could disagree, and nothing downstream would notice.
+  const body = await componentPassBody()
+  const call = body.slice(body.indexOf('syncBomRecipeFromProductComponents(tx'))
+  assert.match(call, /components: components\.map\(/, 'the sync must be handed the pass\'s own `components` array')
+})
+
+test('[o3d-zjsb5.9] a refused BOM recipe rolls back the ProductComponent write too', async () => {
+  const body = await componentPassBody()
+  const cycleBranch = body.slice(body.indexOf("bomOutcome.kind === 'cycle'"))
+  assert.match(
+    cycleBranch, /throw new BomRecipeCycleError/,
+    'a cycle must THROW so the transaction aborts — returning would commit half a recipe',
+  )
+  const src = await readFile(path.join(process.cwd(), 'app/actions/import.ts'), 'utf8')
+  assert.match(src, /e instanceof BomRecipeCycleError/, 'the refusal must be reported to the operator, not swallowed')
+  assert.match(src, /result\.skipped\+\+/, 'a refused row must be counted as skipped')
+})
+
+test('[o3d-zjsb5.9] the BOM sync is gated on the type read UNDER the lock', async () => {
+  // The queue decision was made on a pre-lock type. Gating on that would sync a Bom for a product
+  // that is no longer a BOM — a recipe with no possible reader, and drift the check then reports.
+  const body = await componentPassBody()
+  const gate = body.indexOf("current.type === 'BOM'")
+  const syncAt = body.indexOf('syncBomRecipeFromProductComponents(tx')
+  assert.ok(gate !== -1, 'the sync must be gated on `current.type`, the value read under the lock')
+  assert.ok(gate < syncAt, 'the gate must precede the sync')
+})

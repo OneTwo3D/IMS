@@ -755,6 +755,10 @@ model Product {
   // Kit items (this product is a component)
   kitItemsAsComponent KitItem[] @relation("KitItemComponent")
 
+  /// The one Bom this product's manufacturing recipe lives in (o3d-zjsb5.9). Nullable because
+  /// legacy Bom rows predate the claim and because only BOM-typed products ever have one.
+  manufacturingBom Bom? @relation("ProductManufacturingBom")
+
   // Product components: direct component list for KIT / BOM products
   productComponents     ProductComponent[] @relation("ProductHasComponents")
   usedAsComponentIn     ProductComponent[] @relation("ProductUsedAsComponent")
@@ -2240,6 +2244,23 @@ model Bom {
   active      Boolean   @default(true)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+
+  /// THE FINISHED PRODUCT THIS BOM IS THE RECIPE FOR (o3d-zjsb5.9).
+  ///
+  /// Before this column existed, "the BOM for product X" could only be asked as
+  /// `bom.findFirst({ where: { items: { some: { parentProductId: X } } } })` — which is what
+  /// `createManufacturingOrder` and `createReorderMOs` still do. That question has no unique
+  /// answer: nothing stopped two Bom rows carrying items for the same parent, and the two
+  /// readers broke the tie differently (first-found vs most-recently-updated). An importer
+  /// that has to REWRITE a recipe cannot work against an ambiguous target, and a consistency
+  /// check against ProductComponent cannot either — it would be checking an arbitrary one of
+  /// several candidates, which is the "sound check, wrong subject" failure.
+  ///
+  /// Nullable + UNIQUE, not required: legacy rows predate the claim, and a Bom may still be
+  /// created by hand for a product that already has one claimed elsewhere. The importer CLAIMS
+  /// the Bom it adopts, so the unique index is what makes a second claimed recipe impossible.
+  productId   String?   @unique
+  product     Product?  @relation("ProductManufacturingBom", fields: [productId], references: [id])
 
   items       BomItem[]
   productionOrders ProductionOrder[]

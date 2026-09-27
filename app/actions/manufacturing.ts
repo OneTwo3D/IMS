@@ -374,25 +374,45 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
 
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
 
-    // Find or create a BOM record for this product
-    let bom = await db.bom.findFirst({
-      where: { items: { some: { parentProductId: input.productId } } },
+    // Find or create a BOM record for this product.
+    //
+    // o3d-zjsb5.9: the CLAIM (`Bom.productId`) is consulted first and set on whatever this path
+    // resolves to. Before the claim existed this was `findFirst` on an unordered, non-unique
+    // predicate, so with two Bom rows listing the same parent this path and `createReorderMOs`
+    // (which orders by `updatedAt desc`) could pick DIFFERENT recipes for the same product.
+    // Claiming here means the lazy create no longer leaves a row the importer would have to guess
+    // about later — the importer adopts a claimable row rather than adding a second one.
+    let bom = await db.bom.findUnique({
+      where: { productId: input.productId },
       select: { id: true },
     })
     if (!bom) {
-      bom = await db.bom.create({
-        data: {
-          name: `${product.sku} BOM`,
-          items: {
-            create: product.productComponents.map((c, i) => ({
-              parentProductId: input.productId,
-              componentProductId: c.componentId,
-              qty: c.qty,
-              sortOrder: i,
-            })),
-          },
-        },
+      const adoptable = await db.bom.findFirst({
+        where: { productId: null, items: { some: { parentProductId: input.productId } } },
+        orderBy: { updatedAt: 'desc' },
+        select: { id: true },
       })
+      bom = adoptable
+        ? await db.bom.update({
+          where: { id: adoptable.id },
+          data: { productId: input.productId },
+          select: { id: true },
+        })
+        : await db.bom.create({
+          data: {
+            name: `${product.sku} BOM`,
+            productId: input.productId,
+            items: {
+              create: product.productComponents.map((c, i) => ({
+                parentProductId: input.productId,
+                componentProductId: c.componentId,
+                qty: c.qty,
+                sortOrder: i,
+              })),
+            },
+          },
+          select: { id: true },
+        })
     }
 
     const reference = makeReference()

@@ -4,6 +4,22 @@ Manufacturing orders let you assemble finished products from their components or
 
 BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
 
+## Where a recipe comes from
+
+A recipe can be entered on the product page or loaded in bulk through the products CSV's
+`components` column — see [Importing manufacturing recipes](inventory.md#importing-manufacturing-recipes-bom).
+
+IMS holds each recipe in two places. One copy is what a build order consumes; the other is what
+**planning** reads — the replenishment report's component-demand explosion, automatic reorder build
+orders, and manufacturing analytics. Both are written together by the product form and by the CSV
+import, so they normally agree.
+
+They can still fall out of step for recipes created before this was true, or edited directly in the
+database. The symptom is quiet: the product builds fine one order at a time, but the reorder report
+never suggests building it and its components are never reordered on its behalf. To check, open
+`/api/export/bom-recipes?drift=1` or run `npm run check:bom-recipes`; to repair, re-import the
+product through the products CSV.
+
 ## Lifecycle status and manufacturing
 
 The BOM product's [lifecycle status](glossary.md#lifecycle-status) controls which manufacturing operations are allowed:

@@ -89,6 +89,26 @@ npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                         
 npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
 
+A third, **opt-in and explicitly invoked** file lives outside every glob: `tests/manual/`. Nothing
+collects it, so it can drive real server actions against a real database without making `test:unit`
+need one.
+
+```bash
+# o3d-zjsb5.9 — proves a migrated BOM recipe is USABLE, not merely present: both representations
+# written by one import, the drift check going red and green again, the refusals (unknown component,
+# cycle, row cap), and a production order completed against the migrated Bom.
+BOM_VERIFY_SCRATCH_DB=<your scratch db> npx tsx --test --experimental-test-module-mocks \
+  tests/manual/bom-recipe-import-e2e.ts
+```
+
+It refuses to start unless the connected database is named in `BOM_VERIFY_SCRATCH_DB`, carries the
+`db:stamp-scratch` disposability comment for that name, and is not `onetwo3d_ims_dev` — all three
+checked on a read-only query before anything writes.
+
+`npm run check:bom-recipes` is the read-only half of the same thing, runnable against any database:
+it reports every disagreement between `product_components` and `bom_items` and exits non-zero when
+it finds one. It is deliberately NOT in `check:all`, which must run with no database at all.
+
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows — and several of its files install DDL or disable triggers — into
 whatever database the URL reaches. So EVERY file in the tier refuses to start (o3d-yvn8), before it is

@@ -56,6 +56,60 @@ Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales O
 
 These rules apply consistently across every CSV import in the app — if a screen has a Templates menu next to its Import button, the template, the guidance row, and the empty-cell behaviour all work the same way.
 
+**Row and file limits.** Every CSV importer accepts at most **10,000 rows** and **10 MB** per file.
+A file over 10 MB is refused outright and nothing is imported. A file with more than 10,000 rows is
+**not** refused — the first 10,000 rows are imported and the rest are dropped, with a single error
+line reading `File has more than 10000 rows — N row(s) skipped`. That line is the only notice you
+get, so check the import result rather than assuming a large file loaded whole. Split a larger
+catalogue into several files, and put a product's components in the same file as the product
+wherever you can (see below for what happens when you cannot).
+
+
+### Importing manufacturing recipes (BOM)
+
+A manufactured product's recipe rides in the products CSV's **`components`** column, in the form
+`COMPONENT-SKU:qty;OTHER-SKU:qty`. It is the same column Kits use, and on a `BOM`-type row it is
+what makes the product manufacturable.
+
+IMS keeps that recipe in two places, for two different sets of readers, and **the products CSV
+writes both in one step**: the fulfilment/consumption copy that build orders consume, and the
+planning copy that replenishment reports, reorder-MO generation and manufacturing analytics read.
+This matters because until both exist, a manufactured product is *sellable but invisible to
+planning* — nothing fails, the reorder report simply never suggests building it.
+
+Rules for the `components` column:
+
+- **Every component must exist as a product.** It can be created earlier in the same file, later in
+  the same file, or already be in IMS — order within one file does not matter, because components are
+  resolved after every row has been read. What does matter is that a component in *another* file
+  must be imported **first**.
+- **An unknown component SKU refuses the whole recipe for that row, not just that line.** You get
+  `Row N: component SKU "X" not found`, and the product is still created or updated — with **no
+  recipe at all**. This is the failure worth watching for: it does not stop the import, and a BOM
+  with no recipe looks perfectly normal on the product page. Re-import the row once the component
+  exists. A partial recipe is never written, which is deliberate: a recipe missing one component
+  would produce under-picked builds and mis-picked orders that nothing reports.
+- **A circular recipe is refused.** A product cannot be a component of itself, directly or through a
+  chain. Both the fulfilment copy and the planning copy are checked, and a refusal writes neither.
+- **A BOM recipe can be re-imported at any time**, regardless of open sales orders — see the BOM
+  section below for why. A **Kit** recipe cannot, while orders are in flight against it.
+- Leaving `components` blank leaves an existing recipe alone. It does not clear it.
+
+**Checking that both copies agree.** Nothing in the database forces them to stay in step, so there
+is an explicit check:
+
+- `GET /api/export/bom-recipes` — the manufacturing recipes as IMS holds them, with a `bomClaimed`
+  column. A row with `bomClaimed=FALSE` came from somewhere other than an import and is **not**
+  maintained by it.
+- `GET /api/export/bom-recipes?drift=1` — every disagreement between the two copies, one row per
+  problem, with a plain-English `detail`.
+- `GET /api/export/bom-recipes?template=1` — a minimal worked example of the three columns a recipe
+  needs; import it through the **products** importer, not a separate one.
+- `npm run check:bom-recipes` — the same check from the command line. It exits non-zero when
+  anything disagrees, so it can gate a data load.
+
+Repair in every case is the same: re-import the affected products through the products CSV.
+
 
 ## Creating a Product
 
@@ -157,7 +211,8 @@ Two limits worth knowing:
 
 A product that is manufactured from components. Unlike a Kit, a BOM product holds its own stock. Components are consumed during a build order, and the finished product's stock increases.
 
-Use the component search to define the bill of materials, specifying the quantity of each component consumed per unit produced.
+Use the component search to define the bill of materials, specifying the quantity of each component consumed per unit produced. To load recipes in bulk, use the products CSV's `components` column — see
+**Importing manufacturing recipes (BOM)** above.
 
 **A BOM's component list can be edited at any time**, regardless of open sales orders. Fulfilment
 treats a BOM as a stocked item and never expands its components, so changing the recipe cannot alter
