@@ -1214,6 +1214,30 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/cogs-e2e-fixture.ts': 'operator-run-write',
   'scripts/copy-tax-rates.ts': 'operator-run-write',
   'scripts/csv-import-e2e-fixture.ts': 'operator-run-write',
+  // o3d-zjsb5.9 r10. THE duplicate-recipe repair an operator runs when an import is refused because a
+  // second ACTIVE Bom holds recipe lines for the same product. Classified for what it DOES, read
+  // rather than inferred from its name: it opens the app's pooled client and WRITES APPLICATION ROWS
+  // OUTSIDE ANY REQUEST — `boms.active` for one id, plus one `activity_logs` row — inside a single
+  // transaction. That is the honest label; it is an operator-run write, not a probe and not read-only.
+  //
+  // WHAT IT MAY WRITE, and what it must REFUSE: it deactivates ONE `Bom` by id and never deletes a
+  // `BomItem` (completed production orders are valued through `order.bom.items`). It refuses, writing
+  // nothing, when that Bom is a product's CLAIMED recipe, or is the LAST active recipe of any other
+  // BOM-typed parent — either would make that product silently unplannable, which is the o3d-zjsb5.29
+  // defect the refusal it serves exists to prevent. The refusals are the load-bearing part and each is
+  // pinned by a mutation in tests/concurrency/bom-recipe-import.concurrent.test.ts.
+  //
+  // CAN IT HIT A LIVE DATABASE BY ACCIDENT? It can be POINTED at one — that is its purpose — so it is
+  // loud instead of restricted: before writing it prints the server's own `current_database()`, host,
+  // port and user, and says whether the database carries the disposable-scratch stamp. It reports the
+  // SERVER'S answer rather than echoing `DATABASE_URL`, because the URL is the thing that lies (a
+  // socket-form URL losing its `?host=` retargets the shared cluster). `--dry-run` computes the real
+  // outcome in a transaction and throws it away. The database name also lands in the audit row.
+  //
+  // For THIS test's property: it takes no plugin selection lock and writes no plugin key. It does take
+  // COMPONENT_GRAPH_WRITE_LOCK_KEY, the same advisory lock every other writer of that graph takes, so
+  // unlike most of this group it is safe beside a running app.
+  'scripts/deactivate-duplicate-bom.ts': 'operator-run-write',
   'scripts/find-aliased-purchase-bills.ts': 'operator-run-read',
   'scripts/generate-xero-demo-template.ts': 'operator-run-read',
   'scripts/invariant-check-preflight-fixture.ts': 'operator-run-write',

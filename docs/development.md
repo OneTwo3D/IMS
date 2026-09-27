@@ -109,6 +109,37 @@ checked on a read-only query before anything writes.
 it reports every disagreement between `product_components` and `bom_items` and exits non-zero when
 it finds one. It is deliberately NOT in `check:all`, which must run with no database at all.
 
+`npm run repair:duplicate-bom` is the WRITE half, and the only supported way to clear a duplicate
+active recipe. IMS refuses to write a product's recipe while a second *active* `Bom` holds recipe
+lines for the same product, because planning sums every active recipe and would over-order — so
+without this the refusal blocks that product's import, component edit and build orders with no
+in-application remedy, which is what round 9 of PR #714 caught.
+
+```bash
+npm run repair:duplicate-bom -- --list                # what is duplicated, and the id to pass
+npm run repair:duplicate-bom -- --bom <id> --dry-run  # what would happen; writes nothing
+npm run repair:duplicate-bom -- --bom <id>            # deactivate it; recipe LINES ARE KEPT
+```
+
+It **deactivates, never deletes** — `manufacturing-analytics.ts` values completed production orders
+through `order.bom.items`, so deleting would rewrite history. It **refuses (exit 2)** when the BOM is
+a product's claimed recipe, or is the last active recipe of another BOM-typed product, because
+deactivating in either case makes that product silently unplannable. It takes the component-graph
+lock, logs itself to `activity_logs` (including which database it ran against), and is safe to re-run.
+
+Before it writes anything it prints the target database from the **server's own** `current_database()`,
+with host, port, user, and whether the database carries the `db:stamp-scratch` disposability comment:
+
+```
+TARGET DATABASE: onetwo3d_ims_dev  (host 127.0.0.1/32:5432, user ims)
+  This database is NOT stamped disposable. Treat it as REAL DATA.
+```
+
+It reports the server's answer rather than echoing `DATABASE_URL`, because the URL is the part that can
+lie — a socket-form URL that loses its `?host=` silently retargets the shared cluster. It does not refuse
+an unstamped database (repairing real data is the point); it is loud so an operator who sees the wrong
+name can stop before the write.
+
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows — and several of its files install DDL or disable triggers — into
 whatever database the URL reaches. So EVERY file in the tier refuses to start (o3d-yvn8), before it is

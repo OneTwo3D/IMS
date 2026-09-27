@@ -1,6 +1,8 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
+import { execFile } from 'node:child_process'
 import test, { mock } from 'node:test'
+import { promisify } from 'node:util'
 import { config } from 'dotenv'
 
 /**
@@ -204,6 +206,38 @@ async function driftForThisTest(deps: Deps, ns: string) {
  * this before and after. `qty` is stringified because Prisma hands back Decimal objects that
  * `deepEqual` compares by identity rather than value.
  */
+/**
+ * RUNS THE OPERATOR'S ACTUAL COMMAND, in a child process, against this test's scratch database.
+ *
+ * Round 9's finding was that the duplicate refusal named a remedy the application could not perform,
+ * and that the test "resolves the condition with a direct database update" -- proving the refusal
+ * clears, not that anybody can clear it. So this shells out to the real script with the real argv and
+ * asserts on its real exit code. A `deactivateDuplicateBomRecipe()` call from in-process would have
+ * skipped exactly the parts an operator depends on: argument parsing, the dry-run path, the exit
+ * codes, and whether the thing is wired into package.json at all.
+ *
+ * DATABASE_URL is passed explicitly because the child loads its own `.env` files; without this it
+ * would faithfully repair whatever database the developer's `.env.local` points at.
+ */
+async function runRepairScript(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  const execFileAsync = promisify(execFile)
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      'npx',
+      ['tsx', 'scripts/deactivate-duplicate-bom.ts', ...args],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
+        timeout: 120_000,
+      },
+    )
+    return { code: 0, stdout, stderr }
+  } catch (error) {
+    const failure = error as { code?: number; stdout?: string; stderr?: string }
+    return { code: failure.code ?? 1, stdout: failure.stdout ?? '', stderr: failure.stderr ?? String(error) }
+  }
+}
+
 async function snapshotRecipe(deps: Deps, productId: string, bomId: string) {
   const bom = await deps.db.bom.findUniqueOrThrow({
     where: { id: bomId }, select: { active: true, productId: true },
@@ -658,17 +692,164 @@ test(
       'and must not have committed the new ProductComponent qty either',
     )
 
-    // AND IT CLEARS: deactivating the duplicate (keeping its rows) lets the same import through.
-    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+    // AND IT CLEARS -- THROUGH THE REAL REMEDY, not a database write (round 10).
+    //
+    // This previously did `db.bom.update({ active: false })`, which proved the refusal CLEARS but not
+    // that an operator can clear it. That was the round-9 finding: the refusal named a remedy the
+    // application could not perform, so an affected product was blocked until somebody hand-edited
+    // production data. The fix is a command, so the test runs THE COMMAND -- same argv an operator
+    // types, same exit code, against this test's own scratch database.
+    const dryRun = await runRepairScript(['--bom', duplicate.id, '--dry-run'])
+    assert.equal(dryRun.code, 0, `the dry run must succeed: ${dryRun.stderr}`)
+    assert.match(dryRun.stdout, /DRY RUN/, 'and must say it wrote nothing')
+    // IT MUST NAME THE DATABASE IT IS ABOUT TO CHANGE, from the SERVER's own answer. An operator runs
+    // this by hand during a load window, and this repo has twice been bitten by DATABASE_URL not
+    // resolving where someone believed (a probe table in the gate's scratch database; a socket-form URL
+    // losing `?host=` and retargeting the shared cluster). Asserted on the real scratch database name,
+    // so a banner that printed a constant or echoed the URL would not satisfy it.
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.ok(scratchDatabase.length > 0, 'precondition: the tier must tell us which database it gave us')
+    assert.ok(
+      dryRun.stderr.includes(scratchDatabase),
+      `the command must announce the database it is connected to (expected ${scratchDatabase}), `
+      + `got: ${dryRun.stderr}`,
+    )
+    assert.match(
+      dryRun.stderr, /STAMPED DISPOSABLE/,
+      'and must say whether it is a scratch database -- this one is stamped, so it must say so',
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true,
+      'and a DRY RUN must genuinely not have deactivated it -- otherwise --dry-run is a lie',
+    )
+
+    const repair = await runRepairScript(['--bom', duplicate.id])
+    assert.equal(repair.code, 0, `the repair command must succeed: ${repair.stderr}`)
+    assert.match(repair.stdout, /Deactivated BOM/, `and must say what it did, got: ${repair.stdout}`)
+    // And the audit row records WHICH database, because "was that done on stage or production?" is the
+    // question asked afterwards about a hand-run repair.
+    const audit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: duplicate.id } },
+      select: { description: true, metadata: true },
+      orderBy: { createdAt: 'desc' },
+    })
+    assert.equal(
+      (audit.metadata as { database?: string } | null)?.database, scratchDatabase,
+      'the audit row must record the database the repair ran against',
+    )
+
     assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
       'sku,name,type,components,stockUnit',
       `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'LEG')}:7;${sku(NS, 'RAW')}:2,each`,
-    ]))), [], 'once the duplicate is deactivated the same import must succeed')
+    ]))), [], 'and after running the documented remedy the same import must succeed')
+
+    // Re-running it is safe: an operator who is not sure whether it worked must not be punished.
+    const again = await runRepairScript(['--bom', duplicate.id])
+    assert.equal(again.code, 0, 'the command must be safe to re-run')
+    assert.match(again.stdout, /already inactive/i, 'and should say so rather than pretending to act')
     assert.ok(
       (await deps.db.bomItem.findMany({ where: { bomId: duplicate.id } })).length > 0,
       'and the duplicate\'s ROWS must still be there -- deactivate, never delete, so history resolves',
     )
     void rawId
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r10] the repair command REFUSES to deactivate a recipe another product depends on',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * THE REMEDY MUST NOT BECOME THE DEFECT. "Deactivate this Bom" is not always safe: a Bom row can be
+     * a product's CLAIMED recipe, and one row can legitimately carry items for SEVERAL parents. Either
+     * way, deactivating it makes a BOM-typed product silently unplannable -- which is precisely the
+     * o3d-zjsb5.29 defect the duplicate refusal exists to prevent, moved to a different product.
+     *
+     * Both refusals are driven through the real command and asserted on its exit code (2) and on the
+     * database being unchanged, because a repair tool that reports a refusal and writes anyway is worse
+     * than no tool.
+     */
+    const deps = await loadDeps()
+    const NS = 'L'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+
+    // ARM 1: the product's own CLAIMED recipe. Refusing this is what stops an operator reaching for the
+    // command when the real answer is to change the product's type.
+    const claimed = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const claimedRefusal = await runRepairScript(['--bom', claimed.id])
+    assert.equal(claimedRefusal.code, 2, `a claimed recipe must be REFUSED, got: ${claimedRefusal.stderr}`)
+    assert.match(claimedRefusal.stderr, /live recipe of/i, 'and must say whose recipe it is')
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: claimed.id }, select: { active: true } })).active,
+      true,
+      'and must NOT have deactivated it',
+    )
+
+    // ARM 2: an unclaimed Bom that is the ONLY active recipe of a DIFFERENT BOM-typed parent. LEG becomes
+    // a BOM whose recipe lives solely in this row, so deactivating it would take LEG out of planning.
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'BOM' } })
+    const soleForLeg = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} sole recipe for leg`, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: soleForLeg.id, parentProductId: legId,
+        componentProductId: (await deps.db.product.findUniqueOrThrow({
+          where: { sku: sku(NS, 'RAW') }, select: { id: true },
+        })).id,
+        qty: 1, sortOrder: 0,
+      },
+    })
+    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id])
+    assert.equal(soleRefusal.code, 2, `the sole active recipe of another parent must be REFUSED, got: ${soleRefusal.stderr}`)
+    assert.match(soleRefusal.stderr, /only active recipe for/i, 'and must name the product it would strand')
+    assert.ok(
+      soleRefusal.stderr.includes(sku(NS, 'LEG')),
+      `and name it by SKU so the operator can act, got: ${soleRefusal.stderr}`,
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: soleForLeg.id }, select: { active: true } })).active,
+      true,
+      'and must NOT have deactivated it',
+    )
+
+    // ...but once LEG has another active recipe, the same row is no longer load-bearing and CLEARS.
+    const secondForLeg = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} second recipe for leg`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: secondForLeg.id, parentProductId: legId,
+        componentProductId: (await deps.db.product.findUniqueOrThrow({
+          where: { sku: sku(NS, 'RAW') }, select: { id: true },
+        })).id,
+        qty: 1, sortOrder: 0,
+      },
+    })
+    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id])
+    assert.equal(nowAllowed.code, 0,
+      `once another active recipe exists the refusal must LIFT, got: ${nowAllowed.stderr}`)
+    // And the items are KEPT -- deactivate, never delete, so completed build orders still value.
+    assert.ok(
+      (await deps.db.bomItem.findMany({ where: { bomId: soleForLeg.id } })).length > 0,
+      'and its recipe lines must still be there',
+    )
+    // An audit row must exist: this is a deliberate change to production data made outside the UI.
+    assert.ok(
+      (await deps.db.activityLog.findMany({
+        where: { tag: 'manufacturing', description: { contains: soleForLeg.id } },
+        select: { id: true },
+      })).length > 0,
+      'and the repair must be logged',
+    )
+
+    // Tidy up so a live cycle/duplicate is not left for sibling files (the lesson from round 6).
+    await deps.db.bom.update({ where: { id: secondForLeg.id }, data: { active: false } })
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
   },
 )
 

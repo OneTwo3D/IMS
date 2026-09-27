@@ -21,6 +21,7 @@
     "check:fulfillment-requirement-seam": "node scripts/check-fulfillment-requirement-seam.mjs",
     "check:all": "npm run check:decimal-boundaries && npm run check:connector-fetch-boundaries && npm run check:wms-connector-boundary && npm run check:migration-conventions && npm run check:documented-env-vars && npm run check:wc-sync-row-predicates && npm run check:fulfillment-requirement-seam && npm run check:server-action-guards",
     "check:bom-recipes": "tsx scripts/check-bom-recipe-consistency.ts",
+    "repair:duplicate-bom": "tsx scripts/deactivate-duplicate-bom.ts",
     "db:stamp-scratch": "tsx scripts/stamp-scratch-database.ts",
     "db:unstamp-scratch": "tsx scripts/stamp-scratch-database.ts --unstamp",
     "test:concurrency": "RUN_DB_CONCURRENCY_TESTS=1 tsx --test --experimental-test-module-mocks --import ./tests/no-outbound-network.cjs --import ./tests/concurrency/scratch-database-preload.mts \"tests/concurrency/**/*.test.ts\"",

@@ -114,6 +114,20 @@ names the duplicate recipes. This is deliberate: planning adds up the components
 so it would over-order for that product. Deactivate the duplicates (keep them, so past build orders
 still report correctly), leave one as the live recipe, and re-run the import.
 
+To do that, ask whoever administers the system to run the repair command — there is no button for it,
+because a stray duplicate recipe is a data-migration leftover rather than something you create in
+normal use:
+
+```
+npm run repair:duplicate-bom -- --list                # shows the duplicates and their ids
+npm run repair:duplicate-bom -- --bom <id> --dry-run  # says what would happen, changes nothing
+npm run repair:duplicate-bom -- --bom <id>            # deactivates it, keeping its recipe lines
+```
+
+It will refuse if the recipe it is asked to deactivate is a product's live recipe, or the only active
+recipe another product has — in those cases nothing is changed and it tells you which product is in
+the way.
+
 **A retired recipe is not a disagreement.** The check only reports a circular recipe that *planning
 can actually reach* — an active recipe whose product is still a BOM. Retiring a recipe keeps its lines
 on purpose (see **Changing a product's type** below), so a retired line pointing back at a product
