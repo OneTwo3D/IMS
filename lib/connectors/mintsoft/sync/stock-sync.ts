@@ -38,8 +38,7 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import {
-  lockPurchaseOrderCostRows,
-  lockPurchaseOrders,
+  lockPurchaseOrdersWithCostRows,
   lockStockTransfers,
   lockWmsAsnLineMaps,
   lockWmsAsnMaps,
@@ -1446,15 +1445,11 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // rows locked here are exactly `computeGrossUnitCostBaseByLine`'s inputs, the primary orders' and
     // the linked freight orders' alike, in the sub-order
     // app/actions/purchase-orders.ts:2919-2921 already uses.
-    const lockedPurchaseOrderIds = new Set(await lockPurchaseOrders(tx, [
+    // ONE call, so the parent-then-children order is not this caller's to get right (o3d-6nd55 r3).
+    const lockedPurchaseOrderIds = new Set(await lockPurchaseOrdersWithCostRows(tx, [
       ...discovery.parentPurchaseOrderIds,
       ...discovery.linkedFreightPurchaseOrderIds,
     ]))
-    await lockPurchaseOrderCostRows(
-      tx,
-      [...discovery.parentPurchaseOrderIds, ...discovery.linkedFreightPurchaseOrderIds],
-      lockedPurchaseOrderIds,
-    )
     await lockWmsAsnMaps(tx, discovery.asnMapIds)
     // STEP 4 COVERS EVERY ROW DISCOVERY SAW, NOT JUST THE USABLE ONES (6oyu.19,
     // Codex round-13 MEDIUM-1). Rounds 10-12 locked `discovery.candidates`, and the

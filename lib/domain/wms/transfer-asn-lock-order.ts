@@ -65,9 +65,70 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * THE TWO COST-ROW TABLES AT STEP 2 ARE NOT A NEW ORDER — THEY ARE AN EXISTING ONE, WRITTEN DOWN
  * (o3d-6nd55 r2). `app/actions/purchase-orders.ts` already locks exactly
  * `purchase_orders` → `purchase_order_lines` → `freight_cost_lines`, in that sequence, in both of its
- * invoicing transactions (:2919-2921 and :3305-3308). Recording it here rather than inventing a
- * different one is the whole point: a fifth path claiming an order the existing four do not obey is
- * the failure mode this module exists to prevent.
+ * invoicing transactions (:2919-2921 and :3305-3308).
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * AND HERE IS THE CENSUS, BECAUSE TWO EXAMPLES WERE NOT ENOUGH (o3d-6nd55 r3, Codex round-3 HIGH)
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * Round 2 took the sub-order from those two invoicing transactions rather than inventing one, and
+ * checked it did not invert against the ASN row locks or the posting key. That was the right instinct
+ * and it was still not enough, because A LOCK ORDER IS A PROPERTY OF EVERY PARTICIPANT, NOT OF THE
+ * ONES YOU COPIED FROM. Round 3 found THREE writers taking the children BEFORE the parent, each of
+ * which could deadlock against a PO-backed alignment: PostgreSQL then aborts one side, failing either
+ * an operator's edit or a SKU's alignment.
+ *
+ * THE INVERSION SIGNATURE IS NARROW, and it is worth knowing which writers are even candidates: a
+ * transaction deadlocks against this order only if it acquires a CHILD row and LATER wants the PARENT.
+ * A writer that takes only children, or only the parent, can block and be blocked but cannot form a
+ * cycle. So the census below records, for every writer of these three tables, whether it has that
+ * signature.
+ *
+ * WRITERS OF `purchase_orders`, `purchase_order_lines`, `freight_cost_lines` (census 2026-09-27):
+ *
+ *   PARENT FIRST — correct, and the order this module documents:
+ *     · app/actions/purchase-orders.ts:2919-2921  invoicing — parent, lines, freight lines
+ *     · app/actions/purchase-orders.ts:3305-3308  invoice edit — invoice, parent, invoice lines,
+ *                                                 lines, freight lines
+ *     · app/actions/purchase-orders.ts:1825       `receiveStock` — parent, then lines (:2003)
+ *     · app/actions/purchase-orders.ts:1628       parent, then its own writes
+ *     · app/actions/purchase-orders.ts:4264       `updateFreightPoCosts` — FIXED IN r3; it used to
+ *                                                 delete cost lines first (see below)
+ *     · app/actions/supplier-portal.ts:315        parent FOR UPDATE, then lines (:362), then parent
+ *     · app/actions/mintsoft-sync.ts:3031, :3388  parent, then the ASN rows
+ *     · lib/domain/purchasing/cancellation-service.ts:117  parent only
+ *     · lib/domain/wms/booked-in-service.ts       parent at step 2 (`assertParentIsLocked`), then
+ *                                                 lines (:1135)
+ *     · lib/connectors/mintsoft/sync/stock-sync.ts  alignment — this helper, at step 2
+ *
+ *   CHILDREN THEN PARENT — the deadlock signature. All three FIXED in r3 by taking
+ *   `lockPurchaseOrdersWithCostRows` first:
+ *     · app/actions/purchase-orders.ts `updateFreightPoCosts`  deleted `freight_cost_lines` (:4270)
+ *       and only then updated the freight order (:4300). THIS IS THE ONE ROUND 3 REPORTED. It also
+ *       runs `recalculateLandedCosts`, which rewrites every LINKED PRIMARY order's lines, so the fix
+ *       locks the primaries too — otherwise the same cycle exists one order over.
+ *     · app/actions/purchase-orders.ts `createPurchaseReturn`  locked `purchase_order_lines` (:2358)
+ *       and later updated the parent (:2464).
+ *     · lib/domain/purchasing/purchase-order-fx-rebase.ts  updated lines (:109) and freight lines
+ *       (:117) and only then the parent (:136), inside one transaction.
+ *
+ *   NOT DEADLOCK PARTICIPANTS, and why:
+ *     · app/actions/purchase-orders.ts `updatePurchaseOrder` (:1391, :1442, :1471, :1492, and its
+ *       parent update) runs on the POOLED client, NOT in a transaction, so every statement autocommits
+ *       and it never holds one lock while waiting for another. (It is therefore also not ATOMIC — a
+ *       failure between the delete and the create loses the lines. Pre-existing, out of scope here, and
+ *       deliberately not folded into a lock-ordering change.)
+ *     · lib/domain/purchasing/landed-cost-service.ts:1184, :1540 — takes NO row locks at all, so it is
+ *       BLOCKED by this order rather than cooperating with it, and cannot form a cycle. Two concurrent
+ *       recalculations therefore order themselves on nothing: tracked as o3d-t3mbr.
+ *     · app/actions/purchase-orders.ts:2449 and the supplier-return line writes — covered by the
+ *       `createPurchaseReturn` entry above.
+ *     · lib/data-retention.ts, app/actions/forecasting.ts — parent only, or newly created rows.
+ *     · app/actions/reset.ts — `deleteMany({})` over everything; a destructive dev reset, not a
+ *       concurrent participant.
+ *
+ * IF A FIFTH WRITER APPEARS, add it to this census and call
+ * `lockPurchaseOrdersWithCostRows` — which exists precisely so the inversion cannot be written.
  *
  * WHAT LOCKING THEM BUYS, precisely. `computeGrossUnitCostBaseByLine` — the one definition of what a
  * receipt's units cost — reads `purchase_order_lines` (goods cost, qty, totalBase) and the
@@ -81,8 +142,9 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * lib/domain/purchasing/landed-cost-service.ts contains no `FOR UPDATE`). They are therefore
  * BLOCKED by these locks rather than cooperating with them, which is enough for mutual exclusion in
  * one direction but means two concurrent recalculations still order themselves on nothing. Making the
- * recalc paths take this lock is filed separately; it is a change to four call sites and not to a
- * receipt.
+ * recalc paths take this lock is filed separately (o3d-t3mbr); it is a change to four call sites and
+ * not to a receipt. Note that their CALLERS now hold the lock in the three cases r3 fixed, so a recalc
+ * reached through `updateFreightPoCosts` is covered by its caller's acquisition.
  *
  * `wms_asn_maps` IS IN THE ORDER because booked-in-service updates the ASN header
  * after its line rows while the transfer-ASN `finalizePendingAsn`
@@ -102,8 +164,13 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * re-read away: a row whose parent was not in the locked set at all.
  */
 
-/** The minimum client these helpers need. */
-type LockClient = Pick<Prisma.TransactionClient, '$queryRaw'>
+/**
+ * The minimum client these helpers need. EXPORTED (o3d-6nd55 r3) so a module with its own
+ * structural transaction type can declare that it is able to take these locks, rather than a
+ * caller taking them on its behalf and the ordering guarantee drifting back out of the helper.
+ */
+export type PurchaseOrderLockClient = Pick<Prisma.TransactionClient, '$queryRaw'>
+type LockClient = PurchaseOrderLockClient
 
 /** Ascending, de-duplicated — the within-step order that makes peers queue. */
 function sortedUnique(ids: ReadonlyArray<string>): string[] {
@@ -146,39 +213,40 @@ export async function lockPurchaseOrders(
 }
 
 /**
- * STEPS 2c and 2d — `purchase_order_lines`, then `freight_cost_lines`, for the named orders.
+ * STEPS 2b, 2c AND 2d IN ONE CALL — `purchase_orders`, then `purchase_order_lines`, then
+ * `freight_cost_lines`, for the named orders.
  *
- * TAKE THIS WHENEVER A COST READ WILL BECOME A COST LAYER OR A JOURNAL (o3d-6nd55 r2). The rows it
- * locks are exactly the inputs of `computeGrossUnitCostBaseByLine`: the goods lines of the order and
- * the freight cost lines of the order and of every freight order linked to it. Pass the PRIMARY order
- * ids AND the linked freight order ids — a freight order's cost lines hang off the freight order, so
- * an unlocked freight order is an unlocked input.
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
+ * IT IS ONE FUNCTION SO THE ORDER CANNOT BE GOT WRONG (o3d-6nd55 r3, Codex round-3 HIGH).
+ * ═══════════════════════════════════════════════════════════════════════════════════════════
  *
- * `lockPurchaseOrders` (step 2b) must already have been taken over the same id set: this is the
- * sub-order `app/actions/purchase-orders.ts` uses in both invoicing transactions (:2919-2921,
- * :3305-3308), and the assertion below is what stops a caller taking the children first.
+ * Round 2 exported the parent lock and the cost-row lock SEPARATELY and documented that callers must
+ * take them in that sequence. A documented sequence is a sequence somebody can take backwards, and
+ * round 3 found three writers that already did — see the census in this module's header. The parent
+ * and its cost rows are now acquired by ONE function in ONE fixed order, so a caller cannot express
+ * the inversion: there is no exported way to lock the cost rows without first locking their parent.
  *
- * Locked by `"poId"` rather than by row id, because the point is to cover every cost row the orders
- * HAVE, including one inserted after the caller read them — a row-id list read beforehand could not
- * name an insert. Ordered by id within each statement so two callers at this step queue rather than
- * cross.
+ * That is the same move this branch made for the cancelled-freight predicate, where two literal
+ * copies became one definition and two derivations. A rule with one implementation cannot drift.
+ *
+ * Pass every order whose cost rows will be READ OR WRITTEN — for a freight-cost edit that means the
+ * freight order AND every primary order the recalculation will reach, because those primaries' lines
+ * are what it rewrites. `freight_cost_lines` hang off whichever order carries them, so an unlocked
+ * order is an unlocked input.
+ *
+ * Locked by `"poId"` for the children rather than by row id, because the point is to cover every cost
+ * row the orders HAVE, including one inserted after the caller read them — a row-id list read
+ * beforehand could not name an insert. Ordered by id within each statement so two callers at this step
+ * queue rather than cross.
  */
-export async function lockPurchaseOrderCostRows(
+export async function lockPurchaseOrdersWithCostRows(
   tx: LockClient,
   purchaseOrderIds: ReadonlyArray<string>,
-  lockedPurchaseOrderIds: ReadonlySet<string>,
 ): Promise<string[]> {
-  const ids = sortedUnique(purchaseOrderIds)
+  const ids = await lockPurchaseOrders(tx, purchaseOrderIds)
   if (ids.length === 0) return ids
-  const unlocked = ids.filter((id) => !lockedPurchaseOrderIds.has(id))
-  if (unlocked.length > 0) {
-    throw new Error(
-      'lockPurchaseOrderCostRows: step 2c/2d was reached for purchase order'
-      + `${unlocked.length === 1 ? '' : 's'} ${unlocked.join(', ')} without step 2b. Take `
-      + 'lockPurchaseOrders over the same id set first — the parent before its cost rows is the order '
-      + 'app/actions/purchase-orders.ts already uses (o3d-6nd55).',
-    )
-  }
+  // THE PARENT IS ALREADY HELD by the line above — that is the whole reason these two statements are
+  // not separately callable.
   await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
   await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
   return ids

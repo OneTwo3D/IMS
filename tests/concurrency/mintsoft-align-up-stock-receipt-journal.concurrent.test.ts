@@ -4,6 +4,7 @@ import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 import * as realAccountingNs from '@/lib/accounting'
 import * as realTransitNs from '@/lib/domain/accounting/transit-subledger-movement'
+import * as realLockOrderNs from '@/lib/domain/wms/transfer-asn-lock-order'
 import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 
 /**
@@ -117,6 +118,41 @@ mock.module('@/lib/domain/accounting/transit-subledger-movement', {
         await hook()
       }
       return result
+    },
+  },
+})
+
+/**
+ * ARM 13'S SEAM — A BARRIER BETWEEN THE PARENT LOCK AND THE CHILD LOCKS (r3).
+ *
+ * WHY IT HAS TO BE THERE AND NOWHERE ELSE. The deadlock round 3 found needs one transaction holding
+ * the PARENT while it still wants the CHILDREN, and the other holding a CHILD while it wants the
+ * PARENT. `lockPurchaseOrdersWithCostRows` closes that window deliberately — it takes all three in one
+ * call — so the only way to OBSERVE the window is to park the alignment inside it. Any later barrier
+ * (the enqueue, the transit write) is after the alignment already holds both, where no cycle can form
+ * and the arm would pass whatever the edit path did.
+ *
+ * THE LOCK STATEMENTS ARE REAL. The wrapper takes the parent with the REAL `lockPurchaseOrders`,
+ * awaits the barrier, and then calls the REAL combined helper for the children (its parent
+ * re-acquisition is a no-op, the row is already held by this transaction). So at the barrier PostgreSQL
+ * genuinely holds the parent row and genuinely does not hold the cost rows — the state is not
+ * simulated, only its timing is controlled.
+ */
+let pauseAfterParentLock: (() => Promise<void>) | null = null
+mock.module('@/lib/domain/wms/transfer-asn-lock-order', {
+  namedExports: {
+    ...realLockOrderNs,
+    lockPurchaseOrdersWithCostRows: async (
+      tx: Parameters<typeof realLockOrderNs.lockPurchaseOrdersWithCostRows>[0],
+      ids: Parameters<typeof realLockOrderNs.lockPurchaseOrdersWithCostRows>[1],
+    ) => {
+      if (pauseAfterParentLock) {
+        const hook = pauseAfterParentLock
+        pauseAfterParentLock = null
+        await realLockOrderNs.lockPurchaseOrders(tx, ids)
+        await hook()
+      }
+      return realLockOrderNs.lockPurchaseOrdersWithCostRows(tx, ids)
     },
   },
 })
@@ -1544,4 +1580,121 @@ test('o3d-6nd55 r2: two orders in one alignment agree even against an uncooperat
     INVENTORY_ACCOUNT,
     'and it must be the code that was current when the alignment took its lock, not the remapped one',
   )
+})
+
+/**
+ * ARM 13 — A FREIGHT-COST EDIT AND A PO-BACKED ALIGNMENT MUST NOT DEADLOCK (r3, Codex round-3 HIGH).
+ *
+ * THE DEFECT. Round 2 gave alignment `purchase_orders` → `purchase_order_lines` →
+ * `freight_cost_lines`, taking that sub-order from the two invoicing transactions that already used
+ * it. Round 3 found `updateFreightPoCosts` doing the REVERSE: it deleted the freight order's cost
+ * lines and only then updated the freight order itself. Hold a cost line while alignment holds the
+ * parent and each waits for the other; PostgreSQL aborts one transaction, failing either the
+ * operator's edit or that SKU's alignment. Two more writers had the same signature — the supplier
+ * return and the fx rebase — and all three now take `lockPurchaseOrdersWithCostRows` first. The census
+ * of every writer of those three tables is in lib/domain/wms/transfer-asn-lock-order.ts, because the
+ * lesson is that a lock order is a property of EVERY participant and two examples were not enough.
+ *
+ * WHY THIS IS DETERMINISTIC AND NOT A RACE THAT USUALLY PASSES. The alignment is parked, by the
+ * barrier above, at the one instant where it holds the parent and not the cost rows. The edit is then
+ * started and given time to reach whichever lock it reaches first. Only then is the barrier released.
+ * Under the OLD order that is a guaranteed cycle, not a likely one; under the new order the edit is
+ * simply queued behind the parent and the whole thing serialises.
+ *
+ * WHAT IS ASSERTED: both operations SUCCEED, neither raises SQLSTATE 40P01 (`deadlock detected`), and
+ * the edit's new freight amount really landed — so "no deadlock" cannot be satisfied by an edit that
+ * quietly did nothing.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: any ordering in which the two never contend at all — which is why
+ * the arm asserts the edit's value landed AND that the alignment posted, so both really ran against
+ * the same freight order. It does not establish anything about the supplier-return or fx-rebase
+ * writers; those are covered by the census and, for the fx rebase, by the acquisition-order assertion
+ * in tests/domain/purchasing/purchase-order-fx.test.ts.
+ */
+test('o3d-6nd55 r3: a freight-cost edit interleaved with a PO-backed alignment does not deadlock', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  await enableStockReceiptPosting()
+
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const FREIGHT_TOTAL = 20
+  const EDITED_FREIGHT = 44
+  const seeded = await seedAlignmentTarget('D', QTY, GOODS_UNIT)
+  // A LINKED freight order, so the alignment locks it as one of its parents and the edit targets it.
+  const freight = await seedLinkedFreightPo(seeded, 'live', FREIGHT_TOTAL, 'PO_SENT', true)
+  await db.purchaseOrder.update({ where: { id: freight.poId }, data: { type: 'FREIGHT' } })
+
+  let barrierReleased: () => void = () => {}
+  const barrier = new Promise<void>((resolve) => { barrierReleased = resolve })
+  let alignmentParked: () => void = () => {}
+  const parked = new Promise<void>((resolve) => { alignmentParked = resolve })
+
+  pauseAfterParentLock = async () => {
+    alignmentParked()
+    await barrier
+  }
+
+  let alignError: unknown = null
+  let alignApplied: boolean | null = null
+  const aligning = alignUp(seeded, { delta: QTY, imsQty: 0 }).then(
+    (result) => { alignApplied = result.applied },
+    (error) => { alignError = error },
+  )
+
+  // The alignment now holds the freight order's PARENT row and none of its cost rows.
+  await parked
+
+  let editResult: { success: boolean; error?: string } | null = null as { success: boolean; error?: string } | null
+  let editError: unknown = null
+  const editing = updateFreightPoCosts(freight.poId, [{
+    description: 'edited freight',
+    amountForeign: EDITED_FREIGHT,
+    vatable: false,
+    distributionMethod: 'BY_VALUE',
+  }]).then(
+    (result) => { editResult = result },
+    (error) => { editError = error },
+  )
+
+  // Long enough for the edit to reach its first lock — the parent under the fix, the cost-line delete
+  // without it. Under the old order the cycle exists from here on.
+  await new Promise((resolve) => setTimeout(resolve, 1500))
+  barrierReleased()
+
+  await aligning
+  await editing
+  pauseAfterParentLock = null
+
+  const messages = [alignError, editError, editResult?.error]
+    .map((value) => (value instanceof Error ? value.message : String(value ?? '')))
+    .join(' | ')
+  console.log(`[arm13] alignApplied=${String(alignApplied)} editResult=${JSON.stringify(editResult)} errors=${messages.slice(0, 400)}`)
+
+  assert.ok(
+    !/deadlock detected|40P01/i.test(messages),
+    `neither side may deadlock — PostgreSQL aborting one of them loses either the operator's freight `
+    + `edit or this SKU's alignment. Errors were: ${messages}`,
+  )
+  assert.equal(alignError, null, `the alignment must not fail: ${messages}`)
+  assert.equal(alignApplied, true, 'and it must actually have applied, or it contended over nothing')
+  assert.equal(editError, null, `the freight edit must not fail: ${messages}`)
+  assert.equal(editResult?.success, true, `the freight edit must succeed: ${JSON.stringify(editResult)}`)
+
+  // NOT VACUOUS: the edit's value must really have landed, so "no deadlock" cannot be satisfied by an
+  // edit that did nothing, and both sides must really have touched this freight order.
+  const costLines = await db.freightCostLine.findMany({
+    where: { poId: freight.poId },
+    select: { amountForeign: true, amountBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  console.log(`[arm13] freight cost line(s) after the edit: ${JSON.stringify(costLines)}; alignment journals: ${logs.length}`)
+  assert.equal(costLines.length, 1, `the edit must have replaced the cost line; found ${costLines.length}`)
+  assert.equal(
+    Number(costLines[0]!.amountForeign),
+    EDITED_FREIGHT,
+    'and its new amount must be committed — otherwise the edit was a no-op and contended over nothing',
+  )
+  assert.equal(logs.length, 1, 'and the alignment must have posted its receipt journal')
 })

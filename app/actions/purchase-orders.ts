@@ -5,6 +5,9 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+// o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
+// order the WMS alignment relies on. See that module's census of every writer.
+import { lockPurchaseOrdersWithCostRows } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -2350,6 +2353,14 @@ export async function returnPurchaseOrder(
       // returns could each pass it and both increment qtyReturned (over-return).
       // Locking + re-checking here serialises returns against the same lines and
       // makes a duplicate full submit fail (no returnable qty remains).
+      //
+      // o3d-6nd55 r3: THE PARENT COMES FIRST, because this transaction updates the parent order later
+      // (its status, below) and so had the children-then-parent signature that deadlocks against the
+      // WMS alignment's parent-then-children order. Found by the census in
+      // lib/domain/wms/transfer-asn-lock-order.ts rather than by a failure. This does NOT reorder the
+      // stock-level locks taken above relative to the line locks — it only adds the parent ahead of
+      // both, which introduces no new pair.
+      await lockPurchaseOrdersWithCostRows(tx, [id])
       const poLineIds = Array.from(new Set(linesWithQty.map((rl) => rl.poLineId))).sort()
       await tx.$queryRaw`
         SELECT id FROM purchase_order_lines
@@ -4257,6 +4268,33 @@ export async function updateFreightPoCosts(
   try {
     const session = await requirePermission('purchasing.create')
     const { reference, landedResult } = await db.$transaction(async (tx) => {
+      // ─── o3d-6nd55 r3 (Codex round-3 HIGH): THE PARENT ORDERS BEFORE THEIR COST ROWS ───
+      //
+      // THE DEADLOCK THIS CLOSES. This transaction used to delete `freight_cost_lines` and only THEN
+      // update the freight `purchase_orders` row — children before parent. The WMS stock-sync
+      // alignment takes the opposite order (parent at step 2b, then the cost rows it reads to value a
+      // receipt), which it must, because it has to hold the parent before it can trust what its cost
+      // rows say. Two orders over one pair of tables is a cycle: each transaction waits for the other
+      // and PostgreSQL aborts one, failing either this operator's edit or that SKU's alignment.
+      //
+      // AND IT LOCKS THE LINKED PRIMARIES TOO, not just the freight order. `recalculateLandedCosts`
+      // below rewrites `purchase_order_lines.landedUnitCostBase` on every primary order linked to this
+      // freight order, so those primaries' children are this transaction's children as well — locking
+      // only the freight order would leave the identical cycle one order over. The link rows are read
+      // first, unlocked, purely to discover WHICH orders to lock; the lock is what makes the reads
+      // after it trustworthy.
+      //
+      // `lockPurchaseOrdersWithCostRows` takes parent-then-children in one call, so this call site
+      // cannot express the order that caused the defect.
+      const linkedPrimaries = await tx.landedCostLink.findMany({
+        where: { freightPoId },
+        select: { primaryPoId: true },
+      })
+      await lockPurchaseOrdersWithCostRows(tx, [
+        freightPoId,
+        ...linkedPrimaries.map((link) => link.primaryPoId),
+      ])
+
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
         select: { id: true, reference: true, type: true, fxRateToBase: true },
