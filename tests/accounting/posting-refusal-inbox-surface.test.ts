@@ -1381,4 +1381,55 @@ test('[o3d-j625 r34] both operator-facing projections derive the unaccounted fla
   )
   assert.match(actions, /result\.unaccountedDecline/,
     'and the mark notice must branch on it too, instead of quoting a count of 0')
+
+  /**
+   * o3d-j625 r36 (Codex round 35, HIGH 1) — EVERY SURFACE THAT READS THE COUNT, NOT JUST THE ONES I REMEMBERED.
+   *
+   * r34 identified the trap (a count that is structurally 0 whenever the stamp holds the debt) and then swept
+   * ONE surface. Round 35 found two more: the release action reported nothing, and the refusal table rendered the
+   * flag nowhere at all. So this enumerates the surfaces rather than trusting recall — a third miss after two is
+   * a pattern.
+   *
+   * THE RULE: every operator-facing branch on `deferredEdits > 0` must have an unaccounted branch ahead of it.
+   * Asserted by counting both, so a NEW count-reading string without one fails here.
+   */
+  const countBranches = (actions.match(/(?:result|claim)\.deferredEdits > 0/g) ?? []).length
+  assert.ok(countBranches >= 2,
+    `PRECONDITION: the operator-facing count branches must be found; saw ${countBranches}`)
+  // The mark and the release are the two actions with prose; each must branch on the flag FIRST.
+  /**
+   * o3d-j625 r36: counted per SITE, not matched once. The first version of this used a single
+   * `match(/result.declineUnaccounted ?/)`, and the two mutations that silence the release's ACTIVITY LINE and
+   * its NOTICE each came back GREEN — because silencing one left the other for the regex to find. An existential
+   * match over two sibling branches proves neither of them.
+   */
+  const releaseBranches = (actions.match(/result\.declineUnaccounted\s*\n?\s*\?/g) ?? []).length
+  assert.ok(releaseBranches >= 2,
+    `the release must branch on the unaccounted flag in BOTH its activity description and its operator notice; `
+    + `found ${releaseBranches}. Reading the count alone gives a silent, routine release over a posting that is `
+    + 'still owed (round 35 HIGH 1), and silencing either half is enough to do it.')
+  assert.equal(
+    (actions.match(/declineUnaccounted/g) ?? []).length >= 4, true,
+    'and it must be returned, logged, noticed and put in the metadata — or one of the surfaces goes quiet again',
+  )
+  // The refusal TABLE must render it, and ABOVE its action buttons: the operator decides after reading it.
+  const flagAt = client.indexOf('row.handPostDeclineUnaccounted')
+  assert.ok(flagAt > 0, 'the refusal row must render the unaccounted flag at all (round 35 HIGH 1)')
+  /**
+   * Compared WITHIN the row's own cell, not across the file: an earlier component has its own "Take for hand
+   * posting" label, and a whole-file indexOf compared the flag against THAT one and failed for the wrong reason.
+   * The slice starts at the flag, so finding the row's actions after it is what "before the buttons" means.
+   */
+  // Anchored on the CONTROLS, not on their labels: a mutation that merely wrote the button labels into the
+  // warning text satisfied a label-based check while leaving the block below the buttons. `<Button` cannot be
+  // faked by prose.
+  const rowCellFrom = client.slice(flagAt, flagAt + 4000)
+  assert.ok(rowCellFrom.includes('<Button'),
+    'the unaccounted warning must come BEFORE the refusal row\'s controls — a warning under the buttons is one '
+    + 'the operator reads after choosing, which is the same "documented, not loud" failure in a new place')
+  const beforeFlag = client.slice(0, flagAt)
+  assert.ok(
+    !beforeFlag.slice(beforeFlag.lastIndexOf('row.clearingNote')).includes('<Button'),
+    'and no control for this row may precede it',
+  )
 })

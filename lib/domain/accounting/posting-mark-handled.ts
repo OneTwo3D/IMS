@@ -431,6 +431,15 @@ export type HandPostReleaseResult =
        * on its own, which is why the operator has to be told rather than left to notice.
        */
       deferredEdits: number
+      /**
+       * o3d-j625 r36 (Codex round 35, HIGH 1) — AND WHETHER THE HISTORY IS INCOMPLETE.
+       *
+       * r34 made the stamp hold a reused key's debt when the count could not be written, and taught the MARK to
+       * say so. The RELEASE was left reading `deferredEdits` alone — structurally 0 on exactly that path — so an
+       * operator releasing a stamped claim saw a routine release while an uncounted posting was still owed.
+       * Returned for the same reason the count is: so the caller can SAY SO rather than leave them to notice.
+       */
+      declineUnaccounted: boolean
     }
   | Extract<MarkHandledResult, { ok: false }>
   | { ok: false; code: 'not_claimed'; message: string }
@@ -474,7 +483,14 @@ export async function releasePostingHandPostClaim(
     },
   })
   if (released.count === 0) throw new MarkHandledRaceError()
-  return { ok: true, releasedFrom: row.handPostClaimedBy ?? null, heldSince: row.handPostClaimedAt, deferredEdits }
+  return {
+    ok: true,
+    releasedFrom: row.handPostClaimedBy ?? null,
+    heldSince: row.handPostClaimedAt,
+    deferredEdits,
+    // o3d-j625 r36: read from the row this release just cleared, so it reports what was actually there.
+    declineUnaccounted: row.handPostDeclineUncountedAt != null,
+  }
 }
 
 export async function markPostingHandled(

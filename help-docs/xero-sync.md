@@ -2362,6 +2362,8 @@ Three things about those rows:
   that moment, and the refusal stays on the list, so do **not** release it if you have already posted it by
   hand — press *Mark as handled* instead, or the ledger can get it twice. Releasing somebody else's claim is
   allowed (otherwise a posting nobody can settle would be stuck for ever) and is recorded as a **warning**.
+  If the refusal carries an **incomplete history** (see below), releasing it says so and the row stays
+  outstanding — releasing does not settle that debt, and neither does marking it handled.
 
   **Every posting being settled by hand is listed in its own section — *Postings being settled by hand*.**
   A claim never times out, on purpose: one that lapsed on a timer would re-open exactly the interval it

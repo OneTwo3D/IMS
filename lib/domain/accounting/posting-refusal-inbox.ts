@@ -1020,50 +1020,66 @@ export async function clearAccountingPostingRefusal(
   })
   /**
    * ══════════════════════════════════════════════════════════════════════════════════════════════════════
-   * o3d-j625 r34 — THE RESIDUAL, WRITTEN DOWN PRECISELY. Read this before "improving" any of the above.
+   * o3d-j625 r36 — THE RESIDUAL. Written for somebody deciding whether to accept it, not only for the next
+   * author. Read it before "improving" any of the code above.
    * ══════════════════════════════════════════════════════════════════════════════════════════════════════
    *
-   * The lost invoice edit has been found in rounds 17, 27, 29, 31 and 33, each time through the previous fix's
-   * own edge. What is left after r34 needs ALL of the following at once:
+   * THE FAILURE, in one sentence: an invoice-update posting that IMS owed the ledger can be silently written off
+   * when an operator marks the original hand posting handled, leaving the ledger behind IMS with nothing
+   * outstanding to say so.
+   *
+   * WHAT HAS TO HAPPEN, AND IT IS ALL OF IT AT ONCE — SIX CONDITIONS:
    *
    *   1. a hand-post claim is held on a REUSED posting key (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE,
-   *      BILL_PAYMENT — on any other kind the hand posting satisfies the debt and closing the row is correct);
-   *   2. an enqueue that began BEFORE the claim was taken reaches this clear afterwards. It cannot be an edit
-   *      that arrived DURING the claim: those never get here, because `createAccountingSyncLogRow` reads the
-   *      suppression under this same lock and records the postponement inside the caller's own transaction,
-   *      throwing `HandPostDeferralUnrecordableError` rather than proceeding (r18). That path is closed;
-   *   3. the deferral bump fails — now contained by a savepoint, so this alone is survivable;
-   *   4. the WHOLE locked transaction then fails to commit, discarding the in-transaction stamp with it;
-   *   5. the post-lock fallback write ALSO fails, or the process stops before it runs;
-   *   6. and an operator then marks the original posting handled.
+   *      BILL_PAYMENT). On every other kind the operator's hand posting settles the debt and closing the row is
+   *      correct, so there is nothing to lose;
+   *   2. an enqueue that BEGAN BEFORE the claim was taken reaches this clear afterwards. An edit arriving DURING
+   *      the claim cannot: `createAccountingSyncLogRow` reads the suppression under this same lock and records
+   *      the postponement inside the caller's own transaction, throwing rather than proceeding (r18);
+   *   3. the locked transaction above fails to COMMIT. Note what this does NOT require — see below;
+   *   4. the post-lock fallback write then also fails, or the process stops before it runs;
+   *   5. an operator marks the original posting handled;
+   *   6. and their hand posting used a version of the document OLDER than the enqueue in (2) was carrying.
+   *      Otherwise that enqueue's content is already in what they posted and nothing is actually lost.
    *
-   * WHAT AN OPERATOR SEES IF ALL SIX HOLD: nothing. The row resolves and the ledger may be behind by whatever
-   * that pre-claim enqueue would have posted. That is the accepted limit, and it is why it is written here.
+   * WHAT r34 GOT WRONG, corrected by Codex round 35: it listed "the deferral bump fails" as a condition. IT IS
+   * NOT ONE. On a SUCCESSFUL bump no stamp is written — the bump itself is the evidence — but it lives in this
+   * same transaction, so a commit failure rolls it back too, `result` is never published, and the caller falls
+   * through to the same fallback. Fewer conditions, same end. A residual described with more conditions than it
+   * needs is a residual UNDERSTATED, which is worse than one described plainly.
+   * The end state is pinned by `[o3d-j625 r36 RESIDUAL]` in the concurrency tests, which asserts the LOSS rather
+   * than a defence: if that test ever fails, the residual has narrowed and this note is wrong.
    *
-   * WHY IT IS NARROWER STILL THAN SIX CONDITIONS SUGGESTS, stated so the risk is not overstated either: by (2)
-   * the declined enqueue's payload was composed BEFORE the claim existed, so an operator who posts the
-   * document's CURRENT state by hand has already included it. For anything to be lost they must additionally
-   * have posted a version older than that enqueue's — i.e. read the document, then let an edit land, then take
-   * the claim and post from the stale screen. Real, but a different hazard from the one the deferral count was
-   * built for.
+   * WHAT AN OPERATOR SEES, SURFACE BY SURFACE:
+   *   · conditions 1–3 only (the common failure): the refusal row shows "Incomplete history" ABOVE its buttons;
+   *     the claims list shows "at least one, NOT COUNTED" instead of a number; marking handled KEEPS the row
+   *     outstanding and says the history is incomplete; releasing says the same. They cannot miss it.
+   *   · conditions 1–4 (the fallback failed too): NOTHING on any screen. The only trace is an ERROR activity
+   *     line, `accounting_posting_refusal_decline_not_recorded`, which states in plain words that the stamp could
+   *     not be written and that marking handled WILL close the refusal. An operator would have to have been
+   *     reading the log before acting, which is why a log line was never accepted as the mitigation.
+   *   · conditions 1–6: the row resolves normally and the ledger may be behind. Nothing anywhere says so.
    *
-   * WHY IT IS NOT CLOSED, and which of the two options the review offered was tried. A narrower fail-closed rule
-   * — "for a reused key whose claim we cannot account for, refuse the mark" — was explored first and does not
-   * work: the ordinary case (claim taken, posting made by hand, nothing declined behind it) produces exactly the
-   * same durable state as the dangerous one, namely a claim with no count and no stamp. Requiring positive
-   * evidence of what happened during the claim therefore refuses the ordinary mark too, which is the r6 false
-   * debt on every hand-settled invoice update, and "the ordinary case accounts for itself by resolving normally"
-   * is circular because resolving normally is the thing being decided. The distinguishing fact lives only in the
-   * transaction that failed. An automated reconciliation sweep is the honest remaining option: it needs a
-   * durable "this claim ended unaccounted-for" record to sweep FOR, which is the same write that can fail, so it
-   * moves the window rather than closing it — unless it reconciles against the connector's own ledger state,
-   * which is a much larger surface than this branch.
+   * WHAT THE OPERATOR MUST DO, and it is the same instruction in every case: when a refusal says its history is
+   * incomplete, compare the document with the ledger and then RE-SAVE the document, which queues its current
+   * version. Re-saving is the discharge for these three kinds; releasing and marking handled are not.
    *
-   * WHAT WAS DONE INSTEAD, per the review's second requirement: the failure is visible WHERE THE OPERATOR ACTS.
-   * The stamp is on the refusal row, so the inbox and the claims list show "at least one, NOT COUNTED" instead of
-   * "none"; the mark's own answer carries `unaccountedDecline`, so the notice at the moment of clicking says the
-   * history is incomplete and to check the ledger; and the ERROR log line has stopped being the mechanism, which
-   * was the review's specific objection to r32 — its write is swallowed, so it could never have been one.
+   * WHAT IMS WILL NOT DO FOR THEM: it will not replay the declined payload (on these kinds a posting OVERWRITES
+   * the document, so the only correct posting is the current state, and a captured payload may already be
+   * superseded); it will not retry the posting on a timer; and it will not detect after the fact that a resolved
+   * refusal should not have been resolved — there is no record left to detect it from, which is the residual.
+   *
+   * WHY IT IS NOT CLOSED, both options having been tried. A narrower fail-closed rule — "for a reused key whose
+   * claim we cannot account for, refuse the mark" — does not work: the ORDINARY case (claim taken, posting made
+   * by hand, nothing declined behind it) leaves exactly the same durable state as the dangerous one, namely a
+   * claim with no count and no stamp. Demanding positive evidence of what happened during the claim therefore
+   * refuses the ordinary mark too, which is a false debt on every hand-settled invoice update (the r6 failure),
+   * and "the ordinary case accounts for itself by resolving normally" is circular because resolving normally is
+   * the thing being decided. No durable artefact separates them either: the claim cancelling a queued row happens
+   * in the ordinary flow as well. An automated reconciliation sweep needs a durable "this claim ended
+   * unaccounted-for" record to sweep FOR — the same write that can fail — so it moves the window rather than
+   * closing it, unless it reconciles against the connector's own ledger state, which is a far larger surface than
+   * this branch.
    */
   // o3d-j625 r34: reached only when the locked transaction above did not COMMIT — the in-transaction stamp went
   // with it, so this is the last-ditch attempt, through the pool, with the lock no longer held. It is the

@@ -646,6 +646,13 @@ export type AccountingPostingRefusalRow = {
    * post a later one. Rendered so the holder learns it before they go to the ledger, not afterwards.
    */
   handPostDeferredEdits: number
+  /**
+   * o3d-j625 r36 (Codex round 35, HIGH 1) — `true` when IMS declined a posting behind this refusal's claim and
+   * could not count it. `handPostDeferredEdits` is 0 whenever this is set, so no count on this row can carry the
+   * fact; the table renders this ABOVE the row's actions, because Take, Mark and Release are all decisions it
+   * changes.
+   */
+  handPostDeclineUnaccounted: boolean
 }
 
 /**
@@ -1734,6 +1741,9 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     // o3d-j625 r18: an unconfirmed claim has no established posting key and cannot be taken for hand posting
     // at all, so nothing can have been postponed behind it.
     handPostDeferredEdits: 0,
+    // o3d-j625 r36: and for the same reason nothing can be UNACCOUNTED behind it — there is no claim to decline
+    // behind. `false` here is a fact about provisional rows, not a default.
+    handPostDeclineUnaccounted: false,
   }))
 }
 
@@ -2224,28 +2234,49 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
         // o3d-j625 r18 (Codex round 17, HIGH 1): and what IMS declined to queue while the claim was held is
         // named, because nothing requeues those postings on its own — the outstanding row is the record and
         // re-saving the document is what queues the CURRENT version.
-        + (result.deferredEdits > 0
-          ? ` While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for this key; they `
-            + 'have been added to the refusal\'s count and it stays outstanding. Nothing requeues them by '
-            + 'itself — re-save the document to queue its current version.'
-          : ''),
+        /**
+         * o3d-j625 r36 (Codex round 35, HIGH 1) — THE UNACCOUNTED CASE FIRST, BECAUSE THE COUNT IS ZERO IN IT.
+         *
+         * r34 gave the stamp the job of holding a reused key's debt when the count could not be written, and
+         * taught the MARK to say so. This path still read `deferredEdits` alone, which is structurally 0 there —
+         * so releasing a stamped claim logged and announced a ROUTINE release while an uncounted posting was
+         * still owed. Same trap as the mark's, on a surface I had not swept.
+         */
+        + (result.declineUnaccounted
+          ? ' While it was held, IMS declined AT LEAST ONE posting for this key and COULD NOT RECORD HOW MANY, '
+            + 'so this refusal\'s history is incomplete. It stays outstanding. Nothing requeues it by itself — '
+            + 'compare the document with the ledger, then re-save it to queue its current version.'
+          : result.deferredEdits > 0
+            ? ` While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for this key; they `
+              + 'have been added to the refusal\'s count and it stays outstanding. Nothing requeues them by '
+              + 'itself — re-save the document to queue its current version.'
+            : ''),
       metadata: {
         refusalId: id, releasedBy: session.user.id,
         heldBy: result.releasedFrom, heldSince: result.heldSince.toISOString(),
         deferredEdits: result.deferredEdits,
+        // The machine-readable half, so the log can be read without parsing prose.
+        declineUnaccounted: result.declineUnaccounted,
       },
       resolveUser: false,
     })
     revalidatePath('/sync/exceptions')
     return {
       success: true,
-      ...(result.deferredEdits > 0
+      // o3d-j625 r36: and the operator is told at the moment of releasing, not left with a routine "Released".
+      ...(result.declineUnaccounted
         ? {
-            notice: `Released. While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for `
-              + 'this key; they are counted on the refusal, which stays outstanding. Nothing requeues them by '
-              + 'itself — re-save the document to queue its current version.',
+            notice: 'Released — but this refusal\'s history is INCOMPLETE: while it was held IMS declined at '
+              + 'least one posting for this key and could not record how many. It stays outstanding. Compare the '
+              + 'document with the ledger, then re-save it to queue the current version.',
           }
-        : {}),
+        : result.deferredEdits > 0
+          ? {
+              notice: `Released. While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for `
+                + 'this key; they are counted on the refusal, which stays outstanding. Nothing requeues them by '
+                + 'itself — re-save the document to queue its current version.',
+            }
+          : {}),
     }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)

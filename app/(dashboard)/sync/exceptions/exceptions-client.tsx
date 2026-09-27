@@ -1274,6 +1274,20 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground space-y-1">
                     {/* o3d-j625 r6 (review H4): the action exists ONLY on MANUAL-ONLY rows; the server refuses it on any other. */}
                     <div>{row.clearing ? ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL[row.clearing] : ''}{row.clearingNote ?? 'Unclassified.'}</div>
+                    {/* o3d-j625 r36 (Codex round 35, HIGH 1) — THE INCOMPLETE HISTORY, BEFORE THE BUTTONS.
+                        r34 stamped the row and taught the mark to say so, but the refusal TABLE rendered the flag
+                        nowhere at all, so an operator met it only after acting. It goes ABOVE every action on this
+                        row deliberately: Take, Mark and Release are all decisions that this changes, and a warning
+                        underneath them is one the operator reads after choosing. `handPostDeferredEdits` is 0
+                        whenever this is set, so no count on this row can carry the fact. */}
+                    {row.handPostDeclineUnaccounted ? (
+                      <div className="font-medium text-amber-700">
+                        Incomplete history: while this was held by hand, IMS declined at least one posting for it and
+                        could not record how many. Treat the ledger as possibly behind — compare this document with
+                        the ledger, then re-save it to queue the current version. Releasing or marking it handled
+                        will NOT clear this debt.
+                      </div>
+                    ) : null}
                     {/* o3d-j625 r16: settling by hand is a two-step ACT. Until the posting is taken there is
                         no Mark-as-handled to press — the server refuses one without a claim, and offering a
                         button that always refuses is the "instruction that ends in a refusal" r14 banned. */}

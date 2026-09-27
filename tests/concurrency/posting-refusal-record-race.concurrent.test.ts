@@ -70,6 +70,8 @@ async function loadDeps() {
     // the posting while the operator is in the ledger, and the mark refuses without it, so every test that
     // marks a posting handled now takes it first — which is what an operator does.
     claimPostingForHandPosting: mark.claimPostingForHandPosting,
+    // o3d-j625 r36: the third operator-facing surface — releasing a stamped claim must report it too.
+    releasePostingHandPostClaim: mark.releasePostingHandPostClaim,
     createAccountingSyncLogRow: row.createAccountingSyncLogRow,
   }
 }
@@ -2363,7 +2365,11 @@ test(
  * the server can produce (a constraint, a serialisation failure) is not being exercised — only the two the
  * code distinguishes. That is the whole of what the assertions depend on.
  */
-function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norows' | 'commit'): Db {
+function withDeferralFailure(
+  db: Db,
+  referenceId: string,
+  mode: 'throw' | 'norows' | 'commit' | 'commit-and-fallback',
+): Db {
   const intercept = (target: Record<string, unknown>): unknown => new Proxy(target, {
     get(t, prop, recv) {
       if (prop === 'accountingPostingRefusal') {
@@ -2377,10 +2383,17 @@ function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norow
                 && typeof args.data.handPostDeferredCount === 'object'
                 && args.data.handPostDeferredCount !== null
                 && 'increment' in (args.data.handPostDeferredCount as object)
+              // o3d-j625 r36: the POST-LOCK FALLBACK's own write, identified by what it sets. Failing it is the
+              // only way to reach the end of the residual, where neither signal exists.
+              const stampsUnaccounted = args?.data != null && 'handPostDeclineUncountedAt' in args.data
+                && args.data.handPostDeclineUncountedAt != null
               const isOurs = args?.where?.referenceId === referenceId
-              if (bumpsDeferral && isOurs) {
+              if (bumpsDeferral && isOurs && (mode === 'throw' || mode === 'norows')) {
                 if (mode === 'throw') throw new Error('o3d-j625 r30/r32 injected: the postponement write fails')
                 return { count: 0 }
+              }
+              if (stampsUnaccounted && isOurs && mode === 'commit-and-fallback') {
+                throw new Error('o3d-j625 r36 injected: the fallback stamp write fails too')
               }
               return real.call(tt, args)
             }
@@ -2399,7 +2412,9 @@ function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norow
              * rolls all of it back: the decline, the bump and the stamp alike. That is what a failed commit looks
              * like from the caller's side, and it is the only way to exercise the fallback at all.
              */
-            if (mode === 'commit') throw new Error('o3d-j625 r34 injected: the locked transaction does not commit')
+            if (mode === 'commit' || mode === 'commit-and-fallback') {
+              throw new Error('o3d-j625 r34 injected: the locked transaction does not commit')
+            }
             return answer
           }, opts)
       }
@@ -2873,5 +2888,163 @@ test(
     assert.equal(marked.stillOutstanding, true)
     assert.equal(marked.unaccountedDecline, true,
       'and the mark says the history is incomplete, so the notice can say so instead of quoting 0')
+  },
+)
+
+test(
+  '[o3d-j625 r36 RESIDUAL] a SUCCESSFUL bump is lost too, and the end of the residual is a silent resolve',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * o3d-j625 r36 (Codex round 35, HIGH 2) — THE RESIDUAL DOES NOT REQUIRE A FAILED BUMP.
+     *
+     * r34's note listed "the deferral bump fails" as a condition. It is not one. On a SUCCESSFUL bump no stamp is
+     * written — the bump itself is the evidence — but it lives in the same transaction, so a commit failure rolls
+     * it back as well. `result` is published only after that commit, so the caller falls through to the post-lock
+     * fallback exactly as it would after a failed bump. Fewer conditions, same end.
+     *
+     * This test walks that end deliberately: bump SUCCEEDS, transaction fails to commit, the fallback ALSO fails,
+     * operator marks handled. It asserts THE LOSS rather than a defence, because an accurately described limit is
+     * the deliverable — if a future change prevents this, the assertions here are what will say so.
+     *
+     * WHAT WOULD STILL PASS IT: nothing about the mechanism; it pins the end state exactly. If it ever fails, the
+     * residual has narrowed and the note in posting-refusal-inbox.ts must be rewritten.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r36-residual-end')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'commit-and-fallback'),
+    )
+    console.log(`[r36] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+
+    const row = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostDeferredCount: true, handPostDeclineUncountedAt: true },
+    })
+    console.log(`[r36] row=${JSON.stringify(row)}`)
+    // NEITHER SIGNAL SURVIVED — and note the bump was never interfered with: it succeeded and the commit took it.
+    assert.equal(row.handPostDeferredCount, 0,
+      'the bump SUCCEEDED and was rolled back with the transaction — which is the point: a failed bump is not a '
+      + 'condition of this residual, and r34 described it as though it were')
+    assert.equal(row.handPostDeclineUncountedAt, null, 'and the fallback stamp failed too, so no evidence exists')
+    assert.equal(row.resolvedAt, null, 'the refusal is still outstanding at this point')
+
+    // The caller is STILL told the posting is owed — that part holds without any durable signal.
+    assert.deepEqual(refusalsRecorded.map((r) => r.reason), ['enqueue_refused'])
+    assert.ok(logged.some((l) => l.action === 'sales_invoice_update_not_queued'))
+
+    // AND THE END OF THE RESIDUAL: with no signal, the mark resolves the row. This is the accepted limit.
+    const marked = await deps.markPostingHandled(db as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted the version I had',
+    } as never)
+    console.log(`[r36] mark=${JSON.stringify(marked)}`)
+    assert.equal(marked.ok, true)
+    if (!marked.ok) return
+    assert.equal(marked.stillOutstanding, false,
+      'THE ACCEPTED LIMIT, asserted so it is not mistaken for a defence: with neither the count nor the stamp, '
+      + 'the mark has nothing to read and resolves the row. If this ever returns true the residual has narrowed '
+      + 'and the note in posting-refusal-inbox.ts must be rewritten.')
+    assert.equal(marked.unaccountedDecline, undefined,
+      'and the operator is told nothing, because there is nothing durable left to tell them')
+
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { resolvedAt: true, resolution: true },
+    })
+    assert.ok(after.resolvedAt, 'the row is closed')
+    assert.equal(after.resolution, 'handled_manually')
+
+    /**
+     * WHAT THE OPERATOR *CAN* STILL SEE, and it is exactly one thing. The note claims the activity log is the
+     * last trace, and a claim about a trace has to be checked rather than assumed — this assertion was written
+     * expecting TWO lines and found one, which is the more honest number: the caller's own
+     * `sales_invoice_update_not_queued` is injected by this harness (it is the caller's `logActivity` dep), so in
+     * this test only the clear's own line reaches the database. In production both are written, and the note says
+     * so; what is asserted here is the one this code path owns.
+     */
+    const fallbackLine = await db.activityLog.findFirst({
+      where: {
+        action: 'accounting_posting_refusal_decline_not_recorded',
+        description: { contains: referenceId },
+      },
+      select: { level: true, description: true },
+    })
+    assert.ok(fallbackLine,
+      'the only durable trace left is this ERROR line, which is why the note says an operator would have had to '
+      + 'have been reading the log BEFORE marking — and why a log line was never accepted as the mitigation')
+    assert.equal(fallbackLine.level, 'ERROR')
+    assert.match(fallbackLine.description, /COULD NOT BE WRITTEN EITHER/,
+      'and it says plainly that the stamp failed too, so marking this posting handled WILL close the refusal')
+  },
+)
+
+test(
+  '[o3d-j625 r36 LOUD] RELEASING a stamped claim reports the incomplete history too',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * o3d-j625 r36 (Codex round 35, HIGH 1) — THE THIRD SURFACE.
+     *
+     * r34 identified the trap — with the stamp holding the debt, `deferredEdits` is 0, so any string that reads
+     * the count says "none" — and then fixed only the MARK. The RELEASE still read the count alone, so an
+     * operator releasing a stamped claim got a routine "Released" while an uncounted posting was still owed.
+     * Two surfaces missed after fixing one is a pattern, not bad luck, which is why the release now returns the
+     * state and this asserts it.
+     *
+     * WHAT WOULD STILL PASS IT: different wording. It asserts the release REPORTS the state and that the row
+     * survives the release; the prose is pinned by a source ratchet instead.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r36-release-loud')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+    await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'throw'),
+    )
+    const before = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { handPostDeferredCount: true, handPostDeclineUncountedAt: true, refusedCount: true },
+    })
+    assert.equal(before.handPostDeferredCount, 0, 'PRECONDITION: the count is 0 — this is the trap')
+    assert.ok(before.handPostDeclineUncountedAt, 'PRECONDITION: and the stamp is what holds the debt')
+
+    const released = await db.$transaction((tx) => deps.releasePostingHandPostClaim(tx as never, { id: refusalId }))
+    console.log(`[r36 release] ${JSON.stringify(released)}`)
+    assert.equal(released.ok, true)
+    if (!released.ok) return
+    assert.equal(released.deferredEdits, 0, 'the count really is 0, so it cannot carry the fact')
+    assert.equal(released.declineUnaccounted, true,
+      'THE FINDING: the release must report the incomplete history. Reading `deferredEdits` alone gives a silent, '
+      + 'routine release over a posting that is still owed.')
+
+    const after = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostClaimedAt: true, handPostDeclineUncountedAt: true, refusedCount: true },
+    })
+    assert.equal(after.resolvedAt, null, 'the refusal stays outstanding after the release')
+    assert.equal(after.handPostClaimedAt, null, 'the claim is given back')
+    assert.equal(after.handPostDeclineUncountedAt, null, 'the stamp is discharged with the claim')
+    assert.equal(after.refusedCount, before.refusedCount + 1,
+      'and the uncounted posting is carried into refusedCount, so the row still says why it is outstanding')
   },
 )
