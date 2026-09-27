@@ -193,10 +193,36 @@ that — with every received quantity reading zero, the movement was never inser
 names the purchase order, so the guard's evidence join is satisfied by the cost layer the same
 transaction lays. Transfer-backed book-ins write `TRANSFER_IN`, which the guard does not cover.
 
-What a PO-backed book-in does NOT yet do is post the accounting: it writes no `STOCK_RECEIPT` journal
-and no transit subledger row, where the manual receipt path writes both. So stock and cost layers land
-while the transit account never drains. Tracked as **o3d-8f0p6** — until it lands, a PO-backed WMS
-book-in is correct in stock terms and incomplete in ledger terms.
+**A PO-backed book-in posts its accounting, as of o3d-8f0p6.** It used to write no `STOCK_RECEIPT`
+journal and no transit subledger row where the manual receipt writes both, so stock and cost layers
+landed while the transit clearing account never drained and the GL inventory balance was understated
+against stock that was physically there. The book-in now queues the same two-line journal the manual
+receipt does — **DR Inventory / CR Stock in Transit** — plus the signed transit subledger row for
+−value, **in the same transaction as the movement, the cost layer and the stock level**. All of it
+lives or none of it does: if the enqueue fails, the book-in commits no stock.
+
+Three details are load-bearing:
+
+- **the amount is the value this book-in actually laid layers for**, not the reconciled quantity.
+  `qtyReceived` also covers `coveredBySnapshotQty` (units a prior stock-sync alignment already brought
+  into stock and layered) and `reconciledManualQty` (units a manual receipt already journalled);
+  journalling either would post the same inventory value twice;
+- **the idempotency key is `wms-purchase-receipt:<poId>:<receiptEventId>`**, so a redelivered or
+  replayed webhook cannot queue a second journal, and it can never collide with the manual path's
+  `purchase-receipt:<poId>:<receiptRef>`. A genuinely new event booking a further quantity is a
+  different receipt and gets its own key;
+- **transfer-backed book-ins still post nothing, deliberately.** A transfer moves units the business
+  already owns between its own warehouses: their value never left inventory and never entered
+  *purchase* goods-in-transit. The manual transfer receipt (`app/actions/transfers.ts`) queues no
+  accounting sync either, so this is parity rather than a second gap.
+
+Why it had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
+journal from a stock movement. The Xero daily batch does not read `stock_movements` at all, its
+inventory reconciliation posts Inventory ↔ *Rounding difference* and only for a sub-unit `sweep` gap
+(a receipt-sized gap is `flag`, which is surfaced and never posted), and the transit reconciliation
+aggregates `transit_subledger_movements` — rows written at post time — so a posting that never
+happened is absent from both sides and that window ties out exactly. Proven by
+`tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts`.
 
 ### Purchase-order ASN lines are not landed-quantity aware yet
 
