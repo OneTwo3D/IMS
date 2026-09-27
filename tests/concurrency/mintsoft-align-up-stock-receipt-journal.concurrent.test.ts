@@ -487,6 +487,42 @@ function payloadLines(payload: unknown): Array<{ accountCode?: string; debit?: n
 }
 
 /**
+ * WHICH OF THE THREE RECEIPT WRITERS QUEUED A JOURNAL (r2, after #713 merged).
+ *
+ * All three post `STOCK_RECEIPT` against `referenceType: 'PurchaseOrder'`, and their idempotency keys
+ * are hashed, so the payload's NARRATION is what distinguishes them:
+ *   · align-up   — "… via Mintsoft alignment against ASN …"  (stock-sync.ts)
+ *   · book-in    — "… via WMS ASN …"                          (booked-in-service.ts, o3d-8f0p6)
+ *   · IMS receipt— neither phrase                              (app/actions/purchase-orders.ts)
+ * Asserted rather than assumed: `splitReceiptLogs` throws on a narration it cannot classify, so a
+ * wording change upstream fails loudly instead of silently reclassifying a journal as the other
+ * writer's and making a composition assertion vacuous.
+ */
+function splitReceiptLogs(logs: SyncLogRow[]): { alignUp: SyncLogRow[]; bookIn: SyncLogRow[] } {
+  const alignUp: SyncLogRow[] = []
+  const bookIn: SyncLogRow[] = []
+  for (const log of logs) {
+    const narration = String((log.payload as { narration?: unknown } | null)?.narration ?? '')
+    if (narration.includes('via Mintsoft alignment against ASN')) alignUp.push(log)
+    else if (narration.includes('via WMS ASN')) bookIn.push(log)
+    else {
+      throw new Error(
+        'unclassifiable STOCK_RECEIPT narration — neither writer\'s phrase is present, so this arm '
+        + `cannot tell which path posted it: ${JSON.stringify(narration)}`,
+      )
+    }
+  }
+  return { alignUp, bookIn }
+}
+
+/** The debit amount of a journal payload. */
+function debitOf(payload: unknown): number {
+  const debit = payloadLines(payload).find((l) => typeof l.debit === 'number')?.debit
+  assert.equal(typeof debit, 'number', `payload has no debit line: ${JSON.stringify(payload)}`)
+  return debit as number
+}
+
+/**
  * The PO line as the creation action left it — asserted by every cost arm, because if
  * `createPurchaseOrder` ever starts writing `landedUnitCostBase` these arms stop being about the
  * ordinary path and quietly become about a fixture.
@@ -807,13 +843,17 @@ test('o3d-6nd55: if the journal enqueue fails, the alignment commits no stock ei
  *   · the total layered quantity for the PO line is 10 — each unit costed EXACTLY ONCE, so no unit
  *     can be journalled twice by two writers that each journal the units they layer.
  *
- * WHAT WOULD STILL PASS THIS ARM, and this is a real limit: the book-in's OWN journal is added by
- * o3d-8f0p6, which is NOT on this branch, so this arm cannot read the book-in's journal amount. It
- * pins the quantity exclusion that makes the two amounts disjoint; the book-in's half is pinned from
- * the other side by arm 6 of tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts on
- * that branch, whose mutation swapping `stockQtyToAdd` for `qtyReceived` turns it red. The arm also
- * says nothing about a book-in that reports FEWER units than alignment already credited — that is
- * `resolveWmsAsnLineResidualQty`'s max(), exercised by arm 7 from the other direction.
+ * AND SINCE o3d-8f0p6 MERGED (trunk c1d44e0f) THIS ARM MEASURES BOTH HALVES, which it could not when
+ * it was first written: the book-in now posts its own journal, so the arm reads BOTH and asserts they
+ * partition the delivery — align-up's covers the 6 units it credited, the book-in's covers the
+ * remaining 4, and the two together are the full 10 units of value exactly once. Before the merge this
+ * arm could only pin the quantity exclusion and had to defer the amount to #713's own arm 6; that
+ * caveat is discharged.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: it says nothing about a book-in that reports FEWER units than
+ * alignment already credited — that is `resolveWmsAsnLineResidualQty`'s max(), exercised by arm 7 from
+ * the other direction. It also does not distinguish which writer posted which amount by anything
+ * stronger than the payload narration, which `splitReceiptLogs` refuses to guess at.
  */
 test('o3d-6nd55: units align-up has journalled are excluded from a later book-in', SKIP, async () => {
   loadEnv()
@@ -874,15 +914,31 @@ test('o3d-6nd55: units align-up has journalled are excluded from a later book-in
     `the book-in must have layered only the ${TOTAL - ALIGNED} units alignment did not`,
   )
 
+  // ─── AND NOW BOTH JOURNALS, since o3d-8f0p6 is on trunk ───
   const logs = await stockReceiptLogsFor(seeded.poId)
-  const debits = logs
-    .map((log) => payloadLines(log.payload).find((l) => typeof l.debit === 'number')?.debit ?? 0)
-    .reduce((sum, value) => sum + value, 0)
-  console.log(`[arm6] ${logs.length} STOCK_RECEIPT log(s) totalling ${debits} across both writers`)
-  assert.ok(
-    debits <= TOTAL * seeded.unitCost,
-    `the two writers together must never journal more than the ${TOTAL * seeded.unitCost} of value `
-    + `that actually entered inventory; they journalled ${debits}`,
+  const { alignUp: alignUpLogs, bookIn: bookInLogs } = splitReceiptLogs(logs)
+  const alignUpDebits = alignUpLogs.reduce((sum, log) => sum + debitOf(log.payload), 0)
+  const bookInDebits = bookInLogs.reduce((sum, log) => sum + debitOf(log.payload), 0)
+  console.log(`[arm6] ${logs.length} STOCK_RECEIPT log(s): align-up ${alignUpLogs.length} totalling ${alignUpDebits}, book-in ${bookInLogs.length} totalling ${bookInDebits}; full delivery value ${TOTAL * seeded.unitCost}`)
+
+  assert.equal(alignUpLogs.length, 1, `align-up must have posted exactly one journal; found ${alignUpLogs.length}`)
+  assert.equal(
+    bookInLogs.length,
+    1,
+    `and the book-in exactly one for the remainder; found ${bookInLogs.length}. Zero would mean the `
+    + 'book-in half of the composition is not being measured at all.',
+  )
+  assert.equal(alignUpDebits, ALIGNED * seeded.unitCost, `align-up must journal its ${ALIGNED} units`)
+  assert.equal(
+    bookInDebits,
+    (TOTAL - ALIGNED) * seeded.unitCost,
+    `and the book-in ONLY the remaining ${TOTAL - ALIGNED} — journalling all ${TOTAL} would double-post `
+    + `the ${ALIGNED} units align-up already accounted for`,
+  )
+  assert.equal(
+    alignUpDebits + bookInDebits,
+    TOTAL * seeded.unitCost,
+    `the two writers together must journal the delivery EXACTLY ONCE: ${TOTAL} x ${seeded.unitCost}`,
   )
 })
 
@@ -930,28 +986,46 @@ test('o3d-6nd55: align-up journals only the units a prior book-in did not', SKIP
     select: { receivedQty: true },
   })
   const totalLayered = layers.reduce((sum, layer) => sum + Number(layer.receivedQty), 0)
-  const alignLogs = await stockReceiptLogsFor(seeded.poId)
-  const alignDebits = alignLogs
-    .map((log) => payloadLines(log.payload).find((l) => typeof l.debit === 'number')?.debit ?? 0)
-  console.log(`[arm7] stock=${String(level.quantity)} totalLayered=${totalLayered} logs=${JSON.stringify(alignDebits)}`)
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const { alignUp: alignUpLogs, bookIn: bookInLogs } = splitReceiptLogs(logs)
+  const alignUpDebits = alignUpLogs.reduce((sum, log) => sum + debitOf(log.payload), 0)
+  const bookInDebits = bookInLogs.reduce((sum, log) => sum + debitOf(log.payload), 0)
+  console.log(`[arm7] stock=${String(level.quantity)} totalLayered=${totalLayered}; align-up ${alignUpLogs.length} totalling ${alignUpDebits}, book-in ${bookInLogs.length} totalling ${bookInDebits}`)
 
   assert.equal(Number(level.quantity), TOTAL, 'stock must reach the physical quantity and no more')
   assert.equal(totalLayered, TOTAL, 'each unit costed exactly once across both writers')
   assert.equal(
-    alignLogs.length,
+    alignUpLogs.length,
     1,
     `align-up must post exactly one journal, for the ${TOTAL - BOOKED} units the book-in did not land; `
-    + `found ${alignLogs.length}`,
+    + `found ${alignUpLogs.length}`,
   )
   assert.equal(
-    alignDebits[0],
+    alignUpDebits,
     (TOTAL - BOOKED) * seeded.unitCost,
     `and it must cover ${TOTAL - BOOKED} units, not all ${TOTAL} — the units the book-in already landed `
     + 'are excluded by resolveWmsAsnLineResidualQty',
   )
+  // The book-in's own journal, now that o3d-8f0p6 is on trunk: it went first, so it covers exactly
+  // what it landed, and the two partition the delivery.
+  assert.equal(bookInLogs.length, 1, `the book-in must have posted its own journal; found ${bookInLogs.length}`)
+  assert.equal(bookInDebits, BOOKED * seeded.unitCost, `the book-in must cover its ${BOOKED} units`)
+  assert.equal(
+    alignUpDebits + bookInDebits,
+    TOTAL * seeded.unitCost,
+    `the two writers together must journal the delivery EXACTLY ONCE: ${TOTAL} x ${seeded.unitCost}`,
+  )
+
+  // The transit clearing account must drain by the same total, once per journal.
   const transit = await transitRowsFor(seeded.poId)
-  assert.equal(transit.length, 1)
-  assert.equal(Number(transit[0]!.baseDelta), -(TOTAL - BOOKED) * seeded.unitCost)
+  const transitTotal = transit.reduce((sum, row) => sum + Number(row.baseDelta), 0)
+  console.log(`[arm7] ${transit.length} transit row(s) totalling ${transitTotal}`)
+  assert.equal(transit.length, 2, `one transit row per journal; found ${transit.length}`)
+  assert.equal(
+    transitTotal,
+    -TOTAL * seeded.unitCost,
+    'and the transit account must drain by the whole delivery value, exactly once',
+  )
 })
 
 /**
