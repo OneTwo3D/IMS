@@ -33,6 +33,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { withSavepoint } from '@/lib/db/savepoint'
 import { PLANNING_REACHABLE_BOM_EDGES } from '@/lib/products/bom-recipe'
 
 /**
@@ -87,9 +88,24 @@ export type ServerIdentity = {
 
 export type ServerIdentityDifference = { field: keyof ServerIdentity; expected: string; actual: string }
 
-/** Reads the composite from the SERVER, never from the connection URL — the URL is the part that lies. */
+/**
+ * Reads the composite from the SERVER, never from the connection URL — the URL is the part that lies.
+ *
+ * `includeSystemIdentifier: false` skips the optional query entirely. Callers that already know the role
+ * cannot read it pass that, so inside a mutation transaction the query never runs at all — which is the
+ * safest answer to the problem below.
+ *
+ * THE OPTIONAL QUERY IS WRAPPED IN A SAVEPOINT (round 16, HIGH 3), and catching the JavaScript error is
+ * NOT sufficient on its own. PostgreSQL aborts the WHOLE transaction on any error, including a permission
+ * denial, so a bare try/catch leaves the transaction in state 25P02 and every later statement fails with
+ * "current transaction is aborted" — the BOM queries below would die, reach the generic handler, and a
+ * role denied EXECUTE could not use this command as documented at all. This repository already knows the
+ * family: see lib/db/savepoint.ts, written because a caught P2002 left the same wreckage. Rolling back to
+ * a savepoint is what actually clears the aborted state.
+ */
 export async function readServerIdentity(
   client: Pick<Prisma.TransactionClient, '$queryRaw'>,
+  options: { includeSystemIdentifier?: boolean } = {},
 ): Promise<ServerIdentity> {
   const rows = await client.$queryRaw<Array<{
     database: string; host: string | null; port: string | null
@@ -99,16 +115,18 @@ export async function readServerIdentity(
            inet_server_port()::text AS port
   `
   const row = rows[0]
-  // SEPARATE QUERY, because this one can be refused. Folding it into the statement above would make a
-  // permission error look like a total failure to identify the server.
+
   let systemIdentifier = 'unavailable'
-  try {
-    const control = await client.$queryRaw<Array<{ id: string }>>`
-      SELECT system_identifier::text AS id FROM pg_control_system()
-    `
-    systemIdentifier = control[0]?.id ?? 'unavailable'
-  } catch {
-    systemIdentifier = 'unavailable'
+  if (options.includeSystemIdentifier !== false) {
+    try {
+      const control = await withSavepoint(client, async () => await client.$queryRaw<Array<{ id: string }>>`
+        SELECT system_identifier::text AS id FROM pg_control_system()
+      `)
+      systemIdentifier = control[0]?.id ?? 'unavailable'
+    } catch {
+      // The savepoint above has already rolled the failure back, so the transaction is usable.
+      systemIdentifier = 'unavailable'
+    }
   }
   return {
     database: row?.database ?? 'unknown',
@@ -116,6 +134,40 @@ export async function readServerIdentity(
     port: row?.port ?? 'local socket',
     systemIdentifier,
   }
+}
+
+/**
+ * Is `system_identifier` readable on this connection? Answered OUTSIDE any mutation transaction so the
+ * optional query never has to run inside one (round 16, HIGH 3, preferred shape).
+ */
+export async function systemIdentifierIsReadable(
+  client: Pick<Prisma.TransactionClient, '$queryRaw'>,
+): Promise<boolean> {
+  return (await readServerIdentity(client)).systemIdentifier !== 'unavailable'
+}
+
+/**
+ * PINS THAT CANNOT BE VERIFIED — a SEPARATE rule from {@link compareServerIdentity}, deliberately
+ * (round 16, HIGH 2).
+ *
+ * `compareServerIdentity` SKIPS `systemIdentifier` when either side reads `unavailable`, and that is right
+ * for the UNPINNED path: there the expected value is just what the preflight happened to observe, so
+ * absence of evidence is not evidence of a mismatch.
+ *
+ * It is WRONG for a field the operator explicitly pinned. Letting one rule serve both meant an explicit
+ * `--expect-system-id` was ACCEPTED AND THEN SILENTLY NOT CHECKED — and an operator who pins the
+ * strongest field and is told nothing when it goes unverified is worse off than one who never pinned it,
+ * because they believe they hold a guarantee they do not. Conflating the two cases was the defect.
+ *
+ * Returns the pinned fields that cannot be verified on this pair of reads. Non-empty means REFUSE.
+ */
+export function unverifiablePins(
+  pinned: ReadonlyArray<keyof ServerIdentity>,
+  expected: ServerIdentity,
+  actual: ServerIdentity,
+): Array<keyof ServerIdentity> {
+  return pinned.filter((field) =>
+    expected[field] === 'unavailable' || actual[field] === 'unavailable')
 }
 
 /** Every field that differs. Empty means the composite matches. */
@@ -158,6 +210,12 @@ export type BomRecipeRepairOutcome =
    * The connection is not to the SERVER the caller confirmed. Refused inside the transaction, so the
    * abort discards anything already written (round 12; widened to the composite in round 13).
    */
+  /**
+   * A field the operator explicitly PINNED could not be verified on either read (round 16, HIGH 2).
+   * Distinct from `wrong-database`: nothing disagreed — the check could not be made at all, and saying
+   * "matched" would be a lie about a guarantee the operator asked for.
+   */
+  | { kind: 'identity-unverifiable'; fields: Array<keyof ServerIdentity>; observed: ServerIdentity }
   | {
     kind: 'wrong-database'
     expected: ServerIdentity
@@ -175,7 +233,18 @@ export type BomRecipeRepairOutcome =
  */
 export async function deactivateDuplicateBomRecipe(
   client: RepairClient,
-  args: { bomId: string; actor?: string; database?: string; expectIdentity?: ServerIdentity },
+  args: {
+    bomId: string
+    actor?: string
+    database?: string
+    expectIdentity?: ServerIdentity
+    /** Fields the operator explicitly pinned. These are STRICT: unverifiable means refuse. */
+    pinnedFields?: ReadonlyArray<keyof ServerIdentity>
+    /** False when the caller already established the role cannot read it — then it is never queried. */
+    systemIdentifierReadable?: boolean
+    /** True when the operator explicitly accepted the weaker name-only mode. Recorded in the audit row. */
+    acceptedNameOnly?: boolean
+  },
 ): Promise<BomRecipeRepairOutcome> {
   const { bomId } = args
   await client.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
@@ -192,7 +261,20 @@ export async function deactivateDuplicateBomRecipe(
   // The COMPOSITE, not the name, for the reason in {@link ServerIdentity}: a restored copy keeps its
   // name, so comparing names proves only that this database is called what the operator expected.
   if (args.expectIdentity !== undefined) {
-    const actual = await readServerIdentity(client)
+    const actual = await readServerIdentity(client, {
+      // Not queried at all when the caller established outside this transaction that it is unreadable.
+      includeSystemIdentifier: args.systemIdentifierReadable !== false,
+    })
+
+    // PINNED FIELDS FIRST, and strictly. A pin that cannot be verified is refused, not skipped -- the
+    // separate rule in `unverifiablePins`, for the reason documented there. This also closes the second
+    // half of HIGH 2: the stored expectation can hold `unavailable` from the preflight while the
+    // transaction connection CAN read the identifier, and the lenient rule skipped that too.
+    const unverifiable = unverifiablePins(args.pinnedFields ?? [], args.expectIdentity, actual)
+    if (unverifiable.length > 0) {
+      return { kind: 'identity-unverifiable', fields: unverifiable, observed: actual }
+    }
+
     const differences = compareServerIdentity(args.expectIdentity, actual)
     if (differences.length > 0) {
       return { kind: 'wrong-database', expected: args.expectIdentity, actual, differences }
@@ -263,6 +345,11 @@ export async function deactivateDuplicateBomRecipe(
         // WHICH DATABASE, recorded in the row itself. A repair run by hand during a load window is
         // exactly the case where "was that done on stage or on production?" gets asked afterwards.
         database: args.database ?? null,
+        // THE WEAKER MODE IS VISIBLE AFTER THE FACT (round 16, HIGH 1). A name-only confirmation cannot
+        // tell a same-name copy from the real server, so a run that accepted that has to be
+        // distinguishable later from one that pinned the cluster identity.
+        acceptedNameOnly: args.acceptedNameOnly === true,
+        pinnedFields: [...(args.pinnedFields ?? [])],
         reason: 'o3d-zjsb5.9 duplicate-recipe repair',
       },
     },
@@ -284,6 +371,15 @@ export function describeBomRecipeRepair(outcome: BomRecipeRepairOutcome): string
     case 'claimed':
       return `REFUSED: BOM ${outcome.bomId} is the live recipe of ${outcome.sku}. Deactivating it would make `
         + 'that product unplannable. If you meant to retire that product\'s recipe, change its type instead.'
+    case 'identity-unverifiable':
+      return 'REFUSED: you pinned '
+        + `${outcome.fields.join(', ')}, but that could not be VERIFIED on this connection `
+        + `(it reads "unavailable"). Nothing was written.\n`
+        + `  server reports: ${describeServerIdentity(outcome.observed)}\n`
+        + '  This is refused rather than skipped on purpose: accepting a pin and then not checking it '
+        + 'would leave you believing you had a guarantee you do not have. An ordinary role can normally '
+        + 'read pg_control_system(), so EXECUTE has probably been revoked on this database — either grant '
+        + 'it, or drop the pin and confirm the weaker mode explicitly.'
     case 'wrong-database':
       return 'REFUSED inside the transaction: this is not the server that was confirmed. Nothing was '
         + 'written.\n'

@@ -1252,6 +1252,12 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // the `unavailable` path is defensive for a revoked EXECUTE or a restrictive managed provider, and an
   // `unavailable` identifier is never treated as a mismatch.
   //
+  // A name-only confirmation is a DECISION, not a warning: it needs `--accept-name-only`, refuses without
+  // it, and the acknowledgement lands in the audit row. An explicitly PINNED field that cannot be verified
+  // is REFUSED rather than skipped -- the lenient unavailable rule applies only to the unpinned path. And a
+  // role denied EXECUTE on pg_control_system() still works, because availability is settled before the
+  // mutation transaction and the optional query is savepoint-wrapped (a bare try/catch leaves 25P02).
+  //
   // A WRITE then requires the operator to name that database — `--expect-db <name>`, or typed at a TTY —
   // and REFUSES (exit 3, writing nothing) with neither, instead of reading consent into the absence of a
   // human. Round 11: a banner nobody can act on is a log line, not a safeguard, and the BOM id is no

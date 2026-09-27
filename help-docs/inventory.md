@@ -121,7 +121,16 @@ normal use:
 ```
 npm run repair:duplicate-bom -- --list                # shows the duplicates and their ids
 npm run repair:duplicate-bom -- --bom <id> --dry-run  # says what would happen, changes nothing
-npm run repair:duplicate-bom -- --bom <id> --expect-db <database-name>   # deactivates it
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --accept-name-only   # deactivates it
+```
+
+Confirming only the database *name* is not proof of which server you are on — a copy of the database has
+the same name — so the command makes you say so explicitly with `--accept-name-only`, and records that in
+the activity log. If you know the cluster's id (your installer should have recorded it), pin that instead
+and you do not need the acknowledgement:
+
+```
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --expect-system-id <recorded id>
 ```
 
 The last one asks you to confirm which database you are changing — either with `--expect-db`, or by

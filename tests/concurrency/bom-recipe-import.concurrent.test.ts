@@ -3,7 +3,10 @@ import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import test, { mock } from 'node:test'
 import { promisify } from 'node:util'
+import { PrismaPg } from '@prisma/adapter-pg'
 import { config } from 'dotenv'
+
+import { PrismaClient } from '../../app/generated/prisma/client'
 
 /**
  * o3d-zjsb5.9 — THE BOM RECIPE IMPORT PATH, IN A TIER CI ACTUALLY RUNS.
@@ -75,6 +78,7 @@ type Deps = {
   )['deactivateDuplicateBomRecipe']
   readServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['readServerIdentity']
   compareServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['compareServerIdentity']
+  unverifiablePins: typeof import('../../lib/products/bom-recipe-repair')['unverifiablePins']
   COMPONENT_GRAPH_WRITE_LOCK_KEY: number
 }
 
@@ -99,6 +103,7 @@ async function loadDeps(): Promise<Deps> {
     deactivateDuplicateBomRecipe: repairMod.deactivateDuplicateBomRecipe,
     readServerIdentity: repairMod.readServerIdentity,
     compareServerIdentity: repairMod.compareServerIdentity,
+    unverifiablePins: repairMod.unverifiablePins,
     COMPONENT_GRAPH_WRITE_LOCK_KEY: locksMod.COMPONENT_GRAPH_WRITE_LOCK_KEY,
   }
 }
@@ -228,7 +233,10 @@ async function driftForThisTest(deps: Deps, ns: string) {
  * DATABASE_URL is passed explicitly because the child loads its own `.env` files; without this it
  * would faithfully repair whatever database the developer's `.env.local` points at.
  */
-async function runRepairScript(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runRepairScript(
+  args: string[],
+  envOverrides: Record<string, string> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
   const execFileAsync = promisify(execFile)
   try {
     const { stdout, stderr } = await execFileAsync(
@@ -236,7 +244,7 @@ async function runRepairScript(args: string[]): Promise<{ code: number; stdout: 
       ['tsx', 'scripts/deactivate-duplicate-bom.ts', ...args],
       {
         cwd: process.cwd(),
-        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL, ...envOverrides },
         timeout: 120_000,
       },
     )
@@ -733,7 +741,9 @@ test(
       'and a DRY RUN must genuinely not have deactivated it -- otherwise --dry-run is a lie',
     )
 
-    const repair = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    const repair = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
     assert.equal(repair.code, 0, `the repair command must succeed: ${repair.stderr}`)
     assert.match(repair.stdout, /Deactivated BOM/, `and must say what it did, got: ${repair.stdout}`)
     // And the audit row records WHICH database, because "was that done on stage or production?" is the
@@ -754,7 +764,9 @@ test(
     ]))), [], 'and after running the documented remedy the same import must succeed')
 
     // Re-running it is safe: an operator who is not sure whether it worked must not be punished.
-    const again = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    const again = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
     assert.equal(again.code, 0, 'the command must be safe to re-run')
     assert.match(again.stdout, /already inactive/i, 'and should say so rather than pretending to act')
     assert.ok(
@@ -789,7 +801,7 @@ test(
       where: { productId: tableId }, select: { id: true },
     })
     const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
-    const claimedRefusal = await runRepairScript(['--bom', claimed.id, '--expect-db', scratchDatabase])
+    const claimedRefusal = await runRepairScript(['--bom', claimed.id, '--expect-db', scratchDatabase, '--accept-name-only'])
     assert.equal(claimedRefusal.code, 2, `a claimed recipe must be REFUSED, got: ${claimedRefusal.stderr}`)
     assert.match(claimedRefusal.stderr, /live recipe of/i, 'and must say whose recipe it is')
     assert.equal(
@@ -814,7 +826,7 @@ test(
         qty: 1, sortOrder: 0,
       },
     })
-    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase])
+    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase, '--accept-name-only'])
     assert.equal(soleRefusal.code, 2, `the sole active recipe of another parent must be REFUSED, got: ${soleRefusal.stderr}`)
     assert.match(soleRefusal.stderr, /only active recipe for/i, 'and must name the product it would strand')
     assert.ok(
@@ -840,7 +852,7 @@ test(
         qty: 1, sortOrder: 0,
       },
     })
-    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase])
+    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase, '--accept-name-only'])
     assert.equal(nowAllowed.code, 0,
       `once another active recipe exists the refusal must LIFT, got: ${nowAllowed.stderr}`)
     // And the items are KEPT -- deactivate, never delete, so completed build orders still value.
@@ -945,7 +957,9 @@ test(
     )
 
     // AND THE CORRECT NAME STILL WORKS, so none of the above passes by refusing everything.
-    const accepted = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    const accepted = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
     assert.equal(accepted.code, 0, `the right name must be accepted, got: ${accepted.stderr}`)
     assert.equal(
       (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
@@ -1097,9 +1111,286 @@ test(
     assert.equal(await stillActive(), true, 'and still write nothing')
     const goodWrite = await runRepairScript([
       '--bom', duplicate.id, '--expect-db', String(process.env.IMS_CONCURRENCY_SCRATCH_DB),
+      '--accept-name-only',
     ])
     assert.equal(goodWrite.code, 0, `a correct write must work: ${goodWrite.stderr}`)
     assert.equal(await stillActive(), false, 'and actually deactivate it')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] name-only is a DECISION: it refuses without --accept-name-only, and the audit records it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 1. A run pinning only --expect-db passes on a restored copy -- same name, same BOM
+     * ids -- and the in-transaction re-check compares that server against its OWN preflight identity, so
+     * it passes too. The warning printed immediately before the write required no decision: nothing
+     * stopped, and the operator had no moment in which to act on it. A warning next to a write is not a
+     * decision point.
+     *
+     * This is the option I originally ranked THIRD, and two independent readers converging on it moved it
+     * first. It is also the only one that survives my own objection to requiring an identifier: it cannot
+     * be satisfied by copying the banner, because it is not a value to be copied -- it is recorded intent.
+     */
+    const deps = await loadDeps()
+    const NS = 'P'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const active = async () =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active
+
+    // WITHOUT the acknowledgement: refused, nothing written, and told BOTH ways forward.
+    const bare = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    assert.equal(bare.code, 3, `a name-only write must be REFUSED, got ${bare.code}: ${bare.stderr}`)
+    assert.match(bare.stderr, /NAME only/i, `and must say why, got: ${bare.stderr}`)
+    assert.match(bare.stderr, /--accept-name-only/, 'and must name the acknowledgement flag')
+    assert.match(bare.stderr, /--expect-system-id/, 'and must offer the stronger pin as the better option')
+    // The stronger option must point at the RECORDED value, not the one just printed -- otherwise the
+    // advice trains exactly the paste-from-the-banner habit that makes a pin worthless.
+    assert.match(bare.stderr, /RECORDED AT INSTALL/i,
+      `the advice must not tell the operator to paste the banner value, got: ${bare.stderr}`)
+    assert.equal(await active(), true, 'and nothing may have been written')
+
+    // WITH it: writes, and the weaker mode is visible afterwards.
+    const accepted = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
+    assert.equal(accepted.code, 0, `an acknowledged name-only write must succeed: ${accepted.stderr}`)
+    assert.equal(await active(), false, 'and must actually deactivate it')
+    const audit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: duplicate.id } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal(
+      (audit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, true,
+      'the audit row must record that the weaker name-only mode was accepted',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] a role DENIED EXECUTE on pg_control_system() gets the documented behaviour, for real',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 3, and this is the test that would have caught it -- which is why it uses a REAL role
+     * with EXECUTE revoked rather than a stub.
+     *
+     * Catching the JavaScript error from a denied `pg_control_system()` does NOT restore PostgreSQL's
+     * transaction state: the transaction is left aborted (25P02) and every later statement fails with
+     * "current transaction is aborted", so the BOM queries died and the command reached its generic exit-1
+     * handler. A role denied EXECUTE could not use the command as documented AT ALL. A stub would have
+     * shown none of that, because the poisoning is a database behaviour, not a JavaScript one -- the same
+     * family as the P2002/25P02 tests already in this repository.
+     *
+     * Fixed two ways: availability is determined BEFORE the mutation transaction so the optional query
+     * never runs inside one, and the query is wrapped in a SAVEPOINT so even a mid-run revocation degrades
+     * instead of poisoning.
+     */
+    const deps = await loadDeps()
+    const NS = 'R'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // A ROLE THAT CANNOT READ THE IDENTIFIER, but can do everything else the repair needs.
+    const live = await deps.readServerIdentity(deps.db)
+    const role = `ims_denied_${Date.now().toString(36)}`
+    await deps.db.$executeRawUnsafe(`CREATE ROLE ${role} LOGIN`)
+    try {
+      await deps.db.$executeRawUnsafe(`REVOKE EXECUTE ON FUNCTION pg_control_system() FROM ${role}, PUBLIC`)
+      await deps.db.$executeRawUnsafe(`GRANT CONNECT ON DATABASE "${scratchDatabase}" TO ${role}`)
+      await deps.db.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${role}`)
+      await deps.db.$executeRawUnsafe(
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`)
+      await deps.db.$executeRawUnsafe(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role}`)
+
+      // PRECONDITION: the revoke must actually bite, or this test proves nothing about the denied path.
+      const asDenied = await deps.db.$queryRawUnsafe<Array<{ ok: boolean }>>(
+        `SELECT has_function_privilege('${role}', 'pg_control_system()', 'execute') AS ok`)
+      assert.equal(asDenied[0]?.ok, false, 'precondition: EXECUTE must really be revoked for this role')
+
+      const url = String(process.env.DATABASE_URL).replace('//ims@', `//${role}@`)
+
+      // 1. --list must WORK as that role. Before the fix the identifier query poisoned nothing here
+      //    (no transaction), so this is the cheap half -- but it also proves the role can read the schema.
+      const listed = await runRepairScript(['--list'], { DATABASE_URL: url })
+      // `--list` exits 1 BY DESIGN when duplicates exist, and siblings in this shared-database tier leave
+      // some, so the exit code is not the subject here -- what matters is that it RAN as a denied role and
+      // reported the identifier honestly. Asserting `code !== 1` was my own error and it failed on exactly
+      // that: a legitimate "there are duplicates" exit read as a failure.
+      assert.ok(
+        listed.code === 0 || listed.code === 1,
+        `--list must run as a denied role (0, or 1 when duplicates exist), got ${listed.code}: ${listed.stderr}`,
+      )
+      assert.match(listed.stderr, /system_identifier=unavailable/,
+        `the banner must report the identifier as unavailable, got: ${listed.stderr}`)
+      assert.match(listed.stderr, /could not be read/i, 'and must explain what that means')
+
+      // 2. AN UNVERIFIABLE PIN must be the DOCUMENTED refusal (exit 3), not a generic failure.
+      const pinned = await runRepairScript(
+        ['--bom', duplicate.id, '--expect-db', scratchDatabase, '--expect-system-id', '123'],
+        { DATABASE_URL: url })
+      assert.equal(pinned.code, 3,
+        `a pin this role cannot verify must be exit 3, not a generic failure, got ${pinned.code}: ${pinned.stderr}`)
+      // THE PREFLIGHT's OWN WORDING. The in-transaction check also refuses this, so the exit code alone
+      // cannot show which one fired -- a mutation proved that by deleting the preflight and staying green.
+      // What the preflight uniquely provides is refusing BEFORE a transaction is opened, and saying how to
+      // proceed, so that guidance is what gets asserted.
+      assert.match(pinned.stderr, /drop the pin and pass --accept-name-only/,
+        `the preflight must say how to proceed, got: ${pinned.stderr}`)
+      assert.equal(
+        (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+        true, 'and nothing may have been written',
+      )
+
+      // 3. THE DOCUMENTED FALLBACK: the weaker mode, accepted explicitly, must COMPLETE as this role.
+      //    This is the assertion that fails without the fix -- the mutation transaction opens, the denied
+      //    query aborts it, and the BOM update dies with 25P02 into the generic handler.
+      const fell_back = await runRepairScript(
+        ['--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only'],
+        { DATABASE_URL: url })
+      assert.equal(fell_back.code, 0,
+        `the documented fallback must WORK for a denied role, got ${fell_back.code}: ${fell_back.stderr}`)
+      assert.ok(
+        !/aborted|25P02/i.test(fell_back.stderr),
+        `and must not leave an aborted transaction, got: ${fell_back.stderr}`,
+      )
+      assert.equal(
+        (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+        false, 'and must actually deactivate the duplicate',
+      )
+      // 4. THE SAVEPOINT, ISOLATED -- and this arm exists because a mutation showed it had to.
+      //
+      // Removing the savepoint left all 17 tests green, and so did removing the pre-transaction
+      // availability check: each fix alone is sufficient, so THEY MASK EACH OTHER and neither was
+      // observable. That is precisely "fixed the symptom, left the trap for the next author".
+      //
+      // So this forces the in-transaction query to RUN as the denied role, by passing
+      // `systemIdentifierReadable: true` -- the state a mid-run revocation produces, and the state the
+      // pre-transaction check is designed to avoid. Without the savepoint the denial aborts the
+      // transaction (25P02) and the `boms` UPDATE that follows dies; with it, the read degrades to
+      // `unavailable` and the repair completes. Nothing but the savepoint can make this pass.
+      const deniedClient = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) })
+      try {
+        const second = await deps.db.bom.create({
+          data: { name: `${TAG}${NS} second duplicate`, active: true }, select: { id: true },
+        })
+        await deps.db.bomItem.create({
+          data: {
+            bomId: second.id, parentProductId: tableId, componentProductId: legId, qty: 5, sortOrder: 0,
+          },
+        })
+        // `expectIdentity` IS REQUIRED HERE, and leaving it out is how this arm was vacuous on first
+        // writing: the in-transaction identity read only happens when an expectation was supplied, so
+        // without it the denied query never ran and removing the savepoint stayed green. Caught by the
+        // mutation that was supposed to red -- the arm was testing nothing.
+        // The expectation carries `unavailable` because that is what this role's preflight produces, and
+        // NOTHING is pinned, so the lenient rule applies and the run is allowed to proceed.
+        const deniedPreflight = { ...live, systemIdentifier: 'unavailable' }
+        const survived = await deniedClient.$transaction(async (tx) =>
+          await deps.deactivateDuplicateBomRecipe(tx, {
+            bomId: second.id,
+            expectIdentity: deniedPreflight,
+            pinnedFields: [],
+            systemIdentifierReadable: true, // force the query that this role is denied
+          }))
+        assert.equal(
+          survived.kind, 'deactivated',
+          'the transaction must SURVIVE a denied identifier query and complete the repair — without a '
+          + `savepoint it is left aborted and the following UPDATE dies. Got: ${JSON.stringify(survived)}`,
+        )
+        assert.equal(
+          (await deps.db.bom.findUniqueOrThrow({ where: { id: second.id }, select: { active: true } })).active,
+          false, 'and the deactivation must really have committed',
+        )
+      } finally {
+        await deniedClient.$disconnect()
+      }
+    } finally {
+      // Own cluster, own role: drop it whatever happened.
+      await deps.db.$executeRawUnsafe(
+        `REASSIGN OWNED BY ${role} TO ims; DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role}`)
+        .catch(() => {})
+      await deps.db.$executeRawUnsafe(`GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC`).catch(() => {})
+    }
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] an UNVERIFIABLE pin is refused, not silently skipped',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 2, and it was my own rule serving two cases it should not have. `compareServerIdentity`
+     * skips `systemIdentifier` when either side reads `unavailable` -- right for the UNPINNED path, where
+     * absence of evidence is not evidence of a mismatch. Applied to an EXPLICIT pin it meant the flag was
+     * accepted and then never checked, leaving the operator believing they held the strongest guarantee
+     * available while holding none.
+     *
+     * Driven directly at the contract, for both halves of the finding: the preflight-unavailable case and
+     * the case where the stored expectation holds `unavailable` while the transaction connection CAN read
+     * the identifier -- which the lenient rule also skipped.
+     */
+    const deps = await loadDeps()
+    const live = await deps.readServerIdentity(deps.db)
+    assert.notEqual(live.systemIdentifier, 'unavailable',
+      'precondition: this cluster must be able to read the identifier, or this test proves nothing')
+
+    // Pinned + unavailable on the EXPECTED side (what a preflight that could not read it produces).
+    assert.deepEqual(
+      deps.unverifiablePins(['systemIdentifier'], { ...live, systemIdentifier: 'unavailable' }, live),
+      ['systemIdentifier'],
+      'a pin the EXPECTED side cannot supply must be reported unverifiable',
+    )
+    // Pinned + unavailable on the ACTUAL side (what an in-transaction denial produces).
+    assert.deepEqual(
+      deps.unverifiablePins(['systemIdentifier'], live, { ...live, systemIdentifier: 'unavailable' }),
+      ['systemIdentifier'],
+      'and a pin the ACTUAL side cannot supply must be too',
+    )
+    // UNPINNED stays lenient -- the separation is the point, not a blanket tightening.
+    assert.deepEqual(deps.unverifiablePins([], { ...live, systemIdentifier: 'unavailable' }, live), [],
+      'an UNPINNED unavailable identifier must remain lenient')
+    assert.deepEqual(
+      deps.compareServerIdentity({ ...live, systemIdentifier: 'unavailable' }, live), [],
+      'and compareServerIdentity must be unchanged for the unpinned path',
+    )
+
+    // END TO END through the mutation: a pinned-but-unverifiable identity refuses and writes nothing.
+    const NS = 'Q'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const refused = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, {
+        bomId: duplicate.id,
+        expectIdentity: { ...live, systemIdentifier: 'unavailable' },
+        pinnedFields: ['systemIdentifier'],
+      }))
+    assert.equal(refused.kind, 'identity-unverifiable',
+      `a pinned-but-unverifiable identity must refuse, got: ${JSON.stringify(refused)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
   },
 )
 

@@ -126,6 +126,18 @@ name when prompted. With neither — non-interactive and no flag — it refuses 
 nothing, rather than reading consent into the absence of a human. `--list` and `--dry-run` need no
 confirmation because they write nothing.
 
+**Name-only is a decision, not a warning.** `--expect-db` on its own asserts the NAME, which a restored
+copy also has, so it does not establish which server you are on. A write pinning only the name therefore
+requires `--accept-name-only` and refuses (**exit 3**) without it, and the acknowledgement is recorded in
+the `activity_logs` row so the weaker run is visible afterwards. A warning printed next to the write was
+not a decision point: nothing stopped, and the operator had no moment in which to act.
+
+**A pin that cannot be verified is refused, not skipped.** If you pass `--expect-system-id` and the field
+comes back `unavailable`, the command refuses (**exit 3**) rather than accepting the pin and quietly not
+checking it. The lenient "an unavailable identifier is not a mismatch" rule applies ONLY to the unpinned
+path, where the expected value is merely what the preflight observed; an operator who pins the strongest
+field and is told nothing when it goes unchecked is worse off than one who never pinned it.
+
 That is not belt-and-braces over the banner: a **clone of the database holds the same BOM ids**, so the id
 you pass cannot tell two servers apart, and a `--dry-run` in one shell constrains nothing about where a
 later write lands. The expectation is therefore **checked again inside the mutation transaction** — a check
@@ -149,6 +161,13 @@ The residual limits, stated rather than implied:
 * a **physical** clone (`pg_basebackup`, a streaming replica, a snapshot restore) **copies** the
   `system_identifier`. Same name, same identifier: only host and port distinguish it, and behind a proxy on
   the same address and port, **nothing here distinguishes it**;
+* A role **denied `EXECUTE`** on `pg_control_system()` can still use the command. Two things make that
+  work, and they are belt and braces: availability is settled **before** the mutation transaction opens, so
+  the optional query never runs inside one; and the query is wrapped in a **savepoint**, so even a mid-run
+  revocation degrades instead of poisoning. Catching the JavaScript error is not enough on its own —
+  PostgreSQL aborts the whole transaction on any error, so a bare `try`/`catch` leaves state `25P02` and
+  every later statement fails with "current transaction is aborted". `tests/concurrency` covers this with a
+  real role whose `EXECUTE` is revoked, not a stub.
 * `pg_control_system()` **is readable by an ordinary role** on PostgreSQL 17 — verified with a plain
   `CREATE ROLE ... LOGIN` holding no grants — so the identifier is normally available and the composite is
   normally at full strength. The `unavailable` path is **defensive and the exception**, not the expected

@@ -32,6 +32,7 @@ import {
   compareServerIdentity,
   describeServerIdentity,
   readServerIdentity,
+  unverifiablePins,
 } from '../lib/products/bom-recipe-repair'
 
 // .env MUST load before lib/db is imported — that module builds its pg Pool from
@@ -88,44 +89,76 @@ async function announceTarget(db: Parameters<typeof readServerIdentity>[0]): Pro
  * With neither available -- non-interactive and no flag -- it REFUSES and writes nothing, rather than
  * assuming consent from the absence of a human.
  */
-async function confirmTarget(identity: ServerIdentity): Promise<boolean> {
+type Confirmation =
+  | { ok: false }
+  | { ok: true; pinnedFields: Array<keyof ServerIdentity>; acceptedNameOnly: boolean }
+
+async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
   // An operator may pin as much of the composite as they can be sure of. `--expect-db` alone is the
   // friendly form and is NOT sufficient to distinguish a same-name copy — that is why the others exist,
   // and why the limit is spelled out rather than implied.
   const pinned: Partial<ServerIdentity> = {}
-  const expectedDb = argValue('--expect-db')
-  const expectedHost = argValue('--expect-host')
-  const expectedPort = argValue('--expect-port')
-  const expectedSystemId = argValue('--expect-system-id')
-  if (expectedDb !== undefined) pinned.database = expectedDb
-  if (expectedHost !== undefined) pinned.host = expectedHost
-  if (expectedPort !== undefined) pinned.port = expectedPort
-  if (expectedSystemId !== undefined) pinned.systemIdentifier = expectedSystemId
+  const pinnedFields: Array<keyof ServerIdentity> = []
+  const pin = (field: keyof ServerIdentity, value: string | undefined) => {
+    if (value === undefined) return
+    pinned[field] = value
+    pinnedFields.push(field)
+  }
+  pin('database', argValue('--expect-db'))
+  pin('host', argValue('--expect-host'))
+  pin('port', argValue('--expect-port'))
+  pin('systemIdentifier', argValue('--expect-system-id'))
 
-  if (Object.keys(pinned).length > 0) {
-    // Compare ONLY what was pinned, but compare it against the server's own answer.
-    const differences = compareServerIdentity(
-      { ...identity, ...pinned },
-      identity,
-    )
-    if (differences.length === 0) {
-      if (expectedDb !== undefined && expectedSystemId === undefined) {
-        console.error(
-          '  NOTE: --expect-db matches the database NAME only. A restored copy keeps its name, so this\n'
-          + '  does not prove which server you are on. Pin --expect-system-id '
-          + `${identity.systemIdentifier} to assert that too.\n`,
-        )
-      }
-      return true
+  if (pinnedFields.length > 0) {
+    // A PIN THAT CANNOT BE VERIFIED IS REFUSED, NOT SKIPPED (round 16, HIGH 2). `compareServerIdentity`
+    // deliberately skips `systemIdentifier` when either side reads `unavailable` -- correct for the
+    // UNPINNED path, where absence of evidence is not evidence of a mismatch -- but letting that one rule
+    // serve both cases meant an explicit --expect-system-id was ACCEPTED AND THEN SILENTLY NOT CHECKED.
+    // An operator who pins the strongest field and is told nothing when it goes unverified is worse off
+    // than one who never pinned it, because they believe they hold a guarantee they do not.
+    const unverifiable = unverifiablePins(pinnedFields, { ...identity, ...pinned }, identity)
+    if (unverifiable.length > 0) {
+      console.error(
+        `REFUSED: you pinned ${unverifiable.join(', ')}, but this connection cannot verify it (it reads `
+        + '"unavailable"). Nothing was written. An ordinary role can normally read pg_control_system(), so '
+        + 'EXECUTE has probably been revoked here — grant it, or drop the pin and pass --accept-name-only '
+        + 'to proceed in the weaker mode deliberately.',
+      )
+      return { ok: false }
     }
-    console.error(
-      'REFUSED: this is not the server you named. Nothing was written.\n'
-      + `  you said:  ${differences.map((d) => `${d.field}=${d.expected}`).join(' ')}\n`
-      + `  server is: ${describeServerIdentity(identity)}\n`
-      + '  Check DATABASE_URL before retrying. A cloned database holds the same BOM ids AND the same\n'
-      + '  name, so neither the id nor the name can tell two servers apart.',
-    )
-    return false
+
+    const differences = compareServerIdentity({ ...identity, ...pinned }, identity)
+    if (differences.length > 0) {
+      console.error(
+        'REFUSED: this is not the server you named. Nothing was written.\n'
+        + `  you said:  ${differences.map((d) => `${d.field}=${d.expected}`).join(' ')}\n`
+        + `  server is: ${describeServerIdentity(identity)}\n`
+        + '  Check DATABASE_URL before retrying. A cloned database holds the same BOM ids AND the same\n'
+        + '  name, so neither the id nor the name can tell two servers apart.',
+      )
+      return { ok: false }
+    }
+
+    // NAME-ONLY IS A DECISION, NOT A WARNING (round 16, HIGH 1). A run pinning only the name passes on a
+    // restored copy -- same name, same BOM ids -- and the in-transaction re-check compares that server
+    // against its own preflight, so it passes too. A warning printed immediately before the write is not a
+    // decision point: nothing stops and the operator has no moment in which to act. So the weaker mode is
+    // ACCEPTED EXPLICITLY, and the acceptance is recorded in the audit row.
+    const nameOnly = pinnedFields.length === 1 && pinnedFields[0] === 'database'
+    const accepted = process.argv.includes('--accept-name-only')
+    if (nameOnly && !accepted) {
+      console.error(
+        'REFUSED: --expect-db asserts the database NAME only, and a restored copy KEEPS ITS NAME — so it\n'
+        + '  does not establish which server you are on. Nothing was written. Either:\n'
+        + `    · pin the cluster:  --expect-system-id ${identity.systemIdentifier}\n`
+        + '      using the value RECORDED AT INSTALL, not the one printed above — pasting it back from\n'
+        + '      this banner proves only that you can read it;\n'
+        + '    · or accept the weaker mode deliberately:  --accept-name-only\n'
+        + '      which is recorded in the activity log, so the weaker run is visible afterwards.',
+      )
+      return { ok: false }
+    }
+    return { ok: true, pinnedFields, acceptedNameOnly: nameOnly && accepted }
   }
 
   if (!process.stdin.isTTY) {
@@ -134,7 +167,7 @@ async function confirmTarget(identity: ServerIdentity): Promise<boolean> {
       + 'it and no --expect-db was given. Nothing was written. Re-run with --expect-db '
       + `${identity.database} if that is genuinely the database you mean.`,
     )
-    return false
+    return { ok: false }
   }
 
   process.stderr.write(`Type the database name "${identity.database}" to proceed, or anything else to abort: `)
@@ -152,13 +185,16 @@ async function confirmTarget(identity: ServerIdentity): Promise<boolean> {
     process.stdin.on('data', onData)
     process.stdin.resume()
   })
-  if (typed === identity.database) return true
-  console.error(`REFUSED: you typed "${typed}", which is not "${identity.database}". Nothing was written.`)
-  return false
+  if (typed !== identity.database) {
+    console.error(`REFUSED: you typed "${typed}", which is not "${identity.database}". Nothing was written.`)
+    return { ok: false }
+  }
+  // Typing the name is exactly as strong as --expect-db alone, so it carries the same acknowledgement.
+  return { ok: true, pinnedFields: ['database'], acceptedNameOnly: true }
 }
 
 const VALUE_FLAGS = ['--bom', '--expect-db', '--expect-host', '--expect-port', '--expect-system-id']
-const BARE_FLAGS = ['--list', '--dry-run']
+const BARE_FLAGS = ['--list', '--dry-run', '--accept-name-only']
 
 function validateArgv(argv: string[]): string | null {
   const seen = new Set<string>()
@@ -216,7 +252,8 @@ async function main() {
       + '  tsx scripts/deactivate-duplicate-bom.ts --list\n'
       + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --dry-run\n'
       + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --expect-db <name>\n'
-      + '      [--expect-host <addr>] [--expect-port <n>] [--expect-system-id <n>]\n',
+      + '      [--expect-host <addr>] [--expect-port <n>] [--expect-system-id <n>]\n'
+      + '      [--accept-name-only]  (REQUIRED if you pin only --expect-db)\n',
     )
     return 1
   }
@@ -258,7 +295,11 @@ async function main() {
 
   // The gate applies to the WRITE only. `--list` returned above and `--dry-run` rolls back, so
   // demanding confirmation for either would train operators to type past it.
-  if (!dryRun && !(await confirmTarget(identity))) return 3
+  let confirmation: Confirmation = { ok: true, pinnedFields: [], acceptedNameOnly: false }
+  if (!dryRun) {
+    confirmation = await confirmTarget(identity)
+    if (!confirmation.ok) return 3
+  }
 
   // ONE TRANSACTION, so the lock the repair takes actually covers the decision AND the write, and a
   // dry run can compute the real answer and then throw it away rather than asking a different
@@ -275,6 +316,11 @@ async function main() {
         // a check before the transaction can be defeated by anything that changes which server the
         // connection reaches in between -- which is the whole reason this banner exists.
         expectIdentity: identity,
+        pinnedFields: confirmation.ok ? confirmation.pinnedFields : [],
+        acceptedNameOnly: confirmation.ok ? confirmation.acceptedNameOnly : false,
+        // Established OUTSIDE this transaction, so the optional query never runs inside one where the role
+        // cannot read it (round 16, HIGH 3, preferred shape).
+        systemIdentifierReadable: identity.systemIdentifier !== 'unavailable',
       })
       if (dryRun) throw Object.assign(new Error(SENTINEL), { result })
       return result
@@ -283,13 +329,17 @@ async function main() {
     if (error instanceof Error && error.message === SENTINEL) {
       const result = (error as Error & { result: Awaited<ReturnType<typeof deactivateDuplicateBomRecipe>> }).result
       console.log(`DRY RUN — nothing was written.\n${describeBomRecipeRepair(result)}`)
-      if (result.kind === 'wrong-database') return 3
+      if (result.kind === 'wrong-database' || result.kind === 'identity-unverifiable') return 3
       return result.kind === 'claimed' || result.kind === 'sole-recipe-for-other-parent' ? 2 : 0
     }
     throw error
   }
 
   const line = describeBomRecipeRepair(outcome)
+  if (outcome.kind === 'identity-unverifiable') {
+    console.error(line)
+    return 3
+  }
   if (outcome.kind === 'wrong-database') {
     console.error(line)
     return 3
