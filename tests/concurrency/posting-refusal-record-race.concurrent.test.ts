@@ -2363,7 +2363,7 @@ test(
  * the server can produce (a constraint, a serialisation failure) is not being exercised — only the two the
  * code distinguishes. That is the whole of what the assertions depend on.
  */
-function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norows'): Db {
+function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norows' | 'commit'): Db {
   const intercept = (target: Record<string, unknown>): unknown => new Proxy(target, {
     get(t, prop, recv) {
       if (prop === 'accountingPostingRefusal') {
@@ -2390,7 +2390,18 @@ function withDeferralFailure(db: Db, referenceId: string, mode: 'throw' | 'norow
       if (prop === '$transaction') {
         const real = Reflect.get(t, prop, recv) as (fn: (tx: unknown) => unknown, opts?: unknown) => unknown
         return (fn: (tx: unknown) => unknown, opts?: unknown) =>
-          real.call(t, (tx: unknown) => fn(intercept(tx as Record<string, unknown>)), opts)
+          real.call(t, async (tx: unknown) => {
+            const answer = await fn(intercept(tx as Record<string, unknown>))
+            /**
+             * o3d-j625 r34: `'commit'` models THE WHOLE LOCKED TRANSACTION FAILING TO COMMIT — the one residual
+             * the in-transaction stamp cannot cover, and the only path that reaches the post-lock fallback. The
+             * throw happens after the callback has done its work and INSIDE the real transaction, so Postgres
+             * rolls all of it back: the decline, the bump and the stamp alike. That is what a failed commit looks
+             * like from the caller's side, and it is the only way to exercise the fallback at all.
+             */
+            if (mode === 'commit') throw new Error('o3d-j625 r34 injected: the locked transaction does not commit')
+            return answer
+          }, opts)
       }
       const value = Reflect.get(t, prop, recv)
       return typeof value === 'function' ? value.bind(t) : value
@@ -2475,12 +2486,30 @@ test(
     assert.equal(after.resolvedAt, null, 'the refusal is still outstanding')
     assert.equal(after.handPostClaimedBy, 'operator-A', 'and the claim is untouched')
 
-    const shouted = await db.activityLog.count({
+    /**
+     * o3d-j625 r34: the condition is still REPORTED, but no longer by the last-ditch line this originally
+     * asserted. The stamp now commits inside the locked transaction, so the post-lock fallback — the only writer
+     * of `accounting_posting_refusal_decline_not_recorded` — does not run. Round 33's objection was precisely
+     * that the ERROR write is itself swallowed and so cannot be the mechanism; it has stopped being the
+     * mechanism, and the durable row is. Asserted as BOTH halves so neither can be lost: the fallback is absent
+     * because it was not needed, and the decline line says which signal was left.
+     */
+    const lastDitch = await db.activityLog.count({
       where: { action: 'accounting_posting_refusal_decline_not_recorded', description: { contains: referenceId } },
     })
-    assert.equal(shouted, 1,
-      'and the condition is reported at ERROR: the operator\'s row understates what is owed, so somebody has to '
-      + 'be able to find out')
+    assert.equal(lastDitch, 0,
+      'the post-lock fallback must not have been needed — the stamp commits with the decline, under the lock')
+    const declined = await db.activityLog.findFirst({
+      where: {
+        action: 'accounting_posting_refusal_clear_declined_hand_post_claim',
+        description: { contains: referenceId },
+      },
+      select: { description: true, level: true },
+    })
+    assert.ok(declined, 'and the decline itself is reported, so somebody can still find out')
+    assert.equal(declined.level, 'WARNING')
+    assert.match(declined.description, /could NOT be counted/,
+      'naming which of the two durable signals this decline left behind')
   },
 )
 
@@ -2555,8 +2584,10 @@ test(
     // reached round 32 instead of ending at 30, so this one continues to the end.
     // ═══════════════════════════════════════════════════════════════════════════════════════════════
     assert.ok(after.handPostDeclineUncountedAt,
-      'PRECONDITION: the uncounted postponement must be STAMPED on the row, written outside the transaction '
-      + 'that failed. Without the stamp the mark below has nothing to see and this assertion is the whole fix.')
+      'PRECONDITION: the uncounted postponement must be STAMPED on the row. o3d-j625 r34: written in the SAME '
+      + 'transaction as the decline, under the SAME key lock, with the failed bump contained by a savepoint — '
+      + 'so the two commit together or not at all. r32 wrote it afterwards through the pool, with the lock '
+      + 'already released, which is the window round 33 named.')
     // Read BEFORE the mark, because the contribution below is a DELTA. `refusedCount` is already non-zero here
     // (the reopen that put this debt back bumped it), so an absolute `>= 1` says nothing — the mutation that
     // makes the uncounted decline contribute NOTHING was green against exactly that assertion.
@@ -2643,5 +2674,204 @@ test(
     })
     assert.ok(afterMark.resolvedAt, 'and the row is closed')
     assert.equal(afterMark.resolution, 'handled_manually')
+  },
+)
+
+test(
+  '[o3d-j625 r34] the unaccounted stamp is committed UNDER THE LOCK, not by a second write after it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * o3d-j625 r34 (Codex round 33, HIGH) — the mechanism round 33 named was that the stamp was a SEPARATE
+     * write, attempted after this transaction had ended and the key lock had been released: it could fail on
+     * its own, or the process could stop while it waited for a pool connection, and then NEITHER signal
+     * existed. The ERROR line was the only remaining trace and its own write is swallowed.
+     *
+     * This asserts the structural property that closes that mechanism: when the bump fails, the stamp is
+     * already present in the row by the time the clear returns, and the LAST-DITCH pool path did not run —
+     * proved by its absence from the activity log, since that path always reports
+     * `accounting_posting_refusal_decline_not_recorded`.
+     *
+     * WHAT WOULD STILL PASS IT: a different in-transaction way of writing the stamp (this is about WHERE it is
+     * written, not how). It says nothing about the remaining residual — the whole transaction failing to
+     * commit — which is the fallback path and is deliberately still reachable.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r34-stamp-under-lock')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'throw'),
+    )
+
+    const row = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { handPostDeclineUncountedAt: true, handPostDeferredCount: true, resolvedAt: true },
+    })
+    console.log(`[r34] row=${JSON.stringify(row)}`)
+    assert.equal(row.handPostDeferredCount, 0, 'PRECONDITION: the bump really did fail')
+    assert.ok(row.handPostDeclineUncountedAt, 'and the stamp is nevertheless on the row')
+    assert.equal(row.resolvedAt, null, 'and the refusal is still outstanding')
+
+    // THE STRUCTURAL CLAIM: the last-ditch pool path did not run, so the stamp above came from inside the
+    // locked transaction. That path is the only writer of this action.
+    const lastDitch = await db.activityLog.count({
+      where: {
+        action: 'accounting_posting_refusal_decline_not_recorded',
+        description: { contains: referenceId },
+      },
+    })
+    assert.equal(lastDitch, 0,
+      'the post-lock fallback must NOT have been needed: the stamp is written inside the locked transaction, so '
+      + 'there is no window between the decline and its evidence for a second write to fail in. A non-zero count '
+      + 'here means the stamp is once again a separate write after the lock was released, which is round 33\'s '
+      + 'finding exactly.')
+
+    // And the decline is reported as counted=false, so the audit line says which signal was left.
+    const declined = await db.activityLog.findFirst({
+      where: {
+        action: 'accounting_posting_refusal_clear_declined_hand_post_claim',
+        description: { contains: referenceId },
+      },
+      select: { description: true },
+    })
+    assert.ok(declined, 'the decline itself is still reported')
+    assert.match(declined.description, /could NOT be counted/,
+      'and says the postponement was stamped rather than counted, so the log agrees with the row')
+  },
+)
+
+test(
+  '[o3d-j625 r34 RESIDUAL] when the locked transaction does not commit, the post-lock fallback stamps the row',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * THE NARROWED RESIDUAL, EXERCISED. r34 moved the stamp inside the locked transaction, so the ordinary
+     * failure no longer needs a second write. What is left is the transaction failing to COMMIT, which discards
+     * the in-transaction stamp along with everything else — and that is the only path that still reaches the
+     * post-lock fallback. Four mutations against that fallback came back GREEN on the r34 sweep for want of this
+     * test: a residual nothing exercises is a residual nobody can trust the shape of.
+     *
+     * WHAT WOULD STILL PASS IT: any fallback that stamps the row and reports. It says nothing about the case
+     * where the fallback ALSO fails, which is condition 5 of the residual and is genuinely open — see the note in
+     * posting-refusal-inbox.ts.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r34-commit-fail')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+
+    const { logged, refusalsRecorded } = await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'commit'),
+    )
+    console.log(`[r34 residual] logged=${JSON.stringify(logged)} recorded=${JSON.stringify(refusalsRecorded)}`)
+    // The CALLER must still be told this is not a counted postponement. On the residual path too: `hand-post-
+    // deferred` means "postponed AND counted" (r18), and the count here is 0, so publishing the fallback as an
+    // ordinary decline re-tells r32's lie on exactly the path that has least evidence behind it.
+    assert.deepEqual(refusalsRecorded.map((r) => r.reason), ['enqueue_refused'],
+      'the residual path records a plain refusal, never `hand_post_claim_held`: nothing counted this edit')
+    assert.ok(logged.some((l) => l.action === 'sales_invoice_update_not_queued'), 'and it is still reported as owed')
+
+    const row = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId },
+      select: { resolvedAt: true, handPostDeferredCount: true, handPostDeclineUncountedAt: true },
+    })
+    console.log(`[r34 residual] row=${JSON.stringify(row)}`)
+    assert.equal(row.handPostDeferredCount, 0, 'PRECONDITION: nothing the transaction did survived')
+    assert.ok(row.handPostDeclineUncountedAt,
+      'the POST-LOCK FALLBACK stamped the row, which is the only evidence available once the transaction that '
+      + 'would have carried it has rolled back')
+    assert.equal(row.resolvedAt, null, 'and the refusal is still outstanding')
+
+    // On this path the fallback's own ERROR line IS the reporting, and it must say the stamp landed.
+    const fallback = await db.activityLog.findFirst({
+      where: {
+        action: 'accounting_posting_refusal_decline_not_recorded',
+        description: { contains: referenceId },
+      },
+      select: { description: true, level: true },
+    })
+    assert.ok(fallback, 'the fallback reports')
+    assert.equal(fallback.level, 'ERROR')
+    assert.match(fallback.description, /stamped as carrying an uncounted postponement/,
+      'and says the stamp landed, so the operator is told marking handled will KEEP the row outstanding')
+
+    // And the debt still survives the mark, which is the property the whole lineage is about.
+    const marked = await deps.markPostingHandled(db as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted the version I had',
+    } as never)
+    assert.equal(marked.ok, true, 'the mark itself is accepted')
+    if (!marked.ok) return
+    assert.equal(marked.stillOutstanding, true, 'the debt survives the mark on the residual path too')
+    assert.equal(marked.unaccountedDecline, true,
+      'and the operator is told the history is incomplete rather than shown a count of 0')
+  },
+)
+
+test(
+  '[o3d-j625 r34 LOUD] the unaccounted state reaches the operator, not just the row',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * The fallback requirement round 33 set: the failure must be visible WHERE THE OPERATOR ACTS. Three
+     * mutations — the mark's answer, the inbox row's flag and the claims list's flag — were GREEN for want of
+     * this, which is exactly the "documented but not loud" state that was rejected. `deferredEdits` is 0 whenever
+     * the stamp is holding the debt, so every operator-facing string would otherwise read "none" or "0 later
+     * version(s)": the one thing they must never say.
+     *
+     * WHAT WOULD STILL PASS IT: different wording. It asserts the three signals reach a caller, not the prose.
+     */
+    const deps = await loadDeps()
+    const r28 = await loadR28Deps()
+    const { db } = deps
+    const referenceId = probeId('r34-loud')
+    const key = updateKeyFor(referenceId)
+    t.after(cleanup(db, referenceId))
+
+    const refusalId = (await db.accountingPostingRefusal.create({
+      data: { ...key, ...updateRefusal('retired_chart') } as never,
+      select: { id: true },
+    })).id
+    await runSalesInvoiceUpdateThroughFacadeShape(
+      deps, r28, referenceId,
+      () => takeForHandPosting(deps, refusalId, 'operator-A'),
+      withDeferralFailure(db, referenceId, 'throw'),
+    )
+
+    // THE MARK, at the moment of clicking. The two PROJECTIONS that feed the inbox and the claims list are
+    // pinned by a source ratchet in tests/accounting/posting-refusal-inbox-surface.test.ts instead: they are
+    // server actions and need a request scope (`headers()`), which a concurrency test has no business faking.
+    const before = await db.accountingPostingRefusal.findUniqueOrThrow({
+      where: { id: refusalId }, select: { handPostDeferredCount: true, handPostDeclineUncountedAt: true },
+    })
+    assert.equal(before.handPostDeferredCount, 0, 'PRECONDITION: the count is 0, which is why a flag is needed')
+    assert.ok(before.handPostDeclineUncountedAt, 'PRECONDITION: and the stamp is what holds the debt')
+    const marked = await deps.markPostingHandled(db as never, {
+      id: refusalId, userId: 'operator-A', note: 'posted by hand',
+    } as never)
+    assert.equal(marked.ok, true)
+    if (!marked.ok) return
+    assert.equal(marked.stillOutstanding, true)
+    assert.equal(marked.unaccountedDecline, true,
+      'and the mark says the history is incomplete, so the notice can say so instead of quoting 0')
   },
 )

@@ -77,6 +77,13 @@ export type MarkHandledResult =
       deferredEdits: number
       /** `true` when the refusal was deliberately NOT resolved because a later posting is still owed. */
       stillOutstanding: boolean
+      /**
+       * o3d-j625 r34 (Codex round 33, HIGH) — `true` when the debt is held by the UNACCOUNTED stamp rather than
+       * by the count, so `deferredEdits` is 0 and must not be read as "none were declined". Optional because
+       * only the keep-outstanding exit can produce it; every other answer leaves it absent rather than false, so
+       * a caller cannot mistake "not applicable" for "accounted for".
+       */
+      unaccountedDecline?: boolean
     }
   /**
    * o3d-j625 r16 (Codex round 15, HIGH 1) — `not_claimed` and `claimed_by_other` are the two answers the
@@ -627,6 +634,16 @@ export async function markPostingHandled(
       suppressed: false,
       deferredEdits,
       stillOutstanding: true,
+      /**
+       * o3d-j625 r34 (Codex round 33, HIGH) — SAY, AT THE MOMENT OF CLICKING, THAT THE HISTORY IS INCOMPLETE.
+       *
+       * `deferredEdits` tells the operator HOW MANY postings arrived behind their claim. When the debt is being
+       * kept by the STAMP instead, that number is 0 and would read as "none" — which is the one thing it must
+       * not say, because the truth is "at least one, and IMS could not count it". Returned so the caller's
+       * message can distinguish the two, rather than leaving the operator to infer it from a log line they
+       * would have had to read earlier.
+       */
+      unaccountedDecline: declineUncounted,
     }
   }
   const resolved = await tx.accountingPostingRefusal.updateMany({

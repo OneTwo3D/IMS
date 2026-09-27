@@ -1252,9 +1252,14 @@ test('[o3d-j625 r30] the clear never publishes a decline assigned from inside it
   )
   assert.ok(clear.length > 500, 'PRECONDITION: the clear body must be found, or this test reads nothing')
 
-  // The callback RETURNS the decline...
-  assert.match(clear, /return \{ outcome: 'declined-hand-post-claim', \.\.\.claim \}/,
+  // The callback RETURNS the decline. o3d-j625 r34 re-aimed this: the return is now a ternary over the two
+  // decline outcomes (counted, or stamped as unaccounted), because the stamp is written inside this callback.
+  // The PROPERTY is unchanged and is what this asserts — the decline leaves the callback as a returned value,
+  // never as an assignment into an outer variable from inside a transaction that may still roll back.
+  assert.match(clear, /return counted\s*\n?\s*\? \{ outcome: 'declined-hand-post-claim', \.\.\.claim \}/,
     'the decline must be the lock callback\'s return value')
+  assert.match(clear, /outcome: 'declined-hand-post-claim-not-recorded',/,
+    'and so must the unaccounted variant')
   // ...and the only assignment to the published holder is the one after the lock returns.
   const assignments = clear.match(/^\s*result = /gm) ?? []
   assert.equal(assignments.length, 1,
@@ -1309,14 +1314,71 @@ test('[o3d-j625 r32] every reset of the deferral count also clears the uncounted
   // The decision itself must read BOTH signals, and only on a reused key.
   assert.match(mark, /const keepOutstanding = keyIsReused && \(deferredEdits > 0 \|\| declineUncounted\)/,
     'the reused-key mark decision must treat an uncounted decline as evidence of a postponement')
-  // ...and the stamp must be written from OUTSIDE the transaction that failed, which is the whole fix.
+  /**
+   * o3d-j625 r34 (Codex round 33, HIGH) — THIS ASSERTION IS DELIBERATELY INVERTED FROM ITS r32 FORM.
+   *
+   * r32 asserted the stamp was written OUTSIDE the lock callback, because a bare write inside it would have been
+   * rolled back by the very failure it records. Round 33 named what that bought: the stamp became a SEPARATE
+   * write, attempted after the transaction ended and the key lock was released, so it could fail on its own and
+   * leave no signal at all.
+   *
+   * r34 writes it INSIDE, with the failing bump contained by a savepoint — so the transaction survives the
+   * failure and the stamp commits with the decline or not at all. The r32 assertion is therefore now asserting
+   * the defect. It is inverted rather than deleted, and the reason is recorded here, because the direction of
+   * this rule is the whole of round 33's finding and a future author must not swing it back by accident.
+   */
   const inbox = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/posting-refusal-inbox.ts'), 'utf8')
+  const lockBody = inbox.slice(inbox.indexOf('async (locked) => {'), inbox.indexOf('    result = settled'))
+  assert.match(lockBody, /handPostDeclineUncountedAt: new Date\(\)/,
+    'the stamp MUST be written inside the lock callback, in the same transaction as the decline')
+  assert.match(lockBody, /await withSavepoint\(locked,/,
+    'and the bump it replaces must be contained by a savepoint, or the failure aborts this transaction (25P02) '
+    + 'and takes the stamp with it — which is why r32 could not write it here')
+  // The post-lock write survives ONLY as a last-ditch fallback for the transaction failing to commit.
   assert.match(inbox, /const marked = await markDeclineUncounted\(client, key\)/,
-    'the stamp is written with the OUTER client, after guarded returned — a write inside the lock callback '
-    + 'would be rolled back by the very failure it records, which is why no derivation can work')
-  assert.doesNotMatch(
-    inbox.slice(inbox.indexOf('async (locked) => {'), inbox.indexOf('    result = settled')),
-    /handPostDeclineUncountedAt/,
-    'and it is NOT written inside the lock callback',
+    'the post-lock fallback is kept for the narrowed residual — the locked transaction not committing at all')
+})
+
+/**
+ * o3d-j625 r34 (Codex round 33, HIGH) — THE UNACCOUNTED STATE REACHES BOTH OPERATOR-FACING PROJECTIONS.
+ *
+ * The fallback requirement was that the failure is visible WHERE THE OPERATOR ACTS. Three mutations — the inbox
+ * row's flag, the claims list's flag, and the mark's answer — came back GREEN on the r34 sweep for want of a
+ * test, which is precisely the "documented, not loud" state that was rejected. `handPostDeferredEdits` is 0
+ * whenever the stamp is holding the debt, so without these flags every surface reads "none" or "0 later
+ * version(s)" over a document whose ledger state is unknown.
+ *
+ * Source-level on purpose: both projections are server actions that need a request scope, and the behavioural
+ * half (the mark's answer) is asserted against a real database in the r34 LOUD concurrency test.
+ *
+ * WHAT WOULD STILL PASS IT: different field names or wording, and any rendering that reads the flag. It does not
+ * prove the string an operator finally sees, only that the fact reaches the component that writes it.
+ */
+test('[o3d-j625 r34] both operator-facing projections derive the unaccounted flag from the column', () => {
+  const actions = readFileSync(path.join(process.cwd(), 'app/actions/sync-exceptions.ts'), 'utf8')
+  // The inbox row and the claims row must each DERIVE it, not hardcode it.
+  const derivations = actions.match(/handPostDeclineUncountedAt !== null/g) ?? []
+  assert.equal(derivations.length, 2,
+    `both the inbox row and the claims row must derive the flag from handPostDeclineUncountedAt; found `
+    + `${derivations.length}. A hardcoded false is the mutation that made every surface say "none" over an `
+    + 'unaccounted decline, and it passed the whole sweep before this test existed.')
+  assert.match(actions, /handPostDeclineUnaccounted: row\.handPostDeclineUncountedAt !== null/, 'inbox row')
+  assert.match(actions, /declineUnaccounted: row\.handPostDeclineUncountedAt !== null/, 'claims row')
+  // ...and the mark's answer must carry it rather than a constant.
+  const mark = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/posting-mark-handled.ts'), 'utf8')
+  assert.match(mark, /unaccountedDecline: declineUncounted,/,
+    'the mark must report the state it actually read, not a constant')
+
+  // NON-VACUITY: the operator-facing copy must BRANCH on it, or the flag reaches the page and changes nothing.
+  const client = readFileSync(
+    path.join(process.cwd(), 'app/(dashboard)/sync/exceptions/exceptions-client.tsx'), 'utf8',
   )
+  assert.match(client, /claim\.declineUnaccounted/, 'the claims list must branch on the flag')
+  assert.doesNotMatch(
+    client.slice(client.indexOf('claim.declineUnaccounted'), client.indexOf('claim.declineUnaccounted') + 600),
+    /^\s*\? 'none'/m,
+    'and must not render "none" on the unaccounted branch',
+  )
+  assert.match(actions, /result\.unaccountedDecline/,
+    'and the mark notice must branch on it too, instead of quoting a count of 0')
 })

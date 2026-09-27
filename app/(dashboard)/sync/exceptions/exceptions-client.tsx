@@ -1179,9 +1179,14 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs">
                     {/* o3d-j625 r18 HIGH 1: postings IMS has already declined behind this claim. Shown HERE so
                         the holder learns before going to the ledger that the document has moved on. */}
-                    {claim.deferredEdits > 0
-                      ? `${claim.deferredEdits} — the document has been saved again since; this refusal will stay open`
-                      : 'none'}
+                    {/* o3d-j625 r34: the UNACCOUNTED case first, because it is the one a plain count misreports.
+                        With the stamp holding the debt, `deferredEdits` is 0 and 'none' would be a lie. */}
+                    {claim.declineUnaccounted
+                      ? 'at least one, NOT COUNTED — IMS declined a posting behind this claim and could not record '
+                        + 'how many. Treat the ledger as possibly behind; this refusal will stay open.'
+                      : claim.deferredEdits > 0
+                        ? `${claim.deferredEdits} — the document has been saved again since; this refusal will stay open`
+                        : 'none'}
                   </TableCell>
                   <TableCell className="text-xs">
                     <Button

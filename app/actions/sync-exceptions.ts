@@ -668,6 +668,12 @@ export type AccountingHandPostClaimRow = {
   heldForHours: number
   stale: boolean
   deferredEdits: number
+  /**
+   * o3d-j625 r34 (Codex round 33, HIGH) — `true` when IMS declined a posting behind this claim and could NOT
+   * count it. `deferredEdits` is then 0, so the page must not render "none": the truth is "at least one, and the
+   * history here is incomplete". The holder sees it BEFORE going to the ledger, which is the point.
+   */
+  declineUnaccounted: boolean
 }
 
 /** o3d-j625 r6 (review H4): a recently RESOLVED refusal, so the page says how each one was closed. */
@@ -1278,6 +1284,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         handPostClaimedBy: true,
         // o3d-j625 r18: how many postings IMS has declined to queue behind this claim.
         handPostDeferredCount: true,
+        handPostDeclineUncountedAt: true,
       },
     }),
   ])
@@ -1628,6 +1635,16 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             earlierPostings,
             handPostClaim,
             handPostDeferredEdits: row.handPostDeferredCount,
+            /**
+             * o3d-j625 r34 (Codex round 33, HIGH) — THE ROW ITSELF CARRIES THE UNACCOUNTED STATE.
+             *
+             * When IMS declined a posting behind a claim and could not count it, the refusal is stamped instead,
+             * and that stamp is what keeps the debt through the mark. The inbox must show it, because
+             * `handPostDeferredEdits` is 0 in that case and would otherwise read as "nothing was declined" —
+             * the operator would meet the truth only in an ERROR log line they had to have read earlier, which
+             * is not a mitigation.
+             */
+            handPostDeclineUnaccounted: row.handPostDeclineUncountedAt !== null,
             // o3d-j625 r16: the site's own remedy, VERBATIM, in every case — round 12's property with the
             // exception r14 introduced removed again. What to do FIRST is its own field.
             remedy: row.remedy,
@@ -1995,7 +2012,7 @@ async function loadHandPostClaimPage(params: {
     : { AND: [filtered, { id: { gt: after.id } }] }
   const CLAIM_SELECT = {
     id: true, type: true, referenceType: true, referenceId: true, kind: true,
-    handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true,
+    handPostClaimedAt: true, handPostClaimedBy: true, handPostDeferredCount: true, handPostDeclineUncountedAt: true,
   } as const
   const wantsLongestHeld = after === null && search === ''
   const [rows, total, matched, longest] = await Promise.all([
@@ -2048,6 +2065,7 @@ async function loadHandPostClaimPage(params: {
       heldForHours: Math.round(heldForHours * 10) / 10,
       stale: heldForHours >= HAND_POST_CLAIM_STALE_HOURS,
       deferredEdits: row.handPostDeferredCount,
+      declineUnaccounted: row.handPostDeclineUncountedAt !== null,
     }]
   }
   // A next cursor EXACTLY when a row beyond this page was read. Never derived from `total`, which is counted
@@ -2299,10 +2317,22 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
          * refusal of their mark (the ledger write they made is real and is recorded here), it is a refusal of
          * the claim that the obligation is met.
          */
+        /**
+         * o3d-j625 r34 (Codex round 33, HIGH): and the UNACCOUNTED case gets its own sentence. When the debt is
+         * kept by the stamp rather than by the count, `deferredEdits` is 0 — "IMS was asked to post 0 later
+         * version(s)" is the one thing this must never say, because the truth is "at least one, and IMS could
+         * not count it". The operator meets that at the moment of clicking, which is the requirement: a
+         * residual they would have had to read a log line for earlier is not a mitigation.
+         */
         + (result.stillOutstanding
-          ? ` This row STAYS OUTSTANDING: while the claim was held, IMS was asked to post ${result.deferredEdits} `
-            + 'later version(s) of this document and declined, so the ledger does not hold the current one. '
-            + 'Re-save the document to queue it, or post the current version by hand and mark it again.'
+          ? (result.unaccountedDecline
+            ? ' This row STAYS OUTSTANDING: while the claim was held IMS declined at least one posting of this '
+              + 'document and COULD NOT RECORD HOW MANY, so its history here is incomplete. Treat the ledger as '
+              + 'possibly behind: check the document against the ledger, then re-save it to queue the current '
+              + 'version, or post that version by hand and mark it again.'
+            : ` This row STAYS OUTSTANDING: while the claim was held, IMS was asked to post ${result.deferredEdits} `
+              + 'later version(s) of this document and declined, so the ledger does not hold the current one. '
+              + 'Re-save the document to queue it, or post the current version by hand and mark it again.')
           : ''),
       metadata: {
         refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed,
@@ -2311,6 +2341,9 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
         suppressed: result.suppressed,
         deferredEdits: result.deferredEdits,
         stillOutstanding: result.stillOutstanding,
+        // o3d-j625 r34: the machine-readable half of the sentence above — whether the debt is held by the count
+        // or by the unaccounted stamp. Distinguishable in the log without parsing prose.
+        unaccountedDecline: result.unaccountedDecline ?? false,
       },
       resolveUser: false,
     })
@@ -2322,10 +2355,15 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
       success: true,
       ...(result.stillOutstanding
         ? {
-            notice: 'Your hand posting is recorded, but this row STAYS OUTSTANDING: IMS was asked to post '
-              + `${result.deferredEdits} later version(s) of this document while you held it and declined, so `
-              + 'the ledger does not hold the current one. Re-save the document to queue it, or post the '
-              + 'current version by hand and mark it again.',
+            notice: result.unaccountedDecline
+              ? 'Your hand posting is recorded, but this row STAYS OUTSTANDING: while you held it IMS declined '
+                + 'at least one posting of this document and could not record how many, so its history here is '
+                + 'INCOMPLETE. Check this document against the ledger, then re-save it to queue the current '
+                + 'version, or post that version by hand and mark it again.'
+              : 'Your hand posting is recorded, but this row STAYS OUTSTANDING: IMS was asked to post '
+                + `${result.deferredEdits} later version(s) of this document while you held it and declined, so `
+                + 'the ledger does not hold the current one. Re-save the document to queue it, or post the '
+                + 'current version by hand and mark it again.',
           }
         : {}),
     }

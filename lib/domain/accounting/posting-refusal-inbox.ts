@@ -964,18 +964,110 @@ export async function clearAccountingPostingRefusal(
         // `'unrecordable'` means a client with no table, which `standing` proves is not the case — but "cannot
         // happen" is what r28 said about every step between the assignment and the commit. A value that is
         // announced before the write that makes it true has to be checked, not reasoned about.
-        const recorded = await recordHandPostDeferral(locked as unknown as PostingSuppressionClient, key, new Date())
-        if (recorded !== 'recorded') {
-          throw new Error(`the postponement could not be recorded against the live claim (${recorded})`)
+        /**
+         * o3d-j625 r34 (Codex round 33, HIGH) — THE EVIDENCE IS WRITTEN UNDER THIS LOCK, IN THIS TRANSACTION.
+         *
+         * r32 attempted the bump here and, when it failed, stamped `handPostDeclineUncountedAt` afterwards
+         * through the POOL. Round 33 named the mechanism that leaves open: this transaction has already ended
+         * and the key lock is already released by the time that second write is attempted, so it can fail on
+         * its own, or the process can stop while it waits for a connection — and then neither signal exists and
+         * a later mark resolves the row. The ERROR line was the only remaining trace, and its own write is
+         * swallowed, so "an operator reads the log" was never a mitigation.
+         *
+         * So the bump is now attempted inside a SAVEPOINT. A failed statement aborts a PostgreSQL transaction
+         * (25P02) unless it is contained, which is exactly why r32 could not write the stamp here; contained,
+         * the failure rolls back to the savepoint and THIS transaction is still usable. The stamp is then
+         * written under the SAME lock, in the SAME transaction as the decline itself, so the two commit
+         * together or not at all. There is no window between them to fail in, and no lock to have been
+         * released.
+         *
+         * WHAT IS LEFT is the whole transaction failing to commit, which is one condition where there were two,
+         * and it is caught by the best-effort fallback after `guarded` — see below. Recorded honestly rather
+         * than claimed away.
+         */
+        let counted = false
+        try {
+          counted = await withSavepoint(locked, async () => {
+            const recorded = await recordHandPostDeferral(locked as unknown as PostingSuppressionClient, key, new Date())
+            if (recorded !== 'recorded') {
+              throw new Error(`the postponement could not be recorded against the live claim (${recorded})`)
+            }
+            return true
+          })
+        } catch {
+          // Contained by the savepoint: this transaction is still alive, which is the whole point.
+          counted = false
         }
-        await reportClearDeclinedForHandPostClaim(key, claim.claimedAt, claim.claimedBy)
-        return { outcome: 'declined-hand-post-claim', ...claim }
+        if (!counted) {
+          await table.updateMany({
+            where: { ...key, resolvedAt: null },
+            data: { handPostDeclineUncountedAt: new Date() },
+          })
+        }
+        await reportClearDeclinedForHandPostClaim(key, claim.claimedAt, claim.claimedBy, counted)
+        return counted
+          ? { outcome: 'declined-hand-post-claim', ...claim }
+          : {
+            outcome: 'declined-hand-post-claim-not-recorded',
+            ...claim,
+            because: 'the postponement could not be counted; the refusal is stamped as unaccounted instead',
+          }
       },
     )
     // Reached ONLY if the lock callback returned and its transaction committed. Everything the decline claims
     // is durable by the time this assignment happens, which is the whole of the fix.
     result = settled
   })
+  /**
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   * o3d-j625 r34 — THE RESIDUAL, WRITTEN DOWN PRECISELY. Read this before "improving" any of the above.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * The lost invoice edit has been found in rounds 17, 27, 29, 31 and 33, each time through the previous fix's
+   * own edge. What is left after r34 needs ALL of the following at once:
+   *
+   *   1. a hand-post claim is held on a REUSED posting key (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE,
+   *      BILL_PAYMENT — on any other kind the hand posting satisfies the debt and closing the row is correct);
+   *   2. an enqueue that began BEFORE the claim was taken reaches this clear afterwards. It cannot be an edit
+   *      that arrived DURING the claim: those never get here, because `createAccountingSyncLogRow` reads the
+   *      suppression under this same lock and records the postponement inside the caller's own transaction,
+   *      throwing `HandPostDeferralUnrecordableError` rather than proceeding (r18). That path is closed;
+   *   3. the deferral bump fails — now contained by a savepoint, so this alone is survivable;
+   *   4. the WHOLE locked transaction then fails to commit, discarding the in-transaction stamp with it;
+   *   5. the post-lock fallback write ALSO fails, or the process stops before it runs;
+   *   6. and an operator then marks the original posting handled.
+   *
+   * WHAT AN OPERATOR SEES IF ALL SIX HOLD: nothing. The row resolves and the ledger may be behind by whatever
+   * that pre-claim enqueue would have posted. That is the accepted limit, and it is why it is written here.
+   *
+   * WHY IT IS NARROWER STILL THAN SIX CONDITIONS SUGGESTS, stated so the risk is not overstated either: by (2)
+   * the declined enqueue's payload was composed BEFORE the claim existed, so an operator who posts the
+   * document's CURRENT state by hand has already included it. For anything to be lost they must additionally
+   * have posted a version older than that enqueue's — i.e. read the document, then let an edit land, then take
+   * the claim and post from the stale screen. Real, but a different hazard from the one the deferral count was
+   * built for.
+   *
+   * WHY IT IS NOT CLOSED, and which of the two options the review offered was tried. A narrower fail-closed rule
+   * — "for a reused key whose claim we cannot account for, refuse the mark" — was explored first and does not
+   * work: the ordinary case (claim taken, posting made by hand, nothing declined behind it) produces exactly the
+   * same durable state as the dangerous one, namely a claim with no count and no stamp. Requiring positive
+   * evidence of what happened during the claim therefore refuses the ordinary mark too, which is the r6 false
+   * debt on every hand-settled invoice update, and "the ordinary case accounts for itself by resolving normally"
+   * is circular because resolving normally is the thing being decided. The distinguishing fact lives only in the
+   * transaction that failed. An automated reconciliation sweep is the honest remaining option: it needs a
+   * durable "this claim ended unaccounted-for" record to sweep FOR, which is the same write that can fail, so it
+   * moves the window rather than closing it — unless it reconciles against the connector's own ledger state,
+   * which is a much larger surface than this branch.
+   *
+   * WHAT WAS DONE INSTEAD, per the review's second requirement: the failure is visible WHERE THE OPERATOR ACTS.
+   * The stamp is on the refusal row, so the inbox and the claims list show "at least one, NOT COUNTED" instead of
+   * "none"; the mark's own answer carries `unaccountedDecline`, so the notice at the moment of clicking says the
+   * history is incomplete and to check the ledger; and the ERROR log line has stopped being the mechanism, which
+   * was the review's specific objection to r32 — its write is swallowed, so it could never have been one.
+   */
+  // o3d-j625 r34: reached only when the locked transaction above did not COMMIT — the in-transaction stamp went
+  // with it, so this is the last-ditch attempt, through the pool, with the lock no longer held. It is the
+  // narrowed residual, not the primary path it was in r32.
   if (result.outcome === 'cleared' && seen.claim) {
     // A live claim was read and the postponement did not commit. Owed, and explicitly not postponed.
     //
@@ -1076,6 +1168,8 @@ async function reportClearDeclinedForHandPostClaim(
   key: PostingRefusalKey,
   claimedAt: Date,
   claimedBy: string | null,
+  /** o3d-j625 r34: whether the postponement was COUNTED, or only stamped as unaccounted. */
+  counted = true,
 ): Promise<void> {
   const { logActivity } = await import('@/lib/activity-log')
   await logActivity({
@@ -1088,7 +1182,14 @@ async function reportClearDeclinedForHandPostClaim(
       + `an operator took it to settle by hand at ${claimedAt.toISOString()} and still holds it, which cancelled `
       + 'the queued row this clear was about. The refusal stays OUTSTANDING and the claim stays theirs — '
       + 'clearing it would hide a posting nobody could then release or mark handled, while its claim went on '
-      + 'stopping IMS queueing it.',
-    metadata: { ...key, handPostClaimedAt: claimedAt.toISOString(), handPostClaimedBy: claimedBy },
+      + 'stopping IMS queueing it.'
+      // o3d-j625 r34: which of the two durable signals this decline left behind. The signal itself is what
+      // stops the mark resolving the row; this line only describes it, and is no longer the mechanism.
+      + (counted
+        ? ' The postponement is COUNTED against the claim.'
+        : ' The postponement could NOT be counted, so the refusal is stamped as carrying an UNACCOUNTED decline '
+          + 'instead — written in this same transaction, under this same lock, so it commits with this decline or '
+          + 'not at all. Marking the claim handled will keep the refusal outstanding either way.'),
+    metadata: { ...key, handPostClaimedAt: claimedAt.toISOString(), handPostClaimedBy: claimedBy, postponementCounted: counted },
   }).catch(() => { /* an audit line that cannot be written must not fail the enqueue it describes */ })
 }

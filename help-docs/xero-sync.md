@@ -2373,7 +2373,11 @@ Three things about those rows:
   queued when you took the posting**: taking it cancels that attempt, so from that moment the posting is
   owed again — and the document it came from is told so, instead of being left recording that its work was
   queued. Those are logged as `accounting_posting_refusal_clear_declined_hand_post_claim`, and the posting
-  is recorded as outstanding in the usual way. Anything held far longer than a hand posting takes is
+  is recorded as outstanding in the usual way. **Very rarely the count itself cannot be written** — if so the
+  row says "at least one, NOT COUNTED" rather than a number, and marking the posting handled keeps it open
+  and tells you the history is incomplete. Treat that as "the ledger may be behind": compare the document
+  with the ledger, then re-save it so IMS queues the current version. Anything held far longer than a hand
+  posting takes is
   flagged; nothing acts on that flag, it is a prompt to ask the holder or release it.
 
   **This list is a view of what is being held, not a roll-call.** The longest-held claims are listed
