@@ -233,6 +233,61 @@ test('the migration this repository requires to declare checks now declares them
 // which is a different defect with a different fix; and a table created and dropped by migrations that
 // PRISMA never modelled in the first place. Neither test says anything about column-level changes.
 
+/**
+ * o3d-ec4c0 — THE PROTECTED SET, AS A FUNCTION, so its property can be asserted without a branch that happens to
+ * add SQL.
+ *
+ * Trunk's migrations at the merge base, PLUS every migration a commit on this branch introduced. Both halves
+ * matter and r29 is the reason the second one exists: a branch's migrations reach real databases — stage, a
+ * colleague's checkout, every scratch database a review gates on — long before the branch merges, so deleting one
+ * afterwards leaves a database with history the repo no longer contains.
+ */
+export function buildProtectedMigrationSet(input: {
+  onTrunk: Iterable<string>
+  introducedOnBranch: Iterable<string>
+}): Set<string> {
+  return new Set([...input.onTrunk, ...input.introducedOnBranch])
+}
+
+/**
+ * o3d-ec4c0 — R29'S FINDING, CARRIED ON EVERY BRANCH INCLUDING TRUNK.
+ *
+ * The deletion check below can only show this property when the current branch happens to have added a
+ * migration; on trunk, and on any branch that adds none, there is nothing to demonstrate it with. That is what
+ * made r30's precondition fail everywhere. Asserted here over synthetic inputs instead, so the guarantee holds
+ * wherever the suite runs.
+ *
+ * WHAT WOULD STILL PASS IT: any implementation that unions the two inputs, however written. It says nothing about
+ * how the two inputs are DERIVED from git — that is the deletion check's job, and its `onTrunk.size > 50`
+ * precondition is what keeps it honest.
+ */
+test('o3d-ec4c0: the protected set never collapses to trunk-only, nor to branch-only', () => {
+  const onTrunk = ['20240101000000_a', '20240102000000_b']
+  const introducedOnBranch = ['20260301000000_added_on_this_branch']
+  const set = buildProtectedMigrationSet({ onTrunk, introducedOnBranch })
+
+  // THE r29 PROPERTY: a migration this branch introduced is protected even though trunk has never seen it.
+  assert.ok(set.has('20260301000000_added_on_this_branch'),
+    'a migration introduced on this branch MUST be protected. Dropping it is r29\'s finding: the guard then '
+    + 'protects only trunk, while the migration whose deletion caused the incident is the branch\'s own.')
+  // ...and the trunk half is not lost in the process.
+  for (const dir of onTrunk) {
+    assert.ok(set.has(dir), `trunk's ${dir} must stay protected`)
+  }
+  assert.equal(set.size, 3, 'and nothing else is invented')
+
+  // Each input alone still produces a protected set, so neither half is load-bearing for the other. This is the
+  // case that matters on trunk, where the branch side is empty by construction.
+  assert.deepEqual([...buildProtectedMigrationSet({ onTrunk, introducedOnBranch: [] })].sort(), [...onTrunk].sort(),
+    'on trunk (no branch contribution) the set is exactly trunk\'s migrations — not empty, which would make the '
+    + 'deletion check below inert on the one branch everybody merges into')
+  assert.deepEqual(
+    [...buildProtectedMigrationSet({ onTrunk: [], introducedOnBranch })],
+    [...introducedOnBranch],
+    'and a branch-only set is still protected, so a shallow clone with no trunk ref cannot silently protect nothing',
+  )
+})
+
 test('o3d-j625 r30: no migration this branch has ever had may be deleted from HEAD or the working tree', () => {
   const root = process.cwd()
   const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
@@ -300,20 +355,37 @@ test('o3d-j625 r30: no migration this branch has ever had may be deleted from HE
       .map((line) => line.split('/')[2]),
   )
   const onTrunk = dirsAt(base)
-  const protectedDirs = new Set([...onTrunk, ...introducedOnBranch])
+  const protectedDirs = buildProtectedMigrationSet({ onTrunk, introducedOnBranch })
   const onBranch = dirsAt('HEAD')
 
   assert.ok(onTrunk.size > 50, `PRECONDITION: the walk must actually see the trunk's migrations, saw ${onTrunk.size}`)
   // AND the branch's own must actually be in the protected set, or this test has quietly reverted to r28's.
   // Asserted as a non-empty INTERSECTION with what HEAD has, so it cannot be satisfied by a stale name.
   //
-  // o3d-j625 r30: asserted against `protectedDirs` ITSELF, not against `introducedOnBranch`. Checking the
-  // latter would pass unchanged if the set below quietly reverted to trunk-only — which is r29's finding, so
-  // the precondition has to be able to detect exactly that.
-  const branchOwnProtected = [...introducedOnBranch].filter((dir) => onBranch.has(dir) && protectedDirs.has(dir))
-  assert.ok(branchOwnProtected.length > 0,
-    'PRECONDITION: this branch must contribute at least one migration to the PROTECTED SET, otherwise the r29 '
-    + 'finding is not being exercised and this check has collapsed back to trunk-only')
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  // o3d-ec4c0 — THIS PRECONDITION REDDENED TRUNK, AND THE FIX IS NOT TO DELETE IT
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  //
+  // r30 asserted, unconditionally, that this branch contributes at least one migration to the protected set —
+  // aimed at `protectedDirs` itself (r32) so that a silent collapse back to trunk-only could not pass. The aim
+  // was right and the placement was wrong: `introducedOnBranch` comes from `merge-base..HEAD`, so a branch that
+  // adds no migration contributes none and the PRECONDITION fails before the real deletion check ever runs. On
+  // trunk the range is empty by construction, so it fails there too. The guard could only pass on the branch
+  // that wrote it, which happened to add five migrations — a check whose precondition is satisfied only by its
+  // author's branch is not a check.
+  //
+  // So the property moves OFF the current branch's contents and ONTO the code: `buildProtectedMigrationSet` is
+  // asserted directly, with synthetic inputs, by the test below this one. That carries r29's finding on EVERY
+  // branch — including trunk, and including branches that add no SQL, which are exactly the branches where a
+  // deletion would otherwise go unnoticed. Here, where there is genuinely nothing to exercise, the assertion is
+  // SKIPPED rather than failed; where the branch does add a migration it still runs, because a real example is
+  // worth having when one exists.
+  if (introducedOnBranch.size > 0) {
+    const branchOwnProtected = [...introducedOnBranch].filter((dir) => onBranch.has(dir) && protectedDirs.has(dir))
+    assert.ok(branchOwnProtected.length > 0,
+      'this branch introduced a migration, so it must appear in the PROTECTED SET; if it does not, the set has '
+      + 'collapsed back to trunk-only, which is the r29 finding')
+  }
 
   const deleted = [...protectedDirs].filter((dir) => !onBranch.has(dir))
   assert.deepEqual(deleted, [],
@@ -353,8 +425,12 @@ test('o3d-j625 r28: every table a migration creates is either modelled or droppe
     for (const m of body.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([^"]+)"/gi)) dropped.add(m[1])
   }
   assert.ok(created.size > 50, `PRECONDITION: CREATE TABLE statements must be found, saw ${created.size}`)
-  assert.ok(dropped.has('accounting_hand_post_claim_revisions'),
-    'PRECONDITION: the r28 drop migration must be among those parsed, or this test is not exercising the case it exists for')
+  // o3d-ec4c0: the GENERAL form. r28 named one specific migration here, which made this precondition a hostage
+  // to that directory continuing to exist — the same shape of fragility that reddened trunk one test above. What
+  // it needs to know is that the DROP-parsing path is exercised at all.
+  assert.ok(dropped.size > 0,
+    'PRECONDITION: at least one DROP TABLE must be parsed (e.g. accounting_hand_post_claim_revisions), or this '
+    + 'test is not exercising the case it exists for')
 
   const schema = readFileSync(join(root, 'prisma', 'schema.prisma'), 'utf8')
   const modelled = new Set<string>()
