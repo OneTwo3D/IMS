@@ -127,8 +127,62 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *     · app/actions/reset.ts — `deleteMany({})` over everything; a destructive dev reset, not a
  *       concurrent participant.
  *
- * IF A FIFTH WRITER APPEARS, add it to this census and call
- * `lockPurchaseOrdersWithCostRows` — which exists precisely so the inversion cannot be written.
+ * IF A FIFTH WRITER APPEARS, add it to this census and take the parent through one of the two helpers
+ * below — `lockPurchaseOrdersWithCostRows` if it reads or writes cost rows, `lockPurchaseOrders` if it
+ * only needs the gate.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE CENSUS AGAIN, THIS TIME OVER EVERY RESOURCE (o3d-6nd55 r5, Codex round-4 HIGH)
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * The census above answered "who touches the three PO tables, in what order". It was correct and it
+ * was not enough: `stock_levels` was outside its frame, and the r3 fix that put the parent ahead of the
+ * cost rows put it BELOW the supplier return's stock locks — trading a child/parent inversion for a
+ * stock/parent one. A LOCK ORDER IS A PROPERTY OF EVERY RESOURCE EACH PARTICIPANT TAKES, so here is
+ * every participant's COMPLETE acquisition sequence:
+ *
+ *   `receiveStock` (app/actions/purchase-orders.ts)
+ *       purchase_orders(:1828) → cost_layers(:1985) → stock_levels(:1994) → purchase_order_lines(:2012)
+ *   `createPurchaseReturn`
+ *       purchase_orders(r5) → stock_levels → purchase_order_lines → cost_layers (FIFO consumption)
+ *   PO-backed alignment (lib/connectors/mintsoft/sync/stock-sync.ts)
+ *       stock_transfers → purchase_orders → purchase_order_lines → freight_cost_lines → wms_asn_maps
+ *       → wms_asn_line_maps → stock_levels → cost_layers → settings advisory + plugin/mapping rows
+ *   `updateFreightPoCosts`
+ *       purchase_orders → purchase_order_lines → freight_cost_lines  (then the recalc's own writes)
+ *   fx rebase (`rebasePurchaseOrderStoredBaseAmountsWithParentUpdate`)
+ *       purchase_orders → purchase_order_lines → freight_cost_lines
+ *   invoicing (:2919-2921) / invoice edit (:3305-3308)
+ *       [purchase_invoices →] purchase_orders → [purchase_invoice_lines →] purchase_order_lines
+ *       → freight_cost_lines
+ *   WMS book-in (lib/domain/wms/booked-in-service.ts)
+ *       wms_inbound_receipt_events → stock_transfers/purchase_orders → wms_asn_maps → wms_asn_line_maps
+ *       → stock_levels → cost_layers → settings advisory + mapping rows
+ *
+ * WHY THERE IS NO SINGLE TOTAL RANK, AND WHY THAT IS NOT A GAP. Two families genuinely disagree about
+ * {stock_levels, purchase_order_lines}: the PO receipt/return family takes STOCK FIRST — deliberately,
+ * recorded as audit-18s1 in `createPurchaseReturn`, so those two agree with each other — while the WMS
+ * family takes the PO children at step 2 and stock at step 5. Forcing one rank on both would mean
+ * reordering `receiveStock`, and it is not necessary, because of this:
+ *
+ *   ★ `purchase_orders` IS THE GATE. Every participant above that touches a PO's `purchase_order_lines`,
+ *     its `freight_cost_lines`, or the stock of that PO's products takes the PARENT FIRST and holds it to
+ *     COMMIT. A PO's children are PO-SCOPED, so two participants that can contend on the same child must
+ *     both hold the SAME parent row — and only one of them can. The relative order of stock, lines and
+ *     layers AFTER the parent therefore cannot close a cycle between them for one purchase order, and
+ *     across DIFFERENT purchase orders they have no child in common to cycle on.
+ *
+ * That is the invariant to preserve when adding a participant: not a rank over eight tables, but
+ * "take the parent before anything belonging to it, and hold it to commit".
+ *
+ * ONE RESIDUAL HAZARD, PRE-EXISTING AND DELIBERATELY NOT FIXED HERE (see o3d-chs1h). The gate argument
+ * covers resources SCOPED to a purchase order. `cost_layers` and `stock_levels` are scoped to a
+ * PRODUCT and WAREHOUSE, so two participants on DIFFERENT purchase orders can contend on them:
+ * `receiveStock` takes cost_layers BEFORE stock_levels, `createPurchaseReturn` takes them the other way
+ * round, and a receipt of one order racing a return of another for the SAME product can therefore
+ * cycle. Both orders predate this branch and neither is alignment's; closing it means reordering
+ * `receiveStock`'s layer/stock pair, which is a change to the most heavily used write path in
+ * purchasing and is out of scope for a WMS alignment fix. Filed rather than folded in.
  *
  * WHAT LOCKING THEM BUYS, precisely. `computeGrossUnitCostBaseByLine` — the one definition of what a
  * receipt's units cost — reads `purchase_order_lines` (goods cost, qty, totalBase) and the

@@ -5,6 +5,7 @@ import { config } from 'dotenv'
 import * as realAccountingNs from '@/lib/accounting'
 import * as realTransitNs from '@/lib/domain/accounting/transit-subledger-movement'
 import * as realLockOrderNs from '@/lib/domain/wms/transfer-asn-lock-order'
+import * as realCostLayersNs from '@/lib/cost-layers'
 import { liveMintsoftBookedInAsnRef } from '@/tests/helpers/live-mintsoft-asn-ref'
 
 /**
@@ -153,6 +154,37 @@ mock.module('@/lib/domain/wms/transfer-asn-lock-order', {
         await hook()
       }
       return realLockOrderNs.lockPurchaseOrdersWithCostRows(tx, ids)
+    },
+  },
+})
+
+/**
+ * ARM 14'S SEAM — A BARRIER BETWEEN THE RECEIPT'S PARENT LOCK AND ITS FIRST STOCK LOCK (r5).
+ *
+ * `receiveStock`'s sequence is `purchase_orders` → `cost_layers` → `stock_levels` →
+ * `purchase_order_lines`, and `createCostLayer` sits between the parent lock and the stock upsert. So
+ * wrapping it parks the receipt holding the parent and NOT yet the stock row — the one window in which
+ * the supplier return's stock-before-parent order can close a cycle. Any earlier barrier and the
+ * receipt holds nothing; any later one and it already holds the stock row, where the return simply
+ * queues and the arm would pass whatever order the return used.
+ *
+ * The layer really is created before the pause: the wrapper delegates first, so the state at the
+ * barrier is production's own.
+ */
+let pauseAfterReceiptCostLayer: (() => Promise<void>) | null = null
+mock.module('@/lib/cost-layers', {
+  namedExports: {
+    ...realCostLayersNs,
+    createCostLayer: async (
+      ...args: Parameters<typeof realCostLayersNs.createCostLayer>
+    ) => {
+      const created = await realCostLayersNs.createCostLayer(...args)
+      if (pauseAfterReceiptCostLayer) {
+        const hook = pauseAfterReceiptCostLayer
+        pauseAfterReceiptCostLayer = null
+        await hook()
+      }
+      return created
     },
   },
 })
@@ -1697,4 +1729,123 @@ test('o3d-6nd55 r3: a freight-cost edit interleaved with a PO-backed alignment d
     'and its new amount must be committed — otherwise the edit was a no-op and contended over nothing',
   )
   assert.equal(logs.length, 1, 'and the alignment must have posted its receipt journal')
+})
+
+/**
+ * ARM 14 — A SUPPLIER RETURN AND A RECEIPT OF THE SAME PURCHASE ORDER MUST NOT DEADLOCK
+ * (r5, Codex round-4 HIGH).
+ *
+ * THE DEFECT, AND IT IS THE CENSUS'S OWN FIX ONE RESOURCE OVER. Round 3 put the parent lock into
+ * `createPurchaseReturn` to close a child/parent inversion — and put it BELOW the return's stock-level
+ * locks, so the return then held a stock row and wanted the parent while `receiveStock` held the parent
+ * and wanted that stock row. Round 3's census had framed the question as "who touches the three PO
+ * tables", and `stock_levels` was outside the frame.
+ *
+ * OLDER THAN THIS BRANCH, WHICH IS WHY THE SHAPE MATTERS MORE THAN THE BLAME: the return's closing
+ * parent UPDATE always gave it the stock→parent order. Round 3 made the acquisition explicit and
+ * earlier, widening the window rather than opening it. It is still this branch's to fix, because this
+ * branch is what makes the opposite order load-bearing — alignment holds the parent precisely so it can
+ * trust the cost rows it reads.
+ *
+ * THE FIX IS THE PARENT ONLY, above the first stock lock. Not the combined cost-row helper: this path
+ * touches no freight cost lines, and taking `purchase_order_lines` up there would break the audit-18s1
+ * agreement that the return and the receipt take {stock_levels, purchase_order_lines} in the SAME
+ * order. The gate is the parent; the line locks stay where audit-18s1 put them.
+ *
+ * WHY THIS IS DETERMINISTIC. The receipt is parked, by the barrier above, holding the parent and not yet
+ * the stock row. The return is then started and given time to reach its first lock. Under the pre-r5
+ * order that is a guaranteed cycle; with the parent taken first the return simply queues on the parent
+ * and the two serialise.
+ *
+ * WHAT IS ASSERTED: both operations succeed, neither raises SQLSTATE 40P01, and BOTH effects landed —
+ * the received quantity rose AND the returned quantity rose — so "no deadlock" cannot be satisfied by
+ * an operation that quietly did nothing.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: it says nothing about the {cost_layers, stock_levels} pair, where
+ * `receiveStock` takes layers before stock and the return takes them the other way round. That one is
+ * reachable only ACROSS purchase orders sharing a product, predates this branch on both sides, and
+ * closing it means reordering `receiveStock` — recorded in the census and filed as o3d-chs1h rather
+ * than folded in.
+ */
+test('o3d-6nd55 r5: a supplier return interleaved with a receipt of the same PO does not deadlock', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const { receivePurchaseOrder, returnPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const seeded = await seedAlignmentTarget('R5', 10, 5)
+
+  // Something to return: a first receipt, run to completion with no barrier.
+  const firstReceipt = await receivePurchaseOrder(seeded.poId, [
+    { poLineId: seeded.poLineId, qtyReceived: 6, warehouseId: seeded.warehouseId },
+  ])
+  assert.equal(firstReceipt.success, true, `PRECONDITION: the seeding receipt must succeed: ${firstReceipt.error}`)
+  const beforeLine = await db.purchaseOrderLine.findUniqueOrThrow({
+    where: { id: seeded.poLineId },
+    select: { qtyReceived: true, qtyReturned: true },
+  })
+  assert.equal(Number(beforeLine.qtyReceived), 6, 'PRECONDITION: 6 units must be on the line to return from')
+
+  let barrierReleased: () => void = () => {}
+  const barrier = new Promise<void>((resolve) => { barrierReleased = resolve })
+  let receiptParked: () => void = () => {}
+  const parked = new Promise<void>((resolve) => { receiptParked = resolve })
+
+  pauseAfterReceiptCostLayer = async () => {
+    receiptParked()
+    await barrier
+  }
+
+  // The receipt holds the PARENT and has not yet touched the stock row.
+  let receiptResult: { success: boolean; error?: string } | null = null as { success: boolean; error?: string } | null
+  let receiptError: unknown = null
+  const receiving = receivePurchaseOrder(seeded.poId, [
+    { poLineId: seeded.poLineId, qtyReceived: 2, warehouseId: seeded.warehouseId },
+  ]).then(
+    (result) => { receiptResult = result },
+    (error) => { receiptError = error },
+  )
+  await parked
+
+  let returnResult: { success: boolean; error?: string } | null = null as { success: boolean; error?: string } | null
+  let returnError: unknown = null
+  const returning = returnPurchaseOrder(
+    seeded.poId,
+    [{ poLineId: seeded.poLineId, qtyReturned: 3, warehouseId: seeded.warehouseId }],
+    'damaged in transit',
+  ).then(
+    (result) => { returnResult = result },
+    (error) => { returnError = error },
+  )
+
+  // Long enough for the return to reach its first lock — the parent under the fix, a stock row without
+  // it. Under the pre-r5 order the cycle exists from here on.
+  await new Promise((resolve) => setTimeout(resolve, 1500))
+  barrierReleased()
+
+  await receiving
+  await returning
+  pauseAfterReceiptCostLayer = null
+
+  const messages = [receiptError, returnError, receiptResult?.error, returnResult?.error]
+    .map((value) => (value instanceof Error ? value.message : String(value ?? '')))
+    .join(' | ')
+  console.log(`[arm14] receipt=${JSON.stringify(receiptResult)} return=${JSON.stringify(returnResult)} errors=${messages.slice(0, 400)}`)
+
+  assert.ok(
+    !/deadlock detected|40P01/i.test(messages),
+    'neither side may deadlock — PostgreSQL aborting one of them loses either the operator\'s return or '
+    + `their receipt. Errors were: ${messages}`,
+  )
+  assert.equal(receiptError, null, `the receipt must not throw: ${messages}`)
+  assert.equal(returnError, null, `the return must not throw: ${messages}`)
+  assert.equal(receiptResult?.success, true, `the receipt must succeed: ${JSON.stringify(receiptResult)}`)
+  assert.equal(returnResult?.success, true, `the return must succeed: ${JSON.stringify(returnResult)}`)
+
+  // NOT VACUOUS: both effects must be committed, or "no deadlock" is true of a pair that did nothing.
+  const afterLine = await db.purchaseOrderLine.findUniqueOrThrow({
+    where: { id: seeded.poLineId },
+    select: { qtyReceived: true, qtyReturned: true },
+  })
+  console.log(`[arm14] line after: qtyReceived=${String(afterLine.qtyReceived)} qtyReturned=${String(afterLine.qtyReturned)}`)
+  assert.equal(Number(afterLine.qtyReceived), 8, 'the second receipt must have landed its 2 units (6 + 2)')
+  assert.equal(Number(afterLine.qtyReturned), 3, 'and the return its 3')
 })
