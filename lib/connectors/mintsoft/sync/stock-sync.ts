@@ -889,9 +889,16 @@ async function getAlignmentCandidateLines(
   const purchaseOrderIdByLineId = new Map(purchaseLines.map((line) => [line.id, line.poId]))
   const parentPurchaseOrderIds = new Set<string>()
   const linkedFreightPurchaseOrderIds = new Set<string>()
+  // o3d-6nd55 r6 (Codex round-6 HIGH): PER LINE, not just as one global set. The global set is what the
+  // caller LOCKS; this map is what the re-read CHECKS against the locked set, and the two are different
+  // questions. Discovery runs before the locks, so a freight order linked in between contributes cost
+  // lines that no lock covers — and only a per-line answer can name which candidate to refuse.
+  const contributingFreightByLineId = new Map<string, string[]>()
   for (const line of purchaseLines) {
     parentPurchaseOrderIds.add(line.poId)
-    for (const link of line.po.landedCostLinks) linkedFreightPurchaseOrderIds.add(link.freightPoId)
+    const freightIds = line.po.landedCostLinks.map((link) => link.freightPoId)
+    contributingFreightByLineId.set(line.id, freightIds)
+    for (const freightPoId of freightIds) linkedFreightPurchaseOrderIds.add(freightPoId)
   }
   // 6oyu.19 (Codex r6): capacity must count what has LANDED on the transfer line by
   // ANY route — a manual receipt moves stock_transfer_lines.qtyReceived and touches
@@ -962,6 +969,37 @@ async function getAlignmentCandidateLines(
           asnLineMapId: line.id,
           externalAsnId: line.asn.externalAsnId,
           reason: 'its purchase order appeared after this run took its cost-row locks',
+          kind: 'raced',
+        })
+        continue
+      }
+      // ─── EVERY CONTRIBUTING FREIGHT ORDER MUST BE HELD TOO (o3d-6nd55 r6, Codex round-6 HIGH) ───
+      //
+      // THE HOLE THIS CLOSES. Round 2 discovered the linked freight orders BEFORE the locks and locked
+      // that set, and this re-read then checked only the PRIMARY order and the ASN rows against what was
+      // locked. A freight order LINKED in the window between discovery and the parent lock therefore
+      // contributed its cost lines to the valuation while neither its parent row nor its cost rows were
+      // held — so an fx rebase of that freight order could commit while the alignment posted, leaving the
+      // cost layer and the STOCK_RECEIPT journal valued at a cost that had already changed.
+      //
+      // REFUSE, DO NOT LOCK ON DEMAND. Acquiring a parent discovered at THIS point means taking a lock
+      // after others are already held, which is how a lock order gets taken backwards — the defect rounds
+      // 3 to 5 were entirely about. The candidate is refused as `raced`, the terminal guard in
+      // `applyMintsoftAlignmentForProduct` ends the plan, and the next sweep discovers the freight order
+      // up front and locks it with the rest. One sweep of deferral, no unlocked valuation.
+      //
+      // IT IS CHECKED HERE, BEFORE ANY COST IS READ OR ANYTHING IS POSTED: this re-read builds the
+      // candidate set the plan is made from, and the cost pass runs after the plan.
+      const contributingFreightPoIds = contributingFreightByLineId.get(line.sourceLineId) ?? []
+      const unheldFreightPoIds = locks
+        ? contributingFreightPoIds.filter((freightPoId) => !locks.purchaseOrderIds.has(freightPoId))
+        : []
+      if (unheldFreightPoIds.length > 0) {
+        refused.push({
+          asnLineMapId: line.id,
+          externalAsnId: line.asn.externalAsnId,
+          reason: `a freight order contributing to its cost (${unheldFreightPoIds.join(', ')}) was linked `
+            + 'after this run took its cost-row locks',
           kind: 'raced',
         })
         continue
@@ -1886,6 +1924,14 @@ export async function applyMintsoftAlignmentForProduct(params: {
             // than writing this row against a connector other than the one whose accounts are in the
             // payload above.
             connector: accountingConnector,
+            // o3d-6nd55 r6 (merge with o3d-j625 #700) — THE CHART THE CODES ABOVE CAME FROM.
+            //
+            // o3d-j625 made `chartConnector` REQUIRED on every enqueue, so this call site has to name it
+            // now that the two branches have met. It is `accountingConnector` because that is literally
+            // the argument `accountsForPosting()` was given when this payload's account codes were read
+            // — not a second resolution taken here, which is the divergence the requirement exists to
+            // close. The merged WMS book-in names it the same way for the same reason.
+            chartConnector: accountingConnector,
           })
           // NO POST-ENQUEUE RE-READ, and the reason is measured rather than argued (o3d-6nd55 r2,
           // following o3d-8f0p6 r4 to the same conclusion on the same evidence). Round 1 put one here

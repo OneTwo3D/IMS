@@ -175,6 +175,26 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * That is the invariant to preserve when adding a participant: not a rank over eight tables, but
  * "take the parent before anything belonging to it, and hold it to commit".
  *
+ * IS THE COST READ NOW OVER A FULLY-LOCKED SET? YES, AND HERE IS THE ARGUMENT (o3d-6nd55 r6).
+ * Two things have to hold, and both are now checked rather than assumed:
+ *
+ *   1. EVERY CONTRIBUTING ORDER IS IN THE LOCKED SET AT PLAN TIME. Discovery runs before the locks, so
+ *      the locked set is chosen from a pre-lock read. The re-read under the locks now compares BOTH the
+ *      primary order AND every freight order contributing to each candidate's cost against that set, and
+ *      refuses the candidate as `raced` if any is missing (Codex round-6 HIGH). Refusal, not
+ *      lock-on-demand: acquiring a newly discovered parent here would take a lock after others are held.
+ *
+ *   2. NO NEW CONTRIBUTOR CAN APPEAR AFTER THE LOCK. A contributor becomes one by a `landed_cost_links`
+ *      row referencing the primary order. Inserting a child row requires a `FOR KEY SHARE` lock on the
+ *      referenced parent, and `FOR UPDATE` — which this transaction holds on the primary — conflicts with
+ *      it. So `createFreightPo`'s nested link insert BLOCKS until the alignment commits, even though that
+ *      action takes no explicit lock on the primary at all. This is MEASURED, not read off the manual:
+ *      see the arm named "a freight link cannot be committed while an alignment holds the primary" in
+ *      tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts.
+ *
+ * Together those close the window: the set is validated at plan time and cannot grow afterwards, and
+ * every order in it was locked parent-first by `lockPurchaseOrdersWithCostRows`.
+ *
  * ONE RESIDUAL HAZARD, PRE-EXISTING AND DELIBERATELY NOT FIXED HERE (see o3d-chs1h). The gate argument
  * covers resources SCOPED to a purchase order. `cost_layers` and `stock_levels` are scoped to a
  * PRODUCT and WAREHOUSE, so two participants on DIFFERENT purchase orders can contend on them:

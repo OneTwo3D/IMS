@@ -140,9 +140,29 @@ mock.module('@/lib/domain/accounting/transit-subledger-movement', {
  * simulated, only its timing is controlled.
  */
 let pauseAfterParentLock: (() => Promise<void>) | null = null
+/**
+ * ARM 15'S SEAM — THE WINDOW BETWEEN DISCOVERY AND THE FIRST LOCK (r6).
+ *
+ * `applyMintsoftAlignmentForProduct` discovers its candidates (stock-sync.ts:1458) and then takes its
+ * first lock, `lockStockTransfers` (:1477). Wrapping that call and pausing BEFORE delegating parks the
+ * transaction in the only window where a freight order can be linked without any lock covering it — which
+ * is precisely the window Codex round 6 named. For a purchase-order-only fixture the call locks nothing,
+ * but it is still made, so the barrier still fires.
+ */
+let pauseBeforeFirstLock: (() => Promise<void>) | null = null
 mock.module('@/lib/domain/wms/transfer-asn-lock-order', {
   namedExports: {
     ...realLockOrderNs,
+    lockStockTransfers: async (
+      ...args: Parameters<typeof realLockOrderNs.lockStockTransfers>
+    ) => {
+      if (pauseBeforeFirstLock) {
+        const hook = pauseBeforeFirstLock
+        pauseBeforeFirstLock = null
+        await hook()
+      }
+      return realLockOrderNs.lockStockTransfers(...args)
+    },
     lockPurchaseOrdersWithCostRows: async (
       tx: Parameters<typeof realLockOrderNs.lockPurchaseOrdersWithCostRows>[0],
       ids: Parameters<typeof realLockOrderNs.lockPurchaseOrdersWithCostRows>[1],
@@ -1848,4 +1868,209 @@ test('o3d-6nd55 r5: a supplier return interleaved with a receipt of the same PO 
   console.log(`[arm14] line after: qtyReceived=${String(afterLine.qtyReceived)} qtyReturned=${String(afterLine.qtyReturned)}`)
   assert.equal(Number(afterLine.qtyReceived), 8, 'the second receipt must have landed its 2 units (6 + 2)')
   assert.equal(Number(afterLine.qtyReturned), 3, 'and the return its 3')
+})
+
+/**
+ * ARM 15 — A FREIGHT ORDER LINKED AFTER DISCOVERY MUST NOT VALUE THE RECEIPT (r6, Codex round-6 HIGH).
+ *
+ * THE HOLE. Alignment discovers the linked freight orders BEFORE it takes any lock, and locks that set.
+ * The re-read under the locks then checked only the PRIMARY order and the ASN rows against what was
+ * locked — so a freight order linked in the window between discovery and the parent lock contributed its
+ * cost lines to the valuation while neither its parent row nor its cost rows were held. An fx rebase of
+ * that freight order could then commit while the alignment posted, leaving the cost layer and the
+ * STOCK_RECEIPT journal at a cost that had already changed. Same family as rounds 3-5, one resource
+ * further out.
+ *
+ * THE FIX IS THE REFUSAL THAT ALREADY EXISTED, APPLIED TO THE FREIGHT SET. The re-read now compares every
+ * contributing freight order against the locked set and refuses the candidate as `raced` if any is
+ * missing, which the terminal guard turns into a one-sweep deferral. Refusal rather than lock-on-demand:
+ * acquiring a parent discovered at that point takes a lock after others are held, which is the inversion
+ * rounds 3-5 were about.
+ *
+ * WHAT THIS ARM DOES. It parks the alignment in that exact window, commits a freight order + cost line +
+ * link from another connection, releases, and asserts the alignment REFUSED and wrote nothing. Then it
+ * runs a SECOND sweep, which discovers the freight order up front, locks it, applies — and values the
+ * layer INCLUDING that freight. So the arm pins both halves: the unlocked valuation does not happen, and
+ * the deferral is a deferral rather than a permanent block.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that refuses ALL alignments (the second sweep is what refuses
+ * that), and a fix that refuses for some reason other than the freight set — which is why the refusal
+ * reason is asserted to name the freight order. It says nothing about a link committed AFTER the lock;
+ * arm 16 is what establishes that cannot happen.
+ */
+test('o3d-6nd55 r6: a freight order linked after discovery refuses the alignment, and the next sweep applies', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const LATE_FREIGHT = 20
+  const seeded = await seedAlignmentTarget('L6', QTY, GOODS_UNIT)
+  await assertUntouchedLandedCost(seeded.poLineId, GOODS_UNIT)
+
+  // PRECONDITION: nothing is linked when discovery runs.
+  assert.equal(
+    await db.landedCostLink.count({ where: { primaryPoId: seeded.poId } }),
+    0,
+    'PRECONDITION: the order must start with no freight link, or the window is not the one under test',
+  )
+
+  let linkCommitted = false
+  pauseBeforeFirstLock = async () => {
+    // Committed from the POOL, so it is visible to the alignment's later reads and is genuinely not
+    // covered by any lock the alignment holds — it holds none yet.
+    await seedLinkedFreightPo(seeded, 'late', LATE_FREIGHT, 'PO_SENT', false)
+    linkCommitted = true
+  }
+
+  let firstApplied: boolean | null = null
+  let firstReason = ''
+  let firstError: unknown = null
+  try {
+    const result = await alignUp(seeded, { delta: QTY, imsQty: 0 })
+    firstApplied = result.applied
+    firstReason = result.reason
+  } catch (error) {
+    firstError = error
+  } finally {
+    pauseBeforeFirstLock = null
+  }
+
+  const movementsAfterFirst = await db.stockMovement.count({ where: { productId: seeded.productId } })
+  const layersAfterFirst = await db.costLayer.count({ where: { poLineId: seeded.poLineId } })
+  const logsAfterFirst = await stockReceiptLogsFor(seeded.poId)
+  const levelAfterFirst = await db.stockLevel.findUniqueOrThrow({
+    where: { productId_warehouseId: { productId: seeded.productId, warehouseId: seeded.warehouseId } },
+    select: { quantity: true },
+  })
+  const asnAfterFirst = await db.wmsAsnLineMap.findUniqueOrThrow({
+    where: { id: seeded.asnLineMapId },
+    select: { qtyAccountedViaSnapshot: true },
+  })
+  console.log(`[arm15] linkCommitted=${String(linkCommitted)} firstApplied=${String(firstApplied)} reason=${firstReason.slice(0, 220)} error=${String(firstError).slice(0, 160)}`)
+  console.log(`[arm15] after the refusal: ${movementsAfterFirst} movement(s), ${layersAfterFirst} layer(s), ${logsAfterFirst.length} log(s), stock=${String(levelAfterFirst.quantity)}, snapshotQty=${String(asnAfterFirst.qtyAccountedViaSnapshot)}`)
+
+  assert.equal(linkCommitted, true, 'PRECONDITION: the freight link must have been committed inside the window')
+  assert.equal(firstError, null, `the alignment must refuse cleanly, not throw: ${String(firstError)}`)
+  assert.equal(
+    firstApplied,
+    false,
+    'the alignment must REFUSE: a freight order contributing to the cost was linked after the locks were '
+    + 'taken, so nothing here holds it or its cost rows',
+  )
+  assert.match(
+    firstReason,
+    /freight order contributing to its cost/i,
+    `and the reason must name the freight order, or this refusal is indistinguishable from any other: ${firstReason}`,
+  )
+  assert.equal(movementsAfterFirst, 0, 'no movement may be written')
+  assert.equal(layersAfterFirst, 0, 'and no cost layer — that is the unlocked valuation this closes')
+  assert.equal(logsAfterFirst.length, 0, 'and no receipt journal')
+  assert.equal(Number(levelAfterFirst.quantity), 0, 'and no stock')
+  assert.equal(Number(asnAfterFirst.qtyAccountedViaSnapshot), 0, 'and the ASN line must not claim to have absorbed anything')
+
+  // ─── THE SECOND SWEEP: the deferral is a deferral, and the eventual cost includes the freight ───
+  const expectedUnitCost = GOODS_UNIT + LATE_FREIGHT / QTY
+  const second = await alignUp(seeded, { delta: QTY, imsQty: 0 })
+  assert.equal(second.applied, true, `the next sweep must apply — one sweep of deferral, not a block: ${second.reason}`)
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  console.log(`[arm15] second sweep: layer=${JSON.stringify(layer)} expectedUnit=${expectedUnitCost} logs=${logs.length}`)
+  assert.equal(
+    Number(layer.unitCostBase),
+    expectedUnitCost,
+    `and it must value the layer INCLUDING the freight that was linked (${expectedUnitCost}), now that it `
+    + 'holds that order and its cost rows',
+  )
+  assert.equal(logs.length, 1, 'and post exactly one journal')
+  assert.equal(debitOf(logs[0]!.payload), QTY * expectedUnitCost, 'for the gross value')
+})
+
+/**
+ * ARM 16 — A FREIGHT LINK CANNOT BE COMMITTED WHILE AN ALIGNMENT HOLDS THE PRIMARY.
+ *
+ * WHY THIS ARM EXISTS. Arm 15 closes the window BEFORE the lock. The claim that there is no window AFTER
+ * it rests on a fact about PostgreSQL: inserting a `landed_cost_links` row requires a `FOR KEY SHARE`
+ * lock on the referenced primary order, and `FOR UPDATE` — which the alignment holds — conflicts with it.
+ * `createFreightPo` takes no explicit lock on the primary at all, so if that conflict did not exist a new
+ * contributor could appear between the re-read and the cost read and the coverage argument would be
+ * false.
+ *
+ * READING IT OFF THE MANUAL IS NOT MEASURING IT, so this measures it: a link insert is fired from a
+ * separate pooled connection while the alignment holds everything, and is NOT awaited. A third read then
+ * shows it has not committed. It must then land once the alignment commits — serialised, not rejected,
+ * so "it did not commit" cannot be true for some unrelated reason.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: any mechanism that blocks the insert, including a lock the alignment
+ * takes for a different reason. It establishes that the window is closed, not which statement closes it.
+ */
+test('o3d-6nd55 r6: a freight link cannot be committed while an alignment holds the primary', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const seeded = await seedAlignmentTarget('K6', 2, 7)
+
+  let insertSettled: 'pending' | 'committed' | 'failed' = 'pending'
+  let insertError: string | null = null
+  let observedCountDuringTransaction: number | null = null
+  let settledDuringTransaction: 'pending' | 'committed' | 'failed' = 'pending'
+  let insertPromise: Promise<unknown> = Promise.resolve()
+
+  afterTransitWriteHook = async () => {
+    // A freight order can be created freely — it references nothing the alignment holds. The LINK is the
+    // row that needs a key-share lock on the primary.
+    const freightPo = await db.purchaseOrder.create({
+      data: {
+        reference: uniqueTag('FRK6'),
+        supplierId: (await db.supplier.create({ data: { name: uniqueTag('SK6'), currency: 'GBP' }, select: { id: true } })).id,
+        status: 'PO_SENT',
+        type: 'FREIGHT',
+        currency: 'GBP',
+        fxRateToBase: '1',
+        subtotalForeign: 9,
+        subtotalBase: 9,
+        totalForeign: 9,
+        totalBase: 9,
+      },
+      select: { id: true },
+    })
+    insertPromise = db.landedCostLink
+      .create({ data: { primaryPoId: seeded.poId, freightPoId: freightPo.id, method: 'BY_VALUE', allocated: false } })
+      .then(() => { insertSettled = 'committed' })
+      .catch((error: unknown) => { insertSettled = 'failed'; insertError = String(error).slice(0, 200) })
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    observedCountDuringTransaction = await db.landedCostLink.count({ where: { primaryPoId: seeded.poId } })
+    settledDuringTransaction = insertSettled
+  }
+
+  let applied: boolean
+  try {
+    ;({ applied } = await alignUp(seeded, { delta: seeded.qty, imsQty: 0 }))
+    await insertPromise.catch(() => {})
+  } finally {
+    afterTransitWriteHook = null
+  }
+  const afterRelease = await db.landedCostLink.count({ where: { primaryPoId: seeded.poId } })
+  console.log(`[arm16] applied=${String(applied)}; mid-transaction: links=${String(observedCountDuringTransaction)} insert=${settledDuringTransaction}${insertError ? ` (${insertError})` : ''}; after release: links=${afterRelease} insert=${insertSettled}`)
+
+  assert.equal(
+    observedCountDuringTransaction,
+    0,
+    'THE POINT OF THIS ARM: while the alignment held the primary order FOR UPDATE, a new freight LINK must '
+    + `not have committed — the link count should still have been 0, was ${String(observedCountDuringTransaction)}. `
+    + 'A committed link here means a contributor can appear after the locked re-read and the coverage '
+    + 'argument in transfer-asn-lock-order.ts is false.',
+  )
+  assert.equal(settledDuringTransaction, 'pending', 'and the insert must still have been WAITING at that moment')
+  // NOT VACUOUS: it must land once the lock releases, or "it did not commit" is true for the wrong reason.
+  assert.equal(
+    insertSettled,
+    'committed',
+    `the link must commit once the alignment released the primary — serialised, not rejected${insertError ? `; it failed instead: ${insertError}` : ''}`,
+  )
+  assert.equal(afterRelease, 1, 'and the link must exist afterwards')
+  assert.equal(applied, true, 'and the alignment itself must have succeeded')
 })
