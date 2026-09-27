@@ -108,6 +108,12 @@ is an explicit check:
 - `npm run check:bom-recipes` — the same check from the command line. It exits non-zero when
   anything disagrees, so it can gate a data load.
 
+**A retired recipe is not a disagreement.** The check only reports a circular recipe that *planning
+can actually reach* — an active recipe whose product is still a BOM. Retiring a recipe keeps its lines
+on purpose (see **Changing a product's type** below), so a retired line pointing back at a product
+that now consumes it is an ordinary state after a conversion, not a fault, and the check stays quiet
+about it.
+
 **Editing a recipe after import.** The product page's component editor writes both copies too, in
 one step, so editing an imported BOM keeps them in step — you do not have to re-import to keep
 planning correct.

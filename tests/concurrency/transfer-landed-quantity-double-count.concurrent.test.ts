@@ -448,10 +448,29 @@ test(
     // The refusal above must discriminate. Without this, changing the guard to
     // "always refuse" would pass every assertion in this file.
     loadEnv()
-    const { db, transfer, sourceLayer, source, asnLineMapId } = await seedAlignedInTransitTransfer('nothing')
+    const { db, product, transfer, sourceLayer, source, asnLineMapId } =
+      await seedAlignedInTransitTransfer('nothing')
     // Undo the alignment credit and its layer, leaving a plain dispatched transfer.
     await db.costLayerSourceLine.deleteMany({ where: { sourceCostLayerId: sourceLayer.id } })
-    await db.costLayer.deleteMany({ where: { id: { not: sourceLayer.id }, poLineId: null, warehouseId: { not: source.id } } })
+    // SCOPED TO THIS FIXTURE'S OWN PRODUCT (o3d-zjsb5.9 round 6). Without `productId`, this
+    // predicate is database-wide: "every cost layer that is not mine, has no PO line, and is not in
+    // my source warehouse" matches OTHER test files' layers in this shared-database tier, and
+    // deleting one that a `cogs_entries` row points at raises
+    // `cogs_entries_costLayerId_fkey`. That is not hypothetical -- it is reproducible: run
+    // `bom-recipe-import.concurrent.test.ts` (which completes a production order, so it commits the
+    // tier's first COGS-referenced `poLineId IS NULL` layers) to completion first, then this file,
+    // and this test fails. In a parallel tier run it fails only when the delete loses that race,
+    // which is how it arrived as an intermittent `not ok 145`.
+    const removedAlignmentLayers = await db.costLayer.deleteMany({
+      where: { productId: product.id, id: { not: sourceLayer.id }, poLineId: null, warehouseId: { not: source.id } },
+    })
+    // The scoping above narrowed this predicate, so prove it still MATCHES. A scope that matches
+    // nothing would leave the alignment credit in place and quietly turn this test into a
+    // different, easier one -- the failure mode of the fix, asserted rather than assumed.
+    assert.ok(
+      removedAlignmentLayers.count > 0,
+      'the fixture must actually remove its own alignment layer, or this test no longer tests an un-landed dispatch',
+    )
     await db.wmsAsnLineMap.update({ where: { id: asnLineMapId }, data: { qtyAccountedViaSnapshot: 0 } })
 
     const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')

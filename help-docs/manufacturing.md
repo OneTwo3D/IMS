@@ -25,6 +25,20 @@ never suggests building it and its components are never reordered on its behalf.
 `/api/export/bom-recipes?drift=1` or run `npm run check:bom-recipes`; to repair, re-import the
 product through the products CSV.
 
+## When a build order is refused
+
+Raising a build order re-reads the recipe at the moment it is raised, not when you opened the form. If
+somebody changes the product while you are filling it in, the build order is refused and **nothing is
+written** — you are told which of these happened:
+
+- the product is no longer a BOM, so it has no recipe to build;
+- its components were cleared;
+- its recipe is circular (some product in the recipe eventually consumes the product being built);
+- another user claimed the recipe at the same moment — retry.
+
+In every case no build order is created and the recipe is left exactly as it was. A refusal never
+leaves a half-applied change behind.
+
 ## Lifecycle status and manufacturing
 
 The BOM product's [lifecycle status](glossary.md#lifecycle-status) controls which manufacturing operations are allowed:

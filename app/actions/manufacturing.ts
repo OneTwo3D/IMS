@@ -57,7 +57,11 @@ import {
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
-import { syncBomRecipeFromProductComponents } from '@/lib/products/bom-recipe'
+import {
+  BomRecipeRefusedError,
+  describeBomRecipeRefusal,
+  syncBomRecipeFromProductComponents,
+} from '@/lib/products/bom-recipe'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -433,7 +437,20 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
           qty: Number(component.qty),
         })),
       })
-      if (synced.kind !== 'written') return synced
+      // THROWN, NEVER RETURNED (round 6, finding 1). `syncBomRecipeFromProductComponents` has
+      // already replaced this parent's `BomItem` rows by the time it can detect a cycle -- it must
+      // check the graph it is actually committing, not the one it replaced. So a refusal returned
+      // from this callback COMMITS the rejected recipe: the action reports failure and raises no
+      // order, while an active cyclic BOM graph is left behind for the planning explosion to walk.
+      // Reporting failure while committing the rejected state is worse than either outcome alone.
+      //
+      // This is the SAME defect I introduced and fixed at the import call site in round 2, missed
+      // here because the fix was applied per-site rather than to the shape. The rule is now
+      // shape-wide and asserted as such in `tests/products/bom-recipe.test.ts`: a refusal value must
+      // never leave a transaction callback that has already written.
+      if (synced.kind !== 'written') {
+        throw new BomRecipeRefusedError(describeBomRecipeRefusal(synced))
+      }
       return { ...synced, sku: locked.sku, name: locked.name }
     })
     if (claim.kind === 'gone') {
@@ -451,19 +468,6 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
         success: false,
         error: 'This product\'s components were cleared while the build order was being raised. '
           + 'Nothing was created.',
-      }
-    }
-    if (claim.kind === 'cycle') {
-      return {
-        success: false,
-        error: 'This product\'s manufacturing BOM is circular ('
-          + `${claim.path.join(' -> ')}). Fix the recipe before raising a build order.`,
-      }
-    }
-    if (claim.kind === 'claim-contended') {
-      return {
-        success: false,
-        error: 'Another writer claimed this product\'s manufacturing BOM at the same moment. Try again.',
       }
     }
     const bom = { id: claim.bomId }
@@ -504,6 +508,12 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       level: 'ERROR',
       description: `Failed to create manufacturing order: ${e instanceof Error ? e.message : e}`,
     })
+    // A refused recipe is an operator-actionable outcome, not an internal failure, and the throw is
+    // how it rolled the rejected recipe back (round 6, finding 1). Its own message says what to fix,
+    // so it must not be flattened into the generic error.
+    if (e instanceof BomRecipeRefusedError) {
+      return { success: false, error: `${e.message}. No build order was created.` }
+    }
     return { success: false, error: 'Failed to create manufacturing order.' }
   }
 }

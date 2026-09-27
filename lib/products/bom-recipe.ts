@@ -188,6 +188,29 @@ export function detectBomItemCycleAfterReplacement(
 
 type BomSyncClient = Pick<Prisma.TransactionClient, 'bom' | 'bomItem'>
 
+/**
+ * THE ONE DEFINITION of the BomItem graph that a reader can actually traverse, shared by every walk.
+ *
+ * `replenishment-reports.ts` explodes component demand with
+ * `where: { bom: { active: true }, parentProduct: { type: BOM } }`, and that is the only walk that can
+ * hurt anyone. Three places used to decide this for themselves -- the import preflight, the
+ * in-transaction check, and {@link findBomRecipeDrift} -- and they did NOT agree: the first two scoped
+ * to active BOMs only, the third scoped to nothing at all. Round 5 found the consequence of the third:
+ * a retired A->B recipe plus a live B->A one is an ordinary post-retirement state, yet drift called it
+ * `bom-item-cycle` and the operator command exited 1, while planning could not traverse A->B at all.
+ *
+ * Retiring a recipe KEEPS its items on purpose (a completed production order is still valued through
+ * them), so "every row in the table" is never the right graph. A walk that refuses states its reader
+ * cannot reach is not being careful; it is being wrong in a direction that gets it switched off.
+ *
+ * Exported so the divergence cannot come back: change the reader, change this, and all three walks
+ * follow. `tests/products/bom-recipe.test.ts` asserts every walk uses it.
+ */
+export const PLANNING_REACHABLE_BOM_EDGES = {
+  bom: { active: true },
+  parentProduct: { type: 'BOM' },
+} as const
+
 export type BomRecipeSyncOutcome =
   | { kind: 'written'; bomId: string; claimed: 'created' | 'adopted' | 'already' }
   | { kind: 'cycle'; path: string[] }
@@ -301,14 +324,9 @@ export async function syncBomRecipeFromProductComponents(
   // cycles that the rewrite removes and misses cycles the rewrite creates. The caller aborts its
   // transaction on a cycle, so nothing lands.
   const edges = await client.bomItem.findMany({
-    // SCOPED TO ACTIVE BOMS, and that scope is not cosmetic (o3d-zjsb5.9 round 3 reader audit).
-    // The reader this check protects — `replenishment-reports.ts` explodes component demand from
-    // bom_items — selects `where: { bom: { active: true }, parentProduct: { type: BOM } }`. So the
-    // graph that can actually hurt anyone is the ACTIVE one. Retiring a recipe deliberately KEEPS
-    // its items (deactivated and unclaimed) so completed and in-flight orders still resolve, which
-    // means an unscoped walk counts edges no reader will ever follow and can refuse a perfectly
-    // legitimate re-import. Conservative in the wrong direction is still wrong.
-    where: { bom: { active: true } },
+    // See PLANNING_REACHABLE_BOM_EDGES: one shared definition, so this walk and the drift check
+    // cannot disagree about what the graph is (round 6, finding 2).
+    where: PLANNING_REACHABLE_BOM_EDGES,
     select: { parentProductId: true, componentProductId: true },
   })
   const cycle = detectBomItemCycleInEdges(edges)
@@ -567,15 +585,36 @@ export async function findBomRecipeDrift(client: DriftClient): Promise<BomRecipe
     }
   }
 
-  const cycle = detectBomItemCycleInEdges(bomItems)
+  // THE SAME GRAPH THE PLANNING READER WALKS, not every row in the table (round 6, finding 2).
+  // `replenishment-reports.ts` explodes `bomItem.findMany({ where: { bom: { active: true },
+  // parentProduct: { type: BOM } } })`. This check exists to protect THAT walk, so it must ask about
+  // THAT graph. Passing every `BomItem` row asked a different question and got a wrong answer: a
+  // retired A->B recipe plus a live B->A one is a correct, ordinary state after a retirement, yet it
+  // was reported as `bom-item-cycle` and the operator command exited 1 -- while the reader it claims
+  // to protect cannot traverse A->B at all, so no cycle is reachable. A guard that goes red on
+  // correct states is worse than a narrow one, because it gets ignored, and then it protects nothing.
+  //
+  // The retained retired edges are deliberate (a completed production order is still valued through
+  // them) and are covered by `duplicate-unclaimed-bom` / `bom-items-on-non-bom-product` above, which
+  // are the kinds that SHOULD see them.
+  // The same predicate as PLANNING_REACHABLE_BOM_EDGES, applied in memory because `bomItems` above
+  // is deliberately UNFILTERED -- the other drift kinds need the retired rows this one must ignore.
+  const bomTypedProductIds = new Set(
+    products.filter((product) => product.type === 'BOM').map((product) => product.id),
+  )
+  const planningEdges = bomItems.filter(
+    (item) => item.bom.active && bomTypedProductIds.has(item.parentProductId),
+  )
+  const cycle = detectBomItemCycleInEdges(planningEdges)
   if (cycle) {
     const head = products.find((product) => product.id === cycle[0])
     drift.push({
       productId: cycle[0],
       sku: head?.sku ?? cycle[0],
       kind: 'bom-item-cycle',
-      detail: `bom_items contains a cycle: ${cycle.join(' -> ')} — the planning explosion in `
-        + 'replenishment-reports.ts walks this graph and has no cycle check of its own',
+      detail: `bom_items contains a cycle reachable by planning: ${cycle.join(' -> ')} — the planning `
+        + 'explosion in replenishment-reports.ts walks the active, BOM-parent graph and has no cycle check '
+        + 'of its own',
     })
   }
 

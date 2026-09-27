@@ -196,6 +196,29 @@ async function driftForThisTest(deps: Deps, ns: string) {
   return (await deps.findBomRecipeDrift(deps.db)).filter((row) => row.sku.startsWith(mine))
 }
 
+/**
+ * THE RECIPE AS THE DATABASE HOLDS IT, for asserting a refusal changed NOTHING.
+ *
+ * Round 6's three findings all had the same shape: the action reported failure and the rejected state
+ * committed anyway. Asserting on the return value alone cannot see that, so each refusal test compares
+ * this before and after. `qty` is stringified because Prisma hands back Decimal objects that
+ * `deepEqual` compares by identity rather than value.
+ */
+async function snapshotRecipe(deps: Deps, productId: string, bomId: string) {
+  const bom = await deps.db.bom.findUniqueOrThrow({
+    where: { id: bomId }, select: { active: true, productId: true },
+  })
+  const items = await deps.db.bomItem.findMany({
+    where: { parentProductId: productId },
+    select: { bomId: true, componentProductId: true, qty: true, sortOrder: true },
+    orderBy: [{ bomId: 'asc' }, { componentProductId: 'asc' }],
+  })
+  return {
+    bom,
+    items: items.map((item) => ({ ...item, qty: String(item.qty) })),
+  }
+}
+
 async function seedCatalogue(deps: Deps, ns: string): Promise<{ tableId: string; legId: string; rawId: string }> {
   const loaded = await deps.importProductsCsv(csv([
     'sku,name,type,components,stockUnit',
@@ -419,5 +442,284 @@ test(
       [parent],
       'and the new recipe must actually have been written',
     )
+
+    // AND THE OPERATOR CHECK MUST AGREE (round 6, finding 2). This is the same state from the drift
+    // check's side: a retired PARENT -> CHILD edge alongside a live CHILD -> PARENT one. The write
+    // path was scoped in round 4 but `findBomRecipeDrift` still walked every BomItem row, so it
+    // reported `bom-item-cycle` here and `check:bom-recipes` exited 1 on a correct, ordinary
+    // post-retirement state. A guard that goes red on correct states gets ignored, which is strictly
+    // worse than one that is merely narrow -- so the two walks now share one definition.
+    const drift = await driftForThisTest(deps, NS)
+    assert.deepEqual(
+      drift.filter((row) => row.kind === 'bom-item-cycle'),
+      [],
+      `a retirement plus a reverse edge is NOT a planning cycle, got: ${JSON.stringify(drift)}`,
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] components cleared while a build order waits for the lock is REFUSED, and nothing is written',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE SECOND LOCKED-READ REFUSAL, which round 5 noted was assumed rather than exercised: only
+    // `not-bom` had a test. Both refusals return before any write, so they were safe -- but "safe
+    // because I read it" is what rounds 5 and 6 kept overturning.
+    const deps = await loadDeps()
+    const NS = 'E'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const warehouse = await ownWarehouse(deps, NS)
+    const before = await snapshotRecipe(deps, tableId, originalBom.id)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      await awaitAdvisoryLockWaiter(deps)
+      // An editor empties the recipe while the build order waits. The product stays BOM-typed, so
+      // only the component list distinguishes this from a valid build.
+      await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.equal(created.success, false, 'a build order against an emptied recipe must be REFUSED')
+    assert.match(String(created.error), /components were cleared/i,
+      `the refusal must name what changed, got: ${created.error}`)
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'and no production order may exist',
+    )
+    // THE DATABASE, NOT THE RETURN VALUE. Reporting failure while committing the rejected state is
+    // the trap this round is about, so assert the recipe rows are exactly as they were.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, originalBom.id), before,
+      'the refusal must leave Bom/BomItem byte-for-byte unchanged')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] a build order refused for a CYCLE does not commit the rejected recipe',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 5, FINDING 1 -- and the same defect I introduced and fixed at the import site in round 2.
+     * `syncBomRecipeFromProductComponents` REPLACES this parent's BomItem rows and only then checks
+     * the graph it is committing (it must: checking first asks about the old edges). So returning the
+     * `cycle` outcome from the transaction callback COMMITTED it: the action reported failure and
+     * raised no order, while leaving an active cyclic graph behind for the planning explosion to walk.
+     * Failure reported, rejected state committed -- worse than either alone.
+     */
+    const deps = await loadDeps()
+    const NS = 'F'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const warehouse = await ownWarehouse(deps, NS)
+
+    // THE REVERSE EDGE MUST LIVE IN `bom_items` ONLY, and that is the whole reason this hazard exists.
+    // Importing LEG as a BOM consuming TABLE is refused by the PRE-EXISTING `ProductComponent` cycle
+    // check (`detectComponentCycle`) -- correctly, and I tried it first: `Row 2: circular BOM reference
+    // detected`. So a cycle reachable by the BOM walk can only be one the ProductComponent graph does
+    // NOT have, which is exactly what a legacy `bom_items` row left by an earlier snapshot is. That is
+    // also why `detectComponentCycle` could not be reused for this: it walks `product_components`.
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'BOM' } })
+    const legacyBom = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy leg recipe`, productId: legId, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: legacyBom.id, parentProductId: legId, componentProductId: tableId, qty: 1, sortOrder: 0,
+      },
+    })
+    // MAKE THE REJECTED WRITE DIFFER FROM WHAT IS STORED, or this test cannot see the defect at all.
+    // The sync rewrites TABLE's BomItem rows from its ProductComponent list; if the two already agree,
+    // committing the rejected recipe produces rows identical to the ones already there and "the
+    // database is unchanged" passes whether or not the rollback happened. So desync them first, the way
+    // a direct edit would: ProductComponent now says LEG:9, while BomItem still says LEG:4. A commit of
+    // the rejected recipe would therefore leave LEG:9 behind, which the snapshot WILL see.
+    // (Verified by mutation: with the refusal returned instead of thrown, this test reds.)
+    await deps.db.$executeRaw`
+      UPDATE product_components SET qty = 9
+      WHERE "productId" = ${tableId} AND "componentId" = ${legId}
+    `
+    const before = await snapshotRecipe(deps, tableId, originalBom.id)
+    assert.ok(before.items.length > 0, 'precondition: TABLE must have a recipe to reject')
+    assert.ok(
+      before.items.some((item) => item.componentProductId === legId && item.qty.startsWith('4')),
+      'precondition: BomItem must still hold the OLD qty, so a committed rewrite is detectable',
+    )
+
+    const created = await deps.createManufacturingOrder({
+      productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+    })
+    assert.equal(created.success, false, 'a build order against a cyclic recipe must be REFUSED')
+    assert.match(String(created.error), /circular/i, `the refusal must say why, got: ${created.error}`)
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'and no production order may exist',
+    )
+    // THE POINT OF THE ROUND: the rejected recipe must not be sitting in the database.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, originalBom.id), before,
+      'the refused cycle must have been ROLLED BACK, not committed while the action reported failure')
+    // And the operator check must SEE this one -- it is genuinely reachable by planning, unlike the
+    // retired edges of test 4. The same walk, giving opposite answers on the two states, is the point.
+    const cycleDrift = await driftForThisTest(deps, NS)
+    assert.ok(
+      cycleDrift.some((row) => row.kind === 'bom-item-cycle'),
+      `a LIVE cycle must still be reported as drift, got: ${JSON.stringify(cycleDrift)}`,
+    )
+
+    // CLEAN UP THE CYCLE, and this is load-bearing rather than tidiness.
+    // `detectBomItemCycleInEdges` walks every parent and returns the FIRST cycle it finds ANYWHERE in
+    // the graph -- it is not scoped to the product being written. So this test's deliberate cycle makes
+    // every later BOM import and every later build order fail, in this file and in any sibling sharing
+    // this tier's database, with a message naming two unrelated product ids. Test 7 failed exactly that
+    // way before this cleanup existed. Filed as its own issue, because the same property means one
+    // pre-existing cyclic legacy pair in a real database blocks ALL BOM imports (o3d-zjsb5.9 round 6).
+    await deps.db.bom.update({ where: { id: legacyBom.id }, data: { active: false, productId: null } })
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
+    assert.deepEqual(
+      (await driftForThisTest(deps, NS)).filter((row) => row.kind === 'bom-item-cycle'), [],
+      'and retiring it must clear the cycle again -- proof the cleanup worked, not just that it ran',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] an import that LOSES the BOM claim writes NEITHER representation',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 5, FINDING 3. The component pass handled `cycle` and ignored `claim-contended`, so losing
+     * the compare-and-set returned `true` and COMMITTED the component list with no claimed Bom -- the
+     * sellable-but-unmanufacturable state this whole change exists to remove, reintroduced by the very
+     * CAS added in round 2 to prevent a different form of it.
+     *
+     * WHICH SITE THIS ACTUALLY EXERCISES, stated because a mutation proved my first answer wrong.
+     * Removing the pass-2 guard does NOT red this test. The refusal it observes comes from PASS 1's
+     * `reconcileBomRecipeForProductType`, which runs first, in its own transaction, under the same
+     * graph lock, and already threw on `claim-contended` before round 6. Pass 1 therefore reconciles
+     * every existing BOM-typed row in the CSV, so by the time pass 2 runs the product normally HAS a
+     * claimed Bom and pass 2's adopt-and-CAS branch is not reached at all. I could not construct a
+     * reachable case where pass 2 loses the CAS while pass 1 does not refuse first.
+     *
+     * So the pass-2 guard added in round 6 is FAIL-CLOSED DEFENCE, not a fix for a demonstrated live
+     * path, and its presence is asserted structurally by the shape test in
+     * `tests/products/bom-recipe.test.ts` rather than behaviourally here. What this test does prove,
+     * on the real code path and with a real lost compare-and-set, is the property the finding is
+     * about: when the claim is lost, NEITHER representation is written and the operator is told.
+     */
+    const deps = await loadDeps()
+    const NS = 'G'
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'RAW')},Oak board,SIMPLE,,each`,
+      `${sku(NS, 'OTHER')},Other,SIMPLE,,each`,
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'RAW')}:1,each`,
+    ]))), [], 'the catalogue must import cleanly')
+    const table = await deps.db.product.findUniqueOrThrow({
+      where: { sku: sku(NS, 'TABLE') }, select: { id: true },
+    })
+    const other = await deps.db.product.findUniqueOrThrow({
+      where: { sku: sku(NS, 'OTHER') }, select: { id: true },
+    })
+    // Retire TABLE's recipe so the next import has an UNCLAIMED row to adopt -- the only path that
+    // runs the compare-and-set at all.
+    const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: table.id }, select: { id: true } })
+    await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE id = ${bom.id}`
+    const beforeComponents = await deps.db.productComponent.findMany({
+      where: { productId: table.id }, select: { componentId: true }, orderBy: { componentId: 'asc' },
+    })
+
+    // A GENUINE COMPARE-AND-SET LOSS, forced with a row lock rather than simulated.
+    //
+    // I tried the obvious interleaving first -- claim the row while the import waits for the GRAPH
+    // lock -- and it does not work: the import reads `adoptable` AFTER taking that lock, so it sees the
+    // row already claimed, finds nothing to adopt, and creates a fresh Bom. No contention, and the test
+    // passed while proving nothing. The window is between the helper's READ and its WRITE, inside one
+    // transaction, so it cannot be reached from outside by ordering alone.
+    //
+    // READ COMMITTED gives it to us exactly. An uncommitted `UPDATE` on that row from another
+    // connection leaves the import's read seeing `productId = NULL` (the pre-update row version) while
+    // its `updateMany ... WHERE productId IS NULL` BLOCKS on the row lock. When the other connection
+    // commits, Postgres re-evaluates the predicate against the NEW row version, the row no longer
+    // matches, and `count` comes back 0 -- a real lost CAS, on the real code path.
+    const claimHeld = Promise.withResolvers<number>()
+    const claimRelease = Promise.withResolvers<void>()
+    const claimant = deps.db.$transaction(async (tx) => {
+      const [{ pid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
+      await tx.$executeRaw`UPDATE boms SET "productId" = ${other.id}, active = true WHERE id = ${bom.id}`
+      claimHeld.resolve(pid)
+      await claimRelease.promise
+    }, { timeout: 60_000, maxWait: 10_000 })
+    const claimantSettled = claimant.then(() => undefined, (error: unknown) => error as unknown)
+    const claimantPid = await Promise.race([
+      claimHeld.promise,
+      claimantSettled.then((error) => {
+        throw error ?? new Error('the claimant ended before it held the row')
+      }),
+    ])
+
+    let result: Awaited<ReturnType<typeof deps.importProductsCsv>>
+    try {
+      const inFlight = deps.importProductsCsv(csv([
+        'sku,name,type,components,stockUnit',
+        `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'RAW')}:5,each`,
+      ]))
+      inFlight.catch(() => {})
+      // PROOF THE WINDOW WAS ACTUALLY ENTERED. `pg_blocking_pids` is the lock manager's own answer, not
+      // a reporting field, so this is the authoritative "it is waiting for my row" -- and without it
+      // this test would be asserting about ordinary sequencing.
+      const deadline = Date.now() + 20_000
+      let blocked = 0
+      while (Date.now() < deadline) {
+        const rows = await deps.db.$queryRaw<Array<{ n: bigint }>>`
+          SELECT count(*)::bigint AS n FROM pg_stat_activity
+          WHERE ${claimantPid} = ANY(pg_blocking_pids(pid))
+        `
+        blocked = Number(rows[0]?.n ?? 0)
+        if (blocked > 0) break
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      assert.ok(blocked > 0, 'the import must actually block on the claimed row, or the CAS never raced')
+      result = await (async () => {
+        claimRelease.resolve()
+        return await inFlight
+      })()
+    } finally {
+      claimRelease.resolve()
+      await claimantSettled
+    }
+
+    const errors = errorsOf(result)
+    assert.ok(
+      errors.some((line) => /claimed this product's manufacturing BOM/i.test(line)),
+      `losing the claim must be REPORTED, not ignored, got: ${JSON.stringify(errors)}`,
+    )
+    // Which refusal this is, pinned so the test cannot silently start proving something else -- the
+    // way it silently proved the wrong thing until a surviving mutation said so.
+    assert.ok(
+      errors.some((line) => /while the import\s+was running|while the import was running/.test(line)),
+      `the refusal must be pass 1's reconcile, the reachable site, got: ${JSON.stringify(errors)}`,
+    )
+    // AND ROLLED BACK: the component list must still be the old one, not the qty 5 the CSV asked for.
+    assert.deepEqual(
+      await deps.db.productComponent.findMany({
+        where: { productId: table.id }, select: { componentId: true }, orderBy: { componentId: 'asc' },
+      }),
+      beforeComponents,
+      'the ProductComponent write must NOT have committed without a claimed Bom -- that is exactly the '
+      + 'sellable-but-unmanufacturable split this change exists to prevent',
+    )
+    const stillTheirs = await deps.db.bom.findUniqueOrThrow({
+      where: { id: bom.id }, select: { productId: true },
+    })
+    assert.equal(stillTheirs.productId, other.id, 'and the other writer keeps its claim')
   },
 )

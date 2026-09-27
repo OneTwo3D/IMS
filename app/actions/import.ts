@@ -27,6 +27,8 @@ import {
   findComponentGraphEditBlockers,
 } from '@/lib/products/component-graph-edit-guard'
 import {
+  PLANNING_REACHABLE_BOM_EDGES,
+  describeBomRecipeRefusal,
   detectBomItemCycleAfterReplacement,
   reconcileBomRecipeForProductType,
   syncBomRecipeFromProductComponents,
@@ -895,14 +897,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
       // authoritative check runs after the write inside the transaction that holds the graph lock.
       if (productById.get(productId)?.type === 'BOM') {
         const bomEdges = await db.bomItem.findMany({
-          // SCOPED TO ACTIVE BOMS, and that scope is not cosmetic (o3d-zjsb5.9 round 3 reader audit).
-          // The reader this check protects — `replenishment-reports.ts` explodes component demand from
-          // bom_items — selects `where: { bom: { active: true }, parentProduct: { type: BOM } }`. So the
-          // graph that can actually hurt anyone is the ACTIVE one. Retiring a recipe deliberately KEEPS
-          // its items (deactivated and unclaimed) so completed and in-flight orders still resolve, which
-          // means an unscoped walk counts edges no reader will ever follow and can refuse a perfectly
-          // legitimate re-import. Conservative in the wrong direction is still wrong.
-          where: { bom: { active: true } },
+          // See PLANNING_REACHABLE_BOM_EDGES: one shared definition, so this preflight and the
+          // authoritative in-transaction walk cannot disagree about what the graph is (round 6).
+          where: PLANNING_REACHABLE_BOM_EDGES,
           select: { parentProductId: true, componentProductId: true },
         })
         const bomCycle = detectBomItemCycleAfterReplacement(
@@ -1021,6 +1018,21 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                   + `(${bomOutcome.path.join(' -> ')}) — neither the component list nor the BOM recipe was `
                   + 'written. This can happen when an older BOM recipe for a DIFFERENT product still lists '
                   + 'this one as its parent; re-import that product\'s recipe too, or clear it',
+                )
+              }
+              // EXHAUSTIVE, not a list of the kinds I happened to think of (round 6, finding 3).
+              // `claim-contended` was previously ignored, and ignoring it returned `true` and
+              // COMMITTED the `ProductComponent` write with no claimed Bom -- the sellable-but-
+              // unmanufacturable state this whole change exists to remove, reintroduced by the very
+              // compare-and-set added to prevent a different form of it. A type conversion by a
+              // concurrent editor does NOT take the graph lock, so losing the CAS is reachable here.
+              //
+              // Written as `!== 'written'` so a future outcome kind cannot be silently dropped: a
+              // new kind fails closed, loudly, instead of committing half a recipe.
+              if (bomOutcome.kind !== 'written') {
+                throw new BomRecipeCycleError(
+                  `Row ${cr.lineNum}: ${cr.sku} — ${describeBomRecipeRefusal(bomOutcome)}. Neither the `
+                  + 'component list nor the BOM recipe was written for this row.',
                 )
               }
             }

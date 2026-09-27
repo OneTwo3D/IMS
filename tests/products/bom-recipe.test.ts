@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
 import {
+  PLANNING_REACHABLE_BOM_EDGES,
   compareRecipes,
   detectBomItemCycleAfterReplacement,
   detectBomItemCycleInEdges,
@@ -591,6 +592,104 @@ test('[o3d-zjsb5.9 r2] the editor ROLLS BACK the ProductComponent write when the
     !/return \{ kind: 'bom-cycle'/.test(src) && !/return \{ kind: 'bom-claim-contended'/.test(src),
     'no BOM refusal may be RETURNED out of a transaction that has already written',
   )
+})
+
+test('[o3d-zjsb5.9 r6] every BomItem cycle walk uses the ONE shared graph definition', async () => {
+  // Round 5's finding 2 was two walks disagreeing about what the graph is: the write paths scoped to
+  // active BOMs, the drift check scoped to nothing, so a retirement plus a reverse edge was a cycle to
+  // one and not the other. Three private copies of a predicate is how that happens, so there is now one
+  // exported constant -- and this asserts nobody reintroduces a private copy.
+  const walkers = ['lib/products/bom-recipe.ts', 'app/actions/import.ts']
+  for (const file of walkers) {
+    const src = await readFile(path.join(process.cwd(), file), 'utf8')
+    assert.match(
+      src, /where: PLANNING_REACHABLE_BOM_EDGES/,
+      `${file}: its bom_items walk must use the shared definition, not its own predicate`,
+    )
+    assert.ok(
+      !/where: \{ bom: \{ active: true \} \}/.test(src),
+      `${file}: an inline \`{ bom: { active: true } }\` is a second definition of the graph -- the exact `
+      + 'divergence round 5 found. Use PLANNING_REACHABLE_BOM_EDGES',
+    )
+  }
+  // And the definition must match the reader it exists to mirror. If replenishment stops filtering on
+  // one of these, this reds and somebody has to think, instead of the walks quietly protecting a graph
+  // nobody reads any more.
+  const reader = await readFile(path.join(process.cwd(), 'lib/domain/inventory/replenishment-reports.ts'), 'utf8')
+  assert.match(
+    reader, /where: \{ bom: \{ active: true \}, parentProduct: \{ type: ProductType\.BOM \} \}/,
+    'the planning explosion must still filter on active + BOM-typed parent; if it changed, '
+    + 'PLANNING_REACHABLE_BOM_EDGES must change with it',
+  )
+  assert.deepEqual(
+    PLANNING_REACHABLE_BOM_EDGES,
+    { bom: { active: true }, parentProduct: { type: 'BOM' } },
+    'and the shared definition must be exactly that graph',
+  )
+})
+
+test('[o3d-zjsb5.9 r6] NO call site returns a BOM refusal out of a transaction that has written', async () => {
+  // ROUND 2 FIXED THIS AT ONE SITE. Rounds 5/6 found it at two more: `manufacturing.ts` returned the
+  // refusal (committing a rejected cyclic recipe) and `import.ts` handled only `cycle`, ignoring
+  // `claim-contended` and committing `ProductComponent` with no claimed Bom. The round-2 test could
+  // not catch either, because it asserted about `products.ts` by name. So this one is about the SHAPE
+  // and DISCOVERS its own subjects: every transactional call site is checked, including sites added
+  // after this test was written.
+  const roots = ['app', 'lib']
+  const files: string[] = []
+  const walk = async (dir: string) => {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) await walk(full)
+      else if (entry.name.endsWith('.ts')) {
+        if ((await readFile(full, 'utf8')).includes('syncBomRecipeFromProductComponents(tx')) files.push(full)
+      }
+    }
+  }
+  for (const root of roots) await walk(path.join(process.cwd(), root))
+
+  // THE WALK REACHED SOMETHING. Without this the whole test passes by finding no files at all --
+  // a rename of the helper would make it vacuous rather than red.
+  const relative = files.map((file) => path.relative(process.cwd(), file)).sort()
+  assert.deepEqual(
+    relative,
+    ['app/actions/import.ts', 'app/actions/manufacturing.ts', 'app/actions/products.ts'],
+    'the known transactional call sites must all be found; update this list when one is added, which '
+    + 'is the point at which someone must think about whether the new site throws',
+  )
+
+  for (const file of files) {
+    const src = await readFile(file, 'utf8')
+    const callAt = src.indexOf('syncBomRecipeFromProductComponents(tx')
+    const declAt = src.lastIndexOf('const ', callAt)
+    const outcome = src.slice(declAt + 6, src.indexOf(' ', declAt + 6)).trim()
+    assert.ok(/^[A-Za-z][A-Za-z0-9]*$/.test(outcome), `${file}: could not read the outcome variable name`)
+
+    // The refusal must be EXHAUSTIVE: `!== 'written'`, not a list of the kinds someone remembered.
+    // That is what makes a future outcome kind fail closed instead of committing half a recipe.
+    const after = src.slice(callAt)
+    const guard = after.indexOf(`${outcome}.kind !== 'written'`)
+    assert.ok(
+      guard !== -1,
+      `${path.relative(process.cwd(), file)}: the outcome must be handled exhaustively with `
+      + `\`${outcome}.kind !== 'written'\`. Handling only the kinds you thought of is how `
+      + '`claim-contended` was ignored and committed a component list with no claimed Bom',
+    )
+    // And that guard must THROW, because a callback that RETURNS commits.
+    const block = after.slice(guard, guard + 600)
+    const throwAt = block.indexOf('throw')
+    const returnAt = block.indexOf('return')
+    assert.ok(
+      throwAt !== -1 && (returnAt === -1 || throwAt < returnAt),
+      `${path.relative(process.cwd(), file)}: a refusal must THROW so the transaction aborts. Returning `
+      + 'it commits the rejected recipe while the action reports failure -- the worst of both outcomes',
+    )
+    // No site may hand the outcome value itself back out of the callback.
+    assert.ok(
+      !new RegExp(`return ${outcome}\\b`).test(after) && !new RegExp(`return \\{ \\.\\.\\.${outcome}[,\\s]`).test(after.slice(0, guard)),
+      `${path.relative(process.cwd(), file)}: the refusal value must not be returned out of the transaction`,
+    )
+  }
 })
 
 test('[o3d-zjsb5.9 r2] a type change reconciles the recipe in BOTH writers, on the type just written', async () => {
