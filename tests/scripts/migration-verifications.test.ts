@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { execFileSync } from 'node:child_process'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
@@ -213,4 +215,155 @@ test('the migration this repository requires to declare checks now declares them
   assert.deepEqual(coverage.missing, [], 'every required migration must ship a verify.sql')
   assert.deepEqual(coverage.stale, [])
   assert.equal(coverage.satisfied, true, 'node scripts/run-migration-verifications.mjs --strict must be able to pass')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// o3d-j625 r28 (Codex round 27, HIGH 2) — A MIGRATION THAT HAS BEEN APPLIED SOMEWHERE IS FOREVER.
+//
+// r26 removed a table by DELETING its migration. A fresh database never applies the deleted migration,
+// so every tier of a fully green gate passed; a database that HAD applied it was left with a table no
+// migration drops and `db:schema:drift` rejecting the extra table. The upgrade path is the one path CI
+// never walks, which is why this needs a rule in the repo rather than care from the next author.
+//
+// `scripts/check-migration-conventions.mjs` cannot catch it: it diffs with `--diff-filter=ACMR`, which
+// excludes deletions by construction. So the rule lives here.
+//
+// WHAT WOULD STILL PASS THESE TESTS: renaming a migration directory in the same commit that created it
+// (no ref has it yet, so nothing was applied anywhere); editing the BODY of an already-shipped migration,
+// which is a different defect with a different fix; and a table created and dropped by migrations that
+// PRISMA never modelled in the first place. Neither test says anything about column-level changes.
+
+test('o3d-j625 r30: no migration this branch has ever had may be deleted from HEAD or the working tree', () => {
+  const root = process.cwd()
+  const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+
+  let base: string
+  try {
+    base = git(['merge-base', 'origin/development', 'HEAD'])
+  } catch {
+    // No trunk ref in this checkout (a shallow CI clone). Say so rather than passing quietly.
+    assert.fail('PRECONDITION: origin/development must be fetched for this check to mean anything')
+  }
+
+  const dirsAt = (ref: string) => new Set(
+    git(['ls-tree', '-r', '--name-only', ref, 'prisma/migrations/'])
+      .split('\n')
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+
+  /**
+   * o3d-j625 r30 (Codex round 29, HIGH 2) — THE PROTECTED SET IS TRUNK'S MIGRATIONS **PLUS THIS BRANCH'S OWN**.
+   *
+   * r28 derived it from the merge base alone, which protects an adjacent property: it guards trunk's
+   * migrations while the migration whose deletion caused the whole incident —
+   * 20260926213000_accounting_hand_post_claim_revision — exists ONLY on this branch. Deleting it again, from
+   * HEAD or from the working tree, passed both of r28's checks; the table scan passed too, because the later
+   * DROP survives and the scan only asks whether a created table is dropped or modelled. The guard written to
+   * prevent this exact failure did not prevent this exact failure.
+   *
+   * So a migration introduced by a commit ON THIS BRANCH is protected from the moment that commit exists. The
+   * reason is the same one the whole finding rests on: a branch's migrations get applied to real databases
+   * (stage, a colleague's checkout, every scratch database this issue has gated on) long before the branch
+   * merges, and from then on deleting one leaves a database with history the repo no longer contains.
+   *
+   * WHAT THIS FORBIDS, stated plainly: renaming or removing a migration you added in an EARLIER commit on
+   * this branch. That is deliberate, and the escape hatch is not a flag — it is to make the claim true. Either
+   * reverse it with a LATER migration (the same advice as for trunk's), or rewrite the branch history with an
+   * amend or a rebase so that no commit ever carried it. The second only works when it really was never
+   * applied anywhere, which is exactly the condition under which it is safe.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   * THE LIMIT OF THIS GUARD, STATED (o3d-j625 r32, Codex round 31 HIGH 2 — strengthening filed as o3d-bm8es)
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * It protects trunk's migrations and those introduced by commits CURRENTLY REACHABLE in `merge-base..HEAD`.
+   * A history rewrite — squash, amend, rebase, force-push — that removes a migration's introducing commit also
+   * removes it from the protected set, and the non-empty precondition below still passes because the branch's
+   * other migrations remain. Closing that needs a record outside rewriteable branch history; this guard does
+   * not have one.
+   *
+   * Said here rather than left to be inferred, because a guard that states its own reach is worth more than one
+   * that implies a reach it lacks (o3d-bddq).
+   *
+   * WHAT WOULD STILL PASS IT: adding a migration and deleting it again WITHOUT COMMITTING in between — no
+   * commit ever had it, so nothing could have applied it from this branch; changing the BODY of a shipped
+   * migration, which is a different defect with a different fix; and any change to a migration's directory
+   * that keeps `migration.sql` present under the same directory name. It says nothing about column-level
+   * conventions, which check-migration-conventions.mjs owns.
+   */
+  const introducedOnBranch = new Set(
+    git(['log', '--diff-filter=A', '--name-only', '--pretty=format:', `${base}..HEAD`, '--', 'prisma/migrations/'])
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+  const onTrunk = dirsAt(base)
+  const protectedDirs = new Set([...onTrunk, ...introducedOnBranch])
+  const onBranch = dirsAt('HEAD')
+
+  assert.ok(onTrunk.size > 50, `PRECONDITION: the walk must actually see the trunk's migrations, saw ${onTrunk.size}`)
+  // AND the branch's own must actually be in the protected set, or this test has quietly reverted to r28's.
+  // Asserted as a non-empty INTERSECTION with what HEAD has, so it cannot be satisfied by a stale name.
+  //
+  // o3d-j625 r30: asserted against `protectedDirs` ITSELF, not against `introducedOnBranch`. Checking the
+  // latter would pass unchanged if the set below quietly reverted to trunk-only — which is r29's finding, so
+  // the precondition has to be able to detect exactly that.
+  const branchOwnProtected = [...introducedOnBranch].filter((dir) => onBranch.has(dir) && protectedDirs.has(dir))
+  assert.ok(branchOwnProtected.length > 0,
+    'PRECONDITION: this branch must contribute at least one migration to the PROTECTED SET, otherwise the r29 '
+    + 'finding is not being exercised and this check has collapsed back to trunk-only')
+
+  const deleted = [...protectedDirs].filter((dir) => !onBranch.has(dir))
+  assert.deepEqual(deleted, [],
+    'A migration that this branch or the trunk has already committed is missing from HEAD. Deleting an applied '
+    + 'migration removes nothing from a database that already ran it: `migrate deploy` then has no step that '
+    + 'undoes it and drift rejects the leftover object. Restore it and add a LATER migration that reverses it, '
+    + 'or rewrite history so no commit ever carried it (o3d-j625 r30).')
+
+  // AND ON DISK, which is the check that fires BEFORE the deletion is committed. The comparison above reads
+  // `git ls-tree`, so it is blind to a working tree the author has already emptied — r28's first draft passed
+  // with a trunk migration moved aside, which is precisely the moment an author wants to be told.
+  const missingOnDisk = [...protectedDirs].filter(
+    (dir) => !existsSync(join(root, 'prisma', 'migrations', dir, 'migration.sql')),
+  )
+  assert.deepEqual(missingOnDisk, [],
+    'A protected migration is missing from the working tree. Same rule, caught before the commit: restore it '
+    + 'and reverse it with a later migration instead (o3d-j625 r30).')
+})
+
+test('o3d-j625 r28: every table a migration creates is either modelled or dropped by a later migration', () => {
+  const root = process.cwd()
+  const migrationsDir = join(root, 'prisma', 'migrations')
+  const dirs = readdirSync(migrationsDir).filter((d: string) => /^\d{14}_/.test(d)).sort()
+  assert.ok(dirs.length > 50, `PRECONDITION: the walk must reach the migrations, saw ${dirs.length}`)
+
+  const created = new Map<string, string>()
+  const dropped = new Set<string>()
+  for (const dir of dirs) {
+    let sql: string
+    try {
+      sql = readFileSync(join(migrationsDir, dir, 'migration.sql'), 'utf8')
+    } catch {
+      continue
+    }
+    const body = sql.split('\n').filter((line: string) => !line.trimStart().startsWith('--')).join('\n')
+    for (const m of body.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"([^"]+)"/gi)) created.set(m[1], dir)
+    for (const m of body.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([^"]+)"/gi)) dropped.add(m[1])
+  }
+  assert.ok(created.size > 50, `PRECONDITION: CREATE TABLE statements must be found, saw ${created.size}`)
+  assert.ok(dropped.has('accounting_hand_post_claim_revisions'),
+    'PRECONDITION: the r28 drop migration must be among those parsed, or this test is not exercising the case it exists for')
+
+  const schema = readFileSync(join(root, 'prisma', 'schema.prisma'), 'utf8')
+  const modelled = new Set<string>()
+  for (const m of schema.matchAll(/@@map\("([^"]+)"\)/g)) modelled.add(m[1])
+  assert.ok(modelled.size > 50, `PRECONDITION: schema.prisma @@map names must be found, saw ${modelled.size}`)
+
+  const orphans = [...created.keys()].filter((t) => !modelled.has(t) && !dropped.has(t))
+  assert.deepEqual(orphans, [],
+    'These tables are created by a migration, are not in schema.prisma, and no migration drops them. Every '
+    + 'database that ran the migration will fail db:schema:drift. Add a migration that drops the table '
+    + '(o3d-j625 r28).')
 })

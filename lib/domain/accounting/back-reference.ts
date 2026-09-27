@@ -535,12 +535,12 @@ export const BACK_REFERENCE_PAIRS: ReadonlyArray<{
    */
   holder: ExternalDocumentIdHolder
 }> = [
-  { type: 'SALES_INVOICE', referenceTypes: ['SalesOrder'], holder: { model: 'SalesOrder', column: 'accountingInvoiceId' } },
-  { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'], holder: { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' } },
+  { type: 'SALES_INVOICE', referenceTypes: ['SalesOrder'], holder: { model: 'SalesOrder', column: 'accountingInvoiceId', connectorColumn: 'accountingInvoiceConnector' } },
+  { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'], holder: { model: 'SalesOrderRefund', column: 'accountingCreditNoteId', connectorColumn: 'accountingCreditNoteConnector' } },
   // PurchaseOrder is the LEGACY keying (pre-o3d-9oq): the row names the order, not the bill, and is
   // attributed by resolvePurchaseOrderBackReference or refused.
-  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'], holder: { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' } },
-  { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'], holder: { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' } },
+  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'], holder: { model: 'PurchaseInvoice', column: 'accountingInvoiceId', connectorColumn: 'accountingInvoiceConnector', sourceColumn: 'accountingInvoiceIdSource' } },
+  { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'], holder: { model: 'SupplierCreditNote', column: 'accountingCreditNoteId', connectorColumn: 'accountingCreditNoteConnector' } },
 ]
 
 /** Which model/column a sync type+reference pair's external id lands on, or null if it lands nowhere. */
@@ -925,7 +925,12 @@ async function resolveAndApplyPurchaseOrderBackReference(
     // something the ledger told us. Written in the SAME statement as the id: a provenance recorded
     // separately could fail on its own and leave a guess indistinguishable from an authoritative
     // link, which is the state this column exists to end.
-    data: { accountingInvoiceId: params.externalId, accountingInvoiceIdSource: params.linkSource ?? 'PO_KEYED_REPAIR' },
+    // o3d-j625 r3: and WHOSE bill id it is (see PurchaseInvoice.accountingInvoiceConnector).
+    data: {
+      accountingInvoiceId: params.externalId,
+      accountingInvoiceIdSource: params.linkSource ?? 'PO_KEYED_REPAIR',
+      accountingInvoiceConnector: params.connector,
+    },
   })
   if (written.count !== 1) return { outcome: 'contended', purchaseInvoiceId: attribution.purchaseInvoiceId }
   return { outcome: 'applied', referenceType: 'PurchaseInvoice', referenceId: attribution.purchaseInvoiceId }
@@ -955,6 +960,11 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
         where: { id: referenceId },
         data: {
           accountingInvoiceId: externalId,
+      // o3d-j625 r3 (Codex HIGH 2/HIGH 3): AND WHOSE DOCUMENT IT IS, in the SAME statement. The id
+      // outlives a connector switch; without the connector beside it, a later payment cannot tell
+      // whose primary key it is holding and has to guess at the active one. `connector` is the value
+      // this write already had in scope and already puts in its conflict message.
+          accountingInvoiceConnector: connector,
           invoiceNumber: invoiceNumber ?? undefined,
           invoicedAt,
         },
@@ -976,7 +986,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     try {
       await deps.salesOrderRefund.update({
         where: { id: referenceId },
-        data: { accountingCreditNoteId: externalId },
+        data: { accountingCreditNoteId: externalId, accountingCreditNoteConnector: connector },
       })
     } catch (error) {
       if (!isExternalCreditNoteIdConflict(error)) throw error
@@ -1011,7 +1021,15 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
         // THE AUTHORITATIVE LINK (o3d-wf86): the sync row named this exact bill, so this is what the
         // connector itself reported rather than anything deduced locally. That is why this branch is
         // allowed to overwrite a legacy guess — and now the overwrite is visible as one.
-        data: { accountingInvoiceId: externalId, accountingInvoiceIdSource: params.linkSource ?? 'BILL_KEYED_SYNC' },
+        data: {
+          accountingInvoiceId: externalId,
+          accountingInvoiceIdSource: params.linkSource ?? 'BILL_KEYED_SYNC',
+      // o3d-j625 r3 (Codex HIGH 2/HIGH 3): AND WHOSE DOCUMENT IT IS, in the SAME statement. The id
+      // outlives a connector switch; without the connector beside it, a later payment cannot tell
+      // whose primary key it is holding and has to guess at the active one. `connector` is the value
+      // this write already had in scope and already puts in its conflict message.
+          accountingInvoiceConnector: connector,
+        },
       })
     } catch (error) {
       if (!isExternalBillIdConflict(error)) throw error
@@ -1066,7 +1084,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     try {
       await deps.supplierCreditNote.update({
         where: { id: referenceId },
-        data: { accountingCreditNoteId: externalId },
+        data: { accountingCreditNoteId: externalId, accountingCreditNoteConnector: connector },
       })
     } catch (error) {
       if (!isExternalCreditNoteIdConflict(error)) throw error
@@ -1174,7 +1192,13 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
 /**
  * The four local models that can hold an accounting external document id, and the column they use.
  *
- * `sourceColumn` is the PROVENANCE column beside it, where one exists (o3d-wf86). Only PurchaseInvoice
+ * `connectorColumn` is WHICH CONNECTOR'S document that id is (o3d-j625 r3, Codex HIGH 2/HIGH 3). All
+ * four models have one, because all four ids are somebody else's primary key and all four survive a
+ * connector switch. It is required on every arm deliberately: an optional provenance column is a
+ * column a new holder can be added without, and the whole finding is that the id without it cannot be
+ * routed.
+ *
+ * `sourceColumn` is the HOW-IT-WAS-ACQUIRED column beside it, where one exists (o3d-wf86). Only PurchaseInvoice
  * has one, and that asymmetry is the honest state of the world rather than an omission: the PO-keyed
  * repair is the only writer in the system that DEDUCES which local document an external id belongs
  * to, so it is the only place where "how did this link get here" has more than one possible answer.
@@ -1185,10 +1209,10 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
  * list is how PURCHASE_CREDIT_NOTE fell out of the sweep in r6 finding 2.
  */
 export type ExternalDocumentIdHolder =
-  | { model: 'SalesOrder'; column: 'accountingInvoiceId'; sourceColumn?: undefined }
-  | { model: 'SalesOrderRefund'; column: 'accountingCreditNoteId'; sourceColumn?: undefined }
-  | { model: 'PurchaseInvoice'; column: 'accountingInvoiceId'; sourceColumn: 'accountingInvoiceIdSource' }
-  | { model: 'SupplierCreditNote'; column: 'accountingCreditNoteId'; sourceColumn?: undefined }
+  | { model: 'SalesOrder'; column: 'accountingInvoiceId'; connectorColumn: 'accountingInvoiceConnector'; sourceColumn?: undefined }
+  | { model: 'SalesOrderRefund'; column: 'accountingCreditNoteId'; connectorColumn: 'accountingCreditNoteConnector'; sourceColumn?: undefined }
+  | { model: 'PurchaseInvoice'; column: 'accountingInvoiceId'; connectorColumn: 'accountingInvoiceConnector'; sourceColumn: 'accountingInvoiceIdSource' }
+  | { model: 'SupplierCreditNote'; column: 'accountingCreditNoteId'; connectorColumn: 'accountingCreditNoteConnector'; sourceColumn?: undefined }
 
 /** The Prisma delegate surface the claim lookup and release need. Structural, so a double satisfies it. */
 type ExternalDocumentIdClaimDelegate = {
@@ -1641,7 +1665,14 @@ export async function releaseAndRelinkExternalDocumentId(
         // would read, to the next conflict report, as an authoritative claim to an id it does not
         // have. Written in the same statement, so the pair can never come apart. Harmless on the
         // three models that have no such column: Prisma ignores an undefined field.
-        data: { [holder.column]: null, ...(holder.sourceColumn ? { [holder.sourceColumn]: null } : {}) },
+        // o3d-j625 r3: AND ITS CONNECTOR. A released claim that kept `accountingInvoiceConnector`
+        // would leave a row asserting it holds one connector's document while holding none, and the
+        // enqueue guard reads that column as provenance — so the stale value would be believed.
+        data: {
+          [holder.column]: null,
+          [holder.connectorColumn]: null,
+          ...(holder.sourceColumn ? { [holder.sourceColumn]: null } : {}),
+        },
       })
       if (released.count !== 1) throw new ExternalDocumentIdReleaseAbort({ outcome: 'contended', holderId: params.confirmedHolderId })
 

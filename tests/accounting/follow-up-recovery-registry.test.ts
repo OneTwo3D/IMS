@@ -1993,6 +1993,48 @@ function accountingFollowUpSection(): { slice: string; whole: string } {
   return { slice: code.slice(starts[start]!, end), whole: code }
 }
 
+/**
+ * o3d-j625 r5 (review M-6) — THE SAME TWO RULES, OVER THE SURFACES THIS ROUND ADDED.
+ *
+ * The r4 refusal work wrote operator prose in three new places — the inbox section, the shared reporter's
+ * remedies, and the enqueue guard's — and none of them was scanned: "the remedies satisfy the guard" was
+ * true and unenforced. It also re-introduced the banned literal `detail="…"` shape in the section it added.
+ * Both are checked here, against the same banned list, because the danger is the instruction and not the
+ * file it lives in.
+ */
+test('[o3d-j625 r5] the refusal inbox section and every new refusal surface carry no banned operator instruction', () => {
+  const inbox = readSource(path.join(REPO_ROOT, 'app', '(dashboard)', 'sync', 'exceptions', 'exceptions-client.tsx'))
+  const marker = /\{data\.\w+\.length > 0 \? \(/g
+  const starts: number[] = []
+  for (let m = marker.exec(inbox.code); m; m = marker.exec(inbox.code)) starts.push(m.index)
+  const at = starts.findIndex((index) => inbox.code.startsWith('{data.accountingPostingRefusals', index))
+  assert.notEqual(at, -1, 'the refused-postings section must still be rendered by the exception inbox')
+  const slice = inbox.code.slice(starts[at]!, starts[at + 1] ?? inbox.code.length)
+
+  // CONTROL: the slice is this section and not the whole file.
+  assert.match(slice, /Accounting postings IMS refused to queue/)
+  assert.equal(slice.includes('accountingFollowUpObligations'), false, 'and it stops before the next section')
+
+  // The section text is ONE exported string, not a literal authored here — the r8 shape, banned.
+  assert.match(slice, /detail=\{ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL\}/)
+  assert.doesNotMatch(slice, /detail="/)
+  assertNoBannedInstruction('the refused-postings section', slice)
+
+  // And every surface that writes a remedy for these rows.
+  const scanned = [
+    'lib/domain/accounting/posting-refusal-copy.ts',
+    'lib/domain/accounting/posting-refusal-inbox.ts',
+    'lib/domain/accounting/enqueue-outcome.ts',
+    'lib/accounting.ts',
+  ]
+  for (const rel of scanned) {
+    const { code } = readSource(path.join(REPO_ROOT, rel))
+    assertNoBannedInstruction(rel, code)
+  }
+  // CONTROL: the scan really read those files, so a path typo cannot pass as a clean scan.
+  assert.match(readSource(path.join(REPO_ROOT, scanned[0]!)).code, /ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL/)
+})
+
 test('[o3d-0bfh r9] the exception inbox renders the registry remedy and authors no instruction of its own', () => {
   // THE R8 DEFECT, AS A TEST. The registry said read-and-escalate while this SectionHeading said
   // "create only what is verifiably absent", and nothing compared them because nothing looked at

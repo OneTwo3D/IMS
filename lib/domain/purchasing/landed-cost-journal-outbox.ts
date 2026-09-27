@@ -113,7 +113,8 @@ export type ProcessLandedCostOutboxResult = { claimed: number; succeeded: number
 
 export type LandedCostOutboxDrainDeps = {
   claimWork: typeof claimIntegrationOutboxWork
-  queueJournals: (result: LandedCostRecalcResult) => Promise<unknown>
+  /** o3d-j625 r4: returns how many journals are still OWED, which decides success vs retry. */
+  queueJournals: (result: LandedCostRecalcResult) => Promise<{ owed: number }>
   markSuccess: (options: Parameters<typeof markIntegrationOutboxSuccess>[0]) => Promise<unknown>
   markRetry: (options: Parameters<typeof markIntegrationOutboxRetryableFailure>[0]) => Promise<unknown>
 }
@@ -159,7 +160,14 @@ async function processOneLandedCostOutboxJob(
   if (!job.lockedAt) { result.failed++; return }
   try {
     const payload = LandedCostJournalOutboxPayloadSchema.parse(job.payloadJson)
-    await deps.queueJournals(landedCostOutboxPayloadToRecalcResult(payload))
+    const run = await deps.queueJournals(landedCostOutboxPayloadToRecalcResult(payload))
+    // o3d-j625 r4 (SWEEP 1) — A JOB WHOSE JOURNALS WERE REFUSED IS NOT A SUCCEEDED JOB. Retried with the
+    // outbox's own backoff (the enqueues are idempotent, so what did queue is not duplicated), and
+    // exhausted to a visible failure if the cause never clears. Marking it SUCCEEDED ended the backstop's
+    // interest in the very journals it exists to recover.
+    if (run.owed > 0) {
+      throw new Error(`${run.owed} landed-cost journal(s) could not be queued and are still owed; see the accounting activity log`)
+    }
     await deps.markSuccess({ id: job.id, workerId: LANDED_COST_OUTBOX_WORKER, lockedAt: job.lockedAt })
     result.succeeded++
   } catch (error) {

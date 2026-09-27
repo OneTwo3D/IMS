@@ -78,7 +78,10 @@ function doubleTx(shipments: ShipmentRow[], over: { savepointProbe?: 'accepts' |
 
 function options(queued: unknown[], logged: JournaledShipmentRevaluationRefusal[]) {
   return {
-    accountingSettings: { inventoryAccount: '630', cogsAccount: '500' },
+    // o3d-j625 r12 (merge): `connector` is REQUIRED on an injected chart (o3d-j625 r2, Codex HIGH 1) — an
+    // injected chart that does not say whose it is cannot be routed, and an optional field here would let
+    // the enqueue resolve the connector for itself, which is the defect that requirement closes.
+    accountingSettings: { connector: 'xero' as const, inventoryAccount: '630', cogsAccount: '500' },
     isReversalPostingEnabled: async () => true,
     isDailyBatchPostingEnabled: async () => true,
     queueAccountingSync: async (_tx: unknown, params: unknown) => { queued.push(params); return true },

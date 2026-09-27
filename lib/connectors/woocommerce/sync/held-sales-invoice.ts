@@ -31,6 +31,7 @@
  * settings change between hold and release cannot quietly alter what posts.
  */
 
+import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { HELD_SALES_INVOICE_RECORD_KIND } from '@/lib/domain/sales/wc-sync-row-families'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { PRIOR_ATTEMPT_COUNTERPART_EXISTS_OR } from '@/lib/domain/accounting/prior-posting-evidence'
@@ -94,6 +95,24 @@ export type HeldSalesInvoicePayload = {
   metaKey: string
   /** Everything the accounting connector needs EXCEPT `invoiceNumber`. */
   accountingPayload: Record<string, unknown>
+  /**
+   * o3d-j625 — THE CONNECTOR WHOSE CHART THE ACCOUNT CODES IN `accountingPayload` CAME FROM.
+   *
+   * This module's own contract makes it necessary: "ONLY THE NUMBER IS ADDED ON RELEASE. Nothing else
+   * in the parked payload is recomputed" — so `accountCode`, `shippingAccountCode` and
+   * `discountAccountCode` are FROZEN as the connector's whose chart the import read, and the release
+   * happens whenever WooCommerce gets round to numbering the order, which can be days later. The
+   * release used to enqueue with no connector at all, which resolved the active one afresh: a hold
+   * taken while Xero was active and released after a move to QuickBooks posted a QuickBooks invoice
+   * carrying Xero account codes. This is the widest window of any site o3d-j625's sweep found, and it
+   * is the one that is not a race at all — the two reads are days apart by design.
+   *
+   * OPTIONAL, and absent on every row parked before this field existed. Inventing a value for those
+   * would be this code vouching for a chart read it never saw; absent means the release keeps the
+   * active-connector resolution it has always had. It is NOT part of {@link isHeldSalesInvoicePayload}'s
+   * verdict for the same reason — a legacy hold is still a valid hold and must still be releasable.
+   */
+  chartConnector?: AccountingConnectorId | null
 }
 
 /**
@@ -198,6 +217,8 @@ export function buildHeldSalesInvoicePayload(params: {
   orderNumber: string
   metaKey: string
   accountingPayload: Record<string, unknown>
+  /** o3d-j625: whose chart `accountingPayload`'s account codes are. Frozen with them. */
+  chartConnector: AccountingConnectorId | null
 }): HeldSalesInvoicePayload {
   // Defensive: never park a payload that already carries a number (see isHeldSalesInvoicePayload).
   const { invoiceNumber: _discarded, ...rest } = params.accountingPayload
@@ -210,6 +231,7 @@ export function buildHeldSalesInvoicePayload(params: {
     orderNumber: params.orderNumber,
     metaKey: params.metaKey,
     accountingPayload: rest,
+    chartConnector: params.chartConnector,
   }
 }
 
@@ -219,4 +241,28 @@ export function buildReleasedSalesInvoicePayload(
   invoiceNumber: string,
 ): Record<string, unknown> {
   return { invoiceNumber, ...held.accountingPayload }
+}
+
+/**
+ * o3d-j625: the chart the frozen payload's account codes belong to, narrowed to a routable id.
+ *
+ * `undefined` for a legacy hold (no field) AND for a stored value this build cannot route — a value
+ * that names no queue is not a chart. It deliberately does NOT collapse a stored `null` into
+ * `undefined`: `null` was written by an import that had no accounting connector at all, so the frozen
+ * codes are the empty-string defaults, and the release must answer `not-configured` rather than posting
+ * blank accounts into a connector that has since been switched on.
+ *
+ * o3d-j625 r2 (Codex HIGH 1) — WHAT `undefined` NOW COSTS. r1 wrote that it "keeps that hold's old
+ * behaviour rather than refusing it for ever", where the old behaviour was the enqueue resolving the
+ * active connector. That behaviour no longer exists: `chartConnector` is a required enqueue parameter.
+ * `undefined` therefore means UNATTRIBUTABLE, and `releaseHeldWcSalesInvoice` refuses such a hold —
+ * left PENDING with the reason on the row and a WARNING naming the manual remedy, because a days-wide
+ * gap between the frozen codes and the release is the widest window in the whole issue.
+ */
+export function heldSalesInvoiceChartConnector(
+  held: HeldSalesInvoicePayload,
+): AccountingConnectorId | null | undefined {
+  if (held.chartConnector === null) return null
+  if (isRegisteredAccountingConnector(held.chartConnector)) return held.chartConnector
+  return undefined
 }
