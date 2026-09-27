@@ -73,6 +73,8 @@ type Deps = {
   deactivateDuplicateBomRecipe: typeof import(
     '../../lib/products/bom-recipe-repair'
   )['deactivateDuplicateBomRecipe']
+  readServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['readServerIdentity']
+  compareServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['compareServerIdentity']
   COMPONENT_GRAPH_WRITE_LOCK_KEY: number
 }
 
@@ -95,6 +97,8 @@ async function loadDeps(): Promise<Deps> {
     updateManufacturingOrderStatus: mfgMod.updateManufacturingOrderStatus,
     findBomRecipeDrift: recipeMod.findBomRecipeDrift,
     deactivateDuplicateBomRecipe: repairMod.deactivateDuplicateBomRecipe,
+    readServerIdentity: repairMod.readServerIdentity,
+    compareServerIdentity: repairMod.compareServerIdentity,
     COMPONENT_GRAPH_WRITE_LOCK_KEY: locksMod.COMPONENT_GRAPH_WRITE_LOCK_KEY,
   }
 }
@@ -920,8 +924,12 @@ test(
     // two caught it -- and I cannot make a connection change server mid-run from out here. So this calls
     // the mutation itself with a wrong expectation, which is the guard's own contract: asked inside the
     // transaction that does the writing, a mismatch aborts and the abort discards the write.
+    const liveIdentity = await deps.readServerIdentity(deps.db)
     const inTransaction = await deps.db.$transaction(async (tx) =>
-      await deps.deactivateDuplicateBomRecipe(tx, { bomId: duplicate.id, expectDatabase: 'a-different-database' }))
+      await deps.deactivateDuplicateBomRecipe(tx, {
+        bomId: duplicate.id,
+        expectIdentity: { ...liveIdentity, database: 'a-different-database' },
+      }))
     assert.equal(inTransaction.kind, 'wrong-database',
       `the in-transaction check must refuse, got: ${JSON.stringify(inTransaction)}`)
     assert.equal(
@@ -943,6 +951,152 @@ test(
       (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
       false, 'and the duplicate must now be deactivated',
     )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r13] THE CONTRACT: a same-name server differing in the rest of the composite is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 13, FINDING 1 -- round 12's own argument turned back on round 12's fix. Round 12 reasoned
+     * that a CLONE holds the same BOM ids, so the id cannot distinguish two servers. True, and
+     * incomplete: `current_database()` returns the NAME, and a restored copy KEEPS ITS NAME. So a clone
+     * on another server satisfied `--expect-db` AND the in-transaction re-check. The guard proved "this
+     * database is called X" while the operator needed "this is the server I meant" -- an adjacent
+     * property: sound, and establishing the wrong thing.
+     *
+     * THIS TESTS THE COMPARISON CONTRACT, NOT A SECOND SERVER. I cannot stand up a second cluster here,
+     * so the composite is driven directly with a SYNTHETIC identity that matches on name and differs on
+     * the rest -- which is exactly the clone's shape. The same honest technique as the in-transaction arm
+     * above: the guard's contract, stated as a test, rather than a simulated second machine.
+     */
+    const deps = await loadDeps()
+    const live = await deps.readServerIdentity(deps.db)
+
+    // The live read must actually have found a server, or every assertion below is about nothing.
+    assert.ok(live.database.length > 0 && live.database !== 'unknown',
+      `precondition: the identity read must work, got ${JSON.stringify(live)}`)
+
+    // A CLONE: same name, different cluster. The name alone cannot see this; the composite must.
+    const clone = { ...live, systemIdentifier: '1234567890123456789' }
+    assert.notEqual(live.systemIdentifier, clone.systemIdentifier, 'precondition: the ids must differ')
+    const cloneDifferences = deps.compareServerIdentity(live, clone)
+    assert.deepEqual(
+      cloneDifferences.map((d) => d.field), ['systemIdentifier'],
+      'a same-name clone on another cluster must be caught, and caught ON the identifier',
+    )
+
+    // Same name, different host and port -- the other way a copy is reached.
+    assert.ok(
+      deps.compareServerIdentity(live, { ...live, host: '10.9.9.9', port: '65432' }).length === 2,
+      'a same-name database reached at a different address must also be caught',
+    )
+
+    // AND THE HONEST LIMIT, asserted so nobody mistakes this for more than it is: where
+    // `system_identifier` is unavailable (it is superuser-restricted), its absence must NOT be read as a
+    // mismatch -- absence of evidence is not evidence -- which is precisely the residual hole. A
+    // PHYSICAL clone copies the identifier too, so on the same address it is indistinguishable here.
+    assert.deepEqual(
+      deps.compareServerIdentity(
+        { ...live, systemIdentifier: 'unavailable' },
+        { ...live, systemIdentifier: '999' },
+      ),
+      [],
+      'an unavailable identifier must not be reported as a mismatch -- this IS the documented limit',
+    )
+
+    // The matching case still matches, so none of the above passes by refusing everything.
+    assert.deepEqual(deps.compareServerIdentity(live, { ...live }), [],
+      'and an identical composite must compare equal')
+
+    // END TO END: the in-transaction guard refuses a same-name-only mismatch through the real mutation.
+    const NS = 'N'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const refused = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, { bomId: duplicate.id, expectIdentity: clone }))
+    assert.equal(refused.kind, 'wrong-database',
+      `a clone composite must be refused inside the transaction, got: ${JSON.stringify(refused)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r13] a MISTYPED or malformed argument is a usage error, never a write',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 13, FINDING 2. The parser ignored what it did not recognise, so `--dryrun`, `--dry_run` or
+     * `--dry-run=true` was silently dropped AND THE RUN WROTE. That lands squarely on the exemption:
+     * not requiring confirmation for `--dry-run` is only safe if `--dry-run` cannot be misspelled into a
+     * write. It could, which made the exemption the delivery mechanism -- worse than not having it.
+     */
+    const deps = await loadDeps()
+    const NS = 'O'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const stillActive = async () =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active
+
+    // EVERY ONE OF THESE USED TO BE A WRITE, or would have been under a lenient parser.
+    const malformed: Array<[string, string[]]> = [
+      ['a misspelled dry-run (--dryrun)', ['--bom', duplicate.id, '--dryrun']],
+      ['a misspelled dry-run (--dry_run)', ['--bom', duplicate.id, '--dry_run']],
+      ['--flag=value form', ['--bom', duplicate.id, '--dry-run=true']],
+      ['an unknown option', ['--bom', duplicate.id, '--force']],
+      ['a repeated flag', ['--bom', duplicate.id, '--bom', duplicate.id, '--dry-run']],
+      ['a flag with no value', ['--bom']],
+      ['a value flag swallowing the next flag', ['--bom', '--dry-run']],
+      ['conflicting modes', ['--list', '--bom', duplicate.id]],
+      ['a bare argument', [duplicate.id]],
+    ]
+    for (const [what, args] of malformed) {
+      const run = await runRepairScript(args)
+      assert.equal(run.code, 1, `${what} must be a USAGE ERROR (exit 1), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /Usage error:/, `${what} must say it is a usage error, got: ${run.stderr}`)
+      assert.equal(await stillActive(), true, `${what} must NOT have written anything`)
+    }
+
+    // THE --flag=value MESSAGE, asserted because a mutation showed the exit code alone cannot see it: the
+    // unknown-option check already refuses `--dry-run=true`, so deleting the `=` branch changed nothing
+    // observable. What the branch actually provides is telling an operator that the NAME was right and
+    // only the FORM was wrong, instead of sending them hunting for a flag that does not exist.
+    const equalsForm = await runRepairScript(['--bom', duplicate.id, '--dry-run=true'])
+    assert.match(
+      equalsForm.stderr, /takes no value/,
+      'a bare flag written as --flag=value must be told it takes no value, not merely "unknown option": '
+      + equalsForm.stderr,
+    )
+    const equalsValueFlag = await runRepairScript(['--bom=' + duplicate.id, '--dry-run'])
+    assert.match(
+      equalsValueFlag.stderr, /with a space/,
+      `a value flag written as --flag=value must be told to use a space, got: ${equalsValueFlag.stderr}`,
+    )
+
+    // And the correctly spelled forms still work, so the validator is not simply refusing everything.
+    const goodDryRun = await runRepairScript(['--bom', duplicate.id, '--dry-run'])
+    assert.equal(goodDryRun.code, 0, `a correct --dry-run must work: ${goodDryRun.stderr}`)
+    assert.equal(await stillActive(), true, 'and still write nothing')
+    const goodWrite = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', String(process.env.IMS_CONCURRENCY_SCRATCH_DB),
+    ])
+    assert.equal(goodWrite.code, 0, `a correct write must work: ${goodWrite.stderr}`)
+    assert.equal(await stillActive(), false, 'and actually deactivate it')
   },
 )
 

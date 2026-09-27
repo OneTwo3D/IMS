@@ -27,46 +27,48 @@
  */
 import { config } from 'dotenv'
 
+import {
+  type ServerIdentity,
+  compareServerIdentity,
+  describeServerIdentity,
+  readServerIdentity,
+} from '../lib/products/bom-recipe-repair'
+
 // .env MUST load before lib/db is imported — that module builds its pg Pool from
 // process.env.DATABASE_URL at import time.
 config({ path: '.env.local', quiet: true })
 config({ quiet: true })
 
 /**
- * SAY WHICH DATABASE THIS IS, BEFORE WRITING TO IT.
+ * SAY WHICH SERVER THIS IS, BEFORE WRITING TO IT.
  *
- * This runs during a load window, by hand, against whatever `DATABASE_URL` resolves to — and this repo
- * has already been bitten twice by that resolution not being what the operator believed: a probe table
- * created in the gate's scratch database, and a socket-form URL that lost its `?host=` and silently
- * retargeted the shared cluster. A repair command is the worst place for that surprise, so it prints
- * the server's OWN answer (not the URL it was handed, which is the thing that can lie) and says
- * whether the database carries the disposable-scratch stamp.
+ * Prints the SERVER'S OWN composite identity — database, address, port, cluster system_identifier — not
+ * the URL it was handed, because the URL is the thing that can lie. Also says whether the database
+ * carries the disposable-scratch stamp.
  *
  * It does NOT refuse an unstamped database: repairing production is the entire purpose. Being loud is
- * the point — an operator who sees the wrong database name here can stop before the write.
+ * the point — an operator who sees the wrong server here can stop before the write.
  */
-async function announceTarget(db: {
-  $queryRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<unknown>
-}): Promise<string> {
-  const rows = (await db.$queryRaw`
-    SELECT current_database()::text AS database,
-           current_user::text       AS username,
-           COALESCE(inet_server_addr()::text, 'local socket') AS host,
-           COALESCE(inet_server_port()::text, '?')            AS port,
-           COALESCE(shobj_description(oid, 'pg_database'), '') AS comment
+async function announceTarget(db: Parameters<typeof readServerIdentity>[0]): Promise<ServerIdentity> {
+  const identity = await readServerIdentity(db)
+  const stamped = await db.$queryRaw<Array<{ comment: string | null }>>`
+    SELECT shobj_description(oid, 'pg_database') AS comment
     FROM pg_database WHERE datname = current_database()
-  `) as Array<{ database: string; username: string; host: string; port: string; comment: string }>
-  const row = rows[0]
-  if (!row) return 'unknown'
+  `
   const { DISPOSABLE_DATABASE_MARKER_PREFIX } = await import('../lib/disposable-database-marker')
-  const disposable = row.comment.includes(`${DISPOSABLE_DATABASE_MARKER_PREFIX}(${row.database})`)
+  const comment = stamped[0]?.comment ?? ''
+  const disposable = comment.includes(`${DISPOSABLE_DATABASE_MARKER_PREFIX}(${identity.database})`)
   console.error(
-    `TARGET DATABASE: ${row.database}  (host ${row.host}:${row.port}, user ${row.username})\n`
+    `TARGET SERVER: ${describeServerIdentity(identity)}\n`
     + (disposable
       ? '  This database is STAMPED DISPOSABLE — a scratch database, safe to change.\n'
-      : '  This database is NOT stamped disposable. Treat it as REAL DATA.\n'),
+      : '  This database is NOT stamped disposable. Treat it as REAL DATA.\n')
+    + (identity.systemIdentifier === 'unavailable'
+      ? '  NOTE: system_identifier is unavailable to this role (it is superuser-restricted), so a\n'
+        + '  same-name copy on another cluster cannot be distinguished by it.\n'
+      : ''),
   )
-  return row.database
+  return identity
 }
 
 /**
@@ -84,28 +86,56 @@ async function announceTarget(db: {
  * With neither available -- non-interactive and no flag -- it REFUSES and writes nothing, rather than
  * assuming consent from the absence of a human.
  */
-async function confirmTarget(targetDatabase: string): Promise<boolean> {
-  const expected = argValue('--expect-db')
-  if (expected !== undefined) {
-    if (expected === targetDatabase) return true
+async function confirmTarget(identity: ServerIdentity): Promise<boolean> {
+  // An operator may pin as much of the composite as they can be sure of. `--expect-db` alone is the
+  // friendly form and is NOT sufficient to distinguish a same-name copy — that is why the others exist,
+  // and why the limit is spelled out rather than implied.
+  const pinned: Partial<ServerIdentity> = {}
+  const expectedDb = argValue('--expect-db')
+  const expectedHost = argValue('--expect-host')
+  const expectedPort = argValue('--expect-port')
+  const expectedSystemId = argValue('--expect-system-id')
+  if (expectedDb !== undefined) pinned.database = expectedDb
+  if (expectedHost !== undefined) pinned.host = expectedHost
+  if (expectedPort !== undefined) pinned.port = expectedPort
+  if (expectedSystemId !== undefined) pinned.systemIdentifier = expectedSystemId
+
+  if (Object.keys(pinned).length > 0) {
+    // Compare ONLY what was pinned, but compare it against the server's own answer.
+    const differences = compareServerIdentity(
+      { ...identity, ...pinned },
+      identity,
+    )
+    if (differences.length === 0) {
+      if (expectedDb !== undefined && expectedSystemId === undefined) {
+        console.error(
+          '  NOTE: --expect-db matches the database NAME only. A restored copy keeps its name, so this\n'
+          + '  does not prove which server you are on. Pin --expect-system-id '
+          + `${identity.systemIdentifier} to assert that too.\n`,
+        )
+      }
+      return true
+    }
     console.error(
-      `REFUSED: --expect-db said "${expected}" but this connection is to "${targetDatabase}". `
-      + 'Nothing was written. A cloned database holds the same BOM ids, so the id you passed cannot '
-      + 'tell these apart -- check DATABASE_URL before retrying.',
+      'REFUSED: this is not the server you named. Nothing was written.\n'
+      + `  you said:  ${differences.map((d) => `${d.field}=${d.expected}`).join(' ')}\n`
+      + `  server is: ${describeServerIdentity(identity)}\n`
+      + '  Check DATABASE_URL before retrying. A cloned database holds the same BOM ids AND the same\n'
+      + '  name, so neither the id nor the name can tell two servers apart.',
     )
     return false
   }
 
   if (!process.stdin.isTTY) {
     console.error(
-      `REFUSED: about to write to "${targetDatabase}", but there is nobody to confirm it and no `
-      + '--expect-db was given. Nothing was written. Re-run with --expect-db '
-      + `${targetDatabase} if that is genuinely the database you mean.`,
+      `REFUSED: about to write to ${describeServerIdentity(identity)}, but there is nobody to confirm `
+      + 'it and no --expect-db was given. Nothing was written. Re-run with --expect-db '
+      + `${identity.database} if that is genuinely the database you mean.`,
     )
     return false
   }
 
-  process.stderr.write(`Type the database name "${targetDatabase}" to proceed, or anything else to abort: `)
+  process.stderr.write(`Type the database name "${identity.database}" to proceed, or anything else to abort: `)
   const typed = await new Promise<string>((resolve) => {
     let buffer = ''
     process.stdin.setEncoding('utf8')
@@ -120,9 +150,54 @@ async function confirmTarget(targetDatabase: string): Promise<boolean> {
     process.stdin.on('data', onData)
     process.stdin.resume()
   })
-  if (typed === targetDatabase) return true
-  console.error(`REFUSED: you typed "${typed}", which is not "${targetDatabase}". Nothing was written.`)
+  if (typed === identity.database) return true
+  console.error(`REFUSED: you typed "${typed}", which is not "${identity.database}". Nothing was written.`)
   return false
+}
+
+const VALUE_FLAGS = ['--bom', '--expect-db', '--expect-host', '--expect-port', '--expect-system-id']
+const BARE_FLAGS = ['--list', '--dry-run']
+
+function validateArgv(argv: string[]): string | null {
+  const seen = new Set<string>()
+  for (let at = 0; at < argv.length; at += 1) {
+    const token = argv[at]
+    if (!token.startsWith('--')) {
+      return `unexpected argument "${token}" — every option is a --flag, and values follow their flag`
+    }
+    // `--flag=value` is rejected rather than accepted, because accepting one spelling and silently
+    // dropping the other is how `--dry-run=true` became a write.
+    // `--flag=value` would ALREADY be refused by the unknown-option check below, since no known flag
+    // contains an `=`. This branch exists for the MESSAGE: "unknown option --dry-run=true" sends an
+    // operator hunting for the right flag name when the name was right and only the form was wrong.
+    // A mutation proved the point -- deleting this branch changes no exit code, so the test asserts the
+    // guidance, which is the only thing it actually provides.
+    if (token.includes('=')) {
+      const name = token.slice(0, token.indexOf('='))
+      if (BARE_FLAGS.includes(name)) {
+        return `"${token}" uses --flag=value, but ${name} takes no value — pass just "${name}"`
+      }
+      if (VALUE_FLAGS.includes(name)) {
+        return `"${token}" uses --flag=value; this command takes "${name} <value>" with a space`
+      }
+      return `unknown option "${name}" (and it was written as --flag=value; values follow their flag `
+        + 'with a space)'
+    }
+    if (!VALUE_FLAGS.includes(token) && !BARE_FLAGS.includes(token)) {
+      return `unknown option "${token}". Known options: ${[...BARE_FLAGS, ...VALUE_FLAGS].join(' ')}`
+    }
+    if (seen.has(token)) return `"${token}" given more than once — which one did you mean?`
+    seen.add(token)
+    if (VALUE_FLAGS.includes(token)) {
+      const value = argv[at + 1]
+      if (value === undefined || value.startsWith('--')) return `"${token}" needs a value`
+      at += 1
+    }
+  }
+  if (seen.has('--list') && seen.has('--bom')) return '--list and --bom are different modes; pick one'
+  if (seen.has('--list') && seen.has('--dry-run')) return '--list writes nothing, so --dry-run is meaningless with it'
+  if (!seen.has('--list') && !seen.has('--bom')) return 'nothing to do: pass --list or --bom <id>'
+  return null
 }
 
 function argValue(flag: string): string | undefined {
@@ -131,13 +206,26 @@ function argValue(flag: string): string | undefined {
 }
 
 async function main() {
+  // FIRST, before any import that opens a connection.
+  const problem = validateArgv(process.argv.slice(2))
+  if (problem) {
+    console.error(
+      `Usage error: ${problem}\n\n`
+      + '  tsx scripts/deactivate-duplicate-bom.ts --list\n'
+      + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --dry-run\n'
+      + '  tsx scripts/deactivate-duplicate-bom.ts --bom <id> --expect-db <name>\n'
+      + '      [--expect-host <addr>] [--expect-port <n>] [--expect-system-id <n>]\n',
+    )
+    return 1
+  }
+
   const { db } = await import('../lib/db/index')
   const { findBomRecipeDrift } = await import('../lib/products/bom-recipe')
   const { deactivateDuplicateBomRecipe, describeBomRecipeRepair } = await import(
     '../lib/products/bom-recipe-repair'
   )
 
-  const targetDatabase = await announceTarget(db)
+  const identity = await announceTarget(db)
 
   if (process.argv.includes('--list')) {
     const duplicates = (await findBomRecipeDrift(db)).filter((row) => row.kind === 'duplicate-unclaimed-bom')
@@ -168,7 +256,7 @@ async function main() {
 
   // The gate applies to the WRITE only. `--list` returned above and `--dry-run` rolls back, so
   // demanding confirmation for either would train operators to type past it.
-  if (!dryRun && !(await confirmTarget(targetDatabase))) return 3
+  if (!dryRun && !(await confirmTarget(identity))) return 3
 
   // ONE TRANSACTION, so the lock the repair takes actually covers the decision AND the write, and a
   // dry run can compute the real answer and then throw it away rather than asking a different
@@ -180,11 +268,11 @@ async function main() {
       const result = await deactivateDuplicateBomRecipe(tx, {
         bomId,
         actor: process.env.SUDO_USER || process.env.USER || undefined,
-        database: targetDatabase,
+        database: identity.database,
         // RE-CHECKED INSIDE THE TRANSACTION. Everything above happened on a different statement, and
         // a check before the transaction can be defeated by anything that changes which server the
         // connection reaches in between -- which is the whole reason this banner exists.
-        expectDatabase: targetDatabase,
+        expectIdentity: identity,
       })
       if (dryRun) throw Object.assign(new Error(SENTINEL), { result })
       return result

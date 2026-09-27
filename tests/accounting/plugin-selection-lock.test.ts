@@ -1097,6 +1097,14 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // cannot move a plugin key — and runs in its own transaction rather than the sweep's.
   'lib/fulfillment/pre-fulfilment-reallocation.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
+  // o3d-zjsb5.9 r13. The duplicate-recipe repair's logic, discovered here because `readServerIdentity`
+  // issues raw SELECTs. Read to classify: it constructs NO client of its own -- every statement runs on
+  // the transaction client the caller passes, which is the app's own pooled client. Its SQL is CONSTANT
+  // with no interpolation (`current_database()`, `inet_server_addr()`, `inet_server_port()`,
+  // `pg_control_system()`, and `pg_advisory_xact_lock` with the key as a bind parameter), and the
+  // identity reads are read-only. Its only writes go through Prisma: `boms.active` for one id and one
+  // `activity_logs` row. It cannot touch `settings`, so it cannot move a plugin key.
+  'lib/products/bom-recipe-repair.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
@@ -1233,6 +1241,15 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // disposable-scratch stamp; it reports the SERVER'S answer rather than echoing `DATABASE_URL`, because
   // the URL is the thing that lies (a socket-form URL losing its `?host=` retargets the shared cluster).
   //
+  // WHAT THE IDENTITY CHECK PROVES, AND WHAT IT CANNOT (round 13): the composite is
+  // `current_database()` + `inet_server_addr()` + `inet_server_port()` +
+  // `pg_control_system().system_identifier`, because a RESTORED COPY KEEPS ITS NAME — comparing the name
+  // alone proved "this database is called X" rather than "this is the server I meant". A LOGICAL restore
+  // gets a new system_identifier and IS caught; a PHYSICAL clone (pg_basebackup, replica, snapshot)
+  // copies it, so behind a proxy on the same address NOTHING here distinguishes it, and that limit is
+  // documented rather than implied. `pg_control_system()` is superuser-restricted, so where the role
+  // cannot read it the field is `unavailable` and is never treated as a mismatch.
+  //
   // A WRITE then requires the operator to name that database — `--expect-db <name>`, or typed at a TTY —
   // and REFUSES (exit 3, writing nothing) with neither, instead of reading consent into the absence of a
   // human. Round 11: a banner nobody can act on is a log line, not a safeguard, and the BOM id is no
@@ -1240,6 +1257,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // mutation transaction against `current_database()`, so a connection that changes between the
   // pre-flight and the write is caught and the transaction aborts. `--list` and `--dry-run` need no
   // confirmation because they write nothing; `--dry-run` computes the real outcome and rolls it back.
+  // That exemption is only safe because the WHOLE argument list is validated before the database module
+  // is imported: an unknown flag, a missing value, a repeated flag, `--flag=value` or conflicting modes is
+  // a usage error (exit 1) raised before any connection exists. Under a lenient parser `--dryrun` was
+  // silently dropped and the run WROTE, which made the exemption the delivery mechanism (round 13).
   // The database name also lands in the audit row.
   //
   // For THIS test's property: it takes no plugin selection lock and writes no plugin key. It does take

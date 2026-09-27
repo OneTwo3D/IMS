@@ -128,6 +128,10 @@ The last one asks you to confirm which database you are changing — either with
 typing the database name when it asks. It will not make the change without that, because a copy of the
 database contains the same recipe ids, so the id alone cannot tell a test copy from the real thing.
 
+Be aware that a copy also keeps the same *name*, so confirming the name is not proof of which server you
+are on. Before it writes, the command prints the server's address and cluster id as well; check those if
+there is any chance a copy of the database is in play.
+
 It will refuse if the recipe it is asked to deactivate is a product's live recipe, or the only active
 recipe another product has — in those cases nothing is changed and it tells you which product is in
 the way.

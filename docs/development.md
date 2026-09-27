@@ -128,10 +128,36 @@ confirmation because they write nothing.
 
 That is not belt-and-braces over the banner: a **clone of the database holds the same BOM ids**, so the id
 you pass cannot tell two servers apart, and a `--dry-run` in one shell constrains nothing about where a
-later write lands. The expectation is therefore **checked again inside the mutation transaction**, against
-the server's own `current_database()` — a check made before the transaction can be defeated by anything
-that changes which server the connection reaches in between, and a mismatch there aborts the transaction
-so the write is discarded.
+later write lands. The expectation is therefore **checked again inside the mutation transaction** — a check
+made before the transaction can be defeated by anything that changes which server the connection reaches in
+between, and a mismatch there aborts the transaction so the write is discarded.
+
+**What identity is actually compared, and what it cannot prove.** `--expect-db` asserts the database
+**name**, and a restored copy *keeps its name* — so on its own it proves "this database is called X", not
+"this is the server I meant". The composite Postgres can actually supply is compared instead:
+`current_database()`, `inet_server_addr()`, `inet_server_port()` and
+`pg_control_system().system_identifier`. Pin the stronger parts when you can:
+
+```bash
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --expect-system-id <n>
+```
+
+The residual limits, stated rather than implied:
+
+* a **logical** restore (`pg_dump` into a fresh `initdb`) gets a new `system_identifier`, so it **is**
+  distinguished — this is the common "someone restored a copy of production" case;
+* a **physical** clone (`pg_basebackup`, a streaming replica, a snapshot restore) **copies** the
+  `system_identifier`. Same name, same identifier: only host and port distinguish it, and behind a proxy on
+  the same address and port, **nothing here distinguishes it**;
+* `pg_control_system()` is superuser-restricted by default. Where the role cannot read it the field reads
+  `unavailable`, the composite degrades to name plus address, and the banner says so. An `unavailable`
+  identifier is never treated as a mismatch — absence of evidence is not evidence.
+
+**Every argument is validated before anything connects.** An unknown flag, a flag missing its value, a
+repeated flag, `--flag=value`, or conflicting modes is a usage error (**exit 1**) raised before the database
+module is imported. That is load-bearing rather than tidiness: exempting `--dry-run` from confirmation is
+only safe if `--dry-run` cannot be misspelled into a write, and under a lenient parser `--dryrun` was
+silently dropped and the run wrote.
 
 It **deactivates, never deletes** — `manufacturing-analytics.ts` values completed production orders
 through `order.bom.items`, so deleting would rewrite history. It **refuses (exit 2)** when the BOM is
