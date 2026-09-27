@@ -193,10 +193,91 @@ that — with every received quantity reading zero, the movement was never inser
 names the purchase order, so the guard's evidence join is satisfied by the cost layer the same
 transaction lays. Transfer-backed book-ins write `TRANSFER_IN`, which the guard does not cover.
 
-What a PO-backed book-in does NOT yet do is post the accounting: it writes no `STOCK_RECEIPT` journal
-and no transit subledger row, where the manual receipt path writes both. So stock and cost layers land
-while the transit account never drains. Tracked as **o3d-8f0p6** — until it lands, a PO-backed WMS
-book-in is correct in stock terms and incomplete in ledger terms.
+**A PO-backed book-in posts its accounting, as of o3d-8f0p6.** It used to write no `STOCK_RECEIPT`
+journal and no transit subledger row where the manual receipt writes both, so stock and cost layers
+landed while the transit clearing account never drained and the GL inventory balance was understated
+against stock that was physically there. The book-in now queues the same two-line journal the manual
+receipt does — **DR Inventory / CR Stock in Transit** — plus the signed transit subledger row for
+−value, **in the same transaction as the movement, the cost layer and the stock level**. All of it
+lives or none of it does: if the enqueue fails, the book-in commits no stock.
+
+Four details are load-bearing:
+
+- **the receipt cost is the SHARED gross cost, not `landedUnitCostBase`** (o3d-8f0p6 r2). That column
+  is `Decimal @default(0)` and NOT NULL, and `createPurchaseOrder` never sets it — so the old
+  `landedUnitCostBase ?? unitCostBase` could never fall through, and an ordinary purchase order was
+  booked in at a unit cost of **zero**: a zero-cost FIFO layer, a zero-value movement and, once this
+  path started queueing a journal, no journal at all. The book-in now calls
+  `computeGrossUnitCostBaseByLine`, the same helper the manual receipt uses, and that one value feeds
+  the movement, the cost layer **and** the journal. It is never worse than the old expression: once
+  landed cost has been allocated the recalc writes `landedUnitCostBase = grossUnitCostBase`, so the two
+  coincide. A genuinely free line (a sample, a warranty replacement) has a zero goods cost, so the
+  gross cost is zero and nothing is posted — which is correct, and is why no null-vs-zero column change
+  was needed;
+
+- **the amount is the value this book-in actually laid layers for**, not the reconciled quantity.
+  `qtyReceived` also covers `coveredBySnapshotQty` (units a prior stock-sync alignment already brought
+  into stock and layered) and `reconciledManualQty` (units a manual receipt already journalled);
+  journalling either would post the same inventory value twice;
+- **the idempotency key is `wms-purchase-receipt:<poId>:<receiptEventId>`**, so a redelivered or
+  replayed webhook cannot queue a second journal, and it can never collide with the manual path's
+  `purchase-receipt:<poId>:<receiptRef>`. A genuinely new event booking a further quantity is a
+  different receipt and gets its own key;
+- **transfer-backed book-ins still post nothing, deliberately.** A transfer moves units the business
+  already owns between its own warehouses: their value never left inventory and never entered
+  *purchase* goods-in-transit. The manual transfer receipt (`app/actions/transfers.ts`) queues no
+  accounting sync either, so this is parity rather than a second gap.
+
+**The account mapping is LOCKED for the whole receipt** (o3d-8f0p6 r4). Reading the codes over the
+pool bound nothing, and re-reading them inside the transaction was not enough either: a re-read under
+READ COMMITTED sees a remap that has already committed but holds nothing, so a remap committing *after*
+it — while the book-in walks on through the transfer loop and the ASN updates — still ended with a
+journal on stale codes, and on an ASN spanning several purchase orders could put earlier POs on the old
+mapping and later ones on the new one inside one event.
+
+The book-in now takes the **accounting-selection lock** before reading the codes and holds it to
+commit — and nothing else: the re-read-and-refuse was removed once a mutation showed it could no
+longer fail, because a check that cannot fail is not a guarantee. It is the *same* lock `queueAccountingSyncTx` already takes — the same advisory key, with the
+two mapping rows added to its row set — so there is one lock and one order (advisory first, then rows
+in one `ORDER BY key`), and the enqueue's own later acquisition is a no-op re-entry. `saveXeroSettings`,
+the only writer of those rows, takes it too. The read is **memoised per event**, so every purchase order
+in one ASN posts on one mapping by construction. A remap attempted mid-receipt is **serialised**, not
+rejected: it waits and lands once the receipt commits. The connector is resolved once and pinned to the
+enqueue, so the mapping and the queued row cannot come from two independent resolutions of "which
+ledger".
+
+**What happens if a book-in does refuse.** The refusal path is not self-healing and the recovery is
+manual, so it is written down rather than implied. A failed attempt is rescheduled with backoff by the
+internal sweeper, and after **eight** failed attempts (`MAX_FAILED_ATTEMPTS`) the event is
+**dead-lettered**: `processingStatus` becomes the dead state, `nextRetryAt` is cleared and
+`deadLetteredAt` is stamped, and **the sweeper will not pick it up again**. A fresh delivery of the same
+Mintsoft event resets the attempt counter, so a warehouse that re-sends recovers on its own; an event
+that has already dead-lettered needs a **redelivery or a manual replay** (*Re-check* on the ASN, or the
+sync exception inbox) before its stock moves. Nothing else notices on its own.
+
+**Freight allocation and unweighed lines.** The receipt cost uses the same distribution the manual
+receipt uses, which means a `BY_WEIGHT` cost line allocates only across lines that HAVE a weight: a line
+whose product weight is null gets no share of it while a sibling with a positive weight takes the lot,
+so a **partially weighed PO silently allocates freight to only some of its lines**. That is
+pre-existing and consistent between the two receipt writers rather than new here, and it is recorded
+because it is a real allocation behaviour an operator would not otherwise see. (`BY_VALUE` and
+`BY_QUANTITY` are unaffected; and when NO eligible line has a positive basis the helper falls back to
+an equal split and warns.)
+
+> **This does not yet make WMS receipt accounting complete.** Only the purchase-order-backed
+> *webhook* path posts. The WMS stock-sync **align-up** path still credits PO-backed stock and lays
+> cost layers with no journal and no transit row (**o3d-6nd55**), and because it writes to neither
+> ledger the transit reconciliation still ties out and still hides that omission — so the transit
+> account is not auditable until o3d-6nd55 lands too. The honest claim for this change is "the
+> PO-backed webhook path now posts", not "WMS receipts now post".
+
+Why it had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
+journal from a stock movement. The Xero daily batch does not read `stock_movements` at all, its
+inventory reconciliation posts Inventory ↔ *Rounding difference* and only for a sub-unit `sweep` gap
+(a receipt-sized gap is `flag`, which is surfaced and never posted), and the transit reconciliation
+aggregates `transit_subledger_movements` — rows written at post time — so a posting that never
+happened is absent from both sides and that window ties out exactly. Proven by
+`tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts`.
 
 ### Purchase-order ASN lines are not landed-quantity aware yet
 

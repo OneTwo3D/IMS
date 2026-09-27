@@ -24,6 +24,7 @@ import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/con
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
@@ -200,14 +201,31 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
       return true
     })
 
-    const ops = entries.map(([k, v]) =>
-      db.setting.upsert({
-        where: { key: k },
-        create: { key: k, value: serializeSettingValue(k, v ?? '') },
-        update: { value: serializeSettingValue(k, v ?? '') },
-      }),
-    )
-    await db.$transaction(ops)
+    // ─── o3d-8f0p6 r4: SERIALISE A REMAP AGAINST AN IN-FLIGHT POSTING ───
+    //
+    // This is the ONLY writer of `xero_inventory_account` / `xero_transit_account` — they are absent
+    // from lib/domain/settings/writable-setting-keys.ts, so `setSetting`/`setSettings` THROW on them,
+    // and the other `xero_*` writers in this file touch credentials. So this transaction and the
+    // posting paths are the two participants, and one lock between them is enough.
+    //
+    // WITHOUT IT a remap commits in the middle of a receipt that has already read the old codes, and
+    // the receipt commits a journal on a mapping nothing reconciles against afterwards. The array form
+    // of `$transaction` could not take a lock at all, hence the interactive form.
+    //
+    // LOCK ORDER: `lockAccountingMappingSelection` takes the accounting-selection advisory lock FIRST
+    // and then the rows in one `ORDER BY key` statement — the same order the plugin-selection writers
+    // and `queueAccountingSyncTx` already use, because it is the same lock. This transaction holds no
+    // other lock before it, so it cannot invert anything.
+    await db.$transaction(async (tx) => {
+      await lockAccountingMappingSelection(tx, 'xero')
+      for (const [k, v] of entries) {
+        await tx.setting.upsert({
+          where: { key: k },
+          create: { key: k, value: serializeSettingValue(k, v ?? '') },
+          update: { value: serializeSettingValue(k, v ?? '') },
+        })
+      }
+    })
 
     await logActivity({
       entityType: 'SYSTEM',
