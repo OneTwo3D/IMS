@@ -105,6 +105,20 @@ let injectEnqueueFailure = false
  */
 let remapInventoryAccountOnNextEnqueue: (() => Promise<void>) | null = null
 let remapInventoryAccountAfterFinalAccountRead: (() => Promise<void>) | null = null
+/**
+ * o3d-ln2df — RETIRE THE CHART AFTER THE BOOK-IN HAS READ IT, so the enqueue DECLINES for real.
+ *
+ * This is the production race the refusal exists for, and the ONLY seam in it is WHEN: the book-in reads
+ * the active connector over the pool before its transaction opens, and the enqueue re-asks under the
+ * selection lock inside it. Switching the connector off in that window makes
+ * `pinnedLedgerIsServicedUnderLock` answer no, and the refusal, its reason, its posting key and its
+ * inbox row are then all produced by PRODUCTION code. Nothing about the outcome is fabricated — the
+ * hook only decides the moment, and it fires from the wrapper around the connector read the book-in
+ * itself performs, which is the last point before the transaction opens.
+ *
+ * It is one-shot, and each arm restores the setting.
+ */
+let retireChartAfterConnectorRead = false
 const INJECTED_ENQUEUE_FAILURE = 'o3d-8f0p6 injected STOCK_RECEIPT enqueue failure'
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -121,6 +135,39 @@ mock.module('@/lib/accounting', {
         await hook()
       }
       return realAccountingNs.queueAccountingSyncTx(...args)
+    },
+    /**
+     * o3d-ln2df — THE SAME TWO SEAMS ON THE `WithOutcome` VARIANT, because that is the one the book-in
+     * now takes (it needs the whole answer to tell `refused` from `not-configured`). Without this arm 5
+     * would silently stop injecting anything: the real adapter calls the real boolean enqueue through
+     * the module's own binding, not through the mock above, so the injection would never be reached and
+     * a green arm 5 would be measuring nothing.
+     */
+    queueAccountingSyncTxWithOutcome: async (
+      ...args: Parameters<typeof realAccountingNs.queueAccountingSyncTxWithOutcome>
+    ) => {
+      if (injectEnqueueFailure && args[1]?.type === 'STOCK_RECEIPT') {
+        throw new Error(INJECTED_ENQUEUE_FAILURE)
+      }
+      if (remapInventoryAccountOnNextEnqueue && args[1]?.type === 'STOCK_RECEIPT') {
+        const hook = remapInventoryAccountOnNextEnqueue
+        remapInventoryAccountOnNextEnqueue = null
+        await hook()
+      }
+      return realAccountingNs.queueAccountingSyncTxWithOutcome(...args)
+    },
+    getActiveAccountingConnectorId: async () => {
+      const answer = await realAccountingNs.getActiveAccountingConnectorId()
+      if (retireChartAfterConnectorRead) {
+        retireChartAfterConnectorRead = false
+        const { db } = await import('@/lib/db')
+        await db.setting.upsert({
+          where: { key: 'plugin_xero_enabled' },
+          create: { key: 'plugin_xero_enabled', value: 'false' },
+          update: { value: 'false' },
+        })
+      }
+      return answer
     },
   },
 })
@@ -1726,4 +1773,142 @@ test('o3d-8m8pe: a cancelled linked freight order contributes nothing to the MAN
   const transit = await transitRowsFor(seeded.poId)
   assert.equal(transit.length, 1)
   assert.equal(Number(transit[0]!.baseDelta), -expectedAmount)
+})
+
+/** The exception-inbox rows for a purchase order, whatever the posting scope. */
+async function refusalRowsFor(referenceId: string) {
+  const { db } = await import('@/lib/db')
+  return db.accountingPostingRefusal.findMany({
+    where: { referenceType: 'PurchaseOrder', referenceId },
+    orderBy: { firstRefusedAt: 'asc' },
+    select: { id: true, type: true, kind: true, reason: true, committed: true, remedy: true, scope: true },
+  })
+}
+
+/** The caller's own report of a declined posting, as the activity log carries it. */
+async function notQueuedActivityFor(entityId: string) {
+  const { db } = await import('@/lib/db')
+  return db.activityLog.findMany({
+    where: { entityType: 'PURCHASE_ORDER', entityId, action: 'stock_receipt_journal_not_queued' },
+    select: { id: true, level: true, description: true },
+  })
+}
+
+/**
+ * ARM 14 — A DECLINED RECEIPT JOURNAL IS REPORTED, WITH WHAT IMS COMMITTED AND THE REMEDY.
+ *
+ * o3d-ln2df. The book-in read its enqueue's answer only to gate the transit mirror and then dropped it.
+ * On a decline the book-in committed, the mirror was correctly skipped, and the facade's own
+ * `recordRefusalAsOutstanding` raised an inbox row — but that row carried NO `committed` and NO `remedy`,
+ * because both come from the CALLER through `reportPostingNotQueued`. The operator got a refusal with no
+ * statement of what IMS did anyway and no instruction, which is what rule 3 of
+ * lib/domain/accounting/enqueue-outcome.ts exists to provide. It matters more here than at most reporting
+ * sites because this path CONSUMES the book-in event and nothing re-attempts the journal: stock credited,
+ * cost layers laid, no journal, no transit row, nothing that will ever post them.
+ *
+ * HOW THE DECLINE IS PRODUCED, and it is a real one. The book-in reads the active accounting connector
+ * over the pool BEFORE its transaction opens and the enqueue re-asks under the selection lock inside it.
+ * The connector is switched off in that window — the production race — so
+ * `pinnedLedgerIsServicedUnderLock` answers no and PRODUCTION code decides the refusal, its reason, its
+ * posting key and its inbox row. Nothing about the outcome is fabricated.
+ *
+ * AND THE ORDINARY PATH IS IN THE SAME ARM, on a second purchase order, because a test that only looks at
+ * the refusal can pass for an implementation that refuses EVERYTHING: the accepted book-in must still
+ * queue its journal, still write the transit mirror, and raise NO refusal and NO report.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: an implementation that reported from INSIDE the transaction (which
+ * would leave the report standing after a rollback — not covered here, and the reason the report is
+ * drained after the commit is stated at the site), and one that got the `not-configured` gate wrong in
+ * the silent direction. It does NOT establish that the book-in is re-attempted later; it establishes the
+ * opposite is reported.
+ */
+test('o3d-ln2df: a DECLINED receipt journal is reported with what the book-in committed and the remedy', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 2
+  const GOODS_UNIT = 11
+  const declined = await seedPurchaseBackedAsnViaRealCreate('DQ', QTY, GOODS_UNIT)
+
+  retireChartAfterConnectorRead = true
+  let status: string
+  try {
+    ;({ status } = await runBookedIn(declined, declined.poLineId))
+  } finally {
+    retireChartAfterConnectorRead = false
+    await db.setting.upsert({
+      where: { key: 'plugin_xero_enabled' },
+      create: { key: 'plugin_xero_enabled', value: 'true' },
+      update: { value: 'true' },
+    })
+  }
+
+  // ── THE BOOK-IN STILL COMMITTED. A retired chart must not stop a warehouse receiving stock. ──
+  assert.equal(status, 'processed', `the book-in must still commit on a declined posting; got ${status}`)
+  const movements = await db.stockMovement.findMany({
+    where: { type: 'PURCHASE_RECEIPT', productId: declined.productId },
+    select: { id: true, totalValueBase: true },
+  })
+  const layers = await db.costLayer.count({ where: { poLineId: declined.poLineId } })
+  const logs = await stockReceiptLogsFor(declined.poId)
+  const transit = await transitRowsFor(declined.poId)
+  const refusals = await refusalRowsFor(declined.poId)
+  const reports = await notQueuedActivityFor(declined.poId)
+  console.log(`[arm14] declined PO: status=${status} movements=${movements.length} layers=${layers} STOCK_RECEIPT logs=${logs.length} transit=${transit.length} refusals=${refusals.length} reports=${reports.length} refusalRows=${JSON.stringify(refusals)}`)
+
+  assert.equal(movements.length, 1, 'PRECONDITION: the stock movement must be committed, or there is no committed state to report')
+  assert.equal(layers, 1, 'PRECONDITION: and the cost layer with it')
+  // ── AND THE PRECONDITION THAT MAKES THE REST MEAN ANYTHING: the enqueue really declined. ──
+  assert.equal(logs.length, 0, `PRECONDITION: the enqueue must have DECLINED; found ${logs.length} STOCK_RECEIPT sync row(s), so nothing was refused`)
+  // ── THE TRANSIT MIRROR IS STILL SKIPPED (o3d-bcz9.4): an unqueued journal must not be mirrored. ──
+  assert.equal(transit.length, 0, `a journal that was not queued must not be mirrored; found ${transit.length} transit row(s)`)
+
+  // ── THE REPORT ITSELF, which is what this issue is about. ──
+  assert.equal(refusals.length, 1, `the decline must leave exactly one exception-inbox row; found ${refusals.length}`)
+  const refusal = refusals[0]!
+  assert.equal(refusal.type, 'STOCK_RECEIPT')
+  assert.equal(refusal.kind, 'stock_receipt_journal', 'the SITE names the kind: nothing re-attempts this posting, so the row is closed by marking it handled')
+  assert.ok(
+    (refusal.committed ?? '').length > 0,
+    'the inbox row must state WHAT IMS COMMITTED ANYWAY — a refusal with no `committed` is one an operator cannot act on',
+  )
+  assert.ok(
+    (refusal.remedy ?? '').length > 0,
+    'and WHAT A HUMAN HAS TO DO — `remedy` comes from the caller and was absent before o3d-ln2df',
+  )
+  // Not merely non-empty: the site's OWN sentences, not the enqueue's generic placeholder. Before the fix
+  // the row carried the facade's 'the change that raised this posting is committed in IMS', which says
+  // nothing about a book-in, and a generic remedy that does not mention that nothing will retry this.
+  assert.match(
+    refusal.committed ?? '',
+    /booked in/i,
+    'the `committed` must name what the BOOK-IN did (the goods booked in, the movements and layers), not the enqueue\'s generic placeholder',
+  )
+  assert.match(
+    refusal.remedy ?? '',
+    /by hand/i,
+    'the `remedy` must name the hand posting',
+  )
+  assert.match(
+    refusal.remedy ?? '',
+    /Mark as handled/i,
+    'and how to close the row once it is posted',
+  )
+  assert.equal(reports.length, 1, `and the decline must be reported in the activity log; found ${reports.length}`)
+  assert.equal(reports[0]!.level, 'ERROR', 'at ERROR — a posting the ledger will never receive is not a notice')
+
+  // ── THE ORDINARY PATH, UNCHANGED, so this arm cannot pass by refusing everything. ──
+  const accepted = await seedPurchaseBackedAsnViaRealCreate('DA', QTY, GOODS_UNIT)
+  const okStatus = await runBookedIn(accepted, accepted.poLineId)
+  const okLogs = await stockReceiptLogsFor(accepted.poId)
+  const okTransit = await transitRowsFor(accepted.poId)
+  const okRefusals = await refusalRowsFor(accepted.poId)
+  const okReports = await notQueuedActivityFor(accepted.poId)
+  console.log(`[arm14] accepted PO: status=${okStatus.status} logs=${okLogs.length} transit=${okTransit.length} refusals=${okRefusals.length} reports=${okReports.length}`)
+  assert.equal(okStatus.status, 'processed')
+  assert.equal(okLogs.length, 1, 'the ordinary book-in must still queue its journal')
+  assert.equal(okTransit.length, 1, 'and still write the transit subledger mirror')
+  assert.equal(Number(okTransit[0]!.baseDelta), -(QTY * GOODS_UNIT), 'at the receipt value')
+  assert.equal(okRefusals.length, 0, 'and raise NO refusal — otherwise the arm above would pass for an implementation that refuses everything')
+  assert.equal(okReports.length, 0, 'and no not-queued report')
 })
