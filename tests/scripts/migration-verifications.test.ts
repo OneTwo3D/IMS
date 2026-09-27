@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -234,6 +235,50 @@ test('the migration this repository requires to declare checks now declares them
 // PRISMA never modelled in the first place. Neither test says anything about column-level changes.
 
 /**
+ * o3d-ec4c0 r4 (adversarial review, HIGH) — EVERY MIGRATION EVER ADDED IN `base..ref`, INCLUDING ON PRUNED SIDE
+ * HISTORY.
+ *
+ * `--full-history` is load-bearing and must not be tidied away as noise: git's DEFAULT history simplification
+ * answers "which commits explain the current contents of this path", and the question here is the different one
+ * "was this path ever added anywhere in this range". A side branch that adds a migration and later deletes it,
+ * merged with no net change under `prisma/migrations/`, is exactly the history default simplification is entitled
+ * to prune — and pruning it drops the addition from this walk.
+ *
+ * That omission cannot be recovered downstream: the directory is absent from HEAD too, so the tree-difference
+ * cross-check has nothing to compare against and BOTH derivations miss the same migration. A database that applied
+ * that side branch then retains history the repository no longer contains, which is r29's incident verbatim.
+ *
+ * PRE-EXISTING, not introduced by this branch: the walk has carried default simplification since o3d-j625 r30, and
+ * the invocation is byte-identical between trunk at a6ad39b5 and rounds 1-3 here.
+ *
+ * `cwd` is a parameter solely so a throwaway fixture repository can be walked by the regression test. Nothing but
+ * the repo root is ever passed in the live check.
+ */
+export function migrationsIntroducedBetween(input: {
+  cwd: string
+  base: string
+  ref?: string
+}): Set<string> {
+  const out = execFileSync('git', [
+    'log',
+    '--full-history',
+    '--diff-filter=A',
+    '--name-only',
+    '--pretty=format:',
+    `${input.base}..${input.ref ?? 'HEAD'}`,
+    '--',
+    'prisma/migrations/',
+  ], { cwd: input.cwd, encoding: 'utf8' }).trim()
+  return new Set(
+    out
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+}
+
+/**
  * o3d-ec4c0 — THE PROTECTED SET, AS A FUNCTION, so its property can be asserted without a branch that happens to
  * add SQL.
  *
@@ -305,6 +350,70 @@ export function branchMigrationDerivationsDisagree(input: {
  * how the two inputs are DERIVED from git — that is the deletion check's job, and its `onTrunk.size > 50`
  * precondition is what keeps it honest.
  */
+/**
+ * o3d-ec4c0 r4 (adversarial review, HIGH) — THE PRUNED SIDE BRANCH, AGAINST A REAL GIT REPOSITORY.
+ *
+ * The finding: a side branch adds a migration and later deletes it; its merge has no net change under
+ * `prisma/migrations/`, so git's default history simplification is entitled to prune that side history and the
+ * addition never appears in the walk. Nothing downstream can recover it — the directory is absent from HEAD too,
+ * so the tree-difference cross-check has nothing to compare against and BOTH derivations miss the same migration.
+ * A database that applied that side branch then retains history the repository no longer contains, which is r29's
+ * incident verbatim.
+ *
+ * Built as a throwaway repository rather than synthetically, because the thing under test IS git's history
+ * traversal: a fake `git` runner would only prove that my own mock prunes when I tell it to. The repo lives in this
+ * process's own throwaway /tmp and is removed on `after`, per the tmp-dir sentinel (o3d-tmpleak).
+ *
+ * WHAT WOULD STILL PASS IT: any walk that reports additions on unreachable-by-simplification history —
+ * `--full-history` is one way and the one used. It says nothing about `--simplify-merges` variants, nor about
+ * additions made by a merge commit itself, which `--name-only` does not report for merges either way.
+ */
+test('o3d-ec4c0: a migration added then deleted on a MERGED SIDE BRANCH is still found', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ec4c0-sidebranch-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const g = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' })
+  const migration = (name: string) => {
+    mkdirSync(join(dir, 'prisma', 'migrations', name), { recursive: true })
+    writeFileSync(join(dir, 'prisma', 'migrations', name, 'migration.sql'), 'SELECT 1;\n')
+  }
+
+  g('init', '-q', '-b', 'main', '.')
+  g('config', 'user.email', 'fixture@example.invalid')
+  g('config', 'user.name', 'fixture')
+  g('config', 'commit.gpgsign', 'false')
+
+  migration('20260101000000_base')
+  g('add', '-A'); g('commit', '-q', '-m', 'base')
+  g('branch', 'trunk')
+
+  // The side branch: adds a migration, then deletes it again, so the merge carries NO net change.
+  g('checkout', '-q', '-b', 'side')
+  migration('20260202000000_side_added_then_deleted')
+  g('add', '-A'); g('commit', '-q', '-m', 'side: ADD the migration')
+  g('rm', '-rq', 'prisma/migrations/20260202000000_side_added_then_deleted')
+  g('commit', '-q', '-m', 'side: DELETE it again')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--no-ff', 'side', '-m', 'merge side (no net migration change)')
+
+  const base = g('merge-base', 'trunk', 'main').trim()
+
+  // PRECONDITIONS — without these the fixture could pass for the wrong reason.
+  assert.equal(g('diff', '--name-only', `${base}..main`, '--', 'prisma/migrations/').trim(), '',
+    'PRECONDITION: the merge must carry NO net change under prisma/migrations, or default simplification has no '
+    + 'reason to prune the side history and this fixture is not reproducing the finding')
+  assert.equal(existsSync(join(dir, 'prisma', 'migrations', '20260202000000_side_added_then_deleted')), false,
+    'PRECONDITION: and the directory must be absent from the working tree, which is why the tree-difference '
+    + 'cross-check cannot catch this omission either — both derivations miss the same migration')
+
+  assert.deepEqual(
+    [...migrationsIntroducedBetween({ cwd: dir, base, ref: 'main' })],
+    ['20260202000000_side_added_then_deleted'],
+    'a migration ADDED anywhere in this range must be found even though nothing in the current contents explains '
+    + 'it. Default history simplification answers "which commits explain HEAD"; the question here is "was this '
+    + 'ever added", and only --full-history answers that one',
+  )
+})
+
 test('o3d-ec4c0: the protected set never collapses to trunk-only, nor to branch-only', () => {
   const onTrunk = ['20240101000000_a', '20240102000000_b']
   const introducedOnBranch = ['20260301000000_added_on_this_branch']
@@ -482,13 +591,7 @@ test('o3d-j625 r30: no migration this branch has ever had may be deleted from HE
    * that keeps `migration.sql` present under the same directory name. It says nothing about column-level
    * conventions, which check-migration-conventions.mjs owns.
    */
-  const introducedOnBranch = new Set(
-    git(['log', '--diff-filter=A', '--name-only', '--pretty=format:', `${base}..HEAD`, '--', 'prisma/migrations/'])
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.endsWith('/migration.sql'))
-      .map((line) => line.split('/')[2]),
-  )
+  const introducedOnBranch = migrationsIntroducedBetween({ cwd: root, base })
   const onTrunk = dirsAt(base)
   const protectedDirs = buildProtectedMigrationSet({ onTrunk, introducedOnBranch })
   const onBranch = dirsAt('HEAD')
@@ -527,7 +630,7 @@ test('o3d-j625 r30: no migration this branch has ever had may be deleted from HE
   assert.deepEqual(derivationDisagreement, [],
     'THE TWO DERIVATIONS OF "migrations this branch added" DISAGREE. Comparing the trees directly found '
     + `${derivationDisagreement.length} migration(s) present on HEAD and absent from the merge base that `
-    + `\`git log --diff-filter=A ${base}..HEAD\` did NOT report: ${derivationDisagreement.join(', ')}. The `
+    + `\`git log --full-history --diff-filter=A ${base}..HEAD\` did NOT report: ${derivationDisagreement.join(', ')}. The `
     + 'commit-range derivation is therefore incomplete, and with it the protection of those migrations — '
     + 'silently, which is what this cross-check exists to stop. Note it need not have found NOTHING: finding '
     + 'some and missing others produces exactly this (o3d-ec4c0 round 3).'
