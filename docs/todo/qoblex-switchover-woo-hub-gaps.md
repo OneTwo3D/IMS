@@ -1,5 +1,8 @@
 # Qoblex → IMS switchover: WooCommerce-hub gaps
 
+> **Superseded for bead filing (2026-09-28).** This analysis was done against `main`, which is ~1260 commits behind `development`. Several gaps below are already implemented on `development`: order push, withdrawals, merge handling and split shipments. The reconciled, authoritative version is `bd-handoff-qoblex-switchover.md`, and the owner decisions recorded there take precedence over this file.
+
+
 ## Purpose
 
 Today, WooCommerce is the hub for fulfilment. Two Python services hang off it:

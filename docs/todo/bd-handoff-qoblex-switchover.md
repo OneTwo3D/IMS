@@ -1,385 +1,298 @@
-# Handoff: merge the Qoblex → IMS switchover additions into the beads (Dolt) plan
+# Handoff: merge the 2026-09-28 WooCommerce-hub / Mintsoft decisions into the beads plan
 
-**For:** the Claude Code session on the Proxmox VM, which can reach the `onetwo3d-ims` beads Dolt server.
-**Written:** 2026-09-28, by a cloud session that could not reach Dolt and has **not** seen the existing switchover plan.
-**Self-contained:** everything needed to file each issue is in this file. The repo docs on branch `wip/loving-hawking-72uquf` of `OneTwo3D/IMS` are background only.
+**Audience:** the Claude Code session on the Proxmox VM, which can reach the beads Dolt server.
+**Written:** 2026-09-28 by a cloud session. It was reconciled against:
+- a full `bd export` taken the same day (2157 issues);
+- the IMS `development` branch at `6c0b5c64`.
 
-## Your task
+> `main` is ~1260 commits behind `development`. Anything that cites code refers to `development`.
 
-Merge the 20 issues below into the **existing Qoblex → IMS switchover plan** in beads:
+**Nothing here has been filed yet.** Do not implement features; this is bead filing only.
 
-- 1 Mintsoft epic
-- 7 stages under it
-- 12 gap items
+## What this does
 
-Do **not** implement any feature. This is issue filing only. Finish with `bd dolt push` and a report.
+It merges the owner's 2026-09-28 decisions into the **existing** programme:
 
-## Procedure
+| Bead | Role |
+|---|---|
+| `o3d-sxu1k` | readiness register |
+| `o3d-ofasq` | master plan |
+| `o3d-zjsb5` [firstload] | first load |
+| `o3d-hcx4c` [masterswitch] | master switch |
+| **`o3d-zvec` [msparity]** | parity with the woo-mintsoft plugin; the parent for almost everything below |
 
-1. **Orient.** Run `bd prime`, then list the open plan. Examples: `bd list -t epic`, `bd list --title qoblex`, `bd list --title switchover`.
-2. **Find the parent.** Identify the existing switchover epic and call it `$SWITCHOVER`.
-   - If there is exactly one clear match, use it.
-   - If there are zero or several matches, **stop and ask the user**. Never invent a new switchover epic.
-3. **Merge, don't duplicate.** For every issue below, first search for an existing bead that covers the same thing. Search by distinctive title words and by topic, e.g. "Mintsoft order push", "withdrawal", "split", "refund", "tracking", "product sync", "label".
-   - **Match found:**
-     - Reuse its id.
-     - Add any missing labels, parent link and dependencies.
-     - **Do not overwrite** its description or design. Instead, append the text below under a heading `2026-09-28 switchover handoff`, using `bd update <id> --notes "..."` or this bd version's equivalent.
-     - If the existing bead contradicts a decision below, list the contradiction in your report and leave the bead unchanged.
-   - **Partial overlap:** keep the existing bead, create the new one, and link them as related if this bd version supports it (see `bd dep --help`).
-   - **No match:** create it:
-     ```
-     bd create "<title>" -t <type> -p <prio> -l <labels> --parent <parent> \
-       -d "<description>" --design "<design>" --acceptance "<acceptance>"
-     ```
-     Use `--design-file` with a temp file for long text if quoting gets awkward.
-4. **Labels.** Every issue gets exactly one of `switchover-initial` (needed for the initial switch) or `switchover-post` (future work, explicitly not part of the initial switch). A-issues also get `mintsoft-orders`; B-issues also get `woo-hub-gap`.
-5. **Dependencies.** Once every issue exists, add the dependencies in the table at the end with `bd dep add <issue> <depends-on>` (check `bd dep --help` for this version's syntax).
-6. **Verify and push.**
-   - Run `bd show $SWITCHOVER` and `bd dep tree $SWITCHOVER` (or equivalent).
+It works in three ways:
+- **14 new IMS beads (N1–N14).** Only where nothing existing covers the item.
+- **1 new label-repo bead (N15)** and **1 bead for the Python sync repo (N16)**, for the merge-candidate work already built there.
+- **Notes appended to 12 existing beads.** Decisions and remaining scope, where an existing bead already owns the work.
+
+## Rules
+
+1. **`bd prime` first.** Then confirm that each existing id below exists and is in the stated status. If one is missing, or was closed since 2026-09-28 in a way that changes the picture, stop and report it rather than guessing.
+2. **Conventions** (from the existing plan):
+   - IMS beads: title prefix `[msparity]`, labels `proj:ims,epic:msparity`.
+   - Add one of `switchover-initial` / `switchover-post` to every new bead.
+   - These two labels are new. `switchover-initial` means needed for the PHASE P2 master switch. `switchover-post` means explicitly after it.
+   - Priorities follow bd (0 = highest). Do not confuse them with programme PHASE P0–P3.
+3. **Idempotent.** Before each create, search titles and descriptions (e.g. `bd search`, or `bd list --title`) for an existing match created after this export. Reuse any match.
+4. **Appending notes.**
+   - Do not overwrite existing descriptions.
+   - Use `bd update <id> --notes "..."` (or `bd comments add`, whichever this version supports).
+   - Start every note with `2026-09-28 owner decisions (switchover handoff):`.
+5. **Links.** Add dependencies with `bd dep add <issue> <depends-on>`. Where this plan says "related", use the `related` dep type if supported (`bd dep --help`); otherwise mention the id in the notes.
+6. **Finish.**
    - Run `bd dolt push`.
-   - Commit and push any `.beads` export the repo workflow requires, per `bd prime`.
-7. **Report back:**
-   - a table of key → bead id → created, reused or updated;
-   - any contradictions with existing beads;
-   - anything you could not do.
+   - Then reply with three things:
+     - (a) a table: new key → new id;
+     - (b) the list of ids you annotated;
+     - (c) anything skipped, and why.
 
-## Context: what was decided (2026-09-28)
+## Owner decisions (2026-09-28) to record
 
-- **Target flow:** WooCommerce → IMS → Mintsoft.
-  - The Python `OneTwo3D/woocommerce-mintsoft-sync` (orders and products) retires.
-  - The WooCommerce label plugin retires later.
-- **Merging:** Mintsoft has no merge API, so merging same-customer orders stays manual. The system flags candidates and holds them in `AWAITINGCONFIRMATION` so an operator merges them. It never merges and never releases a hold automatically.
-- **Stays in WooCommerce for now:**
-  - shipping labels (FedEx, Royal Mail Click & Drop)
-  - duty/tax calculation (IMS mirrors the results)
-  - all customer emails
-  - customer tracking pages (AST/TrackShip)
-- **Refunds:**
-  - Started in IMS: only a "to be refunded" flag. No WooCommerce refund record, no status change, no store credit.
-  - Started in WooCommerce: booked in IMS automatically, and the Mintsoft order is amended while it still can be.
-- **EU withdrawals:** IMS has no withdrawal handling today. It must be ported before the Python sync retires.
-- **Live bug:** shipping through IMS shipments never sets the WooCommerce order to `completed`.
+These are the source for every note below.
 
----
+- **D1 — Merging.** Mintsoft has no merge API. Merging same-customer orders stays manual in the Mintsoft UI. IMS flags candidates (same billing email + same normalised shipping address, Mintsoft order still NEW) and **holds both** orders so an operator merges. It **never merges and never releases a merge hold**.
+  - **EU orders** are flagged too, with a customs/IOSS warning. NI, JE, GG and IM count as UK.
+  - **Excluded:** backordered lines and pending withdrawals.
+  - **FedEx groups** are held with a "label by hand" warning.
+  - **Chains** (a third order) are allowed.
+  - **Unresolved holds** get a reminder after 4 h.
+- **D2 — Merge-hold mechanism.** Add a **real Mintsoft hold** capability (`MarkAwaitingConfirmation`, plus a token-scoped marker comment) used **only for merge holds**. Withdrawal keeps today's cancel-based hold (o3d-e1yb as shipped).
+- **D3 — Double postage.** When a merge absorbs an order that paid shipping, flag it as possibly refundable. Never refund automatically.
+- **D4 — Labels.** FedEx and Royal Mail Click & Drop label generation **stays in WooCommerce** (label-sync plugin/service) through the switch. Moving it into IMS is post-switch.
+  - The label service must be changed to read IMS's `_oti_wms_*` meta rather than the legacy `_mintsoft_*` keys. This confirms o3d-ofasq's decision to abandon `_mintsoft_*`.
+  - The Mintsoft OrderNumber must equal what FedEx looks up (check `wc_order_prefix`).
+- **D5 — Duty/tax.** WooCommerce (wclc/Dutify/o3d-ioss-xero) keeps **calculating**. IMS **mirrors** the results and never recomputes them.
+- **D6 — VAT/total guard.** Keep o3d-zvec.5's **measure-first** approach (advisory, no blocking yet). This is confirmed.
+- **D7 — IMS-initiated refunds.** IMS only raises a **"to be refunded"** flag in WooCommerce: meta plus an order note, and an IMS badge. There is **no WooCommerce refund record, no WooCommerce status change, and no store credit**. An operator refunds by hand and clears the flag. The operator's later WooCommerce refund must match the existing IMS credit note, not create a second one.
+- **D8 — WooCommerce-initiated refunds.** These are booked in IMS automatically. Keep **onetwo3d-ims-5fcb's** orthogonal refund status: a fully refunded order keeps its lifecycle status, with `refundStatus=FULL`. The Mintsoft order is cancelled or amended automatically **only while amendable**:
 
-## A. Mintsoft epic
+  | Mintsoft state | Action |
+  |---|---|
+  | NEW | Cancel or amend automatically. |
+  | ONBACKORDER / AWAITINGCONFIRMATION | Only once proven on a test order. |
+  | Merged survivor | Operator flag. |
+  | Mid-pick | Operator flag. |
+  | Packed or later | Expect a return. |
 
-### A0 — epic
-- **Title:** Mintsoft outbound orders + same-customer merge candidates
-- **Type / P / labels / parent:** epic / 1 / switchover-initial, mintsoft-orders / `$SWITCHOVER`
-- **Description:** IMS pushes sales orders to Mintsoft. It also:
-  - handles Mintsoft-side merges;
-  - flags and holds same-customer merge candidates for an operator to merge by hand;
-  - ports EU withdrawal handling;
-  - takes over from the Python WooCommerce→Mintsoft order sync.
-- **Design:** Mintsoft swagger V1 (verified 2026-09-28) has no merge endpoint; merging is UI-only.
-  - Endpoints used:
-    - `PUT /api/Order` (create)
-    - `GET /api/Order/{id}`
-    - `POST /api/Order/{id}` (header only, never items)
-    - `PUT` / `POST` / `DELETE /api/Order/{id}/Items[/{ItemId}]`
-    - `GET /api/Order/{id}/Cancel`
-    - `GET /api/Order/{id}/MarkAwaitingConfirmation` and `/MarkConfirmed`
-    - `POST /api/Order/{id}/Comments`
-    - `GET /api/Order/GetOrderId`
-  - A manual Mintsoft merge leaves the survivor with an `"<a>+<b>"` OrderNumber and `OrderNameValues MergedOrder=True`. The absorbed order is destroyed and returns 404.
-- **Acceptance:** A1–A7 are done. The Python order sync is decommissioned with no duplicate or lost Mintsoft orders.
-
-### A1 — Stage 1: outbound order push
-- **Title:** Stage 1: Outbound sales-order push to Mintsoft (WMS Phase 8) with single-writer ownership switch
-- **Type / P / labels / parent:** feature / 1 / switchover-initial, mintsoft-orders / A0
-- **Description:** Extend `WmsConnector` with outbound order capabilities, so IMS can create, amend, cancel, hold and comment on Mintsoft orders.
-- **Design:**
-  - **Connector methods:**
-    - `pushOrder` (`PUT /api/Order`), `fetchOrder`, `updateOrder`, `cancelOrder`
-    - `holdOrder` (`MarkAwaitingConfirmation`)
-    - `releaseOrder` (`MarkConfirmed`), for the withdrawal flow only
-    - `addOrderComment`
-  - **`WmsOrderLink` table:** links `SalesOrder.id` to the Mintsoft id. Also stores the last seen status, `mergedIntoExternalId`, `isMergedSurvivor`, `mergeHoldSince` and `mergeHoldToken`.
-  - **Courier mapping:** IMS `shippingService` → Mintsoft courier service.
-  - **Ownership switch:** a single-writer switch per sales channel, `python-sync` (the default) or `ims`. IMS refuses to push a channel the Python sync owns.
-  - **Idempotency:** before any create, look up by OrderNumber with `GET /api/Order/GetOrderId`, including `a+b` numbers.
-- **Acceptance:**
-  - IMS can create, amend, hold, release, partially ship and cancel an order, and Mintsoft stays aligned.
-  - The ownership switch provably blocks a double push.
-
-### A2 — Stage 2: EU withdrawal handling
-- **Title:** Stage 2: EU withdrawal-request handling in IMS (port hold/accept/reject lifecycle from the Python sync)
-- **Type / P / labels / parent:** feature / 1 / switchover-initial, mintsoft-orders / A0
-- **Description:** IMS has no withdrawal handling (no model, action or connector code). The Python sync owns the whole WebToffee "EU Order Withdrawal Button" workflow. It must be ported before the changeover, or the customer's EU right of withdrawal is silently dropped from fulfilment.
-- **Design:**
-  - **Intake:** a `SalesOrderWithdrawal` record (REQUESTED / APPROVED / REJECTED, full or partial lines) from the WooCommerce connector, logged with `logActivity`.
-  - **Before first push:** an order with an open withdrawal is never pushed.
-  - **By Mintsoft status:**
-
-    | Mintsoft status | Action |
-    |---|---|
-    | NEW / ONBACKORDER | `MarkAwaitingConfirmation` plus a `[ims-withdrawal-hold:<token>]` comment. |
-    | Mid-pick (PRINTED, AWAITINGPICKING, PICKINGSTARTED, PICKED, PROCESSING) | Write nothing; re-check each tick. There is no API to raise a query. |
-    | HOLDING, FAILED, QUERYRAISED and other uncertain states | Defer, with a one-time escalation. |
-    | PACKED / DESPATCHED / INVOICED | Auto-reject with "order already dispatched". |
-  - **Approved:**
-    - full → `Cancel`, which returns stock;
-    - partial → keep the hold and ask an operator to amend;
-    - after dispatch → handle as a return.
-  - **Rejected:** leave the hold and ask the operator to Confirm. Auto-release is off by default; when on, it may release only a hold whose marker proves ownership.
-  - **Guards:**
-    - a transport failure is not a rejection;
-    - queue entries use compare-and-clear;
-    - a WooCommerce cancellation wins over a withdrawal;
-    - foreign holds (an operator's, or a merge hold) are never released.
-  - **Port from:** `OneTwo3D/woocommerce-mintsoft-sync` `docs/ORDER_SYNC.md` ("Withdrawal requests") and `wc_mintsoft_orders.py` (`WDRAW_*` buckets).
-- **Acceptance:**
-  - Every row of the Python withdrawal branch table has an IMS test.
-  - Open withdrawal state (queue, token, ownership) carries across the cutover.
-
-### A3 — Stage 3: merged Mintsoft orders
-- **Title:** Stage 3: Read-side handling of merged Mintsoft orders (survivor/twin, dispatch fan-out, guards)
-- **Type / P / labels / parent:** feature / 1 / switchover-initial, mintsoft-orders / A0
-- **Description:** Understand merges done by an operator, the Python sync or IMS: detect survivors and absorbed twins, and fan one despatch out to every linked sales order.
-- **Design:**
-  - Detect a survivor by its `a+b` number or `MergedOrder=True`. A twin returns 404 and is resolved to its survivor.
-  - Despatch goes through `applyExternalFulfillmentUpdate` for every linked order, with tracking copied to each.
-  - IMS never updates or cancels a survivor automatically.
-  - Returns matching resolves `a+b` references.
-  - Invoices, payments and Xero postings stay per sales order.
-- **Acceptance:** a merged pair despatched in Mintsoft ships both IMS orders with the same tracking, and nothing writes to the survivor.
-
-### A4 — Stage 4: merge candidates, flag
-- **Title:** Stage 4: Merge candidates - detect and flag same-customer orders
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, mintsoft-orders / A0
-- **Description:** After a new order is pushed, find other open orders from the same billing email with the same shipping address whose Mintsoft order is still NEW, and flag them.
-- **Design:**
-  - **Matching:** normalised email plus effective shipping address (line1, line2, city, postcode without spaces, country), falling back to billing. Case, spacing and punctuation are ignored.
-  - **Excluded:** orders with backordered lines or pending withdrawals.
-  - **EU orders are included,** with the warning "check customs paperwork and IOSS values before merging". Northern Ireland, Jersey, Guernsey and the Isle of Man count as UK.
-  - **Mintsoft gate:** the status is NEW, or AWAITINGCONFIRMATION carrying our merge marker (a chain). Tenancy is checked by ClientId, and duplicate Mintsoft ids collapse into one.
-  - **Output:** a Mergeable badge with partner links, an activity-log entry, and a list on `/sync/mintsoft`. Flag mode makes no Mintsoft writes.
-  - **Reference implementation:** `OneTwo3D/woocommerce-mintsoft-sync` `wc_mintsoft_merge.py` (branch `wip/loving-hawking-72uquf`).
-- **Acceptance:** tests cover normalisation, every exclusion, the EU warning, chains and tenancy, and show that a search failure never affects the push.
-
-### A5 — Stage 5: merge candidates, hold
-- **Title:** Stage 5: Merge candidates - hold both orders in Mintsoft for operator merge, reminder, never auto-release
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, mintsoft-orders / A0
-- **Description:** In hold mode, put every order of a candidate group into AWAITINGCONFIRMATION, so the warehouse can't pick them separately while an operator merges them by hand.
-- **Design:**
-  - **Hold:** `MarkAwaitingConfirmation` plus the comment `[ims-merge-hold:<token>] Merge candidate … Merge in Mintsoft, then Confirm the surviving order.` The EU customs warning and the FedEx manual-label warning are added where they apply.
-  - **Modes:** off / flag / hold. Unknown values mean off.
-  - **Failures:** a hold failure is non-fatal, and the badge says "not held".
-  - **Reminder:** after `MERGE_HOLD_REMIND_HOURS` (default 4), a one-time red badge, activity-log warning and notification. IMS never releases a merge hold.
-  - **Clearing:** hold state clears when the status leaves AWAITINGCONFIRMATION or a merge is detected.
-  - **While held:** edits and cancellations are not pushed (the operator is told to act in Mintsoft), and a withdrawal escalates to a human.
-- **Acceptance:** both orders are held with a marker, flag mode writes nothing, the reminder fires once, and there is no release path.
-
-### A6 — Stage 6: double postage
-- **Title:** Stage 6: Double-postage flag on absorbed orders (no automatic refund)
-- **Type / P / labels / parent:** feature / 3 / switchover-initial, mintsoft-orders / A0
-- **Description:** When a merge absorbs an order that paid for shipping, flag its shipping as possibly refundable. An operator decides and clears the flag. Nothing is refunded automatically.
-- **Acceptance:** the flag appears only when shipping above 0 was paid. It is visible on the order and in a list, and only an operator can clear it.
-
-### A7 — Stage 7: changeover
-- **Title:** Stage 7: Changeover - retire Python WooCommerce->Mintsoft order sync in favour of WooCommerce->IMS->Mintsoft
-- **Type / P / labels / parent:** feature / 1 / switchover-initial, mintsoft-orders / A0
-- **Description:** Cut orders over per channel from the Python sync to IMS without duplicates, and carry the Python sync's state across.
-- **Design:**
-  1. Ship A1 with the channel still owned by `python-sync`.
-  2. Shadow-run A3 read-only against live orders the Python sync created.
-  3. In one maintenance window, set Python `ENABLE_ORDER_SYNC=False` and switch ownership to `ims`. IMS links existing Mintsoft orders by OrderNumber (including `a+b`) and never recreates them.
-  4. Import the WooCommerce meta:
-     - `_mintsoft_wdraw_*`
-     - `_mintsoft_merged` and `merged_into`
-     - `_mintsoft_merge_candidate`
-     - `_mintsoft_merge_hold_since` and `_mintsoft_merge_hold_token`
-     - `_mintsoft_merge_shipping_refund`
-
-     Holds carrying the `[wc-merge-hold:` marker count as ours for chaining.
-  5. Decommission the order sweep (systemd timer `wc-mintsoft-order-sweep`). Retiring the product sync is B8.
-- **Acceptance:** no Mintsoft order is created twice, and every open merged, held or withdrawn order keeps its links and state.
+  Journal the change per refund id.
+- **D9 — Split shipments.** Follow Mintsoft parts. A split whose parts are all cancelled never completes. A cancelled or refunded order is never reopened. IMS-internal one-shipment-per-part stays **deferred** (the parity doc's woo-level decision stands).
+- **D10 — Tracking.** IMS stores the tracking details. WooCommerce, AST and TrackShip keep customer-facing tracking. Map carriers to AST provider slugs, with FedEx and Click & Drop branded as such.
+- **D11 — Customer emails.** These stay in WooCommerce (wphub-partial-shipment, AST, TrackShip). IMS-sent customer emails are post-switch.
+- **D12 — Python product sync.** Retiring it is part of the switchover (o3d-hcx4c.3 / o3d-ofasq §4 STEP 1).
 
 ---
 
-## B. WooCommerce-hub gaps
+## 1. New IMS beads (parent `o3d-zvec` unless stated)
 
-### B1 — bug: status never pushed after shipping
-- **Title:** Bug: shipping via shipments never pushes WooCommerce "completed"
-- **Type / P / labels / parent:** bug / 1 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:**
-  - `reconcileOrderAfterShipment` (`lib/domain/sales/shipment-service.ts`) sets the order to SHIPPED directly.
-  - `updateShipmentStatus` (`app/actions/allocation.ts`, ~715–770) then pushes only the tracking meta (`pushOrderDeliveryMetadata`), never `pushImsStatusToWc` (`lib/connectors/woocommerce/sync/order-status.ts:89`).
-  - So the WooCommerce order stays `processing`, and the completed email with tracking never goes out.
-  - Today only `applySalesOrderStatusTransition` (`app/actions/sales.ts` ~1441) pushes the status.
-- **Design:** after the last shipment ships, push the tracking first and then the status, through the shopping facade, respecting webhook-echo suppression.
-- **Acceptance:** shipping the last shipment triggers exactly one status push; a partial shipment triggers none. Tests pass, and `npm run type-check` and `npm run lint` are clean.
+For each: title / type / priority / extra label / description, then acceptance criteria.
 
-### B2 — order push safeguards
-- **Title:** Order push safeguards for IMS→Mintsoft (store credit, VAT/total guard, courier fallback, duplicate + tenancy protection, recipient data)
-- **Type / P / labels / parent:** feature / 1 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Port the Python sync's push safeguards into the IMS order push.
-- **Design:**
-  - **Store credit:** treated as payment, not discount (Smart Coupons store-credit coupons, wallet and gift-card meta). Mintsoft keeps the full goods value for customs and IOSS.
-  - **VAT/total guard:** refuse the push when the recalculated gross drifts beyond the rounding tolerance, and show the error on the order.
-  - **Prices and SKUs:** unrounded per-unit prices. Lines without a SKU are refused.
-  - **Courier fallback:** retry with a placeholder service when Mintsoft rejects the courier, and flag the order "courier pending" until Mintsoft shows a real courier.
-  - **Duplicate protection:** a durable create-intent journal written before the request, a read-back check, a verify-pending queue, and an exact-match lookup on "Order Number already exists".
-  - **Tenancy:** a mandatory `ClientId`, matched on every read-back (the 3PL tenant is shared).
-  - **Edits and cancels:** only while the order is NEW. Otherwise the operator is told to change it in Mintsoft (IMS warn-and-confirm).
-  - **Failures:** a transient failure is not a rejection. Dead-letter after N rejections, with a badge.
-  - **Recipient data:** add first/last name, company, phone and email to IMS `shippingAddress`; `mapWcAddress` drops them today.
-  - **Reference:** `OneTwo3D/woocommerce-mintsoft-sync` `wc_mintsoft_orders.py` (`push_order`, `_build_payload`) and `scripts/run_mintsoft_order_sweep.py` (`_guarded_push`, the journal).
-- **Acceptance:** a test for each safeguard, and a replay or timeout never produces a second Mintsoft order.
+**N1 — `[msparity] Merge candidates: detect and flag same-customer orders still NEW in Mintsoft`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **When it runs:** after IMS pushes an order.
+- **Matching:** find the customer's other open orders with the same normalised billing email and effective shipping address:
+  - Address fields: line1, line2, city, postcode without spaces, country.
+  - Fall back to billing when there is no shipping address.
+  - Ignore case, spacing and punctuation.
+- **Mintsoft gate:** the linked order is NEW, or held under our merge marker (chain). Check tenancy (ClientId). Collapse duplicate Mintsoft ids.
+- **Exclusions:** see D1.
+- **Output:**
+  - a Mergeable badge with partner links;
+  - an activity log entry;
+  - a list on `/sync/mintsoft`.
+- **Modes:** `off` / `flag` / `hold`. Unknown values mean `off`.
+- **Reference implementation:** `OneTwo3D/woocommerce-mintsoft-sync` `wc_mintsoft_merge.py` (branch `wip/loving-hawking-72uquf`). See D1.
+- **Acceptance:** tests for normalisation, every exclusion, the EU warning, chains and tenancy, and that a detection failure never affects the push.
 
-### B3 — mirror duty/tax
-- **Title:** Mirror WooCommerce duty/tax results into IMS (IOSS/VAT/EORI, duty fees, delivery term, customs values, per-destination HS codes, GTIN/MPN)
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** WooCommerce and its plugins keep calculating duty and tax. IMS imports and stores the results so both systems agree. IMS never recomputes them.
-- **Design:**
-  - **Per order:**
-    - the IOSS number applied
-    - the customer's VAT/EORI number (from the WooCommerce VAT meta keys)
-    - duty and tax fee lines, with `_wclc_duty_component` / `_wclc_tax_component`
-    - the delivery term (IOSS_DDP / DDP / DDU_DAP)
-    - per-line customs-value overrides (`_wc_label_customs_unit_value`)
-  - **Per product:**
-    - HS codes `pa_hs_code`, `pa_us_hs_code` and `_dutify_hs_codes`
-    - `pa_customs_description`
-    - GTIN (`global_unique_id`) and MPN (Yoast)
-  - The Mintsoft push (A1/B2) sends `IOSSNumber` and `VATNumber` from this data.
-- **Acceptance:** an imported order and product show the same values as WooCommerce, updates made in WooCommerce resync, and IMS never changes WooCommerce's calculation.
+**N2 — `[msparity] Mintsoft connector: real hold/release (MarkAwaitingConfirmation / MarkConfirmed) with token-scoped marker, for merge holds only`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Why:** today an IMS hold cancels the Mintsoft order and re-pushes it on release (`lib/domain/wms/order-push-sweep.ts`). An operator cannot merge a cancelled order.
+- **Add to `WmsConnector` / the Mintsoft connector:**
+  - `holdOrder`, via `GET /api/Order/{id}/MarkAwaitingConfirmation`;
+  - a marker comment `[ims-merge-hold:<token>]`;
+  - `hasHoldMarker`.
+- **Release:** `releaseOrder` (`MarkConfirmed`) exists for completeness only. It is not used by merge holds (D1).
+- **Transport failures:** raise; they are not treated as a refusal.
+- **Out of scope:** withdrawal's cancel-based hold is unchanged (D2).
+- **Read first:** o3d-3a0t (the stale-marker hazard).
+- **Acceptance:** a unit test per verb; a transport failure is distinguished from a refusal; the marker round-trips.
 
-### B4 — split shipments
-- **Title:** Split shipments from Mintsoft: per-part shipments, tracking and WooCommerce partial-shipped
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Mintsoft splits an order into parts (`NumberOfParts`, `Part`, with `OrderItems` per part). IMS must follow each part.
-- **Design:**
-  - One IMS shipment per part, with its own tracking.
-  - Push per-part tracking and the partial-shipped status to WooCommerce, keeping the wphub partial-shipment plugin and its per-shipment emails working.
-  - Complete the order only when every part has shipped or been cancelled. An all-cancelled split never completes, and a cancelled or refunded order is never reopened.
-- **Acceptance:** tests for a two-part split shipped weeks apart, one part cancelled, and all parts cancelled.
+**N3 — `[msparity] Merge candidates: hold every order of the group in Mintsoft, overdue reminder, never auto-release`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Depends on:** N1, N2.
+- **Hold mode:** hold every order of the group with N2. Add the EU and FedEx warnings to the marker comment where they apply.
+- **Failures:** a hold failure is non-fatal. The badge then says "not held".
+- **Reminder:** after `MERGE_HOLD_REMIND_HOURS` (default 4), a one-time red badge, an activity-log warning and a notification.
+- **Clearing:** the hold state clears once the order's status leaves AWAITINGCONFIRMATION, or when a merge is detected (existing detection: onetwo3d-ims-vn92.2, o3d-bjc.2.1).
+- **While held:**
+  - edits and cancels are not pushed; show "act in Mintsoft";
+  - a withdrawal on a held order escalates to a human.
+- **Acceptance:** both orders are held with a marker; flag mode writes nothing; the reminder fires once; there is no release code path.
 
-### B5 — tracking details
-- **Title:** Sync Mintsoft tracking details into IMS and push to WooCommerce with AST provider slugs (WC/TrackShip keep customer tracking)
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** IMS captures tracking from the Mintsoft despatch. WooCommerce, AST and TrackShip keep the customer-facing tracking and carrier polling.
-- **Design:**
-  - Capture the tracking number, courier, service and ship date into the IMS shipment.
-  - Map each carrier to its AST provider slug. Today IMS sends free text, which breaks tracking links. Brand FedEx-labelled orders as FedEx and Click & Drop orders as Royal Mail.
-  - Keep reading TrackShip status back (`lib/trackship.ts` already exists).
-  - Re-fire TrackShip for tracked orders that have no TrackShip shipment row.
-  - Mark an order NOTFOUND after repeated 404s.
-- **Acceptance:** the tracking link resolves for every mapped carrier, and TrackShip picks up every shipped order.
+**N4 — `[msparity] Double-postage flag on orders absorbed by a Mintsoft merge (no automatic refund)`**
+- **Type / priority / label:** feature, P3, `switchover-initial`
+- **Trigger:** merge detection repoints an absorbed order to its survivor (`dispatch-sweep.ts`), and that order paid shipping above zero.
+- **Result:** flag the shipping as possibly refundable, with a badge, a list and an operator clear. See D3.
+- **Acceptance:** raised only when shipping above zero was paid, and only an operator can clear it.
 
-### B6 — refunds started in IMS
-- **Title:** Flag IMS refunds in WooCommerce as "to be refunded" for manual handling (no WC refund record, no status change, no store credit)
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** When a refund or credit note is created in IMS, IMS only flags it in WooCommerce. An operator refunds or credits the customer by hand.
-- **Design:**
-  - **Flag:** WooCommerce order meta `_ims_to_be_refunded` (amount, currency, reason, credit-note number) plus an order note: "To be refunded: £x — refund via <gateway> or issue store credit manually". IMS shows a badge and a list of flagged orders.
-  - **What IMS never does:** create a WooCommerce refund record (a full-amount record would set the order to refunded) or change the WooCommerce status.
-  - **Clearing:** the operator clears the flag, which removes the meta and adds a "handled" note.
-  - **Operator's refund:** the later WooCommerce refund arrives through `refund.created` and must match the existing credit note, not create a second one.
-  - **Status push:** `pushImsStatusToWc` must never map REFUNDED or PARTIALLY_REFUNDED. Today it maps only SHIPPED, CANCELLED and ON_HOLD; lock this with a test.
-- **Acceptance:** IMS causes no WooCommerce money movement and no status change, the flag round-trips, and no credit note is duplicated.
+**N5 — `[msparity] BUG: IMS-authority shipments never push WooCommerce "completed" for storefront orders`**
+- **Type / priority / label:** bug, P1, `switchover-initial`
+- **Related:** o3d-zvec.4, o3d-ymgc.
+- **Where it breaks:** on `development`, `app/actions/allocation.ts` (~1576–1655) calls `reconcileOrderAfterShipment`, then only `pushOrderDeliveryMetadata` (tracking).
+- **Why other paths work:** only `sales.ts:1888` and `external-fulfillment.ts:774` call `pushSalesOrderStatus`. So WMS despatch completes the WooCommerce order, but a shipment shipped in IMS does not. The WooCommerce order stays `processing` and no completed email is sent.
+- **Fix:** push tracking first, then the status, respecting zvec.4's only-if-still-processing guard and webhook-echo suppression.
+- **Acceptance:** the last shipment SHIPPED pushes exactly once; a partial shipment pushes nothing; type-check and lint are clean.
 
-### B7 — product sync parity
-- **Title:** Product sync parity with the Python sync (variations, 99-char names, GTIN/EAN two-way, SKU rename, customs fields, cost price, bulk CSV tools)
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Bring the IMS→Mintsoft product sync up to the Python sync's level.
-- **Design:**
-  - **Variations:** only variations exist in Mintsoft. A parent's Mintsoft SKU is deleted only once every variation is confirmed present.
-  - **Names:** `Parent (attr1, attr2)`, fitted to 99 characters. The parent is cut at a word boundary with "…"; the attribute suffix is kept whole.
-  - **Weight and dimensions:** a variation inherits the parent's when its own are missing.
-  - **GTIN/EAN:** filled in both directions, only where the target is empty. Mismatches are logged.
-  - **SKU rename:** keep the Mintsoft product id and rename the SKU in place.
-  - **Barcode collisions:** surfaced for a manual fix.
-  - **Customs:** a dedicated customs description (not the product description). HS code and COO overwrite Mintsoft, and the overwrite is logged.
-  - **Cost price:** taken from IMS cost.
-  - **Bulk tools:** trade-data (HS code / customs description) and COO CSV pushes, dry-run by default.
-  - **Reference:** `OneTwo3D/woocommerce-mintsoft-sync` `wc_mintsoft_sync.py` (`CustomsSyncManager`, `fit_mintsoft_name`, `_resolve_mintsoft_product`), `coo_push.py`, `force_mintsoft_trade_update.py`.
-- **Acceptance:** a test for each behaviour, and a catalogue-wide dry run shows no unexpected differences from the Python sync.
+**N6 — `[msparity] Mintsoft push: recipient name/company/phone/email from the WooCommerce shipping address, plus a store-credit push test`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Recipient data:**
+  - `mapWcAddress` (`lib/connectors/woocommerce/sync/field-mapping.ts`) drops the recipient name, company and phone.
+  - `readAddress` in `order-push-sweep.ts` (~400–508) uses the billing `customerName` and `phone: null`.
+  - Add shipping recipient fields to the IMS sales order and send them to Mintsoft.
+- **Store credit:** add a test proving that store credit (Smart Coupons store-credit coupons, wallet and gift-card meta) is treated as payment, not discount. Mintsoft must keep the full goods value for customs and IOSS. Coordinate with o3d-iklv (the Xero side).
+- **Acceptance:** a gift order ships to the recipient's name and phone; the store-credit test passes.
 
-### B8 — retire the Python product sync
-- **Title:** Retire the Python WooCommerce→Mintsoft product sync
-- **Type / P / labels / parent:** task / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Once B7 is live, make IMS the owner of products and retire the product side of the Python sync.
-- **Design:**
-  - Delete the WooCommerce `product.updated` webhook that points at the Python Flask service.
-  - Stop `wc-mintsoft-webhook.service`.
-  - Disable or remove the plugin's product-sync hooks.
-  - Carry `_mintsoft_product_id` over into IMS product links.
-  - Keep `scripts/inventory_compare.py` for one-off checks until IMS stock alignment has run clean for a period.
-- **Acceptance:** a product edit reaches Mintsoft only through IMS, and no Mintsoft product is duplicated.
+**N7 — `[msparity] Mirror WooCommerce duty/tax results into IMS: IOSS number, delivery term, wclc duty/tax components, per-line customs value, per-destination HS codes`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Related:** o3d-mu0a, onetwo3d-ims-bhdm.
+- **Already present:** `customerVatNumber` → `VATNumber` (`order-push.ts:97`) and generic fee lines.
+- **Missing, to be imported and stored:**
+  - the IOSS number applied;
+  - the delivery term (IOSS_DDP / DDP / DDU_DAP);
+  - `_wclc_duty_component` / `_wclc_tax_component`;
+  - the per-line customs-value override `_wc_label_customs_unit_value`;
+  - product `pa_us_hs_code` and `_dutify_hs_codes`.
+- **Rules:** send `IOSSNumber` on the Mintsoft push. Never recompute (D5).
+- **Acceptance:** imported values equal WooCommerce's, and WooCommerce edits resync.
 
-### B9 — keep the label service working
-- **Title:** Keep the WooCommerce label service working: IMS writes _mintsoft_* order meta back to WooCommerce
-- **Type / P / labels / parent:** task / 1 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Labels (FedEx, Royal Mail Click & Drop) stay in the WooCommerce label service (`OneTwo3D/woocommerce-mintsoft-shipping-label-sync`). That service finds orders through meta the Python order sync writes today. After the switch, IMS must keep writing the same meta, or labels stop working on switchover day.
-- **Design:**
-  - IMS writes `_mintsoft_order_id`, `_mintsoft_order_number`, `_mintsoft_status`, `_mintsoft_tracking_written` and `_mintsoft_terminal` to each WooCommerce order.
-  - The `_mintsoft_filter=active` REST query keeps returning the right orders.
-  - FedEx finds the Mintsoft order by WooCommerce order number, so OrderNumber must stay equal to the WooCommerce number.
-- **Acceptance:** after cutover, a Click & Drop label and a FedEx label both reach the Mintsoft order unchanged.
+**N8 — `[msparity] Port TrackShip re-fire for tracked orders without a TrackShip row, and NOTFOUND handling after repeated Mintsoft 404s`**
+- **Type / priority / label:** feature, P3, `switchover-initial`
+- **Related:** o3d-b6v (in_progress, plugin side).
+- **What to port from the Python sweep:**
+  - the `/trackship/reconcile` re-fire, with backoff;
+  - an order that 404s N consecutive times is marked NOTFOUND and stops polling, with a note.
+- **Rule:** customer-facing tracking stays with WooCommerce and TrackShip (D10).
+- **Acceptance:** tests for re-fire, backoff and the NOTFOUND threshold.
 
-### B10 — move labels into IMS (future)
-- **Title:** Move shipping-label generation (FedEx, Click & Drop) from WooCommerce into IMS
-- **Type / P / labels / parent:** feature / 4 / switchover-post, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Future work, **not part of the initial switch**. Re-home the label service into IMS:
-  - **FedEx:** drafts, live rates, customs engine, 3D packing, pickups, the ETD commercial invoice and letterhead, and multi-parcel PDF merge.
-  - **Click & Drop:** order upload, the label bridge to Mintsoft, and cancel/withdraw.
+**N9 — `[msparity] IMS-initiated refunds: raise a "to be refunded" flag in WooCommerce only (no WC refund record, no status change, no store credit)`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Related:** o3d-7w9v, o3d-etbf.
+- **Current state:** IMS writes nothing to WooCommerce for a refund. `IMS_TO_WC` (`order-status.ts:138`) maps only SHIPPED, CANCELLED and ON_HOLD.
+- **Add:**
+  - WooCommerce order meta `_ims_to_be_refunded` (amount, currency, reason, credit-note number), plus an order note;
+  - an IMS badge and list, with an operator clear that removes the meta and adds a note.
+- **Fix:** WC refund dedup keys only on `externalRefundId`, so the operator's later WooCommerce refund would create a **second credit note**. Match it to the flagged credit note instead.
+- **Lock:** add a test that REFUNDED and PARTIALLY_REFUNDED are never mapped to a WooCommerce status. See D7.
+- **Acceptance:** no WooCommerce money movement or status change from IMS; the flag round-trips; no duplicate credit note.
+
+**N10 — `[msparity] Product sync parity remainder: 99-char Mintsoft names, CostPrice, variable-parent SKU deletion, variation dimension/weight inheritance, bulk trade/COO CSV tools`**
+- **Type / priority / label:** feature, P2, `switchover-initial`
+- **Related:** o3d-mu0a, o3d-zvec.6, onetwo3d-ims-bhdm, o3d-s2yh.
+- **Current state:** `buildMintsoftProductPayload` (`lib/connectors/mintsoft/api/client.ts:218`) sends Name unclipped, no CostPrice, and a single EAN.
+- **Port from the Python sync:**
+  - **Names:** `fit_mintsoft_name`, which cuts the parent at a word boundary with "..." and keeps the variant suffix whole, within 99 characters.
+  - **Cost price:** from IMS cost.
+  - **Variable parents:** delete the parent's Mintsoft SKU only after every variation is confirmed present.
+  - **Inheritance:** a variation inherits the parent's weight and dimensions when its own are missing.
+  - **Bulk tools:** trade-data (HS / customs description) and COO CSV pushes, dry-run by default.
+- **Acceptance:** a test per behaviour, and a catalogue dry run shows no unexpected diffs.
+
+**N11 — `[msparity] BUG: WooCommerce refund of unshipped quantity tries to restock and fails ("no shipment line exists")`**
+- **Type / priority / label:** bug, P2, `switchover-initial`
+- **Related:** o3d-zvec.8.
+- **Where it breaks:** `lib/connectors/woocommerce/sync/refund-sync.ts` (~950) passes the default returns warehouse for any quantity refund. `lib/domain/sales/refund-service.ts` (~775) then throws for unshipped lines.
+- **Fix:** unshipped quantity must release demand and reservation only, which `post-refund-release.ts` already does, with no restock. Shipped quantity is restocked only when the return arrives. Keep the 5fcb design (D8).
+- **Acceptance:** tests cover:
+  - a refund of unshipped quantity;
+  - a partial shipment followed by a refund;
+  - a full refund of an unshipped order (`refundStatus=FULL`, Mintsoft cancelled as today).
+
+**N12 — `[msparity] Cutover: import legacy _mintsoft_* order state into IMS and verify Mintsoft OrderNumber equality`**
+- **Type / priority / label:** task, P1, `switchover-initial`
+- **Blocks:** o3d-hcx4c.3.
+- **Import, at the cutover:**
+  - `_mintsoft_wdraw_*` (queue, token, ownership) into the withdrawal model;
+  - `_mintsoft_merged` / `merged_into` into `WmsOrderPushLink` MERGED;
+  - `_mintsoft_merge_candidate`, `_mintsoft_merge_hold_since` / `_token` into N1/N3 state. Holds placed by the Python sync with the `[wc-merge-hold:` marker count as ours for chaining;
+  - `_mintsoft_merge_shipping_refund` into the N4 flag.
+- **OrderNumber check:** IMS pushes `orderNumber = wc_order_prefix + number` (`order-import.ts:2149`, `order-push-sweep.ts:494`). With a non-empty prefix, IMS will not match orders the Python sync created, nor what the FedEx label service looks up. Decide the prefix, and prove existing Mintsoft orders adopt rather than duplicate (o3d-6sfe).
+- **Acceptance:** a dry run over live WooCommerce meta imports every open order's state; zero OrderNumber mismatches.
+
+**N13 — `[msparity] Post-switch: move shipping-label generation (FedEx, Click & Drop) from WooCommerce into IMS`**
+- **Type / priority / label:** feature, P4, `switchover-post`
+- **Related:** o3d-kaqb2, o3d-ofasq §4 STEP 3, o3d-5hel.
+- **Scope:**
+  - **FedEx:** drafts, rates, customs engine, packing, pickups, ETD commercial invoice and letterhead (LHS), multi-parcel (MPS) PDF merge.
+  - **Click & Drop:** upload, label bridge to Mintsoft, cancel/withdraw.
   - **Customs-value overrides.**
-- **Acceptance:** defined when this work is scheduled.
+- **Not part of the initial switch (D4).**
 
-### B11 — customer emails from IMS (future)
-- **Title:** Customer email communication from IMS (order, shipment, partial-shipment, delivery)
-- **Type / P / labels / parent:** feature / 4 / switchover-post, woo-hub-gap / `$SWITCHOVER`
-- **Description:** Future work, **not part of the initial switch**. All customer emails stay in WooCommerce, AST and TrackShip for now.
-- **Acceptance:** defined when this work is scheduled.
+**N14 — `[msparity] Post-switch: customer email communication from IMS (order, shipment, partial-shipment, delivery)`**
+- **Type / priority / label:** feature, P4, `switchover-post`
+- **Related:** onetwo3d-ims-q66in.1.6.
+- **Scope:** all customer emails stay in WooCommerce, wphub-partial-shipment, AST and TrackShip until then (D11).
 
-### B12 — refunds started in WooCommerce
-- **Title:** WooCommerce-initiated refunds: auto-book in IMS (reduce unshipped qty, cancel if fully refunded) and amend or cancel the Mintsoft order while still amendable
-- **Type / P / labels / parent:** feature / 2 / switchover-initial, woo-hub-gap / `$SWITCHOVER`
-- **Description:** A refund made in WooCommerce has already moved the money. IMS books it automatically, with no "to be refunded" flag, and amends Mintsoft while the order can still be changed.
-  - **IMS today:** `syncWcRefund` (`lib/connectors/woocommerce/sync/refund-sync.ts`) always restocks refunded quantities into the returns warehouse. For unshipped goods, `refund-service.ts` refuses that restock ("no shipment line exists"), and the order line and allocation are never reduced. Verify this with a test, then fix it.
-  - **Python sync today:** it never amends Mintsoft lines on a refund and never cancels a fully refunded order.
-- **Design:**
-  - **IMS side:**
-    - Unshipped refunded quantity: reduce the open line quantity and release the allocation or reservation. No restock.
-    - Shipped quantity: restock only when the return arrives, through the returns inbox.
-    - Everything refunded and nothing shipped: cancel the IMS order.
-    - Shipping-only or amount-only refund: credit note only.
-  - **Mintsoft side,** decided on a fresh GET:
+## 2. New bead outside the IMS tree
 
-    | Mintsoft state | Action |
-    |---|---|
-    | Not pushed yet | Push the reduced order. |
-    | NEW (ONBACKORDER / AWAITINGCONFIRMATION once proven on a test order) | Full refund: `Cancel`. Partial: reduce the quantity with `POST /Items/{ItemId}`, or `DELETE` the item when its quantity reaches 0. Then re-GET to verify, update the header totals, and add a comment. |
-    | Merged survivor | Never amended automatically; operator flag. |
-    | Mid-pick | Operator flag to raise a warehouse query. |
-    | PACKED / DESPATCHED | No amendment; expect a return. |
-    | Already cancelled by a withdrawal | No-op. |
-  - **Rules:**
-    - Journal every change per refund id, so a replayed webhook never amends twice.
-    - A transport failure retries and is never read as "not amendable".
-    - Log everything to the activity log and a WooCommerce order note.
-- **Acceptance:** tests for full, partial and shipping-only refunds; for unshipped and shipped orders; for each Mintsoft status branch; and for webhook replay. A WooCommerce-initiated refund never raises the "to be refunded" flag.
+**N15 — `[labels] Label service: read IMS _oti_wms_* order meta instead of legacy _mintsoft_* (so labels survive the IMS switch)`**
+- **Type / priority / labels:** task, P1, `proj:woocommerce-mintsoft-shipping-label-sync`, `switchover-initial`. No `[msparity]` prefix; it is label-repo work.
+- **Blocks:** o3d-hcx4c.3.
+- **Current reads:** `OneTwo3D/woocommerce-mintsoft-shipping-label-sync` discovers orders via `_mintsoft_order_id`, `_mintsoft_order_number`, `_mintsoft_tracking_written`, `_mintsoft_terminal`, and the `_mintsoft_filter=active` REST query. The WC→Mintsoft Python sync writes these meta keys.
+- **Why:** IMS writes `_oti_wms_*` (`lib/connectors/woocommerce/sync/wms-status.ts`), and o3d-ofasq abandons `_mintsoft_*`.
+- **Change:**
+  - read the IMS keys, falling back to the legacy keys during the transition;
+  - move the REST query to an IMS-meta filter;
+  - FedEx: find the Mintsoft order by the IMS-pushed OrderNumber (see N12).
+- **Acceptance:** on stage after the switch, a Click & Drop label and a FedEx label both reach the Mintsoft order.
 
----
+## 3. Python-sync work already built (same database, different project)
 
-## Dependencies (issue depends on …)
+**N16 — `[merge] woo-mintsoft sync: flag and hold same-customer merge candidates (off/flag/hold), EU warning, refund-check flag`**
+- **Type / priority / labels:** feature, P2, `proj:woocommerce-mintsoft-sync`
+- **Status:** in_progress.
+- **Where the code is:** built on branch `wip/loving-hawking-72uquf` of `OneTwo3D/woocommerce-mintsoft-sync`. Spec: `docs/superpowers/specs/2026-09-28-merge-candidate-hold-design.md`. Tests: 1238 Python on 3.11, plus PHP.
+- **What it adds:**
+  - `wc_mintsoft_merge.py`;
+  - WordPress chips and views (Mergeable / Merge hold / Merge overdue / £ Refund check);
+  - `MINTSOFT_MERGE_CANDIDATES`, which defaults to `off`.
+- **Also on the branch:** a fix for the Python 3.11 CI break (`run_mintsoft_order_sweep.py`, withdrawal note f-string).
+- **Awaiting:** the repo's Codex adversarial pass before merge.
+- **Interim:** it retires with the Python sync (N12 imports its state).
 
-| Issue | Depends on | Why |
-|---|---|---|
-| A2, A3, A4, B2, B4, B5, B9, B12 | A1 | All need the IMS order push. |
-| A5 | A4 | Hold builds on detection. |
-| A6 | A3 | The refund flag comes from merge detection. |
-| A7 | A1, A2, A3, A5, B2, B4, B5, B9, B12 | The changeover must not lose any of these. |
-| B2 | B3 | IOSSNumber and VATNumber come from the mirrored tax data. |
-| B8 | B7 | Don't retire the product sync before parity. |
-| B10 | A7 | Labels move after the changeover. |
-| B11 | A7 | Emails move after the changeover. |
+## 4. Notes to append to existing beads
 
-B1 and B6 have no dependencies. B1 can be fixed now.
+| Id | Append (prefix each with `2026-09-28 owner decisions (switchover handoff):`) |
+|---|---|
+| `o3d-zvec` | Summary of D1–D12, and the list of new children N1–N14. D4: the label service moves to IMS meta (N15) rather than IMS writing `_mintsoft_*`. |
+| `o3d-zvec.1` | D10 carrier → AST slug map. Brand FedEx-labelled orders (`_fedex_tracking_number`) as FedEx and Click & Drop orders as Royal Mail, as the Python sync does. D11: emails stay in WooCommerce, so confirming the WooCommerce completed/despatch email still fires is the whole requirement. Related: N5. |
+| `o3d-zvec.3` | The single-writer switch must also cover per-channel coexistence with the Python sync (`python-sync` / `ims` / `none`) for order push, and for merge-candidate flag/hold (only the owner flags/holds). Related: N12. |
+| `o3d-zvec.4` | Related bug N5: IMS-authority shipments never push the status at all. Apply the same only-if-still-processing guard there. |
+| `o3d-zvec.5` | D6: owner confirmed measure-first. Keep the guard advisory until the measurement justifies blocking. |
+| `o3d-zvec.8` | D8 rules for WooCommerce-initiated refunds. NEW: cancel or amend automatically. ONBACKORDER / AWAITINGCONFIRMATION: only after a test order proves it. Merged survivor or mid-pick: operator flag with an order note. Packed or later: expect a return. Journal per refund id so a replayed webhook never amends twice. Keep the 5fcb orthogonal refund status. Related: N11. |
+| `o3d-zvec.9` | D9: a split whose parts are all cancelled never completes; a cancelled or refunded order is never reopened. IMS-internal one-shipment-per-part stays deferred. |
+| `o3d-hcx4c.3` | Disabling woo-mintsoft must also retire the Python **product** sync (D12). Steps: delete the WooCommerce `product.updated` webhook that points at the Flask service; stop `wc-mintsoft-webhook.service`; disable the plugin's product hooks; keep `scripts/inventory_compare.py` for one-off checks. Blocked by N10, N12 and N15. Labels stay in WooCommerce through this step. |
+| `o3d-zjsb5.12` | Carry `_mintsoft_product_id` (WooCommerce product meta written by the Python sync) into the IMS Mintsoft product links. |
+| `o3d-ofasq` | Record D1–D12. D4 confirms §4's abandonment of `_mintsoft_*`: the label plugin adapts (N15) before STEP 1, and moves into IMS at STEP 3 or later (N13). D5: duty/tax stays computed in WooCommerce and is mirrored (N7). D7/D8: refund policy. |
+| `o3d-sxu1k` | New P1s for the switch gate: N5, N12, N15. Merge-candidate work (N1–N4) is `switchover-initial` P2. |
+| `o3d-e1yb` | D2: withdrawal keeps the cancel-based hold. The new real Mintsoft hold (N2) is for merge holds only. A withdrawal on a merge-held order escalates to a human. |
 
-## Not for this database
+## 5. Dependencies to add (issue → depends on)
 
-The Python-sync work already built on branch `wip/loving-hawking-72uquf` of `OneTwo3D/woocommerce-mintsoft-sync` belongs to that repo's own tracker (`o3d-*`). Do not file it here. That work covers the merge-candidate flag/hold, the EU warning and the Python 3.11 CI fix.
+| Issue | Depends on |
+|---|---|
+| N3 | N1, N2 |
+| N4 | (none; merge detection already exists) |
+| N12 | N1, N3, N4 (their state must exist to import into) |
+| `o3d-hcx4c.3` | N10, N12, N15 |
+| N13 | `o3d-hcx4c.4` |
+| N14 | `o3d-hcx4c.4` |
+| N9 | (none) |
+| N5 | (none; fix now) |
+| N11 | (none; fix now) |
+
+## Done when
+
+- N1–N16 each exist exactly once, with the stated parent, labels and priority.
+- The 12 notes are appended.
+- The dependencies are in place.
+- `bd dolt push` has succeeded, and the report has been sent.

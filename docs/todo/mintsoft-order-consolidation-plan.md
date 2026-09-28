@@ -1,5 +1,8 @@
 # Mintsoft Outbound Orders + Same-Customer Merge Candidates (Epic)
 
+> **Superseded for bead filing (2026-09-28).** This analysis was done against `main`, which is ~1260 commits behind `development`. Several gaps below are already implemented on `development`: order push, withdrawals, merge handling and split shipments. The reconciled, authoritative version is `bd-handoff-qoblex-switchover.md`, and the owner decisions recorded there take precedence over this file.
+
+
 ## Purpose
 
 Save shipping charges by detecting multiple open orders from the same customer while the warehouse has not touched them (Mintsoft status `NEW`). IMS flags them and puts them on hold (`AWAITINGCONFIRMATION`) so an **operator merges them by hand in Mintsoft**. IMS never merges automatically; the owner chose this as the safer design on 2026-09-28.
