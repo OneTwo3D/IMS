@@ -23,6 +23,8 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 - [`mintsoft-wms-connector-plan.md`](mintsoft-wms-connector-plan.md) — architectural design for the Mintsoft warehouse connector.
 - [`mintsoft-wms-connector-implementation-plan.md`](mintsoft-wms-connector-implementation-plan.md) — concrete file-by-file build plan for the Mintsoft connector.
 - [`mintsoft-order-consolidation-plan.md`](mintsoft-order-consolidation-plan.md) — epic: outbound sales-order push to Mintsoft (Phase 8 prerequisite) plus flag-and-hold of same-customer orders so operators merge them in Mintsoft.
+- [`qoblex-switchover-woo-hub-gaps.md`](qoblex-switchover-woo-hub-gaps.md) — Qoblex → IMS switchover: features WooCommerce and its Python services provide today that IMS must cover or deliberately leave in WooCommerce (labels, duty/tax, push safeguards, splits, tracking, refunds, product-sync parity, retiring the Python product sync).
+- [`bd-handoff-qoblex-switchover.md`](bd-handoff-qoblex-switchover.md) — handoff for the Claude Code instance on the VM to file all switchover beads in Dolt.
 - [`WC-followup-plan.md`](WC-followup-plan.md) — WooCommerce work remaining after the webhook-first shift.
 - [`xero-followup-plan.md`](xero-followup-plan.md) — Xero connector boundary work needed before a clean swap to a different accounting connector.
 

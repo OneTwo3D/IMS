@@ -154,16 +154,4 @@ None. Resolved on 2026-09-28:
 
 ## Beads Tracking
 
-The beads Dolt server is only reachable from the Proxmox network, so these issues were not created from the cloud session. Run on the VM:
-
-```bash
-EPIC=$(bd create "Mintsoft outbound orders + same-customer merge candidates" -t epic -p 2 \
-  -d "See docs/todo/mintsoft-order-consolidation-plan.md" --json | jq -r .id)
-bd create "Stage 1: Outbound sales-order push to Mintsoft (WMS Phase 8) with single-writer ownership switch" -t feature -p 2 --parent "$EPIC"
-bd create "Stage 2: EU withdrawal-request handling in IMS (port hold/accept/reject lifecycle from the Python sync)" -t feature -p 1 --parent "$EPIC"
-bd create "Stage 3: Read-side handling of merged Mintsoft orders (survivor/twin, dispatch fan-out, guards)" -t feature -p 2 --parent "$EPIC"
-bd create "Stage 4: Merge candidates - detect and flag same-customer orders" -t feature -p 2 --parent "$EPIC"
-bd create "Stage 5: Merge candidates - hold both orders in Mintsoft for operator merge, reminder, never auto-release" -t feature -p 2 --parent "$EPIC"
-bd create "Stage 6: Double-postage flag on absorbed orders (no automatic refund)" -t feature -p 3 --parent "$EPIC"
-bd create "Stage 7: Changeover - retire Python WooCommerce->Mintsoft order sync in favour of WooCommerce->IMS->Mintsoft" -t feature -p 2 --parent "$EPIC"
-```
+This plan's beads are filed under the Qoblex → IMS switchover epic, following `docs/todo/bd-handoff-qoblex-switchover.md` (keys A0–A7). That handoff supersedes the `bd create` commands that used to be here. Do not run both.
