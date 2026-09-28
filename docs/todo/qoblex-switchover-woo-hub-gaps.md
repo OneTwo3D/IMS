@@ -100,6 +100,42 @@ When the operator's manual WooCommerce refund comes back through the existing `r
 
 `pushImsStatusToWc` must never map `REFUNDED` or `PARTIALLY_REFUNDED` to a WooCommerce status. Today it maps only SHIPPED, CANCELLED and ON_HOLD; keep it that way, and add a test that locks it.
 
+### 6b. Refunds started in WooCommerce → IMS and Mintsoft (Initial)
+
+When an operator refunds in WooCommerce (gateway refund or store credit), the money has already moved. So:
+
+- IMS books it automatically: the credit note, plus changes to the order. It never raises the item 6 "to be refunded" flag for these.
+- Mintsoft is amended automatically **only while the order can still be changed**.
+
+**Today:**
+
+- **IMS.** `syncWcRefund` (`lib/connectors/woocommerce/sync/refund-sync.ts`) already turns every WooCommerce refund into an IMS credit note. When the refund has quantities, it always restocks them into the default returns warehouse. For goods that **have not shipped**, `refund-service.ts` refuses that restock ("no shipment line exists … process as cash-only"). The IMS order line and its allocation are never reduced. Verify this in a test and fix it.
+- **Python sync.** A WooCommerce refund only re-sends the Mintsoft order header (`update_order` never touches items), and a fully refunded order is not cancelled. Refunded goods can still ship.
+
+**IMS side:**
+
+- **Refunded quantity that has not shipped:** reduce the open quantity on the order line and release its allocation or reservation. Do not restock, because the goods never left.
+- **Refunded quantity that has shipped:** restock into the returns warehouse as today, only once the return actually arrives. This follows the returns inbox, not the refund.
+- **Every unit refunded and nothing shipped:** cancel the IMS order.
+- **Shipping-only or amount-only refunds:** credit note only. No quantity change.
+
+**Mintsoft side,** decided on a fresh `GET` of the Mintsoft order:
+
+| Mintsoft state | Action |
+|---|---|
+| Not pushed yet (still queued in IMS) | Push the reduced order. Nothing to amend. |
+| Amendable: `NEW`, and `ONBACKORDER` / `AWAITINGCONFIRMATION` once proven on a test order | **Full refund:** `GET /api/Order/{id}/Cancel`, which returns stock to available. **Partial refund:** reduce the quantity with `POST /api/Order/{id}/Items/{ItemId}`, or remove the line with `DELETE /api/Order/{id}/Items/{ItemId}` when it reaches 0. Re-`GET` the items and verify they match. Then update the header totals (`POST /api/Order/{id}`, a full `NewOrder` rebuilt from the fresh GET). Add a Mintsoft comment. |
+| Merged survivor (`a+b`) | **Never amend automatically.** The order carries another order's goods. Flag "remove X from merged order in Mintsoft" for an operator. |
+| Mid-pick (`PRINTED`, `AWAITINGPICKING`, `PICKINGSTARTED`, `PICKED`, `PROCESSING`) | No API can stop the pick. Flag the operator to raise a warehouse query by hand. |
+| `PACKED` / `DESPATCHED` / `INVOICED` | No amendment. A return is expected; link it to the Mintsoft returns inbox. |
+| Withdrawal already cancelled it | Nothing to do (idempotent). |
+
+**Rules:**
+
+- Transport failures retry and never count as "not amendable".
+- Each Mintsoft change is journalled per refund id, so a replayed `refund.created` webhook cannot amend twice.
+- Every automatic amendment and every operator flag is written to the activity log and as a WooCommerce order note.
+
 ### 7. Product sync parity with the Python sync (Initial)
 
 The IMS → Mintsoft product sync must reach the same level as the Python sync:

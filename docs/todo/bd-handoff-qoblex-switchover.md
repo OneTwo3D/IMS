@@ -21,7 +21,7 @@ Do not implement any of the features. This is issue filing only.
    - `switchover-initial`: required for the initial switchover.
    - `switchover-post`: future work, explicitly not part of the initial switch.
 
-   Also add `woo-hub-gap` to the gap items (B1–B11) and `mintsoft-orders` to the Mintsoft epic and its stages (A0–A7).
+   Also add `woo-hub-gap` to the gap items (B1–B12) and `mintsoft-orders` to the Mintsoft epic and its stages (A0–A7).
 4. **Descriptions.** Use the one-line description given, then add `See docs/todo/<file>.md, item N.`
 5. **Dependencies.** After everything exists, add them with `bd dep add <issue> <depends-on>` (check `bd dep --help` for the exact syntax in this version).
 6. **Finish.** Run `bd dolt push`, then `bd show $SWITCHOVER` to verify. Reply with a table: key → bead id, created or reused.
@@ -58,15 +58,16 @@ Priorities: 0 is highest. Types as given.
 | B9 | `$SWITCHOVER` | task | 1 | switchover-initial | Keep the WooCommerce label service working: IMS writes _mintsoft_* order meta back to WooCommerce | The FedEx and Click & Drop label service depends on _mintsoft_order_id/_order_number/_tracking_written/_terminal and the _mintsoft_filter=active REST query; IMS must keep writing them after the switch. Item 1 (initial dependency). |
 | B10 | `$SWITCHOVER` | feature | 4 | switchover-post | Move shipping-label generation (FedEx, Click & Drop) from WooCommerce into IMS | Future: re-home drafts, rates, customs engine, packing, pickups, ETD, MPS PDFs, and the C&D upload/bridge. Not part of the initial switch. Item 1. |
 | B11 | `$SWITCHOVER` | feature | 4 | switchover-post | Customer email communication from IMS (order, shipment, partial-shipment, delivery) | Future: emails stay in WooCommerce/AST/TrackShip for now. Not part of the initial switch. Item 8. |
+| B12 | `$SWITCHOVER` | feature | 2 | switchover-initial | WooCommerce-initiated refunds: auto-book in IMS (reduce unshipped qty, cancel if fully refunded) and amend or cancel the Mintsoft order while still amendable | WC refund → IMS credit note plus open-qty/allocation release (no restock of unshipped goods); Mintsoft cancel or line amend only in NEW (other states once proven); merged/mid-pick/packed states get an operator flag; journalled per refund id. Item 6b. |
 
 ## Dependencies to add (X depends on Y)
 
 | Issue | Depends on | Why |
 |---|---|---|
-| A2, A3, A4, B2, B4, B5, B9 | A1 | All need the IMS order push. |
+| A2, A3, A4, B2, B4, B5, B9, B12 | A1 | All need the IMS order push. |
 | A5 | A4 | Hold builds on detection. |
 | A6 | A3 | Refund flag comes from merge detection. |
-| A7 | A1, A2, A3, A5, B2, B4, B5, B9 | The changeover must not lose any of these. |
+| A7 | A1, A2, A3, A5, B2, B4, B5, B9, B12 | The changeover must not lose any of these. |
 | B2 | B3 | IOSSNumber and VATNumber come from the mirrored tax data. |
 | B8 | B7 | Don't retire the product sync before parity. |
 | B10 | A7 | Label re-homing comes after the changeover. |
