@@ -20,7 +20,8 @@ Until IMS owns order push, the Python sync is the system of record for merges. I
 | Action | **Flag both orders and hold both** in Mintsoft (`AWAITINGCONFIRMATION`). The new order is pushed first, then both are held. An operator merges in the Mintsoft UI and Confirms the surviving order. |
 | No automation of the merge | IMS never adds lines, renumbers or cancels to merge orders. |
 | Forgotten holds | **Remind, never release.** Once a configurable number of hours has passed (default 4), IMS shows an overdue badge, writes an activity-log warning and sends a notification. The hold stays until a person acts. |
-| Excluded | EU destinations (customs/IOSS), orders on backorder, orders with a pending withdrawal request. |
+| Excluded | Orders on backorder, orders with a pending withdrawal request. |
+| EU | **Flagged and held** like any other group, with a warning to check customs paperwork and IOSS values before merging. The operator decides case by case. |
 | NI / Channel Islands | Treated as **UK** orders. |
 | FedEx | Held as well, with a warning that the FedEx label must be made by hand (the FedEx label plugin cannot label merged orders yet). |
 | Chains | A third order that joins a held or merged pair is flagged and held too. |
@@ -60,9 +61,24 @@ Plus:
 
 Acceptance: the Phase 8 acceptance list in `mintsoft-wms-connector-implementation-plan.md`, plus the ownership switch provably blocks double-push.
 
-### Stage 2 — Withdrawal-request awareness in IMS
+### Stage 2 — EU withdrawal-request handling (port from the Python sync)
 
-IMS has no concept of an EU withdrawal request today; the Python sync reads it from WooCommerce (WebToffee plugin meta). IMS needs a `withdrawalPendingAt` (or equivalent) on `SalesOrder`, populated from the WooCommerce connector, so the consolidation exclusion can be evaluated IMS-side.
+IMS has **no withdrawal handling today** (checked 2026-09-28: no model, action, connector code or plan mentions it). The Python WooCommerce → Mintsoft sync currently owns the whole workflow. Retiring that sync at Stage 7 without porting it would silently drop the customer's EU right of withdrawal from fulfilment, so this stage must land before the changeover.
+
+Source of truth: `OneTwo3D/woocommerce-mintsoft-sync` `docs/ORDER_SYNC.md` ("Withdrawal requests") and `docs/superpowers/specs/2026-07-31-withdrawal-request-to-mintsoft-design.md`. Behaviour to reproduce:
+
+- **Intake.** Requests come from the WebToffee *EU Order Withdrawal Button* plugin in WooCommerce: request id, full vs partial, and approve/reject decisions. They reach IMS through the WooCommerce connector as a `SalesOrderWithdrawal` record (status `REQUESTED` / `APPROVED` / `REJECTED`, partial lines), logged with `logActivity`.
+- **Before first push.** An order with an open withdrawal is **not pushed** to Mintsoft until the request resolves.
+- **Mintsoft `NEW` / `ONBACKORDER`.** Hold with `MarkAwaitingConfirmation`, plus a token-scoped `[ims-withdrawal-hold:<token>]` marker comment for provenance.
+- **Mid-pick** (`PRINTED` … `PROCESSING`). Write nothing and re-evaluate each cron tick. Mintsoft has no API to raise a query, so support acts by hand.
+- **Uncertain pre-dispatch states** (`HOLDING`, `FAILED`, `QUERYRAISED`, …). Defer, with a one-time escalation.
+- **Packed or despatched.** Auto-reject the request with "order already dispatched".
+- **Approved, full.** `Cancel` the Mintsoft order, which returns stock. **Approved, partial.** Hold, and ask an operator to amend the lines. **Approved after dispatch.** Handle it as a return (Phase 7 returns inbox).
+- **Rejected.** Leave the hold in place and ask an operator to Confirm it. Auto-release is off by default, and when it is on it may release only a hold whose marker proves it is IMS's own.
+- **Guards.** Distinguish transport failures from rejections (no dead-lettering during an outage). Use compare-and-clear on queue entries. A WooCommerce cancellation always wins over a withdrawal. Foreign holds (an operator's, or a merge hold) are never released.
+- **Customer-facing.** The rejection reason is shown to the customer through the WebToffee plugin.
+
+Acceptance: every row of the Python sync's withdrawal branch table has an IMS test, and the cutover in Stage 7 carries open withdrawal state across (queue, hold token, ownership).
 
 ### Stage 3 — Read-side understanding of merged Mintsoft orders
 
@@ -78,7 +94,7 @@ Needed as soon as IMS reads Mintsoft order state, regardless of who performed th
 
 After a new sales order N is pushed to Mintsoft, IMS searches its **own** sales orders (no Mintsoft list call is needed):
 
-1. Exclude N if its destination is EU, any line is backordered, or it has a pending withdrawal.
+1. Exclude N if any line is backordered or it has a pending withdrawal. EU destinations are not excluded; they carry a customs/IOSS warning on the badge, the activity log and the Mintsoft comment.
 2. Candidates F: same normalised `customerEmail` and effective `shippingAddress` (line 1, line 2, city, postcode, country; billing fallback), linked Mintsoft order, and the same exclusions as N.
 3. Fresh Mintsoft GET per candidate. Keep it only if the status is `NEW`, or `AWAITINGCONFIRMATION` carrying an IMS merge-hold marker (chains). Candidates that resolve to the same Mintsoft id collapse into one.
 4. Result:
@@ -116,8 +132,9 @@ Target flow: **WooCommerce → IMS → Mintsoft**. Per sales channel:
 1. Stage 1 ships with the channel still owned by `python-sync`. IMS pushes nothing and does not flag or hold candidates, because the Python sync does that for its channels.
 2. Stage 3 runs in read-only mode against live Mintsoft orders created by the Python sync, and proves that fulfilment and tracking reconcile into IMS.
 3. Cut over: set the Python sync's `ENABLE_ORDER_SYNC = False` and flip channel ownership to `ims` in the same maintenance window. The IMS push must find existing Mintsoft orders by `OrderNumber` (including `a+b` survivors) and link them rather than recreating them.
-4. Port the Python merge state. Existing `_mintsoft_merged` / `merged_into`, `_mintsoft_merge_candidate`, `_mintsoft_merge_hold_since` / `_mintsoft_merge_hold_token` and `_mintsoft_merge_shipping_refund` WC meta are imported into `WmsOrderLink`. Python-placed holds (`[wc-merge-hold:` marker) count as IMS-owned for the purpose of chaining.
-5. Decommission the Python order sweep (systemd timer + webhook service). Product/stock sync retirement is tracked separately.
+4. Port open withdrawal state: `_mintsoft_wdraw_*` queue, hold token and ownership, imported into the Stage 2 model.
+5. Port the Python merge state. Existing `_mintsoft_merged` / `merged_into`, `_mintsoft_merge_candidate`, `_mintsoft_merge_hold_since` / `_mintsoft_merge_hold_token` and `_mintsoft_merge_shipping_refund` WC meta are imported into `WmsOrderLink`. Python-placed holds (`[wc-merge-hold:` marker) count as IMS-owned for the purpose of chaining.
+6. Decommission the Python order sweep (systemd timer + webhook service). Product/stock sync retirement is tracked separately.
 
 Acceptance: no Mintsoft order is created twice across the cutover, and every open merged order keeps both WC orders linked.
 
@@ -125,6 +142,8 @@ Acceptance: no Mintsoft order is created twice across the cutover, and every ope
 
 None. Resolved on 2026-09-28:
 - NI and the Channel Islands count as UK.
+- EU orders are flagged and held with a customs/IOSS warning, not excluded.
+- Withdrawal handling does not exist in IMS and is ported in full (Stage 2).
 - Double postage is flagged only.
 - Chains are allowed.
 - The sync flags and holds, and never auto-merges.
@@ -141,7 +160,7 @@ The beads Dolt server is only reachable from the Proxmox network, so these issue
 EPIC=$(bd create "Mintsoft outbound orders + same-customer merge candidates" -t epic -p 2 \
   -d "See docs/todo/mintsoft-order-consolidation-plan.md" --json | jq -r .id)
 bd create "Stage 1: Outbound sales-order push to Mintsoft (WMS Phase 8) with single-writer ownership switch" -t feature -p 2 --parent "$EPIC"
-bd create "Stage 2: Withdrawal-request awareness on SalesOrder (from WooCommerce)" -t feature -p 3 --parent "$EPIC"
+bd create "Stage 2: EU withdrawal-request handling in IMS (port hold/accept/reject lifecycle from the Python sync)" -t feature -p 1 --parent "$EPIC"
 bd create "Stage 3: Read-side handling of merged Mintsoft orders (survivor/twin, dispatch fan-out, guards)" -t feature -p 2 --parent "$EPIC"
 bd create "Stage 4: Merge candidates - detect and flag same-customer orders" -t feature -p 2 --parent "$EPIC"
 bd create "Stage 5: Merge candidates - hold both orders in Mintsoft for operator merge, reminder, never auto-release" -t feature -p 2 --parent "$EPIC"
