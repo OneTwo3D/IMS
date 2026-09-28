@@ -85,15 +85,20 @@ Mintsoft splits an order into parts (`NumberOfParts` / `Part`, `OrderItems` per 
 - Port the TrackShip re-fire for tracked orders that have no TrackShip shipment row.
 - Handle orders that no longer exist in Mintsoft (NOTFOUND after repeated misses).
 
-### 6. Refunds IMS → WooCommerce — record, never move money (Initial)
+### 6. Refunds IMS → WooCommerce — flag only, an operator refunds by hand (Initial)
 
-When a refund or credit note is created in IMS, create the matching WooCommerce refund with `POST /wc/v3/orders/{id}/refunds`, with:
+When a refund or credit note is created in IMS, IMS does **not** create a WooCommerce refund record, does **not** change the WooCommerce order status, and does **not** issue store credit. A full-amount WooCommerce refund record would move the order to `refunded` by itself, so no refund record is created at all.
 
-- `api_refund: false`, so the payment gateway is **not** called and no money moves;
-- `api_restock: false` where the WooCommerce version supports it (IMS owns stock);
-- no store credit issued.
+Instead IMS pushes only:
 
-Add a WooCommerce order note and an IMS badge: **"Manual action: refund £x via <gateway> or issue store credit."** An operator clears the flag once done. Webhook-echo suppression must stop the WooCommerce refund webhook from re-importing it into IMS.
+- **WooCommerce order meta** `_ims_to_be_refunded` holding the amount, currency, reason and IMS credit-note number, plus an order note: **"To be refunded: £x — refund via <gateway> or issue store credit manually."**
+- **An IMS badge** "To be refunded" on the sales order, and a list of flagged orders.
+
+The operator performs the refund in WooCommerce (gateway refund or store credit), then clears the flag in IMS. IMS removes the WooCommerce meta and adds a "refund handled" note.
+
+When the operator's manual WooCommerce refund comes back through the existing `refund.created` webhook, it must be matched to the IMS credit note that raised the flag, not imported as a second credit note.
+
+`pushImsStatusToWc` must never map `REFUNDED` or `PARTIALLY_REFUNDED` to a WooCommerce status. Today it maps only SHIPPED, CANCELLED and ON_HOLD; keep it that way, and add a test that locks it.
 
 ### 7. Product sync parity with the Python sync (Initial)
 
