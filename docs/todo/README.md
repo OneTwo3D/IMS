@@ -22,6 +22,7 @@ For plans that have shipped end-to-end, see `docs/completed/`.
 - [`shopify-connector-followup-plan.md`](shopify-connector-followup-plan.md) — shared work after the connector-owned Shopify implementation.
 - [`mintsoft-wms-connector-plan.md`](mintsoft-wms-connector-plan.md) — architectural design for the Mintsoft warehouse connector.
 - [`mintsoft-wms-connector-implementation-plan.md`](mintsoft-wms-connector-implementation-plan.md) — concrete file-by-file build plan for the Mintsoft connector.
+- [`mintsoft-order-consolidation-plan.md`](mintsoft-order-consolidation-plan.md) — epic: outbound sales-order push to Mintsoft (Phase 8 prerequisite) plus automatic same-customer order consolidation to save shipping.
 - [`WC-followup-plan.md`](WC-followup-plan.md) — WooCommerce work remaining after the webhook-first shift.
 - [`xero-followup-plan.md`](xero-followup-plan.md) — Xero connector boundary work needed before a clean swap to a different accounting connector.
 
