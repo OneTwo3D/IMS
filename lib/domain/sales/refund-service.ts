@@ -718,7 +718,7 @@ async function buildRefundFallbackReturnRows(
         select: {
           id: true,
           lines: {
-            select: { productId: true, qty: true, salesOrderLineId: true },
+            select: { id: true, productId: true, description: true, qty: true, salesOrderLineId: true },
           },
         },
       },
@@ -786,24 +786,56 @@ async function buildRefundFallbackReturnRows(
   for (const [lineId, rows] of sourceRowsByLine) {
     for (const [productId, qty] of rows) remainingByLineProduct.set(lineProductKey(lineId, productId), qty)
   }
+  // THE SAME LINE-SELECTION RULE the return builder applies below (Codex r2 HIGH A): a linked line is its
+  // own source; an unlinked one goes to the first line of its product whose description matches, else the
+  // first line of the product. Attributing a prior unlinked refund anywhere else debits the wrong line's cap.
+  const selectSourceLine = (candidate: { lineId?: string | null; productId: string; description: string }) =>
+    candidate.lineId
+      ? lineById.get(candidate.lineId) ?? null
+      : (lineCandidatesByProduct.get(candidate.productId) ?? []).find((c) => c.description === candidate.description)
+        ?? (lineCandidatesByProduct.get(candidate.productId) ?? [])[0]
+        ?? null
+  const debitLineProduct = (lineId: string, productId: string, qty: number) => {
+    const key = lineProductKey(lineId, productId)
+    remainingByLineProduct.set(key, Math.max(0, (remainingByLineProduct.get(key) ?? 0) - qty))
+  }
+  const REFUND_MOVEMENT_LINE = /:line:([^:]+):warehouse:/
   for (const refund of order.refunds) {
     if (excludeRefundId && refund.id === excludeRefundId) continue
+    const refundLineById = new Map(refund.lines.map((refundLine) => [refundLine.id, refundLine]))
+
+    // WHAT WAS ACTUALLY RETURNED is on record: one inbound movement per (refund line, COMPONENT product),
+    // in component units, keyed with the refund line id. Subtracting that — not a conversion from the
+    // refund line's own quantity — is what keeps a part-shipped KIT honest (Codex r2 HIGH B): a refund
+    // of one kit can return both shipped components through the accounting snapshot, which a
+    // "qty x shipped/ordered" estimate undercounts.
+    const movements = await client.stockMovement.findMany({
+      where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
+      select: { productId: true, qty: true, idempotencyKey: true },
+    })
+    const attributedLineIds = new Set<string>()
+    for (const movement of movements) {
+      const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
+      const refundLine = refundLineId ? refundLineById.get(refundLineId) : undefined
+      const sourceOf = refundLine
+        ? selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId ?? '', description: refundLine.description })
+        : null
+      if (!sourceOf || !refundLine) continue
+      debitLineProduct(sourceOf.id, movement.productId, refundBoundaryNumber(movement.qty))
+      attributedLineIds.add(refundLine.id)
+    }
+
+    // A refund line with NO movement on record (a legacy refund, or one whose stock step has not run) is
+    // estimated from its own quantity, the conservative direction.
     for (const refundLine of refund.lines) {
-      if (!refundLine.productId) continue
-      const attributed = (refundLine.salesOrderLineId && lineById.has(refundLine.salesOrderLineId)
-        ? lineById.get(refundLine.salesOrderLineId)
-        : (lineCandidatesByProduct.get(refundLine.productId) ?? [])[0]) ?? null
-      if (!attributed) continue
-      const rows = sourceRowsByLine.get(attributed.id)
-      const attributedLineQty = refundBoundaryNumber(attributed.qty)
-      if (!rows || attributedLineQty <= 0) continue
+      if (!refundLine.productId || attributedLineIds.has(refundLine.id)) continue
+      const attributed = selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId, description: refundLine.description })
+      const rows = attributed ? sourceRowsByLine.get(attributed.id) : undefined
+      const attributedLineQty = attributed ? refundBoundaryNumber(attributed.qty) : 0
+      if (!attributed || !rows || attributedLineQty <= 0) continue
       for (const [productId, rowQty] of rows) {
         const unitsPerLineUnit = rows.size === 1 && productId === attributed.productId ? 1 : rowQty / attributedLineQty
-        const key = lineProductKey(attributed.id, productId)
-        remainingByLineProduct.set(
-          key,
-          Math.max(0, (remainingByLineProduct.get(key) ?? 0) - refundBoundaryNumber(refundLine.qty) * unitsPerLineUnit),
-        )
+        debitLineProduct(attributed.id, productId, refundBoundaryNumber(refundLine.qty) * unitsPerLineUnit)
       }
     }
   }
