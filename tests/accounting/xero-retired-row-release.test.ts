@@ -175,7 +175,9 @@ mock.module('@/lib/connectors/xero/outbox', {
 // assertion below would be about a row that was never going to be created.
 mock.module('@/lib/accounting', {
   namedExports: {
-    getPaymentAccountMap: async () => ({ card: 'BANK-1' }),
+    getPaymentAccountMap: async () => JSON.stringify({ 'card:GBP': 'BANK-1' }), // o3d-j625 r5: production returns the setting's JSON STRING
+    // o3d-j625 r4: the processor confirms the mapped account against its own chart; held here.
+    accountingBankAccountBelongsTo: async () => true,
     lookupPaymentAccount: () => 'BANK-1',
   },
 })

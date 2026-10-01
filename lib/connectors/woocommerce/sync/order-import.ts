@@ -2,8 +2,12 @@
  * WooCommerce → IMS order import.
  */
 
+import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
@@ -15,6 +19,7 @@ import { decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } fro
 import {
   buildHeldSalesInvoicePayload,
   buildReleasedSalesInvoicePayload,
+  heldSalesInvoiceChartConnector,
   HELD_SALES_INVOICE_RECORD_KIND,
   heldSalesInvoiceQueueWhere,
   HELD_SALES_INVOICE_ORDER_MISSING_MESSAGE,
@@ -1004,6 +1009,8 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
   orderNumber: string
   metaKey: string
   accountingPayload: Record<string, unknown>
+  /** o3d-j625: the chart the frozen account codes came from, parked with them. */
+  chartConnector: AccountingConnectorId | null
 }): Promise<void> {
   const held = buildHeldSalesInvoicePayload({
     externalOrderId: String(params.wcOrder.id),
@@ -1012,6 +1019,7 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
     orderNumber: params.orderNumber,
     metaKey: params.metaKey,
     accountingPayload: params.accountingPayload,
+    chartConnector: params.chartConnector,
   })
   const jsonPayload = JSON.parse(JSON.stringify(held)) as Prisma.InputJsonValue
   const data = {
@@ -1143,14 +1151,66 @@ async function releaseHeldWcSalesInvoice(
 
   const held = row.payload
   const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
+  // o3d-j625 r2 (Codex HIGH 1/HIGH 2) — A HOLD THAT CANNOT NAME ITS CHART IS NOT RELEASED.
+  //
+  // `chartConnector` is now REQUIRED on the enqueue, and `undefined` here means exactly one thing: the
+  // hold was parked before IMS recorded which connector's account codes were frozen into it (or it
+  // carries a value this build cannot route). The frozen payload has real account codes in it, so the
+  // two substitutes are both wrong — resolving the active connector at release time is the o3d-j625
+  // defect over a gap that can be DAYS wide, and `null` would claim the codes were the empty defaults.
+  //
+  // Left PENDING with the reason rather than marked FAILED: the three FAILED sentences check 6 of
+  // `verify.sql` keys on are fixed in a migration, and adding a fourth is a schema change this does not
+  // need. The sweep re-reads the row, writes the same note and changes nothing, so the retry is
+  // idempotent; what it is NOT is silent.
+  const heldChartConnector = heldSalesInvoiceChartConnector(held)
+  if (heldChartConnector === undefined) {
+    await noteHeldReleaseFailure(
+      row.id,
+      `WooCommerce numbered this invoice ${invoiceNumber}, but this hold was parked before IMS recorded `
+      + 'which accounting connector its frozen account codes came from, so releasing it could post one '
+      + 'ledger\u2019s codes into the other\u2019s books. NOTHING was queued and nothing will be: queue the '
+      + 'sales invoice from the order instead.',
+    )
+    if (logFailure) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'sales_invoice_release_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}) but the held `
+          + 'accounting payload does not say which connector\u2019s chart of accounts it was built from, so the '
+          + 'sales invoice was NOT queued. Queue it from the order.',
+        metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber },
+        resolveUser: false,
+      }).catch(() => {})
+    }
+    return 'not-queued'
+  }
+  // o3d-j625 r3 (Codex HIGH 1 family): the outcome is CAPTURED, not because the row re-read below is
+  // insufficient — it is the stronger check and it stays — but because the re-read cannot say WHY there
+  // is no row, and the message written when there is none asserted the wrong reason ("the connector is
+  // disconnected, its sync is switched off") for a REFUSAL. A refusal is a retired chart, and telling an
+  // operator to check a toggle sends them somewhere the answer is not.
+  const enqueueOutcome: { outcome?: EnqueueOutcomeLike } = {}
+  // o3d-j625 r6 (review M1): the release's enqueue identity, ONCE — the enqueue below and the refusal row's
+  // fallback key both read it, so the two cannot name different postings.
+  const releaseIdentity = {
+    type: 'SALES_INVOICE' as const,
+    referenceType: 'SalesOrder',
+    referenceId: orderId,
+    payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
+    idempotencyKey,
+  }
   try {
     const { queueAccountingSync } = await import('@/lib/accounting')
-    await queueAccountingSync({
-      type: 'SALES_INVOICE',
-      referenceType: 'SalesOrder',
-      referenceId: orderId,
-      payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
-      idempotencyKey,
+    enqueueOutcome.outcome = await queueAccountingSync({
+      ...releaseIdentity,
+      // o3d-j625: route by the chart FROZEN with this payload, not by whatever is active at release
+      // time. A hold that cannot name one never gets here — it is refused above.
+      chartConnector: heldChartConnector,
     })
   } catch (error) {
     // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
@@ -1198,13 +1258,45 @@ async function releaseHeldWcSalesInvoice(
   if (!queued) {
     // Left PENDING on purpose, exactly as the throwing case is: the sweep tries again, and the
     // deterministic key means a later success adds one row, not two.
+    // o3d-j625 r3: the reason the enqueue itself gave, where it gave one.
+    const cause = enqueueOutcome.outcome?.reason === 'refused'
+      ? 'The accounting queue REFUSED it: this invoice was built from a chart of accounts whose connector '
+        + 'is no longer the active one (see the accounting activity log for which), so its account codes do '
+        + 'not describe the ledger it would be written to.'
+      : 'The usual cause is that the accounting connector is disconnected, its sync is switched off, or '
+        + 'Sales Invoices are set to off.'
     await noteHeldReleaseFailure(
       row.id,
       `WooCommerce numbered this invoice ${invoiceNumber}, but queueing the held sales invoice produced no `
-      + 'accounting sync row, so NOTHING will post. The usual cause is that the accounting connector is '
-      + 'disconnected, its sync is switched off, or Sales Invoices are set to off. Retried by the WooCommerce '
-      + 'reconcile sweep.',
+      + `accounting sync row, so NOTHING will post. ${cause} Retried by the WooCommerce reconcile sweep.`,
     )
+    // o3d-j625 r4 — THE CASE THAT SETTLED THE DECISION. This runs on a sweep, days after the order was
+    // imported, with no operator present: the hold stays PENDING and the only record was a log line
+    // nobody reads. The refusal is now outstanding work in the exception inbox, and the release that
+    // eventually queues the invoice clears it (the facade clears on a queued enqueue).
+    // The key comes from the SAME params the enqueue above was given, so it is the key the facade's clear uses.
+    await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, enqueueOutcome.outcome?.posting ?? accountingPostingKey(releaseIdentity), {
+      kind: 'sales_invoice_held_release',
+      chartConnector: heldChartConnector,
+      // o3d-j625 r5 (review M-4): the ACTIVE connector, read as such. r4 wrote the CHART's connector into
+      // this column (via the enqueue's reported connector, which on a refusal is the chart's) and, because
+      // this write lands after the facade's own, CLOBBERED the correct pair the facade had just recorded.
+      // The enqueue's own report of it first; read at report time only when the enqueue reported none.
+      activeConnector: enqueueOutcome.outcome?.activeConnector ?? await activeAccountingConnectorForReport(),
+      reason: enqueueOutcome.outcome?.reason === 'refused' ? 'retired_chart' : 'held_release_not_queued',
+      committed: `WooCommerce order ${wcOrder.externalOrderNumber} is imported and holds invoice number ${invoiceNumber}`,
+      remedy:
+        // o3d-j625 r7 (review H-A): r5 offered "queue the sales invoice from the order", which does not exist,
+        // and the sweep retries for the connector the invoice was BUILT for, so it refuses for ever after a
+        // permanent switch.
+        'No sales invoice will post for this order until the hold is released. The WooCommerce reconcile '
+        + 'sweep retries it for the connector it was built for, so switching back releases it. Otherwise raise '
+        + 'the invoice by hand in the ledger and mark this row handled — that stops the sweep posting it too.',
+      detail: { invoiceNumber, idempotencyKey, shoppingSyncLogId: row.id },
+    },
+    // review M-5: when the facade already recorded this refusal with its specific reason, this write only
+    // adds what the release knows — it must not count the same refusal twice.
+    { mergeOnly: enqueueOutcome.outcome?.refusalRecorded === true })
     if (logFailure) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -1214,11 +1306,15 @@ async function releaseHeldWcSalesInvoice(
         level: 'WARNING',
         description:
           `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}), but queueing the held `
-          + 'sales invoice produced no accounting sync row, so NOTHING will post. The usual cause is that the '
-          + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off; the '
-          + 'other is that the sales order was deleted. The order stays queued for release and is retried by the '
+          + `sales invoice produced no accounting sync row, so NOTHING will post. ${cause} The other possibility is `
+          + 'that the sales order was deleted. The order stays queued for release and is retried by the '
           + 'WooCommerce reconcile sweep.',
-        metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber, idempotencyKey },
+        metadata: {
+          connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber, idempotencyKey,
+          // o3d-j625 r3: what the enqueue actually answered, beside the absence the re-read found.
+          enqueueReason: enqueueOutcome.outcome?.reason ?? null,
+          enqueueConnector: enqueueOutcome.outcome?.connector ?? null,
+        },
         resolveUser: false,
       }).catch(() => {})
     }
@@ -2419,12 +2515,44 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       }
 
       if (invoiceNumberResolution.ok) {
-        await queueAccountingSync({
+        const enqueued = await queueAccountingSync({
           type: 'SALES_INVOICE',
           referenceType: 'SalesOrder',
           referenceId: so.id,
           payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload },
+          // o3d-j625: every `accountCode` in `accountingPayload` is `settings.*` from the single read
+          // above, and the import does a great deal of work between the two — the amount-convention
+          // resolution, the per-line tax mapping, the invoice-number resolution. Routed by the chart's
+          // own connector so the row cannot be the other connector's.
+          chartConnector: settings.connector,
         })
+        // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ, which on this arm nothing did.
+        //
+        // The enclosing `catch` only sees THROWS. A refusal returned cleanly, and the import then wrote
+        // `shoppingSyncLog { status: 'SYNCED' }`, an INFO "imported" activity log, and
+        // `{ success: true }` — an order recorded as fully synced with no invoice queued. Unlike the
+        // HELD-release arm below, there was no row re-read to catch it either.
+        if (postingIsOwed(enqueued)) {
+          await reportPostingNotQueued({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'sales_invoice_not_queued',
+            // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+            kind: 'sales_invoice_import',
+            posting: `the sales invoice for imported WooCommerce order ${orderNumber}`,
+            committed: 'the order is imported and marked synced in IMS',
+            remedy:
+              // o3d-j625 r6 (review H4): there is no re-queue from the order; the import queues the invoice once.
+              'No invoice will post for this order. Raise it by hand in the books it belongs to.',
+            outcome: enqueued,
+            metadata: {
+              connector: 'woocommerce',
+              externalOrderId: String(wcOrder.id),
+              orderNumber,
+              chartConnector: settings.connector,
+            },
+          })
+        }
       } else {
         await holdWcSalesInvoiceForMissingNumber({
           salesOrderId: so.id,
@@ -2432,6 +2560,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           orderNumber,
           metaKey: invoiceNumberResolution.metaKey,
           accountingPayload,
+          // o3d-j625: the same chart read that produced every account code in `accountingPayload`,
+          // parked alongside them — the release can be days later and must not re-resolve it.
+          chartConnector: settings.connector,
         })
       }
     } catch (accountingError) {

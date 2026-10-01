@@ -14,14 +14,24 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
+  // o3d-j625 r10 (Codex round 9, HIGH) — BEFORE THE CONNECTOR GATES, DELIBERATELY.
+  //
+  // These are refusals a business transaction could not record because another transaction held the
+  // posting key; they are replayed here, from the pool, where waiting for that key is allowed. Nearly all
+  // of them exist BECAUSE the accounting connector is retired, switched or unconfigured — which is
+  // exactly when every branch below returns `skipped`. Draining inside one of those branches would gate
+  // the reconciler off in the situations that produce its work, so it runs on every tick regardless of
+  // which connector, if any, is enabled. It touches no connector and makes no remote call.
+  const provisionalPostingRefusals = await reconcileProvisionalRefusals()
+
   // Dispatch to the active accounting connector
   if (await isIntegrationPluginEnabled('xero')) {
     const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
     if (enabled?.value !== 'true') {
-      return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
+      return NextResponse.json({ skipped: true, reason: 'Xero sync disabled', provisionalPostingRefusals })
     }
     if (!(await isAccountingConnectorConnected('xero'))) {
-      return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
+      return NextResponse.json({ skipped: true, reason: 'Xero not connected', provisionalPostingRefusals })
     }
     // audit-grob: drain the landed-cost adjustment-journal backstop FIRST so any
     // journals lost to a crash are re-queued (into AccountingSyncLog) in time for
@@ -45,7 +55,7 @@ export async function GET(request: Request) {
     } catch (reenqueueError) {
       console.error('accounting-sync cron: credit-note allocation re-enqueue sweep failed', reenqueueError)
     }
-    return NextResponse.json({ ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox })
+    return NextResponse.json({ ...result, backReferenceRepair, creditNoteAllocationReenqueue, landedCostJournalOutbox, provisionalPostingRefusals })
   }
 
   // THE QUICKBOOKS BRANCH WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
@@ -61,7 +71,7 @@ export async function GET(request: Request) {
   // POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION — are what a second connector would
   // have to satisfy before its rows may be swept. See docs/archive/quickbooks-connector-removal.md.
 
-  return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
+  return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled', provisionalPostingRefusals })
 }
 
 // audit-grob: drain the landed-cost adjustment-journal backstop. Called only from
@@ -74,6 +84,19 @@ async function drainLandedCostJournalOutbox(): Promise<Awaited<ReturnType<typeof
     return await processLandedCostJournalOutbox()
   } catch (outboxError) {
     console.error('accounting-sync cron: landed-cost journal outbox drain failed', outboxError)
+    return undefined
+  }
+}
+
+// o3d-j625 r10: replay the refusals that could not take their posting key inside a caller's
+// transaction. Never allowed to fail the tick — a drain outage must not stop the sync queue — and a
+// failure leaves the claims PENDING, which the exception inbox surfaces past its grace.
+async function reconcileProvisionalRefusals(): Promise<Awaited<ReturnType<typeof import('@/lib/domain/accounting/posting-refusal-reconcile')['reconcileProvisionalPostingRefusals']>> | undefined> {
+  try {
+    const { reconcileProvisionalPostingRefusals } = await import('@/lib/domain/accounting/posting-refusal-reconcile')
+    return await reconcileProvisionalPostingRefusals()
+  } catch (reconcileError) {
+    console.error('accounting-sync cron: provisional posting-refusal reconciliation failed', reconcileError)
     return undefined
   }
 }

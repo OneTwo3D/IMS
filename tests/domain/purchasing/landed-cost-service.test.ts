@@ -880,14 +880,46 @@ async function directRecalcForSingleLayer(params: {
   return recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
 }
 
-test('both landed-cost recalc paths exclude CANCELLED freight POs (audit-izrf)', () => {
-  // Query-level `where` filtering can't be exercised through the mocked tx, so
-  // assert at the source level that BOTH the linked path (recalculateLandedCosts)
-  // and the direct path's landedCostLinks include carry the cancelled-freight
-  // exclusion — a cancelled freight PO must never re-enter landed-cost math.
+test('both landed-cost recalc paths exclude CANCELLED freight POs, from ONE definition (audit-izrf; o3d-6nd55 r2)', () => {
+  // Query-level `where` filtering can't be exercised through the mocked tx, so this asserts at the
+  // source level that BOTH the linked path (recalculateLandedCosts) and the direct path's
+  // landedCostLinks include carry the cancelled-freight exclusion — a cancelled freight PO must never
+  // re-enter landed-cost math.
+  //
+  // WHY THE SHAPE OF THIS TEST CHANGED (o3d-6nd55 r2). It used to count literal copies of the
+  // predicate and require at least TWO, which is exactly the drift that let a THIRD reader — the WMS
+  // stock-sync align-up receipt, lib/connectors/mintsoft/sync/stock-sync.ts — read `landedCostLinks`
+  // with NO filter at all and add cancelled freight back into a cost layer and a STOCK_RECEIPT
+  // journal. A lower bound on copies rewards duplication and says nothing about a reader that has no
+  // copy. The predicate now has ONE definition that every reader derives from, so this asserts:
+  //   · that definition exists, verbatim;
+  //   · there is EXACTLY ONE literal copy of the predicate in the file — the definition itself. This
+  //     is the half that is universal rather than existential: a second copy re-appearing anywhere in
+  //     the file fails, which is the drift the consolidation removes;
+  //   · and both recalc paths derive from it.
   const source = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
-  const matches = source.match(/freightPO:\s*\{\s*status:\s*\{\s*not:\s*'CANCELLED'\s*\}\s*\}/g) ?? []
-  assert.ok(matches.length >= 2, `expected the cancelled-freight filter in both recalc paths, found ${matches.length}`)
+
+  const definition = `export const CONTRIBUTING_LANDED_COST_LINK_WHERE = {
+  freightPO: { status: { not: 'CANCELLED' } },
+} as const`
+  assert.ok(
+    source.includes(definition),
+    'the cancelled-freight predicate must be defined, verbatim, as CONTRIBUTING_LANDED_COST_LINK_WHERE',
+  )
+
+  const literals = source.match(/freightPO:\s*\{\s*status:\s*\{\s*not:\s*'CANCELLED'\s*\}\s*\}/g) ?? []
+  assert.equal(
+    literals.length,
+    1,
+    `the predicate must have EXACTLY ONE definition and no inline copies; found ${literals.length}. `
+    + 'A second copy is how the three readers came to disagree in the first place.',
+  )
+
+  const derivations = source.match(/\.\.\.CONTRIBUTING_LANDED_COST_LINK_WHERE/g) ?? []
+  assert.ok(
+    derivations.length >= 2,
+    `both recalc paths must derive from the shared predicate; found ${derivations.length} derivation(s)`,
+  )
 })
 
 test('recalculateDirectLandedCosts rejects CLOSED purchase orders', async () => {

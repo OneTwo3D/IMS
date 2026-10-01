@@ -6,7 +6,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart, type AccountingSettings } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import {
   addCostLayerSourceLines,
   cogsEntryDataFromConsumed,
@@ -536,6 +537,10 @@ export async function updateManufacturingOrderStatus(
     // Surface skip reason post-tx (set inside the tx). Lets us log a
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
+    // o3d-j625 r3 (Codex HIGH 1 family): the enqueue's answer, out of the transaction the same way the
+    // skip reason is. A HOLDER, not a `let`: a `let` assigned only inside the callback is narrowed to
+    // `never` by TypeScript, which makes every later read of it unable to observe anything at all.
+    const manufacturingJournalOutcome: { outcome?: EnqueueOutcomeLike; chartConnector?: string | null } = {}
     let disassemblyFallback = null as { recoveredLayerCount: number } | null
     // audit-wght: the quantity actually booked into stock at completion — the
     // ASSEMBLY actual (yield loss) when supplied, else the planned quantity.
@@ -902,9 +907,20 @@ export async function updateManufacturingOrderStatus(
           0,
         )
         if (journalTotalBase > 0) {
-          const shouldPostJournal = await isAccountingSyncTypeEnabled('MANUFACTURING_JOURNAL')
+          // o3d-j625 r4 (SWEEP 1): the chart FIRST, then the posting verdict asked OF IT. This used to ask
+          // `isAccountingSyncTypeEnabled` (a resolution of the active connector) and then read the chart
+          // (a second one), so the gate and the account codes could be about two different connectors.
+          // A retired chart is an OWED posting: recorded as a refusal and reported after the commit by
+          // the same channel a declined enqueue uses, never a silent skip.
+          const settings = await getAccountingSettings()
+          const journalVerdict = await accountingPostingVerdictForChart(settings.connector, 'MANUFACTURING_JOURNAL')
+          // review M-2: carried out of the transaction, so the post-commit report names the chart.
+          manufacturingJournalOutcome.chartConnector = settings.connector
+          if (journalVerdict.verdict === 'chart-retired') {
+            manufacturingJournalOutcome.outcome = { queued: false, reason: 'refused', connector: journalVerdict.chartConnector }
+          }
+          const shouldPostJournal = journalVerdict.verdict === 'post'
           if (shouldPostJournal) {
-            const settings = await getAccountingSettings()
             const defaultOverheadAccount = settings.manufacturingOverheadAccount
             const inventoryAccount = settings.inventoryAccount
             if (!inventoryAccount) {
@@ -949,6 +965,13 @@ export async function updateManufacturingOrderStatus(
                 type: 'MANUFACTURING_JOURNAL',
                 referenceType: 'ProductionOrder',
                 referenceId: id,
+                // o3d-j625 r2: every line of this journal is `settings.*` — `settings.inventoryAccount`
+                // on the debit, and `settings.manufacturingOverheadAccount` as the fallback account on
+                // each credit line (and written BACK onto the cost lines just above, which makes the
+                // attribution durable rather than incidental). The transaction that encloses this
+                // consumes components, creates output cost layers and recovers disassembly cost first,
+                // so the window between the chart read and the enqueue spans the whole completion.
+                chartConnector: settings.connector,
                 idempotencyKey: `MFG_JOURNAL:${id}:${stableHash({
                   completedAt: now.toISOString(),
                   lines,
@@ -959,6 +982,13 @@ export async function updateManufacturingOrderStatus(
                   narration,
                   lines,
                 },
+                // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER, CAPTURED. The return value was
+                // discarded entirely and the same transaction then completed the order
+                // (`status, completedAt, qtyProduced`) having ALREADY rewritten the cost lines'
+                // `accountCode`s: the MO closed with overhead capitalised in IMS and no journal in the
+                // ledger, reported as a success. There is already a post-commit reporting channel here
+                // for the SKIPPED case (`manufacturingJournalSkipReason`); a decline uses the same one.
+                reportOutcome: (outcome) => { manufacturingJournalOutcome.outcome = outcome },
               })
             }
           }
@@ -976,6 +1006,26 @@ export async function updateManufacturingOrderStatus(
           data: { status, completedAt: now, qtyProduced: producedQty, usedDisassemblyFallback: disassemblyFallback !== null || equalSplitOverheadUsed },
         })
       })
+
+      // o3d-j625 r3 (Codex HIGH 1 family): and the DECLINED case, which had no channel at all.
+      if (manufacturingJournalOutcome.outcome && postingIsOwed(manufacturingJournalOutcome.outcome)) {
+        await reportPostingNotQueued({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: id,
+          action: 'manufacturing_journal_not_queued',
+          // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+          kind: 'manufacturing_journal',
+          posting: `the manufacturing overhead journal for ${orderPreview.reference}`,
+          committed: 'the production order is COMPLETE in IMS and its overhead is capitalised into the output cost',
+          remedy:
+            'Inventory in the ledger does not carry the capitalised overhead and the overhead accounts '
+            + 'have not been relieved. Post the journal by hand.',
+          outcome: manufacturingJournalOutcome.outcome,
+          // review M-2: the chart WAS in scope here; r4 left it out and the inbox rendered "none",
+          // which reads as "no connector was on" rather than "nobody wrote it down".
+          metadata: { chartConnector: manufacturingJournalOutcome.chartConnector ?? null, productionOrderId: id },
+        })
+      }
 
       // Surface the journal-skipped warning post-tx if needed (set inside tx)
       if (manufacturingJournalSkipReason) {
@@ -1491,6 +1541,13 @@ async function recalculateManufacturingCostLayers(
   // and the companion MANUFACTURING_RECLASS journal share ONE nonce — an A→B→A
   // cost edit must post (or dedup) both together, never just one (cogs-audit scjz.33).
   recalcRunId: string,
+  /**
+   * o3d-j625 r4 (SWEEP 1): the chart the companion MANUFACTURING_RECLASS is built from, handed to the
+   * shipment COGS refresh so its COGS_REVERSAL rows and its batch-ownership decision are about the SAME
+   * connector as the reclass that nets their delta. `null` = no reclass chart (not posting): the refresh
+   * then reads its own, once.
+   */
+  reclassChart: AccountingSettings | null,
 ): Promise<{ cogsDeltaBase: number; inventoryDeltaBase: number }> {
   const po = await tx.productionOrder.findUnique({
     where: { id: productionOrderId },
@@ -1569,7 +1626,10 @@ async function recalculateManufacturingCostLayers(
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
     const shipmentRefresh = await refreshShipmentCogsForCostLayerChange(tx, li.id, {
       recalcRunId,
-      // o3d-c08y: named in a refusal, if this recompute would take a journaled shipment below zero.
+      // BOTH, and they are about different things: the chart this recompute resolved ONCE (o3d-j625 r4,
+      // so every connector question in the refresh is asked of one chart) and the context c08y names in a
+      // below-zero refusal. Neither replaces the other.
+      ...(reclassChart ? { accountingSettings: reclassChart } : {}),
       revaluationContext: { source: 'manufacturing_recompute', operation: 'recompute_production_order', productionOrderId },
     })
     // audit-3aph: the shipment path owns the sold-finished-goods COGS revaluation
@@ -1619,6 +1679,8 @@ export async function updateManufacturingCostLines(
     let newTotal = 0
     let cleanedForWrite = cleaned
 
+    // o3d-j625 r3 (Codex HIGH 1 family): see the holder note above.
+    const reclassOutcome: { outcome?: EnqueueOutcomeLike; chartConnector?: string | null } = {}
     await db.$transaction(async (tx) => {
       await tx.$queryRaw(
         Prisma.sql`SELECT id FROM production_orders WHERE id = ${productionOrderId} FOR UPDATE`,
@@ -1631,10 +1693,19 @@ export async function updateManufacturingCostLines(
       oldTotal = existing.reduce((s, l) => s + Number(l.amountBase), 0)
       newTotal = cleaned.reduce((s, l) => s + l.amountBase, 0)
 
-      const shouldPostReclass = po.status === 'COMPLETED'
-        ? await isAccountingSyncTypeEnabled('MANUFACTURING_RECLASS')
-        : false
-      const settings = shouldPostReclass ? await getAccountingSettings() : null
+      // o3d-j625 r4 (SWEEP 1): chart first, verdict asked OF IT — see the completion journal above. A
+      // retired chart is recorded as a refusal and reported after the commit.
+      const reclassChart = po.status === 'COMPLETED' ? await getAccountingSettings() : null
+      const reclassVerdict = reclassChart
+        ? await accountingPostingVerdictForChart(reclassChart.connector, 'MANUFACTURING_RECLASS')
+        : null
+      // review M-2: same — the chart, out to the report.
+      reclassOutcome.chartConnector = reclassChart?.connector ?? null
+      if (reclassVerdict?.verdict === 'chart-retired') {
+        reclassOutcome.outcome = { queued: false, reason: 'refused', connector: reclassVerdict.chartConnector }
+      }
+      const shouldPostReclass = reclassVerdict?.verdict === 'post'
+      const settings = shouldPostReclass ? reclassChart : null
       if (shouldPostReclass && settings?.manufacturingOverheadAccount) {
         cleanedForWrite = cleaned.map((line) => (
           line.amountBase > 0 && !line.accountCode
@@ -1671,7 +1742,7 @@ export async function updateManufacturingCostLines(
         // the recalc) and the MANUFACTURING_RECLASS key below, so an A→B→A edit
         // posts/dedups both together (cogs-audit scjz.33).
         const recalcRunId = randomUUID()
-        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId)
+        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId, recalcRunId, reclassChart)
         cogsDeltaBase = deltas.cogsDeltaBase
         inventoryDeltaBase = deltas.inventoryDeltaBase
 
@@ -1730,6 +1801,17 @@ export async function updateManufacturingCostLines(
               type: 'MANUFACTURING_RECLASS',
               referenceType: 'ProductionOrder',
               referenceId: productionOrderId,
+              // o3d-j625 r2: `settings.inventoryAccount` and `settings.cogsAccount` are the
+              // capitalisation legs and the overhead legs are the cost lines' own stored
+              // `accountCode`s — which were themselves defaulted from `settings
+              // .manufacturingOverheadAccount` when the order completed.
+              //
+              // `settings` is read exactly when `shouldPostReclass` is true and this whole block is
+              // inside `if (shouldPostReclass)`, so the `null` arm is unreachable. Written as a fallback
+              // rather than a `!` assertion because the two facts are three nested blocks apart — and
+              // `null` is the fail-closed answer anyway: it writes nothing instead of posting a reclass
+              // whose chart nobody read.
+              chartConnector: settings?.connector ?? null,
               idempotencyKey: reclassIdempotencyKey,
               payload: {
                 date: new Date().toISOString().slice(0, 10),
@@ -1737,6 +1819,10 @@ export async function updateManufacturingCostLines(
                 narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
                 lines: journalLines,
               },
+              // o3d-j625 r3 (Codex HIGH 1 family): the answer. Discarded, while the retro cost change it
+              // compensates for was persisted by this same transaction and an INFO log written saying
+              // the cost lines had been updated.
+              reportOutcome: (outcome) => { reclassOutcome.outcome = outcome },
             })
           }
         }
@@ -1754,6 +1840,24 @@ export async function updateManufacturingCostLines(
         },
       })
     }, { maxWait: 5000, timeout: 20000 })
+
+    if (reclassOutcome.outcome && postingIsOwed(reclassOutcome.outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: productionOrderId,
+        action: 'manufacturing_reclass_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'manufacturing_reclass',
+        posting: `the manufacturing reclass journal for production order ${productionOrderId}`,
+        committed: 'the retrospective manufacturing-cost change is saved in IMS',
+        remedy:
+          'The compensating reclass is NOT in the ledger, so COGS and inventory there still reflect the '
+          + 'old cost. Post it by hand.',
+        outcome: reclassOutcome.outcome,
+        // review M-2: the reclass chart was in scope (`reclassChart`), and was not recorded.
+        metadata: { chartConnector: reclassOutcome.chartConnector ?? null, productionOrderId },
+      })
+    }
 
     revalidatePath('/manufacturing')
     revalidatePath(`/manufacturing/${productionOrderId}`)

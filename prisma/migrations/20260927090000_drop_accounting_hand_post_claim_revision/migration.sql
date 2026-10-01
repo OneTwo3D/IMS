@@ -1,0 +1,26 @@
+-- o3d-j625 r28 (Codex round 27, HIGH 2) — DROP THE HAND-POST CLAIM REVISION TABLE, FORWARD-ONLY.
+--
+-- r26 deleted the completeness assertion this table existed to support, and deleted the table's own
+-- migration (20260926213000) along with it. THAT WAS WRONG, and the review is right about why: deleting an
+-- applied migration is not a way to remove a table. On any database that had already applied
+-- 20260926213000, `migrate deploy` then had nothing that dropped the table, while `db:schema:drift`
+-- compared the live schema against a model-free schema.prisma and rejected the extra table. The upgrade
+-- path was broken in a way a FRESH CI database can never show, because a fresh database never applies the
+-- deleted migration — which is exactly how it got through a fully green gate.
+--
+-- So 20260926213000 is restored byte-for-byte (its md5 matches the pre-deletion blob) and this migration
+-- removes the table the only way that works for both a fresh database and one already upgraded: forward,
+-- as its own step, after it.
+--
+-- The MODEL stays out of schema.prisma. Nothing reads the revision any more: the "that is every active
+-- claim" sentence is gone and is not coming back (r26 records why at length), the four bumps in the claim,
+-- the release and the two mark exits went with it, and r26's clear-decline fix needs no revision. Table
+-- dropped, model absent, drift clean on both paths.
+--
+-- `IF EXISTS` is deliberate and is NOT defensive padding. Between r26 and r28 the repo shipped a state in
+-- which the table existed in databases but in no migration, and the only way to make `db:schema:drift` pass
+-- on such a database was to drop the table by hand. A forward-only migration has to be correct for a
+-- database someone has already hand-corrected, otherwise this fix reintroduces the very failure it is
+-- removing, one step later and harder to read. A plain DROP TABLE would be louder, but "loud" is not worth
+-- anything here: there is no information in the error that this comment does not already record.
+DROP TABLE IF EXISTS "accounting_hand_post_claim_revisions";

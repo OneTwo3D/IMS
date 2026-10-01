@@ -319,7 +319,20 @@ export async function getSettingValue(key: string): Promise<string | null> {
   return deserializeSettingValue(key, row.value)
 }
 
-export async function getSettingValues(keys: string[]): Promise<Map<string, string>> {
+/**
+ * The slice of a Prisma client this read needs, so a caller holding a TRANSACTION can read settings
+ * through it rather than over the pool (o3d-8f0p6 r2). A value read over the pool while a
+ * transaction is open is a value that can change before that transaction commits; a caller that must
+ * not be overtaken by a settings edit needs the read to be part of its own unit of work.
+ */
+export type SettingValueReadClient = {
+  setting: { findMany(args: { where: { key: { in: string[] } } }): Promise<Array<{ key: string; value: string }>> }
+}
+
+export async function getSettingValues(
+  keys: string[],
+  client: SettingValueReadClient = db,
+): Promise<Map<string, string>> {
   const result = new Map<string, string>()
   const dbKeys: string[] = []
 
@@ -334,7 +347,7 @@ export async function getSettingValues(keys: string[]): Promise<Map<string, stri
 
   if (dbKeys.length === 0) return result
 
-  const rows = await db.setting.findMany({ where: { key: { in: dbKeys } } })
+  const rows = await client.setting.findMany({ where: { key: { in: dbKeys } } })
   await Promise.all(rows.map((row) => maybeMigrateSetting(row.key, row.value)))
 
   for (const row of rows) {

@@ -38,6 +38,7 @@
  * row lock would be a real cost for no correctness gain.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { ACCOUNTING_CONNECTORS, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
@@ -53,6 +54,27 @@ export type PluginSelectionLockTx = {
   $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>
   $queryRaw<T = unknown>(query: TemplateStringsArray, ...values: unknown[]): Promise<T>
 }
+
+/**
+ * o3d-j625 r13 — THE FENCE IS NOW ON EVERY ACCOUNTING ENQUEUE, SO "A REAL CLIENT CAN ALWAYS SERVE IT" HAS
+ * TO BE CHECKED RATHER THAN ASSUMED.
+ *
+ * Until r13 the locked check ran only for a PINNED enqueue, and the handful of callers that pinned all
+ * passed a Prisma transaction client. Making it unconditional puts it in front of EVERY in-transaction
+ * enqueue, including ones whose caller hands over a narrowed alias — and a client without raw access would
+ * turn a fence into a THROW inside somebody's business transaction. This is the same proof, and the same
+ * shape, as `PrismaClientCanAlwaysReadTheSuppression` in posting-suppression.ts: checked by `tsc`, costing
+ * nothing at runtime. If `Prisma.TransactionClient` ever stops satisfying it, this stops compiling here
+ * instead of failing in a goods receipt.
+ *
+ * (Unit-test doubles are a different matter and are not covered by this: several had to learn to answer the
+ * two statements, which is a fixture catching up with a question the subject now asks — not a client that
+ * cannot answer it.)
+ */
+type AssertTrue<T extends true> = T
+export type PrismaTransactionClientCanAlwaysBeFenced = AssertTrue<
+  Prisma.TransactionClient extends PluginSelectionLockTx ? true : false
+>
 
 /**
  * Acquire the selection lock and read the plugin state through the transaction.
@@ -76,6 +98,87 @@ export async function lockIntegrationPluginSelection(
     ON CONFLICT (key) DO NOTHING`
 
   return readLockedPluginSelection(tx)
+}
+
+/**
+ * ACCOUNTING ACCOUNT-MAPPING KEYS, taken under the SAME lock as the plugin selection (o3d-8f0p6 r4).
+ *
+ * WHY THESE LIVE HERE RATHER THAN IN A LOCK OF THEIR OWN. Round 3 found that a posting which reads
+ * an account code and then commits a journal has bound nothing unless the code cannot move in
+ * between: re-reading under READ COMMITTED sees a remap that already committed, but holds nothing, so
+ * a remap committing AFTER the re-read still lands a journal on stale codes — and, on an ASN spanning
+ * several purchase orders, can put earlier POs on the old mapping and later ones on the new one
+ * inside a single event. The answer is a lock held to COMMIT.
+ *
+ * It is THIS lock, not a second one, and that is the whole point. A separate mapping lock would add a
+ * second acquisition over the `settings` table and a second order to reason about; the accounting
+ * selection lock is already taken first by every writer that touches these rows' neighbours, is
+ * already transactional (so already held to commit), and already has a canonical row order. Adding
+ * keys to its row set costs one more entry in one `ORDER BY key` statement and no new ordering claim.
+ *
+ * LOCK ORDER, unchanged and now covering both key families: the advisory lock FIRST, then the rows in
+ * one `ORDER BY key` statement. Both writers go through this module, so neither can invert it.
+ *
+ * WHO TAKES IT, exhaustively (checked 2026-09-27):
+ *   · `saveXeroSettings` (app/actions/xero-sync.ts) — the ONLY writer of these two rows. They are not
+ *     in `lib/domain/settings/writable-setting-keys.ts`, so `setSetting`/`setSettings` THROW on them
+ *     rather than writing, and the other `xero_*` writers touch credentials, not the mapping.
+ *   · the WMS book-in receipt path (lib/domain/wms/booked-in-service.ts), before it reads the codes.
+ *   · `queueAccountingSyncTx`, via `pinnedLedgerIsServicedUnderLock`, for the plugin rows. It runs
+ *     INSIDE the receipt transaction, which already holds this advisory lock by then, so its
+ *     acquisition is a no-op re-entry rather than a second ordering.
+ */
+export const ACCOUNTING_MAPPING_SETTING_KEYS: Record<AccountingConnectorId, { inventory: string; transit: string }> = {
+  xero: { inventory: 'xero_inventory_account', transit: 'xero_transit_account' },
+}
+
+/** The same keys, flat and sorted, for the lock statement. ONE definition, derived not copied. */
+export function accountingMappingSettingKeys(connector: AccountingConnectorId): string[] {
+  const keys = ACCOUNTING_MAPPING_SETTING_KEYS[connector]
+  return [keys.inventory, keys.transit].sort()
+}
+
+/**
+ * Acquire the selection lock over the plugin rows AND the named connector's account-mapping rows, and
+ * hold both to COMMIT. Use this from any transaction that reads an account code and then posts with
+ * it, and from any writer of those codes.
+ *
+ * Returns nothing: callers read the values they need afterwards, through the same `tx`, knowing no
+ * writer can commit a change to them until this transaction ends.
+ */
+export async function lockAccountingMappingSelection(
+  tx: PluginSelectionLockTx,
+  connector: AccountingConnectorId,
+): Promise<void> {
+  const pluginKeys = [...INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER]
+  const mappingKeys = accountingMappingSettingKeys(connector)
+
+  // FIRST, exactly as lockIntegrationPluginSelection does, and the SAME key: a lock acquired after
+  // the read it protects protects nothing, and a DIFFERENT key here would be the second order this
+  // design exists to avoid.
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
+
+  // Materialise so the rows can be row-locked — but EACH FAMILY WITH ITS OWN ABSENT-VALUE MEANING.
+  // A plugin row's absent value is 'false' (what lockIntegrationPluginSelection writes, and what
+  // parseIntegrationPluginEnabled reads); a mapping row's is the empty string the account readers
+  // fall back to. Materialising both as one literal would silently change what an absent plugin flag
+  // says. Both are semantically inert for their own family.
+  await tx.$executeRaw`
+    INSERT INTO settings (key, value, "updatedAt")
+    SELECT k, 'false', now() FROM unnest(${pluginKeys}::text[]) AS k
+    ON CONFLICT (key) DO NOTHING`
+  await tx.$executeRaw`
+    INSERT INTO settings (key, value, "updatedAt")
+    SELECT k, '', now() FROM unnest(${mappingKeys}::text[]) AS k
+    ON CONFLICT (key) DO NOTHING`
+
+  // ONE statement in ONE canonical order over both families, so the row-lock order is a property of
+  // this statement rather than of the order the caller happened to list them in.
+  await tx.$queryRaw`
+    SELECT key FROM settings
+    WHERE key = ANY(${[...pluginKeys, ...mappingKeys]}::text[])
+    ORDER BY key
+    FOR UPDATE`
 }
 
 /**

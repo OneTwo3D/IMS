@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
+import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -714,6 +715,31 @@ export function landedCostAdjustmentIdempotencyKey(
   )
 }
 
+/**
+ * WHICH LINKED FREIGHT ORDERS STILL CONTRIBUTE LANDED COST — ONE DEFINITION (o3d-6nd55 r2).
+ *
+ * A CANCELLED freight purchase order must no longer contribute: excluding it is exactly what lets
+ * cancellation revert the uplift it had applied. Both landed-cost recalculation paths in this file
+ * have said so for a long time, each with its own inline copy of the predicate and its own audit
+ * reference — `recalculateLandedCosts` (audit-C3) and `recalculateDirectLandedCosts` (audit-izrf).
+ *
+ * WHY IT IS NOW A CONSTANT. Codex round 2 on o3d-6nd55 found the WMS stock-sync align-up path
+ * reading `landedCostLinks` with NO filter, so a cancelled freight order's cost lines were added
+ * back into the align-up cost layer, the stock movement and the STOCK_RECEIPT journal — overstating
+ * inventory by freight the business had cancelled, and disagreeing with what recalculation would
+ * compute for the same units. A third reader of "which links count" was a third chance to get it
+ * wrong, so the predicate has one name and the readers derive it rather than restate it.
+ *
+ * IT FILTERS ON STATUS AND DELIBERATELY NOT ON `LandedCostLink.allocated`. `allocated` records
+ * whether the uplift has been WRITTEN to `landedUnitCostBase` yet; the whole purpose of
+ * `computeGrossUnitCostBaseByLine` is to value a receipt whose freight has NOT been allocated yet, so
+ * filtering on it would zero exactly the case the helper exists for. Cancellation sets both — the
+ * status is the fact about whether the cost still exists, and that is the one both recalc paths test.
+ */
+export const CONTRIBUTING_LANDED_COST_LINK_WHERE = {
+  freightPO: { status: { not: 'CANCELLED' } },
+} as const
+
 export function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
@@ -798,10 +824,21 @@ export function resolveConsumedCogsOffsetAccount(
   return settings.transitAccount
 }
 
+/**
+ * o3d-j625 r4 (SWEEP 1) — HOW MANY OF THIS RUN'S JOURNALS ARE STILL OWED.
+ *
+ * Returned so the landed-cost journal OUTBOX — the backstop that exists precisely to re-run this — can
+ * tell a run that queued everything from a run whose journals were refused. It used to call this, get
+ * `void`, and mark the job SUCCEEDED either way, so a refused journal was reported once and then never
+ * retried by the one mechanism built to retry it.
+ */
+export type LandedCostJournalRunOutcome = { owed: number }
+
 export async function queueLandedCostAdjustmentJournals(
   adjustments: LandedCostRecalcResult,
-): Promise<void> {
+): Promise<LandedCostJournalRunOutcome> {
   const settings = await getAccountingSettings()
+  let owed = 0
 
   for (const adj of adjustments.inventoryTransitAdjustments) {
     const absDelta = Math.abs(adj.totalDelta)
@@ -830,6 +867,9 @@ export async function queueLandedCostAdjustmentJournals(
     // signed delta follows the transit LEG: increase → CR transit (−), decrease → DR
     // transit (+). Keyed by the journal's OWN idempotency key.
     const reclassIdempotencyKey = landedCostAdjustmentIdempotencyKey('inventory', adj)
+    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, so TypeScript does not collapse it to `never` on the
+    // strength of assignments it cannot see inside the transaction callback.
+    const postingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     await db.$transaction(async (tx) => {
       const queued = await queueAccountingSyncTx(tx, {
         type: 'STOCK_IN_TRANSIT',
@@ -837,6 +877,17 @@ export async function queueLandedCostAdjustmentJournals(
         referenceId: adj.primaryPoId,
         payload,
         idempotencyKey: reclassIdempotencyKey,
+        // o3d-j625 r2: `payload`'s two lines are `settings.inventoryAccount` and
+        // `settings.transitAccount` from the ONE `getAccountingSettings()` at the top of
+        // `queueLandedCostAdjustmentJournals`. That read is outside the loop, and each iteration opens
+        // its OWN transaction — so a connector switch part-way through a multi-PO recalculation used to
+        // split one run's journals across two ledgers while every one of them carried the first
+        // connector's codes. Routed by the chart, the later ones refuse instead.
+        chartConnector: settings.connector,
+        // o3d-j625 r3 (Codex HIGH 1 family): the whole answer. Each iteration opens its own transaction
+        // and nothing outside the loop accounts for a failure, so a mid-loop decline silently dropped
+        // that PO's reclass while the recalculation reported normally.
+        reportOutcome: (outcome) => { postingOutcome.outcome = outcome },
       })
       if (queued) {
         await recordTransitSubledgerMovement(tx, {
@@ -848,6 +899,28 @@ export async function queueLandedCostAdjustmentJournals(
         })
       }
     })
+    if (postingOutcome.outcome && postingIsOwed(postingOutcome.outcome)) {
+      owed++
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: adj.primaryPoId,
+        action: 'landed_cost_reclass_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        // o3d-j625 r7 (review H-B): ONE kind whoever raised it. The direct callers (a PO edit, a freight PO, a
+        // cancellation) schedule the landed-cost outbox too, and it retries this SAME posting — r6 called
+        // their refusals manual-only, so a hand-posted journal was then posted again by the outbox.
+        kind: 'landed_cost_transit_journal',
+        posting: `the landed-cost inventory/transit reclass for ${adj.primaryPoRef}`,
+        committed: 'the landed cost is applied to the stock on hand in IMS',
+        // r6 (review H4): the outbox retries its own; posting that one by hand as well would post it twice.
+        remedy:
+          'Inventory and goods-in-transit in the ledger no longer match IMS for this order. The landed-cost '
+          + 'journal outbox retries it once the accounting connector selection has settled; if it has given up, '
+          + 'post the reclass by hand and mark this row handled, which stops IMS posting it too.',
+        outcome: postingOutcome.outcome,
+        metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
+      })
+    }
   }
 
   // scjz.34: the CONSUMED-qty correction (goods already sold) offsets COGS to the
@@ -877,6 +950,9 @@ export async function queueLandedCostAdjustmentJournals(
       ],
     }
     const cogsIdempotencyKey = landedCostAdjustmentIdempotencyKey('cogs', adj)
+    // o3d-j625 r3 (Codex HIGH 1 family): a HOLDER, so TypeScript does not collapse it to `never` on the
+    // strength of assignments it cannot see inside the transaction callback.
+    const cogsPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
     // bcz9.2: commit the COGS journal queue + its subledger ledger row atomically in
     // one transaction so a crash (or a posting-setting change) between them can't leave
     // a queued journal with no ledger row, or a ledger row with no journal — either of
@@ -891,6 +967,11 @@ export async function queueLandedCostAdjustmentJournals(
         referenceId: adj.primaryPoId,
         payload,
         idempotencyKey: cogsIdempotencyKey,
+        // o3d-j625 r2: `settings.cogsAccount` and `resolveConsumedCogsOffsetAccount(settings)` — the
+        // same `settings` object as the reclass loop above, and the same per-iteration transaction.
+        chartConnector: settings.connector,
+        // o3d-j625 r3 (Codex HIGH 1 family): per-iteration, per-transaction, and previously unreported.
+        reportOutcome: (outcome) => { cogsPostingOutcome.outcome = outcome },
       })
       if (queued) {
         await recordCogsSubledgerMovement(tx, {
@@ -914,7 +995,27 @@ export async function queueLandedCostAdjustmentJournals(
         })
       }
     })
+    if (cogsPostingOutcome.outcome && postingIsOwed(cogsPostingOutcome.outcome)) {
+      owed++
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: adj.primaryPoId,
+        action: 'landed_cost_cogs_journal_not_queued',
+        // o3d-j625 r6 (review H4): which site refused, and so whether its row clears itself or is marked handled.
+        kind: 'landed_cost_cogs_journal',
+        posting: `the retrospective COGS adjustment for ${adj.primaryPoRef}`,
+        committed: 'the landed-cost change is applied to the sold units in IMS',
+        remedy:
+          'COGS in the ledger does not reflect this landed-cost change and the freight liability will not drain '
+          + 'out of goods-in-transit. The landed-cost journal outbox retries it once the accounting connector '
+          + 'selection has settled; if it has given up, post the adjustment by hand and mark this row handled, '
+          + 'which stops IMS posting it too.',
+        outcome: cogsPostingOutcome.outcome,
+        metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
+      })
+    }
   }
+  return { owed }
 }
 
 /**
@@ -985,8 +1086,10 @@ export async function recalculateLandedCosts(
 
     const allLinks = await tx.landedCostLink.findMany({
       // audit-C3: a CANCELLED freight PO must no longer contribute landed cost —
-      // excluding it here is what lets cancellation revert the uplift it applied.
-      where: { primaryPoId, freightPO: { status: { not: 'CANCELLED' } } },
+      // excluding it here is what lets cancellation revert the uplift it applied. The predicate is
+      // CONTRIBUTING_LANDED_COST_LINK_WHERE so this path, the direct recalc below and the WMS
+      // align-up receipt cannot disagree about it (o3d-6nd55 r2).
+      where: { primaryPoId, ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
       select: {
         freightPO: {
           select: {
@@ -1375,7 +1478,8 @@ export async function recalculateDirectLandedCosts(
       landedCostLinks: {
         // audit-izrf: a CANCELLED freight PO must no longer contribute landed
         // cost, mirroring the linked-freight recalc path (recalculateLandedCosts).
-        where: { freightPO: { status: { not: 'CANCELLED' } } },
+        // Shared predicate since o3d-6nd55 r2 — see CONTRIBUTING_LANDED_COST_LINK_WHERE.
+        where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
         select: {
           freightPO: {
             select: {

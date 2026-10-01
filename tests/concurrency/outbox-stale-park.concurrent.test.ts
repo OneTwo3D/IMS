@@ -122,6 +122,90 @@ async function blockedChainFrom(db: Db, rootPid: number): Promise<BlockedBackend
 }
 
 /**
+ * PIN `rowId` WITH `SELECT ... FOR UPDATE` ON A CONNECTION OF ITS OWN, and hand back the backend pid
+ * plus a release that is SAFE TO CALL ON ANY PATH (o3d-nuhmy).
+ *
+ * WHY THIS IS A HELPER AND NOT FOUR LINES IN THE TEST. It used to be inline, with
+ * `holderRelease.resolve()` sitting after the evidence assertions and a try/catch around ONLY the
+ * barrier. So a failing assertion skipped the release entirely: the holder transaction then ran to
+ * its own 60_000 ms timeout STILL HOLDING THE CONTESTED ROW LOCK, inside a tier whose files run in
+ * parallel. Measured on the pre-fix control flow: the lock stayed held for 60_181 ms, which is the
+ * 60_880 ms CI recorded when this test failed. One flake starved every other file for a minute.
+ *
+ * Putting the release in a `finally` that the CALLER cannot forget is the fix, and it is why the
+ * discipline lives in a function: a property that depends on statement order is a property the next
+ * edit silently breaks, and it cannot be tested at all while it is spelled out inline.
+ */
+type PinnedRow = {
+  /** Backend pid of the connection holding the row, for `pg_blocking_pids` to name. */
+  pid: number
+  /** Idempotent. Returns the holder transaction's error, if it had one, rather than throwing it. */
+  release: () => Promise<unknown>
+}
+
+async function pinRowForUpdate(db: Db, rowId: string): Promise<PinnedRow> {
+  const pidReady = Promise.withResolvers<number>()
+  const releaseSignal = Promise.withResolvers<void>()
+  const holder = db.$transaction(async (tx) => {
+    const [backend] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
+    await tx.$queryRaw`SELECT id FROM integration_outbox WHERE id = ${rowId} FOR UPDATE`
+    pidReady.resolve(backend.pid)
+    await releaseSignal.promise
+  }, { timeout: 60_000, maxWait: 10_000 })
+  // Attached immediately: if the transaction fails before anyone awaits it, an unhandled rejection
+  // would take the whole runner down rather than fail this test.
+  const settled = holder.then(() => undefined, (error: unknown) => error as unknown)
+
+  // RACED, not awaited bare. If the transaction cannot start -- `maxWait` exhausted on a busy pool
+  // is the realistic case -- `pidReady` never resolves and a bare await hangs the tier for ever.
+  // A test that can hang is the same class of defect as the 60-second leak this change removes.
+  const pid = await Promise.race([
+    pidReady.promise,
+    settled.then((error) => {
+      throw error ?? new Error('the holder transaction ended before it pinned the row')
+    }),
+  ])
+
+  let released = false
+  return {
+    pid,
+    release: async () => {
+      if (released) return undefined
+      released = true
+      releaseSignal.resolve()
+      return await settled
+    },
+  }
+}
+
+/**
+ * Run `body` while `rowId` is pinned, and release the row afterwards WHATEVER body does.
+ *
+ * BODY MUST NOT RETURN A BARE PROMISE, and the type deliberately makes that hard to do by accident.
+ * `await body(...)` FLATTENS a promise an async body returns, so returning the claimants' pending
+ * race would make this helper wait for work that cannot finish until the pin is released -- which
+ * happens in the `finally` below, i.e. never. That deadlocks until the holder's own 60 s timeout:
+ * exactly the failure this change exists to remove, reintroduced through the back door. It was
+ * written that way first and the suite caught it in one run. So deferred work is handed back BOXED,
+ * in a field, where promise chaining cannot reach it.
+ */
+async function withRowPinned<T>(db: Db, rowId: string, body: (holderBackendPid: number) => Promise<{ deferred: T }>): Promise<{ deferred: T }> {
+  const pinned = await pinRowForUpdate(db, rowId)
+  let bodyFailed = false
+  try {
+    return await body(pinned.pid)
+  } catch (error) {
+    bodyFailed = true
+    throw error
+  } finally {
+    const holderError = await pinned.release()
+    // Surfaced ONLY when the body succeeded. Masking the body's own failure with a teardown error is
+    // how a real diagnosis gets lost, and this teardown is exactly the one that used to not happen.
+    if (holderError !== undefined && !bodyFailed) throw holderError
+  }
+}
+
+/**
  * Waits until Postgres reports `expected` backends waiting behind the holder, and returns them.
  *
  * Throws rather than proceeding: a test whose barrier was never reached is a test about something
@@ -137,7 +221,10 @@ async function awaitBlockedOnHolder(db: Db, holderPid: number, expected: number)
   }
   throw new Error(
     `only ${seen.length} of ${expected} claimants ever blocked behind the row lock held by backend ${holderPid}; `
-    + 'without both inside their UPDATE this test would be asserting about read timing, not about the CAS',
+    + 'without both inside their UPDATE this test would be asserting about read timing, not about the CAS'
+    // `wait_event_type` is reported HERE, where it is diagnostic context for a barrier that never
+    // filled, and never asserted on -- see the note in the evidence loop for why (o3d-nuhmy).
+    + ` (saw: ${seen.map((b) => `pid ${b.pid} wait_event_type=${b.wait_event_type} on ${b.query}`).join('; ') || 'nothing'})`,
   )
 }
 
@@ -246,17 +333,10 @@ test(
      * by asking Postgres. See the comment on `awaitBlockedOnHolder`: round 3 asked a stopwatch that
      * started before the candidate SELECT, and that question has an affirmative answer even when a
      * claimant never issued an update at all.
+     *
+     * The pin now lives in `withRowPinned`, which releases it in a `finally` -- see that helper for
+     * why the release cannot be left at the end of the happy path (o3d-nuhmy).
      */
-    const holderPid = Promise.withResolvers<number>()
-    const holderRelease = Promise.withResolvers<void>()
-    const holder = deps.db.$transaction(async (tx) => {
-      const [backend] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
-      await tx.$queryRaw`SELECT id FROM integration_outbox WHERE id = ${seeded.id} FOR UPDATE`
-      holderPid.resolve(backend.pid)
-      await holderRelease.promise
-    }, { timeout: 60_000, maxWait: 10_000 })
-    const pid = await holderPid.promise
-
     async function claimant(workerId: string) {
       const claimed = await deps.claimIntegrationOutboxWork({
         connector: 'sales',
@@ -269,33 +349,49 @@ test(
       return { workerId, claimed }
     }
 
-    const race = Promise.all([claimant('racer-alpha'), claimant('racer-beta')])
+    const race = await withRowPinned(deps.db, seeded.id, async (holderBackendPid) => {
+      // Started only now: the row is already pinned, so both claimants are guaranteed to read the
+      // ORIGINAL lockedAt and then park at their UPDATE rather than racing the pin itself.
+      const inFlight = Promise.all([claimant('racer-alpha'), claimant('racer-beta')])
+      // Handled up front. If the evidence below fails, the pin is released by the helper's `finally`
+      // and these two settle with nobody awaiting them; an unhandled rejection would kill the runner
+      // instead of failing this test.
+      inFlight.catch(() => {})
 
-    // THE DATABASE'S OWN EVIDENCE. Both claimants are inside their UPDATE, waiting behind the row
-    // lock this test's holder is sitting on. Nothing is released until that is true.
-    let blocked: BlockedBackend[]
-    try {
-      blocked = await awaitBlockedOnHolder(deps.db, pid, 2)
-    } catch (error) {
-      holderRelease.resolve()
-      await holder.catch(() => {})
-      await race.catch(() => {})
-      throw error
-    }
-    assert.equal(blocked.length, 2, `exactly two backends must be blocked by the holder; ${blocked.length} were`)
-    for (const backend of blocked) {
-      assert.match(backend.query, /update/i,
-        `backend ${backend.pid} is blocked on a ${backend.query} — a SELECT is not blocked by FOR UPDATE, `
-        + 'so this would not be a claimant inside its compare-and-set')
-      assert.match(backend.query, /integration_outbox/,
-        `backend ${backend.pid} is blocked on some other table: ${backend.query}`)
-      assert.equal(backend.wait_event_type, 'Lock',
-        `backend ${backend.pid} is waiting on ${backend.wait_event_type}, not on a lock`)
-    }
+      // THE DATABASE'S OWN EVIDENCE. Both claimants are inside their UPDATE, waiting behind the row
+      // lock this test's holder is sitting on. Nothing is released until that is true.
+      const blocked = await awaitBlockedOnHolder(deps.db, holderBackendPid, 2)
+      assert.equal(blocked.length, 2, `exactly two backends must be blocked by the holder; ${blocked.length} were`)
+      for (const backend of blocked) {
+        // IDENTITY, NOT LIVENESS -- and that distinction is the whole of o3d-nuhmy. These two say
+        // WHICH statement the backend is blocked on, which is what makes it a claimant inside its
+        // compare-and-set rather than something else queued on the same row.
+        assert.match(backend.query, /update/i,
+          `backend ${backend.pid} is blocked on a ${backend.query} — a SELECT is not blocked by FOR UPDATE, `
+          + 'so this would not be a claimant inside its compare-and-set')
+        assert.match(backend.query, /integration_outbox/,
+          `backend ${backend.pid} is blocked on some other table: ${backend.query}`)
+        // DO NOT ASSERT ON `backend.wait_event_type` HERE. It is selected for diagnostics only.
+        //
+        // `pg_blocking_pids(pid)` is a function evaluated against the LOCK MANAGER and is
+        // authoritative about the wait queue; `wait_event_type` is a field the waiting backend sets
+        // when it ENTERS a wait and clears when it LEAVES, atomic with neither the lock manager nor
+        // the other columns of its own row. So a backend genuinely queued on this row -- satisfying
+        // `blockedChainFrom`'s WHERE clause AND naming the holder as its blocker -- can report NULL
+        // in the very same query. Measured: 2 of 798 observed blocked backends, running this exact
+        // query shape against two backends queued behind one holder over 400 rounds.
+        //
+        // It was also REDUNDANT, which is why removing it costs nothing: the WHERE clause already
+        // demanded a non-empty blocker set and the chain closure already demanded a blocker rooted
+        // at this holder. THAT is the lock-manager evidence the barrier exists to obtain.
+      }
+      // BOXED, not returned bare: see `withRowPinned`. Returning `inFlight` itself would be
+      // flattened by the helper's `await` and deadlock on the pin it is waiting for.
+      return { deferred: inFlight }
+    })
 
-    holderRelease.resolve()
-    await holder
-    const results = await race
+    // The pin is gone (released by `withRowPinned`), so the claimants can now settle.
+    const results = await race.deferred
 
     const winners = results.filter((result) => result.claimed.length > 0)
     const losers = results.filter((result) => result.claimed.length === 0)
@@ -310,6 +406,72 @@ test(
     assert.equal(after.lockedBy, winners[0].workerId, 'the row must record the winner as its holder')
     assert.notEqual(after.lockedBy, 'worker-that-never-came-back', 'the dead holder must have been displaced')
     assert.ok(after.lockedAt !== null && after.lockedAt > seeded.lockedAt!, 'the lock must have been re-taken')
+  },
+)
+
+test(
+  '[o3d-nuhmy] a failing evidence assertion releases the pinned row at once, not after the 60s transaction timeout',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * THE AMPLIFIER, PINNED. The test above used to leave `holderRelease` unresolved whenever an
+     * assertion in its evidence loop threw, because the resolve sat after the loop and the try/catch
+     * wrapped only the barrier. The holder then ran to its own 60_000 ms timeout STILL HOLDING the
+     * contested row lock, inside a tier whose files run in parallel -- so one flake starved every
+     * other file for a minute. Measured on the pre-fix control flow: 60_181 ms of held lock, which
+     * is the 60_880 ms CI recorded.
+     *
+     * WHAT THIS ASSERTS, AND WHY IT IS NOT JUST A STOPWATCH. A test that asserts "the timeout did
+     * not happen" is awkward and slow, so the primary assertion is the EFFECT: once the body has
+     * thrown, `FOR UPDATE NOWAIT` on that row SUCCEEDS. NOWAIT raises 55P03 the instant the row is
+     * locked by anyone else, so its success is direct proof the pin is gone -- not an inference from
+     * elapsed time. The elapsed bound is corroboration, and it is deliberately loose: releasing is
+     * immediate (milliseconds), the regression is 60 s, and 30 s sits far from both.
+     */
+    const deps = await loadDeps()
+    const key = probeKey('release-on-throw')
+    const seeded = await seedStalePark(deps.db, {
+      connector: 'sales',
+      operation: 'refund.reservation-release',
+      idempotencyKey: key,
+      payloadJson: { orderId: 'probe-order', refundId: 'probe-refund' },
+    })
+    t.after(() => deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: key } }))
+
+    const forced = new Error('forced evidence failure, standing in for the wait_event_type assertion')
+    let sawPid = 0
+    const startedAt = Date.now()
+    await assert.rejects(
+      withRowPinned(deps.db, seeded.id, async (holderBackendPid) => {
+        // PRECONDITION: the row really was pinned before we threw. Without this the test would pass
+        // just as happily if `withRowPinned` had never taken a lock at all.
+        sawPid = holderBackendPid
+        const [{ locked }] = await deps.db.$queryRaw<Array<{ locked: boolean }>>`
+          SELECT TRUE AS locked FROM pg_locks l
+          JOIN pg_stat_activity a ON a.pid = l.pid
+          WHERE a.pid = ${holderBackendPid} AND l.locktype = 'transactionid' AND l.mode = 'ExclusiveLock'
+          LIMIT 1
+        `
+        assert.equal(locked, true, 'precondition: the holder must own a transaction lock before we throw')
+        throw forced
+      }) as Promise<unknown>,
+      (error: unknown) => error === forced,
+      'the body\'s own error must propagate -- a teardown error must not mask it',
+    )
+    const elapsedMs = Date.now() - startedAt
+    assert.ok(sawPid > 0, 'precondition: the body must have run with a real holder pid')
+
+    // THE PRIMARY ASSERTION. NOWAIT fails immediately (55P03) while anyone holds the row, so this
+    // succeeding is proof the pin was released on the throwing path.
+    await deps.db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM integration_outbox WHERE id = ${seeded.id} FOR UPDATE NOWAIT`
+    })
+
+    assert.ok(
+      elapsedMs < 30_000,
+      `the pinned row must be released when the body throws, not held until the holder transaction `
+      + `times out; this took ${elapsedMs} ms (the pre-fix control flow measured 60_181 ms)`,
+    )
   },
 )
 

@@ -629,10 +629,12 @@ export type BackReferenceSweepDeps = {
   /**
    * MUST report whether the follow-ups were ACTUALLY ENQUEUED (o3d-peh1).
    *
-   * The connector's enqueue has THREE deliberate refusals, and they are exactly the members of
+   * The connector's enqueue has FOUR deliberate refusals, and they are exactly the members of
    * `FollowUpEnqueueDeclineReason`: an ambiguous idempotency-token history, a ledger that will not
-   * confirm the attempt is absent, and a revival target with no attempt revision whose type the
-   * ledger probe does not speak for. (`FollowUpEnqueueRefusalReason` is WIDER than that, and
+   * confirm the attempt is absent, a revival target with no attempt revision whose type the
+   * ledger probe does not speak for, and (o3d-j625 r18) an operator holding the hand-posting claim on the
+   * posting — they are raising this follow-up in the ledger by hand, so IMS must not queue it and it is not
+   * yet there either. (`FollowUpEnqueueRefusalReason` is WIDER than that, and
    * deliberately so since o3d-batch-ret r6: `FollowUpPreEnqueueRefusalReason` carries the refusals a
    * CONNECTOR raises one frame up, where a requested payment has no account mapped and the enqueue is
    * never reached at all. Those reach this sweep through exactly the same outcome type.) A SLOT LOST TO A LIVE ROW UNDER ANOTHER TOKEN IS NOT ONE OF

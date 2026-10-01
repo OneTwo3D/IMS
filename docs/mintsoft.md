@@ -60,6 +60,84 @@ Mintsoft connector settings cannot be marked active until a **Test Connection** 
 
 Upward deltas are absorbed into open ASN lines as provisional goods-in receipts (cost layers from the source PO/transfer line), tracked as alignment snapshot credits that the booked-in webhook later reconciles. A delta no open ASN line can explain stays a manual discrepancy.
 
+**A PO-backed align-up is a receipt writer, and posts like one (o3d-6nd55).** It credits stock and
+lays a purchase-order-linked FIFO cost layer, so it is the third path that raises inventory value from
+a purchase order — beside the receipt entered in IMS and the WMS booked-in webhook. Two things were
+wrong and are fixed together:
+
+- **the cost was always zero.** The branch read `landedUnitCostBase ?? unitCostBase`, and
+  `landedUnitCostBase` is `Decimal @default(0)` and NOT NULL while `createPurchaseOrder` never sets
+  it — so the `??` could never fall through and an ordinary purchase order aligned up at a unit cost
+  of **zero**: a zero-cost cost layer and a zero-value stock movement for goods that cost real money.
+  Inventory was understated for those units for ever, and no journal would have repaired it because
+  the cost itself was wrong. Align-up now calls `computeGrossUnitCostBaseByLine` — the same helper the
+  IMS receipt and (since o3d-8f0p6) the book-in use: the goods cost plus that line's share of the
+  order's own and its linked freight orders' additional cost lines. **One value feeds the movement,
+  the cost layer and the journal.** A genuinely free line (a sample, a warranty replacement) has a
+  zero goods cost, so the gross cost is zero, stock is still credited and nothing is posted — which is
+  correct, and is why no null-vs-zero column change was needed;
+- **it posted nothing.** No `STOCK_RECEIPT` journal and no transit subledger row. It now queues the
+  same two-line journal the IMS receipt does — **DR Inventory / CR Stock in Transit** — plus the
+  signed transit subledger row for −value, **in the same transaction as the movement, the cost layer
+  and the stock level**. All of it lives or none of it does: if the enqueue fails, the alignment
+  credits no stock and the ASN line does not claim to have absorbed the units, so the next sweep tries
+  again.
+
+The journal's idempotency key is `wms-align-up:<asnLineMapId>:<movementId>`, so it can collide with
+neither the webhook's `wms-purchase-receipt:<poId>:<eventId>` nor the IMS receipt's
+`purchase-receipt:<poId>:<receiptRef>`, and one sweep crediting two ASN lines of one order posts two
+journals for two disjoint quantities. **The two WMS paths do not double-post, in either direction:**
+align-up journals the quantity it credits and records it on `wms_asn_line_maps.qtyAccountedViaSnapshot`
+in the same transaction, which is exactly the `coveredBySnapshotQty` a later book-in subtracts before
+journalling; and the reverse is `resolveWmsAsnLineResidualQty`, which caps align-up at
+`expectedQty − max(qtyAccountedViaSnapshot, lastProcessedReceivedQty)`, so units a book-in already
+landed are outside every allocation align-up can make.
+
+**Transfer-backed align-up allocations post nothing, deliberately** — a transfer moves units the
+business already owns between its own warehouses, so their value never left inventory and never
+entered *purchase* goods-in-transit. `app/actions/transfers.ts` queues no accounting sync either.
+
+**The cost inputs are LOCKED, and so is the account mapping (o3d-6nd55 r2).** Round 1 read both with
+no lock and tried to defend itself by re-reading and refusing on a difference, which holds nothing: a
+re-read sees only a change that has *already* committed, so a change landing after it still ends up in
+committed books. Both are now locks held to commit:
+
+- **the cost rows** — `purchase_orders`, then `purchase_order_lines`, then `freight_cost_lines`, for
+  the primary order *and* every linked freight order — taken at step 2 of the global row-lock order
+  (`lib/domain/wms/transfer-asn-lock-order.ts`). That sub-order is not new: it is the one
+  `app/actions/purchase-orders.ts` already uses in both of its invoicing transactions. A landed-cost
+  or freight edit therefore cannot commit between the moment the alignment reads a cost and the moment
+  it commits the layer and the journal for it. A PO-backed ASN line whose order appeared *after* those
+  locks were taken is refused as a raced row and left to the next sweep, exactly as a raced transfer
+  is. Every cost is then read in one pass **before** any movement, layer, journal or stock row is
+  written, so the read-then-write order is structural rather than something a reader has to verify;
+- **the two account codes** — through `lockAccountingMappingSelection`, which is the *existing*
+  accounting-selection lock (the same advisory key `queueAccountingSyncTx` already takes) with the two
+  mapping rows added to its row set, so there is one lock and one order rather than a second one. It is
+  read once per alignment and reused, so an alignment spanning several purchase orders cannot put
+  earlier orders on the old mapping and later ones on the new one. A remap is **serialised**, not
+  refused: it waits and lands once the alignment commits.
+
+**A CANCELLED linked freight order contributes nothing (o3d-6nd55 r2).** Cancellation leaves the link
+row in place, marks the freight order `CANCELLED` and the link unallocated, and both landed-cost
+recalculation paths already exclude it — so including it here would have added freight the business had
+cancelled into the cost layer, the movement and the journal, and disagreed with what recalculation
+computes for the same units. The predicate has one definition,
+`CONTRIBUTING_LANDED_COST_LINK_WHERE` in `lib/domain/purchasing/landed-cost-service.ts`, which all
+three readers derive from. It filters on the freight order's **status** and deliberately not on
+`LandedCostLink.allocated`: `allocated` records whether the uplift has been written to
+`landedUnitCostBase` yet, and valuing a receipt whose freight is not yet allocated is the whole purpose
+of the shared gross-cost helper.
+
+Why this had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
+journal from a stock movement, and the reconciliation that should have caught the omission **hid** it.
+The Xero daily batch does not read `stock_movements` at all; its inventory reconciliation posts
+Inventory ↔ *Rounding difference* and only for a sub-unit `sweep` gap (a receipt-sized gap is `flag`,
+surfaced and never posted); and the transit reconciliation aggregates `transit_subledger_movements`,
+which are written **at post time**, so a posting that never happened is absent from *both* of its sides
+and that window ties out exactly. Proven by
+`tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts`.
+
 ### Align down (Mintsoft holds less — shrinkage / already-shipped)
 
 Downward deltas are auto-corrected by posting a negative stock adjustment (FIFO consumption + inventory GL journal via `applyStockAdjustment`), but only when EVERY gate passes; otherwise the discrepancy stays open carrying the hold reason:
@@ -193,10 +271,93 @@ that — with every received quantity reading zero, the movement was never inser
 names the purchase order, so the guard's evidence join is satisfied by the cost layer the same
 transaction lays. Transfer-backed book-ins write `TRANSFER_IN`, which the guard does not cover.
 
-What a PO-backed book-in does NOT yet do is post the accounting: it writes no `STOCK_RECEIPT` journal
-and no transit subledger row, where the manual receipt path writes both. So stock and cost layers land
-while the transit account never drains. Tracked as **o3d-8f0p6** — until it lands, a PO-backed WMS
-book-in is correct in stock terms and incomplete in ledger terms.
+**A PO-backed book-in posts its accounting, as of o3d-8f0p6.** It used to write no `STOCK_RECEIPT`
+journal and no transit subledger row where the manual receipt writes both, so stock and cost layers
+landed while the transit clearing account never drained and the GL inventory balance was understated
+against stock that was physically there. The book-in now queues the same two-line journal the manual
+receipt does — **DR Inventory / CR Stock in Transit** — plus the signed transit subledger row for
+−value, **in the same transaction as the movement, the cost layer and the stock level**. All of it
+lives or none of it does: if the enqueue fails, the book-in commits no stock.
+
+Four details are load-bearing:
+
+- **the receipt cost is the SHARED gross cost, not `landedUnitCostBase`** (o3d-8f0p6 r2). That column
+  is `Decimal @default(0)` and NOT NULL, and `createPurchaseOrder` never sets it — so the old
+  `landedUnitCostBase ?? unitCostBase` could never fall through, and an ordinary purchase order was
+  booked in at a unit cost of **zero**: a zero-cost FIFO layer, a zero-value movement and, once this
+  path started queueing a journal, no journal at all. The book-in now calls
+  `computeGrossUnitCostBaseByLine`, the same helper the manual receipt uses, and that one value feeds
+  the movement, the cost layer **and** the journal. It is never worse than the old expression: once
+  landed cost has been allocated the recalc writes `landedUnitCostBase = grossUnitCostBase`, so the two
+  coincide. A genuinely free line (a sample, a warranty replacement) has a zero goods cost, so the
+  gross cost is zero and nothing is posted — which is correct, and is why no null-vs-zero column change
+  was needed;
+
+- **the amount is the value this book-in actually laid layers for**, not the reconciled quantity.
+  `qtyReceived` also covers `coveredBySnapshotQty` (units a prior stock-sync alignment already brought
+  into stock and layered) and `reconciledManualQty` (units a manual receipt already journalled);
+  journalling either would post the same inventory value twice;
+- **the idempotency key is `wms-purchase-receipt:<poId>:<receiptEventId>`**, so a redelivered or
+  replayed webhook cannot queue a second journal, and it can never collide with the manual path's
+  `purchase-receipt:<poId>:<receiptRef>`. A genuinely new event booking a further quantity is a
+  different receipt and gets its own key;
+- **transfer-backed book-ins still post nothing, deliberately.** A transfer moves units the business
+  already owns between its own warehouses: their value never left inventory and never entered
+  *purchase* goods-in-transit. The manual transfer receipt (`app/actions/transfers.ts`) queues no
+  accounting sync either, so this is parity rather than a second gap.
+
+**The account mapping is LOCKED for the whole receipt** (o3d-8f0p6 r4). Reading the codes over the
+pool bound nothing, and re-reading them inside the transaction was not enough either: a re-read under
+READ COMMITTED sees a remap that has already committed but holds nothing, so a remap committing *after*
+it — while the book-in walks on through the transfer loop and the ASN updates — still ended with a
+journal on stale codes, and on an ASN spanning several purchase orders could put earlier POs on the old
+mapping and later ones on the new one inside one event.
+
+The book-in now takes the **accounting-selection lock** before reading the codes and holds it to
+commit — and nothing else: the re-read-and-refuse was removed once a mutation showed it could no
+longer fail, because a check that cannot fail is not a guarantee. It is the *same* lock `queueAccountingSyncTx` already takes — the same advisory key, with the
+two mapping rows added to its row set — so there is one lock and one order (advisory first, then rows
+in one `ORDER BY key`), and the enqueue's own later acquisition is a no-op re-entry. `saveXeroSettings`,
+the only writer of those rows, takes it too. The read is **memoised per event**, so every purchase order
+in one ASN posts on one mapping by construction. A remap attempted mid-receipt is **serialised**, not
+rejected: it waits and lands once the receipt commits. The connector is resolved once and pinned to the
+enqueue, so the mapping and the queued row cannot come from two independent resolutions of "which
+ledger".
+
+**What happens if a book-in does refuse.** The refusal path is not self-healing and the recovery is
+manual, so it is written down rather than implied. A failed attempt is rescheduled with backoff by the
+internal sweeper, and after **eight** failed attempts (`MAX_FAILED_ATTEMPTS`) the event is
+**dead-lettered**: `processingStatus` becomes the dead state, `nextRetryAt` is cleared and
+`deadLetteredAt` is stamped, and **the sweeper will not pick it up again**. A fresh delivery of the same
+Mintsoft event resets the attempt counter, so a warehouse that re-sends recovers on its own; an event
+that has already dead-lettered needs a **redelivery or a manual replay** (*Re-check* on the ASN, or the
+sync exception inbox) before its stock moves. Nothing else notices on its own.
+
+**Freight allocation and unweighed lines.** The receipt cost uses the same distribution the manual
+receipt uses, which means a `BY_WEIGHT` cost line allocates only across lines that HAVE a weight: a line
+whose product weight is null gets no share of it while a sibling with a positive weight takes the lot,
+so a **partially weighed PO silently allocates freight to only some of its lines**. That is
+pre-existing and consistent between the two receipt writers rather than new here, and it is recorded
+because it is a real allocation behaviour an operator would not otherwise see. (`BY_VALUE` and
+`BY_QUANTITY` are unaffected; and when NO eligible line has a positive basis the helper falls back to
+an equal split and warns.)
+
+> **ALL THREE WMS-side receipt writers now post (o3d-8f0p6 then o3d-6nd55).** This webhook path was
+> the second of three. The WMS stock-sync **align-up** path — which also credits PO-backed stock and
+> lays cost layers — posted nothing either, and because it wrote to *neither* ledger the transit
+> reconciliation tied out and hid the omission, so shipping this change alone did not make the transit
+> account auditable. It does now: align-up queues the same journal and the same transit row, in its own
+> transaction, and the two exclude each other's quantities (see **Align up** above). The caveat this
+> paragraph used to carry — "the PO-backed webhook path now posts", not "WMS receipts now post" — is
+> discharged.
+
+Why it had to be fixed at the source rather than in a sweep: nothing downstream derives a receipt
+journal from a stock movement. The Xero daily batch does not read `stock_movements` at all, its
+inventory reconciliation posts Inventory ↔ *Rounding difference* and only for a sub-unit `sweep` gap
+(a receipt-sized gap is `flag`, which is surfaced and never posted), and the transit reconciliation
+aggregates `transit_subledger_movements` — rows written at post time — so a posting that never
+happened is absent from both sides and that window ties out exactly. Proven by
+`tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts`.
 
 ### Purchase-order ASN lines are not landed-quantity aware yet
 
@@ -221,6 +382,8 @@ double-stock bug. The order is therefore o3d-papk first, then the PO retry path.
 Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
 
 - Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, missing transfer cost-layer snapshot, an **unreadable remote quantity** and a **missing remote ASN item** (the last two are o3d-btiw: an operator acknowledging a warning cannot supply a quantity the warehouse never served).
+- **`missing_local_line` means the ASN line names a source line IMS does not have — not that there was nothing to do for it (o3d-h66s).** The IMS purchase-order / stock-transfer rows are read for **every** line of the ASN, not only the ones with new quantity to apply, so a line whose remote quantity has not moved since the last callback is recognised as the healthy line it is. Until o3d-h66s that read was restricted to lines with a positive delta, so a zero-delta line reported its own existing IMS line as missing; because the warning is aggregate, that held the **whole** callback in an approval-blocked review and applied nothing for its other lines either. In practice that meant every partially booked ASN, every re-check of an ASN already settled, and any line whose `QuantityBooked` was a readable `0`. A `sourceLineId` that genuinely resolves to no IMS row still raises the warning and still blocks, with or without a delta.
+- **The warnings are AGGREGATE, by decision.** One line's blocking warning holds the whole receipt event, including sibling lines that have units to credit: a receipt event has one `processingStatus`, so applying some lines while holding others would move stock under a row that reads `REQUIRES_REVIEW` and leave the `reviewDetails` an operator later approves describing a state that has already changed. What makes it workable is that the review is per-line underneath — `reviewDetails.lines[].warnings` and the `mintsoft_booked_in_review_required` activity entry name the offending `asnLineMapId`, and a healthy line's warning list is empty — so an unknown line can never be silently skipped. Whether the hold should become per-line is tracked as **o3d-0qtvb**.
 - `received_over_expected` is a variance warning. It always requires admin review, but approval accepts the over-receipt and lets processing continue.
 - Approval requires fresh admin auth and the admin mutation header. Successful approvals stamp `reviewedAt` and `reviewedBy`; failed approval attempts remain visible through `lastError` and activity logs without stamping those success fields.
 - Activity logs include aggregate and line-level warning details so post-hoc audits can identify which ASN lines were approved.
@@ -228,7 +391,7 @@ Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dr
 
 ### Direct ASN Lookup Rollback
 
-Direct booked-in reconciliation calls Mintsoft's `/api/ASN/:id` endpoint. If staging or production API discovery shows a different direct endpoint shape, set `MINTSOFT_USE_BULK_ASN_LOOKUP=true` to temporarily restore the legacy list-and-match path while the connector endpoint is corrected. Leave it unset or `false` for normal operation. The list-and-match path reads the complete `GET /api/ASN/List` under the same rules as duplicate recovery above (until o3d-bhvu it requested `GET /api/ASN`, which is 405 on live Mintsoft, so the rollback path failed every time). Both paths share one known gap: the live ASN item carries `QuantityReceieved`/`QuantityBooked`, which the booked-in normalizer does not read yet (o3d-btiw).
+Direct booked-in reconciliation calls Mintsoft's `/api/ASN/:id` endpoint. If staging or production API discovery shows a different direct endpoint shape, set `MINTSOFT_USE_BULK_ASN_LOOKUP=true` to temporarily restore the legacy list-and-match path while the connector endpoint is corrected. Leave it unset or `false` for normal operation. The list-and-match path reads the complete `GET /api/ASN/List` under the same rules as duplicate recovery above (until o3d-bhvu it requested `GET /api/ASN`, which is 405 on live Mintsoft, so the rollback path failed every time). Both paths read the live ASN item's `QuantityExpected`/`QuantityReceieved`/`QuantityBooked` through `lib/connectors/mintsoft/api/asn-quantities.ts` as of o3d-btiw (#704); the sentence that used to stand here said the booked-in normalizer did not read them yet, and that stopped being true when #704 merged.
 
 ### Typed Retry-State Migration Runbook
 

@@ -123,6 +123,26 @@ proof the database is disposable (see "WHAT A MARKER PROVES" below). All of thes
 * the name is not obviously real — `onetwoinventory`, `onetwo3d…`, `postgres…`/`template…`/`pg_…`, or
   anything containing `prod`/`live`, are refused however they are stamped and declared.
 
+**THE SAME STAMP GATES THE ONE PRODUCTION SWEEP THIS TIER DRIVES (o3d-1q28).** Some lanes have to run
+a real production function that is a SWEEP over the globally oldest rows rather than over the caller's
+fixtures, and `purgeExpiredActivityLogs` (`lib/activity-log-cleanup.ts`) takes no client and no
+predicate at all: it is an unbounded oldest-first `DELETE FROM activity_logs` loop. Two things stop it
+reaching a real database:
+
+* `tests/concurrency/withheld-marker-durability.concurrent.test.ts` PROVISIONS ITS OWN DATABASE
+  (`tests/helpers/throwaway-database.ts`), stamps it, points `DATABASE_URL` at it before `@/lib/db` is
+  first imported, and drops it in a `finally` — so the sweep's "globally oldest rows" are the lane's own
+  fixtures and nothing else; AND
+* the sweep itself REFUSES, naming the database, when `RUN_DB_CONCURRENCY_TESTS=1` and the database it
+  reached does not carry the stamp. Pointing a lane at its own database is configuration, and
+  configuration being wrong was the whole defect. With the tier flag unset the check is one
+  `process.env` comparison and no round trip, so a production retention cron is unaffected — a real
+  database is never stamped, and a sweep that refused to run against production would be a worse
+  defect than the one this closes.
+
+The stamp text has ONE definition, `lib/disposable-database-marker.ts`, which the tier guard above and
+the sweep both read.
+
 **WHAT A MARKER PROVES, AND NOTHING MORE:** a marker is evidence that someone who owns the database
 deliberately wrote this exact sentence naming this exact database — not that the stamper ran, and not
 that the database was empty. The guard compares one string, the text is a constant in this repository,
@@ -195,7 +215,10 @@ RESIDUALS, so nobody has to discover them:
 
 `npm run validate:db` runs this tier only when `IMS_CONCURRENCY_SCRATCH_DB` is set, and prints a
 SKIPPED notice otherwise; CI (`fresh-db-drift` in `.github/workflows/schema-guardrails.yml`) stamps and
-declares its own per-run `ims_ci` service database, so the tier is gated on every PR that touches it.
+declares its own per-run `ims_ci` service database, so the tier is gated on every pull request that is
+not documentation-only (o3d-fuls0 replaced that job's `paths:` allowlist with
+`paths-ignore: ["**/*.md"]`; it used to be gated on a hand-picked list of subjects that the tier had
+outgrown).
 
 **HOW EVERY FILE IS COVERED (o3d-yvn8).** Until this change 31 of the tier's 35 files had no guard and
 seeded whatever `DATABASE_URL` reached — measured before the fix on an unstamped, undeclared database:
@@ -303,10 +326,16 @@ the second job.
 WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser version of this sentence
 ("the job runs `tests/db/**`") was true of the glob and false of what executed:
 
-* **ENFORCED.** A pull request touching one of the job's `paths:` filters runs `npm run test:db`
-  against a freshly migrated database, and a failing suite turns the job red — proved by mutation,
-  not by reading: set `PRESERVE_LEGACY_WC_ORDER_CURRENCY_EVIDENCE = false` in
-  `lib/connectors/shopping-webhook-retention.ts` and `npm run test:db` exits non-zero.
+* **ENFORCED.** A pull request runs `npm run test:db` against a freshly migrated database, and a
+  failing suite turns the job red — proved by mutation, not by reading: set
+  `PRESERVE_LEGACY_WC_ORDER_CURRENCY_EVIDENCE = false` in
+  `lib/connectors/shopping-webhook-retention.ts` and `npm run test:db` exits non-zero. Since
+  o3d-fuls0 the trigger is `paths-ignore: ["**/*.md"]` rather than an allowlist of subjects: the
+  allowlist named the tests and a hand-picked seven of their subjects, and the two sets drifted —
+  `lib/settings-store.ts` was absent while 22 of 38 concurrency files import it, and
+  `lib/domain/wms/booked-in-service.ts` was absent while three concurrency files exist only to pin
+  it. A doc-only pull request still skips the job, because `paths-ignore` skips a run only when
+  every changed file matches; a PR touching a doc **and** a line of code runs it.
 * **ENFORCED, for `RUN_DB_RETENTION_TESTS` ALONE.** `test:db` sets it together with
   `REQUIRE_DB_RETENTION_TESTS`, and ALL THREE files gated on it throw on load if they are handed the
   `REQUIRE_` half without its own. An edit that drops `RUN_DB_RETENTION_TESTS` from `test:db`
@@ -335,8 +364,12 @@ WHAT THAT DOES AND DOES NOT BUY YOU. State it precisely, because the looser vers
 * **NOT ENFORCED: that the job keeps existing.** o3d-11rf r13 through r16 attempted that with a
   standing guard that read the workflow to prove the job really invoked the script; the guard was
   withdrawn, because it kept admitting deterministic states in which the job was green and the suites
-  never ran. An edit that deletes the job, renames the script, or drops `tests/db/**` from the
-  `paths:` filters is caught by review and by nothing else. **o3d-n3yt** carries this one.
+  never ran. An edit that deletes the job or renames the script is caught by review and by nothing
+  else. **o3d-n3yt** carries this one. What IS enforced, since o3d-fuls0, is the trigger: the two
+  tests in `tests/scripts/deploy-order.test.ts` named after that issue require both events to be
+  `paths-ignore: ["**/*.md"]` and refuse any surviving `paths:` allowlist, because `paths` and
+  `paths-ignore` on the same event make the workflow invalid and an invalid workflow does not run at
+  all. That says nothing about the job inside it still doing anything.
 * **NOT ENFORCED: `tests/concurrency/**`.** Dropping `RUN_DB_CONCURRENCY_TESTS` from
   `test:concurrency` would silently skip that whole tier exactly as `RUN_DB_RETENTION_TESTS` did.
   That tier has no `REQUIRE_` counterpart in any file, so it does not even have the one-pair tripwire

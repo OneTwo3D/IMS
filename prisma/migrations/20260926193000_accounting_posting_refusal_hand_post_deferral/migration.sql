@@ -1,0 +1,27 @@
+-- o3d-j625 r18 (Codex round 17, HIGH 1) — AN EDIT IMS DECLINED TO QUEUE WHILE A HAND-POSTING CLAIM WAS HELD.
+--
+-- r16's claim stops IMS queueing a posting while an operator is in the ledger making it by hand. It did so
+-- through the same channel a COMPLETED hand posting uses, and the enqueue then answered
+-- `{ queued: true, reason: 'handled-by-hand' }` for both. On the three posting keys that successive
+-- postings SHARE by design (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE, BILL_PAYMENT) that collapsed two
+-- opposite facts: saving a LATER edit during the claim wrote no sync row AND recorded no refusal, because
+-- every consumer reads `queued: true` as "a counterpart exists in the ledger". Ending the claim requeued
+-- nothing. The ledger stayed behind IMS with no outstanding debt for that edit — worse than the duplicate
+-- the claim exists to stop, because a duplicate is visible in the ledger and this was visible nowhere.
+--
+-- These two columns are the record of that postponement, and they are written CAUSALLY: the increment
+-- happens in the same statement-sequence that read the live claim, under the posting key's advisory lock.
+-- Deliberately NOT a timestamp comparison — `lastRefusedAt` and `handPostClaimedAt` are stamped by two
+-- application processes' clocks, and o3d-j625 r12 removed the last decision in this module that rested on
+-- comparing two of those.
+--
+-- Both ways a claim can end DISCHARGE the count, and what discharging means differs by key:
+--   · a REUSED key — the operator posted an EARLIER version by hand, so the refusal stays OUTSTANDING with
+--     the postponed edits added to `refusedCount`; the ledger still does not hold the current document.
+--   · any other key — the postponed enqueue was a RETRY of the very posting just made by hand, so the row
+--     resolves and suppresses exactly as before.
+--
+-- NULLABLE / ZERO-DEFAULTED AND NOT BACKFILLED: 0 and NULL mean "nothing was postponed", which is what
+-- every existing row is.
+ALTER TABLE "accounting_posting_refusals" ADD COLUMN "handPostDeferredCount" INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE "accounting_posting_refusals" ADD COLUMN "handPostDeferredAt" TIMESTAMP(3);

@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -213,4 +216,626 @@ test('the migration this repository requires to declare checks now declares them
   assert.deepEqual(coverage.missing, [], 'every required migration must ship a verify.sql')
   assert.deepEqual(coverage.stale, [])
   assert.equal(coverage.satisfied, true, 'node scripts/run-migration-verifications.mjs --strict must be able to pass')
+})
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// o3d-j625 r28 (Codex round 27, HIGH 2) — A MIGRATION THAT HAS BEEN APPLIED SOMEWHERE IS FOREVER.
+//
+// r26 removed a table by DELETING its migration. A fresh database never applies the deleted migration,
+// so every tier of a fully green gate passed; a database that HAD applied it was left with a table no
+// migration drops and `db:schema:drift` rejecting the extra table. The upgrade path is the one path CI
+// never walks, which is why this needs a rule in the repo rather than care from the next author.
+//
+// `scripts/check-migration-conventions.mjs` cannot catch it: it diffs with `--diff-filter=ACMR`, which
+// excludes deletions by construction. So the rule lives here.
+//
+// WHAT WOULD STILL PASS THESE TESTS: renaming a migration directory in the same commit that created it
+// (no ref has it yet, so nothing was applied anywhere); editing the BODY of an already-shipped migration,
+// which is a different defect with a different fix; and a table created and dropped by migrations that
+// PRISMA never modelled in the first place. Neither test says anything about column-level changes.
+
+/**
+ * o3d-ec4c0 r4 (adversarial review, HIGH) — EVERY MIGRATION EVER ADDED IN `base..ref`, INCLUDING ON PRUNED SIDE
+ * HISTORY.
+ *
+ * `--full-history` is load-bearing and must not be tidied away as noise: git's DEFAULT history simplification
+ * answers "which commits explain the current contents of this path", and the question here is the different one
+ * "was this path ever added anywhere in this range". A side branch that adds a migration and later deletes it,
+ * merged with no net change under `prisma/migrations/`, is exactly the history default simplification is entitled
+ * to prune — and pruning it drops the addition from this walk.
+ *
+ * That omission cannot be recovered downstream: the directory is absent from HEAD too, so the tree-difference
+ * cross-check has nothing to compare against and BOTH derivations miss the same migration. A database that applied
+ * that side branch then retains history the repository no longer contains, which is r29's incident verbatim.
+ *
+ * PRE-EXISTING, not introduced by this branch: the walk has carried default simplification since o3d-j625 r30, and
+ * the invocation is byte-identical between trunk at a6ad39b5 and rounds 1-3 here.
+ *
+ * `cwd` is a parameter solely so a throwaway fixture repository can be walked by the regression test. Nothing but
+ * the repo root is ever passed in the live check.
+ */
+export function migrationsIntroducedBetween(input: {
+  cwd: string
+  base: string
+  ref?: string
+}): Set<string> {
+  const out = execFileSync('git', [
+    // Top-level: ignore refs/replace and grafts, which can rewrite the very history being walked.
+    '--no-replace-objects',
+    'log',
+    // --full-history: default history simplification may prune a side branch that adds then deletes. SET.
+    '--full-history',
+    // -m: a merge commit's own additions are only visible as a per-parent diff; without it git prints no paths
+    // for a merge at all (o3d-ec4c0 round 6; reproduced on this repo's merge ecec2a75: 0 paths, 11 with -m). SET.
+    '-m',
+    // --no-renames: a renamed migration directory is status R, not A, so `--diff-filter=A` would miss the NEW
+    // name. This also makes the walk independent of the ambient `diff.renames` (default true) and of copy
+    // detection (`diff.renames=copies`, `-C`). SET.
+    '--no-renames',
+    // --diff-filter=A: after --no-renames the only status that introduces a path is A. R and C cannot occur
+    // once renames/copies are off, so AR/AC would add nothing; M (edit of an existing file) and D are not
+    // additions. SET to exactly A.
+    '--diff-filter=A',
+    // -z with --name-only: NUL-separated, never quoted, so it does not depend on `core.quotepath` and odd path
+    // bytes cannot be octal-escaped into something that no longer ends in `/migration.sql`. SET.
+    '--name-only',
+    '-z',
+    // Empty format: no subject lines to confuse the parse. `--no-show-signature` stops an ambient
+    // `log.showSignature=true` interleaving gpg text into the stream. SET.
+    '--pretty=format:',
+    '--no-show-signature',
+    // The range `base..ref`. NOT `--first-parent` (would hide every side branch), NOT `--ancestry-path`, NOT
+    // `--simplify-by-decoration`/`--simplify-merges`/`--sparse`, NOT `--no-merges` (would hide merge-added
+    // paths), NOT `--follow` (single-file only), no `--since`/`--max-count`/`--skip`: each narrows the walk. UNSET.
+    `${input.base}..${input.ref ?? 'HEAD'}`,
+    // Pathspec limiting is intentional and cannot hide an addition: it restricts to the migrations tree, and
+    // the filter below needs nothing outside it. `:(literal)`-style magic is unnecessary for a fixed prefix.
+    '--',
+    'prisma/migrations/',
+  ], { cwd: input.cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+  return new Set(
+    out
+      .split('\0')
+      .map((line) => line.replace(/^\n+/, ''))
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+}
+
+/**
+ * o3d-ec4c0 — THE PROTECTED SET, AS A FUNCTION, so its property can be asserted without a branch that happens to
+ * add SQL.
+ *
+ * Trunk's migrations at the merge base, PLUS every migration a commit on this branch introduced. Both halves
+ * matter and r29 is the reason the second one exists: a branch's migrations reach real databases — stage, a
+ * colleague's checkout, every scratch database a review gates on — long before the branch merges, so deleting one
+ * afterwards leaves a database with history the repo no longer contains.
+ */
+export function buildProtectedMigrationSet(input: {
+  onTrunk: Iterable<string>
+  introducedOnBranch: Iterable<string>
+}): Set<string> {
+  return new Set([...input.onTrunk, ...input.introducedOnBranch])
+}
+
+/**
+ * o3d-ec4c0 r2 (adversarial review, HIGH) — THE SAME FACT, DERIVED TWICE, REQUIRED TO AGREE.
+ *
+ * Skipping the contribution assertion when `introducedOnBranch` is empty closed the trunk failure and opened a
+ * quieter hole: an empty set means either "this branch genuinely adds no migration" OR "the git derivation
+ * produced nothing because it is broken", and the skip treats both as fine. r30 treated both as failure, which is
+ * what reddened trunk. Neither behaviour distinguishes them, in opposite directions.
+ *
+ * `onBranch \ onTrunk` is a SECOND, independent derivation of "migrations this branch added" — a set difference
+ * between two `git ls-tree` reads, rather than `--diff-filter=A` over the `merge-base..HEAD` commit RANGE. The
+ * two cannot both be broken by the same mistake, so requiring them to agree turns the disclosure into a check.
+ *
+ * CONTAINMENT, NOT NON-EMPTINESS (o3d-ec4c0 round 3). The first version returned early whenever the commit range
+ * found anything at all, which encoded "if the range found something, trust it entirely" — and non-empty is not
+ * the same as correct. A derivation that finds one migration and misses two is non-empty and wrong, and the set
+ * difference would have found all three. So every directory the difference finds must ALSO appear in the range,
+ * and what is returned is `(onBranch \ onTrunk) \ introducedOnBranch`. That subsumes the all-empty case — with
+ * an empty range the whole difference is reported, which is round 2's behaviour exactly — and adds the partial
+ * case round 2 missed.
+ *
+ * STILL ONE-DIRECTIONAL, and this must not become set equality. `introducedOnBranch` may legitimately contain
+ * directories absent from the difference: a migration this branch added that has since landed on trunk appears in
+ * the range but no longer in the difference. Containment in this direction says nothing about those, which is the
+ * point; equality would fail on any ordinary up-to-date branch.
+ *
+ * SHALLOW CLONES ARE NOT THIS FUNCTION'S PROBLEM, and the layering is the point rather than an omission. With no
+ * usable merge base `onTrunk` is empty or tiny, so the difference becomes "every migration in the repo" and this
+ * check would fire with a misleading message. Its CALLER asserts `onTrunk.size > 50` FIRST, so that case is
+ * reported as what it is — a checkout this test cannot reason about — before ever reaching here. Adding a second
+ * guard inside this function would duplicate that precondition and give two different messages for one cause.
+ */
+export function branchMigrationDerivationsDisagree(input: {
+  introducedOnBranch: Iterable<string>
+  onBranch: Iterable<string>
+  onTrunk: Iterable<string>
+}): string[] {
+  const onTrunk = new Set(input.onTrunk)
+  const introduced = new Set(input.introducedOnBranch)
+  // Every migration the tree difference finds must also be in the commit range. NOT the converse — see above.
+  return [...new Set(input.onBranch)]
+    .filter((dir) => !onTrunk.has(dir) && !introduced.has(dir))
+    .sort()
+}
+
+/**
+ * o3d-ec4c0 — R29'S FINDING, CARRIED ON EVERY BRANCH INCLUDING TRUNK.
+ *
+ * The deletion check below can only show this property when the current branch happens to have added a
+ * migration; on trunk, and on any branch that adds none, there is nothing to demonstrate it with. That is what
+ * made r30's precondition fail everywhere. Asserted here over synthetic inputs instead, so the guarantee holds
+ * wherever the suite runs.
+ *
+ * WHAT WOULD STILL PASS IT: any implementation that unions the two inputs, however written. It says nothing about
+ * how the two inputs are DERIVED from git — that is the deletion check's job, and its `onTrunk.size > 50`
+ * precondition is what keeps it honest.
+ */
+/**
+ * o3d-ec4c0 r4 (adversarial review, HIGH) — THE PRUNED SIDE BRANCH, AGAINST A REAL GIT REPOSITORY.
+ *
+ * The finding: a side branch adds a migration and later deletes it; its merge has no net change under
+ * `prisma/migrations/`, so git's default history simplification is entitled to prune that side history and the
+ * addition never appears in the walk. Nothing downstream can recover it — the directory is absent from HEAD too,
+ * so the tree-difference cross-check has nothing to compare against and BOTH derivations miss the same migration.
+ * A database that applied that side branch then retains history the repository no longer contains, which is r29's
+ * incident verbatim.
+ *
+ * Built as a throwaway repository rather than synthetically, because the thing under test IS git's history
+ * traversal: a fake `git` runner would only prove that my own mock prunes when I tell it to. The repo lives in this
+ * process's own throwaway /tmp and is removed on `after`, per the tmp-dir sentinel (o3d-tmpleak).
+ *
+ * WHAT WOULD STILL PASS IT: any walk that reports additions on unreachable-by-simplification history —
+ * `--full-history` is one way and the one used. It says nothing about `--simplify-merges` variants, nor about
+ * additions made by a merge commit itself — those are the r6 fixture below, and need `-m`.
+ */
+/**
+ * Throwaway repository shared by every walk fixture below. `diff.renames` is set to TRUE explicitly: it is git's
+ * default, and pinning it here is what lets the `--no-renames` mutation be red rather than silently masked by a
+ * fixture that happened to disable detection.
+ */
+function walkFixture(t: { after: (fn: () => void) => void }, prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const g = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' })
+  const migrationPath = (name: string) => join('prisma', 'migrations', name)
+  const migration = (name: string, body = 'SELECT 1;\n') => {
+    mkdirSync(join(dir, migrationPath(name)), { recursive: true })
+    writeFileSync(join(dir, migrationPath(name), 'migration.sql'), body)
+  }
+  const commitAll = (message: string) => { g('add', '-A'); g('commit', '-q', '-m', message) }
+  g('init', '-q', '-b', 'main', '.')
+  g('config', 'user.email', 'fixture@example.invalid')
+  g('config', 'user.name', 'fixture')
+  g('config', 'commit.gpgsign', 'false')
+  g('config', 'diff.renames', 'true')
+  migration('20260101000000_base', 'SELECT 0;\n')
+  commitAll('base')
+  g('branch', 'trunk')
+  return {
+    dir, g, migration, migrationPath, commitAll,
+    inHead: (name: string) => existsSync(join(dir, migrationPath(name))),
+    walk: () => migrationsIntroducedBetween({ cwd: dir, base: g('merge-base', 'trunk', 'main').trim(), ref: 'main' }),
+  }
+}
+
+test('o3d-ec4c0: a migration added then deleted on a MERGED SIDE BRANCH is still found', (t) => {
+  const f = walkFixture(t, 'ec4c0-sidebranch-')
+  const { g } = f
+
+  // The side branch: adds a migration, then deletes it again, so the merge carries NO net change.
+  g('checkout', '-q', '-b', 'side')
+  f.migration('20260202000000_side_added_then_deleted')
+  f.commitAll('side: ADD the migration')
+  g('rm', '-rq', f.migrationPath('20260202000000_side_added_then_deleted'))
+  g('commit', '-q', '-m', 'side: DELETE it again')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--no-ff', 'side', '-m', 'merge side (no net migration change)')
+
+  const base = g('merge-base', 'trunk', 'main').trim()
+
+  // PRECONDITIONS — without these the fixture could pass for the wrong reason.
+  assert.equal(g('diff', '--name-only', `${base}..main`, '--', 'prisma/migrations/').trim(), '',
+    'PRECONDITION: the merge must carry NO net change under prisma/migrations, or default simplification has no '
+    + 'reason to prune the side history and this fixture is not reproducing the finding')
+  assert.equal(f.inHead('20260202000000_side_added_then_deleted'), false,
+    'PRECONDITION: and the directory must be absent from the working tree, which is why the tree-difference '
+    + 'cross-check cannot catch this omission either — both derivations miss the same migration')
+
+  assert.deepEqual(
+    [...f.walk()],
+    ['20260202000000_side_added_then_deleted'],
+    'a migration ADDED anywhere in this range must be found even though nothing in the current contents explains '
+    + 'it. Default history simplification answers "which commits explain HEAD"; the question here is "was this '
+    + 'ever added", and only --full-history answers that one',
+  )
+})
+
+/**
+ * o3d-ec4c0 r6 (adversarial review, HIGH) — A MIGRATION ADDED BY A MERGE COMMIT ITSELF.
+ *
+ * `git log` prints no paths for a merge unless told to diff it against each parent (`-m`). A merge that itself
+ * introduces a migration — a conflict resolution, or `merge --no-commit` plus an added file — has no non-merge
+ * commit that adds it, so a walk without `-m` never sees it; and if a later commit deletes it the directory is
+ * absent from HEAD, so the tree-difference cross-check sees nothing either.
+ *
+ * WHAT WOULD STILL PASS IT: a walk that reports the merge's additions but loses a different class (renames, odd
+ * paths — see the next tests and the option table on `migrationsIntroducedBetween`).
+ */
+test('o3d-ec4c0 r6: a migration added by a MERGE COMMIT ITSELF, then deleted, is still found', (t) => {
+  const f = walkFixture(t, 'ec4c0-mergeadd-')
+  const { g } = f
+  const name = '20260303000000_added_by_the_merge_itself'
+
+  g('checkout', '-q', '-b', 'side')
+  writeFileSync(join(f.dir, 'unrelated.txt'), 'side work\n')
+  f.commitAll('side: unrelated work, no migration')
+  g('checkout', '-q', 'main')
+  writeFileSync(join(f.dir, 'main.txt'), 'main work\n')
+  f.commitAll('main: unrelated work so the merge is a real two-parent merge')
+  g('merge', '-q', '--no-ff', '--no-commit', 'side')
+  f.migration(name)
+  g('add', '-A')
+  g('commit', '-q', '-m', 'merge side AND add a migration in the merge itself')
+  const mergeSha = g('rev-parse', 'HEAD').trim()
+  g('rm', '-rq', f.migrationPath(name))
+  g('commit', '-q', '-m', 'later: delete the migration the merge added')
+
+  // PRECONDITIONS
+  assert.equal(g('rev-list', '--parents', '-n1', mergeSha).trim().split(' ').length, 3,
+    'PRECONDITION: the commit that adds the migration must be a merge with exactly two parents')
+  assert.equal(g('log', '--no-merges', '--full-history', '--diff-filter=A', '--format=%h', '--', f.migrationPath(name)).trim(), '',
+    'PRECONDITION: no NON-merge commit ever ADDED the migration, so only a per-parent merge diff can see it')
+  assert.equal(f.inHead(name), false, 'PRECONDITION: the migration is absent from HEAD')
+
+  assert.deepEqual([...f.walk()], [name],
+    'the walk must report a migration that only a merge commit added (needs -m)')
+})
+
+/**
+ * o3d-ec4c0 r6 — A RENAMED MIGRATION. With rename detection on (git's default `diff.renames=true`), the commit
+ * that moves a directory records the NEW name with status R, not A, so `--diff-filter=A` never reports it. The
+ * old name is still reported (its own addition), which is why the guard's own deletion check would see that one
+ * vanish — this fixture pins the walk itself, which must report BOTH names.
+ */
+test('o3d-ec4c0 r6: a migration added, RENAMED, and the new name deleted is found under both names', (t) => {
+  const f = walkFixture(t, 'ec4c0-rename-')
+  const { g } = f
+  const oldName = '20260404000000_before_rename'
+  const newName = '20260404000001_after_rename'
+
+  g('checkout', '-q', '-b', 'feature')
+  f.migration(oldName, 'SELECT 42;\n')
+  f.commitAll('feature: add migration')
+  g('mv', f.migrationPath(oldName), f.migrationPath(newName))
+  g('commit', '-q', '-m', 'feature: rename the migration directory')
+  const renameSha = g('rev-parse', 'HEAD').trim()
+  g('rm', '-rq', f.migrationPath(newName))
+  g('commit', '-q', '-m', 'feature: delete the renamed migration')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--ff-only', 'feature')
+
+  // PRECONDITIONS
+  assert.match(g('show', '-M', '--name-status', '--format=', renameSha).trim(), /^R\d+\t.*20260404000000_before_rename\/migration\.sql\t.*20260404000001_after_rename\/migration\.sql$/m,
+    'PRECONDITION: with default rename detection the move commit really is recorded as R, not A')
+  assert.equal(f.inHead(oldName) || f.inHead(newName), false, 'PRECONDITION: neither name is in HEAD')
+
+  assert.deepEqual([...f.walk()].sort(), [newName, oldName].sort(),
+    'the walk must report the NEW name of a renamed migration (needs --no-renames)')
+})
+
+/** Control: an ordinary branch adding a migration that STAYS — the walk reports it and nothing is "deleted". */
+test('o3d-ec4c0 r6: control — a branch adding a migration that stays reports it and loses nothing', (t) => {
+  const f = walkFixture(t, 'ec4c0-control-')
+  const { g } = f
+  const name = '20260505000000_kept'
+
+  g('checkout', '-q', '-b', 'feature')
+  f.migration(name)
+  f.commitAll('feature: add a migration that stays')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--no-ff', 'feature', '-m', 'merge feature')
+
+  // PRECONDITIONS
+  assert.equal(f.inHead(name), true, 'PRECONDITION: the migration really is present at HEAD')
+  assert.equal(g('rev-list', '--parents', '-n1', 'HEAD').trim().split(' ').length, 3,
+    'PRECONDITION: HEAD is a real merge, so this control also exercises -m')
+
+  const walked = [...f.walk()]
+  assert.deepEqual(walked, [name], 'the walk reports exactly the one migration the branch added')
+  assert.deepEqual(walked.filter((n) => !f.inHead(n)), [], 'and none of them is missing from HEAD, so the guard does not fire')
+})
+
+test('o3d-ec4c0: the protected set never collapses to trunk-only, nor to branch-only', () => {
+  const onTrunk = ['20240101000000_a', '20240102000000_b']
+  const introducedOnBranch = ['20260301000000_added_on_this_branch']
+  const set = buildProtectedMigrationSet({ onTrunk, introducedOnBranch })
+
+  // THE r29 PROPERTY: a migration this branch introduced is protected even though trunk has never seen it.
+  assert.ok(set.has('20260301000000_added_on_this_branch'),
+    'a migration introduced on this branch MUST be protected. Dropping it is r29\'s finding: the guard then '
+    + 'protects only trunk, while the migration whose deletion caused the incident is the branch\'s own.')
+  // ...and the trunk half is not lost in the process.
+  for (const dir of onTrunk) {
+    assert.ok(set.has(dir), `trunk's ${dir} must stay protected`)
+  }
+  assert.equal(set.size, 3, 'and nothing else is invented')
+
+  // Each input alone still produces a protected set, so neither half is load-bearing for the other. This is the
+  // case that matters on trunk, where the branch side is empty by construction.
+  assert.deepEqual([...buildProtectedMigrationSet({ onTrunk, introducedOnBranch: [] })].sort(), [...onTrunk].sort(),
+    'on trunk (no branch contribution) the set is exactly trunk\'s migrations — not empty, which would make the '
+    + 'deletion check below inert on the one branch everybody merges into')
+  assert.deepEqual(
+    [...buildProtectedMigrationSet({ onTrunk: [], introducedOnBranch })],
+    [...introducedOnBranch],
+    'and a branch-only set is still protected, so a shallow clone with no trunk ref cannot silently protect nothing',
+  )
+})
+
+/**
+ * o3d-ec4c0 r2 (adversarial review, HIGH) — THE CROSS-CHECK, DRIVEN DIRECTLY.
+ *
+ * The consistency check can only fire for real on a branch that HAS added a migration, so on trunk — and on this
+ * branch — the live test cannot demonstrate it. Same technique as `buildProtectedMigrationSet`: assert the
+ * function over synthetic inputs so the guarantee holds wherever the suite runs.
+ *
+ * WHAT WOULD STILL PASS IT: any implementation computing the one-directional difference, however written. It says
+ * nothing about `onTrunk` being correctly populated — that is the caller's `onTrunk.size > 50` precondition, and
+ * deliberately not duplicated here.
+ */
+test('o3d-ec4c0: a broken branch-migration derivation is caught by the second derivation', () => {
+  const onTrunk = ['20240101000000_a', '20240102000000_b']
+  const added = '20260401000000_added_here'
+
+  // 1. THE REGRESSION THE REVIEW IS ABOUT: the commit range found nothing, the trees disagree.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [], onBranch: [...onTrunk, added], onTrunk }),
+    [added],
+    'a migration present on HEAD and absent from the merge base, with an EMPTY commit-range derivation, must be '
+    + 'reported: that combination can only mean the derivation is broken, and the skip would otherwise disable '
+    + 'branch-migration protection silently',
+  )
+
+  // 1b. THE ROUND-3 FINDING: the range found SOMETHING but missed others. Non-empty is not the same as correct,
+  //     and the early return this replaces trusted any non-empty range entirely.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [added],
+      onBranch: [...onTrunk, added, '20260402000000_missed_one', '20260403000000_missed_two'],
+      onTrunk,
+    }),
+    ['20260402000000_missed_one', '20260403000000_missed_two'],
+    'a commit-range derivation that finds ONE migration and misses two is non-empty and WRONG. Every directory '
+    + 'the tree difference finds must also appear in the range; the two it missed must be reported, or a deleted '
+    + 'branch migration goes unprotected while the cross-check reports agreement (o3d-ec4c0 round 3)',
+  )
+
+  // 2. THE TRUNK CASE, which must NOT fail — it is what reddened trunk under r30.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [], onBranch: onTrunk, onTrunk }),
+    [],
+    'both derivations empty is a branch that genuinely adds nothing, including trunk itself; this must be silent',
+  )
+
+  // 3. THE CONTROL, and it is what stops containment becoming a fourth red trunk: an ordinary branch whose two
+  //    derivations agree must report NOTHING. Containment is a superset of the old check, so this is the arm that
+  //    proves the widening did not make it fire on healthy branches.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({ introducedOnBranch: [added], onBranch: [...onTrunk, added], onTrunk }),
+    [],
+    'CONTROL: on a healthy branch the two derivations agree and nothing is reported. If this ever fails, the '
+    + 'check fires on every branch that adds a migration and trunk goes red again',
+  )
+  // ...and the same with several, so "agrees" is not an accident of there being exactly one.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [added, '20260405000000_second'],
+      onBranch: [...onTrunk, added, '20260405000000_second'],
+      onTrunk,
+    }),
+    [],
+    'CONTROL: still silent when the branch added several and the range found all of them',
+  )
+
+  // 4. THE LEGITIMATE ASYMMETRY, which is why set equality is NOT asserted: a migration this branch added has
+  //    since landed on trunk, so the commit range still names it while the tree difference no longer does.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [added],
+      onBranch: [...onTrunk, added],
+      onTrunk: [...onTrunk, added],
+    }),
+    [],
+    'a branch migration that has since landed on trunk appears in the commit range but not in the difference. '
+    + 'Asserting equality of the two sets would fail on any up-to-date branch, which is why the implication is '
+    + 'one-directional',
+  )
+
+  // ...and several at once are all reported, sorted, so the message names every directory the difference found.
+  assert.deepEqual(
+    branchMigrationDerivationsDisagree({
+      introducedOnBranch: [],
+      onBranch: ['20260501000000_z', ...onTrunk, '20260402000000_y'],
+      onTrunk,
+    }),
+    ['20260402000000_y', '20260501000000_z'],
+    'every directory the second derivation found is named, in a stable order',
+  )
+})
+
+test('o3d-j625 r30: no migration this branch has ever had may be deleted from HEAD or the working tree', () => {
+  const root = process.cwd()
+  const git = (args: string[]) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim()
+
+  let base: string
+  try {
+    base = git(['merge-base', 'origin/development', 'HEAD'])
+  } catch {
+    // No trunk ref in this checkout (a shallow CI clone). Say so rather than passing quietly.
+    assert.fail('PRECONDITION: origin/development must be fetched for this check to mean anything')
+  }
+
+  const dirsAt = (ref: string) => new Set(
+    git(['ls-tree', '-r', '--name-only', ref, 'prisma/migrations/'])
+      .split('\n')
+      .filter((line) => line.endsWith('/migration.sql'))
+      .map((line) => line.split('/')[2]),
+  )
+
+  /**
+   * o3d-j625 r30 (Codex round 29, HIGH 2) — THE PROTECTED SET IS TRUNK'S MIGRATIONS **PLUS THIS BRANCH'S OWN**.
+   *
+   * r28 derived it from the merge base alone, which protects an adjacent property: it guards trunk's
+   * migrations while the migration whose deletion caused the whole incident —
+   * 20260926213000_accounting_hand_post_claim_revision — exists ONLY on this branch. Deleting it again, from
+   * HEAD or from the working tree, passed both of r28's checks; the table scan passed too, because the later
+   * DROP survives and the scan only asks whether a created table is dropped or modelled. The guard written to
+   * prevent this exact failure did not prevent this exact failure.
+   *
+   * So a migration introduced by a commit ON THIS BRANCH is protected from the moment that commit exists. The
+   * reason is the same one the whole finding rests on: a branch's migrations get applied to real databases
+   * (stage, a colleague's checkout, every scratch database this issue has gated on) long before the branch
+   * merges, and from then on deleting one leaves a database with history the repo no longer contains.
+   *
+   * WHAT THIS FORBIDS, stated plainly: renaming or removing a migration you added in an EARLIER commit on
+   * this branch. That is deliberate, and the escape hatch is not a flag — it is to make the claim true. Either
+   * reverse it with a LATER migration (the same advice as for trunk's), or rewrite the branch history with an
+   * amend or a rebase so that no commit ever carried it. The second only works when it really was never
+   * applied anywhere, which is exactly the condition under which it is safe.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   * THE LIMIT OF THIS GUARD, STATED (o3d-j625 r32, Codex round 31 HIGH 2 — strengthening filed as o3d-bm8es)
+   * ══════════════════════════════════════════════════════════════════════════════════════════════════════
+   *
+   * It protects trunk's migrations and those introduced by commits CURRENTLY REACHABLE in `merge-base..HEAD`.
+   * A history rewrite — squash, amend, rebase, force-push — that removes a migration's introducing commit also
+   * removes it from the protected set, and the non-empty precondition below still passes because the branch's
+   * other migrations remain. Closing that needs a record outside rewriteable branch history; this guard does
+   * not have one.
+   *
+   * Said here rather than left to be inferred, because a guard that states its own reach is worth more than one
+   * that implies a reach it lacks (o3d-bddq).
+   *
+   * WHAT WOULD STILL PASS IT: adding a migration and deleting it again WITHOUT COMMITTING in between — no
+   * commit ever had it, so nothing could have applied it from this branch; changing the BODY of a shipped
+   * migration, which is a different defect with a different fix; and any change to a migration's directory
+   * that keeps `migration.sql` present under the same directory name. It says nothing about column-level
+   * conventions, which check-migration-conventions.mjs owns.
+   */
+  const introducedOnBranch = migrationsIntroducedBetween({ cwd: root, base })
+  const onTrunk = dirsAt(base)
+  const protectedDirs = buildProtectedMigrationSet({ onTrunk, introducedOnBranch })
+  const onBranch = dirsAt('HEAD')
+
+  assert.ok(onTrunk.size > 50, `PRECONDITION: the walk must actually see the trunk's migrations, saw ${onTrunk.size}`)
+  // AND the branch's own must actually be in the protected set, or this test has quietly reverted to r28's.
+  // Asserted as a non-empty INTERSECTION with what HEAD has, so it cannot be satisfied by a stale name.
+  //
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  // o3d-ec4c0 — THIS PRECONDITION REDDENED TRUNK, AND THE FIX IS NOT TO DELETE IT
+  // ══════════════════════════════════════════════════════════════════════════════════════════════════════
+  //
+  // r30 asserted, unconditionally, that this branch contributes at least one migration to the protected set —
+  // aimed at `protectedDirs` itself (r32) so that a silent collapse back to trunk-only could not pass. The aim
+  // was right and the placement was wrong: `introducedOnBranch` comes from `merge-base..HEAD`, so a branch that
+  // adds no migration contributes none and the PRECONDITION fails before the real deletion check ever runs. On
+  // trunk the range is empty by construction, so it fails there too. The guard could only pass on the branch
+  // that wrote it, which happened to add five migrations — a check whose precondition is satisfied only by its
+  // author's branch is not a check.
+  //
+  // So the property moves OFF the current branch's contents and ONTO the code: `buildProtectedMigrationSet` is
+  // asserted directly, with synthetic inputs, by the test below this one. That carries r29's finding on EVERY
+  // branch — including trunk, and including branches that add no SQL, which are exactly the branches where a
+  // deletion would otherwise go unnoticed. Here, where there is genuinely nothing to exercise, the assertion is
+  // SKIPPED rather than failed; where the branch does add a migration it still runs, because a real example is
+  // worth having when one exists.
+  //
+  // o3d-ec4c0 r2 (adversarial review, HIGH) — AND THE SKIP IS NOW EARNED RATHER THAN ASSUMED.
+  //
+  // An empty `introducedOnBranch` means either "this branch adds no migration" or "the derivation is broken", and
+  // skipping on it treated both as fine — which stops protecting branch migrations the moment the derivation
+  // regresses. So the same fact is derived a SECOND way, by set difference between the two `ls-tree` reads, and
+  // the two must agree before the skip is allowed. Reached only after `onTrunk.size > 50` above, which is what
+  // covers the shallow-clone case where the difference would be the whole repo.
+  const derivationDisagreement = branchMigrationDerivationsDisagree({ introducedOnBranch, onBranch, onTrunk })
+  assert.deepEqual(derivationDisagreement, [],
+    'THE TWO DERIVATIONS OF "migrations this branch added" DISAGREE. Comparing the trees directly found '
+    + `${derivationDisagreement.length} migration(s) present on HEAD and absent from the merge base that `
+    + `\`git log --full-history --diff-filter=A ${base}..HEAD\` did NOT report: ${derivationDisagreement.join(', ')}. The `
+    + 'commit-range derivation is therefore incomplete, and with it the protection of those migrations — '
+    + 'silently, which is what this cross-check exists to stop. Note it need not have found NOTHING: finding '
+    + 'some and missing others produces exactly this (o3d-ec4c0 round 3).'
+    // o3d-ec4c0 r3: if this names most of the repo's migrations, the cause is almost certainly a bad merge base
+    // rather than a broken range — but `onTrunk.size > 50` above fires first in that case and says so, so this
+    // hint is a pointer for a reader, not a second guard. See the note on the function for why not.
+    + (derivationDisagreement.length > 50
+      ? ' THIS NAMES MOST OF THE REPO: suspect the merge base, not the range — see the onTrunk precondition above.'
+      : ''))
+
+  if (introducedOnBranch.size > 0) {
+    const branchOwnProtected = [...introducedOnBranch].filter((dir) => onBranch.has(dir) && protectedDirs.has(dir))
+    assert.ok(branchOwnProtected.length > 0,
+      'this branch introduced a migration, so it must appear in the PROTECTED SET; if it does not, the set has '
+      + 'collapsed back to trunk-only, which is the r29 finding')
+  }
+
+  const deleted = [...protectedDirs].filter((dir) => !onBranch.has(dir))
+  assert.deepEqual(deleted, [],
+    'A migration that this branch or the trunk has already committed is missing from HEAD. Deleting an applied '
+    + 'migration removes nothing from a database that already ran it: `migrate deploy` then has no step that '
+    + 'undoes it and drift rejects the leftover object. Restore it and add a LATER migration that reverses it, '
+    + 'or rewrite history so no commit ever carried it (o3d-j625 r30).')
+
+  // AND ON DISK, which is the check that fires BEFORE the deletion is committed. The comparison above reads
+  // `git ls-tree`, so it is blind to a working tree the author has already emptied — r28's first draft passed
+  // with a trunk migration moved aside, which is precisely the moment an author wants to be told.
+  const missingOnDisk = [...protectedDirs].filter(
+    (dir) => !existsSync(join(root, 'prisma', 'migrations', dir, 'migration.sql')),
+  )
+  assert.deepEqual(missingOnDisk, [],
+    'A protected migration is missing from the working tree. Same rule, caught before the commit: restore it '
+    + 'and reverse it with a later migration instead (o3d-j625 r30).')
+})
+
+test('o3d-j625 r28: every table a migration creates is either modelled or dropped by a later migration', () => {
+  const root = process.cwd()
+  const migrationsDir = join(root, 'prisma', 'migrations')
+  const dirs = readdirSync(migrationsDir).filter((d: string) => /^\d{14}_/.test(d)).sort()
+  assert.ok(dirs.length > 50, `PRECONDITION: the walk must reach the migrations, saw ${dirs.length}`)
+
+  const created = new Map<string, string>()
+  const dropped = new Set<string>()
+  for (const dir of dirs) {
+    let sql: string
+    try {
+      sql = readFileSync(join(migrationsDir, dir, 'migration.sql'), 'utf8')
+    } catch {
+      continue
+    }
+    const body = sql.split('\n').filter((line: string) => !line.trimStart().startsWith('--')).join('\n')
+    for (const m of body.matchAll(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"([^"]+)"/gi)) created.set(m[1], dir)
+    for (const m of body.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"([^"]+)"/gi)) dropped.add(m[1])
+  }
+  assert.ok(created.size > 50, `PRECONDITION: CREATE TABLE statements must be found, saw ${created.size}`)
+  // o3d-ec4c0: the GENERAL form. r28 named one specific migration here, which made this precondition a hostage
+  // to that directory continuing to exist — the same shape of fragility that reddened trunk one test above. What
+  // it needs to know is that the DROP-parsing path is exercised at all.
+  assert.ok(dropped.size > 0,
+    'PRECONDITION: at least one DROP TABLE must be parsed (e.g. accounting_hand_post_claim_revisions), or this '
+    + 'test is not exercising the case it exists for')
+
+  const schema = readFileSync(join(root, 'prisma', 'schema.prisma'), 'utf8')
+  const modelled = new Set<string>()
+  for (const m of schema.matchAll(/@@map\("([^"]+)"\)/g)) modelled.add(m[1])
+  assert.ok(modelled.size > 50, `PRECONDITION: schema.prisma @@map names must be found, saw ${modelled.size}`)
+
+  const orphans = [...created.keys()].filter((t) => !modelled.has(t) && !dropped.has(t))
+  assert.deepEqual(orphans, [],
+    'These tables are created by a migration, are not in schema.prisma, and no migration drops them. Every '
+    + 'database that ran the migration will fail db:schema:drift. Add a migration that drops the table '
+    + '(o3d-j625 r28).')
 })

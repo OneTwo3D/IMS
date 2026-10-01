@@ -1,5 +1,9 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import {
+  lockPurchaseOrdersWithCostRows,
+  type PurchaseOrderLockClient,
+} from '@/lib/domain/wms/transfer-asn-lock-order'
 
 export type PurchaseOrderFxRebaseInput = {
   subtotalForeign: unknown
@@ -35,15 +39,17 @@ export type PurchaseOrderFxRebaseDb = {
   }
 }
 
-export type PurchaseOrderFxRebaseTransactionDb<TResult = unknown> = PurchaseOrderFxRebaseDb & {
-  purchaseOrder: {
-    update(args: {
-      where: { id: string }
-      data: Record<string, unknown>
-      select?: unknown
-    }): Promise<TResult>
+export type PurchaseOrderFxRebaseTransactionDb<TResult = unknown> = PurchaseOrderFxRebaseDb
+  & PurchaseOrderLockClient
+  & {
+    purchaseOrder: {
+      update(args: {
+        where: { id: string }
+        data: Record<string, unknown>
+        select?: unknown
+      }): Promise<TResult>
+    }
   }
-}
 
 export type PurchaseOrderFxRebaseTransactionalDb<TResult = unknown> = {
   $transaction<T>(fn: (tx: PurchaseOrderFxRebaseTransactionDb<TResult>) => Promise<T>): Promise<T>
@@ -131,6 +137,19 @@ export async function rebasePurchaseOrderStoredBaseAmountsWithParentUpdate<TResu
   parentUpdate: PurchaseOrderFxRebaseParentUpdate,
 ): Promise<TResult> {
   return db.$transaction(async (tx) => {
+    // ─── o3d-6nd55 r3: THE PARENT BEFORE ITS COST ROWS ───
+    //
+    // This transaction rewrote `purchase_order_lines` and `freight_cost_lines` and only THEN updated
+    // the `purchase_orders` row — children before parent, the signature that deadlocks against the WMS
+    // stock-sync alignment's parent-then-children order. Found by the writer census in
+    // lib/domain/wms/transfer-asn-lock-order.ts rather than by a production failure; an fx-rate edit on
+    // a linked FREIGHT order is exactly a case an alignment can be holding.
+    //
+    // The lock is taken HERE, inside the function that does the writing, rather than asked of the
+    // caller — which is why `PurchaseOrderFxRebaseTransactionDb` now requires `$queryRaw`. A caller
+    // that forgets is the defect this whole round is about.
+    await lockPurchaseOrdersWithCostRows(tx, [poId])
+
     const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(tx, poId, order, fxRateToBase)
 
     return tx.purchaseOrder.update({
