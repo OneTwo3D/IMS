@@ -8,6 +8,20 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Purchase-order lines have a landed-quantity definition (o3d-papk, first half)
+
+- **A manual purchase-order receipt can no longer be booked on top of units the WMS stock-sync
+  alignment already brought in.** The alignment lands stock and a cost layer without writing
+  `qtyReceived`, so the receipt guard saw the whole line as outstanding: aligning 6 of a 10-unit line
+  and then receiving 10 by hand put 16 units into stock for 10 physical ones, with a second cost layer
+  and a second `STOCK_RECEIPT` journal. The guard now refuses more than `qty − landed`, read inside the
+  transaction under the order lock.
+- A purchase order is RECEIVED (after a manual receipt or a WMS book-in) once every line has *landed*,
+  not only once `qtyReceived` reaches `qty`; the alignment planner caps a PO line at its own residue and
+  refuses an ASN whose order is CANCELLED or CLOSED; the EOL-archive incoming figure and the product
+  incoming badges count a PO line by what has landed. No migration.
+- The ASN creator's sizing and the retry path are unchanged and follow in the second half (o3d-6b9c).
+
 ### Parked connectors removed (o3d-remove-parked-connectors)
 
 - **Shopify (shopping) and QuickBooks Online (accounting) are no longer shipped.** The owner's

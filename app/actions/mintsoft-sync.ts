@@ -3740,7 +3740,9 @@ export async function createMintsoftPurchaseOrderAsn(
     // where it can be queried afterwards — the failed job's summary and an activity entry — rather than
     // only inside an error string. Nothing is adopted or retried on it here: the matcher in the connector
     // is what looks an existing ASN up, by the reference and the item source line ids.
-    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError ? error.externalAsnId : null
+    // o3d-0xspr: MintsoftAsnStatusUnreadableError carries the id of an ASN that EXISTS at the warehouse and was
+    // not recorded, exactly as the verification error does, so it is retained the same way.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError ? error.externalAsnId : null
 
     await db.wmsAsnMap.updateMany({
       where: {
@@ -4880,7 +4882,9 @@ export async function createMintsoftTransferAsn(
     // where it can be queried afterwards — the failed job's summary and an activity entry — rather than
     // only inside an error string. Nothing is adopted or retried on it here: the matcher in the connector
     // is what looks an existing ASN up, by the reference and the item source line ids.
-    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError ? error.externalAsnId : null
+    // o3d-0xspr: as in the purchase-order creator — the unreadable-status error carries an ASN that exists at
+    // the warehouse and was not recorded.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError ? error.externalAsnId : null
 
     await db.wmsAsnMap.updateMany({
       where: {

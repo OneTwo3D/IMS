@@ -359,23 +359,42 @@ aggregates `transit_subledger_movements` — rows written at post time — so a 
 happened is absent from both sides and that window ties out exactly. Proven by
 `tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts`.
 
-### Purchase-order ASN lines are not landed-quantity aware yet
+### Purchase-order lines have a landed-quantity definition (o3d-papk, first half)
 
-The two asymmetries above are one scope boundary, not two oversights. A purchase-order line has no
-"landed quantity" definition: the alignment credits `wms_asn_line_maps.qtyAccountedViaSnapshot` for a
-PO-sourced row and lays its cost layer without writing `purchase_order_lines.qtyReceived` either, so
-the same two columns disagree — but nothing yet defines how to combine them for a PO (o3d-papk).
+The WMS stock-sync alignment credits `wms_asn_line_maps.qtyAccountedViaSnapshot` for a PO-sourced row,
+lays its cost layer and queues its `STOCK_RECEIPT` journal, and **never writes
+`purchase_order_lines.qtyReceived`** (writing it through is rejected: the booked-in reconciliation reads
+the line-wide `qtyReceived` as manual receipts against *this* ASN, so aligned units parked there would be
+read as manual and a replacement ASN would add no stock). So an aligned line has landed units and a
+`qtyReceived` of zero. `lib/domain/inventory/po-line-landed-quantity.ts` is the one definition:
 
-Until that exists, the PO ASN path deliberately keeps BOTH of its old behaviours:
+> **landed = `qtyReceived` + Σ over every `wms_asn_line_maps` row of the line (closed and retired rows
+> included) of `max(0, qtyAccountedViaSnapshot − qtyAccountedViaReceipt)`**
 
-- lines are sized `qty - qtyReceived`, which over-states when an alignment has already brought units in;
-- a retry deletes or resizes a credited pending reservation, which loses that credit.
+and *outstanding* is `max(0, qty − landed)`, zero for a CANCELLED or CLOSED order. These now use it:
 
-Retiring a credited PO reservation without landed-aware sizing would be worse, not better: the
-replacement reservation would be raised at the full outstanding quantity with a zero credit, so a
-booked-in receipt against it would find nothing to cover the already-landed units and would add their
-stock a second time. The delete is a lost-evidence bug; retiring it first would make it a
-double-stock bug. The order is therefore o3d-papk first, then the PO retry path.
+- **the manual receipt** (`receivePurchaseOrder`) refuses more than the outstanding quantity — read inside
+  the transaction under the `purchase_orders` lock — so a receipt can no longer be booked on top of units
+  alignment already brought in (previously 10 aligned-6 then 10 received gave stock 16 for 10 physical
+  units, a second cost layer and a second journal);
+- **the PO status** after a manual receipt or a WMS book-in is RECEIVED when every line's *landed* quantity
+  reaches its quantity (alignment itself still does not change a PO's status);
+- **the alignment planner** caps an allocation by the PO line's own residue (`qty − landed`), shared across
+  that line's open ASN rows, as it already did for transfer lines; and it refuses an ASN whose PO is
+  CANCELLED or CLOSED as *unusable* (never as *raced*, which would block the SKU for ever) while a healthy
+  sibling keeps aligning;
+- **the receipt-timing check** on align-down, the **EOL auto-archive incoming figure** (which also stops
+  counting a PO line's own open ASN row a second time) and the **incoming-stock badges** in the product
+  list and detail pages.
+
+**Not done here, still open.** The PO ASN *creator* still sizes lines `qty − qtyReceived`, and a retry
+still deletes or resizes a credited pending reservation, losing the credit. Retiring a credited PO
+reservation without landed-aware sizing would be worse, not better (the replacement would be raised at the
+full outstanding quantity with a zero credit, so a booked-in receipt would add the already-landed units'
+stock a second time), so both land together in the second half (o3d-6b9c). The returns, invoicing,
+purchase-statistics, outstanding-PO-value, receipt-quantity, replenishment and display readers still read
+`qtyReceived` alone (o3d-nnics). A line partly received by hand and then covered by a landed-sized ASN
+loses units at booked-in time (o3d-67kw3, separate).
 
 ### Receipt Review
 

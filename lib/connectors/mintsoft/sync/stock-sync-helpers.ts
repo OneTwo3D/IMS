@@ -5,6 +5,10 @@ import {
   type TransferLineResidualQty,
   type WmsAsnLineResidualQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+import {
+  requirePurchaseOrderLineResidualQty,
+  type PurchaseOrderLineResidualQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
 
 type ThresholdConfig = {
   absoluteDelta: number | null
@@ -35,6 +39,13 @@ export type MintsoftAlignmentCandidate = {
    * look (the round-6 finding). See `transferLineResiduals` below.
    */
   transferLineId: string | null
+  /**
+   * The purchase-order line this ASN row draws from, or null for a STOCK_TRANSFER_LINE
+   * candidate (o3d-papk). The planner applies that line's own residue as a second cap,
+   * exactly as for a transfer line: an already-landed PO line offers no capacity however
+   * open its ASN rows look. See `purchaseLineResiduals` below.
+   */
+  purchaseLineId: string | null
   sortAt: Date | string
   sortId: string
 }
@@ -191,6 +202,10 @@ export function collectMissingInWmsCandidates(input: {
  *      the line by ANY route, shared across every open ASN row of that line and
  *      depleted as this plan allocates.
  *
+ * A PURCHASE-ORDER line is capped the same way (o3d-papk): its residue is `line.qty`
+ * less its LANDED quantity (`qtyReceived` plus the unabsorbed alignment credit over every
+ * ASN row, closed ones included), through `purchaseLineResiduals`.
+ *
  * Applying only (1) is the round-6 finding: a line received manually moves
  * `stock_transfer_lines.qtyReceived` and neither ASN column, so a fully received
  * line still looked like open capacity. Applying only (2) — round 6's fix, which
@@ -212,6 +227,13 @@ export function planMintsoftAlignmentAllocations(input: {
    * because "no entry" and "no cap" must not look alike.
    */
   transferLineResiduals: ReadonlyMap<string, TransferLineResidualQty>
+  /**
+   * LINE SCOPE for purchase orders (o3d-papk): the residue of every PO line any candidate
+   * draws from, keyed by PO-line id. Required (pass an empty map when every candidate is a
+   * transfer line); a candidate naming a PO line that is absent throws, for the same
+   * reason as above.
+   */
+  purchaseLineResiduals: ReadonlyMap<string, PurchaseOrderLineResidualQty>
 }): {
   allocations: MintsoftAlignmentAllocation[]
   unallocatedQty: number
@@ -236,6 +258,9 @@ export function planMintsoftAlignmentAllocations(input: {
   // ASN rows on one transfer line share the line's residue instead of each getting
   // the whole of it.
   const lineCapacityRemaining = new Map<string, number>()
+  // The same, for PO lines. A separate map: a transfer-line id and a PO-line id are different
+  // namespaces and must never share a capacity entry.
+  const purchaseLineCapacityRemaining = new Map<string, number>()
 
   for (const candidate of candidates) {
     if (remaining <= 0) break
@@ -252,6 +277,16 @@ export function planMintsoftAlignmentAllocations(input: {
       availableQty = Math.min(availableQty, lineCapacity)
     }
 
+    const purchaseLineId = candidate.purchaseLineId
+    if (purchaseLineId != null) {
+      let lineCapacity = purchaseLineCapacityRemaining.get(purchaseLineId)
+      if (lineCapacity === undefined) {
+        lineCapacity = Math.max(0, requirePurchaseOrderLineResidualQty(input.purchaseLineResiduals, purchaseLineId).qtyNumber)
+        purchaseLineCapacityRemaining.set(purchaseLineId, lineCapacity)
+      }
+      availableQty = Math.min(availableQty, lineCapacity)
+    }
+
     if (availableQty <= 0) continue
 
     const qty = Math.min(remaining, availableQty)
@@ -262,6 +297,9 @@ export function planMintsoftAlignmentAllocations(input: {
     remaining -= qty
     if (transferLineId != null) {
       lineCapacityRemaining.set(transferLineId, (lineCapacityRemaining.get(transferLineId) ?? 0) - qty)
+    }
+    if (purchaseLineId != null) {
+      purchaseLineCapacityRemaining.set(purchaseLineId, (purchaseLineCapacityRemaining.get(purchaseLineId) ?? 0) - qty)
     }
   }
 

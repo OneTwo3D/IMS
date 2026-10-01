@@ -28,6 +28,11 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
+  isPurchaseOrderLineFullyLanded,
+  loadPurchaseOrderLineLandedQty,
+  requirePoLineLandedQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
+import {
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
   queueAccountingSyncTxWithOutcome,
@@ -1211,11 +1216,18 @@ export async function processBookedInEvent(
         const updatedLines = await tx.purchaseOrderLine.findMany({
           where: { poId },
           select: {
+            id: true,
             qty: true,
             qtyReceived: true,
           },
         })
-        const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
+        // o3d-papk (D1): "all received" means LANDED >= qty. A line the WMS stock-sync alignment brought in
+        // has qtyReceived 0 and its units on wms_asn_line_maps, so `qtyReceived >= qty` left such an order
+        // PARTIALLY_RECEIVED for ever. Read on this transaction, under the purchase_orders row lock taken
+        // above, after this book-in's own qtyReceived and qtyAccountedViaReceipt writes in the loop.
+        const updatedLanded = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
+        const allReceived = updatedLines.every((line) =>
+          isPurchaseOrderLineFullyLanded(line.qty, requirePoLineLandedQty(updatedLanded, line.id)))
         await tx.purchaseOrder.update({
           where: { id: poId },
           data: {
