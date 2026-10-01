@@ -265,6 +265,13 @@ async function runRepairScript(
 async function runRepairScriptOnTty(
   args: string[],
   typed = '',
+  /**
+   * `raw` is written to the pty exactly as given (no newline appended) -- a partial line, or `\x03`
+   * (Ctrl-C). `closeStdin` then closes `script`'s own stdin, which util-linux `script` turns into an EOF
+   * (Ctrl-D) on the pty: the operator's end-of-input. `afterPrompt` holds `raw` back until the prompt text
+   * has actually been printed, so a Ctrl-C cannot land before the handler it is testing exists.
+   */
+  opts: { raw?: string; closeStdin?: boolean; afterPrompt?: boolean } = {},
 ): Promise<{ code: number; output: string }> {
   const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
   const command = ['npx', 'tsx', 'scripts/deactivate-duplicate-bom.ts', ...args].map(quote).join(' ')
@@ -278,6 +285,19 @@ async function runRepairScriptOnTty(
     child.stderr.on('data', (chunk) => { output += String(chunk) })
     // Input is queued in the pty line buffer, so it does not matter that the prompt appears later.
     if (typed) child.stdin.write(`${typed}\n`)
+    const sendRaw = () => {
+      if (opts.raw) child.stdin.write(opts.raw)
+      if (opts.closeStdin) child.stdin.end()
+    }
+    if (opts.afterPrompt) {
+      const poll = setInterval(() => {
+        if (/Type the database name/.test(output)) { clearInterval(poll); sendRaw() }
+      }, 50)
+      child.on('close', () => clearInterval(poll))
+    } else {
+      sendRaw()
+    }
+    child.stdin.on('error', () => { /* script may already have exited */ })
     const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
     child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, output }) })
   })
@@ -1608,6 +1628,86 @@ test(
     const typedAudit = await auditOf(typedId)
     assert.equal(typedAudit?.identityRoute, 'typed-at-tty', 'the audit row must record the typed route')
     assert.equal(typedAudit?.acceptedNameOnly, true, 'and must not claim an acknowledgement was unnecessary')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r21] ON A TTY, EVERY way the typed-name prompt can END without the name is a REFUSAL (exit 3), never a silent exit 0',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 21, HIGH. Closing stdin at the prompt before a newline left the confirmation promise
+     * unresolved. In Node a promise that never settles is a SILENT SUCCESS: the event loop empties and the
+     * process exits 0 although nothing was deactivated and no audit row was written, so a shell or operator
+     * during the switchover reads "repair complete". Every arm below asserts (1) the prompt was REACHED,
+     * (2) the exit status, (3) the database was not touched, and the positive control proves the harness
+     * does not simply make everything refuse. `script` is required: if it is missing this FAILS.
+     */
+    const deps = await loadDeps()
+    const NS = 'U'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+
+    const hasScript = await new Promise<boolean>((resolve) => {
+      const probe = spawn('script', ['--version'])
+      probe.on('error', () => resolve(false))
+      probe.on('close', (code) => resolve(code === 0))
+    })
+    assert.equal(hasScript, true, 'util-linux `script` is REQUIRED for this test; it must not be skipped')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+    const auditCount = async (id: string) => deps.db.activityLog.count({
+      where: { tag: 'manufacturing', description: { contains: id } },
+    })
+
+    // SIGINT is the one arm whose status is the WRAPPER's: the pty delivers Ctrl-C to the whole foreground
+    // group, and `tsx` (which runs the script) maps a SIGINT it received to 130 whatever its child returned.
+    // So the script's own exit 3 cannot be read here; what IS proven is the refusal line, the unchanged
+    // database, and a nonzero status.
+    const expectedCode = (what: string) => (/SIGINT/.test(what) ? [130, 3] : [3])
+    const refusalArms: Array<[string, (id: string) => Promise<{ code: number; output: string }>]> = [
+      ['stdin closed at the prompt before any input (EOF on an empty line)',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { closeStdin: true, afterPrompt: true })],
+      // On a pty the FIRST Ctrl-D only flushes the partial line to the reader; the SECOND, on the now-empty
+      // line, is the EOF. Without the second the process correctly keeps waiting, so both are sent.
+      ['stdin closed after a PARTIAL line with no newline',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { raw: `${db.slice(0, 4)}\x04\x04`, closeStdin: true, afterPrompt: true })],
+      ['Ctrl-C (SIGINT) at the prompt',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { raw: '\x03', afterPrompt: true })],
+      ['a WRONG typed name',
+        (id) => runRepairScriptOnTty(['--bom', id], 'not-the-database')],
+    ]
+    for (const [what, run] of refusalArms) {
+      const id = await makeDuplicate(what)
+      const before = await auditCount(id)
+      const result = await run(id)
+      const prompts = (result.output.match(/Type the database name/g) ?? []).length
+      assert.equal(prompts, 1, `${what}: precondition -- the prompt must have been reached exactly once (saw ${prompts}): ${result.output}`)
+      assert.ok(expectedCode(what).includes(result.code), `${what}: must REFUSE with exit ${expectedCode(what).join(' or ')}, got ${result.code}: ${result.output}`)
+      assert.equal(await active(id), true, `${what}: must NOT have deactivated anything`)
+      assert.equal(await auditCount(id), before, `${what}: must NOT have written an audit row`)
+      if (!/WRONG/.test(what)) {
+        assert.match(result.output, /NOT confirmed.*Nothing was written/s, `${what}: must say the target was not confirmed: ${result.output}`)
+      }
+    }
+
+    // POSITIVE CONTROL: the correct name still writes, so none of the above passed by refusing everything.
+    const okId = await makeDuplicate('correct name')
+    const ok = await runRepairScriptOnTty(['--bom', okId], db)
+    assert.equal((ok.output.match(/Type the database name/g) ?? []).length, 1, `control: the prompt must have been reached: ${ok.output}`)
+    assert.equal(ok.code, 0, `control: the correct name must be allowed: ${ok.output}`)
+    assert.equal(await active(okId), false, 'control: and must deactivate it')
+    assert.equal(await auditCount(okId) > 0, true, 'control: and must write an audit row')
   },
 )
 

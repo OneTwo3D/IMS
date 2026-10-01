@@ -156,20 +156,55 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
       return { ok: false }
     }
     process.stderr.write(`Type the database name "${identity.database}" to proceed, or anything else to abort: `)
-    const answer = await new Promise<string>((resolve) => {
+    // A PROMISE THAT NEVER SETTLES IS A SILENT SUCCESS (round 21, HIGH). When the event loop empties Node
+    // exits 0, so an operator whose terminal closed, or who pressed Ctrl-D, saw "done" although nothing was
+    // deactivated and no audit row was written. This is the ONE place that waits for the typed name, and it
+    // settles on EVERY way the wait can end -- name typed, or a refusal:
+    //   1. a newline arrives                      -> the typed line is returned (the only route to a write)
+    //   2. stdin 'end'   (EOF / Ctrl-D, empty line or after a PARTIAL line with no newline) -> refusal
+    //   3. stdin 'close' (the stream was torn down, e.g. the terminal went away)            -> refusal
+    //   4. stdin 'error' (EIO / EBADF on a dead pty)                                        -> refusal
+    //   5. SIGINT (Ctrl-C at the prompt)                                                    -> refusal
+    //   6. SIGHUP / SIGTERM (the terminal hung up, or something asked us to stop)           -> refusal
+    //   7. a non-TTY stdin never reaches here (refused above), and one that closes is 2/3/4.
+    // `settle` is idempotent, so several of these firing for one cause is harmless, and it removes every
+    // listener it added so nothing keeps the process alive or answers a later prompt.
+    const answer = await new Promise<string | null>((resolve) => {
       let buffer = ''
-      process.stdin.setEncoding('utf8')
+      let settled = false
+      const signals: NodeJS.Signals[] = ['SIGINT', 'SIGHUP', 'SIGTERM']
+      const settle = (value: string | null) => {
+        if (settled) return
+        settled = true
+        process.stdin.off('data', onData)
+        process.stdin.off('end', onEnd)
+        process.stdin.off('close', onEnd)
+        process.stdin.off('error', onEnd)
+        for (const signal of signals) process.off(signal, onEnd)
+        process.stdin.pause()
+        resolve(value)
+      }
+      const onEnd = () => settle(null)
       const onData = (chunk: string) => {
         buffer += chunk
-        if (buffer.includes('\n')) {
-          process.stdin.off('data', onData)
-          process.stdin.pause()
-          resolve(buffer.slice(0, buffer.indexOf('\n')).trim())
-        }
+        if (buffer.includes('\n')) settle(buffer.slice(0, buffer.indexOf('\n')).trim())
       }
+      process.stdin.setEncoding('utf8')
       process.stdin.on('data', onData)
+      process.stdin.on('end', onEnd)
+      process.stdin.on('close', onEnd)
+      process.stdin.on('error', onEnd)
+      for (const signal of signals) process.on(signal, onEnd)
       process.stdin.resume()
     })
+    if (answer === null) {
+      process.stderr.write('\n')
+      console.error(
+        `REFUSED: input ended at the prompt (end of input, Ctrl-C or a closed terminal), so the target `
+        + `${identity.database} was NOT confirmed. Nothing was written.`,
+      )
+      return { ok: false }
+    }
     if (answer !== identity.database) {
       console.error(`REFUSED: you typed "${answer}", which is not "${identity.database}". Nothing was written.`)
       return { ok: false }
