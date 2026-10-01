@@ -8956,3 +8956,54 @@ test('[o3d-zvec.21 j] successive one-kit refunds of a part-shipped kit (accounti
   assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
   assert.equal(stockOnHand(state), 2, 'the second kit never shipped: no component may be restocked for it')
 })
+
+test('[o3d-zvec.21 k] same product AND description, different PRICES: an unlinked refund priced for B takes B\'s stock and B\'s COGS, and the cap debits B', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: 'WC-9001', orderNumber: 'SO-1', status: 'SHIPPED',
+      fxRateToBase: 1, totalBase: 50,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 50,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'), allocationBatchAmount: 10,
+    }],
+    lines: [
+      { id: 'line-a', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } },
+      { id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } },
+    ],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 50, cogsBatchAmount: 10,
+      lines: [
+        { id: 'shipment-line-a', lineId: 'line-a', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-a', qty: 1, unitCostBase: 4 }] },
+        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-b', qty: 1, unitCostBase: 6 }] },
+      ],
+    }],
+    costLayers: [
+      { id: 'layer-a', productId: 'product-1', poLineId: 'po-a', receivedQty: 1, unitCostBase: 4 },
+      { id: 'layer-b', productId: 'product-1', poLineId: 'po-b', receivedQty: 1, unitCostBase: 6 },
+    ],
+  })
+  assert.equal(state.lines[0].description, state.lines[1].description, 'PRECONDITION: identical descriptions')
+  assert.notEqual(state.lines[0].totalBase, state.lines[1].totalBase, 'PRECONDITION: different prices')
+  const snapshotLines = (refundIndex: number) => (state.refundLines[refundIndex].costLayerSnapshot as Array<{ shipmentLineId: string }>).map((entry) => entry.shipmentLineId)
+
+  const unlinked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9051),
+    lines: [{ productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30 }],
+    accountingSettings,
+  })
+  assert.equal(unlinked.success, true, `PRECONDITION: unlinked refund recorded (${unlinked.success ? '' : unlinked.error})`)
+  assert.equal(state.refundLines[0].salesOrderLineId ?? null, null, 'PRECONDITION: the refund line has no link')
+  assert.deepEqual(snapshotLines(0), ['shipment-line-b'], 'COGS: the price-matched line B is reversed')
+  for (const refund of state.refunds) refund.accountingRetryRequired = false
+
+  const linked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9052),
+    lines: [{ lineId: 'line-a', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+    accountingSettings,
+  })
+
+  assert.equal(linked.success, true, `refund must not fail (${linked.success ? '' : linked.error})`)
+  assert.deepEqual(snapshotLines(1), ['shipment-line-a'], 'COGS: the linked refund reverses A')
+  assert.equal(stockOnHand(state), 2, 'STOCK: both shipped units came back, B\'s then A\'s (the cap debited B, not A)')
+  assert.deepEqual(state.movements.map((movement) => movement.qty), [1, 1])
+})

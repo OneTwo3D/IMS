@@ -692,6 +692,7 @@ async function buildRefundFallbackReturnRows(
           productId: true,
           description: true,
           qty: true,
+          totalBase: true,
         },
       },
       allocations: {
@@ -718,7 +719,7 @@ async function buildRefundFallbackReturnRows(
         select: {
           id: true,
           lines: {
-            select: { id: true, productId: true, description: true, qty: true, salesOrderLineId: true },
+            select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
         },
       },
@@ -786,15 +787,20 @@ async function buildRefundFallbackReturnRows(
   for (const [lineId, rows] of sourceRowsByLine) {
     for (const [productId, qty] of rows) remainingByLineProduct.set(lineProductKey(lineId, productId), qty)
   }
-  // THE SAME LINE-SELECTION RULE the return builder applies below (Codex r2 HIGH A): a linked line is its
-  // own source; an unlinked one goes to the first line of its product whose description matches, else the
-  // first line of the product. Attributing a prior unlinked refund anywhere else debits the wrong line's cap.
-  const selectSourceLine = (candidate: { lineId?: string | null; productId: string; description: string }) =>
+  // THE SAME LINE-CHOICE RULE as the return builder below and as the COGS split: `sortLinesForRefundLine`
+  // (link, else price, else description, else first). Attributing a prior refund anywhere else debits the
+  // wrong line's cap.
+  const selectSourceLine = (candidate: {
+    lineId?: string | null
+    productId: string
+    description: string
+    qty: DecimalInput
+    totalBase: DecimalInput
+    unitPriceBase?: DecimalInput | null
+  }) =>
     candidate.lineId
       ? lineById.get(candidate.lineId) ?? null
-      : (lineCandidatesByProduct.get(candidate.productId) ?? []).find((c) => c.description === candidate.description)
-        ?? (lineCandidatesByProduct.get(candidate.productId) ?? [])[0]
-        ?? null
+      : sortLinesForRefundLine(lineCandidatesByProduct.get(candidate.productId) ?? [], candidate)[0] ?? null
   const debitLineProduct = (lineId: string, productId: string, qty: number) => {
     const key = lineProductKey(lineId, productId)
     remainingByLineProduct.set(key, Math.max(0, (remainingByLineProduct.get(key) ?? 0) - qty))
@@ -818,7 +824,7 @@ async function buildRefundFallbackReturnRows(
       const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
       const refundLine = refundLineId ? refundLineById.get(refundLineId) : undefined
       const sourceOf = refundLine
-        ? selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId ?? '', description: refundLine.description })
+        ? selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId ?? '', description: refundLine.description, qty: refundLine.qty, totalBase: refundLine.totalBase, unitPriceBase: refundLine.unitPriceBase })
         : null
       if (!sourceOf || !refundLine) continue
       debitLineProduct(sourceOf.id, movement.productId, refundBoundaryNumber(movement.qty))
@@ -829,7 +835,7 @@ async function buildRefundFallbackReturnRows(
     // estimated from its own quantity, the conservative direction.
     for (const refundLine of refund.lines) {
       if (!refundLine.productId || attributedLineIds.has(refundLine.id)) continue
-      const attributed = selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId, description: refundLine.description })
+      const attributed = selectSourceLine({ lineId: refundLine.salesOrderLineId, productId: refundLine.productId, description: refundLine.description, qty: refundLine.qty, totalBase: refundLine.totalBase, unitPriceBase: refundLine.unitPriceBase })
       const rows = attributed ? sourceRowsByLine.get(attributed.id) : undefined
       const attributedLineQty = attributed ? refundBoundaryNumber(attributed.qty) : 0
       if (!attributed || !rows || attributedLineQty <= 0) continue
@@ -844,11 +850,14 @@ async function buildRefundFallbackReturnRows(
     if (!line.productId || line.qty <= 0) return []
     const refundLineId = 'id' in line ? line.id : null
 
-    const sourceLine = line.lineId
-      ? lineById.get(line.lineId) ?? null
-      : (lineCandidatesByProduct.get(line.productId) ?? []).find((candidate) => candidate.description === line.description)
-        ?? (lineCandidatesByProduct.get(line.productId) ?? [])[0]
-        ?? null
+    const sourceLine = selectSourceLine({
+      lineId: line.lineId,
+      productId: line.productId,
+      description: line.description,
+      qty: line.qty,
+      totalBase: line.totalBase,
+      unitPriceBase: 'unitPriceBase' in line ? line.unitPriceBase : null,
+    })
 
     if (!sourceLine) {
       throw new RefundReturnSourceError(
@@ -1074,6 +1083,57 @@ async function createReturnInboundMovementAndCostLayersTx(
   return 'created'
 }
 
+/**
+ * THE ONE LINE-CHOICE RULE for a refund line against the order's lines of the same product (Codex r3 HIGH).
+ *
+ * Stock (the return builder), the per-line cap (the prior-return attribution) and COGS
+ * (`consumeRefundLineQuantity`) all ask "which order line does this refund line belong to?". They used to
+ * answer it three ways, so an unlinked refund priced for line B could reverse B's COGS and return B's stock
+ * while the cap debited A. They now all call this, so they cannot disagree by construction:
+ *   1. the line the refund line is LINKED to,
+ *   2. else the line whose unit price matches the refund's unit price,
+ *   3. else the line whose description matches,
+ *   4. else the first (stable order).
+ * Lines indistinguishable by all of these (same product, price and description) are genuinely ambiguous;
+ * the first is chosen, in every consumer alike.
+ */
+function sortLinesForRefundLine<T extends { id: string; qty: DecimalInput; totalBase: DecimalInput; description: string }>(
+  candidates: readonly T[],
+  refundLine: {
+    lineId?: string | null
+    description: string
+    qty: DecimalInput
+    totalBase: DecimalInput
+    unitPriceBase?: DecimalInput | null
+  },
+): T[] {
+  const refundQty = refundBoundaryNumber(refundLine.qty)
+  const refundUnitPrice = refundLine.unitPriceBase != null
+    ? refundBoundaryNumber(refundLine.unitPriceBase)
+    : (refundQty > 0 ? refundBoundaryNumber(refundLine.totalBase) / refundQty : null)
+  const priceMatches = (unitRevenue: number): boolean =>
+    refundUnitPrice != null && Math.abs(unitRevenue - refundUnitPrice) < 0.0001
+  return [...candidates].sort((a, b) => {
+    const aLineMatch = refundLine.lineId != null && a.id === refundLine.lineId
+    const bLineMatch = refundLine.lineId != null && b.id === refundLine.lineId
+    if (aLineMatch !== bLineMatch) return aLineMatch ? -1 : 1
+
+    const unitOf = (line: T) => {
+      const qty = refundBoundaryNumber(line.qty)
+      return qty > 0 ? refundBoundaryNumber(line.totalBase) / qty : 0
+    }
+    const aPriceMatch = priceMatches(unitOf(a))
+    const bPriceMatch = priceMatches(unitOf(b))
+    if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
+
+    const aDescMatch = a.description === refundLine.description
+    const bDescMatch = b.description === refundLine.description
+    if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
+
+    return 0
+  })
+}
+
 function consumeRefundLineQuantity(
   lineStates: Array<{
     id: string
@@ -1112,34 +1172,10 @@ function consumeRefundLineQuantity(
   let unshippedRevenue = 0
   let assignedRevenue = 0
   const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
-  const refundUnitPrice = refundLine.unitPriceBase != null
-    ? refundBoundaryNumber(refundLine.unitPriceBase)
-    : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
-
-  const priceMatches = (unitRevenue: number, candidateUnitPrice: number | null): boolean => {
-    if (candidateUnitPrice == null) return false
-    return Math.abs(unitRevenue - candidateUnitPrice) < 0.0001
-  }
-
-  const matchingLines = lineStates
-    .filter((line) => line.productId === refundLine.productId)
-    .sort((a, b) => {
-      const aLineMatch = refundLine.lineId != null && a.id === refundLine.lineId
-      const bLineMatch = refundLine.lineId != null && b.id === refundLine.lineId
-      if (aLineMatch !== bLineMatch) return aLineMatch ? -1 : 1
-
-      const aUnitRevenue = a.qty > 0 ? a.totalBase / a.qty : 0
-      const bUnitRevenue = b.qty > 0 ? b.totalBase / b.qty : 0
-      const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
-      const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
-      if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
-
-      const aDescMatch = a.description === refundLine.description
-      const bDescMatch = b.description === refundLine.description
-      if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
-
-      return 0
-    })
+  const matchingLines = sortLinesForRefundLine(
+    lineStates.filter((line) => line.productId === refundLine.productId),
+    refundLine,
+  )
 
   for (const line of matchingLines) {
     if (remainingQty <= 0 || line.qty <= 0) break
