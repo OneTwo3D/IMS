@@ -1,0 +1,57 @@
+# o3d-bddq — THE ARCHIVE SEAL, RUN UNCONDITIONALLY.
+#
+# `archive/` is excluded from tsconfig, from eslint, from the `tests/**/*.test.ts` glob and from every
+# `check:*` SCAN_ROOT — which is the whole point of archiving. So `scripts/check-archive-sealed.mjs`
+# is the ONLY gate in this repository that can see a change to an archived file, and git's rename
+# detection can make one during a merge with no conflict marker (it did, twice in one day: o3d-c08y
+# and o3d-j625).
+#
+# WHY THIS IS ITS OWN WORKFLOW. The seal's only CI home was `npm run validate`, which runs in the
+# Production Readiness `validate` job — and that job is conditional on `classify_changes`, whose
+# classifier marks a diff as cheap when EVERY changed path matches `*.md`, `docs/*`, `.gitignore` or
+# `CHANGELOG.md`. `archive/` contains Markdown (3 of its 50 sealed paths today, including the
+# recovery instructions), so a diff that touched nothing but archived Markdown was classified cheap
+# and the one gate that can see archive/ did not run. A gate a change classifier can switch off is
+# not a gate; the same argument was already settled for the Server Action guards in o3d-hic9, and this
+# workflow follows it: no `paths:` filter, no `paths-ignore:`, no `needs:`, no job-level `if:`.
+#
+# AND NOT `paths-ignore: ["**/*.md"]`. That pattern is right for a guard over CODE (PR #709 is
+# applying it to schema-guardrails.yml). It would be the SAME BUG here wearing different clothes: an
+# archived `.md` is one of the cases that matters, so ignoring Markdown would re-open precisely the
+# hole this workflow closes.
+#
+# `fetch-depth: 0` because the check's BRANCH co-change locus resolves `origin/development` and needs
+# a merge base with HEAD to diff against. Without that history the check now EXITS NONZERO (it used to
+# print a notice and pass), so this setting is load-bearing: do not shorten it.
+name: Archive Seal
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-seal-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  archive-seal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      # No `npm ci`: the check shells out to git and reads two files. It must not be able to fail for
+      # a reason unrelated to archive/, and it must stay cheap enough that running it on every diff —
+      # including a one-line Markdown diff — is never worth gating.
+      - run: npm run check:archive-sealed

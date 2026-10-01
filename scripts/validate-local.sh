@@ -89,6 +89,18 @@ run_step 'migration conventions'          npm run check:migration-conventions
 run_step 'server action guards'           npm run check:server-action-guards
 run_step 'unit tests'                     npm run test:unit
 run_step 'workflow docs'                  npm run docs:workflows:check
+# o3d-bddq: archive/ is excluded from tsconfig, eslint, the test glob and every check:* SCAN_ROOT, so
+# a rename heuristic can merge a branch's edits into an archived file with NO conflict marker and
+# nothing else here can see it. It happened twice in one day. This step is the only gate that looks.
+# It reads HEAD *AND* the INDEX *AND* the working tree, and names which one is wrong: round 1 read
+# only HEAD and was blind mid-merge (HEAD is still the PRE-merge commit), round 2 read only the index
+# and was blind to a change that was committed and then restored there. Neither was ever the answer
+# on its own. ARCHIVE_SEAL_REF only substitutes another commit-ish for HEAD; it does not switch the
+# index and working tree off.
+# THIS IS NOT THE SEAL'S ONLY CI HOME, deliberately: the job that runs this script is conditional on
+# the Production Readiness change classifier, which skips when every changed path ends in `.md` — and
+# archive/ is largely Markdown. .github/workflows/archive-seal.yml runs the seal unconditionally.
+run_step 'archive sealed'                 npm run check:archive-sealed
 run_step 'prisma schema scope'            npm run db:schema:scope -- "${schema_scope_base_ref}" "${schema_scope_head_ref}"
 
 # THE SUMMARY IS THE POINT OF THE EXERCISE. It lists every step and its result, so a reader can see

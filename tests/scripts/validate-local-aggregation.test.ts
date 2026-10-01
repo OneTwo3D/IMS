@@ -33,6 +33,28 @@ const REPO = process.cwd()
 const SCRIPT_PATH = join(REPO, 'scripts/validate-local.sh')
 const SCRIPT = readFileSync(SCRIPT_PATH, 'utf8')
 
+/**
+ * THE STEP TOTAL IS DERIVED FROM THE SHIPPED SCRIPT, NOT TYPED (o3d-bddq).
+ *
+ * These four assertions used to spell the total `10`. That is an assertion about the step COUNT,
+ * and the property this file guards is that EVERY step ran and is accounted for — so adding a
+ * legitimate eleventh step (`archive sealed`, o3d-bddq) turned four of them red for a reason that
+ * has nothing to do with the defect they exist to catch, and the cheap repair would have been to
+ * type `11` and wait for the next one.
+ *
+ * Counting `run_step` invocations is the same fact the summary reports, read from the same file the
+ * test runs, so the two cannot drift. The precondition below is what stops it degrading into a
+ * tautology: if the count ever comes back 0 — a renamed dispatcher, a moved script — these tests
+ * would otherwise assert `0 of 0 steps failed; all 0 ran.` against a script that ran nothing.
+ */
+const STEP_COUNT = SCRIPT.split('\n').filter((line) => /^run_step\s/.test(line)).length
+assert.ok(
+  STEP_COUNT >= 10,
+  `PRECONDITION: expected at least the ten steps o3d-amy8 was written about, counted ${STEP_COUNT} `
+  + '`run_step` invocations in scripts/validate-local.sh',
+)
+const summary = (failed: number) => new RegExp(`${failed} of ${STEP_COUNT} steps failed; all ${STEP_COUNT} ran\\.`)
+
 type Harness = { path: string, log: string, run: (script?: string) => { status: number, output: string } }
 
 /**
@@ -99,7 +121,7 @@ test('[o3d-amy8] a lint error does not conceal a failing test', (t) => {
 
   // A red job must be readable as "these gates failed and the rest ran", which is the thing the
   // old output could not say.
-  assert.match(output, /2 of 10 steps failed; all 10 ran\./)
+  assert.match(output, summary(2))
 })
 
 test('[o3d-amy8] every gate downstream of a lint error still runs and is accounted for', (t) => {
@@ -124,7 +146,7 @@ test('[o3d-amy8] every gate downstream of a lint error still runs and is account
     `the schema-scope check must run with its two refs: ${ran.join(', ')}`)
 
   assert.equal(status, 1, 'one failing gate still fails the run')
-  assert.match(output, /1 of 10 steps failed; all 10 ran\./)
+  assert.match(output, summary(1))
   // NOT VACUOUS: the summary distinguishes, rather than printing FAIL for everything.
   assert.match(output, /PASS {2}unit tests/)
   assert.match(output, /FAIL {2}lint/)
@@ -135,7 +157,7 @@ test('[o3d-amy8] a clean run passes and says so', (t) => {
   const { status, output } = h.run()
 
   assert.equal(status, 0, output)
-  assert.match(output, /0 of 10 steps failed; all 10 ran\./)
+  assert.match(output, summary(0))
   assert.ok(!/FAIL {2}/.test(output), output)
 })
 
@@ -158,7 +180,7 @@ test('[o3d-amy8] a failed prisma generate is named as the likely cause of what f
   assert.equal(status, 1)
   assert.match(output, /NOTE: `prisma generate` failed/,
     'the one real ordering dependency in this sequence must be called out, since fail-fast no longer implies it')
-  assert.match(output, /3 of 10 steps failed; all 10 ran\./)
+  assert.match(output, summary(3))
 })
 
 /**
