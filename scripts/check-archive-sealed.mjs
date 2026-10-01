@@ -132,6 +132,58 @@ function gitProbeRefExists(ref) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// LISTING CHANGED PATHS — EVERY OPTION THAT CHANGES WHICH PATHS CAN BE SEEN IS SET EXPLICITLY
+// -----------------------------------------------------------------------------
+// `git diff --name-only` with DEFAULT options collapses a delete+add into a RENAME and names only
+// the DESTINATION, so an archived file moved to a live path dropped its archive/ SOURCE out of the
+// list, and a manifest row removed in a second commit sailed through (PR #707 round 6). Whether it
+// did so also depended on the user's `diff.renames`, so the guard behaved differently per machine.
+// Nothing about a listing below is left to ambient config. Table (option -> set? -> why):
+//   rename detection   --no-renames, -c diff.renames=false   SET. A rename becomes D(source)+A(dest),
+//                      so BOTH ends are listed; also drops the dependence on `diff.renames`.
+//   copy detection     same flags (diff.renames=copies is overridden by =false and --no-renames)
+//                      SET. A copy is then a plain A; its source is untouched and not a change.
+//   --diff-filter      ACDMRTUXB  SET to every letter: A/C/D/M/R, T (TYPE change, file -> symlink),
+//                      U unmerged, X unknown, B broken pair. Spelled out so no future default or
+//                      alias can narrow it; `*` is omitted because it only matters with other letters.
+//   mode-only change   reported as M. SET `-c core.fileMode=true` on the worktree listing, since
+//                      `core.fileMode=false` would hide an exec-bit flip there (tree-vs-tree
+//                      listings compare recorded modes and ignore the setting).
+//   -z                 SET, parsed on NUL. Without it `core.quotepath` C-quotes odd paths ("a\"b",
+//                      non-ASCII, newline) so a path in archive/ stops matching `archive/`.
+//   --ignore-submodules=none, -c diff.ignoreSubmodules=none   SET. A submodule pointer change under
+//                      archive/ is a change; the default (or config) may say otherwise.
+//   pathspec limiting  NONE on the branch/tip listings: they list the whole diff and the caller
+//                      filters on the `archive/` prefix, so a rename's non-archive end is not cut off.
+//                      The worktree/untracked subjects pass `-- archive/` on purpose (their subject
+//                      IS archive/ and there is no rename to lose).
+//   --no-ext-diff      SET (a configured external diff driver could print anything).
+//   history walk       NOT APPLICABLE: the branch listing is a TREE-vs-TREE diff of the merge base and
+//                      HEAD (`base...HEAD`), and the tip listing is one commit's diff-tree. Neither
+//                      walks history, so --full-history/--simplify-merges cannot hide a path.
+//   merge commits (tip) `-c` (combined). It lists only paths that differ from EVERY parent. It CAN
+//                      therefore hide a path that arrived only through ONE parent of a merge — by
+//                      design: that is what lets a trailered re-seal merged in from development
+//                      not be refused a second time. It does not matter for correctness, because the
+//                      BRANCH listing diffs the merge base against HEAD as a whole and sees the path
+//                      regardless of which parent carried it; that locus is mandatory (above).
+//   EOL / autocrlf     tree-vs-tree listings compare blob ids, which EOL settings do not touch; only
+//                      the worktree listing reads the filesystem, and it is a subject check (hash
+//                      mismatch vs the index), not a co-change listing.
+//   core.quotepath     moot under -z.
+// A `-z` stream is parsed by splitting on NUL; an empty trailing field is dropped, and an empty or
+// non-string result can never reach `touchesBoth`.
+const PATH_LISTING_FLAGS = [
+  '--no-ext-diff', '--no-renames', '--ignore-submodules=none', '--diff-filter=ACDMRTUXB', '--name-only', '-z',
+]
+const PATH_LISTING_CONFIG = ['-c', 'diff.renames=false', '-c', 'diff.ignoreSubmodules=none', '-c', 'core.fileMode=true']
+
+function listPaths(gitArgs, whatItIsFor, remedy) {
+  const out = gitOrThrowSealError([...PATH_LISTING_CONFIG, ...gitArgs], whatItIsFor, remedy)
+  return out.split('\0').filter((p) => p !== '')
+}
+
 function lines(out) {
   if (typeof out !== 'string') throw new TypeError('lines() needs git output, not a failure')
   return out.split('\n').filter((line) => line.trim() !== '')
@@ -286,7 +338,7 @@ if (CONFLICTED.size === 0) {
 
 // The index is not the whole story: a file edited and not yet staged is still a file the next
 // `git add -A` commits, and a file dropped into archive/ and never added is not in the index at all.
-for (const path of lines(gitOrThrowSealError(['diff', '--no-ext-diff', '--name-only', '--', 'archive/'], 'the WORKTREE subject'))) {
+for (const path of listPaths(['diff', ...PATH_LISTING_FLAGS, '--', 'archive/'], 'the WORKTREE subject')) {
   problems.push(`WORKTREE  MODIFIED  ${path}  (edited and not staged; the next \`git add\` commits it)`)
 }
 for (const path of lines(gitOrThrowSealError(['ls-files', '--others', '--exclude-standard', '--', 'archive/'], 'the UNTRACKED subject'))) {
@@ -322,10 +374,10 @@ function coChange(locusName, paths, messages, how) {
 // what this commit itself contributed. `--first-parent` would instead attribute everything a merge
 // brought in from development to the merge — including a legitimate, trailered re-seal made there —
 // and refuse it a second time on the branch that merged it.
-const tipPaths = lines(gitOrThrowSealError(
-  ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', COMMITTED_REF],
+const tipPaths = listPaths(
+  ['diff-tree', '-r', '-c', '--no-commit-id', ...PATH_LISTING_FLAGS, COMMITTED_REF],
   `the tip-commit co-change locus (what ${COMMITTED_SUBJECT} itself changed)`,
-))
+)
 coChange(
   COMMITTED_SUBJECT,
   tipPaths,
@@ -357,11 +409,11 @@ gitOrThrowSealError(
   BASE_REMEDY,
 )
 const range = `${base}...${COMMITTED_REF}`
-const branchPaths = lines(gitOrThrowSealError(
-  ['diff', '--no-ext-diff', '--name-only', range],
+const branchPaths = listPaths(
+  ['diff', ...PATH_LISTING_FLAGS, range],
   `the BRANCH co-change locus, which is the whole branch diff`,
   BASE_REMEDY,
-))
+)
 coChange(
   'BRANCH',
   branchPaths,

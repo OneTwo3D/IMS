@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -463,7 +463,7 @@ test('o3d-bddq r5: a merge base that exists but a THREE-DOT DIFF THAT FAILS is r
   withScratchRepo((repo) => {
     splitChangeOnBranch(repo)
     // The script also runs `git diff` for the WORKTREE subject, so fail only the three-dot range form.
-    withGitShim('[ "$1" = "diff" ] && case "$*" in *...*) true;; *) false;; esac', 'range-diff', (shimEnv) => {
+    withGitShim('case " $* " in *" diff "*...*) true;; *) false;; esac', 'range-diff', (shimEnv) => {
       // PRECONDITIONS: the merge base resolves, and the range diff fails through the shim only.
       assert.equal(spawnSync('git', ['merge-base', 'development', 'HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } }).status, 0, 'PRECONDITION: a merge base exists')
       assert.notEqual(spawnSync('git', ['diff', '--name-only', 'development...HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } }).status, 0, 'PRECONDITION: the range diff fails')
@@ -471,7 +471,7 @@ test('o3d-bddq r5: a merge base that exists but a THREE-DOT DIFF THAT FAILS is r
       const { status, output } = runSealIn(repo, shimEnv)
       assert.notEqual(status, 0, `a failed branch diff must refuse, not read as no changes:\n${output}`)
       assert.match(output, /BRANCH co-change locus/)
-      assert.match(output, /git diff --no-ext-diff --name-only development\.\.\.HEAD/, 'the message names the command that failed')
+      assert.match(output, /diff .*development\.\.\.HEAD/, 'the message names the command that failed')
       assert.doesNotMatch(output, /archived path\(s\) match/)
     })
   })
@@ -502,7 +502,7 @@ test('o3d-bddq r5: with NO default base (origin/development and development both
 
 test('o3d-bddq r5: a failing tip-commit diff-tree is REFUSED, not read as "no changed paths"', () => {
   withScratchRepo((repo) => {
-    withGitShim('[ "$1" = "diff-tree" ]', 'diff-tree', (shimEnv) => {
+    withGitShim('case " $* " in *" diff-tree "*) true;; *) false;; esac', 'diff-tree', (shimEnv) => {
       const probe = spawnSync('git', ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } })
       assert.notEqual(probe.status, 0, 'PRECONDITION: diff-tree really fails through the shim')
       assert.equal(runSealIn(repo).status, 0, 'PRECONDITION: the same repo passes with real git')
@@ -611,4 +611,147 @@ test('o3d-bddq r3: the seal is NOT reachable only through the classifier-gated v
   const seal = effectiveYaml(SEAL_WORKFLOW)
   assert.match(seal, /npm run check:archive-sealed/, 'PRECONDITION: the stripped workflow still invokes the seal')
   assert.doesNotMatch(seal, /classify_changes/, 'the seal workflow must not consult the change classifier')
+})
+
+/**
+ * o3d-bddq round 6 — RENAMES, TYPE CHANGES AND ODD PATH NAMES MUST NOT HIDE AN ARCHIVE/ PATH.
+ *
+ * `git diff --name-only` with default options collapses a delete+add into a rename and names only the
+ * DESTINATION. Move an archived file to a live path in one commit and drop its manifest row in the
+ * next: the blob checks agree with the new tree, the tip commit touches only the manifest, and the
+ * branch diff named only `lib/…` — so the archived SOURCE never appeared and the check passed. Every
+ * arm sets `diff.renames` EXPLICITLY (never the ambient default) and asserts, with git's DEFAULT
+ * listing, that the hazard is really present, so it cannot pass by examining nothing.
+ */
+const ARCHIVED_ONE = 'archive/connectors/one.ts'
+
+/** What the OLD listing saw: default options, name-only, with the repo's own diff.renames. */
+function defaultListing(repo: string): string[] {
+  return git(repo, ['diff', '--name-only', 'development...HEAD']).split('\n').filter((l) => l !== '')
+}
+
+function commitAll(repo: string, message: string, ...more: string[]): void {
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', message, ...more.flatMap((m) => ['-m', m])])
+}
+
+function dropManifestRow(repo: string, archivedPath: string): void {
+  const file = path.join(repo, 'scripts/archive-sealed-manifest.tsv')
+  const kept = readFileSync(file, 'utf8').split('\n').filter((l) => !l.startsWith(`${archivedPath}\t`))
+  assert.ok(kept.length < readFileSync(file, 'utf8').split('\n').length, `PRECONDITION: the manifest had a row for ${archivedPath}`)
+  writeFileSync(file, kept.join('\n'))
+}
+
+for (const renames of ['true', 'false'] as const) {
+  test(`o3d-bddq r6: archive/ -> live-path RENAME then a manifest-row removal is refused (diff.renames=${renames})`, () => {
+    withScratchRepo((repo) => {
+      git(repo, ['config', 'diff.renames', renames])
+      git(repo, ['checkout', '-q', '-b', 'feature'])
+      mkdirSync(path.join(repo, 'lib'), { recursive: true })
+      git(repo, ['mv', ARCHIVED_ONE, 'lib/one.ts'])
+      commitAll(repo, 'move an archived file to a live path')
+      dropManifestRow(repo, ARCHIVED_ONE)
+      commitAll(repo, 'drop its manifest row, separately, with no trailer')
+      if (renames === 'true') {
+        // PRECONDITION: this is the bug. Git's own default listing names only the destination.
+        assert.deepEqual(defaultListing(repo), ['lib/one.ts', 'scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: default rename detection hides the archive/ source')
+      }
+      assert.deepEqual(git(repo, ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD']).trim().split('\n'), ['scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: the tip commit touches only the manifest')
+      const { status, output } = runSealIn(repo)
+      assert.equal(status, 1, `an archived file renamed out and its row removed must refuse:\n${output}`)
+      assert.match(output, /BRANCH\s+CO-CHANGE/)
+      assert.match(output, /archive\/connectors\/one\.ts/, 'the SOURCE path is what must be named')
+    })
+  })
+}
+
+test('o3d-bddq r6 control: the same rename-out and row removal PASSES when it declares the trailer', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['config', 'diff.renames', 'true'])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    mkdirSync(path.join(repo, 'lib'), { recursive: true })
+    git(repo, ['mv', ARCHIVED_ONE, 'lib/one.ts'])
+    commitAll(repo, 'move an archived file to a live path')
+    dropManifestRow(repo, ARCHIVED_ONE)
+    commitAll(repo, 'drop its manifest row', 'Archive-Seal-Rewrite: unarchiving one.ts for o3d-test')
+    assert.deepEqual(defaultListing(repo), ['lib/one.ts', 'scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: the same rename-hiding shape as the refusing arm')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 0, `a declared unarchive must pass:\n${output}`)
+  })
+})
+
+test('o3d-bddq r6: a rename INTO archive/ (live path -> archive/) with a re-seal is refused', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['config', 'diff.renames', 'true'])
+    mkdirSync(path.join(repo, 'lib'), { recursive: true })
+    writeFileSync(path.join(repo, 'lib/live.ts'), 'export const live = 1\n')
+    commitAll(repo, 'a live file')
+    git(repo, ['branch', '-f', 'development', 'HEAD'])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    git(repo, ['mv', 'lib/live.ts', 'archive/connectors/live.ts'])
+    commitAll(repo, 'move a live file into the archive')
+    reseal(repo)
+    commitAll(repo, 're-seal, separately, with no trailer')
+    assert.deepEqual(defaultListing(repo), ['archive/connectors/live.ts', 'scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: git reports the rename destination only')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, output)
+    assert.match(output, /BRANCH\s+CO-CHANGE/)
+    assert.match(output, /archive\/connectors\/live\.ts/)
+  })
+})
+
+test('o3d-bddq r6: a rename WITHIN archive/ names BOTH the source and the destination', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['config', 'diff.renames', 'true'])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    git(repo, ['mv', ARCHIVED_ONE, 'archive/connectors/uno.ts'])
+    commitAll(repo, 'rename inside the archive')
+    reseal(repo)
+    commitAll(repo, 're-seal, separately, with no trailer')
+    // PRECONDITION: git's default listing names only the destination — the source vanishes.
+    assert.deepEqual(defaultListing(repo), ['archive/connectors/uno.ts', 'scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: the source is hidden by rename detection')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, output)
+    assert.match(output, /archive\/connectors\/one\.ts/, 'the SOURCE must be named')
+    assert.match(output, /archive\/connectors\/uno\.ts/, 'and the destination')
+    assert.match(output, /2 path\(s\) under archive\//)
+  })
+})
+
+test('o3d-bddq r6: a file -> symlink TYPE CHANGE under archive/ is seen (diff-filter must include T)', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['config', 'diff.renames', 'true'])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    rmSync(path.join(repo, ARCHIVED_ONE))
+    symlinkSync('two.ts', path.join(repo, ARCHIVED_ONE))
+    commitAll(repo, 'replace an archived file with a symlink')
+    reseal(repo)
+    commitAll(repo, 're-seal, separately, with no trailer')
+    // PRECONDITION: git really classifies it as a type change (T), not a modification.
+    const raw = git(repo, ['diff', '--raw', '--no-renames', 'development...HEAD', '--', ARCHIVED_ONE])
+    assert.match(raw, /\sT\t/, `PRECONDITION: the change is a T (type change):\n${raw}`)
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, `a type change under archive/ plus a re-seal must refuse:\n${output}`)
+    assert.match(output, /BRANCH\s+CO-CHANGE/)
+    assert.match(output, /archive\/connectors\/one\.ts/)
+  })
+})
+
+test('o3d-bddq r6: an ODD PATH NAME (quote, newline, non-ASCII, space) under archive/ is seen — the -z parse', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['config', 'diff.renames', 'true'])
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    const odd = 'archive/connectors/we"ird\nna me é.ts'
+    writeFileSync(path.join(repo, odd), 'export const odd = 1\n')
+    commitAll(repo, 'add an oddly named archived file')
+    reseal(repo)
+    commitAll(repo, 're-seal, separately, with no trailer')
+    // PRECONDITION: default quoting really mangles the path so it no longer starts with archive/.
+    const quoted = defaultListing(repo).find((l) => l.includes('ird'))
+    assert.ok(quoted !== undefined && quoted.startsWith('"'), `PRECONDITION: git C-quotes the path in default output: ${quoted}`)
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 1, `an odd-named archive/ path plus a re-seal must refuse:\n${output}`)
+    assert.match(output, /BRANCH\s+CO-CHANGE/)
+    assert.ok(output.includes(odd), `the raw, unquoted path must be named:\n${output}`)
+  })
 })
