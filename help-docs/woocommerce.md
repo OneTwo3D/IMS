@@ -332,6 +332,8 @@ The **Status Mapping** tab controls how WooCommerce statuses translate to One Tw
 
 Other IMS status changes are not pushed back to WooCommerce.
 
+The **Shipped** push fires when the order reaches Shipped in IMS — the last shipment on the order is shipped, or an operator sets the order to Shipped — and is sent **after** the shipment's tracking, so WooCommerce's completed email carries it. A partial shipment pushes tracking only. IMS only promotes an order that WooCommerce still holds as `processing`: an order an operator has cancelled, refunded, put on hold or completed by hand in WooCommerce is left as it is, and if IMS cannot read the order's current WooCommerce status it does not promote it (the skip is recorded in the activity log as `wc_completion_skipped`). A failed push never fails the shipment; it is logged as `shopping_status_push_failed`. Orders despatched by the warehouse (Mintsoft) push the same status through the same guard.
+
 ### Tracking Sync (IMS to WC)
 
 Shipment tracking is pushed back to WooCommerce when:
