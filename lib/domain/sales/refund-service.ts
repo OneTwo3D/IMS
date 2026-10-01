@@ -718,7 +718,7 @@ async function buildRefundFallbackReturnRows(
         select: {
           id: true,
           lines: {
-            select: { productId: true, qty: true },
+            select: { productId: true, qty: true, salesOrderLineId: true },
           },
         },
       },
@@ -774,6 +774,40 @@ async function buildRefundFallbackReturnRows(
     remainingReturnable.set(productId, Math.max(0, dispatched - priorReturned))
   }
 
+  // o3d-zvec.21 (Codex r1 #1): the product-wide cap above lets one line's refund consume ANOTHER line's
+  // shipped units when two lines share a product (A orders 2 / ships 1, B ships 1: A's second refund took
+  // B's unit although accounting books A's second unit as unshipped). So every row is ALSO capped against
+  // the remaining shipped quantity of ITS OWN order line: dispatched on (line, component product) minus
+  // what earlier refunds already returned against that line, converted to component units. A prior refund
+  // line with no line link is attributed the way a new one without a link is: to the first line of that
+  // product.
+  const lineProductKey = (lineId: string, productId: string) => `${lineId}|${productId}`
+  const remainingByLineProduct = new Map<string, number>()
+  for (const [lineId, rows] of sourceRowsByLine) {
+    for (const [productId, qty] of rows) remainingByLineProduct.set(lineProductKey(lineId, productId), qty)
+  }
+  for (const refund of order.refunds) {
+    if (excludeRefundId && refund.id === excludeRefundId) continue
+    for (const refundLine of refund.lines) {
+      if (!refundLine.productId) continue
+      const attributed = (refundLine.salesOrderLineId && lineById.has(refundLine.salesOrderLineId)
+        ? lineById.get(refundLine.salesOrderLineId)
+        : (lineCandidatesByProduct.get(refundLine.productId) ?? [])[0]) ?? null
+      if (!attributed) continue
+      const rows = sourceRowsByLine.get(attributed.id)
+      const attributedLineQty = refundBoundaryNumber(attributed.qty)
+      if (!rows || attributedLineQty <= 0) continue
+      for (const [productId, rowQty] of rows) {
+        const unitsPerLineUnit = rows.size === 1 && productId === attributed.productId ? 1 : rowQty / attributedLineQty
+        const key = lineProductKey(attributed.id, productId)
+        remainingByLineProduct.set(
+          key,
+          Math.max(0, (remainingByLineProduct.get(key) ?? 0) - refundBoundaryNumber(refundLine.qty) * unitsPerLineUnit),
+        )
+      }
+    }
+  }
+
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
     const refundLineId = 'id' in line ? line.id : null
@@ -815,8 +849,11 @@ async function buildRefundFallbackReturnRows(
       if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
       const rawReturnQty = isPlainLine ? Math.min(line.qty, totalQty) : perUnitQty * line.qty
       const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
-      const cappedQty = Math.min(rawReturnQty, available)
+      const lineKey = lineProductKey(sourceLine.id, productId)
+      const lineAvailable = Math.max(0, remainingByLineProduct.get(lineKey) ?? 0)
+      const cappedQty = Math.min(rawReturnQty, available, lineAvailable)
       remainingReturnable.set(productId, available - cappedQty)
+      remainingByLineProduct.set(lineKey, lineAvailable - cappedQty)
 
       if (cappedQty <= 0) return []
       return [{ productId, qty: cappedQty, refundLineId }]

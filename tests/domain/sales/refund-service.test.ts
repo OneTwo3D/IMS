@@ -8840,3 +8840,37 @@ test('[o3d-zvec.21 g] the accounting RETRY of a Woo refund covering a shipped AN
   assert.equal(retried.success, true, `retry must not throw on the unshipped line (${retried.success ? '' : retried.error})`)
   assert.equal(stockOnHand(state), 3, 'the retry did not restock a second time (idempotent) and never restocked line-2')
 })
+
+test('[o3d-zvec.21 h] two lines of the SAME product: successive refunds of line A never restock line B\'s shipped unit', async () => {
+  // Line A orders 2 and ships 1; line B (same product) orders 1 and ships 1. The product shipped 2 in
+  // total, but only ONE of those units belongs to A.
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 2
+  state.lines[0].totalBase = 40
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1 (B)', qty: 1, totalBase: 20 })
+  state.orders[0].totalBase = 60
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+    ],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: the product shipped 2 units in total')
+  assert.equal(state.shipments[0].lines.find((line) => line.lineId === 'line-1')?.qty, 1, 'PRECONDITION: only ONE of them belongs to line A')
+  const refundA = (externalRefundId: number) => createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, externalRefundId),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+  })
+
+  const first = await refundA(9021)
+  assert.equal(first.success, true)
+  assert.equal(stockOnHand(state), 1, 'PRECONDITION: the first refund restocked A\'s one shipped unit')
+
+  const second = await refundA(9022)
+
+  assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
+  assert.equal(stockOnHand(state), 1, 'A has no shipped unit left: the second refund must not consume B\'s')
+  assert.equal(state.refunds[1].returnWarehouseId, null, 'and records no return warehouse')
+})

@@ -1149,8 +1149,8 @@ export async function syncWcRefund(
       action: 'refund_synced',
       tag: 'sync',
       level: 'INFO',
-      description: `Synced WC refund for order #${so.externalOrderNumber} — ${refundAmountForeign.toFixed(2)} ${hasQtyRefund ? '(with restock)' : '(monetary only)'}`,
-      metadata: { externalRefundId: wcRefund.id, amount: refundAmountForeign, hasRestock: hasQtyRefund },
+      description: `Synced WC refund for order #${so.externalOrderNumber} — ${refundAmountForeign.toFixed(2)} ${hasQtyRefund ? '(with returned quantity; only shipped units are restocked)' : '(monetary only)'}`,
+      metadata: { externalRefundId: wcRefund.id, amount: refundAmountForeign, hasQtyRefund },
       resolveUser: false,
     })
 
