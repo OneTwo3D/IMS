@@ -48,8 +48,19 @@ const LIVE_INSTRUCTIONS = [
   /post a reversing journal there/,
 ]
 
+// The ORACLE for "which operations have a draft form" is written here, independently of the list
+// the subject is built from. Deriving it from DRAFT_CAPABLE_SEMANTIC_LIST made the oracle shrink in
+// step with any member dropped from that list, so dropping one stayed green at runtime (found by
+// mutation; only tsc caught it). Xero payments, attachments and non-document ledger writes have no
+// draft status; every other semantic resolves resolveInvoiceStatus / resolveJournalStatus.
+const EXPECTED_DRAFT_SEMANTICS: readonly string[] = ['CREATE_DOCUMENT', 'UPDATE_DOCUMENT', 'POST_JOURNAL']
+
 const DRAFT_CAPABLE = (type: AccountingSyncType): boolean =>
-  (DRAFT_CAPABLE_SEMANTIC_LIST as readonly string[]).includes(operationSemanticFor(type) ?? '')
+  EXPECTED_DRAFT_SEMANTICS.includes(operationSemanticFor(type) ?? '')
+
+test('o3d-d3re: DRAFT_CAPABLE_SEMANTIC_LIST is exactly the independently stated draft-capable set', () => {
+  assert.deepEqual([...DRAFT_CAPABLE_SEMANTIC_LIST].sort(), [...EXPECTED_DRAFT_SEMANTICS].sort())
+})
 
 test('o3d-d3re: the matrix under test is the real enum, and it is not empty', () => {
   // PRECONDITION, PRINTED: every (type x mode) cell is evaluated and counted.
@@ -69,9 +80,7 @@ test('o3d-d3re: the matrix under test is the real enum, and it is not empty', ()
   // The whole file is a sweep over this list. If it were short — or if `_postingMode` stopped
   // reaching the function — every assertion below would pass over nothing.
   assert.ok(ALL_TYPES.length >= 25, `expected the full AccountingSyncType enum, saw ${ALL_TYPES.length}`)
-  const draftCapable = ALL_TYPES.filter(
-    (type) => (DRAFT_CAPABLE_SEMANTIC_LIST as readonly string[]).includes(operationSemanticFor(type) ?? ''),
-  )
+  const draftCapable = ALL_TYPES.filter(DRAFT_CAPABLE)
   assert.ok(draftCapable.length >= 20, `expected many draft-capable types, saw ${draftCapable.length}`)
   // AND THE TWO SIDES MUST BOTH BE POPULATED, or "every draft-capable type" is a claim about six
   // journals and "every other type" is a claim about nothing.
