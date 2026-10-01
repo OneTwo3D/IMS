@@ -656,11 +656,32 @@ async function getShipmentLineCostSnapshot(
   )
 }
 
+/**
+ * o3d-zvec.21: build the stock rows a refund returns, from what SHIPPED.
+ *
+ * THE PER-LINE SPLIT (storefront refunds, `skipUnshipped`). A refunded quantity is split shipped-first,
+ * the same order `consumeRefundLineQuantity` uses for the COGS/allocation reversal, so the stock side and
+ * the accounting side can never disagree about which units are which:
+ *
+ *   restockable = min(refunded, shipped on that line and not already returned by an earlier refund)
+ *   remainder   = refunded - restockable   -> UNSHIPPED: demand/reservation is released (post-commit,
+ *                                              post-refund-release.ts via the in-tx outbox row) and NOTHING
+ *                                              is restocked — those units never left, so nothing came back.
+ *
+ * A line with no shipped quantity at all therefore contributes NO row instead of throwing
+ * "no shipment line exists" (which used to fail the whole refund, credit note included). The throw is kept
+ * for the operator-recorded path: there the operator explicitly asked for stock to be returned, and a
+ * refusal that names the remedy ("process as cash-only") is the right answer.
+ *
+ * This function does not decide WHEN shipped units come back; it only never invents units that did not
+ * ship. Nothing here is read outside the order lock: callers build rows inside the refund transaction.
+ */
 async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
   lines: Array<RefundRequestLine | CreatedRefundLine>,
   excludeRefundId?: string,
+  options: { skipUnshipped?: boolean } = {},
 ): Promise<RefundReturnRow[]> {
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
@@ -772,15 +793,27 @@ async function buildRefundFallbackReturnRows(
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
     const sourceLineQty = refundBoundaryNumber(sourceLine.qty)
     if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
+      // o3d-zvec.21: an UNSHIPPED line has nothing to restock — its demand is released, not returned.
+      if (options.skipUnshipped) return []
       throw new RefundReturnSourceError(
         `Cannot restock product ${sourceLine.productId ?? line.productId} for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.`,
       )
     }
 
+    // o3d-zvec.21: a plain (non-kit) line that shipped PART of its quantity returns shipped-first —
+    // min(refunded, shipped) — not proportionally. Proportional (shipped/ordered per refunded unit) turned
+    // "refund 3 of 5, 3 shipped" into 1.8 units restocked. A fully shipped line (shipped == ordered) is
+    // identical either way, so the shipped path is unchanged; kits keep the proportional factor because
+    // their component rows are not in line units.
+    const isPlainLine = options.skipUnshipped === true
+      && sourceRows.size === 1
+      && sourceLine.productId != null
+      && sourceRows.has(sourceLine.productId)
+
     return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
       const perUnitQty = totalQty / sourceLineQty
       if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
-      const rawReturnQty = perUnitQty * line.qty
+      const rawReturnQty = isPlainLine ? Math.min(line.qty, totalQty) : perUnitQty * line.qty
       const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
       const cappedQty = Math.min(rawReturnQty, available)
       remainingReturnable.set(productId, available - cappedQty)
@@ -3203,6 +3236,12 @@ export async function createSalesOrderRefund(
   // fallback return-row build, the snapshot return rows AND the inbound movement, so
   // a chargeback can't fail on a restock path even if a warehouse was supplied (Codex).
   const effectiveReturnWarehouseId = input.chargeback ? undefined : input.returnWarehouseId
+  // o3d-zvec.21: a STOREFRONT refund (a WooCommerce refund, or one hand-recorded from its park — both carry
+  // the external refund id and are persisted with source WOO_SYNC) states a refunded QUANTITY but cannot
+  // say whether those units ever left the warehouse. Units that did not ship are released (demand and
+  // reservation, post-refund-release.ts) and never restocked; only shipped units are restocked. An
+  // operator-entered refund keeps its explicit "return this stock" contract and its refusals.
+  const storefrontRefund = input.externalRefundId != null && !input.chargeback
 
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
@@ -3591,10 +3630,23 @@ export async function createSalesOrderRefund(
 
     if (
       effectiveReturnWarehouseId &&
+      !storefrontRefund &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
       so.shipments.length === 0
     ) {
       return { error: 'Cannot return refunded stock before the order has shipped' } as const
+    }
+
+    // o3d-zvec.21: the restock decision for a storefront refund is taken HERE, under the order lock taken
+    // above and from shipment rows read in this same transaction — a shipment of the last unit racing this
+    // refund is serialised by that lock (the shipment commits first and is seen as shipped, or this refund
+    // commits first and the unit is released), and shipped quantity is never read before the lock. If no
+    // shipped quantity is left to restock, no return warehouse is recorded at all, so nothing downstream
+    // (staging, inbound stock, the accounting retry) can restock what never shipped.
+    let restockWarehouseId = effectiveReturnWarehouseId
+    if (storefrontRefund && effectiveReturnWarehouseId) {
+      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true })
+      if (restockable.length === 0) restockWarehouseId = undefined
     }
 
     // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
@@ -4061,7 +4113,7 @@ export async function createSalesOrderRefund(
         totalBase,
         totalsBasis: 'NET',
         source: refundSource,
-        returnWarehouseId: effectiveReturnWarehouseId || null,
+        returnWarehouseId: restockWarehouseId || null,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
@@ -4206,8 +4258,8 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
-    const fallbackReturnRows = effectiveReturnWarehouseId
-      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
+    const fallbackReturnRows = restockWarehouseId
+      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
       : []
 
     // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
@@ -4263,6 +4315,7 @@ export async function createSalesOrderRefund(
       releaseEligible,
       releaseUnmatchedAnomaly,
       fallbackReturnRows,
+      restockWarehouseId,
     }
   }).catch((error) => {
     if (isRefundReturnSourceError(error)) {
@@ -4347,7 +4400,7 @@ export async function createSalesOrderRefund(
           orderRef: refundOrderRef,
           refundId: txResult.createdRefund.id,
           refundLines: txResult.createdRefundLines,
-          returnWarehouseId: effectiveReturnWarehouseId,
+          returnWarehouseId: txResult.restockWarehouseId,
           accountingSettings: input.accountingSettings!,
           so: txResult.so,
           newStatus: txResult.newStatus,
@@ -4460,7 +4513,7 @@ export async function createSalesOrderRefund(
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
   // scjz.70: effectiveReturnWarehouseId is undefined for a chargeback, so the
   // inbound return movement is skipped (the customer keeps the goods).
-  if (effectiveReturnWarehouseId && !accountingWarning) {
+  if (txResult.restockWarehouseId && !accountingWarning) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
@@ -4470,7 +4523,7 @@ export async function createSalesOrderRefund(
       applyReturnInboundStockTx(tx, {
         referenceType: 'SalesOrderRefund',
         referenceId: txResult.createdRefund.id,
-        warehouseId: effectiveReturnWarehouseId!,
+        warehouseId: txResult.restockWarehouseId!,
         rows: returnRows,
         note: 'Refund return',
       })
@@ -4765,6 +4818,7 @@ export async function retrySalesOrderRefundAccounting(
           id: true,
           orderId: true,
           returnWarehouseId: true,
+          externalRefundId: true,
           chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
@@ -4988,7 +5042,11 @@ export async function retrySalesOrderRefundAccounting(
         const snapshotRows = staged.snapshotReturnRows ?? []
         const returnRows = snapshotRows.length > 0
           ? snapshotRows
-          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id)
+          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id, {
+            // o3d-zvec.21: the same rule the creation applied — a storefront refund never restocks (or
+            // throws on) a line that did not ship. Its persisted external id is how creation chose it.
+            skipUnshipped: refund.externalRefundId != null,
+          })
         returnedRows = await applyReturnInboundStockTx(tx, {
           referenceType: 'SalesOrderRefund',
           referenceId: refund.id,
