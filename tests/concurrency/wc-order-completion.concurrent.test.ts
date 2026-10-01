@@ -435,3 +435,46 @@ test('o3d-zvec.15 (review 2, HIGH 4): a claim whose worker died is surfaced as a
   assert.equal(wc.puts, 1)
   assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
 })
+
+test('o3d-zvec.15 (review 2, HIGH 4b): a slow worker that finishes while the park is waiting wins — the park is a compare-and-set, not an overwrite', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { key } = await seedRow(deps, 'slow-worker')
+  const t0 = new Date()
+  const [claimed] = await deps.claimIntegrationOutboxWork({
+    connector: 'woocommerce', operation: 'order.complete', idempotencyKeys: [key],
+    limit: 1, workerId: 'woocommerce-order-completion', maxAttempts: deps.WC_ORDER_COMPLETION_MAX_ATTEMPTS, now: t0,
+  })
+  assert.ok(claimed, 'precondition: the row is claimed')
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { lockedAt: new Date(t0.getTime() - 3_600_000) } })
+
+  // The "dead" worker is only slow: it holds the row and is about to record success.
+  const holderReady = Promise.withResolvers<void>()
+  const holderGo = Promise.withResolvers<void>()
+  const holder = deps.db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM integration_outbox WHERE "idempotencyKey" = ${key} FOR UPDATE`
+    holderReady.resolve()
+    await holderGo.promise
+    await tx.integrationOutbox.update({ where: { idempotencyKey: key }, data: { status: 'SUCCEEDED', lockedAt: null, lockedBy: null } })
+  }, { timeout: 30_000 })
+  await holderReady.promise
+
+  const parking = deps.parkStaleWcOrderCompletionClaims(t0)
+  // Release the holder only once the park's UPDATE is demonstrably blocked behind it.
+  let blocked = 0
+  for (let i = 0; i < 500 && blocked === 0; i++) {
+    const rows = await deps.db.$queryRaw<Array<{ n: number }>>`
+      SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE wait_event_type = 'Lock' AND query LIKE '%integration_outbox%' AND query ILIKE '%update%'`
+    blocked = rows[0].n
+    if (blocked === 0) await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  assert.ok(blocked >= 1, 'precondition: the park really was waiting on the row the slow worker holds')
+  holderGo.resolve()
+  await holder
+  const parked = await parking
+
+  assert.equal(parked, 0, 'the park lost the race and did nothing')
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', 'the slow worker\'s success stands')
+})

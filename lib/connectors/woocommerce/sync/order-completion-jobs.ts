@@ -239,11 +239,11 @@ export async function processWcOrderCompletionJobs(options?: {
         await retry('the status push returned no outcome, so completion cannot be confirmed')
         continue
       }
-      if (outcome.kind === 'not-applicable') {
+      if (outcome?.kind === 'not-applicable') {
         await retry('the order has no WooCommerce link or no pushable status, so it was not completed')
         continue
       }
-      if (outcome.kind === 'ineligible' && outcome.class !== 'finalised') {
+      if (outcome?.kind === 'ineligible' && outcome.class !== 'finalised') {
         await retry(`WooCommerce order is "${outcome.wcStatus}" (${outcome.class === 'unknown' ? 'a status IMS has no reading of; add a status mapping' : 'not ready to complete'}), not completed`)
         continue
       }
