@@ -72,7 +72,8 @@ import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { enqueueStockSync, pushOrderDeliveryMetadata, pushSalesOrderStatus } from '@/lib/shopping'
+import { enqueueStockSync, pushSalesOrderStatus } from '@/lib/shopping'
+import { pushShipmentCompletionToShopping } from '@/lib/fulfillment/shipment-completion-push'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import {
   resolveLineTaxRateBatch,
@@ -1884,7 +1885,18 @@ export async function applySalesOrderStatusTransition(
     // Push status back to the order's shopping connector(s) (fire-and-forget).
     // b8i6.1: routed through the facade so it dispatches to the order's actual
     // connector (WooCommerce pushes; a connector without a push port is skipped).
-    if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
+    const pushStatusToShopping = (options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0
+    if (targetStatus === 'SHIPPED') {
+      // o3d-zvec.15: SHIPPED goes through the one completion helper — tracking first, THEN the status —
+      // so the storefront's completed email carries the tracking. This used to push the status
+      // un-awaited BEFORE the tracking, racing it. Awaited and never throws.
+      await pushShipmentCompletionToShopping({
+        orderId: id,
+        orderReachedShipped: true,
+        pushStatus: pushStatusToShopping,
+        orderRef: getSalesOrderReference(so),
+      })
+    } else if (pushStatusToShopping) {
       pushSalesOrderStatus(id, targetStatus)
         .then((res) => {
           if (!res.success) throw new Error(res.error ?? 'unknown error')
@@ -1900,14 +1912,6 @@ export async function applySalesOrderStatusTransition(
             metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(syncError) },
           })
         })
-    }
-
-    if (targetStatus === 'SHIPPED') {
-      try {
-        await pushOrderDeliveryMetadata(id)
-      } catch (syncError) {
-        console.error(syncError)
-      }
     }
 
     return { success: true }

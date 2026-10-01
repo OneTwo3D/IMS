@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import { pushShipmentCompletionToShopping } from '@/lib/fulfillment/shipment-completion-push'
 import { decimalToNumber } from '@/lib/decimal'
 import {
   availableQtyFromRequirements,
@@ -1573,10 +1574,14 @@ export async function updateShipmentStatus(
       return result
     }
 
+    // o3d-zvec.15: set by the reconciliation below ONLY when this call moved the order to SHIPPED.
+    let orderReachedShipped = false
+    const completionAuthority = options?.completionAuthority ?? 'IMS'
     if (targetStatus === 'SHIPPED') {
       const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
-        completionAuthority: options?.completionAuthority ?? 'IMS',
+        completionAuthority,
       })
+      orderReachedShipped = reconciliation.orderReachedShipped === true
       // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
       // quantity, so it was deliberately left in its pre-shipment status instead of being declared
       // complete. Only ever set under IMS completion authority — an externally fulfilled order is
@@ -1643,11 +1648,17 @@ export async function updateShipmentStatus(
       metadata: { shipmentId, warehouseCode: result.shipment.warehouse.code, previousStatus: result.previousStatus, newStatus: targetStatus },
     })
     if (targetStatus === 'SHIPPED') {
-      try {
-        await pushOrderDeliveryMetadata(result.shipment.orderId)
-      } catch (syncError) {
-        console.error(syncError)
-      }
+      // Tracking first, then — only when THIS call completed the order — the SHIPPED status, so the
+      // storefront's completed email carries the tracking (o3d-zvec.15). Post-commit and best-effort:
+      // the helper never throws. Under EXTERNAL completion authority the storefront/WMS owns the
+      // status (applyExternalFulfillmentUpdate pushes it itself, an inbound WooCommerce completion
+      // must never echo), so only the tracking goes from here.
+      await pushShipmentCompletionToShopping({
+        orderId: result.shipment.orderId,
+        orderReachedShipped,
+        pushStatus: completionAuthority === 'IMS',
+        orderRef: result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber,
+      })
       try {
         await enqueueStockSync(
           result.stockSyncProductIds,

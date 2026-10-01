@@ -124,6 +124,14 @@ export type ShipmentReconciliationResult = {
    * all, because a different mechanism has already decided the order is complete.
    */
   shortfall?: OrderShipmentShortfallLine[]
+  /**
+   * o3d-zvec.15: present (and `true`) ONLY when THIS call moved the order to SHIPPED — the flip
+   * happened under the order lock in this very reconciliation. It is the single "the order has just
+   * been completed" signal the post-commit side effects key on (the WooCommerce completion push), so
+   * that they fire exactly once per completion: absent for a partial shipment, for a shortfall-held
+   * order, for an order some other path had already promoted, and for a retry that finds it done.
+   */
+  orderReachedShipped?: true
 }
 
 function canRunTransaction(
@@ -1457,7 +1465,11 @@ export async function reconcileOrderAfterShipment(
     .filter(Boolean)
     .join(', ')
 
+  // Set only inside the committed callback below, by the one statement that flips the status; read
+  // only after `runInTransaction` returned, i.e. after the commit (a rollback throws past the read).
+  let orderReachedShipped = false
   const shortfall = await runInTransaction(client, async (tx) => {
+    orderReachedShipped = false // a retried callback must not inherit an aborted attempt's flip
     await lockSalesOrder(tx, shipment.orderId)
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
@@ -1514,6 +1526,7 @@ export async function reconcileOrderAfterShipment(
         trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
       },
     })
+    orderReachedShipped = true
     return null
   })
 
@@ -1524,5 +1537,6 @@ export async function reconcileOrderAfterShipment(
     shouldGenerateInvoice: !shortfall && trigger?.value === 'on_shipped',
     orderId: shipment.orderId,
     ...(shortfall ? { shortfall } : {}),
+    ...(orderReachedShipped ? { orderReachedShipped: true as const } : {}),
   }
 }

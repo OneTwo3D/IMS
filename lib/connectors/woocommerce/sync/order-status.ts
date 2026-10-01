@@ -174,6 +174,27 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       return
     }
 
+    // Only-if-still-processing guard (o3d-zvec.4, o3d-zvec.15). A COMPLETION is a promotion, and it
+    // fires WooCommerce's completed-order machinery (customer email, downloads). Promote only an
+    // order that is still `processing`: if an operator has cancelled, refunded, held, finalised or
+    // otherwise moved it by hand, pushing `completed` would resurrect it. An unreadable WooCommerce
+    // status fails CLOSED for the same reason — we cannot show the order is still ours to promote.
+    // Cancel/hold pushes are not promotions and are left as they were.
+    if (externalStatus === 'completed') {
+      const wcStatus = (currentWc.data as { status?: string } | null)?.status
+      if (currentWc.error || !isWcStatus(wcStatus, 'processing')) {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_skipped', tag: 'sync',
+          level: currentWc.error ? 'WARNING' : 'INFO',
+          description: currentWc.error
+            ? `Did not push ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: could not read its current status (${currentWc.error})`
+            : `Did not push ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: it is ${String(wcStatus)}, not processing, so it was left as it is`,
+          resolveUser: false,
+        })
+        return
+      }
+    }
+
     const { data: pushedOrder, error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
 
     if (error) {
