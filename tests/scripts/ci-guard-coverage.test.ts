@@ -65,6 +65,25 @@ export function expandNpmRuns(line: string, scripts: Record<string, string>, see
   return seen
 }
 
+/**
+ * AUDITABLE DIRECT INVOCATIONS ONLY. A line counts only if the WHOLE line is `npm run <script>` (optionally
+ * `-s`, optionally `-- args`). So `echo 'npm run x'`, a `# comment`, quoted text, `npm run x || true`,
+ * `npm run x; y`, `a && npm run x`, `if cond; then npm run x` and a line continued with a backslash are NOT
+ * invocations. A block that turns errexit off (`set +e`, `set +o errexit`) or traps cannot be trusted to
+ * propagate failure, so none of its lines count.
+ */
+const DIRECT_RE = /^npm run (?:-s )?([A-Za-z0-9:_-]+)(?: -- .*)?$/
+const MASKING_RE = /(^|[\s;&|])(set\s+\+e|set\s+\+o\s+errexit|trap\s)/
+export function directInvocations(body: string): string[] {
+  if (MASKING_RE.test(body)) return []
+  const out: string[] = []
+  for (const line of body.split('\n')) {
+    const m = DIRECT_RE.exec(line.trim())
+    if (m) out.push(m[1])
+  }
+  return out
+}
+
 const yaml = require('js-yaml') as { load: (s: string) => unknown }
 const WF_DIR = join(REPO, '.github/workflows')
 const workflowFiles = readdirSync(WF_DIR).filter((f) => /\.ya?ml$/.test(f))
@@ -76,6 +95,22 @@ export function skippability(doc: Json): string | null {
   for (const [event, cfg] of Object.entries(on)) {
     if (cfg && typeof cfg === 'object' && ('paths' in cfg || 'paths-ignore' in cfg)) return `${event} has a path filter`
   }
+  const pr = (on as Json).pull_request as Json | null
+  if (pr && typeof pr === 'object') {
+    if ('branches-ignore' in pr) return 'pull_request has branches-ignore'
+    if ('branches' in pr) {
+      const b = pr.branches as string[]
+      if (!Array.isArray(b) || !b.some((x) => x === 'development' || x === '**' || x === '*')) {
+        return 'pull_request branches do not include development'
+      }
+    }
+    if ('types' in pr) {
+      const t = pr.types as string[]
+      if (!Array.isArray(t) || !['opened', 'synchronize', 'reopened'].every((x) => t.includes(x))) {
+        return 'pull_request types exclude opened/synchronize/reopened'
+      }
+    }
+  }
   return null
 }
 export function ungatedInvocations(doc: Json, scripts: Record<string, string>): Set<string> {
@@ -86,7 +121,8 @@ export function ungatedInvocations(doc: Json, scripts: Record<string, string>): 
     for (const step of (job.steps ?? []) as Json[]) {
       if (step.if !== undefined || step['continue-on-error'] !== undefined) continue
       if (typeof step.run !== 'string') continue
-      for (const n of expandNpmRuns(step.run, scripts)) out.add(n)
+      if (step.shell !== undefined || step['working-directory'] !== undefined) continue
+      for (const n of directInvocations(step.run)) for (const m of expandNpmRuns(`npm run ${n}`, scripts)) out.add(m)
     }
   }
   return out
@@ -94,10 +130,24 @@ export function ungatedInvocations(doc: Json, scripts: Record<string, string>): 
 export function localInvocations(sh: string, scripts: Record<string, string>): Set<string> {
   const out = new Set<string>()
   for (const line of sh.split('\n')) {
-    if (!/^run_step\s/.test(line)) continue
-    for (const n of expandNpmRuns(line, scripts)) out.add(n)
+    const m = /^run_step\s+'[^']*'\s+(npm run (?:-s )?[A-Za-z0-9:_-]+)$/.exec(line)
+    if (!m) continue
+    for (const n of expandNpmRuns(m[1], scripts)) out.add(n)
   }
   return out
+}
+
+/** Ungated jobs that run more than one check:* script DIRECTLY: a failing one would hide the rest. */
+export function jobsHidingFailures(doc: Json): string[] {
+  const bad: string[] = []
+  if (skippability(doc)) return bad
+  for (const [id, job] of Object.entries((doc.jobs ?? {}) as Record<string, Json>)) {
+    const n = ((job.steps ?? []) as Json[])
+      .flatMap((st) => (typeof st.run === 'string' ? directInvocations(st.run) : []))
+      .filter((x) => x.startsWith('check:')).length
+    if (n > 1) bad.push(`${id} runs ${n} check:* scripts in one job`)
+  }
+  return bad
 }
 
 function coverage(scripts = SCRIPTS, workflows?: Json[], sh?: string) {
@@ -142,6 +192,15 @@ test('PRECONDITION: the workflows were found and parsed, and the check:* scripts
 test('every check:* script runs in an ungated workflow and in validate-local.sh, or is allowlisted with a reason', () => {
   const { ci, local } = coverage()
   assert.deepEqual(findings(CHECKS, ci, local), [])
+})
+
+test('no ungated job runs two check:* guards: GitHub skips later steps after a failure, so one red guard would hide the rest', () => {
+  const { docs } = coverage()
+  const all = docs.flatMap((d) => jobsHidingFailures(d))
+  const guardJobs = docs.flatMap((d) => (skippability(d) ? [] : Object.keys((d.jobs ?? {}) as Json)))
+  console.log(`# job-independence examined ${guardJobs.length} jobs in ungated workflows`)
+  assert.ok(guardJobs.length >= 9, `expected at least 9 jobs in ungated workflows, found ${guardJobs.length}`)
+  assert.deepEqual(all, [])
 })
 
 test('every member of check:all is covered individually, so the alias allowlist hides nothing', () => {
@@ -193,4 +252,41 @@ test('detector: findings go red for an unrun guard, a new unrun check:zz, and a 
   assert.equal(findings(['check:zz'], new Set(), new Set(), {}, {}).length, 2)
   assert.equal(findings(['check:zz'], new Set(), new Set(['check:zz']), { 'check:zz': '' }, {}).length, 1)
   assert.equal(findings(['check:zz'], new Set(), new Set(['check:zz']), { 'check:zz': 'a sufficiently long reason' }, {}).length, 0)
+})
+
+test('detector: only whole-line direct invocations count (echo, comment, quoted, conditional, masked, continued)', () => {
+  assert.deepEqual(directInvocations('npm run check:foo'), ['check:foo'])
+  assert.deepEqual(directInvocations('npm run -s check:foo -- --x'), ['check:foo'])
+  assert.deepEqual(directInvocations('npm ci\nnpm run check:foo\nnpm run check:bar'), ['check:foo', 'check:bar'])
+  for (const bad of [
+    "echo 'npm run check:foo'", '# npm run check:foo', 'echo "x" # npm run check:foo', "'npm run check:foo'",
+    'npm run check:foo || true', 'npm run check:foo; true', 'npm run check:foo | tee x', 'npm run check:foo &',
+    'true && npm run check:foo', 'if [ -n "$X" ]; then npm run check:foo; fi', '[ -n "$X" ] && npm run check:foo',
+    'npm run check:foo \\\n|| true', 'set +e\nnpm run check:foo',
+    'set +o errexit\nnpm run check:foo', 'trap true ERR\nnpm run check:foo',
+  ]) {
+    const got = directInvocations(bad)
+    assert.deepEqual(got, [], `must not count: ${JSON.stringify(bad)}`)
+  }
+  assert.equal(localInvocations("run_step 'x' npm run check:foo || true\n", S).size, 0)
+  assert.equal(localInvocations("run_step 'x' echo npm run check:foo\n", S).size, 0)
+})
+test('detector: a pull_request trigger that excludes development PRs is skippable', () => {
+  const t = (pr: Json) => skippability(wf({ on: { pull_request: pr } }))
+  assert.equal(t({ branches: ['development'] }), null)
+  assert.equal(t({}), null)
+  assert.match(String(t({ branches: ['main'] })), /branches do not include development/)
+  assert.match(String(t({ 'branches-ignore': ['development'] })), /branches-ignore/)
+  assert.match(String(t({ types: ['closed'] })), /types exclude/)
+  assert.equal(t({ types: ['opened', 'synchronize', 'reopened', 'labeled'] }), null)
+})
+test('detector: two guards in one job are flagged, two in separate jobs are not', () => {
+  const two = wf({}, {}, {}, 'npm run check:foo\nnpm run check:bar')
+  assert.equal(jobsHidingFailures(two).length, 1)
+  const sep = wf()
+  ;(sep.jobs as Json).k = { steps: [{ run: 'npm run check:bar' }] }
+  assert.deepEqual(jobsHidingFailures(sep), [])
+  const twoSteps = wf()
+  ;((twoSteps.jobs as Json).j as Json).steps = [{ run: 'npm run check:foo' }, { run: 'npm run check:bar' }]
+  assert.equal(jobsHidingFailures(twoSteps).length, 1)
 })

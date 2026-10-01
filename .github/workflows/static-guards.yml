@@ -19,6 +19,10 @@
 # second thing that can go stale (the same defect one level down), and each guard costs seconds. They
 # are repeated here so that coverage does not depend on a path list being right.
 #
+# ONE JOB PER GUARD, deliberately: GitHub skips the later steps of a job after the first failing step,
+# so seven steps in one job would let one red guard hide the other six. Separate jobs are independent;
+# tests/scripts/ci-guard-coverage.test.ts fails if an ungated job runs more than one check:* script.
+#
 # `fetch-depth: 0` is load-bearing for check:migration-conventions, which merge-bases against
 # origin/<base> and fails (does not pass) when it cannot. `npm ci` is needed because the
 # TypeScript-AST guards import `typescript`. No Prisma client, database or build is involved.
@@ -40,7 +44,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  static-guards:
+  documented-env-vars:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -53,9 +57,81 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check:documented-env-vars
+  wc-sync-row-predicates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:wc-sync-row-predicates
+  fulfillment-requirement-seam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:fulfillment-requirement-seam
+  wms-connector-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:wms-connector-boundary
+  migration-conventions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:migration-conventions
+  decimal-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:decimal-boundaries
+  connector-fetch-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
       - run: npm run check:connector-fetch-boundaries
