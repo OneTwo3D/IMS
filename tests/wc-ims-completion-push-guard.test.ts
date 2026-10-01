@@ -214,3 +214,21 @@ test('o3d-zvec.15 (HIGH 2): a THROWING WooCommerce read is reported as an error,
   assert.deepEqual(outcome, { kind: 'error', error: 'socket hang up' })
   assert.deepEqual(state.puts, [])
 })
+
+test('o3d-zvec.15 (arm 8, connector half): every push RE-READS WooCommerce — a status changed between two attempts is honoured', async () => {
+  state.wcStatus = 'on-hold'
+  const first = await push('SHIPPED')
+  assert.equal(state.fetches.length, 1)
+  assert.deepEqual(first, { kind: 'ineligible', wcStatus: 'on-hold', class: 'not-ready' })
+
+  state.wcStatus = 'processing' // the operator released the hold
+  const second = await push('SHIPPED')
+  assert.equal(state.fetches.length, 2, 'a second GET, not a cached first status')
+  assert.deepEqual(second, { kind: 'pushed' })
+
+  state.wcStatus = 'cancelled' // and a different order of events must not be remembered either
+  const third = await push('SHIPPED')
+  assert.equal(state.fetches.length, 3)
+  assert.equal(third.kind, 'ineligible')
+  assert.equal(state.puts.length, 1, 'exactly the one PUT, made while the order was in flight')
+})
