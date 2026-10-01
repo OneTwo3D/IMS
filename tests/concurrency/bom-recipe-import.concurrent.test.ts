@@ -1697,7 +1697,7 @@ test(
       assert.equal(await active(id), true, `${what}: must NOT have deactivated anything`)
       assert.equal(await auditCount(id), before, `${what}: must NOT have written an audit row`)
       if (!/WRONG/.test(what)) {
-        assert.match(result.output, /NOT confirmed.*Nothing was written/s, `${what}: must say the target was not confirmed: ${result.output}`)
+        assert.match(result.output, /NOT confirmed[\s\S]*Nothing was written/, `${what}: must say the target was not confirmed: ${result.output}`)
       }
     }
 
