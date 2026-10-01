@@ -22,6 +22,12 @@ import {
   validateProductStructureChange,
 } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import {
+  BomRecipeRefusedError,
+  describeBomRecipeRefusal,
+  reconcileBomRecipeForProductType,
+  syncBomRecipeFromProductComponents,
+} from '@/lib/products/bom-recipe'
 import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
@@ -1059,6 +1065,36 @@ export async function updateProduct(
     // no-op for a mutation that cannot change any sales line's requirements (BOM <-> SIMPLE).
     await bumpFulfillmentGraphVersions(tx, id, kitnessMutation)
 
+    // o3d-zjsb5.9 round 2, finding 1b: the clearComponents delete left `BomItem` BEHIND. Placed
+    // AFTER the fulfilment-graph bump deliberately: that bump must stay adjacent to the write it
+    // describes (tests/products/component-graph-edit-guard.test.ts asserts the proximity), and the
+    // manufacturing mirror is separate bookkeeping that depends on neither. Reconciling on the
+    // type the transaction just wrote covers all four directions, which `clearComponents` alone
+    // cannot: it is FALSE for KIT -> BOM, where the components are kept and the product now needs a
+    // claimed Bom or planning has no recipe for it at all.
+    //
+    // LOCKING, STATED HONESTLY: this transaction deliberately holds only its PER-SKU lock and not
+    // the coarse component-graph one — taking it here would invert the documented lock order (see
+    // the kitness guard above and lib/db/advisory-locks.ts). So the cycle check inside the reconcile
+    // is best-effort here, exactly like the in-flight-sales guard it sits next to. What is NOT
+    // best-effort is the claim: `syncBomRecipeFromProductComponents` adopts with a compare-and-set
+    // and refuses rather than overwriting, which is what makes an unlocked path safe to claim from.
+    const bomReconcile = await reconcileBomRecipeForProductType(tx, {
+      productId: id,
+      sku: data.sku,
+      type: data.type,
+      productName: data.name,
+    })
+    // THROWN for the same reason as in `saveProductComponents`: the type write and the component
+    // delete above are already in this transaction, so a return would commit them while refusing
+    // the recipe half.
+    // EXHAUSTIVE (round 8): listing the kinds meant round 8's new `active-duplicates` would have
+    // fallen straight through and committed. `synced`/`retired` are the only non-refusals.
+    if (bomReconcile.kind !== 'synced' && bomReconcile.kind !== 'retired') {
+      throw new BomRecipeRefusedError(describeBomRecipeRefusal(bomReconcile))
+    }
+
+
     return {
       from: previousCategoryName,
       to: data.categoryName ?? null,
@@ -1073,6 +1109,12 @@ export async function updateProduct(
     // Before the ProductStructureChangedError branch: this is not a stale-read conflict and
     // reloading will not help, so it must not be told to reload.
     if (error instanceof ComponentGraphInFlightSalesError) {
+      return { message: error.message }
+    }
+    // Same placement argument as the branch above: a refused BOM recipe is not a stale read, so
+    // "reload and try again" would send the operator round a loop that cannot succeed — except for
+    // the contended-claim case, whose own message says to reload because there reloading DOES help.
+    if (error instanceof BomRecipeRefusedError) {
       return { message: error.message }
     }
     if (error instanceof ProductStructureChangedError) {
@@ -1478,6 +1520,35 @@ export async function saveProductComponents(
       // o3d-4kfh r6: the CAS half — see the kitness path in updateProduct. A no-op on a BOM, whose
       // component list no sales line expands.
       await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
+
+      // o3d-zjsb5.9 round 2, finding 1: THIS EDITOR IS THE PATH PEOPLE ACTUALLY USE, and it wrote
+      // only ONE of the two representations. The CSV component pass syncs both; this did not. So an
+      // imported BOM edited here left production consuming the new list (ProductComponent) while
+      // planning kept the old one (BomItem) — and the consistency check this branch adds would have
+      // spent its life reporting a defect the product created daily, which is worse than not having
+      // it.
+      //
+      // Same mechanism, same transaction, same `COMPONENT_GRAPH_WRITE_LOCK_KEY` held above, same
+      // source list that ProductComponent was just written from. BOM only: a KIT is consumed at
+      // sale and has no production order, so a Bom for one would be a recipe with no reader.
+      if (current.type === 'BOM') {
+        const bomOutcome = await syncBomRecipeFromProductComponents(tx, {
+          productId,
+          sku: current.sku,
+          components: components.map((component) => ({
+            componentProductId: component.componentId,
+            qty: Number(component.qty),
+          })),
+        })
+        // THROWN, not returned. Every other refusal in this transaction happens BEFORE any write,
+        // so returning it commits an empty transaction and is fine. This one happens AFTER the
+        // `ProductComponent` write above, and a callback that RETURNS commits — so returning would
+        // land one representation of a recipe the other rejected, which is the exact split this
+        // change exists to prevent. The throw is caught below and reported as an ordinary refusal.
+        if (bomOutcome.kind !== 'written') {
+          throw new BomRecipeRefusedError(describeBomRecipeRefusal(bomOutcome))
+        }
+      }
       return null
     })
     if (conflict === 'self') return { success: false, error: 'A product cannot be a component of itself' }
@@ -1494,6 +1565,7 @@ export async function saveProductComponents(
     if (conflict && typeof conflict === 'object' && conflict.kind === 'in-flight-sales') {
       return { success: false, error: describeComponentGraphEditBlockers(conflict.blockers) }
     }
+
     const warnings = await findMatchingProductComponentConfigurations(productId, components)
     await logActivity({
       entityType: 'PRODUCT',

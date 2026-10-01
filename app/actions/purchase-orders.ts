@@ -62,6 +62,7 @@ import {
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   computeGrossUnitCostBaseByLine,
+  CONTRIBUTING_LANDED_COST_LINK_WHERE,
   queueLandedCostAdjustmentJournals,
   recalculateDirectLandedCosts,
   recalculateLandedCosts,
@@ -1759,6 +1760,10 @@ export async function receivePurchaseOrder(
           select: { amountBase: true, distributionMethod: true },
         },
         landedCostLinks: {
+          // o3d-8m8pe: this pre-transaction read is not consumed for cost (the in-transaction `currentPo`
+          // read below is), but a reader of this relation that skips cancelled freight is the invariant;
+          // derived from the shared predicate so a later use of `po.landedCostLinks` cannot reintroduce it.
+          where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
           select: {
             freightPO: {
               select: {
@@ -1878,6 +1883,20 @@ export async function receivePurchaseOrder(
             select: { amountBase: true, distributionMethod: true },
           },
           landedCostLinks: {
+            // o3d-8m8pe: a CANCELLED freight PO must not contribute to the cost of these units.
+            // Cancellation leaves the link row in place, marks the freight PO CANCELLED and the link
+            // unallocated, and BOTH landed-cost recalculation paths exclude it
+            // (landed-cost-service.ts audit-C3 and audit-izrf). Without this `where` the receipt laid a
+            // cost layer, a movement value and a STOCK_RECEIPT journal that INCLUDE freight the business
+            // cancelled — overstating inventory and disagreeing with what recalculation computes for the
+            // very same units. DERIVED from the single definition, never restated: a second literal copy
+            // of the rule is how three readers came to disagree about it in the first place (o3d-6nd55 r2).
+            //
+            // ON THE STATUS AND NOT ON `allocated`: `allocated` records whether the uplift has been
+            // written to `landedUnitCostBase` yet, and valuing a receipt whose freight is NOT yet
+            // allocated is the entire purpose of `computeGrossUnitCostBaseByLine` below — filtering on it
+            // would zero the ordinary case and replace an overstatement with an understatement.
+            where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
             select: {
               freightPO: {
                 select: {
@@ -2043,13 +2062,20 @@ export async function receivePurchaseOrder(
 
       const freightPoIds: string[] = []
       if (allReceived) {
+        // o3d-8m8pe (adversarial review HIGH, o3d-c1qdi): the SAME defect as the cost read above, in the
+        // full-receipt path. Cancelling a freight order leaves its link row, so an unfiltered read
+        // here included the CANCELLED freight PO; the loop below then rejected its status and rolled
+        // back the whole receipt (the goods could not be received in full), and `allocated: true`
+        // would have marked a cancelled order's cost as applied. Derived from the one shared predicate
+        // so allocation, auto-receive and cost cannot disagree about which links count. A cancelled
+        // freight PO is SKIPPED, not rejected. Every other state is handled exactly as before.
         const freightLinks = await tx.landedCostLink.findMany({
-          where: { primaryPoId: id },
+          where: { primaryPoId: id, ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
           select: { freightPoId: true },
         })
         if (freightLinks.length > 0) {
           await tx.landedCostLink.updateMany({
-            where: { primaryPoId: id },
+            where: { primaryPoId: id, ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
             data: { allocated: true },
           })
         }

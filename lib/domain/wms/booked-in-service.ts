@@ -30,12 +30,20 @@ import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/
 import {
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
-  queueAccountingSyncTx,
+  queueAccountingSyncTxWithOutcome,
   readStockReceiptAccountsTx,
   type StockReceiptAccounts,
 } from '@/lib/accounting'
+import {
+  postingIsOwed,
+  reportPostingNotQueued,
+  type EnqueueOutcomeLike,
+} from '@/lib/domain/accounting/enqueue-outcome'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
-import { computeGrossUnitCostBaseByLine } from '@/lib/domain/purchasing/landed-cost-service'
+import {
+  computeGrossUnitCostBaseByLine,
+  CONTRIBUTING_LANDED_COST_LINK_WHERE,
+} from '@/lib/domain/purchasing/landed-cost-service'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -349,6 +357,28 @@ export async function processBookedInEvent(
     // do any of this at all, and a flip of THAT is answered by the enqueue's own fence.
     const accountingConnector = await getActiveAccountingConnectorId()
     const accountingSettings = await getAccountingSettingsFor(accountingConnector)
+
+    // o3d-ln2df: WHAT THE RECEIPT-JOURNAL ENQUEUE ANSWERED, CARRIED OUT OF THE TRANSACTION SO A DECLINE
+    // CAN BE REPORTED.
+    //
+    // The enqueue's answer was read only to gate the transit mirror — correctly — and the decline itself
+    // went nowhere: the book-in commits stock and cost layers, the mirror is skipped, and nothing states
+    // what stands in IMS against what the ledger lacks. On this path nothing re-attempts the journal
+    // either (the book-in event is consumed), so an unreported decline is PERMANENT, silent accounting
+    // incompleteness. See the report drained after the commit below.
+    //
+    // ONE ENTRY PER PURCHASE ORDER, because `receiptLinesByPoId` posts one journal per order and an ASN
+    // can span several — a single holder would report only the last of them.
+    //
+    // REPORTED AFTER THE COMMIT, NOT HERE, and for the reason the manual receipt states at
+    // app/actions/purchase-orders.ts: an activity-log write uses its own connection, so logging inside
+    // this transaction would leave the report standing if the transaction later rolled back — and this
+    // transaction still has the transfer loop and the ASN updates to run, either of which can throw.
+    const receiptPostingDeclines: Array<{
+      poId: string
+      poReference: string
+      outcome: EnqueueOutcomeLike
+    }> = []
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -867,6 +897,21 @@ export async function processBookedInEvent(
               select: { amountBase: true, distributionMethod: true },
             },
             landedCostLinks: {
+              // o3d-8m8pe: a CANCELLED freight PO must not contribute to the cost of these units. This
+              // query COPIED the manual receipt's (app/actions/purchase-orders.ts) when o3d-8f0p6 r2
+              // routed the book-in through the shared gross-cost helper, so the unfiltered read travelled
+              // with the fix. Cancellation leaves the link row in place, marks the freight PO CANCELLED
+              // and the link unallocated, and BOTH landed-cost recalculation paths exclude it
+              // (landed-cost-service.ts audit-C3 and audit-izrf) — so without this `where` the book-in's
+              // cost layer, movement value and STOCK_RECEIPT journal all carry freight the business
+              // cancelled. DERIVED from the single definition, never restated inline: a second literal
+              // copy of the rule is how three readers came to disagree about it (o3d-6nd55 r2).
+              //
+              // ON THE STATUS AND NOT ON `allocated`: `allocated` records whether the uplift has been
+              // written to `landedUnitCostBase` yet, and valuing a receipt whose freight is NOT yet
+              // allocated is the entire purpose of `computeGrossUnitCostBaseByLine` below — filtering on
+              // it would zero the ordinary case and swap an overstatement for an understatement.
+              where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
               select: {
                 freightPO: {
                   select: {
@@ -1241,7 +1286,7 @@ export async function processBookedInEvent(
             `wms-purchase-receipt:${poId}:${lockedEvent.id}`,
             payload,
           )
-          const queued = await queueAccountingSyncTx(tx, {
+          const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
             type: 'STOCK_RECEIPT',
             referenceType: 'PurchaseOrder',
             referenceId: poId,
@@ -1273,7 +1318,7 @@ export async function processBookedInEvent(
           // decision (bcz9.4) rather than a second settings read, so the two can never disagree: a
           // journal that was not queued must not be mirrored, or the transit reconciliation would
           // report a GL/subledger gap that is really a bookkeeping artefact of this line.
-          if (queued) {
+          if (enqueued.queued) {
             await recordTransitSubledgerMovement(tx, {
               sourceType: 'STOCK_RECEIPT',
               sourceRef: poId,
@@ -1281,6 +1326,18 @@ export async function processBookedInEvent(
               baseDelta: -amount,
               journalDate: payload.date,
             })
+          } else {
+            // o3d-ln2df: AND THE DECLINE IS RECORDED FOR REPORTING. `postingIsOwed` is applied where the
+            // report is made, not here: a `not-configured` answer is not a debt and must stay silent, and
+            // the whole ANSWER is what distinguishes it from `refused` — which is why this site takes the
+            // `WithOutcome` variant of the enqueue rather than the boolean, exactly as
+            // lib/domain/inventory/stock-adjustment-apply.ts and the other four reporting sites do.
+            //
+            // THE COMMIT/SKIP BEHAVIOUR IS UNCHANGED, deliberately: the book-in still commits (a retired
+            // chart must not stop a warehouse receiving stock) and the transit mirror is still skipped (a
+            // journal that was not queued must not be mirrored — o3d-bcz9.4). This only makes the refusal
+            // REPORT what it did anyway, and what a human has to do about it.
+            receiptPostingDeclines.push({ poId, poReference: po.reference, outcome: enqueued })
           }
         }
       }
@@ -1600,6 +1657,58 @@ export async function processBookedInEvent(
           })),
       }
     }, STOCK_TX_OPTIONS)
+
+    // ─── o3d-ln2df: A DECLINED RECEIPT JOURNAL IS REPORTED, WITH WHAT IMS COMMITTED AND THE REMEDY ───
+    //
+    // THE DEFECT THIS CLOSES. The enqueue's answer gated the transit mirror and was then dropped. On a
+    // decline the book-in committed, the mirror was skipped, and the facade's own
+    // `recordRefusalAsOutstanding` raised an inbox row — but that row carried NO `committed` and NO
+    // `remedy`, because both come from the CALLER through `reportPostingNotQueued`. The operator got a
+    // refusal with no statement of what IMS did anyway and no instruction, which is precisely what rule 3
+    // of lib/domain/accounting/enqueue-outcome.ts exists to provide. Every other site that commits local
+    // state over a declined posting reports — the manual receipt, return and bill
+    // (app/actions/purchase-orders.ts), app/actions/manufacturing.ts,
+    // lib/domain/inventory/stock-adjustment-apply.ts, lib/domain/purchasing/landed-cost-service.ts and
+    // lib/connectors/woocommerce/sync/order-import.ts — and this one was the exception.
+    //
+    // AND WHY IT MATTERS MORE HERE THAN AT SOME OF THOSE SITES: on a refusal this path CONSUMES the
+    // book-in event and nothing re-attempts the journal, so the posting is not merely late. Stock is
+    // credited, cost layers are laid, there is no STOCK_RECEIPT journal and no transit subledger row, and
+    // nothing in IMS will ever post them. It is also invisible to the transit reconciliation, because a
+    // posting that never happened is absent from BOTH sides of that comparison and the window ties out
+    // exactly (the trap recorded at movement-cogs-relevance.ts:291-295).
+    //
+    // GATED ON `postingIsOwed`, so a `not-configured` answer stays silent: with no connector that posts
+    // this type there is no GL counterpart to owe. `refused` and `hand-post-deferred` are owed and are
+    // reported.
+    for (const decline of receiptPostingDeclines) {
+      if (!postingIsOwed(decline.outcome)) continue
+      await reportPostingNotQueued({
+        entityType: 'PURCHASE_ORDER',
+        entityId: decline.poId,
+        action: 'stock_receipt_journal_not_queued',
+        // The same kind the manual receipt's STOCK_RECEIPT refusal uses: nothing re-attempts this
+        // posting, so the row is closed by an operator marking it handled rather than by clearing itself.
+        kind: 'stock_receipt_journal',
+        posting: `the stock receipt journal for PO ${decline.poReference}`,
+        // WHAT ACTUALLY STANDS IN IMS on this path, named specifically rather than borrowed from the
+        // manual receipt: the goods are booked in and the stock movements and cost layers are committed.
+        committed:
+          'the goods are booked in from the WMS ASN and the stock movements and cost layers are committed '
+          + 'in IMS',
+        remedy:
+          'Goods-in-transit has NOT been drained into inventory in the ledger, and nothing in IMS will '
+          + 'post this journal later — the book-in event has been consumed. Post the journal by hand, then '
+          + 'Mark as handled.',
+        outcome: decline.outcome,
+        metadata: {
+          reference: decline.poReference,
+          externalAsnId: event.externalAsnId,
+          wmsInboundReceiptEventId: event.id,
+          chartConnector: accountingConnector,
+        },
+      })
+    }
 
     if (processed.duplicate) {
       return {

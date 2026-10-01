@@ -89,6 +89,134 @@ npm run test:concurrency   # RUN_DB_CONCURRENCY_TESTS=1                         
 npm run test:db            # RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 -> tests/db/**
 ```
 
+A third, **opt-in and explicitly invoked** file lives outside every glob: `tests/manual/`. Nothing
+collects it, so it can drive real server actions against a real database without making `test:unit`
+need one.
+
+```bash
+# o3d-zjsb5.9 — proves a migrated BOM recipe is USABLE, not merely present: both representations
+# written by one import, the drift check going red and green again, the refusals (unknown component,
+# cycle, row cap), and a production order completed against the migrated Bom.
+BOM_VERIFY_SCRATCH_DB=<your scratch db> npx tsx --test --experimental-test-module-mocks \
+  tests/manual/bom-recipe-import-e2e.ts
+```
+
+It refuses to start unless the connected database is named in `BOM_VERIFY_SCRATCH_DB`, carries the
+`db:stamp-scratch` disposability comment for that name, and is not `onetwo3d_ims_dev` — all three
+checked on a read-only query before anything writes.
+
+`npm run check:bom-recipes` is the read-only half of the same thing, runnable against any database:
+it reports every disagreement between `product_components` and `bom_items` and exits non-zero when
+it finds one. It is deliberately NOT in `check:all`, which must run with no database at all.
+
+`npm run repair:duplicate-bom` is the WRITE half, and the only supported way to clear a duplicate
+active recipe. IMS refuses to write a product's recipe while a second *active* `Bom` holds recipe
+lines for the same product, because planning sums every active recipe and would over-order — so
+without this the refusal blocks that product's import, component edit and build orders with no
+in-application remedy, which is what round 9 of PR #714 caught.
+
+```bash
+npm run repair:duplicate-bom -- --list                # what is duplicated, and the id to pass
+npm run repair:duplicate-bom -- --bom <id> --dry-run  # what would happen; writes nothing
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name>   # deactivate it; LINES ARE KEPT
+```
+
+**A write must confirm the target database.** Pass `--expect-db <name>`, or run it on a TTY and type the
+name when prompted. With neither — non-interactive and no flag — it refuses with **exit 3** and writes
+nothing, rather than reading consent into the absence of a human. `--list` and `--dry-run` need no
+confirmation because they write nothing.
+
+**Naming the database is mandatory, and name/host/port cannot establish which server you are on.**
+
+* `--expect-db` is **required** for any non-interactive write. Its absence is a usage error (**exit 1**),
+  raised before anything connects. Pinning only `--expect-host` or `--expect-port` never says *which*
+  database was meant, and the in-transaction check compares the server against its own preflight reading,
+  so it cannot catch an initially wrong target.
+* A write then requires **either** `--expect-system-id` **or** `--accept-name-only`. Nothing else
+  satisfies it.
+
+The reason is that **name, host and port are all clone-invariant**: a restored copy reached at the same
+address, with the same name, on the same port has identical values for all three. So none of them
+distinguishes the clone, and *more* of them is not *stronger* — two clone-invariant pins establish exactly
+what one does. `system_identifier` is the only field in the composite that differs for a logical restore,
+and therefore the only one whose presence changes what has been established.
+
+**Do not "improve" this by accepting host + port as sufficient.** That was the bypass: adding
+`--expect-host` with a value copied off the printed banner discharged the acknowledgement and wrote
+`acceptedNameOnly: false` into the audit row, so the record asserted no acknowledgement was needed at a
+moment when nothing had identified the target.
+
+The audit row records `identityRoute` (`system-identifier`, `name-only-acknowledged` or `typed-at-tty`)
+alongside the pinned field names, so what was actually established is recoverable afterwards.
+
+**A pin that cannot be verified is refused, not skipped.** If you pass `--expect-system-id` and the field
+comes back `unavailable`, the command refuses (**exit 3**) rather than accepting the pin and quietly not
+checking it. The lenient "an unavailable identifier is not a mismatch" rule applies ONLY to the unpinned
+path, where the expected value is merely what the preflight observed; an operator who pins the strongest
+field and is told nothing when it goes unchecked is worse off than one who never pinned it.
+
+That is not belt-and-braces over the banner: a **clone of the database holds the same BOM ids**, so the id
+you pass cannot tell two servers apart, and a `--dry-run` in one shell constrains nothing about where a
+later write lands. The expectation is therefore **checked again inside the mutation transaction** — a check
+made before the transaction can be defeated by anything that changes which server the connection reaches in
+between, and a mismatch there aborts the transaction so the write is discarded.
+
+**What identity is actually compared, and what it cannot prove.** `--expect-db` asserts the database
+**name**, and a restored copy *keeps its name* — so on its own it proves "this database is called X", not
+"this is the server I meant". The composite Postgres can actually supply is compared instead:
+`current_database()`, `inet_server_addr()`, `inet_server_port()` and
+`pg_control_system().system_identifier`. Pin the stronger parts when you can:
+
+```bash
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --expect-system-id <n>
+```
+
+The residual limits, stated rather than implied:
+
+* a **logical** restore (`pg_dump` into a fresh `initdb`) gets a new `system_identifier`, so it **is**
+  distinguished — this is the common "someone restored a copy of production" case;
+* a **physical** clone (`pg_basebackup`, a streaming replica, a snapshot restore) **copies** the
+  `system_identifier`. Same name, same identifier: only host and port distinguish it, and behind a proxy on
+  the same address and port, **nothing here distinguishes it**;
+* A role **denied `EXECUTE`** on `pg_control_system()` can still use the command. Two things make that
+  work, and they are belt and braces: availability is settled **before** the mutation transaction opens, so
+  the optional query never runs inside one; and the query is wrapped in a **savepoint**, so even a mid-run
+  revocation degrades instead of poisoning. Catching the JavaScript error is not enough on its own —
+  PostgreSQL aborts the whole transaction on any error, so a bare `try`/`catch` leaves state `25P02` and
+  every later statement fails with "current transaction is aborted". `tests/concurrency` covers this with a
+  real role whose `EXECUTE` is revoked, not a stub.
+* `pg_control_system()` **is readable by an ordinary role** on PostgreSQL 17 — verified with a plain
+  `CREATE ROLE ... LOGIN` holding no grants — so the identifier is normally available and the composite is
+  normally at full strength. The `unavailable` path is **defensive and the exception**, not the expected
+  case: `EXECUTE` can be revoked, and a managed provider may restrict these functions. Where that happens
+  the field reads `unavailable`, the composite degrades to name plus address, and the banner says so. An
+  `unavailable` identifier is never treated as a mismatch — absence of evidence is not evidence.
+
+**Every argument is validated before anything connects.** An unknown flag, a flag missing its value, a
+repeated flag, `--flag=value`, or conflicting modes is a usage error (**exit 1**) raised before the database
+module is imported. That is load-bearing rather than tidiness: exempting `--dry-run` from confirmation is
+only safe if `--dry-run` cannot be misspelled into a write, and under a lenient parser `--dryrun` was
+silently dropped and the run wrote.
+
+It **deactivates, never deletes** — `manufacturing-analytics.ts` values completed production orders
+through `order.bom.items`, so deleting would rewrite history. It **refuses (exit 2)** when the BOM is
+a product's claimed recipe, or is the last active recipe of another BOM-typed product, because
+deactivating in either case makes that product silently unplannable. It takes the component-graph
+lock, logs itself to `activity_logs` (including which database it ran against), and is safe to re-run.
+
+Before it writes anything it prints the target database from the **server's own** `current_database()`,
+with host, port, user, and whether the database carries the `db:stamp-scratch` disposability comment:
+
+```
+TARGET DATABASE: onetwo3d_ims_dev  (host 127.0.0.1/32:5432, user ims)
+  This database is NOT stamped disposable. Treat it as REAL DATA.
+```
+
+It reports the server's answer rather than echoing `DATABASE_URL`, because the URL is the part that can
+lie — a socket-form URL that loses its `?host=` silently retargets the shared cluster. It does not refuse
+an unstamped database (repairing real data is the point); it is loud so an operator who sees the wrong
+name can stop before the write.
+
 **Point `DATABASE_URL` at a scratch database you created for the run, never at a shared one.** The
 concurrency tier seeds fixture rows — and several of its files install DDL or disable triggers — into
 whatever database the URL reaches. So EVERY file in the tier refuses to start (o3d-yvn8), before it is

@@ -1097,6 +1097,14 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // cannot move a plugin key — and runs in its own transaction rather than the sweep's.
   'lib/fulfillment/pre-fulfilment-reallocation.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
+  // o3d-zjsb5.9 r13. The duplicate-recipe repair's logic, discovered here because `readServerIdentity`
+  // issues raw SELECTs. Read to classify: it constructs NO client of its own -- every statement runs on
+  // the transaction client the caller passes, which is the app's own pooled client. Its SQL is CONSTANT
+  // with no interpolation (`current_database()`, `inet_server_addr()`, `inet_server_port()`,
+  // `pg_control_system()`, and `pg_advisory_xact_lock` with the key as a bind parameter), and the
+  // identity reads are read-only. Its only writes go through Prisma: `boms.active` for one id and one
+  // `activity_logs` row. It cannot touch `settings`, so it cannot move a plugin key.
+  'lib/products/bom-recipe-repair.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
@@ -1214,6 +1222,63 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/cogs-e2e-fixture.ts': 'operator-run-write',
   'scripts/copy-tax-rates.ts': 'operator-run-write',
   'scripts/csv-import-e2e-fixture.ts': 'operator-run-write',
+  // o3d-zjsb5.9 r10. THE duplicate-recipe repair an operator runs when an import is refused because a
+  // second ACTIVE Bom holds recipe lines for the same product. Classified for what it DOES, read
+  // rather than inferred from its name: it opens the app's pooled client and WRITES APPLICATION ROWS
+  // OUTSIDE ANY REQUEST — `boms.active` for one id, plus one `activity_logs` row — inside a single
+  // transaction. That is the honest label; it is an operator-run write, not a probe and not read-only.
+  //
+  // WHAT IT MAY WRITE, and what it must REFUSE: it deactivates ONE `Bom` by id and never deletes a
+  // `BomItem` (completed production orders are valued through `order.bom.items`). It refuses, writing
+  // nothing, when that Bom is a product's CLAIMED recipe, or is the LAST active recipe of any other
+  // BOM-typed parent — either would make that product silently unplannable, which is the o3d-zjsb5.29
+  // defect the refusal it serves exists to prevent. The refusals are the load-bearing part and each is
+  // pinned by a mutation in tests/concurrency/bom-recipe-import.concurrent.test.ts.
+  //
+  // CAN IT HIT A LIVE DATABASE BY ACCIDENT? It can be POINTED at one — that is its purpose — so the
+  // target is DECLARED AND CHECKED rather than merely announced. Before writing it prints the server's
+  // own `current_database()`, host, port and user, and whether the database carries the
+  // disposable-scratch stamp; it reports the SERVER'S answer rather than echoing `DATABASE_URL`, because
+  // the URL is the thing that lies (a socket-form URL losing its `?host=` retargets the shared cluster).
+  //
+  // WHAT THE IDENTITY CHECK PROVES, AND WHAT IT CANNOT (round 13): the composite is
+  // `current_database()` + `inet_server_addr()` + `inet_server_port()` +
+  // `pg_control_system().system_identifier`, because a RESTORED COPY KEEPS ITS NAME — comparing the name
+  // alone proved "this database is called X" rather than "this is the server I meant". A LOGICAL restore
+  // gets a new system_identifier and IS caught; a PHYSICAL clone (pg_basebackup, replica, snapshot)
+  // copies it, so behind a proxy on the same address NOTHING here distinguishes it, and that limit is
+  // documented rather than implied. `pg_control_system()` IS readable by an ordinary role on PG17
+  // (verified with a plain LOGIN role holding no grants), so the composite is normally at full strength;
+  // the `unavailable` path is defensive for a revoked EXECUTE or a restrictive managed provider, and an
+  // `unavailable` identifier is never treated as a mismatch.
+  //
+  // Naming the target database is MANDATORY for a non-interactive write (a usage error before anything
+  // connects), and the write then needs EITHER `--expect-system-id` OR `--accept-name-only`. Name, host and
+  // port are all CLONE-INVARIANT -- a restored copy matches on all three -- so no number of them can
+  // discharge the acknowledgement; only `system_identifier` differs for a logical restore. The audit row
+  // records which route established the target, so it can never assert an acknowledgement was unnecessary
+  // when nothing identified the server (round 18). An explicitly PINNED field that cannot be verified
+  // is REFUSED rather than skipped -- the lenient unavailable rule applies only to the unpinned path. And a
+  // role denied EXECUTE on pg_control_system() still works, because availability is settled before the
+  // mutation transaction and the optional query is savepoint-wrapped (a bare try/catch leaves 25P02).
+  //
+  // A WRITE then requires the operator to name that database — `--expect-db <name>`, or typed at a TTY —
+  // and REFUSES (exit 3, writing nothing) with neither, instead of reading consent into the absence of a
+  // human. Round 11: a banner nobody can act on is a log line, not a safeguard, and the BOM id is no
+  // protection either because a CLONE holds the same ids. The expectation is verified AGAIN inside the
+  // mutation transaction against `current_database()`, so a connection that changes between the
+  // pre-flight and the write is caught and the transaction aborts. `--list` and `--dry-run` need no
+  // confirmation because they write nothing; `--dry-run` computes the real outcome and rolls it back.
+  // That exemption is only safe because the WHOLE argument list is validated before the database module
+  // is imported: an unknown flag, a missing value, a repeated flag, `--flag=value` or conflicting modes is
+  // a usage error (exit 1) raised before any connection exists. Under a lenient parser `--dryrun` was
+  // silently dropped and the run WROTE, which made the exemption the delivery mechanism (round 13).
+  // The database name also lands in the audit row.
+  //
+  // For THIS test's property: it takes no plugin selection lock and writes no plugin key. It does take
+  // COMPONENT_GRAPH_WRITE_LOCK_KEY, the same advisory lock every other writer of that graph takes, so
+  // unlike most of this group it is safe beside a running app.
+  'scripts/deactivate-duplicate-bom.ts': 'operator-run-write',
   'scripts/find-aliased-purchase-bills.ts': 'operator-run-read',
   'scripts/generate-xero-demo-template.ts': 'operator-run-read',
   'scripts/invariant-check-preflight-fixture.ts': 'operator-run-write',

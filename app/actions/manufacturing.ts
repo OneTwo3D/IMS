@@ -57,6 +57,12 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import {
+  BomRecipeRefusedError,
+  describeBomRecipeRefusal,
+  syncBomRecipeFromProductComponents,
+} from '@/lib/products/bom-recipe'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -359,69 +365,154 @@ type CreateInput = {
 export async function createManufacturingOrder(input: CreateInput): Promise<{ success: boolean; error?: string; id?: string }> {
   try {
     await requirePermission('manufacturing')
-    // Validate product has BOM components
-    const product = await db.product.findUnique({
+
+    // PREFLIGHT ONLY. Re-read and re-validated under the graph lock below, and that read is the one
+    // everything downstream uses (o3d-zjsb5.9 round 3). Kept so the ordinary rejections still return
+    // a clean message without opening a transaction at all.
+    const preflight = await db.product.findUnique({
       where: { id: input.productId },
-      select: {
-        sku: true,
-        name: true,
-        type: true,
-        productComponents: { select: { componentId: true, qty: true } },
-      },
+      select: { type: true, productComponents: { select: { componentId: true } } },
     })
-    if (!product) return { success: false, error: 'Product not found.' }
-    if (product.type !== 'BOM') return { success: false, error: 'Product is not a BOM type.' }
-    if (product.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
+    if (!preflight) return { success: false, error: 'Product not found.' }
+    if (preflight.type !== 'BOM') return { success: false, error: 'Product is not a BOM type.' }
+    if (preflight.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
 
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
 
-    // Find or create a BOM record for this product
-    let bom = await db.bom.findFirst({
-      where: { items: { some: { parentProductId: input.productId } } },
-      select: { id: true },
-    })
-    if (!bom) {
-      bom = await db.bom.create({
-        data: {
-          name: `${product.sku} BOM`,
-          items: {
-            create: product.productComponents.map((c, i) => ({
-              parentProductId: input.productId,
-              componentProductId: c.componentId,
-              qty: c.qty,
-              sortOrder: i,
-            })),
-          },
+    // Find or create a BOM record for this product.
+    //
+    // o3d-zjsb5.9 round 2, finding 4: THIS IS A RACE, and the claim introduced it. The previous
+    // shape read an unclaimed row and then `update`d it BY ID unconditionally, so two concurrent
+    // manufacturing-order requests for DIFFERENT products could both see the same unclaimed row and
+    // both claim it — the second silently transferring that Bom from the first product to itself.
+    // The unique index cannot catch it: both writes target ONE row and each leaves exactly one
+    // claim standing.
+    //
+    // Two things fix it, and both are needed:
+    //   1. every claim path now runs under `COMPONENT_GRAPH_WRITE_LOCK_KEY`, the same lock the CSV
+    //      component pass and the editor take, so claims are serialized instead of interleaved.
+    //      This path took NO lock at all before, which is why holding it elsewhere did not help;
+    //   2. `syncBomRecipeFromProductComponents` makes the adoption a compare-and-set
+    //      (`updateMany` with `productId: null` in the predicate) and refuses if it does not affect
+    //      exactly one row. That is the belt: it holds even if some future caller forgets the lock.
+    //
+    // Calling the shared helper rather than hand-rolling the claim also means this path MIRRORS
+    // `ProductComponent` into the recipe instead of only seeding it on first create, so raising an
+    // order repairs a drifted recipe rather than building against a stale one.
+    // o3d-zjsb5.9 round 3: THE LOCK SERIALIZED THE WRITE BUT NOT THE DATA IT WROTE. Round 2 took the
+    // graph lock here, which was the right lock — but the product's type and component list were read
+    // BEFORE it, outside any transaction. So while this request waited for the lock, an editor or a
+    // CSV import could change the recipe, and this action would then write the OLD list into BomItem
+    // and raise an order against it; or a type conversion could RETIRE the Bom, and this action would
+    // claim and reactivate it for a product that is no longer BOM-typed.
+    //
+    // Same answer as o3d-8f0p6/#713, which had the same shape with account codes: read and validate
+    // INSIDE the transaction, after acquiring the lock, and use THAT read for everything downstream.
+    // A snapshot older than the lock describes a state the lock is not protecting.
+    const claim = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+
+      // THE AUTHORITATIVE READ. Everything below uses this one, never the preflight.
+      const locked = await tx.product.findUnique({
+        where: { id: input.productId },
+        select: {
+          sku: true,
+          name: true,
+          type: true,
+          productComponents: { select: { componentId: true, qty: true }, orderBy: { sortOrder: 'asc' } },
         },
       })
-    }
+      // ABORTED, not adapted. A product that stopped being BOM-typed while we waited must not have
+      // its recipe claimed and reactivated, and one whose components were cleared must not have an
+      // order raised against an empty recipe.
+      if (!locked) return { kind: 'gone' as const }
+      if (locked.type !== 'BOM') return { kind: 'not-bom' as const, type: locked.type }
+      if (locked.productComponents.length === 0) return { kind: 'no-components' as const }
 
-    const reference = makeReference()
-    const order = await db.productionOrder.create({
-      data: {
-        reference,
-        orderType: input.orderType,
-        bomId: bom.id,
-        outputProductId: input.productId,
-        warehouseId: input.warehouseId,
-        manufacturerId: input.manufacturerId || null,
-        qtyPlanned: input.qtyPlanned,
-        scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
-        notes: input.notes || null,
-      },
+      const synced = await syncBomRecipeFromProductComponents(tx, {
+        productId: input.productId,
+        sku: locked.sku,
+        productName: locked.name,
+        components: locked.productComponents.map((component) => ({
+          componentProductId: component.componentId,
+          qty: Number(component.qty),
+        })),
+      })
+      // THROWN, NEVER RETURNED (round 6, finding 1). `syncBomRecipeFromProductComponents` has
+      // already replaced this parent's `BomItem` rows by the time it can detect a cycle -- it must
+      // check the graph it is actually committing, not the one it replaced. So a refusal returned
+      // from this callback COMMITS the rejected recipe: the action reports failure and raises no
+      // order, while an active cyclic BOM graph is left behind for the planning explosion to walk.
+      // Reporting failure while committing the rejected state is worse than either outcome alone.
+      //
+      // This is the SAME defect I introduced and fixed at the import call site in round 2, missed
+      // here because the fix was applied per-site rather than to the shape. The rule is now
+      // shape-wide and asserted as such in `tests/products/bom-recipe.test.ts`: a refusal value must
+      // never leave a transaction callback that has already written.
+      if (synced.kind !== 'written') {
+        throw new BomRecipeRefusedError(describeBomRecipeRefusal(synced))
+      }
+
+      // THE ORDER IS CREATED IN HERE, under the lock that validated it (round 8, finding 1).
+      // Creating it after this transaction committed left a gap: the lock was released, and a
+      // concurrent BOM -> SIMPLE conversion could retire the Bom and clear ProductComponent before the
+      // insert landed. The order was still created against the retired recipe, and STARTING it then
+      // snapshotted the now-empty component list -- assembly with nothing reserved, which is the
+      // consequence that actually costs stock.
+      //
+      // Same boundary as round 4, other side of it. Round 4 moved the READ inside the lock because a
+      // snapshot older than the lock describes a state the lock is not protecting; this moves the WRITE
+      // inside for the mirror-image reason -- a write landing after the lock is a write nothing
+      // protected. Validating under a lock and then acting outside it is not serialization.
+      const reference = makeReference()
+      const created = await tx.productionOrder.create({
+        data: {
+          reference,
+          orderType: input.orderType,
+          bomId: synced.bomId,
+          outputProductId: input.productId,
+          warehouseId: input.warehouseId,
+          manufacturerId: input.manufacturerId || null,
+          qtyPlanned: input.qtyPlanned,
+          scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
+          notes: input.notes || null,
+        },
+        select: { id: true },
+      })
+      return { ...synced, sku: locked.sku, name: locked.name, orderId: created.id, reference }
     })
+    if (claim.kind === 'gone') {
+      return { success: false, error: 'Product not found.' }
+    }
+    if (claim.kind === 'not-bom') {
+      return {
+        success: false,
+        error: `This product changed to ${claim.type} while the build order was being raised, so it no `
+          + 'longer has a manufacturing recipe. Nothing was created.',
+      }
+    }
+    if (claim.kind === 'no-components') {
+      return {
+        success: false,
+        error: 'This product\'s components were cleared while the build order was being raised. '
+          + 'Nothing was created.',
+      }
+    }
+    const { orderId, reference } = claim
 
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
-      entityId: order.id,
+      entityId: orderId,
       tag: 'manufacturing',
       action: 'created',
-      description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${product.sku} — ${product.name} (${input.qtyPlanned} units)`,
-      metadata: { reference, sku: product.sku, orderType: input.orderType, qty: input.qtyPlanned },
+      // From the LOCKED read, not the preflight: the activity log must describe the product as it was
+      // when the order was actually raised.
+      description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${claim.sku} — ${claim.name} (${input.qtyPlanned} units)`,
+      metadata: { reference, sku: claim.sku, orderType: input.orderType, qty: input.qtyPlanned },
     })
 
     revalidatePath('/manufacturing')
-    return { success: true, id: order.id }
+    return { success: true, id: orderId }
   } catch (e) {
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
@@ -430,6 +521,12 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       level: 'ERROR',
       description: `Failed to create manufacturing order: ${e instanceof Error ? e.message : e}`,
     })
+    // A refused recipe is an operator-actionable outcome, not an internal failure, and the throw is
+    // how it rolled the rejected recipe back (round 6, finding 1). Its own message says what to fix,
+    // so it must not be flattened into the generic error.
+    if (e instanceof BomRecipeRefusedError) {
+      return { success: false, error: `${e.message}. No build order was created.` }
+    }
     return { success: false, error: 'Failed to create manufacturing order.' }
   }
 }
@@ -1104,6 +1201,19 @@ export async function updateManufacturingOrderStatus(
       let startedComponents: ProductionOrderComponentSnapshot = []
       // Reserve inside the same locked transaction as the status transition.
       await db.$transaction(async (tx) => {
+        // THE GRAPH LOCK FIRST, then the order row (round 8, finding 1, second half).
+        //
+        // The order row lock alone does not stop an editor or an import changing the recipe while this
+        // start runs, and STARTING is where the damage lands: the snapshot frozen here is what
+        // completion consumes, so an empty one means an assembly that reserves nothing and then
+        // consumes nothing while producing output. Taking the same lock the recipe writers take is what
+        // makes the read below authoritative rather than merely fresh.
+        //
+        // ORDER MATTERS: graph lock OUTERMOST, then row locks -- the same order `import.ts` and
+        // `products.ts` use. Acquiring the row first and the graph lock second would make this the
+        // reverse-order pair that #715 r3 was raised for, and two paths that disagree about lock order
+        // deadlock under exactly the concurrency they were added to survive.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
         await tx.$queryRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
         const lockedOrder = await tx.productionOrder.findUnique({
           where: { id },
@@ -1123,6 +1233,30 @@ export async function updateManufacturingOrderStatus(
         const componentSnapshot: ProductionOrderComponentSnapshot = liveComponents.map(
           (comp) => ({ componentId: comp.componentId, qty: Number(comp.qty) }),
         )
+
+        // STILL ELIGIBLE? Creation validated this, but starting is a SEPARATE act with its own gap, and
+        // a build order can sit in DRAFT for days while the catalogue changes underneath it. Refusing
+        // here fails closed and is recoverable -- fix the recipe, start again -- whereas proceeding
+        // freezes an empty snapshot onto the order and every later step trusts it.
+        const lockedProduct = await tx.product.findUnique({
+          where: { id: orderPreview.outputProductId },
+          select: { type: true, sku: true },
+        })
+        if (!lockedProduct) throw new Error('The product this order builds no longer exists.')
+        if (lockedProduct.type !== 'BOM') {
+          throw new Error(
+            `${lockedProduct.sku} is no longer a manufactured (BOM) product — it is now `
+            + `${lockedProduct.type}, so it has no recipe to build. Nothing was reserved and the order `
+            + 'was not started.',
+          )
+        }
+        if (componentSnapshot.length === 0) {
+          throw new Error(
+            `${lockedProduct.sku} has no components, so starting this order would reserve nothing and `
+            + 'then assemble from an empty recipe. Restore its components and start the order again. '
+            + 'Nothing was reserved.',
+          )
+        }
         startedComponents = componentSnapshot
 
         if (isAssembly) {

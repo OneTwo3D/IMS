@@ -105,6 +105,20 @@ let injectEnqueueFailure = false
  */
 let remapInventoryAccountOnNextEnqueue: (() => Promise<void>) | null = null
 let remapInventoryAccountAfterFinalAccountRead: (() => Promise<void>) | null = null
+/**
+ * o3d-ln2df — RETIRE THE CHART AFTER THE BOOK-IN HAS READ IT, so the enqueue DECLINES for real.
+ *
+ * This is the production race the refusal exists for, and the ONLY seam in it is WHEN: the book-in reads
+ * the active connector over the pool before its transaction opens, and the enqueue re-asks under the
+ * selection lock inside it. Switching the connector off in that window makes
+ * `pinnedLedgerIsServicedUnderLock` answer no, and the refusal, its reason, its posting key and its
+ * inbox row are then all produced by PRODUCTION code. Nothing about the outcome is fabricated — the
+ * hook only decides the moment, and it fires from the wrapper around the connector read the book-in
+ * itself performs, which is the last point before the transaction opens.
+ *
+ * It is one-shot, and each arm restores the setting.
+ */
+let retireChartAfterConnectorRead = false
 const INJECTED_ENQUEUE_FAILURE = 'o3d-8f0p6 injected STOCK_RECEIPT enqueue failure'
 mock.module('@/lib/accounting', {
   namedExports: {
@@ -121,6 +135,39 @@ mock.module('@/lib/accounting', {
         await hook()
       }
       return realAccountingNs.queueAccountingSyncTx(...args)
+    },
+    /**
+     * o3d-ln2df — THE SAME TWO SEAMS ON THE `WithOutcome` VARIANT, because that is the one the book-in
+     * now takes (it needs the whole answer to tell `refused` from `not-configured`). Without this arm 5
+     * would silently stop injecting anything: the real adapter calls the real boolean enqueue through
+     * the module's own binding, not through the mock above, so the injection would never be reached and
+     * a green arm 5 would be measuring nothing.
+     */
+    queueAccountingSyncTxWithOutcome: async (
+      ...args: Parameters<typeof realAccountingNs.queueAccountingSyncTxWithOutcome>
+    ) => {
+      if (injectEnqueueFailure && args[1]?.type === 'STOCK_RECEIPT') {
+        throw new Error(INJECTED_ENQUEUE_FAILURE)
+      }
+      if (remapInventoryAccountOnNextEnqueue && args[1]?.type === 'STOCK_RECEIPT') {
+        const hook = remapInventoryAccountOnNextEnqueue
+        remapInventoryAccountOnNextEnqueue = null
+        await hook()
+      }
+      return realAccountingNs.queueAccountingSyncTxWithOutcome(...args)
+    },
+    getActiveAccountingConnectorId: async () => {
+      const answer = await realAccountingNs.getActiveAccountingConnectorId()
+      if (retireChartAfterConnectorRead) {
+        retireChartAfterConnectorRead = false
+        const { db } = await import('@/lib/db')
+        await db.setting.upsert({
+          where: { key: 'plugin_xero_enabled' },
+          create: { key: 'plugin_xero_enabled', value: 'false' },
+          update: { value: 'false' },
+        })
+      }
+      return answer
     },
   },
 })
@@ -1471,4 +1518,501 @@ test('o3d-8f0p6 r4: two purchase orders in one ASN post on the same account mapp
     + 'them must not split the event across two mappings',
   )
   assert.deepEqual(codesA, [INVENTORY_ACCOUNT, TRANSIT_ACCOUNT], 'and on the mapping that was current when the event began')
+})
+
+/**
+ * A LINKED FREIGHT PURCHASE ORDER with one cost line, linked to `primary` (o3d-8m8pe arms 12 and 13).
+ *
+ * Copied from arm 9 of tests/concurrency/mintsoft-align-up-stock-receipt-journal.concurrent.test.ts,
+ * which is the proof for the SAME defect on the third receipt writer. `status` and `allocated` are set
+ * explicitly because the state these arms are about is precisely the one cancellation leaves behind:
+ * the link row still present, the freight order CANCELLED, the link unallocated. The freight order's
+ * own rows are seeded directly rather than through a cancellation action — the SUBJECT here is which
+ * links the cost read counts, not how an order comes to be cancelled, and driving a cancellation would
+ * also run landed-cost recalculation and write the cost columns these arms are measuring.
+ */
+async function seedLinkedFreightPoFor(
+  primaryPoId: string,
+  label: string,
+  amount: number,
+  status: 'PO_SENT' | 'CANCELLED',
+  allocated: boolean,
+): Promise<{ poId: string }> {
+  const { db } = await import('@/lib/db')
+  const tag = uniqueTag(`FR${label}`)
+  const supplier = await db.supplier.create({
+    data: { name: `${tag} freight supplier`, currency: 'GBP' },
+    select: { id: true },
+  })
+  const freightPo = await db.purchaseOrder.create({
+    data: {
+      reference: tag,
+      supplierId: supplier.id,
+      status,
+      type: 'FREIGHT',
+      currency: 'GBP',
+      fxRateToBase: '1',
+      subtotalForeign: amount,
+      subtotalBase: amount,
+      totalForeign: amount,
+      totalBase: amount,
+      freightCostLines: {
+        create: [{
+          description: `${label} freight`,
+          amountForeign: `${amount}.0000`,
+          amountBase: `${amount}.0000`,
+          vatable: false,
+          distributionMethod: 'BY_VALUE',
+        }],
+      },
+    },
+    select: { id: true },
+  })
+  await db.landedCostLink.create({
+    data: { primaryPoId, freightPoId: freightPo.id, method: 'BY_VALUE', allocated },
+    select: { id: true },
+  })
+  return { poId: freightPo.id }
+}
+
+/**
+ * THE TWO LINKS, READ BACK, so neither arm can assert the absence of something that was never there.
+ * Returns the rows it examined, and the count is printed by the caller.
+ */
+async function assertBothFreightLinksSeeded(primaryPoId: string, arm: string) {
+  const { db } = await import('@/lib/db')
+  const links = await db.landedCostLink.findMany({
+    where: { primaryPoId },
+    select: { freightPoId: true, allocated: true, freightPO: { select: { status: true } } },
+  })
+  console.log(`[${arm}] examined ${links.length} landed-cost link(s): ${JSON.stringify(links)}`)
+  assert.equal(links.length, 2, 'PRECONDITION: both freight links must exist on the primary order')
+  assert.equal(
+    links.filter((l) => l.freightPO.status === 'CANCELLED').length,
+    1,
+    'PRECONDITION: exactly one of them must be CANCELLED — that is the one whose cost must vanish',
+  )
+  return links
+}
+
+/**
+ * ARM 12 — A CANCELLED LINKED FREIGHT ORDER MUST NOT REACH THE WMS BOOK-IN'S LAYER, MOVEMENT OR JOURNAL.
+ *
+ * o3d-8m8pe. This file's book-in read `landedCostLinks` with NO `where`, because it COPIED the manual
+ * receipt's query verbatim when o3d-8f0p6 r2 routed the book-in through the shared gross-cost helper —
+ * so the defect travelled with the fix. Cancelling a freight order leaves the link row in place, marks
+ * the freight order CANCELLED and the link unallocated, and BOTH landed-cost recalculation paths
+ * exclude it (landed-cost-service.ts, audit-C3 and audit-izrf). The book-in therefore added freight the
+ * business had cancelled back into its cost layer, its stock movement and its STOCK_RECEIPT journal:
+ * inventory overstated, and a value that disagrees with what recalculation computes for the very same
+ * units.
+ *
+ * THE FIXTURE IS THE STATE CANCELLATION LEAVES: a live linked freight order with a cost line, a SECOND
+ * CANCELLED one with a much larger cost line, and both links present. So the arm distinguishes
+ * "excludes cancelled freight" from "ignores linked freight altogether" — the live one must still be IN,
+ * and that positive half is what stops the arm passing by valuing nothing at all.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that filters on `LandedCostLink.allocated` instead of on the
+ * freight order's status. That would ALSO exclude the cancelled link here, but it would wrongly zero
+ * live-but-not-yet-allocated freight, which is the ordinary state at receipt time and is exactly what
+ * the live half of this arm asserts is included (the live link is seeded `allocated: false`). It also
+ * says nothing about a freight order cancelled AFTER this read, which is the mapping lock's business
+ * and is arms 10 and 11.
+ */
+test('o3d-8m8pe: a cancelled linked freight order contributes nothing to the WMS book-in cost', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const LIVE_FREIGHT = 20
+  const CANCELLED_FREIGHT = 400
+  // No DIRECT freight on the primary: the only freight in play is linked, so nothing else can make the
+  // gross cost exceed the goods cost.
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('CF', QTY, GOODS_UNIT)
+
+  const liveFreight = await seedLinkedFreightPoFor(seeded.poId, 'live', LIVE_FREIGHT, 'PO_SENT', false)
+  const cancelledFreight = await seedLinkedFreightPoFor(seeded.poId, 'dead', CANCELLED_FREIGHT, 'CANCELLED', false)
+  await assertBothFreightLinksSeeded(seeded.poId, 'arm12')
+  assert.ok(liveFreight.poId !== cancelledFreight.poId)
+
+  const expectedUnitCost = GOODS_UNIT + LIVE_FREIGHT / QTY
+  const expectedAmount = QTY * expectedUnitCost
+  const wrongUnitCost = GOODS_UNIT + (LIVE_FREIGHT + CANCELLED_FREIGHT) / QTY
+
+  const { status } = await runBookedIn(seeded, seeded.poLineId)
+  assert.equal(status, 'processed', 'PRECONDITION: the book-in must have processed')
+
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const debit = payloadLines(logs[0]?.payload ?? null).find((l) => typeof l.debit === 'number')
+  console.log(`[arm12] goods ${GOODS_UNIT} + LIVE freight ${LIVE_FREIGHT}/${QTY} => expected unit ${expectedUnitCost}; including the cancelled ${CANCELLED_FREIGHT} would give ${wrongUnitCost}; layer=${JSON.stringify(layer)} movement=${JSON.stringify(movement)} debit=${String(debit?.debit)}`)
+
+  assert.notEqual(expectedUnitCost, wrongUnitCost, 'PRECONDITION: the two answers must be distinguishable')
+  assert.equal(
+    Number(layer.unitCostBase),
+    expectedUnitCost,
+    `the cost layer must carry the LIVE freight only (${expectedUnitCost}); ${wrongUnitCost} means the `
+    + 'cancelled freight order was added back in, overstating inventory',
+  )
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so must the movement')
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  assert.equal(debit?.debit, expectedAmount, `and the journal debit must be ${expectedAmount}`)
+  assert.equal(Number(movement.totalValueBase), debit?.debit, 'movement value == journal debit')
+  assert.equal(Number(layer.unitCostBase) * Number(layer.receivedQty), debit?.debit, 'layer value == journal debit')
+
+  // AND THE LIVE FREIGHT REALLY IS IN: this is what separates the fix from "ignore linked freight", and
+  // from a filter on `allocated` (the live link above is unallocated, as it is at receipt time).
+  assert.ok(
+    expectedUnitCost > GOODS_UNIT,
+    'PRECONDITION: the live freight must move the unit cost above the goods cost, or this arm would '
+    + 'also pass for a fix that dropped linked freight altogether',
+  )
+  assert.notEqual(Number(layer.unitCostBase), GOODS_UNIT, 'the live freight must be IN the layer, not merely the cancelled one out')
+
+  const transit = await transitRowsFor(seeded.poId)
+  assert.equal(transit.length, 1)
+  assert.equal(Number(transit[0]!.baseDelta), -expectedAmount)
+})
+
+/**
+ * ARM 13 — THE SAME, FOR THE MANUAL RECEIPT (app/actions/purchase-orders.ts).
+ *
+ * o3d-8m8pe. The manual receipt's `currentPo` query is the OLDEST of the three unfiltered readers and
+ * the one `computeGrossUnitCostBaseByLine` was written for, so it carried the same defect: a cancelled
+ * freight order's cost lines re-entered the receipt's cost layer, its stock movement and its
+ * STOCK_RECEIPT journal.
+ *
+ * WHY THIS ARM LIVES IN THIS FILE. The fixtures the defect needs — a real purchase order with a linked
+ * freight order, the accounting connector switched on, and the STOCK_RECEIPT log/transit readers — are
+ * all here, and arm 3 already drives `receivePurchaseOrder` from this file for the same reason.
+ *
+ * WHY THE RECEIPT IS PARTIAL. This arm isolates the COST read. The FULL receipt, which also runs the
+ * auto-receive loop over the links, is arm 13b below (that loop used to reject a CANCELLED freight order
+ * and roll the whole receipt back — o3d-c1qdi, fixed in the same change). The gross unit cost the helper
+ * computes does not depend on the received quantity, so this partial receipt measures the same number.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: the same `allocated` filter arm 12 names, and a fix applied only to
+ * the book-in (arm 12 is the one that catches the reverse).
+ */
+test('o3d-8m8pe: a cancelled linked freight order contributes nothing to the MANUAL receipt cost', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const RECEIVE_QTY = 3
+  const GOODS_UNIT = 10
+  const LIVE_FREIGHT = 20
+  const CANCELLED_FREIGHT = 400
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('CM', QTY, GOODS_UNIT)
+
+  const liveFreight = await seedLinkedFreightPoFor(seeded.poId, 'mlive', LIVE_FREIGHT, 'PO_SENT', false)
+  const cancelledFreight = await seedLinkedFreightPoFor(seeded.poId, 'mdead', CANCELLED_FREIGHT, 'CANCELLED', false)
+  await assertBothFreightLinksSeeded(seeded.poId, 'arm13')
+  assert.ok(liveFreight.poId !== cancelledFreight.poId)
+
+  // BY_VALUE over one line: the whole live freight amount lands on it, spread over the LINE's qty — not
+  // over the received qty — so this is the same unit cost a full receipt would compute.
+  const expectedUnitCost = GOODS_UNIT + LIVE_FREIGHT / QTY
+  const expectedAmount = RECEIVE_QTY * expectedUnitCost
+  const wrongUnitCost = GOODS_UNIT + (LIVE_FREIGHT + CANCELLED_FREIGHT) / QTY
+
+  const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const received = await receivePurchaseOrder(seeded.poId, [
+    { poLineId: seeded.poLineId, qtyReceived: RECEIVE_QTY, warehouseId: seeded.warehouseId },
+  ])
+  assert.equal(received.success, true, `PRECONDITION: the manual receipt must succeed: ${received.error}`)
+  const po = await db.purchaseOrder.findUniqueOrThrow({ where: { id: seeded.poId }, select: { status: true } })
+  assert.equal(po.status, 'PARTIALLY_RECEIVED', 'PRECONDITION: the receipt must be the PARTIAL one this arm is about')
+
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const debit = payloadLines(logs[0]?.payload ?? null).find((l) => typeof l.debit === 'number')
+  console.log(`[arm13] goods ${GOODS_UNIT} + LIVE freight ${LIVE_FREIGHT}/${QTY} => expected unit ${expectedUnitCost}; including the cancelled ${CANCELLED_FREIGHT} would give ${wrongUnitCost}; layer=${JSON.stringify(layer)} movement=${JSON.stringify(movement)} debit=${String(debit?.debit)}`)
+
+  assert.notEqual(expectedUnitCost, wrongUnitCost, 'PRECONDITION: the two answers must be distinguishable')
+  assert.equal(
+    Number(layer.unitCostBase),
+    expectedUnitCost,
+    `the cost layer must carry the LIVE freight only (${expectedUnitCost}); ${wrongUnitCost} means the `
+    + 'cancelled freight order was added back in, overstating inventory',
+  )
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so must the movement')
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  assert.equal(debit?.debit, expectedAmount, `and the journal debit must be ${expectedAmount}`)
+  assert.equal(Number(movement.totalValueBase), debit?.debit, 'movement value == journal debit')
+  assert.equal(Number(layer.unitCostBase) * Number(layer.receivedQty), debit?.debit, 'layer value == journal debit')
+
+  // AND THE LIVE FREIGHT REALLY IS IN — the positive half, without which this arm would pass for a
+  // receipt that valued nothing.
+  assert.ok(
+    expectedUnitCost > GOODS_UNIT,
+    'PRECONDITION: the live freight must move the unit cost above the goods cost, or this arm would '
+    + 'also pass for a fix that dropped linked freight altogether',
+  )
+  assert.notEqual(Number(layer.unitCostBase), GOODS_UNIT, 'the live freight must be IN the layer, not merely the cancelled one out')
+
+  const transit = await transitRowsFor(seeded.poId)
+  assert.equal(transit.length, 1)
+  assert.equal(Number(transit[0]!.baseDelta), -expectedAmount)
+})
+
+/**
+ * ARM 13b — A FULL MANUAL RECEIPT WITH A CANCELLED LINKED FREIGHT ORDER COMMITS.
+ *
+ * o3d-8m8pe (adversarial review, HIGH, then o3d-c1qdi). Arm 13 above is deliberately PARTIAL and the
+ * defect it could not see lives on the other branch: when a manual receipt COMPLETES the primary order,
+ * `receivePurchaseOrder` reads the primary's links to allocate and auto-receive linked freight. That
+ * read was unfiltered, so it included the CANCELLED freight order, `validateLinkedFreightReceiptStatus`
+ * rejected it, and the whole receipt rolled back — a cancelled freight link made the goods impossible to
+ * receive in full. Same defect as the cost read, third reader of "which links count".
+ *
+ * THE FIXTURE is the state cancellation leaves: one LIVE linked freight order (PO_SENT, unallocated,
+ * has a cost line) and one CANCELLED one with a much larger cost line, both linked to the primary.
+ * It asserts, in one receipt: the receipt commits and completes the primary; the LIVE freight order is
+ * allocated and auto-received exactly as before; the CANCELLED one is untouched (still CANCELLED, no
+ * receivedAt, link not allocated, updatedAt unmoved); and the cost carries the live freight and not the
+ * cancelled — the live half is what stops the arm passing by valuing nothing.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that only filters the cost read (arm 13 stays green; this one
+ * reds with the rollback), and a fix that skips the auto-receive loop but still marks EVERY link
+ * `allocated` (caught by the cancelled link's `allocated` assertion).
+ */
+test('o3d-8m8pe: a FULL manual receipt with a cancelled linked freight order commits and leaves it untouched', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 4
+  const GOODS_UNIT = 10
+  const LIVE_FREIGHT = 20
+  const CANCELLED_FREIGHT = 400
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('CX', QTY, GOODS_UNIT)
+
+  const liveFreight = await seedLinkedFreightPoFor(seeded.poId, 'xlive', LIVE_FREIGHT, 'PO_SENT', false)
+  const cancelledFreight = await seedLinkedFreightPoFor(seeded.poId, 'xdead', CANCELLED_FREIGHT, 'CANCELLED', false)
+  await assertBothFreightLinksSeeded(seeded.poId, 'arm13b')
+  assert.ok(liveFreight.poId !== cancelledFreight.poId)
+  const cancelledBefore = await db.purchaseOrder.findUniqueOrThrow({
+    where: { id: cancelledFreight.poId },
+    select: { status: true, receivedAt: true, updatedAt: true },
+  })
+  assert.equal(cancelledBefore.status, 'CANCELLED', 'PRECONDITION: the dead freight order is CANCELLED')
+
+  const expectedUnitCost = GOODS_UNIT + LIVE_FREIGHT / QTY
+  const expectedAmount = QTY * expectedUnitCost
+  const wrongUnitCost = GOODS_UNIT + (LIVE_FREIGHT + CANCELLED_FREIGHT) / QTY
+  assert.notEqual(expectedUnitCost, wrongUnitCost, 'PRECONDITION: the two answers must be distinguishable')
+
+  const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const received = await receivePurchaseOrder(seeded.poId, [
+    { poLineId: seeded.poLineId, qtyReceived: QTY, warehouseId: seeded.warehouseId },
+  ])
+  assert.equal(
+    received.success,
+    true,
+    `the FULL receipt must commit with a cancelled linked freight order present: ${received.error}`,
+  )
+  const po = await db.purchaseOrder.findUniqueOrThrow({ where: { id: seeded.poId }, select: { status: true } })
+  assert.equal(po.status, 'RECEIVED', 'PRECONDITION: the receipt must be the FULL one this arm is about')
+
+  const links = await db.landedCostLink.findMany({
+    where: { primaryPoId: seeded.poId },
+    select: { freightPoId: true, allocated: true },
+  })
+  const liveLink = links.find((l) => l.freightPoId === liveFreight.poId)
+  const deadLink = links.find((l) => l.freightPoId === cancelledFreight.poId)
+  console.log(`[arm13b] examined ${links.length} link(s) after the receipt: ${JSON.stringify(links)}`)
+  assert.equal(links.length, 2, 'both links still exist')
+  assert.equal(liveLink?.allocated, true, 'the LIVE freight link is allocated, exactly as before')
+  assert.equal(deadLink?.allocated, false, 'the CANCELLED freight link must NOT be marked allocated')
+
+  const liveAfter = await db.purchaseOrder.findUniqueOrThrow({
+    where: { id: liveFreight.poId },
+    select: { status: true, receivedAt: true },
+  })
+  assert.equal(liveAfter.status, 'RECEIVED', 'the LIVE freight order is auto-received, exactly as before')
+  assert.ok(liveAfter.receivedAt, 'with its receivedAt stamped')
+
+  const cancelledAfter = await db.purchaseOrder.findUniqueOrThrow({
+    where: { id: cancelledFreight.poId },
+    select: { status: true, receivedAt: true, updatedAt: true },
+  })
+  assert.equal(cancelledAfter.status, 'CANCELLED', 'the CANCELLED freight order stays CANCELLED')
+  assert.equal(cancelledAfter.receivedAt, null, 'and is not stamped received')
+  assert.equal(cancelledAfter.updatedAt.getTime(), cancelledBefore.updatedAt.getTime(), 'and is not written at all')
+  assert.equal(
+    await db.stockMovement.count({ where: { referenceId: cancelledFreight.poId } }),
+    0,
+    'and no stock movement refers to it',
+  )
+
+  const layer = await db.costLayer.findFirstOrThrow({
+    where: { poLineId: seeded.poLineId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  const movement = await db.stockMovement.findFirstOrThrow({
+    where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId },
+    select: { unitCostBase: true, totalValueBase: true },
+  })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const debit = payloadLines(logs[0]?.payload ?? null).find((l) => typeof l.debit === 'number')
+  console.log(`[arm13b] expected unit ${expectedUnitCost}; with the cancelled ${CANCELLED_FREIGHT} it would be ${wrongUnitCost}; layer=${JSON.stringify(layer)} movement=${JSON.stringify(movement)} debit=${String(debit?.debit)}`)
+  assert.equal(Number(layer.unitCostBase), expectedUnitCost, 'the layer carries the LIVE freight only')
+  assert.equal(Number(movement.unitCostBase), expectedUnitCost, 'and so does the movement')
+  assert.equal(logs.length, 1, `the journal must be queued; found ${logs.length}`)
+  assert.equal(debit?.debit, expectedAmount, `and the journal debit must be ${expectedAmount}`)
+  // The positive half: the live freight is IN, so this arm cannot pass by valuing nothing.
+  assert.ok(expectedUnitCost > GOODS_UNIT && Number(layer.unitCostBase) !== GOODS_UNIT, 'the live freight must be IN the layer')
+})
+
+/** The exception-inbox rows for a purchase order, whatever the posting scope. */
+async function refusalRowsFor(referenceId: string) {
+  const { db } = await import('@/lib/db')
+  return db.accountingPostingRefusal.findMany({
+    where: { referenceType: 'PurchaseOrder', referenceId },
+    orderBy: { firstRefusedAt: 'asc' },
+    select: { id: true, type: true, kind: true, reason: true, committed: true, remedy: true, scope: true },
+  })
+}
+
+/** The caller's own report of a declined posting, as the activity log carries it. */
+async function notQueuedActivityFor(entityId: string) {
+  const { db } = await import('@/lib/db')
+  return db.activityLog.findMany({
+    where: { entityType: 'PURCHASE_ORDER', entityId, action: 'stock_receipt_journal_not_queued' },
+    select: { id: true, level: true, description: true },
+  })
+}
+
+/**
+ * ARM 14 — A DECLINED RECEIPT JOURNAL IS REPORTED, WITH WHAT IMS COMMITTED AND THE REMEDY.
+ *
+ * o3d-ln2df. The book-in read its enqueue's answer only to gate the transit mirror and then dropped it.
+ * On a decline the book-in committed, the mirror was correctly skipped, and the facade's own
+ * `recordRefusalAsOutstanding` raised an inbox row — but that row carried NO `committed` and NO `remedy`,
+ * because both come from the CALLER through `reportPostingNotQueued`. The operator got a refusal with no
+ * statement of what IMS did anyway and no instruction, which is what rule 3 of
+ * lib/domain/accounting/enqueue-outcome.ts exists to provide. It matters more here than at most reporting
+ * sites because this path CONSUMES the book-in event and nothing re-attempts the journal: stock credited,
+ * cost layers laid, no journal, no transit row, nothing that will ever post them.
+ *
+ * HOW THE DECLINE IS PRODUCED, and it is a real one. The book-in reads the active accounting connector
+ * over the pool BEFORE its transaction opens and the enqueue re-asks under the selection lock inside it.
+ * The connector is switched off in that window — the production race — so
+ * `pinnedLedgerIsServicedUnderLock` answers no and PRODUCTION code decides the refusal, its reason, its
+ * posting key and its inbox row. Nothing about the outcome is fabricated.
+ *
+ * AND THE ORDINARY PATH IS IN THE SAME ARM, on a second purchase order, because a test that only looks at
+ * the refusal can pass for an implementation that refuses EVERYTHING: the accepted book-in must still
+ * queue its journal, still write the transit mirror, and raise NO refusal and NO report.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: an implementation that reported from INSIDE the transaction (which
+ * would leave the report standing after a rollback — not covered here, and the reason the report is
+ * drained after the commit is stated at the site), and one that got the `not-configured` gate wrong in
+ * the silent direction. It does NOT establish that the book-in is re-attempted later; it establishes the
+ * opposite is reported.
+ */
+test('o3d-ln2df: a DECLINED receipt journal is reported with what the book-in committed and the remedy', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 2
+  const GOODS_UNIT = 11
+  const declined = await seedPurchaseBackedAsnViaRealCreate('DQ', QTY, GOODS_UNIT)
+
+  retireChartAfterConnectorRead = true
+  let status: string
+  try {
+    ;({ status } = await runBookedIn(declined, declined.poLineId))
+  } finally {
+    retireChartAfterConnectorRead = false
+    await db.setting.upsert({
+      where: { key: 'plugin_xero_enabled' },
+      create: { key: 'plugin_xero_enabled', value: 'true' },
+      update: { value: 'true' },
+    })
+  }
+
+  // ── THE BOOK-IN STILL COMMITTED. A retired chart must not stop a warehouse receiving stock. ──
+  assert.equal(status, 'processed', `the book-in must still commit on a declined posting; got ${status}`)
+  const movements = await db.stockMovement.findMany({
+    where: { type: 'PURCHASE_RECEIPT', productId: declined.productId },
+    select: { id: true, totalValueBase: true },
+  })
+  const layers = await db.costLayer.count({ where: { poLineId: declined.poLineId } })
+  const logs = await stockReceiptLogsFor(declined.poId)
+  const transit = await transitRowsFor(declined.poId)
+  const refusals = await refusalRowsFor(declined.poId)
+  const reports = await notQueuedActivityFor(declined.poId)
+  console.log(`[arm14] declined PO: status=${status} movements=${movements.length} layers=${layers} STOCK_RECEIPT logs=${logs.length} transit=${transit.length} refusals=${refusals.length} reports=${reports.length} refusalRows=${JSON.stringify(refusals)}`)
+
+  assert.equal(movements.length, 1, 'PRECONDITION: the stock movement must be committed, or there is no committed state to report')
+  assert.equal(layers, 1, 'PRECONDITION: and the cost layer with it')
+  // ── AND THE PRECONDITION THAT MAKES THE REST MEAN ANYTHING: the enqueue really declined. ──
+  assert.equal(logs.length, 0, `PRECONDITION: the enqueue must have DECLINED; found ${logs.length} STOCK_RECEIPT sync row(s), so nothing was refused`)
+  // ── THE TRANSIT MIRROR IS STILL SKIPPED (o3d-bcz9.4): an unqueued journal must not be mirrored. ──
+  assert.equal(transit.length, 0, `a journal that was not queued must not be mirrored; found ${transit.length} transit row(s)`)
+
+  // ── THE REPORT ITSELF, which is what this issue is about. ──
+  assert.equal(refusals.length, 1, `the decline must leave exactly one exception-inbox row; found ${refusals.length}`)
+  const refusal = refusals[0]!
+  assert.equal(refusal.type, 'STOCK_RECEIPT')
+  assert.equal(refusal.kind, 'stock_receipt_journal', 'the SITE names the kind: nothing re-attempts this posting, so the row is closed by marking it handled')
+  assert.ok(
+    (refusal.committed ?? '').length > 0,
+    'the inbox row must state WHAT IMS COMMITTED ANYWAY — a refusal with no `committed` is one an operator cannot act on',
+  )
+  assert.ok(
+    (refusal.remedy ?? '').length > 0,
+    'and WHAT A HUMAN HAS TO DO — `remedy` comes from the caller and was absent before o3d-ln2df',
+  )
+  // Not merely non-empty: the site's OWN sentences, not the enqueue's generic placeholder. Before the fix
+  // the row carried the facade's 'the change that raised this posting is committed in IMS', which says
+  // nothing about a book-in, and a generic remedy that does not mention that nothing will retry this.
+  assert.match(
+    refusal.committed ?? '',
+    /booked in/i,
+    'the `committed` must name what the BOOK-IN did (the goods booked in, the movements and layers), not the enqueue\'s generic placeholder',
+  )
+  assert.match(
+    refusal.remedy ?? '',
+    /by hand/i,
+    'the `remedy` must name the hand posting',
+  )
+  assert.match(
+    refusal.remedy ?? '',
+    /Mark as handled/i,
+    'and how to close the row once it is posted',
+  )
+  assert.equal(reports.length, 1, `and the decline must be reported in the activity log; found ${reports.length}`)
+  assert.equal(reports[0]!.level, 'ERROR', 'at ERROR — a posting the ledger will never receive is not a notice')
+
+  // ── THE ORDINARY PATH, UNCHANGED, so this arm cannot pass by refusing everything. ──
+  const accepted = await seedPurchaseBackedAsnViaRealCreate('DA', QTY, GOODS_UNIT)
+  const okStatus = await runBookedIn(accepted, accepted.poLineId)
+  const okLogs = await stockReceiptLogsFor(accepted.poId)
+  const okTransit = await transitRowsFor(accepted.poId)
+  const okRefusals = await refusalRowsFor(accepted.poId)
+  const okReports = await notQueuedActivityFor(accepted.poId)
+  console.log(`[arm14] accepted PO: status=${okStatus.status} logs=${okLogs.length} transit=${okTransit.length} refusals=${okRefusals.length} reports=${okReports.length}`)
+  assert.equal(okStatus.status, 'processed')
+  assert.equal(okLogs.length, 1, 'the ordinary book-in must still queue its journal')
+  assert.equal(okTransit.length, 1, 'and still write the transit subledger mirror')
+  assert.equal(Number(okTransit[0]!.baseDelta), -(QTY * GOODS_UNIT), 'at the receipt value')
+  assert.equal(okRefusals.length, 0, 'and raise NO refusal — otherwise the arm above would pass for an implementation that refuses everything')
+  assert.equal(okReports.length, 0, 'and no not-queued report')
 })
