@@ -232,3 +232,19 @@ test('o3d-zvec.15 (arm 8, connector half): every push RE-READS WooCommerce — a
   assert.equal(third.kind, 'ineligible')
   assert.equal(state.puts.length, 1, 'exactly the one PUT, made while the order was in flight')
 })
+
+test('o3d-zvec.15 (review 2, HIGH 1): WooCommerce\'s own cancelled / on-hold / pending / failed / refunded are never completed, even with a mapping row to an in-flight status', async () => {
+  let evaluated = 0
+  for (const slug of ['cancelled', 'on-hold', 'pending', 'failed', 'refunded']) {
+    state.puts.length = 0
+    state.fetches.length = 0
+    state.wcStatus = slug
+    state.mappings = [{ externalStatus: slug, imsStatus: 'PROCESSING' }]
+    const outcome = await push('SHIPPED')
+    assert.equal(state.fetches.length, 1, `${slug}: precondition — the status was read`)
+    assert.equal(outcome.kind, 'ineligible', `${slug} mapped to PROCESSING must still be refused`)
+    assert.deepEqual(state.puts, [], `${slug}: no PUT`)
+    evaluated++
+  }
+  assert.equal(evaluated, 5)
+})

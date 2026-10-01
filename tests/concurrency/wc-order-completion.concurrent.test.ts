@@ -38,6 +38,10 @@ const wc = {
   gets: 0,
   puts: 0,
   events: [] as string[],
+  /** The status push resolves to this shape instead of the storefront model (HIGH 3). */
+  statusOverride: null as FacadeResult | null,
+  /** How the tracking push behaves (medium). `skipped` = nothing to push, which is not a failure. */
+  tracking: 'ok' as 'ok' | 'skipped' | 'fail' | 'throw',
 }
 const activity: Array<Record<string, unknown>> = []
 
@@ -48,12 +52,16 @@ mock.module('@/lib/shopping', {
   namedExports: {
     pushOrderDeliveryMetadata: async (orderId: string) => {
       wc.events.push(`tracking:${orderId}`)
+      if (wc.tracking === 'throw') throw new Error('tracking socket hang up')
+      if (wc.tracking === 'fail') return { success: false, error: 'WooCommerce: tracking HTTP 500' }
+      if (wc.tracking === 'skipped') return { success: true, skipped: true }
       return { success: true }
     },
     pushSalesOrderStatus: async (orderId: string, status: string): Promise<FacadeResult> => {
       wc.events.push(`status:${orderId}:${status}`)
       wc.gets++ // every attempt re-reads the storefront
       if (wc.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, wc.delayMs))
+      if (wc.statusOverride) return wc.statusOverride
       if (wc.readFails) return { success: false, error: 'WooCommerce: HTTP 503', outcome: { kind: 'read-failed', error: 'HTTP 503' } }
       if (wc.status === 'completed') return { success: true, outcome: { kind: 'already-at-target' } }
       if (wc.status === 'cancelled') return { success: true, outcome: { kind: 'ineligible', wcStatus: 'cancelled', class: 'finalised' } }
@@ -73,6 +81,8 @@ function resetWc() {
   wc.gets = 0
   wc.puts = 0
   wc.events.length = 0
+  wc.statusOverride = null
+  wc.tracking = 'ok'
   activity.length = 0
 }
 
@@ -305,5 +315,123 @@ test('o3d-zvec.15 (arm 12): crash safety — a row committed with the flip is co
   assert.ok(drain.claimed >= 1, 'the drain found it')
   assert.equal(wc.puts >= 1, true)
   assert.ok(wc.events.includes(`status:${orderId}:SHIPPED`))
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+})
+
+test('o3d-zvec.15 (review 2, HIGH 3): a skipped / not-applicable / unrecognised status result is NOT success — the row stays retryable until the connector is back', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  const cases: Array<{ name: string; result: FacadeResult }> = [
+    { name: 'no runnable connector (skipped)', result: { success: true, skipped: true } },
+    { name: 'skipped even with a pushed outcome attached (isolates the skipped check from the no-outcome check)', result: { success: true, skipped: true, outcome: { kind: 'pushed' } } },
+    { name: 'not-applicable outcome', result: { success: true, outcome: { kind: 'not-applicable' } } },
+    { name: 'success with no outcome at all', result: { success: true } },
+  ]
+  let evaluated = 0
+  for (const c of cases) {
+    resetWc()
+    const { key } = await seedRow(deps, 'hold')
+    wc.statusOverride = c.result
+    const first = await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key] })
+    assert.equal(first.claimed, 1, `${c.name}: precondition — the row was claimed and the override reached`)
+    assert.equal(wc.gets, 1, `${c.name}: the status double was reached`)
+    const row = await rowOf(deps, key)
+    assert.equal(row.status, 'RETRYABLE_FAILED', `${c.name}: must retry, not SUCCEEDED (was ${row.status})`)
+    assert.equal(row.attempts, 1)
+
+    // Restoring the connector completes it.
+    wc.statusOverride = null
+    await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], now: new Date(row.nextAttemptAt!.getTime() + 1) })
+    assert.equal(wc.puts, 1, `${c.name}: completed once the connector is back`)
+    assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+    evaluated++
+  }
+  assert.equal(evaluated, 4)
+})
+
+test('o3d-zvec.15 (review 2, HIGH 3b): the only successes are pushed, already-at-target and a finalised order', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  const cases: Array<{ name: string; result: FacadeResult }> = [
+    { name: 'pushed', result: { success: true, outcome: { kind: 'pushed' } } },
+    { name: 'already-at-target', result: { success: true, outcome: { kind: 'already-at-target' } } },
+    { name: 'ineligible finalised', result: { success: true, outcome: { kind: 'ineligible', wcStatus: 'cancelled', class: 'finalised' } } },
+  ]
+  let evaluated = 0
+  for (const c of cases) {
+    resetWc()
+    const { key } = await seedRow(deps, 'accept')
+    wc.statusOverride = c.result
+    await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key] })
+    assert.equal(wc.gets, 1, `${c.name}: precondition`)
+    assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', c.name)
+    evaluated++
+  }
+  assert.equal(evaluated, 3)
+})
+
+test('o3d-zvec.15 (review 2, medium): a failed or thrown TRACKING push blocks the completion for that attempt and is retried; nothing-to-push does not block', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  let evaluated = 0
+  for (const mode of ['fail', 'throw'] as const) {
+    resetWc()
+    const { orderId, key } = await seedRow(deps, `trk-${mode}`)
+    wc.tracking = mode
+    await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key] })
+    assert.deepEqual(wc.events, [`tracking:${orderId}`], `${mode}: tracking was attempted and the status was NOT`)
+    assert.equal(wc.puts, 0, `${mode}: no completion PUT (the email must not fire without tracking)`)
+    const row = await rowOf(deps, key)
+    assert.equal(row.status, 'RETRYABLE_FAILED', mode)
+    assert.match(String(row.lastError), /tracking/i, `${mode}: the error names tracking`)
+
+    wc.tracking = 'ok'
+    await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], now: new Date(row.nextAttemptAt!.getTime() + 1) })
+    assert.equal(wc.puts, 1, `${mode}: completes once tracking lands`)
+    assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+    evaluated++
+  }
+  // Legitimately nothing to push (no tracking number, unlinked): completion must remain possible.
+  resetWc()
+  const { key } = await seedRow(deps, 'trk-skipped')
+  wc.tracking = 'skipped'
+  await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key] })
+  assert.equal(wc.puts, 1, 'skipped tracking does not block completion')
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+  evaluated++
+  assert.equal(evaluated, 3)
+})
+
+test('o3d-zvec.15 (review 2, HIGH 4): a claim whose worker died is surfaced as a PERMANENT_FAILED exception, never re-driven, and Replay completes it', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { key } = await seedRow(deps, 'killed')
+  const fresh = await seedRow(deps, 'fresh-claim')
+  const t0 = new Date()
+
+  // The worker claims the row and then dies: nothing marks it.
+  const claimed = await deps.claimIntegrationOutboxWork({
+    connector: 'woocommerce', operation: 'order.complete', idempotencyKeys: [key, fresh.key],
+    limit: 2, workerId: 'woocommerce-order-completion', maxAttempts: deps.WC_ORDER_COMPLETION_MAX_ATTEMPTS, now: t0,
+  })
+  assert.equal(claimed.length, 2, 'precondition: both rows are PROCESSING')
+  // The second claim is recent (inside the lease); only the first is aged past it.
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { lockedAt: new Date(t0.getTime() - 3_600_000) } })
+  assert.equal((await rowOf(deps, key)).status, 'PROCESSING')
+
+  const drain = await deps.processWcOrderCompletionJobs({ now: t0 })
+  assert.equal(wc.puts, 0, 'the unsafe-to-replay row is NOT re-driven automatically')
+  const parked = await rowOf(deps, key)
+  assert.equal(parked.status, 'PERMANENT_FAILED', 'surfaced in Sync > Exceptions, not stuck PROCESSING')
+  assert.match(String(parked.lastError), /worker|claim/i)
+  assert.equal(drain.deadLettered >= 1, true)
+  assert.equal(activity.filter((a) => a.action === 'wc_completion_dead_lettered').length >= 1, true, 'and an ERROR is logged')
+  assert.equal((await rowOf(deps, fresh.key)).status, 'PROCESSING', 'a claim still inside its lease is left alone')
+
+  // The operator's Replay (reset to PENDING, attempts 0) re-reads WooCommerce and completes it exactly once.
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { status: 'PENDING', attempts: 0, lastError: null, lockedAt: null, lockedBy: null } })
+  await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], now: t0 })
+  assert.equal(wc.puts, 1)
   assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
 })

@@ -37,6 +37,13 @@ const ROWS: Row[] = [
   { name: 'on-hold', reading: { slug: 'on-hold', imsStatus: 'ON_HOLD', handledBy: null }, expected: 'ineligible-not-ready' },
   { name: 'pending', reading: { slug: 'pending', imsStatus: 'PENDING_PAYMENT', handledBy: null }, expected: 'ineligible-not-ready' },
   { name: 'failed', reading: { slug: 'failed', imsStatus: 'PENDING_PAYMENT', handledBy: null }, expected: 'ineligible-not-ready' },
+  // HIGH 1 of the second review: the status-mapping action lets an operator map ANY slug to PROCESSING. The
+  // canonical WooCommerce slugs are refused BEFORE the configurable mapping is consulted.
+  { name: 'cancelled MAPPED to PROCESSING', reading: { slug: 'cancelled', imsStatus: 'PROCESSING', handledBy: null }, expected: 'ineligible-finalised' },
+  { name: 'on-hold MAPPED to PROCESSING', reading: { slug: 'on-hold', imsStatus: 'PROCESSING', handledBy: null }, expected: 'ineligible-not-ready' },
+  { name: 'pending MAPPED to PROCESSING', reading: { slug: 'pending', imsStatus: 'PROCESSING', handledBy: null }, expected: 'ineligible-not-ready' },
+  { name: 'failed MAPPED to PICKING', reading: { slug: 'failed', imsStatus: 'PICKING', handledBy: null }, expected: 'ineligible-not-ready' },
+  { name: 'refunded MAPPED to PACKING', reading: { slug: 'refunded', imsStatus: 'PACKING', handledBy: 'refund-sync' }, expected: 'ineligible-finalised' },
   { name: 'unmapped custom status', reading: { slug: 'foo', imsStatus: null, handledBy: null }, expected: 'ineligible-unknown' },
   { name: 'empty status', reading: { slug: '', imsStatus: null, handledBy: null }, expected: 'ineligible-unknown' },
 ]
@@ -49,7 +56,7 @@ test('o3d-zvec.15 (arm 1): the completion eligibility table', () => {
     evaluated++
   }
   assert.equal(evaluated, ROWS.length)
-  assert.ok(evaluated >= 16, `the table must have been walked in full, evaluated ${evaluated}`)
+  assert.ok(evaluated >= 21, `the table must have been walked in full, evaluated ${evaluated}`)
 })
 
 test('o3d-zvec.15 (arm 1): the target is a parameter — a non-default target is judged against it', () => {

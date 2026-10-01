@@ -81,6 +81,56 @@ export type WcOrderCompletionRunSummary = {
   errors: string[]
 }
 
+/**
+ * SURFACE (never re-drive) a completion whose worker died after claiming it.
+ *
+ * `woocommerce/order.complete` is `unsafe-to-replay` (the registry says why), so a PROCESSING row whose lock
+ * has gone stale is never handed to a second worker automatically, and until now it stayed PROCESSING for ever
+ * — never reaching PERMANENT_FAILED, so never on Sync > Exceptions. This moves exactly those rows (stale lock
+ * past the drain lease) to PERMANENT_FAILED with a message that says what happened, using a compare-and-set on
+ * the lock the dead worker took, so a worker that is merely slow and finishes in the meantime wins and the
+ * park is a no-op.
+ *
+ * Why this is the safe recovery and an automatic re-drive is not: nothing proves whether the PUT landed. Why
+ * Replay IS safe: it resets the row to PENDING and the next attempt re-reads WooCommerce first, so a PUT that
+ * did land is `already-at-target` and sends nothing, and one that did not is simply made. PERMANENT_FAILED is
+ * inert for this operation (the only enqueue is keyed per flip and returns the existing row untouched), unlike
+ * the stock push, so the row stays put until an operator acts.
+ */
+export async function parkStaleWcOrderCompletionClaims(now: Date = new Date()): Promise<number> {
+  const { db } = await import('@/lib/db')
+  const { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } = await import('@/lib/domain/integrations/outbox-leases')
+  const staleBefore = new Date(now.getTime() - INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default)
+  const stale = await db.integrationOutbox.findMany({
+    where: { connector: CONNECTOR, operation: OPERATION, status: 'PROCESSING', lockedAt: { lt: staleBefore } },
+    select: { id: true, lockedAt: true, lockedBy: true, payloadJson: true },
+    take: 50,
+  })
+  let parked = 0
+  for (const row of stale) {
+    const result = await db.integrationOutbox.updateMany({
+      where: { id: row.id, status: 'PROCESSING', lockedAt: row.lockedAt },
+      data: {
+        status: 'PERMANENT_FAILED',
+        nextAttemptAt: null,
+        lastError: 'The worker that claimed this completion stopped before recording a result, so it is not known whether WooCommerce was completed. Replay it: the retry re-reads the order first, so a completion that already landed is not sent again.',
+        lockedAt: null,
+        lockedBy: null,
+        attempts: { increment: 1 },
+      },
+    })
+    if (result.count === 0) continue
+    parked++
+    const orderId = (row.payloadJson as { orderId?: string } | null)?.orderId ?? 'unknown'
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_dead_lettered', tag: 'sync', level: 'ERROR',
+      description: `WooCommerce completion for order ${orderId} was claimed by a worker that never finished. Replay it from Sync exceptions; the replay re-reads the storefront order.`,
+      resolveUser: false,
+    }).catch(() => {})
+  }
+  return parked
+}
+
 export async function processWcOrderCompletionJobs(options?: {
   idempotencyKeys?: string[]
   limit?: number
@@ -89,6 +139,8 @@ export async function processWcOrderCompletionJobs(options?: {
   const summary: WcOrderCompletionRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options?.idempotencyKeys?.length === 0) return summary
   const now = options?.now
+  // The cron drain (no explicit keys) also surfaces claims whose worker died.
+  if (!options?.idempotencyKeys) summary.deadLettered += await parkStaleWcOrderCompletionClaims(now ?? new Date())
   const jobs = await claimIntegrationOutboxWork({
     connector: CONNECTOR,
     operation: OPERATION,
@@ -147,29 +199,56 @@ export async function processWcOrderCompletionJobs(options?: {
       // The facade, not the connector: it owns "is a storefront connector runnable at all".
       const { pushOrderDeliveryMetadata, pushSalesOrderStatus } = await import('@/lib/shopping')
 
-      // (a) Tracking FIRST so WooCommerce's completed email carries it. A tracking failure does not hold
-      // the status back (the completion matters more than the meta, and the two are written independently).
+      // (a) Tracking FIRST so WooCommerce's completed email carries it. A failed or thrown tracking push is a
+      // RETRYABLE OBLIGATION that blocks the completion PUT for this attempt: the customer email must not fire
+      // without the tracking it promises. Tracking that is legitimately not there (no tracking number yet, an
+      // unlinked order) comes back `skipped`, which is not a failure, so completion stays possible. A
+      // tracking failure that outlasts the bound dead-letters like any other, for an operator to replay.
+      let trackingError: string | null = null
       try {
         const tracking = await pushOrderDeliveryMetadata(orderId)
-        if (!tracking.success) console.warn('[order-completion] tracking push failed', tracking.error)
-      } catch (trackingError) {
-        console.warn('[order-completion] tracking push threw', trackingError)
+        if (!tracking.success && !tracking.skipped) trackingError = tracking.error ?? 'unknown error'
+      } catch (thrown) {
+        trackingError = thrown instanceof Error ? thrown.message : String(thrown)
+      }
+      if (trackingError !== null) {
+        await retry(`tracking push failed, completion held back so the customer email carries it: ${trackingError}`)
+        continue
       }
 
-      // (b) The status, behind a fresh GET + eligibility classification on every attempt.
+      // (b) The status, behind a fresh GET + eligibility classification on every attempt. The GET is made
+      // immediately before the PUT inside pushImsStatusToWc. WooCommerce has no conditional update, so an
+      // operator edit landing between those two requests can still be overwritten: an ACCEPTED, documented
+      // inter-system race, the window kept as small as one round trip.
       const status = await pushSalesOrderStatus(orderId, 'SHIPPED')
       if (!status.success) {
         await retry(status.error ?? 'WooCommerce status push failed')
         continue
       }
+      // SUCCESS means the storefront is now complete or deliberately left alone, and nothing else: pushed,
+      // already-at-target, or a finalised order (cancelled/refunded/completed by hand). A skipped result (no
+      // runnable connector), `not-applicable`, a not-ready/unknown status, or no outcome at all is NOT success:
+      // it stays retryable so that restoring the connector (or releasing the hold) can still complete the
+      // order, and dead-letters visibly after the bound.
       const outcome = status.outcome
-      if (outcome?.kind === 'ineligible' && outcome.class !== 'finalised') {
+      if (status.skipped) {
+        await retry('no runnable WooCommerce connector (not configured or no credentials), so the order was not completed')
+        continue
+      }
+      if (!outcome) {
+        await retry('the status push returned no outcome, so completion cannot be confirmed')
+        continue
+      }
+      if (outcome.kind === 'not-applicable') {
+        await retry('the order has no WooCommerce link or no pushable status, so it was not completed')
+        continue
+      }
+      if (outcome.kind === 'ineligible' && outcome.class !== 'finalised') {
         await retry(`WooCommerce order is "${outcome.wcStatus}" (${outcome.class === 'unknown' ? 'a status IMS has no reading of; add a status mapping' : 'not ready to complete'}), not completed`)
         continue
       }
       await markIntegrationOutboxSuccess(claim)
-      if (status.skipped) summary.skipped++
-      else summary.succeeded++
+      summary.succeeded++
     } catch (error) {
       await retry(error instanceof Error ? error.message : String(error)).catch((markError) => {
         summary.errors.push(markError instanceof Error ? markError.message : String(markError))

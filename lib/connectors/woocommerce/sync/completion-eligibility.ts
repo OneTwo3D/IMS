@@ -26,6 +26,14 @@ export type WcCompletionEligibility =
   | 'ineligible-unknown'
 
 const FINALISED_IMS_STATUSES: ReadonlySet<string> = new Set(['CANCELLED', 'COMPLETED', 'DELIVERED'])
+/**
+ * WooCommerce's OWN statuses that can never be in flight, refused BEFORE the configurable mapping is read. The
+ * status-mapping action accepts any slug and maps it to any IMS status, so a row sending `cancelled` or
+ * `on-hold` to PROCESSING would otherwise make this rule complete an order the operator cancelled or held.
+ * (`completed` and `refunded` are already caught by `handledBy`.)
+ */
+const CANONICAL_CANCELLED_SLUGS: ReadonlySet<string> = new Set(['cancelled'])
+const CANONICAL_NOT_READY_SLUGS: ReadonlySet<string> = new Set(['on-hold', 'pending', 'failed'])
 const NOT_READY_IMS_STATUSES: ReadonlySet<string> = new Set(['ON_HOLD', 'PENDING_PAYMENT', 'DRAFT'])
 
 export function classifyWcCompletionEligibility(input: {
@@ -42,6 +50,8 @@ export function classifyWcCompletionEligibility(input: {
   // `handledBy` carries completed and refunded. Refunded MUST be excluded here and not by its reading:
   // the built-in map reads `refunded` as PROCESSING (the refund state is orthogonal to the lifecycle).
   if (reading.handledBy !== null) return 'ineligible-finalised'
+  if (CANONICAL_CANCELLED_SLUGS.has(slug)) return 'ineligible-finalised'
+  if (CANONICAL_NOT_READY_SLUGS.has(slug)) return 'ineligible-not-ready'
   if (reading.imsStatus !== null && FINALISED_IMS_STATUSES.has(reading.imsStatus)) return 'ineligible-finalised'
   // Withdrawal statuses deliberately have no mapping row, but an operator may have added one; the
   // withdrawal settings win either way, so check them BEFORE the mapping.

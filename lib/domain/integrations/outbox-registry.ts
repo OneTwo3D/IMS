@@ -266,9 +266,16 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // stale-lock reclaim is not something a local verdict can call safe. The status PUT is guarded
     // (a fresh GET + classifyWcCompletionEligibility on EVERY attempt, so a repeat finds `completed` and
     // sends nothing), but the tracking meta write, the shoppingSyncLog row and the activity log sit outside
-    // that guard, hence an effect SEQUENCE. Consequence: no stale-lock reclaim — a worker that dies
-    // mid-send leaves the row PROCESSING, the health check warns after 10 minutes, and an operator marks it
-    // failed and replays it from /sync/exceptions (the replay re-reads WooCommerce, so it is harmless).
+    // that guard, hence an effect SEQUENCE. Consequence: no AUTOMATIC stale-lock reclaim — nothing proves
+    // whether a dead worker's PUT landed, and 'remote-write-idempotent' needs an ordering guarantee the
+    // remote enforces, which WooCommerce's unconditional PUT does not give. (Each attempt does re-read the
+    // status first, which makes a repeat harmless in the common case, but a GET is not a fence, so the
+    // verdict stays honest rather than being argued up.) A row whose worker died is NOT left parked for
+    // ever, though: the cron drain moves a PROCESSING row whose lock is past the drain lease to
+    // PERMANENT_FAILED (`parkStaleWcOrderCompletionClaims`, compare-and-set on the dead worker's lock) so it
+    // shows on /sync/exceptions with an explanation, and Replay there is safe BECAUSE the retry re-reads
+    // WooCommerce first. PERMANENT_FAILED is inert for this operation: its only enqueue is keyed per flip
+    // and returns the existing row untouched, so nothing resets it behind the operator's back.
     'order.complete': {
       name: 'orderComplete',
       schema: WcOrderCompletionOutboxPayloadSchema,
