@@ -28,7 +28,14 @@ This repository uses an `x.y.z` release scheme.
   term draws on a branded pool (the line's unreconciled manual receipts less the new
   `wms_asn_line_maps.manualQtyBaseline`, written when an ASN row is created or resized), and transfer lines get the
   same fix. **Migration:** one additive column, `NOT NULL DEFAULT 0`, no backfill.
-- The ASN creator's sizing and the retry path are unchanged and follow in the second half (o3d-6b9c).
+- **A purchase-order ASN is sized by what has landed, and a credited reservation is never deleted or resized in
+  place (o3d-papk follow-up; the minimal purchase-order half of o3d-6b9c).** A retry, the post-mismatch discard
+  and the finalize conflict used to delete the pending reservation, cascading the alignment credit that is the
+  only record that units landed (landed fell from 10 to 4 while stock stayed at 10), and the ASN sent to the live
+  warehouse was sized `qty − qtyReceived`, so landed units were asked for again. The creator now sizes by landed
+  outstanding (branded all the way to the wire), retires a credited reservation (closed, credit kept) and
+  reserves the remainder on a new one, disposes under `purchase_orders` → ASN header → ASN lines, returns
+  operator refusals so a retirement commits, and refuses to claim a retired reservation (both creators).
 
 ### Parked connectors removed (o3d-remove-parked-connectors)
 

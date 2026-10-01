@@ -69,12 +69,21 @@ import {
   type TransferLineOutstandingQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
 import {
+  disposePendingAsnReservation,
   disposePendingTransferAsnReservation,
+  lockPendingAsnReservation,
   lockPendingTransferAsnReservation,
   pendingAsnReservationCarriesCredit,
   type LockedPendingAsnReservation,
 } from '@/lib/domain/wms/pending-asn-retirement'
-import { lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import {
+  hasPoOutstandingQty,
+  loadPurchaseOrderLineOutstandingQty,
+  poOutstandingQtyEquals,
+  requirePoLineOutstandingQty,
+  type PurchaseOrderLineOutstandingQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
+import { lockPurchaseOrders, lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { loadUnreconciledManualReceiptQty } from '@/lib/domain/wms/manual-receipt-pool'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -2942,7 +2951,13 @@ export async function createMintsoftPurchaseOrderAsn(
     sourceLineId: string
     productId: string
     sku: string
-    expectedQty: number
+    /**
+     * THE BRANDED READING, not a number (o3d-papk, as o3d-zzgp did for transfers). Only
+     * lib/domain/inventory/po-line-landed-quantity.ts can produce one, so a reservation cannot be assembled from
+     * `qty - qtyReceived`; it becomes a number exactly once, as the `quantity` on the wire, where the PO line is
+     * not in scope to be subtracted.
+     */
+    outstanding: PurchaseOrderLineOutstandingQty
     externalProductId: string
   }
 
@@ -2969,6 +2984,9 @@ export async function createMintsoftPurchaseOrderAsn(
       packageCount: number | null
       lines: ReservedAsnLine[]
     }
+
+  /** An operator-facing refusal, RETURNED so the reservation transaction commits first (o3d-papk, as o3d-zzgp r4). */
+  type AsnReservationRefusal = { kind: 'refused'; error: string }
 
   type FinalizedAsnOutcome = {
     kind: 'existing' | 'recovered' | 'created'
@@ -3019,7 +3037,8 @@ export async function createMintsoftPurchaseOrderAsn(
         sourceLineId: line.sourceLineId,
         productId: line.productId,
         sku: line.sku,
-        expectedQty: line.expectedQty,
+        // OUTPUT BOUNDARY: this figure only goes into the sync-log payload.
+        expectedQty: line.outstanding.qtyNumber,
         externalAsnLineId: createdLine.externalLineId,
         payload: createdLine.raw ?? null,
         externalAsnId,
@@ -3027,8 +3046,21 @@ export async function createMintsoftPurchaseOrderAsn(
     })
   }
 
-  async function reserveAsn(): Promise<AsnReservation> {
-    return db.$transaction(async (tx) => {
+  /**
+   * THE RULE FOR EVERY `throw` IN THIS TRANSACTION (o3d-zzgp round 4, carried to purchase orders by o3d-papk).
+   * A throw inside a Prisma interactive transaction ROLLS BACK every write made before it, so a retirement of a
+   * credited reservation followed by a thrown operator refusal would be undone and leave the reservation OPEN, still
+   * an alignment candidate. An OPERATOR REFUSAL ("nothing outstanding", "not linked to a Mintsoft product") that can
+   * run after a disposal write is therefore RETURNED as `{ kind: 'refused' }` and raised by the caller after the
+   * commit; an INTEGRITY ABORT (a stored figure that disagrees with the one just written, a disposal that
+   * contradicts the credit read under the same locks) is still THROWN and rolls back on purpose.
+   *
+   * Narrow by design: only exits that can follow a disposal write (or the stale-claim demotion) are converted.
+   */
+  async function reserveAsn(): Promise<AsnReservation | AsnReservationRefusal> {
+    const refuse = (error: string): AsnReservationRefusal => ({ kind: 'refused', error })
+
+    return db.$transaction(async (tx): Promise<AsnReservation | AsnReservationRefusal> => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${parsedId.data} FOR UPDATE`
 
       const po = await tx.purchaseOrder.findUnique({
@@ -3164,74 +3196,127 @@ export async function createMintsoftPurchaseOrderAsn(
         })
       }
 
-      const pendingAsn = await tx.wmsAsnMap.findFirst({
+      const pendingReservationWhere = {
+        connector: 'mintsoft',
+        closedAt: null,
+        status: 'CREATE_PENDING',
+        externalAsnId: {
+          startsWith: pendingAsnPrefix,
+        },
+      } satisfies Prisma.WmsAsnMapWhereInput
+
+      const pendingAsnHeader = await tx.wmsAsnMap.findFirst({
         where: {
-          connector: 'mintsoft',
+          ...pendingReservationWhere,
           sourceType: 'PURCHASE_ORDER',
           sourceId: po.id,
-          closedAt: null,
-          status: 'CREATE_PENDING',
-          externalAsnId: {
-            startsWith: pendingAsnPrefix,
-          },
         },
         orderBy: [{ createdAt: 'desc' }],
-        select: {
-          id: true,
-          lines: {
-            orderBy: [{ id: 'asc' }],
-            select: {
-              id: true,
-              sourceLineId: true,
-              productId: true,
-              sku: true,
-              expectedQty: true,
-            },
-          },
-        },
+        select: { id: true },
       })
 
+      // o3d-papk. Everything below decides from the reservation's CREDIT and then acts on it, so the credit is
+      // read under the established locks — `purchase_orders` (held since the top of this transaction), then the
+      // ASN header, then its line maps — and not from the discovery read above. This is the order every other
+      // participant already takes (alignment 2b -> 3 -> 4, book-in 2b -> 3 -> 4), so it adds no cycle.
+      let pendingAsn: LockedPendingAsnReservation | null = pendingAsnHeader
+        ? await lockPendingAsnReservation(tx, {
+            parent: { kind: 'PURCHASE_ORDER', id: po.id },
+            asnMapId: pendingAsnHeader.id,
+            reservationWhere: pendingReservationWhere,
+          })
+        : null
+
+      // o3d-papk: THE ASN IS SIZED FROM THIS NUMBER AND IT GOES TO A LIVE WMS. It used to be `qty - qtyReceived`,
+      // which ignores every unit the WMS stock-sync alignment has already brought into stock (that path credits
+      // `wms_asn_line_maps.qtyAccountedViaSnapshot` and never writes `qtyReceived`), so a retry after a failed push
+      // told Mintsoft to expect units already on its own shelves. Read under the purchase_orders lock above, from
+      // `tx`, so a concurrent alignment cannot land between the lock and this read. The BRANDED value travels.
+      const outstandingByPoLineId = await loadPurchaseOrderLineOutstandingQty(
+        tx,
+        po.lines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: po.status })),
+      )
       const outstandingLines = po.lines
         .map((line) => ({
           sourceLineId: line.id,
           productId: line.productId,
           sku: line.product.sku,
           externalProductId: line.product.wmsProductLinks[0]?.externalProductId ?? null,
-          expectedQty: Number(line.qty) - Number(line.qtyReceived),
+          outstanding: requirePoLineOutstandingQty(outstandingByPoLineId, line.id),
         }))
-        .filter((line) => line.expectedQty > 0)
+        .filter((line) => hasPoOutstandingQty(line.outstanding))
+      const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
       // o3d-papk / o3d-67kw3: the manual receipts the line already holds that no ASN has reconciled, read under
       // the purchase_orders lock above. A row created or resized now is sized for what is outstanding AFTER
       // them, so they are stored on it and the book-in does not mistake them for receipts against THIS ASN.
       const manualBaselineByLineId = await loadUnreconciledManualReceiptQty(tx, 'PURCHASE_ORDER_LINE', po.lines)
 
+      // o3d-papk (the transfer creator's o3d-zzgp round 2, HIGH-1 AND HIGH-2, one entity over). A CREATE_PENDING
+      // reservation whose lines carry alignment credit cannot be re-used, because both things a retry did to it
+      // were destructive: it DELETED the reservation when nothing was outstanding (cascading the credit rows that
+      // are the only record the alignment landed those units), and it re-pointed the credited row's `expectedQty`
+      // at the fresh figure (ten became four with six still credited, so the four fresh units would have been
+      // read as already covered and added no stock). The credited reservation is RETIRED (closed, its expectation
+      // shrunk to what it was credited, noted) and the outstanding remainder is reserved on a NEW ASN with a zero
+      // credit, by falling through to the create path below.
+      if (pendingAsn && pendingAsnReservationCarriesCredit(pendingAsn.lines)) {
+        const outcome = await disposePendingAsnReservation(tx, {
+          parent: { kind: 'PURCHASE_ORDER', id: po.id },
+          asnMapId: pendingAsn.asnMapId,
+          reservationWhere: pendingReservationWhere,
+        })
+        // The disposal re-reads under the same locks this transaction already holds, so it cannot see anything
+        // but the credit the predicate just saw.
+        if (outcome !== 'retired') {
+          // INTEGRITY ABORT, rolls back on purpose: the disposal re-read the same locked rows and reached a
+          // different verdict, so neither read is trustworthy.
+          throw new Error(`A credited pending ASN reservation was ${outcome}, not retired (o3d-papk).`)
+        }
+        pendingAsn = null
+      }
+
       if (pendingAsn) {
         const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
         if (unmappedLine) {
-          throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+          return refuse(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
         }
 
         if (outstandingLines.length === 0) {
-          await tx.wmsAsnMap.delete({
-            where: { id: pendingAsn.id },
+          // Uncredited by the branch above, so there is no evidence to lose and this deletes. The disposal is
+          // still the only route out, because the fact that makes the delete safe is re-read there under the
+          // locks, and nowhere else.
+          await disposePendingAsnReservation(tx, {
+            parent: { kind: 'PURCHASE_ORDER', id: po.id },
+            asnMapId: pendingAsn.asnMapId,
+            reservationWhere: pendingReservationWhere,
           })
-          throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
+          // RETURNED, not thrown: the delete above (and any stale-claim demotion) must commit.
+          return refuse('This purchase order has no outstanding quantity left to place on an ASN.')
         }
 
         // q66in.4.6: a retry may carry a NEW ETA — keep the watchdog anchored to
         // the value actually sent to the WMS, not the first attempt's.
         await tx.wmsAsnMap.update({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           data: { eta: etaIso ? new Date(etaIso) : null },
         })
 
-        const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
         const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
         const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
 
+        // A line drops out of the outstanding set BECAUSE something landed it, and the alignment lands units by
+        // crediting these very columns — so this `deleteMany` was the per-line form of the same defect.
+        //
+        // THE LOCKS ARE THE FIX: this runs under the purchase-order, ASN header and line-map locks taken above,
+        // after a credit re-read under them, and this branch is only entered when that re-read found no credit
+        // anywhere on the reservation. The three zero-credit conditions are the BACKSTOP: they keep a row with
+        // visible credit out of the delete if the locks were ever lost (see pending-asn-retirement.ts).
         await tx.wmsAsnLineMap.deleteMany({
           where: {
-            asnMapId: pendingAsn.id,
+            asnMapId: pendingAsn.asnMapId,
+            qtyAccountedViaSnapshot: 0,
+            qtyAccountedViaReceipt: 0,
+            lastProcessedReceivedQty: 0,
             ...(activeSourceLineIds.length > 0
               ? { sourceLineId: { notIn: activeSourceLineIds } }
               : {}),
@@ -3246,20 +3331,20 @@ export async function createMintsoftPurchaseOrderAsn(
               data: {
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
-                expectedQty: outstandingLine.expectedQty,
+                expectedQty: outstandingLine.outstanding.qtyNumber,
                 manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
           } else {
             await tx.wmsAsnLineMap.create({
               data: {
-                asnMapId: pendingAsn.id,
+                asnMapId: pendingAsn.asnMapId,
                 externalAsnLineId: `pending:${outstandingLine.sourceLineId}`,
                 sourceType: 'PURCHASE_ORDER_LINE',
                 sourceLineId: outstandingLine.sourceLineId,
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
-                expectedQty: outstandingLine.expectedQty,
+                expectedQty: outstandingLine.outstanding.qtyNumber,
                 manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
@@ -3267,7 +3352,7 @@ export async function createMintsoftPurchaseOrderAsn(
         }
 
         const refreshedPendingAsn = await tx.wmsAsnMap.findUnique({
-          where: { id: pendingAsn.id },
+          where: { id: pendingAsn.asnMapId },
           select: {
             id: true,
             lines: {
@@ -3284,13 +3369,26 @@ export async function createMintsoftPurchaseOrderAsn(
         })
 
         if (!refreshedPendingAsn || refreshedPendingAsn.lines.length === 0) {
+          // INTEGRITY ABORT, rolls back on purpose: the lines were written a moment ago in this transaction, so
+          // an empty re-read means those writes did not land.
           throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
         }
 
         const pendingLines = refreshedPendingAsn.lines.map((line) => {
           const outstandingLine = outstandingBySourceLineId.get(line.sourceLineId)
           if (!outstandingLine?.externalProductId) {
+            // INTEGRITY ABORT, rolls back on purpose: every outstanding line's link was checked and RETURNED as
+            // a refusal above, so reaching this means the rows and the read disagree.
             throw new Error(`Outstanding SKU ${line.sku} is not linked to a Mintsoft product.`)
+          }
+          // The re-read is here to pick up the ids of rows created just above, so what it says about the
+          // QUANTITY is checked against the branded reading rather than substituted for it.
+          if (Number(line.expectedQty) !== outstandingLine.outstanding.qtyNumber) {
+            // INTEGRITY ABORT, rolls back on purpose: the resize did not store what it wrote.
+            throw new Error(
+              `Mintsoft ASN line for PO line ${line.sourceLineId} stored ${Number(line.expectedQty)} `
+              + `where the outstanding quantity is ${outstandingLine.outstanding.qtyNumber}.`,
+            )
           }
 
           return {
@@ -3298,7 +3396,7 @@ export async function createMintsoftPurchaseOrderAsn(
             sourceLineId: line.sourceLineId,
             productId: line.productId,
             sku: line.sku,
-            expectedQty: Number(line.expectedQty),
+            outstanding: outstandingLine.outstanding,
             externalProductId: outstandingLine.externalProductId,
           } satisfies ReservedAsnLine
         })
@@ -3320,12 +3418,13 @@ export async function createMintsoftPurchaseOrderAsn(
       }
 
       if (outstandingLines.length === 0) {
-        throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
+        // RETURNED, not thrown: a retirement or a stale-claim demotion made above in this transaction must commit.
+        return refuse('This purchase order has no outstanding quantity left to place on an ASN.')
       }
 
       const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
       if (unmappedLine) {
-        throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+        return refuse(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
       }
 
       const asnMap = await tx.wmsAsnMap.create({
@@ -3345,7 +3444,7 @@ export async function createMintsoftPurchaseOrderAsn(
               sourceLineId: line.sourceLineId,
               productId: line.productId,
               sku: line.sku,
-              expectedQty: line.expectedQty,
+              expectedQty: line.outstanding.qtyNumber,
               manualQtyBaseline: manualBaselineByLineId.get(line.sourceLineId) ?? 0,
             })),
           },
@@ -3377,14 +3476,24 @@ export async function createMintsoftPurchaseOrderAsn(
         eta: etaIso,
         packagingType: data.packagingType ?? null,
         packageCount: data.packageCount ?? null,
-        lines: asnMap.lines.map((line, index) => ({
-          asnLineMapId: line.id,
-          sourceLineId: line.sourceLineId,
-          productId: line.productId,
-          sku: line.sku,
-          expectedQty: Number(line.expectedQty),
-          externalProductId: outstandingLines[index]!.externalProductId!,
-        })),
+        // Paired by `sourceLineId`, not by array index: the rows come back ordered by cuid while the outstanding
+        // lines are in PO-line order. The branded outstanding quantity travels with the pair.
+        lines: asnMap.lines.map((line) => {
+          const outstandingLine = outstandingBySourceLineId.get(line.sourceLineId)
+          if (!outstandingLine?.externalProductId) {
+            // INTEGRITY ABORT, rolls back on purpose: every outstanding line's link was checked and RETURNED as
+            // a refusal above, so reaching this means the rows and the read disagree.
+            throw new Error(`Outstanding SKU ${line.sku} is not linked to a Mintsoft product.`)
+          }
+          return {
+            asnLineMapId: line.id,
+            sourceLineId: line.sourceLineId,
+            productId: line.productId,
+            sku: line.sku,
+            outstanding: outstandingLine.outstanding,
+            externalProductId: outstandingLine.externalProductId,
+          } satisfies ReservedAsnLine
+        }),
       } satisfies AsnReservation
     }, { maxWait: 5000, timeout: 30000 })
   }
@@ -3399,6 +3508,7 @@ export async function createMintsoftPurchaseOrderAsn(
         where: { id: reservation.poId },
         select: {
           id: true,
+          status: true,
           lines: {
             select: {
               id: true,
@@ -3413,10 +3523,20 @@ export async function createMintsoftPurchaseOrderAsn(
         return 'Purchase order no longer exists.'
       }
 
-      const outstandingBySourceLineId = new Map<string, number>()
+      // o3d-papk: MUST use the same definition as `reserveAsn` above. If these two disagree the revalidation
+      // refuses every create with "Outstanding quantities changed after reservation" — and if both used
+      // `qty - qtyReceived` they agree on the wrong number, which is how an over-sized ASN gets through.
+      const outstandingByPoLineId = await loadPurchaseOrderLineOutstandingQty(
+        tx,
+        po.lines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: po.status })),
+      )
+      // Branded on both sides: this map holds the readings the module produced, and the comparison below is
+      // `poOutstandingQtyEquals`, so neither side of the check that gates a push to a live warehouse can be a
+      // hand-computed number.
+      const outstandingBySourceLineId = new Map<string, PurchaseOrderLineOutstandingQty>()
       for (const line of po.lines) {
-        const outstanding = Number(line.qty) - Number(line.qtyReceived)
-        if (outstanding > 0) {
+        const outstanding = requirePoLineOutstandingQty(outstandingByPoLineId, line.id)
+        if (hasPoOutstandingQty(outstanding)) {
           outstandingBySourceLineId.set(line.id, outstanding)
         }
       }
@@ -3427,7 +3547,7 @@ export async function createMintsoftPurchaseOrderAsn(
 
       for (const reservedLine of reservation.lines) {
         const currentOutstanding = outstandingBySourceLineId.get(reservedLine.sourceLineId)
-        if (currentOutstanding === undefined || currentOutstanding !== reservedLine.expectedQty) {
+        if (!currentOutstanding || !poOutstandingQtyEquals(currentOutstanding, reservedLine.outstanding)) {
           return 'Outstanding quantities changed after reservation.'
         }
       }
@@ -3446,7 +3566,9 @@ export async function createMintsoftPurchaseOrderAsn(
     return findRecoverableMintsoftAsn(remoteAsns, {
       reference: reservation.reference,
       externalWarehouseId: reservation.externalWarehouseId,
-      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.expectedQty })),
+      // OUTPUT BOUNDARY: matching a remote ASN's quantities against the reservation (o3d-papk: the branded
+      // outstanding reading becomes a plain number here, and only here).
+      lines: reservation.lines.map((line) => ({ sourceLineId: line.sourceLineId, expectedQty: line.outstanding.qtyNumber })),
       // o3d-bhvu round 7 / o3d-54al: an ASN IMS has ALREADY MAPPED is a partial it recorded, not what a lost
       // create left behind, and that is the only thing that tells the two apart.
       mapKnowledge: await readMintsoftAsnMapKnowledge(remoteAsns),
@@ -3458,6 +3580,10 @@ export async function createMintsoftPurchaseOrderAsn(
       where: {
         id: asnMapId,
         status: 'CREATE_PENDING',
+        // o3d-papk: a RETIRED reservation keeps status CREATE_PENDING (retirement sets closedAt only), so without
+        // this a retired row could be claimed and pushed, and finalize would then reopen it. One atomic conditional
+        // UPDATE: no lock needed, it neither deletes nor changes credit.
+        closedAt: null,
       },
       data: {
         status: 'CREATE_IN_FLIGHT',
@@ -3467,18 +3593,29 @@ export async function createMintsoftPurchaseOrderAsn(
     return claimed.count === 1
   }
 
-  async function discardPendingReservation(asnMapId: string): Promise<void> {
-    await db.wmsAsnMap.deleteMany({
-      where: {
-        id: asnMapId,
-        connector: 'mintsoft',
-        sourceType: 'PURCHASE_ORDER',
-        sourceId: parsedId.data,
-        externalAsnId: {
-          startsWith: pendingAsnPrefix,
+  /**
+   * o3d-papk (the transfer creator's o3d-zzgp round 3, one entity over). This runs when the revalidation finds the
+   * outstanding quantities have moved since the reservation — and an interleaving WMS alignment, or a manual
+   * receipt after one, is WHAT MOVES THEM. It used to be one unlocked autocommit `deleteMany` that cascaded the
+   * very credit rows the alignment had just written. The reservation is now disposed of in ONE transaction that
+   * takes `purchase_orders` -> `wms_asn_maps` -> `wms_asn_line_maps` before it reads anything: retired when it
+   * holds credit, deleted only when it holds none.
+   */
+  async function discardPendingReservation(
+    reservation: Extract<AsnReservation, { kind: 'pending' }>,
+  ): Promise<void> {
+    await db.$transaction(async (tx) => {
+      await disposePendingAsnReservation(tx, {
+        parent: { kind: 'PURCHASE_ORDER', id: reservation.poId },
+        asnMapId: reservation.asnMapId,
+        reservationWhere: {
+          connector: 'mintsoft',
+          externalAsnId: {
+            startsWith: pendingAsnPrefix,
+          },
         },
-      },
-    })
+      })
+    }, { maxWait: 5000, timeout: 15000 })
   }
 
   async function finalizePendingAsn(
@@ -3501,7 +3638,12 @@ export async function createMintsoftPurchaseOrderAsn(
     const mappedLines = mapCreatedMintsoftAsnLines(reservation.lines, createdAsn.externalAsnId, createdAsn)
 
     return db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM wms_asn_maps WHERE id = ${reservation.asnMapId} FOR UPDATE`
+      // STEP 2b THEN STEP 3 (o3d-papk). This used to lock the header alone. The conflict branch below disposes of
+      // the reservation, and the disposal takes the purchase-order lock before it reads any credit — taking it
+      // there, after this header lock, would be the step-3-before-step-2 inversion the global order exists to
+      // forbid. So the order comes first here, and the header second, as they do on every other path.
+      await lockPurchaseOrders(tx, [reservation.poId])
+      await lockWmsAsnMaps(tx, [reservation.asnMapId])
 
       const conflictingAsn = await tx.wmsAsnMap.findUnique({
         where: {
@@ -3521,8 +3663,13 @@ export async function createMintsoftPurchaseOrderAsn(
       })
 
       if (conflictingAsn && conflictingAsn.id !== reservation.asnMapId) {
-        await tx.wmsAsnMap.delete({
-          where: { id: reservation.asnMapId },
+        // Same rule as everywhere else on this path: the superseded reservation may be deleted only while it
+        // holds no credit. A concurrent alignment can have credited it between the reservation and this point —
+        // its lines are candidates for exactly as long as `closedAt` is null. Decided under the purchase-order,
+        // header and line locks, in this transaction.
+        await disposePendingAsnReservation(tx, {
+          parent: { kind: 'PURCHASE_ORDER', id: reservation.poId },
+          asnMapId: reservation.asnMapId,
         })
 
         return {
@@ -3597,7 +3744,13 @@ export async function createMintsoftPurchaseOrderAsn(
 
   try {
     const connector = getWmsConnector('mintsoft')
-    const reservation = await reserveAsn()
+    const reserved = await reserveAsn()
+    // Raised HERE, after the reservation transaction has committed, so a retirement it made is kept (o3d-papk,
+    // as o3d-zzgp r4). The catch below records it as before.
+    if (reserved.kind === 'refused') {
+      throw new Error(reserved.error)
+    }
+    const reservation = reserved
     let outcome: FinalizedAsnOutcome
     let replayWarning: string | null = null
 
@@ -3610,7 +3763,7 @@ export async function createMintsoftPurchaseOrderAsn(
       } else {
         const mismatch = await revalidatePendingReservation(reservation)
         if (mismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
         }
 
@@ -3621,7 +3774,7 @@ export async function createMintsoftPurchaseOrderAsn(
 
         const recheckedMismatch = await revalidatePendingReservation(reservation)
         if (recheckedMismatch) {
-          await discardPendingReservation(reservation.asnMapId)
+          await discardPendingReservation(reservation)
           throw new Error(`${recheckedMismatch} Please retry creating the Mintsoft ASN.`)
         }
 
@@ -3637,7 +3790,9 @@ export async function createMintsoftPurchaseOrderAsn(
             sourceLineId: line.sourceLineId,
             externalProductId: line.externalProductId,
             sku: line.sku,
-            quantity: line.expectedQty,
+            // THE OUTPUT BOUNDARY, and the only `.qtyNumber` on this path: what a LIVE warehouse is told to
+            // expect (o3d-papk).
+            quantity: line.outstanding.qtyNumber,
           })),
         })
 
@@ -3694,7 +3849,7 @@ export async function createMintsoftPurchaseOrderAsn(
                 reference: reservation.reference,
                 eta: reservation.eta ?? null,
                 carrier: reservation.carrier ?? null,
-                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.expectedQty })),
+                lines: reservation.lines.map((line) => ({ sku: line.sku, quantity: line.outstanding.qtyNumber })),
               }
             : {}),
         },
@@ -4565,6 +4720,9 @@ export async function createMintsoftTransferAsn(
       where: {
         id: asnMapId,
         status: 'CREATE_PENDING',
+        // o3d-papk: as in the purchase-order creator — a RETIRED reservation keeps status CREATE_PENDING and must
+        // not be claimable.
+        closedAt: null,
       },
       data: {
         status: 'CREATE_IN_FLIGHT',

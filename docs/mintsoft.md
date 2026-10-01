@@ -159,8 +159,10 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   NOT `qty - qtyReceived` (o3d-zzgp): the stock-sync alignment above raises stock and lays cost layers
   without writing `qtyReceived`, so that subtraction asked a live warehouse to expect units already on
   its own shelves. The reservation and its pre-push revalidation read the same figure under the
-  transfer's row lock, so they cannot disagree and refuse every create. Purchase-order ASN lines are
-  still sized as `qty - qtyReceived`; a PO line has no landed-quantity definition yet (see below).
+  transfer's row lock, so they cannot disagree and refuse every create. **Purchase-order ASN lines are
+  sized the same way** (o3d-papk): `qty` less the PO line's *landed* quantity, by the one definition in
+  `lib/domain/inventory/po-line-landed-quantity.ts` (see below), read under the `purchase_orders` row lock;
+  the branded figure travels to the wire quantity and the pre-push revalidation compares it, not a number.
 - A **retry** of a transfer ASN create never deletes or resizes a reservation that already holds
   credit. `wms_asn_line_maps.qtyAccountedViaSnapshot` is the ONLY record that the alignment brought
   those units in and costed them, so the reservation is **retired** instead: `closedAt` is set (which
@@ -181,7 +183,14 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   attempt then refuses the create — "nothing outstanding", "not linked to a Mintsoft product": the
   reservation transaction returns the refusal and the action raises it after commit, because a refusal
   thrown inside the transaction would roll the retirement back and leave the reservation open.
-  Purchase-order ASN reservations still delete on retry (see below).
+  **The same rule now applies to a purchase-order ASN create** (o3d-papk): the retry, the post-mismatch
+  discard and the finalize conflict branch all dispose of a pending reservation through the one
+  generalised `disposePendingAsnReservation` (`lib/domain/wms/pending-asn-retirement.ts`), which takes
+  `purchase_orders` (step 2b, a gate only) → `wms_asn_maps` → `wms_asn_line_maps` first. A credited PO
+  reservation is retired (the retired row keeps counting in the line's landed quantity) and the landed
+  outstanding is reserved on a NEW reservation with a zero credit; one holding no credit is still deleted or
+  resized in place. Operator refusals that can follow a disposal write are returned, not thrown, so the
+  retirement commits. The claim also refuses a retired row (`closedAt IS NULL`) for both creators.
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
@@ -387,13 +396,13 @@ and *outstanding* is `max(0, qty − landed)`, zero for a CANCELLED or CLOSED or
   counting a PO line's own open ASN row a second time) and the **incoming-stock badges** in the product
   list and detail pages.
 
-**Not done here, still open.** The PO ASN *creator* still sizes lines `qty − qtyReceived`, and a retry
-still deletes or resizes a credited pending reservation, losing the credit. Retiring a credited PO
-reservation without landed-aware sizing would be worse, not better (the replacement would be raised at the
-full outstanding quantity with a zero credit, so a booked-in receipt would add the already-landed units'
-stock a second time), so both land together in the second half (o3d-6b9c). The returns, invoicing,
-purchase-statistics, outstanding-PO-value, receipt-quantity, replenishment and display readers still read
-`qtyReceived` alone (o3d-nnics).
+**Also in this change (the second commit, the PO half of o3d-6b9c, minimal).** The PO ASN creator is
+sized by landed outstanding and a credited pending reservation is never deleted or resized in place — see
+"ASN Flow" above for the rule and the lock order. Deliberately NOT done here and still open: the creator's
+other defects (otay: never-created ASNs still count as alignment candidates; l2u6: claim/catch-demotion
+locking; gwh4 and the dead `CREATE_IN_FLIGHT` stale-claim recovery; the pending-id random suffix) and
+the returns, invoicing, purchase-statistics, outstanding-PO-value, receipt-quantity, replenishment and display
+readers, which still read `qtyReceived` alone (o3d-nnics).
 
 #### Booked-in reconciliation: the manual-receipt pool (o3d-papk follow-up, o3d-67kw3)
 
