@@ -1,6 +1,7 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
 import { execFile, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { promisify } from 'node:util'
 import { PrismaPg } from '@prisma/adapter-pg'
@@ -1262,7 +1263,16 @@ test(
     // A ROLE THAT CANNOT READ THE IDENTIFIER, but can do everything else the repair needs.
     const live = await deps.readServerIdentity(deps.db)
     const role = `ims_denied_${Date.now().toString(36)}`
-    await deps.db.$executeRawUnsafe(`CREATE ROLE ${role} LOGIN`)
+    // THE ROLE MUST BE ABLE TO LOG IN UNDER WHATEVER AUTH THE SERVER USES (round 22). CI's Postgres uses
+    // password auth, so a password-less LOGIN role cannot connect there; trust auth (the local rig) ignores
+    // the password. Hex only, so it is safe to interpolate into CREATE ROLE. It is a throwaway for a
+    // throwaway role and travels in the child's environment, never on a command line.
+    const rolePassword = randomBytes(16).toString('hex')
+    // WHO THE ADMIN CONNECTION IS, for the cleanup below -- not a literal `ims`, which exists only on the
+    // local harness and is how the first version of this cleanup silently did nothing in CI.
+    const adminRole = (await deps.db.$queryRawUnsafe<Array<{ u: string }>>('SELECT current_user AS u'))[0]?.u
+    assert.ok(adminRole, 'precondition: the admin connection must report its role')
+    await deps.db.$executeRawUnsafe(`CREATE ROLE ${role} LOGIN PASSWORD '${rolePassword}'`)
     try {
       await deps.db.$executeRawUnsafe(`REVOKE EXECUTE ON FUNCTION pg_control_system() FROM ${role}, PUBLIC`)
       await deps.db.$executeRawUnsafe(`GRANT CONNECT ON DATABASE "${scratchDatabase}" TO ${role}`)
@@ -1276,7 +1286,28 @@ test(
         `SELECT has_function_privilege('${role}', 'pg_control_system()', 'execute') AS ok`)
       assert.equal(asDenied[0]?.ok, false, 'precondition: EXECUTE must really be revoked for this role')
 
-      const url = String(process.env.DATABASE_URL).replace('//ims@', `//${role}@`)
+      // BUILT WITH THE URL API from whatever DATABASE_URL the environment supplies. The first version
+      // string-replaced the literal `//ims@`, which exists only in the local harness: in CI the URL is
+      // postgres:postgres@..., the replace was a NO-OP, and every "denied role" arm ran as the SUPERUSER,
+      // who can always read pg_control_system(). It failed on every CI head for four rounds.
+      const roleUrl = new URL(String(process.env.DATABASE_URL))
+      roleUrl.username = role
+      roleUrl.password = rolePassword
+      const url = roleUrl.toString()
+
+      // PROOF THE DENIED ROLE IS WHAT WE CONNECT AS. Without this a setup that silently degrades to the
+      // admin connection makes every arm below examine nothing.
+      const identityProbe = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) })
+      try {
+        const who = await identityProbe.$queryRawUnsafe<Array<{ u: string; su: boolean }>>(
+          'SELECT current_user AS u, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS su')
+        assert.equal(who[0]?.u, role,
+          `the denied-role setup did not take effect: the connection ran as "${who[0]?.u}", not "${role}"`)
+        assert.equal(who[0]?.su, false,
+          `the denied-role setup did not take effect: "${role}" is a SUPERUSER and can always read pg_control_system()`)
+      } finally {
+        await identityProbe.$disconnect()
+      }
 
       // 1. --list must WORK as that role. Before the fix the identifier query poisoned nothing here
       //    (no transaction), so this is the cheap half -- but it also proves the role can read the schema.
@@ -1376,7 +1407,7 @@ test(
     } finally {
       // Own cluster, own role: drop it whatever happened.
       await deps.db.$executeRawUnsafe(
-        `REASSIGN OWNED BY ${role} TO ims; DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role}`)
+        `REASSIGN OWNED BY ${role} TO ${adminRole}; DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role}`)
         .catch(() => {})
       await deps.db.$executeRawUnsafe(`GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC`).catch(() => {})
     }
