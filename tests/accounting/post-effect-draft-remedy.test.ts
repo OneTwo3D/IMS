@@ -7,7 +7,7 @@ import {
   OPERATION_SEMANTIC_BY_TYPE,
   operationSemanticFor,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import { AccountingSyncType } from '@/app/generated/prisma/enums'
 
 /**
  * o3d-d3re — THE FENCE-LOSS REMEDY MUST NOT SEND AN OPERATOR TO CREDIT-NOTE A DRAFT.
@@ -29,7 +29,9 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
  * which drive the real `processPendingXeroSync` loop.
  */
 
-const ALL_TYPES = Object.keys(OPERATION_SEMANTIC_BY_TYPE) as AccountingSyncType[]
+// THE REAL PRISMA ENUM, not the semantic map's keys: a type added to the enum but forgotten in the
+// map would otherwise vanish from the sweep instead of failing it.
+const ALL_TYPES = Object.values(AccountingSyncType) as AccountingSyncType[]
 
 /**
  * The three LIVE instructions, each of which moves real money when followed. A draft remedy may
@@ -50,6 +52,20 @@ const DRAFT_CAPABLE = (type: AccountingSyncType): boolean =>
   (DRAFT_CAPABLE_SEMANTIC_LIST as readonly string[]).includes(operationSemanticFor(type) ?? '')
 
 test('o3d-d3re: the matrix under test is the real enum, and it is not empty', () => {
+  // PRECONDITION, PRINTED: every (type x mode) cell is evaluated and counted.
+  assert.deepEqual([...ALL_TYPES].sort(), Object.keys(OPERATION_SEMANTIC_BY_TYPE).sort(),
+    'the enum and the semantic map must name the same types')
+  let evaluated = 0
+  for (const type of ALL_TYPES) {
+    for (const mode of ['draft', 'submitted'] as const) {
+      const out = postEffectFor(type, { _postingMode: mode } as never)
+      assert.ok(out.effect && out.remedy, `${type}/${mode} returned no wording`)
+      evaluated += 1
+    }
+  }
+  console.log(`# o3d-d3re matrix: ${evaluated} type x mode cases evaluated (${ALL_TYPES.length} types x 2 modes)`)
+  assert.notEqual(evaluated, 0)
+  assert.equal(evaluated, ALL_TYPES.length * 2)
   // The whole file is a sweep over this list. If it were short — or if `_postingMode` stopped
   // reaching the function — every assertion below would pass over nothing.
   assert.ok(ALL_TYPES.length >= 25, `expected the full AccountingSyncType enum, saw ${ALL_TYPES.length}`)
