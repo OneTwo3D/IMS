@@ -260,19 +260,43 @@ export function migrationsIntroducedBetween(input: {
   ref?: string
 }): Set<string> {
   const out = execFileSync('git', [
+    // Top-level: ignore refs/replace and grafts, which can rewrite the very history being walked.
+    '--no-replace-objects',
     'log',
+    // --full-history: default history simplification may prune a side branch that adds then deletes. SET.
     '--full-history',
+    // -m: a merge commit's own additions are only visible as a per-parent diff; without it git prints no paths
+    // for a merge at all (o3d-ec4c0 round 6; reproduced on this repo's merge ecec2a75: 0 paths, 11 with -m). SET.
+    '-m',
+    // --no-renames: a renamed migration directory is status R, not A, so `--diff-filter=A` would miss the NEW
+    // name. This also makes the walk independent of the ambient `diff.renames` (default true) and of copy
+    // detection (`diff.renames=copies`, `-C`). SET.
+    '--no-renames',
+    // --diff-filter=A: after --no-renames the only status that introduces a path is A. R and C cannot occur
+    // once renames/copies are off, so AR/AC would add nothing; M (edit of an existing file) and D are not
+    // additions. SET to exactly A.
     '--diff-filter=A',
+    // -z with --name-only: NUL-separated, never quoted, so it does not depend on `core.quotepath` and odd path
+    // bytes cannot be octal-escaped into something that no longer ends in `/migration.sql`. SET.
     '--name-only',
+    '-z',
+    // Empty format: no subject lines to confuse the parse. `--no-show-signature` stops an ambient
+    // `log.showSignature=true` interleaving gpg text into the stream. SET.
     '--pretty=format:',
+    '--no-show-signature',
+    // The range `base..ref`. NOT `--first-parent` (would hide every side branch), NOT `--ancestry-path`, NOT
+    // `--simplify-by-decoration`/`--simplify-merges`/`--sparse`, NOT `--no-merges` (would hide merge-added
+    // paths), NOT `--follow` (single-file only), no `--since`/`--max-count`/`--skip`: each narrows the walk. UNSET.
     `${input.base}..${input.ref ?? 'HEAD'}`,
+    // Pathspec limiting is intentional and cannot hide an addition: it restricts to the migrations tree, and
+    // the filter below needs nothing outside it. `:(literal)`-style magic is unnecessary for a fixed prefix.
     '--',
     'prisma/migrations/',
-  ], { cwd: input.cwd, encoding: 'utf8' }).trim()
+  ], { cwd: input.cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
   return new Set(
     out
-      .split('\n')
-      .map((line) => line.trim())
+      .split('\0')
+      .map((line) => line.replace(/^\n+/, ''))
       .filter((line) => line.endsWith('/migration.sql'))
       .map((line) => line.split('/')[2]),
   )
@@ -366,31 +390,47 @@ export function branchMigrationDerivationsDisagree(input: {
  *
  * WHAT WOULD STILL PASS IT: any walk that reports additions on unreachable-by-simplification history —
  * `--full-history` is one way and the one used. It says nothing about `--simplify-merges` variants, nor about
- * additions made by a merge commit itself, which `--name-only` does not report for merges either way.
+ * additions made by a merge commit itself — those are the r6 fixture below, and need `-m`.
  */
-test('o3d-ec4c0: a migration added then deleted on a MERGED SIDE BRANCH is still found', (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'ec4c0-sidebranch-'))
+/**
+ * Throwaway repository shared by every walk fixture below. `diff.renames` is set to TRUE explicitly: it is git's
+ * default, and pinning it here is what lets the `--no-renames` mutation be red rather than silently masked by a
+ * fixture that happened to disable detection.
+ */
+function walkFixture(t: { after: (fn: () => void) => void }, prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const g = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8' })
-  const migration = (name: string) => {
-    mkdirSync(join(dir, 'prisma', 'migrations', name), { recursive: true })
-    writeFileSync(join(dir, 'prisma', 'migrations', name, 'migration.sql'), 'SELECT 1;\n')
+  const migrationPath = (name: string) => join('prisma', 'migrations', name)
+  const migration = (name: string, body = 'SELECT 1;\n') => {
+    mkdirSync(join(dir, migrationPath(name)), { recursive: true })
+    writeFileSync(join(dir, migrationPath(name), 'migration.sql'), body)
   }
-
+  const commitAll = (message: string) => { g('add', '-A'); g('commit', '-q', '-m', message) }
   g('init', '-q', '-b', 'main', '.')
   g('config', 'user.email', 'fixture@example.invalid')
   g('config', 'user.name', 'fixture')
   g('config', 'commit.gpgsign', 'false')
-
-  migration('20260101000000_base')
-  g('add', '-A'); g('commit', '-q', '-m', 'base')
+  g('config', 'diff.renames', 'true')
+  migration('20260101000000_base', 'SELECT 0;\n')
+  commitAll('base')
   g('branch', 'trunk')
+  return {
+    dir, g, migration, migrationPath, commitAll,
+    inHead: (name: string) => existsSync(join(dir, migrationPath(name))),
+    walk: () => migrationsIntroducedBetween({ cwd: dir, base: g('merge-base', 'trunk', 'main').trim(), ref: 'main' }),
+  }
+}
+
+test('o3d-ec4c0: a migration added then deleted on a MERGED SIDE BRANCH is still found', (t) => {
+  const f = walkFixture(t, 'ec4c0-sidebranch-')
+  const { g } = f
 
   // The side branch: adds a migration, then deletes it again, so the merge carries NO net change.
   g('checkout', '-q', '-b', 'side')
-  migration('20260202000000_side_added_then_deleted')
-  g('add', '-A'); g('commit', '-q', '-m', 'side: ADD the migration')
-  g('rm', '-rq', 'prisma/migrations/20260202000000_side_added_then_deleted')
+  f.migration('20260202000000_side_added_then_deleted')
+  f.commitAll('side: ADD the migration')
+  g('rm', '-rq', f.migrationPath('20260202000000_side_added_then_deleted'))
   g('commit', '-q', '-m', 'side: DELETE it again')
   g('checkout', '-q', 'main')
   g('merge', '-q', '--no-ff', 'side', '-m', 'merge side (no net migration change)')
@@ -401,17 +441,112 @@ test('o3d-ec4c0: a migration added then deleted on a MERGED SIDE BRANCH is still
   assert.equal(g('diff', '--name-only', `${base}..main`, '--', 'prisma/migrations/').trim(), '',
     'PRECONDITION: the merge must carry NO net change under prisma/migrations, or default simplification has no '
     + 'reason to prune the side history and this fixture is not reproducing the finding')
-  assert.equal(existsSync(join(dir, 'prisma', 'migrations', '20260202000000_side_added_then_deleted')), false,
+  assert.equal(f.inHead('20260202000000_side_added_then_deleted'), false,
     'PRECONDITION: and the directory must be absent from the working tree, which is why the tree-difference '
     + 'cross-check cannot catch this omission either — both derivations miss the same migration')
 
   assert.deepEqual(
-    [...migrationsIntroducedBetween({ cwd: dir, base, ref: 'main' })],
+    [...f.walk()],
     ['20260202000000_side_added_then_deleted'],
     'a migration ADDED anywhere in this range must be found even though nothing in the current contents explains '
     + 'it. Default history simplification answers "which commits explain HEAD"; the question here is "was this '
     + 'ever added", and only --full-history answers that one',
   )
+})
+
+/**
+ * o3d-ec4c0 r6 (adversarial review, HIGH) — A MIGRATION ADDED BY A MERGE COMMIT ITSELF.
+ *
+ * `git log` prints no paths for a merge unless told to diff it against each parent (`-m`). A merge that itself
+ * introduces a migration — a conflict resolution, or `merge --no-commit` plus an added file — has no non-merge
+ * commit that adds it, so a walk without `-m` never sees it; and if a later commit deletes it the directory is
+ * absent from HEAD, so the tree-difference cross-check sees nothing either.
+ *
+ * WHAT WOULD STILL PASS IT: a walk that reports the merge's additions but loses a different class (renames, odd
+ * paths — see the next tests and the option table on `migrationsIntroducedBetween`).
+ */
+test('o3d-ec4c0 r6: a migration added by a MERGE COMMIT ITSELF, then deleted, is still found', (t) => {
+  const f = walkFixture(t, 'ec4c0-mergeadd-')
+  const { g } = f
+  const name = '20260303000000_added_by_the_merge_itself'
+
+  g('checkout', '-q', '-b', 'side')
+  writeFileSync(join(f.dir, 'unrelated.txt'), 'side work\n')
+  f.commitAll('side: unrelated work, no migration')
+  g('checkout', '-q', 'main')
+  writeFileSync(join(f.dir, 'main.txt'), 'main work\n')
+  f.commitAll('main: unrelated work so the merge is a real two-parent merge')
+  g('merge', '-q', '--no-ff', '--no-commit', 'side')
+  f.migration(name)
+  g('add', '-A')
+  g('commit', '-q', '-m', 'merge side AND add a migration in the merge itself')
+  const mergeSha = g('rev-parse', 'HEAD').trim()
+  g('rm', '-rq', f.migrationPath(name))
+  g('commit', '-q', '-m', 'later: delete the migration the merge added')
+
+  // PRECONDITIONS
+  assert.equal(g('rev-list', '--parents', '-n1', mergeSha).trim().split(' ').length, 3,
+    'PRECONDITION: the commit that adds the migration must be a merge with exactly two parents')
+  assert.equal(g('log', '--no-merges', '--full-history', '--diff-filter=A', '--format=%h', '--', f.migrationPath(name)).trim(), '',
+    'PRECONDITION: no NON-merge commit ever ADDED the migration, so only a per-parent merge diff can see it')
+  assert.equal(f.inHead(name), false, 'PRECONDITION: the migration is absent from HEAD')
+
+  assert.deepEqual([...f.walk()], [name],
+    'the walk must report a migration that only a merge commit added (needs -m)')
+})
+
+/**
+ * o3d-ec4c0 r6 — A RENAMED MIGRATION. With rename detection on (git's default `diff.renames=true`), the commit
+ * that moves a directory records the NEW name with status R, not A, so `--diff-filter=A` never reports it. The
+ * old name is still reported (its own addition), which is why the guard's own deletion check would see that one
+ * vanish — this fixture pins the walk itself, which must report BOTH names.
+ */
+test('o3d-ec4c0 r6: a migration added, RENAMED, and the new name deleted is found under both names', (t) => {
+  const f = walkFixture(t, 'ec4c0-rename-')
+  const { g } = f
+  const oldName = '20260404000000_before_rename'
+  const newName = '20260404000001_after_rename'
+
+  g('checkout', '-q', '-b', 'feature')
+  f.migration(oldName, 'SELECT 42;\n')
+  f.commitAll('feature: add migration')
+  g('mv', f.migrationPath(oldName), f.migrationPath(newName))
+  g('commit', '-q', '-m', 'feature: rename the migration directory')
+  const renameSha = g('rev-parse', 'HEAD').trim()
+  g('rm', '-rq', f.migrationPath(newName))
+  g('commit', '-q', '-m', 'feature: delete the renamed migration')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--ff-only', 'feature')
+
+  // PRECONDITIONS
+  assert.match(g('show', '-M', '--name-status', '--format=', renameSha).trim(), /^R\d+\t.*20260404000000_before_rename\/migration\.sql\t.*20260404000001_after_rename\/migration\.sql$/m,
+    'PRECONDITION: with default rename detection the move commit really is recorded as R, not A')
+  assert.equal(f.inHead(oldName) || f.inHead(newName), false, 'PRECONDITION: neither name is in HEAD')
+
+  assert.deepEqual([...f.walk()].sort(), [newName, oldName].sort(),
+    'the walk must report the NEW name of a renamed migration (needs --no-renames)')
+})
+
+/** Control: an ordinary branch adding a migration that STAYS — the walk reports it and nothing is "deleted". */
+test('o3d-ec4c0 r6: control — a branch adding a migration that stays reports it and loses nothing', (t) => {
+  const f = walkFixture(t, 'ec4c0-control-')
+  const { g } = f
+  const name = '20260505000000_kept'
+
+  g('checkout', '-q', '-b', 'feature')
+  f.migration(name)
+  f.commitAll('feature: add a migration that stays')
+  g('checkout', '-q', 'main')
+  g('merge', '-q', '--no-ff', 'feature', '-m', 'merge feature')
+
+  // PRECONDITIONS
+  assert.equal(f.inHead(name), true, 'PRECONDITION: the migration really is present at HEAD')
+  assert.equal(g('rev-list', '--parents', '-n1', 'HEAD').trim().split(' ').length, 3,
+    'PRECONDITION: HEAD is a real merge, so this control also exercises -m')
+
+  const walked = [...f.walk()]
+  assert.deepEqual(walked, [name], 'the walk reports exactly the one migration the branch added')
+  assert.deepEqual(walked.filter((n) => !f.inHead(n)), [], 'and none of them is missing from HEAD, so the guard does not fire')
 })
 
 test('o3d-ec4c0: the protected set never collapses to trunk-only, nor to branch-only', () => {
