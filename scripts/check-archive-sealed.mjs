@@ -68,7 +68,8 @@
 //   ARCHIVE_SEAL_MANIFEST   the manifest to compare against (default scripts/archive-sealed-manifest.tsv)
 //   ARCHIVE_SEAL_REF        a commit-ish to use as the COMMITTED subject instead of HEAD
 //   ARCHIVE_SEAL_BASE_REF   the base for the BRANCH co-change locus (default: origin/development,
-//                           then development; if neither resolves the locus is announced as NOT RUN)
+//                           then development). The locus is mandatory: a base that does not resolve,
+//                           has no merge base, or whose diff fails is a NONZERO exit, not a notice.
 //   ARCHIVE_SEAL_REWRITE=1  required by `--write`, so regenerating the manifest can never be a side
 //                           effect of a routine command
 
@@ -94,31 +95,54 @@ function fail(message) {
   process.exit(1)
 }
 
-function git(args) {
-  return execFileSync('git', args, { encoding: 'utf8' })
+// AN UNREADABLE STATE IS NEVER AN EMPTY STATE (o3d-bddq, PR #707 round 5).
+// Round 4 had one helper that turned every git failure into `null` and callers that read `null` as
+// `[]` / `''`. That converts "I could not look" into "I looked and found nothing", which PASSES — a
+// shallow clone whose base had no merge base made `git diff base...HEAD` fail, the branch locus saw
+// zero paths, and a split archive/manifest change went through. So there are exactly two ways to
+// call git here, and the names say which:
+//   gitOrThrowSealError  the call MUST succeed. Failure ends the check, NONZERO, saying what could
+//                        not run. There is no value a caller can mistake for "nothing found".
+//   gitProbeRefExists    answers one yes/no question ("does this ref resolve?"). It returns a
+//                        boolean, never output, so it cannot be fed to `lines()`.
+function runGit(args) {
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 }
 
-function gitOrNull(args) {
+function gitOrThrowSealError(args, whatItIsFor, remedy = 'fetch enough history (`git fetch --unshallow`, `git fetch origin`) or fix the repository, then re-run') {
   try {
-    return git(args)
+    return runGit(args)
+  } catch (error) {
+    const stderr = String(error?.stderr ?? '').trim()
+    return fail(
+      `could not run \`git ${args.join(' ')}\` (${whatItIsFor})${stderr ? `: ${stderr}` : ''}. `
+      + 'An unreadable state is not an empty one: the check refuses rather than treat "could not '
+      + `look" as "found nothing". To fix: ${remedy}.`,
+    )
+  }
+}
+
+/** True when the ref resolves to a commit. The ONLY place a git failure is read as an answer. */
+function gitProbeRefExists(ref) {
+  try {
+    runGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])
+    return true
   } catch {
-    return null
+    return false
   }
 }
 
 function lines(out) {
-  return (out ?? '').split('\n').filter((line) => line.trim() !== '')
+  if (typeof out !== 'string') throw new TypeError('lines() needs git output, not a failure')
+  return out.split('\n').filter((line) => line.trim() !== '')
 }
 
 function treeEntries(ref) {
   // `ls-tree -r` carries the BLOB HASH, so this compares contents and not merely which paths exist.
-  const out = gitOrNull(['ls-tree', '-r', ref, '--', 'archive/'])
-  if (out === null) {
-    fail(
-      `cannot resolve ${COMMITTED_SUBJECT} to a tree. The committed subject is not optional — a `
-      + 'repository where the commit cannot be read is one where this check has not run.',
-    )
-  }
+  const out = gitOrThrowSealError(
+    ['ls-tree', '-r', ref, '--', 'archive/'],
+    `the committed subject, ${COMMITTED_SUBJECT}. It is not optional — a repository where the commit cannot be read is one where this check has not run`,
+  )
   const entries = new Map()
   for (const line of lines(out)) {
     // <mode> <type> <sha>\t<path>
@@ -136,7 +160,7 @@ function indexEntries() {
   // `ls-files -s` carries the BLOB HASH and the STAGE, and it reads the INDEX — the one place a
   // half-merged archive/ exists before anyone commits it.
   const entries = new Map()
-  for (const line of lines(git(['ls-files', '-s', '--', 'archive/']))) {
+  for (const line of lines(gitOrThrowSealError(['ls-files', '-s', '--', 'archive/'], 'the INDEX subject'))) {
     // <mode> <sha> <stage>\t<path>
     const [meta, path] = line.split('\t')
     const parts = (meta ?? '').split(/\s+/)
@@ -226,7 +250,6 @@ const committed = treeEntries(COMMITTED_REF)
 const index = indexEntries()
 
 const problems = []
-const notices = []
 
 /** Compare one blob-bearing subject against the manifest, naming the subject on every line. */
 function compare(subjectName, entries) {
@@ -263,10 +286,10 @@ if (CONFLICTED.size === 0) {
 
 // The index is not the whole story: a file edited and not yet staged is still a file the next
 // `git add -A` commits, and a file dropped into archive/ and never added is not in the index at all.
-for (const path of lines(git(['diff', '--no-ext-diff', '--name-only', '--', 'archive/']))) {
+for (const path of lines(gitOrThrowSealError(['diff', '--no-ext-diff', '--name-only', '--', 'archive/'], 'the WORKTREE subject'))) {
   problems.push(`WORKTREE  MODIFIED  ${path}  (edited and not staged; the next \`git add\` commits it)`)
 }
-for (const path of lines(git(['ls-files', '--others', '--exclude-standard', '--', 'archive/']))) {
+for (const path of lines(gitOrThrowSealError(['ls-files', '--others', '--exclude-standard', '--', 'archive/'], 'the UNTRACKED subject'))) {
   problems.push(`UNTRACKED PRESENT   ${path}  (in the working tree and not in the index)`)
 }
 
@@ -299,29 +322,52 @@ function coChange(locusName, paths, messages, how) {
 // what this commit itself contributed. `--first-parent` would instead attribute everything a merge
 // brought in from development to the merge — including a legitimate, trailered re-seal made there —
 // and refuse it a second time on the branch that merged it.
-const tipPaths = lines(gitOrNull(['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', COMMITTED_REF]))
-coChange(COMMITTED_SUBJECT, tipPaths, gitOrNull(['log', '-1', '--format=%B', COMMITTED_REF]) ?? '', `the ${COMMITTED_SUBJECT} commit`)
+const tipPaths = lines(gitOrThrowSealError(
+  ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', COMMITTED_REF],
+  `the tip-commit co-change locus (what ${COMMITTED_SUBJECT} itself changed)`,
+))
+coChange(
+  COMMITTED_SUBJECT,
+  tipPaths,
+  gitOrThrowSealError(['log', '-1', '--format=%B', COMMITTED_REF], `the commit message of ${COMMITTED_SUBJECT}, which is where the trailer is read from`),
+  `the ${COMMITTED_SUBJECT} commit`,
+)
 
 // Locus 2 — the whole branch, which is what a pull request actually presents, and the locus that
-// catches the same change split across two commits. Needs a base; a shallow clone may not have one,
-// and that is ANNOUNCED rather than passed over in silence.
+// catches the same change split across two commits. It is NOT OPTIONAL and has no opt-out: it needs
+// (a) a base that resolves, (b) a merge base with the committed subject, and (c) a diff that runs.
+// Any of the three missing ends the check NONZERO. Round 4 announced a missing base as a NOTICE and
+// exited 0, and read a failed three-dot diff as an empty path list — a shallow clone therefore
+// passed a split change. A notice is not a check; a failed diff is not "no changes".
 const BASE_CANDIDATES = process.env.ARCHIVE_SEAL_BASE_REF
   ? [process.env.ARCHIVE_SEAL_BASE_REF]
   : ['origin/development', 'development']
-const base = BASE_CANDIDATES.find((ref) => gitOrNull(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]) !== null) ?? null
-if (base === null) {
-  notices.push(
-    `the BRANCH co-change locus did NOT RUN: none of ${BASE_CANDIDATES.join(', ')} resolves here, so `
-    + 'there is no base to diff against. Set ARCHIVE_SEAL_BASE_REF, or fetch enough history. Only the '
-    + `${COMMITTED_SUBJECT} commit was examined for a manifest/archive co-change.`,
+const BASE_REMEDY = 'fetch the base with enough history (`git fetch origin development` — a shallow clone needs `git fetch --unshallow` or a deeper `--depth`) or set ARCHIVE_SEAL_BASE_REF to a ref that has one'
+const base = BASE_CANDIDATES.find((ref) => gitProbeRefExists(ref))
+if (base === undefined) {
+  fail(
+    `the BRANCH co-change locus CANNOT RUN: none of ${BASE_CANDIDATES.join(', ')} resolves here, so there `
+    + 'is no base to diff against, and without it a change split across two commits (archive/ in one, '
+    + `the manifest in another) is invisible. This is a refusal, not a notice. To fix: ${BASE_REMEDY}.`,
   )
-} else {
-  const range = `${base}...${COMMITTED_REF}`
-  const branchPaths = lines(gitOrNull(['diff', '--no-ext-diff', '--name-only', range]))
-  coChange('BRANCH', branchPaths, gitOrNull(['log', '--format=%B', `${base}..${COMMITTED_REF}`]) ?? '', `git diff ${range}`)
 }
-
-for (const notice of notices) console.error(`archive seal: NOTICE: ${notice}`)
+gitOrThrowSealError(
+  ['merge-base', base, COMMITTED_REF],
+  `the merge base of ${base} and ${COMMITTED_SUBJECT}; the BRANCH co-change locus CANNOT RUN without one`,
+  BASE_REMEDY,
+)
+const range = `${base}...${COMMITTED_REF}`
+const branchPaths = lines(gitOrThrowSealError(
+  ['diff', '--no-ext-diff', '--name-only', range],
+  `the BRANCH co-change locus, which is the whole branch diff`,
+  BASE_REMEDY,
+))
+coChange(
+  'BRANCH',
+  branchPaths,
+  gitOrThrowSealError(['log', '--format=%B', `${base}..${COMMITTED_REF}`], 'the branch commit messages, where the trailer is read from', BASE_REMEDY),
+  `git diff ${range}`,
+)
 
 if (problems.length > 0) {
   console.error(

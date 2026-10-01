@@ -188,6 +188,9 @@ function withScratchRepo(run: (repo: string) => void): void {
     writeFileSync(path.join(repo, 'scripts/archive-sealed-manifest.tsv'), manifest)
     git(repo, ['add', '-A'])
     git(repo, ['commit', '-qm', 'manifest'])
+    // The BRANCH co-change locus is mandatory and diffs against a base, so every scratch repo carries
+    // a `development` at the sealed commit — the same shape as a feature branch off trunk.
+    git(repo, ['branch', 'development'])
     const control = runSealIn(repo)
     assert.equal(control.status, 0, `PRECONDITION: the scratch repo must pass its own seal:\n${control.output}`)
     run(repo)
@@ -392,13 +395,147 @@ test('o3d-bddq r3: the co-change is caught when SPLIT ACROSS TWO COMMITS on a br
   })
 })
 
-test('o3d-bddq r3: an unresolvable base ANNOUNCES that the BRANCH locus did not run', () => {
+/**
+ * o3d-bddq round 5 — AN UNREADABLE STATE IS NEVER AN EMPTY STATE.
+ *
+ * Round 4 mapped every git failure to `null` and read `null` as "no changed paths". A base that
+ * resolved but had no merge base made `git diff base...HEAD` fail, the BRANCH locus saw nothing, and
+ * a change split across two commits (archive/ in one, the manifest in the other — so the tip commit
+ * touches only the manifest) passed with exit 0. A missing base was a printed NOTICE and exit 0.
+ * Every arm below asserts its PRECONDITION first, so it cannot pass vacuously if git behaves
+ * differently from what the arm assumes.
+ */
+function splitChangeOnBranch(repo: string): void {
+  git(repo, ['checkout', '-q', '-b', 'feature'])
+  writeFileSync(path.join(repo, 'archive/connectors/one.ts'), 'export const one = 999\n')
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 'touch the archive'])
+  reseal(repo)
+  git(repo, ['add', '-A'])
+  git(repo, ['commit', '-qm', 're-seal, separately, with no trailer anywhere'])
+  const tip = git(repo, ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD']).trim().split('\n')
+  assert.deepEqual(tip, ['scripts/archive-sealed-manifest.tsv'], 'PRECONDITION: the tip commit touches only the manifest')
+}
+
+function gitStatus(cwd: string, args: string[]): number {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  return result.status ?? -1
+}
+
+/** A `git` on PATH that fails when the shell test `failWhen` holds, and defers to the real git otherwise. */
+function withGitShim(failWhen: string, label: string, run: (env: Record<string, string>) => void): void {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'archive-seal-shim-'))
+  try {
+    const real = execFileSync('which', ['git'], { encoding: 'utf8' }).trim()
+    const shim = path.join(dir, 'git')
+    writeFileSync(shim, `#!/bin/sh\nif ${failWhen}; then echo "shim: simulated ${label} failure" >&2; exit 128; fi\nexec "${real}" "$@"\n`, { mode: 0o755 })
+    run({ PATH: `${dir}:${process.env.PATH ?? ''}` })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('o3d-bddq r5: a base that RESOLVES but has no merge base is REFUSED, not read as an empty diff', () => {
   withScratchRepo((repo) => {
+    // An unrelated root commit: the shape a shallow clone gives when the base ref and HEAD no longer
+    // share history within the fetched depth.
+    git(repo, ['checkout', '-q', '--orphan', 'unrelated'])
+    git(repo, ['rm', '-rfq', '.'])
+    writeFileSync(path.join(repo, 'x.txt'), 'x\n')
+    git(repo, ['add', 'x.txt'])
+    git(repo, ['commit', '-qm', 'unrelated root'])
+    git(repo, ['checkout', '-q', 'main'])
+    splitChangeOnBranch(repo)
+    // PRECONDITIONS: the base resolves, and the three-dot diff really fails (git: "no merge base").
+    assert.equal(gitStatus(repo, ['rev-parse', '--verify', '--quiet', 'unrelated^{commit}']), 0, 'PRECONDITION: the base resolves')
+    assert.notEqual(gitStatus(repo, ['merge-base', 'unrelated', 'HEAD']), 0, 'PRECONDITION: there is no merge base')
+    assert.notEqual(gitStatus(repo, ['diff', '--name-only', 'unrelated...HEAD']), 0, 'PRECONDITION: the three-dot diff fails')
+    const { status, output } = runSealIn(repo, { ARCHIVE_SEAL_BASE_REF: 'unrelated' })
+    assert.notEqual(status, 0, `an unreadable branch diff must refuse, not pass:\n${output}`)
+    assert.match(output, /CANNOT RUN/)
+    assert.match(output, /merge base/)
+    assert.match(output, /ARCHIVE_SEAL_BASE_REF/, 'the message must say how to fix it')
+    assert.doesNotMatch(output, /archived path\(s\) match/, 'it must not also print the success line')
+  })
+})
+
+test('o3d-bddq r5: a merge base that exists but a THREE-DOT DIFF THAT FAILS is refused', () => {
+  withScratchRepo((repo) => {
+    splitChangeOnBranch(repo)
+    // The script also runs `git diff` for the WORKTREE subject, so fail only the three-dot range form.
+    withGitShim('[ "$1" = "diff" ] && case "$*" in *...*) true;; *) false;; esac', 'range-diff', (shimEnv) => {
+      // PRECONDITIONS: the merge base resolves, and the range diff fails through the shim only.
+      assert.equal(spawnSync('git', ['merge-base', 'development', 'HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } }).status, 0, 'PRECONDITION: a merge base exists')
+      assert.notEqual(spawnSync('git', ['diff', '--name-only', 'development...HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } }).status, 0, 'PRECONDITION: the range diff fails')
+      assert.equal(gitStatus(repo, ['diff', '--name-only', 'development...HEAD']), 0, 'PRECONDITION: real git can run it')
+      const { status, output } = runSealIn(repo, shimEnv)
+      assert.notEqual(status, 0, `a failed branch diff must refuse, not read as no changes:\n${output}`)
+      assert.match(output, /BRANCH co-change locus/)
+      assert.match(output, /git diff --no-ext-diff --name-only development\.\.\.HEAD/, 'the message names the command that failed')
+      assert.doesNotMatch(output, /archived path\(s\) match/)
+    })
+  })
+})
+
+test('o3d-bddq r5: a base ref that does not exist is REFUSED, not announced and passed', () => {
+  withScratchRepo((repo) => {
+    assert.notEqual(gitStatus(repo, ['rev-parse', '--verify', '--quiet', 'refs/heads/no-such-base^{commit}']), 0, 'PRECONDITION: the base does not resolve')
     const { status, output } = runSealIn(repo, { ARCHIVE_SEAL_BASE_REF: 'refs/heads/no-such-base' })
-    // A locus that cannot run must say so rather than be silently absent — "it printed nothing" is
-    // how this whole defect class travels.
-    assert.match(output, /BRANCH co-change locus did NOT RUN/)
-    assert.equal(status, 0, `an absent base is announced, not fatal:\n${output}`)
+    assert.notEqual(status, 0, `a missing base must refuse:\n${output}`)
+    assert.match(output, /BRANCH co-change locus CANNOT RUN/)
+    assert.match(output, /ARCHIVE_SEAL_BASE_REF/)
+    assert.doesNotMatch(output, /archived path\(s\) match/)
+  })
+})
+
+test('o3d-bddq r5: with NO default base (origin/development and development both absent) the check is REFUSED', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['branch', '-D', 'development'])
+    for (const ref of ['origin/development', 'development']) {
+      assert.notEqual(gitStatus(repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]), 0, `PRECONDITION: ${ref} is absent`)
+    }
+    const { status, output } = runSealIn(repo)
+    assert.notEqual(status, 0, `no base anywhere must refuse:\n${output}`)
+    assert.match(output, /none of origin\/development, development resolves/)
+  })
+})
+
+test('o3d-bddq r5: a failing tip-commit diff-tree is REFUSED, not read as "no changed paths"', () => {
+  withScratchRepo((repo) => {
+    withGitShim('[ "$1" = "diff-tree" ]', 'diff-tree', (shimEnv) => {
+      const probe = spawnSync('git', ['diff-tree', '-r', '-c', '--no-commit-id', '--name-only', 'HEAD'], { cwd: repo, env: { ...process.env, ...shimEnv } })
+      assert.notEqual(probe.status, 0, 'PRECONDITION: diff-tree really fails through the shim')
+      assert.equal(runSealIn(repo).status, 0, 'PRECONDITION: the same repo passes with real git')
+      const { status, output } = runSealIn(repo, shimEnv)
+      assert.notEqual(status, 0, `a failed diff-tree must refuse:\n${output}`)
+      assert.match(output, /tip-commit co-change locus/)
+      assert.match(output, /diff-tree/)
+    })
+  })
+})
+
+test('o3d-bddq r5 control: trunk itself (base == HEAD, empty branch diff) PASSES', () => {
+  withScratchRepo((repo) => {
+    const head = git(repo, ['rev-parse', 'HEAD']).trim()
+    assert.equal(git(repo, ['rev-parse', 'development']).trim(), head, 'PRECONDITION: the base is HEAD')
+    assert.equal(git(repo, ['diff', '--name-only', 'development...HEAD']).trim(), '', 'PRECONDITION: the branch diff is empty')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 0, output)
+    assert.match(output, /2 archived path\(s\) match/)
+  })
+})
+
+test('o3d-bddq r5 control: a full-history branch that does not touch archive/ PASSES', () => {
+  withScratchRepo((repo) => {
+    git(repo, ['checkout', '-q', '-b', 'feature'])
+    mkdirSync(path.join(repo, 'lib'), { recursive: true })
+    writeFileSync(path.join(repo, 'lib/live.ts'), 'export const live = 1\n')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-qm', 'live work'])
+    const changed = git(repo, ['diff', '--name-only', 'development...HEAD']).trim().split('\n')
+    assert.deepEqual(changed, ['lib/live.ts'], 'PRECONDITION: the branch diff is non-empty, resolvable, and touches no archive/ path')
+    const { status, output } = runSealIn(repo)
+    assert.equal(status, 0, output)
   })
 })
 
