@@ -141,7 +141,44 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
   pin('port', argValue('--expect-port'))
   pin('systemIdentifier', argValue('--expect-system-id'))
 
-  if (pinnedFields.length > 0) {
+  // NO PIN AT ALL: the operator names the database by TYPING it. That is not a second route to the write --
+  // it becomes a `database` pin and falls through to the SAME checks and the SAME `dischargeIdentity` call
+  // as every flag combination (round 20). Typing is an interactive acknowledgement of the weaker mode, which
+  // is why `typed` feeds `acknowledged` below.
+  let typed = false
+  if (pinnedFields.length === 0) {
+    if (!process.stdin.isTTY) {
+      console.error(
+        `REFUSED: about to write to ${describeServerIdentity(identity)}, but there is nobody to confirm `
+        + 'it and no --expect-db was given. Nothing was written. Re-run with --expect-db '
+        + `${identity.database} if that is genuinely the database you mean.`,
+      )
+      return { ok: false }
+    }
+    process.stderr.write(`Type the database name "${identity.database}" to proceed, or anything else to abort: `)
+    const answer = await new Promise<string>((resolve) => {
+      let buffer = ''
+      process.stdin.setEncoding('utf8')
+      const onData = (chunk: string) => {
+        buffer += chunk
+        if (buffer.includes('\n')) {
+          process.stdin.off('data', onData)
+          process.stdin.pause()
+          resolve(buffer.slice(0, buffer.indexOf('\n')).trim())
+        }
+      }
+      process.stdin.on('data', onData)
+      process.stdin.resume()
+    })
+    if (answer !== identity.database) {
+      console.error(`REFUSED: you typed "${answer}", which is not "${identity.database}". Nothing was written.`)
+      return { ok: false }
+    }
+    pin('database', identity.database)
+    typed = true
+  }
+
+  {
     // A PIN THAT CANNOT BE VERIFIED IS REFUSED, NOT SKIPPED (round 16, HIGH 2). `compareServerIdentity`
     // deliberately skips `systemIdentifier` when either side reads `unavailable` -- correct for the
     // UNPINNED path, where absence of evidence is not evidence of a mismatch -- but letting that one rule
@@ -175,7 +212,7 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
     // over {pinned fields} x {acknowledged}, so a generated test can assert it for EVERY reachable
     // combination rather than for the ones someone thought of. Rounds 16 and 18 each patched one
     // combination and left the next; this stops that sequence rather than adding to it.
-    const acknowledged = process.argv.includes('--accept-name-only')
+    const acknowledged = typed || process.argv.includes('--accept-name-only')
     const discharge = dischargeIdentity({ pinnedFields, acknowledged })
     if (!discharge.allowed) {
       if (discharge.reason === 'unnamed-database') {
@@ -201,44 +238,12 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
     return {
       ok: true,
       pinnedFields,
-      route: discharge.route,
+      route: typed && discharge.route === 'name-only-acknowledged' ? 'typed-at-tty' : discharge.route,
       // NEVER asserts an acknowledgement was unnecessary: it is false ONLY when the identifier actually
       // established the target, which is exactly what `route` says.
       acceptedNameOnly: discharge.route !== 'system-identifier',
     }
   }
-
-  if (!process.stdin.isTTY) {
-    console.error(
-      `REFUSED: about to write to ${describeServerIdentity(identity)}, but there is nobody to confirm `
-      + 'it and no --expect-db was given. Nothing was written. Re-run with --expect-db '
-      + `${identity.database} if that is genuinely the database you mean.`,
-    )
-    return { ok: false }
-  }
-
-  process.stderr.write(`Type the database name "${identity.database}" to proceed, or anything else to abort: `)
-  const typed = await new Promise<string>((resolve) => {
-    let buffer = ''
-    process.stdin.setEncoding('utf8')
-    const onData = (chunk: string) => {
-      buffer += chunk
-      if (buffer.includes('\n')) {
-        process.stdin.off('data', onData)
-        process.stdin.pause()
-        resolve(buffer.slice(0, buffer.indexOf('\n')).trim())
-      }
-    }
-    process.stdin.on('data', onData)
-    process.stdin.resume()
-  })
-  if (typed !== identity.database) {
-    console.error(`REFUSED: you typed "${typed}", which is not "${identity.database}". Nothing was written.`)
-    return { ok: false }
-  }
-  // Typing the name is exactly as strong as --expect-db alone -- the name is clone-invariant -- so it
-  // carries the same acknowledgement rather than discharging it.
-  return { ok: true, pinnedFields: ['database'], route: 'typed-at-tty', acceptedNameOnly: true }
 }
 
 const VALUE_FLAGS = ['--bom', '--expect-db', '--expect-host', '--expect-port', '--expect-system-id']
@@ -284,20 +289,24 @@ function validateArgv(argv: string[]): string | null {
   if (seen.has('--list') && seen.has('--dry-run')) return '--list writes nothing, so --dry-run is meaningless with it'
   if (!seen.has('--list') && !seen.has('--bom')) return 'nothing to do: pass --list or --bom <id>'
 
-  // THE TARGET DATABASE MUST ALWAYS BE NAMED for a non-interactive write (round 18). Without this,
-  // `--expect-host` or `--expect-port` could be supplied ALONE: the run would then never state which
-  // database it meant, and because the in-transaction check compares the server against its own preflight
-  // reading, an initially wrong target is not caught by it at all. A TTY run is exempt because typing the
-  // name at the prompt IS naming it.
+  // THE TARGET DATABASE MUST ALWAYS BE NAMED for a write (rounds 18 and 20). Without this,
+  // `--expect-host`, `--expect-port` or `--expect-system-id` could be supplied ALONE: the run would then
+  // never state which database it meant -- the same BOM id can exist in a restored database on the SAME
+  // cluster, so even the cluster identifier does not say -- and because the in-transaction check compares
+  // the server against its own preflight reading, an initially wrong target is not caught by it at all.
+  // Round 20: this used to exempt every TTY run, so on a TTY any identity pin skipped the typed-name
+  // prompt. Now only a run with NO pin at all reaches the prompt (typing the name IS naming it); a TTY run
+  // that pins something else must still name the database by flag. REFUSED before connecting, and
+  // `dischargeIdentity` is the backstop if this is ever bypassed.
   //
   // Checked here rather than after connecting, so a usage mistake cannot reach a database.
   const writing = seen.has('--bom') && !seen.has('--dry-run')
   const pinsSomething = seen.has('--expect-db') || seen.has('--expect-host')
     || seen.has('--expect-port') || seen.has('--expect-system-id')
-  if (writing && !process.stdin.isTTY && !seen.has('--expect-db')) {
+  if (writing && !seen.has('--expect-db') && (!process.stdin.isTTY || pinsSomething)) {
     return pinsSomething
-      ? 'a write must always name the target database: add --expect-db <name>. Pinning only --expect-host '
-        + 'or --expect-port never says WHICH database you meant'
+      ? 'a write must always name the target database: add --expect-db <name>. Pinning only --expect-host, '
+        + '--expect-port or --expect-system-id never says WHICH database you meant'
       : 'a write must name the target database: add --expect-db <name>'
   }
   return null

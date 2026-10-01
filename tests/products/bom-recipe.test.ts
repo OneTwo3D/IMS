@@ -14,7 +14,7 @@ import {
   syncBomRecipeFromProductComponents,
   toRecipeMap,
 } from '../../lib/products/bom-recipe.ts'
-import { dischargeIdentity } from '../../lib/products/bom-recipe-repair.ts'
+import { type ServerIdentity, dischargeIdentity } from '../../lib/products/bom-recipe-repair.ts'
 
 /**
  * o3d-zjsb5.9 — BOM RECIPES HAD NO IMPORT PATH.
@@ -623,53 +623,50 @@ test('[o3d-zjsb5.9 r20] UNIVERSAL: every combination of pins discharges identity
 
   // THE FIELD LIST IS NOT TRUSTED: it is checked against a real ServerIdentity's own keys, so a field added
   // to the composite without being considered here fails rather than being silently unexamined.
-  const sampleIdentity = { database: 'd', host: 'h', port: 'p', systemIdentifier: 's' }
+  const sampleIdentity: ServerIdentity = { database: 'd', host: 'h', port: 'p', systemIdentifier: 's' }
   assert.deepEqual(
     Object.keys(sampleIdentity).sort(), [...FIELDS].sort(),
     'ServerIdentity gained or lost a field — extend this test, because an unconsidered field is exactly '
     + 'how the last two bypasses happened',
   )
 
+  // THE EXPECTED TABLE IS WRITTEN OUT, not computed. A loop that derives each expectation from `includes`
+  // restates the implementation, so it would agree with any rewrite of it -- including a wrong one. This is
+  // a literal of all 16 pin sets (D database, H host, P port, S system identifier) x acknowledged
+  // [false, true], so each row is an independent claim about one input.
+  const U = { allowed: false, reason: 'unnamed-database' } as const
+  const N = { allowed: false, reason: 'not-established' } as const
+  const ID = { allowed: true, route: 'system-identifier' } as const
+  const ACK = { allowed: true, route: 'name-only-acknowledged' } as const
+  const EXPECTED: Record<string, [unknown, unknown]> = {
+    // pins:   [acknowledged=false, acknowledged=true]
+    '':     [U, U],    'H':    [U, U],    'P':    [U, U],    'HP':   [U, U],
+    'S':    [U, U],    'HS':   [U, U],    'PS':   [U, U],    'HPS':  [U, U],
+    'D':    [N, ACK],  'DH':   [N, ACK],  'DP':   [N, ACK],  'DHP':  [N, ACK],
+    'DS':   [ID, ID],  'DHS':  [ID, ID],  'DPS':  [ID, ID],  'DHPS': [ID, ID],
+  }
+  const LETTER = { database: 'D', host: 'H', port: 'P', systemIdentifier: 'S' } as const
+  assert.equal(Object.keys(EXPECTED).length, 16, 'the table must cover every one of the 16 pin sets')
+
+  let examined = 0
   let allowedCount = 0
-  let refusedCount = 0
   for (let mask = 0; mask < 1 << FIELDS.length; mask += 1) {
     const pinnedFields = FIELDS.filter((_, index) => (mask & (1 << index)) !== 0)
+    const key = pinnedFields.map((field) => LETTER[field]).sort((a, b) => 'DHPS'.indexOf(a) - 'DHPS'.indexOf(b)).join('')
+    assert.ok(key in EXPECTED, `pin set "${key}" has no row in the expected table`)
     for (const acknowledged of [false, true]) {
       const got = dischargeIdentity({ pinnedFields, acknowledged })
-      const named = pinnedFields.includes('database')
-      const byIdentifier = pinnedFields.includes('systemIdentifier')
-      const label = `pins=[${pinnedFields.join(',')}] acknowledged=${acknowledged}`
-
-      if (!named) {
-        assert.deepEqual(got, { allowed: false, reason: 'unnamed-database' },
-          `${label}: a write must always NAME the target database`)
-        refusedCount += 1
-        continue
-      }
-      if (byIdentifier) {
-        assert.deepEqual(got, { allowed: true, route: 'system-identifier' },
-          `${label}: the cluster identifier establishes the target`)
-        allowedCount += 1
-        continue
-      }
-      if (acknowledged) {
-        assert.deepEqual(got, { allowed: true, route: 'name-only-acknowledged' },
-          `${label}: the weaker mode is allowed only when explicitly acknowledged`)
-        allowedCount += 1
-        continue
-      }
-      // EVERY remaining case is clone-invariant pins only, and must refuse however many were supplied.
-      assert.deepEqual(got, { allowed: false, reason: 'not-established' },
-        `${label}: clone-invariant pins establish nothing, however many are supplied`)
-      refusedCount += 1
+      assert.deepEqual(got, EXPECTED[key][acknowledged ? 1 : 0],
+        `pins=[${pinnedFields.join(',')}] acknowledged=${acknowledged}`)
+      examined += 1
+      if (got.allowed) allowedCount += 1
     }
   }
 
-  // THE LOOP REACHED BOTH OUTCOMES. Without this, a `dischargeIdentity` that refused everything -- or
-  // allowed everything -- could pass whichever branch happened to be asserted.
-  assert.equal(allowedCount + refusedCount, 32, 'every one of the 32 inputs must have been examined')
-  assert.equal(allowedCount, 12, 'and 12 of them must be ALLOWED (named, and either identified or acknowledged)')
-  assert.equal(refusedCount, 20, 'with the other 20 refused')
+  // THE LOOP REACHED BOTH OUTCOMES: a function that refused everything, or allowed everything, would fail
+  // a row above, and these counts show the loop was not vacuous.
+  assert.equal(examined, 32, 'every one of the 32 inputs must have been examined')
+  assert.equal(allowedCount, 12, '12 are allowed (named, and either identified or acknowledged)')
 })
 
 test('[o3d-zjsb5.9 r20] UNIVERSAL: the write has no route that bypasses the decision', async () => {

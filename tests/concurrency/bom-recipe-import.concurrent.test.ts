@@ -1,6 +1,6 @@
 import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import test, { mock } from 'node:test'
 import { promisify } from 'node:util'
 import { PrismaPg } from '@prisma/adapter-pg'
@@ -253,6 +253,34 @@ async function runRepairScript(
     const failure = error as { code?: number; stdout?: string; stderr?: string }
     return { code: failure.code ?? 1, stdout: failure.stdout ?? '', stderr: failure.stderr ?? String(error) }
   }
+}
+
+/**
+ * THE SAME COMMAND UNDER A REAL PSEUDO-TERMINAL (round 20). `execFile` gives the child a pipe, so
+ * `process.stdin.isTTY` is false and every branch that depends on a human being present is unreachable
+ * from `runRepairScript`. util-linux `script` allocates a pty, so the script genuinely sees a TTY. Exit
+ * status is propagated by `-e`; the pty merges stdout and stderr into one stream, returned as `output`.
+ * `typed` is what the "operator" types at a prompt, if one appears.
+ */
+async function runRepairScriptOnTty(
+  args: string[],
+  typed = '',
+): Promise<{ code: number; output: string }> {
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+  const command = ['npx', 'tsx', 'scripts/deactivate-duplicate-bom.ts', ...args].map(quote).join(' ')
+  return new Promise((resolve) => {
+    const child = spawn('script', ['-qec', command, '/dev/null'], {
+      cwd: process.cwd(),
+      env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
+    })
+    let output = ''
+    child.stdout.on('data', (chunk) => { output += String(chunk) })
+    child.stderr.on('data', (chunk) => { output += String(chunk) })
+    // Input is queued in the pty line buffer, so it does not matter that the prompt appears later.
+    if (typed) child.stdin.write(`${typed}\n`)
+    const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, output }) })
+  })
 }
 
 async function snapshotRecipe(deps: Deps, productId: string, bomId: string) {
@@ -1500,6 +1528,86 @@ test(
       'name-only-acknowledged', 'the audit row must record the acknowledgement route')
     assert.equal((ackAudit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, true,
       'and must NOT claim an acknowledgement was unnecessary -- that was the bug')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r20] ON A TTY, a write that pins other fields but never names the database is REFUSED',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 20, HIGH. `--expect-db` was required only when stdin was NOT a TTY, so on a TTY any identity
+     * flag took the pinned branch and skipped the typed-name prompt: `--bom <id> --expect-system-id <id>`
+     * wrote without ever saying WHICH database on that cluster was meant, and the audit row recorded
+     * `identityRoute: system-identifier, acceptedNameOnly: false`. The same BOM id can exist in a restored
+     * database on the same cluster, so the cluster identifier alone does not name the target.
+     *
+     * This drives the operator's command under a real pty, which `runRepairScript` cannot (its child has a
+     * pipe for stdin), so the TTY-only branch is actually reached.
+     */
+    const deps = await loadDeps()
+    const NS = 'T'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const live = await deps.readServerIdentity(deps.db)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.notEqual(live.systemIdentifier, 'unavailable', 'precondition: the identifier must be readable')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+    const auditOf = async (id: string) => (await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: id } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })).metadata as { identityRoute?: string; acceptedNameOnly?: boolean } | null
+
+    // PRECONDITION: the pty really is a TTY. With a wrong typed name the script must reach the PROMPT and
+    // refuse on what was typed. A non-TTY run would instead say "nobody to confirm", so this fails loudly
+    // if the harness stopped providing a terminal and every arm below would be examining nothing.
+    const control = await makeDuplicate('control')
+    const wrong = await runRepairScriptOnTty(['--bom', control], 'not-the-database')
+    assert.equal(wrong.code, 3, `control: a wrong typed name must be REFUSED (exit 3): ${wrong.output}`)
+    assert.match(wrong.output, /you typed "not-the-database"/, `control: the prompt must have been reached: ${wrong.output}`)
+    assert.equal(await active(control), true, 'control: nothing written')
+
+    // THE FINDING: --expect-system-id, no --expect-db, on a TTY. Every typed answer must be irrelevant,
+    // because it is refused before connecting; the correct database name is supplied to prove that.
+    for (const [what, args] of [
+      ['system id only', ['--expect-system-id', live.systemIdentifier]],
+      ['system id plus host and port', [
+        '--expect-system-id', live.systemIdentifier, '--expect-host', live.host, '--expect-port', live.port]],
+      ['system id plus the acknowledgement', ['--expect-system-id', live.systemIdentifier, '--accept-name-only']],
+      ['host only', ['--expect-host', live.host]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScriptOnTty(['--bom', id, ...args], db)
+      assert.equal(run.code, 1, `${what}: must be REFUSED as a usage error (exit 1), got ${run.code}: ${run.output}`)
+      assert.match(run.output, /name the target database/i, `${what}: must say why: ${run.output}`)
+      assert.doesNotMatch(run.output, /Type the database name/, `${what}: must be refused BEFORE any prompt`)
+      assert.equal(await active(id), true, `${what}: must NOT have written anything`)
+    }
+
+    // THE POSITIVE ARMS, so the refusals above are not simply "everything on a TTY refuses".
+    const named = await makeDuplicate('named plus identifier')
+    const okRun = await runRepairScriptOnTty(['--bom', named, '--expect-db', db, '--expect-system-id', live.systemIdentifier])
+    assert.equal(okRun.code, 0, `named plus identifier must be allowed on a TTY: ${okRun.output}`)
+    assert.equal(await active(named), false, 'and must deactivate it')
+    assert.deepEqual(await auditOf(named), { ...(await auditOf(named)), identityRoute: 'system-identifier', acceptedNameOnly: false })
+
+    const typedId = await makeDuplicate('typed')
+    const typedRun = await runRepairScriptOnTty(['--bom', typedId], db)
+    assert.equal(typedRun.code, 0, `typing the right name must be allowed: ${typedRun.output}`)
+    assert.equal(await active(typedId), false, 'and must deactivate it')
+    const typedAudit = await auditOf(typedId)
+    assert.equal(typedAudit?.identityRoute, 'typed-at-tty', 'the audit row must record the typed route')
+    assert.equal(typedAudit?.acceptedNameOnly, true, 'and must not claim an acknowledgement was unnecessary')
   },
 )
 
