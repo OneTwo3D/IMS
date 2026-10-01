@@ -1694,14 +1694,10 @@ test('o3d-8m8pe: a cancelled linked freight order contributes nothing to the WMS
  * freight order, the accounting connector switched on, and the STOCK_RECEIPT log/transit readers — are
  * all here, and arm 3 already drives `receivePurchaseOrder` from this file for the same reason.
  *
- * WHY THE RECEIPT IS PARTIAL. A FULL receipt enters the `allReceived` branch, which tries to mark every
- * linked freight order RECEIVED and throws on a CANCELLED one
- * (`validateLinkedFreightReceiptStatus`) — i.e. the whole receipt is refused before any cost is read,
- * so the cost question could not be asked at all. That refusal is an ADJACENT defect (a cancelled
- * freight link blocks a full manual receipt outright) and is FILED, not fixed here: o3d-8m8pe's scope is
- * the cost read. A PARTIAL receipt skips that branch, and the gross unit cost the helper computes does
- * not depend on the received quantity — it is the line's own qty and totalBase — so the partial receipt
- * measures exactly the same number the full one would.
+ * WHY THE RECEIPT IS PARTIAL. This arm isolates the COST read. The FULL receipt, which also runs the
+ * auto-receive loop over the links, is arm 13b below (that loop used to reject a CANCELLED freight order
+ * and roll the whole receipt back — o3d-c1qdi, fixed in the same change). The gross unit cost the helper
+ * computes does not depend on the received quantity, so this partial receipt measures the same number.
  *
  * WHAT WOULD STILL PASS THIS ARM: the same `allocated` filter arm 12 names, and a fix applied only to
  * the book-in (arm 12 is the one that catches the reverse).
