@@ -21,6 +21,8 @@ const state = {
   syncLogs: [] as Row[],
   activity: [] as Row[],
   linked: true,
+  mappings: [] as Array<{ externalStatus: string; imsStatus: string }>,
+  fetchThrows: false,
 }
 
 mock.module('@/lib/activity-log', {
@@ -37,6 +39,9 @@ mock.module('@/lib/db', {
           shoppingLinks: state.linked ? [{ externalOrderId: '1001', externalOrderNumber: '1001' }] : [],
         }),
       },
+      // The importer's own reading of a status (readWcOrderStatus) reads the mapping table.
+      shoppingStatusMapping: { findMany: async () => state.mappings },
+      setting: { findMany: async () => [] },
       shoppingSyncLog: {
         create: async ({ data }: { data: Row }) => { state.syncLogs.push(data); return data },
       },
@@ -47,6 +52,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (path: string) => {
       state.fetches.push(path)
+      if (state.fetchThrows) throw new Error('socket hang up')
       if (state.fetchError) return { data: null, totalPages: 0, totalItems: 0, error: state.fetchError }
       return { data: { status: state.wcStatus }, totalPages: 1, totalItems: 1 }
     },
@@ -68,17 +74,20 @@ beforeEach(() => {
   state.syncLogs.length = 0
   state.activity.length = 0
   state.linked = true
+  state.mappings = []
+  state.fetchThrows = false
 })
 
 async function push(status: string) {
   const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
-  await pushImsStatusToWc('so-1', status)
+  return pushImsStatusToWc('so-1', status)
 }
 
 test('o3d-zvec.15 (c0): a PROCESSING order is promoted to completed, once', async () => {
-  await push('SHIPPED')
+  const outcome = await push('SHIPPED')
   assert.equal(state.fetches.length, 1, 'precondition: WooCommerce was asked what state the order is in')
   assert.deepEqual(state.puts, [{ path: '/orders/1001', body: { status: 'completed' } }])
+  assert.deepEqual(outcome, { kind: 'pushed' })
 })
 
 test('o3d-zvec.15 (c): an order WooCommerce no longer holds as processing is NEVER promoted', async () => {
@@ -87,7 +96,8 @@ test('o3d-zvec.15 (c): an order WooCommerce no longer holds as processing is NEV
     state.puts.length = 0
     state.activity.length = 0
     state.wcStatus = wcStatus
-    await push('SHIPPED')
+    const outcome = await push('SHIPPED')
+    assert.equal(outcome.kind, 'ineligible', `${wcStatus}: reported as ineligible, not as success`)
     assert.equal(state.fetches.length, 1, `${wcStatus}: precondition — the status was really read`)
     assert.deepEqual(state.puts, [], `${wcStatus}: no write may resurrect the order`)
     assert.equal(
@@ -99,7 +109,8 @@ test('o3d-zvec.15 (c): an order WooCommerce no longer holds as processing is NEV
 
 test('o3d-zvec.15 (c2): an UNREADABLE WooCommerce status fails closed — no promotion', async () => {
   state.fetchError = 'HTTP 503'
-  await push('SHIPPED')
+  const outcome = await push('SHIPPED')
+  assert.deepEqual(outcome, { kind: 'read-failed', error: 'HTTP 503' }, 'a failed read is a FAILURE, never void/success (HIGH 2)')
   assert.equal(state.fetches.length, 1, 'precondition: the read was attempted and failed')
   assert.deepEqual(state.puts, [])
   const skipped = state.activity.filter((a) => a.action === 'wc_completion_skipped')
@@ -109,7 +120,8 @@ test('o3d-zvec.15 (c2): an UNREADABLE WooCommerce status fails closed — no pro
 
 test('o3d-zvec.15 (c3): an order WooCommerce already holds as completed is not re-PUT (no second email)', async () => {
   state.wcStatus = 'completed'
-  await push('SHIPPED')
+  const outcome = await push('SHIPPED')
+  assert.deepEqual(outcome, { kind: 'already-at-target' })
   assert.equal(state.fetches.length, 1, 'precondition: it read completed')
   assert.deepEqual(state.puts, [])
 })
@@ -141,7 +153,8 @@ test('o3d-zvec.15 (f): the promotion is recorded so the inbound webhook echo is 
 
 test('o3d-zvec.15: a failed write is logged and nothing is recorded as pushed', async () => {
   state.putError = 'HTTP 500'
-  await push('SHIPPED')
+  const outcome = await push('SHIPPED')
+  assert.deepEqual(outcome, { kind: 'write-failed', error: 'HTTP 500' })
   assert.equal(state.puts.length, 1, 'precondition: the write was attempted')
   assert.deepEqual(state.syncLogs, [])
   assert.equal(state.activity.filter((a) => a.action === 'wc_push_failed').length, 1)
@@ -149,7 +162,55 @@ test('o3d-zvec.15: a failed write is logged and nothing is recorded as pushed', 
 
 test('o3d-zvec.15: an order with no WooCommerce link is left alone', async () => {
   state.linked = false
-  await push('SHIPPED')
+  const outcome = await push('SHIPPED')
+  assert.deepEqual(outcome, { kind: 'not-applicable' })
   assert.deepEqual(state.fetches, [])
+  assert.deepEqual(state.puts, [])
+})
+
+// --- o3d-zvec.15 review HIGHs --------------------------------------------------------------------
+
+test('o3d-zvec.15 (HIGH 1): a CUSTOM ready status the importer maps to an in-flight status is completed', async () => {
+  const cases: Array<{ wc: string; mapping: { externalStatus: string; imsStatus: string } | null }> = [
+    { wc: 'ready-to-ship', mapping: { externalStatus: 'ready-to-ship', imsStatus: 'PROCESSING' } },
+    { wc: 'packed-custom', mapping: { externalStatus: 'wc-packed-custom', imsStatus: 'PACKING' } },
+    { wc: 'partial-shipped', mapping: null }, // our own plugin's status: no mapping row at all
+  ]
+  let evaluated = 0
+  for (const c of cases) {
+    state.puts.length = 0
+    state.fetches.length = 0
+    state.wcStatus = c.wc
+    state.mappings = c.mapping ? [c.mapping] : []
+    const outcome = await push('SHIPPED')
+    assert.equal(state.fetches.length, 1, `${c.wc}: precondition — the status was read`)
+    assert.deepEqual(outcome, { kind: 'pushed' }, c.wc)
+    assert.deepEqual(state.puts, [{ path: '/orders/1001', body: { status: 'completed' } }], c.wc)
+    evaluated++
+  }
+  assert.equal(evaluated, 3)
+})
+
+test('o3d-zvec.15 (HIGH 1): refunded with NO mapping row is still refused although the built-in reading is PROCESSING', async () => {
+  state.wcStatus = 'refunded'
+  state.mappings = []
+  const outcome = await push('SHIPPED')
+  assert.equal(state.fetches.length, 1, 'precondition: read')
+  assert.deepEqual(outcome, { kind: 'ineligible', wcStatus: 'refunded', class: 'finalised' })
+  assert.deepEqual(state.puts, [])
+})
+
+test('o3d-zvec.15 (HIGH 1): an UNMAPPED custom status is held with class unknown', async () => {
+  state.wcStatus = 'awaiting-courier'
+  const outcome = await push('SHIPPED')
+  assert.deepEqual(outcome, { kind: 'ineligible', wcStatus: 'awaiting-courier', class: 'unknown' })
+  assert.deepEqual(state.puts, [])
+})
+
+test('o3d-zvec.15 (HIGH 2): a THROWING WooCommerce read is reported as an error, not swallowed', async () => {
+  state.fetchThrows = true
+  const outcome = await push('SHIPPED')
+  assert.equal(state.fetches.length, 1, 'precondition: the throwing double was reached')
+  assert.deepEqual(outcome, { kind: 'error', error: 'socket hang up' })
   assert.deepEqual(state.puts, [])
 })

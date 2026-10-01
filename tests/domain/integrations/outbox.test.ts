@@ -24,6 +24,7 @@ import {
   type IntegrationOutboxDrainLeaseMs,
 } from '@/lib/domain/integrations/outbox-leases'
 import {
+  INTEGRATION_OUTBOX_OPERATIONS,
   INTEGRATION_OUTBOX_REGISTRY,
   integrationOutboxReplayPolicy,
   integrationOutboxStaleReclaimScope,
@@ -906,7 +907,7 @@ test('every registered outbox operation declares a known replay-safety answer an
   }
   // The walk itself is asserted, not just its verdict: a registry this loop failed to enumerate
   // would otherwise pass by examining nothing.
-  assert.ok(declared.length >= 7, `expected the registry walk to reach every operation, saw ${declared.length}`)
+  assert.ok(declared.length >= 8, `expected the registry walk to reach every operation, saw ${declared.length}`)
   for (const { key, replay, keyedBy } of declared) {
     assert.ok(
       (OUTBOX_REPLAY_SAFETY_VALUES as readonly string[]).includes(replay),
@@ -935,6 +936,10 @@ test('every registered outbox operation declares a known replay-safety answer an
       'mintsoft/inbound.booked-in',
       'sales/refund.reservation-release',
       'sales/refund.unmatched-warning',
+      // o3d-zvec.15: assessed on o3d-8td2's terms. The effect is a customer-visible status PUT behind a
+      // fresh GET + eligibility check on every attempt, with the tracking write, the sync-log row and the
+      // activity log outside that guard: an effect sequence, hence unsafe-to-replay (no stale reclaim).
+      'woocommerce/order.complete',
       'woocommerce/stock.push',
       'xero/accounting.post',
     ],
@@ -952,6 +957,9 @@ test('the seven verdicts are the round-3 corrected ones', () => {
     // Codex round 2 HIGH 1: absolute-value writes are safe against repetition, NOT against a
     // reordering, and WooCommerce offers no token to reject a regression with.
     'woocommerce/stock.push': 'unsafe-to-replay',
+    // o3d-zvec.15: the completed push fires WooCommerce's customer email; the tracking write sits outside its
+    // guard. An effect sequence, so no safe verdict.
+    'woocommerce/order.complete': 'unsafe-to-replay',
     // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an EmailOutbox
     // row that no fence couples to this worker's completion. ROUND 16: this line used to add "whose
     // own queue is unfenced — o3d-alnk", and o3d-alnk is the branch that stopped it being true. The
@@ -969,6 +977,18 @@ test('the seven verdicts are the round-3 corrected ones', () => {
     'sales/refund.reservation-release': 'local-only-guarded',
     'sales/refund.unmatched-warning': 'local-only-guarded',
   })
+})
+
+test('o3d-zvec.15 (arm 14): woocommerce/order.complete is an effect sequence, unsafe to replay, never stale-reclaimed, and its payload is validated', () => {
+  const entry = INTEGRATION_OUTBOX_REGISTRY.woocommerce['order.complete']
+  assert.ok(entry, 'precondition: the operation is registered')
+  assert.equal(entry.effects.keyedBy, 'effect-sequence')
+  assert.equal(entry.replay, 'unsafe-to-replay')
+  assert.equal(integrationOutboxStaleReclaimScope('woocommerce', 'order.complete'), null, 'no stale-lock reclaim for a customer-visible PUT')
+  assert.equal(INTEGRATION_OUTBOX_OPERATIONS.woocommerce.orderComplete, 'order.complete')
+  assert.equal(entry.schema.safeParse({ orderId: 'so-1' }).success, true)
+  assert.equal(entry.schema.safeParse({ orderId: '  ' }).success, false)
+  assert.equal(entry.schema.safeParse({}).success, false)
 })
 
 test('only the unsafe replay answer withholds a stale-lock reclaim', () => {

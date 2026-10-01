@@ -16,6 +16,12 @@ export const WcStockSyncOutboxPayloadSchema = z.object({
   webhookQty: z.number().finite().nullable().optional().default(null),
 })
 
+// o3d-zvec.15: the durable "complete this storefront order" job, enqueued INSIDE the transaction that
+// ships the order. Carries only the order id: the job re-reads the order and WooCommerce on EVERY attempt.
+export const WcOrderCompletionOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+})
+
 export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
@@ -253,6 +259,28 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
       name: 'stockSync',
       schema: WcStockSyncOutboxPayloadSchema,
       effects: ONE_EFFECT,
+      replay: 'unsafe-to-replay',
+    },
+    // o3d-zvec.15. UNSAFE, and for the reason the stock push is: the effect is a customer-visible
+    // WooCommerce status PUT (it fires the completed email), so a second worker re-running it after a
+    // stale-lock reclaim is not something a local verdict can call safe. The status PUT is guarded
+    // (a fresh GET + classifyWcCompletionEligibility on EVERY attempt, so a repeat finds `completed` and
+    // sends nothing), but the tracking meta write, the shoppingSyncLog row and the activity log sit outside
+    // that guard, hence an effect SEQUENCE. Consequence: no stale-lock reclaim — a worker that dies
+    // mid-send leaves the row PROCESSING, the health check warns after 10 minutes, and an operator marks it
+    // failed and replays it from /sync/exceptions (the replay re-reads WooCommerce, so it is harmless).
+    'order.complete': {
+      name: 'orderComplete',
+      schema: WcOrderCompletionOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the WooCommerce status PUT to completed, behind a fresh GET and classifyWcCompletionEligibility on every attempt',
+        effectsOutsideTheGuard: [
+          'tracking meta PUT (pushImsTrackingToWc), which replaces the meta absolutely',
+          'shoppingSyncLog SYNCED row for the status push',
+          'logActivity wc_status_pushed / wc_completion_skipped / wc_completion_retry',
+        ],
+      },
       replay: 'unsafe-to-replay',
     },
   },
@@ -551,6 +579,7 @@ export type LandedCostJournalOutboxPayload = z.infer<typeof LandedCostJournalOut
 export type AccountingPostingRefusalProvisionalPayload = z.infer<typeof AccountingPostingRefusalProvisionalPayloadSchema>
 export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRefundReservationReleaseOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
+export type WcOrderCompletionOutboxPayload = z.infer<typeof WcOrderCompletionOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
 

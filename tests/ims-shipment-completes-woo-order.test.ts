@@ -10,6 +10,12 @@ import test, { beforeEach, mock } from 'node:test'
  * REAL `updateShipmentStatus` and the REAL completion helper; only the storage and the connector
  * edge are doubles.
  *
+ * Since the review of #719 the completion is a DURABLE job: the reconcile enqueues it in the flip's own
+ * transaction and hands back its key, and the action makes one un-awaited post-commit attempt with that
+ * key. So the contract asserted here is: a key exists exactly for the call that completed the order and
+ * owns the storefront; the attempt is made with exactly that key; the shipment never waits on or fails
+ * with it. (What the job DOES — tracking, then status, retry — is tested where the job lives.)
+ *
  * The reconcile double mirrors the one thing the action reads from the real function — "did THIS
  * call move the order to SHIPPED" — over shipment rows it owns, and every arm asserts its
  * precondition from the double's own record (`reconcileResults`, the order's final status) so a
@@ -26,8 +32,8 @@ const state = {
   reconcileResults: [] as Array<Record<string, unknown>>,
   reconcileOptions: [] as Array<Record<string, unknown> | undefined>,
   activity: [] as Array<Record<string, unknown>>,
-  trackingBehaviour: 'ok' as 'ok' | 'throw',
-  statusBehaviour: 'ok' as 'ok' | 'throw' | 'fail',
+  /** How the post-commit attempt behaves: resolves, rejects, or never settles. */
+  attemptBehaviour: 'ok' as 'ok' | 'reject' | 'hang',
 }
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
@@ -50,14 +56,14 @@ mock.module('@/lib/shopping', {
     enqueueStockSync: async () => { state.calls.push('stock') },
     pushOrderDeliveryMetadata: async (orderId: string) => {
       state.calls.push(`tracking:${orderId}`)
-      if (state.trackingBehaviour === 'throw') throw new Error('tracking push exploded')
       return { success: true }
     },
-    pushSalesOrderStatus: async (orderId: string, status: string) => {
-      state.calls.push(`status:${orderId}:${status}`)
-      if (state.statusBehaviour === 'throw') throw new Error('status push exploded')
-      if (state.statusBehaviour === 'fail') return { success: false, error: 'WooCommerce: 503' }
-      return { success: true }
+    scheduleShoppingOrderCompletion: async () => null,
+    processShoppingOrderCompletions: async (options: { idempotencyKeys?: string[] }) => {
+      state.calls.push(`attempt:${(options.idempotencyKeys ?? []).join(',')}`)
+      if (state.attemptBehaviour === 'reject') throw new Error('WooCommerce is down')
+      if (state.attemptBehaviour === 'hang') return new Promise(() => {})
+      return { claimed: 1, succeeded: 1, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
     },
   },
 })
@@ -101,6 +107,8 @@ mock.module('@/lib/domain/sales/shipment-service', {
       if (allShipped && !['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(state.orderStatus)) {
         state.orderStatus = 'SHIPPED'
         result = { ...result, orderReachedShipped: true }
+        // The real function enqueues the job in the flip's transaction when asked and the order is linked.
+        if (options?.storefrontCompletion) result = { ...result, storefrontCompletionKey: `key-${shipment.orderId}` }
       }
       state.reconcileResults.push(result)
       return result
@@ -137,8 +145,7 @@ function seed(orderStatus: string, shipmentStatuses: string[]) {
   state.reconcileResults.length = 0
   state.reconcileOptions.length = 0
   state.activity.length = 0
-  state.trackingBehaviour = 'ok'
-  state.statusBehaviour = 'ok'
+  state.attemptBehaviour = 'ok'
 }
 
 beforeEach(() => seed('ALLOCATED', ['PACKED']))
@@ -148,124 +155,130 @@ async function ship(shipmentId: string, options?: Record<string, unknown>) {
   return updateShipmentStatus(shipmentId, 'SHIPPED', undefined, options)
 }
 
-const STATUS_CALLS = (calls: string[]) => calls.filter((c) => c.startsWith('status:'))
+const ATTEMPTS = (calls: string[]) => calls.filter((c) => c.startsWith('attempt:'))
+const TRACKING = (calls: string[]) => calls.filter((c) => c.startsWith('tracking:'))
+/** Let the un-awaited post-commit attempt run. */
+const settle = () => new Promise((resolve) => setImmediate(resolve))
 
-test('o3d-zvec.15 (a): the LAST shipment shipped pushes tracking THEN the status, exactly once', async () => {
+test('o3d-zvec.15 (a): the LAST shipment shipped makes exactly one post-commit attempt, on the key enqueued with the flip', async () => {
   seed('ALLOCATED', ['PACKED'])
   const result = await ship('ship-1')
+  await settle()
 
-  // Preconditions: the shipment really shipped and THIS call really took the order to SHIPPED.
+  // Preconditions: the shipment really shipped and THIS call really took the order to SHIPPED and got a key.
   assert.equal(result.success, true)
   assert.equal(state.shipments[0].status, 'SHIPPED')
   assert.equal(state.reconcileResults.length, 1, 'the reconcile double was reached')
   assert.equal(state.reconcileResults[0].orderReachedShipped, true, 'and it promoted the order')
+  assert.equal(state.reconcileResults[0].storefrontCompletionKey, 'key-so-1')
   assert.equal(state.orderStatus, 'SHIPPED')
+  // The IMS-authority default asked for the durable completion.
+  assert.equal(state.reconcileOptions[0]?.storefrontCompletion, true)
 
-  const pushes = state.calls.filter((c) => c !== 'stock')
-  assert.deepEqual(pushes, ['tracking:so-1', 'status:so-1:SHIPPED'], 'tracking first so the completed email carries it, then the status, once')
+  assert.deepEqual(ATTEMPTS(state.calls), ['attempt:key-so-1'], 'one attempt, on that key (tracking-then-status is the job\'s own order)')
+  assert.deepEqual(TRACKING(state.calls), [], 'the action does not push tracking separately when the job owns it')
 })
 
-test('o3d-zvec.15 (b): a PARTIAL shipment pushes tracking but never the status', async () => {
+test('o3d-zvec.15 (b): a PARTIAL shipment pushes tracking but makes NO completion attempt', async () => {
   seed('ALLOCATED', ['PACKED', 'PACKED'])
   const result = await ship('ship-1')
+  await settle()
 
-  // Preconditions: one shipment shipped, one still open, and the order did NOT reach SHIPPED.
   assert.equal(result.success, true)
   assert.deepEqual(state.shipments.map((s) => s.status), ['SHIPPED', 'PACKED'])
   assert.equal(state.reconcileResults.length, 1, 'the reconcile double was reached')
   assert.equal(state.reconcileResults[0].orderReachedShipped, undefined)
   assert.equal(state.orderStatus, 'ALLOCATED')
 
-  assert.deepEqual(state.calls.filter((c) => c.startsWith('tracking:')), ['tracking:so-1'], 'tracking still flows for the shipped part')
-  assert.deepEqual(STATUS_CALLS(state.calls), [], 'but the order has not reached SHIPPED, so nothing is promoted')
+  assert.deepEqual(TRACKING(state.calls), ['tracking:so-1'], 'tracking still flows for the shipped part')
+  assert.deepEqual(ATTEMPTS(state.calls), [])
 })
 
 test('o3d-zvec.15 (b2): shipping the SECOND of two shipments is the one that completes it', async () => {
   seed('ALLOCATED', ['PACKED', 'PACKED'])
   await ship('ship-1')
-  assert.deepEqual(STATUS_CALLS(state.calls), [], 'precondition: nothing pushed after the first')
+  await settle()
+  assert.deepEqual(ATTEMPTS(state.calls), [], 'precondition: no attempt after the first')
   await ship('ship-2')
+  await settle()
 
   assert.equal(state.orderStatus, 'SHIPPED', 'precondition: the second shipment completed the order')
-  assert.deepEqual(STATUS_CALLS(state.calls), ['status:so-1:SHIPPED'])
+  assert.deepEqual(ATTEMPTS(state.calls), ['attempt:key-so-1'])
 })
 
-test('o3d-zvec.15 (b3): a shortfall-held order (reconcile did not promote it) pushes no status', async () => {
-  // The real reconcile leaves a short order in its pre-shipment status. Model it by an order the
-  // double will not promote, and prove the double really declined (no `orderReachedShipped`).
+test('o3d-zvec.15 (b3): a shortfall-held / not-promoted order makes no attempt', async () => {
   seed('CANCELLED', ['PACKED'])
   const result = await ship('ship-1')
+  await settle()
 
   assert.equal(result.success, true)
   assert.equal(state.shipments[0].status, 'SHIPPED')
   assert.equal(state.reconcileResults.length, 1)
   assert.equal(state.reconcileResults[0].orderReachedShipped, undefined)
-  assert.deepEqual(STATUS_CALLS(state.calls), [])
+  assert.deepEqual(ATTEMPTS(state.calls), [])
 })
 
-test('o3d-zvec.15 (d): a status push that THROWS or FAILS does not fail the shipment, and is logged', async () => {
-  for (const behaviour of ['throw', 'fail'] as const) {
+test('o3d-zvec.15 (arm 11): the shipment SUCCEEDS when the post-commit attempt rejects, and when it never settles', async () => {
+  let evaluated = 0
+  for (const behaviour of ['reject', 'hang'] as const) {
     seed('ALLOCATED', ['PACKED'])
-    state.statusBehaviour = behaviour
+    state.attemptBehaviour = behaviour
+    // `hang` would make this await forever if the action awaited the attempt: that is the proof.
     const result = await ship('ship-1')
+    await settle()
 
-    // Preconditions: the failing double was actually called, and the order did reach SHIPPED.
-    assert.deepEqual(STATUS_CALLS(state.calls), ['status:so-1:SHIPPED'], `${behaviour}: the status push was attempted`)
+    // Preconditions: the failing double was reached and the order did reach SHIPPED.
+    assert.deepEqual(ATTEMPTS(state.calls), ['attempt:key-so-1'], `${behaviour}: the attempt was made`)
     assert.equal(state.orderStatus, 'SHIPPED')
 
-    assert.equal(result.success, true, `${behaviour}: the shipment must not be failed by a storefront push`)
+    assert.equal(result.success, true, `${behaviour}: the shipment must not be failed by a storefront attempt`)
     assert.equal(state.shipments[0].status, 'SHIPPED', `${behaviour}: and not rolled back`)
-    const logged = state.activity.filter((a) => a.action === 'shopping_status_push_failed')
-    assert.equal(logged.length, 1, `${behaviour}: the failure is visible, not silent`)
+    evaluated++
   }
+  assert.equal(evaluated, 2)
 })
 
-test('o3d-zvec.15 (d2): a tracking push that throws does not stop the status push, nor fail the shipment', async () => {
-  seed('ALLOCATED', ['PACKED'])
-  state.trackingBehaviour = 'throw'
-  const result = await ship('ship-1')
-
-  assert.ok(state.calls.includes('tracking:so-1'), 'precondition: the throwing tracking double was reached')
-  assert.equal(result.success, true)
-  assert.deepEqual(STATUS_CALLS(state.calls), ['status:so-1:SHIPPED'])
-})
-
-test('o3d-zvec.15 (e): re-running the same shipment (a retry) does not push the status twice', async () => {
+test('o3d-zvec.15 (e): re-running the same shipment (a retry) makes no second attempt', async () => {
   seed('ALLOCATED', ['PACKED'])
   await ship('ship-1')
-  assert.deepEqual(STATUS_CALLS(state.calls), ['status:so-1:SHIPPED'], 'precondition: the first run pushed once')
+  await settle()
+  assert.deepEqual(ATTEMPTS(state.calls), ['attempt:key-so-1'], 'precondition: the first run attempted once')
 
   const retry = await ship('ship-1')
+  await settle()
   assert.equal(retry.success, true)
   assert.equal(state.reconcileResults.length, 2, 'precondition: the retry reached reconcile')
   assert.equal(state.reconcileResults[1].orderReachedShipped, undefined, 'and reconcile reported nothing new')
-  assert.deepEqual(STATUS_CALLS(state.calls), ['status:so-1:SHIPPED'], 'still exactly one status push')
+  assert.deepEqual(ATTEMPTS(state.calls), ['attempt:key-so-1'], 'still exactly one attempt')
 })
 
-test('o3d-zvec.15 (e2): an order ALREADY SHIPPED by another path is not pushed again when its last shipment lands', async () => {
-  // The second-path case, isolated from the retry guard: this call DOES transition the shipment, so
-  // only "did this call promote the order" can keep the push from happening twice.
+test('o3d-zvec.15 (e2): an order ALREADY SHIPPED by another path gets no attempt when its last shipment lands', async () => {
+  // This call DOES transition the shipment, so only "did this call promote the order" keeps it single.
   seed('SHIPPED', ['PACKED'])
   const result = await ship('ship-1')
+  await settle()
 
   assert.equal(result.success, true)
   assert.equal(state.shipments[0].status, 'SHIPPED', 'precondition: the shipment really transitioned')
   assert.equal(state.reconcileResults.length, 1)
   assert.equal(state.reconcileResults[0].orderReachedShipped, undefined)
-  assert.deepEqual(STATUS_CALLS(state.calls), [], 'the order was promoted elsewhere, which owns its status push')
+  assert.deepEqual(ATTEMPTS(state.calls), [])
 })
 
-test('o3d-zvec.15 (g): an EXTERNALLY fulfilled dispatch leaves the status push to its own caller', async () => {
-  // applyExternalFulfillmentUpdate pushes the status itself after every shipment is applied, and a
-  // storefront-sourced completion must never echo it back. Under EXTERNAL authority this action
-  // pushes tracking only.
-  seed('ALLOCATED', ['PACKED'])
+test('o3d-zvec.15 (g): an EXTERNAL-authority dispatch asks for the durable completion only when its caller says so', async () => {
   const { INTERNAL_ACTION_BYPASS } = await import('@/lib/internal-action-bypass')
-  const result = await ship('ship-1', { internalBypassToken: INTERNAL_ACTION_BYPASS, completionAuthority: 'EXTERNAL' })
-
-  assert.equal(result.success, true)
-  assert.equal(state.reconcileResults[0]?.orderReachedShipped, true, 'precondition: the order did reach SHIPPED')
-  assert.deepEqual(state.reconcileOptions[0], { completionAuthority: 'EXTERNAL' })
-  assert.deepEqual(STATUS_CALLS(state.calls), [])
-  assert.deepEqual(state.calls.filter((c) => c.startsWith('tracking:')), ['tracking:so-1'])
+  let evaluated = 0
+  for (const [storefrontCompletion, expectedAttempts] of [[undefined, 0], [false, 0], [true, 1]] as const) {
+    seed('ALLOCATED', ['PACKED'])
+    const result = await ship('ship-1', { internalBypassToken: INTERNAL_ACTION_BYPASS, completionAuthority: 'EXTERNAL', storefrontCompletion })
+    await settle()
+    assert.equal(result.success, true)
+    assert.equal(state.reconcileResults[0]?.orderReachedShipped, true, 'precondition: the order did reach SHIPPED')
+    assert.equal(state.reconcileOptions[0]?.completionAuthority, 'EXTERNAL')
+    assert.equal(state.reconcileOptions[0]?.storefrontCompletion, storefrontCompletion ?? false, `storefrontCompletion=${storefrontCompletion}`)
+    assert.equal(ATTEMPTS(state.calls).length, expectedAttempts, `storefrontCompletion=${storefrontCompletion}`)
+    if (expectedAttempts === 0) assert.deepEqual(TRACKING(state.calls), ['tracking:so-1'], 'tracking still goes')
+    evaluated++
+  }
+  assert.equal(evaluated, 3)
 })

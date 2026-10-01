@@ -142,10 +142,27 @@ const IMS_TO_WC: Partial<Record<SalesOrderStatus, string>> = {
   ON_HOLD: 'on-hold',
 }
 
-export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderStatus): Promise<void> {
+/**
+ * What a status push actually did (o3d-zvec.15). It used to return void, so a failed read, a refused
+ * write and a thrown error were all indistinguishable from success: the facade reported success and
+ * no caller could retry. Callers that need durability (the order-completion job) map these onto a
+ * retry / success / dead-letter decision.
+ */
+export type WcStatusPushOutcome =
+  | { kind: 'pushed' }
+  | { kind: 'already-at-target' }
+  /** No WooCommerce equivalent for this IMS status, the order is missing, or it is not a WooCommerce order. */
+  | { kind: 'not-applicable' }
+  /** WooCommerce holds the order in a status IMS must not promote from. `class` says why. */
+  | { kind: 'ineligible'; wcStatus: string; class: 'finalised' | 'not-ready' | 'unknown' }
+  | { kind: 'read-failed'; error: string }
+  | { kind: 'write-failed'; error: string }
+  | { kind: 'error'; error: string }
+
+export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderStatus): Promise<WcStatusPushOutcome> {
   try {
     const externalStatus = IMS_TO_WC[newStatus]
-    if (!externalStatus) return // no WC equivalent
+    if (!externalStatus) return { kind: 'not-applicable' } // no WC equivalent
 
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
@@ -161,8 +178,9 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       },
     })
     const wcLink = order?.shoppingLinks[0]
-    if (!order) return
-    if (!wcLink?.externalOrderId) return // not a WC order
+    if (!order) return { kind: 'not-applicable' }
+    if (!wcLink?.externalOrderId) return { kind: 'not-applicable' } // not a WC order
+    const wcRef = wcLink.externalOrderNumber ?? order.externalOrderNumber
 
     // Idempotent: skip the PUT when WooCommerce is already at the target status.
     // Re-PUTting the same status risks re-firing storefront transition hooks (e.g. the
@@ -170,28 +188,37 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     // completion via the companion plugin, or a WMS bridge pushing the status directly
     // during the cutover period.
     const currentWc = await wcFetch(`/orders/${wcLink.externalOrderId}`)
-    if (!currentWc.error && (currentWc.data as { status?: string } | null)?.status === externalStatus) {
-      return
-    }
+    const wcStatus = (currentWc.data as { status?: string } | null)?.status
+    if (!currentWc.error && wcStatus === externalStatus) return { kind: 'already-at-target' }
 
-    // Only-if-still-processing guard (o3d-zvec.4, o3d-zvec.15). A COMPLETION is a promotion, and it
-    // fires WooCommerce's completed-order machinery (customer email, downloads). Promote only an
-    // order that is still `processing`: if an operator has cancelled, refunded, held, finalised or
-    // otherwise moved it by hand, pushing `completed` would resurrect it. An unreadable WooCommerce
-    // status fails CLOSED for the same reason — we cannot show the order is still ours to promote.
-    // Cancel/hold pushes are not promotions and are left as they were.
+    // Eligibility guard (o3d-zvec.4 check 1, o3d-zvec.15). A COMPLETION is a promotion: it fires
+    // WooCommerce's completed-order machinery (customer email, downloads), so it is pushed only to an
+    // order the storefront still holds in flight — decided by classifyWcCompletionEligibility from the
+    // importer's own reading of the status, NOT by a literal `processing`, so a custom ready status
+    // mapped to PROCESSING still completes. An unreadable status FAILS CLOSED and is reported as
+    // `read-failed` (never as success) so the caller retries. Cancel/hold pushes are not promotions and
+    // are left as they were.
     if (externalStatus === 'completed') {
-      const wcStatus = (currentWc.data as { status?: string } | null)?.status
-      if (currentWc.error || !isWcStatus(wcStatus, 'processing')) {
+      if (currentWc.error) {
         await logActivity({
-          entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_skipped', tag: 'sync',
-          level: currentWc.error ? 'WARNING' : 'INFO',
-          description: currentWc.error
-            ? `Did not push ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: could not read its current status (${currentWc.error})`
-            : `Did not push ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: it is ${String(wcStatus)}, not processing, so it was left as it is`,
+          entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_skipped', tag: 'sync', level: 'WARNING',
+          description: `Did not push ${externalStatus} to WC order #${wcRef}: could not read its current status (${currentWc.error})`,
           resolveUser: false,
         })
-        return
+        return { kind: 'read-failed', error: String(currentWc.error) }
+      }
+      const { readWcCompletionEligibility } = await import('./completion-eligibility')
+      const { eligibility, slug } = await readWcCompletionEligibility(wcStatus, externalStatus)
+      if (eligibility === 'already-at-target') return { kind: 'already-at-target' }
+      if (eligibility !== 'eligible') {
+        const cls = eligibility === 'ineligible-finalised' ? 'finalised' : (eligibility === 'ineligible-not-ready' ? 'not-ready' : 'unknown')
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_skipped', tag: 'sync',
+          level: cls === 'finalised' ? 'INFO' : 'WARNING',
+          description: `Did not push ${externalStatus} to WC order #${wcRef}: it is "${slug}" (${cls === 'finalised' ? 'already finalised, so it was left as it is' : cls === 'not-ready' ? 'not ready to complete' : 'a status IMS has no reading of; add a status mapping for it'})`,
+          resolveUser: false,
+        })
+        return { kind: 'ineligible', wcStatus: slug, class: cls }
       }
     }
 
@@ -200,10 +227,10 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     if (error) {
       await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_push_failed', tag: 'sync', level: 'WARNING',
-        description: `Failed to push status ${newStatus} → ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: ${error}`,
+        description: `Failed to push status ${newStatus} → ${externalStatus} to WC order #${wcRef}: ${error}`,
         resolveUser: false,
       })
-      return
+      return { kind: 'write-failed', error: String(error) }
     }
 
     // Record WHEN our write landed, straight from WooCommerce's own clock.
@@ -229,10 +256,13 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
 
     await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_pushed', tag: 'sync', level: 'INFO',
-      description: `Pushed status ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}`,
+      description: `Pushed status ${externalStatus} to WC order #${wcRef}`,
       resolveUser: false,
     })
-  } catch {
-    // Fire-and-forget — don't break the IMS flow
+    return { kind: 'pushed' }
+  } catch (error) {
+    // Reported, not swallowed: a caller that retries needs to know. The facade turns this into
+    // `success: false`; the callers that stay fire-and-forget log it.
+    return { kind: 'error', error: error instanceof Error ? error.message : String(error) }
   }
 }

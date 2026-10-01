@@ -30,7 +30,13 @@ import { getShoppingConnector, SHOPPING_CONNECTORS, type ShoppingConnectorId } f
 
 export type PushProductMetadataResult = { success: boolean; skipped?: boolean; error?: string }
 export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string }
-export type PushOrderStatusResult = { success: boolean; skipped?: boolean; error?: string }
+export type PushOrderStatusResult = {
+  success: boolean
+  skipped?: boolean
+  error?: string
+  /** What the connector actually did (o3d-zvec.15). `success` is false only for read-failed / write-failed / error. */
+  outcome?: import('@/lib/connectors/woocommerce/sync/order-status').WcStatusPushOutcome
+}
 export type FxRatePushConnectorResult = {
   connector: ShoppingConnectorId
   supported: boolean
@@ -303,8 +309,14 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
     switch (connector) {
       case 'woocommerce': {
         const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
-        await pushImsStatusToWc(orderId, status)
-        return { connector, result: { success: true } }
+        const outcome = await pushImsStatusToWc(orderId, status)
+        // A failed read, a refused write and a thrown error are FAILURES (o3d-zvec.15): this used to report
+        // success unconditionally, so no caller could log or retry them. An ineligible order (cancelled
+        // by hand, say) is not a failure — the connector left it alone on purpose — and `outcome` says so.
+        if (outcome.kind === 'read-failed' || outcome.kind === 'write-failed' || outcome.kind === 'error') {
+          return { connector, result: { success: false, error: outcome.error, outcome } }
+        }
+        return { connector, result: { success: true, outcome } }
       }
     }
   }))
@@ -314,10 +326,34 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
     return {
       success: false,
       error: failures.map((entry) => `${getShoppingConnector(entry.connector).label}: ${entry.result.error ?? 'unknown error'}`).join('; '),
+      outcome: failures[0]?.result.outcome,
     }
   }
 
-  return { success: true, skipped: results.every((entry) => !!entry.result.skipped) }
+  return {
+    success: true,
+    skipped: results.every((entry) => !!entry.result.skipped),
+    outcome: results.find((entry) => entry.result.outcome)?.result.outcome,
+  }
+}
+
+/**
+ * Durably schedule the storefront completion of an order, INSIDE the transaction that ships it (o3d-zvec.15).
+ * Connector-neutral: each connector that completes orders owns its own job. Returns the job's idempotency
+ * key for the post-commit immediate attempt, or null when no connector has anything to complete.
+ */
+export async function scheduleShoppingOrderCompletion(
+  tx: Parameters<typeof import('@/lib/connectors/woocommerce/sync/order-completion-jobs').scheduleWcOrderCompletion>[0],
+  input: { orderId: string; shippedAt: Date },
+): Promise<string | null> {
+  const { scheduleWcOrderCompletion } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
+  return scheduleWcOrderCompletion(tx, input)
+}
+
+/** Drain/attempt the scheduled storefront completions (post-commit immediate attempt and the cron). */
+export async function processShoppingOrderCompletions(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcOrderCompletionJobs } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
+  return processWcOrderCompletionJobs(options)
 }
 
 /**

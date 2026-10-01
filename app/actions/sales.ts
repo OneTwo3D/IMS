@@ -73,7 +73,7 @@ import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushSalesOrderStatus } from '@/lib/shopping'
-import { pushShipmentCompletionToShopping } from '@/lib/fulfillment/shipment-completion-push'
+import { pushShipmentCompletionToShopping, scheduleManualShipCompletion } from '@/lib/fulfillment/shipment-completion-push'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import {
   resolveLineTaxRateBatch,
@@ -1739,8 +1739,14 @@ export async function applySalesOrderStatusTransition(
       await reconcileAllocationBeforeFulfilment(id)
     }
 
+    // o3d-zvec.15: whether this transition owns the storefront status push (false for a WooCommerce-driven
+    // transition, which would only echo). Decided before the transaction so the SHIPPED branch below can
+    // enqueue the durable completion job inside it.
+    const pushStatusToShopping = (options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0
+    let storefrontCompletionKey: string | null = null
     if (!orderUpdated) {
       const transitionResult = await db.$transaction(async (tx) => {
+        storefrontCompletionKey = null // a retried callback must not inherit an aborted attempt's key
         return updateSalesOrderStatusUnderLock(tx, {
           orderId: id,
           targetStatus,
@@ -1807,6 +1813,10 @@ export async function applySalesOrderStatusTransition(
               if (unshipped > 0) {
                 throw new Error('Ship individual shipments first — not all shipments are shipped yet')
               }
+              // o3d-zvec.15: the durable storefront completion commits WITH the SHIPPED flip (order row
+              // already locked by updateSalesOrderStatusUnderLock; the outbox row is a leaf), and the push
+              // itself happens after the commit.
+              storefrontCompletionKey = await scheduleManualShipCompletion(lockedTx as never, { orderId: id, enabled: pushStatusToShopping })
             }
           },
         })
@@ -1885,16 +1895,13 @@ export async function applySalesOrderStatusTransition(
     // Push status back to the order's shopping connector(s) (fire-and-forget).
     // b8i6.1: routed through the facade so it dispatches to the order's actual
     // connector (WooCommerce pushes; a connector without a push port is skipped).
-    const pushStatusToShopping = (options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0
     if (targetStatus === 'SHIPPED') {
-      // o3d-zvec.15: SHIPPED goes through the one completion helper — tracking first, THEN the status —
-      // so the storefront's completed email carries the tracking. This used to push the status
-      // un-awaited BEFORE the tracking, racing it. Awaited and never throws.
+      // o3d-zvec.15: SHIPPED goes through the one completion helper. The durable completion job was
+      // enqueued inside the transaction above (tracking first, THEN the status, when it runs); this is the
+      // immediate post-commit attempt. This used to push the status un-awaited BEFORE the tracking.
       await pushShipmentCompletionToShopping({
         orderId: id,
-        orderReachedShipped: true,
-        pushStatus: pushStatusToShopping,
-        orderRef: getSalesOrderReference(so),
+        completionKey: storefrontCompletionKey,
       })
     } else if (pushStatusToShopping) {
       pushSalesOrderStatus(id, targetStatus)
