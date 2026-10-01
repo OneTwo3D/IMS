@@ -147,6 +147,42 @@ export async function systemIdentifierIsReadable(
 }
 
 /**
+ * THE ONE DECISION about whether a write has established its target — pure, total, and the only thing the
+ * command consults (round 20).
+ *
+ * WHY THIS IS A FUNCTION RATHER THAN A PREDICATE INLINE IN THE SCRIPT. Rounds 16 and 18 each closed one
+ * existential gap in that predicate -- "is `--expect-db` the sole pin?", then "are all the pins
+ * clone-invariant?" -- and each time the NEXT combination was left for the next reader to find. Patching
+ * sibling conditions one at a time does not terminate, because an assertion about the combinations someone
+ * thought of proves nothing about the ones they did not.
+ *
+ * Extracting the decision makes the input space ENUMERABLE: four pinnable fields and one acknowledgement
+ * flag, so 32 total inputs, all of which a generated test asserts over. That is a universal statement about
+ * every reachable combination, including combinations nobody has imagined, which is what no amount of
+ * further predicate patching could give.
+ *
+ * THE RULE, and it is the whole rule:
+ *   · the target database must be NAMED -- nothing else says WHICH database is meant; and
+ *   · identity must be established by the CLUSTER IDENTIFIER, or the weaker mode explicitly ACKNOWLEDGED.
+ * Host and port are checked when supplied but discharge nothing, because they are clone-invariant: see
+ * {@link ServerIdentity}. A restored copy matches on name, host and port together, so no number of them
+ * distinguishes it.
+ */
+export type IdentityDischarge =
+  | { allowed: true; route: 'system-identifier' | 'name-only-acknowledged' }
+  | { allowed: false; reason: 'unnamed-database' | 'not-established' }
+
+export function dischargeIdentity(input: {
+  pinnedFields: ReadonlyArray<keyof ServerIdentity>
+  acknowledged: boolean
+}): IdentityDischarge {
+  if (!input.pinnedFields.includes('database')) return { allowed: false, reason: 'unnamed-database' }
+  if (input.pinnedFields.includes('systemIdentifier')) return { allowed: true, route: 'system-identifier' }
+  if (input.acknowledged) return { allowed: true, route: 'name-only-acknowledged' }
+  return { allowed: false, reason: 'not-established' }
+}
+
+/**
  * PINS THAT CANNOT BE VERIFIED — a SEPARATE rule from {@link compareServerIdentity}, deliberately
  * (round 16, HIGH 2).
  *

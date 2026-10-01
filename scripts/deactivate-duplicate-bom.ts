@@ -31,6 +31,7 @@ import {
   type ServerIdentity,
   compareServerIdentity,
   describeServerIdentity,
+  dischargeIdentity,
   readServerIdentity,
   unverifiablePins,
 } from '../lib/products/bom-recipe-repair'
@@ -170,17 +171,20 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
       return { ok: false }
     }
 
-    // WHAT WAS ESTABLISHED, not which flags appeared (round 18). Only `system_identifier` can discharge
-    // this, because it is the only non-clone-invariant field in the composite — see
-    // CLONE_INVARIANT_FIELDS above. Everything else is either an acknowledgement or a refusal.
-    //
-    // The previous shape asked whether `--expect-db` was the SOLE pin, which made
-    // `--expect-db X --expect-host <value from the banner>` a bypass: two clone-invariant pins, no
-    // acknowledgement demanded, and an audit row claiming none was needed. Enumerating the bad
-    // combinations would have left the next one.
-    const establishedByIdentifier = pinnedFields.includes('systemIdentifier')
+    // THE DECISION IS NOT MADE HERE (round 20). It lives in `dischargeIdentity`, a pure total function
+    // over {pinned fields} x {acknowledged}, so a generated test can assert it for EVERY reachable
+    // combination rather than for the ones someone thought of. Rounds 16 and 18 each patched one
+    // combination and left the next; this stops that sequence rather than adding to it.
     const acknowledged = process.argv.includes('--accept-name-only')
-    if (!establishedByIdentifier && !acknowledged) {
+    const discharge = dischargeIdentity({ pinnedFields, acknowledged })
+    if (!discharge.allowed) {
+      if (discharge.reason === 'unnamed-database') {
+        console.error(
+          'REFUSED: a write must name the target database — add --expect-db <name>. Pinning only the host\n'
+          + '  or the port never says WHICH database you meant. Nothing was written.',
+        )
+        return { ok: false }
+      }
       const clonePins = pinnedFields.filter((field) => CLONE_INVARIANT_FIELDS.includes(field))
       console.error(
         `REFUSED: you pinned ${clonePins.join(', ')}, but a restored copy of this database has the SAME\n`
@@ -197,10 +201,10 @@ async function confirmTarget(identity: ServerIdentity): Promise<Confirmation> {
     return {
       ok: true,
       pinnedFields,
-      route: establishedByIdentifier ? 'system-identifier' : 'name-only-acknowledged',
+      route: discharge.route,
       // NEVER asserts an acknowledgement was unnecessary: it is false ONLY when the identifier actually
-      // established the target.
-      acceptedNameOnly: !establishedByIdentifier,
+      // established the target, which is exactly what `route` says.
+      acceptedNameOnly: discharge.route !== 'system-identifier',
     }
   }
 

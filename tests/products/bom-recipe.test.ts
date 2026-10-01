@@ -14,6 +14,7 @@ import {
   syncBomRecipeFromProductComponents,
   toRecipeMap,
 } from '../../lib/products/bom-recipe.ts'
+import { dischargeIdentity } from '../../lib/products/bom-recipe-repair.ts'
 
 /**
  * o3d-zjsb5.9 — BOM RECIPES HAD NO IMPORT PATH.
@@ -596,6 +597,108 @@ test('[o3d-zjsb5.9 r2] the editor ROLLS BACK the ProductComponent write when the
     !/return \{ kind: 'bom-cycle'/.test(src) && !/return \{ kind: 'bom-claim-contended'/.test(src),
     'no BOM refusal may be RETURNED out of a transaction that has already written',
   )
+})
+
+test('[o3d-zjsb5.9 r20] UNIVERSAL: every combination of pins discharges identity by exactly one route', () => {
+  /**
+   * THE TEST THAT REPLACES THE SEQUENCE, rather than adding to it.
+   *
+   * Round 16 closed "is --expect-db the sole pin?". Round 18 closed "are all the pins clone-invariant?".
+   * Each closed ONE existential gap and left the next combination for the next reader, because an
+   * assertion about the combinations someone thought of says nothing about the ones they did not. Patching
+   * siblings one at a time does not terminate.
+   *
+   * So this asserts the rule over the WHOLE INPUT SPACE: all 16 subsets of the four pinnable fields, times
+   * acknowledged true/false -- 32 inputs, generated, none hand-picked. A combination nobody has imagined
+   * cannot bypass it, because it is not a list of combinations.
+   *
+   * WHAT WOULD STILL PASS IT, stated so it is not mistaken for more than it is:
+   *   · a new PINNABLE FIELD added to ServerIdentity and to the script's flags but not to FIELDS below --
+   *     so FIELDS is asserted against the keys of a real identity object, and adding a field without
+   *     extending this test reds it;
+   *   · a second route to the write that never calls `dischargeIdentity` at all. That is not a property of
+   *     this function, and it is covered by the companion test below.
+   */
+  const FIELDS = ['database', 'host', 'port', 'systemIdentifier'] as const
+
+  // THE FIELD LIST IS NOT TRUSTED: it is checked against a real ServerIdentity's own keys, so a field added
+  // to the composite without being considered here fails rather than being silently unexamined.
+  const sampleIdentity = { database: 'd', host: 'h', port: 'p', systemIdentifier: 's' }
+  assert.deepEqual(
+    Object.keys(sampleIdentity).sort(), [...FIELDS].sort(),
+    'ServerIdentity gained or lost a field — extend this test, because an unconsidered field is exactly '
+    + 'how the last two bypasses happened',
+  )
+
+  let allowedCount = 0
+  let refusedCount = 0
+  for (let mask = 0; mask < 1 << FIELDS.length; mask += 1) {
+    const pinnedFields = FIELDS.filter((_, index) => (mask & (1 << index)) !== 0)
+    for (const acknowledged of [false, true]) {
+      const got = dischargeIdentity({ pinnedFields, acknowledged })
+      const named = pinnedFields.includes('database')
+      const byIdentifier = pinnedFields.includes('systemIdentifier')
+      const label = `pins=[${pinnedFields.join(',')}] acknowledged=${acknowledged}`
+
+      if (!named) {
+        assert.deepEqual(got, { allowed: false, reason: 'unnamed-database' },
+          `${label}: a write must always NAME the target database`)
+        refusedCount += 1
+        continue
+      }
+      if (byIdentifier) {
+        assert.deepEqual(got, { allowed: true, route: 'system-identifier' },
+          `${label}: the cluster identifier establishes the target`)
+        allowedCount += 1
+        continue
+      }
+      if (acknowledged) {
+        assert.deepEqual(got, { allowed: true, route: 'name-only-acknowledged' },
+          `${label}: the weaker mode is allowed only when explicitly acknowledged`)
+        allowedCount += 1
+        continue
+      }
+      // EVERY remaining case is clone-invariant pins only, and must refuse however many were supplied.
+      assert.deepEqual(got, { allowed: false, reason: 'not-established' },
+        `${label}: clone-invariant pins establish nothing, however many are supplied`)
+      refusedCount += 1
+    }
+  }
+
+  // THE LOOP REACHED BOTH OUTCOMES. Without this, a `dischargeIdentity` that refused everything -- or
+  // allowed everything -- could pass whichever branch happened to be asserted.
+  assert.equal(allowedCount + refusedCount, 32, 'every one of the 32 inputs must have been examined')
+  assert.equal(allowedCount, 12, 'and 12 of them must be ALLOWED (named, and either identified or acknowledged)')
+  assert.equal(refusedCount, 20, 'with the other 20 refused')
+})
+
+test('[o3d-zjsb5.9 r20] UNIVERSAL: the write has no route that bypasses the decision', async () => {
+  // The companion property, and the one the generated test above cannot give: that `dischargeIdentity` is
+  // the ONLY thing standing in front of the write. Discovered by scanning rather than by naming lines, so a
+  // second write or a second gate added later is caught -- the same move that fixed the r6 finding, where a
+  // test naming one file by name could not see the other two call sites.
+  const src = await readFile(path.join(process.cwd(), 'scripts/deactivate-duplicate-bom.ts'), 'utf8')
+
+  const writes = [...src.matchAll(/deactivateDuplicateBomRecipe\(/g)]
+  assert.equal(writes.length, 1,
+    `exactly one call to the mutation is expected; found ${writes.length}. A second call site needs its own `
+    + 'gate, and this test is the only thing that will tell you so')
+
+  const gates = [...src.matchAll(/dischargeIdentity\(/g)]
+  assert.equal(gates.length, 1, 'and exactly one place may decide whether identity was established')
+
+  // Ordering: the decision must precede the write, and the write must be guarded by the gate's verdict.
+  assert.ok(gates[0].index! < writes[0].index!, 'the decision must be made BEFORE the write')
+  assert.match(src, /if \(!confirmation\.ok\) return 3/,
+    'the write must be unreachable when the gate refused')
+
+  // And no `ok: true` may be fabricated for a path that reaches a write: every one must carry a route.
+  for (const match of src.matchAll(/ok: true[,\s]/g)) {
+    const window = src.slice(match.index!, match.index! + 220)
+    assert.match(window, /route:/,
+      'every confirmed path must record WHICH route established the target, so the audit row can never '
+      + 'assert an acknowledgement was unnecessary when nothing identified the server')
+  }
 })
 
 test('[o3d-zjsb5.9 r8] the production order is INSERTED inside the locked transaction', async () => {
