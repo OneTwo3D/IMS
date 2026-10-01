@@ -20,9 +20,9 @@
 # archived `.md` is one of the cases that matters, so ignoring Markdown would re-open precisely the
 # hole this workflow closes.
 #
-# `fetch-depth: 0` because the check's BRANCH co-change locus resolves `origin/development` to diff
-# against. Without history it degrades to a printed NOTICE rather than a silent skip, but a notice is
-# not a check.
+# `fetch-depth: 0` because the check's BRANCH co-change locus resolves `origin/development` and needs
+# a merge base with HEAD to diff against. Without that history the check now EXITS NONZERO (it used to
+# print a notice and pass), so this setting is load-bearing: do not shorten it.
 name: Archive Seal
 
 on:

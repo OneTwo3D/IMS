@@ -584,8 +584,11 @@ Archive-Seal-Rewrite: <what is being archived or unarchived, and why>
 Two loci are examined: the tip commit (combined diff, so a merge is judged on what it contributed
 rather than on everything it brought in) and the whole branch against its base
 (`ARCHIVE_SEAL_BASE_REF`, default `origin/development` then `development`), which catches the same
-change split across two commits. If no base resolves — a shallow clone — the branch locus prints a
-`NOTICE: the BRANCH co-change locus did NOT RUN` rather than being silently absent.
+change split across two commits. The branch locus is mandatory and has no opt-out: it needs a base that
+resolves, a merge base with `HEAD`, and a branch diff that runs. If any is missing — typically a shallow
+clone — the check exits **nonzero** naming what could not run (`git fetch origin development`, or
+`git fetch --unshallow`, or set `ARCHIVE_SEAL_BASE_REF`). A failed `diff-tree`/`diff` is likewise a
+refusal and never read as "no changed paths": an unreadable state is not an empty one.
 
 **Subjects.** Every problem line names where it was found: `HEAD` (the committed tree), `INDEX`
 (staged), `WORKTREE` (edited, not staged), `UNTRACKED`, `CONFLICT` (index stages 1/2/3), or `BRANCH`.
