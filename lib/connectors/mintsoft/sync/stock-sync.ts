@@ -33,7 +33,9 @@ import {
   type TransferLineResidualQty,
   type WmsAsnLineResidualQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
+  derivePurchaseOrderReceiptStatus,
   isPurchaseOrderUsableForWmsReceipt,
   loadPurchaseOrderLineLandedQty,
   loadPurchaseOrderLineOutstandingQty,
@@ -2152,6 +2154,37 @@ export async function applyMintsoftAlignmentForProduct(params: {
           qtyAccountedViaSnapshot: { increment: allocation.qty },
           note: null,
         },
+      })
+    }
+
+    // ─── THE ORDER'S STATUS FOLLOWS WHAT HAS LANDED (o3d-papk C3, Codex MEDIUM) ───
+    //
+    // The alignment lands units without writing `qtyReceived`, so a purchase order stocked entirely by alignment
+    // stayed PO_SENT / SHIPPED with `receivedAt` unset: no manual receipt is outstanding to run the derivation
+    // that the receipt and the book-in carry, so nothing ever would. The same derivation
+    // (`derivePurchaseOrderReceiptStatus`) runs here, over the landed quantity read on `tx`, under the
+    // `purchase_orders` row lock taken at step 2b (held to commit): NO new lock. It only ever moves an order
+    // FORWARD along the purchase-order workflow (`validatePurchaseOrderStatusTransition` refuses anything else),
+    // so a RECEIVED, INVOICED, returned or closed order is left as it is.
+    const alignedPurchaseOrderIds = [...new Set(plan.allocations.flatMap((allocation) => {
+      const purchaseCost = costByAsnLineMapId.get(allocation.asnLineMapId)
+      return purchaseCost ? [purchaseCost.poId] : []
+    }))].sort()
+    for (const poId of alignedPurchaseOrderIds) {
+      const order = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: poId },
+        select: { id: true, status: true, lines: { select: { id: true, qty: true, qtyReceived: true } } },
+      })
+      const landedByLineId = await loadPurchaseOrderLineLandedQty(tx, order.lines)
+      const nextStatus = derivePurchaseOrderReceiptStatus(order.lines.map((line) => ({
+        qty: line.qty,
+        landed: requirePoLineLandedQty(landedByLineId, line.id),
+      })))
+      if (nextStatus === order.status) continue
+      if (!validatePurchaseOrderStatusTransition(order.status, nextStatus).success) continue
+      await tx.purchaseOrder.update({
+        where: { id: order.id },
+        data: { status: nextStatus, ...(nextStatus === 'RECEIVED' ? { receivedAt: now } : {}) },
       })
     }
 

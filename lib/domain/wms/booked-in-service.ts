@@ -30,7 +30,7 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
-  isPurchaseOrderLineFullyLanded,
+  derivePurchaseOrderReceiptStatus,
   loadPurchaseOrderLineLandedQty,
   requirePoLineLandedQty,
 } from '@/lib/domain/inventory/po-line-landed-quantity'
@@ -1256,12 +1256,15 @@ export async function processBookedInEvent(
         // PARTIALLY_RECEIVED for ever. Read on this transaction, under the purchase_orders row lock taken
         // above, after this book-in's own qtyReceived and qtyAccountedViaReceipt writes in the loop.
         const updatedLanded = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
-        const allReceived = updatedLines.every((line) =>
-          isPurchaseOrderLineFullyLanded(line.qty, requirePoLineLandedQty(updatedLanded, line.id)))
+        const newStatus = derivePurchaseOrderReceiptStatus(updatedLines.map((line) => ({
+          qty: line.qty,
+          landed: requirePoLineLandedQty(updatedLanded, line.id),
+        })))
+        const allReceived = newStatus === 'RECEIVED'
         await tx.purchaseOrder.update({
           where: { id: poId },
           data: {
-            status: allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED',
+            status: newStatus,
             ...(allReceived ? { receivedAt: now } : {}),
           },
         })

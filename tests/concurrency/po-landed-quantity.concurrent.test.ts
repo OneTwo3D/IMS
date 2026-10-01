@@ -498,3 +498,86 @@ test(
     console.log('# A8: evaluated 3 lines (1 control, 1 fully landed, 1 cancelled)')
   },
 )
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// C3 — THE ALIGNMENT ADVANCES THE ORDER'S STATUS FROM WHAT HAS LANDED (Codex MEDIUM)
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+async function poRow(po: SeededPo) {
+  const { db } = await import('@/lib/db')
+  return db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { status: true, receivedAt: true } })
+}
+
+test(
+  'C3-1: a purchase order completed ONLY by alignment becomes PARTIALLY_RECEIVED, then RECEIVED with receivedAt set',
+  SKIP,
+  async () => {
+    const po = await seedPo('c31', [10, 5])
+    const [l1, l2] = [po.lines[0]!, po.lines[1]!]
+    await addAsn(po, l1, { expectedQty: 10, status: 'OPEN' })
+    await addAsn(po, l2, { expectedQty: 5, status: 'OPEN' })
+    const start = await poRow(po)
+    assert.equal(start.status, 'PO_SENT', 'PRECONDITION: the order starts PO_SENT')
+
+    const first = await alignUp(po, l1, { delta: 10, imsQty: 0 })
+    assert.equal(first.applied, true, `PRECONDITION: line one aligned: ${JSON.stringify(first)}`)
+    const afterFirst = await poRow(po)
+    assert.equal((await snapshotOf(po, l1)).qtyReceived, 0, 'PRECONDITION: line one has qtyReceived 0 (landed through alignment only)')
+    assert.equal(afterFirst.status, 'PARTIALLY_RECEIVED', 'one of two lines has landed')
+    assert.equal(afterFirst.receivedAt, null, 'not received yet')
+
+    const second = await alignUp(po, l2, { delta: 5, imsQty: 0 })
+    assert.equal(second.applied, true, `PRECONDITION: line two aligned: ${JSON.stringify(second)}`)
+    assert.equal((await snapshotOf(po, l2)).qtyReceived, 0, 'PRECONDITION: line two has qtyReceived 0 as well (every line landed through alignment only)')
+    const afterSecond = await poRow(po)
+    console.log(`# C3-1: status after line one ${afterFirst.status}, after line two ${afterSecond.status}, receivedAt ${afterSecond.receivedAt ? 'set' : 'null'}`)
+    assert.equal(afterSecond.status, 'RECEIVED', 'every line has landed: the order is RECEIVED')
+    assert.notEqual(afterSecond.receivedAt, null, 'receivedAt is set')
+    console.log('# C3-1: evaluated 2 alignments on a 2-line order')
+  },
+)
+
+test(
+  'C3-2: the alignment never regresses an order: a RECEIVED order whose lines read partly landed stays RECEIVED',
+  SKIP,
+  async () => {
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('c32', [10])
+    const line = po.lines[0]!
+    await addAsn(po, line, { expectedQty: 10, status: 'OPEN' })
+    // The shape that would regress: an order already past PARTIALLY_RECEIVED (here RECEIVED, e.g. closed out by
+    // an operator) while the line has room left. The derivation says PARTIALLY_RECEIVED; the workflow must refuse it.
+    await db.purchaseOrder.update({ where: { id: po.poId }, data: { status: 'RECEIVED', receivedAt: new Date('2026-01-01T00:00:00Z') } })
+
+    const aligned = await alignUp(po, line, { delta: 4, imsQty: 0 })
+    assert.equal(aligned.applied, true, `PRECONDITION: the alignment applied (4 of 10 landed): ${JSON.stringify(aligned)}`)
+    assert.equal((await snapshotOf(po, line)).stock, 4, 'PRECONDITION: 4 units are in stock')
+    const after = await poRow(po)
+    console.log(`# C3-2: status ${after.status} after a partial alignment on a RECEIVED order`)
+    assert.equal(after.status, 'RECEIVED', 'RECEIVED is not regressed to PARTIALLY_RECEIVED')
+    assert.equal(after.receivedAt?.toISOString(), '2026-01-01T00:00:00.000Z', 'receivedAt is untouched')
+    console.log('# C3-2: evaluated 1 forward-only guard')
+  },
+)
+
+test(
+  'C3-3: a partial alignment moves PO_SENT to PARTIALLY_RECEIVED (and an order that is not receivable is left alone)',
+  SKIP,
+  async () => {
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('c33', [10])
+    const line = po.lines[0]!
+    await addAsn(po, line, { expectedQty: 10, status: 'OPEN' })
+    const aligned = await alignUp(po, line, { delta: 4, imsQty: 0 })
+    assert.equal(aligned.applied, true, `PRECONDITION: applied: ${JSON.stringify(aligned)}`)
+    assert.equal((await poRow(po)).status, 'PARTIALLY_RECEIVED', '4 of 10 landed: PARTIALLY_RECEIVED')
+
+    const invoiced = await seedPo('c33i', [10])
+    const invoicedLine = invoiced.lines[0]!
+    await addAsn(invoiced, invoicedLine, { expectedQty: 10, status: 'OPEN' })
+    await db.purchaseOrder.update({ where: { id: invoiced.poId }, data: { status: 'INVOICED' } })
+    const second = await alignUp(invoiced, invoicedLine, { delta: 10, imsQty: 0 })
+    assert.equal(second.applied, true, `PRECONDITION: applied against the invoiced order: ${JSON.stringify(second)}`)
+    assert.equal((await poRow(invoiced)).status, 'INVOICED', 'INVOICED has no path back to RECEIVED: left alone')
+    console.log('# C3-3: evaluated 2 orders (PO_SENT -> PARTIALLY_RECEIVED, INVOICED untouched)')
+  },
+)

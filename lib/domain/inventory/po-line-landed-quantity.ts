@@ -195,6 +195,19 @@ export function isPurchaseOrderLineFullyLanded(lineQty: DecimalInput, landed: Pu
   return maxZero(roundQuantity(subtractMoney(toDecimal(lineQty), landed.qty), 6)).lte(PO_LANDED_QTY_EPSILON)
 }
 
+/**
+ * THE PURCHASE ORDER'S RECEIPT STATUS FROM WHAT HAS LANDED (o3d-papk, D1): RECEIVED when every line has landed,
+ * otherwise PARTIALLY_RECEIVED. ONE definition, adopted by the manual receipt, the WMS book-in and the WMS
+ * stock-sync alignment so the three cannot drift (the alignment landed units without any of them noticing,
+ * which left an order fully stocked by alignment open for ever). Pure: callers decide whether the order's
+ * CURRENT status may move to it (see `validatePurchaseOrderStatusTransition`).
+ */
+export function derivePurchaseOrderReceiptStatus(
+  lines: ReadonlyArray<{ qty: DecimalInput; landed: PurchaseOrderLineLandedQty }>,
+): 'RECEIVED' | 'PARTIALLY_RECEIVED' {
+  return lines.every((line) => isPurchaseOrderLineFullyLanded(line.qty, line.landed)) ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
+}
+
 // ---------------------------------------------------------------------------
 // OUTSTANDING: "HOW MUCH IS STILL COMING?"
 // ---------------------------------------------------------------------------

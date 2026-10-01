@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   aggregatePurchaseOrderLineOutstandingQty,
+  derivePurchaseOrderReceiptStatus,
   hasPoOutstandingQty,
   isPurchaseOrderLineFullyLanded,
   isPurchaseOrderUsableForWmsReceipt,
@@ -179,4 +180,23 @@ test('A1 the loaders, residual and aggregation compose', async () => {
   assert.equal(readPurchaseOrderOutstandingTotal(totals, 'p2'), 0)
   assert.equal(totals.lineCounts.get('p1'), 2)
   assert.equal(totals.lineCounts.get('p2'), 1)
+})
+
+test('C3 derivePurchaseOrderReceiptStatus: RECEIVED only when EVERY line has landed, by landed and not by qtyReceived', () => {
+  const landed = (poLineId: string, qtyReceived: number, credit = 0) =>
+    resolvePurchaseOrderLineLandedQty({ poLineId, qtyReceived, wmsAsnLines: credit > 0 ? [row(credit, 0)] : [] })
+  // Both lines landed, line one entirely through an alignment credit (qtyReceived 0).
+  assert.equal(derivePurchaseOrderReceiptStatus([
+    { qty: 10, landed: landed('l1', 0, 10) },
+    { qty: 5, landed: landed('l2', 5) },
+  ]), 'RECEIVED')
+  // One line short.
+  assert.equal(derivePurchaseOrderReceiptStatus([
+    { qty: 10, landed: landed('l1', 0, 10) },
+    { qty: 5, landed: landed('l2', 4) },
+  ]), 'PARTIALLY_RECEIVED')
+  // The old derivation (qtyReceived >= qty) would have said PARTIALLY_RECEIVED for line one.
+  assert.equal(derivePurchaseOrderReceiptStatus([{ qty: 10, landed: landed('l1', 0, 10) }]), 'RECEIVED')
+  assert.equal(derivePurchaseOrderReceiptStatus([{ qty: 10, landed: landed('l1', 3, 4) }]), 'PARTIALLY_RECEIVED')
+  console.log('# C3 derive: evaluated 4 fixtures')
 })

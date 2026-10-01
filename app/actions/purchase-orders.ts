@@ -24,7 +24,7 @@ import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-erro
 // o3d-papk: "how much of this line is still to come" is `qty - LANDED`, not `qty - qtyReceived`. The WMS
 // alignment lands units by crediting wms_asn_line_maps.qtyAccountedViaSnapshot and never writes qtyReceived.
 import {
-  isPurchaseOrderLineFullyLanded,
+  derivePurchaseOrderReceiptStatus,
   loadPurchaseOrderLineLandedQty,
   loadPurchaseOrderLineOutstandingQty,
   requirePoLineLandedQty,
@@ -2077,9 +2077,11 @@ export async function receivePurchaseOrder(
       // qtyReceived of 0, so the old `qtyReceived >= qty` left such an order PARTIALLY_RECEIVED for ever.
       // Read under the same purchase_orders row lock, after this receipt's own qtyReceived increments.
       const updatedLanded = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
-      const allReceived = updatedLines.every((line) =>
-        isPurchaseOrderLineFullyLanded(line.qty, requirePoLineLandedQty(updatedLanded, line.id)))
-      const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
+      const newStatus = derivePurchaseOrderReceiptStatus(updatedLines.map((line) => ({
+        qty: line.qty,
+        landed: requirePoLineLandedQty(updatedLanded, line.id),
+      })))
+      const allReceived = newStatus === 'RECEIVED'
       const receiptTransition = validatePurchaseReceiptStatusUpdate(currentPo.status, newStatus)
       if (!receiptTransition.success) throw new Error(receiptTransition.error)
       await tx.purchaseOrder.update({

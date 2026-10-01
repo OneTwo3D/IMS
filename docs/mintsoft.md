@@ -386,8 +386,13 @@ and *outstanding* is `max(0, qty − landed)`, zero for a CANCELLED or CLOSED or
   the transaction under the `purchase_orders` lock — so a receipt can no longer be booked on top of units
   alignment already brought in (previously 10 aligned-6 then 10 received gave stock 16 for 10 physical
   units, a second cost layer and a second journal);
-- **the PO status** after a manual receipt or a WMS book-in is RECEIVED when every line's *landed* quantity
-  reaches its quantity (alignment itself still does not change a PO's status);
+- **the PO status** after a manual receipt, a WMS book-in **or an alignment** is RECEIVED when every line's
+  *landed* quantity reaches its quantity (one derivation, `derivePurchaseOrderReceiptStatus`, so the three
+  cannot drift). The alignment moves an order only FORWARD along the purchase-order workflow (PO_SENT / SHIPPED
+  → PARTIALLY_RECEIVED → RECEIVED, `receivedAt` set on RECEIVED) and under the `purchase_orders` lock it already
+  holds; a RECEIVED, INVOICED, returned or closed order is left as it is. An order fully stocked by alignment
+  alone therefore no longer stays open for ever. (The freight-order auto-receipt cascade a manual receipt runs
+  is not run by the book-in or the alignment, as before.)
 - **the alignment planner** caps an allocation by the PO line's own residue (`qty − landed`), shared across
   that line's open ASN rows, as it already did for transfer lines; and it refuses an ASN whose PO is
   CANCELLED or CLOSED as *unusable* (never as *raced*, which would block the SKU for ever) while a healthy

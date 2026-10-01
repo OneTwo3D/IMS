@@ -36,6 +36,10 @@ This repository uses an `x.y.z` release scheme.
   outstanding (branded all the way to the wire), retires a credited reservation (closed, credit kept) and
   reserves the remainder on a new one, disposes under `purchase_orders` → ASN header → ASN lines, returns
   operator refusals so a retirement commits, and refuses to claim a retired reservation (both creators).
+- **The WMS stock-sync alignment advances a purchase order's status (o3d-papk follow-up).** An order stocked
+  entirely by alignment stayed PO_SENT with `receivedAt` unset. The alignment now derives the status from the
+  landed quantity under the order lock it already holds (forward only); the manual receipt and the book-in use
+  the same derivation.
 
 ### Parked connectors removed (o3d-remove-parked-connectors)
 
