@@ -8822,8 +8822,10 @@ test('[o3d-zvec.21 g] the accounting RETRY of a Woo refund covering a shipped AN
     { id: 'layer-1', productId: 'product-1', poLineId: null, receivedQty: 5, unitCostBase: 4 },
     { id: 'layer-2', productId: 'product-2', poLineId: null, receivedQty: 1, unitCostBase: 4 },
   )
-  state.shipments[0].shipmentJournalDate = new Date('2026-01-02T00:00:00.000Z')
-  state.shipments[0].lines[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 3, unitCostBase: 4, orderAllocationId: 'alloc-1', source: 'shipment' }]
+  // The shipment is SHIPPED but not yet journaled (the normal state until the daily batch runs), so the
+  // staging prices the refund from the ALLOCATIONS and yields no shipment-source rows: the retry must
+  // therefore build its return rows from the physical shipment — the fallback builder under test.
+  assert.equal(state.shipments[0].shipmentJournalDate, null, 'PRECONDITION: the shipment is not journaled')
   state.allocations[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 5, unitCostBase: 4, orderAllocationId: 'alloc-1', source: 'allocation' }]
   state.refunds[0].accountingRetryRequired = true
   state.orders[0].revenueDeferredDate = new Date('2026-01-01T00:00:00.000Z')
