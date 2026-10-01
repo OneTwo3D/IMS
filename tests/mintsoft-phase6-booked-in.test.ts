@@ -11,24 +11,34 @@ import { resolveTransferLineLandedQty } from '../lib/domain/inventory/transfer-l
 import {
   buildBookedInDryRun,
   reconcileBookedInQuantities,
+  resolveManualReceiptPool,
   sliceTransferSnapshotForReceipt,
 } from '../lib/domain/wms/asn-reconciliation.ts'
+
+/** o3d-papk: the manual-receipt pool is branded; a test builds one the way production does. */
+const poolOf = (lineQtyReceived: number, lineReconciledAcrossAsns = 0) =>
+  resolveManualReceiptPool({ lineQtyReceived, lineReconciledAcrossAsns, rowManualQtyBaseline: 0 })
+const NO_POOL = poolOf(0)
 
 test('reconcileBookedInQuantities only books the unaccounted delta from Mintsoft', () => {
   assert.deepEqual(
     reconcileBookedInQuantities({
       expectedQty: 100,
       currentReceivedQty: 60,
-      localReceivedQty: 20,
+      manualReceiptPool: poolOf(20),
       lastProcessedReceivedQty: 0,
       qtyAccountedViaSnapshot: 60,
       qtyAccountedViaReceipt: 0,
     }),
+    // o3d-papk: the snapshot credit covers its units FIRST (60 of them), so no manual receipt is needed to
+    // explain the rest. The old order took the manual 20 first and left landed 20 short of the stock added
+    // (Codex H1): qtyReceived must rise by the whole 60 here, because the 60 credited units are no longer
+    // counted by the snapshot arm once `qtyAccountedViaReceipt` has absorbed them.
     {
       currentReceivedQty: 60,
-      qtyReceived: 40,
-      reconciledManualQty: 20,
-      coveredBySnapshotQty: 40,
+      qtyReceived: 60,
+      reconciledManualQty: 0,
+      coveredBySnapshotQty: 60,
       stockQtyToAdd: 0,
       newlyProcessedQty: 60,
     },
@@ -38,7 +48,7 @@ test('reconcileBookedInQuantities only books the unaccounted delta from Mintsoft
     reconcileBookedInQuantities({
       expectedQty: 100,
       currentReceivedQty: 60,
-      localReceivedQty: 60,
+      manualReceiptPool: poolOf(60, 60),
       lastProcessedReceivedQty: 60,
       qtyAccountedViaSnapshot: 60,
       qtyAccountedViaReceipt: 60,
@@ -57,7 +67,7 @@ test('reconcileBookedInQuantities only books the unaccounted delta from Mintsoft
     reconcileBookedInQuantities({
       expectedQty: 100,
       currentReceivedQty: 60,
-      localReceivedQty: 0,
+      manualReceiptPool: NO_POOL,
       lastProcessedReceivedQty: 0,
       qtyAccountedViaSnapshot: 30,
       qtyAccountedViaReceipt: 0,
@@ -106,7 +116,7 @@ test('buildBookedInDryRun summarizes a safe ASN without warnings', () => {
         sku: 'SKU-1',
         expectedQty: 10,
         currentRemoteReceivedQty: 6,
-        localReceivedQty: 2,
+        manualReceiptPool: poolOf(2, 2),
         qtyAccountedViaSnapshot: 0,
         qtyAccountedViaReceipt: 2,
         lastProcessedReceivedQty: 2,
@@ -136,7 +146,7 @@ test('buildBookedInDryRun flags ambiguous ASNs before stock mutation', () => {
         sku: 'SKU-1',
         expectedQty: 10,
         currentRemoteReceivedQty: 12,
-        localReceivedQty: 0,
+        manualReceiptPool: NO_POOL,
         qtyAccountedViaSnapshot: 0,
         qtyAccountedViaReceipt: 0,
         lastProcessedReceivedQty: 0,
@@ -151,7 +161,7 @@ test('buildBookedInDryRun flags ambiguous ASNs before stock mutation', () => {
         sku: 'SKU-2',
         expectedQty: 10,
         currentRemoteReceivedQty: 4,
-        localReceivedQty: 0,
+        manualReceiptPool: NO_POOL,
         qtyAccountedViaSnapshot: 7,
         qtyAccountedViaReceipt: 0,
         lastProcessedReceivedQty: 7,
@@ -167,7 +177,7 @@ test('buildBookedInDryRun flags ambiguous ASNs before stock mutation', () => {
         sku: 'SKU-3',
         expectedQty: 10,
         currentRemoteReceivedQty: 5,
-        localReceivedQty: 0,
+        manualReceiptPool: NO_POOL,
         qtyAccountedViaSnapshot: 0,
         qtyAccountedViaReceipt: 0,
         lastProcessedReceivedQty: 0,
@@ -183,6 +193,7 @@ test('buildBookedInDryRun flags ambiguous ASNs before stock mutation', () => {
         sku: 'SKU-4',
         expectedQty: 2,
         currentRemoteReceivedQty: 1,
+        manualReceiptPool: NO_POOL,
       },
     ],
   })
@@ -214,6 +225,7 @@ test('buildBookedInDryRun treats missing localLineExists as unsafe', () => {
         sku: 'SKU-1',
         expectedQty: 10,
         currentRemoteReceivedQty: 5,
+        manualReceiptPool: NO_POOL,
       },
     ],
   })
@@ -231,7 +243,7 @@ test('buildBookedInDryRun only flags over-receipts outside the quantity toleranc
     productId: 'product-1',
     sku: 'SKU-1',
     expectedQty: 10,
-    localReceivedQty: 0,
+    manualReceiptPool: NO_POOL,
     qtyAccountedViaSnapshot: 0,
     qtyAccountedViaReceipt: 0,
     lastProcessedReceivedQty: 0,
@@ -284,6 +296,7 @@ test('buildBookedInDryRun preserves multiple warning codes on one line', () => {
         sku: 'SKU-1',
         expectedQty: 10,
         currentRemoteReceivedQty: 12,
+        manualReceiptPool: NO_POOL,
         qtyAccountedViaSnapshot: 8,
         lastProcessedReceivedQty: 8,
       },

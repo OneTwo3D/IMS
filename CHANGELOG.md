@@ -20,6 +20,14 @@ This repository uses an `x.y.z` release scheme.
   not only once `qtyReceived` reaches `qty`; the alignment planner caps a PO line at its own residue and
   refuses an ASN whose order is CANCELLED or CLOSED; the EOL-archive incoming figure and the product
   incoming badges count a PO line by what has landed. No migration.
+- **A WMS book-in no longer lets a line's landed quantity fall (o3d-papk follow-up, o3d-67kw3).** The booked-in
+  reconciliation took the line-wide `qtyReceived` as "manual receipts against this ASN" and applied it before the
+  snapshot cover, so align 6, receive 4 by hand, book 6 left landed at 6 and the guard accepted another 4 (stock 14
+  for 10 physical units), and a line partly received by hand and then covered by an ASN sized for the rest lost
+  units at book-in (line 10, manual 4, ASN 6, booked 6: only +2). The snapshot cover now comes first, the manual
+  term draws on a branded pool (the line's unreconciled manual receipts less the new
+  `wms_asn_line_maps.manualQtyBaseline`, written when an ASN row is created or resized), and transfer lines get the
+  same fix. **Migration:** one additive column, `NOT NULL DEFAULT 0`, no backfill.
 - The ASN creator's sizing and the retry path are unchanged and follow in the second half (o3d-6b9c).
 
 ### Parked connectors removed (o3d-remove-parked-connectors)

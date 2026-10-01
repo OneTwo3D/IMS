@@ -393,8 +393,38 @@ reservation without landed-aware sizing would be worse, not better (the replacem
 full outstanding quantity with a zero credit, so a booked-in receipt would add the already-landed units'
 stock a second time), so both land together in the second half (o3d-6b9c). The returns, invoicing,
 purchase-statistics, outstanding-PO-value, receipt-quantity, replenishment and display readers still read
-`qtyReceived` alone (o3d-nnics). A line partly received by hand and then covered by a landed-sized ASN
-loses units at booked-in time (o3d-67kw3, separate).
+`qtyReceived` alone (o3d-nnics).
+
+#### Booked-in reconciliation: the manual-receipt pool (o3d-papk follow-up, o3d-67kw3)
+
+A WMS book-in has to split each newly booked delta into three things: units the alignment **already put in
+stock** (covered by the ASN row's unabsorbed snapshot credit), units a **manual receipt** already put in stock,
+and genuinely new stock. `lib/domain/wms/asn-reconciliation.ts` does it in that order:
+
+> `covered = min(delta, unabsorbed credit)` first; `manual = min(delta − covered, manual-receipt pool)` second;
+> `qtyReceived += delta − manual`; `stock added = delta − covered − manual`.
+
+and the invariant, property-tested over a grid, is that **a book-in changes landed by exactly the stock it
+adds**. The previous order took the manual term first, which let landed *fall* (align 6, receive 4 by hand,
+Mintsoft books 6: `qtyReceived` rose by 2, `qtyAccountedViaReceipt` by 6, landed 10 → 6, the PO flipped back to
+PARTIALLY_RECEIVED and a second manual receipt of 4 was accepted: stock 14 for 10 physical units). The same
+defect existed for transfer lines and is fixed in the same function.
+
+The **manual-receipt pool** is branded (`ManualReceiptPool`; only `resolveManualReceiptPool` builds one, so a
+caller cannot pass the raw `qtyReceived` again) and is the line's manual receipts that no ASN has reconciled:
+
+> `pool = max(0, qtyReceived − Σ lastProcessedReceivedQty over every ASN row of the line (closed included) − this row's manualQtyBaseline)`
+
+`qtyReceived − Σ lastProcessed` is an exact identity (the only writers are the manual receipt, the PO book-in and
+the transfer book-in, all under the parent order's row lock). **`wms_asn_line_maps.manualQtyBaseline`** (migration
+`20261001220000`, `NOT NULL DEFAULT 0`, no backfill: 0 is the old behaviour) removes the manual receipts that
+**pre-date** the ASN row: the creators store that same figure, read under the parent lock, when a row is created or
+resized. That is o3d-67kw3: line 10, manual 4, ASN sized for the 6 outstanding, Mintsoft books 6 used to add only 2
+(4 units lost); the 4 are now in the baseline, the pool is 0 and all 6 land. The dry-run (the review an operator
+approves) and the applied book-in read the same pool, so the figure shown is the stock added.
+
+Not resolvable by IMS, filed as a policy question: a manual receipt of *different* units than the ASN's, on the same
+line, while the ASN is still open, is indistinguishable from the same units received twice (o3d-papk S4).
 
 ### Receipt Review
 

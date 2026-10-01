@@ -10,7 +10,7 @@ import {
   requireLandedQty,
   requireOutstandingQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
-import { buildBookedInDryRun } from '@/lib/domain/wms/asn-reconciliation'
+import { buildBookedInDryRun, resolveManualReceiptPool } from '@/lib/domain/wms/asn-reconciliation'
 
 /**
  * o3d-zzgp — THE ONE WITH REAL CONSEQUENCES, AND THE RETRY THAT UNDOES IT.
@@ -701,7 +701,7 @@ test('o3d-zzgp Codex r1 HIGH-2: the historical credit and the fresh remote expec
       sku: line.sku,
       expectedQty: Number(line.expectedQty),
       currentRemoteReceivedQty: 4,
-      localReceivedQty: 0,
+      manualReceiptPool: resolveManualReceiptPool({ lineQtyReceived: 0, lineReconciledAcrossAsns: 0, rowManualQtyBaseline: 0 }),
       qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
       qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
       lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),

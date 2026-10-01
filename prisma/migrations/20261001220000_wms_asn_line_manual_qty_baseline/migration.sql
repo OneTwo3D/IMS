@@ -1,0 +1,12 @@
+-- o3d-papk (6a follow-up) — remember how many manual receipts a line already had when its ASN row was sized.
+--
+-- WHY: the booked-in reconciliation reads "manual receipts made against THIS ASN" as the line's unreconciled
+-- manual receipts (qtyReceived minus the quantities every ASN row of the line has already reconciled). A manual
+-- receipt made BEFORE the ASN row was created or resized is not one of them: the ASN was sized for what was
+-- still outstanding AFTER it (o3d-67kw3: line 10, manual 4, ASN for 6, Mintsoft books 6 -> only +2 added).
+-- The creators write this column from that same unreconciled figure, read under the parent order's row lock.
+--
+-- ADDITIVE AND BACKFILL-FREE: NOT NULL DEFAULT 0 is the old behaviour for every existing row (nothing is
+-- subtracted), and the application is not live against a production database yet, so there is nothing to
+-- backfill. A constant default is a metadata-only change on PostgreSQL 11+: no table rewrite.
+ALTER TABLE "wms_asn_line_maps" ADD COLUMN "manualQtyBaseline" DECIMAL(12,4) NOT NULL DEFAULT 0;

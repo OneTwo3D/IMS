@@ -11,11 +11,13 @@ import {
   buildBookedInDryRun,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
+  resolveManualReceiptPool,
   resolveRemoteBookedInQuantity,
   sliceTransferSnapshotForReceipt,
   type BookedInDryRun,
   type BookedInDryRunWarningCode,
 } from './asn-reconciliation'
+import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
 import {
   isStockMovementIdempotencyConflict,
@@ -565,6 +567,7 @@ export async function processBookedInEvent(
           qtyAccountedViaSnapshot: true,
           qtyAccountedViaReceipt: true,
           lastProcessedReceivedQty: true,
+          manualQtyBaseline: true,
         },
       })
 
@@ -703,6 +706,29 @@ export async function processBookedInEvent(
 
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
       const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
+      // o3d-papk / o3d-67kw3: THE ONE POOL, shared by the dry run below and by the applied reconciliation
+      // further down. It is the line's manual receipts that no ASN has reconciled yet, less this row's
+      // baseline, read here on `tx` under the parent locks asserted just above — so the review an operator
+      // approves and the stock the approval adds are computed from the same number.
+      const purchasePools = await loadManualReceiptPools(
+        tx,
+        'PURCHASE_ORDER_LINE',
+        purchaseOrderLines,
+        purchaseCandidateLines
+          .filter((line) => purchaseLineById.has(line.sourceLineId))
+          .map((line) => ({ asnLineMapId: line.id, sourceLineId: line.sourceLineId, manualQtyBaseline: line.manualQtyBaseline })),
+      )
+      const transferPools = await loadManualReceiptPools(
+        tx,
+        'STOCK_TRANSFER_LINE',
+        transferLines,
+        transferCandidateLines
+          .filter((line) => transferLineById.has(line.sourceLineId))
+          .map((line) => ({ asnLineMapId: line.id, sourceLineId: line.sourceLineId, manualQtyBaseline: line.manualQtyBaseline })),
+      )
+      // A row with no usable local line (unsupported source type, missing line) has no manual receipts to
+      // count; the dry run reports `missing_local_line` / `unsupported_source_type` for it instead.
+      const noManualReceipts = resolveManualReceiptPool({ lineQtyReceived: 0, lineReconciledAcrossAsns: 0, rowManualQtyBaseline: 0 })
       const now = new Date()
       // Keep buildBookedInDryRun pure and I/O-free: this transaction holds row locks while
       // deriving review state, so any remote/database reads must happen before this point.
@@ -725,7 +751,11 @@ export async function processBookedInEvent(
             sku: line.sku,
             expectedQty: Number(line.expectedQty),
             currentRemoteReceivedQty: line.currentRemoteReceivedQty,
-            localReceivedQty: Number(purchaseLine?.qtyReceived ?? transferLine?.qtyReceived ?? 0),
+            manualReceiptPool: purchaseLine
+              ? requireManualReceiptPool(purchasePools, line.id)
+              : transferLine
+                ? requireManualReceiptPool(transferPools, line.id)
+                : noManualReceipts,
             qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
             qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
             lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
@@ -998,7 +1028,7 @@ export async function processBookedInEvent(
           const reconciled = reconcileBookedInQuantities({
             expectedQty: receiptLine.expectedQty,
             currentReceivedQty: receiptLine.currentReceivedQty,
-            localReceivedQty: Number(poLine.qtyReceived),
+            manualReceiptPool: requireManualReceiptPool(purchasePools, receiptLine.asnLineMapId),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
             qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
             qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,
@@ -1409,7 +1439,7 @@ export async function processBookedInEvent(
           const reconciled = reconcileBookedInQuantities({
             expectedQty: receiptLine.expectedQty,
             currentReceivedQty: receiptLine.currentReceivedQty,
-            localReceivedQty: Number(transferLine.qtyReceived),
+            manualReceiptPool: requireManualReceiptPool(transferPools, receiptLine.asnLineMapId),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
             qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
             qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,

@@ -75,6 +75,7 @@ import {
   type LockedPendingAsnReservation,
 } from '@/lib/domain/wms/pending-asn-retirement'
 import { lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { loadUnreconciledManualReceiptQty } from '@/lib/domain/wms/manual-receipt-pool'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -3199,6 +3200,10 @@ export async function createMintsoftPurchaseOrderAsn(
           expectedQty: Number(line.qty) - Number(line.qtyReceived),
         }))
         .filter((line) => line.expectedQty > 0)
+      // o3d-papk / o3d-67kw3: the manual receipts the line already holds that no ASN has reconciled, read under
+      // the purchase_orders lock above. A row created or resized now is sized for what is outstanding AFTER
+      // them, so they are stored on it and the book-in does not mistake them for receipts against THIS ASN.
+      const manualBaselineByLineId = await loadUnreconciledManualReceiptQty(tx, 'PURCHASE_ORDER_LINE', po.lines)
 
       if (pendingAsn) {
         const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
@@ -3242,6 +3247,7 @@ export async function createMintsoftPurchaseOrderAsn(
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
                 expectedQty: outstandingLine.expectedQty,
+                manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
           } else {
@@ -3254,6 +3260,7 @@ export async function createMintsoftPurchaseOrderAsn(
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
                 expectedQty: outstandingLine.expectedQty,
+                manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
           }
@@ -3339,6 +3346,7 @@ export async function createMintsoftPurchaseOrderAsn(
               productId: line.productId,
               sku: line.sku,
               expectedQty: line.expectedQty,
+              manualQtyBaseline: manualBaselineByLineId.get(line.sourceLineId) ?? 0,
             })),
           },
         },
@@ -4195,6 +4203,9 @@ export async function createMintsoftTransferAsn(
         }))
         .filter((line) => hasOutstandingQty(line.outstanding))
       const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
+      // o3d-papk / o3d-67kw3: the manual receipts each line already holds that no ASN has reconciled, read under
+      // the stock_transfers lock held since the top of this transaction (see the purchase-order creator).
+      const manualBaselineByLineId = await loadUnreconciledManualReceiptQty(tx, 'STOCK_TRANSFER_LINE', transfer.lines)
 
       // o3d-zzgp round 2, Codex HIGH-1 AND HIGH-2 — THE TWO HALVES OF ONE MISTAKE.
       //
@@ -4303,6 +4314,7 @@ export async function createMintsoftTransferAsn(
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
                 expectedQty: outstandingLine.outstanding.qtyNumber,
+                manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
           } else {
@@ -4315,6 +4327,7 @@ export async function createMintsoftTransferAsn(
                 productId: outstandingLine.productId,
                 sku: outstandingLine.sku,
                 expectedQty: outstandingLine.outstanding.qtyNumber,
+                manualQtyBaseline: manualBaselineByLineId.get(outstandingLine.sourceLineId) ?? 0,
               },
             })
           }
@@ -4417,6 +4430,7 @@ export async function createMintsoftTransferAsn(
               productId: line.productId,
               sku: line.sku,
               expectedQty: line.outstanding.qtyNumber,
+              manualQtyBaseline: manualBaselineByLineId.get(line.sourceLineId) ?? 0,
             })),
           },
         },

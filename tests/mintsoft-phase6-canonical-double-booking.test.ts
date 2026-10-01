@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { reconcileBookedInQuantities } from '../lib/domain/wms/asn-reconciliation.ts'
+import { reconcileBookedInQuantities, resolveManualReceiptPool } from '../lib/domain/wms/asn-reconciliation.ts'
 
 /**
  * Canonical partial-ASN double-booking prevention (0jls5 mt6fm / Mintsoft Phase 6).
@@ -66,7 +66,12 @@ function applyBookedInCallback(ledger: Ledger, remoteReceivedQty: number) {
   const reconciled = reconcileBookedInQuantities({
     expectedQty: ledger.expectedQty,
     currentReceivedQty: remoteReceivedQty,
-    localReceivedQty: ledger.localReceivedQty,
+    // The pool is the line's qtyReceived less what the ASN has reconciled (nothing else touches the line here).
+    manualReceiptPool: resolveManualReceiptPool({
+      lineQtyReceived: ledger.localReceivedQty,
+      lineReconciledAcrossAsns: ledger.lastProcessedReceivedQty,
+      rowManualQtyBaseline: 0,
+    }),
     lastProcessedReceivedQty: ledger.lastProcessedReceivedQty,
     qtyAccountedViaSnapshot: ledger.qtyAccountedViaSnapshot,
     qtyAccountedViaReceipt: ledger.qtyAccountedViaReceipt,
