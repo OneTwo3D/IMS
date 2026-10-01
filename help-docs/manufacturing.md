@@ -4,6 +4,46 @@ Manufacturing orders let you assemble finished products from their components or
 
 BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
 
+## Where a recipe comes from
+**If the product changes while you are raising a build order**, the order is refused rather than
+raised against stale information: IMS re-reads the product's type and components at the moment it
+takes its lock, so a recipe edited in that instant is used in its *new* form, and a product converted
+away from BOM in that instant is refused with a message saying so. Nothing is part-created.
+
+
+A recipe can be entered on the product page or loaded in bulk through the products CSV's
+`components` column — see [Importing manufacturing recipes](inventory.md#importing-manufacturing-recipes-bom).
+
+IMS holds each recipe in two places. One copy is what a build order consumes; the other is what
+**planning** reads — the replenishment report's component-demand explosion, automatic reorder build
+orders, and manufacturing analytics. Both are written together by the product form, by the product-type change, and by the CSV import, so
+they normally agree.
+
+They can still fall out of step for recipes created before this was true, or edited directly in the
+database. The symptom is quiet: the product builds fine one order at a time, but the reorder report
+never suggests building it and its components are never reordered on its behalf. To check, open
+`/api/export/bom-recipes?drift=1` or run `npm run check:bom-recipes`; to repair, re-import the
+product through the products CSV.
+
+## When a build order is refused
+
+Raising a build order re-reads the recipe at the moment it is raised, not when you opened the form. If
+somebody changes the product while you are filling it in, the build order is refused and **nothing is
+written** — you are told which of these happened:
+
+- the product is no longer a BOM, so it has no recipe to build;
+- its components were cleared;
+- its recipe is circular (some product in the recipe eventually consumes the product being built);
+- another user claimed the recipe at the same moment — retry.
+
+In every case no build order is created and the recipe is left exactly as it was. A refusal never
+leaves a half-applied change behind.
+
+**Starting an order re-checks it too.** A build order can sit in draft for days, so the recipe is
+checked again at the moment you start it — before any stock is reserved. Starting is refused if the
+product is no longer a manufactured (BOM) product, or if its components have been removed. Nothing is
+reserved and the order stays in draft, so you can fix the recipe and start it again.
+
 ## Lifecycle status and manufacturing
 
 The BOM product's [lifecycle status](glossary.md#lifecycle-status) controls which manufacturing operations are allowed:

@@ -26,6 +26,25 @@ import {
   componentGraphMutationAffectsFulfillment,
   findComponentGraphEditBlockers,
 } from '@/lib/products/component-graph-edit-guard'
+import {
+  PLANNING_REACHABLE_BOM_EDGES,
+  describeBomRecipeRefusal,
+  detectBomItemCycleAfterReplacement,
+  reconcileBomRecipeForProductType,
+  syncBomRecipeFromProductComponents,
+} from '@/lib/products/bom-recipe'
+
+/**
+ * A BOM recipe the component pass refused because it closes a cycle in the `bom_items` graph
+ * (o3d-zjsb5.9). Thrown rather than returned so the whole transaction — including the
+ * `ProductComponent` write that precedes it — rolls back.
+ */
+class BomRecipeCycleError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BomRecipeCycleError'
+  }
+}
 
 /**
  * Product types that can own ProductComponent rows. The CSV import queues a row for the
@@ -471,6 +490,13 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (!preview) {
           let resolvedCategoryId: string | null = null
           const outcome: RenameOutcome = await db.$transaction(async (tx) => {
+            // o3d-zjsb5.9 round 2: the GRAPH lock FIRST, then the per-SKU locks — the same order
+            // pass 2 and the editor use, which is what keeps the two lock families deadlock-free.
+            // This transaction now reconciles the BOM recipe on a type change, so it is a
+            // component-graph writer and has to join that protocol; taking the per-SKU lock first
+            // and the graph lock afterwards would invert the order against pass 2 and deadlock two
+            // concurrent imports.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
             // o3d-42hw: this row can RENAME an existing product, which frees one sku and
             // claims another, so it belongs in the write protocol exactly as the create does.
             // Both skus are locked; the helper collapses them when the sku is unchanged.
@@ -557,6 +583,42 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             // old version, so commitment and dispatch now refuse it even when the guard above saw an
             // empty blocker set because that allocation's transaction was still open.
             await bumpFulfillmentGraphVersions(tx, existingProduct.id, kitnessMutation)
+
+            // o3d-zjsb5.9 round 2, finding 1b: the clearComponents delete left `BomItem` BEHIND. Placed
+            // AFTER the fulfilment-graph bump deliberately: that bump must stay adjacent to the write it
+            // describes (tests/products/component-graph-edit-guard.test.ts asserts the proximity), and the
+            // manufacturing mirror is separate bookkeeping that depends on neither. Reconciling
+            // on the type this transaction just wrote covers all four directions, which
+            // `clearComponents` alone cannot — it is FALSE for KIT -> BOM, where the components are
+            // kept and the product now needs a claimed Bom or planning has no recipe for it.
+            //
+            // This transaction holds the GRAPH lock (taken first, above) and the per-SKU locks, so
+            // the reconcile runs under the same protection as pass 2's component write.
+            const importReconcile = await reconcileBomRecipeForProductType(tx, {
+              productId: existingProduct.id,
+              sku,
+              type: (updateData.type as string | undefined) ?? current.type,
+            })
+            if (importReconcile.kind === 'cycle') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): changing this product's type would make the manufacturing BOM graph `
+                + `circular (${importReconcile.path.join(' -> ')}) — the row was not written`,
+              )
+            }
+            if (importReconcile.kind === 'claim-contended') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): another writer claimed this product's manufacturing BOM while the import `
+                + 'was running — the row was not written, re-run to pick it up',
+              )
+            }
+            // EXHAUSTIVE (round 8), for the same reason as the component pass: this listed the kinds it
+            // knew, so round 8's `active-duplicates` would have fallen through and committed the type
+            // write with a recipe planning double-counts. Anything that is not a success refuses.
+            if (importReconcile.kind !== 'synced' && importReconcile.kind !== 'retired') {
+              throw new BomRecipeCycleError(
+                `Row ${lineNum} (${sku}): ${describeBomRecipeRefusal(importReconcile)}`,
+              )
+            }
             // The structure this row ACTUALLY committed, for the in-run cache below. The
             // locked defaults can preserve a concurrent type/parent, so the pre-lock values
             // no longer describe the row (Codex review, r3).
@@ -836,6 +898,33 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         continue
       }
 
+      // o3d-zjsb5.9: the same question about the OTHER graph — `bom_items` — so that a DRY RUN can
+      // report the refusal that execute will make. `detectComponentCycle` above cannot answer it:
+      // its recursive CTE names `product_components` and nothing else. This is a preflight in
+      // exactly the sense the one above is: it reads a graph another writer may change, and the
+      // authoritative check runs after the write inside the transaction that holds the graph lock.
+      if (productById.get(productId)?.type === 'BOM') {
+        const bomEdges = await db.bomItem.findMany({
+          // See PLANNING_REACHABLE_BOM_EDGES: one shared definition, so this preflight and the
+          // authoritative in-transaction walk cannot disagree about what the graph is (round 6).
+          where: PLANNING_REACHABLE_BOM_EDGES,
+          select: { parentProductId: true, componentProductId: true },
+        })
+        const bomCycle = detectBomItemCycleAfterReplacement(
+          bomEdges,
+          productId,
+          components.map((component) => component.componentId),
+        )
+        if (bomCycle) {
+          result.errors.push(
+            `Row ${cr.lineNum}: ${cr.sku} would make the manufacturing BOM graph circular `
+            + `(${bomCycle.join(' -> ')}) — neither the component list nor the BOM recipe was written`,
+          )
+          result.skipped++
+          continue
+        }
+      }
+
       try {
         if (!preview) {
           // o3d-w998: this pass runs LONG after the row that queued it, in its own
@@ -900,6 +989,61 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             // o3d-4kfh r6: the CAS half of the same protection — see the kitness path above. A no-op
             // on a BOM, whose component list no sales line expands.
             await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
+
+            // o3d-zjsb5.9: THE SECOND REPRESENTATION. `ProductComponent` is what fulfilment and
+            // production-order consumption read; `Bom`/`BomItem` is what PLANNING reads
+            // (replenishment component explosion, reorder-MO generation, manufacturing
+            // analytics). Nothing wrote the second one from any importer, so a Qoblex BOM loaded
+            // through this CSV was sellable and invisible to planning, with no guard, constraint
+            // or log saying so.
+            //
+            // It is written HERE — same transaction, same advisory lock, same parsed component
+            // list — rather than by a second importer or a seeding script, so the two
+            // representations cannot be written from two different sources at two different
+            // times. That is what makes drift unrepresentable for anything this code wrote,
+            // instead of merely checked afterwards. `findBomRecipeDrift` covers the rows this
+            // code did NOT write.
+            //
+            // BOM ONLY. A KIT is consumed at sale, never manufactured: it has no production
+            // order, so a Bom for it would be a recipe with no reader. `Kit`/`KitItem` is
+            // deliberately left alone here for the same reason it has no reader today — see the
+            // note on the issue.
+            if (current.type === 'BOM') {
+              const bomOutcome = await syncBomRecipeFromProductComponents(tx, {
+                productId,
+                sku: current.sku,
+                components: components.map((component) => ({
+                  componentProductId: component.componentId,
+                  qty: component.qty,
+                })),
+              })
+              if (bomOutcome.kind === 'cycle') {
+                // THROWN, not returned: the `ProductComponent` write above has already happened
+                // in this transaction and must not commit either. Landing one representation of a
+                // recipe the other refuses is the exact split this change exists to prevent.
+                throw new BomRecipeCycleError(
+                  `Row ${cr.lineNum}: ${cr.sku} would make the manufacturing BOM graph circular `
+                  + `(${bomOutcome.path.join(' -> ')}) — neither the component list nor the BOM recipe was `
+                  + 'written. This can happen when an older BOM recipe for a DIFFERENT product still lists '
+                  + 'this one as its parent; re-import that product\'s recipe too, or clear it',
+                )
+              }
+              // EXHAUSTIVE, not a list of the kinds I happened to think of (round 6, finding 3).
+              // `claim-contended` was previously ignored, and ignoring it returned `true` and
+              // COMMITTED the `ProductComponent` write with no claimed Bom -- the sellable-but-
+              // unmanufacturable state this whole change exists to remove, reintroduced by the very
+              // compare-and-set added to prevent a different form of it. A type conversion by a
+              // concurrent editor does NOT take the graph lock, so losing the CAS is reachable here.
+              //
+              // Written as `!== 'written'` so a future outcome kind cannot be silently dropped: a
+              // new kind fails closed, loudly, instead of committing half a recipe.
+              if (bomOutcome.kind !== 'written') {
+                throw new BomRecipeCycleError(
+                  `Row ${cr.lineNum}: ${cr.sku} — ${describeBomRecipeRefusal(bomOutcome)}. Neither the `
+                  + 'component list nor the BOM recipe was written for this row.',
+                )
+              }
+            }
             return true
           })
           if (wrote === 'in-flight-sales') {
@@ -933,6 +1077,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           }
         }
       } catch (e: unknown) {
+        // o3d-zjsb5.9: reported with its own message, and counted as a SKIPPED row. The generic
+        // branch below prefixes "Components for <sku>:" and leaves `skipped` untouched, which for
+        // a refusal (as opposed to an unexpected fault) would under-report the row count in the
+        // dry-run preview the operator decides on.
+        if (e instanceof BomRecipeCycleError) {
+          result.errors.push(e.message)
+          result.skipped++
+          continue
+        }
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push(`Components for ${cr.sku}: ${msg}`)
       }

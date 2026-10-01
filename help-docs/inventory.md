@@ -56,6 +56,114 @@ Every screen with a **Templates** menu (Inventory, Customers, Suppliers, Sales O
 
 These rules apply consistently across every CSV import in the app — if a screen has a Templates menu next to its Import button, the template, the guidance row, and the empty-cell behaviour all work the same way.
 
+**Row and file limits.** Every CSV importer accepts at most **10,000 rows** and **10 MB** per file.
+A file over 10 MB is refused outright and nothing is imported. A file with more than 10,000 rows is
+**not** refused — the first 10,000 rows are imported and the rest are dropped, with a single error
+line reading `File has more than 10000 rows — N row(s) skipped`. That line is the only notice you
+get, so check the import result rather than assuming a large file loaded whole. Split a larger
+catalogue into several files, and put a product's components in the same file as the product
+wherever you can (see below for what happens when you cannot).
+
+
+### Importing manufacturing recipes (BOM)
+
+A manufactured product's recipe rides in the products CSV's **`components`** column, in the form
+`COMPONENT-SKU:qty;OTHER-SKU:qty`. It is the same column Kits use, and on a `BOM`-type row it is
+what makes the product manufacturable.
+
+IMS keeps that recipe in two places, for two different sets of readers, and **the products CSV
+writes both in one step**: the fulfilment/consumption copy that build orders consume, and the
+planning copy that replenishment reports, reorder-MO generation and manufacturing analytics read.
+This matters because until both exist, a manufactured product is *sellable but invisible to
+planning* — nothing fails, the reorder report simply never suggests building it.
+
+Rules for the `components` column:
+
+- **Every component must exist as a product.** It can be created earlier in the same file, later in
+  the same file, or already be in IMS — order within one file does not matter, because components are
+  resolved after every row has been read. What does matter is that a component in *another* file
+  must be imported **first**.
+- **An unknown component SKU refuses the whole recipe for that row, not just that line.** You get
+  `Row N: component SKU "X" not found`, and the product is still created or updated — with **no
+  recipe at all**. This is the failure worth watching for: it does not stop the import, and a BOM
+  with no recipe looks perfectly normal on the product page. Re-import the row once the component
+  exists. A partial recipe is never written, which is deliberate: a recipe missing one component
+  would produce under-picked builds and mis-picked orders that nothing reports.
+- **A circular recipe is refused.** A product cannot be a component of itself, directly or through a
+  chain. Both the fulfilment copy and the planning copy are checked, and a refusal writes neither.
+- **A BOM recipe can be re-imported at any time**, regardless of open sales orders — see the BOM
+  section below for why. A **Kit** recipe cannot, while orders are in flight against it.
+- Leaving `components` blank leaves an existing recipe alone. It does not clear it.
+
+**Checking that both copies agree.** Nothing in the database forces them to stay in step, so there
+is an explicit check:
+
+- `GET /api/export/bom-recipes` — the manufacturing recipes as IMS holds them, with a `bomClaimed`
+  column. A row with `bomClaimed=FALSE` came from somewhere other than an import and is **not**
+  maintained by it.
+- `GET /api/export/bom-recipes?drift=1` — every disagreement between the two copies, one row per
+  problem, with a plain-English `detail`.
+- `GET /api/export/bom-recipes?template=1` — a minimal worked example of the three columns a recipe
+  needs; import it through the **products** importer, not a separate one.
+- `npm run check:bom-recipes` — the same check from the command line. It exits non-zero when
+  anything disagrees, so it can gate a data load.
+
+**Two active recipes stops an import.** If a product somehow has more than one *active* manufacturing
+recipe — usually a legacy recipe left by an older data load — importing it is refused, and the message
+names the duplicate recipes. This is deliberate: planning adds up the components of every active recipe,
+so it would over-order for that product. Deactivate the duplicates (keep them, so past build orders
+still report correctly), leave one as the live recipe, and re-run the import.
+
+To do that, ask whoever administers the system to run the repair command — there is no button for it,
+because a stray duplicate recipe is a data-migration leftover rather than something you create in
+normal use:
+
+```
+npm run repair:duplicate-bom -- --list                # shows the duplicates and their ids
+npm run repair:duplicate-bom -- --bom <id> --dry-run  # says what would happen, changes nothing
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --accept-name-only   # deactivates it
+```
+
+Confirming only the database *name* is not proof of which server you are on — a copy of the database has
+the same name, and it is also reached at the same address and port — so the command makes you say so
+explicitly with `--accept-name-only`, and records that in the activity log. Adding the host or the port
+does not remove the need for it, because a copy matches on those too. If you know the cluster's id (your installer should have recorded it), pin that instead
+and you do not need the acknowledgement:
+
+```
+npm run repair:duplicate-bom -- --bom <id> --expect-db <name> --expect-system-id <recorded id>
+```
+
+The last one asks you to confirm which database you are changing — either with `--expect-db`, or by
+typing the database name when it asks. It will not make the change without that, because a copy of the
+database contains the same recipe ids, so the id alone cannot tell a test copy from the real thing.
+
+Be aware that a copy also keeps the same *name*, so confirming the name is not proof of which server you
+are on. Before it writes, the command prints the server's address and cluster id as well; check those if
+there is any chance a copy of the database is in play.
+
+It will refuse if the recipe it is asked to deactivate is a product's live recipe, or the only active
+recipe another product has — in those cases nothing is changed and it tells you which product is in
+the way.
+
+**A retired recipe is not a disagreement.** The check only reports a circular recipe that *planning
+can actually reach* — an active recipe whose product is still a BOM. Retiring a recipe keeps its lines
+on purpose (see **Changing a product's type** below), so a retired line pointing back at a product
+that now consumes it is an ordinary state after a conversion, not a fault, and the check stays quiet
+about it.
+
+**Editing a recipe after import.** The product page's component editor writes both copies too, in
+one step, so editing an imported BOM keeps them in step — you do not have to re-import to keep
+planning correct.
+
+**Changing a product's type.** Converting a BOM to any non-manufactured type *retires* its
+manufacturing recipe: the recipe is marked inactive and stops being that product's recipe, but its
+lines are kept so past build orders still report correctly. Converting back to BOM re-adopts the same
+recipe and reactivates it — you do not end up with two. Converting a Kit to a BOM gives it a
+manufacturing recipe from the components it already had.
+
+Repair in every case is the same: re-import the affected products through the products CSV.
+
 
 ## Creating a Product
 
@@ -157,7 +265,8 @@ Two limits worth knowing:
 
 A product that is manufactured from components. Unlike a Kit, a BOM product holds its own stock. Components are consumed during a build order, and the finished product's stock increases.
 
-Use the component search to define the bill of materials, specifying the quantity of each component consumed per unit produced.
+Use the component search to define the bill of materials, specifying the quantity of each component consumed per unit produced. To load recipes in bulk, use the products CSV's `components` column — see
+**Importing manufacturing recipes (BOM)** above.
 
 **A BOM's component list can be edited at any time**, regardless of open sales orders. Fulfilment
 treats a BOM as a stocked item and never expands its components, so changing the recipe cannot alter

@@ -1,0 +1,2009 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import assert from 'node:assert/strict'
+import { execFile, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
+import test, { mock } from 'node:test'
+import { promisify } from 'node:util'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { config } from 'dotenv'
+
+import { PrismaClient } from '../../app/generated/prisma/client'
+
+/**
+ * o3d-zjsb5.9 — THE BOM RECIPE IMPORT PATH, IN A TIER CI ACTUALLY RUNS.
+ *
+ * WHY THIS FILE EXISTS AT ALL, stated plainly because it is a process defect as much as a technical
+ * one (round 3 verdict). The branch's central claim is that a migrated manufacturing recipe is
+ * GENUINELY USABLE — not merely present. That was proven, but in two places CI never looks: the
+ * end-to-end proof sat in `tests/manual/`, which nothing collects, and the automated tests sat in
+ * `tests/products/`, which `test:unit` covers but the concurrency job's glob does not. A property
+ * that only holds when somebody remembers to run something is documentation, not a gate. So the
+ * load-bearing parts live here, in `tests/concurrency/**`, which gates every merge.
+ *
+ * TWO THINGS ARE PROVEN HERE.
+ *
+ * 1. THE INTERLEAVING (round 3's HIGH). `createManufacturingOrder` took the component-graph lock but
+ *    read the product's type and component list BEFORE it, outside any transaction. The lock
+ *    serialized the write and not the data written: while the request waited, an editor could change
+ *    the recipe — and the action would then write the OLD list into BomItem and raise an order
+ *    against it — or a type conversion could RETIRE the Bom, and the action would claim and
+ *    reactivate it for a product that is no longer BOM-typed. Both are driven here through a
+ *    deliberate barrier, and both must be REFUSED rather than acted on.
+ *
+ *    The barrier is the advisory lock itself, held by this test on a connection of its own, so the
+ *    interleaving is a fact of the sequence and not of the scheduler: the action provably cannot
+ *    proceed past its lock acquisition until this test commits, which is precisely the window the
+ *    finding is about.
+ *
+ * 2. THE RECIPE IS USABLE END TO END: one products CSV writes BOTH representations, and a production
+ *    order is created AND COMPLETED against the migrated Bom, moving stock. That is the claim the
+ *    whole branch rests on, and it now runs on every PR.
+ *
+ * Needs a real PostgreSQL — the advisory lock, the unique index on `boms.productId`, the foreign keys
+ * and the deferrable stock-movement evidence trigger all participate. Gated behind
+ * RUN_DB_CONCURRENCY_TESTS=1 like its siblings.
+ */
+
+const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
+
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+    requireInternalUser: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
+  },
+})
+mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
+// Belt, not decoration: importProductsCsv schedules a WooCommerce metadata push and an IMMEDIATE
+// stock sync. A scratch database has no connector rows so both are no-ops, but "no vendor calls"
+// must not rest on a database happening to be empty.
+mock.module('@/lib/shopping', {
+  namedExports: {
+    enqueueStockSync: async () => {},
+    pushProductMetadata: async () => ({ success: true }),
+  },
+})
+
+config({ path: '.env.local', quiet: true })
+config({ quiet: true })
+
+type Deps = {
+  db: typeof import('../../lib/db/index')['db']
+  importProductsCsv: typeof import('../../app/actions/import')['importProductsCsv']
+  importOpeningStockCsv: typeof import('../../app/actions/import')['importOpeningStockCsv']
+  saveProductComponents: typeof import('../../app/actions/products')['saveProductComponents']
+  createManufacturingOrder: typeof import('../../app/actions/manufacturing')['createManufacturingOrder']
+  updateManufacturingOrderStatus: typeof import('../../app/actions/manufacturing')['updateManufacturingOrderStatus']
+  findBomRecipeDrift: typeof import('../../lib/products/bom-recipe')['findBomRecipeDrift']
+  deactivateDuplicateBomRecipe: typeof import(
+    '../../lib/products/bom-recipe-repair'
+  )['deactivateDuplicateBomRecipe']
+  readServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['readServerIdentity']
+  compareServerIdentity: typeof import('../../lib/products/bom-recipe-repair')['compareServerIdentity']
+  unverifiablePins: typeof import('../../lib/products/bom-recipe-repair')['unverifiablePins']
+  COMPONENT_GRAPH_WRITE_LOCK_KEY: number
+}
+
+async function loadDeps(): Promise<Deps> {
+  const [dbMod, importMod, productsMod, mfgMod, recipeMod, locksMod, repairMod] = await Promise.all([
+    import('../../lib/db/index'),
+    import('../../app/actions/import'),
+    import('../../app/actions/products'),
+    import('../../app/actions/manufacturing'),
+    import('../../lib/products/bom-recipe'),
+    import('../../lib/db/advisory-locks'),
+    import('../../lib/products/bom-recipe-repair'),
+  ])
+  return {
+    db: dbMod.db,
+    importProductsCsv: importMod.importProductsCsv,
+    importOpeningStockCsv: importMod.importOpeningStockCsv,
+    saveProductComponents: productsMod.saveProductComponents,
+    createManufacturingOrder: mfgMod.createManufacturingOrder,
+    updateManufacturingOrderStatus: mfgMod.updateManufacturingOrderStatus,
+    findBomRecipeDrift: recipeMod.findBomRecipeDrift,
+    deactivateDuplicateBomRecipe: repairMod.deactivateDuplicateBomRecipe,
+    readServerIdentity: repairMod.readServerIdentity,
+    compareServerIdentity: repairMod.compareServerIdentity,
+    unverifiablePins: repairMod.unverifiablePins,
+    COMPONENT_GRAPH_WRITE_LOCK_KEY: locksMod.COMPONENT_GRAPH_WRITE_LOCK_KEY,
+  }
+}
+
+function csv(rows: string[]): FormData {
+  const data = new FormData()
+  data.set('file', new File([rows.join('\n')], 'products.csv', { type: 'text/csv' }))
+  data.set('mode', 'execute')
+  return data
+}
+
+function errorsOf(result: { errors?: string[] }): string[] {
+  return result.errors ?? []
+}
+
+/**
+ * A prefix unique to this run, so a re-run never collides with its own leftovers -- AND a per-test
+ * namespace on top of it, so the three tests below never collide with EACH OTHER. They share a
+ * database and each one mutates the catalogue it seeds (one rewrites the recipe, one converts the
+ * product away from BOM), so a shared namespace would make each test's fixture depend on the order
+ * the previous one left things in. Caught the first run: the warehouse `code` unique index.
+ */
+const TAG = `BR${Date.now().toString(36).toUpperCase()}`
+const sku = (ns: string, name: string) => `${TAG}${ns}-${name}`
+
+/**
+ * HOLD THE COMPONENT-GRAPH LOCK on a connection of its own, run `body` while it is held, and release
+ * it whatever body does.
+ *
+ * Deliberately the same discipline as o3d-nuhmy's `withRowPinned`: the release is in a `finally` the
+ * caller cannot forget, and deferred work is handed back BOXED so `await` cannot flatten it into a
+ * wait for something that needs the lock released first.
+ */
+async function whileHoldingGraphLock<T>(
+  deps: Deps,
+  body: () => Promise<{ deferred: T }>,
+): Promise<{ deferred: T }> {
+  const held = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const holder = deps.db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${deps.COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+    held.resolve()
+    await release.promise
+  }, { timeout: 60_000, maxWait: 10_000 })
+  const settled = holder.then(() => undefined, (error: unknown) => error as unknown)
+  await Promise.race([
+    held.promise,
+    settled.then((error) => { throw error ?? new Error('the lock holder ended before it took the lock') }),
+  ])
+  try {
+    return await body()
+  } finally {
+    release.resolve()
+    await settled
+  }
+}
+
+/** Waits until `pg_locks` shows somebody WAITING for the advisory lock we are holding. */
+async function awaitAdvisoryLockWaiter(deps: Deps, expected = 1): Promise<number> {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const rows = await deps.db.$queryRaw<Array<{ n: bigint }>>`
+      SELECT count(*)::bigint AS n FROM pg_locks
+      WHERE locktype = 'advisory' AND NOT granted
+        AND classid = 0 AND objid = ${deps.COMPONENT_GRAPH_WRITE_LOCK_KEY}
+    `
+    const waiting = Number(rows[0]?.n ?? 0)
+    if (waiting >= expected) return waiting
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+  throw new Error(
+    `no caller ever blocked on the component-graph advisory lock; without that, this test would be `
+    + 'asserting about ordinary sequencing rather than about the window the finding is in',
+  )
+}
+
+/**
+ * A WAREHOUSE OF OUR OWN, never the seed's.
+ *
+ * This tier's guard refuses any database with rows in `users`, `organisations` or `currencies` --
+ * exactly what `prisma/seed.ts` creates -- so a concurrency test cannot assume a seeded database and
+ * must write what it needs. (`resolveBaseCurrencyCode` falls back to the default with no organisation
+ * row, which is why the imports below work regardless.) Products and warehouses are explicitly NOT
+ * evidence of repurposing: the guard's own note records that one green tier run left 47 products and
+ * 85 warehouses behind.
+ */
+async function ownWarehouse(deps: Deps, ns: string): Promise<{ id: string; code: string }> {
+  return await deps.db.warehouse.create({
+    data: { code: sku(ns, 'WH').slice(0, 20), name: `${TAG}${ns} probe warehouse` },
+    select: { id: true, code: true },
+  })
+}
+
+/**
+ * DRIFT FOR THIS TEST'S OWN PRODUCTS ONLY, and the scoping is not tidiness.
+ *
+ * `findBomRecipeDrift` deliberately scans the WHOLE database -- that is what makes it useful as an
+ * operator check. Asserting its result is empty inside this tier would therefore assert that no other
+ * file, and no earlier run, has ever left a drifted row behind: the guard's own note records that one
+ * green tier run left 47 products and 85 warehouses in place, and sibling tests create drift on
+ * purpose. Caught while mutation-testing this very file -- a leftover row from the previous run failed
+ * an assertion about code the mutation had not touched, which is a false signal in both directions.
+ */
+async function driftForThisTest(deps: Deps, ns: string) {
+  const mine = `${TAG}${ns}-`
+  return (await deps.findBomRecipeDrift(deps.db)).filter((row) => row.sku.startsWith(mine))
+}
+
+/**
+ * THE RECIPE AS THE DATABASE HOLDS IT, for asserting a refusal changed NOTHING.
+ *
+ * Round 6's three findings all had the same shape: the action reported failure and the rejected state
+ * committed anyway. Asserting on the return value alone cannot see that, so each refusal test compares
+ * this before and after. `qty` is stringified because Prisma hands back Decimal objects that
+ * `deepEqual` compares by identity rather than value.
+ */
+/**
+ * RUNS THE OPERATOR'S ACTUAL COMMAND, in a child process, against this test's scratch database.
+ *
+ * Round 9's finding was that the duplicate refusal named a remedy the application could not perform,
+ * and that the test "resolves the condition with a direct database update" -- proving the refusal
+ * clears, not that anybody can clear it. So this shells out to the real script with the real argv and
+ * asserts on its real exit code. A `deactivateDuplicateBomRecipe()` call from in-process would have
+ * skipped exactly the parts an operator depends on: argument parsing, the dry-run path, the exit
+ * codes, and whether the thing is wired into package.json at all.
+ *
+ * DATABASE_URL is passed explicitly because the child loads its own `.env` files; without this it
+ * would faithfully repair whatever database the developer's `.env.local` points at.
+ */
+async function runRepairScript(
+  args: string[],
+  envOverrides: Record<string, string> = {},
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const execFileAsync = promisify(execFile)
+  try {
+    const { stdout, stderr } = await execFileAsync(
+      'npx',
+      ['tsx', 'scripts/deactivate-duplicate-bom.ts', ...args],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL, ...envOverrides },
+        timeout: 120_000,
+      },
+    )
+    return { code: 0, stdout, stderr }
+  } catch (error) {
+    const failure = error as { code?: number; stdout?: string; stderr?: string }
+    return { code: failure.code ?? 1, stdout: failure.stdout ?? '', stderr: failure.stderr ?? String(error) }
+  }
+}
+
+/**
+ * THE SAME COMMAND UNDER A REAL PSEUDO-TERMINAL (round 20). `execFile` gives the child a pipe, so
+ * `process.stdin.isTTY` is false and every branch that depends on a human being present is unreachable
+ * from `runRepairScript`. util-linux `script` allocates a pty, so the script genuinely sees a TTY. Exit
+ * status is propagated by `-e`; the pty merges stdout and stderr into one stream, returned as `output`.
+ * `typed` is what the "operator" types at a prompt, if one appears.
+ */
+async function runRepairScriptOnTty(
+  args: string[],
+  typed = '',
+  /**
+   * `raw` is written to the pty exactly as given (no newline appended) -- a partial line, or `\x03`
+   * (Ctrl-C). `closeStdin` then closes `script`'s own stdin, which util-linux `script` turns into an EOF
+   * (Ctrl-D) on the pty: the operator's end-of-input. `afterPrompt` holds `raw` back until the prompt text
+   * has actually been printed, so a Ctrl-C cannot land before the handler it is testing exists.
+   */
+  opts: { raw?: string; closeStdin?: boolean; afterPrompt?: boolean } = {},
+): Promise<{ code: number; output: string }> {
+  const quote = (value: string) => `'${value.replace(/'/g, `'\\''`)}'`
+  const command = ['npx', 'tsx', 'scripts/deactivate-duplicate-bom.ts', ...args].map(quote).join(' ')
+  return new Promise((resolve) => {
+    const child = spawn('script', ['-qec', command, '/dev/null'], {
+      cwd: process.cwd(),
+      env: { ...process.env, DATABASE_URL: process.env.DATABASE_URL },
+    })
+    let output = ''
+    child.stdout.on('data', (chunk) => { output += String(chunk) })
+    child.stderr.on('data', (chunk) => { output += String(chunk) })
+    // Input is queued in the pty line buffer, so it does not matter that the prompt appears later.
+    if (typed) child.stdin.write(`${typed}\n`)
+    const sendRaw = () => {
+      if (opts.raw) child.stdin.write(opts.raw)
+      if (opts.closeStdin) child.stdin.end()
+    }
+    if (opts.afterPrompt) {
+      const poll = setInterval(() => {
+        if (/Type the database name/.test(output)) { clearInterval(poll); sendRaw() }
+      }, 50)
+      child.on('close', () => clearInterval(poll))
+    } else {
+      sendRaw()
+    }
+    child.stdin.on('error', () => { /* script may already have exited */ })
+    const timer = setTimeout(() => child.kill('SIGKILL'), 120_000)
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code: code ?? 1, output }) })
+  })
+}
+
+async function snapshotRecipe(deps: Deps, productId: string, bomId: string) {
+  const bom = await deps.db.bom.findUniqueOrThrow({
+    where: { id: bomId }, select: { active: true, productId: true },
+  })
+  const items = await deps.db.bomItem.findMany({
+    where: { parentProductId: productId },
+    select: { bomId: true, componentProductId: true, qty: true, sortOrder: true },
+    orderBy: [{ bomId: 'asc' }, { componentProductId: 'asc' }],
+  })
+  return {
+    bom,
+    items: items.map((item) => ({ ...item, qty: String(item.qty) })),
+  }
+}
+
+async function seedCatalogue(deps: Deps, ns: string): Promise<{ tableId: string; legId: string; rawId: string }> {
+  const loaded = await deps.importProductsCsv(csv([
+    'sku,name,type,components,stockUnit',
+    `${sku(ns, 'RAW')},Oak board,SIMPLE,,each`,
+    `${sku(ns, 'LEG')},Table leg,SIMPLE,,each`,
+    `${sku(ns, 'TABLE')},Oak table,BOM,${sku(ns, 'LEG')}:4;${sku(ns, 'RAW')}:2,each`,
+  ]))
+  assert.deepEqual(errorsOf(loaded), [], 'the catalogue must import cleanly')
+  const table = await deps.db.product.findUniqueOrThrow({ where: { sku: sku(ns, 'TABLE') }, select: { id: true } })
+  const leg = await deps.db.product.findUniqueOrThrow({ where: { sku: sku(ns, 'LEG') }, select: { id: true } })
+  const raw = await deps.db.product.findUniqueOrThrow({ where: { sku: sku(ns, 'RAW') }, select: { id: true } })
+  return { tableId: table.id, legId: leg.id, rawId: raw.id }
+}
+
+test(
+  '[o3d-zjsb5.9] one products CSV writes BOTH representations, and the migrated recipe completes a production order',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'A'
+    const { tableId, legId, rawId } = await seedCatalogue(deps, NS)
+
+    const table = await deps.db.product.findUniqueOrThrow({
+      where: { id: tableId },
+      select: {
+        productComponents: { select: { componentId: true, qty: true } },
+        manufacturingBom: { select: { id: true, active: true, productId: true, items: { select: { componentProductId: true, qty: true } } } },
+      },
+    })
+    assert.equal(table.productComponents.length, 2, 'the fulfilment/consumption copy must be written')
+    assert.ok(table.manufacturingBom, 'the PLANNING copy must be written too — this is the gap the branch closes')
+    assert.equal(table.manufacturingBom.productId, tableId, 'and it must be claimed by the product')
+    assert.equal(table.manufacturingBom.active, true, 'and active, or planning filters it out')
+    assert.deepEqual(
+      table.manufacturingBom.items.map((item) => [item.componentProductId, Number(item.qty)]).sort(),
+      [[legId, 4], [rawId, 2]].sort(),
+      'the two representations must agree, component for component',
+    )
+    assert.deepEqual(await driftForThisTest(deps, NS), [], 'no drift after the load')
+
+    // Stock for the components, through the sanctioned opening-stock path: a hand-written movement is
+    // refused by the deferrable reporting-evidence trigger.
+    const warehouse = await ownWarehouse(deps, NS)
+    const stock = await deps.importOpeningStockCsv(csv([
+      'sku,warehouseCode,qty,unitCostBase',
+      `${sku(NS, 'RAW')},${warehouse.code},500,1`,
+      `${sku(NS, 'LEG')},${warehouse.code},500,2`,
+    ]))
+    assert.deepEqual(errorsOf(stock), [], 'opening stock must load')
+
+    const created = await deps.createManufacturingOrder({
+      productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 2,
+    })
+    assert.ok(created.success && created.id, `order create failed: ${JSON.stringify(created)}`)
+    const order = await deps.db.productionOrder.findUniqueOrThrow({
+      where: { id: created.id }, select: { bomId: true },
+    })
+    assert.equal(order.bomId, table.manufacturingBom.id,
+      'the order must run against the MIGRATED Bom, not one invented lazily at create time')
+
+    assert.ok((await deps.updateManufacturingOrderStatus(created.id, 'IN_PROGRESS')).success)
+    assert.ok((await deps.updateManufacturingOrderStatus(created.id, 'COMPLETED')).success)
+    const output = await deps.db.stockLevel.findFirstOrThrow({
+      where: { productId: tableId, warehouseId: warehouse.id }, select: { quantity: true },
+    })
+    assert.equal(Number(output.quantity), 2, 'completing the order must add finished stock — this is "usable", not "present"')
+    assert.deepEqual(await driftForThisTest(deps, NS), [], 'and the two representations still agree')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r3] a recipe edited while a build order waits for the graph lock is not written from the stale snapshot',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'B'
+    const { tableId, legId, rawId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({ where: { productId: tableId }, select: { id: true } })
+    const warehouse = await ownWarehouse(deps, NS)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      // The action does its preflight read now, then blocks on the lock we are holding.
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      // THE WINDOW, ESTABLISHED BY THE SERVER rather than by a sleep: it is provably parked on the
+      // lock, so its snapshot is provably older than anything we change next.
+      await awaitAdvisoryLockWaiter(deps)
+
+      // Change the recipe underneath it. Done with raw SQL ON OUR OWN connection because the editor
+      // would want the very lock we are holding -- the point is that the action's snapshot is now
+      // stale, not how it became stale.
+      await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+      await deps.db.$executeRaw`
+        INSERT INTO product_components ("id", "productId", "componentId", qty, "sortOrder")
+        VALUES (${`pc-${TAG}${NS}-new`}, ${tableId}, ${rawId}, 9, 0)
+      `
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.ok(created.success, `the order should still be raised, from the CURRENT recipe: ${JSON.stringify(created)}`)
+
+    // THE ASSERTION THAT MATTERS. The recipe written under the lock must be the one that existed when
+    // the lock was granted (RAW x9), never the pre-lock snapshot (LEG x4 + RAW x2).
+    const after = await deps.db.bom.findUniqueOrThrow({
+      where: { id: originalBom.id },
+      select: { items: { select: { componentProductId: true, qty: true } } },
+    })
+    assert.deepEqual(
+      after.items.map((item) => [item.componentProductId, Number(item.qty)]),
+      [[rawId, 9]],
+      'BomItem must mirror the recipe as of the LOCKED read; the stale snapshot would have written LEG x4 + RAW x2',
+    )
+    assert.ok(
+      !after.items.some((item) => item.componentProductId === legId),
+      'the dropped component must not survive in the planning copy',
+    )
+    assert.deepEqual(await driftForThisTest(deps, NS), [],
+      'and the two representations must agree afterwards — a stale write is exactly the drift this branch removes')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r3] a BOM retired while a build order waits for the graph lock is REFUSED, not claimed and reactivated',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    const deps = await loadDeps()
+    const NS = 'C'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({ where: { productId: tableId }, select: { id: true } })
+    const warehouse = await ownWarehouse(deps, NS)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      await awaitAdvisoryLockWaiter(deps)
+
+      // Retire the recipe exactly as a type conversion does: product away from BOM, recipe
+      // deactivated and unclaimed, items KEPT so history still resolves.
+      await deps.db.$executeRaw`UPDATE products SET type = 'SIMPLE' WHERE id = ${tableId}`
+      await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE id = ${originalBom.id}`
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.equal(created.success, false, 'raising a build order for a product that is no longer a BOM must be REFUSED')
+    assert.match(String(created.error), /no longer has a manufacturing recipe|changed to SIMPLE/i,
+      `the refusal must say what happened, got: ${created.error}`)
+
+    // AND THE REFUSAL MUST BE COMPLETE: nothing claimed, nothing reactivated, no order.
+    const bom = await deps.db.bom.findUniqueOrThrow({
+      where: { id: originalBom.id }, select: { active: true, productId: true },
+    })
+    assert.equal(bom.active, false, 'the retired recipe must NOT have been reactivated')
+    assert.equal(bom.productId, null, 'and must NOT have been re-claimed for a product that is no longer BOM-typed')
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'and no production order may exist for it',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r3] a RETIRED recipe\'s edges do not block a legitimate re-import through the cycle check',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * A CONSEQUENCE OF RETIRE-NOT-DELETE, found by auditing every reader of Bom/BomItem for the
+     * `active` filter (round 3). Retiring keeps the items on purpose, so open and completed production
+     * orders still resolve. But the two cycle walks -- the import preflight and the in-transaction
+     * check -- read `bom_items` with no `active` filter, so a retired recipe's edges stayed in the
+     * graph they walk. The reader those walks protect
+     * (`replenishment-reports.ts`: `where: { bom: { active: true }, parentProduct: { type: BOM } }`)
+     * cannot follow those edges at all, so counting them cannot prevent a real problem -- it can only
+     * refuse a legitimate import. Conservative in the wrong direction is still wrong.
+     */
+    const deps = await loadDeps()
+    const NS = 'D'
+    const parent = sku(NS, 'PARENT')
+    const child = sku(NS, 'CHILD')
+
+    // Two BOMs where each is, at some point, a component of the other -- legal only because the first
+    // arrangement is retired before the second is created.
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'RAW')},Oak board,SIMPLE,,each`,
+      `${child},Child,BOM,${sku(NS, 'RAW')}:1,each`,
+      `${parent},Parent,BOM,${child}:2,each`,
+    ]))), [], 'the first arrangement must import')
+
+    // Retire the PARENT exactly as a type conversion does: items kept, recipe deactivated+unclaimed.
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,stockUnit', `${parent},Parent,SIMPLE,each`,
+    ]))), [], 'the conversion must import')
+    const retired = await deps.db.bom.findFirstOrThrow({
+      where: { items: { some: { parentProduct: { sku: parent } } } },
+      select: { active: true, productId: true, items: { select: { id: true } } },
+    })
+    assert.equal(retired.active, false, 'precondition: the recipe must be retired')
+    assert.ok(retired.items.length > 0, 'precondition: and its items KEPT -- that is what makes this a hazard')
+
+    // NOW the reverse direction is legitimate: PARENT is no longer a BOM, so CHILD may consume it.
+    // With the walk unscoped, the retired PARENT -> CHILD edge closes a cycle and refuses this.
+    const result = await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit', `${child},Child,BOM,${parent}:1,each`,
+    ]))
+    assert.ok(
+      !errorsOf(result).some((line) => /circular/i.test(line)),
+      `a retired recipe's edges must not refuse this import, got: ${JSON.stringify(errorsOf(result))}`,
+    )
+    const childRow = await deps.db.product.findUniqueOrThrow({
+      where: { sku: child },
+      select: { manufacturingBom: { select: { items: { select: { component: { select: { sku: true } } } } } } },
+    })
+    assert.deepEqual(
+      childRow.manufacturingBom?.items.map((item) => item.component.sku),
+      [parent],
+      'and the new recipe must actually have been written',
+    )
+
+    // AND THE OPERATOR CHECK MUST AGREE (round 6, finding 2). This is the same state from the drift
+    // check's side: a retired PARENT -> CHILD edge alongside a live CHILD -> PARENT one. The write
+    // path was scoped in round 4 but `findBomRecipeDrift` still walked every BomItem row, so it
+    // reported `bom-item-cycle` here and `check:bom-recipes` exited 1 on a correct, ordinary
+    // post-retirement state. A guard that goes red on correct states gets ignored, which is strictly
+    // worse than one that is merely narrow -- so the two walks now share one definition.
+    const drift = await driftForThisTest(deps, NS)
+    assert.deepEqual(
+      drift.filter((row) => row.kind === 'bom-item-cycle'),
+      [],
+      `a retirement plus a reverse edge is NOT a planning cycle, got: ${JSON.stringify(drift)}`,
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r8] a conversion after the recipe sync but before the insert creates NO order',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 7, FINDING 1 -- the same boundary as round 4, from the other side. Round 4 moved the READ
+     * inside the graph lock. The order INSERT was still outside it: the transaction validated the
+     * product, synced the recipe, COMMITTED, and only then created the production order. A BOM -> SIMPLE
+     * conversion in that gap retired the Bom and cleared ProductComponent, and the order was created
+     * anyway -- against a retired recipe, which STARTING would then snapshot as empty.
+     *
+     * The window is between the sync and the insert, both of which are now in one transaction, so it
+     * cannot be entered from outside any more -- which is the point, and also why this test attacks the
+     * boundary rather than that interior gap: it holds the graph lock, lets the whole create block on it,
+     * converts the product, and releases. If the insert is inside the lock the conversion is seen and the
+     * order is refused; if it is outside, the order lands against the retired recipe.
+     */
+    const deps = await loadDeps()
+    const NS = 'H'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      await awaitAdvisoryLockWaiter(deps)
+      // A type conversion, exactly as updateProduct performs one: type away from BOM, components
+      // cleared, recipe retired with its items kept.
+      await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+      await deps.db.$executeRaw`UPDATE products SET type = 'SIMPLE' WHERE id = ${tableId}`
+      await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE "productId" = ${tableId}`
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.equal(created.success, false, 'the build order must be REFUSED, not raised against a retired recipe')
+    // THE DATABASE, not the return value: the finding is precisely that the action could report one
+    // thing while the insert landed anyway.
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'NO production order may exist for a product that stopped being a BOM before the insert',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r8] STARTING an order revalidates the recipe and reserves nothing when it is gone',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * THE SECOND HALF of round 7's finding 1, and the half that actually costs stock. Creation is not the
+     * only gap: an order can sit in DRAFT while the catalogue changes, and STARTING it froze
+     * `componentSnapshot` from a live read with no eligibility check. An emptied recipe therefore froze
+     * `[]`, the ASSEMBLY reservation loop ran zero times, and completion produced finished goods while
+     * consuming and reserving NOTHING -- stock invented from an empty recipe.
+     *
+     * Asserted on the reservations, not just the refusal, because "reserved nothing" is the damage.
+     */
+    const deps = await loadDeps()
+    const NS = 'I'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const warehouse = await ownWarehouse(deps, NS)
+    assert.deepEqual(errorsOf(await deps.importOpeningStockCsv(csv([
+      'sku,warehouseCode,qty,unitCostBase',
+      `${sku(NS, 'RAW')},${warehouse.code},500,1`,
+      `${sku(NS, 'LEG')},${warehouse.code},500,2`,
+    ]))), [], 'opening stock must load')
+
+    const created = await deps.createManufacturingOrder({
+      productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 2,
+    })
+    assert.ok(created.success && created.id, `order create failed: ${JSON.stringify(created)}`)
+
+    // Now the recipe goes away while the order sits in DRAFT -- no race needed; this is a Tuesday.
+    await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+    const reservedBefore = await deps.db.stockLevel.findMany({
+      where: { warehouseId: warehouse.id }, select: { productId: true, reservedQty: true },
+      orderBy: { productId: 'asc' },
+    })
+
+    const started = await deps.updateManufacturingOrderStatus(created.id, 'IN_PROGRESS')
+    assert.equal(started.success, false, 'starting an order whose recipe was emptied must be REFUSED')
+
+    const after = await deps.db.productionOrder.findUniqueOrThrow({
+      where: { id: created.id }, select: { status: true, componentSnapshot: true, startedAt: true },
+    })
+    assert.equal(after.status, 'DRAFT', 'the order must not have moved to IN_PROGRESS')
+    assert.equal(after.startedAt, null, 'and must not have been stamped as started')
+    assert.notDeepEqual(after.componentSnapshot, [],
+      'and must NOT have frozen an empty component snapshot -- that snapshot is what completion consumes')
+    assert.deepEqual(
+      await deps.db.stockLevel.findMany({
+        where: { warehouseId: warehouse.id }, select: { productId: true, reservedQty: true },
+        orderBy: { productId: 'asc' },
+      }),
+      reservedBefore,
+      'and NOTHING may be reserved -- an assembly that reserves nothing is the loss this prevents',
+    )
+
+    // AND THE TYPE ARM: still refused when the product stops being a BOM, components intact.
+    const NS2 = 'J'
+    const second = await seedCatalogue(deps, NS2)
+    const warehouse2 = await ownWarehouse(deps, NS2)
+    // STOCK, so the refusal below can only be about the TYPE. Without it this arm refused for want of
+    // stock and passed with the type check deleted -- a mutation survived and said so.
+    assert.deepEqual(errorsOf(await deps.importOpeningStockCsv(csv([
+      'sku,warehouseCode,qty,unitCostBase',
+      `${sku(NS2, 'RAW')},${warehouse2.code},500,1`,
+      `${sku(NS2, 'LEG')},${warehouse2.code},500,2`,
+    ]))), [], 'opening stock must load for the type arm')
+    const order2 = await deps.createManufacturingOrder({
+      productId: second.tableId, warehouseId: warehouse2.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+    })
+    assert.ok(order2.success && order2.id, `second order create failed: ${JSON.stringify(order2)}`)
+    await deps.db.$executeRaw`UPDATE products SET type = 'SIMPLE' WHERE id = ${second.tableId}`
+    const started2 = await deps.updateManufacturingOrderStatus(order2.id, 'IN_PROGRESS')
+    assert.equal(started2.success, false, 'starting an order whose product is no longer a BOM must be REFUSED')
+    assert.match(
+      String(started2.error), /no longer a manufactured \(BOM\) product|no recipe to build/i,
+      `and refused FOR THE TYPE, not incidentally for want of stock, got: ${started2.error}`,
+    )
+    assert.equal(
+      (await deps.db.productionOrder.findUniqueOrThrow({
+        where: { id: order2.id }, select: { status: true },
+      })).status,
+      'DRAFT',
+      'and it must stay in DRAFT',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r8] an import is REFUSED while another ACTIVE Bom holds items for the same parent',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 7, FINDING 2 -- a deferral reversed, because the adoption path CREATES the situation the
+     * deferral assumed away. Adoption rewrites one Bom and leaves the others in place; while they are
+     * inactive that is harmless, but `replenishment-reports.ts` selects every ACTIVE BomItem whose parent
+     * is BOM-typed and has no "the claimed Bom wins" rule, so two active recipes for one product means
+     * component demand is the SUM of both. The import used to succeed and every plan double-counted,
+     * with the drift check reporting it afterwards -- observing a wrong number while it is used.
+     *
+     * Refused at the import, not fixed in the readers: that keeps the reader-side change in
+     * o3d-zjsb5.30 and makes this fail closed, loudly, where a PREP phase can resolve it at source.
+     */
+    const deps = await loadDeps()
+    const NS = 'K'
+    const { tableId, legId, rawId } = await seedCatalogue(deps, NS)
+    const claimed = await deps.db.bom.findUniqueOrThrow({ where: { productId: tableId }, select: { id: true } })
+
+    // A second ACTIVE Bom holding items for the SAME parent -- what a legacy load or an older snapshot
+    // leaves behind. Unclaimed, so it does not collide with the productId unique index.
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // PRECONDITION: planning really does read BOTH, so the refusal is preventing a real wrong number and
+    // not guarding a hypothetical. This is the reader's own predicate.
+    const visibleToPlanning = await deps.db.bomItem.findMany({
+      where: { bom: { active: true }, parentProduct: { id: tableId, type: 'BOM' } },
+      select: { bomId: true },
+    })
+    assert.ok(
+      new Set(visibleToPlanning.map((item) => item.bomId)).size > 1,
+      'precondition: planning must be able to see items for this parent in MORE THAN ONE active Bom, '
+      + 'or this test is not about double-counting at all',
+    )
+
+    const before = await snapshotRecipe(deps, tableId, claimed.id)
+    const result = await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'LEG')}:7;${sku(NS, 'RAW')}:2,each`,
+    ]))
+    const errors = errorsOf(result)
+    assert.ok(
+      errors.some((line) => /more than one ACTIVE manufacturing recipe/i.test(line)),
+      `the import must be REFUSED while active duplicates exist, got: ${JSON.stringify(errors)}`,
+    )
+    assert.ok(
+      errors.some((line) => line.includes(duplicate.id)),
+      `and the refusal must NAME the duplicate so it can be resolved, got: ${JSON.stringify(errors)}`,
+    )
+    // Neither representation may have moved: the qty 7 the CSV asked for must not be anywhere.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, claimed.id), before,
+      'the refused import must leave the claimed recipe exactly as it was')
+    assert.deepEqual(
+      (await deps.db.productComponent.findMany({
+        where: { productId: tableId, componentId: legId }, select: { qty: true },
+      })).map((row) => String(row.qty)).map((qty) => qty.split('.')[0]),
+      ['4'],
+      'and must not have committed the new ProductComponent qty either',
+    )
+
+    // AND IT CLEARS -- THROUGH THE REAL REMEDY, not a database write (round 10).
+    //
+    // This previously did `db.bom.update({ active: false })`, which proved the refusal CLEARS but not
+    // that an operator can clear it. That was the round-9 finding: the refusal named a remedy the
+    // application could not perform, so an affected product was blocked until somebody hand-edited
+    // production data. The fix is a command, so the test runs THE COMMAND -- same argv an operator
+    // types, same exit code, against this test's own scratch database.
+    const dryRun = await runRepairScript(['--bom', duplicate.id, '--dry-run'])
+    assert.equal(dryRun.code, 0, `the dry run must succeed: ${dryRun.stderr}`)
+    assert.match(dryRun.stdout, /DRY RUN/, 'and must say it wrote nothing')
+    // IT MUST NAME THE DATABASE IT IS ABOUT TO CHANGE, from the SERVER's own answer. An operator runs
+    // this by hand during a load window, and this repo has twice been bitten by DATABASE_URL not
+    // resolving where someone believed (a probe table in the gate's scratch database; a socket-form URL
+    // losing `?host=` and retargeting the shared cluster). Asserted on the real scratch database name,
+    // so a banner that printed a constant or echoed the URL would not satisfy it.
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.ok(scratchDatabase.length > 0, 'precondition: the tier must tell us which database it gave us')
+    assert.ok(
+      dryRun.stderr.includes(scratchDatabase),
+      `the command must announce the database it is connected to (expected ${scratchDatabase}), `
+      + `got: ${dryRun.stderr}`,
+    )
+    assert.match(
+      dryRun.stderr, /STAMPED DISPOSABLE/,
+      'and must say whether it is a scratch database -- this one is stamped, so it must say so',
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true,
+      'and a DRY RUN must genuinely not have deactivated it -- otherwise --dry-run is a lie',
+    )
+
+    const repair = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
+    assert.equal(repair.code, 0, `the repair command must succeed: ${repair.stderr}`)
+    assert.match(repair.stdout, /Deactivated BOM/, `and must say what it did, got: ${repair.stdout}`)
+    // And the audit row records WHICH database, because "was that done on stage or production?" is the
+    // question asked afterwards about a hand-run repair.
+    const audit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: duplicate.id } },
+      select: { description: true, metadata: true },
+      orderBy: { createdAt: 'desc' },
+    })
+    assert.equal(
+      (audit.metadata as { database?: string } | null)?.database, scratchDatabase,
+      'the audit row must record the database the repair ran against',
+    )
+
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'LEG')}:7;${sku(NS, 'RAW')}:2,each`,
+    ]))), [], 'and after running the documented remedy the same import must succeed')
+
+    // Re-running it is safe: an operator who is not sure whether it worked must not be punished.
+    const again = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
+    assert.equal(again.code, 0, 'the command must be safe to re-run')
+    assert.match(again.stdout, /already inactive/i, 'and should say so rather than pretending to act')
+    assert.ok(
+      (await deps.db.bomItem.findMany({ where: { bomId: duplicate.id } })).length > 0,
+      'and the duplicate\'s ROWS must still be there -- deactivate, never delete, so history resolves',
+    )
+    void rawId
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r10] the repair command REFUSES to deactivate a recipe another product depends on',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * THE REMEDY MUST NOT BECOME THE DEFECT. "Deactivate this Bom" is not always safe: a Bom row can be
+     * a product's CLAIMED recipe, and one row can legitimately carry items for SEVERAL parents. Either
+     * way, deactivating it makes a BOM-typed product silently unplannable -- which is precisely the
+     * o3d-zjsb5.29 defect the duplicate refusal exists to prevent, moved to a different product.
+     *
+     * Both refusals are driven through the real command and asserted on its exit code (2) and on the
+     * database being unchanged, because a repair tool that reports a refusal and writes anyway is worse
+     * than no tool.
+     */
+    const deps = await loadDeps()
+    const NS = 'L'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+
+    // ARM 1: the product's own CLAIMED recipe. Refusing this is what stops an operator reaching for the
+    // command when the real answer is to change the product's type.
+    const claimed = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const claimedRefusal = await runRepairScript(['--bom', claimed.id, '--expect-db', scratchDatabase, '--accept-name-only'])
+    assert.equal(claimedRefusal.code, 2, `a claimed recipe must be REFUSED, got: ${claimedRefusal.stderr}`)
+    assert.match(claimedRefusal.stderr, /live recipe of/i, 'and must say whose recipe it is')
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: claimed.id }, select: { active: true } })).active,
+      true,
+      'and must NOT have deactivated it',
+    )
+
+    // ARM 2: an unclaimed Bom that is the ONLY active recipe of a DIFFERENT BOM-typed parent. LEG becomes
+    // a BOM whose recipe lives solely in this row, so deactivating it would take LEG out of planning.
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'BOM' } })
+    const soleForLeg = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} sole recipe for leg`, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: soleForLeg.id, parentProductId: legId,
+        componentProductId: (await deps.db.product.findUniqueOrThrow({
+          where: { sku: sku(NS, 'RAW') }, select: { id: true },
+        })).id,
+        qty: 1, sortOrder: 0,
+      },
+    })
+    const soleRefusal = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase, '--accept-name-only'])
+    assert.equal(soleRefusal.code, 2, `the sole active recipe of another parent must be REFUSED, got: ${soleRefusal.stderr}`)
+    assert.match(soleRefusal.stderr, /only active recipe for/i, 'and must name the product it would strand')
+    assert.ok(
+      soleRefusal.stderr.includes(sku(NS, 'LEG')),
+      `and name it by SKU so the operator can act, got: ${soleRefusal.stderr}`,
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: soleForLeg.id }, select: { active: true } })).active,
+      true,
+      'and must NOT have deactivated it',
+    )
+
+    // ...but once LEG has another active recipe, the same row is no longer load-bearing and CLEARS.
+    const secondForLeg = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} second recipe for leg`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: secondForLeg.id, parentProductId: legId,
+        componentProductId: (await deps.db.product.findUniqueOrThrow({
+          where: { sku: sku(NS, 'RAW') }, select: { id: true },
+        })).id,
+        qty: 1, sortOrder: 0,
+      },
+    })
+    const nowAllowed = await runRepairScript(['--bom', soleForLeg.id, '--expect-db', scratchDatabase, '--accept-name-only'])
+    assert.equal(nowAllowed.code, 0,
+      `once another active recipe exists the refusal must LIFT, got: ${nowAllowed.stderr}`)
+    // And the items are KEPT -- deactivate, never delete, so completed build orders still value.
+    assert.ok(
+      (await deps.db.bomItem.findMany({ where: { bomId: soleForLeg.id } })).length > 0,
+      'and its recipe lines must still be there',
+    )
+    // An audit row must exist: this is a deliberate change to production data made outside the UI.
+    assert.ok(
+      (await deps.db.activityLog.findMany({
+        where: { tag: 'manufacturing', description: { contains: soleForLeg.id } },
+        select: { id: true },
+      })).length > 0,
+      'and the repair must be logged',
+    )
+
+    // Tidy up so a live cycle/duplicate is not left for sibling files (the lesson from round 6).
+    await deps.db.bom.update({ where: { id: secondForLeg.id }, data: { active: false } })
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r12] the repair REFUSES an unconfirmed or MISMATCHED target database, and writes nothing',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 11'S FINDING. The banner printed the server identity and then immediately wrote, so an
+     * operator who discovered that DATABASE_URL had resolved somewhere unexpected could not react -- a
+     * log line, not a safeguard. The sharpest part is that the BOM ID IS NO PROTECTION EITHER: a CLONE
+     * of the database holds the same id, so "the id was there, so I must be on the right server" is
+     * precisely the reasoning that fails. And `--dry-run` constrains nothing about a later write,
+     * because it is a separate invocation.
+     *
+     * Three arms, because there are three distinct ways this can go wrong, and one test per way is what
+     * lets a mutation point at the thing it broke.
+     */
+    const deps = await loadDeps()
+    const NS = 'M'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // ARM 1: NOBODY CONFIRMED ANYTHING. Non-interactive (the test runner gives the child no TTY) and no
+    // --expect-db, so consent must NOT be assumed from the absence of a human.
+    // ROUND 18 MOVED THIS EARLIER, and the exit code changed with it: naming the target database is now
+    // MANDATORY for a non-interactive write, so an unnamed one is a USAGE error (exit 1) refused BEFORE
+    // anything connects, rather than a post-banner refusal (exit 3). Strictly better -- a usage mistake
+    // cannot reach a database at all -- and the assertion is updated rather than the rule relaxed.
+    const unconfirmed = await runRepairScript(['--bom', duplicate.id])
+    assert.equal(unconfirmed.code, 1,
+      `an unnamed write must be a USAGE error, got code ${unconfirmed.code}: ${unconfirmed.stderr}`)
+    assert.match(unconfirmed.stderr, /name the target database/i,
+      `and must say what is missing, got: ${unconfirmed.stderr}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and must NOT have deactivated anything',
+    )
+
+    // ARM 2: CONFIRMED THE WRONG DATABASE. The id exists here, which is exactly the clone case -- so the
+    // only thing that can catch it is the name.
+    const wrongName = `${scratchDatabase}_not_this_one`
+    const mismatched = await runRepairScript(['--bom', duplicate.id, '--expect-db', wrongName])
+    assert.equal(mismatched.code, 3,
+      `a mismatched target must be REFUSED, got code ${mismatched.code}: ${mismatched.stderr}`)
+    // The message must name BOTH, or the operator cannot tell which of the two is wrong.
+    assert.ok(
+      mismatched.stderr.includes(wrongName) && mismatched.stderr.includes(scratchDatabase),
+      `the refusal must name what was EXPECTED and what was FOUND, got: ${mismatched.stderr}`,
+    )
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and must NOT have deactivated anything',
+    )
+
+    // ARM 3: THE IN-TRANSACTION RE-VERIFICATION, exercised directly.
+    //
+    // The pre-flight check and this one both refuse a mismatch, so a script run cannot show which of the
+    // two caught it -- and I cannot make a connection change server mid-run from out here. So this calls
+    // the mutation itself with a wrong expectation, which is the guard's own contract: asked inside the
+    // transaction that does the writing, a mismatch aborts and the abort discards the write.
+    const liveIdentity = await deps.readServerIdentity(deps.db)
+    const inTransaction = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, {
+        bomId: duplicate.id,
+        expectIdentity: { ...liveIdentity, database: 'a-different-database' },
+      }))
+    assert.equal(inTransaction.kind, 'wrong-database',
+      `the in-transaction check must refuse, got: ${JSON.stringify(inTransaction)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    assert.equal(
+      (await deps.db.activityLog.findMany({
+        where: { description: { contains: duplicate.id } }, select: { id: true },
+      })).length,
+      0,
+      'and no audit row either -- a refusal is not an act',
+    )
+
+    // AND THE CORRECT NAME STILL WORKS, so none of the above passes by refusing everything.
+    const accepted = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
+    assert.equal(accepted.code, 0, `the right name must be accepted, got: ${accepted.stderr}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      false, 'and the duplicate must now be deactivated',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r13] THE CONTRACT: a same-name server differing in the rest of the composite is refused',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 13, FINDING 1 -- round 12's own argument turned back on round 12's fix. Round 12 reasoned
+     * that a CLONE holds the same BOM ids, so the id cannot distinguish two servers. True, and
+     * incomplete: `current_database()` returns the NAME, and a restored copy KEEPS ITS NAME. So a clone
+     * on another server satisfied `--expect-db` AND the in-transaction re-check. The guard proved "this
+     * database is called X" while the operator needed "this is the server I meant" -- an adjacent
+     * property: sound, and establishing the wrong thing.
+     *
+     * THIS TESTS THE COMPARISON CONTRACT, NOT A SECOND SERVER. I cannot stand up a second cluster here,
+     * so the composite is driven directly with a SYNTHETIC identity that matches on name and differs on
+     * the rest -- which is exactly the clone's shape. The same honest technique as the in-transaction arm
+     * above: the guard's contract, stated as a test, rather than a simulated second machine.
+     */
+    const deps = await loadDeps()
+    const live = await deps.readServerIdentity(deps.db)
+
+    // The live read must actually have found a server, or every assertion below is about nothing.
+    assert.ok(live.database.length > 0 && live.database !== 'unknown',
+      `precondition: the identity read must work, got ${JSON.stringify(live)}`)
+
+    // A CLONE: same name, different cluster. The name alone cannot see this; the composite must.
+    const clone = { ...live, systemIdentifier: '1234567890123456789' }
+    assert.notEqual(live.systemIdentifier, clone.systemIdentifier, 'precondition: the ids must differ')
+    const cloneDifferences = deps.compareServerIdentity(live, clone)
+    assert.deepEqual(
+      cloneDifferences.map((d) => d.field), ['systemIdentifier'],
+      'a same-name clone on another cluster must be caught, and caught ON the identifier',
+    )
+
+    // Same name, different host and port -- the other way a copy is reached.
+    assert.ok(
+      deps.compareServerIdentity(live, { ...live, host: '10.9.9.9', port: '65432' }).length === 2,
+      'a same-name database reached at a different address must also be caught',
+    )
+
+    // AND THE HONEST LIMIT, asserted so nobody mistakes this for more than it is: where
+    // `system_identifier` is unavailable its absence must NOT be read as a mismatch -- absence of
+    // evidence is not evidence -- which is precisely the residual hole. That path is DEFENSIVE and rare:
+    // an ordinary role CAN read pg_control_system() on PG17 (verified with a plain LOGIN role holding no
+    // grants), so it only arises where EXECUTE was revoked or a managed provider restricts it. The
+    // standing limit is different and unfixable here: a PHYSICAL clone copies the identifier, so on the
+    // same address it is indistinguishable.
+    assert.deepEqual(
+      deps.compareServerIdentity(
+        { ...live, systemIdentifier: 'unavailable' },
+        { ...live, systemIdentifier: '999' },
+      ),
+      [],
+      'an unavailable identifier must not be reported as a mismatch -- this IS the documented limit',
+    )
+
+    // The matching case still matches, so none of the above passes by refusing everything.
+    assert.deepEqual(deps.compareServerIdentity(live, { ...live }), [],
+      'and an identical composite must compare equal')
+
+    // END TO END: the in-transaction guard refuses a same-name-only mismatch through the real mutation.
+    const NS = 'N'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const refused = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, { bomId: duplicate.id, expectIdentity: clone }))
+    assert.equal(refused.kind, 'wrong-database',
+      `a clone composite must be refused inside the transaction, got: ${JSON.stringify(refused)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r13] a MISTYPED or malformed argument is a usage error, never a write',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 13, FINDING 2. The parser ignored what it did not recognise, so `--dryrun`, `--dry_run` or
+     * `--dry-run=true` was silently dropped AND THE RUN WROTE. That lands squarely on the exemption:
+     * not requiring confirmation for `--dry-run` is only safe if `--dry-run` cannot be misspelled into a
+     * write. It could, which made the exemption the delivery mechanism -- worse than not having it.
+     */
+    const deps = await loadDeps()
+    const NS = 'O'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const stillActive = async () =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active
+
+    // EVERY ONE OF THESE USED TO BE A WRITE, or would have been under a lenient parser.
+    const malformed: Array<[string, string[]]> = [
+      ['a misspelled dry-run (--dryrun)', ['--bom', duplicate.id, '--dryrun']],
+      ['a misspelled dry-run (--dry_run)', ['--bom', duplicate.id, '--dry_run']],
+      ['--flag=value form', ['--bom', duplicate.id, '--dry-run=true']],
+      ['an unknown option', ['--bom', duplicate.id, '--force']],
+      ['a repeated flag', ['--bom', duplicate.id, '--bom', duplicate.id, '--dry-run']],
+      ['a flag with no value', ['--bom']],
+      ['a value flag swallowing the next flag', ['--bom', '--dry-run']],
+      ['conflicting modes', ['--list', '--bom', duplicate.id]],
+      ['a bare argument', [duplicate.id]],
+    ]
+    for (const [what, args] of malformed) {
+      const run = await runRepairScript(args)
+      assert.equal(run.code, 1, `${what} must be a USAGE ERROR (exit 1), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /Usage error:/, `${what} must say it is a usage error, got: ${run.stderr}`)
+      assert.equal(await stillActive(), true, `${what} must NOT have written anything`)
+    }
+
+    // THE --flag=value MESSAGE, asserted because a mutation showed the exit code alone cannot see it: the
+    // unknown-option check already refuses `--dry-run=true`, so deleting the `=` branch changed nothing
+    // observable. What the branch actually provides is telling an operator that the NAME was right and
+    // only the FORM was wrong, instead of sending them hunting for a flag that does not exist.
+    const equalsForm = await runRepairScript(['--bom', duplicate.id, '--dry-run=true'])
+    assert.match(
+      equalsForm.stderr, /takes no value/,
+      'a bare flag written as --flag=value must be told it takes no value, not merely "unknown option": '
+      + equalsForm.stderr,
+    )
+    const equalsValueFlag = await runRepairScript(['--bom=' + duplicate.id, '--dry-run'])
+    assert.match(
+      equalsValueFlag.stderr, /with a space/,
+      `a value flag written as --flag=value must be told to use a space, got: ${equalsValueFlag.stderr}`,
+    )
+
+    // And the correctly spelled forms still work, so the validator is not simply refusing everything.
+    const goodDryRun = await runRepairScript(['--bom', duplicate.id, '--dry-run'])
+    assert.equal(goodDryRun.code, 0, `a correct --dry-run must work: ${goodDryRun.stderr}`)
+    assert.equal(await stillActive(), true, 'and still write nothing')
+    const goodWrite = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', String(process.env.IMS_CONCURRENCY_SCRATCH_DB),
+      '--accept-name-only',
+    ])
+    assert.equal(goodWrite.code, 0, `a correct write must work: ${goodWrite.stderr}`)
+    assert.equal(await stillActive(), false, 'and actually deactivate it')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] name-only is a DECISION: it refuses without --accept-name-only, and the audit records it',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 1. A run pinning only --expect-db passes on a restored copy -- same name, same BOM
+     * ids -- and the in-transaction re-check compares that server against its OWN preflight identity, so
+     * it passes too. The warning printed immediately before the write required no decision: nothing
+     * stopped, and the operator had no moment in which to act on it. A warning next to a write is not a
+     * decision point.
+     *
+     * This is the option I originally ranked THIRD, and two independent readers converging on it moved it
+     * first. It is also the only one that survives my own objection to requiring an identifier: it cannot
+     * be satisfied by copying the banner, because it is not a value to be copied -- it is recorded intent.
+     */
+    const deps = await loadDeps()
+    const NS = 'P'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const active = async () =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active
+
+    // WITHOUT the acknowledgement: refused, nothing written, and told BOTH ways forward.
+    const bare = await runRepairScript(['--bom', duplicate.id, '--expect-db', scratchDatabase])
+    assert.equal(bare.code, 3, `a name-only write must be REFUSED, got ${bare.code}: ${bare.stderr}`)
+    // The message now states the REASON rather than the flag shape: a restored copy shares the name, the
+    // address and the port, which is why no combination of them discharges the acknowledgement (round 18).
+    assert.match(bare.stderr, /restored copy|SAME name/i, `and must say why, got: ${bare.stderr}`)
+    assert.match(bare.stderr, /--accept-name-only/, 'and must name the acknowledgement flag')
+    assert.match(bare.stderr, /--expect-system-id/, 'and must offer the stronger pin as the better option')
+    // The stronger option must point at the RECORDED value, not the one just printed -- otherwise the
+    // advice trains exactly the paste-from-the-banner habit that makes a pin worthless.
+    assert.match(bare.stderr, /RECORDED AT INSTALL/i,
+      `the advice must not tell the operator to paste the banner value, got: ${bare.stderr}`)
+    assert.equal(await active(), true, 'and nothing may have been written')
+
+    // WITH it: writes, and the weaker mode is visible afterwards.
+    const accepted = await runRepairScript([
+      '--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only',
+    ])
+    assert.equal(accepted.code, 0, `an acknowledged name-only write must succeed: ${accepted.stderr}`)
+    assert.equal(await active(), false, 'and must actually deactivate it')
+    const audit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: duplicate.id } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal(
+      (audit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, true,
+      'the audit row must record that the weaker name-only mode was accepted',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] a role DENIED EXECUTE on pg_control_system() gets the documented behaviour, for real',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 3, and this is the test that would have caught it -- which is why it uses a REAL role
+     * with EXECUTE revoked rather than a stub.
+     *
+     * Catching the JavaScript error from a denied `pg_control_system()` does NOT restore PostgreSQL's
+     * transaction state: the transaction is left aborted (25P02) and every later statement fails with
+     * "current transaction is aborted", so the BOM queries died and the command reached its generic exit-1
+     * handler. A role denied EXECUTE could not use the command as documented AT ALL. A stub would have
+     * shown none of that, because the poisoning is a database behaviour, not a JavaScript one -- the same
+     * family as the P2002/25P02 tests already in this repository.
+     *
+     * Fixed two ways: availability is determined BEFORE the mutation transaction so the optional query
+     * never runs inside one, and the query is wrapped in a SAVEPOINT so even a mid-run revocation degrades
+     * instead of poisoning.
+     */
+    const deps = await loadDeps()
+    const NS = 'R'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const scratchDatabase = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+
+    // A ROLE THAT CANNOT READ THE IDENTIFIER, but can do everything else the repair needs.
+    const live = await deps.readServerIdentity(deps.db)
+    const role = `ims_denied_${Date.now().toString(36)}`
+    // THE ROLE MUST BE ABLE TO LOG IN UNDER WHATEVER AUTH THE SERVER USES (round 22). CI's Postgres uses
+    // password auth, so a password-less LOGIN role cannot connect there; trust auth (the local rig) ignores
+    // the password. Hex only, so it is safe to interpolate into CREATE ROLE. It is a throwaway for a
+    // throwaway role and travels in the child's environment, never on a command line.
+    const rolePassword = randomBytes(16).toString('hex')
+    // WHO THE ADMIN CONNECTION IS, for the cleanup below -- not a literal `ims`, which exists only on the
+    // local harness and is how the first version of this cleanup silently did nothing in CI.
+    const adminRole = (await deps.db.$queryRawUnsafe<Array<{ u: string }>>('SELECT current_user AS u'))[0]?.u
+    assert.ok(adminRole, 'precondition: the admin connection must report its role')
+    await deps.db.$executeRawUnsafe(`CREATE ROLE ${role} LOGIN PASSWORD '${rolePassword}'`)
+    try {
+      await deps.db.$executeRawUnsafe(`REVOKE EXECUTE ON FUNCTION pg_control_system() FROM ${role}, PUBLIC`)
+      await deps.db.$executeRawUnsafe(`GRANT CONNECT ON DATABASE "${scratchDatabase}" TO ${role}`)
+      await deps.db.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${role}`)
+      await deps.db.$executeRawUnsafe(
+        `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`)
+      await deps.db.$executeRawUnsafe(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role}`)
+
+      // PRECONDITION: the revoke must actually bite, or this test proves nothing about the denied path.
+      const asDenied = await deps.db.$queryRawUnsafe<Array<{ ok: boolean }>>(
+        `SELECT has_function_privilege('${role}', 'pg_control_system()', 'execute') AS ok`)
+      assert.equal(asDenied[0]?.ok, false, 'precondition: EXECUTE must really be revoked for this role')
+
+      // BUILT WITH THE URL API from whatever DATABASE_URL the environment supplies. The first version
+      // string-replaced the literal `//ims@`, which exists only in the local harness: in CI the URL is
+      // postgres:postgres@..., the replace was a NO-OP, and every "denied role" arm ran as the SUPERUSER,
+      // who can always read pg_control_system(). It failed on every CI head for four rounds.
+      const roleUrl = new URL(String(process.env.DATABASE_URL))
+      roleUrl.username = role
+      roleUrl.password = rolePassword
+      const url = roleUrl.toString()
+
+      // PROOF THE DENIED ROLE IS WHAT WE CONNECT AS. Without this a setup that silently degrades to the
+      // admin connection makes every arm below examine nothing.
+      const identityProbe = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) })
+      try {
+        const who = await identityProbe.$queryRawUnsafe<Array<{ u: string; su: boolean }>>(
+          'SELECT current_user AS u, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS su')
+        assert.equal(who[0]?.u, role,
+          `the denied-role setup did not take effect: the connection ran as "${who[0]?.u}", not "${role}"`)
+        assert.equal(who[0]?.su, false,
+          `the denied-role setup did not take effect: "${role}" is a SUPERUSER and can always read pg_control_system()`)
+      } finally {
+        await identityProbe.$disconnect()
+      }
+
+      // 1. --list must WORK as that role. Before the fix the identifier query poisoned nothing here
+      //    (no transaction), so this is the cheap half -- but it also proves the role can read the schema.
+      const listed = await runRepairScript(['--list'], { DATABASE_URL: url })
+      // `--list` exits 1 BY DESIGN when duplicates exist, and siblings in this shared-database tier leave
+      // some, so the exit code is not the subject here -- what matters is that it RAN as a denied role and
+      // reported the identifier honestly. Asserting `code !== 1` was my own error and it failed on exactly
+      // that: a legitimate "there are duplicates" exit read as a failure.
+      assert.ok(
+        listed.code === 0 || listed.code === 1,
+        `--list must run as a denied role (0, or 1 when duplicates exist), got ${listed.code}: ${listed.stderr}`,
+      )
+      assert.match(listed.stderr, /system_identifier=unavailable/,
+        `the banner must report the identifier as unavailable, got: ${listed.stderr}`)
+      assert.match(listed.stderr, /could not be read/i, 'and must explain what that means')
+
+      // 2. AN UNVERIFIABLE PIN must be the DOCUMENTED refusal (exit 3), not a generic failure.
+      const pinned = await runRepairScript(
+        ['--bom', duplicate.id, '--expect-db', scratchDatabase, '--expect-system-id', '123'],
+        { DATABASE_URL: url })
+      assert.equal(pinned.code, 3,
+        `a pin this role cannot verify must be exit 3, not a generic failure, got ${pinned.code}: ${pinned.stderr}`)
+      // THE PREFLIGHT's OWN WORDING. The in-transaction check also refuses this, so the exit code alone
+      // cannot show which one fired -- a mutation proved that by deleting the preflight and staying green.
+      // What the preflight uniquely provides is refusing BEFORE a transaction is opened, and saying how to
+      // proceed, so that guidance is what gets asserted.
+      assert.match(pinned.stderr, /drop the pin and pass --accept-name-only/,
+        `the preflight must say how to proceed, got: ${pinned.stderr}`)
+      assert.equal(
+        (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+        true, 'and nothing may have been written',
+      )
+
+      // 3. THE DOCUMENTED FALLBACK: the weaker mode, accepted explicitly, must COMPLETE as this role.
+      //    This is the assertion that fails without the fix -- the mutation transaction opens, the denied
+      //    query aborts it, and the BOM update dies with 25P02 into the generic handler.
+      const fell_back = await runRepairScript(
+        ['--bom', duplicate.id, '--expect-db', scratchDatabase, '--accept-name-only'],
+        { DATABASE_URL: url })
+      assert.equal(fell_back.code, 0,
+        `the documented fallback must WORK for a denied role, got ${fell_back.code}: ${fell_back.stderr}`)
+      assert.ok(
+        !/aborted|25P02/i.test(fell_back.stderr),
+        `and must not leave an aborted transaction, got: ${fell_back.stderr}`,
+      )
+      assert.equal(
+        (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+        false, 'and must actually deactivate the duplicate',
+      )
+      // 4. THE SAVEPOINT, ISOLATED -- and this arm exists because a mutation showed it had to.
+      //
+      // Removing the savepoint left all 17 tests green, and so did removing the pre-transaction
+      // availability check: each fix alone is sufficient, so THEY MASK EACH OTHER and neither was
+      // observable. That is precisely "fixed the symptom, left the trap for the next author".
+      //
+      // So this forces the in-transaction query to RUN as the denied role, by passing
+      // `systemIdentifierReadable: true` -- the state a mid-run revocation produces, and the state the
+      // pre-transaction check is designed to avoid. Without the savepoint the denial aborts the
+      // transaction (25P02) and the `boms` UPDATE that follows dies; with it, the read degrades to
+      // `unavailable` and the repair completes. Nothing but the savepoint can make this pass.
+      const deniedClient = new PrismaClient({ adapter: new PrismaPg({ connectionString: url }) })
+      try {
+        const second = await deps.db.bom.create({
+          data: { name: `${TAG}${NS} second duplicate`, active: true }, select: { id: true },
+        })
+        await deps.db.bomItem.create({
+          data: {
+            bomId: second.id, parentProductId: tableId, componentProductId: legId, qty: 5, sortOrder: 0,
+          },
+        })
+        // `expectIdentity` IS REQUIRED HERE, and leaving it out is how this arm was vacuous on first
+        // writing: the in-transaction identity read only happens when an expectation was supplied, so
+        // without it the denied query never ran and removing the savepoint stayed green. Caught by the
+        // mutation that was supposed to red -- the arm was testing nothing.
+        // The expectation carries `unavailable` because that is what this role's preflight produces, and
+        // NOTHING is pinned, so the lenient rule applies and the run is allowed to proceed.
+        const deniedPreflight = { ...live, systemIdentifier: 'unavailable' }
+        const survived = await deniedClient.$transaction(async (tx) =>
+          await deps.deactivateDuplicateBomRecipe(tx, {
+            bomId: second.id,
+            expectIdentity: deniedPreflight,
+            pinnedFields: [],
+            systemIdentifierReadable: true, // force the query that this role is denied
+          }))
+        assert.equal(
+          survived.kind, 'deactivated',
+          'the transaction must SURVIVE a denied identifier query and complete the repair — without a '
+          + `savepoint it is left aborted and the following UPDATE dies. Got: ${JSON.stringify(survived)}`,
+        )
+        assert.equal(
+          (await deps.db.bom.findUniqueOrThrow({ where: { id: second.id }, select: { active: true } })).active,
+          false, 'and the deactivation must really have committed',
+        )
+      } finally {
+        await deniedClient.$disconnect()
+      }
+    } finally {
+      // Own cluster, own role: drop it whatever happened.
+      await deps.db.$executeRawUnsafe(
+        `REASSIGN OWNED BY ${role} TO ${adminRole}; DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role}`)
+        .catch(() => {})
+      await deps.db.$executeRawUnsafe(`GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC`).catch(() => {})
+    }
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r14] an UNVERIFIABLE pin is refused, not silently skipped',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 16, HIGH 2, and it was my own rule serving two cases it should not have. `compareServerIdentity`
+     * skips `systemIdentifier` when either side reads `unavailable` -- right for the UNPINNED path, where
+     * absence of evidence is not evidence of a mismatch. Applied to an EXPLICIT pin it meant the flag was
+     * accepted and then never checked, leaving the operator believing they held the strongest guarantee
+     * available while holding none.
+     *
+     * Driven directly at the contract, for both halves of the finding: the preflight-unavailable case and
+     * the case where the stored expectation holds `unavailable` while the transaction connection CAN read
+     * the identifier -- which the lenient rule also skipped.
+     */
+    const deps = await loadDeps()
+    const live = await deps.readServerIdentity(deps.db)
+    assert.notEqual(live.systemIdentifier, 'unavailable',
+      'precondition: this cluster must be able to read the identifier, or this test proves nothing')
+
+    // Pinned + unavailable on the EXPECTED side (what a preflight that could not read it produces).
+    assert.deepEqual(
+      deps.unverifiablePins(['systemIdentifier'], { ...live, systemIdentifier: 'unavailable' }, live),
+      ['systemIdentifier'],
+      'a pin the EXPECTED side cannot supply must be reported unverifiable',
+    )
+    // Pinned + unavailable on the ACTUAL side (what an in-transaction denial produces).
+    assert.deepEqual(
+      deps.unverifiablePins(['systemIdentifier'], live, { ...live, systemIdentifier: 'unavailable' }),
+      ['systemIdentifier'],
+      'and a pin the ACTUAL side cannot supply must be too',
+    )
+    // UNPINNED stays lenient -- the separation is the point, not a blanket tightening.
+    assert.deepEqual(deps.unverifiablePins([], { ...live, systemIdentifier: 'unavailable' }, live), [],
+      'an UNPINNED unavailable identifier must remain lenient')
+    assert.deepEqual(
+      deps.compareServerIdentity({ ...live, systemIdentifier: 'unavailable' }, live), [],
+      'and compareServerIdentity must be unchanged for the unpinned path',
+    )
+
+    // END TO END through the mutation: a pinned-but-unverifiable identity refuses and writes nothing.
+    const NS = 'Q'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const duplicate = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy duplicate`, active: true }, select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: { bomId: duplicate.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+    })
+    const refused = await deps.db.$transaction(async (tx) =>
+      await deps.deactivateDuplicateBomRecipe(tx, {
+        bomId: duplicate.id,
+        expectIdentity: { ...live, systemIdentifier: 'unavailable' },
+        pinnedFields: ['systemIdentifier'],
+      }))
+    assert.equal(refused.kind, 'identity-unverifiable',
+      `a pinned-but-unverifiable identity must refuse, got: ${JSON.stringify(refused)}`)
+    assert.equal(
+      (await deps.db.bom.findUniqueOrThrow({ where: { id: duplicate.id }, select: { active: true } })).active,
+      true, 'and nothing may have been written',
+    )
+    await deps.db.bom.update({ where: { id: duplicate.id }, data: { active: false } })
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r15] CLONE-INVARIANT pins never discharge the acknowledgement, however many are supplied',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 18. The round-16 safeguard asked whether --expect-db was the SOLE pin, which made
+     * `--expect-db X --expect-host <value copied off the banner>` a BYPASS: the write proceeded with no
+     * acknowledgement and the audit row recorded `acceptedNameOnly: false`, actively asserting that none
+     * was needed at a moment when NOTHING had identified the server.
+     *
+     * The principle, and the reason this is not a list of flag combinations: name, host and port are all
+     * CLONE-INVARIANT. A restored copy reached at the same address, same name, same port has identical
+     * values for all three, so none of them distinguishes the clone and "more pins" is not "stronger".
+     * `system_identifier` is the only field in the composite that differs for a logical restore, so it is
+     * the only one whose presence changes what has been established.
+     *
+     * Every case below is therefore derived from that property rather than enumerated: the clone-invariant
+     * combinations refuse, the identifier route is allowed, and the audit row says which happened.
+     */
+    const deps = await loadDeps()
+    const NS = 'S'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const live = await deps.readServerIdentity(deps.db)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.notEqual(live.systemIdentifier, 'unavailable',
+      'precondition: the identifier must be readable, or the allowed-route arms prove nothing')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+
+    // A WRITE MUST ALWAYS NAME THE DATABASE. Pinning only host or port never says WHICH database was
+    // meant, and the in-transaction check compares the server against its own preflight, so it cannot
+    // catch an initially wrong target. Refused as a USAGE error, before anything connects.
+    for (const [what, args] of [
+      ['host only', ['--expect-host', live.host]],
+      ['port only', ['--expect-port', live.port]],
+      ['host and port, still unnamed', ['--expect-host', live.host, '--expect-port', live.port]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScript(['--bom', id, ...args])
+      assert.equal(run.code, 1, `${what} must be a USAGE error (exit 1), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /name the target database/i, `${what} must say why, got: ${run.stderr}`)
+      assert.equal(await active(id), true, `${what} must NOT have written anything`)
+    }
+
+    // CLONE-INVARIANT PINS, NAMED BUT UNACKNOWLEDGED. Each of these passed under the old sole-pin rule.
+    for (const [what, args] of [
+      ['name plus host', ['--expect-db', db, '--expect-host', live.host]],
+      ['name plus port', ['--expect-db', db, '--expect-port', live.port]],
+      ['name plus host plus port (all banner values)',
+        ['--expect-db', db, '--expect-host', live.host, '--expect-port', live.port]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScript(['--bom', id, ...args])
+      assert.equal(run.code, 3, `${what} must be REFUSED (exit 3), got ${run.code}: ${run.stderr}`)
+      assert.match(run.stderr, /SAME name, the SAME address and the SAME port|restored copy/i,
+        `${what} must be refused for CLONE-INVARIANCE, not for some incidental reason: ${run.stderr}`)
+      assert.equal(await active(id), true, `${what} must NOT have written anything`)
+    }
+
+    // THE IDENTIFIER ROUTE: allowed with NO acknowledgement, and the audit row says so.
+    const byId = await makeDuplicate('by identifier')
+    const idRun = await runRepairScript([
+      '--bom', byId, '--expect-db', db, '--expect-system-id', live.systemIdentifier,
+    ])
+    assert.equal(idRun.code, 0, `pinning the identifier must be allowed: ${idRun.stderr}`)
+    assert.equal(await active(byId), false, 'and must actually deactivate it')
+    const idAudit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: byId } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal((idAudit.metadata as { identityRoute?: string } | null)?.identityRoute,
+      'system-identifier', 'the audit row must record the identifier route')
+    assert.equal((idAudit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, false,
+      'and acceptedNameOnly may be false ONLY here, where the identifier really established the target')
+
+    // THE ACKNOWLEDGEMENT ROUTE: allowed, and recorded as the weaker one.
+    const byAck = await makeDuplicate('by acknowledgement')
+    const ackRun = await runRepairScript([
+      '--bom', byAck, '--expect-db', db, '--expect-host', live.host, '--accept-name-only',
+    ])
+    assert.equal(ackRun.code, 0, `an acknowledged write must be allowed: ${ackRun.stderr}`)
+    assert.equal(await active(byAck), false, 'and must actually deactivate it')
+    const ackAudit = await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: byAck } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })
+    assert.equal((ackAudit.metadata as { identityRoute?: string } | null)?.identityRoute,
+      'name-only-acknowledged', 'the audit row must record the acknowledgement route')
+    assert.equal((ackAudit.metadata as { acceptedNameOnly?: boolean } | null)?.acceptedNameOnly, true,
+      'and must NOT claim an acknowledgement was unnecessary -- that was the bug')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r20] ON A TTY, a write that pins other fields but never names the database is REFUSED',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 20, HIGH. `--expect-db` was required only when stdin was NOT a TTY, so on a TTY any identity
+     * flag took the pinned branch and skipped the typed-name prompt: `--bom <id> --expect-system-id <id>`
+     * wrote without ever saying WHICH database on that cluster was meant, and the audit row recorded
+     * `identityRoute: system-identifier, acceptedNameOnly: false`. The same BOM id can exist in a restored
+     * database on the same cluster, so the cluster identifier alone does not name the target.
+     *
+     * This drives the operator's command under a real pty, which `runRepairScript` cannot (its child has a
+     * pipe for stdin), so the TTY-only branch is actually reached.
+     */
+    const deps = await loadDeps()
+    const NS = 'T'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const live = await deps.readServerIdentity(deps.db)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+    assert.notEqual(live.systemIdentifier, 'unavailable', 'precondition: the identifier must be readable')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+    const auditOf = async (id: string) => (await deps.db.activityLog.findFirstOrThrow({
+      where: { tag: 'manufacturing', description: { contains: id } },
+      select: { metadata: true }, orderBy: { createdAt: 'desc' },
+    })).metadata as { identityRoute?: string; acceptedNameOnly?: boolean } | null
+
+    // PRECONDITION: the pty really is a TTY. With a wrong typed name the script must reach the PROMPT and
+    // refuse on what was typed. A non-TTY run would instead say "nobody to confirm", so this fails loudly
+    // if the harness stopped providing a terminal and every arm below would be examining nothing.
+    const control = await makeDuplicate('control')
+    const wrong = await runRepairScriptOnTty(['--bom', control], 'not-the-database')
+    assert.equal(wrong.code, 3, `control: a wrong typed name must be REFUSED (exit 3): ${wrong.output}`)
+    assert.match(wrong.output, /you typed "not-the-database"/, `control: the prompt must have been reached: ${wrong.output}`)
+    assert.equal(await active(control), true, 'control: nothing written')
+
+    // THE FINDING: --expect-system-id, no --expect-db, on a TTY. Every typed answer must be irrelevant,
+    // because it is refused before connecting; the correct database name is supplied to prove that.
+    for (const [what, args] of [
+      ['system id only', ['--expect-system-id', live.systemIdentifier]],
+      ['system id plus host and port', [
+        '--expect-system-id', live.systemIdentifier, '--expect-host', live.host, '--expect-port', live.port]],
+      ['system id plus the acknowledgement', ['--expect-system-id', live.systemIdentifier, '--accept-name-only']],
+      ['host only', ['--expect-host', live.host]],
+    ] as Array<[string, string[]]>) {
+      const id = await makeDuplicate(what)
+      const run = await runRepairScriptOnTty(['--bom', id, ...args], db)
+      assert.equal(run.code, 1, `${what}: must be REFUSED as a usage error (exit 1), got ${run.code}: ${run.output}`)
+      assert.match(run.output, /name the target database/i, `${what}: must say why: ${run.output}`)
+      assert.doesNotMatch(run.output, /Type the database name/, `${what}: must be refused BEFORE any prompt`)
+      assert.equal(await active(id), true, `${what}: must NOT have written anything`)
+    }
+
+    // THE POSITIVE ARMS, so the refusals above are not simply "everything on a TTY refuses".
+    const named = await makeDuplicate('named plus identifier')
+    const okRun = await runRepairScriptOnTty(['--bom', named, '--expect-db', db, '--expect-system-id', live.systemIdentifier])
+    assert.equal(okRun.code, 0, `named plus identifier must be allowed on a TTY: ${okRun.output}`)
+    assert.equal(await active(named), false, 'and must deactivate it')
+    assert.deepEqual(await auditOf(named), { ...(await auditOf(named)), identityRoute: 'system-identifier', acceptedNameOnly: false })
+
+    const typedId = await makeDuplicate('typed')
+    const typedRun = await runRepairScriptOnTty(['--bom', typedId], db)
+    assert.equal(typedRun.code, 0, `typing the right name must be allowed: ${typedRun.output}`)
+    assert.equal(await active(typedId), false, 'and must deactivate it')
+    const typedAudit = await auditOf(typedId)
+    assert.equal(typedAudit?.identityRoute, 'typed-at-tty', 'the audit row must record the typed route')
+    assert.equal(typedAudit?.acceptedNameOnly, true, 'and must not claim an acknowledgement was unnecessary')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r21] ON A TTY, EVERY way the typed-name prompt can END without the name is a REFUSAL (exit 3), never a silent exit 0',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 21, HIGH. Closing stdin at the prompt before a newline left the confirmation promise
+     * unresolved. In Node a promise that never settles is a SILENT SUCCESS: the event loop empties and the
+     * process exits 0 although nothing was deactivated and no audit row was written, so a shell or operator
+     * during the switchover reads "repair complete". Every arm below asserts (1) the prompt was REACHED,
+     * (2) the exit status, (3) the database was not touched, and the positive control proves the harness
+     * does not simply make everything refuse. `script` is required: if it is missing this FAILS.
+     */
+    const deps = await loadDeps()
+    const NS = 'U'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const db = String(process.env.IMS_CONCURRENCY_SCRATCH_DB)
+
+    const hasScript = await new Promise<boolean>((resolve) => {
+      const probe = spawn('script', ['--version'])
+      probe.on('error', () => resolve(false))
+      probe.on('close', (code) => resolve(code === 0))
+    })
+    assert.equal(hasScript, true, 'util-linux `script` is REQUIRED for this test; it must not be skipped')
+
+    const makeDuplicate = async (tag: string) => {
+      const bom = await deps.db.bom.create({
+        data: { name: `${TAG}${NS} dup ${tag}`, active: true }, select: { id: true },
+      })
+      await deps.db.bomItem.create({
+        data: { bomId: bom.id, parentProductId: tableId, componentProductId: legId, qty: 3, sortOrder: 0 },
+      })
+      return bom.id
+    }
+    const active = async (id: string) =>
+      (await deps.db.bom.findUniqueOrThrow({ where: { id }, select: { active: true } })).active
+    const auditCount = async (id: string) => deps.db.activityLog.count({
+      where: { tag: 'manufacturing', description: { contains: id } },
+    })
+
+    // SIGINT is the one arm whose status is the WRAPPER's: the pty delivers Ctrl-C to the whole foreground
+    // group, and `tsx` (which runs the script) maps a SIGINT it received to 130 whatever its child returned.
+    // So the script's own exit 3 cannot be read here; what IS proven is the refusal line, the unchanged
+    // database, and a nonzero status.
+    const expectedCode = (what: string) => (/SIGINT/.test(what) ? [130, 3] : [3])
+    const refusalArms: Array<[string, (id: string) => Promise<{ code: number; output: string }>]> = [
+      ['stdin closed at the prompt before any input (EOF on an empty line)',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { closeStdin: true, afterPrompt: true })],
+      // On a pty the FIRST Ctrl-D only flushes the partial line to the reader; the SECOND, on the now-empty
+      // line, is the EOF. Without the second the process correctly keeps waiting, so both are sent.
+      ['stdin closed after a PARTIAL line with no newline',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { raw: `${db.slice(0, 4)}\x04\x04`, closeStdin: true, afterPrompt: true })],
+      ['Ctrl-C (SIGINT) at the prompt',
+        (id) => runRepairScriptOnTty(['--bom', id], '', { raw: '\x03', afterPrompt: true })],
+      ['a WRONG typed name',
+        (id) => runRepairScriptOnTty(['--bom', id], 'not-the-database')],
+    ]
+    for (const [what, run] of refusalArms) {
+      const id = await makeDuplicate(what)
+      const before = await auditCount(id)
+      const result = await run(id)
+      const prompts = (result.output.match(/Type the database name/g) ?? []).length
+      assert.equal(prompts, 1, `${what}: precondition -- the prompt must have been reached exactly once (saw ${prompts}): ${result.output}`)
+      assert.ok(expectedCode(what).includes(result.code), `${what}: must REFUSE with exit ${expectedCode(what).join(' or ')}, got ${result.code}: ${result.output}`)
+      assert.equal(await active(id), true, `${what}: must NOT have deactivated anything`)
+      assert.equal(await auditCount(id), before, `${what}: must NOT have written an audit row`)
+      if (!/WRONG/.test(what)) {
+        assert.match(result.output, /NOT confirmed[\s\S]*Nothing was written/, `${what}: must say the target was not confirmed: ${result.output}`)
+      }
+    }
+
+    // POSITIVE CONTROL: the correct name still writes, so none of the above passed by refusing everything.
+    const okId = await makeDuplicate('correct name')
+    const ok = await runRepairScriptOnTty(['--bom', okId], db)
+    assert.equal((ok.output.match(/Type the database name/g) ?? []).length, 1, `control: the prompt must have been reached: ${ok.output}`)
+    assert.equal(ok.code, 0, `control: the correct name must be allowed: ${ok.output}`)
+    assert.equal(await active(okId), false, 'control: and must deactivate it')
+    assert.equal(await auditCount(okId) > 0, true, 'control: and must write an audit row')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] components cleared while a build order waits for the lock is REFUSED, and nothing is written',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE SECOND LOCKED-READ REFUSAL, which round 5 noted was assumed rather than exercised: only
+    // `not-bom` had a test. Both refusals return before any write, so they were safe -- but "safe
+    // because I read it" is what rounds 5 and 6 kept overturning.
+    const deps = await loadDeps()
+    const NS = 'E'
+    const { tableId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const warehouse = await ownWarehouse(deps, NS)
+    const before = await snapshotRecipe(deps, tableId, originalBom.id)
+
+    const outcome = await whileHoldingGraphLock(deps, async () => {
+      const inFlight = deps.createManufacturingOrder({
+        productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+      })
+      inFlight.catch(() => {})
+      await awaitAdvisoryLockWaiter(deps)
+      // An editor empties the recipe while the build order waits. The product stays BOM-typed, so
+      // only the component list distinguishes this from a valid build.
+      await deps.db.$executeRaw`DELETE FROM product_components WHERE "productId" = ${tableId}`
+      return { deferred: inFlight }
+    })
+
+    const created = await outcome.deferred
+    assert.equal(created.success, false, 'a build order against an emptied recipe must be REFUSED')
+    assert.match(String(created.error), /components were cleared/i,
+      `the refusal must name what changed, got: ${created.error}`)
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'and no production order may exist',
+    )
+    // THE DATABASE, NOT THE RETURN VALUE. Reporting failure while committing the rejected state is
+    // the trap this round is about, so assert the recipe rows are exactly as they were.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, originalBom.id), before,
+      'the refusal must leave Bom/BomItem byte-for-byte unchanged')
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] a build order refused for a CYCLE does not commit the rejected recipe',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 5, FINDING 1 -- and the same defect I introduced and fixed at the import site in round 2.
+     * `syncBomRecipeFromProductComponents` REPLACES this parent's BomItem rows and only then checks
+     * the graph it is committing (it must: checking first asks about the old edges). So returning the
+     * `cycle` outcome from the transaction callback COMMITTED it: the action reported failure and
+     * raised no order, while leaving an active cyclic graph behind for the planning explosion to walk.
+     * Failure reported, rejected state committed -- worse than either alone.
+     */
+    const deps = await loadDeps()
+    const NS = 'F'
+    const { tableId, legId } = await seedCatalogue(deps, NS)
+    const originalBom = await deps.db.bom.findUniqueOrThrow({
+      where: { productId: tableId }, select: { id: true },
+    })
+    const warehouse = await ownWarehouse(deps, NS)
+
+    // THE REVERSE EDGE MUST LIVE IN `bom_items` ONLY, and that is the whole reason this hazard exists.
+    // Importing LEG as a BOM consuming TABLE is refused by the PRE-EXISTING `ProductComponent` cycle
+    // check (`detectComponentCycle`) -- correctly, and I tried it first: `Row 2: circular BOM reference
+    // detected`. So a cycle reachable by the BOM walk can only be one the ProductComponent graph does
+    // NOT have, which is exactly what a legacy `bom_items` row left by an earlier snapshot is. That is
+    // also why `detectComponentCycle` could not be reused for this: it walks `product_components`.
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'BOM' } })
+    const legacyBom = await deps.db.bom.create({
+      data: { name: `${TAG}${NS} legacy leg recipe`, productId: legId, active: true },
+      select: { id: true },
+    })
+    await deps.db.bomItem.create({
+      data: {
+        bomId: legacyBom.id, parentProductId: legId, componentProductId: tableId, qty: 1, sortOrder: 0,
+      },
+    })
+    // MAKE THE REJECTED WRITE DIFFER FROM WHAT IS STORED, or this test cannot see the defect at all.
+    // The sync rewrites TABLE's BomItem rows from its ProductComponent list; if the two already agree,
+    // committing the rejected recipe produces rows identical to the ones already there and "the
+    // database is unchanged" passes whether or not the rollback happened. So desync them first, the way
+    // a direct edit would: ProductComponent now says LEG:9, while BomItem still says LEG:4. A commit of
+    // the rejected recipe would therefore leave LEG:9 behind, which the snapshot WILL see.
+    // (Verified by mutation: with the refusal returned instead of thrown, this test reds.)
+    await deps.db.$executeRaw`
+      UPDATE product_components SET qty = 9
+      WHERE "productId" = ${tableId} AND "componentId" = ${legId}
+    `
+    const before = await snapshotRecipe(deps, tableId, originalBom.id)
+    assert.ok(before.items.length > 0, 'precondition: TABLE must have a recipe to reject')
+    assert.ok(
+      before.items.some((item) => item.componentProductId === legId && item.qty.startsWith('4')),
+      'precondition: BomItem must still hold the OLD qty, so a committed rewrite is detectable',
+    )
+
+    const created = await deps.createManufacturingOrder({
+      productId: tableId, warehouseId: warehouse.id, orderType: 'ASSEMBLY', qtyPlanned: 1,
+    })
+    assert.equal(created.success, false, 'a build order against a cyclic recipe must be REFUSED')
+    assert.match(String(created.error), /circular/i, `the refusal must say why, got: ${created.error}`)
+    assert.equal(
+      await deps.db.productionOrder.count({ where: { outputProductId: tableId } }), 0,
+      'and no production order may exist',
+    )
+    // THE POINT OF THE ROUND: the rejected recipe must not be sitting in the database.
+    assert.deepEqual(await snapshotRecipe(deps, tableId, originalBom.id), before,
+      'the refused cycle must have been ROLLED BACK, not committed while the action reported failure')
+    // And the operator check must SEE this one -- it is genuinely reachable by planning, unlike the
+    // retired edges of test 4. The same walk, giving opposite answers on the two states, is the point.
+    const cycleDrift = await driftForThisTest(deps, NS)
+    assert.ok(
+      cycleDrift.some((row) => row.kind === 'bom-item-cycle'),
+      `a LIVE cycle must still be reported as drift, got: ${JSON.stringify(cycleDrift)}`,
+    )
+
+    // CLEAN UP THE CYCLE, and this is load-bearing rather than tidiness.
+    // `detectBomItemCycleInEdges` walks every parent and returns the FIRST cycle it finds ANYWHERE in
+    // the graph -- it is not scoped to the product being written. So this test's deliberate cycle makes
+    // every later BOM import and every later build order fail, in this file and in any sibling sharing
+    // this tier's database, with a message naming two unrelated product ids. Test 7 failed exactly that
+    // way before this cleanup existed. Filed as its own issue, because the same property means one
+    // pre-existing cyclic legacy pair in a real database blocks ALL BOM imports (o3d-zjsb5.9 round 6).
+    await deps.db.bom.update({ where: { id: legacyBom.id }, data: { active: false, productId: null } })
+    await deps.db.product.update({ where: { id: legId }, data: { type: 'SIMPLE' } })
+    assert.deepEqual(
+      (await driftForThisTest(deps, NS)).filter((row) => row.kind === 'bom-item-cycle'), [],
+      'and retiring it must clear the cycle again -- proof the cleanup worked, not just that it ran',
+    )
+  },
+)
+
+test(
+  '[o3d-zjsb5.9 r6] an import that LOSES the BOM claim writes NEITHER representation',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    /**
+     * ROUND 5, FINDING 3. The component pass handled `cycle` and ignored `claim-contended`, so losing
+     * the compare-and-set returned `true` and COMMITTED the component list with no claimed Bom -- the
+     * sellable-but-unmanufacturable state this whole change exists to remove, reintroduced by the very
+     * CAS added in round 2 to prevent a different form of it.
+     *
+     * WHICH SITE THIS ACTUALLY EXERCISES, stated because a mutation proved my first answer wrong.
+     * Removing the pass-2 guard does NOT red this test. The refusal it observes comes from PASS 1's
+     * `reconcileBomRecipeForProductType`, which runs first, in its own transaction, under the same
+     * graph lock, and already threw on `claim-contended` before round 6. Pass 1 therefore reconciles
+     * every existing BOM-typed row in the CSV, so by the time pass 2 runs the product normally HAS a
+     * claimed Bom and pass 2's adopt-and-CAS branch is not reached at all. I could not construct a
+     * reachable case where pass 2 loses the CAS while pass 1 does not refuse first.
+     *
+     * So the pass-2 guard added in round 6 is FAIL-CLOSED DEFENCE, not a fix for a demonstrated live
+     * path, and its presence is asserted structurally by the shape test in
+     * `tests/products/bom-recipe.test.ts` rather than behaviourally here. What this test does prove,
+     * on the real code path and with a real lost compare-and-set, is the property the finding is
+     * about: when the claim is lost, NEITHER representation is written and the operator is told.
+     */
+    const deps = await loadDeps()
+    const NS = 'G'
+    assert.deepEqual(errorsOf(await deps.importProductsCsv(csv([
+      'sku,name,type,components,stockUnit',
+      `${sku(NS, 'RAW')},Oak board,SIMPLE,,each`,
+      `${sku(NS, 'OTHER')},Other,SIMPLE,,each`,
+      `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'RAW')}:1,each`,
+    ]))), [], 'the catalogue must import cleanly')
+    const table = await deps.db.product.findUniqueOrThrow({
+      where: { sku: sku(NS, 'TABLE') }, select: { id: true },
+    })
+    const other = await deps.db.product.findUniqueOrThrow({
+      where: { sku: sku(NS, 'OTHER') }, select: { id: true },
+    })
+    // Retire TABLE's recipe so the next import has an UNCLAIMED row to adopt -- the only path that
+    // runs the compare-and-set at all.
+    const bom = await deps.db.bom.findUniqueOrThrow({ where: { productId: table.id }, select: { id: true } })
+    await deps.db.$executeRaw`UPDATE boms SET active = false, "productId" = NULL WHERE id = ${bom.id}`
+    const beforeComponents = await deps.db.productComponent.findMany({
+      where: { productId: table.id }, select: { componentId: true }, orderBy: { componentId: 'asc' },
+    })
+
+    // A GENUINE COMPARE-AND-SET LOSS, forced with a row lock rather than simulated.
+    //
+    // I tried the obvious interleaving first -- claim the row while the import waits for the GRAPH
+    // lock -- and it does not work: the import reads `adoptable` AFTER taking that lock, so it sees the
+    // row already claimed, finds nothing to adopt, and creates a fresh Bom. No contention, and the test
+    // passed while proving nothing. The window is between the helper's READ and its WRITE, inside one
+    // transaction, so it cannot be reached from outside by ordering alone.
+    //
+    // READ COMMITTED gives it to us exactly. An uncommitted `UPDATE` on that row from another
+    // connection leaves the import's read seeing `productId = NULL` (the pre-update row version) while
+    // its `updateMany ... WHERE productId IS NULL` BLOCKS on the row lock. When the other connection
+    // commits, Postgres re-evaluates the predicate against the NEW row version, the row no longer
+    // matches, and `count` comes back 0 -- a real lost CAS, on the real code path.
+    const claimHeld = Promise.withResolvers<number>()
+    const claimRelease = Promise.withResolvers<void>()
+    const claimant = deps.db.$transaction(async (tx) => {
+      const [{ pid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
+      await tx.$executeRaw`UPDATE boms SET "productId" = ${other.id}, active = true WHERE id = ${bom.id}`
+      claimHeld.resolve(pid)
+      await claimRelease.promise
+    }, { timeout: 60_000, maxWait: 10_000 })
+    const claimantSettled = claimant.then(() => undefined, (error: unknown) => error as unknown)
+    const claimantPid = await Promise.race([
+      claimHeld.promise,
+      claimantSettled.then((error) => {
+        throw error ?? new Error('the claimant ended before it held the row')
+      }),
+    ])
+
+    let result: Awaited<ReturnType<typeof deps.importProductsCsv>>
+    try {
+      const inFlight = deps.importProductsCsv(csv([
+        'sku,name,type,components,stockUnit',
+        `${sku(NS, 'TABLE')},Oak table,BOM,${sku(NS, 'RAW')}:5,each`,
+      ]))
+      inFlight.catch(() => {})
+      // PROOF THE WINDOW WAS ACTUALLY ENTERED. `pg_blocking_pids` is the lock manager's own answer, not
+      // a reporting field, so this is the authoritative "it is waiting for my row" -- and without it
+      // this test would be asserting about ordinary sequencing.
+      const deadline = Date.now() + 20_000
+      let blocked = 0
+      while (Date.now() < deadline) {
+        const rows = await deps.db.$queryRaw<Array<{ n: bigint }>>`
+          SELECT count(*)::bigint AS n FROM pg_stat_activity
+          WHERE ${claimantPid} = ANY(pg_blocking_pids(pid))
+        `
+        blocked = Number(rows[0]?.n ?? 0)
+        if (blocked > 0) break
+        await new Promise((resolve) => setTimeout(resolve, 20))
+      }
+      assert.ok(blocked > 0, 'the import must actually block on the claimed row, or the CAS never raced')
+      result = await (async () => {
+        claimRelease.resolve()
+        return await inFlight
+      })()
+    } finally {
+      claimRelease.resolve()
+      await claimantSettled
+    }
+
+    const errors = errorsOf(result)
+    assert.ok(
+      errors.some((line) => /claimed this product's manufacturing BOM/i.test(line)),
+      `losing the claim must be REPORTED, not ignored, got: ${JSON.stringify(errors)}`,
+    )
+    // Which refusal this is, pinned so the test cannot silently start proving something else -- the
+    // way it silently proved the wrong thing until a surviving mutation said so.
+    assert.ok(
+      errors.some((line) => /while the import\s+was running|while the import was running/.test(line)),
+      `the refusal must be pass 1's reconcile, the reachable site, got: ${JSON.stringify(errors)}`,
+    )
+    // AND ROLLED BACK: the component list must still be the old one, not the qty 5 the CSV asked for.
+    assert.deepEqual(
+      await deps.db.productComponent.findMany({
+        where: { productId: table.id }, select: { componentId: true }, orderBy: { componentId: 'asc' },
+      }),
+      beforeComponents,
+      'the ProductComponent write must NOT have committed without a claimed Bom -- that is exactly the '
+      + 'sellable-but-unmanufacturable split this change exists to prevent',
+    )
+    const stillTheirs = await deps.db.bom.findUniqueOrThrow({
+      where: { id: bom.id }, select: { productId: true },
+    })
+    assert.equal(stillTheirs.productId, other.id, 'and the other writer keeps its claim')
+  },
+)

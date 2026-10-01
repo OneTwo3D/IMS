@@ -274,6 +274,11 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires manufacturing analytics access: ADMIN, MANAGER, or FINANCE role.',
   },
+  '/api/export/bom-recipes': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with manufacturing permission — it exposes every BOM '
+      + 'recipe, and in ?drift=1 mode which recipes disagree with product_components.',
+  },
   '/api/stock-position/filter-options': {
     access: 'authenticated',
     reason: 'Requires stock-position report access before returning bounded warehouse/category/supplier filter options.',

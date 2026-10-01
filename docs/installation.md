@@ -231,7 +231,10 @@ a live database on 5432. So:
   `DB_HOST:DB_PORT` the way the application opens its own. Unequal stops the run. This is the same
   server-identity rule `scripts/fence-db-connections.mjs` already uses to decide whether two
   connections are the same cluster; the *system identifier* is deliberately **not** used, because a
-  `pg_basebackup` clone inherits its origin's, and it is superuser-only besides.
+  `pg_basebackup` clone inherits its origin's — which is the whole reason, and enough of one. (It is
+  **not** superuser-only, as an earlier version of this sentence claimed: on PostgreSQL 17 a plain
+  `LOGIN` role with no grants reads `pg_control_system()`. The decision stands on the clone-inheritance
+  reason alone.)
 
 The endpoint connection is made as a throwaway role this run creates with a random name and
 password and drops immediately. That is what lets the check run **before** anything has been done
