@@ -276,6 +276,14 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
     // shows on /sync/exceptions with an explanation, and Replay there is safe BECAUSE the retry re-reads
     // WooCommerce first. PERMANENT_FAILED is inert for this operation: its only enqueue is keyed per flip
     // and returns the existing row untouched, so nothing resets it behind the operator's back.
+    //
+    // THE INVARIANT THAT MAKES PARK + REPLAY SAFE: a claim older than the drain lease means the worker is
+    // dead or aborted. A worker holds no DB lock while it talks to WooCommerce, so that is enforced on the
+    // WORKER, not assumed: every attempt runs under a hard 2 minute deadline (attempt-fence.ts) folded into
+    // every WooCommerce request it makes (tracking GET/PUT, status GET/PUT), and re-checks the deadline AND
+    // that it still owns its row immediately before the status PUT. The lease is 10 minutes, deadline 2: a
+    // request that was already on the wire when the deadline fired can land at most one deadline after the
+    // attempt began, long before the park could run, so a Replay's attempt never overlaps a live one.
     'order.complete': {
       name: 'orderComplete',
       schema: WcOrderCompletionOutboxPayloadSchema,

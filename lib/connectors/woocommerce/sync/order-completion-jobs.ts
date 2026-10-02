@@ -28,6 +28,7 @@ import {
   markIntegrationOutboxSuccess,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
+import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
   parseIntegrationOutboxPayload,
@@ -135,6 +136,8 @@ export async function processWcOrderCompletionJobs(options?: {
   idempotencyKeys?: string[]
   limit?: number
   now?: Date
+  /** Test seam: the attempt deadline. Production uses WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS. */
+  attemptDeadlineMs?: number
 }): Promise<WcOrderCompletionRunSummary> {
   const summary: WcOrderCompletionRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options?.idempotencyKeys?.length === 0) return summary
@@ -196,55 +199,67 @@ export async function processWcOrderCompletionJobs(options?: {
     }
 
     try {
-      // The facade, not the connector: it owns "is a storefront connector runnable at all".
-      const { pushOrderDeliveryMetadata, pushSalesOrderStatus } = await import('@/lib/shopping')
+      // ONE FENCED ATTEMPT (attempt-fence.ts): a hard overall deadline over every WooCommerce request below,
+      // and a pre-write check that this worker still owns its row. Returns the retry reason, or null when the
+      // order is completed / deliberately left alone.
+      const { db } = await import('@/lib/db')
+      const deadlineMs = options?.attemptDeadlineMs ?? WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS
+      const fence = {
+        signal: AbortSignal.timeout(deadlineMs),
+        stillOwned: async () => (await db.integrationOutbox.count({
+          where: { id: job.id, status: 'PROCESSING', lockedBy: WORKER_ID, lockedAt: job.lockedAt },
+        })) === 1,
+      }
+      const retryReason = await runWithWcAttemptFence(fence, async (): Promise<string | null> => {
+        // The facade, not the connector: it owns "is a storefront connector runnable at all".
+        const { pushOrderDeliveryMetadata, pushSalesOrderStatus } = await import('@/lib/shopping')
 
-      // (a) Tracking FIRST so WooCommerce's completed email carries it. A failed or thrown tracking push is a
-      // RETRYABLE OBLIGATION that blocks the completion PUT for this attempt: the customer email must not fire
-      // without the tracking it promises. Tracking that is legitimately not there (no tracking number yet, an
-      // unlinked order) comes back `skipped`, which is not a failure, so completion stays possible. A
-      // tracking failure that outlasts the bound dead-letters like any other, for an operator to replay.
-      let trackingError: string | null = null
-      try {
-        const tracking = await pushOrderDeliveryMetadata(orderId)
-        if (!tracking.success && !tracking.skipped) trackingError = tracking.error ?? 'unknown error'
-      } catch (thrown) {
-        trackingError = thrown instanceof Error ? thrown.message : String(thrown)
-      }
-      if (trackingError !== null) {
-        await retry(`tracking push failed, completion held back so the customer email carries it: ${trackingError}`)
-        continue
-      }
+        // (a) Tracking FIRST so WooCommerce's completed email carries it. A failed or thrown tracking push is a
+        // RETRYABLE OBLIGATION that blocks the completion PUT for this attempt: the customer email must not fire
+        // without the tracking it promises. Tracking that is legitimately not there (no tracking number yet, an
+        // unlinked order) comes back `skipped`, which is not a failure, so completion stays possible. A
+        // tracking failure that outlasts the bound dead-letters like any other, for an operator to replay.
+        let trackingError: string | null = null
+        try {
+          const tracking = await pushOrderDeliveryMetadata(orderId)
+          if (!tracking.success && !tracking.skipped) trackingError = tracking.error ?? 'unknown error'
+        } catch (thrown) {
+          trackingError = thrown instanceof Error ? thrown.message : String(thrown)
+        }
+        if (trackingError !== null) {
+          return `tracking push failed, completion held back so the customer email carries it: ${trackingError}`
+        }
 
-      // (b) The status, behind a fresh GET + eligibility classification on every attempt. The GET is made
-      // immediately before the PUT inside pushImsStatusToWc. WooCommerce has no conditional update, so an
-      // operator edit landing between those two requests can still be overwritten: an ACCEPTED, documented
-      // inter-system race, the window kept as small as one round trip.
-      const status = await pushSalesOrderStatus(orderId, 'SHIPPED')
-      if (!status.success) {
-        await retry(status.error ?? 'WooCommerce status push failed')
-        continue
-      }
-      // SUCCESS means the storefront is now complete or deliberately left alone, and nothing else: pushed,
-      // already-at-target, or a finalised order (cancelled/refunded/completed by hand). A skipped result (no
-      // runnable connector), `not-applicable`, a not-ready/unknown status, or no outcome at all is NOT success:
-      // it stays retryable so that restoring the connector (or releasing the hold) can still complete the
-      // order, and dead-letters visibly after the bound.
-      const outcome = status.outcome
-      if (status.skipped) {
-        await retry('no runnable WooCommerce connector (not configured or no credentials), so the order was not completed')
-        continue
-      }
-      if (!outcome) {
-        await retry('the status push returned no outcome, so completion cannot be confirmed')
-        continue
-      }
-      if (outcome?.kind === 'not-applicable') {
-        await retry('the order has no WooCommerce link or no pushable status, so it was not completed')
-        continue
-      }
-      if (outcome?.kind === 'ineligible' && outcome.class !== 'finalised') {
-        await retry(`WooCommerce order is "${outcome.wcStatus}" (${outcome.class === 'unknown' ? 'a status IMS has no reading of; add a status mapping' : 'not ready to complete'}), not completed`)
+        // (b) The status, behind a fresh GET + eligibility classification on every attempt. The GET is made
+        // immediately before the PUT inside pushImsStatusToWc. WooCommerce has no conditional update, so an
+        // operator edit landing between those two requests can still be overwritten: an ACCEPTED, documented
+        // inter-system race, the window kept as small as one round trip.
+        const status = await pushSalesOrderStatus(orderId, 'SHIPPED')
+        if (!status.success) {
+          return status.error ?? 'WooCommerce status push failed'
+        }
+        // SUCCESS means the storefront is now complete or deliberately left alone, and nothing else: pushed,
+        // already-at-target, or a finalised order (cancelled/refunded/completed by hand). A skipped result (no
+        // runnable connector), `not-applicable`, a not-ready/unknown status, or no outcome at all is NOT success:
+        // it stays retryable so that restoring the connector (or releasing the hold) can still complete the
+        // order, and dead-letters visibly after the bound.
+        const outcome = status.outcome
+        if (status.skipped) {
+          return 'no runnable WooCommerce connector (not configured or no credentials), so the order was not completed'
+        }
+        if (!outcome) {
+          return 'the status push returned no outcome, so completion cannot be confirmed'
+        }
+        if (outcome?.kind === 'not-applicable') {
+          return 'the order has no WooCommerce link or no pushable status, so it was not completed'
+        }
+        if (outcome?.kind === 'ineligible' && outcome.class !== 'finalised') {
+          return `WooCommerce order is "${outcome.wcStatus}" (${outcome.class === 'unknown' ? 'a status IMS has no reading of; add a status mapping' : 'not ready to complete'}), not completed`
+        }
+        return null
+      })
+      if (retryReason !== null) {
+        await retry(retryReason)
         continue
       }
       await markIntegrationOutboxSuccess(claim)

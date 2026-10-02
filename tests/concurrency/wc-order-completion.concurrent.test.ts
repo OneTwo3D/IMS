@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
+import { assertWcAttemptMayWrite, currentWcAttemptSignal } from '@/lib/connectors/woocommerce/attempt-fence'
 
 /**
  * o3d-zvec.15 — THE DURABLE WOOCOMMERCE ORDER-COMPLETION JOB AGAINST A REAL POSTGRES.
@@ -42,6 +43,10 @@ const wc = {
   statusOverride: null as FacadeResult | null,
   /** How the tracking push behaves (medium). `skipped` = nothing to push, which is not a failure. */
   tracking: 'ok' as 'ok' | 'skipped' | 'fail' | 'throw',
+  /** A PAUSED WooCommerce request, consumed by the first status push only: `honour` ends when the attempt
+   *  signal aborts (as a real aborted fetch does); `ignore` models a request that does not notice. */
+  pause: 'none' as 'none' | 'honour' | 'ignore',
+  pauseMs: 0,
 }
 const activity: Array<Record<string, unknown>> = []
 
@@ -60,8 +65,25 @@ mock.module('@/lib/shopping', {
     pushSalesOrderStatus: async (orderId: string, status: string): Promise<FacadeResult> => {
       wc.events.push(`status:${orderId}:${status}`)
       wc.gets++ // every attempt re-reads the storefront
+      let aborted: Error | null = null
       if (wc.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, wc.delayMs))
       if (wc.statusOverride) return wc.statusOverride
+      if (wc.pause !== 'none') {
+        const mode = wc.pause
+        wc.pause = 'none' // first push only
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, wc.pauseMs)
+          if (mode === 'honour') {
+            currentWcAttemptSignal()?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('WooCommerce request aborted at the attempt deadline')) }, { once: true })
+          }
+        }).catch((error: Error) => { aborted = error })
+        if (aborted) return { success: false, error: aborted.message, outcome: { kind: 'error', error: aborted.message } }
+        // What the connector does right before its PUT.
+        try { await assertWcAttemptMayWrite() } catch (error) {
+          const message = (error as Error).message
+          return { success: false, error: message, outcome: { kind: 'error', error: message } }
+        }
+      }
       if (wc.readFails) return { success: false, error: 'WooCommerce: HTTP 503', outcome: { kind: 'read-failed', error: 'HTTP 503' } }
       if (wc.status === 'completed') return { success: true, outcome: { kind: 'already-at-target' } }
       if (wc.status === 'cancelled') return { success: true, outcome: { kind: 'ineligible', wcStatus: 'cancelled', class: 'finalised' } }
@@ -83,6 +105,8 @@ function resetWc() {
   wc.events.length = 0
   wc.statusOverride = null
   wc.tracking = 'ok'
+  wc.pause = 'none'
+  wc.pauseMs = 0
   activity.length = 0
 }
 
@@ -477,4 +501,67 @@ test('o3d-zvec.15 (review 2, HIGH 4b): a slow worker that finishes while the par
 
   assert.equal(parked, 0, 'the park lost the race and did nothing')
   assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', 'the slow worker\'s success stands')
+})
+
+test('o3d-zvec.15 (round 3): a PAUSED WooCommerce request is aborted at the attempt deadline — no PUT, a retryable row', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { key } = await seedRow(deps, 'paused-honour')
+  wc.pause = 'honour'
+  wc.pauseMs = 5_000 // would outlast the deadline by far
+  const startedAt = Date.now()
+  const run = await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], attemptDeadlineMs: 150 })
+  const elapsed = Date.now() - startedAt
+  assert.equal(run.claimed, 1, 'precondition: claimed')
+  assert.equal(wc.gets, 1, 'precondition: the paused request was reached')
+  assert.ok(elapsed < 3_000, `the worker gave up at the deadline, not after the pause (${elapsed} ms)`)
+  assert.equal(wc.puts, 0)
+  const row = await rowOf(deps, key)
+  assert.equal(row.status, 'RETRYABLE_FAILED')
+  assert.match(String(row.lastError), /abort|deadline/i)
+})
+
+test('o3d-zvec.15 (round 3): a request that does NOT notice the deadline still cannot PUT (deadline check isolated: the row is still ours)', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { key } = await seedRow(deps, 'paused-ignore')
+  wc.pause = 'ignore'
+  wc.pauseMs = 500
+  await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], attemptDeadlineMs: 150 })
+  assert.equal(wc.gets, 1, 'precondition: the paused request ran to its end')
+  assert.equal(wc.puts, 0, 'the pre-write deadline check refused the PUT')
+  const row = await rowOf(deps, key)
+  assert.equal(row.status, 'RETRYABLE_FAILED', 'and the row is still ours (not parked), so only the deadline can explain it')
+  assert.match(String(row.lastError), /deadline passed/)
+})
+
+test('o3d-zvec.15 (round 3): park + Replay while a worker is paused completes EXACTLY ONCE — the paused worker never PUTs (ownership check isolated: deadline far away)', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => cleanup(deps))
+  resetWc()
+  const { key } = await seedRow(deps, 'park-replay')
+  wc.pause = 'ignore'
+  wc.pauseMs = 800
+
+  // Worker A: paused inside a WooCommerce request, deadline far away (10 s) so only OWNERSHIP can stop it.
+  const a = deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], attemptDeadlineMs: 10_000 })
+  for (let i = 0; i < 200 && wc.gets === 0; i++) await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(wc.gets, 1, 'precondition: A is inside its paused request')
+  assert.equal((await rowOf(deps, key)).status, 'PROCESSING')
+
+  // Its claim goes stale; the drain parks it; the operator replays; worker B completes it.
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { lockedAt: new Date(Date.now() - 3_600_000) } })
+  assert.equal(await deps.parkStaleWcOrderCompletionClaims(new Date()), 1, 'precondition: parked')
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { status: 'PENDING', attempts: 0, lastError: null, lockedAt: null, lockedBy: null } })
+  await deps.processWcOrderCompletionJobs({ idempotencyKeys: [key] })
+  assert.equal(wc.puts, 1, 'precondition: B completed it')
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+
+  // A wakes up and must not write.
+  const aRun = await a
+  assert.equal(wc.puts, 1, 'exactly one PUT in total: the paused worker was refused')
+  assert.equal(aRun.claimed, 1)
+  assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', 'and its late result did not disturb the settled row')
 })

@@ -248,3 +248,26 @@ test('o3d-zvec.15 (review 2, HIGH 1): WooCommerce\'s own cancelled / on-hold / p
   }
   assert.equal(evaluated, 5)
 })
+
+test('o3d-zvec.15 (round 3): the status PUT is refused once the attempt deadline has passed or the worker lost its job — and sent when neither', async () => {
+  const { runWithWcAttemptFence } = await import('@/lib/connectors/woocommerce/attempt-fence')
+  const expired = new AbortController()
+  expired.abort()
+  const cases: Array<{ name: string; fence: { signal: AbortSignal; stillOwned: () => Promise<boolean> }; puts: number; outcome: string }> = [
+    { name: 'deadline passed', fence: { signal: expired.signal, stillOwned: async () => true }, puts: 0, outcome: 'error' },
+    { name: 'lock lost (parked/replayed)', fence: { signal: new AbortController().signal, stillOwned: async () => false }, puts: 0, outcome: 'error' },
+    { name: 'inside the deadline and still owned', fence: { signal: new AbortController().signal, stillOwned: async () => true }, puts: 1, outcome: 'pushed' },
+  ]
+  let evaluated = 0
+  for (const c of cases) {
+    state.puts.length = 0
+    state.fetches.length = 0
+    state.wcStatus = 'processing'
+    const outcome = await runWithWcAttemptFence(c.fence, () => push('SHIPPED'))
+    assert.equal(state.fetches.length, 1, `${c.name}: precondition — the status was read, so only the pre-write check can explain the result`)
+    assert.equal(outcome.kind, c.outcome, c.name)
+    assert.equal(state.puts.length, c.puts, c.name)
+    evaluated++
+  }
+  assert.equal(evaluated, 3)
+})

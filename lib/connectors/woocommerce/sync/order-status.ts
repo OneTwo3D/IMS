@@ -8,6 +8,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import type { ExternalFulfillmentRefusal } from '@/lib/fulfillment/external-fulfillment'
 import { wcFetch, wcPut } from '../api'
+import { assertWcAttemptMayWrite } from '../attempt-fence'
 import type { WcFullOrder } from './types'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
 
@@ -221,6 +222,11 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         return { kind: 'ineligible', wcStatus: slug, class: cls }
       }
     }
+
+    // The attempt fence (attempt-fence.ts): refuse the write if the completion attempt's deadline has passed or
+    // this worker no longer owns its job. A no-op for every caller that is not a completion attempt. Thrown,
+    // so the outer catch reports it as a retryable `error`.
+    await assertWcAttemptMayWrite()
 
     const { data: pushedOrder, error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
 
