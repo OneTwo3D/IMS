@@ -9007,3 +9007,60 @@ test('[o3d-zvec.21 k] same product AND description, different PRICES: an unlinke
   assert.equal(stockOnHand(state), 2, 'STOCK: both shipped units came back, B\'s then A\'s (the cap debited B, not A)')
   assert.deepEqual(state.movements.map((movement) => movement.qty), [1, 1])
 })
+
+for (const variant of ['linked', 'unlinked'] as const) {
+  test(`[o3d-zvec.21 m-${variant}] a quantity-2 refund across two shipped quantity-1 lines of one product returns BOTH units`, async () => {
+    const state = unshippedRefundState(0)
+    state.lines[0].qty = 1
+    state.lines[0].totalBase = 20
+    state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 })
+    for (const line of state.lines) line.taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+    state.orders[0].totalBase = 40
+    state.shipments.push({
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+      revenueRecognizedAmount: null, cogsBatchAmount: null,
+      lines: [
+        { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      ],
+    })
+    assert.equal(shippedUnits(state), 2, 'PRECONDITION: two units shipped, one per line')
+    assert.equal(state.lines.every((line) => line.qty === 1), true, 'PRECONDITION: each line ordered 1, so one line cannot absorb the refund alone')
+
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...wooRefundInput(2, 9061),
+      lines: [{
+        ...(variant === 'linked' ? { lineId: 'line-1' } : {}),
+        productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 40,
+      }],
+    })
+
+    assert.equal(result.success, true, `refund must not fail (${result.success ? '' : result.error})`)
+    assert.equal(stockOnHand(state), 2, 'both shipped units are returnable: the refund continues into the second line, as the COGS split does')
+  })
+}
+
+test('[o3d-zvec.21 n] a line\'s UNSHIPPED share is consumed before the refund moves on: ordered 2 / shipped 1, then another line shipped 1', async () => {
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 2
+  state.lines[0].totalBase = 40
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 })
+  state.orders[0].totalBase = 60
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+    ],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: A shipped 1 of its 2, B shipped its 1')
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(2, 9062),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 40 }],
+  })
+
+  assert.equal(result.success, true, `refund must not fail (${result.success ? '' : result.error})`)
+  assert.equal(stockOnHand(state), 1, 'A\'s refund of 2 is its shipped 1 + its unshipped 1: B\'s shipped unit is not touched')
+})
