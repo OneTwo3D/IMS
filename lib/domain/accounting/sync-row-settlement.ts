@@ -670,18 +670,27 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
  * post" means the follow-up is CLOSED, and hasExistingSyncLog counting PENDING/PROCESSING/SYNCED
  * will rightly refuse to enqueue another one.
  * ------------------------------------------------------------------------------------------------
- * LOAD-BEARING SIDE EFFECT of the NOT_POSTED branch — deliberate, not incidental.
+ * WHAT THE NOT_POSTED BRANCH NO LONGER DOES (o3d-f709, C1) — this block used to be headed
+ * "LOAD-BEARING SIDE EFFECT ... the intended unblock", and it described the opposite behaviour.
  *
- * enqueueFollowUpSyncLog selects `status: 'FAILED'` when it gathers the ambiguity set
- * (lib/connectors/xero/sync-processor.ts, lib/connectors/quickbooks/sync-processor.ts). Moving a
- * FAILED row to CANCELLED REMOVES it from that set. For a money-moving type (INVOICE_PAYMENT,
- * PURCHASE_CREDIT_NOTE_ALLOCATION), planFollowUpEnqueue refuses whenever two or more DISTINCT
- * tokens could have committed; cancelling one of them drops the distinct-token count to one and
- * turns that `refuse` into a `create`/`reuse`.
+ * Moving a FAILED row to CANCELLED used to REMOVE it from the ambiguity set `enqueueFollowUpSyncLog`
+ * gathers, which turned a `refuse` into a `create`/`reuse` for a money-moving type, and it freed the
+ * work slot so the same posting could be queued again. That was the settlement action's stated
+ * purpose, and its premise was that the assertion was evidence. It is not: a person said "nothing
+ * posted" about a ledger IMS never read, and a lost response, a late webhook and a hand-post all
+ * leave the same row. So:
  *
- * That is exactly the intended unblock for o3d-nf9i's part-payment history — and it is also why the
- * assertion has to be a real, audited statement of fact rather than a convenience button.
- * Cancelling a row that DID post would let a duplicate payment out.
+ *   - `planFollowUpEnqueue` REFUSES a money follow-up while a settled-NOT_POSTED row for the same
+ *     document stands in the scope;
+ *   - the enqueue's already-present check (`classifyPriorAttempts`) reads the row as a BLOCKED work
+ *     slot and refuses, instead of raising a replacement;
+ *   - `ledgerStanding` reads it ASSERTED_NOT_POSTED: it may have reached the ledger, it is never a
+ *     ledger fact, and retention keeps it.
+ *
+ * What the assertion still does: it records, against the operator's name, that they looked and
+ * believed nothing posted - which is useful evidence for the next person - and it releases the
+ * ORDER (the delete guard's own status reading is a separate, later conversion). The operator's way
+ * to re-post is now to hand-post in the accounting system and mark the posting handled.
  * ------------------------------------------------------------------------------------------------
  */
 export function buildSettlementData(
@@ -800,10 +809,14 @@ export function settlementMirrorStatus(outcome: SettlementOutcome): AccountingEv
  * o3d-11rf r2 — WHAT THIS VOID RETIRES, recorded on the event so the enqueue side can tell.
  *
  * ONE ATTEMPT, and only that. The operator asserted that THE ROW THEY SETTLED reached nothing; they
- * were not asked, and did not answer, whether the document is still owed. It usually is — settling a
- * row NOT_POSTED is precisely what lets a replacement be enqueued, because `classifyPriorAttempts`
- * reads a CANCELLED attempt as asserting nothing was sent. So a later live attempt at the same
- * document may take the shared mirror back to PENDING.
+ * were not asked, and did not answer, whether the document is still owed. It usually is.
+ *
+ * o3d-f709 (C1): this used to continue "settling a row NOT_POSTED is precisely what lets a replacement
+ * be enqueued, because `classifyPriorAttempts` reads a CANCELLED attempt as asserting nothing was
+ * sent". It no longer does: an operator-settled attempt BLOCKS the work slot, so no replacement is
+ * enqueued on it and nothing revives the mirror from it. The basis is kept because a replacement CAN
+ * still arrive by another route (a row IMS retired itself, which frees the slot), and the mirror must
+ * still tell a retired ATTEMPT from a retired DOCUMENT.
  *
  * That is NOT true of `voidMirroredAccountingEventsForOrder`, which retires the DOCUMENT because the
  * order is cancelled, and the two were indistinguishable on the row until this. See
