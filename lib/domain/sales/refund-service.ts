@@ -1122,8 +1122,11 @@ function sortLinesForRefundLine<T extends { id: string; qty: DecimalInput; total
       const qty = refundBoundaryNumber(line.qty)
       return qty > 0 ? refundBoundaryNumber(line.totalBase) / qty : 0
     }
-    const aPriceMatch = priceMatches(unitOf(a))
-    const bPriceMatch = priceMatches(unitOf(b))
+    // (aUnitRevenue/bUnitRevenue keep the names the refund-figure inventory pins for this comparator.)
+    const aUnitRevenue = unitOf(a)
+    const bUnitRevenue = unitOf(b)
+    const aPriceMatch = priceMatches(aUnitRevenue)
+    const bPriceMatch = priceMatches(bUnitRevenue)
     if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
 
     const aDescMatch = a.description === refundLine.description
