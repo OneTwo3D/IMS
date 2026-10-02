@@ -3,9 +3,13 @@ import test from 'node:test'
 
 import ts from 'typescript'
 
-import { collectStatusClauses } from '../../scripts/check-accounting-cancelled-row-predicates.mjs'
+import { collectStatusClauses } from '../../scripts/check-ledger-standing-readers.mjs'
 
 /**
+ * (Ported unchanged in substance from tests/scripts/cancelled-row-predicate-census.test.ts when the
+ * guard became check-ledger-standing-readers.mjs: `collectStatusClauses` and its `rescued` tag are
+ * the structural half of a declaration, and every shape below is still refused.)
+ *
  * o3d-f709 round 2 (Codex MEDIUM) — THE CENSUS THAT EXISTS TO TELL AN `AND` FROM AN `OR` COMMITTED
  * THE CONFUSION ITSELF.
  *

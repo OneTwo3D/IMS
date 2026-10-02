@@ -4,7 +4,7 @@ import test from 'node:test'
 
 import ts from 'typescript'
 
-import { scanProgram } from '../../scripts/check-accounting-cancelled-row-predicates.mjs'
+import { scanProgram } from '../../scripts/check-ledger-standing-readers.mjs'
 
 /**
  * o3d-f709 round 3 (Codex MEDIUM 1) — THE CENSUS FOLLOWS A SYNC-LOG ROW INTO A HELPER THAT TOOK IT
@@ -98,14 +98,11 @@ test('[o3d-f709 r3] a `{ status, paymentId }` reader IS a reader of a sync-log r
     'lib/census-fixture-loader.ts': LOADER,
     'lib/census-fixture-reader.ts': READER,
   })
-  const flagged = result.failures.filter((f: string) => f.startsWith('lib/census-fixture-reader.ts'))
-  assert.equal(flagged.length, 1, `the exact shape Codex found must be caught: ${result.failures.join('\n')}`)
-  assert.match(flagged[0], /decides what a CANCELLED sync row means/)
-  assert.match(
-    flagged[0],
-    /REDUCED sync-log row \{paymentId,status\}, built at lib\/census-fixture-loader\.ts:\d+/,
-    'and it says WHERE the evidence columns were dropped, which is the fact a reader has to act on',
-  )
+  const flagged = result.sites.filter((s: { file: string; kind: string }) => s.file === 'lib/census-fixture-reader.ts' && s.kind === 'cmp-cancelled')
+  assert.equal(flagged.length, 1, `the exact shape Codex found must be caught: ${JSON.stringify(result.sites)}`)
+  assert.equal(flagged[0].decl, 'unregisteredLocalReceipts')
+  assert.equal(flagged[0].key, 'lib/census-fixture-reader.ts::unregisteredLocalReceipts::cmp-cancelled#1',
+    'and it is keyed per site, so a declaration can name exactly this one')
   assert.equal(
     result.reducedRowShapes.get('paymentId,status')?.startsWith('lib/census-fixture-loader.ts:'),
     true,
@@ -118,7 +115,7 @@ test('[o3d-f709 r3] and it is the REDUCTION that makes it one, not the shape of 
   // this table, and flagging it would make the census a blanket ban on the word CANCELLED. The
   // detector must be silent here and loud above, or it is measuring nothing.
   const result = scan({ 'lib/census-fixture-reader.ts': READER })
-  assert.deepEqual(result.failures, [])
+  assert.deepEqual(result.sites, [], 'no reduction was minted, so nothing here is a sync-log reader')
   assert.equal(result.reducedRowShapes.has('paymentId,status'), false)
 })
 
@@ -140,6 +137,6 @@ test('[o3d-f709 r3] the reduction is followed through a SECOND reduction as well
       }
     `,
   })
-  const flagged = result.failures.filter((f: string) => f.startsWith('lib/census-fixture-reader2.ts'))
-  assert.equal(flagged.length, 1, result.failures.join('\n'))
+  const flagged = result.sites.filter((s: { file: string; kind: string }) => s.file === 'lib/census-fixture-reader2.ts' && s.kind === 'cmp-cancelled')
+  assert.equal(flagged.length, 1, JSON.stringify(result.sites))
 })

@@ -233,7 +233,7 @@ function mayHoldLedgerPayment(row: ExistingInvoicePaymentSync): boolean {
  * asks what the follow-up machinery is doing, not what the ledger received; the shared set is
  * payment-ledger-hold's, so the two files cannot drift, and it omits FAILED as well as CANCELLED —
  * which is why it is not a spelling of "an abandoned row committed nothing" (see the census header
- * in scripts/check-accounting-cancelled-row-predicates.mjs on why a set that drops FAILED too is a
+ * in scripts/check-ledger-standing-readers.mjs (CANCELLED_COMPLEMENT) on why a set that drops FAILED too is a
  * different claim).
  */
 function hasLiveRegistrationWork(row: ExistingInvoicePaymentSync): boolean {

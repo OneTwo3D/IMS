@@ -1,0 +1,52 @@
+# o3d-f709 / o3d-vzje — LEDGER-STANDING READERS, RUN UNCONDITIONALLY.
+#
+# `AccountingSyncLog.status`, `externalTransactionId` and `settlementBasis` are read as statements
+# about the ledger in some sixty places, and three of the claims those reads make are false (a
+# CANCELLED row is not proof nothing posted; a SYNCED row may rest on an operator's typed id; a
+# document id may be one nobody saw). lib/domain/accounting/ledger-standing.ts states the rule once;
+# `scripts/check-ledger-standing-readers.mjs` fails the build on any reader that is neither inside it
+# nor DECLARED, per site, in scripts/ledger-standing-reader-declarations.mjs - and on a declaration
+# nothing matches.
+#
+# NO `paths:` FILTER, NO classifier, NO `needs:`, NO `if:`, NO `continue-on-error`. The declarations
+# file is itself a thing a change can edit, and the sites are scattered across app/, lib/ and
+# scripts/: a hand-kept path list would be a second thing that can go stale, and a guard a change
+# classifier can switch off is not a guard (the same argument archive-seal.yml and
+# server-action-auth-guard.yml settled). tests/scripts/ci-guard-coverage.test.ts parses this file and
+# fails if any of those appears, or if the one `npm run check:*` step below is not a single bare line.
+#
+# `npm ci` because the scan imports `typescript`; `prisma generate` because the scan is TYPE-AWARE - it
+# builds a ts.Program and decides whose `.status` a read is from the checker. Without the generated
+# client the enum types resolve to `any`, which would silently weaken every comparison detector and
+# then fail on stale declarations or on the "subject not reached" floors rather than pass. No database
+# or build is involved.
+name: Ledger Standing Guard
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ledger-standing-guard-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ledger-standing-readers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npm run check:ledger-standing-readers
