@@ -106,3 +106,27 @@ export function readSingleXeroDocument<T extends object = Record<string, unknown
 export function readXeroBalance(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
 }
+
+/**
+ * The credit note's own Allocations collection, reduced to what this bill has already been given, in
+ * minor units (cents). FAIL-CLOSED: the collection must be an array and every entry must be an object
+ * naming its invoice (`Invoice.InvoiceID`, a non-empty string) with a finite non-negative `Amount`
+ * number; anything else returns null = UNREADABLE (we cannot tell whose money it is, so we cannot tell
+ * whether OUR allocation already exists). Ids compare trimmed and case-insensitively.
+ */
+export function readAllocatedToInvoiceCents(allocations: unknown, invoiceId: string): number | null {
+  if (!Array.isArray(allocations)) return null
+  const wanted = invoiceId.trim().toLowerCase()
+  if (wanted === '') return null
+  let cents = 0
+  for (const entry of allocations) {
+    if (typeof entry !== 'object' || entry === null) return null
+    const e = entry as { Amount?: unknown; Invoice?: { InvoiceID?: unknown } | null }
+    const id = e.Invoice && typeof e.Invoice === 'object' ? e.Invoice.InvoiceID : undefined
+    if (typeof id !== 'string' || id.trim() === '') return null
+    const amount = readXeroBalance(e.Amount)
+    if (amount === null) return null
+    if (id.trim().toLowerCase() === wanted) cents += Math.round(amount * 100)
+  }
+  return cents
+}

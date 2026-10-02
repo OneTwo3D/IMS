@@ -7,7 +7,7 @@ import { findOrCreateContact } from './contacts'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
-import { readSingleXeroDocument, readXeroBalance } from './single-document'
+import { readAllocatedToInvoiceCents, readSingleXeroDocument, readXeroBalance } from './single-document'
 import {
   MINTED_CREDIT_NOTE_NUMBER_PREFIX,
   decidePurchaseCreditNotePost,
@@ -436,6 +436,36 @@ export function resolveCreditNoteAllocationAmount(params: {
   return Math.round(capped * 100) / 100
 }
 
+/**
+ * The decision table (o3d-h9pb, Codex round 2). R = requested, A = already allocated to THIS bill per the
+ * credit note's own Allocations, RC = RemainingCredit, AD = AmountDue.
+ *   A >= R                       -> already-allocated: idempotent success, no PUT (whatever RC / AD say).
+ *   A <  R, min(R-A, RC, AD) > 0 -> put that residual.
+ *   A <  R, RC = 0, AD > 0       -> refuse: credit exhausted (allocated to another document or refunded).
+ *   A <  R, RC > 0, AD = 0       -> refuse: the bill has nothing due (settled by something else).
+ *   A <  R, RC = 0, AD = 0       -> refuse: both, and none of it is our allocation.
+ * Refusals never PUT and never report success.
+ */
+export function decideCreditNoteAllocation(p: {
+  requested: number
+  remainingCredit: number
+  amountDue: number
+  allocatedCents: number
+}): { action: 'put'; amount: number } | { action: 'already-allocated' } | { action: 'refuse'; reason: string } {
+  const requestedCents = Math.round(p.requested * 100)
+  if (p.allocatedCents >= requestedCents) return { action: 'already-allocated' }
+  const need = (requestedCents - p.allocatedCents) / 100
+  const amount = resolveCreditNoteAllocationAmount({ requested: need, remainingCredit: p.remainingCredit, amountDue: p.amountDue })
+  if (amount > 0) return { action: 'put', amount }
+  const have = `${(p.allocatedCents / 100).toFixed(2)} of the ${p.requested.toFixed(2)} requested is allocated to this bill`
+  const cause = p.remainingCredit <= 0 && p.amountDue <= 0
+    ? 'the credit note has no credit remaining and the bill has nothing due (neither is explained by an allocation to this bill)'
+    : p.remainingCredit <= 0
+      ? 'the credit note has no credit remaining (it was allocated to another document or refunded) while the bill still has an amount due'
+      : 'the bill has nothing due (it was settled by something other than this credit note) while the credit note still has credit'
+  return { action: 'refuse', reason: `Nothing was allocated: ${cause}; ${have}. Resolve in Xero, then retry.` }
+}
+
 type XeroCreditNoteRemainingResponse = {
   CreditNotes?: Array<{ CreditNoteID: string; RemainingCredit?: number }>
 }
@@ -461,7 +491,7 @@ export async function allocatePurchaseCreditNote(
   }
   // o3d-h9pb: the allocation amount is sized from these two documents, so each must be the one asked
   // for. Unreadable is UNKNOWN: nothing is allocated, and it is reported as a failure, not as zero.
-  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown }>(
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown; Allocations?: unknown }>(
     cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
   if (cnRead.status === 'unreadable') {
     return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
@@ -485,8 +515,21 @@ export async function allocatePurchaseCreditNote(
     return { success: false, error: 'Bill read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated' }
   }
 
-  const allocateAmount = resolveCreditNoteAllocationAmount({ requested: params.amount, remainingCredit, amountDue })
-  if (allocateAmount <= 0) return { success: true, allocatedAmount: 0 }
+  // o3d-h9pb (Codex round 2): a ZERO computed amount is not "already allocated". RemainingCredit 0 can mean
+  // the credit went to ANOTHER bill (or was refunded); AmountDue 0 can mean something ELSE settled this
+  // bill. Only the credit note's own Allocations can say that OUR allocation exists.
+  const requested = Math.round(params.amount * 100) / 100
+  if (!Number.isFinite(requested) || requested <= 0) {
+    return { success: false, error: `The requested allocation amount (${params.amount}) is not a positive amount, so nothing was allocated` }
+  }
+  const allocatedCents = readAllocatedToInvoiceCents(cnRead.document.Allocations, params.invoiceId)
+  if (allocatedCents === null) {
+    return { success: false, error: 'Credit note read from Xero states no readable Allocations, so IMS cannot tell whether it is already allocated to this bill' }
+  }
+  const decision = decideCreditNoteAllocation({ requested, remainingCredit, amountDue, allocatedCents })
+  if (decision.action === 'already-allocated') return { success: true, allocatedAmount: 0 }
+  if (decision.action === 'refuse') return { success: false, error: decision.reason }
+  const allocateAmount = decision.amount
 
   const res = await xeroPut<{ Allocations?: Array<{ Amount: number }> }>(
     `CreditNotes/${params.creditNoteId}/Allocations`,

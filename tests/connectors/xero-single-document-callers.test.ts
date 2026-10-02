@@ -79,7 +79,7 @@ function shapes(key: string, idField: string, id: string, good: Record<string, u
 /* ------------------- allocatePurchaseCreditNote: two reads, two isolating arms ------------------- */
 
 const PARAMS = { creditNoteId: 'cn-1', invoiceId: 'bill-1', amount: 25, date: '2026-08-01' }
-const NOTE = { CreditNoteID: 'cn-1', RemainingCredit: 40 }
+const NOTE = { CreditNoteID: 'cn-1', RemainingCredit: 40, Allocations: [] as unknown[] }
 const BILL = { InvoiceID: 'bill-1', AmountDue: 25 }
 
 test('[o3d-h9pb credit-notes.ts CreditNotes/{id}] an unreadable credit note allocates NOTHING', async () => {
@@ -177,11 +177,11 @@ test('[o3d-h9pb HIGH] allocatePurchaseCreditNote: an unreadable RemainingCredit 
   assert.equal(control.success, true)
   assert.equal(puts.length, 1, 'PRECONDITION: with readable figures the allocation IS sent')
 
-  // A legitimate zero is still the idempotent no-op, so the fix did not turn every zero into a failure.
+  // A zero balance is idempotent success ONLY when the credit note's own Allocations show OUR allocation.
   puts = []
-  xeroBodies = { 'CreditNotes/cn-1': { CreditNotes: [{ ...NOTE, RemainingCredit: 0 }] }, 'Invoices/bill-1': { Invoices: [BILL] } }
+  xeroBodies = { 'CreditNotes/cn-1': { CreditNotes: [{ ...NOTE, RemainingCredit: 0, Allocations: [{ Amount: 25, Invoice: { InvoiceID: 'BILL-1' } }] }] }, 'Invoices/bill-1': { Invoices: [{ ...BILL, AmountDue: 0 }] } }
   const zero = await allocatePurchaseCreditNote(PARAMS)
-  assert.deepEqual([zero.success, zero.allocatedAmount, puts.length], [true, 0, 0], 'a stated zero is a settled retry')
+  assert.deepEqual([zero.success, zero.allocatedAmount, puts.length], [true, 0, 0], 'our allocation exists: a settled retry')
 
   let cases = 0
   for (const [label, corrupt] of BAD_FIGURES) {
@@ -223,4 +223,76 @@ test('[o3d-h9pb HIGH] reconcile: a document that states no Status is UNKNOWN / n
   }
   assert.equal(cases, 4)
   console.log(`# o3d-h9pb HIGH reconcile Status: ${cases} unreadable cases`)
+})
+
+/* ------------- o3d-h9pb (Codex round 2): a READABLE zero balance is not "already allocated" ------------- */
+
+test('[o3d-h9pb HIGH r2] allocatePurchaseCreditNote decision table: RC x AD x allocated-to-THIS-bill', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  const OTHER = { Amount: 40, Invoice: { InvoiceID: 'bill-OTHER' } }
+  const OURS = (amount: number) => ({ Amount: amount, Invoice: { InvoiceID: 'bill-1' } })
+  // [name, RC, AD, allocations, expected: 'put:<amount>' | 'ok-noop' | 'refuse:<regex source>']
+  const table: Array<[string, number, number, unknown[], string]> = [
+    ['RC>0 AD>0, not allocated: allocate', 40, 25, [], 'put:25'],
+    ['RC>0 AD>0, ours already covers it: no second allocation', 40, 25, [OURS(25)], 'ok-noop'],
+    ['RC>0 AD>0, ours covers part: allocate only the residual', 40, 25, [OURS(10)], 'put:15'],
+    ['RC=0 AD>0, not allocated to this bill (exhausted on ANOTHER bill)', 0, 25, [OTHER], 'refuse:no credit remaining \\(it was allocated to another document or refunded\\)'],
+    ['RC=0 AD>0, no allocations at all (refunded)', 0, 25, [], 'refuse:no credit remaining'],
+    ['RC=0 AD>0, ours covers it: our allocation exists', 0, 25, [OURS(25)], 'ok-noop'],
+    ['RC=0 AD>0, ours covers only part: a shortfall, not success', 0, 25, [OURS(10)], 'refuse:10.00 of the 25.00 requested'],
+    ['RC>0 AD=0, not allocated to this bill (bill settled by something else)', 40, 0, [OTHER], 'refuse:the bill has nothing due'],
+    ['RC>0 AD=0, ours covers it', 40, 0, [OURS(25)], 'ok-noop'],
+    ['RC=0 AD=0, not allocated to this bill', 0, 0, [OTHER], 'refuse:neither is explained'],
+    ['RC=0 AD=0, ours covers it', 0, 0, [OURS(25)], 'ok-noop'],
+    ['RC=0 AD=0, ours covers part', 0, 0, [OURS(5)], 'refuse:5.00 of the 25.00'],
+  ]
+  let cases = 0
+  for (const [name, rc, ad, allocations, expected] of table) {
+    puts = []
+    xeroBodies = {
+      'CreditNotes/cn-1': { CreditNotes: [{ ...NOTE, RemainingCredit: rc, Allocations: allocations }] },
+      'Invoices/bill-1': { Invoices: [{ ...BILL, AmountDue: ad }] },
+    }
+    const result = await allocatePurchaseCreditNote(PARAMS)
+    if (expected.startsWith('put:')) {
+      assert.equal(result.success, true, `${name}: ${JSON.stringify(result)}`)
+      assert.equal(result.allocatedAmount, Number(expected.slice(4)), name)
+      assert.equal(puts.length, 1, `${name}: exactly one PUT`)
+    } else if (expected === 'ok-noop') {
+      assert.deepEqual([result.success, result.allocatedAmount, puts.length], [true, 0, 0], name)
+    } else {
+      assert.equal(result.success, false, `${name}: ${JSON.stringify(result)}`)
+      assert.match(result.error ?? '', new RegExp(expected.slice(7)), name)
+      assert.deepEqual(puts, [], `${name}: NO PUT`)
+    }
+    cases += 1
+  }
+  assert.equal(cases, 12)
+  console.log(`# o3d-h9pb HIGH r2 allocation decision table: ${cases} cells`)
+})
+
+test('[o3d-h9pb HIGH r2] an unreadable Allocations collection is a failure, never "not allocated" and never "already allocated"', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  const shapes: Array<[string, unknown]> = [
+    ['omitted', undefined], ['null', null], ['string', 'x'], ['object', {}],
+    ['entry not an object', ['x']], ['entry without invoice', [{ Amount: 25 }]],
+    ['entry with blank invoice id', [{ Amount: 25, Invoice: { InvoiceID: ' ' } }]],
+    ['entry amount string', [{ Amount: '25', Invoice: { InvoiceID: 'bill-1' } }]],
+    ['entry amount NaN', [{ Amount: Number.NaN, Invoice: { InvoiceID: 'bill-1' } }]],
+    ['entry amount negative', [{ Amount: -5, Invoice: { InvoiceID: 'bill-1' } }]],
+  ]
+  let cases = 0
+  for (const [name, allocations] of shapes) {
+    puts = []
+    const note: Record<string, unknown> = { ...NOTE }
+    if (allocations === undefined) delete note.Allocations; else note.Allocations = allocations
+    xeroBodies = { 'CreditNotes/cn-1': { CreditNotes: [note] }, 'Invoices/bill-1': { Invoices: [BILL] } }
+    const result = await allocatePurchaseCreditNote(PARAMS)
+    assert.equal(result.success, false, `${name}: ${JSON.stringify(result)}`)
+    assert.match(result.error ?? '', /no readable Allocations/, name)
+    assert.deepEqual(puts, [], `${name}: NO PUT`)
+    cases += 1
+  }
+  assert.equal(cases, 10)
+  console.log(`# o3d-h9pb HIGH r2 Allocations shapes: ${cases} unreadable cases`)
 })
