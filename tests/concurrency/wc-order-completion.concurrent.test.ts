@@ -544,6 +544,9 @@ test('o3d-zvec.15 (round 3): park + Replay while a worker is paused completes EX
   const { key } = await seedRow(deps, 'park-replay')
   wc.pause = 'ignore'
   wc.pauseMs = 800
+  // The store keeps reporting `processing` after B's PUT, so "already completed" cannot explain A's silence:
+  // only the pre-write check can.
+  wc.staysProcessing = true
 
   // Worker A: paused inside a WooCommerce request, deadline far away (10 s) so only OWNERSHIP can stop it.
   const a = deps.processWcOrderCompletionJobs({ idempotencyKeys: [key], attemptDeadlineMs: 10_000 })
