@@ -124,6 +124,20 @@ export type ShipmentReconciliationResult = {
    * all, because a different mechanism has already decided the order is complete.
    */
   shortfall?: OrderShipmentShortfallLine[]
+  /**
+   * o3d-zvec.15: present (and `true`) ONLY when THIS call moved the order to SHIPPED — the flip
+   * happened under the order lock in this very reconciliation. It is the single "the order has just
+   * been completed" signal the post-commit side effects key on (the WooCommerce completion push), so
+   * that they fire exactly once per completion: absent for a partial shipment, for a shortfall-held
+   * order, for an order some other path had already promoted, and for a retry that finds it done.
+   */
+  orderReachedShipped?: true
+  /**
+   * o3d-zvec.15: the idempotency key of the durable WooCommerce completion job enqueued IN the flip's own
+   * transaction — present only when the call flipped the order, asked for `storefrontCompletion`, and the
+   * order has a storefront link. The caller makes the immediate post-commit attempt with it.
+   */
+  storefrontCompletionKey?: string
 }
 
 function canRunTransaction(
@@ -1436,6 +1450,11 @@ export async function reconcileOrderAfterShipment(
      * `applyExternalFulfillmentUpdate` declares `EXTERNAL`.
      */
     completionAuthority?: OrderCompletionAuthority
+    /**
+     * o3d-zvec.15: also enqueue the durable storefront-completion job inside the flip's transaction.
+     * Default false: only a caller that owns the storefront status asks for it.
+     */
+    storefrontCompletion?: boolean
   },
 ): Promise<ShipmentReconciliationResult> {
   const completionAuthority: OrderCompletionAuthority = options?.completionAuthority ?? 'IMS'
@@ -1457,7 +1476,13 @@ export async function reconcileOrderAfterShipment(
     .filter(Boolean)
     .join(', ')
 
+  // Set only inside the committed callback below, by the one statement that flips the status; read
+  // only after `runInTransaction` returned, i.e. after the commit (a rollback throws past the read).
+  let orderReachedShipped = false
+  let storefrontCompletionKey: string | null = null
   const shortfall = await runInTransaction(client, async (tx) => {
+    orderReachedShipped = false // a retried callback must not inherit an aborted attempt's flip
+    storefrontCompletionKey = null
     await lockSalesOrder(tx, shipment.orderId)
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
@@ -1506,14 +1531,24 @@ export async function reconcileOrderAfterShipment(
 
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
     if (!transition.success) throw new Error(transition.error)
+    const shippedAt = new Date()
     await tx.salesOrder.update({
       where: { id: shipment.orderId },
       data: {
         status: 'SHIPPED',
-        shippedAt: new Date(),
+        shippedAt,
         trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
       },
     })
+    // o3d-zvec.15: the durable storefront-completion intent commits WITH the flip or not at all. It is one
+    // INSERT into integration_outbox on this transaction's client, taken AFTER the order lock above — the
+    // order row is the parent and is already held, and the outbox row is a leaf nothing else locks first
+    // (see the lock-order note on the PR). No WooCommerce I/O here: the push happens after the commit.
+    if (options?.storefrontCompletion) {
+      const { scheduleShoppingOrderCompletion } = await import('@/lib/shopping')
+      storefrontCompletionKey = await scheduleShoppingOrderCompletion(tx as never, { orderId: shipment.orderId, shippedAt })
+    }
+    orderReachedShipped = true
     return null
   })
 
@@ -1524,5 +1559,7 @@ export async function reconcileOrderAfterShipment(
     shouldGenerateInvoice: !shortfall && trigger?.value === 'on_shipped',
     orderId: shipment.orderId,
     ...(shortfall ? { shortfall } : {}),
+    ...(orderReachedShipped ? { orderReachedShipped: true as const } : {}),
+    ...(orderReachedShipped && storefrontCompletionKey ? { storefrontCompletionKey } : {}),
   }
 }

@@ -55,6 +55,25 @@ async function runConnectorTick(input: {
   }
 }
 
+/**
+ * Drain the durable storefront-completion jobs (o3d-zvec.15): the retry path for a WooCommerce completion
+ * that failed (or never ran) after the order shipped. Gated on the plugin being enabled and NOT on
+ * `wc_sync_enabled` — the status push has never been gated by that setting, and an order must not stay
+ * `processing` in the storefront because inbound sync is switched off. Never throws.
+ */
+async function drainOrderCompletions(): Promise<ConnectorTickResult> {
+  try {
+    if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+      return { skipped: true, reason: 'woocommerce_plugin_disabled' }
+    }
+    const { processShoppingOrderCompletions } = await import('@/lib/shopping')
+    return { ...(await processShoppingOrderCompletions()) }
+  } catch (error) {
+    console.warn('[shopping-webhook-inbox] order-completion drain failed', { error: normalizeCronError(error) })
+    return { skipped: false, error: normalizeCronError(error) }
+  }
+}
+
 async function getWcSyncEnabled(): Promise<boolean> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
   return enabled?.value === 'true'
@@ -86,7 +105,9 @@ export async function GET(request: Request) {
         }),
       ])
 
-      return { connectors: { woocommerce } } as Record<string, unknown>
+      const orderCompletions = await drainOrderCompletions()
+
+      return { connectors: { woocommerce: { ...woocommerce, orderCompletions } } } as Record<string, unknown>
     },
   })
 

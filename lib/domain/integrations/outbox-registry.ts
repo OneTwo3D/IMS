@@ -16,6 +16,12 @@ export const WcStockSyncOutboxPayloadSchema = z.object({
   webhookQty: z.number().finite().nullable().optional().default(null),
 })
 
+// o3d-zvec.15: the durable "complete this storefront order" job, enqueued INSIDE the transaction that
+// ships the order. Carries only the order id: the job re-reads the order and WooCommerce on EVERY attempt.
+export const WcOrderCompletionOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+})
+
 export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
@@ -253,6 +259,43 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
       name: 'stockSync',
       schema: WcStockSyncOutboxPayloadSchema,
       effects: ONE_EFFECT,
+      replay: 'unsafe-to-replay',
+    },
+    // o3d-zvec.15. UNSAFE, and for the reason the stock push is: the effect is a customer-visible
+    // WooCommerce status PUT (it fires the completed email), so a second worker re-running it after a
+    // stale-lock reclaim is not something a local verdict can call safe. The status PUT is guarded
+    // (a fresh GET + classifyWcCompletionEligibility on EVERY attempt, so a repeat finds `completed` and
+    // sends nothing), but the tracking meta write, the shoppingSyncLog row and the activity log sit outside
+    // that guard, hence an effect SEQUENCE. Consequence: no AUTOMATIC stale-lock reclaim — nothing proves
+    // whether a dead worker's PUT landed, and 'remote-write-idempotent' needs an ordering guarantee the
+    // remote enforces, which WooCommerce's unconditional PUT does not give. (Each attempt does re-read the
+    // status first, which makes a repeat harmless in the common case, but a GET is not a fence, so the
+    // verdict stays honest rather than being argued up.) A row whose worker died is NOT left parked for
+    // ever, though: the cron drain moves a PROCESSING row whose lock is past the drain lease to
+    // PERMANENT_FAILED (`parkStaleWcOrderCompletionClaims`, compare-and-set on the dead worker's lock) so it
+    // shows on /sync/exceptions with an explanation, and Replay there is safe BECAUSE the retry re-reads
+    // WooCommerce first. PERMANENT_FAILED is inert for this operation: its only enqueue is keyed per flip
+    // and returns the existing row untouched, so nothing resets it behind the operator's back.
+    //
+    // THE INVARIANT THAT MAKES PARK + REPLAY SAFE: a claim older than the drain lease means the worker is
+    // dead or aborted. A worker holds no DB lock while it talks to WooCommerce, so that is enforced on the
+    // WORKER, not assumed: every attempt runs under a hard 2 minute deadline (attempt-fence.ts) folded into
+    // every WooCommerce request it makes (tracking GET/PUT, status GET/PUT), and re-checks the deadline AND
+    // that it still owns its row immediately before the status PUT. The lease is 10 minutes, deadline 2: a
+    // request that was already on the wire when the deadline fired can land at most one deadline after the
+    // attempt began, long before the park could run, so a Replay's attempt never overlaps a live one.
+    'order.complete': {
+      name: 'orderComplete',
+      schema: WcOrderCompletionOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the WooCommerce status PUT to completed, behind a fresh GET and classifyWcCompletionEligibility on every attempt',
+        effectsOutsideTheGuard: [
+          'tracking meta PUT (pushImsTrackingToWc), which replaces the meta absolutely',
+          'shoppingSyncLog SYNCED row for the status push',
+          'logActivity wc_status_pushed / wc_completion_skipped / wc_completion_retry',
+        ],
+      },
       replay: 'unsafe-to-replay',
     },
   },
@@ -551,6 +594,7 @@ export type LandedCostJournalOutboxPayload = z.infer<typeof LandedCostJournalOut
 export type AccountingPostingRefusalProvisionalPayload = z.infer<typeof AccountingPostingRefusalProvisionalPayloadSchema>
 export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRefundReservationReleaseOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
+export type WcOrderCompletionOutboxPayload = z.infer<typeof WcOrderCompletionOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
 

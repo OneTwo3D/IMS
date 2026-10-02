@@ -159,18 +159,26 @@ test('o3d-0i5y r2: the storefront completion path declares the same authority â€
   assert.equal(state.shipmentStatusOptions[0]?.completionAuthority, 'EXTERNAL')
 })
 
-test('o3d-0i5y r2: the storefront completion push survives â€” it is gated on the order reaching SHIPPED', async () => {
-  // The visible customer-facing consequence of r1's regression: while the order was held out of
-  // SHIPPED, shouldPushStorefrontCompletion returned false and the despatch email never fired.
-  reset()
-  const { applyExternalFulfillmentUpdate } = await loadModule()
-
-  await applyExternalFulfillmentUpdate({
-    source: 'mintsoft',
-    lookup: { orderId: 'order-1' },
-    targetShipmentStatus: 'SHIPPED',
-    tracking: [{ trackingNumber: 'TRACK-1', shippingService: 'DPD' }],
-  })
-
-  assert.deepEqual(state.pushedStatuses, ['SHIPPED'])
+test('o3d-zvec.15 (arm 6): a WMS dispatch asks for the DURABLE storefront completion; a WooCommerce-sourced one does not', async () => {
+  // The visible customer-facing consequence of o3d-0i5y r1's regression: while the order was held out of
+  // SHIPPED the despatch email never fired. The push is now a durable job enqueued with the order flip, so
+  // the boundary's job is to ask for it for a WMS source and NEVER for the storefront's own completion
+  // (that would only echo). Both arms assert the cases they evaluated, so an empty walk cannot pass.
+  let evaluated = 0
+  for (const [source, expected] of [['mintsoft', true], ['woocommerce', false]] as const) {
+    reset()
+    const { applyExternalFulfillmentUpdate } = await loadModule()
+    await applyExternalFulfillmentUpdate({
+      source,
+      lookup: { orderId: 'order-1' },
+      targetShipmentStatus: 'SHIPPED',
+      tracking: [{ trackingNumber: 'TRACK-1', shippingService: 'DPD' }],
+    })
+    assert.equal(state.shipmentStatusOptions.length, 1, `${source}: updateShipmentStatus was reached`)
+    assert.equal(state.shipmentStatusOptions[0]?.storefrontCompletion, expected, `${source}: storefrontCompletion`)
+    // And the old fire-and-forget push from this module is gone for good.
+    assert.deepEqual(state.pushedStatuses, [], `${source}: no direct status push from the boundary`)
+    evaluated++
+  }
+  assert.equal(evaluated, 2)
 })

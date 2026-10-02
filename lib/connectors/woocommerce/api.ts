@@ -3,6 +3,7 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import type { ConnectorCredentials } from '../types'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentials } from './credentials'
 import { validateWooCommerceBaseUrl } from './url-safety'
+import { currentWcAttemptSignal } from './attempt-fence'
 
 const GENERIC_WC_NOT_CONFIGURED_ERROR = 'WooCommerce integration is not configured.'
 
@@ -63,6 +64,16 @@ export async function getWcCredentials(): Promise<ConnectorCredentials | null> {
  * instead of the number being three copies of a literal nobody can see from outside).
  */
 export const WC_REQUEST_TIMEOUT_MS = 120_000
+
+/**
+ * The per-request signal: the ceiling above, folded with the ambient completion-attempt deadline when one is
+ * running (attempt-fence.ts), so a completion attempt's requests all die at its overall deadline.
+ */
+function wcRequestSignal(): AbortSignal {
+  const perRequest = AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS)
+  const attempt = currentWcAttemptSignal()
+  return attempt ? AbortSignal.any([perRequest, attempt]) : perRequest
+}
 
 /**
  * Value used for a pagination header WooCommerce did not send readably (o3d-jcx).
@@ -215,7 +226,7 @@ export async function wcFetch(
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
   const res = await connectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
-    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
+    signal: wcRequestSignal(),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -260,7 +271,7 @@ export async function wcPost(
     method: 'POST',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
+    signal: wcRequestSignal(),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -291,7 +302,7 @@ export async function wcPut(
     method: 'PUT',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
+    signal: wcRequestSignal(),
   }, {
     connectorName: 'WooCommerce',
   })
