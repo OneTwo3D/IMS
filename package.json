@@ -24,7 +24,7 @@
     "repair:duplicate-bom": "tsx scripts/deactivate-duplicate-bom.ts",
     "db:stamp-scratch": "tsx scripts/stamp-scratch-database.ts",
     "db:unstamp-scratch": "tsx scripts/stamp-scratch-database.ts --unstamp",
-    "test:concurrency": "RUN_DB_CONCURRENCY_TESTS=1 tsx --test --experimental-test-module-mocks --import ./tests/no-outbound-network.cjs --import ./tests/concurrency/scratch-database-preload.mts \"tests/concurrency/**/*.test.ts\"",
+    "test:concurrency": "RUN_DB_CONCURRENCY_TESTS=1 tsx --test --test-concurrency=1 --experimental-test-module-mocks --import ./tests/no-outbound-network.cjs --import ./tests/concurrency/scratch-database-preload.mts \"tests/concurrency/**/*.test.ts\"",
     "test:db": "RUN_DB_RETENTION_TESTS=1 REQUIRE_DB_RETENTION_TESTS=1 tsx --test --import ./tests/no-outbound-network.cjs \"tests/db/**/*.test.ts\"",
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",

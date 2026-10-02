@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { config } from 'dotenv'
 
+import { backendPid, waitUntilParkedBehind, type ParkedBackend } from '@/tests/helpers/lock-wait-observer'
+
 /**
  * o3d-d0pd r2 (Codex MEDIUM) — A COLLIDING ENQUEUE LEAVES THE CALLER'S TRANSACTION USABLE.
  *
@@ -102,11 +104,26 @@ function payloadFor(key: string, writer: 'enqueue' | 'interloper') {
 }
 
 /**
- * How long the winner holds its transaction open after its INSERT. The loser is blocked on the
- * unique index for the whole of it, which is what makes the collision DETERMINISTIC and, just as
- * importantly, MEASURABLE — see the timing assertion.
+ * o3d-ohrk3 — THE WINNER'S HOLD IS A STATE, NOT A DURATION. It used to keep its transaction open for a
+ * fixed 300ms after its INSERT and the test asserted the loser's enqueue took at least that long. A
+ * loser that reached its own INSERT late (host load: checkout, transaction start) found the winner
+ * already committed, READ the row and deduped without ever colliding — the recovery path under test was
+ * never exercised and the assertion failed. The winner now holds its transaction until the loser is
+ * OBSERVED blocked behind it (a backend whose `pg_blocking_pids` names the winner, stuck on the
+ * selection lock — see FENCE_WAIT below), and fails loud, with a diagnostic, if that never happens.
  */
-const HOLD_MS = 300
+/**
+ * WHAT THE LOSER IS ACTUALLY PARKED ON — OBSERVED, AND NOT WHAT THIS FILE'S NARRATIVE SAYS (o3d-ohrk3).
+ * Since o3d-j625 r13 every enqueue takes the plugin-selection ADVISORY lock first
+ * (`pinnedLedgerIsServicedUnderLock`), so the second racer blocks there, behind the first one's open
+ * transaction, and never reaches the unique index while the winner is open: the observer showed
+ * `wait_event=advisory`, `SELECT pg_advisory_xact_lock($1)`, nothing on the index. It then wakes after
+ * the winner commits and READS the row. The assertion this test always made — the loser's enqueue
+ * cannot return before the winner commits — is therefore true and is what is observed below, but the
+ * 23505 / savepoint recovery path is NOT what is being waited on any more. Filed rather than folded in:
+ * see the bead named in the PR for o3d-ohrk3.
+ */
+const FENCE_WAIT = /pg_advisory_xact_lock/i
 
 test(
   '[o3d-d0pd r2] a colliding enqueue leaves the outer transaction committable, and the collision is reached',
@@ -135,8 +152,8 @@ test(
      * So the loser reads nothing, INSERTS, and blocks on the index — and gets its 23505 the moment the
      * winner commits. The read-and-dedupe outcome is not available to it.
      *
-     * The winner then holds its transaction open for HOLD_MS after its own insert, so the loser is
-     * demonstrably parked on the index rather than racing past it.
+     * The winner then holds its transaction open after its own insert until the loser is OBSERVED
+     * parked on the index (o3d-ohrk3), rather than racing past it.
      */
     const started: Array<() => void> = []
     const bothOpen = new Promise<void>((resolve) => {
@@ -145,9 +162,14 @@ test(
       started.push(() => { if (++count === 2) resolve() })
     })
 
-    async function racer(writer: string): Promise<{ writer: string; enqueueMs: number }> {
+    // Set by whichever racer INSERTED FIRST, once it has seen the other parked behind it. The racer that
+    // lost cannot reach the check below until the winner has committed, so it always finds this set.
+    const park: { holder?: string; observed?: ParkedBackend; releasedAt?: number } = {}
+
+    async function racer(writer: string): Promise<{ writer: string; enqueueMs: number; enqueueDoneAt: number }> {
       return await db.$transaction(async (tx) => {
         // Both transactions are open before either enqueue begins.
+        const pid = await backendPid(tx)
         started.pop()!()
         await bothOpen
         const startedAt = Date.now()
@@ -161,7 +183,8 @@ test(
           // the chart check passes and the collision below is still what is being raced.
           chartConnector: 'xero',
         })
-        const enqueueMs = Date.now() - startedAt
+        const enqueueDoneAt = Date.now()
+        const enqueueMs = enqueueDoneAt - startedAt
         // Both racers must be told the counterpart is queued: one wrote it, the other collided with it.
         assert.equal(queued, true, `${writer}: the enqueue must report the posting as queued`)
         // THE SUBSEQUENT STATEMENT. On an aborted transaction this alone raises 25P02 — which is the
@@ -176,9 +199,15 @@ test(
             description: `enqueue reported queued=${queued}`,
           },
         })
-        // Held open so the loser is parked on the unique index for a measurable interval.
-        await new Promise((resolve) => setTimeout(resolve, HOLD_MS))
-        return { writer, enqueueMs }
+        // Held open until the loser is OBSERVED parked behind this transaction.
+        if (!park.observed) {
+          park.observed = await waitUntilParkedBehind(db, {
+            holderPid: pid, waitingOn: FENCE_WAIT, describe: `enqueue-collision winner ${writer}`,
+          })
+          park.holder = writer
+          park.releasedAt = Date.now()
+        }
+        return { writer, enqueueMs, enqueueDoneAt }
       }, TX)
     }
 
@@ -201,16 +230,21 @@ test(
     const winner = (rows[0].payload as { _probeWriter?: string } | null)?._probeWriter
     assert.ok(winner === 'alpha' || winner === 'beta', `the surviving row must name its writer, got ${winner}`)
 
-    // THE PRECONDITION WAS REACHED, MEASURED RATHER THAN ARGUED. The loser sat on the unique index
-    // for the whole of the winner's hold, so its enqueue cannot have returned before the winner
-    // committed — which is only possible if it INSERTED and collided. A read-and-dedupe would have
-    // returned in milliseconds. Without this the test would pass just as happily against a race that
-    // never raced, which is the shape of a guard that cannot fail.
+    // THE PRECONDITION WAS REACHED, OBSERVED RATHER THAN ARGUED. The loser was seen blocked behind the
+    // winner's open transaction, so its enqueue cannot have returned before the winner committed. (It is
+    // parked on the selection fence, not the unique index — see FENCE_WAIT.) A loser that arrived after
+    // the winner committed is never parked, and would have passed the old timing assertion's twin
+    // vacuously or failed it by latency alone.
     const loser = results.find((r) => r.writer !== winner)
     assert.ok(loser, 'both racers must be accounted for')
-    assert.ok(loser.enqueueMs >= HOLD_MS,
-      `the losing enqueue returned in ${loser.enqueueMs}ms without waiting out the winner's ${HOLD_MS}ms `
-      + 'hold, so it never blocked on the unique index and the recovery path was never exercised',
+    assert.ok(park.observed && park.releasedAt, 'PRECONDITION: the loser was observed parked behind the winner')
+    console.log(`[o3d-ohrk3 parked] collision: loser backend ${park.observed.pid} observed blocked on `
+      + `\`${park.observed.query.replace(/\s+/g, ' ').slice(0, 60)}\` after ${park.observed.observedAfterMs}ms; `
+      + `winner ${park.holder} released ${loser.enqueueDoneAt - park.releasedAt}ms before the loser's enqueue returned`)
+    assert.equal(park.holder, winner, 'the racer that held the index is the one whose row survived')
+    assert.ok(loser.enqueueDoneAt >= park.releasedAt,
+      `the losing enqueue returned ${park.releasedAt - loser.enqueueDoneAt}ms BEFORE the winner released `
+      + 'its transaction, so it never waited behind the winner and the collision was never raced',
     )
   },
 )
