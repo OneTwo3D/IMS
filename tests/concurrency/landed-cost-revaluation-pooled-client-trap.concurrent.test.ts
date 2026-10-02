@@ -86,7 +86,7 @@ mock.module('@/lib/auth/server', {
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/shopping', { namedExports: { enqueueStockSync: async () => {} } })
 
-async function seedWorld(label: string) {
+async function seedWorld(label: string, freightStatus: 'PO_SENT' | 'PARTIALLY_RECEIVED' = 'PO_SENT') {
   const { db } = await import('@/lib/db')
   const tag = `NRL4T-${label}-${randomUUID().replace(/-/g, '').slice(0, 20)}`
   const now = new Date()
@@ -109,7 +109,7 @@ async function seedWorld(label: string) {
   })
   const freight = await db.purchaseOrder.create({
     data: {
-      reference: `PO-F-${tag}`, type: 'FREIGHT', supplierId: supplier.id, status: 'PO_SENT', currency: 'GBP', fxRateToBase: 1,
+      reference: `PO-F-${tag}`, type: 'FREIGHT', supplierId: supplier.id, status: freightStatus, currency: 'GBP', fxRateToBase: 1,
       subtotalForeign: 20, subtotalBase: 20, taxForeign: 0, taxBase: 0, totalForeign: 20, totalBase: 20,
       freightCostLines: { create: [{ description: 'Freight', amountForeign: 20, amountBase: 20, vatable: false, distributionMethod: 'BY_VALUE', sortOrder: 0 }] },
       asFreightFor: { create: [{ primaryPoId: goods.id, method: 'BY_VALUE', allocated: false }] },
@@ -190,7 +190,8 @@ test('o3d-nrl4 PR A: no pooled client inside the revaluation transactions', { sk
   await t.test('cancelPurchaseOrderService (FREIGHT): its transaction touches only tx', async () => {
     const { cancelPurchaseOrderService } = await import('@/lib/domain/purchasing/cancellation-service')
     const { recalculateLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
-    const world = await seedWorld('cnc')
+    // PARTIALLY_RECEIVED: the purchase-order state machine only lets that kind of freight order be cancelled.
+    const world = await seedWorld('cnc', 'PARTIALLY_RECEIVED')
     resetTrap()
     await db.$transaction((tx) => recalculateLandedCosts(tx, world.freightId, undefined, { triggeredById: null, reason: 'freight_purchase_order_costs_updated' }), TX)
     assert.equal(await layerUnitCost(world.layerId), 7, 'PRECONDITION: the freight was applied before it is cancelled')
