@@ -25,6 +25,15 @@
  * isolation; the daily-sync / preview call sites only assemble their inputs.
  */
 
+import {
+  UNPROVEN_CANCELLED_WHERE,
+  WORK_SLOT_OCCUPIED_WHERE,
+  ledgerStanding,
+  workSlotStanding,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
+import type { Prisma } from '@/app/generated/prisma/client'
+
 function round2(value: number): number {
   return Math.round(value * 100) / 100
 }
@@ -107,4 +116,78 @@ export function batchContainsFinalUnjournaledShipment(
   const unjournaled = dispatchedOrderShipments.filter((shipment) => !shipment.shipmentJournalDate)
   if (unjournaled.length === 0) return false
   return unjournaled.every((shipment) => shipmentIdsInThisBatch.has(shipment.id))
+}
+
+// ---------------------------------------------------------------------------
+// o3d-3la07 (M5/M6, D3) - WHAT THE UNEARNED-REVENUE NETTING RESTS ON, REPORT-ONLY.
+//
+// `sumPostedUnearnedReversal` nets the debit of an order's PENDING / PROCESSING / SYNCED
+// UNEARNED_REV_REVERSAL rows out of the deferral the true-up recognises. Two of the rows that decision
+// rests on are not ledger facts:
+//
+//   * a SYNCED row an OPERATOR settled as posted (ASSERTED_POSTED) is COUNTED, on its queued payload;
+//   * a CANCELLED row that may have reached the ledger (ASSERTED_NOT_POSTED, or a claimed attempt
+//     cancelled with no proof) is NOT counted, though the reversal may exist.
+//
+// Batch 1 changes NO ARITHMETIC (D3: the hold-out design belongs to P2-7). This module's job is that
+// the run SAYS it: one warning per order, naming the rows. `UNEARNED_REVERSAL_NETTING_WHERE` is the
+// read width (the counted set plus the unproven cancelled rows) and `countedUnearnedReversalRows` is
+// the counted set, derived from the module's own work-slot predicate so the netting is byte-for-byte
+// what it was.
+// ---------------------------------------------------------------------------
+
+/** The rows to LOAD: the counted set (work-slot statuses) and the CANCELLED rows that may have posted. */
+export const UNEARNED_REVERSAL_NETTING_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  OR: [WORK_SLOT_OCCUPIED_WHERE, UNPROVEN_CANCELLED_WHERE],
+}
+
+export type UnearnedReversalSyncRow = LedgerStandingRow & {
+  id: string
+  referenceType: string
+  referenceId: string
+  payload: unknown
+}
+
+/** The rows the netting COUNTS: exactly the PENDING / PROCESSING / SYNCED set it always summed. */
+export function countedUnearnedReversalRows<T extends LedgerStandingRow>(rows: T[]): T[] {
+  return rows.filter((row) => workSlotStanding(row).slot === 'OCCUPIED')
+}
+
+export type UnearnedReversalStandingReport = {
+  /** Counted in the netting although an operator typed the document id (their figure is queued intent). */
+  assertedCounted: string[]
+  /** NOT counted although they may have reached the ledger (asserted NOT_POSTED / unproven CANCELLED). */
+  mayHavePostedNotCounted: string[]
+}
+
+/** The rows an order's netting rests on that are not ledger facts. Empty when there are none. */
+export function unearnedReversalStandingReport(rows: UnearnedReversalSyncRow[]): UnearnedReversalStandingReport {
+  const counted = new Set(countedUnearnedReversalRows(rows).map((row) => row.id))
+  const assertedCounted: string[] = []
+  const mayHavePostedNotCounted: string[] = []
+  for (const row of rows) {
+    const standing = ledgerStanding(row)
+    if (counted.has(row.id)) {
+      if (standing === 'ASSERTED_POSTED') assertedCounted.push(row.id)
+    } else if (standing !== 'PROVEN_NOT_POSTED') {
+      mayHavePostedNotCounted.push(row.id)
+    }
+  }
+  return { assertedCounted, mayHavePostedNotCounted }
+}
+
+/** The operator-facing sentence for one order, or null when its netting rests on ledger facts alone. */
+export function describeUnearnedReversalReport(
+  orderRef: string,
+  report: UnearnedReversalStandingReport,
+): string | null {
+  if (report.assertedCounted.length === 0 && report.mayHavePostedNotCounted.length === 0) return null
+  const parts: string[] = []
+  if (report.assertedCounted.length > 0) {
+    parts.push(`sync log(s) ${report.assertedCounted.join(', ')} were settled as posted by an OPERATOR and are COUNTED as unearned revenue already reversed on their queued figure, which nobody read in the ledger`)
+  }
+  if (report.mayHavePostedNotCounted.length > 0) {
+    parts.push(`sync log(s) ${report.mayHavePostedNotCounted.join(', ')} are cancelled but may have reached the ledger and are NOT counted, so the true-up may recognise revenue a reversal already took out`)
+  }
+  return `Order ${orderRef}: the deferred-revenue true-up netted UNEARNED_REV_REVERSAL rows it cannot vouch for - ${parts.join('; ')}. The arithmetic is unchanged (report only); check the unearned revenue account for this order.`
 }

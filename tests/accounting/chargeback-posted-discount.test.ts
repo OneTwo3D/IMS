@@ -169,7 +169,7 @@ test('reads the LATEST posted sales-invoice event — an UPDATE supersedes the c
   const reader = {
     async findFirst(args: Record<string, unknown>) {
       seen.push(args)
-      return { linesJson: POSTED_WITH_DISCOUNT_LINE }
+      return { linesJson: POSTED_WITH_DISCOUNT_LINE, status: 'POSTED', postBasis: 'CONNECTOR' }
     },
   }
   const posted = await readPostedSalesInvoiceDiscountForOrder(reader as never, 'order-1')
@@ -182,7 +182,7 @@ test('reads the LATEST posted sales-invoice event — an UPDATE supersedes the c
       status: 'POSTED',
     },
     orderBy: { createdAt: 'desc' },
-    select: { linesJson: true },
+    select: { linesJson: true, status: true, postBasis: true },
   })
 })
 

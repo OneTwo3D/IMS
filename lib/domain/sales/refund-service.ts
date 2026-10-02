@@ -50,11 +50,15 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
+  describeJournalRowState,
   extractPayloadNetMovement,
+  journalRowProvesAmount,
   payloadLinesLegible,
   proveAllocationDebitPosting,
   proveJournalPosting,
+  unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -1453,12 +1457,23 @@ async function stageRefundAccountingReversals(
         // below could not see it — so a cancelled-then-refunded order credited the same units twice.
         type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL', 'ALLOCATION_REVERSAL'] },
       },
-      select: { type: true, status: true, referenceType: true, referenceId: true, payload: true },
+      // o3d-3la07 (M7/M8): the ledger-standing columns ride with every row, so no consumer below can
+      // read a status or an id as a statement about the ledger without asking `ledgerStanding`.
+      select: {
+        type: true,
+        referenceType: true,
+        referenceId: true,
+        payload: true,
+        ...LEDGER_STANDING_SELECT,
+      },
     })
-    /** Rows whose journal is queued, in flight or in the ledger — i.e. pounds that will move. */
-    const livePriorReversals = priorReversals.filter((row) => (
-      row.status === 'PENDING' || row.status === 'PROCESSING' || row.status === 'SYNCED'
-    ))
+    /**
+     * Rows whose journal is queued, in flight or in the ledger — i.e. pounds that will move. The
+     * OCCUPIED slot is the module's own statement of that set (PENDING / PROCESSING / SYNCED).
+     * An OCCUPIED row can still be an operator's assertion (`asserted`): what each consumer does with
+     * that is stated where it consumes it.
+     */
+    const livePriorReversals = priorReversals.filter((row) => workSlotStanding(row).slot === 'OCCUPIED')
 
     const shipmentLineSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
     for (const shipment of orderAccounting?.shipments ?? []) {
@@ -1714,9 +1729,36 @@ async function stageRefundAccountingReversals(
     // feeds, unchanged, so the reverser on the other side of this contra reads the same lines the
     // same way.
 
-    const priorUnearnedReversed = livePriorReversals
+    const priorUnearnedReversedRows = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+    const priorUnearnedReversed = priorUnearnedReversedRows
       .reduce((sum, row) => sum + extractPayloadNetMovement(row.payload, settings.unearnedRevenueAccount, 'debit'), 0)
+    // o3d-3la07 (M7, REPORT-ONLY - the arithmetic above is unchanged). An UNEARNED_REV_REVERSAL that an
+    // operator settled as posted still reduces the unearned revenue this refund may reverse (the
+    // reversal is claimed to exist, so counting it errs towards under-reversing), but its figure is the
+    // QUEUED payload's, not a ledger read. This sum has no unresolved branch to park on (unlike the
+    // Allocated Inventory relief below), so what to do instead is a design decision (o3d-3la07 note):
+    // until then the refund proceeds as before and SAYS so.
+    const assertedUnearnedReversalRows = priorUnearnedReversedRows
+      .filter((row) => ledgerStanding(row) === 'ASSERTED_POSTED')
+    if (assertedUnearnedReversalRows.length > 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_reversal_rests_on_operator_assertion',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `${assertedUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order were settled as posted by an OPERATOR typing in a document id, and this refund counted their queued payload as unearned revenue already reversed (£${priorUnearnedReversed.toFixed(2)} in total, all rows). IMS never read those journals in the ledger: check the unearned revenue account for this order.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            assertedReversalCount: assertedUnearnedReversalRows.length,
+            priorUnearnedReversed,
+          },
+        },
+      })
+    }
 
     // o3d-o97 r5 — WHAT A JOURNAL ROW PROVES, WHICH IS NEVER ITS STATUS.
     //
@@ -1864,7 +1906,7 @@ async function stageRefundAccountingReversals(
       }
       const journal = await tx.accountingSyncLog.findUnique({
         where: { id: record.syncLogId },
-        select: { status: true, connector: true, payload: true },
+        select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
       })
       // Deleted by retention once terminal: read as the recorded amount, the least destructive of
       // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
@@ -1901,7 +1943,7 @@ async function stageRefundAccountingReversals(
       if (proof.kind === 'unproved') {
         return {
           kind: 'unresolved',
-          reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} is ${proof.statuses}, not SYNCED — whether those pounds moved is not established, and guessing either way moves real money`,
+          reason: `the journal that was to credit Allocated Inventory £${record.recorded.toFixed(2)} for ${record.subject} is ${unprovedJournalClause(proof)} — whether those pounds moved is not established, and guessing either way moves real money`,
         }
       }
       if (proof.amount <= 0) {
@@ -1949,6 +1991,14 @@ async function stageRefundAccountingReversals(
     // so they are counted whole. There is no per-order row to record them on.
     for (const row of livePriorReversals) {
       if (row.type !== 'UNEARNED_REV_REVERSAL' || row.referenceType !== 'SalesOrder') continue
+      // o3d-3la07 (M7, AMOUNT): an operator-asserted reversal's lines are what was QUEUED, not a ledger
+      // figure, so it is not counted as relief: the order's open balance is UNRESOLVED and the refund
+      // says why (the existing `priorRefundReliefUnresolved` branch), exactly as for a prior refund's
+      // own journal below. Queued (PENDING/PROCESSING) rows keep counting, as they always have.
+      if (ledgerStanding(row) === 'ASSERTED_POSTED') {
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS never read it in the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
+        continue
+      }
       priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
@@ -2005,7 +2055,7 @@ async function stageRefundAccountingReversals(
           assumedReliefTotal += recordedRelief
           assumedReliefNotes.push(`prior refund ${priorRefund.id}'s £${recordedRelief.toFixed(2)} of Allocated Inventory relief was counted from its own record because its reversal journal has settled but its lines have been compacted off the row, so what it actually credited to ${settings.allocatedInventoryAccount} cannot be read`)
         } else if (proof.kind === 'unproved') {
-          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief but its reversal journal is ${proof.statuses}, not SYNCED — whether that credit reached the ledger is not established, so how much of the A2 debit is still open cannot be either`
+          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief but its reversal journal is ${unprovedJournalClause(proof)} — whether that credit reached the ledger is not established, so how much of the A2 debit is still open cannot be either`
         } else {
           // PROVED. The pounds are the journal's own CR to this account — which may legitimately be
           // ZERO (a settled reversal that credited a different account, or none), and a proved zero
@@ -2041,7 +2091,7 @@ async function stageRefundAccountingReversals(
         } else if (proof.kind === 'illegible') {
           priorRefundReliefUnresolved = `prior refund ${priorRefund.id} claimed allocated units and its reversal journal has settled, but the journal's lines are no longer on the row, so how much it credited Allocated Inventory cannot be established`
         } else {
-          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} claimed allocated units and its reversal journal is ${proof.statuses}, not SYNCED — how much it has already credited Allocated Inventory cannot be established`
+          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} claimed allocated units and its reversal journal is ${unprovedJournalClause(proof)} — how much it has already credited Allocated Inventory cannot be established`
         }
         continue
       }
@@ -2107,14 +2157,19 @@ async function stageRefundAccountingReversals(
       const recordedReversalTotal = orderAccounting?.allocationReversalAmount != null
         ? refundBoundaryNumber(orderAccounting.allocationReversalAmount)
         : 0
-      const unsettled = reversalRows.filter((row) => row.status !== 'SYNCED')
-      const settledRows = reversalRows.filter((row) => row.status === 'SYNCED')
+      // o3d-3la07 (M8): "settled" for an AMOUNT is a CONFIRMED, SYNCED row. An operator-asserted
+      // reversal is unsettled here - it lands in the existing UNRESOLVED branch below.
+      const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
+      const settledRows = reversalRows.filter((row) => journalRowProvesAmount(row))
       const legible = settledRows.filter((row) => payloadLinesLegible(row.payload))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either
         // guess is wrong in the ledger. The refusal names the statuses so an operator can see which.
-        allocationReversalReliefUnresolved = `this order has ${unsettled.length} Allocated Inventory reversal journal(s) recorded ${[...new Set(unsettled.map((row) => row.status))].join('/')}, not SYNCED — whether those pounds have left Allocated Inventory is not established, so how much of the A2 debit is still open cannot be either`
+        allocationReversalReliefUnresolved = `this order has ${unsettled.length} Allocated Inventory reversal journal(s) recorded ${unprovedJournalClause({
+          statuses: [...new Set(unsettled.map((row) => describeJournalRowState(row)))].join('/'),
+          asserted: unsettled.some((row) => ledgerStanding(row) === 'ASSERTED_POSTED'),
+        })} — whether those pounds have left Allocated Inventory is not established, so how much of the A2 debit is still open cannot be either`
       } else {
         const proof = proveJournalPosting(legible, settings.allocatedInventoryAccount, 'credit')
         // `proveJournalPosting` answers 'unproved'/'absent' for an EMPTY list, which here means only

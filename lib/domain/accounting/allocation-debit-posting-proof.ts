@@ -66,11 +66,58 @@ import {
   parseAllocationDebitPasses,
   sumAllocationDebitPasses,
 } from '@/lib/domain/accounting/allocation-debit-passes'
+import {
+  LEDGER_STANDING_SELECT,
+  ledgerStanding,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
 
 export type JournalLedgerProof =
   | { kind: 'proved'; amount: number }
   | { kind: 'illegible' }
-  | { kind: 'unproved'; statuses: string }
+  /**
+   * `asserted` (o3d-3la07): at least one row is SYNCED only because an OPERATOR typed a document id
+   * (ASSERTED_POSTED). The journal is claimed to exist, but its `payload` lines are what was QUEUED,
+   * not a figure anybody read in the ledger, so it proves no AMOUNT (D2).
+   */
+  | { kind: 'unproved'; statuses: string; asserted?: boolean }
+
+/** A journal row as the amount proof reads it: the ledger-standing columns plus the payload. */
+export type JournalProofRow = LedgerStandingRow & { payload: unknown }
+
+/**
+ * o3d-3la07 (M8/M9) - A ROW THAT CAN PROVE AN AMOUNT: SETTLED (SYNCED) AND A LEDGER FACT.
+ *
+ * `ledgerStanding(row) === 'CONFIRMED_POSTED'` is the module's answer to "did the connector answer?";
+ * SYNCED is kept beside it because the proof reads the journal's own lines as what the ledger holds,
+ * and truth-table row 6 admits a non-SYNCED row that merely carries a connector id (this proof has
+ * always refused those, and the conversion does not widen it). An operator-typed id (ASSERTED_POSTED)
+ * is refused: AMOUNT questions never count it (D2).
+ */
+export function journalRowProvesAmount(row: LedgerStandingRow): boolean {
+  return journalRowIsSettled(row) && ledgerStanding(row) === 'CONFIRMED_POSTED'
+}
+
+/** SETTLED: the row reached SYNCED. Says nothing about WHO settled it - `ledgerStanding` does. */
+export function journalRowIsSettled(row: { status: string }): boolean {
+  return row.status === 'SYNCED'
+}
+
+/** The status word for a row the amount proof refused, naming an operator assertion where there is one. */
+export function describeJournalRowState(row: LedgerStandingRow): string {
+  return ledgerStanding(row) === 'ASSERTED_POSTED' ? `${row.status} on an operator's assertion` : row.status
+}
+
+/**
+ * The tail of a refusal sentence for an unproved journal: "is FAILED, not SYNCED" for a row that did
+ * not settle, and an explicit assertion wording for one that settled only on an operator's say-so.
+ * (The string the refusal tests assert for the status rows is unchanged.)
+ */
+export function unprovedJournalClause(proof: { statuses: string; asserted?: boolean }): string {
+  return proof.asserted
+    ? `${proof.statuses} (a document id an operator typed in - IMS never read the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
+    : `${proof.statuses}, not SYNCED`
+}
 
 function boundaryNumber(value: unknown): number {
   if (value === null || value === undefined) return 0
@@ -126,13 +173,18 @@ export function payloadLinesLegible(payload: unknown): boolean {
 }
 
 export function proveJournalPosting(
-  rows: Array<{ status: string; payload: unknown }>,
+  rows: JournalProofRow[],
   accountCode: string,
   side: 'credit' | 'debit',
 ): JournalLedgerProof {
   if (rows.length === 0) return { kind: 'unproved', statuses: 'absent' }
-  if (rows.some((row) => row.status !== 'SYNCED')) {
-    return { kind: 'unproved', statuses: rows.map((row) => row.status).join('/') }
+  // o3d-3la07 (M8/M9): an AMOUNT is proved by a CONFIRMED row only (see journalRowProvesAmount).
+  if (rows.some((row) => !journalRowProvesAmount(row))) {
+    return {
+      kind: 'unproved',
+      statuses: rows.map((row) => describeJournalRowState(row)).join('/'),
+      asserted: rows.some((row) => ledgerStanding(row) === 'ASSERTED_POSTED'),
+    }
   }
   if (rows.some((row) => !payloadLinesLegible(row.payload))) return { kind: 'illegible' }
   if (!accountCode) return { kind: 'unproved', statuses: 'no Allocated Inventory account configured' }
@@ -249,8 +301,8 @@ export type AllocationDebitPostingProofClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { status: true; connector: true; payload: true }
-    }): Promise<{ status: string; connector: string | null; payload: unknown } | null>
+      select: { status: true; connector: true; payload: true } & typeof LEDGER_STANDING_SELECT
+    }): Promise<(JournalProofRow & { connector: string | null }) | null>
   }
 }
 
@@ -407,7 +459,7 @@ export async function proveAllocationDebitPosting<C extends string = string>(
   for (const [journalId, share] of byJournal) {
     const journal = await client.accountingSyncLog.findUnique({
       where: { id: journalId },
-      select: { status: true, connector: true, payload: true },
+      select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
     })
     if (!journal) {
       return {
@@ -432,10 +484,17 @@ export async function proveAllocationDebitPosting<C extends string = string>(
           : `the A2 journal this order was staged into names no ledger, so whether its pounds are in the books this ${target.activeConnector} reversal would credit cannot be established`,
       }
     }
-    if (journal.status !== 'SYNCED') {
+    // o3d-3la07 (M9): THIS IS THE EXISTENCE QUESTION ("is there a journal at all?") and an
+    // operator-asserted one answers it (D2): the journal is claimed to exist, so the refusal below is
+    // not "nothing was debited" - it is the AMOUNT proof's, which never counts an assertion. Anything
+    // else that did not settle keeps the original refusal.
+    const standing = ledgerStanding(journal)
+    if (standing !== 'ASSERTED_POSTED' && !journalRowProvesAmount(journal)) {
       return {
         kind: 'refused',
-        reason: `the A2 journal this order was staged into is ${journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`,
+        reason: journalRowIsSettled(journal)
+          ? 'the A2 journal this order was staged into is SYNCED but its settlement basis is not one this build recognises, so whether it reached the ledger cannot be established'
+          : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`,
       }
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole
@@ -461,7 +520,9 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         kind: 'refused',
         reason: proof.kind === 'illegible'
           ? `the A2 journal this order was staged into has settled but its lines are no longer readable (evidence compaction), so whether it debited Allocated Inventory (${target.allocatedInventoryAccount}) at all — let alone the £${share.toFixed(2)} recorded against this order — cannot be established`
-          : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
+          : proof.asserted
+            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but nobody read its lines in the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
+            : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
       }
     }
     if (proof.amount <= 0) {

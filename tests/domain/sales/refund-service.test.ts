@@ -275,6 +275,11 @@ type State = {
     referenceId: string
     status: string
     payload: unknown
+    // o3d-3la07: the ledger-standing columns. OMITTED means the connector's own writeback (NULL), so the
+    // many fixtures that name none keep meaning a connector-confirmed row; the 1b tests name them.
+    externalTransactionId?: string | null
+    settlementBasis?: string | null
+    abandonedBeforeRemoteCall?: boolean | null
   }>
   settings: Record<string, string>
   // `rate` and `usedFor` are how a tax code is PRICED (o3d-w00 Codex r4 #2). Optional only because the
@@ -718,6 +723,9 @@ function createClient(state: State): RefundServiceClient {
         referenceType: log.referenceType,
         referenceId: log.referenceId,
         payload: log.payload,
+        externalTransactionId: log.externalTransactionId ?? null,
+        settlementBasis: log.settlementBasis ?? null,
+        abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
       })),
       // o3d-o97 r3: the A2 journal probed BY ITS OWN DB-MINTED ID. A missing row is not "no
       // journal" — retention deletes terminal rows — which is why the caller refuses on it.
@@ -733,6 +741,7 @@ function createClient(state: State): RefundServiceClient {
         const projected: Record<string, unknown> = {}
         for (const key of Object.keys(select ?? { status: true, connector: true })) {
           projected[key] = (log as unknown as Record<string, unknown>)[key]
+            ?? (['settlementBasis', 'abandonedBeforeRemoteCall', 'externalTransactionId'].includes(key) ? null : undefined)
         }
         return projected
       },
@@ -3328,7 +3337,12 @@ function a2StagedWithOrphanReversalState(): State {
 }
 
 /** The SYNCED reversal journal itself: CR Allocated Inventory £10 / DR Inventory £10. */
-function seedPostedAllocationReversal(state: State, status = 'SYNCED'): void {
+function seedPostedAllocationReversal(
+  state: State,
+  status = 'SYNCED',
+  // o3d-3la07: the ledger-standing columns of the reversal row. Omitted = the connector's own writeback.
+  standingColumns: { externalTransactionId?: string | null; settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null } = {},
+): void {
   // o3d-i0o6 r3: APPENDED, not assigned over the top. Assigning discarded the A2 batch journal the
   // order's attribution names, so the proof refused on a missing journal and every assertion below
   // about NETTING was measuring a refusal instead.
@@ -3339,6 +3353,7 @@ function seedPostedAllocationReversal(state: State, status = 'SYNCED'): void {
     referenceType: 'SalesOrder',
     referenceId: 'order-1',
     status,
+    ...standingColumns,
     payload: {
       lines: [
         { accountCode: accountingSettings.inventoryAccount, debit: 10 },
@@ -7901,9 +7916,11 @@ async function unstageThroughDeclaredAllocationRewrite(state: State, declaredQty
     shipment: { findFirst: async () => null },
     shipmentLine: { findMany: async () => [] },
     accountingSyncLog: {
-      findUnique: async ({ where }: { where: { id: string } }) => (
-        (state.accountingSyncLogs ?? []).find((row) => (row as { id?: string }).id === where.id) ?? null
-      ),
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const row = (state.accountingSyncLogs ?? []).find((candidate) => (candidate as { id?: string }).id === where.id)
+        // o3d-3la07: a fixture that names no ledger-standing column means the connector's own writeback.
+        return row ? { settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null, ...row } : null
+      },
     },
     activityLog: { create: async ({ data }: { data: Record<string, unknown> }) => data },
     orderAllocation: {
@@ -9099,4 +9116,168 @@ test('[o3d-zvec.21 o] an earlier refund that restocked NOTHING is still replayed
 
   assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
   assert.equal(stockOnHand(state), 1, 'A has 1 unit left, then B\'s shipped unit: exactly one unit comes back')
+})
+
+
+// ===========================================================================================
+// o3d-3la07 (M7 / M8) - A PRIOR REVERSAL AN OPERATOR ASSERTED IS NOT RELIEF THE REFUND CAN NET.
+//
+// Every relief figure here is read off a journal's OWN payload lines (`proveJournalPosting`). An
+// operator-typed document id settles a row (SYNCED + OPERATOR_ASSERTION + id = ASSERTED_POSTED) without
+// IMS ever reading the ledger, and its payload is what was QUEUED - so it proves no AMOUNT. The refund
+// therefore treats it as UNRESOLVED (the existing refusal: nothing is credited, the A2 stamp survives,
+// the refund row says why) instead of netting a figure nobody read. Visible effect: a refund PARKS more
+// often (under-relief) where an operator settled a reversal by hand.
+// ===========================================================================================
+
+const COMPLETE_REFUND = {
+  orderId: 'order-1',
+  lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+  reason: 'Goodwill full refund',
+  creditNotePrefix: 'CN-',
+  accountingSettings,
+  activeAccountingConnector: 'xero',
+} as const
+
+const STANDING_REVERSALS: Array<{
+  standing: string
+  status: string
+  columns: { externalTransactionId?: string | null; settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null }
+  resolves: boolean
+}> = [
+  { standing: 'CONFIRMED_POSTED', status: 'SYNCED', columns: { externalTransactionId: 'JNL-R1' }, resolves: true },
+  { standing: 'ASSERTED_POSTED', status: 'SYNCED', columns: { externalTransactionId: 'TYPED-R1', settlementBasis: 'OPERATOR_ASSERTION' }, resolves: false },
+  { standing: 'ASSERTED_NOT_POSTED', status: 'CANCELLED', columns: { settlementBasis: 'OPERATOR_ASSERTION' }, resolves: false },
+  { standing: 'PROVEN_NOT_POSTED', status: 'CANCELLED', columns: { settlementBasis: 'VERIFIED_REVERSAL' }, resolves: false },
+  { standing: 'UNKNOWN', status: 'SYNCED', columns: { settlementBasis: 'SOMETHING_NEW' }, resolves: false },
+  { standing: 'LIVE_WORK', status: 'PENDING', columns: {}, resolves: false },
+]
+
+for (const testCase of STANDING_REVERSALS) {
+  test(`[o3d-3la07 M8] ALLOCATION_REVERSAL ${testCase.standing}: the refund ${testCase.resolves ? 'NETS it (credits the open £10)' : 'is UNRESOLVED (credits nothing)'}`, async () => {
+    const state = a2StagedWithOrphanReversalState()
+    seedPostedAllocationReversal(state, testCase.status, testCase.columns)
+    const seeded = state.accountingSyncLogs?.find((log) => log.id === 'alloc-reversal-1')
+    assert.equal(seeded?.status, testCase.status, 'PRECONDITION: the reversal row is seeded in the standing under test')
+
+    const result = await createSalesOrderRefund(createClient(state), { ...COMPLETE_REFUND })
+
+    assert.equal(result.success, true)
+    assert.equal(findAllocatedInventoryCredit(result), testCase.resolves ? 10 : null, `standing ${testCase.standing}`)
+    if (testCase.resolves) {
+      assert.equal(state.refunds[0].allocationBasisUnresolved, null)
+    } else {
+      assert.match(String(state.refunds[0].allocationBasisUnresolved), /Allocated Inventory reversal journal\(s\) recorded /)
+      assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the A2 stamp survives so the order stays reportable')
+    }
+    console.log(`M8 ALLOCATION_REVERSAL ${testCase.standing}: credit=${findAllocatedInventoryCredit(result)} unresolved=${state.refunds[0].allocationBasisUnresolved != null}`)
+  })
+}
+
+test('[o3d-3la07 M8] ISOLATING ARM: the asserted reversal has perfectly LEGIBLE lines and is still unresolved (legibility is not standing); the SAME lines confirmed resolve', async () => {
+  const asserted = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(asserted, 'SYNCED', { externalTransactionId: 'TYPED-R1', settlementBasis: 'OPERATOR_ASSERTION' })
+  const confirmed = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(confirmed, 'SYNCED', { externalTransactionId: 'JNL-R1' })
+
+  const assertedResult = await createSalesOrderRefund(createClient(asserted), { ...COMPLETE_REFUND })
+  const confirmedResult = await createSalesOrderRefund(createClient(confirmed), { ...COMPLETE_REFUND })
+
+  const lines = (asserted.accountingSyncLogs?.find((log) => log.id === 'alloc-reversal-1')?.payload as { lines: unknown[] }).lines
+  assert.equal(lines.length, 2, 'PRECONDITION: the asserted row carries legible journal lines')
+  assert.deepEqual(lines, (confirmed.accountingSyncLogs?.find((log) => log.id === 'alloc-reversal-1')?.payload as { lines: unknown[] }).lines, 'identical lines on both rows')
+  assert.equal(findAllocatedInventoryCredit(assertedResult), null)
+  assert.match(String(asserted.refunds[0].allocationBasisUnresolved), /SYNCED on an operator's assertion/)
+  assert.match(String(asserted.refunds[0].allocationBasisUnresolved), /not a connector-confirmed posting/)
+  assert.equal(findAllocatedInventoryCredit(confirmedResult), 10)
+  console.log('M8 isolating arm: identical legible lines; asserted -> unresolved, confirmed -> credit 10')
+})
+
+test('[o3d-3la07 M8] a PRIOR REFUND reversal journal an operator asserted is UNRESOLVED, not netted (the same journal confirmed nets £10)', async () => {
+  const run = async (columns: { externalTransactionId?: string | null; settlementBasis?: string | null }) => {
+    const state = a2StagedFourUnitState()
+    seedPriorAllocationRefund(state)
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      connector: 'xero',
+      type: 'UNEARNED_REV_REVERSAL',
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-prior',
+      status: 'SYNCED',
+      ...columns,
+      payload: { lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '1210', credit: 10 }] },
+    }]
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...COMPLETE_REFUND,
+      lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 75, lineKind: 'sale' }],
+    })
+    return { state, result }
+  }
+  const confirmed = await run({ externalTransactionId: 'JNL-P1' })
+  assert.equal(findAllocatedInventoryCredit(confirmed.result), 30, 'PRECONDITION: the confirmed journal is netted')
+  const asserted = await run({ externalTransactionId: 'TYPED-P1', settlementBasis: 'OPERATOR_ASSERTION' })
+  assert.equal(findAllocatedInventoryCredit(asserted.result), null, 'nothing is credited against an unproved relief')
+  assert.match(String(asserted.state.refunds.find((refund) => refund.id !== 'refund-prior')?.allocationBasisUnresolved), /prior refund refund-prior claimed allocated units and its reversal journal is SYNCED on an operator's assertion/)
+  console.log('M8 prior-refund journal: confirmed -> 30, asserted -> unresolved')
+})
+
+test('[o3d-3la07 M7] an ORDER-LEVEL UNEARNED_REV_REVERSAL an operator asserted is UNRESOLVED, not counted as relief (confirmed counts)', async () => {
+  const run = async (columns: { externalTransactionId?: string | null; settlementBasis?: string | null }, status = 'SYNCED') => {
+    const state = a2StagedFourUnitState()
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      connector: 'xero',
+      type: 'UNEARNED_REV_REVERSAL',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      status,
+      ...columns,
+      payload: { lines: [{ accountCode: '1210', credit: 10 }] },
+    }]
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...COMPLETE_REFUND,
+      lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    })
+    return { state, result }
+  }
+  const confirmed = await run({ externalTransactionId: 'JNL-O1' })
+  assert.equal(findAllocatedInventoryCredit(confirmed.result), 30, 'PRECONDITION: the confirmed order-level reversal is counted as £10 relief')
+  const pending = await run({}, 'PENDING')
+  assert.equal(findAllocatedInventoryCredit(pending.result), 30, 'a queued reversal keeps counting, exactly as it always has')
+  const asserted = await run({ externalTransactionId: 'TYPED-O1', settlementBasis: 'OPERATOR_ASSERTION' })
+  assert.equal(findAllocatedInventoryCredit(asserted.result), null, 'an asserted figure is not netted: the balance is unresolved')
+  assert.match(String(asserted.state.refunds[0].allocationBasisUnresolved), /order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR/)
+  console.log('M7 order-level: confirmed -> 30, pending -> 30, asserted -> unresolved')
+})
+
+test('[o3d-3la07 M7, report-only] an asserted UNEARNED_REV_REVERSAL still reduces the unearned reversal (arithmetic UNCHANGED) and the refund WARNS', async () => {
+  const run = async (columns: { externalTransactionId?: string | null; settlementBasis?: string | null }) => {
+    const state = a2StagedFourUnitState()
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      connector: 'xero',
+      type: 'UNEARNED_REV_REVERSAL',
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      status: 'SYNCED',
+      ...columns,
+      // Debits the UNEARNED REVENUE account (2100): £30 already reversed out of the deferral.
+      payload: { lines: [{ accountCode: '2100', debit: 30 }] },
+    }]
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...COMPLETE_REFUND,
+      lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    })
+    const unearned = result.success
+      ? (result.accountingSyncs.find((sync) => sync.type === 'UNEARNED_REV_REVERSAL')?.payload as { lines?: Array<{ accountCode?: string; debit?: number }> } | undefined)
+        ?.lines?.find((line) => line.accountCode === '2100')?.debit ?? null
+      : null
+    return { state, unearned }
+  }
+  const confirmed = await run({ externalTransactionId: 'JNL-U1' })
+  const asserted = await run({ externalTransactionId: 'TYPED-U1', settlementBasis: 'OPERATOR_ASSERTION' })
+  assert.equal(confirmed.unearned, 70, 'PRECONDITION: £100 deferred less £30 already reversed')
+  assert.equal(asserted.unearned, confirmed.unearned, 'GOLDEN: the arithmetic is unchanged by the standing')
+  const warnings = (asserted.state.activityLogs as Array<{ action?: string; level?: string }>).filter((entry) => entry.action === 'refund_unearned_reversal_rests_on_operator_assertion')
+  assert.equal(warnings.length, 1, 'and the refund says so, once')
+  assert.equal(warnings[0].level, 'WARNING')
+  assert.equal((confirmed.state.activityLogs as Array<{ action?: string }>).filter((entry) => entry.action === 'refund_unearned_reversal_rests_on_operator_assertion').length, 0, 'a confirmed row is never reported')
+  console.log(`M7 report-only: unearned confirmed=${confirmed.unearned} asserted=${asserted.unearned}; warnings asserted=${warnings.length} confirmed=0`)
 })

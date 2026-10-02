@@ -9,10 +9,16 @@ import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
+  UNEARNED_REVERSAL_NETTING_WHERE,
+  countedUnearnedReversalRows,
+  describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
+  unearnedReversalStandingReport,
+  type UnearnedReversalSyncRow,
 } from '@/lib/domain/accounting/deferred-trueup'
+import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { takeDailyBatchWindow, resolveXeroDailyBatchLimit } from '@/lib/connectors/xero/daily-sync'
 import {
@@ -60,6 +66,12 @@ export type DailyBatchPreviewShipment = {
 export type DailyBatchPreview = {
   generatedAt: string
   cachedFor: number // seconds remaining in cache, 0 if fresh
+  /**
+   * o3d-3la07 (M6, D3: report-only): one sentence per order whose deferred-revenue netting rests on
+   * UNEARNED_REV_REVERSAL rows that are not ledger facts (an operator-asserted row counted, or a
+   * cancelled row that may have posted left out). The figures in this preview are unchanged by them.
+   */
+  warnings?: string[]
   groupA1: {
     orderCount: number
     totalRevenue: number
@@ -338,6 +350,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
     bShipments.filter((shipment) => shipment.order.refundStatus === 'PARTIAL').map((shipment) => shipment.orderId),
   )
   const bReversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+  const bReversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
+  const unearnedReversalWarnings: string[] = []
   const bShippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
   const bRefundedUnshippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
   if (bOrderIds.length > 0) {
@@ -346,24 +360,35 @@ async function computePreview(): Promise<DailyBatchPreview> {
       select: { id: true, orderId: true },
     })
     const bRefundIdToOrderId = new Map(bRefunds.map((refund) => [refund.id, refund.orderId]))
+    // o3d-3la07 (M6, D3: REPORT-ONLY): the same read width and the same counted set as the cron's
+    // netting (see runDailyBatchSync), so the preview matches what posts AND says what the cron says.
     const bReversalSyncs = await db.accountingSyncLog.findMany({
       where: {
-        connector: 'xero',
-        type: 'UNEARNED_REV_REVERSAL',
-        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        OR: [
-          { referenceType: 'SalesOrder', referenceId: { in: bOrderIds } },
-          { referenceType: 'SalesOrderRefund', referenceId: { in: bRefunds.map((refund) => refund.id) } },
+        AND: [
+          { connector: 'xero', type: 'UNEARNED_REV_REVERSAL' },
+          UNEARNED_REVERSAL_NETTING_WHERE,
+          {
+            OR: [
+              { referenceType: 'SalesOrder', referenceId: { in: bOrderIds } },
+              { referenceType: 'SalesOrderRefund', referenceId: { in: bRefunds.map((refund) => refund.id) } },
+            ],
+          },
         ],
       },
-      select: { referenceType: true, referenceId: true, payload: true },
+      select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
     })
     for (const sync of bReversalSyncs) {
       const targetOrderId = sync.referenceType === 'SalesOrder' ? sync.referenceId : bRefundIdToOrderId.get(sync.referenceId)
       if (!targetOrderId) continue
-      const list = bReversalSyncsByOrder.get(targetOrderId) ?? []
-      list.push({ payload: sync.payload })
-      bReversalSyncsByOrder.set(targetOrderId, list)
+      const allRows = bReversalStandingRowsByOrder.get(targetOrderId) ?? []
+      allRows.push(sync)
+      bReversalStandingRowsByOrder.set(targetOrderId, allRows)
+    }
+    for (const [targetOrderId, allRows] of bReversalStandingRowsByOrder) {
+      bReversalSyncsByOrder.set(
+        targetOrderId,
+        countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+      )
     }
     if (bPartialOrderIds.size > 0) {
       const [bAllocations, bDispatchedLines, bRefundLines] = await Promise.all([
@@ -427,6 +452,11 @@ async function computePreview(): Promise<DailyBatchPreview> {
       bReversalSyncsByOrder.get(orderId) ?? [],
       bSettings.xero_unearned_revenue_account,
     )
+    const unearnedReport = describeUnearnedReversalReport(
+      getSalesOrderReference({ id: orderId, ...order }),
+      unearnedReversalStandingReport(bReversalStandingRowsByOrder.get(orderId) ?? []),
+    )
+    if (unearnedReport) unearnedReversalWarnings.push(unearnedReport)
     const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
     let runningRevenue = 0
 
@@ -516,6 +546,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
   return {
     generatedAt: new Date().toISOString(),
     cachedFor: 0,
+    ...(unearnedReversalWarnings.length > 0 ? { warnings: unearnedReversalWarnings } : {}),
     groupA1: a1,
     groupA2: a2,
     groupB: b,

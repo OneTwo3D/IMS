@@ -915,9 +915,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
       },
       // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
       // retention deletes terminal rows — so the un-stage keeps the stamp for it.
-      findUnique: async ({ where }: { where: { id: string } }) => (
-        (state.accountingSyncLogs ?? []).find((row) => row.id === where.id) ?? null
-      ),
+      // o3d-3la07: a fixture that names no ledger-standing column means the connector's own writeback.
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const row = (state.accountingSyncLogs ?? []).find((candidate) => candidate.id === where.id)
+        return row ? { settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null, ...row } : null
+      },
     },
     accountingEvent: {
       findMany: async () => [],
@@ -3248,7 +3250,7 @@ function createResetTx(options: {
       findFirst: async () => (options.journaledShipmentId ? { id: options.journaledShipmentId } : null),
     },
     accountingSyncLog: {
-      findUnique: async () => (options.a2JournalStatus ? { status: options.a2JournalStatus } : null),
+      findUnique: async () => (options.a2JournalStatus ? { status: options.a2JournalStatus, settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null } : null),
     },
     activityLog: {
       create: async ({ data }: { data: Record<string, unknown> }) => {

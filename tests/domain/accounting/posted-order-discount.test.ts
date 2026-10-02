@@ -55,6 +55,8 @@ type EventRow = {
   businessDate: string
   createdAt: string
   linesJson: unknown
+  /** o3d-3la07 (AE2): HOW the event came to be POSTED. The default fixture is the connector's own writeback. */
+  postBasis: string | null
 }
 
 type SyncLogRow = {
@@ -182,6 +184,7 @@ function postedInvoice(over: Partial<EventRow> = {}): EventRow {
     createdAt: '2026-05-02T09:00:00.000Z',
     // accountCode present: this invoice really did carry a negative "Order discount" line of 10.
     linesJson: documentPayload({ discount: { amount: 10, accountCode: '260' } }),
+    postBasis: 'CONNECTOR',
     ...over,
   }
   // r13 finding 2. DISTINCT by default, derived from what distinguishes the fixture, because
@@ -1457,4 +1460,58 @@ test('a DISAGREEMENT carries both the claim and the evidence, and they agree (o3
     !read.ok && read.reason === 'UNRECOVERABLE' ? read.postedDocuments : null,
     { count: 2, externalIds: ['INV-A', 'INV-B'] },
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-3la07 (AE2) - A POSTED MIRROR'S `linesJson` IS THE LEDGER'S ONLY WHEN THE CONNECTOR CONFIRMED THE POST.
+//
+// For an operator-asserted post the lines are what was queued at enqueue time, and a mirror written before
+// `postBasis` existed records no basis at all. Replaying either as "what the invoice carried" restates a
+// discount from intent. Such a document is UNRECOVERABLE (the existing refusal), never a figure.
+// ---------------------------------------------------------------------------
+
+const MIRROR_STANDINGS: Array<{ standing: string; postBasis: string | null; reads: boolean }> = [
+  { standing: 'CONFIRMED (connector)', postBasis: 'CONNECTOR', reads: true },
+  { standing: 'CONFIRMED (sync-log backfill, D6)', postBasis: 'SYNC_LOG_BACKFILL', reads: true },
+  { standing: 'ASSERTED', postBasis: 'OPERATOR_ASSERTION', reads: false },
+  { standing: 'UNRECORDED (no basis, pre-column mirror)', postBasis: null, reads: false },
+  { standing: 'UNRECOGNISED basis', postBasis: 'SOMETHING_NEW', reads: false },
+]
+
+for (const testCase of MIRROR_STANDINGS) {
+  test(`[o3d-3la07 AE2] a POSTED mirror that is ${testCase.standing}: ${testCase.reads ? 'its discount is READ' : 'UNRECOVERABLE'}`, async () => {
+    const { client } = makeClient({ events: [postedInvoice({ postBasis: testCase.postBasis })] })
+
+    const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+    if (testCase.reads) {
+      assert.equal(read.ok, true)
+      assert.equal(read.ok && read.amount, 10)
+    } else {
+      assert.equal(read.ok, false)
+      assert.equal(!read.ok && read.reason, 'UNRECOVERABLE')
+      assert.match(!read.ok && 'detail' in read ? read.detail : '', /a SALES_INVOICE was posted for this order but (it is recorded from an OPERATOR-asserted post|its post is not recorded as confirmed)/)
+      assert.equal(!read.ok && 'postedDocuments' in read ? read.postedDocuments.count : -1, 1, 'the document still counts as one that EXISTS')
+    }
+    console.log(`AE2 ${testCase.standing}: ${read.ok ? `read ${read.amount}` : 'UNRECOVERABLE'}`)
+  })
+}
+
+test('[o3d-3la07 AE2] ISOLATING ARM: the asserted mirror has a perfectly READABLE payload - the lines are not what refuse it', async () => {
+  const asserted = postedInvoice({ postBasis: 'OPERATOR_ASSERTION' })
+  const confirmed = postedInvoice({ postBasis: 'CONNECTOR' })
+  assert.deepEqual(asserted.linesJson, confirmed.linesJson, 'PRECONDITION: identical payloads')
+  const a = await readPostedInvoiceOrderDiscount(makeClient({ events: [asserted] }).client, { id: 'order-1', currency: 'GBP' })
+  const c = await readPostedInvoiceOrderDiscount(makeClient({ events: [confirmed] }).client, { id: 'order-1', currency: 'GBP' })
+  assert.equal(a.ok, false)
+  assert.equal(c.ok, true)
+})
+
+test('[o3d-3la07 AE2] one asserted document among confirmed ones refuses the WHOLE read (a netting cannot omit it)', async () => {
+  const { client } = makeClient({
+    events: [postedInvoice(), postedInvoice({ externalId: 'INV-779', createdAt: '2026-05-03T09:00:00.000Z', postBasis: 'OPERATOR_ASSERTION' })],
+  })
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+  assert.equal(read.ok, false)
+  assert.equal(!read.ok && 'postedDocuments' in read ? read.postedDocuments.count : -1, 2)
 })

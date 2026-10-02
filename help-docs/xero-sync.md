@@ -2020,6 +2020,13 @@ posting, and a settlement that reported success over a contradiction would leave
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
 
+**A document id you typed in is a claim that the document exists, not a figure the IMS read.** Settling a row as "posted" with a document id you entered stops the IMS posting it a second time, but the lines IMS holds for it are what was *queued*, not what Xero holds. So wherever an amount is needed, the IMS no longer uses them:
+
+- **A refund** that has to net an earlier reversal journal you settled this way (an order-level reversal, an Allocated Inventory reversal, or an earlier refund's reversal) is **parked with its reason** (the refund row's allocation-basis note says "settled as posted by an OPERATOR") instead of crediting Allocated Inventory against a figure nobody read. Confirm the journal in Xero and the next refund of that order resolves normally. An unearned-revenue reversal you settled this way is still counted (arithmetic unchanged for now) and the refund adds a warning to the activity log.
+- **The deferred-revenue true-up** of the daily batch and its preview count the same rows as before and now say, per order, which rows they rest on that nobody read (an asserted row they counted, or a cancelled row that may have posted and they left out). The preview shows the warning; the batch logs it. Nothing is held back yet.
+- **The unrealised FX run** still treats a journal you typed in as existing (so it does not post it twice) and logs a warning for each one it relied on.
+- **A discount restated or reversed from a posted document** (chargebacks, the restated-discount handoff, credit-note netting) goes to **manual** when the posted document's mirror records only your assertion, or records no confirmation at all (every mirror written before the IMS recorded how a post was confirmed). Raise the credit note or adjustment by hand.
+
 **Settling "it did not post" retires that attempt, not the document.** A "did not post" settlement
 marks the shared accounting event **Void**, which is what stops a finished row leaving work that
 reconciliation reads as still owed. It is not a statement that the document is no longer wanted. Since

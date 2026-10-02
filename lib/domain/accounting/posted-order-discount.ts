@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { readDiscountRestatement, restatementHadPostedInvoice } from './discount-restatement'
+import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * o3d-y14 r3 finding 1 — WHAT THE INVOICE POSTED, for a chargeback that must mirror it.
@@ -185,6 +186,8 @@ type MirroredDocument = {
   /** Read for the document-set fingerprint only (r12 finding 1); it decides no amount. */
   createdAt: unknown
   linesJson: unknown
+  /** o3d-3la07 (AE2): HOW the event came to be POSTED. Decides whether `linesJson` can be read as the ledger's. */
+  postBasis: string | null
 }
 
 /** A SALES_INVOICE_UPDATE that has not settled — the rows the first refusal below is about. */
@@ -546,6 +549,13 @@ export type PostedInvoiceOrderDiscount =
       documentSet: string[]
     }
 
+/** Why a POSTED mirror's lines are not replayed: the post is not confirmed as the connector's own (o3d-3la07). */
+export function unconfirmedMirrorDetail(standing: 'ASSERTED' | 'UNRECORDED' | 'NOT_POSTED'): string {
+  return standing === 'ASSERTED'
+    ? 'it is recorded from an OPERATOR-asserted post, so its stored lines are what was queued at enqueue time, not what the ledger holds'
+    : 'its post is not recorded as confirmed by the connector (a mirror written before IMS recorded how a post was confirmed), so its stored lines are not proven to be what the ledger holds'
+}
+
 export async function readPostedInvoiceOrderDiscount(
   client: PostedInvoiceEventClient,
   order: { id: string; currency: string },
@@ -607,6 +617,7 @@ export async function readPostedInvoiceOrderDiscount(
       externalId: true,
       createdAt: true,
       linesJson: true,
+      postBasis: true,
     },
   })) as MirroredDocument[]
 
@@ -619,7 +630,14 @@ export async function readPostedInvoiceOrderDiscount(
   // invisible in every field the re-validation compares.
   let firstFailure: { type: string; detail: string } | null = null
   for (const document of documents) {
-    const read = readPostedDocumentDiscount(document, order.currency)
+    // o3d-3la07 (AE2): `linesJson` of a POSTED mirror is what the ledger holds ONLY when the connector
+    // confirmed the post. For an operator-asserted post it is the lines queued at enqueue time, and a
+    // pre-column mirror records no basis at all - neither may be replayed as "what the invoice carried".
+    // Such a document is UNRECOVERABLE (the existing refusal): the amount is never guessed from it.
+    const standing = mirroredPostStanding(document)
+    const read = standing === 'CONFIRMED'
+      ? readPostedDocumentDiscount(document, order.currency)
+      : { ok: false as const, detail: unconfirmedMirrorDetail(standing) }
     postedEntries.push(
       `POSTED ${describeMirroredRow(document)} ${document.currency} ` +
         (read.ok
