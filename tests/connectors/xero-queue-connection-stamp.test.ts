@@ -47,6 +47,13 @@ const tx = {
     return (isLockedPluginSelectionRead(strings) ? lockedPluginSelectionRows(['xero']) : []) as never
   },
   accountingSyncLog: {
+    // Round 2 (#724 HIGH 2): the prior-attempt read runs INSIDE the transaction, under the scope lock,
+    // so it is answered by the transaction client. A live row is the case `existingIdempotent` models.
+    async findMany() {
+      return state.existingIdempotent
+        ? [{ id: 'already-queued', status: 'PENDING', externalTransactionId: null }]
+        : []
+    },
     async create(args: { data: Record<string, unknown> }) {
       state.created.push(args.data)
       return { id: `log-${state.created.length}` }
@@ -60,16 +67,6 @@ mock.module('@/lib/db', {
       accountingToken: {
         async findUnique() {
           return state.activeTenantId === null ? null : { tenantId: state.activeTenantId }
-        },
-      },
-      accountingSyncLog: {
-        // o3d-d0pd: the already-present check reads EVERY row for the key, in any status, and
-        // decides from the row's own evidence — see prior-posting-evidence.ts. A live row is the
-        // case this fixture models.
-        async findMany() {
-          return state.existingIdempotent
-            ? [{ id: 'already-queued', status: 'PENDING', externalTransactionId: null }]
-            : []
         },
       },
       async $transaction(fn: (client: unknown) => Promise<unknown>) { return fn(tx) },
