@@ -17,6 +17,7 @@ import {
 } from '@/lib/domain/accounting/payment-reversal'
 import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
 
 /**
@@ -43,10 +44,20 @@ import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
  * fixture rather than defaulted: the whole round-4 point is that a registration's remote outcome is a
  * fact the planner must be TOLD, never one it may assume.
  */
-const PROCESSING_ROW = { id: 'log-inflight', status: 'PROCESSING', bodyCouldHavePosted: true }
-const SYNCED_ROW = { id: 'log-posted', status: 'SYNCED', bodyCouldHavePosted: true }
-const PENDING_ROW = { id: 'log-1', status: 'PENDING', bodyCouldHavePosted: true }
-const FAILED_ROW = { id: 'log-failed', status: 'FAILED', bodyCouldHavePosted: true }
+/**
+ * o3d-f709: EVERY FIXTURE CARRIES THE LEDGER COLUMNS, explicitly. The planner judges a row by
+ * `ledgerStanding`, which reads an absent column (`undefined`) as an unrecognised basis - UNKNOWN,
+ * refuse - so a fixture that omitted them would be asserting the fail-closed branch by accident.
+ */
+const NO_EVIDENCE = {
+  externalTransactionId: null as string | null,
+  settlementBasis: null as string | null,
+  abandonedBeforeRemoteCall: null as boolean | null,
+}
+const PROCESSING_ROW = { id: 'log-inflight', status: 'PROCESSING', ...NO_EVIDENCE, bodyCouldHavePosted: true }
+const SYNCED_ROW = { id: 'log-posted', status: 'SYNCED', ...NO_EVIDENCE, externalTransactionId: 'PAY-1', bodyCouldHavePosted: true }
+const PENDING_ROW = { id: 'log-1', status: 'PENDING', ...NO_EVIDENCE, bodyCouldHavePosted: true }
+const FAILED_ROW = { id: 'log-failed', status: 'FAILED', ...NO_EVIDENCE, bodyCouldHavePosted: true }
 
 test('a PENDING registration is superseded — nothing has been sent, so cancelling it IS the whole event', () => {
   const plan = planBillPaymentSupersession([PENDING_ROW])
@@ -112,17 +123,71 @@ test('a FAILED registration whose stored body could never have been sent blocks 
   assert.deepEqual(plan.proceed && plan.supersede, [])
 })
 
-test('CANCELLED rows still block nothing, and a FAILED row is never rewritten', () => {
-  // CANCELLED is the one status every writer in this tree asserts only where "nothing was sent" is
-  // TRUE, so it frees the slot. FAILED now blocks — but the planner never returns it as superseded, so
-  // nothing rewrites it and the evidence that an attempt was made survives.
-  const plan = planBillPaymentSupersession([{ id: 'log-2', status: 'CANCELLED', bodyCouldHavePosted: true }])
-  assert.equal(plan.proceed, true)
-  assert.deepEqual(plan.proceed && plan.supersede, [])
-
+test('a FAILED row is never rewritten, and is not superseded', () => {
+  // FAILED blocks - but the planner never returns it as superseded, so nothing rewrites it and the
+  // evidence that an attempt was made survives.
   const withFailed = planBillPaymentSupersession([FAILED_ROW])
   assert.equal(withFailed.proceed, false)
   assert.equal(withFailed.proceed === false && withFailed.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+})
+
+/**
+ * o3d-f709 / M3 - EVERY CANCELLED ROW IS JUDGED BY WHAT IT PROVES. The old test here read "CANCELLED
+ * rows still block nothing" and its comment was the defect written down ("the one status every writer
+ * in this tree asserts only where 'nothing was sent' is TRUE"). Each case below is one writer's row.
+ *
+ * ISOLATION (two-mechanism masking): these drive `planBillPaymentSupersession` directly. There is no
+ * enqueue, no idempotency key and no unique index in play, so a refusal here can only be the PLANNER's.
+ * The enqueue-side mechanism is tested separately, bypassing this planner, in
+ * tests/accounting/prior-posting-evidence-standing.test.ts.
+ */
+function cancelledRow(over: Partial<typeof NO_EVIDENCE>, id = 'log-cancelled') {
+  return { id, status: 'CANCELLED', ...NO_EVIDENCE, bodyCouldHavePosted: true, ...over }
+}
+
+test('o3d-f709 M3 HEADLINE: a FAILED registration an operator settled NOT_POSTED REFUSES a second payment', () => {
+  // THE SCENARIO THE SALVAGE BRANCH DID NOT FIX. The bill's BILL_PAYMENT FAILED (the call may have
+  // landed and the response been lost); an operator opened /sync and settled it NOT_POSTED, which
+  // writes CANCELLED + OPERATOR_ASSERTION + no id. That row matched none of IN_FLIGHT / POSTED /
+  // AMBIGUOUS, so the planner proceeded: Mark Paid queued a SECOND supplier payment.
+  const settled = cancelledRow({ settlementBasis: 'OPERATOR_ASSERTION' })
+  console.log(`# precondition M3: ${JSON.stringify(settled)} standing=${ledgerStanding(settled)}`)
+  assert.equal(ledgerStanding(settled), 'ASSERTED_NOT_POSTED', 'the fixture is the NOT_POSTED settlement shape')
+  const plan = planBillPaymentSupersession([settled])
+  assert.equal(plan.proceed, false)
+  assert.equal(plan.proceed === false && plan.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+  assert.deepEqual(plan.proceed === false && plan.blocking.map((r) => r.id), ['log-cancelled'])
+})
+
+test('o3d-f709 M3: a CANCELLED row that proves nothing (an unflagged canceller) refuses; the proved ones do not', () => {
+  const cases: Array<[string, ReturnType<typeof cancelledRow>, boolean]> = [
+    ['unflagged canceller (knew nothing)', cancelledRow({}), false],
+    ['flag explicitly false', cancelledRow({ abandonedBeforeRemoteCall: false }), false],
+    ['the SUPERSESSION writer\'s own row (pre-call proof, no id)', cancelledRow({ abandonedBeforeRemoteCall: true }), true],
+    ['a VERIFIED_REVERSAL that keeps its id', cancelledRow({ settlementBasis: 'VERIFIED_REVERSAL', externalTransactionId: 'PAY-9' }), true],
+    ['pre-call flag but still naming a document', cancelledRow({ abandonedBeforeRemoteCall: true, externalTransactionId: 'PAY-9' }), false],
+  ]
+  for (const [name, row, proceeds] of cases) {
+    const plan = planBillPaymentSupersession([row])
+    assert.equal(plan.proceed, proceeds, name)
+  }
+  assert.ok(cases.some(([, , p]) => p) && cases.some(([, , p]) => !p), 'the population is split both ways')
+})
+
+test('o3d-f709 M3: an operator-ASSERTED POSTED payment refuses under its own code, not as a ledger fact', () => {
+  const asserted = { id: 'log-asserted', status: 'SYNCED', ...NO_EVIDENCE, externalTransactionId: 'TYPED-1', settlementBasis: 'OPERATOR_ASSERTION', bodyCouldHavePosted: true }
+  assert.equal(ledgerStanding(asserted), 'ASSERTED_POSTED')
+  const plan = planBillPaymentSupersession([asserted])
+  assert.equal(plan.proceed === false && plan.refusal, 'PAYMENT_ASSERTED_POSTED')
+  assert.match(billPaymentRefusalMessage('PAYMENT_ASSERTED_POSTED'), /recorded as POSTED by an operator/)
+  assert.match(billPaymentRefusalMessage('PAYMENT_ASSERTED_POSTED'), /has not seen that payment/)
+  assert.doesNotMatch(billPaymentRefusalMessage('PAYMENT_ASSERTED_POSTED'), /cancel that sync entry/,
+    'cancelling an entry no longer clears anything (C1), so the remedy must not say it does')
+})
+
+test('o3d-f709 M3: the refusal text no longer prescribes "cancel that sync entry" (a NOT_POSTED settlement does not clear)', () => {
+  assert.doesNotMatch(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /cancel that sync entry/)
+  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /not proof|neither is proof/i)
 })
 
 test('in-flight and already-posted are both reported ahead of may-have-posted', () => {
@@ -147,7 +212,9 @@ test('every refusal tells the operator what to do, and the posted one says where
   assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /NOT proof/)
   assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /response lost/)
   assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /Open the bill in the connector/)
-  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /cancel that sync entry/)
+  // C1 (o3d-f709): this used to assert /cancel that sync entry/ - the remedy a NOT_POSTED settlement
+  // provided. It no longer clears anything, so the text must not promise it.
+  assert.doesNotMatch(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /cancel that sync entry/)
 })
 
 // ---------------------------------------------------------------------------
@@ -156,7 +223,20 @@ test('every refusal tells the operator what to do, and the posted one says where
 // the caller at all. These drive the real function against a recording transaction client.
 // ---------------------------------------------------------------------------
 
-type SyncRow = { id: string; status: string; payload?: unknown }
+type SyncRow = {
+  id: string
+  status: string
+  payload?: unknown
+  externalTransactionId?: string | null
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
+  attemptRevision?: number
+}
+
+/** A survey row with the ledger columns defaulted to what Prisma returns for an untouched row. */
+function full(row: SyncRow): Record<string, unknown> {
+  return { externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, attemptRevision: 0, ...row }
+}
 
 function mockTx(rows: SyncRow[], options: { paidCount?: number; retiredCount?: number; afterRetire?: SyncRow[] } = {}) {
   const calls = {
@@ -170,20 +250,23 @@ function mockTx(rows: SyncRow[], options: { paidCount?: number; retiredCount?: n
       findMany: async (args: Record<string, unknown>) => {
         calls.syncFindMany.push(args)
         findManyCount += 1
-        if (findManyCount === 1) return rows
-        // The shortfall re-read APPLIES ITS OWN STATUS FILTER here. A mock that returned
-        // `afterRetire` whole would answer every possible query identically, so a test asserting
-        // "a row that went FAILED refuses" would pass against a version that only ever looked for
-        // in-flight rows — it would be measuring the mock, not the code.
-        const after = options.afterRetire ?? []
-        const status = (args.where as { status?: { in?: string[]; not?: string } } | undefined)?.status
-        if (status?.in) return after.filter((row) => status.in!.includes(row.status))
-        if (status?.not) return after.filter((row) => row.status !== status.not)
-        return after
+        if (findManyCount === 1) return rows.map(full)
+        // The shortfall re-read EVALUATES ITS OWN `where` against the rows (matchesWhere, which throws
+        // on an operator it does not implement). A mock that returned `afterRetire` whole would answer
+        // every possible query identically, so a test asserting "a row that went FAILED refuses" would
+        // pass against a version that only ever looked for in-flight rows - it would be measuring the
+        // mock, not the code.
+        const after = (options.afterRetire ?? []).map(full)
+        return after.filter((row) => matchesWhere(row, args.where as Record<string, unknown>))
       },
       updateMany: async (args: { where?: unknown; data?: unknown }) => {
         calls.syncUpdateMany.push(args)
-        return { count: options.retiredCount ?? rows.filter((r) => r.status === 'PENDING').length }
+        // The CAS is EVALUATED against the surveyed rows too: a PENDING row that was claimed before
+        // (attemptRevision > 0) or that carries an id does not match the writer's fence.
+        return {
+          count: options.retiredCount
+            ?? rows.map(full).filter((row) => matchesWhere(row, args.where as Record<string, unknown>)).length,
+        }
       },
     },
     purchaseInvoice: {
@@ -241,11 +324,17 @@ test('with nothing claimed or posted, the bill is marked paid and the PENDING ro
   assert.deepEqual(calls.invoiceUpdateMany[0].where, { id: 'inv-1', paidAt: null })
   // PENDING only. SYNCED must not appear in this fence: a row read as PENDING that reached SYNCED in
   // between has POSTED, and a fence naming SYNCED would sweep it up as though it had not.
+  // o3d-f709 / M3: PENDING, never claimed (attemptRevision 0) and naming no document - the three facts
+  // that make `abandonedBeforeRemoteCall: true` TRUE of every row this write touches.
   assert.deepEqual(calls.syncUpdateMany[0].where, {
     id: { in: ['log-1', 'log-2'] },
     status: { in: ['PENDING'] },
+    attemptRevision: 0,
+    externalTransactionId: null,
   })
   assert.equal((calls.syncUpdateMany[0].data as { status: string }).status, 'CANCELLED')
+  assert.equal((calls.syncUpdateMany[0].data as { abandonedBeforeRemoteCall: boolean }).abandonedBeforeRemoteCall, true,
+    'the supersession CANCEL records the pre-call proof, or the planner would refuse the row it created')
   assert.equal((calls.syncUpdateMany[0].data as { errorMessage: string }).errorMessage, BILL_PAYMENT_SUPERSEDED_REASON)
   assert.match(BILL_PAYMENT_SUPERSEDED_REASON, /had not been sent/)
 })
@@ -364,8 +453,63 @@ test('the survey reads the payload, so the FAILED exemption is decided by the sh
 
   const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
 
-  assert.deepEqual(calls.syncFindMany[0].select, { id: true, status: true, payload: true })
+  // o3d-f709 / M3: the survey also loads every column `ledgerStanding` reads.
+  assert.deepEqual(calls.syncFindMany[0].select, {
+    id: true, payload: true,
+    status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true,
+  })
   assert.equal(result.outcome, 'paid', 'a body the connector would reject before sending blocks nothing')
+})
+
+test('o3d-f709 M3: THE WRITER AND THE PLANNER AGREE - the row the supersession CANCEL produces does not block the next Mark Paid', async () => {
+  // The invariant that forces the writer fix into the same commit as the planner: run the writer, take
+  // the `data` it wrote, apply it to the row it matched, and hand THAT row back to the planner.
+  const original = { id: 'log-1', status: 'PENDING', payload: { accountingInvoiceId: 'xero-inv-1', bankAccountId: 'acct-1', amount: 120.5 } }
+  const { tx, calls } = mockTx([original])
+  const first = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+  assert.equal(first.outcome, 'paid')
+  assert.equal(first.outcome === 'paid' && first.retiredCount, 1)
+
+  const written = calls.syncUpdateMany[0].data as Record<string, unknown>
+  const afterWrite = { ...full(original), ...written }
+  console.log(`# precondition writer->planner: wrote ${JSON.stringify(written)}`)
+  assert.equal(afterWrite.status, 'CANCELLED')
+  assert.equal(ledgerStanding(afterWrite as never), 'PROVEN_NOT_POSTED', 'the row the writer made proves its own abandonment')
+
+  // The bill is reversed and marked paid again: the SECOND call sees the cancelled row.
+  const second = mockTx([afterWrite as SyncRow])
+  const again = await markBillPaidSupersedingStaleRegistrations(second.tx as never, PARAMS)
+  assert.equal(again.outcome, 'paid', 'a superseded row must not lock the bill for ever')
+})
+
+test('o3d-f709 M3 ISOLATING ARM: the same row WITHOUT the pre-call stamp blocks (so the stamp is what lets it through)', async () => {
+  // Remove `abandonedBeforeRemoteCall: true` from the writer's output and the identical row refuses.
+  const unstamped = { id: 'log-1', status: 'CANCELLED', abandonedBeforeRemoteCall: null }
+  const { tx, calls } = mockTx([unstamped])
+  const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+  assert.equal(result.outcome, 'refused')
+  assert.equal(result.outcome === 'refused' && result.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+  assert.equal(calls.invoiceUpdateMany.length, 0, 'refused BEFORE the bill was written as paid')
+})
+
+test('o3d-f709 M3: the CANCEL is fenced on attemptRevision 0 and no document id - a retried (claimed-once) PENDING row is NOT stamped pre-call', async () => {
+  // A PENDING row with attemptRevision > 0 was claimed once and put back (a retry): it may have
+  // posted, so claiming "abandoned before any remote call" would be false. The CAS misses it, the
+  // count falls short and the shortfall re-read refuses it as STATE_CHANGED.
+  const retried = { id: 'log-retried', status: 'PENDING', attemptRevision: 2 }
+  const { tx, calls } = mockTx([retried], { afterRetire: [retried] })
+  const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+  console.log(`# precondition CAS: surveyed ${JSON.stringify(retried)}; update where ${JSON.stringify(calls.syncUpdateMany[0]?.where)}`)
+  assert.equal(calls.syncUpdateMany.length, 1, 'the CANCEL was attempted')
+  assert.equal(result.outcome, 'refused')
+  assert.equal(result.outcome === 'refused' && result.refusal, 'PAYMENT_STATE_CHANGED')
+
+  // and a PENDING row that names a document is not "pre-call" either: the planner already treats it
+  // as CONFIRMED_POSTED, so Mark Paid refuses before any write.
+  const named = mockTx([{ id: 'log-named', status: 'PENDING', externalTransactionId: 'PAY-7' }])
+  const r2 = await markBillPaidSupersedingStaleRegistrations(named.tx as never, PARAMS)
+  assert.equal(r2.outcome === 'refused' && r2.refusal, 'PAYMENT_ALREADY_POSTED')
+  assert.equal(named.calls.syncUpdateMany.length, 0)
 })
 
 // ---------------------------------------------------------------------------
