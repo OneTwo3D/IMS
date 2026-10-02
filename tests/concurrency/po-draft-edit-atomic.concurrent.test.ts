@@ -395,9 +395,18 @@ test(
     for (let i = 0; i < DB_POOL_MAX; i += 1) seeded.push((await seedDraft(`a6-${i}`, [3, 4])).po)
     assert.equal(seeded.length, DB_POOL_MAX, 'PRECONDITION: one DRAFT order per pool connection')
     const started = Date.now()
-    const results = await Promise.all(seeded.map((po) => updatePurchaseOrder(po.poId, editFor(po, [5, 6], {
-      additionalCosts: [{ description: 'freight', amountForeign: 3, vatable: false, distributionMethod: 'BY_VALUE' }],
-    }))))
+    // Every line carries a per-line tax-rate OVERRIDE, the only input that makes the line tax resolution query
+    // the database at all; and the edit sets currency/fx, the only input that makes it read the base currency.
+    // Those are the two reads that used to leave the transaction's connection.
+    const { db } = await import('@/lib/db')
+    const taxRate = await db.taxRate.create({ data: { name: `${fixtures.uid()}-fgu3-vat`, rate: 0.2, usedFor: 'PURCHASE' }, select: { id: true } })
+    const results = await Promise.all(seeded.map((po) => {
+      const edit = editFor(po, [5, 6], {
+        additionalCosts: [{ description: 'freight', amountForeign: 3, vatable: false, distributionMethod: 'BY_VALUE' }],
+      })
+      edit.lines = edit.lines!.map((line) => ({ ...line, taxRateId: taxRate.id }))
+      return updatePurchaseOrder(po.poId, edit)
+    }))
     const elapsed = Date.now() - started
     const failures = results.filter((r) => !r.success).map((r) => (r.error ?? '').slice(0, 140))
     console.log(`# A6: ${results.length} concurrent edits (pool max ${DB_POOL_MAX}, acquisition timeout ${DB_POOL_ACQUISITION_TIMEOUT_MS}ms) in ${elapsed}ms, failures=${failures.length}`)
