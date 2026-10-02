@@ -373,9 +373,14 @@ test('a CANCELLED row that still names the payment it reversed does NOT alarm fo
   // The one place post evidence is deliberately outranked. A verified reversal writes CANCELLED and
   // KEEPS the document id, precisely so the row remains a complete account of a payment that existed
   // and was undone — so reading that id as a live hold would turn the fix into a permanent alarm.
-  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9' }) })
+  // o3d-f709 (D4): "a verified reversal" is now RECORDED as one - settlementBasis VERIFIED_REVERSAL - and
+  // that basis, not the absence of two columns, is what makes the kept id an account of an undone
+  // payment. The same row WITHOUT the basis reads as a live hold (isolating arm below).
+  const v = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9', settlementBasis: 'VERIFIED_REVERSAL' }) })
   assert.equal(v.status, 'UNPAID')
   assert.equal(v.discrepancy, false)
+  const bare = settlementStatus({ ...base, paidLocally: false, payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9' }) })
+  assert.equal(bare.status, 'LEDGER_UNMATCHED', 'ISOLATING ARM: without the recorded basis nothing says the id was reversed')
 })
 
 test('an order with no payment at all is simply unpaid', () => {
@@ -578,15 +583,20 @@ test('[o3d-anu8] a CANCELLED row an operator asserted POSTED is not reported as 
   assert.match(v.detail, /PAY-TYPED/)
 })
 
-test('[o3d-anu8] a CANCELLED row an operator asserted NEVER posted keeps the verdict but names the basis', () => {
-  const v = settlementStatus({
-    ...base,
-    payment: row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }),
-    totalForeign: 100,
-  })
-  assert.equal(v.status, 'NOT_SENT')
-  assert.equal(v.basis, 'OPERATOR_ASSERTION', 'the same conclusion, reached from a human\'s word')
-  assert.match(v.detail, /OPERATOR'S ASSERTION/)
+test('[o3d-anu8, C1] a CANCELLED row an operator asserted NEVER posted is LEDGER_UNDECIDED, not NOT_SENT - a person\'s word is not proof', () => {
+  // THE FLIP. This test asserted `NOT_SENT` with basis OPERATOR_ASSERTION ("the same conclusion, reached
+  // from a human's word"). C1: an operator's NOT_POSTED is not proof the ledger was never told, so the
+  // verdict must not state "the ledger was never told" - it says nobody can speak for the attempt.
+  const settled = row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })
+  const v = settlementStatus({ ...base, payment: settled, totalForeign: 100 })
+  console.log(`# precondition settlement-status C1: ${JSON.stringify({ status: settled.status, basis: settled.settlementBasis })} => ${v.status}/${v.basis}`)
+  assert.equal(v.status, 'LEDGER_UNDECIDED')
+  assert.equal(v.basis, 'OPERATOR_ASSERTION', 'the verdict still names whose word it is')
+  assert.match(v.detail, /person's word about a ledger IMS never read/)
+  assert.doesNotMatch(v.detail, /never told/)
+  // and on the not-paid-locally path too
+  const unpaid = settlementStatus({ ...base, paidLocally: false, payment: settled })
+  assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
 })
 
 test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {
@@ -704,7 +714,8 @@ test('[o3d-f709] a VERIFIED reversal is still an absence, not an unresolved paym
     payment: row({
       status: 'CANCELLED',
       externalTransactionId: 'PAY-REVERSED',
-      settlementBasis: null,
+      // o3d-f709 (D4): recorded as what it is. Without this basis the row reads LEDGER_UNRESOLVED.
+      settlementBasis: 'VERIFIED_REVERSAL',
       abandonedBeforeRemoteCall: null,
     }),
     totalForeign: 100,

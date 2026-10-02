@@ -581,6 +581,25 @@ export function settlementStatus(input: {
       // THE STANDING IS ASKED FIRST AND IT IS WHAT DECIDES, so no row the classifier declines to
       // call NOTHING can reach the NOT_SENT sentence, whatever a later hand adds to this switch.
       const standing = registrationLedgerStanding(p)
+      // o3d-f709 / M15 (C1): THE NOT_POSTED SETTLEMENT IS NO LONGER "NEVER SENT". This branch used to
+      // fall to the NOT_SENT sentence below for a CANCELLED + OPERATOR_ASSERTION row with no id - "the
+      // ledger was never told ... an OPERATOR'S ASSERTION that nothing posted" - which is a person's
+      // word presented as the verdict. The classifier now calls it UNDECIDED, and the verdict has to
+      // say so rather than reach the LEDGER_UNRESOLVED sentence beneath, which names a payment id this
+      // row does not have.
+      if (standing === 'UNDECIDED' && assertedPost && !hasPostEvidence(p)) {
+        return {
+          status: 'LEDGER_UNDECIDED',
+          discrepancy: true,
+          basis: 'OPERATOR_ASSERTION',
+          detail:
+            'An operator settled this payment attempt as NOT posted and the row was then retired. That is a '
+            + 'person\'s word about a ledger IMS never read: a lost response or a payment made by hand would leave '
+            + 'exactly the same row, so IMS does not treat it as proof that nothing posted. Open the invoice in the '
+            + 'accounting system and check whether a payment is on it before recording or registering anything '
+            + 'else against this document.',
+        }
+      }
       if (standing !== 'NOTHING') {
         // TWO ROWS, ONE STANDING, AND THE DIFFERENCE IS WHOSE ID IT IS. Both carry a document id the
         // cancellation does not account for; the operator's was typed in and the sweep's was issued

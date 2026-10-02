@@ -30,7 +30,8 @@
  * database or a Xero tenant.
  */
 
-import { VERIFIED_REVERSAL_SETTLEMENT_BASIS, isOperatorAssertedSettlement } from './sync-row-settlement'
+import { ledgerStanding } from './ledger-standing'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
 
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
 export const PAYMENT_REGISTRATION_TYPE = 'INVOICE_PAYMENT'
@@ -167,33 +168,39 @@ export type RegistrationLedgerStanding =
   | 'NOTHING'
 
 /**
- * o3d-f709 — IS A CANCELLED ROW'S DOCUMENT ID ACCOUNTED FOR BY THE CANCELLATION ITSELF?
+ * WHAT ONE REGISTRATION ROW SAYS ABOUT THE LEDGER, as the three answers deletePayment and the
+ * settlement verdict need. A THIN ADAPTER over `ledgerStanding` (ledger-standing.ts, o3d-f709): the
+ * rule is the module's, this only maps its six standings onto the three answers.
  *
- * `true` for exactly ONE shape, and it is the shape the short-circuit below was written for:
- * `buildVerifiedReversalData`'s. That writes `{ status: CANCELLED, errorMessage }` after IMS asked
- * Xero about the payment and was told DELETED — and it touches NEITHER of the two columns read
- * here, which is what makes it recognisable.
+ *   PROVEN_NOT_POSTED                           -> NOTHING   the sweep's pre-call proof, or a
+ *                                                            VERIFIED_REVERSAL (Xero said DELETED).
+ *                                                            A verified reversal that KEEPS its id
+ *                                                            reads NOTHING by its basis, which is what
+ *                                                            the old "touches neither column" test was
+ *                                                            reconstructing.
+ *   CONFIRMED_POSTED | ASSERTED_POSTED | LIVE_WORK -> HELD    the ledger holds a payment, an operator
+ *                                                            says it does, or one is on its way.
+ *   ASSERTED_NOT_POSTED                         -> UNDECIDED  C1 (M15). An operator's NOT_POSTED used
+ *                                                            to read NOTHING, so deletePayment
+ *                                                            destroyed the last local record of a
+ *                                                            payment on a person's word. It is now an
+ *                                                            attempt nobody can speak for.
+ *   UNKNOWN                                     -> FAILED / an unrecognised basis -> UNDECIDED;
+ *                                                  CANCELLED with NULL basis and no id -> NOTHING.
  *
- * The two shapes it is `false` for both carry an id NOTHING has accounted for:
+ * THAT LAST ARM IS THE ONE DELIBERATE DIVERGENCE FROM `mayHaveReachedLedger`, and it is stated rather
+ * than hidden (o3d-7sn5): an unflagged CANCELLED registration with no id and no operator assertion
+ * reads UNKNOWN to the module and NOTHING here. The producers of that row on THIS path are the two
+ * `deletePayment` retirements ("Retired: the local payment it registered was deleted"), which retire
+ * PENDING rows this very module classifies `retirable` - nothing sent. Reading them UNDECIDED would
+ * alarm for ever over every order that ever had a receipt deleted. Closing the divergence means
+ * stamping those writers `abandonedBeforeRemoteCall` and reading the arm UNDECIDED; that is filed,
+ * not done here.
  *
- *   `settlementBasis = OPERATOR_ASSERTION` — `buildCancelledSaleSettlementData`: a human typed a
- *   document id in. That is an unverified claim the document EXISTS, the opposite fact (o3d-anu8).
- *
- *   `abandonedBeforeRemoteCall = true` — `cancelOrphanedRowsUnderLock`, and this one was missed.
- *   The sweep proves "pre-call" from `status = 'PENDING'` and nothing else, but a POSTED row is put
- *   BACK to PENDING whenever follow-up work fails, KEEPING its external id
- *   (`postedRowRetryColumns`, and Xero's single-statement recovery write). The sweep then retires it
- *   without clearing that id, and its claim is contradicted by the row's own contents. This is not a
- *   new rule: `cancelledClaimIsResolved` has vetoed both resolutions on a non-null
- *   `externalTransactionId` since o3d-nepa, in exactly these words — "the id exists only because a
- *   remote call returned". The delete path simply was not asking.
+ * `settlementBasis` and `abandonedBeforeRemoteCall` stay OPTIONAL in the parameter, as before, and
+ * absent reads as null: callers that have only a status and an id (the settlement verdict) are not
+ * made to invent columns. The delete path's `PaymentRegistrationRow` REQUIRES them.
  */
-function cancelledDocumentIdIsAccountedFor(
-  row: { settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null },
-): boolean {
-  return !isOperatorAssertedSettlement(row.settlementBasis) && row.abandonedBeforeRemoteCall !== true
-}
-
 export function registrationLedgerStanding(
   row: {
     status: string
@@ -202,47 +209,34 @@ export function registrationLedgerStanding(
     abandonedBeforeRemoteCall?: boolean | null
   },
 ): RegistrationLedgerStanding {
-  // CANCELLED IS ASKED FIRST, AHEAD OF POST EVIDENCE, and this is the one place that precedence is
-  // inverted. Everywhere else a document id outranks a status, because a status is what IMS wrote
-  // down and a document id is what the ledger gave back. CANCELLED is the exception because it is
-  // written where "nothing stands there" has ALREADY been established — a PENDING row retired
-  // before any call, or a registration retired after Xero was asked and answered DELETED. A
-  // cancelled row that still names a payment is the complete account of a payment that existed and
-  // was undone (see buildVerifiedReversalData), and reading that id as a live hold would alarm for
-  // ever over the reversal that fixed it.
-  //
-  // ONE WRITER BREAKS THAT, AND IT PRODUCES A BYTE-IDENTICAL ROW (o3d-anu8).
-  // `buildVerifiedReversalData` writes { CANCELLED, externalTransactionId, errorMessage } after
-  // asking Xero and being told DELETED. `buildCancelledSaleSettlementData` writes { CANCELLED,
-  // externalTransactionId, errorMessage } because an operator typed a document id in and the sale
-  // this row belongs to is cancelled. The first is a verified absence; the second is an UNVERIFIED
-  // CLAIM THAT THE DOCUMENT EXISTS — the opposite fact — and the two rows differ in exactly one
-  // column, this one. Reading the asserted row as NOTHING lets deletePayment destroy the last local
-  // record of a payment that may be standing in a real ledger.
-  //
-  // So the short-circuit applies only where the CANCELLED actually establishes an absence. An
-  // asserted row that NAMES a document falls through to the post-evidence rule below and reads
-  // HELD, which is what its own note says it is.
-  //
-  // AND A SECOND WRITER BREAKS IT THE SAME WAY (o3d-f709). `cancelOrphanedRowsUnderLock` retires a
-  // PENDING row to CANCELLED, stamping `abandonedBeforeRemoteCall: true` on the strength of that
-  // status alone — but a posted row is put BACK to PENDING whenever follow-up work fails, keeping
-  // the id the ledger issued, and the sweep does not clear it. That row too is an id nothing has
-  // accounted for, and reading it as NOTHING let deletePayment destroy the last local record of a
-  // payment standing in a live ledger. See cancelledDocumentIdIsAccountedFor above; the rule it
-  // applies is `cancelledClaimIsResolved`'s external-id veto, which this path was not asking.
-  //
-  // An asserted CANCELLED row with NO document id (the NOT_POSTED settlement) still reads NOTHING,
-  // deliberately: that assertion IS "nothing posted", it is audited with a person's name on it, and
-  // giving a stranded receipt a way out is what the settlement action exists for.
-  if (row.status === 'CANCELLED' && (!hasPostEvidence(row) || cancelledDocumentIdIsAccountedFor(row))) {
-    return 'NOTHING'
+  const standing = ledgerStanding({
+    status: row.status,
+    externalTransactionId: row.externalTransactionId ?? null,
+    settlementBasis: row.settlementBasis ?? null,
+    abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+  })
+  switch (standing) {
+    case 'PROVEN_NOT_POSTED':
+      return 'NOTHING'
+    case 'CONFIRMED_POSTED':
+    case 'ASSERTED_POSTED':
+    case 'LIVE_WORK':
+      return 'HELD'
+    case 'ASSERTED_NOT_POSTED':
+      return 'UNDECIDED'
+    case 'UNKNOWN':
+      break
   }
-  // POST EVIDENCE OUTRANKS STATUS. The processor calls the ledger BEFORE it writes the result down,
-  // so a FAILED row naming a document is a failure recorded in front of a payment that exists.
+  // UNKNOWN. POST EVIDENCE OUTRANKS STATUS (o3d-ju8t): a row naming a document is a hold whatever else
+  // is unrecognised about it. A FAILED attempt is the classic undecided one; an unrecognised basis must
+  // not be read as anything kinder; and the one arm that reads NOTHING is documented above.
   if (hasPostEvidence(row)) return 'HELD'
-  if ((LEDGER_HELD_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) return 'HELD'
   if ((UNDECIDED_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) return 'UNDECIDED'
+  if (row.status === 'CANCELLED') {
+    const unflagged = (row.settlementBasis ?? null) === null && !hasPostEvidence(row)
+    return unflagged ? 'NOTHING' : 'UNDECIDED'
+  }
+  if ((LEDGER_HELD_REGISTRATION_STATUSES as readonly string[]).includes(row.status)) return 'HELD'
   return 'NOTHING'
 }
 
@@ -356,6 +350,14 @@ export function describeAttemptUndecidedRefusal(
   orderReference: string,
 ): PaymentDeleteRefusal {
   const entries = undecided.map((row) => row.id).join(', ')
+  // o3d-f709 / M15 (C1): an UNDECIDED row can now be a CANCELLED one an operator settled "not posted".
+  // The text below says FAILED, which would be untrue of it, so it gets its own paragraph.
+  const settledByOperator = undecided.some((row) => row.status === 'CANCELLED')
+  const operatorNote = settledByOperator
+    ? '\n\nAn operator settled one of these entries as "not posted". That is a person\'s word about an '
+      + 'accounting system IMS never read, not proof - the payment may still be there - so it does not '
+      + 'free this receipt for deletion.'
+    : ''
   return {
     code: 'registration_attempt_undecided',
     message:
@@ -373,7 +375,8 @@ export function describeAttemptUndecidedRefusal(
       + 'the payment reference and can check the reversal for you.\n\n'
       + `IMS cannot settle this on its own: the failed entry (${entries}) names no payment to look up, `
       + 'and an invoice showing nothing looks the same whether the payment was removed or never '
-      + 'arrived — which is why the reference has to come from you, and why IMS still checks it.',
+      + 'arrived — which is why the reference has to come from you, and why IMS still checks it.'
+      + operatorNote,
   }
 }
 

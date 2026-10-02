@@ -50,6 +50,7 @@ import {
   type PaymentDeleteRefusalCode,
   type PaymentRegistrationRow,
 } from '@/lib/domain/accounting/payment-ledger-hold'
+import { UNPROVEN_CANCELLED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import {
   queueAccountingSync,
   queueAccountingSyncTxWithOutcome,
@@ -3967,6 +3968,12 @@ async function readPaymentRegistrations(
       OR: [
         { status: { in: [...READABLE_REGISTRATION_STATUSES] } },
         { externalTransactionId: { not: null } },
+        // o3d-f709 / M15 (C1): THE ROWS AN OPERATOR SETTLED NOT_POSTED, and every other CANCELLED row
+        // that proves nothing. They carry no document id and are not in a readable status, so this
+        // read never saw them - and `registrationLedgerStanding` now answers UNDECIDED for the
+        // asserted one, which is a verdict that only exists for rows that are READ. The classifier,
+        // not this query, decides which of them matter; reading more is the safe direction.
+        UNPROVEN_CANCELLED_WHERE,
       ],
     },
     // o3d-anu8: settlementBasis, because a CANCELLED row carrying a document id is written by TWO

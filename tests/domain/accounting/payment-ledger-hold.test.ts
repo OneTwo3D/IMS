@@ -136,6 +136,23 @@ test('every status the splitter can classify is one the query is told to read', 
   }
 })
 
+test('[o3d-f709 M15] the delete READS the rows the classifier now has an opinion on: the query carries the unproven-CANCELLED fragment', async () => {
+  // A verdict only exists for rows that are READ. An operator-settled NOT_POSTED registration has no
+  // document id and is in no readable status, so before M15 it was never loaded and the classifier's
+  // new UNDECIDED answer was unreachable in production however correct the pure function was.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  const start = source.indexOf('async function readPaymentRegistrations')
+  assert.ok(start > 0, 'the reader still exists under this name')
+  const end = source.indexOf('\n}\n', start)
+  const body = source.slice(start, end)
+  console.log(`# readPaymentRegistrations body length=${body.length} mentions UNPROVEN_CANCELLED_WHERE=${body.includes('UNPROVEN_CANCELLED_WHERE')}`)
+  assert.match(body, /OR: \[[\s\S]*UNPROVEN_CANCELLED_WHERE[\s\S]*\]/)
+  assert.match(body, /abandonedBeforeRemoteCall: true/)
+  assert.match(body, /settlementBasis: true/)
+})
+
 test('the delete refusal names the document and points at the remedy, not at a warning', () => {
   const refusal = describeLedgerHoldRefusal([reg({ status: 'SYNCED', externalTransactionId: 'PAY-9' })], 'SO-1001')
   assert.equal(refusal.code, 'ledger_holds_payment')
@@ -184,7 +201,7 @@ test('the undecided refusal states what is UNKNOWN, and never that a payment exi
 // ONE CLASSIFIER, so the delete and the settlement verdict cannot answer differently
 // ---------------------------------------------------------------------------
 
-test('registrationLedgerStanding gives the three answers, and a BARE CANCELLED is NOTHING even with a document id', () => {
+test('registrationLedgerStanding gives the three answers; a VERIFIED reversal that keeps its id is NOTHING, and a BARE CANCELLED with an id is a HOLD', () => {
   // The drift this closes: the delete grew a third answer for a FAILED row naming no document while
   // the settlement verdict kept two, so the row one module refused to touch was shown by the other
   // as a plainly unpaid order needing no attention.
@@ -194,13 +211,15 @@ test('registrationLedgerStanding gives the three answers, and a BARE CANCELLED i
   // Post evidence outranks status...
   assert.equal(registrationLedgerStanding({ status: 'FAILED', externalTransactionId: 'PAY-1' }), 'HELD')
   assert.equal(registrationLedgerStanding({ status: 'FAILED', externalTransactionId: null }), 'UNDECIDED')
-  // ...except against CANCELLED, the one status written only where "nothing stands there" is already
-  // established. A verified reversal KEEPS the document id on purpose, so reading it as a live hold
-  // would make the fix alarm for ever.
-  // BARE: no settlementBasis and no abandonedBeforeRemoteCall, i.e. the verified reversal's shape.
-  // The two cancellations that carry an id NOTHING has accounted for read HELD instead — see the
-  // o3d-anu8 and o3d-f709 tests below.
-  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1' }), 'NOTHING')
+  // ...except against a VERIFIED REVERSAL (o3d-f709, D4). It KEEPS the document id on purpose, so reading
+  // it as a live hold would make the fix alarm for ever - and it is now recognised by its BASIS, which
+  // is what the old "touches neither column" test was reconstructing. A BARE CANCELLED row that still
+  // names a document (no basis, no flag) used to read NOTHING for that reason; nothing recorded that
+  // anything was verified, so it now reads HELD like every other CANCELLED row naming a document.
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL' }), 'NOTHING')
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1' }), 'HELD')
+  // A CANCELLED row naming no document and carrying no operator assertion: the documented divergence
+  // from `mayHaveReachedLedger` (see the adapter's header, o3d-7sn5).
   assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null }), 'NOTHING')
 })
 
@@ -209,7 +228,7 @@ test('the splitter is expressed in those same answers, so it cannot classify a r
     reg({ id: 'held', status: 'SYNCED', externalTransactionId: 'PAY-1' }),
     reg({ id: 'queued', status: 'PENDING' }),
     reg({ id: 'unknown', status: 'FAILED' }),
-    reg({ id: 'reversed', status: 'CANCELLED', externalTransactionId: 'PAY-2' }),
+    reg({ id: 'reversed', status: 'CANCELLED', externalTransactionId: 'PAY-2', settlementBasis: 'VERIFIED_REVERSAL' }),
   ]
   const split = splitPaymentRegistrations(rows)
   assert.deepEqual(split.ledgerHold.map((r) => r.id), ['held'])
@@ -434,25 +453,49 @@ test('hasPostEvidence ignores whitespace-only ids', () => {
 // DOCUMENT EXISTS. They differ in exactly one column.
 // ---------------------------------------------------------------------------
 
-test('[o3d-anu8] a CANCELLED registration an OPERATOR asserted still HOLDS — only a verified reversal is NOTHING', () => {
-  // The verified reversal, unchanged: Xero was asked and answered.
+test('[o3d-anu8, C1] a CANCELLED registration an OPERATOR asserted HOLDS (with an id) or is UNDECIDED (without) - only a VERIFIED reversal is NOTHING', () => {
+  // The verified reversal: Xero was asked and answered. It is recognised by its BASIS (D4).
   assert.equal(
-    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: null }),
+    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'VERIFIED_REVERSAL' }),
     'NOTHING',
   )
-  // The assertion. Reading this as NOTHING lets deletePayment destroy the last local record of a
-  // payment that may be standing in a real ledger.
+  // The assertion that a payment POSTED. Reading this as NOTHING lets deletePayment destroy the last
+  // local record of a payment that may be standing in a real ledger.
   assert.equal(
     registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'OPERATOR_ASSERTION' }),
     'HELD',
   )
-  // ...and the NOT_POSTED settlement, which names no document, still frees the receipt. That
-  // assertion IS "nothing posted", it is audited with a person's name on it, and giving a stranded
-  // receipt a way out is what the settlement action exists for.
-  assert.equal(
-    registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }),
-    'NOTHING',
+  // THE FLIP (C1 / M15). The NOT_POSTED settlement, which names no document, used to read NOTHING:
+  // "that assertion IS nothing posted, audited with a person's name, and giving a stranded receipt a
+  // way out is what the settlement action exists for". A person's word about a ledger IMS never read
+  // is not proof, so it is an attempt nobody can speak for.
+  const settled = { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }
+  console.log(`# precondition M15: ${JSON.stringify(settled)} => ${registrationLedgerStanding(settled)}`)
+  assert.equal(registrationLedgerStanding(settled), 'UNDECIDED')
+  // ISOLATING ARM: the identical row without the assertion is still NOTHING (the documented divergence).
+  assert.equal(registrationLedgerStanding({ ...settled, settlementBasis: null }), 'NOTHING')
+  // The splitter files it under `undecided`, so deletePayment refuses.
+  const split = splitPaymentRegistrations([reg({ id: 'settled', ...settled })])
+  assert.deepEqual(split.undecided.map((r) => r.id), ['settled'])
+  assert.deepEqual(split.retirable, [])
+  assert.deepEqual(split.ledgerHold, [])
+})
+
+test('[o3d-f709 M15] an UNRECOGNISED basis on a CANCELLED registration is UNDECIDED, never NOTHING', () => {
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'SOMETHING_NEWER' }), 'UNDECIDED')
+  assert.equal(registrationLedgerStanding({ status: 'CANCELLED', externalTransactionId: 'PAY-1', settlementBasis: 'SOMETHING_NEWER' }), 'HELD')
+})
+
+test('[o3d-f709 M15] the undecided refusal does not call an operator-settled row FAILED, and says a person\'s word is not proof', () => {
+  const refusal = describeAttemptUndecidedRefusal(
+    [reg({ id: 'log-9', status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' })],
+    'SO-1001',
   )
+  assert.match(refusal.message, /settled one of these entries as "not posted"/)
+  assert.match(refusal.message, /person's word about an accounting system IMS never read/)
+  // and the ordinary FAILED text carries no such paragraph
+  const failed = describeAttemptUndecidedRefusal([reg({ id: 'log-7', status: 'FAILED' })], 'SO-1001')
+  assert.doesNotMatch(failed.message, /settled one of these entries/)
 })
 
 test('[o3d-f709] a CANCELLED registration the ORPHAN SWEEP retired still HOLDS when it names a payment', () => {
@@ -483,13 +526,12 @@ test('[o3d-f709] a CANCELLED registration the ORPHAN SWEEP retired still HOLDS w
     }),
     'NOTHING',
   )
-  // ...and the VERIFIED REVERSAL is untouched: it writes neither column, so its id stays accounted
-  // for by the cancellation itself and the reversal that fixed the discrepancy does not alarm for
-  // ever.
+  // ...and the VERIFIED REVERSAL is NOTHING by its BASIS (D4): it keeps its id, and the reversal that
+  // fixed the discrepancy does not alarm for ever.
   assert.equal(
     registrationLedgerStanding({
       status: 'CANCELLED', externalTransactionId: 'PAY-1',
-      settlementBasis: null, abandonedBeforeRemoteCall: null,
+      settlementBasis: 'VERIFIED_REVERSAL', abandonedBeforeRemoteCall: null,
     }),
     'NOTHING',
   )
