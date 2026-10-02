@@ -656,11 +656,32 @@ async function getShipmentLineCostSnapshot(
   )
 }
 
+/**
+ * o3d-zvec.21: build the stock rows a refund returns, from what SHIPPED.
+ *
+ * THE PER-LINE SPLIT (storefront refunds, `skipUnshipped`). A refunded quantity is split shipped-first,
+ * the same order `consumeRefundLineQuantity` uses for the COGS/allocation reversal, so the stock side and
+ * the accounting side can never disagree about which units are which:
+ *
+ *   restockable = min(refunded, shipped on that line and not already returned by an earlier refund)
+ *   remainder   = refunded - restockable   -> UNSHIPPED: demand/reservation is released (post-commit,
+ *                                              post-refund-release.ts via the in-tx outbox row) and NOTHING
+ *                                              is restocked — those units never left, so nothing came back.
+ *
+ * A line with no shipped quantity at all therefore contributes NO row instead of throwing
+ * "no shipment line exists" (which used to fail the whole refund, credit note included). The throw is kept
+ * for the operator-recorded path: there the operator explicitly asked for stock to be returned, and a
+ * refusal that names the remedy ("process as cash-only") is the right answer.
+ *
+ * This function does not decide WHEN shipped units come back; it only never invents units that did not
+ * ship. Nothing here is read outside the order lock: callers build rows inside the refund transaction.
+ */
 async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
   lines: Array<RefundRequestLine | CreatedRefundLine>,
   excludeRefundId?: string,
+  options: { skipUnshipped?: boolean } = {},
 ): Promise<RefundReturnRow[]> {
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
@@ -671,6 +692,7 @@ async function buildRefundFallbackReturnRows(
           productId: true,
           description: true,
           qty: true,
+          totalBase: true,
         },
       },
       allocations: {
@@ -692,18 +714,31 @@ async function buildRefundFallbackReturnRows(
           },
         },
       },
+      // EVERY earlier refund, in creation order (Codex r5): the allocation walk must replay each earlier
+      // QUANTITY refund — including one that restocked nothing and so carries no return warehouse — or it
+      // would hand that refund's units to the next one. `returnWarehouseId` says only whether stock came
+      // back, and is used to debit stock, never to decide whether the refund consumed line quantity.
       refunds: {
-        where: { returnWarehouseId: { not: null } },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: {
           id: true,
+          returnWarehouseId: true,
           lines: {
-            select: { productId: true, qty: true },
+            select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
         },
       },
     },
   })
   if (!order) return []
+
+  // Only refunds created BEFORE the one being built (the walk replays history; a later refund must not
+  // consume the units this one is entitled to — the accounting retry rebuilds an OLD refund's rows).
+  const priorRefunds: typeof order.refunds = []
+  for (const refund of order.refunds) {
+    if (excludeRefundId && refund.id === excludeRefundId) break
+    priorRefunds.push(refund)
+  }
 
   const lineById = new Map(order.lines.map((line) => [line.id, line]))
   const lineCandidatesByProduct = new Map<string, typeof order.lines>()
@@ -729,8 +764,8 @@ async function buildRefundFallbackReturnRows(
   }
 
   const priorReturnedByProduct = new Map<string, number>()
-  for (const refund of order.refunds) {
-    if (excludeRefundId && refund.id === excludeRefundId) continue
+  for (const refund of priorRefunds) {
+    if (!refund.returnWarehouseId) continue // only refunds that actually returned stock debit the product cap
     for (const refundLine of refund.lines) {
       if (!refundLine.productId) continue
       priorReturnedByProduct.set(
@@ -753,20 +788,160 @@ async function buildRefundFallbackReturnRows(
     remainingReturnable.set(productId, Math.max(0, dispatched - priorReturned))
   }
 
+  // o3d-zvec.21 (Codex r1 #1): the product-wide cap above lets one line's refund consume ANOTHER line's
+  // shipped units when two lines share a product (A orders 2 / ships 1, B ships 1: A's second refund took
+  // B's unit although accounting books A's second unit as unshipped). So every row is ALSO capped against
+  // the remaining shipped quantity of ITS OWN order line: dispatched on (line, component product) minus
+  // what earlier refunds already returned against that line, converted to component units. A prior refund
+  // line with no line link is attributed the way a new one without a link is: to the first line of that
+  // product.
+  const lineProductKey = (lineId: string, productId: string) => `${lineId}|${productId}`
+  const remainingByLineProduct = new Map<string, number>()
+  for (const [lineId, rows] of sourceRowsByLine) {
+    for (const [productId, qty] of rows) remainingByLineProduct.set(lineProductKey(lineId, productId), qty)
+  }
+  // THE SAME LINE-CHOICE RULE as the return builder below and as the COGS split: `sortLinesForRefundLine`
+  // (link, else price, else description, else first), walked line by line by `allocateRefundQtyAcrossLines`.
+  // Attributing a prior refund anywhere else debits the wrong line's cap.
+  const sortedCandidatesFor = (candidate: {
+    lineId?: string | null
+    productId: string
+    description: string
+    qty: DecimalInput
+    totalBase: DecimalInput
+    unitPriceBase?: DecimalInput | null
+  }) => sortLinesForRefundLine(lineCandidatesByProduct.get(candidate.productId) ?? [], candidate)
+  // What each line still has to refund, in LINE units: ordered minus what earlier refunds (replayed in
+  // order through the same allocation) already took from it.
+  const lineUnitsLeft = new Map<string, number>(order.lines.map((l) => [l.id, refundBoundaryNumber(l.qty)]))
+  const priorAllocations = new Map<string, Array<{ line: (typeof order.lines)[number]; take: number }>>()
+  for (const refund of priorRefunds) {
+    for (const refundLine of refund.lines) {
+      if (!refundLine.productId) continue
+      priorAllocations.set(refundLine.id, allocateRefundQtyAcrossLines(
+        sortedCandidatesFor({ ...refundLine, lineId: refundLine.salesOrderLineId, productId: refundLine.productId }),
+        refundBoundaryNumber(refundLine.qty),
+        lineUnitsLeft,
+      ))
+    }
+  }
+  const debitAcross = (sortedLines: ReadonlyArray<{ id: string }>, productId: string, qty: number) => {
+    let left = qty
+    for (const line of sortedLines) {
+      if (left <= 0) break
+      const key = lineProductKey(line.id, productId)
+      const available = remainingByLineProduct.get(key)
+      if (available == null) continue
+      const d = Math.min(left, available)
+      remainingByLineProduct.set(key, available - d)
+      left -= d
+    }
+  }
+  const REFUND_MOVEMENT_LINE = /:line:([^:]+):warehouse:/
+  for (const refund of priorRefunds) {
+    if (!refund.returnWarehouseId) continue // restocked nothing: no stock to debit (its line units were replayed above)
+    const refundLineById = new Map(refund.lines.map((refundLine) => [refundLine.id, refundLine]))
+
+    // WHAT WAS ACTUALLY RETURNED is on record: one inbound movement per (refund line, COMPONENT product),
+    // in component units, keyed with the refund line id. Subtracting that — not a conversion from the
+    // refund line's own quantity — is what keeps a part-shipped KIT honest (Codex r2 HIGH B).
+    //
+    // DOCUMENTED RESIDUAL (Codex r4 HIGH 2, o3d-zvec.27): that record is a stock movement, and movement
+    // retention can delete it. A refund line with no movement on record falls back to the estimate below
+    // (refund qty x shipped components / ordered), which is LOW for successive refunds of a PARTIALLY
+    // shipped KIT, so a later refund could restock a component that never shipped. It needs retention
+    // configured AND a part-shipped kit AND successive refunds; non-kit lines are unaffected because
+    // their estimate is exact. The durable fix is to persist returned component quantities per refund
+    // line outside retention.
+    const movements = await client.stockMovement.findMany({
+      where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
+      select: { productId: true, qty: true, idempotencyKey: true },
+    })
+    const attributedLineIds = new Set<string>()
+    for (const movement of movements) {
+      const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
+      const refundLine = refundLineId ? refundLineById.get(refundLineId) : undefined
+      if (!refundLine || !refundLine.productId) continue
+      debitAcross(
+        sortedCandidatesFor({ ...refundLine, lineId: refundLine.salesOrderLineId, productId: refundLine.productId }),
+        movement.productId,
+        refundBoundaryNumber(movement.qty),
+      )
+      attributedLineIds.add(refundLine.id)
+    }
+
+    // A refund line with NO movement on record (a legacy refund, or one whose stock step has not run) is
+    // estimated from the lines its quantity was allocated to, the conservative direction.
+    for (const refundLine of refund.lines) {
+      if (!refundLine.productId || attributedLineIds.has(refundLine.id)) continue
+      for (const { line: attributed, take } of priorAllocations.get(refundLine.id) ?? []) {
+        const rows = sourceRowsByLine.get(attributed.id)
+        const attributedLineQty = refundBoundaryNumber(attributed.qty)
+        if (!rows || attributedLineQty <= 0) continue
+        for (const [productId, rowQty] of rows) {
+          const unitsPerLineUnit = rows.size === 1 && productId === attributed.productId ? 1 : rowQty / attributedLineQty
+          debitAcross([attributed], productId, take * unitsPerLineUnit)
+        }
+      }
+    }
+  }
+
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
     const refundLineId = 'id' in line ? line.id : null
 
-    const sourceLine = line.lineId
-      ? lineById.get(line.lineId) ?? null
-      : (lineCandidatesByProduct.get(line.productId) ?? []).find((candidate) => candidate.description === line.description)
-        ?? (lineCandidatesByProduct.get(line.productId) ?? [])[0]
-        ?? null
+    const candidate = {
+      lineId: line.lineId,
+      productId: line.productId,
+      description: line.description,
+      qty: line.qty,
+      totalBase: line.totalBase,
+      unitPriceBase: 'unitPriceBase' in line ? line.unitPriceBase : null,
+    }
+    const sortedLines = sortedCandidatesFor(candidate)
+    const sourceLine = line.lineId ? lineById.get(line.lineId) ?? null : sortedLines[0] ?? null
 
     if (!sourceLine) {
       throw new RefundReturnSourceError(
         `Cannot restock product ${line.productId} for refund: no matching sales order line exists on the original order.`,
       )
+    }
+
+    // o3d-zvec.21 (Codex r4 HIGH 1): a STOREFRONT refund is spread over the product's lines exactly as the
+    // COGS split spreads it — sorted by the shared rule, line by line, each line absorbing at most what it
+    // still has to refund, shipped-first within the line — and only the SHIPPED part of each line's share
+    // becomes a return row, capped by that line's own remaining shipped quantity. A quantity-2 refund over
+    // two shipped quantity-1 lines therefore returns both units, and a line's unshipped share is consumed
+    // (released, not returned) before the walk moves on to the next line.
+    if (options.skipUnshipped) {
+      const walk = sortedLines.includes(sourceLine) ? sortedLines : [sourceLine, ...sortedLines]
+      const rows: RefundReturnRow[] = []
+      for (const { line: allocated, take } of allocateRefundQtyAcrossLines(walk, line.qty, lineUnitsLeft)) {
+        const allocatedRows = sourceRowsByLine.get(allocated.id)
+        const allocatedQty = refundBoundaryNumber(allocated.qty)
+        if (!allocatedRows || allocatedRows.size === 0 || allocatedQty <= 0) continue
+        const plain = allocatedRows.size === 1 && allocated.productId != null && allocatedRows.has(allocated.productId)
+        // Shipped line units this line can still return: its remaining shipped components / per-unit factor.
+        let shippedLineUnits = take
+        for (const [productId, totalQty] of allocatedRows) {
+          const perUnit = plain ? 1 : totalQty / allocatedQty
+          if (!Number.isFinite(perUnit) || perUnit <= 0) continue
+          shippedLineUnits = Math.min(shippedLineUnits, Math.max(0, remainingByLineProduct.get(lineProductKey(allocated.id, productId)) ?? 0) / perUnit)
+        }
+        for (const [productId, totalQty] of allocatedRows) {
+          const perUnit = plain ? 1 : totalQty / allocatedQty
+          if (!Number.isFinite(perUnit) || perUnit <= 0) continue
+          const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
+          const lineKey = lineProductKey(allocated.id, productId)
+          const lineAvailable = Math.max(0, remainingByLineProduct.get(lineKey) ?? 0)
+          const cappedQty = Math.min(shippedLineUnits * perUnit, available, lineAvailable)
+          if (cappedQty <= 0) continue
+          remainingReturnable.set(productId, available - cappedQty)
+          remainingByLineProduct.set(lineKey, lineAvailable - cappedQty)
+          rows.push({ productId, qty: cappedQty, refundLineId })
+        }
+      }
+      return rows
     }
 
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
@@ -782,8 +957,11 @@ async function buildRefundFallbackReturnRows(
       if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
       const rawReturnQty = perUnitQty * line.qty
       const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
-      const cappedQty = Math.min(rawReturnQty, available)
+      const lineKey = lineProductKey(sourceLine.id, productId)
+      const lineAvailable = Math.max(0, remainingByLineProduct.get(lineKey) ?? 0)
+      const cappedQty = Math.min(rawReturnQty, available, lineAvailable)
       remainingReturnable.set(productId, available - cappedQty)
+      remainingByLineProduct.set(lineKey, lineAvailable - cappedQty)
 
       if (cappedQty <= 0) return []
       return [{ productId, qty: cappedQty, refundLineId }]
@@ -972,6 +1150,85 @@ async function createReturnInboundMovementAndCostLayersTx(
   return 'created'
 }
 
+/**
+ * THE ONE LINE-CHOICE RULE for a refund line against the order's lines of the same product (Codex r3 HIGH).
+ *
+ * Stock (the return builder), the per-line cap (the prior-return attribution) and COGS
+ * (`consumeRefundLineQuantity`) all ask "which order line does this refund line belong to?". They used to
+ * answer it three ways, so an unlinked refund priced for line B could reverse B's COGS and return B's stock
+ * while the cap debited A. They now all call this, so they cannot disagree by construction:
+ *   1. the line the refund line is LINKED to,
+ *   2. else the line whose unit price matches the refund's unit price,
+ *   3. else the line whose description matches,
+ *   4. else the first (stable order).
+ * Lines indistinguishable by all of these (same product, price and description) are genuinely ambiguous;
+ * the first is chosen, in every consumer alike.
+ */
+function sortLinesForRefundLine<T extends { id: string; qty: DecimalInput; totalBase: DecimalInput; description: string }>(
+  candidates: readonly T[],
+  refundLine: {
+    lineId?: string | null
+    description: string
+    qty: DecimalInput
+    totalBase: DecimalInput
+    unitPriceBase?: DecimalInput | null
+  },
+): T[] {
+  const refundQty = refundBoundaryNumber(refundLine.qty)
+  const refundUnitPrice = refundLine.unitPriceBase != null
+    ? refundBoundaryNumber(refundLine.unitPriceBase)
+    : (refundQty > 0 ? refundBoundaryNumber(refundLine.totalBase) / refundQty : null)
+  const priceMatches = (unitRevenue: number): boolean =>
+    refundUnitPrice != null && Math.abs(unitRevenue - refundUnitPrice) < 0.0001
+  return [...candidates].sort((a, b) => {
+    const aLineMatch = refundLine.lineId != null && a.id === refundLine.lineId
+    const bLineMatch = refundLine.lineId != null && b.id === refundLine.lineId
+    if (aLineMatch !== bLineMatch) return aLineMatch ? -1 : 1
+
+    const unitOf = (line: T) => {
+      const qty = refundBoundaryNumber(line.qty)
+      return qty > 0 ? refundBoundaryNumber(line.totalBase) / qty : 0
+    }
+    // (aUnitRevenue/bUnitRevenue keep the names the refund-figure inventory pins for this comparator.)
+    const aUnitRevenue = unitOf(a)
+    const bUnitRevenue = unitOf(b)
+    const aPriceMatch = priceMatches(aUnitRevenue)
+    const bPriceMatch = priceMatches(bUnitRevenue)
+    if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
+
+    const aDescMatch = a.description === refundLine.description
+    const bDescMatch = b.description === refundLine.description
+    if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
+
+    return 0
+  })
+}
+
+/**
+ * Spread a refund quantity over the (already sorted) lines of one product, line by line, each line
+ * absorbing at most what it still has to refund, until the quantity is used up — the same walk
+ * `consumeRefundLineQuantity` makes for the COGS split (Codex r4 HIGH). `unitsLeft` is mutated.
+ * The return builder and the replay of earlier refunds both use it, so the lines a refund is charged to
+ * are the same lines whichever of them is asking.
+ */
+function allocateRefundQtyAcrossLines<T extends { id: string }>(
+  sortedLines: readonly T[],
+  qty: number,
+  unitsLeft: Map<string, number>,
+): Array<{ line: T; take: number }> {
+  const taken: Array<{ line: T; take: number }> = []
+  let remaining = qty
+  for (const line of sortedLines) {
+    if (remaining <= 0) break
+    const take = Math.min(remaining, Math.max(0, unitsLeft.get(line.id) ?? 0))
+    if (take <= 1e-9) continue
+    unitsLeft.set(line.id, (unitsLeft.get(line.id) ?? 0) - take)
+    remaining -= take
+    taken.push({ line, take })
+  }
+  return taken
+}
+
 function consumeRefundLineQuantity(
   lineStates: Array<{
     id: string
@@ -1010,34 +1267,10 @@ function consumeRefundLineQuantity(
   let unshippedRevenue = 0
   let assignedRevenue = 0
   const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
-  const refundUnitPrice = refundLine.unitPriceBase != null
-    ? refundBoundaryNumber(refundLine.unitPriceBase)
-    : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
-
-  const priceMatches = (unitRevenue: number, candidateUnitPrice: number | null): boolean => {
-    if (candidateUnitPrice == null) return false
-    return Math.abs(unitRevenue - candidateUnitPrice) < 0.0001
-  }
-
-  const matchingLines = lineStates
-    .filter((line) => line.productId === refundLine.productId)
-    .sort((a, b) => {
-      const aLineMatch = refundLine.lineId != null && a.id === refundLine.lineId
-      const bLineMatch = refundLine.lineId != null && b.id === refundLine.lineId
-      if (aLineMatch !== bLineMatch) return aLineMatch ? -1 : 1
-
-      const aUnitRevenue = a.qty > 0 ? a.totalBase / a.qty : 0
-      const bUnitRevenue = b.qty > 0 ? b.totalBase / b.qty : 0
-      const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
-      const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
-      if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
-
-      const aDescMatch = a.description === refundLine.description
-      const bDescMatch = b.description === refundLine.description
-      if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
-
-      return 0
-    })
+  const matchingLines = sortLinesForRefundLine(
+    lineStates.filter((line) => line.productId === refundLine.productId),
+    refundLine,
+  )
 
   for (const line of matchingLines) {
     if (remainingQty <= 0 || line.qty <= 0) break
@@ -3203,6 +3436,12 @@ export async function createSalesOrderRefund(
   // fallback return-row build, the snapshot return rows AND the inbound movement, so
   // a chargeback can't fail on a restock path even if a warehouse was supplied (Codex).
   const effectiveReturnWarehouseId = input.chargeback ? undefined : input.returnWarehouseId
+  // o3d-zvec.21: a STOREFRONT refund (a WooCommerce refund, or one hand-recorded from its park — both carry
+  // the external refund id and are persisted with source WOO_SYNC) states a refunded QUANTITY but cannot
+  // say whether those units ever left the warehouse. Units that did not ship are released (demand and
+  // reservation, post-refund-release.ts) and never restocked; only shipped units are restocked. An
+  // operator-entered refund keeps its explicit "return this stock" contract and its refusals.
+  const storefrontRefund = input.externalRefundId != null && !input.chargeback
 
   const totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
   const txResult = await runInTransaction(client, async (tx) => {
@@ -3591,10 +3830,23 @@ export async function createSalesOrderRefund(
 
     if (
       effectiveReturnWarehouseId &&
+      !storefrontRefund &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
       so.shipments.length === 0
     ) {
       return { error: 'Cannot return refunded stock before the order has shipped' } as const
+    }
+
+    // o3d-zvec.21: the restock decision for a storefront refund is taken HERE, under the order lock taken
+    // above and from shipment rows read in this same transaction — a shipment of the last unit racing this
+    // refund is serialised by that lock (the shipment commits first and is seen as shipped, or this refund
+    // commits first and the unit is released), and shipped quantity is never read before the lock. If no
+    // shipped quantity is left to restock, no return warehouse is recorded at all, so nothing downstream
+    // (staging, inbound stock, the accounting retry) can restock what never shipped.
+    let restockWarehouseId = effectiveReturnWarehouseId
+    if (storefrontRefund && effectiveReturnWarehouseId) {
+      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true })
+      if (restockable.length === 0) restockWarehouseId = undefined
     }
 
     // o3d-w00 #2/#5 + o3d-iup: fail closed on a monetary-only (unlinked) SALE line the order can't tax
@@ -4061,7 +4313,7 @@ export async function createSalesOrderRefund(
         totalBase,
         totalsBasis: 'NET',
         source: refundSource,
-        returnWarehouseId: effectiveReturnWarehouseId || null,
+        returnWarehouseId: restockWarehouseId || null,
         // scjz.70: persist so a later accounting retry that RE-STAGES (vs replays
         // the stored syncs) reproduces the revenue-only treatment.
         chargeback: input.chargeback ?? false,
@@ -4206,8 +4458,8 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
-    const fallbackReturnRows = effectiveReturnWarehouseId
-      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
+    const fallbackReturnRows = restockWarehouseId
+      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
       : []
 
     // o3d-67y: eligibility is derived from RESIDUAL reserved quantity under this order lock, not lifecycle
@@ -4263,6 +4515,7 @@ export async function createSalesOrderRefund(
       releaseEligible,
       releaseUnmatchedAnomaly,
       fallbackReturnRows,
+      restockWarehouseId,
     }
   }).catch((error) => {
     if (isRefundReturnSourceError(error)) {
@@ -4347,7 +4600,7 @@ export async function createSalesOrderRefund(
           orderRef: refundOrderRef,
           refundId: txResult.createdRefund.id,
           refundLines: txResult.createdRefundLines,
-          returnWarehouseId: effectiveReturnWarehouseId,
+          returnWarehouseId: txResult.restockWarehouseId,
           accountingSettings: input.accountingSettings!,
           so: txResult.so,
           newStatus: txResult.newStatus,
@@ -4460,7 +4713,7 @@ export async function createSalesOrderRefund(
   let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
   // scjz.70: effectiveReturnWarehouseId is undefined for a chargeback, so the
   // inbound return movement is skipped (the customer keeps the goods).
-  if (effectiveReturnWarehouseId && !accountingWarning) {
+  if (txResult.restockWarehouseId && !accountingWarning) {
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
@@ -4470,7 +4723,7 @@ export async function createSalesOrderRefund(
       applyReturnInboundStockTx(tx, {
         referenceType: 'SalesOrderRefund',
         referenceId: txResult.createdRefund.id,
-        warehouseId: effectiveReturnWarehouseId!,
+        warehouseId: txResult.restockWarehouseId!,
         rows: returnRows,
         note: 'Refund return',
       })
@@ -4765,6 +5018,7 @@ export async function retrySalesOrderRefundAccounting(
           id: true,
           orderId: true,
           returnWarehouseId: true,
+          externalRefundId: true,
           chargeback: true,
           accountingRetryRequired: true,
           accountingRetrySyncs: true,
@@ -4988,7 +5242,11 @@ export async function retrySalesOrderRefundAccounting(
         const snapshotRows = staged.snapshotReturnRows ?? []
         const returnRows = snapshotRows.length > 0
           ? snapshotRows
-          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id)
+          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id, {
+            // o3d-zvec.21: the same rule the creation applied — a storefront refund never restocks (or
+            // throws on) a line that did not ship. Its persisted external id is how creation chose it.
+            skipUnshipped: refund.externalRefundId != null,
+          })
         returnedRows = await applyReturnInboundStockTx(tx, {
           referenceType: 'SalesOrderRefund',
           referenceId: refund.id,

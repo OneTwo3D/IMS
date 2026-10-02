@@ -564,6 +564,9 @@ function createClient(state: State): RefundServiceClient {
               })
               .map((refund) => ({
                 id: refund.id,
+                // The production select carries it (the return builder reads it); a double that drops it
+                // makes every prior refund look like one that restocked nothing.
+                returnWarehouseId: refund.returnWarehouseId,
                 allocatedReliefAmount: refund.allocatedReliefAmount ?? null,
                 lines: state.refundLines.filter((line) => line.refundId === refund.id),
             })),
@@ -8530,4 +8533,570 @@ test('[o3d-j625 r6 H4] Retry refund accounting raises the SAME refund postings t
       `${type}: the retry raises the posting the refused attempt asked for`,
     )
   }
+})
+
+// ---------------------------------------------------------------------------------------------------
+// o3d-zvec.21 — a WooCommerce refund of UNSHIPPED quantity releases demand and reservation, and does NOT
+// restock; only quantity that actually shipped is ever restocked.
+//
+// Trunk passed the default returns warehouse for ANY quantity refund, so (a) an entirely unshipped order
+// was refused with "Cannot return refunded stock before the order has shipped" and (b) an unshipped line
+// on a partly shipped order THREW "no shipment line exists" out of the fallback return-row builder — in
+// both cases the whole refund (credit note included) failed for want of a restock nobody asked for.
+// ---------------------------------------------------------------------------------------------------
+
+const UNSHIPPED_LINE_QTY = 5
+const UNSHIPPED_UNIT_PRICE = 20
+
+/** One 5-unit line (20 each), all 5 allocated, `shippedQty` of them already in a SHIPPED shipment. */
+function unshippedRefundState(shippedQty: number, overrides: Partial<State> = {}): State {
+  return baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: 'WC-9001',
+      orderNumber: 'SO-1',
+      status: shippedQty > 0 ? 'PARTIALLY_SHIPPED' : 'ALLOCATED',
+      fxRateToBase: 1,
+      totalBase: UNSHIPPED_LINE_QTY * UNSHIPPED_UNIT_PRICE,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: UNSHIPPED_LINE_QTY,
+      totalBase: UNSHIPPED_LINE_QTY * UNSHIPPED_UNIT_PRICE,
+    }],
+    allocations: [{
+      id: 'alloc-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-main',
+      qty: UNSHIPPED_LINE_QTY,
+      costLayerSnapshot: [],
+    }],
+    shipments: shippedQty > 0
+      ? [{
+          id: 'shipment-1',
+          orderId: 'order-1',
+          status: 'SHIPPED',
+          shipmentJournalDate: null,
+          revenueRecognizedAmount: null,
+          cogsBatchAmount: null,
+          lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: shippedQty, costLayerSnapshot: [] }],
+        }]
+      : [],
+    ...overrides,
+  })
+}
+
+/** The refund-service client with the release-backstop outbox made OBSERVABLE (the default double is a sink). */
+function outboxObservingClient(state: State) {
+  const client = createClient(state) as unknown as {
+    integrationOutbox: { create: (args: { data: Record<string, unknown> }) => Promise<unknown> }
+  }
+  const outbox: Array<Record<string, unknown>> = []
+  client.integrationOutbox.create = async ({ data }) => {
+    outbox.push(data)
+    return data
+  }
+  return { client: client as unknown as RefundServiceClient, outbox }
+}
+
+function wooRefundInput(qty: number, externalRefundId: number, extra: Record<string, unknown> = {}) {
+  return {
+    orderId: 'order-1',
+    lines: [{
+      lineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty,
+      totalBase: qty * UNSHIPPED_UNIT_PRICE,
+    }],
+    reason: 'WooCommerce refund',
+    returnWarehouseId: 'warehouse-returns',
+    externalRefundId,
+    creditNotePrefix: 'CN-',
+    ...extra,
+  }
+}
+
+const shippedUnits = (state: State) => state.shipments
+  .filter((shipment) => shipment.status === 'SHIPPED')
+  .reduce((sum, shipment) => sum + shipment.lines.reduce((lineSum, line) => lineSum + line.qty, 0), 0)
+const stockOnHand = (state: State) => state.stockLevels.reduce((sum, level) => sum + level.quantity, 0)
+
+test('[o3d-zvec.21 a] a Woo refund of an entirely UNSHIPPED line commits, releases demand, and restocks nothing', async () => {
+  const state = unshippedRefundState(0)
+  assert.equal(shippedUnits(state), 0, 'PRECONDITION: nothing has shipped')
+  assert.equal(state.allocations[0].qty, 5, 'PRECONDITION: the units are allocated (a live reservation exists)')
+  const { client, outbox } = outboxObservingClient(state)
+
+  const result = await createSalesOrderRefund(client, wooRefundInput(2, 9001))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  assert.equal(state.refunds.length, 1, 'the credit note was raised')
+  assert.equal(state.refunds[0].returnWarehouseId, null, 'no return warehouse is recorded: nothing came back')
+  assert.equal(state.movements.length, 0, 'NO stock movement')
+  assert.equal(stockOnHand(state), 0, 'NO restock')
+  assert.deepEqual(result.success && result.returnedRows, [])
+  assert.equal(result.success && result.releaseEligible, true, 'demand/reservation release is scheduled')
+  assert.equal(outbox.filter((row) => row.operation === 'refund.reservation-release').length, 1, 'exactly one release backstop row')
+  assert.equal(state.orders[0].refundStatus, 'PARTIAL')
+  assert.equal(state.orders[0].status, 'ALLOCATED', 'the lifecycle status is untouched')
+})
+
+test('[o3d-zvec.21 a2] the same unshipped refund WITH accounting staging also commits and restocks nothing', async () => {
+  const state = unshippedRefundState(0)
+  state.orders[0].revenueDeferredDate = new Date('2026-01-01T00:00:00.000Z')
+  state.orders[0].unearnedRevenueAmount = 100
+  assert.equal(shippedUnits(state), 0, 'PRECONDITION: nothing has shipped')
+  assert.ok(state.orders[0].revenueDeferredDate, 'PRECONDITION: the accounting staging path runs')
+
+  const result = await createSalesOrderRefund(createClient(state), wooRefundInput(2, 9002, { accountingSettings }))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  assert.equal(state.refunds[0].returnWarehouseId, null)
+  assert.equal(state.movements.length, 0)
+  assert.equal(stockOnHand(state), 0)
+})
+
+test('[o3d-zvec.21 b] ship 3 of 5 then a Woo refund of ALL 5: only the 3 shipped units are restocked, the 2 unshipped are released', async () => {
+  const state = unshippedRefundState(3)
+  assert.equal(shippedUnits(state), 3, 'PRECONDITION: exactly 3 of 5 shipped')
+  const { client, outbox } = outboxObservingClient(state)
+
+  const result = await createSalesOrderRefund(client, wooRefundInput(5, 9003))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  const restocked = state.movements.filter((movement) => movement.referenceType === 'SalesOrderRefund')
+  assert.equal(restocked.reduce((sum, movement) => sum + movement.qty, 0), 3, 'restock is capped at what shipped — never the 2 unshipped')
+  assert.equal(stockOnHand(state), 3)
+  assert.equal(result.success && result.releaseEligible, true, 'the unshipped remainder releases demand/reservation')
+  assert.equal(outbox.filter((row) => row.operation === 'refund.reservation-release').length, 1)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+})
+
+test('[o3d-zvec.21 b2] ship a DIFFERENT line, refund the wholly unshipped one: no throw, no restock, release scheduled', async () => {
+  const state = unshippedRefundState(0)
+  state.lines.push({
+    id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 10,
+  })
+  state.allocations.push({
+    id: 'alloc-2', orderId: 'order-1', lineId: 'line-2', productId: 'product-2', warehouseId: 'warehouse-main', qty: 1, costLayerSnapshot: [],
+  })
+  state.orders[0].totalBase = 110
+  state.orders[0].status = 'PARTIALLY_SHIPPED'
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [{ id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [] }],
+  })
+  assert.equal(
+    state.shipments[0].lines.some((line) => line.lineId === 'line-1'),
+    false,
+    'PRECONDITION: the REFUNDED line (line-1) has no shipment line, though the order HAS a shipment — the exact "no shipment line exists" shape',
+  )
+  const { client, outbox } = outboxObservingClient(state)
+
+  const result = await createSalesOrderRefund(client, wooRefundInput(5, 9004))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  assert.equal(state.movements.length, 0, 'the shipped unit of the OTHER line is not touched either')
+  assert.equal(state.refunds[0].returnWarehouseId, null)
+  assert.equal(outbox.filter((row) => row.operation === 'refund.reservation-release').length, 1)
+})
+
+test('[o3d-zvec.21 c] a FULL Woo refund of an entirely unshipped order is refundStatus=FULL, lifecycle untouched, nothing restocked', async () => {
+  const state = unshippedRefundState(0)
+  assert.equal(shippedUnits(state), 0, 'PRECONDITION: nothing has shipped')
+  const { client, outbox } = outboxObservingClient(state)
+
+  const result = await createSalesOrderRefund(client, wooRefundInput(5, 9005))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  assert.equal(state.orders[0].status, 'ALLOCATED', 'the lifecycle status is NOT moved by a full refund')
+  assert.equal(state.movements.length, 0)
+  assert.equal(result.success && result.newStatus, 'REFUNDED')
+  assert.equal(outbox.filter((row) => row.operation === 'refund.reservation-release').length, 1, 'a full refund still releases the reservation')
+})
+
+test('[o3d-zvec.21 d] replaying the same Woo refund id releases once, restocks once, raises one credit note', async () => {
+  const state = unshippedRefundState(3)
+  assert.equal(shippedUnits(state), 3, 'PRECONDITION: partly shipped, so there IS something to restock and something to release')
+  const { client, outbox } = outboxObservingClient(state)
+  const input = wooRefundInput(5, 9006)
+
+  const first = await createSalesOrderRefund(client, input)
+  assert.equal(first.success, true)
+  const afterFirst = {
+    refunds: state.refunds.length,
+    refundLines: state.refundLines.length,
+    movements: state.movements.length,
+    stock: stockOnHand(state),
+    outbox: outbox.length,
+  }
+  assert.equal(afterFirst.outbox, 1, 'PRECONDITION: the first delivery did schedule a release')
+  assert.equal(afterFirst.stock, 3, 'PRECONDITION: the first delivery did restock the shipped units')
+
+  const second = await createSalesOrderRefund(client, input)
+
+  assert.equal(second.success, true)
+  assert.equal(second.success && second.replayed, true, 'the second delivery was recognised as a replay')
+  assert.equal(state.refunds.length, afterFirst.refunds, 'no second credit note')
+  assert.equal(state.refundLines.length, afterFirst.refundLines)
+  assert.equal(state.movements.length, afterFirst.movements, 'no second restock')
+  assert.equal(stockOnHand(state), afterFirst.stock)
+  assert.equal(outbox.length, afterFirst.outbox, 'no second release')
+})
+
+test('[o3d-zvec.21 e] CONTROL: a Woo refund of a fully SHIPPED line restocks exactly as before', async () => {
+  const state = unshippedRefundState(5)
+  assert.equal(shippedUnits(state), 5, 'PRECONDITION: the whole line shipped')
+  const { client } = outboxObservingClient(state)
+
+  const result = await createSalesOrderRefund(client, wooRefundInput(2, 9007))
+
+  assert.equal(result.success, true, `refund must not throw / fail (${result.success ? '' : result.error})`)
+  assert.equal(state.refunds[0].returnWarehouseId, 'warehouse-returns', 'the return warehouse is still recorded for shipped stock')
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.movements[0].qty, 2)
+  assert.equal(state.movements[0].toWarehouseId, 'warehouse-returns')
+  assert.equal(stockOnHand(state), 2)
+})
+
+test('[o3d-zvec.21 e2] CONTROL: an OPERATOR-recorded return of unshipped stock is still refused (explicit request, not a storefront refund)', async () => {
+  const state = unshippedRefundState(0)
+  assert.equal(shippedUnits(state), 0, 'PRECONDITION: nothing has shipped')
+  const input = wooRefundInput(2, 9008)
+  delete (input as { externalRefundId?: number }).externalRefundId
+
+  const result = await createSalesOrderRefund(createClient(state), input)
+
+  assert.deepEqual(result, { success: false, error: 'Cannot return refunded stock before the order has shipped' })
+  assert.equal(state.refunds.length, 0)
+})
+
+test('[o3d-zvec.21 f] a refund over-stating shipped units (ship 3, refund 5) never restocks more than shipped, however often it is retried', async () => {
+  const state = unshippedRefundState(3)
+  assert.equal(shippedUnits(state), 3, 'PRECONDITION: 3 shipped')
+  const first = await createSalesOrderRefund(createClient(state), wooRefundInput(3, 9009))
+  assert.equal(first.success, true)
+  assert.equal(stockOnHand(state), 3, 'PRECONDITION: the first refund restocked all 3 shipped units')
+
+  // A second, distinct refund of the remaining 2 (unshipped) units: nothing shipped remains to restock.
+  const second = await createSalesOrderRefund(createClient(state), wooRefundInput(2, 9010))
+
+  assert.equal(second.success, true, `refund must not throw / fail (${second.success ? '' : second.error})`)
+  assert.equal(stockOnHand(state), 3, 'the already-restocked shipped units are not restocked again')
+  assert.equal(state.refunds[1].returnWarehouseId, null, 'the second refund carries no return warehouse: no shipped quantity left')
+})
+
+test('[o3d-zvec.21 g] the accounting RETRY of a Woo refund covering a shipped AND a wholly-unshipped line does not throw and does not restock twice', async () => {
+  const state = unshippedRefundState(3)
+  state.lines.push({ id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 10 })
+  state.allocations.push({
+    id: 'alloc-2', orderId: 'order-1', lineId: 'line-2', productId: 'product-2', warehouseId: 'warehouse-main', qty: 1,
+    costLayerSnapshot: [{ costLayerId: 'layer-2', qty: 1, unitCostBase: 4, orderAllocationId: 'alloc-2', source: 'allocation' }],
+  })
+  state.orders[0].totalBase = 110
+  const created = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(3, 9011),
+    lines: [
+      { lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 3, totalBase: 60 },
+      { lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 10 },
+    ],
+  })
+  assert.equal(created.success, true, `PRECONDITION: creation succeeded (${created.success ? '' : created.error})`)
+  assert.equal(shippedUnits(state), 3, 'PRECONDITION: line-2 never shipped')
+  assert.equal(state.shipments[0].lines.some((line) => line.lineId === 'line-2'), false, 'PRECONDITION: line-2 has NO shipment line')
+  assert.equal(stockOnHand(state), 3, 'PRECONDITION: only the shipped line-1 units were restocked at creation')
+  assert.equal(state.refunds[0].returnWarehouseId, 'warehouse-returns', 'PRECONDITION: the persisted refund carries a return warehouse, so the retry reaches the return-row builder')
+  assert.equal(state.refunds[0].externalRefundId, 9011, 'PRECONDITION: it is a storefront refund')
+  // Give the staging the cost basis a really-journaled order has, so the retry gets as far as the return
+  // rows (the thing under test) instead of stopping on an unrelated "cannot reverse COGS" refusal.
+  state.costLayers.push(
+    { id: 'layer-1', productId: 'product-1', poLineId: null, receivedQty: 5, unitCostBase: 4 },
+    { id: 'layer-2', productId: 'product-2', poLineId: null, receivedQty: 1, unitCostBase: 4 },
+  )
+  // The shipment is SHIPPED but not yet journaled (the normal state until the daily batch runs), so the
+  // staging prices the refund from the ALLOCATIONS and yields no shipment-source rows: the retry must
+  // therefore build its return rows from the physical shipment — the fallback builder under test.
+  assert.equal(state.shipments[0].shipmentJournalDate, null, 'PRECONDITION: the shipment is not journaled')
+  state.allocations[0].costLayerSnapshot = [{ costLayerId: 'layer-1', qty: 5, unitCostBase: 4, orderAllocationId: 'alloc-1', source: 'allocation' }]
+  state.refunds[0].accountingRetryRequired = true
+  state.orders[0].revenueDeferredDate = new Date('2026-01-01T00:00:00.000Z')
+  state.orders[0].unearnedRevenueAmount = 110
+
+  const retried = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: state.refunds[0].id,
+    accountingSettings,
+    creditNotePostingEnabled: false,
+  })
+
+  assert.equal(retried.success, true, `retry must not throw on the unshipped line (${retried.success ? '' : retried.error})`)
+  assert.equal(stockOnHand(state), 3, 'the retry did not restock a second time (idempotent) and never restocked line-2')
+})
+
+test('[o3d-zvec.21 h] two lines of the SAME product: successive refunds of line A never restock line B\'s shipped unit', async () => {
+  // Line A orders 2 and ships 1; line B (same product) orders 1 and ships 1. The product shipped 2 in
+  // total, but only ONE of those units belongs to A.
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 2
+  state.lines[0].totalBase = 40
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1 (B)', qty: 1, totalBase: 20 })
+  state.orders[0].totalBase = 60
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+    ],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: the product shipped 2 units in total')
+  assert.equal(state.shipments[0].lines.find((line) => line.lineId === 'line-1')?.qty, 1, 'PRECONDITION: only ONE of them belongs to line A')
+  const refundA = (externalRefundId: number) => createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, externalRefundId),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+  })
+
+  const first = await refundA(9021)
+  assert.equal(first.success, true)
+  assert.equal(stockOnHand(state), 1, 'PRECONDITION: the first refund restocked A\'s one shipped unit')
+
+  const second = await refundA(9022)
+
+  assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
+  assert.equal(stockOnHand(state), 1, 'A has no shipped unit left: the second refund must not consume B\'s')
+  assert.equal(state.refunds[1].returnWarehouseId, null, 'and records no return warehouse')
+})
+
+test('[o3d-zvec.21 i] an earlier UNLINKED return that took line B\'s unit does not exhaust line A\'s cap', async () => {
+  // A and B share a product and each shipped 1. The unlinked refund names B in its description, so the
+  // builder returns B's unit. A later LINKED refund of A must still get A's own unit back.
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 1
+  state.lines[0].totalBase = 20
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1 (B)', qty: 1, totalBase: 20 })
+  // One uniform tax identity, so the unlinked (itemised-by-description) refund is not quarantined as un-taxable.
+  for (const line of state.lines) line.taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+  state.orders[0].totalBase = 40
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+    ],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: A and B each shipped one unit')
+
+  const unlinked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9031),
+    lines: [{ productId: 'product-1', description: 'Product 1 (B)', qty: 1, totalBase: 20 }],
+  })
+  assert.equal(unlinked.success, true, `PRECONDITION: the unlinked refund recorded (${unlinked.success ? '' : unlinked.error})`)
+  assert.equal(state.refundLines[0].salesOrderLineId ?? null, null, 'PRECONDITION: that refund line carries no sales-order-line link')
+  assert.equal(stockOnHand(state), 1, 'PRECONDITION: it returned one unit (B\'s)')
+
+  const linked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9032),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+  })
+
+  assert.equal(linked.success, true, `refund must not fail (${linked.success ? '' : linked.error})`)
+  assert.equal(stockOnHand(state), 2, 'A\'s own shipped unit is still returnable')
+})
+
+test('[o3d-zvec.21 j] successive one-kit refunds of a part-shipped kit (accounting staged) restock only what shipped', async () => {
+  // Kit orders 2 (1 kit = 2 of comp-1), ONE kit shipped = 2 component units. The first one-kit refund
+  // returns both components through the accounting snapshot; the second refers to the UNSHIPPED kit and
+  // falls back to the builder, which must see that no shipped component is left.
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: 'WC-9001', orderNumber: 'SO-1', status: 'PARTIALLY_SHIPPED',
+      fxRateToBase: 1, totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'), allocationBatchAmount: 40,
+    }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', description: 'Kit', qty: 2, totalBase: 100 }],
+    productGraph: {
+      'kit-1': { type: 'KIT', productComponents: [{ componentId: 'comp-1', qty: 2, component: { sku: 'COMP-1', type: 'SIMPLE', oversellAllowed: false } }] },
+    },
+    allocations: [{
+      id: 'alloc-1', orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-main', qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10, orderAllocationId: 'alloc-1', source: 'allocation' }],
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 50, cogsBatchAmount: 20,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', productId: 'comp-1', qty: 2, costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }] }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', poLineId: 'po-line-1', receivedQty: 4, unitCostBase: 10 }],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: one kit shipped = 2 component units')
+  const refundOneKit = (externalRefundId: number) => createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, externalRefundId),
+    lines: [{ lineId: 'line-1', productId: 'kit-1', description: 'Kit', qty: 1, totalBase: 50 }],
+    accountingSettings,
+  })
+
+  const first = await refundOneKit(9041)
+  assert.equal(first.success, true, `PRECONDITION: first refund recorded (${first.success ? '' : first.error})`)
+  assert.equal(stockOnHand(state), 2, 'PRECONDITION: the first refund returned both shipped components')
+  // The queued accounting of the first refund completes before the second is raised (that gate is not under test).
+  for (const refund of state.refunds) refund.accountingRetryRequired = false
+
+  const second = await refundOneKit(9042)
+
+  assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
+  assert.equal(stockOnHand(state), 2, 'the second kit never shipped: no component may be restocked for it')
+})
+
+test('[o3d-zvec.21 k] same product AND description, different PRICES: an unlinked refund priced for B takes B\'s stock and B\'s COGS, and the cap debits B', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', externalOrderNumber: 'WC-9001', orderNumber: 'SO-1', status: 'SHIPPED',
+      fxRateToBase: 1, totalBase: 50,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: 50,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'), allocationBatchAmount: 10,
+    }],
+    lines: [
+      { id: 'line-a', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } },
+      { id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false } },
+    ],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 50, cogsBatchAmount: 10,
+      lines: [
+        { id: 'shipment-line-a', lineId: 'line-a', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-a', qty: 1, unitCostBase: 4 }] },
+        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [{ costLayerId: 'layer-b', qty: 1, unitCostBase: 6 }] },
+      ],
+    }],
+    costLayers: [
+      { id: 'layer-a', productId: 'product-1', poLineId: 'po-a', receivedQty: 1, unitCostBase: 4 },
+      { id: 'layer-b', productId: 'product-1', poLineId: 'po-b', receivedQty: 1, unitCostBase: 6 },
+    ],
+  })
+  assert.equal(state.lines[0].description, state.lines[1].description, 'PRECONDITION: identical descriptions')
+  assert.notEqual(state.lines[0].totalBase, state.lines[1].totalBase, 'PRECONDITION: different prices')
+  const snapshotLines = (refundIndex: number) => (state.refundLines[refundIndex].costLayerSnapshot as Array<{ shipmentLineId: string }>).map((entry) => entry.shipmentLineId)
+
+  const unlinked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9051),
+    lines: [{ productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 30 }],
+    accountingSettings,
+  })
+  assert.equal(unlinked.success, true, `PRECONDITION: unlinked refund recorded (${unlinked.success ? '' : unlinked.error})`)
+  assert.equal(state.refundLines[0].salesOrderLineId ?? null, null, 'PRECONDITION: the refund line has no link')
+  assert.deepEqual(snapshotLines(0), ['shipment-line-b'], 'COGS: the price-matched line B is reversed')
+  for (const refund of state.refunds) refund.accountingRetryRequired = false
+
+  const linked = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9052),
+    lines: [{ lineId: 'line-a', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+    accountingSettings,
+  })
+
+  assert.equal(linked.success, true, `refund must not fail (${linked.success ? '' : linked.error})`)
+  assert.deepEqual(snapshotLines(1), ['shipment-line-a'], 'COGS: the linked refund reverses A')
+  assert.equal(stockOnHand(state), 2, 'STOCK: both shipped units came back, B\'s then A\'s (the cap debited B, not A)')
+  assert.deepEqual(state.movements.map((movement) => movement.qty), [1, 1])
+})
+
+for (const variant of ['linked', 'unlinked'] as const) {
+  test(`[o3d-zvec.21 m-${variant}] a quantity-2 refund across two shipped quantity-1 lines of one product returns BOTH units`, async () => {
+    const state = unshippedRefundState(0)
+    state.lines[0].qty = 1
+    state.lines[0].totalBase = 20
+    state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 })
+    for (const line of state.lines) line.taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }
+    state.orders[0].totalBase = 40
+    state.shipments.push({
+      id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+      revenueRecognizedAmount: null, cogsBatchAmount: null,
+      lines: [
+        { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+        { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      ],
+    })
+    assert.equal(shippedUnits(state), 2, 'PRECONDITION: two units shipped, one per line')
+    assert.equal(state.lines.every((line) => line.qty === 1), true, 'PRECONDITION: each line ordered 1, so one line cannot absorb the refund alone')
+
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...wooRefundInput(2, 9061),
+      lines: [{
+        ...(variant === 'linked' ? { lineId: 'line-1' } : {}),
+        productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 40,
+      }],
+    })
+
+    assert.equal(result.success, true, `refund must not fail (${result.success ? '' : result.error})`)
+    assert.equal(stockOnHand(state), 2, 'both shipped units are returnable: the refund continues into the second line, as the COGS split does')
+  })
+}
+
+test('[o3d-zvec.21 n] a line\'s UNSHIPPED share is consumed before the refund moves on: ordered 2 / shipped 1, then another line shipped 1', async () => {
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 2
+  state.lines[0].totalBase = 40
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 })
+  state.orders[0].totalBase = 60
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [
+      { id: 'shipment-line-a', lineId: 'line-1', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+      { id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] },
+    ],
+  })
+  assert.equal(shippedUnits(state), 2, 'PRECONDITION: A shipped 1 of its 2, B shipped its 1')
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(2, 9062),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 40 }],
+  })
+
+  assert.equal(result.success, true, `refund must not fail (${result.success ? '' : result.error})`)
+  assert.equal(stockOnHand(state), 1, 'A\'s refund of 2 is its shipped 1 + its unshipped 1: B\'s shipped unit is not touched')
+})
+
+test('[o3d-zvec.21 o] an earlier refund that restocked NOTHING is still replayed: unshipped-then-combined refunds across two same-product lines', async () => {
+  // A orders 2, ships none; B (same product) orders 1, ships 1. Refund 1 of A first: nothing shipped on
+  // A, so it records NO return warehouse. A later 2-unit refund sorted to A takes A's remaining unit and
+  // then B's shipped unit, as the COGS split does.
+  const state = unshippedRefundState(0)
+  state.lines[0].qty = 2
+  state.lines[0].totalBase = 40
+  state.lines.push({ id: 'line-b', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 })
+  state.orders[0].totalBase = 60
+  state.shipments.push({
+    id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', shipmentJournalDate: null,
+    revenueRecognizedAmount: null, cogsBatchAmount: null,
+    lines: [{ id: 'shipment-line-b', lineId: 'line-b', productId: 'product-1', qty: 1, costLayerSnapshot: [] }],
+  })
+  assert.equal(shippedUnits(state), 1, 'PRECONDITION: only B\'s unit shipped; A shipped nothing')
+
+  const first = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(1, 9071),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 20 }],
+  })
+  assert.equal(first.success, true, `PRECONDITION: first refund recorded (${first.success ? '' : first.error})`)
+  assert.equal(state.refunds[0].returnWarehouseId, null, 'PRECONDITION: the first refund restocked nothing and recorded no return warehouse')
+  assert.equal(stockOnHand(state), 0)
+
+  const second = await createSalesOrderRefund(createClient(state), {
+    ...wooRefundInput(2, 9072),
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 40 }],
+  })
+
+  assert.equal(second.success, true, `refund must not fail (${second.success ? '' : second.error})`)
+  assert.equal(stockOnHand(state), 1, 'A has 1 unit left, then B\'s shipped unit: exactly one unit comes back')
 })

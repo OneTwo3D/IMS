@@ -79,6 +79,14 @@ run_step 'type-check'                     npm run type-check
 run_step 'decimal boundaries'             npm run check:decimal-boundaries
 run_step 'connector fetch boundaries'     npm run check:connector-fetch-boundaries
 run_step 'migration conventions'          npm run check:migration-conventions
+# o3d-ok6hk: these four were in check:all but in no workflow and not here, so they ran only when
+# someone typed check:all. They are ALSO run by .github/workflows/static-guards.yml, which is ungated
+# (this script's CI job is classifier-gated and skips a Markdown-only diff, and check:documented-env-vars
+# is about Markdown). tests/scripts/ci-guard-coverage.test.ts fails when a check:* script is in neither.
+run_step 'documented env vars'            npm run check:documented-env-vars
+run_step 'wc sync row predicates'         npm run check:wc-sync-row-predicates
+run_step 'fulfillment requirement seam'   npm run check:fulfillment-requirement-seam
+run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # o3d-hic9: the Server Action authorization guards were in check:all but in no CI workflow, so they
 # only ran when someone remembered to type check:all locally. validate-local.sh exists so local and
 # CI run the same policy, so they belong here too. They are ALSO run by
