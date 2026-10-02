@@ -22,8 +22,16 @@ import test, { mock } from 'node:test'
 const state = {
   // o3d-d0pd: the already-present check now reads every row for the key in ANY status and decides
   // from its evidence, so the fixture carries the columns that verdict is reached from.
-  existingRow: null as { id: string; status: string; externalTransactionId: string | null } | null,
+  existingRow: null as {
+    id: string
+    status: string
+    externalTransactionId: string | null
+    settlementBasis?: string | null
+    abandonedBeforeRemoteCall?: boolean | null
+  } | null,
   created: [] as unknown[],
+  /** Every `tx.activityLog.create` - the report/refusal rows written THROUGH the caller's transaction. */
+  activity: [] as Array<{ action: string; description: string }>,
 }
 
 mock.module('@/lib/integration-plugins', {
@@ -66,7 +74,11 @@ function tx() {
       // makes every claim about the query vacuous — and the query is half of o3d-d0pd: a classifier
       // that handles FAILED correctly is worth nothing behind a read that filters FAILED out.
       findMany: async ({ where }: { where?: { status?: { in?: string[] } } } = {}) => {
-        const rows = state.existingRow ? [state.existingRow] : []
+        // o3d-f709: an omitted ledger column reads as `undefined` (an unrecognised basis: UNKNOWN), so the
+        // fixture defaults them to what Prisma returns for an untouched row.
+        const rows = state.existingRow
+          ? [{ settlementBasis: null, abandonedBeforeRemoteCall: null, ...state.existingRow }]
+          : []
         const statuses = where?.status?.in
         return statuses ? rows.filter((row) => statuses.includes(row.status)) : rows
       },
@@ -75,7 +87,12 @@ function tx() {
         return { id: 'log-new', ...(data as Record<string, unknown>) }
       },
     },
-    activityLog: { create: async () => ({ id: 'act-1' }) },
+    activityLog: {
+      create: async ({ data }: { data: { action: string; description: string } }) => {
+        state.activity.push({ action: data.action, description: data.description })
+        return { id: 'act-1' }
+      },
+    },
     $executeRaw: async () => 1,
     // o3d-j625 r13: the selection FENCE now runs on every enqueue, so the double answers its locked read
     // (tests/helpers/plugin-selection-double.ts). Xero enabled, which is this fixture's premise — an empty
@@ -103,6 +120,7 @@ const params = {
 test.beforeEach(() => {
   state.existingRow = null
   state.created = []
+  state.activity = []
 })
 
 test('[o3d-ekn8 r4] a WRITE reports queued with no already-queued reason', async () => {
@@ -163,13 +181,90 @@ test('[o3d-d0pd] a FAILED row that NAMES a document reports the counterpart, and
   assert.equal(outcome.reason, 'already-queued', 'and this call wrote nothing, so a roll-back would undo nothing')
 })
 
-test('[o3d-d0pd] a CANCELLED row does NOT block: cancel-and-re-queue is a documented remedy', async () => {
-  state.existingRow = { id: 'log-cancelled', status: 'CANCELLED', externalTransactionId: null }
+test('[o3d-f709 / o3d-kj718] a CLAIMED attempt that was cancelled without proof REFUSES the same-key retry at the ENQUEUE DECISION', async () => {
+  // The sale-cancel sweep over a FAILED/PROCESSING row, the post-time retirement of a claimed row and
+  // a capacity refusal all leave CANCELLED + no id + NO pre-call stamp. The index does not cover it,
+  // so the enqueue is the only thing between this retry and a second posting.
+  state.existingRow = { id: 'log-claimed-cancelled', status: 'CANCELLED', externalTransactionId: null }
   const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
   const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
 
-  // MUTATION ROUTE: treat CANCELLED as unresolved and this writes nothing — deleting the only exit
-  // `describeCreateDispatchRemedy` offers for a row an operator has settled as NOT_POSTED.
+  console.log(`# precondition kj718 enqueue: created=${state.created.length} outcome=${JSON.stringify(outcome)} activity=${state.activity.map((a) => a.action)}`)
+  assert.equal(state.created.length, 0, 'no second posting beside a possibly-posted attempt')
+  assert.equal(outcome.queued, false)
+  assert.equal(outcome.reason, 'refused', 'still owed: the caller must not settle on it')
+  assert.deepEqual(state.activity.map((a) => a.action), ['accounting_enqueue_refused_unresolved_attempt'])
+  assert.match(state.activity[0].description, /cancelled without proof/)
+})
+
+test('[o3d-f709 / o3d-kj718] ISOLATING ARM: a NEVER-CLAIMED cancelled row (stamped pre-call) re-enqueues', async () => {
+  state.existingRow = { id: 'log-never-claimed', status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
+  assert.equal(state.created.length, 1, 'the sale-cancel / supersession / sweep cancellation of an unclaimed row stays re-enqueueable')
+  assert.equal(outcome.queued, true)
+  assert.deepEqual(state.activity, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-f709 / M11 - the two answers a row an OPERATOR settled gets, driven through the REAL enqueue.
+//
+// TWO-MECHANISM ISOLATION. These tests bypass the BILL_PAYMENT supersession planner entirely (they
+// call the enqueue directly), and the planner tests (bill-payment-supersession.test.ts) never reach an
+// enqueue, so a refusal here can only be the enqueue's own classification.
+// ---------------------------------------------------------------------------
+
+test('[o3d-f709 M11, D2] an operator-typed SYNCED id SUPPRESSES the enqueue AND a report row is written through tx', async () => {
+  state.existingRow = {
+    id: 'log-typed', status: 'SYNCED', externalTransactionId: 'TYPED-1', settlementBasis: 'OPERATOR_ASSERTION',
+  }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
+  console.log(`# precondition M11 asserted: created=${state.created.length} activity=${JSON.stringify(state.activity.map((a) => a.action))}`)
+  assert.equal(state.created.length, 0, 'suppressed: the document is claimed to exist')
+  assert.equal(outcome.queued, true)
+  assert.equal(outcome.reason, 'already-queued')
+  assert.deepEqual(state.activity.map((a) => a.action), ['accounting_enqueue_suppressed_by_operator_assertion'],
+    'and the suppression is REPORTED, never silent')
+  assert.match(state.activity[0].description, /OPERATOR'S WORD/)
+  assert.match(state.activity[0].description, /TYPED-1/)
+})
+
+test('[o3d-f709 M11, D2] ISOLATING ARM: the same SYNCED row confirmed by the connector suppresses WITHOUT a report', async () => {
+  // Mutating the suppression to "report always" or "never report" is told apart by this pair: with
+  // the assertion the report row exists, without it none does.
+  state.existingRow = { id: 'log-real', status: 'SYNCED', externalTransactionId: 'PAY-1', settlementBasis: null }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
+  assert.equal(state.created.length, 0)
+  assert.equal(outcome.reason, 'already-queued')
+  assert.deepEqual(state.activity, [], 'an ordinary suppression is not a warning')
+})
+
+test('[o3d-f709 M11, C1/D1] a CANCELLED row an operator settled NOT_POSTED REFUSES the enqueue - nothing written, refusal reported', async () => {
+  state.existingRow = {
+    id: 'log-settled', status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION',
+  }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
+  console.log(`# precondition M11 blocked: created=${state.created.length} outcome=${JSON.stringify(outcome)}`)
+  assert.equal(state.created.length, 0, 'a second row for this key is the duplicate posting')
+  assert.equal(outcome.queued, false)
+  assert.equal(outcome.reason, 'refused', 'the posting is STILL OWED, so a caller must not settle on it')
+  assert.deepEqual(state.activity.map((a) => a.action), ['accounting_enqueue_refused_asserted_not_posted'])
+  assert.match(state.activity[0].description, /settled by an operator as "not posted"/)
+  assert.match(state.activity[0].description, /mark this posting handled/)
+})
+
+test('[o3d-f709 M11] ISOLATING ARM: the identical CANCELLED row WITHOUT the assertion, but PROVEN pre-call, writes the replacement', async () => {
+  state.existingRow = { id: 'log-cancelled', status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
   assert.equal(state.created.length, 1)
   assert.equal(outcome.queued, true)
 })

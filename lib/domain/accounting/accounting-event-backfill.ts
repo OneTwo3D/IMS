@@ -17,6 +17,7 @@ import {
   type AccountingEventMirrorTransactionClient,
 } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
+import { SYNC_LOG_BACKFILL_POST_BASIS } from './accounting-event-post-basis'
 import { isExternalAccountingReferenceUniqueError, isIdempotencyKeyUniqueError } from './prisma-errors'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
 import {
@@ -182,6 +183,10 @@ function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: s
     currency: baseCurrency,
     status: log.status,
     externalId: log.externalTransactionId,
+    // o3d-f709 (D6): the repair mirrors a sync log the backfill already refused to read as an operator
+    // assertion (see the candidate select), so a POSTED repair is a connector fact the log carries,
+    // recorded as such rather than as an unwitnessed CONNECTOR write.
+    postBasis: SYNC_LOG_BACKFILL_POST_BASIS,
   })
 }
 

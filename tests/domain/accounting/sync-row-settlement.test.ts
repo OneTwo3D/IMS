@@ -382,6 +382,19 @@ test('the basis is read from the COLUMN, never from the settlement note', () => 
   assert.equal(isOperatorAssertedSettlement('Settled by operator: verified POSTED as INV-1.'), false)
 })
 
+test('o3d-f709 (D4): an UNRECOGNISED non-null basis reads UNKNOWN, never CONNECTOR_CONFIRMED (it used to fail open)', () => {
+  // Precondition printed: these are the four values the build writes or the connector leaves behind.
+  assert.deepEqual(
+    [null, undefined, 'OPERATOR_ASSERTION', 'OPERATOR_RELEASE', 'VERIFIED_REVERSAL'].map((b) => settlementBasisOf(b)),
+    ['CONNECTOR_CONFIRMED', 'CONNECTOR_CONFIRMED', 'OPERATOR_ASSERTION', 'OPERATOR_RELEASE', 'VERIFIED_REVERSAL'],
+  )
+  for (const unknown of ['CONNECTOR_CONFIRMED', 'verified_reversal', '', ' ', 'OPERATOR_ASSERTION ', 'SOMETHING_NEWER']) {
+    // 'CONNECTOR_CONFIRMED' is in the list on purpose: it is the TYPE's name for NULL, never a value
+    // anything writes, so a row carrying that literal is a hand edit and must not read as confirmed.
+    assert.equal(settlementBasisOf(unknown), 'UNKNOWN', `"${unknown}" must fail closed`)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // r3, Codex finding 2 — A CONTRADICTED ASSERTION IS REFUSED, NOT ANNOTATED.
 // ---------------------------------------------------------------------------

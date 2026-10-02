@@ -16,6 +16,12 @@ import {
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
+import {
+  LEDGER_STANDING_SELECT,
+  WORK_SLOT_OCCUPIED_WHERE,
+  isProvenLedgerFact,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
@@ -98,7 +104,6 @@ import {
   planFollowUpEnqueue,
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
-  type SettlementAssertionReliance,
 } from '@/lib/domain/accounting/followup-idempotency'
 import {
   isOperatorAssertedSettlement,
@@ -1103,7 +1108,8 @@ async function hasExistingSyncLog(
       type,
       referenceType,
       referenceId,
-      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      // o3d-f709 / M12: the work slot's own predicate (ledger-standing.ts), not a re-spelling of it.
+      ...WORK_SLOT_OCCUPIED_WHERE,
     },
     // o3d-anu8: settlementBasis, because the occupying row is what makes the enqueue a silent skip
     // and a SYNCED row is written by TWO things — the processor's writeback after Xero answered, and
@@ -1151,64 +1157,6 @@ type FollowUpOriginEvidence =
   | { from: 'postedRow'; record: AccountingOriginRecord }
   /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
   | { from: 'unobserved' }
-
-/**
- * o3d-anu8 — THIS MONEY POST IS CLEARED BY A HUMAN'S WORD, and the record says so.
- *
- * The plan carries `restsOnAssertion` only on a money-moving create/reuse whose scope holds a row an
- * operator settled as NOT_POSTED. That settlement is what dropped the distinct-token count and turned
- * a refusal into this enqueue — deliberately, it is the documented purpose of the action — but
- * without this line the resulting payment is indistinguishable from one the connector's own history
- * cleared, and if the assertion was wrong there is nothing to lead anybody back to it.
- *
- * WRITTEN INSIDE THE ENQUEUE'S OWN TRANSACTION, AFTER THE ROW EXISTS (Codex, this branch). The first
- * revision wrote it at PLAN time, with `logActivity(...).catch(() => {})`, and got both halves wrong:
- *
- *   • NOT TIED TO THE OUTCOME. The word in the record is "Enqueued", and at that point nothing had
- *     been. Three things could still stop the enqueue afterwards — the unfenced-reuse refusal, the
- *     ledger-clearance refusal, and the create/revive itself (a lost compare-and-swap, a unique-index
- *     collision, any database failure). Each leaves a WARNING on the log asserting a money post that
- *     never happened, which is worse than silence: the next person to reconcile a suspected duplicate
- *     is led to a payment that does not exist, and the operator assertion it names looks acted upon.
- *   • NOT DURABLE. `.catch(() => {})` is the correct default for the hundreds of informational writes
- *     in this codebase and the wrong one here. This record is the ONLY thing that will ever say a
- *     ledger-affecting post rested on a human's word rather than on evidence — o3d-nf9i's own rule,
- *     and `logActivityInTransaction` exists for exactly it. Best-effort would let the enqueue commit
- *     with the reliance silently unrecorded and nothing would ever surface the gap.
- *
- * One transaction, so the record and the row commit together or neither does: an unwritable record
- * aborts the enqueue rather than leaving a money post nobody can trace back to the assertion that
- * released it. Called on BOTH arms — a revived row is as much a post cleared by that assertion as a
- * created one — and on neither of the arms that did not enqueue.
- */
-async function recordEnqueueRestingOnAssertion(
-  tx: Pick<Prisma.TransactionClient, 'activityLog'>,
-  identity: { type: FollowUpSyncType; referenceType: string; referenceId: string },
-  plan: { action: 'create' | 'reuse'; restsOnAssertion?: SettlementAssertionReliance },
-): Promise<void> {
-  if (!plan.restsOnAssertion) return
-  await logActivityInTransaction(tx, {
-    // Explicit null: the session lookup logActivity falls back on is a React cache() read, which has
-    // no place inside a database transaction — and no operator is present here anyway. The people
-    // this names are on the settlement rows the metadata points at.
-    userId: null,
-    entityType: 'SYSTEM',
-    action: 'xero_followup_enqueue_rests_on_operator_assertion',
-    tag: 'sync',
-    level: 'WARNING',
-    description: `Enqueued Xero ${identity.type} for ${identity.referenceType} ${identity.referenceId} while `
-      + `${plan.restsOnAssertion.assertedNotPostedRowIds.length} earlier row(s) for it are CANCELLED because an `
-      + 'OPERATOR asserted they never posted. IMS verified nothing about that: if any of them did reach the ledger, '
-      + 'this post duplicates it. Reconcile in the accounting system if this money appears twice.',
-    metadata: {
-      type: identity.type,
-      referenceType: identity.referenceType,
-      referenceId: identity.referenceId,
-      assertedNotPostedRowIds: plan.restsOnAssertion.assertedNotPostedRowIds,
-      planAction: plan.action,
-    },
-  })
-}
 
 /**
  * Exported for unit tests (o3d-e2mz r3): the revival compare-and-swap in here is the one write on a
@@ -1277,10 +1225,9 @@ export async function enqueueFollowUpSyncLog(
     where: {
       connector: XERO_CONNECTOR, type, referenceType, referenceId,
       // o3d-anu8: the SAME query widened rather than a second one, because the two row sets answer
-      // one question between them. FAILED rows are the ambiguity set. A CANCELLED row carrying
-      // OPERATOR_ASSERTION is a row that LEFT that set on a human's word — `buildSettlementData`
-      // documents that as the intended unblock — and the planner is told about it so a money post
-      // cleared that way can be recorded as such instead of looking connector-cleared.
+      // one question between them. FAILED rows are the ambiguity set. o3d-f709 (M12, C1): a CANCELLED
+      // row carrying OPERATOR_ASSERTION is NOT a row that left that set on evidence - it is a person's
+      // word about a ledger IMS never read - so it is read here only so the planner can REFUSE on it.
       OR: [
         { status: 'FAILED' },
         { status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS },
@@ -1304,7 +1251,7 @@ export async function enqueueFollowUpSyncLog(
     },
   })
   // Split back out. Only FAILED rows are the ambiguity set the planner counts tokens over; the
-  // asserted-cancelled ones are carried purely so a plan can say what cleared it (o3d-anu8).
+  // asserted-cancelled ones are handed over so the planner can refuse on them (o3d-f709, M12).
   // The PAYLOAD travels with the id (Codex round 2, MEDIUM). These rows are scoped to the ORDER, not
   // to the document this follow-up targets, so the planner filters them by anchor before it records
   // a reliance on them — and it can only do that from the payload. Handing over ids alone is what
@@ -1343,16 +1290,21 @@ export async function enqueueFollowUpSyncLog(
     const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: ${plan.reason} `
       + 'Nothing was queued and the FAILED rows are unchanged. '
       + 'A RETRY CANNOT CLEAR THIS: the manual retry applies the same rule and refuses for the same reason. Open the '
-      + 'document in Xero, establish which attempt actually landed, and record that on each row with Settle on the '
-      + 'accounting sync log (\'it posted, here is the id\' / \'it did not post\'). The follow-up is enqueued by the '
-      + 'next sweep once the scope is no longer ambiguous.'
+      + 'document in Xero and establish which attempt actually landed. If one did, record it with Settle on the '
+      + 'accounting sync log (\'it posted, here is the id\'). If none did, record the payment in Xero by hand: '
+      + 'settling a row as \'it did not post\' does NOT clear this any more, because that is an operator\'s word '
+      + 'about a ledger IMS never read and IMS will not send money again on the strength of it.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_followup_enqueue_refused',
       tag: 'sync',
       level: 'WARNING',
       description: message,
-      metadata: { type, referenceType, referenceId, reason: 'plan_refused', failedRowIds: failedRows.map((row) => row.id) },
+      metadata: {
+        type, referenceType, referenceId, reason: 'plan_refused',
+        failedRowIds: failedRows.map((row) => row.id),
+        ...(plan.assertedNotPostedRowIds ? { assertedNotPostedRowIds: plan.assertedNotPostedRowIds } : {}),
+      },
     })
     return refusedFollowUpEnqueue({ type, referenceType, referenceId, reason: 'plan_refused', message })
   }
@@ -1527,8 +1479,6 @@ export async function enqueueFollowUpSyncLog(
           },
         })
         if (revived.count === 0) return 'cas-lost' as const
-        // The reliance record commits with the revival, or the revival does not commit.
-        await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
         await scheduleXeroAccountingOutbox(tx, {
           accountingSyncLogId: plan.syncLogId,
           // Explicit 0 rather than resetAttempts: a PROCESSING outbox row honours only an
@@ -1572,9 +1522,6 @@ export async function enqueueFollowUpSyncLog(
         return 'hand-post-claim-held' as const
       }
       const log = created.row
-      // Same rule on the create arm: one transaction, so a money post cleared by an assertion cannot
-      // exist without the line that says so.
-      await recordEnqueueRestingOnAssertion(tx, { type, referenceType, referenceId }, plan)
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
@@ -6823,13 +6770,15 @@ export function selectCreditNotesNeedingAllocation(
   return out
 }
 
-/** A `PURCHASE_CREDIT_NOTE` sync row, narrowed to the two columns provenance is resolved from. */
-export type CreditNotePostRow = {
-  /**
-   * The document this row's post RETURNED. This — not the row's status, and not its recency — is what
-   * makes a row the issuing post of a particular credit note.
-   */
-  externalTransactionId: string | null
+/**
+ * A `PURCHASE_CREDIT_NOTE` sync row, narrowed to what provenance is resolved from.
+ *
+ * o3d-f709 / M18: the WHOLE {@link LedgerStandingRow}, REQUIRED. The document id still makes a row the
+ * candidate issuing post - not its status, not its recency - but only a row whose id the CONNECTOR
+ * returned may be the issuing post: an id an operator TYPED in names a document IMS never saw, so the
+ * organisation recorded on that row's payload is the enqueue-time stamp of a post nobody observed.
+ */
+export type CreditNotePostRow = LedgerStandingRow & {
   /** The stored payload, verbatim. What gets inherited, stamp or no stamp. */
   payload: unknown
 }
@@ -6878,7 +6827,16 @@ export type IssuingPostOrigin =
 export function selectIssuingPostOriginRecord(rows: CreditNotePostRow[], creditNoteId: string): IssuingPostOrigin {
   const wanted = creditNoteId.trim()
   if (wanted === '') return { outcome: 'no-issuing-row' }
-  const issuing = rows.filter((row) => (row.externalTransactionId ?? '').trim() === wanted)
+  // o3d-f709 / M18: THE ID MATCHES AND THE ID WAS THE CONNECTOR'S. `isProvenLedgerFact` is the module's
+  // CONFIRMED_POSTED: a document id on a row whose basis is the connector's own writeback (or an
+  // operator release of a connector id). An operator-asserted id - SYNCED by settlement, or the
+  // cancelled-sale variant - is excluded, so a typed string can no longer make its row "the issuing
+  // post" and lend the allocation an organisation nobody observed. A VERIFIED_REVERSAL row is excluded
+  // too: the payment/credit it names was reversed, and a reversed document's row is not the post that
+  // issued the credit the allocation is carrying.
+  const issuing = rows.filter(
+    (row) => (row.externalTransactionId ?? '').trim() === wanted && isProvenLedgerFact(row),
+  )
   if (issuing.length === 0) return { outcome: 'no-issuing-row' }
 
   // Distinct organisations actually NAMED by rows that issued this document. More than one is a
@@ -7063,7 +7021,9 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
     },
     // Only for a stable read; the choice among several issuing rows is made by rank, not by order.
     orderBy: [{ syncedAt: 'desc' }, { createdAt: 'desc' }],
-    select: { referenceId: true, externalTransactionId: true, payload: true },
+    // o3d-f709 / M18: LEDGER_STANDING_SELECT, so the issuing-post test can tell a connector's id from
+    // an operator's.
+    select: { referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
   })
   const postsByCreditNote = new Map<string, CreditNotePostRow[]>()
   for (const row of creditNotePosts) {

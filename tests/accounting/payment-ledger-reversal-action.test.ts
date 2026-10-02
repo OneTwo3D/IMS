@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
 
 // o3d-1vuv — deletePayment's fail-closed ledger check, and reverseLedgerPayment, the remedy that
 // makes the refusal reachable.
@@ -26,6 +27,9 @@ type SyncRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   payload: unknown
+  /** o3d-f709: the ledger-standing columns; absent in the double reads as null, as an untouched row does. */
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 /**
@@ -98,29 +102,14 @@ const state = {
   mutateAfterRegistrationRead: null as (() => void) | null,
 }
 
+/**
+ * o3d-f709 / M15: the shared evaluator. The registration read now carries `UNPROVEN_CANCELLED_WHERE`
+ * (nested AND / OR / `not`), which this file's own three-operator evaluator could not read; the shared
+ * one handles AND / OR / NOT and THROWS on an operator it does not implement, which is the property
+ * the local copy was written to have.
+ */
 function matches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
-  for (const [key, condition] of Object.entries(where)) {
-    if (key === 'OR') {
-      if (!(condition as Array<Record<string, unknown>>).some((b) => matches(row, b))) return false
-      continue
-    }
-    const value = row[key]
-    if (condition !== null && typeof condition === 'object') {
-      const test = condition as Record<string, unknown>
-      for (const op of Object.keys(test)) {
-        if (op === 'in') {
-          if (!(test.in as unknown[]).includes(value)) return false
-        } else if (op === 'not') {
-          if (test.not === null ? value === null : value === test.not) return false
-        } else {
-          throw new Error(`test double does not implement where operator ${op}`)
-        }
-      }
-      continue
-    }
-    if (value !== condition) return false
-  }
-  return true
+  return matchesWhere(row, where)
 }
 
 function project<T extends Record<string, unknown>>(row: T, select?: Record<string, boolean>) {
@@ -430,15 +419,30 @@ test('a FAILED registration is READ at all — the query, not just the classific
   assert.ok(readWithStatus, 'the registration query must ask for FAILED rows, not only rows with a document id')
 })
 
-test('a CANCELLED registration with no document id still lets the receipt go', async () => {
-  // The boundary of the change. CANCELLED is the one status IMS only writes where "nothing was
-  // sent" has already been established, so widening FAILED must not sweep it up and make an
-  // ordinary correction impossible.
+test('a CANCELLED registration with no document id and no operator assertion still lets the receipt go', async () => {
+  // The boundary of the change. widening FAILED must not sweep up the rows IMS itself retired and make
+  // an ordinary correction impossible (the documented divergence from mayHaveReachedLedger, o3d-7sn5).
   const { deletePayment } = await loadActions()
   state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null })]
   const result = await deletePayment('pay-1', 'order-1')
   assert.equal(result.success, true)
   assert.ok(!paymentStillThere())
+})
+
+test('[o3d-f709 M15, C1] a CANCELLED registration an operator settled NOT_POSTED REFUSES the delete - it is read, and it is UNDECIDED', async () => {
+  // THE FLIP. An operator's NOT_POSTED used to free the receipt; it is a person's word about a ledger
+  // IMS never read, so deletePayment refuses (and the row has to be READ for that to be possible: it
+  // has no id and is in no readable status).
+  const { deletePayment } = await loadActions()
+  state.syncRows = [syncRow({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })]
+  console.log(`# precondition M15 delete: ${JSON.stringify(state.syncRows[0])}`)
+  const result = await deletePayment('pay-1', 'order-1')
+  assert.equal(result.success, false)
+  assert.equal(result.code, 'registration_attempt_undecided')
+  assert.ok(paymentStillThere(), 'the receipt was NOT deleted')
+  assert.match(result.error ?? '', /settled one of these entries as "not posted"/)
+  // ISOLATING ARM: the identical row without the assertion lets it go (previous test), so the refusal
+  // is the assertion's.
 })
 
 test('a receipt with only a queued registration deletes, retiring it in the SAME transaction', async () => {

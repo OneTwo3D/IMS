@@ -41,7 +41,9 @@ test('PROCESSING is in the delete guard\'s live set, so leaving it there is suff
 test('the sweep cancels PENDING and leaves PROCESSING alone (o3d-sref)', async () => {
   const { readFileSync } = await import('node:fs')
   const { join } = await import('node:path')
-  const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
+  // Round 2 (#724): the cancelling statements live in lib/domain/accounting/orphan-sweep.ts so the
+  // 'use server' action file exports nothing non-async and the pre-call stamp is testable on its own.
+  const src = readFileSync(join(process.cwd(), 'lib/domain/accounting/orphan-sweep.ts'), 'utf8')
 
   // The updateMany that retires rows must scope to PENDING only. Asserted against the source
   // because the alternative — a full server-action harness with auth, settings and revalidatePath —
@@ -52,10 +54,10 @@ test('the sweep cancels PENDING and leaves PROCESSING alone (o3d-sref)', async (
   //
   // Anchored on the QUERY, not on the client it runs against: round 5 moved the update inside a
   // fenced transaction, so it is `tx.accountingSyncLog.updateMany` now and could be renamed again.
-  const update = src.slice(src.indexOf('accountingSyncLog.updateMany('))
-  const updateArgs = update.slice(0, update.indexOf('})'))
+  // BOTH statements: the never-claimed one and the unstamped rest.
+  const updateArgs = src.slice(src.indexOf('accountingSyncLog.updateMany('))
 
-  assert.match(updateArgs, /status: 'PENDING' as const/, 'PENDING rows are still retired')
+  assert.match(updateArgs, /status: 'PENDING'/, 'PENDING rows are still retired')
   assert.doesNotMatch(
     updateArgs,
     /status: 'PROCESSING'/,

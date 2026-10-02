@@ -31,6 +31,21 @@ export function matchesWhere(row: Record<string, unknown>, where: WhereNode): bo
       if (!branches.every((branch) => matchesWhere(row, branch))) return false
       continue
     }
+    // o3d-f709: `NOT` takes a WHERE OBJECT, not an operand — `{ NOT: { settlementBasis: 'X' } }`.
+    // Without this branch it fell through to the operator loop below and THREW, which was the
+    // right failure but not a reading. It is a boolean negation of the sub-object here, which is
+    // exact for the non-nullable columns it is used on; `UNRESOLVED_ABANDONED_CLAIM_WHERE` states
+    // in its own comment why every NULLABLE column it negates is ORed with an explicit `IS NULL`
+    // arm rather than left to a bare `NOT`, and this evaluator therefore never has to model SQL's
+    // three-valued logic to agree with the database about that predicate.
+    if (key === 'NOT') {
+      if (Array.isArray(condition)) {
+        if ((condition as WhereNode[]).some((branch) => matchesWhere(row, branch))) return false
+        continue
+      }
+      if (matchesWhere(row, condition as WhereNode)) return false
+      continue
+    }
     const value = row[key]
     if (condition !== null && typeof condition === 'object') {
       for (const [operator, operand] of Object.entries(condition as Record<string, unknown>)) {

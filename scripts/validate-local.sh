@@ -86,6 +86,10 @@ run_step 'migration conventions'          npm run check:migration-conventions
 run_step 'documented env vars'            npm run check:documented-env-vars
 run_step 'wc sync row predicates'         npm run check:wc-sync-row-predicates
 run_step 'fulfillment requirement seam'   npm run check:fulfillment-requirement-seam
+# o3d-f709: what an AccountingSyncLog row says about the ledger is decided in ONE module and every other
+# reader is declared. Needs the generated Prisma client (the scan is type-aware), which the surrounding
+# `validate` job has already produced.
+run_step 'ledger standing readers'        npm run check:ledger-standing-readers
 run_step 'wms connector boundary'         npm run check:wms-connector-boundary
 # o3d-hic9: the Server Action authorization guards were in check:all but in no CI workflow, so they
 # only ran when someone remembered to type check:all locally. validate-local.sh exists so local and

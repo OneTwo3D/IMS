@@ -14,10 +14,13 @@
  *     that event already holds — and RETURNED WITHOUT TOUCHING IT. A live PENDING sync row with a
  *     VOID mirror, which is the precise state o3d-11rf claimed to remove.
  *
- * AND IT IS NOT ONLY A RACE. `classifyPriorAttempts` treats a CANCELLED attempt as asserting that
- * nothing was sent, so a settled-NOT_POSTED row is exactly what LETS a replacement be enqueued.
- * Settle a row on Monday and re-queue it on Tuesday and the mirror is still VOID: the lock decides
- * the concurrent case, and the wrong end state is reachable with no concurrency at all.
+ * AND IT IS NOT ONLY A RACE. `classifyPriorAttempts` used to treat a CANCELLED attempt as asserting
+ * that nothing was sent, so a settled-NOT_POSTED row was exactly what LET a replacement be enqueued.
+ * Settle a row on Monday and re-queue it on Tuesday and the mirror was still VOID: the lock decides
+ * the concurrent case, and the wrong end state was reachable with no concurrency at all.
+ * (o3d-f709, C1: an operator-settled attempt now BLOCKS the work slot - the enqueue refuses rather
+ * than replace it - so that particular route is closed. A replacement can still follow a row IMS
+ * retired itself, which frees the slot, and the same reasoning applies there.)
  *
  * THE FIX IS NOT "REVIVE A VOID EVENT". Reviving on the mere existence of a new live attempt would
  * resurrect work a LEGITIMATE void retired, and `voidMirroredAccountingEventsForOrder` writes

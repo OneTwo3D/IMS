@@ -112,6 +112,7 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 
+import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
@@ -140,6 +141,14 @@ export const AMBIGUOUS_INVOICE_PAYMENT_STATUSES = ['FAILED'] as const
 export type PostedInvoicePaymentRegistration = {
   id: string
   status: string
+  /**
+   * o3d-f709 / M16 - the two columns `ledgerStanding` needs beside `status` and `settlementBasis`, both
+   * REQUIRED: the retired-document arm below asks "did a payment demonstrably go?" of the row's whole
+   * evidence rather than of its SYNCED status, and a loader that forgot one would read `undefined` as
+   * the permissive answer.
+   */
+  externalTransactionId: string | null
+  abandonedBeforeRemoteCall: boolean | null
   /**
    * HOW this row reached its status (o3d-anu8). NULL = the connector's own writeback. On an
    * `OPERATOR_ASSERTION` row nothing was sent, so `amount` below is what IMS INTENDED to send and is
@@ -263,10 +272,17 @@ export function decideInvoicePaymentPost(input: {
   const retired = input.registrations.filter(
     (row) =>
       row.id !== input.entryId
-      // POSTED, i.e. SYNCED: money the ledger acknowledged. A FAILED row on a retired document is
-      // the ambiguity rule's business and a PENDING one is the enqueue gate's — this arm is about a
-      // payment that demonstrably went.
-      && (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      // A PAYMENT THAT DEMONSTRABLY WENT. SYNCED (money the ledger acknowledged), OR - o3d-f709 / M16 -
+      // ANY row that still names the document the ledger issued or that an operator asserted, whatever
+      // its status: a CANCELLED row the orphan sweep retired over a posted payment keeps its id, and
+      // this is the one gate no enqueue path can skip, so it must not read "CANCELLED" as "went
+      // away". A VERIFIED_REVERSAL (the ledger was asked) and a row proven pre-call do not match: their
+      // standing is PROVEN_NOT_POSTED. A FAILED row naming no document is still the ambiguity rule's
+      // business and a PENDING one is the enqueue gate's.
+      && (
+        (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+        || ['CONFIRMED_POSTED', 'ASSERTED_POSTED'].includes(ledgerStanding(row))
+      )
       && row.accountingInvoiceId != null
       && row.accountingInvoiceId !== input.accountingInvoiceId
       && (row.paymentId == null || entryPaymentId == null || row.paymentId === entryPaymentId),
@@ -488,6 +504,8 @@ export async function guardInvoicePaymentCapacity(
     status: string
     payload: unknown
     settlementBasis: string | null
+    externalTransactionId: string | null
+    abandonedBeforeRemoteCall: boolean | null
     remoteAttemptedAt: Date | null
     attemptStampingCustodyAt: Date | null
   }[]
@@ -524,9 +542,10 @@ export async function guardInvoicePaymentCapacity(
         // are read as a PAIR because neither proves anything alone — see `attemptProvenNeverMade`.
         select: {
           id: true,
-          status: true,
           payload: true,
-          settlementBasis: true,
+          // o3d-f709 / M16: every column `ledgerStanding` reads, spread from the module so the select
+          // and the reading cannot drift.
+          ...LEDGER_STANDING_SELECT,
           remoteAttemptedAt: true,
           attemptStampingCustodyAt: true,
         },
@@ -609,6 +628,8 @@ export async function guardInvoicePaymentCapacity(
       id: row.id,
       status: row.status,
       settlementBasis: row.settlementBasis,
+      externalTransactionId: row.externalTransactionId,
+      abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
       // o3d-6abj: the exact decimal string in preference to the JSON number, through the SAME reader
       // the coverage route uses. `null` when the payload will not say — never the double instead.
       registeredAmount: payloadRegisteredAmount(row.payload, order.currency),

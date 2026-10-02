@@ -196,7 +196,45 @@ test(
 )
 
 test(
-  '[o3d-d0pd] a CANCELLED attempt does not block: cancel-and-re-queue still works under contention',
+  '[o3d-f709 / o3d-kj718] a CANCELLED attempt with NO pre-call proof REFUSES every racing retry: no second posting',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { db, queueXeroSync } = await loadDeps()
+    await enableXeroCogsReversal(db)
+
+    const refundId = probeId('refund-cancelled-claimed')
+    const key = `sales-order-refund:${refundId}:cogs-reversal`
+    t.after(async () => {
+      await db.accountingEvent.deleteMany({ where: { sourceEntityId: refundId } }).catch(() => undefined)
+      await db.accountingSyncLog.deleteMany({ where: { referenceId: refundId } })
+    })
+
+    // A CLAIMED attempt that was cancelled (attemptRevision > 0), with no stamp: it may have reached the
+    // ledger, and the partial unique index does not cover a cancelled row.
+    await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: 'COGS_REVERSAL', status: 'CANCELLED',
+        referenceType: 'SalesOrderRefund', referenceId: refundId,
+        payload: reversalPayload(key), attemptStampingCustodyAt: new Date(), attemptRevision: 2,
+      },
+    })
+
+    const outcomes = await Promise.all(
+      Array.from({ length: CONCURRENT_RETRIES }, () => queueXeroSync({
+        type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: refundId,
+        payload: reversalPayload(key), idempotencyKey: key,
+      })),
+    )
+
+    const written = await db.accountingSyncLog.findMany({ where: { referenceId: refundId, status: 'PENDING' }, select: { id: true } })
+    console.log(`# precondition kj718 concurrency: pending replacements=${written.length}; outcomes=${outcomes.map((o) => o.reason ?? (o.queued ? 'queued' : '?')).join(',')}`)
+    assert.equal(written.length, 0, 'no replacement is written beside a possibly-posted attempt')
+    assert.equal(outcomes.every((o) => o.queued === false && o.reason === 'refused'), true)
+  },
+)
+
+test(
+  '[o3d-d0pd] a CANCELLED attempt PROVEN never to have been sent does not block: re-queue still works under contention',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     // `describeCreateDispatchRemedy` prescribes "cancel this row and re-queue the work from the
@@ -221,6 +259,11 @@ test(
         referenceId: refundId,
         payload: reversalPayload(key),
         attemptStampingCustodyAt: new Date(),
+        // o3d-f709 / o3d-kj718: THE PRE-CALL PROOF. This row stood here unstamped and the re-queue was
+        // free; an UNSTAMPED cancelled row is now a claimed attempt nobody can speak for and refuses
+        // (the test below). A never-claimed cancellation (orphan sweep, supersession, sale-cancel sweep
+        // over an unclaimed PENDING row) carries this stamp in the same UPDATE as its status.
+        abandonedBeforeRemoteCall: true,
       },
     })
 

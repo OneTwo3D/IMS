@@ -77,6 +77,11 @@ function registrationFor(payload: Record<string, unknown>, currency = 'GBP'): Re
   return {
     id: 'log_1',
     status: 'SYNCED',
+    // o3d-f709: neither marker set — the ordinary shape, and the one `mayHaveReachedLedger`
+    // refuses to read as "nothing was sent". Irrelevant to a SYNCED row; named because the
+    // type requires it rather than defaulting it, so a reader cannot ask without loading it.
+    abandonedBeforeRemoteCall: null,
+    settlementBasis: null,
     externalTransactionId: 'PAY-1',
     syncedAt: new Date('2026-08-20T11:00:00.000Z'),
     syncedAtDatabaseClock: new Date('2026-08-20T11:00:00.000Z'),

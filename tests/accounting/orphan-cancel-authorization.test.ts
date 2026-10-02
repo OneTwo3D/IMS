@@ -32,7 +32,11 @@ const state = {
 }
 
 const accountingSyncLog = {
-  updateMany: async (args: unknown) => { state.updates.push(args); return { count: 2 } },
+  // The sweep is two statements (round 2, #724): the never-claimed one, then the unstamped rest.
+  updateMany: async (args: unknown) => {
+    state.updates.push(args)
+    return { count: (args as { data: { abandonedBeforeRemoteCall?: boolean } }).data.abandonedBeforeRemoteCall === true ? 2 : 0 }
+  },
   count: async () => 0,
 }
 
@@ -105,7 +109,7 @@ test('ADMIN passes the REAL gate and the cancel runs', async () => {
 
   assert.equal(result.success, true)
   assert.equal(result.cancelled, 2)
-  assert.equal(state.updates.length, 1, 'it really reached the update — the gate was passed, not absent')
+  assert.equal(state.updates.length, 2, 'it really reached the updates — the gate was passed, not absent')
 })
 
 test('MANAGER is REFUSED by the real gate, and refused by THROWING — which is why the UI must not offer it', async () => {

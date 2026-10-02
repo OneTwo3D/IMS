@@ -135,8 +135,12 @@ const accountingSyncLog = {
     state.ops.push('updateMany')
     state.updates.push(args)
     // The switch lands HERE: after the action resolved its scope, while the update is in flight.
-    state.onUpdate?.()
-    return { count: state.pending }
+    // Round 2 (#724): the sweep is TWO statements - the never-claimed one, which alone carries the
+    // pre-call stamp, then the unstamped retirement of whatever else is PENDING. The fixture's PENDING
+    // population is all "never claimed", so the stamped statement matches it and the second matches nothing.
+    const stamped = args.data.abandonedBeforeRemoteCall === true
+    if (stamped) state.onUpdate?.()
+    return { count: stamped ? state.pending : 0 }
   },
   count: async (args: unknown) => {
     state.ops.push('count')
@@ -273,11 +277,12 @@ test('the whole decision runs in ONE transaction, and BOTH locks are taken befor
       'materialise-rows',
       'select-plugin-rows-for-update',
       'updateMany',
+      'updateMany',
       'select-plugin-rows-for-update',
       'count',
       'tx-end',
     ],
-    'lock, materialise, locked read, update, locked re-read (the fence), count — in that order',
+    'lock, materialise, locked read, update (never-claimed, then the rest), locked re-read (the fence), count — in that order',
   )
 
   assert.match(state.raw[0], /pg_advisory_xact_lock/)
@@ -296,7 +301,7 @@ test('the whole decision runs in ONE transaction, and BOTH locks are taken befor
   assert.match(state.raw[1], /INSERT INTO settings/i)
   assert.match(state.raw[1], /ON CONFLICT \(key\) DO NOTHING/i, 'idempotent: it writes the value an absent row already means')
 
-  assert.equal(state.updates.length, 1, 'the update ran inside it')
+  assert.equal(state.updates.length, 2, 'both updates ran inside it')
 })
 
 test('the selection is read THROUGH the transaction, never through the pooled client', async () => {
@@ -528,12 +533,26 @@ test('the cancel RECORDS that no remote call was made, on the same update as the
   const result = await cancel('quickbooks')
 
   assert.equal(result.success, true)
-  assert.equal(state.updates.length, 1, 'one statement, so the claim cannot outlive its predicate')
-  assert.match(JSON.stringify(state.updates[0].where), /"status":"PENDING"/)
-  assert.equal(state.updates[0].data.status, 'CANCELLED')
+  // Round 2 (#724 Codex HIGH 1): `status = PENDING` alone is NOT the proof - a CLAIMED row returned to
+  // PENDING keeps its attempt revision and a posted one keeps its id. So the stamp is written ONLY by the
+  // statement whose own predicate carries the claim evidence, and the retirement of every other PENDING
+  // row is a second, UNSTAMPED statement.
+  assert.equal(state.updates.length, 2, 'the stamped never-claimed statement, then the unstamped retirement')
+  const [stamped, rest] = state.updates
+  assert.match(JSON.stringify(stamped.where), /"status":"PENDING"/)
+  assert.match(JSON.stringify(stamped.where), /"attemptRevision":0/, 'proof from the row: it was never claimed')
+  assert.match(JSON.stringify(stamped.where), /"externalTransactionId":null/, 'and it holds no ledger id')
+  assert.equal(stamped.data.status, 'CANCELLED')
   assert.equal(
-    state.updates[0].data.abandonedBeforeRemoteCall,
+    stamped.data.abandonedBeforeRemoteCall,
     true,
     'without this the recreate sweep can never tell this row from one abandoned mid-flight',
+  )
+  assert.match(JSON.stringify(rest.where), /"status":"PENDING"/)
+  assert.equal(rest.data.status, 'CANCELLED')
+  assert.equal(
+    'abandonedBeforeRemoteCall' in rest.data,
+    false,
+    'a PENDING row the first statement did not match may have been claimed or posted: retired UNSTAMPED',
   )
 })

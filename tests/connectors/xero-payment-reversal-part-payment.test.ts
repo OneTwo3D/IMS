@@ -632,6 +632,10 @@ function billRegistration(overrides: Row = {}): Row {
     referenceId: 'pi_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS',
+    // The columns ledger-standing.ts reads. EXPLICIT null, as Prisma returns them: an absent key is
+    // `undefined`, which the module reads as an unrecognised basis (UNKNOWN) on purpose.
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...withRegisteredDocument('XB1', overrides),
@@ -647,6 +651,8 @@ function salesRegistration(overrides: Row = {}): Row {
     referenceId: 'so_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS-S',
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...withRegisteredDocument('XS1', overrides),
@@ -926,16 +932,66 @@ test('a zero-paid bill whose registration POSTED before the read IS reversed: ou
   assert.ok(state.activity.some((a) => a.action === 'bill_payment_reversal_detected'))
 })
 
-test('a zero-paid bill whose only registration is CANCELLED IS reversed: nothing of ours can be in flight', async () => {
+test('o3d-f709 C1 (FLIPPED): a zero-paid bill whose registration an operator SETTLED NOT_POSTED is WITHHELD, not reversed', async () => {
   reset()
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  // THIS TEST USED TO ASSERT THE OPPOSITE (`billsReversed === 1`). A NOT_POSTED settlement writes
+  // exactly this shape: CANCELLED, no document id, and a `settlementBasis` recording that a PERSON
+  // said nothing posted. IMS never read the ledger for it, so the zero is not "the whole story": the
+  // registration may stand in front of a payment that has not landed, and reversing here clears
+  // `paidAt` and re-arms Mark Paid over it - a second supplier payment.
+  state.syncLogs = [billRegistration({
+    status: 'CANCELLED', externalTransactionId: null, syncedAt: null,
+    settlementBasis: 'OPERATOR_ASSERTION',
+  })]
+  assert.deepEqual(
+    [state.syncLogs[0].status, state.syncLogs[0].settlementBasis, state.syncLogs[0].externalTransactionId],
+    ['CANCELLED', 'OPERATOR_ASSERTION', null],
+    'precondition: the asserted NOT_POSTED shape',
+  )
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [], 'paidAt must not be cleared on an assertion')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+})
+
+test('o3d-f709: the same bill with an UNRESOLVED cancellation is WITHHELD, not reversed', async () => {
+  reset()
+  // THE TEST ABOVE USED TO BE THIS ONE, and its comment was the defect written down: "CANCELLED is
+  // only ever asserted where nothing was sent". `cancelPendingSalesInvoiceSyncForOrder` and the
+  // post-time retirement of a CLAIMED row both write CANCELLED knowing nothing, and the processors
+  // post BEFORE they persist — so this row may be a supplier payment sitting in Xero. Reversing on
+  // it clears `paidAt` and re-arms Mark Paid over it.
   state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
   state.purchaseInvoices = [paidBillRow()]
   state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
 
   const result = await poll()
 
-  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'],
-    'CANCELLED is only ever asserted where nothing was sent — and it is the operator remedy for a stuck FAILED row')
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+    'paidAt must not be cleared on a row nothing has resolved')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+})
+
+test('o3d-f709: a cancellation the ORPHAN SWEEP proved pre-call also lets the reversal through', async () => {
+  // The second of the two resolutions, and the reason this is not "never reverse on a cancelled
+  // row": `cancelOrphanedRowsUnderLock` matches PENDING — provably pre-call — and records it in the
+  // same UPDATE. Without this arm every bill the sweep has ever tidied would withhold for ever.
+  reset()
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({
+    status: 'CANCELLED', externalTransactionId: null, syncedAt: null,
+    abandonedBeforeRemoteCall: true,
+  })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'])
   assert.equal(result.billsReversed, 1)
 })
 
@@ -1158,9 +1214,14 @@ test('a withheld reversal is asked again on a timer, and a cancelled registratio
   state.invoices = []
   state.activityRows = [withheldMarker()]
   state.purchaseInvoices = [paidBillRow()]
-  // The operator cancelled the stuck registration, which is exactly what the withheld warning told
-  // them to do. CANCELLED asserts nothing was sent, so the zero is now the whole story.
-  state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
+  // The registration is a CANCELLED row the orphan sweep PROVED pre-call. o3d-f709 C1: this used to
+  // be an operator's NOT_POSTED settlement, which no longer resolves anything (a person's word about a
+  // ledger IMS never read); the sweep's `abandonedBeforeRemoteCall` is the proof that makes the zero
+  // the whole story.
+  state.syncLogs = [billRegistration({
+    status: 'CANCELLED', externalTransactionId: null, syncedAt: null,
+    abandonedBeforeRemoteCall: true,
+  })]
   state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
 
   const result = await poll()

@@ -259,17 +259,56 @@ export const OPERATOR_ASSERTION_SETTLEMENT_BASIS = 'OPERATOR_ASSERTION'
  */
 export const OPERATOR_RELEASE_SETTLEMENT_BASIS = 'OPERATOR_RELEASE'
 
-export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION' | 'OPERATOR_RELEASE'
+/**
+ * o3d-f709 (D4) - THE BASIS FOR A CANCELLATION IMS ITSELF VERIFIED AGAINST THE LEDGER.
+ *
+ * Written, in the same UPDATE as the CANCELLED status, by exactly the three paths that retire a
+ * registration AFTER ASKING the accounting system and being told the payment is gone:
+ *
+ *   `buildVerifiedReversalData`          - deletePayment "Reverse in ledger and delete": Xero was
+ *                                          asked and answered DELETED for the payment id.
+ *   `buildAssertedReversalData`          - the same, for an UNDECIDED row whose payment id the
+ *                                          operator supplied and Xero confirmed was on this invoice
+ *                                          and DELETED.
+ *   `retireBillPaymentRegistrationsReversedInLedger` - the payment poller, in the transaction that
+ *                                          clears paidAt, having just read the bill back from the
+ *                                          ledger and proved the reversal.
+ *
+ * It is the only way, besides the orphan sweep's `abandonedBeforeRemoteCall`, for a CANCELLED row to
+ * read as PROVEN not posted (ledger-standing.ts, truth-table row 5) - and unlike the sweep's flag it
+ * is valid whether or not the row names a document: a verified reversal is "the payment existed and
+ * was undone", which is precisely a CANCELLED row that keeps its id.
+ *
+ * It is NOT an operator claim: OPERATOR_ASSERTION means a person said so; this means the connector
+ * answered.
+ */
+export const VERIFIED_REVERSAL_SETTLEMENT_BASIS = 'VERIFIED_REVERSAL'
+
+export type SettlementBasis =
+  | 'CONNECTOR_CONFIRMED'
+  | 'OPERATOR_ASSERTION'
+  | 'OPERATOR_RELEASE'
+  | 'VERIFIED_REVERSAL'
+  /** A non-null value this build does not recognise. FAILS CLOSED: never read as a confirmation. */
+  | 'UNKNOWN'
 
 /**
  * The basis a row's recorded outcome rests on. Reads the column rather than the errorMessage text:
  * o3d-h2wx established that errorMessage carries no provenance — both connectors overwrite it with
  * the remote system's own words — so a settlement note is not something a reader may key on.
+ *
+ * o3d-f709 (D4): a non-null value that is not one of the three written bases USED TO READ AS
+ * CONNECTOR_CONFIRMED - the one answer that means "the connector told us". A typo, a value from a
+ * newer build or a hand-edited row would therefore have laundered itself into a confirmation. It now
+ * reads UNKNOWN, which no reader treats as a confirmation. NULL is the connector's own writeback and
+ * stays CONNECTOR_CONFIRMED.
  */
 export function settlementBasisOf(settlementBasis: string | null | undefined): SettlementBasis {
+  if (settlementBasis === null || settlementBasis === undefined) return 'CONNECTOR_CONFIRMED'
   if (settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'OPERATOR_ASSERTION'
   if (settlementBasis === OPERATOR_RELEASE_SETTLEMENT_BASIS) return 'OPERATOR_RELEASE'
-  return 'CONNECTOR_CONFIRMED'
+  if (settlementBasis === VERIFIED_REVERSAL_SETTLEMENT_BASIS) return 'VERIFIED_REVERSAL'
+  return 'UNKNOWN'
 }
 
 export function isOperatorAssertedSettlement(settlementBasis: string | null | undefined): boolean {
@@ -279,6 +318,11 @@ export function isOperatorAssertedSettlement(settlementBasis: string | null | un
 /** Whether this row's STATUS was reached by an operator release rather than by the connector. */
 export function isOperatorReleasedSettlement(settlementBasis: string | null | undefined): boolean {
   return settlementBasisOf(settlementBasis) === 'OPERATOR_RELEASE'
+}
+
+/** Whether IMS verified this row's cancellation against the ledger (see VERIFIED_REVERSAL_SETTLEMENT_BASIS). */
+export function isVerifiedReversalSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'VERIFIED_REVERSAL'
 }
 
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'
@@ -626,18 +670,27 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
  * post" means the follow-up is CLOSED, and hasExistingSyncLog counting PENDING/PROCESSING/SYNCED
  * will rightly refuse to enqueue another one.
  * ------------------------------------------------------------------------------------------------
- * LOAD-BEARING SIDE EFFECT of the NOT_POSTED branch — deliberate, not incidental.
+ * WHAT THE NOT_POSTED BRANCH NO LONGER DOES (o3d-f709, C1) — this block used to be headed
+ * "LOAD-BEARING SIDE EFFECT ... the intended unblock", and it described the opposite behaviour.
  *
- * enqueueFollowUpSyncLog selects `status: 'FAILED'` when it gathers the ambiguity set
- * (lib/connectors/xero/sync-processor.ts, lib/connectors/quickbooks/sync-processor.ts). Moving a
- * FAILED row to CANCELLED REMOVES it from that set. For a money-moving type (INVOICE_PAYMENT,
- * PURCHASE_CREDIT_NOTE_ALLOCATION), planFollowUpEnqueue refuses whenever two or more DISTINCT
- * tokens could have committed; cancelling one of them drops the distinct-token count to one and
- * turns that `refuse` into a `create`/`reuse`.
+ * Moving a FAILED row to CANCELLED used to REMOVE it from the ambiguity set `enqueueFollowUpSyncLog`
+ * gathers, which turned a `refuse` into a `create`/`reuse` for a money-moving type, and it freed the
+ * work slot so the same posting could be queued again. That was the settlement action's stated
+ * purpose, and its premise was that the assertion was evidence. It is not: a person said "nothing
+ * posted" about a ledger IMS never read, and a lost response, a late webhook and a hand-post all
+ * leave the same row. So:
  *
- * That is exactly the intended unblock for o3d-nf9i's part-payment history — and it is also why the
- * assertion has to be a real, audited statement of fact rather than a convenience button.
- * Cancelling a row that DID post would let a duplicate payment out.
+ *   - `planFollowUpEnqueue` REFUSES a money follow-up while a settled-NOT_POSTED row for the same
+ *     document stands in the scope;
+ *   - the enqueue's already-present check (`classifyPriorAttempts`) reads the row as a BLOCKED work
+ *     slot and refuses, instead of raising a replacement;
+ *   - `ledgerStanding` reads it ASSERTED_NOT_POSTED: it may have reached the ledger, it is never a
+ *     ledger fact, and retention keeps it.
+ *
+ * What the assertion still does: it records, against the operator's name, that they looked and
+ * believed nothing posted - which is useful evidence for the next person - and it releases the
+ * ORDER (the delete guard's own status reading is a separate, later conversion). The operator's way
+ * to re-post is now to hand-post in the accounting system and mark the posting handled.
  * ------------------------------------------------------------------------------------------------
  */
 export function buildSettlementData(
@@ -756,10 +809,14 @@ export function settlementMirrorStatus(outcome: SettlementOutcome): AccountingEv
  * o3d-11rf r2 — WHAT THIS VOID RETIRES, recorded on the event so the enqueue side can tell.
  *
  * ONE ATTEMPT, and only that. The operator asserted that THE ROW THEY SETTLED reached nothing; they
- * were not asked, and did not answer, whether the document is still owed. It usually is — settling a
- * row NOT_POSTED is precisely what lets a replacement be enqueued, because `classifyPriorAttempts`
- * reads a CANCELLED attempt as asserting nothing was sent. So a later live attempt at the same
- * document may take the shared mirror back to PENDING.
+ * were not asked, and did not answer, whether the document is still owed. It usually is.
+ *
+ * o3d-f709 (C1): this used to continue "settling a row NOT_POSTED is precisely what lets a replacement
+ * be enqueued, because `classifyPriorAttempts` reads a CANCELLED attempt as asserting nothing was
+ * sent". It no longer does: an operator-settled attempt BLOCKS the work slot, so no replacement is
+ * enqueued on it and nothing revives the mirror from it. The basis is kept because a replacement CAN
+ * still arrive by another route (a row IMS retired itself, which frees the slot), and the mirror must
+ * still tell a retired ATTEMPT from a retired DOCUMENT.
  *
  * That is NOT true of `voidMirroredAccountingEventsForOrder`, which retires the DOCUMENT because the
  * order is cancelled, and the two were indistinguishable on the row until this. See

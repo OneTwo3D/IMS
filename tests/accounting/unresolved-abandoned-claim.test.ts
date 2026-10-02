@@ -98,7 +98,7 @@ const CANCELLED_ROWS: Row[] = [
   cancelled({ settlementBasis: 'CONNECTOR_CONFIRMED' }),
 ]
 
-test('[o3d-nepa] a proved pre-call abandonment OR an operator assertion resolves a cancelled row', async () => {
+test('[o3d-nepa, C1] ONLY a proved pre-call abandonment resolves a cancelled row; an operator assertion does not', async () => {
   assert.deepEqual(
     CANCELLED_ROWS.map(matchesUnresolvedAbandonedClaim),
     [
@@ -108,8 +108,8 @@ test('[o3d-nepa] a proved pre-call abandonment OR an operator assertion resolves
       true,
       false, // the orphan sweep's own pre-call proof
       true, // ...unless the row names a document, which outranks it
-      false, // ROUND 4: a human looked in the ledger and asserted NOT_POSTED
-      true, // ...unless the row names a document (buildCancelledSaleSettlementData's shape)
+      true, // C1 (o3d-f709), FLIPPED from false: a person's NOT_POSTED assertion is not proof
+      true, // ...and with a document (buildCancelledSaleSettlementData's shape) it is kept twice over
       true, // a CONNECTOR_CONFIRMED basis is not an assertion about an abandonment
     ],
     'null and false are both "not on record"; and a row naming a document is kept whatever else says, '
@@ -117,15 +117,19 @@ test('[o3d-nepa] a proved pre-call abandonment OR an operator assertion resolves
   )
 })
 
-test('[o3d-nepa round 4] an operator-settled NOT_POSTED row is DELETABLE, not an immortal tombstone', async () => {
-  // The defect, stated as the single row it was about. Before round 4 this was `true` — retained for
-  // ever, compacted, and unexplainable — even though the operator had explicitly resolved it.
+test('[o3d-nepa round 4, REVERSED by C1] an operator-settled NOT_POSTED row is RETAINED, not deletable by age', async () => {
+  // Round 4 made this row deletable ("a human who looked in the ledger"). C1 (o3d-f709) reverses it:
+  // IMS never looked, a person said so, and a lost response / late webhook / hand-post all leave the
+  // same row. Deleting it by age would destroy the only local record that the question was ever open.
   const settled = cancelled({ settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS })
-  assert.equal(matchesUnresolvedAbandonedClaim(settled), false, 'retention no longer holds it back')
-  assert.equal(cancelledClaimIsResolved(settled), true, 'and the shared rule calls it resolved')
+  // Precondition printed: this is the NOT_POSTED shape - CANCELLED, asserted, no id, no sweep flag.
+  assert.deepEqual([settled.status, settled.settlementBasis, settled.externalTransactionId, settled.abandonedBeforeRemoteCall],
+    ['CANCELLED', 'OPERATOR_ASSERTION', null, null])
+  assert.equal(matchesUnresolvedAbandonedClaim(settled), true, 'retention holds it back')
+  assert.equal(cancelledClaimIsResolved(settled), false, 'and the shared rule calls it unresolved')
 
-  // The bound that stops this becoming "delete every cancelled row": an unsettled one still stays.
-  assert.equal(matchesUnresolvedAbandonedClaim(cancelled()), true)
+  // The bound that stops this becoming "keep every cancelled row": the sweep's own proof still resolves.
+  assert.equal(matchesUnresolvedAbandonedClaim(cancelled({ abandonedBeforeRemoteCall: true })), false)
 })
 
 test('[o3d-nepa] the retention predicate and the recreate verdict are the SAME rule, row for row', async () => {
@@ -140,7 +144,7 @@ test('[o3d-nepa] the retention predicate and the recreate verdict are the SAME r
   }
 })
 
-test('[o3d-nepa round 4] the new arm cannot reach the daily-batch recreate verdict', async () => {
+test('[o3d-nepa round 4, C1] a daily-batch row cannot carry a NOT_POSTED assertion at all, so C1 changes nothing for the recreate verdict', async () => {
   // The one reader here that MOVES MONEY. `cancelledClaimIsResolved` fires only on a CANCELLED row
   // that carries an operator assertion AND NO document id, and the only settlement that produces
   // that shape is a NOT_POSTED one. A DAILY_BATCH type admits POSTED and nothing else — a POSTED
