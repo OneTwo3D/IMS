@@ -16,7 +16,12 @@ import {
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
-import { WORK_SLOT_OCCUPIED_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import {
+  LEDGER_STANDING_SELECT,
+  WORK_SLOT_OCCUPIED_WHERE,
+  isProvenLedgerFact,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
@@ -6765,13 +6770,15 @@ export function selectCreditNotesNeedingAllocation(
   return out
 }
 
-/** A `PURCHASE_CREDIT_NOTE` sync row, narrowed to the two columns provenance is resolved from. */
-export type CreditNotePostRow = {
-  /**
-   * The document this row's post RETURNED. This — not the row's status, and not its recency — is what
-   * makes a row the issuing post of a particular credit note.
-   */
-  externalTransactionId: string | null
+/**
+ * A `PURCHASE_CREDIT_NOTE` sync row, narrowed to what provenance is resolved from.
+ *
+ * o3d-f709 / M18: the WHOLE {@link LedgerStandingRow}, REQUIRED. The document id still makes a row the
+ * candidate issuing post - not its status, not its recency - but only a row whose id the CONNECTOR
+ * returned may be the issuing post: an id an operator TYPED in names a document IMS never saw, so the
+ * organisation recorded on that row's payload is the enqueue-time stamp of a post nobody observed.
+ */
+export type CreditNotePostRow = LedgerStandingRow & {
   /** The stored payload, verbatim. What gets inherited, stamp or no stamp. */
   payload: unknown
 }
@@ -6820,7 +6827,16 @@ export type IssuingPostOrigin =
 export function selectIssuingPostOriginRecord(rows: CreditNotePostRow[], creditNoteId: string): IssuingPostOrigin {
   const wanted = creditNoteId.trim()
   if (wanted === '') return { outcome: 'no-issuing-row' }
-  const issuing = rows.filter((row) => (row.externalTransactionId ?? '').trim() === wanted)
+  // o3d-f709 / M18: THE ID MATCHES AND THE ID WAS THE CONNECTOR'S. `isProvenLedgerFact` is the module's
+  // CONFIRMED_POSTED: a document id on a row whose basis is the connector's own writeback (or an
+  // operator release of a connector id). An operator-asserted id - SYNCED by settlement, or the
+  // cancelled-sale variant - is excluded, so a typed string can no longer make its row "the issuing
+  // post" and lend the allocation an organisation nobody observed. A VERIFIED_REVERSAL row is excluded
+  // too: the payment/credit it names was reversed, and a reversed document's row is not the post that
+  // issued the credit the allocation is carrying.
+  const issuing = rows.filter(
+    (row) => (row.externalTransactionId ?? '').trim() === wanted && isProvenLedgerFact(row),
+  )
   if (issuing.length === 0) return { outcome: 'no-issuing-row' }
 
   // Distinct organisations actually NAMED by rows that issued this document. More than one is a
@@ -7005,7 +7021,9 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
     },
     // Only for a stable read; the choice among several issuing rows is made by rank, not by order.
     orderBy: [{ syncedAt: 'desc' }, { createdAt: 'desc' }],
-    select: { referenceId: true, externalTransactionId: true, payload: true },
+    // o3d-f709 / M18: LEDGER_STANDING_SELECT, so the issuing-post test can tell a connector's id from
+    // an operator's.
+    select: { referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
   })
   const postsByCreditNote = new Map<string, CreditNotePostRow[]>()
   for (const row of creditNotePosts) {
