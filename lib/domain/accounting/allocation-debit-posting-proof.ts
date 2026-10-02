@@ -103,6 +103,29 @@ export function journalRowIsSettled(row: { status: string }): boolean {
   return row.status === 'SYNCED'
 }
 
+/**
+ * True when a refund's unresolved-basis reason was produced by an operator-asserted journal (every wording
+ * in this module and in refund-service names the OPERATOR / an operator's assertion; no other reason does).
+ */
+export function isAssertedJournalRefusal(reason: string): boolean {
+  return /operator/i.test(reason)
+}
+
+/**
+ * o3d-3la07 - WHAT AN OPERATOR CAN DO TODAY about a refund withheld on an operator-asserted journal.
+ *
+ * There is no supported action that records confirmed amount evidence for an asserted journal or clears the
+ * withheld reversal (filed as a bead with the options). Until one exists the finding is LOUD (a critical
+ * accounting invariant, `sales_order_refund_allocation_basis_unresolved`, plus a WARNING ActivityLog row at the
+ * moment of the refusal) and the reversal is raised by hand. Said exactly, because on a FULL refund there is no
+ * "next refund" that could resolve it.
+ */
+export const ASSERTED_JOURNAL_REMEDY =
+  'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+  "in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited). " +
+  'The IMS has no screen yet that records that credit or clears this finding, and checking the journal does not change what the IMS stored, ' +
+  'so a later refund does not resolve it: the finding stays listed under the critical accounting finding sales_order_refund_allocation_basis_unresolved'
+
 /** The status word for a row the amount proof refused, naming an operator assertion where there is one. */
 export function describeJournalRowState(row: LedgerStandingRow): string {
   return ledgerStanding(row) === 'ASSERTED_POSTED' ? `${row.status} on an operator's assertion` : row.status

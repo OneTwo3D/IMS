@@ -50,8 +50,10 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
+  ASSERTED_JOURNAL_REMEDY,
   describeJournalRowState,
   extractPayloadNetMovement,
+  isAssertedJournalRefusal,
   journalRowProvesAmount,
   payloadLinesLegible,
   proveAllocationDebitPosting,
@@ -2825,6 +2827,12 @@ async function stageRefundAccountingReversals(
       // which reason an operator is shown first.
       allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved ?? allocationReversalReliefUnresolved
     }
+    // o3d-3la07: a reversal withheld because a journal rests on an operator's assertion has no supported
+    // resolving action yet, so the reason carries the exact manual steps (see ASSERTED_JOURNAL_REMEDY).
+    const withheldOnAssertedJournal = allocationBasisUnresolved != null && isAssertedJournalRefusal(allocationBasisUnresolved)
+    if (withheldOnAssertedJournal && allocationBasisUnresolved != null) {
+      allocationBasisUnresolved = `${allocationBasisUnresolved}. ${ASSERTED_JOURNAL_REMEDY}`
+    }
     // o3d-o97 r6: the apportionment prices only SOME of the pool's unrecorded units and this refund
     // is PARTIAL, so neither of the two things that make the blend safe applies — the cap only bites
     // above the open balance and the residue only runs on a full refund, and a strict subset of a
@@ -2991,6 +2999,22 @@ async function stageRefundAccountingReversals(
           `Recorded A2 debit £${postedAllocationDebit.toFixed(2)}; this refund credited Allocated Inventory £${allocationReversal.toFixed(2)}.`,
         ].filter((part): part is string => !!part).join('. ')
       : null
+
+    // o3d-3la07: LOUD AT THE MOMENT IT IS WITHHELD. The standing critical invariant lists it later; this
+    // row says so now, naming the refund, the order and the reason.
+    if (withheldOnAssertedJournal && withheldSomething) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_allocation_reversal_withheld_asserted_journal',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Refund ${params.refundId} withheld its Allocated Inventory reversal because a journal it depends on was settled as posted by an operator: ${allocationBasisUnresolved}`,
+          metadata: { orderId: params.orderId, refundId: params.refundId, newStatus: params.newStatus },
+        },
+      })
+    }
 
     // o3d-o97 r3: written on EVERY pass, so a retry that now resolves clears a stale refusal.
     //  * `allocatedReliefAmount` — THIS REFUND'S OWN RELIEF, recorded inside the same transaction

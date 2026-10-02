@@ -1,5 +1,6 @@
 'use client'
 
+import { DailyBatchPreviewWarnings } from './daily-batch-preview-warnings'
 import { ACCOUNTING_CONNECTORS, getAccountingConnectorDefinition } from '@/lib/connectors/accounting-registry'
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
@@ -1386,6 +1387,8 @@ function DailyBatchPanel({
             </Button>
           </div>
         </div>
+
+        <DailyBatchPreviewWarnings warnings={preview.warnings} />
 
         {previewTotal === 0 && preview.groupA1.orderCount === 0 && preview.groupA2.orderCount === 0 && preview.groupB.shipmentCount === 0 && preview.groupBPreviewed !== false ? (
           <div className="text-center py-8 text-sm text-muted-foreground">

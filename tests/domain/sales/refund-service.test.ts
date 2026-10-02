@@ -9281,3 +9281,71 @@ test('[o3d-3la07 M7, report-only] an asserted UNEARNED_REV_REVERSAL still reduce
   assert.equal((confirmed.state.activityLogs as Array<{ action?: string }>).filter((entry) => entry.action === 'refund_unearned_reversal_rests_on_operator_assertion').length, 0, 'a confirmed row is never reported')
   console.log(`M7 report-only: unearned confirmed=${confirmed.unearned} asserted=${asserted.unearned}; warnings asserted=${warnings.length} confirmed=0`)
 })
+
+// ===========================================================================================
+// o3d-3la07 (Codex round 1, HIGH) - A REFUND WITHHELD ON AN OPERATOR-ASSERTED JOURNAL MUST BE LOUD AND ACCURATE.
+//
+// There is no supported action yet that records confirmed amount evidence for an asserted journal, and on a FULL
+// refund there is no "next refund". So the withheld reversal is (a) listed by the standing critical invariant
+// `sales_order_refund_allocation_basis_unresolved` (its note is the refund's allocationBasisUnresolved, which
+// now carries the exact manual steps), and (b) announced AT THE MOMENT IT IS WITHHELD by a WARNING ActivityLog
+// row naming the refund and order. Only an ASSERTED journal gets the remedy text and the row; every other
+// unresolved standing keeps its own wording (the table below pins both directions).
+// ===========================================================================================
+
+function assertedWithheldLogs(state: State): Array<{ action?: string; level?: string; entityId?: string }> {
+  return (state.activityLogs as Array<{ action?: string; level?: string; entityId?: string }>)
+    .filter((entry) => entry.action === 'refund_allocation_reversal_withheld_asserted_journal')
+}
+
+for (const testCase of STANDING_REVERSALS) {
+  const asserted = testCase.standing === 'ASSERTED_POSTED'
+  test(`[o3d-3la07 HIGH] ALLOCATION_REVERSAL ${testCase.standing}: ${asserted ? 'withheld LOUDLY with the manual steps and one WARNING row' : testCase.resolves ? 'resolves, nothing to announce' : 'unresolved in its own words, NO asserted-journal remedy or row'}`, async () => {
+    const state = a2StagedWithOrphanReversalState()
+    seedPostedAllocationReversal(state, testCase.status, testCase.columns)
+    assert.equal(state.accountingSyncLogs?.find((log) => log.id === 'alloc-reversal-1')?.status, testCase.status, 'PRECONDITION: seeded standing')
+
+    const result = await createSalesOrderRefund(createClient(state), { ...COMPLETE_REFUND })
+    assert.equal(result.success, true)
+
+    const note = String(state.refunds[0].allocationBasisUnresolved ?? '')
+    assert.equal(note.includes('WHAT TO DO TODAY'), asserted, `remedy text iff asserted (${testCase.standing})`)
+    assert.equal(assertedWithheldLogs(state).length, asserted ? 1 : 0, `loud row iff asserted (${testCase.standing})`)
+    if (asserted) {
+      assert.match(note, /DR Inventory \/ CR Allocated Inventory/)
+      assert.match(note, /does not resolve it/)
+      assert.doesNotMatch(note, /next refund resolves/i)
+      const [row] = assertedWithheldLogs(state)
+      assert.equal(row.level, 'WARNING')
+      assert.equal(row.entityId, 'order-1')
+      assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'the A2 stamp survives, so the standing finding keeps listing it')
+    }
+    console.log(`HIGH ALLOCATION_REVERSAL ${testCase.standing}: remedy=${note.includes('WHAT TO DO TODAY')} loudRows=${assertedWithheldLogs(state).length}`)
+  })
+}
+
+test('[o3d-3la07 HIGH] an OPERATOR-ASSERTED A2 BATCH JOURNAL on a FULL refund is withheld loudly (the stranded case); the confirmed journal is not', async () => {
+  const run = async (columns: { settlementBasis: string | null; externalTransactionId: string | null }) => {
+    const state = a2StagedAllocatedState()
+    const a2 = state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.ok(a2, 'PRECONDITION: the fixture seeds an A2 batch journal')
+    Object.assign(a2, columns)
+    const result = await createSalesOrderRefund(createClient(state), { ...COMPLETE_REFUND })
+    assert.equal(result.success, true)
+    return { state, result }
+  }
+  const confirmed = await run({ settlementBasis: null, externalTransactionId: 'JNL-A2' })
+  assert.equal(findAllocatedInventoryCredit(confirmed.result), 20, 'PRECONDITION: confirmed journal reverses the whole £20')
+  assert.equal(assertedWithheldLogs(confirmed.state).length, 0)
+
+  const asserted = await run({ settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
+  assert.equal(asserted.state.orders[0].refundStatus, 'FULL', 'a FULL refund: there is no next refund')
+  assert.equal(findAllocatedInventoryCredit(asserted.result), null, 'nothing is credited')
+  assert.notEqual(asserted.state.orders[0].inventoryAllocatedDate, null)
+  const note = String(asserted.state.refunds[0].allocationBasisUnresolved)
+  assert.match(note, /OPERATOR typing in a document id/)
+  assert.match(note, /WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit/)
+  assert.match(note, /Recorded A2 debit £20\.00/, 'and it names the figure to raise by hand')
+  assert.equal(assertedWithheldLogs(asserted.state).length, 1)
+  console.log('HIGH A2 journal: confirmed credit 20, no row; asserted FULL refund -> note with steps + 1 WARNING row')
+})
