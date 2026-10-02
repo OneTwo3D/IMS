@@ -130,6 +130,7 @@ import { releaseReservationsAfterRefund } from '@/lib/domain/sales/post-refund-r
 import { shouldWarnPaidWithoutInvoice, shouldWarnPaidOrderCancelledWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
 import { PermanentStatusTransitionError, isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
+import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { isPaymentStatusMismatch } from '@/lib/domain/sales/o2c-guards'
 import {
   cancelSalesOrderFulfillmentState,
@@ -4299,7 +4300,15 @@ export async function reverseLedgerPayment(
         const refusal = refuseLedgerLookupFailure(externalId, response.error)
         return { success: false, code: refusal.code, error: refusal.message }
       }
-      const ledgerStatus = response.data?.Payments?.[0]?.Status
+      // o3d-h9pb: bound to the payment asked for. An unreadable answer is UNKNOWN and refuses as a
+      // failed lookup; it is never read as "reversed" and never as a status of its own.
+      const heldPayment = readSingleXeroDocument<{ PaymentID?: string; Status?: string }>(
+        response.data, 'Payments', 'PaymentID', externalId)
+      if (heldPayment.status === 'unreadable') {
+        const refusal = refuseLedgerLookupFailure(externalId, heldPayment.reason)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const ledgerStatus = heldPayment.document.Status
       if (!isReversedInLedger(ledgerStatus)) {
         const refusal = refuseLedgerStillHolds(externalId, ledgerStatus ?? 'unknown')
         return { success: false, code: refusal.code, error: refusal.message }
@@ -4329,11 +4338,15 @@ export async function reverseLedgerPayment(
         const refusal = refuseLedgerLookupFailure(assertedReference, response.error)
         return { success: false, code: refusal.code, error: refusal.message }
       }
-      const found = response.data?.Payments?.[0]
-      if (!found) {
-        const refusal = refuseLedgerLookupFailure(assertedReference, 'the accounting system returned no payment with that reference')
+      // o3d-h9pb: bound to the reference the operator typed — a different payment of the same value
+      // must not stand in for it. Unreadable is UNKNOWN: refused as a failed lookup.
+      const foundRead = readSingleXeroDocument<{ PaymentID?: string; Status?: string; Amount?: number; Invoice?: { InvoiceID?: string; CurrencyCode?: string } }>(
+        response.data, 'Payments', 'PaymentID', assertedReference)
+      if (foundRead.status === 'unreadable') {
+        const refusal = refuseLedgerLookupFailure(assertedReference, `the accounting system did not return exactly the payment with that reference (${foundRead.reason})`)
         return { success: false, code: refusal.code, error: refusal.message }
       }
+      const found = foundRead.document
       // FACT ONE: it is on this order's invoice.
       const invoiceId = found.Invoice?.InvoiceID ?? null
       if (!sameLedgerIdentifier(invoiceId, orderForReference.accountingInvoiceId)) {
@@ -4370,7 +4383,11 @@ export async function reverseLedgerPayment(
         const refusal = refuseLedgerLookupFailure(ledgerInvoiceId, invoiceResponse.error)
         return { success: false, code: refusal.code, error: refusal.message }
       }
-      const ledgerInvoice = invoiceResponse.data?.Invoices?.[0]
+      // o3d-h9pb: bound to the invoice asked for; a different invoice's payment list would otherwise
+      // answer "nothing is standing here". Unreadable is UNKNOWN: refused below as before.
+      const ledgerInvoiceRead = readSingleXeroDocument<{ InvoiceID?: string; CurrencyCode?: string; Payments?: Array<{ PaymentID?: string; Amount?: number }> }>(
+        invoiceResponse.data, 'Invoices', 'InvoiceID', ledgerInvoiceId)
+      const ledgerInvoice = ledgerInvoiceRead.status === 'found' ? ledgerInvoiceRead.document : undefined
       const standingPayments = ledgerInvoice?.Payments
       // An invoice with nothing on it answers with an EMPTY LIST; a response with no list at all is a
       // question unanswered, and is refused rather than read as "nothing is standing there".

@@ -22,6 +22,8 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 
 Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
 
+If Xero does not return the organisation's base currency at the moment you click Connect (a temporary Xero error, or a response IMS cannot read), the connection is **refused** and nothing is stored — an unreadable currency is never treated as a matching one. Try Connect again; the message distinguishes this from a genuine mismatch. (IMS does not yet remember the verified currency after connecting; that check happens at connect time only.)
+
 ### Which organisation this instance may connect to
 
 **IMS will not guess which Xero organisation to invoice into.** If the person authorising the

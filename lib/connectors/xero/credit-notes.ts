@@ -7,6 +7,7 @@ import { findOrCreateContact } from './contacts'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
+import { readSingleXeroDocument } from './single-document'
 import {
   MINTED_CREDIT_NOTE_NUMBER_PREFIX,
   decidePurchaseCreditNotePost,
@@ -455,16 +456,28 @@ export async function allocatePurchaseCreditNote(
   opts?: { idempotencyKey?: string },
 ): Promise<{ success: boolean; allocatedAmount?: number; error?: string }> {
   const cnRes = await xeroGet<XeroCreditNoteRemainingResponse>(`CreditNotes/${params.creditNoteId}`)
-  if (!cnRes.ok || !cnRes.data?.CreditNotes?.length) {
+  if (!cnRes.ok) {
     return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
   }
-  const remainingCredit = cnRes.data.CreditNotes[0].RemainingCredit ?? 0
+  // o3d-h9pb: the allocation amount is sized from these two documents, so each must be the one asked
+  // for. Unreadable is UNKNOWN: nothing is allocated, and it is reported as a failure, not as zero.
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: number }>(
+    cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
+  if (cnRead.status === 'unreadable') {
+    return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
+  }
+  const remainingCredit = cnRead.document.RemainingCredit ?? 0
 
   const billRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${params.invoiceId}`)
-  if (!billRes.ok || !billRes.data?.Invoices?.length) {
+  if (!billRes.ok) {
     return { success: false, error: billRes.error ?? 'Bill not found in Xero for allocation' }
   }
-  const amountDue = billRes.data.Invoices[0].AmountDue ?? 0
+  const billRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: number }>(
+    billRes.data, 'Invoices', 'InvoiceID', params.invoiceId)
+  if (billRead.status === 'unreadable') {
+    return { success: false, error: `Bill not read from Xero for allocation: ${billRead.reason}` }
+  }
+  const amountDue = billRead.document.AmountDue ?? 0
 
   const allocateAmount = resolveCreditNoteAllocationAmount({ requested: params.amount, remainingCredit, amountDue })
   if (allocateAmount <= 0) return { success: true, allocatedAmount: 0 }
