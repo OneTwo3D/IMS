@@ -113,7 +113,7 @@ export type PaymentRegistrationRow = {
    * alone.
    *
    * REQUIRED here, unlike `settlementBasis`, and required for the reason
-   * cancelled-row-evidence.ts gives about `LedgerStandingRow`: absent reads as "not flagged", which
+   * ledger-standing.ts gives about `LedgerStandingRow`: absent reads as "not flagged", which
    * is the PERMISSIVE answer on this path — it lets deletePayment destroy the local record of a
    * payment. A caller that has not loaded the column must fail `tsc`, not quietly get the old
    * verdict.

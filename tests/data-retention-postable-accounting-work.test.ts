@@ -75,11 +75,11 @@ type Where = {
   status?: { notIn?: string[]; in?: string[] } | string
   type?: { in?: string[]; notIn?: string[] }
   referenceType?: { in?: string[] }
-  externalTransactionId?: { not: null } | null
+  externalTransactionId?: { not: string | null } | string | null
   backReferenceCheckedAt?: null
   backReferenceEvidenceCompactedAt?: null
   abandonedBeforeRemoteCall?: boolean | null
-  settlementBasis?: string | null
+  settlementBasis?: string | null | { not: string | null }
   NOT?: Where
   AND?: Where[]
   OR?: Where[]
@@ -131,9 +131,25 @@ function matches(row: SyncRow, where: Where): boolean {
   // `NOT` clause would match every row, so the negation would always be false and the whole arm
   // would rest on the null test alone — an operator-settled row would look retained here while the
   // database deleted it, and every test in this file would still pass.
-  if ('settlementBasis' in where && (row.settlementBasis ?? null) !== where.settlementBasis) return false
-  if (where.externalTransactionId === null && (row.externalTransactionId ?? null) !== null) return false
-  if (where.externalTransactionId && row.externalTransactionId == null) return false
+  // C1 / ledger-standing.ts: the unresolved-claim predicate now carries `settlementBasis: { not: 'X' }`
+  // and `externalTransactionId: { not: '' }` / `''`. SQL-faithful: a `not` over a NULL column is NULL
+  // and EXCLUDES the row (the predicate pairs every such arm with an explicit IS NULL arm, which is
+  // exactly the property being relied on), so the double must not read null as "differs".
+  if ('settlementBasis' in where) {
+    const wanted = where.settlementBasis as string | null | { not: string | null }
+    const actual = row.settlementBasis ?? null
+    if (wanted !== null && typeof wanted === 'object') {
+      if (actual === null || actual === wanted.not) return false
+    } else if (actual !== wanted) return false
+  }
+  if ('externalTransactionId' in where) {
+    const wanted = where.externalTransactionId as string | null | { not: string | null }
+    const actual = row.externalTransactionId ?? null
+    if (wanted !== null && typeof wanted === 'object') {
+      if (wanted.not === null) { if (actual === null) return false }
+      else if (actual === null || actual === wanted.not) return false
+    } else if (actual !== wanted) return false
+  }
   if ('backReferenceCheckedAt' in where && (row.backReferenceCheckedAt ?? null) !== null) return false
   if ('backReferenceEvidenceCompactedAt' in where && (row.backReferenceEvidenceCompactedAt ?? null) !== null) {
     return false

@@ -632,6 +632,10 @@ function billRegistration(overrides: Row = {}): Row {
     referenceId: 'pi_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS',
+    // The columns ledger-standing.ts reads. EXPLICIT null, as Prisma returns them: an absent key is
+    // `undefined`, which the module reads as an unrecognised basis (UNKNOWN) on purpose.
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...withRegisteredDocument('XB1', overrides),
@@ -647,6 +651,8 @@ function salesRegistration(overrides: Row = {}): Row {
     referenceId: 'so_1',
     status: 'SYNCED',
     externalTransactionId: 'PAY-OURS-S',
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
     // Stamped by `clock_timestamp()` in the sync processor's own transaction (round 4).
     syncedAt: databaseNow(-5 * 60_000),
     ...withRegisteredDocument('XS1', overrides),

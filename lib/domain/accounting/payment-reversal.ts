@@ -10,7 +10,7 @@ import {
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
-import { MAY_HAVE_REACHED_LEDGER_WHERE, type LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { MAY_HAVE_REACHED_LEDGER_WHERE, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
@@ -997,7 +997,7 @@ export async function markBillPaidSupersedingStaleRegistrations(
     // `cancelOrphanedRowsUnderLock`, which matches PENDING and records the fact in the same UPDATE.
     // `cancelPendingSalesInvoiceSyncForOrder`, the post-time retirement of a claimed row and an
     // operator's own NOT_POSTED settlement all reach CANCELLED as well, and the first two of those
-    // establish nothing at all. The rule is stated once in `cancelled-row-evidence.ts`.
+    // establish nothing at all. The rule is stated once in `ledger-standing.ts`.
     //
     // Refusing costs one attempt: the row now records its own outcome, and the next try sees it in the
     // survey where it is judged on what it says.

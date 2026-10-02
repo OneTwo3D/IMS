@@ -15,7 +15,7 @@
  *
  * Sixteen readers nonetheless spelt "a cancelled row committed nothing" for themselves, each under a
  * comment asserting it, and the money-path ones turn that into an ADMITTED reversal, a released
- * blocker, or a second payment. `lib/domain/accounting/cancelled-row-evidence.ts` states the rule
+ * blocker, or a second payment. `lib/domain/accounting/ledger-standing.ts` states the rule
  * once, over `cancelledClaimIsResolved`, in the two languages the readers ask it in.
  *
  * ── AND THE SAME RULE AFTER THE ROW HAS BEEN TAKEN APART (o3d-f709 round 3) ──────────────────────
@@ -179,7 +179,7 @@ import ts from 'typescript'
 const ROOT = process.cwd()
 
 /** The module that owns the rule. Nothing else may state it. */
-const OWNING_MODULE = 'lib/domain/accounting/cancelled-row-evidence.ts'
+const OWNING_MODULE = 'lib/domain/accounting/ledger-standing.ts'
 
 /** The exported Prisma predicate every excluding query must route through. */
 const SHARED_WHERE = 'MAY_HAVE_REACHED_LEDGER_WHERE'

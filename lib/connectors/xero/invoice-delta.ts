@@ -5,7 +5,7 @@
  * type/status partitioning are where this went wrong before, and both are pure given a fetcher.
  */
 
-import { mayHaveReachedLedger, type LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { mayHaveReachedLedger, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
   addMoney,
@@ -1505,7 +1505,7 @@ export type RegisteredPaymentRow = {
    * genuine NULL. Optional fields would therefore turn "this reader did not load the evidence" into
    * a silent, correct-looking verdict. Required, a caller that has not loaded them does not compile.
    *
-   * See lib/domain/accounting/cancelled-row-evidence.ts for the rule and
+   * See lib/domain/accounting/ledger-standing.ts for the rule and
    * lib/domain/accounting/unresolved-abandoned-claim.ts for the argument behind it.
    */
   abandonedBeforeRemoteCall: boolean | null

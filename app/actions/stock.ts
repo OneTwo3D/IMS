@@ -5,7 +5,7 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -499,7 +499,7 @@ export async function updateAdjustmentMovement(
       // 'CANCELLED' }` under a comment saying a cancelled row is "deliberately abandoned — never
       // re-queued, so they never reach the ledger". Abandonment is not a statement about the
       // ledger: the processors post BEFORE they persist SYNCED, so a row abandoned after it was
-      // claimed may already carry a journal. The rule is stated once in `cancelled-row-evidence.ts`;
+      // claimed may already carry a journal. The rule is stated once in `ledger-standing.ts`;
       // only a row carrying its own proof of a pre-call abandonment stops blocking the edit.
       const postedJournal = await tx.accountingSyncLog.findFirst({
         where: {

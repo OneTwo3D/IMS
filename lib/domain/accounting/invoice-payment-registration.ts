@@ -16,7 +16,7 @@
 import {
   mayHaveReachedLedger,
   type LedgerStandingRow,
-} from './cancelled-row-evidence'
+} from './ledger-standing'
 import {
   classifyLedgerSettlement,
   type LedgerSettlementProbe,
@@ -119,7 +119,7 @@ export type InvoicePaymentRegistrationDecision =
  *
  * The four gates below used to ask `status !== 'CANCELLED'` and `couldHaveReachedLedger !== false`,
  * which is this tree's oldest hand-written claim — "an abandoned row committed nothing" — and it is
- * FALSE for the majority of cancelled rows (cancelled-row-evidence.ts states why, once). The gates
+ * FALSE for the majority of cancelled rows (ledger-standing.ts states why, once). The gates
  * now ask {@link mayHaveReachedLedger}, and that reading needs three columns beyond the status.
  *
  * THEY ARE REQUIRED RATHER THAN OPTIONAL, AND THAT IS THE FIX RATHER THAN A DETAIL OF IT. Two of
@@ -207,7 +207,7 @@ export type ExistingInvoicePaymentSync = LedgerStandingRow & {
  *   `mayHaveReachedLedger(row) === false` — the COLUMN proof, and the one that was missing. A
  *   cancellation resolves only when nothing local contradicts it; a CANCELLED row that still names
  *   the document the ledger issued resolves NOTHING, whatever the sweep stamped on it. The rule is
- *   `cancelledClaimIsResolved`, stated once in cancelled-row-evidence.ts.
+ *   `cancelledClaimIsResolved`, stated once in ledger-standing.ts.
  *
  * Either proof is sufficient. Neither is available from the STATUS, which is what the four gates
  * used to read, and what let a swept CANCELLED receipt be registered a second time against a

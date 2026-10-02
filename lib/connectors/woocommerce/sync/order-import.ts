@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
@@ -892,7 +892,7 @@ async function applyResolvedWcInvoiceNumber(
     // say "every state except CANCELLED", on the ground that a cancelled row "commits to nothing";
     // the settlement writers and the post-time retirement of a claimed row both reach CANCELLED
     // without establishing that. Only a cancelled row carrying its own proof of a pre-call
-    // abandonment drops out now, through the one rule in `cancelled-row-evidence.ts`.
+    // abandonment drops out now, through the one rule in `ledger-standing.ts`.
     const salesInvoiceSyncRowCount = await tx.accountingSyncLog.count({
       where: {
         referenceType: 'SalesOrder',

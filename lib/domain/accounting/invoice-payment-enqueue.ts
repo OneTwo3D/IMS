@@ -41,7 +41,7 @@ import {
 } from '@/lib/domain/accounting/back-reference'
 import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
-import type { LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'

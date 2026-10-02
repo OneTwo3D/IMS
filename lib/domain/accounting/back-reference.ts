@@ -479,7 +479,7 @@ export async function resolvePurchaseOrderBackReference(
   // this predicate the two are the same set — every row with a non-null external id satisfies that
   // disjunction, by its `status != CANCELLED` arm or by `UNRESOLVED_ABANDONED_CLAIM_WHERE`'s
   // external-id veto — and composing a clause that can never exclude anything would state the rule
-  // a second time to no effect, which is what cancelled-row-evidence.ts exists to stop. The id IS
+  // a second time to no effect, which is what ledger-standing.ts exists to stop. The id IS
   // the evidence here; nothing further needs deciding.
   //
   // AND THE `=== 0` FENCE BELOW STILL MEANS WHAT IT SAYS. Its purpose is that the decision is made

@@ -23,7 +23,7 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
-import type { LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 /**
  * o3d-remove-parked-connectors — THE ROUTE THE TWO r16 CASES USED IS ARCHIVED.
  *

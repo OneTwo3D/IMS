@@ -16,7 +16,7 @@ import {
   reversalIsProven,
 } from '@/lib/domain/accounting/payment-reversal'
 import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
 
 /**
