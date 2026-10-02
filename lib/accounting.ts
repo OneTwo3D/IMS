@@ -21,6 +21,8 @@ import { withSavepoint } from '@/lib/db/savepoint'
 import { readPostingSuppression, reportSuppressedPosting, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import {
   classifyPriorAttempts,
+  describeAssertedPriorAttempt,
+  describeBlockedPriorAttempt,
   describeUnresolvedPriorAttempt,
   isIdempotencyKeyIndexCollision,
   PRIOR_ATTEMPT_SELECT,
@@ -1527,7 +1529,54 @@ export async function queueAccountingSyncTx(
     // NOTHING IS WRITTEN HERE. `queued: true` means "the work is on the queue", not "this call put
     // it there" — see ConnectorEnqueueOutcome.reason (o3d-ekn8 r4).
     if (verdict.kind === 'live' || verdict.kind === 'posted') {
+      // o3d-f709 / M11 (D2) - SUPPRESSED ON AN OPERATOR'S WORD IS STILL SUPPRESSED, AND NEVER SILENT.
+      // The occupant (or the only document-bearing row) is a SYNCED row an operator typed a document
+      // id into: the document is claimed to exist, so no second one is raised, but IMS never saw it.
+      // The report goes through `tx`, exactly like the refusal below and for the same reason - a
+      // report recorded against a transaction that then rolls back would describe something that did
+      // not happen. THE LOCK / TRANSACTION EFFECT, stated: this is one extra INSERT on the caller's
+      // transaction, taken while the follow-up scope lock above is already held, and it is NOT
+      // swallowed - a failed write has aborted the CALLER's transaction, so a formerly silent
+      // success can now fail the caller's commit. That is the price of "always reported" (D2), and it
+      // is paid only on the asserted path.
+      if (verdict.asserted) {
+        await tx.activityLog.create({
+          data: {
+            entityType: 'SYSTEM',
+            action: 'accounting_enqueue_suppressed_by_operator_assertion',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: describeAssertedPriorAttempt({
+              ...params,
+              syncLogId: verdict.syncLogId,
+              ...(verdict.externalTransactionId ? { externalTransactionId: verdict.externalTransactionId } : {}),
+            }),
+          },
+        })
+      }
       return answer({ queued: true, reason: 'already-queued' }, context.connector)
+    }
+    if (verdict.kind === 'blocked') {
+      // C1 / D1 - an operator settled a prior attempt NOT_POSTED. REFUSED, not decided: the posting
+      // stays owed, nothing is raised, and the operator hand-posts and marks it handled. Written
+      // through `tx` and NOT swallowed, for the same reason as the unresolved refusal below.
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SYSTEM',
+          action: 'accounting_enqueue_refused_asserted_not_posted',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: describeBlockedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
+        },
+      })
+      return answer({ queued: false, reason: 'refused' }, context.connector, {
+        reason: 'asserted_not_posted_prior_attempt',
+        remedy:
+          `An earlier attempt at this posting (accounting sync row ${verdict.syncLogId}) was settled by an operator as `
+          + '"not posted", which is not proof. Check the accounting system; if the document is missing, post it there by '
+          + 'hand and mark the posting handled.',
+        detail: { syncLogId: verdict.syncLogId },
+      })
     }
     if (verdict.kind === 'unresolved') {
       // REFUSED, not decided — the posting is still owed. Written through `tx` so it shares the

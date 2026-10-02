@@ -203,6 +203,13 @@ export function isProvenLedgerFact(row: LedgerStandingRow): boolean {
 
 export type WorkSlot = 'OCCUPIED' | 'BLOCKED' | 'FREE'
 
+/**
+ * The statuses that OCCUPY a posting's work slot: the partial unique indexes' own predicate
+ * (`status IN ('PENDING','PROCESSING','SYNCED')`). Stated once; `WORK_SLOT_OCCUPIED_WHERE`,
+ * `workSlotStanding` and prior-posting-evidence's live set all derive from it.
+ */
+export const WORK_SLOT_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+
 export type WorkSlotStanding = {
   slot: WorkSlot
   /**
@@ -227,7 +234,7 @@ export type WorkSlotStanding = {
  */
 export function workSlotStanding(row: LedgerStandingRow): WorkSlotStanding {
   const asserted = row.settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS
-  if (row.status === 'PENDING' || row.status === 'PROCESSING' || row.status === 'SYNCED') {
+  if ((WORK_SLOT_STATUSES as readonly string[]).includes(row.status)) {
     return { slot: 'OCCUPIED', asserted }
   }
   if (ledgerStanding(row) === 'ASSERTED_NOT_POSTED') return { slot: 'BLOCKED', asserted: true }
@@ -321,7 +328,7 @@ export const MAY_HAVE_REACHED_LEDGER_WHERE: Prisma.AccountingSyncLogWhereInput =
  * the query, the TypeScript (`workSlotStanding`) and the database agree by construction.
  */
 export const WORK_SLOT_OCCUPIED_WHERE: Prisma.AccountingSyncLogWhereInput = {
-  status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+  status: { in: [...WORK_SLOT_STATUSES] },
 }
 
 // ---------------------------------------------------------------------------

@@ -939,6 +939,33 @@ test('[o3d-j625 r6 M4] an UNRESOLVED prior attempt refuses — and, when asked, 
   assert.equal(reported.outcome?.refusalRecorded, true, 'and the answer says so, so the caller merges instead of recounting')
 })
 
+test('[o3d-f709 M11, D1] a prior attempt an operator settled NOT_POSTED REFUSES - and, when asked, lands in the refusal inbox as owed', async () => {
+  // D1: the BLOCKED enqueue rides the existing refusal path, so the posting is recorded as OUTSTANDING
+  // (hand-post + Mark Handled) and is never silently dropped. The inbox does not (yet) show a
+  // BLOCKED-specific wording: that is filed as its own work.
+  reset(['xero'])
+  const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  txModel.priorAttempts = [{ id: 'settled-1', status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }]
+  const reported: { outcome?: Record<string, unknown> } = {}
+
+  const queued = await queueAccountingSyncTx(transactionDouble() as never, {
+    ...TX_REQUEST,
+    type: 'STOCK_RECEIPT' as const,
+    payload: { lines: [{ accountCode: settings.inventoryAccount, debit: 10 }] },
+    idempotencyKey: 'purchase-receipt:po-1:GRN-8:h',
+    chartConnector: settings.connector,
+    recordRefusalAsOutstanding: true,
+    reportOutcome: (outcome) => { reported.outcome = outcome as unknown as Record<string, unknown> },
+  })
+
+  assert.equal(queued, false, 'PRECONDITION: refused - the settlement did not free the slot')
+  assert.equal(insertedInTx.length, 0, 'nothing written')
+  assert.equal(outstandingRefusals().length, 1)
+  assert.equal(outstandingRefusals()[0]!.reason, 'asserted_not_posted_prior_attempt')
+  assert.equal(reported.outcome?.refusalRecorded, true)
+})
+
 test('[o3d-j625 r6 M4] a PINNED ledger the selection no longer services refuses — and records, when asked', async () => {
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')

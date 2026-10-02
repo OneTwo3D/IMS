@@ -1,5 +1,11 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
+import {
+  LEDGER_STANDING_SELECT,
+  WORK_SLOT_STATUSES,
+  workSlotStanding,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * o3d-d0pd — WHAT AN ALREADY-PRESENT CHECK HAS TO PROVE BEFORE IT RAISES A SECOND ROW.
@@ -45,12 +51,19 @@ import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
  *               posting stays owed, and the refusal names the row an operator can resolve — retry
  *               that row, or settle it with the per-row settlement action on /sync.
  *
- * WHY CANCELLED IS NOT A BLOCKER (unless it carries a document id). CANCELLED is this codebase's own
- * assertion that nothing was sent — `classifyRegisteredPayment` says so in as many words, and the
- * NOT_POSTED settlement moves a row there precisely so that it LEAVES the partial unique indexes.
- * `describeCreateDispatchRemedy` then prescribes "cancel this row and re-queue the work from the
- * source document, which raises a new row with no dispatch on record". Treating CANCELLED as a
- * blocker would delete that remedy, which is the only exit some rows have.
+ * WHY AN UNPROVEN CANCELLED ROW IS NOT A BLOCKER, AND WHY AN OPERATOR-SETTLED ONE IS (o3d-f709, C1).
+ * A CANCELLED row leaves the partial unique indexes, so its WORK SLOT is free (`workSlotStanding`):
+ * the cancel-and-requeue remedy `describeCreateDispatchRemedy` prescribes still works for a row IMS
+ * itself retired. That is a statement about the SLOT, not about the ledger - a CANCELLED row with no
+ * recorded proof may still have posted, and whether it did is `ledgerStanding`'s separate question
+ * (UNKNOWN), tracked as its own work.
+ *
+ * ONE CANCELLED ROW IS DIFFERENT: the NOT_POSTED settlement (CANCELLED + OPERATOR_ASSERTION, no id).
+ * It used to be the way to re-queue work: "the operator looked, nothing posted, free the slot".
+ * C1: an operator's word about a ledger IMS never read is not proof, so the slot is BLOCKED - the
+ * enqueue refuses, and the operator hand-posts and marks the posting handled. And a SYNCED row an
+ * operator typed a document id into still occupies the slot (the document is claimed to exist) but
+ * the suppression is REPORTED, never silent.
  *
  * WHY THIS IS NOT `attemptProvenNeverMade`. That predicate is the canonical "no remote call left this
  * row" test and it is the right one — for the three STAMPED_MONEY_TYPES, which are the only types
@@ -67,22 +80,31 @@ import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
  * row", and it includes FAILED — which is the very status this module refuses to read as live. This
  * one is the unique index's own predicate, restated so the query and the index agree by construction.
  */
-export const PRIOR_ATTEMPT_LIVE_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+export const PRIOR_ATTEMPT_LIVE_STATUSES = WORK_SLOT_STATUSES
 
-/** The columns a verdict is reached from. Selecting fewer would make the verdict unsound, not partial. */
-export type PriorAttemptRow = {
-  id: string
-  status: string
-  externalTransactionId: string | null
-}
+/**
+ * The columns a verdict is reached from. Selecting fewer would make the verdict unsound, not partial:
+ * the whole {@link LedgerStandingRow} is REQUIRED, so a caller that did not load `settlementBasis`
+ * fails `tsc` rather than reading an operator's assertion as a connector's answer.
+ */
+export type PriorAttemptRow = LedgerStandingRow & { id: string }
 
 export type PriorAttemptVerdict =
   /** No row for this key. The enqueue may write one. */
   | { kind: 'none' }
-  /** A row is on the queue. The counterpart exists or will. */
-  | { kind: 'live'; syncLogId: string }
-  /** A row in some status names a document that exists in the ledger. */
-  | { kind: 'posted'; syncLogId: string; externalTransactionId: string }
+  /**
+   * A row OCCUPIES the work slot. The counterpart exists or will. `asserted` is true when EVERY
+   * occupant rests on an operator's typed document id: the suppression is then REPORTED (D2).
+   */
+  | { kind: 'live'; syncLogId: string; asserted: boolean; externalTransactionId: string | null }
+  /** A row in some status names a document that exists in the ledger. `asserted`: only an operator says so. */
+  | { kind: 'posted'; syncLogId: string; externalTransactionId: string; asserted: boolean }
+  /**
+   * C1 / D1: an operator settled a prior attempt NOT_POSTED. The slot is BLOCKED - not free, not
+   * occupied. The enqueue REFUSES; the operator hand-posts and marks the posting handled. No
+   * automatic re-post.
+   */
+  | { kind: 'blocked'; syncLogId: string }
   /** A terminal row with no document id: nothing can say whether its attempt landed. */
   | { kind: 'unresolved'; syncLogId: string }
 
@@ -91,33 +113,48 @@ function documentId(row: PriorAttemptRow): string | null {
   return id.length > 0 ? id : null
 }
 
-function isLive(row: PriorAttemptRow): boolean {
-  return (PRIOR_ATTEMPT_LIVE_STATUSES as readonly string[]).includes(row.status)
-}
-
 /**
  * The verdict for one idempotency key, from every row that carries it.
  *
  * PRECEDENCE IS DELIBERATE and it is not "first row wins":
  *
- *   1. `live` — a standing row is the ordinary, healthy answer, and it is the one the fourteen
- *      existing callers already depend on. A live row beside a failed one means the work IS queued.
- *   2. `posted` — no live row, but a document exists. The counterpart is there.
- *   3. `unresolved` — no live row and no document id, but a terminal attempt that cannot be ruled
- *      out. Only now does the enqueue refuse.
+ *   1. `live` - a row OCCUPIES the slot (`workSlotStanding`). The ordinary, healthy answer, and the
+ *      one the fourteen existing callers already depend on. A connector-backed occupant outranks an
+ *      asserted one: the suppression then rests on evidence, and is not flagged.
+ *   2. `posted` - no occupant, but a document id exists in some status. The counterpart is there.
+ *   3. `blocked` - no occupant and no document, but an operator settled an attempt NOT_POSTED.
+ *   4. `unresolved` - a FAILED attempt that cannot be ruled out. Only now does the enqueue refuse for
+ *      the older reason.
  *
- * Anything else (CANCELLED with no document id) is not a blocker at all — see the header.
+ * Anything else (a CANCELLED row with no document id and no operator assertion) frees the slot - see
+ * the header for why that is a statement about the slot only.
  */
 export function classifyPriorAttempts(rows: readonly PriorAttemptRow[]): PriorAttemptVerdict {
-  const live = rows.find((row) => isLive(row))
-  if (live) return { kind: 'live', syncLogId: live.id }
+  const standings = rows.map((row) => ({ row, slot: workSlotStanding(row), id: documentId(row) }))
 
-  for (const row of rows) {
-    const id = documentId(row)
-    if (id) return { kind: 'posted', syncLogId: row.id, externalTransactionId: id }
+  const occupants = standings.filter((s) => s.slot.slot === 'OCCUPIED')
+  if (occupants.length > 0) {
+    const backed = occupants.find((s) => !s.slot.asserted)
+    const chosen = backed ?? occupants[0]
+    return { kind: 'live', syncLogId: chosen.row.id, asserted: backed === undefined, externalTransactionId: chosen.id }
   }
 
-  // FAILED only. CANCELLED asserts nothing was sent, so it is not one of these.
+  const documented = standings.filter((s) => s.id !== null)
+  if (documented.length > 0) {
+    const backed = documented.find((s) => !s.slot.asserted)
+    const chosen = backed ?? documented[0]
+    return {
+      kind: 'posted',
+      syncLogId: chosen.row.id,
+      externalTransactionId: chosen.id as string,
+      asserted: backed === undefined,
+    }
+  }
+
+  const blocked = standings.find((s) => s.slot.slot === 'BLOCKED')
+  if (blocked) return { kind: 'blocked', syncLogId: blocked.row.id }
+
+  // FAILED only. An unproven CANCELLED row frees the slot, so it is not one of these.
   const unresolved = rows.find((row) => row.status === 'FAILED')
   if (unresolved) return { kind: 'unresolved', syncLogId: unresolved.id }
 
@@ -148,7 +185,7 @@ export function priorAttemptsWhere(scope: {
 }
 
 /** The columns {@link classifyPriorAttempts} reads, as a Prisma `select`. */
-export const PRIOR_ATTEMPT_SELECT = { id: true, status: true, externalTransactionId: true } as const
+export const PRIOR_ATTEMPT_SELECT = { id: true, ...LEDGER_STANDING_SELECT } as const
 
 /**
  * "A COUNTERPART FOR THIS POSTING EXISTS OR WILL", as a Prisma predicate — the `live` and `posted`
@@ -189,6 +226,47 @@ export function describeUnresolvedPriorAttempt(params: {
     + 'would create a SECOND document if the first one landed. REMEDY: resolve that row on /sync — '
     + 'retry it, or record its document id with the per-row settlement action if the document is '
     + 'already in the ledger. This posting is still outstanding until you do.'
+}
+
+/**
+ * What is REPORTED when an enqueue is suppressed because a row an OPERATOR typed a document id into
+ * occupies (or names) the posting (D2). The suppression is right - the document is claimed to exist -
+ * but it must never be silent: IMS has not seen that document, and if the typed id is wrong the
+ * posting is simply never made.
+ */
+export function describeAssertedPriorAttempt(params: {
+  type: string
+  referenceType: string
+  referenceId: string
+  syncLogId: string
+  externalTransactionId?: string
+}): string {
+  return `NOTHING WAS QUEUED, ON AN OPERATOR'S WORD. A ${params.type} for ${params.referenceType} `
+    + `${params.referenceId} was not raised because sync row ${params.syncLogId} was settled by an operator as `
+    + `posted${params.externalTransactionId ? ` (document ${params.externalTransactionId})` : ''} - a document id typed in `
+    + 'by hand, which IMS never saw in the accounting system. Raising it again could post a second document if '
+    + 'the operator is right; not raising it leaves the posting missing if they are wrong. Open that document in '
+    + 'the accounting system and confirm it exists.'
+}
+
+/**
+ * What an operator is told when an enqueue REFUSES because a prior attempt was settled NOT_POSTED
+ * (C1, D1). It names the ROW and states the remedy, which is NOT "settle it again" and NOT "re-queue":
+ * IMS will not send this posting again on an operator's word.
+ */
+export function describeBlockedPriorAttempt(params: {
+  type: string
+  referenceType: string
+  referenceId: string
+  syncLogId: string
+}): string {
+  return `NOTHING WAS QUEUED. A previous ${params.type} attempt for ${params.referenceType} ${params.referenceId} `
+    + `(sync row ${params.syncLogId}) was settled by an operator as "not posted". That is a person's word about an `
+    + 'accounting system IMS never read - a lost response, a late webhook or a hand-posted document would leave the '
+    + 'same row - so IMS will not post this again on the strength of it, and posting again could create a SECOND '
+    + 'document. REMEDY: open the accounting system. If the document is there, nothing more is owed. If it is not, '
+    + 'post it there by hand and mark this posting handled in the refusal inbox. This posting is still outstanding '
+    + 'until you do.'
 }
 
 /**
