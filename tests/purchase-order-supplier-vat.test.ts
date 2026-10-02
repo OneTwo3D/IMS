@@ -23,7 +23,7 @@ test('server PO actions resolve line VAT from the supplier/order default, not de
   // The shared helper exists and is used by both create and update paths.
   assert.match(text, /async function resolvePurchaseLineTaxRates\(/)
   assert.equal(
-    (text.match(/resolvePurchaseLineTaxRates\(input\.lines, orderDefaultCtx\)/g) || []).length,
+    (text.match(/resolvePurchaseLineTaxRates\(input\.lines, orderDefaultCtx(?:, tx)?\)/g) || []).length,
     2,
     'both createPurchaseOrder and updatePurchaseOrder must resolve via the shared supplier-rate helper',
   )
