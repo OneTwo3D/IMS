@@ -146,7 +146,7 @@ function repoWithMigration(t: import('node:test').TestContext, sql: string) {
 }
 
 function run(dir: string, env: Record<string, string>) {
-  const r = spawnSync('node', [SCRIPT], { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH ?? '', HOME: '/nonexistent', ...env } })
+  const r = spawnSync('node', [SCRIPT], { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH ?? '', HOME: '/nonexistent', ...env } as NodeJS.ProcessEnv })
   return { status: r.status, out: `${r.stdout}${r.stderr}` }
 }
 
