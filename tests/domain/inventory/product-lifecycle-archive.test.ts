@@ -86,7 +86,7 @@ function createArchiveClient(options: {
         const productId = (args as { where: { productId: string } }).where.productId
         const incoming = incomingByProductId.get(productId) ?? '0'
         return decimal(incoming).gt(0)
-          ? [{ qty: decimal(incoming), qtyReceived: decimal(0) }]
+          ? [{ id: `po-line-${productId}`, qty: decimal(incoming), qtyReceived: decimal(0), po: { status: 'PO_SENT' } }]
           : []
       },
     },
@@ -125,8 +125,8 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
   const client = {
     purchaseOrderLine: {
       findMany: async () => [
-        { qty: decimal('10'), qtyReceived: decimal('4') },
-        { qty: decimal('2'), qtyReceived: decimal('3') },
+        { id: 'po-line-a', qty: decimal('10'), qtyReceived: decimal('4'), po: { status: 'PO_SENT' } },
+        { id: 'po-line-b', qty: decimal('2'), qtyReceived: decimal('3'), po: { status: 'PARTIALLY_RECEIVED' } },
       ],
     },
     stockTransferLine: {
@@ -147,7 +147,8 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
       findMany: async (args?: unknown) => {
         const where = (args as { where: { asn?: { status: { in: string[] } }; sourceType?: string } }).where
         if (!where.asn) {
-          assert.equal(where.sourceType, 'STOCK_TRANSFER_LINE')
+          // The landed-quantity loaders (transfer arm, and since o3d-papk the PO arm).
+          assert.ok(['STOCK_TRANSFER_LINE', 'PURCHASE_ORDER_LINE'].includes(where.sourceType ?? ''))
           return []
         }
         wmsAsnStatusFilter = where.asn.status.in
@@ -302,4 +303,46 @@ test('product lifecycle archive rolls back the archive update when the audit log
 
   assert.equal(products[0]?.active, true)
   assert.equal(products[0]?.lifecycleStatus, 'EOL')
+})
+
+test('o3d-papk: a PO line landed through alignment is counted once, and its mirror ASN row is not counted again', async () => {
+  const wmsAsnQueries: string[] = []
+  const client = {
+    purchaseOrderLine: {
+      findMany: async () => [
+        // Six of ten landed through the alignment credit; qtyReceived is zero (the defect's shape).
+        { id: 'po-line-aligned', qty: decimal('10'), qtyReceived: decimal('0'), po: { status: 'PO_SENT' } },
+        // An ordinary line with no ASN at all.
+        { id: 'po-line-plain', qty: decimal('3'), qtyReceived: decimal('1'), po: { status: 'PO_SENT' } },
+      ],
+    },
+    stockTransferLine: { findMany: async () => [] },
+    productionOrder: { findMany: async () => [] },
+    wmsAsnLineMap: {
+      findMany: async (args?: unknown) => {
+        const where = (args as { where: { asn?: unknown; sourceType?: string } }).where
+        if (!where.asn) {
+          wmsAsnQueries.push(`loader:${where.sourceType}`)
+          if (where.sourceType !== 'PURCHASE_ORDER_LINE') return []
+          return [{ sourceLineId: 'po-line-aligned', qtyAccountedViaSnapshot: decimal('6'), qtyAccountedViaReceipt: decimal('0') }]
+        }
+        wmsAsnQueries.push('arm')
+        return [
+          // The mirror of po-line-aligned: expected 10, credited 6. Counted by the PO arm already.
+          { sourceType: 'PURCHASE_ORDER_LINE', sourceLineId: 'po-line-aligned', expectedQty: decimal('10'), qtyAccountedViaSnapshot: decimal('6'), qtyAccountedViaReceipt: decimal('0') },
+          // A PO ASN row whose line is NOT among the open lines above: the only evidence, so it still counts.
+          { sourceType: 'PURCHASE_ORDER_LINE', sourceLineId: 'po-line-elsewhere', expectedQty: decimal('5'), qtyAccountedViaSnapshot: decimal('0'), qtyAccountedViaReceipt: decimal('0') },
+        ]
+      },
+    },
+  }
+
+  const incoming = await getProductIncomingStock('product-1', { client: client as never })
+
+  // PRECONDITIONS: both reads happened, so the figures below are not the product of an empty fixture.
+  assert.deepEqual([...wmsAsnQueries].sort(), ['arm', 'loader:PURCHASE_ORDER_LINE'])
+  console.log(`# o3d-papk archive unit arm: evaluated ${wmsAsnQueries.length} ASN reads, 2 PO lines, 2 ASN rows`)
+  assert.equal(incoming.purchaseOrders, '6', '(10 − 6 landed) + (3 − 1) = 6; the old arm said 12')
+  assert.equal(incoming.wmsAsn, '5', 'only the row whose line the PO arm did not count')
+  assert.equal(incoming.total, '11')
 })

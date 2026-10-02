@@ -21,6 +21,15 @@ import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-alloc
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+// o3d-papk: "how much of this line is still to come" is `qty - LANDED`, not `qty - qtyReceived`. The WMS
+// alignment lands units by crediting wms_asn_line_maps.qtyAccountedViaSnapshot and never writes qtyReceived.
+import {
+  derivePurchaseOrderReceiptStatus,
+  loadPurchaseOrderLineLandedQty,
+  loadPurchaseOrderLineOutstandingQty,
+  requirePoLineLandedQty,
+  requirePoLineOutstandingQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { updatePreferredSuppliersForPlacedPurchaseOrder } from '@/lib/domain/purchasing/preferred-supplier'
 import { applyHeaderOrderDiscount } from '@/lib/domain/purchasing/order-discount'
@@ -1818,10 +1827,18 @@ export async function receivePurchaseOrder(
     // receipt may legitimately split one line across warehouses, but the TOTAL must not
     // over-receive it — the old per-row check let two rows for the same line each pass
     // (each ≤ outstanding) while their sum exceeded it.
+    //
+    // o3d-papk: OUTSTANDING means `qty - LANDED`, where landed counts the units the WMS alignment has already
+    // brought into stock (they sit on wms_asn_line_maps, never on qtyReceived). This pre-transaction read is
+    // only an early, UNLOCKED refusal; the authoritative check is the in-transaction one below, read under
+    // the purchase_orders row lock.
     const receiveByPoLine = sumReceiptQtyByPoLine(linesWithQty)
+    const earlyOutstanding = await loadPurchaseOrderLineOutstandingQty(
+      db,
+      po.lines.map((l) => ({ id: l.id, qty: l.qty, qtyReceived: l.qtyReceived, poStatus: po.status })),
+    )
     for (const [poLineId, totalQty] of receiveByPoLine) {
-      const poLine = po.lines.find((l) => l.id === poLineId)!
-      const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
+      const outstanding = requirePoLineOutstandingQty(earlyOutstanding, poLineId).qty
       if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
         return { success: false, error: `Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()})` }
       }
@@ -1949,11 +1966,19 @@ export async function receivePurchaseOrder(
       // Re-validate outstanding qty under lock — the pre-tx check used a
       // stale snapshot that concurrent receipts could have advanced past. mgyk:
       // validate the SUMMED qty per PO line (a line may be split across warehouses).
+      //
+      // o3d-papk: read under the purchase_orders row lock taken above, on the TRANSACTION client. Every
+      // writer of a PO line's credit columns (alignment, the book-in, the retirement disposal) holds this
+      // same row first, so no line lock is needed and none is added.
       const lockedLineMap = new Map(currentPo.lines.map((line) => [line.id, line]))
+      const lockedOutstanding = await loadPurchaseOrderLineOutstandingQty(
+        tx,
+        currentPo.lines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: currentPo.status })),
+      )
       for (const [poLineId, totalQty] of sumReceiptQtyByPoLine(linesWithQty)) {
         const poLine = lockedLineMap.get(poLineId)
         if (!poLine) throw new Error('Invalid PO line')
-        const outstanding = toDecimal(poLine.qty).minus(toDecimal(poLine.qtyReceived))
+        const outstanding = requirePoLineOutstandingQty(lockedOutstanding, poLineId).qty
         if (roundQuantity(totalQty, 6).greaterThan(roundQuantity(outstanding, 6))) {
           throw new Error(`Cannot receive more than outstanding qty (${roundQuantity(outstanding, 6).toNumber()}) for line ${poLineId}`)
         }
@@ -2055,10 +2080,17 @@ export async function receivePurchaseOrder(
 
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
-        select: { qty: true, qtyReceived: true },
+        select: { id: true, qty: true, qtyReceived: true },
       })
-      const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
-      const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
+      // o3d-papk (D1): "all received" means LANDED >= qty. A line the WMS alignment brought in has a
+      // qtyReceived of 0, so the old `qtyReceived >= qty` left such an order PARTIALLY_RECEIVED for ever.
+      // Read under the same purchase_orders row lock, after this receipt's own qtyReceived increments.
+      const updatedLanded = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
+      const newStatus = derivePurchaseOrderReceiptStatus(updatedLines.map((line) => ({
+        qty: line.qty,
+        landed: requirePoLineLandedQty(updatedLanded, line.id),
+      })))
+      const allReceived = newStatus === 'RECEIVED'
       const receiptTransition = validatePurchaseReceiptStatusUpdate(currentPo.status, newStatus)
       if (!receiptTransition.success) throw new Error(receiptTransition.error)
       await tx.purchaseOrder.update({

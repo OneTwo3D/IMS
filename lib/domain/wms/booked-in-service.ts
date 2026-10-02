@@ -11,11 +11,13 @@ import {
   buildBookedInDryRun,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
+  resolveManualReceiptPool,
   resolveRemoteBookedInQuantity,
   sliceTransferSnapshotForReceipt,
   type BookedInDryRun,
   type BookedInDryRunWarningCode,
 } from './asn-reconciliation'
+import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
 import {
   isStockMovementIdempotencyConflict,
@@ -27,6 +29,13 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import {
+  derivePurchaseOrderReceiptStatus,
+  isPurchaseOrderUsableForWmsReceipt,
+  loadPurchaseOrderLineLandedQty,
+  requirePoLineLandedQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
 import {
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
@@ -87,6 +96,8 @@ const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
   'missing_local_line',
   'unsupported_source_type',
   'cost_layer_snapshot_missing',
+  // o3d-papk: approval cannot make a cancelled or closed purchase order receivable.
+  'parent_not_receivable',
   // o3d-btiw. An operator acknowledging a warning cannot supply a quantity the warehouse never
   // served, so these two must not be approvable: approval would resume with the unknown quantity
   // still unknown. The remedy is to make the WMS serve the quantity (or to correct the mapping) and
@@ -560,6 +571,7 @@ export async function processBookedInEvent(
           qtyAccountedViaSnapshot: true,
           qtyAccountedViaReceipt: true,
           lastProcessedReceivedQty: true,
+          manualQtyBaseline: true,
         },
       })
 
@@ -698,6 +710,29 @@ export async function processBookedInEvent(
 
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
       const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
+      // o3d-papk / o3d-67kw3: THE ONE POOL, shared by the dry run below and by the applied reconciliation
+      // further down. It is the line's manual receipts that no ASN has reconciled yet, less this row's
+      // baseline, read here on `tx` under the parent locks asserted just above — so the review an operator
+      // approves and the stock the approval adds are computed from the same number.
+      const purchasePools = await loadManualReceiptPools(
+        tx,
+        'PURCHASE_ORDER_LINE',
+        purchaseOrderLines,
+        purchaseCandidateLines
+          .filter((line) => purchaseLineById.has(line.sourceLineId))
+          .map((line) => ({ asnLineMapId: line.id, sourceLineId: line.sourceLineId, manualQtyBaseline: line.manualQtyBaseline })),
+      )
+      const transferPools = await loadManualReceiptPools(
+        tx,
+        'STOCK_TRANSFER_LINE',
+        transferLines,
+        transferCandidateLines
+          .filter((line) => transferLineById.has(line.sourceLineId))
+          .map((line) => ({ asnLineMapId: line.id, sourceLineId: line.sourceLineId, manualQtyBaseline: line.manualQtyBaseline })),
+      )
+      // A row with no usable local line (unsupported source type, missing line) has no manual receipts to
+      // count; the dry run reports `missing_local_line` / `unsupported_source_type` for it instead.
+      const noManualReceipts = resolveManualReceiptPool({ lineQtyReceived: 0, lineReconciledAcrossAsns: 0, rowManualQtyBaseline: 0 })
       const now = new Date()
       // Keep buildBookedInDryRun pure and I/O-free: this transaction holds row locks while
       // deriving review state, so any remote/database reads must happen before this point.
@@ -720,10 +755,15 @@ export async function processBookedInEvent(
             sku: line.sku,
             expectedQty: Number(line.expectedQty),
             currentRemoteReceivedQty: line.currentRemoteReceivedQty,
-            localReceivedQty: Number(purchaseLine?.qtyReceived ?? transferLine?.qtyReceived ?? 0),
+            manualReceiptPool: purchaseLine
+              ? requireManualReceiptPool(purchasePools, line.id)
+              : transferLine
+                ? requireManualReceiptPool(transferPools, line.id)
+                : noManualReceipts,
             qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
             qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
             lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+            parentReceivable: purchaseLine ? isPurchaseOrderUsableForWmsReceipt(purchaseLine.po.status) : undefined,
             localLineExists: line.sourceType === 'PURCHASE_ORDER_LINE'
               ? Boolean(purchaseLine)
               : line.sourceType === 'STOCK_TRANSFER_LINE'
@@ -929,6 +969,14 @@ export async function processBookedInEvent(
           throw new Error(`Purchase order ${poId} not found for ASN ${lockedEvent.externalAsnId}`)
         }
 
+        // o3d-papk (Codex round 2, HIGH): the dry run above holds a callback for REVIEW (`parent_not_receivable`,
+        // approval-blocked) before it reaches here, so this is a backstop for the same fact read again under the same
+        // lock: nothing may add stock, a cost layer or a journal against a CANCELLED or CLOSED order. The same predicate
+        // the alignment and the manual receipt use. INTEGRITY ABORT: rolls back on purpose.
+        if (!isPurchaseOrderUsableForWmsReceipt(po.status)) {
+          throw new Error(`Purchase order ${po.reference} is ${po.status} and cannot be received against for ASN ${lockedEvent.externalAsnId}`)
+        }
+
         // ─── o3d-8f0p6 r2: ONE COST FOR THE MOVEMENT, THE LAYER AND THE JOURNAL ───
         //
         // THE DEFECT THIS REPLACES was `Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)`.
@@ -993,7 +1041,7 @@ export async function processBookedInEvent(
           const reconciled = reconcileBookedInQuantities({
             expectedQty: receiptLine.expectedQty,
             currentReceivedQty: receiptLine.currentReceivedQty,
-            localReceivedQty: Number(poLine.qtyReceived),
+            manualReceiptPool: requireManualReceiptPool(purchasePools, receiptLine.asnLineMapId),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
             qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
             qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,
@@ -1211,18 +1259,33 @@ export async function processBookedInEvent(
         const updatedLines = await tx.purchaseOrderLine.findMany({
           where: { poId },
           select: {
+            id: true,
             qty: true,
             qtyReceived: true,
           },
         })
-        const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
-        await tx.purchaseOrder.update({
-          where: { id: poId },
-          data: {
-            status: allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED',
-            ...(allReceived ? { receivedAt: now } : {}),
-          },
-        })
+        // o3d-papk (D1): "all received" means LANDED >= qty. A line the WMS stock-sync alignment brought in
+        // has qtyReceived 0 and its units on wms_asn_line_maps, so `qtyReceived >= qty` left such an order
+        // PARTIALLY_RECEIVED for ever. Read on this transaction, under the purchase_orders row lock taken
+        // above, after this book-in's own qtyReceived and qtyAccountedViaReceipt writes in the loop.
+        const updatedLanded = await loadPurchaseOrderLineLandedQty(tx, updatedLines)
+        const newStatus = derivePurchaseOrderReceiptStatus(updatedLines.map((line) => ({
+          qty: line.qty,
+          landed: requirePoLineLandedQty(updatedLanded, line.id),
+        })))
+        const allReceived = newStatus === 'RECEIVED'
+        // o3d-papk (Codex round 2): a status is only ever WRITTEN along the purchase-order workflow, never over a status
+        // the workflow does not allow it from (it used to overwrite INVOICED, RETURNED and, with no review step,
+        // CANCELLED). Staying where it is is not a regression: the stock and the landed quantity are recorded either way.
+        if (newStatus === po.status || validatePurchaseOrderStatusTransition(po.status, newStatus).success) {
+          await tx.purchaseOrder.update({
+            where: { id: poId },
+            data: {
+              status: newStatus,
+              ...(allReceived && newStatus !== po.status ? { receivedAt: now } : {}),
+            },
+          })
+        }
 
         // ─── o3d-8f0p6: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
         //
@@ -1397,7 +1460,7 @@ export async function processBookedInEvent(
           const reconciled = reconcileBookedInQuantities({
             expectedQty: receiptLine.expectedQty,
             currentReceivedQty: receiptLine.currentReceivedQty,
-            localReceivedQty: Number(transferLine.qtyReceived),
+            manualReceiptPool: requireManualReceiptPool(transferPools, receiptLine.asnLineMapId),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
             qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
             qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,

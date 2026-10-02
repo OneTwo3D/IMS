@@ -33,6 +33,17 @@ import {
   type TransferLineResidualQty,
   type WmsAsnLineResidualQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import {
+  derivePurchaseOrderReceiptStatus,
+  isPurchaseOrderUsableForWmsReceipt,
+  loadPurchaseOrderLineLandedQty,
+  loadPurchaseOrderLineOutstandingQty,
+  requirePoLineLandedQty,
+  requirePoLineOutstandingQty,
+  resolvePurchaseOrderLineResidualQty,
+  type PurchaseOrderLineResidualQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
@@ -511,7 +522,9 @@ async function resolveOpenDiscrepancies(binding: SyncBinding, productId: string,
   })
 }
 
-async function detectReceiptTimingConflict(
+// Exported for tests/concurrency/po-landed-quantity.concurrent.test.ts (o3d-papk A8): it is the align-down
+// receipt-timing guard and is otherwise reachable only through a sweep that calls the live Mintsoft API.
+export async function detectReceiptTimingConflict(
   binding: SyncBinding,
   productId: string,
   delta: number,
@@ -547,13 +560,25 @@ async function detectReceiptTimingConflict(
     const poLine = await db.purchaseOrderLine.findUnique({
       where: { id: candidate.sourceLineId },
       select: {
+        id: true,
         qty: true,
         qtyReceived: true,
+        po: { select: { status: true } },
       },
     })
     if (!poLine) continue
 
-    const outstandingReceipt = Number(poLine.qty) - Number(poLine.qtyReceived)
+    // o3d-papk: OUTSTANDING is `qty - LANDED` (alignment lands units without writing qtyReceived), and an
+    // order that expects nothing more (CANCELLED, CLOSED) has none.
+    const outstandingReceipt = requirePoLineOutstandingQty(
+      await loadPurchaseOrderLineOutstandingQty(db, [{
+        id: poLine.id,
+        qty: poLine.qty,
+        qtyReceived: poLine.qtyReceived,
+        poStatus: poLine.po.status,
+      }]),
+      poLine.id,
+    ).qtyNumber
     const remainingExpected = Number(candidate.expectedQty) - Number(candidate.lastProcessedReceivedQty)
     if (outstandingReceipt > 0 && remainingExpected > 0 && delta <= remainingExpected) {
       return `Open ASN ${candidate.asn.externalAsnId} still has ${formatQuantity(remainingExpected)} pending receipt`
@@ -596,6 +621,11 @@ type RefusedAlignmentCandidate = {
   asnLineMapId: string
   externalAsnId: string
   reason: string
+  /**
+   * Which kind of parent an `unusable` refusal is about, so the operator-facing status sentence names the
+   * right one (o3d-papk). Absent means a transfer.
+   */
+  parent?: 'purchase_order'
   /**
    * `unusable` — the ASN line cannot be used at all (its transfer is gone or is not
    * in a status that may bring units to rest).
@@ -667,6 +697,11 @@ type AlignmentCandidateSet = {
    * across the line's open ASN rows.
    */
   transferLineResiduals: Map<string, TransferLineResidualQty>
+  /**
+   * LINE SCOPE for purchase orders (o3d-papk): residue of every PO line the usable PO candidates draw from,
+   * keyed by PO-line id; the planner's second cap for them, shared across the line's open ASN rows.
+   */
+  purchaseLineResiduals: Map<string, PurchaseOrderLineResidualQty>
   /**
    * Every parent transfer of every transfer-backed ASN row seen — INCLUDING the
    * refused ones — so the caller knows which `stock_transfers` rows to lock at step
@@ -876,8 +911,12 @@ async function getAlignmentCandidateLines(
       select: {
         id: true,
         poId: true,
+        qty: true,
+        qtyReceived: true,
         po: {
           select: {
+            reference: true,
+            status: true,
             landedCostLinks: {
               where: { ...CONTRIBUTING_LANDED_COST_LINK_WHERE },
               select: { freightPoId: true },
@@ -907,9 +946,18 @@ async function getAlignmentCandidateLines(
     tx,
     transferLines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })),
   )
+  // o3d-papk: the same for PO lines. `qty - qtyReceived` is not the room a PO line has left, because the
+  // alignment lands units without writing qtyReceived. Read on `tx`, in the re-read that runs under the
+  // step-2b purchase_orders locks; EVERY ASN row of the line counts, closed ones included.
+  const landedByPurchaseLineId = await loadPurchaseOrderLineLandedQty(
+    tx,
+    purchaseLines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })),
+  )
+  const purchaseLineById = new Map(purchaseLines.map((line) => [line.id, line]))
 
   const candidates: AlignmentCandidateLine[] = []
   const transferLineResiduals = new Map<string, TransferLineResidualQty>()
+  const purchaseLineResiduals = new Map<string, PurchaseOrderLineResidualQty>()
   const refused: RefusedAlignmentCandidate[] = []
   const parentTransferIds = new Set<string>()
   const asnMapIds = new Set<string>(lines.map((line) => line.asnMapId))
@@ -973,6 +1021,22 @@ async function getAlignmentCandidateLines(
         })
         continue
       }
+      // o3d-papk: A CANCELLED OR CLOSED ORDER EXPECTS NOTHING MORE, so units can no more be brought to rest
+      // against it than against a cancelled transfer. Refused as `unusable` and NEVER as `raced`: nothing
+      // closes a cancelled order's ASN, so a `raced` refusal (terminal for the whole plan) would block
+      // align-up for every SKU on it for ever, which is the round-13 lesson transfers already carry. The
+      // order is held (checked above), so its status is read under the lock.
+      const purchaseLine = purchaseLineById.get(line.sourceLineId)
+      if (purchaseLine && !isPurchaseOrderUsableForWmsReceipt(purchaseLine.po.status)) {
+        refused.push({
+          asnLineMapId: line.id,
+          externalAsnId: line.asn.externalAsnId,
+          reason: `purchase order ${purchaseLine.po.reference} is ${purchaseLine.po.status}`,
+          kind: 'unusable',
+          parent: 'purchase_order',
+        })
+        continue
+      }
       // ─── EVERY CONTRIBUTING FREIGHT ORDER MUST BE HELD TOO (o3d-6nd55 r6, Codex round-6 HIGH) ───
       //
       // THE HOLE THIS CLOSES. Round 2 discovered the linked freight orders BEFORE the locks and locked
@@ -1004,6 +1068,16 @@ async function getAlignmentCandidateLines(
         })
         continue
       }
+      // o3d-papk: the LINE-scope cap, from the same landed reading the manual receipt uses. A line the
+      // alignment or a receipt has already brought in offers no capacity however open its ASN rows look.
+      // `purchaseLine` exists: `purchaseOrderIdByLineId` found it above.
+      purchaseLineResiduals.set(
+        line.sourceLineId,
+        resolvePurchaseOrderLineResidualQty({
+          lineQty: purchaseLine!.qty,
+          landed: requirePoLineLandedQty(landedByPurchaseLineId, line.sourceLineId),
+        }),
+      )
       candidates.push({
         id: line.id,
         sourceType: 'PURCHASE_ORDER_LINE',
@@ -1099,6 +1173,7 @@ async function getAlignmentCandidateLines(
   return {
     candidates,
     transferLineResiduals,
+    purchaseLineResiduals,
     parentTransferIds: [...parentTransferIds],
     parentPurchaseOrderIds: [...parentPurchaseOrderIds],
     linkedFreightPurchaseOrderIds: [...linkedFreightPurchaseOrderIds],
@@ -1123,9 +1198,13 @@ function describeRefusedAlignmentCandidates(refused: ReadonlyArray<RefusedAlignm
   // The status sentence is only true of the `unusable` ones. Appending it to a
   // snapshot cap would tell an operator to go and look at a transfer status that is
   // perfectly fine (Codex round-8 HIGH-1).
-  const statusNote = refused.some((entry) => entry.kind === 'unusable')
+  const transferStatusNote = refused.some((entry) => entry.kind === 'unusable' && entry.parent !== 'purchase_order')
     ? ` Alignment only uses an ASN whose transfer is ${WMS_RECEIPT_USABLE_TRANSFER_STATUSES.join(' or ')}.`
     : ''
+  const purchaseStatusNote = refused.some((entry) => entry.kind === 'unusable' && entry.parent === 'purchase_order')
+    ? ' Alignment does not use an ASN whose purchase order is CANCELLED or CLOSED.'
+    : ''
+  const statusNote = `${transferStatusNote}${purchaseStatusNote}`
   // And a raced row is not a problem to go and look at — it is work deferred by one
   // sweep. Saying so keeps it out of the operator's defect pile (Codex round-10).
   const racedNote = refused.some((entry) => entry.kind === 'raced')
@@ -1641,10 +1720,12 @@ export async function applyMintsoftAlignmentForProduct(params: {
         asnLineMapId: candidate.id,
         asnResidualQty: candidate.asnResidualQty,
         transferLineId: candidate.sourceType === 'STOCK_TRANSFER_LINE' ? candidate.sourceLineId : null,
+        purchaseLineId: candidate.sourceType === 'PURCHASE_ORDER_LINE' ? candidate.sourceLineId : null,
         sortAt: candidate.asn.createdAt,
         sortId: candidate.id,
       })),
       transferLineResiduals: candidateSet.transferLineResiduals,
+      purchaseLineResiduals: candidateSet.purchaseLineResiduals,
     })
 
     if (plan.allocations.length === 0 || plan.unallocatedQty > 0.0001) {
@@ -2073,6 +2154,37 @@ export async function applyMintsoftAlignmentForProduct(params: {
           qtyAccountedViaSnapshot: { increment: allocation.qty },
           note: null,
         },
+      })
+    }
+
+    // ─── THE ORDER'S STATUS FOLLOWS WHAT HAS LANDED (o3d-papk C3, Codex MEDIUM) ───
+    //
+    // The alignment lands units without writing `qtyReceived`, so a purchase order stocked entirely by alignment
+    // stayed PO_SENT / SHIPPED with `receivedAt` unset: no manual receipt is outstanding to run the derivation
+    // that the receipt and the book-in carry, so nothing ever would. The same derivation
+    // (`derivePurchaseOrderReceiptStatus`) runs here, over the landed quantity read on `tx`, under the
+    // `purchase_orders` row lock taken at step 2b (held to commit): NO new lock. It only ever moves an order
+    // FORWARD along the purchase-order workflow (`validatePurchaseOrderStatusTransition` refuses anything else),
+    // so a RECEIVED, INVOICED, returned or closed order is left as it is.
+    const alignedPurchaseOrderIds = [...new Set(plan.allocations.flatMap((allocation) => {
+      const purchaseCost = costByAsnLineMapId.get(allocation.asnLineMapId)
+      return purchaseCost ? [purchaseCost.poId] : []
+    }))].sort()
+    for (const poId of alignedPurchaseOrderIds) {
+      const order = await tx.purchaseOrder.findUniqueOrThrow({
+        where: { id: poId },
+        select: { id: true, status: true, lines: { select: { id: true, qty: true, qtyReceived: true } } },
+      })
+      const landedByLineId = await loadPurchaseOrderLineLandedQty(tx, order.lines)
+      const nextStatus = derivePurchaseOrderReceiptStatus(order.lines.map((line) => ({
+        qty: line.qty,
+        landed: requirePoLineLandedQty(landedByLineId, line.id),
+      })))
+      if (nextStatus === order.status) continue
+      if (!validatePurchaseOrderStatusTransition(order.status, nextStatus).success) continue
+      await tx.purchaseOrder.update({
+        where: { id: order.id },
+        data: { status: nextStatus, ...(nextStatus === 'RECEIVED' ? { receivedAt: now } : {}) },
       })
     }
 

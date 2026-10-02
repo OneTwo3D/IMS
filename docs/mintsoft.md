@@ -159,8 +159,10 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   NOT `qty - qtyReceived` (o3d-zzgp): the stock-sync alignment above raises stock and lays cost layers
   without writing `qtyReceived`, so that subtraction asked a live warehouse to expect units already on
   its own shelves. The reservation and its pre-push revalidation read the same figure under the
-  transfer's row lock, so they cannot disagree and refuse every create. Purchase-order ASN lines are
-  still sized as `qty - qtyReceived`; a PO line has no landed-quantity definition yet (see below).
+  transfer's row lock, so they cannot disagree and refuse every create. **Purchase-order ASN lines are
+  sized the same way** (o3d-papk): `qty` less the PO line's *landed* quantity, by the one definition in
+  `lib/domain/inventory/po-line-landed-quantity.ts` (see below), read under the `purchase_orders` row lock;
+  the branded figure travels to the wire quantity and the pre-push revalidation compares it, not a number.
 - A **retry** of a transfer ASN create never deletes or resizes a reservation that already holds
   credit. `wms_asn_line_maps.qtyAccountedViaSnapshot` is the ONLY record that the alignment brought
   those units in and costed them, so the reservation is **retired** instead: `closedAt` is set (which
@@ -181,7 +183,25 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   attempt then refuses the create — "nothing outstanding", "not linked to a Mintsoft product": the
   reservation transaction returns the refusal and the action raises it after commit, because a refusal
   thrown inside the transaction would roll the retirement back and leave the reservation open.
-  Purchase-order ASN reservations still delete on retry (see below).
+  **The same rule now applies to a purchase-order ASN create** (o3d-papk): the retry, the post-mismatch
+  discard and the finalize conflict branch all dispose of a pending reservation through the one
+  generalised `disposePendingAsnReservation` (`lib/domain/wms/pending-asn-retirement.ts`), which takes
+  `purchase_orders` (step 2b, a gate only) → `wms_asn_maps` → `wms_asn_line_maps` first. A credited PO
+  reservation is retired (the retired row keeps counting in the line's landed quantity) and the landed
+  outstanding is reserved on a NEW reservation with a zero credit; one holding no credit is still deleted or
+  resized in place. Operator refusals that can follow a disposal write are returned, not thrown, so the
+  retirement commits. The claim also refuses a retired row (`closedAt IS NULL`) for both creators.
+  **Two requests that reserved the same row** (o3d-papk, Codex round 2): the discard only ever disposes of an
+  UNCLAIMED, OPEN reservation (`status = CREATE_PENDING AND closedAt IS NULL`; the claim is what moves a row to
+  `CREATE_IN_FLIGHT`), so a request whose revalidation failed cannot retire the row another request has claimed and
+  is pushing. The finalize is a compare-and-set under the parent and header locks, before any write: the row must
+  still be open, in the status its own step left it in (`CREATE_IN_FLIGHT` after a claim, `CREATE_PENDING` for a
+  duplicate-recovery adoption) and carry the same lines at the quantities that were reserved. If it does not, the
+  finalize FAILS CLOSED: nothing is written to the row (it is not reopened, mapped or resized), and the id of the
+  ASN the warehouse did create is retained on the failed job's summary (`unrecordedExternalAsnId`) and a WARNING
+  activity entry, exactly as for an ASN whose read-back did not verify; the next create attempt is refused by name
+  by the duplicate matcher (or adopts the ASN if the row has come to match it), so no second ASN is created and the
+  orphan is neither lost nor silently adopted. Both creators.
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
@@ -359,27 +379,81 @@ aggregates `transit_subledger_movements` — rows written at post time — so a 
 happened is absent from both sides and that window ties out exactly. Proven by
 `tests/concurrency/wms-purchase-receipt-journal.concurrent.test.ts`.
 
-### Purchase-order ASN lines are not landed-quantity aware yet
+### Purchase-order lines have a landed-quantity definition (o3d-papk, first half)
 
-The two asymmetries above are one scope boundary, not two oversights. A purchase-order line has no
-"landed quantity" definition: the alignment credits `wms_asn_line_maps.qtyAccountedViaSnapshot` for a
-PO-sourced row and lays its cost layer without writing `purchase_order_lines.qtyReceived` either, so
-the same two columns disagree — but nothing yet defines how to combine them for a PO (o3d-papk).
+The WMS stock-sync alignment credits `wms_asn_line_maps.qtyAccountedViaSnapshot` for a PO-sourced row,
+lays its cost layer and queues its `STOCK_RECEIPT` journal, and **never writes
+`purchase_order_lines.qtyReceived`** (writing it through is rejected: the booked-in reconciliation reads
+the line-wide `qtyReceived` as manual receipts against *this* ASN, so aligned units parked there would be
+read as manual and a replacement ASN would add no stock). So an aligned line has landed units and a
+`qtyReceived` of zero. `lib/domain/inventory/po-line-landed-quantity.ts` is the one definition:
 
-Until that exists, the PO ASN path deliberately keeps BOTH of its old behaviours:
+> **landed = `qtyReceived` + Σ over every `wms_asn_line_maps` row of the line (closed and retired rows
+> included) of `max(0, qtyAccountedViaSnapshot − qtyAccountedViaReceipt)`**
 
-- lines are sized `qty - qtyReceived`, which over-states when an alignment has already brought units in;
-- a retry deletes or resizes a credited pending reservation, which loses that credit.
+and *outstanding* is `max(0, qty − landed)`, zero for a CANCELLED or CLOSED order. These now use it:
 
-Retiring a credited PO reservation without landed-aware sizing would be worse, not better: the
-replacement reservation would be raised at the full outstanding quantity with a zero credit, so a
-booked-in receipt against it would find nothing to cover the already-landed units and would add their
-stock a second time. The delete is a lost-evidence bug; retiring it first would make it a
-double-stock bug. The order is therefore o3d-papk first, then the PO retry path.
+- **the manual receipt** (`receivePurchaseOrder`) refuses more than the outstanding quantity — read inside
+  the transaction under the `purchase_orders` lock — so a receipt can no longer be booked on top of units
+  alignment already brought in (previously 10 aligned-6 then 10 received gave stock 16 for 10 physical
+  units, a second cost layer and a second journal);
+- **the PO status** after a manual receipt, a WMS book-in **or an alignment** is RECEIVED when every line's
+  *landed* quantity reaches its quantity (one derivation, `derivePurchaseOrderReceiptStatus`, so the three
+  cannot drift). The alignment moves an order only FORWARD along the purchase-order workflow (PO_SENT / SHIPPED
+  → PARTIALLY_RECEIVED → RECEIVED, `receivedAt` set on RECEIVED) and under the `purchase_orders` lock it already
+  holds; a RECEIVED, INVOICED, returned or closed order is left as it is. An order fully stocked by alignment
+  alone therefore no longer stays open for ever. (The freight-order auto-receipt cascade a manual receipt runs
+  is not run by the book-in or the alignment, as before.)
+- **the alignment planner** caps an allocation by the PO line's own residue (`qty − landed`), shared across
+  that line's open ASN rows, as it already did for transfer lines; and it refuses an ASN whose PO is
+  CANCELLED or CLOSED as *unusable* (never as *raced*, which would block the SKU for ever) while a healthy
+  sibling keeps aligning;
+- **the receipt-timing check** on align-down, the **EOL auto-archive incoming figure** (which also stops
+  counting a PO line's own open ASN row a second time) and the **incoming-stock badges** in the product
+  list and detail pages.
+
+**Also in this change (the second commit, the PO half of o3d-6b9c, minimal).** The PO ASN creator is
+sized by landed outstanding and a credited pending reservation is never deleted or resized in place — see
+"ASN Flow" above for the rule and the lock order. Deliberately NOT done here and still open: the creator's
+other defects (otay: never-created ASNs still count as alignment candidates; l2u6: claim/catch-demotion
+locking; gwh4 and the dead `CREATE_IN_FLIGHT` stale-claim recovery; the pending-id random suffix) and
+the returns, invoicing, purchase-statistics, outstanding-PO-value, receipt-quantity, replenishment and display
+readers, which still read `qtyReceived` alone (o3d-nnics).
+
+#### Booked-in reconciliation: the manual-receipt pool (o3d-papk follow-up, o3d-67kw3)
+
+A WMS book-in has to split each newly booked delta into three things: units the alignment **already put in
+stock** (covered by the ASN row's unabsorbed snapshot credit), units a **manual receipt** already put in stock,
+and genuinely new stock. `lib/domain/wms/asn-reconciliation.ts` does it in that order:
+
+> `covered = min(delta, unabsorbed credit)` first; `manual = min(delta − covered, manual-receipt pool)` second;
+> `qtyReceived += delta − manual`; `stock added = delta − covered − manual`.
+
+and the invariant, property-tested over a grid, is that **a book-in changes landed by exactly the stock it
+adds**. The previous order took the manual term first, which let landed *fall* (align 6, receive 4 by hand,
+Mintsoft books 6: `qtyReceived` rose by 2, `qtyAccountedViaReceipt` by 6, landed 10 → 6, the PO flipped back to
+PARTIALLY_RECEIVED and a second manual receipt of 4 was accepted: stock 14 for 10 physical units). The same
+defect existed for transfer lines and is fixed in the same function.
+
+The **manual-receipt pool** is branded (`ManualReceiptPool`; only `resolveManualReceiptPool` builds one, so a
+caller cannot pass the raw `qtyReceived` again) and is the line's manual receipts that no ASN has reconciled:
+
+> `pool = max(0, qtyReceived − Σ lastProcessedReceivedQty over every ASN row of the line (closed included) − this row's manualQtyBaseline)`
+
+`qtyReceived − Σ lastProcessed` is an exact identity (the only writers are the manual receipt, the PO book-in and
+the transfer book-in, all under the parent order's row lock). **`wms_asn_line_maps.manualQtyBaseline`** (migration
+`20261001220000`, `NOT NULL DEFAULT 0`, no backfill: 0 is the old behaviour) removes the manual receipts that
+**pre-date** the ASN row: the creators store that same figure, read under the parent lock, when a row is created or
+resized. That is o3d-67kw3: line 10, manual 4, ASN sized for the 6 outstanding, Mintsoft books 6 used to add only 2
+(4 units lost); the 4 are now in the baseline, the pool is 0 and all 6 land. The dry-run (the review an operator
+approves) and the applied book-in read the same pool, so the figure shown is the stock added.
+
+Not resolvable by IMS, filed as a policy question: a manual receipt of *different* units than the ASN's, on the same
+line, while the ASN is still open, is indistinguishable from the same units received twice (o3d-papk S4).
 
 ### Receipt Review
 
-Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
+Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. **A callback against a CANCELLED or CLOSED purchase order is one of them** (`parent_not_receivable`, "Purchase order cancelled or closed", approval-blocked: nothing may be received against an order the business has called off, so approval cannot release it; the alignment and the manual receipt refuse the same state). A booked-in status write goes through the purchase-order workflow (`validatePurchaseOrderStatusTransition`), so a late book-in against an INVOICED or returned order lands its stock and landed quantity but never overwrites the status (o3d-yaazk). Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
 
 - Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, missing transfer cost-layer snapshot, an **unreadable remote quantity** and a **missing remote ASN item** (the last two are o3d-btiw: an operator acknowledging a warning cannot supply a quantity the warehouse never served).
 - **`missing_local_line` means the ASN line names a source line IMS does not have — not that there was nothing to do for it (o3d-h66s).** The IMS purchase-order / stock-transfer rows are read for **every** line of the ASN, not only the ones with new quantity to apply, so a line whose remote quantity has not moved since the last callback is recognised as the healthy line it is. Until o3d-h66s that read was restricted to lines with a positive delta, so a zero-delta line reported its own existing IMS line as missing; because the warning is aggregate, that held the **whole** callback in an approval-blocked review and applied nothing for its other lines either. In practice that meant every partially booked ASN, every re-check of an ASN already settled, and any line whose `QuantityBooked` was a readable `0`. A `sourceLineId` that genuinely resolves to no IMS row still raises the warning and still blocks, with or without a delta.

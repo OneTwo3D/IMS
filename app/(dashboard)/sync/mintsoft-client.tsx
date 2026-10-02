@@ -59,6 +59,8 @@ const RECEIPT_REVIEW_WARNING_LABELS: Record<string, string> = {
   missing_local_line: 'IMS line missing',
   // o3d-btiw: the ASN line exists in IMS but the warehouse returned no item for it.
   missing_remote_line: 'Mintsoft line missing',
+  // o3d-papk: the purchase order was cancelled or closed; nothing may be received against it.
+  parent_not_receivable: 'Purchase order cancelled or closed',
   received_over_expected: 'Over-received',
   remote_regression: 'Mintsoft quantity decreased',
   // o3d-btiw: Mintsoft served no usable QuantityBooked, so how much was booked in is UNKNOWN. It is
@@ -71,6 +73,7 @@ const RECEIPT_REVIEW_BLOCKING_WARNINGS = new Set([
   'cost_layer_snapshot_missing',
   'missing_local_line',
   'missing_remote_line',
+  'parent_not_receivable',
   'remote_quantity_unreadable',
   'remote_regression',
   'unsupported_source_type',

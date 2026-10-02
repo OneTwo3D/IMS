@@ -44,6 +44,16 @@ import {
   requireOutstandingQty,
   transferOutstandingTotalEntries,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
+// o3d-papk: the PO arms ask the same question for purchase-order lines: `qty − LANDED`. Alignment credits
+// wms_asn_line_maps and never writes purchase_order_lines.qtyReceived, so subtracting qtyReceived alone showed
+// units already on the shelf as still on order.
+import {
+  aggregatePurchaseOrderLineOutstandingQty,
+  hasPoOutstandingQty,
+  loadPurchaseOrderLineOutstandingQty,
+  purchaseOrderOutstandingTotalEntries,
+  requirePoLineOutstandingQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
 import {
   ComponentGraphInFlightSalesError,
   bumpFulfillmentGraphVersions,
@@ -248,13 +258,14 @@ export async function listProducts(params: {
       where: { productId: { in: allProductIds }, transfer: { status: 'IN_TRANSIT' } },
       select: { id: true, productId: true, qty: true, qtyReceived: true },
     }),
-    db.purchaseOrderLine.groupBy({
-      by: ['productId'],
+    // Not a groupBy, for the same reason as the transfer arm: the landed quantity is a per-LINE fact
+    // (o3d-papk).
+    db.purchaseOrderLine.findMany({
       where: {
         productId: { in: allProductIds },
         po: { status: { in: INCOMING_PO_STATUSES }, type: 'GOODS' },
       },
-      _sum: { qty: true, qtyReceived: true },
+      select: { id: true, productId: true, qty: true, qtyReceived: true, po: { select: { status: true } } },
     }),
   ])
 
@@ -272,9 +283,15 @@ export async function listProducts(params: {
   for (const [productId, remaining] of transferOutstandingTotalEntries(incomingTransferTotals)) {
     incomingByProduct.set(productId, (incomingByProduct.get(productId) ?? 0) + remaining)
   }
-  for (const po of incomingPOs) {
-    const remaining = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
-    if (remaining > 0) incomingByProduct.set(po.productId, (incomingByProduct.get(po.productId) ?? 0) + remaining)
+  const incomingPoOutstanding = await loadPurchaseOrderLineOutstandingQty(
+    db,
+    incomingPOs.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: line.po.status })),
+  )
+  const incomingPoTotals = aggregatePurchaseOrderLineOutstandingQty(
+    incomingPOs.map((line) => [line.productId, requirePoLineOutstandingQty(incomingPoOutstanding, line.id)] as const),
+  )
+  for (const [productId, remaining] of purchaseOrderOutstandingTotalEntries(incomingPoTotals)) {
+    incomingByProduct.set(productId, (incomingByProduct.get(productId) ?? 0) + remaining)
   }
 
   const products: ProductRow[] = rawProducts.map((p) => {
@@ -411,7 +428,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
           type: 'GOODS',
         },
       },
-      select: { qty: true, qtyReceived: true, po: { select: { destinationWarehouseId: true, destinationWarehouse: { select: { id: true, code: true, name: true } } } } },
+      select: { id: true, qty: true, qtyReceived: true, po: { select: { status: true, destinationWarehouseId: true, destinationWarehouse: { select: { id: true, code: true, name: true } } } } },
     }),
   ])
 
@@ -443,14 +460,22 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   )
 
   // PO incoming grouped by destination warehouse (null = unassigned)
-  const incomingPoByWarehouse = new Map<string, number>()
+  const openPoOutstanding = await loadPurchaseOrderLineOutstandingQty(
+    db,
+    openPoLines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: line.po.status })),
+  )
+  // Branded all the way through (o3d-papk), keyed by destination warehouse.
+  const openPoTotalsByWarehouse = aggregatePurchaseOrderLineOutstandingQty(
+    openPoLines.map((line) => [
+      line.po.destinationWarehouseId ?? '__unassigned__',
+      requirePoLineOutstandingQty(openPoOutstanding, line.id),
+    ] as const),
+  )
+  const incomingPoByWarehouse = new Map<string, number>(purchaseOrderOutstandingTotalEntries(openPoTotalsByWarehouse))
   for (const line of openPoLines) {
+    if (!hasPoOutstandingQty(requirePoLineOutstandingQty(openPoOutstanding, line.id))) continue
     const wid = line.po.destinationWarehouseId ?? '__unassigned__'
-    const remaining = Math.max(0, Number(line.qty) - Number(line.qtyReceived))
-    if (remaining > 0) {
-      incomingPoByWarehouse.set(wid, (incomingPoByWarehouse.get(wid) ?? 0) + remaining)
-      if (line.po.destinationWarehouse) warehouseInfoMap.set(wid, line.po.destinationWarehouse)
-    }
+    if (line.po.destinationWarehouse) warehouseInfoMap.set(wid, line.po.destinationWarehouse)
   }
   // Top-level incomingPoQty = only lines with no destination warehouse assigned
   const incomingPoQty = (incomingPoByWarehouse.get('__unassigned__') ?? 0).toFixed(2)
@@ -472,13 +497,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         where: { productId: { in: variantIds }, transfer: { status: 'IN_TRANSIT' } },
         select: { id: true, productId: true, qty: true, qtyReceived: true },
       }),
-      db.purchaseOrderLine.groupBy({
-        by: ['productId'],
+      db.purchaseOrderLine.findMany({
         where: {
           productId: { in: variantIds },
           po: { status: { in: INCOMING_PO_STATUSES }, type: 'GOODS' },
         },
-        _sum: { qty: true, qtyReceived: true },
+        select: { id: true, productId: true, qty: true, qtyReceived: true, po: { select: { status: true } } },
       }),
     ])
     const vTransferOutstanding = await loadTransferLineOutstandingQty(db, vTransfers)
@@ -488,9 +512,15 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     for (const [productId, rem] of transferOutstandingTotalEntries(vTransferTotals)) {
       variantIncomingMap.set(productId, (variantIncomingMap.get(productId) ?? 0) + rem)
     }
-    for (const po of vPOs) {
-      const rem = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
-      if (rem > 0) variantIncomingMap.set(po.productId, (variantIncomingMap.get(po.productId) ?? 0) + rem)
+    const vPoOutstanding = await loadPurchaseOrderLineOutstandingQty(
+      db,
+      vPOs.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: line.po.status })),
+    )
+    const vPoTotals = aggregatePurchaseOrderLineOutstandingQty(
+      vPOs.map((line) => [line.productId, requirePoLineOutstandingQty(vPoOutstanding, line.id)] as const),
+    )
+    for (const [productId, rem] of purchaseOrderOutstandingTotalEntries(vPoTotals)) {
+      variantIncomingMap.set(productId, (variantIncomingMap.get(productId) ?? 0) + rem)
     }
   }
 
@@ -2196,6 +2226,7 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
         },
       },
       select: {
+        id: true,
         qty: true,
         qtyReceived: true,
         po: { select: { id: true, reference: true, status: true, expectedDelivery: true } },
@@ -2221,9 +2252,16 @@ export async function getIncomingDetails(productId: string, warehouseId: string)
 
   const results: IncomingDetail[] = []
 
+  const poOutstanding = await loadPurchaseOrderLineOutstandingQty(
+    db,
+    poLines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: line.po.status })),
+  )
   for (const line of poLines) {
-    const remaining = Number(line.qty) - Number(line.qtyReceived)
-    if (remaining > 0) {
+    // A per-LINE display row: the field on the serialised row has to be a number, so `hasPoOutstandingQty`
+    // and `.qtyNumber` are the output boundary (stated as a limit, as for the transfer arm below).
+    const outstanding = requirePoLineOutstandingQty(poOutstanding, line.id)
+    const remaining = outstanding.qtyNumber
+    if (hasPoOutstandingQty(outstanding)) {
       results.push({
         type: 'purchase_order',
         id: line.po.id,

@@ -3845,6 +3845,13 @@ model WmsAsnLineMap {
   qtyAccountedViaSnapshot Decimal  @db.Decimal(12, 4) @default(0)
   qtyAccountedViaReceipt  Decimal  @db.Decimal(12, 4) @default(0)
   lastProcessedReceivedQty Decimal @db.Decimal(12, 4) @default(0)
+  /// o3d-papk: the units of this row's source line that had ALREADY been received by hand and not yet reconciled
+  /// against any ASN (qtyReceived - sum(lastProcessedReceivedQty) over every ASN row of the line) at the moment this
+  /// row was created or resized, read under the parent order's row lock. A manual receipt made BEFORE the ASN was
+  /// sized is not a manual receipt against it, so the booked-in reconciliation subtracts this from the line's
+  /// unreconciled manual receipts when it works out how many of the booked units a manual receipt already covered.
+  /// 0 for every legacy row, which is the old behaviour.
+  manualQtyBaseline      Decimal   @db.Decimal(12, 4) @default(0)
   note                   String?
   lastCallbackAt         DateTime?
   createdAt              DateTime  @default(now())

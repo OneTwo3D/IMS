@@ -4,6 +4,11 @@ import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { db } from '@/lib/db'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
+  loadPurchaseOrderLineOutstandingQty,
+  requirePoLineOutstandingQty,
+  sumPurchaseOrderLineOutstandingQty,
+} from '@/lib/domain/inventory/po-line-landed-quantity'
+import {
   loadTransferLineOutstandingQty,
   requireOutstandingQty,
   sumTransferLineOutstandingQty,
@@ -64,7 +69,8 @@ export async function getProductIncomingStock(
         productId,
         po: { type: 'GOODS', status: { in: [...OPEN_PO_STATUSES] } },
       },
-      select: { qty: true, qtyReceived: true },
+      // `id` and the order's status so the landed quantity can be loaded for these exact lines (o3d-papk).
+      select: { id: true, qty: true, qtyReceived: true, po: { select: { status: true } } },
     }),
     client.stockTransferLine.findMany({
       where: {
@@ -99,10 +105,16 @@ export async function getProductIncomingStock(
     }),
   ])
 
-  const purchaseOrders = poLines.reduce(
-    (sum, line) => sum.add(Prisma.Decimal.max(0, toDecimal(line.qty).minus(line.qtyReceived))),
-    new Prisma.Decimal(0),
+  // o3d-papk: `qty − qtyReceived` is not "outstanding" for a PO line either. The WMS alignment lands units
+  // by crediting wms_asn_line_maps.qtyAccountedViaSnapshot and never writes qtyReceived, so a line landed
+  // entirely that way read as fully outstanding. Outstanding is `qty − landed`.
+  const outstandingByPoLineId = await loadPurchaseOrderLineOutstandingQty(
+    client,
+    poLines.map((line) => ({ id: line.id, qty: line.qty, qtyReceived: line.qtyReceived, poStatus: line.po.status })),
   )
+  const purchaseOrders = new Prisma.Decimal(sumPurchaseOrderLineOutstandingQty(
+    poLines.map((line) => requirePoLineOutstandingQty(outstandingByPoLineId, line.id)),
+  ).toString())
   // o3d-zzgp. TWO defects in one expression, and fixing either alone leaves a wrong
   // number:
   //
@@ -138,16 +150,19 @@ export async function getProductIncomingStock(
   // ASN left open) is not excluded, because no arm above counted it and it is then
   // the only evidence that something is still due in.
   //
-  // DELIBERATELY NOT EXTENDED TO PURCHASE-ORDER ASN ROWS. The same double-count
-  // exists between the `purchaseOrders` arm and PO-sourced ASN rows, and the same
-  // alignment path credits `qtyAccountedViaSnapshot` without writing
-  // `purchase_order_lines.qtyReceived` — but a PO line has no landed-quantity
-  // definition to read yet, so correcting it needs its own module. Tracked separately
-  // (o3d-zzgp follow-up); the asymmetry here is a scope boundary, not an oversight.
+  // THE SAME HOLDS FOR PURCHASE-ORDER ASN ROWS (o3d-papk). A PO line has its own landed-quantity
+  // definition now, so the `purchaseOrders` arm above is the authority for every line whose parent order is
+  // open and its ASN rows are that line's mirror; counting a row again here would be the same double-count
+  // the transfer arm closed. A row whose order is NOT open (received, cancelled with the ASN left open) is
+  // not excluded, because no arm above counted it.
   const transferLineIdsCountedAbove = new Set(transferLines.map((line) => line.id))
+  const purchaseLineIdsCountedAbove = new Set(poLines.map((line) => line.id))
   const wmsAsn = asnLines.reduce(
     (sum, line) => {
       if (line.sourceType === 'STOCK_TRANSFER_LINE' && transferLineIdsCountedAbove.has(line.sourceLineId)) {
+        return sum
+      }
+      if (line.sourceType === 'PURCHASE_ORDER_LINE' && purchaseLineIdsCountedAbove.has(line.sourceLineId)) {
         return sum
       }
       return sum.add(Prisma.Decimal.max(
