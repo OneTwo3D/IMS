@@ -8,6 +8,48 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Purchase-order lines have a landed-quantity definition (o3d-papk, first half)
+
+- **A manual purchase-order receipt can no longer be booked on top of units the WMS stock-sync
+  alignment already brought in.** The alignment lands stock and a cost layer without writing
+  `qtyReceived`, so the receipt guard saw the whole line as outstanding: aligning 6 of a 10-unit line
+  and then receiving 10 by hand put 16 units into stock for 10 physical ones, with a second cost layer
+  and a second `STOCK_RECEIPT` journal. The guard now refuses more than `qty − landed`, read inside the
+  transaction under the order lock.
+- A purchase order is RECEIVED (after a manual receipt or a WMS book-in) once every line has *landed*,
+  not only once `qtyReceived` reaches `qty`; the alignment planner caps a PO line at its own residue and
+  refuses an ASN whose order is CANCELLED or CLOSED; the EOL-archive incoming figure and the product
+  incoming badges count a PO line by what has landed. No migration.
+- **A WMS book-in no longer lets a line's landed quantity fall (o3d-papk follow-up, o3d-67kw3).** The booked-in
+  reconciliation took the line-wide `qtyReceived` as "manual receipts against this ASN" and applied it before the
+  snapshot cover, so align 6, receive 4 by hand, book 6 left landed at 6 and the guard accepted another 4 (stock 14
+  for 10 physical units), and a line partly received by hand and then covered by an ASN sized for the rest lost
+  units at book-in (line 10, manual 4, ASN 6, booked 6: only +2). The snapshot cover now comes first, the manual
+  term draws on a branded pool (the line's unreconciled manual receipts less the new
+  `wms_asn_line_maps.manualQtyBaseline`, written when an ASN row is created or resized), and transfer lines get the
+  same fix. **Migration:** one additive column, `NOT NULL DEFAULT 0`, no backfill.
+- **A purchase-order ASN is sized by what has landed, and a credited reservation is never deleted or resized in
+  place (o3d-papk follow-up; the minimal purchase-order half of o3d-6b9c).** A retry, the post-mismatch discard
+  and the finalize conflict used to delete the pending reservation, cascading the alignment credit that is the
+  only record that units landed (landed fell from 10 to 4 while stock stayed at 10), and the ASN sent to the live
+  warehouse was sized `qty − qtyReceived`, so landed units were asked for again. The creator now sizes by landed
+  outstanding (branded all the way to the wire), retires a credited reservation (closed, credit kept) and
+  reserves the remainder on a new one, disposes under `purchase_orders` → ASN header → ASN lines, returns
+  operator refusals so a retirement commits, and refuses to claim a retired reservation (both creators).
+- **The WMS stock-sync alignment advances a purchase order's status (o3d-papk follow-up).** An order stocked
+  entirely by alignment stayed PO_SENT with `receivedAt` unset. The alignment now derives the status from the
+  landed quantity under the order lock it already holds (forward only); the manual receipt and the book-in use
+  the same derivation.
+
+- **A WMS booked-in callback no longer receives against a cancelled or closed purchase order, and never overwrites an
+  order's status (o3d-papk round 2, o3d-yaazk).** A partly received order cancelled while its ASN stayed open took stock,
+  a cost layer and a journal from a later callback and then had CANCELLED overwritten with PARTIALLY_RECEIVED/RECEIVED. The
+  callback is now held for review with an approval-blocked `parent_not_receivable` warning, and the status is only written
+  along the purchase-order workflow.
+- **Two ASN-create requests that reserved the same row can no longer retire or reopen it under each other (o3d-papk round 2).**
+  The discard only touches an unclaimed, open reservation, and the finalize is a compare-and-set that fails closed (retaining
+  the id of the ASN the warehouse created) instead of reopening a row whose expectation a retirement had rewritten. Both creators.
+
 ### Parked connectors removed (o3d-remove-parked-connectors)
 
 - **Shopify (shopping) and QuickBooks Online (accounting) are no longer shipped.** The owner's

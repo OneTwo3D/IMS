@@ -10,7 +10,7 @@ import {
 } from '@/lib/connectors/mintsoft/api/asn-quantities'
 import { normalizeMintsoftAsn } from '@/lib/connectors/mintsoft/api/normalizers'
 import { normalizeMintsoftAsnFetchByIdResult } from '@/lib/connectors/mintsoft/api/client'
-import { buildBookedInDryRun, resolveRemoteBookedInQuantity } from '@/lib/domain/wms/asn-reconciliation'
+import { buildBookedInDryRun, resolveManualReceiptPool, resolveRemoteBookedInQuantity } from '@/lib/domain/wms/asn-reconciliation'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import * as fakeMintsoftRouteNs from '../app/api/e2e/mintsoft/[...slug]/route.ts'
 import {
@@ -83,7 +83,12 @@ function dryRunOverRemote(remote: WmsAsnRef, options: {
       sku: '22771122402-02',
       expectedQty: options.expectedQty,
       currentRemoteReceivedQty,
-      localReceivedQty: options.localReceivedQty ?? lastProcessedReceivedQty,
+      // o3d-papk: the pool is the line's `qtyReceived` (this option) less what every ASN row has reconciled.
+      manualReceiptPool: resolveManualReceiptPool({
+        lineQtyReceived: options.localReceivedQty ?? lastProcessedReceivedQty,
+        lineReconciledAcrossAsns: lastProcessedReceivedQty,
+        rowManualQtyBaseline: 0,
+      }),
       lastProcessedReceivedQty,
       localLineExists: true,
       remoteQuantityRefusal: resolved.refusal,
@@ -296,7 +301,7 @@ test('a refusal is honoured by buildBookedInDryRun even if the caller passes a q
       sku: 'SKU',
       expectedQty: 12,
       currentRemoteReceivedQty: 12,
-      localReceivedQty: 3,
+      manualReceiptPool: resolveManualReceiptPool({ lineQtyReceived: 3, lineReconciledAcrossAsns: 3, rowManualQtyBaseline: 0 }),
       lastProcessedReceivedQty: 3,
       localLineExists: true,
       remoteQuantityRefusal: { code: 'remote_quantity_unreadable', detail: 'test' },

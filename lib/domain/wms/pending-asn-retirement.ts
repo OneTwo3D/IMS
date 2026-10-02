@@ -61,6 +61,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import type { Decimal, DecimalInput } from '@/lib/domain/math/decimal'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
+  lockPurchaseOrders,
   lockStockTransfers,
   lockWmsAsnLineMaps,
   lockWmsAsnMaps,
@@ -72,6 +73,17 @@ import {
  * by the WMS action layer and a cycle through it would make load order load-bearing.
  */
 export const PENDING_ASN_CREDIT_EPSILON = 0.0001
+
+/**
+ * THE PARENT OF A PENDING ASN RESERVATION (o3d-papk 6a follow-up, C2). This module was written for transfers
+ * (o3d-zzgp) and hard-coded that parent; the purchase-order creator has the identical defect (a retry deletes the
+ * reservation, and with it the alignment credit that is the only record that units landed), so the same
+ * disposal now serves both. The parent decides three things and only three: which row is locked at step 2
+ * (`stock_transfers` = 2a, `purchase_orders` = 2b), which `wms_asn_maps.sourceType` the header must carry, and
+ * which words the retirement note and the errors use. Everything else is shared, deliberately: two copies of a
+ * lock order is how two copies drift.
+ */
+export type PendingAsnParent = { kind: 'STOCK_TRANSFER' | 'PURCHASE_ORDER'; id: string }
 
 /** The columns of one `wms_asn_line_maps` row this module needs to see. */
 export type PendingAsnReservationLine = {
@@ -103,6 +115,8 @@ export type PendingAsnReservationRetirement = {
    * evidence, and is deleted exactly as before.
    */
   reason: 'credited'
+  /** Which parent's wording the note carries. Defaults to a transfer, as this module always did. */
+  parentKind: PendingAsnParent['kind']
   lines: RetiredAsnReservationLine[]
 }
 
@@ -153,11 +167,13 @@ export function pendingAsnReservationCarriesCredit(
  */
 export function planPendingAsnReservationRetirement(
   lines: ReadonlyArray<PendingAsnReservationLine>,
+  parentKind: PendingAsnParent['kind'] = 'STOCK_TRANSFER',
 ): PendingAsnReservationRetirement | null {
   if (!pendingAsnReservationCarriesCredit(lines)) return null
 
   return {
     reason: 'credited',
+    parentKind,
     lines: lines.map((line) => {
       const credited = creditedQtyOnPendingAsnLine(line)
       return {
@@ -172,11 +188,15 @@ export function planPendingAsnReservationRetirement(
 }
 
 /** The note left on a retired row, naming both figures. */
-export function retiredAsnLineNote(line: RetiredAsnReservationLine): string {
+export function retiredAsnLineNote(
+  line: RetiredAsnReservationLine,
+  parentKind: PendingAsnParent['kind'] = 'STOCK_TRANSFER',
+): string {
+  const column = parentKind === 'PURCHASE_ORDER' ? 'purchase_order_lines.qtyReceived' : 'stock_transfer_lines.qtyReceived'
   return 'o3d-zzgp: reservation retired on retry; expectation shrunk from '
     + `${line.originalExpectedQty} to the ${line.retainedCreditQtyNumber} unit(s) already credited here. `
     + 'The credit columns are the only record that those units landed (the WMS alignment never '
-    + 'writes stock_transfer_lines.qtyReceived), so this row is closed rather than deleted and any '
+    + `writes ${column}), so this row is closed rather than deleted and any `
     + 'remaining outstanding quantity is reserved on a NEW ASN.'
 }
 
@@ -231,7 +251,7 @@ export async function retirePendingAsnReservation(
       data: {
         // Decimal(12,4) in the schema; a string keeps the value exact through Prisma.
         expectedQty: roundQuantity(line.retainedCreditQty, 4).toFixed(4),
-        note: retiredAsnLineNote(line),
+        note: retiredAsnLineNote(line, retirement.parentKind),
       },
     })
   }
@@ -327,7 +347,7 @@ export class PendingAsnDisposalBackstopError extends Error {
 
   constructor(asnMapId: string) {
     super(
-      `Pending ASN reservation ${asnMapId} was judged uncredited under the transfer → ASN header → ASN line `
+      `Pending ASN reservation ${asnMapId} was judged uncredited under the parent order → ASN header → ASN line `
       + 'locks, but the zero-credit guard on its delete refused it. Something wrote credit without taking '
       + 'those locks. Nothing was deleted and the reservation is left as it is (o3d-zzgp r3).',
     )
@@ -345,7 +365,7 @@ export class PendingAsnLineNotLockedError extends Error {
   constructor(asnMapId: string, lineIds: string[]) {
     super(
       `Pending ASN reservation ${asnMapId} gained line row(s) ${lineIds.join(', ')} after its step-4 lock was `
-      + 'taken. Lines of a transfer reservation are only created under the transfer lock this transaction '
+      + 'taken. Lines of a pending reservation are only created under the parent order lock this transaction '
       + 'holds, so this should be impossible; the disposal is abandoned rather than acting on an unlocked row '
       + '(o3d-zzgp r3).',
     )
@@ -358,8 +378,13 @@ export type LockedPendingAsnReservation = {
 }
 
 /**
- * Take step 2, step 3 and step 4 for one transfer reservation, in that order, and
+ * Take step 2 (the parent), step 3 and step 4 for one pending reservation, in that order, and
  * return what the reservation looks like UNDER them.
+ *
+ * STEP 2 IS THE PARENT'S OWN ROW: `stock_transfers` (2a) for a transfer, `purchase_orders` (2b) for a purchase
+ * order. For a purchase order that row is a GATE only (no cost rows are taken here), and the credit read below
+ * needs nothing more: every writer of a PO ASN row's credit columns (the alignment, the booked-in service, this
+ * disposal) holds the `purchase_orders` row first.
  *
  * `null` when no header matching `reservationWhere` exists once the locks are held —
  * a concurrent disposal or a finalizer got there first, or it is no longer the
@@ -367,24 +392,28 @@ export type LockedPendingAsnReservation = {
  * so a status or external-id change that commits while this waits is seen.
  *
  * Re-locking a row this transaction already holds is a no-op in PostgreSQL, so a
- * caller that took the transfer lock at the top of its transaction (the reservation)
+ * caller that took the parent lock at the top of its transaction (the reservation)
  * can call this without special-casing, and the order is still 2 → 3 → 4.
  */
-export async function lockPendingTransferAsnReservation(
+export async function lockPendingAsnReservation(
   tx: Prisma.TransactionClient,
-  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+  input: { parent: PendingAsnParent; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
 ): Promise<LockedPendingAsnReservation | null> {
-  await lockStockTransfers(tx, [input.transferId]) // step 2
+  if (input.parent.kind === 'STOCK_TRANSFER') {
+    await lockStockTransfers(tx, [input.parent.id]) // step 2a
+  } else {
+    await lockPurchaseOrders(tx, [input.parent.id]) // step 2b
+  }
   await lockWmsAsnMaps(tx, [input.asnMapId]) // step 3
 
   const header = await tx.wmsAsnMap.findFirst({
     where: {
       ...input.reservationWhere,
       id: input.asnMapId,
-      sourceType: 'STOCK_TRANSFER',
+      sourceType: input.parent.kind,
       // The parent this transaction locked at step 2. A header pointing anywhere else
       // is not one these locks cover, so it is not ours to dispose of.
-      sourceId: input.transferId,
+      sourceId: input.parent.id,
     },
     select: { id: true },
   })
@@ -411,19 +440,19 @@ export async function lockPendingTransferAsnReservation(
 export type PendingAsnDisposalOutcome = 'retired' | 'deleted' | 'absent'
 
 /**
- * THE ONLY WAY a pending transfer ASN reservation is disposed of: lock (2 → 3 → 4),
+ * THE ONLY WAY a pending ASN reservation is disposed of: lock (2 → 3 → 4),
  * re-read the credit, then retire it if anything is credited or delete it if nothing
  * is — all inside the caller's transaction, which must not have taken a step-3 or
  * step-4 lock before calling (it may hold step 2).
  */
-export async function disposePendingTransferAsnReservation(
+export async function disposePendingAsnReservation(
   tx: Prisma.TransactionClient,
-  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+  input: { parent: PendingAsnParent; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
 ): Promise<PendingAsnDisposalOutcome> {
-  const reservation = await lockPendingTransferAsnReservation(tx, input)
+  const reservation = await lockPendingAsnReservation(tx, input)
   if (!reservation) return 'absent'
 
-  const retirement = planPendingAsnReservationRetirement(reservation.lines)
+  const retirement = planPendingAsnReservationRetirement(reservation.lines, input.parent.kind)
   if (retirement) {
     await retirePendingAsnReservation(tx, reservation.asnMapId, retirement)
     return 'retired'
@@ -433,12 +462,36 @@ export async function disposePendingTransferAsnReservation(
     where: {
       ...input.reservationWhere,
       id: reservation.asnMapId,
-      sourceType: 'STOCK_TRANSFER',
-      sourceId: input.transferId,
+      sourceType: input.parent.kind,
+      sourceId: input.parent.id,
       // THE BACKSTOP — see UNCREDITED_ASN_MAP_WHERE. The locks above are the fix.
       ...UNCREDITED_ASN_MAP_WHERE,
     },
   })
   if (count !== 1) throw new PendingAsnDisposalBackstopError(reservation.asnMapId)
   return 'deleted'
+}
+
+/** The transfer-shaped entry point, kept so the transfer creator and its tests read as they always did. */
+export async function lockPendingTransferAsnReservation(
+  tx: Prisma.TransactionClient,
+  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+): Promise<LockedPendingAsnReservation | null> {
+  return lockPendingAsnReservation(tx, {
+    parent: { kind: 'STOCK_TRANSFER', id: input.transferId },
+    asnMapId: input.asnMapId,
+    reservationWhere: input.reservationWhere,
+  })
+}
+
+/** The transfer-shaped entry point; see `disposePendingAsnReservation`. */
+export async function disposePendingTransferAsnReservation(
+  tx: Prisma.TransactionClient,
+  input: { transferId: string; asnMapId: string; reservationWhere?: Prisma.WmsAsnMapWhereInput },
+): Promise<PendingAsnDisposalOutcome> {
+  return disposePendingAsnReservation(tx, {
+    parent: { kind: 'STOCK_TRANSFER', id: input.transferId },
+    asnMapId: input.asnMapId,
+    reservationWhere: input.reservationWhere,
+  })
 }

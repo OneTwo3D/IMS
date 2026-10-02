@@ -9,6 +9,11 @@ import {
   resolveWmsAsnLineResidualQty,
   type TransferLineResidualQty,
 } from '../lib/domain/inventory/transfer-landed-quantity.ts'
+import {
+  resolvePurchaseOrderLineLandedQty,
+  resolvePurchaseOrderLineResidualQty,
+  type PurchaseOrderLineResidualQty,
+} from '../lib/domain/inventory/po-line-landed-quantity.ts'
 
 const auth = 'default' in authNs
   ? authNs.default as typeof import('../lib/connectors/mintsoft/api/auth.ts')
@@ -203,20 +208,21 @@ function lineResidue(input: {
 }
 
 const NO_TRANSFER_LINES: ReadonlyMap<string, TransferLineResidualQty> = new Map()
+const NO_PURCHASE_LINES: ReadonlyMap<string, PurchaseOrderLineResidualQty> = new Map()
 
 test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity first', () => {
   assert.deepEqual(
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 9,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-b',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-b', expectedQty: 10, qtyAccountedViaSnapshot: 3 }),
           transferLineId: null,
           sortAt: '2026-04-22T10:05:00.000Z',
           sortId: 'line-b',
         },
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-a',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-a', expectedQty: 5 }),
           transferLineId: null,
@@ -224,6 +230,7 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
           sortId: 'line-a',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     {
@@ -239,7 +246,7 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 20,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-a',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-a', expectedQty: 5, qtyAccountedViaSnapshot: 2 }),
           transferLineId: null,
@@ -247,6 +254,7 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
           sortId: 'line-a',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     {
@@ -263,14 +271,14 @@ test('planMintsoftAlignmentAllocations breaks same-timestamp ties by line id', (
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 3,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-b',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-b', expectedQty: 5 }),
           transferLineId: null,
           sortAt: '2026-04-22T10:00:00.000Z',
           sortId: 'line-b',
         },
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-a',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-a', expectedQty: 5 }),
           transferLineId: null,
@@ -278,6 +286,7 @@ test('planMintsoftAlignmentAllocations breaks same-timestamp ties by line id', (
           sortId: 'line-a',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     {
@@ -299,7 +308,7 @@ test('an ASN line whose transfer line has already been received offers no capaci
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 10,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-t',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-t', expectedQty: 10 }),
           transferLineId: 'tl-1',
@@ -307,6 +316,7 @@ test('an ASN line whose transfer line has already been received offers no capaci
           sortId: 'line-t',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: new Map([
         ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, qtyReceived: 10 })],
       ]),
@@ -322,7 +332,7 @@ test('a partly-landed transfer line offers only its genuine remainder (Codex r6 
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 10,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-t',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-t', expectedQty: 10 }),
           transferLineId: 'tl-1',
@@ -330,6 +340,7 @@ test('a partly-landed transfer line offers only its genuine remainder (Codex r6 
           sortId: 'line-t',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: new Map([
         ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, qtyReceived: 4 })],
       ]),
@@ -346,7 +357,7 @@ test('a PURCHASE_ORDER_LINE candidate is unaffected — it has no transfer line 
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 10,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'line-p',
           asnResidualQty: asnResidue({ asnLineMapId: 'line-p', expectedQty: 10 }),
           transferLineId: null,
@@ -354,6 +365,7 @@ test('a PURCHASE_ORDER_LINE candidate is unaffected — it has no transfer line 
           sortId: 'line-p',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     { allocations: [{ asnLineMapId: 'line-p', qty: 10 }], unallocatedQty: 0 },
@@ -375,7 +387,7 @@ test('a follow-up ASN absorbs its whole remainder after an earlier ASN closed (C
   const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
     delta: 7,
     candidates: [
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-2',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-2', expectedQty: 7 }),
         transferLineId: 'tl-1',
@@ -383,6 +395,7 @@ test('a follow-up ASN absorbs its whole remainder after an earlier ASN closed (C
         sortId: 'asn-2',
       },
     ],
+    purchaseLineResiduals: NO_PURCHASE_LINES,
     transferLineResiduals: new Map([
       ['tl-1', lineResidue({
         transferLineId: 'tl-1',
@@ -409,14 +422,14 @@ test('two open ASNs on ONE transfer line share the line residue, they do not eac
   const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
     delta: 12,
     candidates: [
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-a',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-a', expectedQty: 6 }),
         transferLineId: 'tl-1',
         sortAt: '2026-04-22T10:00:00.000Z',
         sortId: 'asn-a',
       },
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-b',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-b', expectedQty: 6 }),
         transferLineId: 'tl-1',
@@ -424,6 +437,7 @@ test('two open ASNs on ONE transfer line share the line residue, they do not eac
         sortId: 'asn-b',
       },
     ],
+    purchaseLineResiduals: NO_PURCHASE_LINES,
     transferLineResiduals: new Map([
       ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, qtyReceived: 2 })],
     ]),
@@ -454,21 +468,21 @@ test('THREE open ASNs on one transfer line share the line residue in ASN ORDER (
       // DELIBERATELY OUT OF ORDER: newest first, then oldest, then the middle one.
       // A missing or reversed sort re-orders the allocations and changes the third
       // row's quantity, so the sort is load-bearing for this assertion.
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-c',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-c', expectedQty: 4 }),
         transferLineId: 'tl-1',
         sortAt: '2026-04-24T10:00:00.000Z',
         sortId: 'asn-c',
       },
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-a',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-a', expectedQty: 4 }),
         transferLineId: 'tl-1',
         sortAt: '2026-04-22T10:00:00.000Z',
         sortId: 'asn-a',
       },
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-b',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-b', expectedQty: 4 }),
         transferLineId: 'tl-1',
@@ -476,6 +490,7 @@ test('THREE open ASNs on one transfer line share the line residue in ASN ORDER (
         sortId: 'asn-b',
       },
     ],
+    purchaseLineResiduals: NO_PURCHASE_LINES,
     transferLineResiduals: new Map([
       ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, qtyReceived: 1 })],
     ]),
@@ -508,6 +523,7 @@ test('the ASN sort is by created-at, not input order — a reversed input alloca
     asnLineMapId: row.asnLineMapId,
     asnResidualQty: asnResidue({ asnLineMapId: row.asnLineMapId, expectedQty: 5 }),
     transferLineId: 'tl-1',
+    purchaseLineId: null,
     sortAt: row.sortAt,
     sortId: row.asnLineMapId,
   }))
@@ -515,6 +531,7 @@ test('the ASN sort is by created-at, not input order — a reversed input alloca
   const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
     delta: 3,
     candidates,
+    purchaseLineResiduals: NO_PURCHASE_LINES,
     transferLineResiduals: new Map([
       ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10 })],
     ]),
@@ -535,7 +552,7 @@ test('the LINE residue is capped by what the dispatch snapshot can still cost (C
   const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
     delta: 10,
     candidates: [
-      {
+      { purchaseLineId: null,
         asnLineMapId: 'asn-1',
         asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
         transferLineId: 'tl-1',
@@ -543,6 +560,7 @@ test('the LINE residue is capped by what the dispatch snapshot can still cost (C
         sortId: 'asn-1',
       },
     ],
+    purchaseLineResiduals: NO_PURCHASE_LINES,
     transferLineResiduals: new Map([
       ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, costableRemainingQty: 6 })],
     ]),
@@ -565,7 +583,7 @@ test('the costable cap does not bind when the snapshot is complete (Codex r8 —
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 10,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'asn-1',
           asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
           transferLineId: 'tl-1',
@@ -573,6 +591,7 @@ test('the costable cap does not bind when the snapshot is complete (Codex r8 —
           sortId: 'asn-1',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: new Map([
         ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10, costableRemainingQty: 10 })],
       ]),
@@ -589,7 +608,7 @@ test('the ASN cap still binds when it is tighter than the line cap (Codex r7 —
     stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 9,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'asn-small',
           asnResidualQty: asnResidue({ asnLineMapId: 'asn-small', expectedQty: 2 }),
           transferLineId: 'tl-1',
@@ -597,6 +616,7 @@ test('the ASN cap still binds when it is tighter than the line cap (Codex r7 —
           sortId: 'asn-small',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: new Map([
         ['tl-1', lineResidue({ transferLineId: 'tl-1', lineQty: 10 })],
       ]),
@@ -612,7 +632,7 @@ test('a transfer-backed candidate with no line residue supplied throws rather th
     () => stockSyncHelpers.planMintsoftAlignmentAllocations({
       delta: 5,
       candidates: [
-        {
+        { purchaseLineId: null,
           asnLineMapId: 'asn-1',
           asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 5 }),
           transferLineId: 'tl-missing',
@@ -620,6 +640,7 @@ test('a transfer-backed candidate with no line residue supplied throws rather th
           sortId: 'asn-1',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     /no line-scope residual quantity was loaded for transfer line tl-missing/,
@@ -649,6 +670,7 @@ test('the two residues are separate types — the line-wide figure cannot reach 
           sortId: 'asn-2',
         },
       ],
+      purchaseLineResiduals: NO_PURCHASE_LINES,
       transferLineResiduals: NO_TRANSFER_LINES,
     }),
     /no line-scope residual quantity was loaded/,
@@ -675,3 +697,126 @@ export type ProofLandedIsNotAsnResidue = Assert<NotAssignable<
   ReturnType<typeof asnResidue>
 >>
 export type ProofPlainNumberIsNotAsnResidue = Assert<NotAssignable<number, ReturnType<typeof asnResidue>>>
+
+// ---------------------------------------------------------------------------
+// o3d-papk (6a): THE PURCHASE-ORDER LINE CAP IN THE PLANNER
+// ---------------------------------------------------------------------------
+
+function poResidue(input: {
+  poLineId: string
+  lineQty: number
+  qtyReceived?: number
+  wmsAsnLines?: Array<{ qtyAccountedViaSnapshot: number; qtyAccountedViaReceipt: number }>
+}): PurchaseOrderLineResidualQty {
+  return resolvePurchaseOrderLineResidualQty({
+    lineQty: input.lineQty,
+    landed: resolvePurchaseOrderLineLandedQty({
+      poLineId: input.poLineId,
+      qtyReceived: input.qtyReceived ?? 0,
+      wmsAsnLines: input.wmsAsnLines ?? [],
+    }),
+  })
+}
+
+test('planMintsoftAlignmentAllocations: an already-landed PO line offers no capacity however open its ASN row looks (o3d-papk)', () => {
+  // The ASN row has all ten units of room; the LINE has landed ten by hand. Only the line cap can refuse.
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 5,
+    candidates: [{
+      asnLineMapId: 'asn-1',
+      asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
+      transferLineId: null,
+      purchaseLineId: 'pl-1',
+      sortAt: '2026-04-22T10:00:00.000Z',
+      sortId: 'asn-1',
+    }],
+    transferLineResiduals: NO_TRANSFER_LINES,
+    purchaseLineResiduals: new Map([['pl-1', poResidue({ poLineId: 'pl-1', lineQty: 10, qtyReceived: 10 })]]),
+  })
+  assert.deepEqual(plan.allocations, [])
+  assert.equal(plan.unallocatedQty, 5)
+  console.log('# o3d-papk planner arm 1: evaluated 1 PO candidate against a fully received line')
+})
+
+test('planMintsoftAlignmentAllocations: two ASN rows on one PO line share the LINE residue, counted by LANDED (o3d-papk)', () => {
+  // qty 10, six already landed through alignment on a row that is still open (qtyReceived 0): residue 4.
+  // Row one has 4 left of its own, row two has 10: without the shared line cap the plan would allocate 4 + 2.
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 6,
+    candidates: [
+      {
+        asnLineMapId: 'asn-1',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10, qtyAccountedViaSnapshot: 6 }),
+        transferLineId: null,
+        purchaseLineId: 'pl-1',
+        sortAt: '2026-04-22T10:00:00.000Z',
+        sortId: 'asn-1',
+      },
+      {
+        asnLineMapId: 'asn-2',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-2', expectedQty: 10 }),
+        transferLineId: null,
+        purchaseLineId: 'pl-1',
+        sortAt: '2026-04-23T10:00:00.000Z',
+        sortId: 'asn-2',
+      },
+    ],
+    transferLineResiduals: NO_TRANSFER_LINES,
+    purchaseLineResiduals: new Map([['pl-1', poResidue({
+      poLineId: 'pl-1',
+      lineQty: 10,
+      wmsAsnLines: [{ qtyAccountedViaSnapshot: 6, qtyAccountedViaReceipt: 0 }],
+    })]]),
+  })
+  assert.deepEqual(plan.allocations, [{ asnLineMapId: 'asn-1', qty: 4 }])
+  assert.equal(plan.unallocatedQty, 2, 'the line residue is 4, so only 4 of the 6 are explained')
+  console.log('# o3d-papk planner arm 2: evaluated 2 rows sharing one line residue of 4')
+})
+
+test('planMintsoftAlignmentAllocations: a PO candidate with no line residue loaded throws, never "no cap" (o3d-papk)', () => {
+  assert.throws(
+    () => stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 1,
+      candidates: [{
+        asnLineMapId: 'asn-1',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-1', expectedQty: 10 }),
+        transferLineId: null,
+        purchaseLineId: 'pl-missing',
+        sortAt: '2026-04-22T10:00:00.000Z',
+        sortId: 'asn-1',
+      }],
+      transferLineResiduals: NO_TRANSFER_LINES,
+      purchaseLineResiduals: NO_PURCHASE_LINES,
+    }),
+    /no line-scope residual quantity was loaded for purchase-order line pl-missing/,
+  )
+})
+
+test('planMintsoftAlignmentAllocations: a transfer-line id and a PO-line id never share a capacity entry (o3d-papk)', () => {
+  // The SAME id string names a transfer line (residue 2) and a PO line (residue 5). Each keeps its own cap.
+  const plan = stockSyncHelpers.planMintsoftAlignmentAllocations({
+    delta: 7,
+    candidates: [
+      {
+        asnLineMapId: 'asn-t',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-t', expectedQty: 10 }),
+        transferLineId: 'same-id',
+        purchaseLineId: null,
+        sortAt: '2026-04-22T10:00:00.000Z',
+        sortId: 'asn-t',
+      },
+      {
+        asnLineMapId: 'asn-p',
+        asnResidualQty: asnResidue({ asnLineMapId: 'asn-p', expectedQty: 10 }),
+        transferLineId: null,
+        purchaseLineId: 'same-id',
+        sortAt: '2026-04-23T10:00:00.000Z',
+        sortId: 'asn-p',
+      },
+    ],
+    transferLineResiduals: new Map([['same-id', lineResidue({ transferLineId: 'same-id', lineQty: 2 })]]),
+    purchaseLineResiduals: new Map([['same-id', poResidue({ poLineId: 'same-id', lineQty: 5 })]]),
+  })
+  assert.deepEqual(plan.allocations, [{ asnLineMapId: 'asn-t', qty: 2 }, { asnLineMapId: 'asn-p', qty: 5 }])
+  assert.equal(plan.unallocatedQty, 0)
+})

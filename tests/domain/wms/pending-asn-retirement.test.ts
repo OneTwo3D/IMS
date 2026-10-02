@@ -5,6 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import {
   PendingAsnDisposalBackstopError,
   creditedQtyOnPendingAsnLine,
+  disposePendingAsnReservation,
   disposePendingTransferAsnReservation,
   pendingAsnReservationCarriesCredit,
   planPendingAsnReservationRetirement,
@@ -158,7 +159,13 @@ function fakeTx(options: {
   beforeDelete?: (lines: FakeLine[]) => void
 }) {
   const events: string[] = []
-  const state = { lines: options.lines, headerDeleted: false, closedAt: null as Date | null }
+  const state = {
+    lines: options.lines,
+    headerDeleted: false,
+    closedAt: null as Date | null,
+    lastFindWhere: null as Record<string, unknown> | null,
+    lastDeleteWhere: null as Record<string, unknown> | null,
+  }
   const credited = (line: FakeLine) => !line.qtyAccountedViaSnapshot.equals(0)
     || !line.qtyAccountedViaReceipt.equals(0)
     || !line.lastProcessedReceivedQty.equals(0)
@@ -170,7 +177,8 @@ function fakeTx(options: {
       return []
     },
     wmsAsnMap: {
-      findFirst: async () => {
+      findFirst: async (args: { where: Record<string, unknown> }) => {
+        state.lastFindWhere = args.where
         events.push('read:header')
         return options.headerMatches === false ? null : { id: 'asn-1' }
       },
@@ -180,6 +188,7 @@ function fakeTx(options: {
         return {}
       },
       deleteMany: async (args: { where: Record<string, unknown> }) => {
+        state.lastDeleteWhere = args.where
         options.beforeDelete?.(state.lines)
         events.push('write:delete-header')
         if (args.where.lines && state.lines.some(credited)) return { count: 0 }
@@ -272,4 +281,49 @@ test('o3d-zzgp r3: a reservation that is no longer the caller\'s is left alone',
   assert.equal(events.some((event) => event.startsWith('write:')), false, 'nothing written')
   // The header was checked AFTER its lock, not before.
   assert.ok(events.indexOf('read:header') > events.indexOf('lock:wms_asn_maps'))
+})
+
+// ---------------------------------------------------------------------------
+// o3d-papk (6a follow-up, C2): the SAME disposal serves a purchase order's reservation.
+// ---------------------------------------------------------------------------
+
+test('o3d-papk: a PURCHASE-ORDER reservation is disposed under purchase_orders -> header -> lines, scoped to the PURCHASE_ORDER source type', async () => {
+  const { tx, events, state } = fakeTx({ lines: [fakeLine()] })
+
+  const outcome = await disposePendingAsnReservation(tx as never, { parent: { kind: 'PURCHASE_ORDER', id: 'po-1' }, asnMapId: 'asn-1' })
+
+  assert.equal(outcome, 'deleted')
+  assert.deepEqual(events.filter((event) => event.startsWith('lock:')), ['lock:purchase_orders', 'lock:wms_asn_maps', 'lock:wms_asn_line_maps'], 'step 2b, then 3, then 4 — and never stock_transfers')
+  assert.equal(state.lastFindWhere?.sourceType, 'PURCHASE_ORDER', 'the header read is scoped to purchase-order reservations')
+  assert.equal(state.lastFindWhere?.sourceId, 'po-1')
+  assert.equal(state.lastDeleteWhere?.sourceType, 'PURCHASE_ORDER', 'and so is the delete: it can never remove a transfer reservation')
+  assert.equal(state.lastDeleteWhere?.sourceId, 'po-1')
+  assert.ok(state.lastDeleteWhere?.lines, 'the zero-credit backstop is still in the delete')
+})
+
+test('o3d-papk: a credited PURCHASE-ORDER reservation is retired, never deleted, and its note names the purchase-order column', async () => {
+  const { tx, events, state } = fakeTx({ lines: [fakeLine({ snapshot: '6' })] })
+  const notes: string[] = []
+  ;(tx.wmsAsnLineMap as unknown as { update: (args: { data: { note?: string } }) => Promise<unknown> }).update = async (args) => {
+    notes.push(args.data.note ?? '')
+    return {}
+  }
+
+  const outcome = await disposePendingAsnReservation(tx as never, { parent: { kind: 'PURCHASE_ORDER', id: 'po-1' }, asnMapId: 'asn-1' })
+
+  assert.equal(outcome, 'retired')
+  assert.equal(events.includes('write:delete-header'), false)
+  assert.ok(state.closedAt instanceof Date)
+  assert.equal(notes.length, 1)
+  assert.match(notes[0]!, /purchase_order_lines\.qtyReceived/)
+  assert.doesNotMatch(notes[0]!, /stock_transfer_lines/)
+  console.log('# o3d-papk: evaluated 2 purchase-order disposals (delete, retire)')
+})
+
+test('o3d-papk: the transfer entry point is unchanged: it still locks stock_transfers and names the transfer column', async () => {
+  const { tx, events, state } = fakeTx({ lines: [fakeLine()] })
+  await disposePendingTransferAsnReservation(tx as never, { transferId: 'trf-1', asnMapId: 'asn-1' })
+  assert.deepEqual(events.filter((event) => event.startsWith('lock:')), ['lock:stock_transfers', 'lock:wms_asn_maps', 'lock:wms_asn_line_maps'])
+  assert.equal(state.lastDeleteWhere?.sourceType, 'STOCK_TRANSFER')
+  assert.match(retiredAsnLineNote({ asnLineMapId: 'a', sourceLineId: 'l', retainedCreditQty: new Prisma.Decimal(6), retainedCreditQtyNumber: 6, originalExpectedQty: 10 }), /stock_transfer_lines\.qtyReceived/)
 })
