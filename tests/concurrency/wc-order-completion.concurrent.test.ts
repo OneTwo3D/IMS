@@ -65,7 +65,7 @@ mock.module('@/lib/shopping', {
     pushSalesOrderStatus: async (orderId: string, status: string): Promise<FacadeResult> => {
       wc.events.push(`status:${orderId}:${status}`)
       wc.gets++ // every attempt re-reads the storefront
-      let aborted: Error | null = null
+      const pausedAbort: { error: Error | null } = { error: null }
       if (wc.delayMs > 0) await new Promise((resolve) => setTimeout(resolve, wc.delayMs))
       if (wc.statusOverride) return wc.statusOverride
       if (wc.pause !== 'none') {
@@ -76,8 +76,8 @@ mock.module('@/lib/shopping', {
           if (mode === 'honour') {
             currentWcAttemptSignal()?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('WooCommerce request aborted at the attempt deadline')) }, { once: true })
           }
-        }).catch((error: Error) => { aborted = error })
-        if (aborted) return { success: false, error: aborted.message, outcome: { kind: 'error', error: aborted.message } }
+        }).catch((error: Error) => { pausedAbort.error = error })
+        if (pausedAbort.error) return { success: false, error: pausedAbort.error.message, outcome: { kind: 'error', error: pausedAbort.error.message } }
         // What the connector does right before its PUT.
         try { await assertWcAttemptMayWrite() } catch (error) {
           const message = (error as Error).message
