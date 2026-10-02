@@ -9130,14 +9130,14 @@ test('[o3d-zvec.21 o] an earlier refund that restocked NOTHING is still replayed
 // often (under-relief) where an operator settled a reversal by hand.
 // ===========================================================================================
 
-const COMPLETE_REFUND = {
+const COMPLETE_REFUND: Parameters<typeof createSalesOrderRefund>[1] = {
   orderId: 'order-1',
   lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
   reason: 'Goodwill full refund',
   creditNotePrefix: 'CN-',
   accountingSettings,
   activeAccountingConnector: 'xero',
-} as const
+}
 
 const STANDING_REVERSALS: Array<{
   standing: string
