@@ -714,11 +714,15 @@ async function buildRefundFallbackReturnRows(
           },
         },
       },
+      // EVERY earlier refund, in creation order (Codex r5): the allocation walk must replay each earlier
+      // QUANTITY refund — including one that restocked nothing and so carries no return warehouse — or it
+      // would hand that refund's units to the next one. `returnWarehouseId` says only whether stock came
+      // back, and is used to debit stock, never to decide whether the refund consumed line quantity.
       refunds: {
-        where: { returnWarehouseId: { not: null } },
-        orderBy: { createdAt: 'asc' },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
         select: {
           id: true,
+          returnWarehouseId: true,
           lines: {
             select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
@@ -727,6 +731,14 @@ async function buildRefundFallbackReturnRows(
     },
   })
   if (!order) return []
+
+  // Only refunds created BEFORE the one being built (the walk replays history; a later refund must not
+  // consume the units this one is entitled to — the accounting retry rebuilds an OLD refund's rows).
+  const priorRefunds: typeof order.refunds = []
+  for (const refund of order.refunds) {
+    if (excludeRefundId && refund.id === excludeRefundId) break
+    priorRefunds.push(refund)
+  }
 
   const lineById = new Map(order.lines.map((line) => [line.id, line]))
   const lineCandidatesByProduct = new Map<string, typeof order.lines>()
@@ -752,8 +764,8 @@ async function buildRefundFallbackReturnRows(
   }
 
   const priorReturnedByProduct = new Map<string, number>()
-  for (const refund of order.refunds) {
-    if (excludeRefundId && refund.id === excludeRefundId) continue
+  for (const refund of priorRefunds) {
+    if (!refund.returnWarehouseId) continue // only refunds that actually returned stock debit the product cap
     for (const refundLine of refund.lines) {
       if (!refundLine.productId) continue
       priorReturnedByProduct.set(
@@ -803,8 +815,7 @@ async function buildRefundFallbackReturnRows(
   // order through the same allocation) already took from it.
   const lineUnitsLeft = new Map<string, number>(order.lines.map((l) => [l.id, refundBoundaryNumber(l.qty)]))
   const priorAllocations = new Map<string, Array<{ line: (typeof order.lines)[number]; take: number }>>()
-  for (const refund of order.refunds) {
-    if (excludeRefundId && refund.id === excludeRefundId) continue
+  for (const refund of priorRefunds) {
     for (const refundLine of refund.lines) {
       if (!refundLine.productId) continue
       priorAllocations.set(refundLine.id, allocateRefundQtyAcrossLines(
@@ -827,8 +838,8 @@ async function buildRefundFallbackReturnRows(
     }
   }
   const REFUND_MOVEMENT_LINE = /:line:([^:]+):warehouse:/
-  for (const refund of order.refunds) {
-    if (excludeRefundId && refund.id === excludeRefundId) continue
+  for (const refund of priorRefunds) {
+    if (!refund.returnWarehouseId) continue // restocked nothing: no stock to debit (its line units were replayed above)
     const refundLineById = new Map(refund.lines.map((refundLine) => [refundLine.id, refundLine]))
 
     // WHAT WAS ACTUALLY RETURNED is on record: one inbound movement per (refund line, COMPONENT product),
@@ -1210,7 +1221,7 @@ function allocateRefundQtyAcrossLines<T extends { id: string }>(
   for (const line of sortedLines) {
     if (remaining <= 0) break
     const take = Math.min(remaining, Math.max(0, unitsLeft.get(line.id) ?? 0))
-    if (take <= 0) continue
+    if (take <= 1e-9) continue
     unitsLeft.set(line.id, (unitsLeft.get(line.id) ?? 0) - take)
     remaining -= take
     taken.push({ line, take })
