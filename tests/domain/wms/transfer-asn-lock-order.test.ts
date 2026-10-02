@@ -147,7 +147,7 @@ type ScopeWorld = {
   transfers: Record<string, string[]>
 }
 
-function scopeClient(world: ScopeWorld, onLayerLock?: () => void) {
+function scopeClient(world: ScopeWorld, onLock?: (table: string) => void) {
   const log: string[] = []
   const client = {
     $queryRaw: (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -174,7 +174,7 @@ function scopeClient(world: ScopeWorld, onLayerLock?: () => void) {
       const lock = /FROM (stock_transfers|purchase_orders|purchase_order_lines|freight_cost_lines|cost_layers) WHERE[\s\S]*FOR (NO KEY UPDATE|UPDATE)/.exec(sql)
       if (lock) {
         log.push(`lock:${lock[1]}:${lock[2]}:${JSON.stringify(values[0])}`)
-        if (lock[1] === 'cost_layers') onLayerLock?.()
+        onLock?.(lock[1]!)
         return Promise.resolve([])
       }
       throw new Error(`unexpected statement: ${sql}`)
@@ -183,7 +183,18 @@ function scopeClient(world: ScopeWorld, onLayerLock?: () => void) {
   return { client, log }
 }
 
-test('lockLandedCostRevaluationScope takes transfers, then orders with their cost rows, then layers (NO KEY UPDATE), ascending, and re-discovers last (o3d-nrl4 A)', async () => {
+/** Collapse a statement log into its phases: D = a discovery pass, then each lock's table. */
+function phases(log: string[]): string[] {
+  const out: string[] = []
+  for (const entry of log) {
+    const label = entry.startsWith('discover:') ? 'D' : entry.split(':')[1]!
+    if (label === 'D' && out[out.length - 1] === 'D') continue
+    out.push(label)
+  }
+  return out
+}
+
+test('lockLandedCostRevaluationScope takes transfers, then orders with their cost rows, re-discovers, then layers (NO KEY UPDATE), ascending, and re-discovers last (o3d-nrl4 A)', async () => {
   const world: ScopeWorld = {
     links: ['po-b', 'po-a'],
     rootLayers: ['l-2', 'l-1'],
@@ -203,17 +214,17 @@ test('lockLandedCostRevaluationScope takes transfers, then orders with their cos
     'lock:freight_cost_lines:UPDATE:["fr-1","po-a","po-b"]',
     'lock:cost_layers:NO KEY UPDATE:["l-1","l-2","l-3"]',
   ])
-  const firstLock = log.findIndex((entry) => entry.startsWith('lock:'))
-  const lastLock = log.length - 1 - [...log].reverse().findIndex((entry) => entry.startsWith('lock:'))
-  assert.ok(log.slice(0, firstLock).every((entry) => entry.startsWith('discover:')), 'discovery precedes every lock')
-  assert.ok(log.slice(lastLock + 1).length > 0 && log.slice(lastLock + 1).every((entry) => entry.startsWith('discover:')), 're-discovery follows the last lock')
+  assert.deepEqual(
+    phases(log),
+    ['D', 'stock_transfers', 'purchase_orders', 'purchase_order_lines', 'freight_cost_lines', 'D', 'cost_layers', 'D'],
+    'discovery, 2a, 2b-2d, re-discovery #1, 6, re-discovery #2 — in exactly that order',
+  )
   assert.ok(!scope.transferIds.includes('t-x'), 'an unrelated transfer is not locked')
 })
 
-test('lockLandedCostRevaluationScope refuses a transfer or layer that appears between discovery and the locks (o3d-nrl4 A)', async () => {
+test('lockLandedCostRevaluationScope refuses a TRANSFER that appears while it queues for the orders — before taking any layer (o3d-nrl4 A)', async () => {
   const world: ScopeWorld = { links: ['po-a'], rootLayers: ['l-1'], outputs: {}, transfers: { 't-1': ['l-1'] } }
-  // A dispatch from l-1 commits once the layer lock is taken: the re-discovery sees t-2.
-  const raced = scopeClient(world, () => { world.transfers['t-2'] = ['l-1'] })
+  const raced = scopeClient(world, (table) => { if (table === 'freight_cost_lines') world.transfers['t-2'] = ['l-1'] })
   await assert.rejects(
     lockLandedCostRevaluationScope(raced.client as never, { freightPoId: 'fr-1' }),
     (error: unknown) => {
@@ -224,9 +235,23 @@ test('lockLandedCostRevaluationScope refuses a transfer or layer that appears be
       return true
     },
   )
-  // A new layer on a primary line.
+  assert.equal(raced.log.filter((entry) => entry.startsWith('lock:cost_layers')).length, 0, 'refused before any layer lock')
+})
+
+test('lockLandedCostRevaluationScope refuses a transfer or layer that appears while the layers are being locked (o3d-nrl4 A)', async () => {
+  const world: ScopeWorld = { links: ['po-a'], rootLayers: ['l-1'], outputs: {}, transfers: { 't-1': ['l-1'] } }
+  const raced = scopeClient(world, (table) => { if (table === 'cost_layers') world.transfers['t-2'] = ['l-1'] })
+  await assert.rejects(
+    lockLandedCostRevaluationScope(raced.client as never, { freightPoId: 'fr-1' }),
+    (error: unknown) => {
+      assert.ok(error instanceof LandedCostScopeRacedError)
+      assert.deepEqual(error.unlockedTransferIds, ['t-2'])
+      return true
+    },
+  )
+  // A new layer on a primary line after the layers were locked.
   const world2: ScopeWorld = { links: ['po-a'], rootLayers: ['l-1'], outputs: {}, transfers: {} }
-  const raced2 = scopeClient(world2, () => { world2.rootLayers.push('l-new') })
+  const raced2 = scopeClient(world2, (table) => { if (table === 'cost_layers') world2.rootLayers.push('l-new') })
   await assert.rejects(lockLandedCostRevaluationScope(raced2.client as never, { primaryPoIds: ['po-a'] }), (error: unknown) => {
     assert.ok(error instanceof LandedCostScopeRacedError)
     assert.deepEqual(error.unlockedCostLayerIds, ['l-new'])
@@ -235,6 +260,14 @@ test('lockLandedCostRevaluationScope refuses a transfer or layer that appears be
   // And the negative control: nothing changed -> no refusal (the check is not a blanket throw).
   const calm: ScopeWorld = { links: ['po-a'], rootLayers: ['l-1'], outputs: {}, transfers: { 't-1': ['l-1'] } }
   await lockLandedCostRevaluationScope(scopeClient(calm).client as never, { freightPoId: 'fr-1' })
+})
+
+test('lockLandedCostRevaluationScope takes a LAYER that appears while it queues for the orders — an alignment committing its receipt is not a race (o3d-nrl4 A)', async () => {
+  const world: ScopeWorld = { links: [], rootLayers: [], outputs: {}, transfers: {} }
+  const { client, log } = scopeClient(world, (table) => { if (table === 'freight_cost_lines') world.rootLayers.push('l-aligned') })
+  const scope = await lockLandedCostRevaluationScope(client as never, { primaryPoIds: ['po-a'] })
+  assert.deepEqual(scope.costLayerIds, ['l-aligned'], 'the layer the alignment created is part of the scope')
+  assert.deepEqual(log.filter((entry) => entry.startsWith('lock:cost_layers')), ['lock:cost_layers:NO KEY UPDATE:["l-aligned"]'])
 })
 
 test('lockLandedCostRevaluationScope walks source lines to the propagation depth and no further, and survives a cycle (o3d-nrl4 A)', async () => {

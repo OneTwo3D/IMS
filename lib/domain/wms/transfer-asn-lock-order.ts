@@ -375,7 +375,9 @@ export async function lockPurchaseOrdersWithCostRows(
 //
 //   discovery (UNLOCKED, read only) → 2a stock_transfers over the transfer closure
 //   → 2b/2c/2d purchase_orders, purchase_order_lines, freight_cost_lines over the freight order and every
-//   primary → 6 cost_layers over the layer closure, FOR NO KEY UPDATE → RE-DISCOVERY under the locks.
+//   primary → RE-DISCOVERY #1 (a new transfer or order refuses; a new LAYER joins the next statement,
+//   because primaries' layers are final once their order is held and layers are still ahead at step 6)
+//   → 6 cost_layers over the layer closure, FOR NO KEY UPDATE → RE-DISCOVERY #2 under every lock.
 //
 // WHY FOR NO KEY UPDATE AND NOT FOR UPDATE ON THE LAYERS. Dispatch, FIFO consumption and production
 // consumption take `FOR UPDATE` on the layers they draw from (consumeFifoLayers), which conflicts with
@@ -520,22 +522,66 @@ export async function lockLandedCostRevaluationScope(
 
   await lockStockTransfers(tx, planned.transferIds) // 2a
   await lockPurchaseOrdersWithCostRows(tx, planned.purchaseOrderIds) // 2b, 2c, 2d
-  if (planned.costLayerIds.length > 0) {
-    await tx.$queryRaw`SELECT id FROM cost_layers WHERE id = ANY(${planned.costLayerIds}::text[]) ORDER BY id FOR NO KEY UPDATE` // 6
-  }
 
-  // RE-DISCOVER under the locks: whatever committed meanwhile is visible now and is outside what we hold.
+  // RE-DISCOVER #1, UNDER THE ORDER LOCKS. A cost layer on a primary order's line is only ever created or
+  // consumed by a path holding that order (receiveStock, alignment, book-in, cancellation all take the
+  // parent first), so the primaries' own layers are FINAL from here. A layer that appeared while this
+  // transaction was queueing for the order (an alignment committing its receipt) is therefore not a race:
+  // layers are step 6, still ahead of us, so it joins the layer statement below. A TRANSFER or an ORDER
+  // that is new is a race: those are steps 2a/2b, which this transaction has already passed.
+  const underOrders = await discoverLandedCostRevaluationScope(tx, request)
+  assertScopeStillHeld({
+    observed: underOrders,
+    heldTransferIds: planned.transferIds,
+    heldPurchaseOrderIds: planned.purchaseOrderIds,
+    heldCostLayerIds: underOrders.costLayerIds, // layers are not yet locked and may still be added
+  })
+  await lockCostLayersForRevaluation(tx, underOrders.costLayerIds) // 6
+
+  // RE-DISCOVER #2, UNDER EVERY LOCK: whatever committed while the layers were being locked (a dispatch
+  // from a primary layer, a production run consuming one) is visible now and is outside what we hold.
   const observed = await discoverLandedCostRevaluationScope(tx, request)
-  const heldTransfers = new Set(planned.transferIds)
-  const heldLayers = new Set(planned.costLayerIds)
-  const heldOrders = new Set(planned.purchaseOrderIds)
-  const unlockedTransferIds = observed.transferIds.filter((id) => !heldTransfers.has(id))
-  const unlockedCostLayerIds = observed.costLayerIds.filter((id) => !heldLayers.has(id))
-  const unlockedPurchaseOrderIds = observed.purchaseOrderIds.filter((id) => !heldOrders.has(id))
+  assertScopeStillHeld({
+    observed,
+    heldTransferIds: planned.transferIds,
+    heldPurchaseOrderIds: planned.purchaseOrderIds,
+    heldCostLayerIds: underOrders.costLayerIds,
+  })
+  return {
+    purchaseOrderIds: planned.purchaseOrderIds,
+    primaryPoIds: planned.primaryPoIds,
+    transferIds: planned.transferIds,
+    costLayerIds: underOrders.costLayerIds,
+  }
+}
+
+/** STEP 6 for a revaluation: one statement, ascending, `FOR NO KEY UPDATE` (see the block comment above). */
+async function lockCostLayersForRevaluation(tx: LockClient, costLayerIds: ReadonlyArray<string>): Promise<void> {
+  const ids = sortedUnique(costLayerIds)
+  if (ids.length === 0) return
+  await tx.$queryRaw`SELECT id FROM cost_layers WHERE id = ANY(${ids}::text[]) ORDER BY id FOR NO KEY UPDATE`
+}
+
+/**
+ * The refusal: anything the revaluation would touch that this transaction does not hold. One function so
+ * both re-discoveries apply the same rule, and so the two ways of getting it wrong (never calling it, or
+ * comparing against the wrong set) are each a one-line change a test can be made to catch.
+ */
+function assertScopeStillHeld(params: {
+  observed: LandedCostRevaluationScope
+  heldTransferIds: ReadonlyArray<string>
+  heldPurchaseOrderIds: ReadonlyArray<string>
+  heldCostLayerIds: ReadonlyArray<string>
+}): void {
+  const heldTransfers = new Set(params.heldTransferIds)
+  const heldLayers = new Set(params.heldCostLayerIds)
+  const heldOrders = new Set(params.heldPurchaseOrderIds)
+  const unlockedTransferIds = params.observed.transferIds.filter((id) => !heldTransfers.has(id))
+  const unlockedCostLayerIds = params.observed.costLayerIds.filter((id) => !heldLayers.has(id))
+  const unlockedPurchaseOrderIds = params.observed.purchaseOrderIds.filter((id) => !heldOrders.has(id))
   if (unlockedTransferIds.length + unlockedCostLayerIds.length + unlockedPurchaseOrderIds.length > 0) {
     throw new LandedCostScopeRacedError({ unlockedPurchaseOrderIds, unlockedTransferIds, unlockedCostLayerIds })
   }
-  return planned
 }
 
 /** STEP 3 — `wms_asn_maps`, the ASN header, before any of its line rows. */

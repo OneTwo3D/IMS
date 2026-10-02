@@ -27,6 +27,7 @@ import { config } from 'dotenv'
  *       else (order, primary order and layer all still lockable) -> transfers are step 2a.
  *   L2  an alignment-shaped session (transfer, then the order) races the recalculation, 20 times: no 40P01.
  *   L3  a dispatch committing between discovery and lock -> LandedCostScopeRacedError, nothing written.
+ *   L5  a layer an alignment commits while the recalculation queues for the order joins the scope (no refusal)
  *   L4  a consumer drawing from the layer blocks behind the scope lock BEFORE any write, then consumes
  *       at the NEW cost.
  *   C*  the three production callers take the same lock first and turn a race into a retry message.
@@ -431,6 +432,38 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
     } finally {
       release.resolve()
       await probe.end()
+    }
+  })
+
+  await t.test('L5: a layer an alignment commits while the recalculation queues for the order is NOT a race: it joins the scope and is repriced', async () => {
+    const world = await seedWorld('l5')
+    const alignment = await rawSession(databaseUrl)
+    const probe = await rawSession(databaseUrl)
+    try {
+      const alignmentPid = await rawPid(alignment)
+      await alignment.query('BEGIN')
+      // The alignment holds the PRIMARY ORDER (step 2b) ...
+      await alignment.query('SELECT id FROM purchase_orders WHERE id = $1 FOR UPDATE', [world.goodsId])
+      let finished = false
+      const running = db.$transaction((tx) => lockAndRecalculate(tx, world.freightId), TX)
+        .then((v) => { finished = true; return { ok: true as const, value: v } }, (e) => { finished = true; return { ok: false as const, error: e } })
+      // ... the recalculation has already DISCOVERED (before any lock) and is parked on that order ...
+      const blocked = await waitForBlocked(probe, { blockedBy: alignmentPid, waitingOn: /purchase_orders/i, describe: 'L5', finished: () => finished })
+      // ... and the alignment now creates and commits its receipt layer on the primary's line.
+      const lateLayer = await db.costLayer.create({
+        data: { productId: world.productId, warehouseId: world.w1, receivedQty: 3, remainingQty: 3, unitCostBase: BASE_UNIT, poLineId: world.goodsLineId },
+        select: { id: true },
+      })
+      await alignment.query('COMMIT')
+      console.log(`L5 PRECONDITION: backend ${blocked.pid} parked on the order held by pid ${alignmentPid}; late layer ${lateLayer.id} committed meanwhile`)
+      const outcome = await running
+      assert.equal(outcome.ok, true, `a layer that appeared under the order lock must not refuse the revaluation: ${outcome.ok ? '' : String(outcome.error)}`)
+      if (outcome.ok) assert.ok(outcome.value.scope.costLayerIds.includes(lateLayer.id), 'the late layer is in the locked scope')
+      assert.equal(await layerUnitCost(lateLayer.id), BASE_UNIT + FREIGHT / LINE_QTY, 'and it was repriced')
+      assert.equal(await layerUnitCost(world.layerId), BASE_UNIT + FREIGHT / LINE_QTY)
+    } finally {
+      await alignment.query('ROLLBACK').catch(() => {})
+      await alignment.end(); await probe.end()
     }
   })
 
