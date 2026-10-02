@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import { pushShipmentCompletionToShopping } from '@/lib/fulfillment/shipment-completion-push'
 import { decimalToNumber } from '@/lib/decimal'
 import {
   availableQtyFromRequirements,
@@ -1553,6 +1554,13 @@ export async function updateShipmentStatus(
      * passes `EXTERNAL`, because the storefront/WMS driving it has already made that decision.
      */
     completionAuthority?: OrderCompletionAuthority
+    /**
+     * o3d-zvec.15: whether THIS dispatch owns the storefront completion (enqueues the durable
+     * WooCommerce completion job with the order flip). Defaults to `completionAuthority === 'IMS'`;
+     * `applyExternalFulfillmentUpdate` passes true for a WMS source and false for a storefront-sourced
+     * completion, which would only echo.
+     */
+    storefrontCompletion?: boolean
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
@@ -1573,10 +1581,15 @@ export async function updateShipmentStatus(
       return result
     }
 
+    // o3d-zvec.15: set by the reconciliation below ONLY when this call moved the order to SHIPPED.
+    let storefrontCompletionKey: string | null = null
+    const completionAuthority = options?.completionAuthority ?? 'IMS'
     if (targetStatus === 'SHIPPED') {
       const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
-        completionAuthority: options?.completionAuthority ?? 'IMS',
+        completionAuthority,
+        storefrontCompletion: options?.storefrontCompletion ?? completionAuthority === 'IMS',
       })
+      storefrontCompletionKey = reconciliation.storefrontCompletionKey ?? null
       // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
       // quantity, so it was deliberately left in its pre-shipment status instead of being declared
       // complete. Only ever set under IMS completion authority — an externally fulfilled order is
@@ -1643,11 +1656,14 @@ export async function updateShipmentStatus(
       metadata: { shipmentId, warehouseCode: result.shipment.warehouse.code, previousStatus: result.previousStatus, newStatus: targetStatus },
     })
     if (targetStatus === 'SHIPPED') {
-      try {
-        await pushOrderDeliveryMetadata(result.shipment.orderId)
-      } catch (syncError) {
-        console.error(syncError)
-      }
+      // The durable completion job was enqueued with the order flip (above, inside its transaction); this
+      // is the immediate post-commit attempt — tracking first, then the status, never failing the shipment
+      // (o3d-zvec.15). Without a key (partial shipment, EXTERNAL authority with no storefrontCompletion, an
+      // unlinked order) only the tracking goes.
+      await pushShipmentCompletionToShopping({
+        orderId: result.shipment.orderId,
+        completionKey: storefrontCompletionKey,
+      })
       try {
         await enqueueStockSync(
           result.stockSyncProductIds,

@@ -7,7 +7,6 @@ import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } fro
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
-import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { isShoppingConnectorId, shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 
@@ -712,6 +711,11 @@ export async function applyExternalFulfillmentUpdate(
           // customer despatch email it exists to fire), and raise a `shipped_short` WARNING on
           // every external dispatch. See `OrderCompletionAuthority`.
           completionAuthority: 'EXTERNAL',
+          // o3d-zvec.15: a WMS dispatch is the thing that completes the storefront order, so the
+          // durable completion job is enqueued WITH the flip (tracking first, then the status; retried
+          // by the cron; held for orders WooCommerce no longer has in flight). A storefront-sourced
+          // completion must never push back, as it would only echo.
+          storefrontCompletion: isWmsConnectorId(update.source),
         },
       )
 
@@ -745,39 +749,10 @@ export async function applyExternalFulfillmentUpdate(
     resolveUser: false,
   })
 
-  // When a WMS dispatch has fully shipped the order, push the storefront status
-  // forward (SHIPPED → WooCommerce "completed") so the storefront fires its customer
-  // despatch email — e.g. Advanced Shipment Tracking emails the tracking on the
-  // →completed transition, not on a raw tracking-meta write. Writing the tracking meta
-  // alone (above) leaves the WC order in its prior status and the customer un-emailed.
-  // Gated to WMS sources: a storefront-sourced fulfilment already has the storefront as
-  // the source of truth, so pushing status back would just echo.
-  if (update.targetShipmentStatus === 'SHIPPED' && isWmsConnectorId(update.source)) {
-    const current = await db.salesOrder.findUnique({ where: { id: order.id }, select: { status: true } })
-    if (current && shouldPushStorefrontCompletion(update.source, update.targetShipmentStatus, current.status)) {
-      // Best-effort: the shipment + tracking are already applied; a failed status push
-      // must not fail the dispatch. But log it — a missed completion = a missed customer
-      // despatch email, which would otherwise be invisible.
-      const logCompletionPushFailure = (detail: string) =>
-        logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: order.id,
-          action: 'wc_completion_push_failed',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Storefront completion push failed for despatched order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}: ${detail} — customer despatch email may not have fired`,
-          metadata: { source: update.source },
-          resolveUser: false,
-        }).catch(() => {})
-      try {
-        const { pushSalesOrderStatus } = await import('@/lib/shopping')
-        const pushResult = await pushSalesOrderStatus(order.id, current.status as SalesOrderStatus)
-        if (!pushResult.success) await logCompletionPushFailure(pushResult.error ?? 'unknown error')
-      } catch (error) {
-        await logCompletionPushFailure(error instanceof Error ? error.message : 'unexpected error')
-      }
-    }
-  }
+  // The storefront completion for a WMS dispatch (SHIPPED -> WooCommerce "completed", which fires the
+  // customer despatch email) is no longer pushed from here. It is a durable `woocommerce/order.complete`
+  // job enqueued inside the transaction that flips the order (storefrontCompletion above), so a failed
+  // push is retried instead of being lost for good (o3d-zvec.15).
 
   return { success: true }
 }

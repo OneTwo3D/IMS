@@ -1296,10 +1296,64 @@ test('reconcileOrderAfterShipment marks fully shipped order and returns invoice 
 
   const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
 
-  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1' })
+  // o3d-zvec.15: `orderReachedShipped` is the flip signal the storefront completion push keys on.
+  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1', orderReachedShipped: true })
   assert.equal(state.orders[0].status, 'SHIPPED')
   assert.equal(state.orders[0].trackingNumber, 'TRACK-1, TRACK-2')
   assert.ok(state.orders[0].shippedAt instanceof Date)
+})
+
+// --- o3d-zvec.15: `orderReachedShipped` is true for EXACTLY the call that promoted the order ---------
+// The storefront completion push keys on it, so each way of NOT promoting must leave it absent.
+
+test('o3d-zvec.15: orderReachedShipped is true once for the promoting call and absent on every re-run', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 },
+    ],
+  })
+
+  const first = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'SHIPPED', 'precondition: the first call promoted the order')
+  assert.equal(first.orderReachedShipped, true)
+
+  const again = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'SHIPPED')
+  assert.equal(again.orderReachedShipped, undefined, 'a re-run finds the order already SHIPPED and promotes nothing')
+})
+
+test('o3d-zvec.15: an order some other path already moved to SHIPPED is not reported as newly shipped', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'SHIPPED' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+  })
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'SHIPPED', 'precondition: it really was SHIPPED already')
+  assert.equal(result.orderReachedShipped, undefined)
+})
+
+test('o3d-zvec.15: a shortfall-held order is not reported as newly shipped', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 4 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+  })
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+  assert.ok(result.shortfall, 'precondition: the shortfall branch was reached')
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+  assert.equal(result.orderReachedShipped, undefined)
 })
 
 // --- o3d-0i5y: "every shipment shipped" is not "order complete" ---------------------------------
