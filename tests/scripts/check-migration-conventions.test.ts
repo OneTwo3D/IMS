@@ -189,3 +189,25 @@ test('migration conventions: an all-zero before SHA falls back to the parent com
   assert.equal(bad.status, 1, bad.out)
   assert.match(bad.out, /Cannot resolve the comparison range|Unable to compute merge-base/)
 })
+
+test('migration conventions: a PUSH event payload alone (no env base) supplies the before SHA, in CI, so every caller is correct by default', (t) => {
+  const risky = repoWithMigration(t, RISKY)
+  risky.g('update-ref', 'refs/remotes/origin/development', risky.head) // the trap: the default base is HEAD
+  const payload = (dir: string, before: string) => {
+    const f = join(dir, '..', `event-${before.slice(0, 7)}.json`)
+    writeFileSync(f, JSON.stringify({ before }))
+    return f
+  }
+  const bad = run(risky.dir, { CI: 'true', GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: payload(risky.dir, risky.base) })
+  assert.equal(bad.status, 1, bad.out)
+  assert.match(bad.out, /DROP COLUMN/)
+  const clean = repoWithMigration(t, 'ALTER TABLE "products" ADD COLUMN "n" TEXT;\n')
+  clean.g('update-ref', 'refs/remotes/origin/development', clean.head)
+  const ok = run(clean.dir, { CI: 'true', GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: payload(clean.dir, clean.base) })
+  assert.equal(ok.status, 0, ok.out)
+  assert.match(ok.out, /\(1 migration file\(s\) examined/)
+  // And without the payload the same shape still fails loud rather than passing vacuously.
+  const none = run(risky.dir, { CI: 'true', GITHUB_EVENT_NAME: 'push' })
+  assert.equal(none.status, 1, none.out)
+  assert.match(none.out, /comparison range .* is empty/)
+})

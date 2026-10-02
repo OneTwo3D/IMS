@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const MIN_RATIONALE_LENGTH = 24
@@ -322,11 +323,27 @@ export function resolveBaseRef(baseRef, headRef, { ci = false } = {}) {
   return base
 }
 
+/**
+ * On a `push` event the right base is the event's `before` SHA. Reading it here, when no explicit base was
+ * given, makes every caller correct by default: `npm run validate` (CI=true) calls this with no argument, and
+ * the default `origin/development` is HEAD itself on a push to development (o3d-ok6hk).
+ */
+export function baseFromGithubEvent(env = process.env) {
+  if (env.GITHUB_EVENT_NAME !== 'push' || !env.GITHUB_EVENT_PATH) return undefined
+  try {
+    const before = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))?.before
+    return typeof before === 'string' && before ? before : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function main() {
   const baseRef =
     process.argv[2]
     ?? process.env.MIGRATION_CONVENTION_BASE_REF
     ?? process.env.SCHEMA_SCOPE_BASE_REF
+    ?? baseFromGithubEvent()
     ?? (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : 'origin/development')
   const headRef =
     process.argv[3]
