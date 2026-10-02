@@ -369,6 +369,18 @@ file's own root `before` while the guard hook was still awaiting, and ran it eve
 refused (both measured). `email-outbox-claim-fence` additionally creates its own database through
 `tests/helpers/throwaway-database.ts`; the configured one must still pass the guard first.
 
+**The tier runs ONE FILE AT A TIME (`--test-concurrency=1`, o3d-ohrk3).** node:test otherwise runs
+`availableParallelism() - 1` files at once, all against the one scratch database, and several files
+write rows no file owns — the plugin-selection settings (`plugin_xero_enabled`, `xero_sync_enabled`)
+above all. `pinned-ledger-fence` deliberately switches the accounting plugin off for the length of its
+race while `enqueue-collision-transaction`, `duplicate-reversal-enqueue` and others switch it on or
+enqueue against it, so two files overlapping made each the other's flaky failure (measured under 8 CPU
+burners: that pair failed 3 of 20 runs at the default concurrency on the old test files, 3 of 30 on the
+new ones, and 0 of 30 with `--test-concurrency=1`). The cost is wall-clock only: a machine with two CPUs
+already gets a default of 1. Within a file the race tests do not sleep
+for a lock holder either: they hold until the other side is OBSERVED parked (`pg_blocking_pids`) via
+`tests/helpers/lock-wait-observer.ts`, and fail loudly if it never parks.
+
 **Neither tier is absent from `npm run test:unit`, and only one of the two is gated end to end.**
 `test:unit`'s glob is `tests/**/*.test.ts`, so it collects `tests/concurrency/**` and `tests/db/**`
 along with everything else. What they then DO under it differs, and the difference is what you need
