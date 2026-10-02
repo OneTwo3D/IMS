@@ -86,7 +86,7 @@ async function waitForBlockedBackend(probe: RawClient, blockerPid: number, waiti
   }
 }
 
-const PARENT_LOCK = /FROM purchase_orders WHERE id = ANY\(.*FOR UPDATE/is
+const PARENT_LOCK = /FROM purchase_orders WHERE id = ANY\([\s\S]*FOR UPDATE/i
 
 test.before(async () => {
   if (!RUN) return
