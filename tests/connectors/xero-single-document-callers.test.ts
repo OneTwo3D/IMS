@@ -20,6 +20,12 @@ import test, { beforeEach, mock } from 'node:test'
 let xeroBodies: Record<string, unknown> = {}
 let xeroServed: string[] = []
 let puts: string[] = []
+/** o3d-h9pb r5: how the doubled Xero answers an Allocations PUT. */
+type PutMode = 'echo' | 'replay-always' | 'keyed-replay' | 'reject-changed' | { raw: unknown }
+let putMode: PutMode = 'echo'
+let putKeys: Array<string | undefined> = []
+let firstResponse: unknown = null
+const idemStore = new Map<string, { body: string; response: unknown }>()
 let putBodies: Array<{ Allocations: Array<{ Amount: number; Invoice: { InvoiceID: string } }> }> = []
 let salesUpdates = 0
 let activity: Array<Record<string, unknown>> = []
@@ -32,7 +38,25 @@ mock.module('@/lib/connectors/xero/api', {
       return { ok: true, status: 200, data: xeroBodies[path] }
     },
     xeroPost: async () => ({ ok: false, status: 500, error: 'not expected' }),
-    xeroPut: async (path: string, body: never) => { puts.push(path); putBodies.push(body); return { ok: true, status: 200, data: {} } },
+    xeroPut: async (path: string, body: { Allocations: Array<{ Amount: number; Invoice: { InvoiceID: string } }> }, opts?: { idempotencyKey?: string }) => {
+      puts.push(path); putBodies.push(body); putKeys.push(opts?.idempotencyKey)
+      const echo = { Allocations: body.Allocations.map((a) => ({ Amount: a.Amount, Invoice: { InvoiceID: a.Invoice.InvoiceID } })) }
+      if (typeof putMode === 'object') return { ok: true, status: 200, data: putMode.raw }
+      if (putMode === 'replay-always') {
+        if (firstResponse === null) firstResponse = echo
+        return { ok: true, status: 200, data: firstResponse }
+      }
+      const key = opts?.idempotencyKey
+      if ((putMode === 'keyed-replay' || putMode === 'reject-changed') && key) {
+        const seen = idemStore.get(key)
+        if (seen) {
+          if (putMode === 'reject-changed' && seen.body !== JSON.stringify(body)) return { ok: false, status: 400, error: 'idempotency key reused with a different request body' }
+          return { ok: true, status: 200, data: seen.response }
+        }
+        idemStore.set(key, { body: JSON.stringify(body), response: echo })
+      }
+      return { ok: true, status: 200, data: echo }
+    },
   },
 })
 mock.module('@/lib/connectors/xero/contacts', { namedExports: { findOrCreateContact: async () => 'contact-1' } })
@@ -63,6 +87,10 @@ beforeEach(() => {
   xeroServed = []
   puts = []
   putBodies = []
+  putKeys = []
+  putMode = 'echo'
+  firstResponse = null
+  idemStore.clear()
   salesUpdates = 0
   activity = []
 })
@@ -308,6 +336,7 @@ const stateFor = (rc: number, ad: number, allocations: unknown[]) => {
   }
   puts = []
   putBodies = []
+  putKeys = []
 }
 const OURS_ = (amount: number) => ({ Amount: amount, Invoice: { InvoiceID: 'bill-1' } })
 
@@ -369,4 +398,96 @@ test('[o3d-h9pb HIGH r4] exact fit succeeds; and NEVER more than min(remaining c
   }
   assert.equal(cells, 100)
   console.log(`# o3d-h9pb HIGH r4 grid: ${cells} (RC x AD x A) cells, success iff allocated >= requested, never over-sent`)
+})
+
+/* ------- o3d-h9pb (Codex round 5): one idempotency key per distinct allocation; completion only from the response ------- */
+
+const KEYED = { idempotencyKey: 'ims-purchase-credit-note-allocation-row-1' }
+
+test('[o3d-h9pb HIGH r5] the PUT carries a derived per-allocation key: same residual => same key, a different one => a different key', async () => {
+  const { allocatePurchaseCreditNote, deriveAllocationIdempotencyKey } = await import('@/lib/connectors/xero/credit-notes')
+  stateFor(40, 25, [])
+  const ok = await allocatePurchaseCreditNote(PARAMS, KEYED)
+  assert.equal(ok.success, true, JSON.stringify(ok))
+  assert.equal(putKeys.length, 1, 'PRECONDITION: a PUT was sent')
+  assert.match(putKeys[0] ?? '', /^ims-pcna-[0-9a-f]{64}$/)
+  assert.ok((putKeys[0] ?? '').length <= 128)
+  assert.notEqual(putKeys[0], KEYED.idempotencyKey, 'not the raw row key')
+  // retry of the SAME residual reuses the key
+  stateFor(40, 25, [])
+  await allocatePurchaseCreditNote(PARAMS, KEYED)
+  const sameAgain = putKeys[0]
+  assert.equal(sameAgain, deriveAllocationIdempotencyKey(KEYED.idempotencyKey, 'cn-1', 'bill-1', 2500, 0))
+  // a DIFFERENT residual (10 already allocated => 15) gets a different key
+  stateFor(40, 25, [OURS_(10)])
+  await allocatePurchaseCreditNote(PARAMS, KEYED)
+  assert.notEqual(putKeys[0], sameAgain)
+  const k = (cn: string, inv: string, c: number, a: number) => deriveAllocationIdempotencyKey('r', cn, inv, c, a)
+  const keys = new Set([k('cn-1', 'b', 1500, 10), k('cn-2', 'b', 1500, 10), k('cn-1', 'b2', 1500, 10), k('cn-1', 'b', 1000, 10), k('cn-1', 'b', 1500, 0)])
+  assert.equal(keys.size, 5, 'every input changes the key')
+  assert.equal(k('CN-1', 'B', 1, 1), k('cn-1', 'b', 1, 1), 'ids compare case-insensitively')
+  console.log('# o3d-h9pb HIGH r5 key derivation: 3 PUT-level + 5 distinctness + 1 case cases')
+})
+
+test('[o3d-h9pb HIGH r5] capped PUT then residual retry against a Xero that REPLAYS on a reused key and one that REJECTS a changed body', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  for (const mode of ['keyed-replay', 'reject-changed'] as const) {
+    putMode = mode
+    idemStore.clear()
+    stateFor(10, 25, [])
+    const first = await allocatePurchaseCreditNote(PARAMS, KEYED)
+    assert.equal(first.success, false, `${mode}: capped PUT is partial`)
+    assert.equal(first.partial?.shortfall, 15, mode)
+    stateFor(20, 15, [OURS_(10)])
+    const second = await allocatePurchaseCreditNote(PARAMS, KEYED)
+    assert.equal(putBodies.length, 1, `${mode}: PRECONDITION the residual PUT was sent`)
+    assert.equal(putBodies[0]!.Allocations[0]!.Amount, 15, mode)
+    assert.equal(second.success, true, `${mode}: ${JSON.stringify(second)}`)
+    assert.equal(idemStore.size, 2, `${mode}: two distinct keys reached Xero`)
+  }
+  console.log('# o3d-h9pb HIGH r5 two-attempt scenario: 2 Xero models (keyed replay, reject changed body)')
+})
+
+test('[o3d-h9pb HIGH r5] a response that does not confirm THIS amount on THIS bill is never completion', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  // A Xero that replays the FIRST response to the residual retry whatever key it carries.
+  putMode = 'replay-always'
+  stateFor(10, 25, [])
+  await allocatePurchaseCreditNote(PARAMS, KEYED)
+  stateFor(20, 15, [OURS_(10)])
+  const replayed = await allocatePurchaseCreditNote(PARAMS, KEYED)
+  assert.equal(putBodies.length, 1, 'PRECONDITION: the residual PUT was sent and answered with the OLD response')
+  assert.equal(replayed.success, false, JSON.stringify(replayed))
+  assert.match(replayed.error ?? '', /Allocation not confirmed/)
+  assert.equal(replayed.allocatedAmount, undefined, 'no completion claim')
+
+  const shapes: Array<[string, unknown]> = [
+    ['no Allocations', {}], ['null body', null], ['empty list', { Allocations: [] }], ['not a list', { Allocations: 'x' }],
+    ['other bill', { Allocations: [{ Amount: 25, Invoice: { InvoiceID: 'bill-OTHER' } }] }],
+    ['no invoice stated', { Allocations: [{ Amount: 25 }] }],
+    ['wrong amount', { Allocations: [{ Amount: 10, Invoice: { InvoiceID: 'bill-1' } }] }],
+    ['amount as string', { Allocations: [{ Amount: '25', Invoice: { InvoiceID: 'bill-1' } }] }],
+    ['malformed entry', { Allocations: ['x'] }],
+  ]
+  let cases = 0
+  for (const [name, raw] of shapes) {
+    putMode = { raw }
+    stateFor(40, 25, [])
+    const r = await allocatePurchaseCreditNote(PARAMS, KEYED)
+    assert.equal(putBodies.length, 1, `${name}: PRECONDITION PUT sent`)
+    assert.equal(r.success, false, `${name}: ${JSON.stringify(r)}`)
+    assert.match(r.error ?? '', /Allocation not confirmed/, name)
+    cases += 1
+  }
+  // CONTROLS: the matching response (any id case, extra entries) confirms.
+  for (const raw of [
+    { Allocations: [{ Amount: 25, Invoice: { InvoiceID: 'BILL-1' } }] },
+    { Allocations: [{ Amount: 5, Invoice: { InvoiceID: 'bill-OTHER' } }, { Amount: 25, Invoice: { InvoiceID: 'bill-1' } }] },
+  ]) {
+    putMode = { raw }
+    stateFor(40, 25, [])
+    assert.equal((await allocatePurchaseCreditNote(PARAMS, KEYED)).success, true)
+  }
+  assert.equal(cases, 9)
+  console.log(`# o3d-h9pb HIGH r5 response confirmation: replay + ${cases} unconfirmed shapes + 2 controls`)
 })

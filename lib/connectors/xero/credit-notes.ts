@@ -2,6 +2,7 @@
  * Push credit notes to Xero.
  */
 
+import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
 import { imsRateToXeroCurrencyRate } from './fx'
@@ -466,6 +467,32 @@ export function decideCreditNoteAllocation(p: {
   return { action: 'refuse', reason: `Nothing was allocated: ${cause}; ${have}. Resolve in Xero, then retry.` }
 }
 
+/** o3d-h9pb: the Idempotency-Key for ONE allocation PUT (see allocatePurchaseCreditNote). <= 128 chars. */
+export function deriveAllocationIdempotencyKey(
+  rowKey: string, creditNoteId: string, invoiceId: string, amountCents: number, alreadyAllocatedCents: number,
+): string {
+  const digest = createHash('sha256')
+    .update([rowKey, creditNoteId.toLowerCase(), invoiceId.toLowerCase(), amountCents, alreadyAllocatedCents].join('|'))
+    .digest('hex')
+  return `ims-pcna-${digest}`
+}
+
+/**
+ * Does the PUT response itself show THIS amount allocated to THIS bill? Requires an Allocation whose
+ * Invoice.InvoiceID is the bill (case-insensitive) and whose Amount equals what was sent, to the cent.
+ */
+export function allocationConfirmedByResponse(allocations: unknown, invoiceId: string, sentCents: number): boolean {
+  if (!Array.isArray(allocations)) return false
+  const wanted = invoiceId.trim().toLowerCase()
+  return allocations.some((entry) => {
+    if (typeof entry !== 'object' || entry === null) return false
+    const e = entry as { Amount?: unknown; Invoice?: { InvoiceID?: unknown } | null }
+    const id = e.Invoice && typeof e.Invoice === 'object' ? e.Invoice.InvoiceID : undefined
+    const amount = readXeroBalance(e.Amount)
+    return typeof id === 'string' && id.trim().toLowerCase() === wanted && amount !== null && Math.round(amount * 100) === sentCents
+  })
+}
+
 type XeroCreditNoteRemainingResponse = {
   CreditNotes?: Array<{ CreditNoteID: string; RemainingCredit?: number }>
 }
@@ -537,19 +564,39 @@ export async function allocatePurchaseCreditNote(
   if (decision.action === 'refuse') return { success: false, error: decision.reason }
   const allocateAmount = decision.amount
 
-  const res = await xeroPut<{ Allocations?: Array<{ Amount: number }> }>(
+  // o3d-h9pb (Codex round 5), half 1: ONE KEY PER DISTINCT ALLOCATION. The processor's key is derived from
+  // the row, so a retry that sends a DIFFERENT residual would reuse it; inside Xero's idempotency window
+  // Xero may replay the first response or reject the changed body. The key sent is therefore derived from
+  // the row's key + credit note + bill + amount + what was already allocated: the same residual reuses its
+  // key (a safe replay), a different residual gets its own.
+  const sentCents = Math.round(allocateAmount * 100)
+  const putOpts = opts?.idempotencyKey
+    ? { ...opts, idempotencyKey: deriveAllocationIdempotencyKey(opts.idempotencyKey, params.creditNoteId, params.invoiceId, sentCents, allocatedCents) }
+    : opts
+  const res = await xeroPut<{ Allocations?: unknown }>(
     `CreditNotes/${params.creditNoteId}/Allocations`,
     { Allocations: [{ Invoice: { InvoiceID: params.invoiceId }, Amount: allocateAmount, Date: params.date }] },
-    opts,
+    putOpts,
   )
   if (!res.ok) {
     return { success: false, error: res.error ?? 'Failed to allocate credit note to bill' }
+  }
+  // Half 2: a 200 is not proof of WHAT was applied (a replayed response describes the FIRST request). Completion
+  // is claimed only from the response's own Allocation for this bill and this amount. Strict by design: if the
+  // response does not confirm it, the failure is safe, because the retry recomputes the residual from the
+  // credit note's Allocations (an applied allocation is then seen as applied and the retry is a no-op).
+  if (!allocationConfirmedByResponse(res.data?.Allocations, params.invoiceId, sentCents)) {
+    return {
+      success: false,
+      error: `Allocation not confirmed: Xero answered OK but its response does not show ${allocateAmount.toFixed(2)} allocated to this bill, `
+        + 'so IMS cannot tell whether it was applied (a replayed or changed response looks like this). No completion is claimed; retry, which re-reads the credit note and sends only what is still missing.',
+    }
   }
   // o3d-h9pb (Codex round 4): success means the bill now holds the WHOLE requested amount. A PUT capped by
   // the credit (or the bill's amount due) leaves a shortfall that nothing would otherwise retry or record,
   // so it is reported as a failure that says a PARTIAL allocation WAS made. The retry is safe: the
   // residual is computed from the credit note's own Allocations, so it sends only the remainder.
-  const totalCents = allocatedCents + Math.round(allocateAmount * 100)
+  const totalCents = allocatedCents + sentCents
   const requestedCents = Math.round(requested * 100)
   if (totalCents >= requestedCents) return { success: true, allocatedAmount: allocateAmount }
   const partial = {
