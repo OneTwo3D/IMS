@@ -92,6 +92,12 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *                                                 lines, freight lines
  *     · app/actions/purchase-orders.ts:1825       `receiveStock` — parent, then lines (:2003)
  *     · app/actions/purchase-orders.ts:1628       parent, then its own writes
+ *     · app/actions/purchase-orders.ts `updatePurchaseOrder` — o3d-fgu3: ONE transaction taking
+ *                                                 `lockPurchaseOrdersWithCostRows` first, re-reading the
+ *                                                 status under the lock, then lines, freight lines, parent.
+ *                                                 (Before o3d-fgu3 it ran on the pooled client, so it was
+ *                                                 neither a participant nor atomic.) It touches no cost
+ *                                                 layer or stock row.
  *     · app/actions/purchase-orders.ts:4264       `updateFreightPoCosts` — FIXED IN r3; it used to
  *                                                 delete cost lines first (see below)
  *     · app/actions/supplier-portal.ts:315        parent FOR UPDATE, then lines (:362), then parent
@@ -113,11 +119,6 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *       (:117) and only then the parent (:136), inside one transaction.
  *
  *   NOT DEADLOCK PARTICIPANTS, and why:
- *     · app/actions/purchase-orders.ts `updatePurchaseOrder` (:1391, :1442, :1471, :1492, and its
- *       parent update) runs on the POOLED client, NOT in a transaction, so every statement autocommits
- *       and it never holds one lock while waiting for another. (It is therefore also not ATOMIC — a
- *       failure between the delete and the create loses the lines. Pre-existing, out of scope here, and
- *       deliberately not folded into a lock-ordering change.)
  *     · lib/domain/purchasing/landed-cost-service.ts:1184, :1540 — takes NO row locks at all, so it is
  *       BLOCKED by this order rather than cooperating with it, and cannot form a cycle. Two concurrent
  *       recalculations therefore order themselves on nothing: tracked as o3d-t3mbr.
