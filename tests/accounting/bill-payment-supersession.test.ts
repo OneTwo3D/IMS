@@ -410,6 +410,24 @@ test('o3d-f709: the shortfall re-read asks the SHARED rule, not a hand-written "
     'and FAILED was never proof of a non-call (o3d-ju8t)')
 })
 
+test('o3d-f709 M4, C1: the shortfall re-read REFUSES a row that went CANCELLED on an operator\'s word, and lets a VERIFIED reversal through', async () => {
+  // The CAS missed (count 0) and the row is now CANCELLED. Through the shared fragment, an operator's
+  // NOT_POSTED (no proof) is a refusal; the ledger-verified reversal and the sweep's pre-call proof are not.
+  const gone = (over: Partial<SyncRow>): SyncRow => ({ ...over, id: 'log-1', status: 'CANCELLED' })
+  const cases: Array<[string, SyncRow, 'refused' | 'paid']> = [
+    ['operator-asserted NOT_POSTED', gone({ settlementBasis: 'OPERATOR_ASSERTION' }), 'refused'],
+    ['verified reversal naming its payment', gone({ settlementBasis: 'VERIFIED_REVERSAL', externalTransactionId: 'PAY-1' }), 'paid'],
+    ['the sweep\'s pre-call proof', gone({ abandonedBeforeRemoteCall: true }), 'paid'],
+    ['an unflagged canceller', gone({}), 'refused'],
+  ]
+  for (const [name, after, expected] of cases) {
+    const { tx } = mockTx([{ id: 'log-1', status: 'PENDING' }], { retiredCount: 0, afterRetire: [after] })
+    const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+    console.log(`# M4 ${name}: ${result.outcome}`)
+    assert.equal(result.outcome, expected, name)
+  }
+})
+
 test('losing the paidAt compare-and-swap reports already-paid and retires nothing', async () => {
   const { tx, calls } = mockTx([{ id: 'log-1', status: 'PENDING' }], { paidCount: 0 })
 

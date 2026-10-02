@@ -1260,6 +1260,37 @@ test('[o3d-psrx] a RESOLVED cancellation has told the ledger nothing', () => {
   )
 })
 
+test('[o3d-f709 M2, C1] an operator-asserted NOT_POSTED registration has NOT told the ledger nothing - the receipt counts as spoken for', () => {
+  // THE FLIP of the M2 reading for the one row a person vouched for: `unregisteredLocalReceipts` is what
+  // decides whether the reversal pass clears paidAt and raises a chargeback credit note, so a receipt
+  // whose only registration may have posted must NOT be reported unregistered.
+  const asserted = reg({ status: 'CANCELLED', paymentId: 'pay_1', settlementBasis: 'OPERATOR_ASSERTION' })
+  console.log(`# precondition M2: ${JSON.stringify(asserted)} => ${JSON.stringify(unregisteredLocalReceipts(['pay_1'], [asserted]))}`)
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [asserted]), [])
+  // ISOLATING ARM: the sweep-proved twin leaves the receipt unregistered, so the answer is the assertion's.
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'CANCELLED', paymentId: 'pay_1', abandonedBeforeRemoteCall: true })]), ['pay_1'])
+})
+
+test('[o3d-f709 M2/M1, D4] a VERIFIED_REVERSAL registration that keeps its payment id has told the ledger nothing NOW', () => {
+  // The ledger was asked and said the payment is gone. The row keeps its id on purpose (an account of a
+  // payment that existed and was undone), and the basis is what lets it read as an absence.
+  const reversed = reg({ status: 'CANCELLED', paymentId: 'pay_1', externalTransactionId: 'PAY-9', settlementBasis: 'VERIFIED_REVERSAL' })
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reversed]), ['pay_1'])
+  // ... and the classifier drops it out of the registration set instead of withholding on it (M1):
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const row = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: 'PAY-9',
+    abandonedBeforeRemoteCall: null, settlementBasis: 'VERIFIED_REVERSAL',
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [row], READ_AT), { verdict: 'NOTHING_REGISTERED' })
+  // ISOLATING ARM: the same row without the basis is a payment that may stand: withheld.
+  const bare = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: 'PAY-9',
+    abandonedBeforeRemoteCall: null, settlementBasis: null,
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [bare], READ_AT), { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
+})
+
 test('[o3d-f709 r3] a CANCELLED registration that still names a payment has NOT told nothing', () => {
   // THE SIXTEENTH READER (Codex MEDIUM 1). This helper read `status !== 'CANCELLED'` and called
   // every retired row "never sent". The cross-connector orphan sweep retires a PENDING row —
