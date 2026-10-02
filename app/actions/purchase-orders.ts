@@ -53,9 +53,9 @@ import {
   markBillPaidSupersedingStaleRegistrations,
 } from '@/lib/domain/accounting/payment-reversal'
 import {
-  updatePurchaseOrderFxRateOnly,
-  type PurchaseOrderFxRateOnlyUpdateDb,
-} from '@/lib/domain/purchasing/purchase-order-fx-update'
+  rebasePurchaseOrderStoredBaseAmounts,
+  type PurchaseOrderFxRebaseDb,
+} from '@/lib/domain/purchasing/purchase-order-fx-rebase'
 import {
   assertPurchaseInvoiceEditable,
   buildPurchaseInvoiceAccountingPayload,
@@ -73,7 +73,6 @@ import {
   computeGrossUnitCostBaseByLine,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   queueLandedCostAdjustmentJournals,
-  recalculateDirectLandedCosts,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
@@ -1333,278 +1332,285 @@ export async function updatePurchaseOrder(
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
-    const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
-    const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
-    const baseCurrency = shouldRefreshFxRate ? await getBaseCurrencyCode() : null
-    const fxRate = shouldRefreshFxRate && !rateOnlyFxRefresh
-      ? await resolvePurchaseOrderFxRateToBase(db, {
-          currency: input.currency ?? existing.currency,
-          baseCurrency: baseCurrency!,
-          asOf: new Date(),
-          inputRateToBase: input.fxRateToBase,
-        })
-      : Number(existing.fxRateToBase)
-    const inclVat = !!input.pricesIncludeVat
-    const vatRate = input.taxRateValue ?? 0
-
-    const updates: Record<string, unknown> = {
-      ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
-      ...(input.currency !== undefined && { currency: input.currency }),
-      ...(shouldRefreshFxRate && !rateOnlyFxRefresh && { fxRateToBase: fxRate }),
-      ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
-      ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
-      ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
-      ...(input.notes !== undefined && { notes: input.notes || null }),
-      ...(input.internalNotes !== undefined && { internalNotes: input.internalNotes || null }),
-      ...(input.skipPreferredSupplierUpdate !== undefined && { skipPreferredSupplierUpdate: input.skipPreferredSupplierUpdate }),
-    }
-
-    // Order-level tax rate update (always apply when lines are being saved,
-    // because line VAT has to be recomputed in the same pass).
-    if (input.lines || input.taxRateId !== undefined || input.taxRateName !== undefined) {
-      updates.taxRateName = input.taxRateName || null
-      updates.taxRatePercent = vatRate > 0 ? vatRate : null
-    }
-
-    if (input.lines) {
-      // --- Tax rate resolution (mirror createPurchaseOrder) -------------
-      const orderDefaultRate = input.taxRateId
-        ? await db.taxRate.findUnique({
-            where: { id: input.taxRateId },
-            select: taxRateProfileSelect,
-          })
-        : input.taxRateName
-        ? await db.taxRate.findFirst({
-            where: { name: input.taxRateName, active: true },
-            select: taxRateProfileSelect,
-          })
-        : null
-      const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
-      const orderDefaultCtx = {
-        id: orderDefaultProfile?.taxRateId ?? null,
-        name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
-        rate: orderDefaultProfile?.taxRateValue ?? vatRate,
-        accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
-        isCompound: orderDefaultProfile?.isCompound ?? false,
-        reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
-        reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
-        components: orderDefaultProfile?.components ?? [],
-      }
-
-      // Validate every line's product is purchasable.
-      const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
-      if (productIdsForTax.length) {
-        const productRows = await db.product.findMany({
-          where: { id: { in: productIdsForTax } },
-          select: { id: true, lifecycleStatus: true },
-        })
-        const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
-        if (nonPurchasableProduct) {
-          return { success: false, error: 'Only active and draft products can be added to purchase orders' }
-        }
-      }
-
-      // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
-      const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx)
-
-      // Delete existing lines and recreate
-      await db.purchaseOrderLine.deleteMany({ where: { poId: id } })
-      // Also clear any pre-existing purchase-unit aggregate data on the PO
-      // line level — the edit form currently operates in stock-unit terms
-      // (purchaseUnitId is not edited inline), so we preserve only what
-      // the form sends.
-      let subtotalForeign = 0
-      let subtotalBase = 0
-      let totalTaxForeign = 0
-      let totalTaxBase = 0
-
-      const lineData = input.lines.map((l, i) => {
-        const resolved = lineResolved[i]
-        const resolvedId = resolved.taxRateId
-        const lineRate = resolved.taxRateValue
-        const lineInclVat = inclVat && lineRate > 0
-
-        // `unitCostForeign` is the user-entered pre-discount price per unit
-        // (gross when `pricesIncludeVat`, else net). `discountAmount` is in
-        // the same tax convention. Mirrors `createPurchaseOrder` exactly.
-        const discAmt = l.discountAmount ?? 0
-        const grossAfterDisc = Math.max(0, l.qty * l.unitCostForeign - discAmt)
-        const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
-        const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
-        const { unitCostBase, totalForeign, totalBase } = calcLineTotals(netUnitForeign, l.qty, fxRate)
-        const lineTaxForeign = lineInclVat
-          ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
-          : Math.round(totalForeign * lineRate * 10000) / 10000
-        const lineTaxBase = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
-        subtotalForeign += totalForeign
-        subtotalBase += totalBase
-        totalTaxForeign += lineTaxForeign
-        totalTaxBase += lineTaxBase
-        return {
-          poId: id,
-          productId: l.productId,
-          description: l.description || null,
-          qty: l.qty,
-          purchaseUnitId: l.purchaseUnitId || null,
-          purchaseUnitQty: l.purchaseUnitQty ?? null,
-          unitCostForeign: netUnitForeign,
-          unitCostBase,
-          discountStr: l.discountStr ?? null,
-          discountAmount: discAmt,
-          taxRateId: resolvedId,
-          taxForeign: lineTaxForeign,
-          taxBase: lineTaxBase,
-          totalForeign,
-          totalBase,
-          sortOrder: l.sortOrder ?? i,
-        }
+    // ─── o3d-fgu3: THE WHOLE DRAFT EDIT IS ONE TRANSACTION, PARENT FIRST ───
+    //
+    // This action used to run on the POOLED client: every delete and create below autocommitted, so a
+    // failure between `purchaseOrderLine.deleteMany` and `createMany` lost the order's lines for good, and
+    // a status change (send, approve) landing between the DRAFT check above and the writes was edited
+    // anyway. The edit now runs in ONE transaction that takes `purchase_orders` FIRST — then
+    // `purchase_order_lines` and `freight_cost_lines`, in `lockPurchaseOrdersWithCostRows`'s single fixed
+    // order, exactly as `updateFreightPoCosts` and the fx rebase do — and re-reads the status UNDER that
+    // lock. It touches no cost layer and no stock row, so it is not a participant in the cost_layers vs
+    // stock_levels order (o3d-chs1h). A refusal returns before any write; any throw rolls the lot back.
+    const edit = await db.$transaction(async (tx) => {
+      await lockPurchaseOrdersWithCostRows(tx, [id])
+      const locked = await tx.purchaseOrder.findUnique({
+        where: { id },
+        select: {
+          status: true,
+          currency: true,
+          fxRateToBase: true,
+          subtotalForeign: true,
+          taxForeign: true,
+          totalForeign: true,
+          directFreightForeign: true,
+          directFreightBase: true,
+        },
       })
-      await db.purchaseOrderLine.createMany({ data: lineData })
-
-      // Order-level discount (mirrors createPurchaseOrder exactly). Split
-      // proportionally across net subtotal and line VAT using the pre-
-      // discount blend so per-rate totals each drop by the same %. Runs
-      // BEFORE additional-cost VAT is folded in so the discount only
-      // scales the line portion of the order.
-      const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
-      const editDiscounted = applyHeaderOrderDiscount({
-        subtotalForeign,
-        subtotalBase,
-        taxForeign: totalTaxForeign,
-        taxBase: totalTaxBase,
-        orderDiscountForeign: orderDiscountForeignInput,
-        inclVat,
-        fxRate,
-      })
-      subtotalForeign = editDiscounted.subtotalForeign
-      subtotalBase = editDiscounted.subtotalBase
-      totalTaxForeign = editDiscounted.taxForeign
-      totalTaxBase = editDiscounted.taxBase
-      updates.discountStr = input.orderDiscountStr ?? null
-      updates.discountAmount = orderDiscountForeignInput
-
-      // Additional costs (shipping, customs, handling, etc.) — mirror
-      // createPurchaseOrder exactly: replace all freightCostLines, rebuild
-      // directFreight aggregates, and fold VAT on vatable costs into the
-      // order tax totals.
-      if (input.additionalCosts !== undefined) {
-        await db.freightCostLine.deleteMany({ where: { poId: id } })
-        let directFreightForeign = 0
-        let additionalCostVatForeign = 0
-        const costLineData = (input.additionalCosts ?? [])
-          .filter((ac) => ac.amountForeign > 0)
-          .map((ac, i) => {
-            directFreightForeign += ac.amountForeign
-            if (ac.vatable && vatRate > 0) {
-              additionalCostVatForeign += Math.round(ac.amountForeign * vatRate * 10000) / 10000
-            }
-            return {
-              poId: id,
-              description: ac.description || 'Additional cost',
-              amountForeign: ac.amountForeign,
-              amountBase: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
-              vatable: ac.vatable,
-              distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
-              sortOrder: i,
-            }
-          })
-        if (costLineData.length > 0) {
-          await db.freightCostLine.createMany({ data: costLineData })
-        }
-        const directFreightBase = Math.round((directFreightForeign / fxRate) * 10000) / 10000
-        const additionalCostVatBase = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
-        totalTaxForeign += additionalCostVatForeign
-        totalTaxBase += additionalCostVatBase
-        updates.directFreightForeign = directFreightForeign
-        updates.directFreightBase = directFreightBase
-        // Preserve the first cost's distribution method as the PO-level
-        // landedCostMethod (matches createPurchaseOrder behaviour).
-        const firstMethod = (input.additionalCosts ?? []).find((ac) => ac.amountForeign > 0)?.distributionMethod
-        if (firstMethod && ['BY_VALUE', 'BY_WEIGHT', 'BY_QUANTITY', 'EQUAL_SPLIT'].includes(firstMethod)) {
-          updates.landedCostMethod = firstMethod
-        }
-      }
-
-      // directFreight may have been updated above; use the new values
-      // when present, otherwise preserve the existing amounts from the PO.
-      const currentDirectFreightForeign =
-        (updates.directFreightForeign as number | undefined) ?? Number(existing.directFreightForeign)
-      const currentDirectFreightBase =
-        (updates.directFreightBase as number | undefined) ?? Number(existing.directFreightBase)
-      updates.subtotalForeign = subtotalForeign
-      updates.subtotalBase = subtotalBase
-      updates.taxForeign = totalTaxForeign
-      updates.taxBase = totalTaxBase
-      updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
-      updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
-      // Persist the VAT convention actually used to recompute these totals + the header discount, so a
-      // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
-      // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
-      updates.pricesIncludeVat = inclVat
-    }
-
-    const po = rateOnlyFxRefresh
-      ? await updatePurchaseOrderFxRateOnly(
-          db as unknown as PurchaseOrderFxRateOnlyUpdateDb<Parameters<typeof mapPoRow>[0]>,
-          id,
-          {
-            currency: existing.currency,
-            subtotalForeign: existing.subtotalForeign,
-            taxForeign: existing.taxForeign,
-            totalForeign: existing.totalForeign,
-            directFreightForeign: existing.directFreightForeign,
-          },
-          {
-            currency: input.currency,
-            fxRateToBase: input.fxRateToBase,
-          },
-          {
+      if (!locked) return { refused: 'PO not found' }
+      if (locked.status !== 'DRAFT') return { refused: 'Only DRAFT POs can be edited' }
+      const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
+      const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
+      const baseCurrency = shouldRefreshFxRate ? await getBaseCurrencyCode() : null
+      const fxRate = shouldRefreshFxRate && !rateOnlyFxRefresh
+        ? await resolvePurchaseOrderFxRateToBase(tx, {
+            currency: input.currency ?? locked.currency,
             baseCurrency: baseCurrency!,
             asOf: new Date(),
-            parentUpdate: { data: updates, select: PO_SELECT },
-          },
-        )
-      : await db.purchaseOrder.update({
-          where: { id },
-          data: updates,
-          select: PO_SELECT,
-        })
-
-    // If additional costs were changed on a GOODS PO that has already been
-    // received (cost layers exist), recalculate the landed unit cost on
-    // each PO line and update the corresponding cost layers. This also
-    // computes retrospective COGS adjustments for consumed stock.
-    let landedCostAuditRunIds: string[] = []
-    if (input.additionalCosts !== undefined && ['PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED'].includes(existing.status)) {
-      try {
-        const landedResult = await db.$transaction(async (tx) => {
-          return recalculateDirectLandedCosts(tx, id, undefined, {
-            triggeredById: session.user.id,
-            reason: 'purchase_order_additional_costs_updated',
-            scheduleAdjustmentJournals: true, // audit-grob durable backstop
+            inputRateToBase: input.fxRateToBase,
           })
-        }, STOCK_TX_OPTIONS)
-        landedCostAuditRunIds = landedResult.auditRunIds
+        : Number(locked.fxRateToBase)
+      const inclVat = !!input.pricesIncludeVat
+      const vatRate = input.taxRateValue ?? 0
 
-        try {
-          await queueLandedCostAdjustmentJournals(landedResult)
-        } catch { /* Accounting queue errors should not block the main flow */ }
-        for (const adj of landedResult.cogsAdjustments) {
-          await logActivity({
-            entityType: 'PURCHASE_ORDER', entityId: id, action: 'cogs_adjusted', tag: 'purchase', level: 'INFO',
-            description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to additional cost change`,
-            metadata: { totalDelta: adj.totalDelta, landedCostAuditRunIds: landedResult.auditRunIds },
-          })
-        }
-      } catch (e) {
-        // Log but don't fail the PO update — the cost lines are saved,
-        // the recalculation can be retried via the freight PO path later.
-        await logActivity({
-          entityType: 'PURCHASE_ORDER', entityId: id, action: 'landed_cost_recalc_failed', tag: 'purchase', level: 'WARNING',
-          description: `Failed to recalculate landed costs after additional cost edit: ${String(e)}`,
-        })
+      const updates: Record<string, unknown> = {
+        ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
+        ...(input.currency !== undefined && { currency: input.currency }),
+        ...(shouldRefreshFxRate && !rateOnlyFxRefresh && { fxRateToBase: fxRate }),
+        ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
+        ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
+        ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
+        ...(input.notes !== undefined && { notes: input.notes || null }),
+        ...(input.internalNotes !== undefined && { internalNotes: input.internalNotes || null }),
+        ...(input.skipPreferredSupplierUpdate !== undefined && { skipPreferredSupplierUpdate: input.skipPreferredSupplierUpdate }),
       }
-    }
+
+      // Order-level tax rate update (always apply when lines are being saved,
+      // because line VAT has to be recomputed in the same pass).
+      if (input.lines || input.taxRateId !== undefined || input.taxRateName !== undefined) {
+        updates.taxRateName = input.taxRateName || null
+        updates.taxRatePercent = vatRate > 0 ? vatRate : null
+      }
+
+      if (input.lines) {
+        // --- Tax rate resolution (mirror createPurchaseOrder) -------------
+        const orderDefaultRate = input.taxRateId
+          ? await tx.taxRate.findUnique({
+              where: { id: input.taxRateId },
+              select: taxRateProfileSelect,
+            })
+          : input.taxRateName
+          ? await tx.taxRate.findFirst({
+              where: { name: input.taxRateName, active: true },
+              select: taxRateProfileSelect,
+            })
+          : null
+        const orderDefaultProfile = orderDefaultRate ? resolvedTaxRateFromProfile(orderDefaultRate, 'fallback') : null
+        const orderDefaultCtx = {
+          id: orderDefaultProfile?.taxRateId ?? null,
+          name: orderDefaultProfile?.taxRateName ?? input.taxRateName ?? null,
+          rate: orderDefaultProfile?.taxRateValue ?? vatRate,
+          accountingTaxType: orderDefaultProfile?.accountingTaxType ?? null,
+          isCompound: orderDefaultProfile?.isCompound ?? false,
+          reverseCharge: orderDefaultProfile?.reverseCharge ?? false,
+          reportingCategory: orderDefaultProfile?.reportingCategory ?? null,
+          components: orderDefaultProfile?.components ?? [],
+        }
+
+        // Validate every line's product is purchasable.
+        const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+        if (productIdsForTax.length) {
+          const productRows = await tx.product.findMany({
+            where: { id: { in: productIdsForTax } },
+            select: { id: true, lifecycleStatus: true },
+          })
+          const nonPurchasableProduct = productRows.find((p) => !isPurchasableProductStatus(p.lifecycleStatus))
+          if (nonPurchasableProduct) {
+            return { refused: 'Only active and draft products can be added to purchase orders' }
+          }
+        }
+
+        // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
+        const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx)
+
+        // Delete existing lines and recreate
+        await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
+        // Also clear any pre-existing purchase-unit aggregate data on the PO
+        // line level — the edit form currently operates in stock-unit terms
+        // (purchaseUnitId is not edited inline), so we preserve only what
+        // the form sends.
+        let subtotalForeign = 0
+        let subtotalBase = 0
+        let totalTaxForeign = 0
+        let totalTaxBase = 0
+
+        const lineData = input.lines.map((l, i) => {
+          const resolved = lineResolved[i]
+          const resolvedId = resolved.taxRateId
+          const lineRate = resolved.taxRateValue
+          const lineInclVat = inclVat && lineRate > 0
+
+          // `unitCostForeign` is the user-entered pre-discount price per unit
+          // (gross when `pricesIncludeVat`, else net). `discountAmount` is in
+          // the same tax convention. Mirrors `createPurchaseOrder` exactly.
+          const discAmt = l.discountAmount ?? 0
+          const grossAfterDisc = Math.max(0, l.qty * l.unitCostForeign - discAmt)
+          const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
+          const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
+          const { unitCostBase, totalForeign, totalBase } = calcLineTotals(netUnitForeign, l.qty, fxRate)
+          const lineTaxForeign = lineInclVat
+            ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
+            : Math.round(totalForeign * lineRate * 10000) / 10000
+          const lineTaxBase = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
+          subtotalForeign += totalForeign
+          subtotalBase += totalBase
+          totalTaxForeign += lineTaxForeign
+          totalTaxBase += lineTaxBase
+          return {
+            poId: id,
+            productId: l.productId,
+            description: l.description || null,
+            qty: l.qty,
+            purchaseUnitId: l.purchaseUnitId || null,
+            purchaseUnitQty: l.purchaseUnitQty ?? null,
+            unitCostForeign: netUnitForeign,
+            unitCostBase,
+            discountStr: l.discountStr ?? null,
+            discountAmount: discAmt,
+            taxRateId: resolvedId,
+            taxForeign: lineTaxForeign,
+            taxBase: lineTaxBase,
+            totalForeign,
+            totalBase,
+            sortOrder: l.sortOrder ?? i,
+          }
+        })
+        await tx.purchaseOrderLine.createMany({ data: lineData })
+
+        // Order-level discount (mirrors createPurchaseOrder exactly). Split
+        // proportionally across net subtotal and line VAT using the pre-
+        // discount blend so per-rate totals each drop by the same %. Runs
+        // BEFORE additional-cost VAT is folded in so the discount only
+        // scales the line portion of the order.
+        const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
+        const editDiscounted = applyHeaderOrderDiscount({
+          subtotalForeign,
+          subtotalBase,
+          taxForeign: totalTaxForeign,
+          taxBase: totalTaxBase,
+          orderDiscountForeign: orderDiscountForeignInput,
+          inclVat,
+          fxRate,
+        })
+        subtotalForeign = editDiscounted.subtotalForeign
+        subtotalBase = editDiscounted.subtotalBase
+        totalTaxForeign = editDiscounted.taxForeign
+        totalTaxBase = editDiscounted.taxBase
+        updates.discountStr = input.orderDiscountStr ?? null
+        updates.discountAmount = orderDiscountForeignInput
+
+        // Additional costs (shipping, customs, handling, etc.) — mirror
+        // createPurchaseOrder exactly: replace all freightCostLines, rebuild
+        // directFreight aggregates, and fold VAT on vatable costs into the
+        // order tax totals.
+        if (input.additionalCosts !== undefined) {
+          await tx.freightCostLine.deleteMany({ where: { poId: id } })
+          let directFreightForeign = 0
+          let additionalCostVatForeign = 0
+          const costLineData = (input.additionalCosts ?? [])
+            .filter((ac) => ac.amountForeign > 0)
+            .map((ac, i) => {
+              directFreightForeign += ac.amountForeign
+              if (ac.vatable && vatRate > 0) {
+                additionalCostVatForeign += Math.round(ac.amountForeign * vatRate * 10000) / 10000
+              }
+              return {
+                poId: id,
+                description: ac.description || 'Additional cost',
+                amountForeign: ac.amountForeign,
+                amountBase: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
+                vatable: ac.vatable,
+                distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
+                sortOrder: i,
+              }
+            })
+          if (costLineData.length > 0) {
+            await tx.freightCostLine.createMany({ data: costLineData })
+          }
+          const directFreightBase = Math.round((directFreightForeign / fxRate) * 10000) / 10000
+          const additionalCostVatBase = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
+          totalTaxForeign += additionalCostVatForeign
+          totalTaxBase += additionalCostVatBase
+          updates.directFreightForeign = directFreightForeign
+          updates.directFreightBase = directFreightBase
+          // Preserve the first cost's distribution method as the PO-level
+          // landedCostMethod (matches createPurchaseOrder behaviour).
+          const firstMethod = (input.additionalCosts ?? []).find((ac) => ac.amountForeign > 0)?.distributionMethod
+          if (firstMethod && ['BY_VALUE', 'BY_WEIGHT', 'BY_QUANTITY', 'EQUAL_SPLIT'].includes(firstMethod)) {
+            updates.landedCostMethod = firstMethod
+          }
+        }
+
+        // directFreight may have been updated above; use the new values
+        // when present, otherwise preserve the existing amounts from the PO.
+        const currentDirectFreightForeign =
+          (updates.directFreightForeign as number | undefined) ?? Number(locked.directFreightForeign)
+        const currentDirectFreightBase =
+          (updates.directFreightBase as number | undefined) ?? Number(locked.directFreightBase)
+        updates.subtotalForeign = subtotalForeign
+        updates.subtotalBase = subtotalBase
+        updates.taxForeign = totalTaxForeign
+        updates.taxBase = totalTaxBase
+        updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
+        updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
+        // Persist the VAT convention actually used to recompute these totals + the header discount, so a
+        // later supplier requote reapplies the discount in the same convention (o3d-lx1). Kept aligned with
+        // the recalculation: an edit that recomputes as net stores false, inclusive stores true.
+        updates.pricesIncludeVat = inclVat
+      }
+
+      const po = rateOnlyFxRefresh
+        ? await (async () => {
+            // A rate-only edit rebases every stored base amount. It is done HERE, on the locked transaction,
+            // rather than through updatePurchaseOrderFxRateOnly: that helper opens its own transaction,
+            // which cannot nest, and its `existing` snapshot would have been read before the lock.
+            const fxRateToBase = await resolvePurchaseOrderFxRateToBase(tx, {
+              currency: input.currency ?? locked.currency,
+              baseCurrency: baseCurrency!,
+              asOf: new Date(),
+              inputRateToBase: input.fxRateToBase,
+            })
+            const rebasedPurchaseOrder = await rebasePurchaseOrderStoredBaseAmounts(
+              tx as unknown as PurchaseOrderFxRebaseDb,
+              id,
+              {
+                subtotalForeign: locked.subtotalForeign,
+                taxForeign: locked.taxForeign,
+                totalForeign: locked.totalForeign,
+                directFreightForeign: locked.directFreightForeign,
+              },
+              fxRateToBase,
+            )
+            return tx.purchaseOrder.update({
+              where: { id },
+              data: {
+                ...updates,
+                ...rebasedPurchaseOrder,
+                ...(input.currency !== undefined && { currency: input.currency }),
+                fxRateToBase,
+              },
+              select: PO_SELECT,
+            })
+          })()
+        : await tx.purchaseOrder.update({
+            where: { id },
+            data: updates,
+            select: PO_SELECT,
+          })
+      return { po }
+    }, STOCK_TX_OPTIONS)
+    if ('refused' in edit) return { success: false, error: edit.refused }
+    const po = edit.po
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -1620,7 +1626,7 @@ export async function updatePurchaseOrder(
       tag: 'purchase',
       level: 'INFO',
       description: `Updated PO ${mapped.reference}`,
-      metadata: { reference: mapped.reference, landedCostAuditRunIds },
+      metadata: { reference: mapped.reference },
     })
     return { success: true, po: mapped }
   } catch (e) {
