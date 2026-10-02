@@ -133,77 +133,6 @@ export async function queueXeroSync(params: {
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
   }, await activeAccountingIdProvenance('xero'))
 
-  if (params.idempotencyKey) {
-    // o3d-d0pd: EVERY prior attempt for this key, in ANY status — not just the live ones. A FAILED
-    // row can name a real document (the remote call is made before its result is written back), and
-    // the partial unique index carries the same three-status predicate this query used to, so
-    // nothing else was going to stop the duplicate either. See prior-posting-evidence.ts.
-    const priorAttempts = await db.accountingSyncLog.findMany({
-      where: priorAttemptsWhere({ ...params, connector: 'xero', idempotencyKey: params.idempotencyKey }),
-      select: PRIOR_ATTEMPT_SELECT,
-    })
-    const verdict = classifyPriorAttempts(priorAttempts)
-    // ALREADY PRESENT IS QUEUED: a row for this posting is standing, so the GL counterpart exists.
-    // A document with an id EXISTS. Nothing is written, and nothing needs to be.
-    if (verdict.kind === 'live' || verdict.kind === 'posted') {
-      // o3d-f709 / M11 (D2): suppressed on an operator's typed document id is still suppressed and is
-      // REPORTED. Best-effort here, exactly as this file's own refusal log below is: this enqueue opens
-      // no transaction of its own at this point, so a failed log costs nothing and must not turn a
-      // correct suppression into a throw.
-      if (verdict.asserted) {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'accounting_enqueue_suppressed_by_operator_assertion',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: describeAssertedPriorAttempt({
-            ...params,
-            syncLogId: verdict.syncLogId,
-            ...(verdict.externalTransactionId ? { externalTransactionId: verdict.externalTransactionId } : {}),
-          }),
-          metadata: {
-            connector: 'xero', type: params.type, referenceType: params.referenceType,
-            referenceId: params.referenceId, assertingSyncLogId: verdict.syncLogId,
-          },
-        }).catch(() => { /* logging must never turn a suppression into a throw */ })
-      }
-      return verdict.kind === 'live' ? { queued: true } : { queued: true, reason: 'already-queued' }
-    }
-    // C1 / D1: an operator settled a prior attempt NOT_POSTED. REFUSED, not decided - the posting is
-    // still owed; the operator hand-posts and marks it handled.
-    if (verdict.kind === 'blocked') {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_enqueue_refused_asserted_not_posted',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: describeBlockedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
-        metadata: {
-          connector: 'xero', type: params.type, referenceType: params.referenceType,
-          referenceId: params.referenceId, blockingSyncLogId: verdict.syncLogId,
-        },
-      }).catch(() => { /* logging must never turn a refusal into a throw */ })
-      return { queued: false, reason: 'refused' }
-    }
-    // REFUSED, not decided: a failed attempt that may have landed. The posting is still owed and the
-    // caller must not read this as success.
-    if (verdict.kind === 'unresolved') {
-      const description = describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId })
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_enqueue_refused_unresolved_attempt',
-        tag: 'accounting',
-        level: 'WARNING',
-        description,
-        metadata: {
-          connector: 'xero', type: params.type, referenceType: params.referenceType,
-          referenceId: params.referenceId, blockingSyncLogId: verdict.syncLogId,
-        },
-      }).catch(() => { /* logging must never turn a refusal into a throw */ })
-      return { queued: false, reason: 'refused' }
-    }
-  }
-
   try {
     let mirrorErrorMessage: string | null = null
     let deletedOrder = false
@@ -217,6 +146,7 @@ export async function queueXeroSync(params: {
     // primitive's answer below for why this cannot share `handledByHand`.
     let handPostDeferred = false
     let staleDiscount: { payloadDiscount: number; liveDiscount: number } | null = null
+    let priorVerdict: ReturnType<typeof classifyPriorAttempts> | null = null
     await db.$transaction(async (tx) => {
       // o3d-hrak: join the sales-order delete protocol. The hard delete locks the order and
       // checks for live accounting work; without taking the SAME lock here, a poster holding a
@@ -292,6 +222,29 @@ export async function queueXeroSync(params: {
         if (staleDiscount) return
       }
 
+      // o3d-f709 (Codex round 2 HIGH 2) - THE PRIOR-ATTEMPT READ AND ITS CLASSIFICATION LIVE HERE, UNDER
+      // THE SCOPE LOCK, IMMEDIATELY BEFORE THE INSERT. They used to run on the pooled client BEFORE this
+      // transaction opened, so under contention one enqueue could read "no prior attempt" while another
+      // created one that then became FAILED or settled NOT_POSTED - leaving the partial unique index - and
+      // the first would insert beside it without ever re-classifying. Taken after `lockFollowUpScope`,
+      // no competing enqueue for this scope can be between its own read and insert, and any transition
+      // another committed first is visible. (Same ordering as `queueAccountingSyncTx` in lib/accounting.ts.)
+      if (params.idempotencyKey) {
+        // o3d-d0pd: EVERY prior attempt for this key, in ANY status - not just the live ones. See
+        // prior-posting-evidence.ts.
+        const priorAttempts = await tx.accountingSyncLog.findMany({
+          where: priorAttemptsWhere({ ...params, connector: 'xero', idempotencyKey: params.idempotencyKey }),
+          select: PRIOR_ATTEMPT_SELECT,
+        })
+        const verdict = classifyPriorAttempts(priorAttempts)
+        if (verdict.kind !== 'none') {
+          // Nothing is written: the answer is given after the transaction, where the logging is
+          // best-effort exactly as it was.
+          priorVerdict = verdict
+          return
+        }
+      }
+
       const created = await createAccountingSyncLogRow(tx, {
           connector: 'xero',
           type: params.type,
@@ -340,6 +293,69 @@ export async function queueXeroSync(params: {
         mirrorErrorMessage = `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`
       }
     })
+    if (priorVerdict) {
+      const verdict = priorVerdict as Exclude<ReturnType<typeof classifyPriorAttempts>, { kind: 'none' }>
+      // ALREADY PRESENT IS QUEUED: a row for this posting is standing, so the GL counterpart exists.
+      // A document with an id EXISTS. Nothing is written, and nothing needs to be.
+      if (verdict.kind === 'live' || verdict.kind === 'posted') {
+        // o3d-f709 / M11 (D2): suppressed on an operator's typed document id is still suppressed and is
+        // REPORTED. Best-effort here, exactly as this file's own refusal log below is: this enqueue opens
+        // no transaction of its own at this point, so a failed log costs nothing and must not turn a
+        // correct suppression into a throw.
+        if (verdict.asserted) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'accounting_enqueue_suppressed_by_operator_assertion',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: describeAssertedPriorAttempt({
+              ...params,
+              syncLogId: verdict.syncLogId,
+              ...(verdict.externalTransactionId ? { externalTransactionId: verdict.externalTransactionId } : {}),
+            }),
+            metadata: {
+              connector: 'xero', type: params.type, referenceType: params.referenceType,
+              referenceId: params.referenceId, assertingSyncLogId: verdict.syncLogId,
+            },
+          }).catch(() => { /* logging must never turn a suppression into a throw */ })
+        }
+        return verdict.kind === 'live' ? { queued: true } : { queued: true, reason: 'already-queued' }
+      }
+      // C1 / D1: an operator settled a prior attempt NOT_POSTED. REFUSED, not decided - the posting is
+      // still owed; the operator hand-posts and marks it handled.
+      if (verdict.kind === 'blocked') {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'accounting_enqueue_refused_asserted_not_posted',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: describeBlockedPriorAttempt({ ...params, syncLogId: verdict.syncLogId }),
+          metadata: {
+            connector: 'xero', type: params.type, referenceType: params.referenceType,
+            referenceId: params.referenceId, blockingSyncLogId: verdict.syncLogId,
+          },
+        }).catch(() => { /* logging must never turn a refusal into a throw */ })
+        return { queued: false, reason: 'refused' }
+      }
+      // REFUSED, not decided: a failed attempt that may have landed. The posting is still owed and the
+      // caller must not read this as success.
+      if (verdict.kind === 'unresolved') {
+        const description = describeUnresolvedPriorAttempt({ ...params, syncLogId: verdict.syncLogId })
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'accounting_enqueue_refused_unresolved_attempt',
+          tag: 'accounting',
+          level: 'WARNING',
+          description,
+          metadata: {
+            connector: 'xero', type: params.type, referenceType: params.referenceType,
+            referenceId: params.referenceId, blockingSyncLogId: verdict.syncLogId,
+          },
+        }).catch(() => { /* logging must never turn a refusal into a throw */ })
+        return { queued: false, reason: 'refused' }
+      }
+
+    }
     if (staleDiscount) await logStaleOrderDiscountEnqueue('xero', params, staleDiscount)
     if (mirrorErrorMessage) {
       await logActivity({
