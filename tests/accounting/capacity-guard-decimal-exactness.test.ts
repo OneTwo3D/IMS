@@ -240,6 +240,8 @@ test('[o3d-6abj] prior registrations are summed from the EXACT string, not the J
       id: 'prior',
       status: 'SYNCED',
       settlementBasis: null,
+      externalTransactionId: null,
+      abandonedBeforeRemoteCall: null,
       // 99, not the 1 the number claims: the sum must leave no room for a 50.
       registeredAmount: payloadRegisteredAmount(
         { amount: 1, [REGISTERED_AMOUNT_DECIMAL_FIELD]: '99.00', currency: 'GBP' }, 'GBP'),
