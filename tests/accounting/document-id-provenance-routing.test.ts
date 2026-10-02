@@ -383,7 +383,7 @@ mock.module('@/lib/db', {
  * below applies that rule, so "the refusal write failed and the caller's transaction is still committable"
  * is a property the tests can observe rather than a claim about a try/catch.
  */
-const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, failSuppressionRead: false, txRefusalWrites: 0, pooledRefusalWrites: 0, priorAttempts: [] as Array<{ id: string; status: string; externalTransactionId: string | null }> }
+const txModel = { savepointDepth: 0, aborted: false, failRefusalWrites: false, failSuppressionRead: false, txRefusalWrites: 0, pooledRefusalWrites: 0, priorAttempts: [] as Array<{ id: string; status: string; externalTransactionId: string | null; settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null }> }
 mock.module('@/lib/db/savepoint', {
   namedExports: {
     withSavepoint: async <T>(_tx: unknown, fn: () => Promise<T>): Promise<T> => {

@@ -16,6 +16,7 @@ import {
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
+import { WORK_SLOT_OCCUPIED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
@@ -1102,7 +1103,8 @@ async function hasExistingSyncLog(
       type,
       referenceType,
       referenceId,
-      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+      // o3d-f709 / M12: the work slot's own predicate (ledger-standing.ts), not a re-spelling of it.
+      ...WORK_SLOT_OCCUPIED_WHERE,
     },
     // o3d-anu8: settlementBasis, because the occupying row is what makes the enqueue a silent skip
     // and a SYNCED row is written by TWO things — the processor's writeback after Xero answered, and
