@@ -57,8 +57,9 @@ function loadEnv() {
 
 function deferred<T = void>() {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((r) => { resolve = r })
-  return { promise, resolve }
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
 }
 
 type RawClient = {
@@ -401,7 +402,12 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
         const pid = await txPid(tx)
         const { lockLandedCostRevaluationScope } = await import('@/lib/domain/wms/transfer-asn-lock-order')
         const { recalculateLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
-        await lockLandedCostRevaluationScope(tx, { freightPoId: world.freightId })
+        try {
+          await lockLandedCostRevaluationScope(tx, { freightPoId: world.freightId })
+        } catch (error) {
+          locked.reject(error) // the arm fails loudly instead of waiting for a lock that was never taken
+          throw error
+        }
         locked.resolve(pid) // locks held, NOTHING written yet
         await release.promise
         return recalculateLandedCosts(tx, world.freightId, undefined, { triggeredById: null, reason: 'freight_purchase_order_costs_updated' })
@@ -541,6 +547,7 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
         console.log(`C2b PRECONDITION: late dispatch ${t2} committed while createFreightPo was parked; result=${JSON.stringify({ success: result.success, error: result.error })}`)
         assert.equal(result.success, false)
         assert.match(String(result.error), /Retry the action/)
+        assert.doesNotMatch(String(result.error), /^Error:|LandedCostScopeRacedError/, 'a clean operator message, not a stringified exception')
         const links = await db.landedCostLink.count({ where: { primaryPoId: world.goodsId } })
         assert.equal(links, 0, 'the freight order and its link rolled back with the refusal')
         assert.equal(await layerUnitCost(world.layerId), BASE_UNIT)
