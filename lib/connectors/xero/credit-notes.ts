@@ -7,7 +7,7 @@ import { findOrCreateContact } from './contacts'
 import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
 import { PAGE_SIZE } from './invoice-delta'
-import { readSingleXeroDocument } from './single-document'
+import { readSingleXeroDocument, readXeroBalance } from './single-document'
 import {
   MINTED_CREDIT_NOTE_NUMBER_PREFIX,
   decidePurchaseCreditNotePost,
@@ -461,23 +461,29 @@ export async function allocatePurchaseCreditNote(
   }
   // o3d-h9pb: the allocation amount is sized from these two documents, so each must be the one asked
   // for. Unreadable is UNKNOWN: nothing is allocated, and it is reported as a failure, not as zero.
-  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: number }>(
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown }>(
     cnRes.data, 'CreditNotes', 'CreditNoteID', params.creditNoteId)
   if (cnRead.status === 'unreadable') {
     return { success: false, error: `Credit note not read from Xero for allocation: ${cnRead.reason}` }
   }
-  const remainingCredit = cnRead.document.RemainingCredit ?? 0
+  const remainingCredit = readXeroBalance(cnRead.document.RemainingCredit)
+  if (remainingCredit === null) {
+    return { success: false, error: 'Credit note read from Xero states no readable RemainingCredit, so IMS cannot tell how much can be allocated' }
+  }
 
   const billRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${params.invoiceId}`)
   if (!billRes.ok) {
     return { success: false, error: billRes.error ?? 'Bill not found in Xero for allocation' }
   }
-  const billRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: number }>(
+  const billRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: unknown }>(
     billRes.data, 'Invoices', 'InvoiceID', params.invoiceId)
   if (billRead.status === 'unreadable') {
     return { success: false, error: `Bill not read from Xero for allocation: ${billRead.reason}` }
   }
-  const amountDue = billRead.document.AmountDue ?? 0
+  const amountDue = readXeroBalance(billRead.document.AmountDue)
+  if (amountDue === null) {
+    return { success: false, error: 'Bill read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated' }
+  }
 
   const allocateAmount = resolveCreditNoteAllocationAmount({ requested: params.amount, remainingCredit, amountDue })
   if (allocateAmount <= 0) return { success: true, allocatedAmount: 0 }

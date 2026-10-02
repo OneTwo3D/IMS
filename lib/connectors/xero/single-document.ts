@@ -96,3 +96,13 @@ export function readSingleXeroDocument<T extends object = Record<string, unknown
   }
   return { status: 'found', document: document as T }
 }
+
+/**
+ * A balance figure (RemainingCredit, AmountDue, ...) read off a document that was already bound to the
+ * request. It must be a finite, non-negative JSON NUMBER; absent, null, a string, NaN, Infinity or a
+ * negative is `null` = UNREADABLE. A caller must never default it with `?? 0`: a missing balance read as
+ * zero is "nothing to do", which reports success for a money operation that was never performed.
+ */
+export function readXeroBalance(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}

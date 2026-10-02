@@ -157,3 +157,70 @@ test('[o3d-h9pb payment-reconcile.ts markPaid] an unreadable invoice re-read sta
   assert.equal(cases, 6)
   console.log(`# o3d-h9pb payment-reconcile.ts markPaid: ${cases} unreadable cases + 1 correct-document control`)
 })
+
+/* --------- o3d-h9pb (Codex HIGH): a bound document with a MISSING or unreadable figure is not zero --------- */
+
+const BAD_FIGURES: Array<[string, (doc: Record<string, unknown>, field: string) => Record<string, unknown>]> = [
+  ['omitted', (d, f) => { const c = { ...d }; delete c[f]; return c }],
+  ['null', (d, f) => ({ ...d, [f]: null })],
+  ['string', (d, f) => ({ ...d, [f]: '40' })],
+  ['NaN', (d, f) => ({ ...d, [f]: Number.NaN })],
+  ['Infinity', (d, f) => ({ ...d, [f]: Number.POSITIVE_INFINITY })],
+  ['negative', (d, f) => ({ ...d, [f]: -1 })],
+]
+
+test('[o3d-h9pb HIGH] allocatePurchaseCreditNote: an unreadable RemainingCredit or AmountDue is a failure, not "nothing to allocate"', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  xeroBodies = { 'CreditNotes/cn-1': { CreditNotes: [NOTE] }, 'Invoices/bill-1': { Invoices: [BILL] } }
+  puts = []
+  const control = await allocatePurchaseCreditNote(PARAMS)
+  assert.equal(control.success, true)
+  assert.equal(puts.length, 1, 'PRECONDITION: with readable figures the allocation IS sent')
+
+  // A legitimate zero is still the idempotent no-op, so the fix did not turn every zero into a failure.
+  puts = []
+  xeroBodies = { 'CreditNotes/cn-1': { CreditNotes: [{ ...NOTE, RemainingCredit: 0 }] }, 'Invoices/bill-1': { Invoices: [BILL] } }
+  const zero = await allocatePurchaseCreditNote(PARAMS)
+  assert.deepEqual([zero.success, zero.allocatedAmount, puts.length], [true, 0, 0], 'a stated zero is a settled retry')
+
+  let cases = 0
+  for (const [label, corrupt] of BAD_FIGURES) {
+    for (const [field, side] of [['RemainingCredit', 'note'], ['AmountDue', 'bill']] as const) {
+      puts = []
+      xeroBodies = {
+        'CreditNotes/cn-1': { CreditNotes: [side === 'note' ? corrupt(NOTE, field) : NOTE] },
+        'Invoices/bill-1': { Invoices: [side === 'bill' ? corrupt(BILL, field) : BILL] },
+      }
+      const result = await allocatePurchaseCreditNote(PARAMS)
+      assert.equal(result.success, false, `${field} ${label}: ${JSON.stringify(result)}`)
+      assert.match(result.error ?? '', new RegExp(field), `${field} ${label}: names the figure`)
+      assert.equal(result.allocatedAmount, undefined, `${field} ${label}`)
+      assert.deepEqual(puts, [], `${field} ${label}: NO allocation PUT`)
+      cases += 1
+    }
+  }
+  assert.equal(cases, 12)
+  console.log(`# o3d-h9pb HIGH allocatePurchaseCreditNote figures: ${cases} unreadable cases + 2 controls`)
+})
+
+test('[o3d-h9pb HIGH] reconcile: a document that states no Status is UNKNOWN / not written, never "unpaid"', async () => {
+  const { reconcileXeroPayments, classifyDoc } = await import('@/lib/connectors/xero/payment-reconcile')
+  let cases = 0
+  for (const [label, status] of [['omitted', undefined], ['null', null], ['empty', ''], ['number', 7]] as const) {
+    const doc = { id: 'o1', accountingInvoiceId: 'INV-1', imsPaid: true, label: 'x' }
+    const verdict = classifyDoc(doc, { InvoiceID: 'INV-1', Status: status as never })
+    assert.equal(verdict.kind, 'unknown', `classifyDoc ${label} (IMS paid): not a suspect advance`)
+    assert.equal(classifyDoc({ ...doc, imsPaid: false }, { InvoiceID: 'INV-1', Status: status as never }).kind, 'unknown', `classifyDoc ${label} (IMS unpaid): not "consistent"`)
+    // markPaid's own re-read, ids matching but Status unreadable: nothing written.
+    salesUpdates = 0
+    const inv = { ...PAID, Status: status }
+    xeroBodies = { 'Invoices?IDs=INV-1': { Invoices: [PAID] }, 'Invoices/INV-1': { Invoices: [inv] } }
+    const report = await reconcileXeroPayments({ apply: true })
+    assert.equal(report.missedPayments[0]!.applied, false, label)
+    assert.match(report.missedPayments[0]!.skipped ?? '', /no Status/, label)
+    assert.equal(salesUpdates, 0, `${label}: paidAt not written`)
+    cases += 1
+  }
+  assert.equal(cases, 4)
+  console.log(`# o3d-h9pb HIGH reconcile Status: ${cases} unreadable cases`)
+})

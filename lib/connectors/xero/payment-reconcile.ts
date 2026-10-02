@@ -98,6 +98,8 @@ export type ReconcileVerdict =
  */
 export function classifyDoc(doc: LinkedDoc, xero: XeroReconcileInvoice | undefined): ReconcileVerdict {
   if (!xero) return { kind: 'unknown' }
+  // o3d-h9pb: a document that states no Status is UNKNOWN, not 'unpaid' (which would read as consistent).
+  if (typeof xero.Status !== 'string' || xero.Status === '') return { kind: 'unknown' }
   const paidInXero = xero.Status === 'PAID'
 
   if (paidInXero && !doc.imsPaid) return { kind: 'missed-payment', xero }
@@ -253,6 +255,7 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
         return { applied: false, reason: `could not re-read the invoice from Xero: ${invRead.reason}` }
       }
       const inv = invRead.document
+      if (typeof inv.Status !== 'string' || inv.Status === '') return { applied: false, reason: 'the invoice re-read from Xero states no Status, so IMS cannot tell whether it is still PAID' }
       if (inv.Status !== 'PAID') return { applied: false, reason: `no longer PAID in Xero (now ${inv.Status}) — the poller or a reversal moved first` }
 
       const settled = parseSettlementDate(inv.FullyPaidOnDate)
