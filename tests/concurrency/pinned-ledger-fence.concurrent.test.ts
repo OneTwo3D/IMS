@@ -5,6 +5,7 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
+import { backendPid, waitUntilParkedBehind, type ParkedBackend } from '../helpers/lock-wait-observer.ts'
 
 /**
  * o3d-i0o6 r8 (Codex round 7, HIGH) — A CONNECTOR SWITCH CANNOT COMMIT BETWEEN THE PINNED-LEDGER
@@ -40,18 +41,37 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  * with. Test 4 is test 3's race with `xero_sync_enabled` set to `'false'` first, and test 5 is its
  * uncontended control.
  *
+ * o3d-ohrk3 — THE HOLD IS A STATE, NOT A DURATION. Every test here used to keep the lock holder's
+ * transaction open for a fixed `HOLD_MS` and assert on elapsed wall-clock time. That is a race
+ * between a sleep and the other side's latency: under host load the waiter's pooled pre-checks,
+ * connection checkout and transaction start can outlast the hold, the holder commits first, and the
+ * waiter runs uncontended against the already-switched selection (PR #724 test 123: `not-configured`
+ * where `refused` was asserted; the r13 in-transaction case: a PENDING xero row where none may exist).
+ * Now the holder releases only once the OTHER side is OBSERVED parked behind it — a backend whose
+ * `pg_blocking_pids` names the holder, stuck on `pg_advisory_xact_lock` — through
+ * tests/helpers/lock-wait-observer.ts, which FAILS LOUD if the park is never seen instead of letting the
+ * test proceed. Each case prints the observation, and asserts it, as its precondition. The elapsed-time
+ * assertions are replaced by ORDER assertions taken from the same clock as the release (the waiter
+ * cannot have finished before the holder released), which is the property they were a proxy for.
+ *
  * Gated behind RUN_DB_CONCURRENCY_TESTS=1: `npm run test:concurrency`.
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 /**
- * How long the enqueue holds its transaction open after its INSERT (test 1), or the switch holds the
- * selection (test 3). Long enough that "was the other side blocked for the whole of it" is not a
- * scheduling coincidence.
+ * The ONE remaining wall-clock bound in this file: the UNCONTENDED liveness test (test 5), where no
+ * lock is held by anyone and "it did not hang" is the whole claim, so there is no state to wait for.
+ * It is not a hold any more — nothing sleeps for it.
  */
-const HOLD_MS = 500
-/** Slack for scheduler jitter on the blocked side's own wake-up. */
-const SLACK_MS = 100
+const UNCONTENDED_BOUND_MS = 500
+/**
+ * Ceiling on how long a NEGATIVE control (an enqueue that must NOT be blocked by the switch) keeps the
+ * switch's lock held while waiting for that enqueue to return. A healthy run releases within tens of
+ * milliseconds, as soon as the enqueue has answered; this only bounds the failure where it is blocked.
+ */
+const UNBLOCKED_CEILING_MS = 5_000
+/** What a fenced enqueue is stuck on while parked behind a holder (`lockIntegrationPluginSelection`). */
+const FENCE_WAIT = /pg_advisory_xact_lock/i
 const TX = { timeout: 30_000, maxWait: 20_000 }
 
 function loadEnv(): void {
@@ -108,8 +128,9 @@ async function startFromXeroActive(db: Db): Promise<void> {
 /**
  * The switch, taken exactly as the app takes it: the selection lock FIRST, then the write.
  *
- * `holdMs` keeps the transaction open AFTER the write so the other side can be observed waiting on
- * it. Returns how long the whole transaction took, which is the measurement.
+ * `holdUntil` keeps the transaction open AFTER the write until a STATE is reached (the other side
+ * observed parked behind it — o3d-ohrk3), never for a fixed time. Returns when it released the lock and
+ * when COMMIT completed, which is what the order assertions are taken against.
  */
 /**
  * o3d-remove-parked-connectors — WHAT THE SWITCH IS NOW.
@@ -124,23 +145,151 @@ async function startFromXeroActive(db: Db): Promise<void> {
  * measures — that the fence's read WAITS on the switcher's lock, and that the verdict is taken after
  * it commits — is unchanged, because those are properties of the lock, not of the number of ids.
  */
+type SwitchResult = {
+  /** Wall-clock of the whole switch transaction (diagnostic). */
+  switchMs: number
+  /** Taken as the transaction body returns, i.e. immediately before COMMIT releases the lock. */
+  releasedAt: number
+  /** Taken after COMMIT returned. */
+  completedAt: number
+}
+
 async function switchAwayFromXero(
   db: Db,
   lockIntegrationPluginSelection: Awaited<ReturnType<typeof loadDeps>>['lockIntegrationPluginSelection'],
-  options: { holdMs?: number; onLockHeld?: () => void } = {},
-): Promise<number> {
+  options: {
+    /**
+     * Awaited INSIDE the transaction after the write: the lock stays held until it settles. A rejection
+     * rolls the switch back and fails the test with the rejection's diagnostic.
+     */
+    holdUntil?: (holderPid: number) => Promise<void>
+    onLockHeld?: (holderPid: number) => void
+  } = {},
+): Promise<SwitchResult> {
   const startedAt = Date.now()
+  let releasedAt = 0
   await db.$transaction(async (tx) => {
+    const holderPid = await backendPid(tx)
     await lockIntegrationPluginSelection(tx)
-    options.onLockHeld?.()
+    options.onLockHeld?.(holderPid)
     for (const [key, value] of [
       [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'false'],
     ] as Array<[string, string]>) {
       await tx.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
-    if (options.holdMs) await new Promise((resolve) => setTimeout(resolve, options.holdMs))
+    if (options.holdUntil) await options.holdUntil(holderPid)
+    releasedAt = Date.now()
   }, TX)
-  return Date.now() - startedAt
+  const completedAt = Date.now()
+  return { switchMs: completedAt - startedAt, releasedAt, completedAt }
+}
+
+/**
+ * THE SWITCH-FIRST RACE, with the hold made a state (o3d-ohrk3).
+ *
+ * The switch takes the selection and writes it uncommitted. `startEnqueue` runs only once the lock is
+ * held. The switch then keeps the lock until a backend blocked by it, stuck on the fence's advisory
+ * lock, is OBSERVED — and only then commits. So the enqueue's pooled pre-checks (which cannot see the
+ * uncommitted switch under READ COMMITTED) have happened or are happening against a selection that has
+ * provably not moved, however long checkout and transaction start take under load.
+ *
+ * If the park is never observed the switch's transaction rejects and ROLLS BACK, and this rejects with
+ * the observer's diagnostic: an enqueue that stopped taking the fence goes red as "never parked".
+ */
+async function raceEnqueueBehindSwitch<T>(
+  db: Db,
+  lockIntegrationPluginSelection: Awaited<ReturnType<typeof loadDeps>>['lockIntegrationPluginSelection'],
+  describe: string,
+  startEnqueue: () => Promise<T>,
+): Promise<{ switched: SwitchResult; enqueue: T; enqueueDoneAt: number; parked: ParkedBackend }> {
+  let lockHeld!: () => void
+  const switchHoldsTheLock = new Promise<void>((resolve) => { lockHeld = resolve })
+  let parked: ParkedBackend | null = null
+
+  const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
+    onLockHeld: () => lockHeld(),
+    holdUntil: async (holderPid) => {
+      parked = await waitUntilParkedBehind(db, { holderPid, waitingOn: FENCE_WAIT, describe })
+    },
+  })
+  const enqueueing = (async () => {
+    await switchHoldsTheLock
+    const enqueue = await startEnqueue()
+    return { enqueue, enqueueDoneAt: Date.now() }
+  })()
+
+  const [switchedOutcome, enqueueOutcome] = await Promise.allSettled([switcher, enqueueing])
+  // The observer's diagnostic is the root cause; whatever the enqueue did without a fence is fallout.
+  if (switchedOutcome.status === 'rejected') throw switchedOutcome.reason
+  if (enqueueOutcome.status === 'rejected') throw enqueueOutcome.reason
+  assert.ok(parked, 'PRECONDITION: the enqueue was observed parked behind the switch')
+  return { switched: switchedOutcome.value, ...enqueueOutcome.value, parked }
+}
+
+type Deps = Awaited<ReturnType<typeof loadDeps>>
+
+/**
+ * THE ENQUEUE-FIRST RACE, with the hold made a state (o3d-ohrk3).
+ *
+ * The enqueue goes first, INSERTS, and keeps its transaction open until the switch is OBSERVED parked
+ * behind it (a backend blocked by the enqueue's own backend, on the selection lock) — and only then
+ * commits. Nothing sleeps. If the switch is never seen parked the enqueue's transaction rejects and
+ * rolls back, with the observer's diagnostic: a fence that stopped holding the selection goes red as
+ * "never parked", not as a timing guess.
+ */
+async function raceSwitchBehindOpenEnqueue(
+  db: Db,
+  deps: Pick<Deps, 'queueAccountingSyncTx' | 'lockIntegrationPluginSelection'>,
+  describe: string,
+  enqueueParams: Parameters<Deps['queueAccountingSyncTx']>[1],
+): Promise<{ queued: boolean | null; switched: SwitchResult; enqueueReleasedAt: number; parked: ParkedBackend }> {
+  let queued: boolean | null = null
+  let parked: ParkedBackend | null = null
+  let enqueueReleasedAt = 0
+  let inserted!: (pid: number) => void
+  const enqueueHasInserted = new Promise<number>((resolve) => { inserted = resolve })
+
+  const enqueueing = db.$transaction(async (tx) => {
+    const enqueuePid = await backendPid(tx)
+    queued = await deps.queueAccountingSyncTx(tx, enqueueParams)
+    inserted(enqueuePid)
+    // Held open until the switch is DEMONSTRABLY parked on the lock this transaction holds.
+    parked = await waitUntilParkedBehind(db, { holderPid: enqueuePid, waitingOn: FENCE_WAIT, describe })
+    enqueueReleasedAt = Date.now()
+  }, TX)
+  // Never rejects: lets the switch side stop waiting if the enqueue fails before it has inserted.
+  const enqueueSettled = enqueueing.then(() => undefined, () => undefined)
+
+  const switching = (async () => {
+    const pid = await Promise.race([enqueueHasInserted, enqueueSettled])
+    if (pid === undefined) return null
+    return switchAwayFromXero(db, deps.lockIntegrationPluginSelection)
+  })()
+
+  const [enqueueOutcome, switchOutcome] = await Promise.allSettled([enqueueing, switching])
+  if (enqueueOutcome.status === 'rejected') throw enqueueOutcome.reason
+  if (switchOutcome.status === 'rejected') throw switchOutcome.reason
+  assert.ok(switchOutcome.value, 'PRECONDITION: the enqueue reached its insert, so the switch was started')
+  assert.ok(parked, 'PRECONDITION: the switch was observed parked behind the open enqueue')
+  return { queued, switched: switchOutcome.value, enqueueReleasedAt, parked }
+}
+
+/**
+ * The PRECONDITION and the ORDER, for a waiter that was released by a holder (o3d-ohrk3).
+ * `parked` proves the waiter reached the lock while the holder still held it; `waiterDoneAt >=
+ * releasedAt` says it could not have answered before the holder let go — which is what the old
+ * `elapsedMs >= HOLD_MS - SLACK_MS` was a wall-clock proxy for.
+ */
+function assertWaitedForHolder(
+  label: string, parked: ParkedBackend, releasedAt: number, waiterDoneAt: number, defect = '',
+): void {
+  console.log(`[o3d-ohrk3 parked] ${label}: waiter backend ${parked.pid} observed blocked on `
+    + `\`${parked.query.replace(/\s+/g, ' ').slice(0, 60)}\` after ${parked.observedAfterMs}ms; holder released `
+    + `${waiterDoneAt - releasedAt}ms before the waiter finished`)
+  assert.ok(parked.pid > 0, `${label}: PRECONDITION — the waiter was observed parked behind the holder`)
+  assert.ok(waiterDoneAt >= releasedAt,
+    `${label}: the waiter finished ${releasedAt - waiterDoneAt}ms BEFORE the holder released the selection, `
+    + `so its verdict was not taken under the lock it was meant to wait for. ${defect}`)
 }
 
 /** One setting row, for the tests that need a toggle the plugin switch does not touch. */
@@ -186,21 +335,20 @@ test(
     /**
      * THE INTERLEAVING, and why this direction is the one that proves the HIGH.
      *
-     * The enqueue goes first and INSERTS. Its transaction then stays open for HOLD_MS before
-     * committing. If the selection lock is genuinely held by that transaction, the switch — which
+     * The enqueue goes first and INSERTS. Its transaction then stays open until the switch is OBSERVED
+     * parked behind it (o3d-ohrk3), and only then commits. If the selection lock is genuinely held by that transaction, the switch — which
      * takes the same lock and the same rows — cannot commit until the insert is durable. So the
      * question "could a switch have landed between the check and the write" is answered by measuring
      * whether the switch was able to land at all while the writing transaction lived.
      *
      * Under round 7's unlocked check the enqueue takes no plugin lock, the switch commits in a few
-     * milliseconds, and the assertion below fails by ~400ms.
+     * milliseconds and is never seen parked, so the observer fails the test with "never parked".
      */
-    let queued: boolean | null = null
-    const signal: { fire?: () => void } = {}
-    const enqueueHasInserted = new Promise<void>((resolve) => { signal.fire = resolve })
-
-    const enqueue = db.$transaction(async (tx) => {
-      queued = await queueAccountingSyncTx(tx, {
+    const { queued, switched, enqueueReleasedAt, parked } = await raceSwitchBehindOpenEnqueue(
+      db,
+      { queueAccountingSyncTx, lockIntegrationPluginSelection },
+      'test 1 (pinned, in-transaction)',
+      {
         type: 'ALLOCATION_REVERSAL',
         connector: 'xero',
         referenceType: REFERENCE_TYPE,
@@ -209,18 +357,8 @@ test(
         // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
         // passes and the refusal under test is still the LOCKED fence's.
         chartConnector: 'xero',
-      })
-      signal.fire!()
-      // Held open, so the switch is demonstrably parked rather than merely losing a coin toss.
-      await new Promise((resolve) => setTimeout(resolve, HOLD_MS))
-    }, TX)
-
-    const switcher = (async () => {
-      await enqueueHasInserted
-      return switchAwayFromXero(db, lockIntegrationPluginSelection)
-    })()
-
-    const [, switchMs] = await Promise.all([enqueue, switcher])
+      },
+    )
 
     // THE PRECONDITION WAS REACHED. Without a row written, every timing below would hold over an
     // enqueue that refused and locked nothing — a guard that cannot fail.
@@ -228,36 +366,19 @@ test(
     const rows = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } })
     assert.deepEqual(rows, [{ connector: 'xero' }], 'exactly one row, on the ledger the credit was pinned to')
 
-    // THE FENCE, MEASURED. The switch took the plugin-selection lock through the same helper the app
-    // uses and could not complete until the enqueue's transaction ended.
-    assert.ok(switchMs >= HOLD_MS - SLACK_MS,
-      `the connector switch committed in ${switchMs}ms while the enqueue's transaction was open for `
-      + `${HOLD_MS}ms after its INSERT. That is the defect: the pinned-ledger check is a snapshot and `
-      + 'the selection can move between it and the write, which puts the credit on a queue no '
-      + 'scheduled drain reads — and the orphan path then records its amount as posted relief',
+    // THE FENCE, OBSERVED. The switch took the plugin-selection lock through the same helper the app
+    // uses, was seen parked behind the enqueue's open transaction, and could not complete until that
+    // transaction ended.
+    assertWaitedForHolder(
+      'test 1: the connector switch waited for the open pinned enqueue',
+      parked, enqueueReleasedAt, switched.completedAt,
+      'A switch that commits while the enqueue is open is the defect: the pinned-ledger check is a '
+      + 'snapshot and the selection can move between it and the write, which puts the credit on a queue '
+      + 'no scheduled drain reads — and the orphan path then records its amount as posted relief',
     )
   },
 )
 
-/**
- * o3d-j625 r13 (Codex on the merged head, HIGH) — THIS CONTROL ASSERTED THE DEFECT, AND IS INVERTED.
- *
- * It ran test 1's race with the pin removed and required the switch NOT to be blocked, on the stated
- * grounds that "the unpinned path still resolves-then-writes without a fence … it is filed rather than
- * fenced, because fencing it would put a global advisory lock in front of every accounting enqueue".
- * Codex executed that residual: an unpinned call whose connector is deactivated between the chart read
- * and the insert writes a row nothing will ever process AND clears the outstanding refusal, so the
- * identity rule this branch spent four rounds building is handed false evidence. The fence is now
- * unconditional, so the first arm below is the opposite of what this test used to say.
- *
- * ITS STRUCTURAL JOB SURVIVES, AND IT HAD TO. The measurement in test 1 means "the FENCE blocked the
- * switch" only if something else — the order lock, the follow-up scope lock, the pool — is not doing the
- * blocking. With every enqueue now fenced, an unpinned call can no longer be that negative control, so
- * the second arm supplies one: an enqueue whose SYNC TOGGLE IS OFF is answered before the fenced
- * transaction is ever opened (`notConfiguredUnderPinnedLedgerFence` with no pin — see
- * lib/connectors/xero/queue.ts), so it takes no selection lock and does NOT block the switch. Two arms
- * differing in exactly one setting, and the one that takes the fence is the one that blocks.
- */
 test(
   '[o3d-j625 r13] an UNPINNED enqueue is fenced TOO — and an enqueue that never opens the fenced transaction still is not',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -271,12 +392,11 @@ test(
     t.after(() => startFromXeroActive(db))
 
     // ── ARM 1: unpinned, connector ACTIVE, sync ON. The fence is taken, so the switch must wait for it.
-    const signal: { fire?: () => void } = {}
-    const enqueueHasInserted = new Promise<void>((resolve) => { signal.fire = resolve })
-    let queued: boolean | null = null
-
-    const enqueue = db.$transaction(async (tx) => {
-      queued = await queueAccountingSyncTx(tx, {
+    const arm1 = await raceSwitchBehindOpenEnqueue(
+      db,
+      { queueAccountingSyncTx, lockIntegrationPluginSelection },
+      'test 2 arm 1 (unpinned, in-transaction)',
+      {
         type: 'ALLOCATION_REVERSAL',
         referenceType: REFERENCE_TYPE,
         referenceId,
@@ -284,23 +404,16 @@ test(
         // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
         // passes and the refusal under test is still the LOCKED fence's.
         chartConnector: 'xero',
-      })
-      signal.fire!()
-      await new Promise((resolve) => setTimeout(resolve, HOLD_MS))
-    }, TX)
+      },
+    )
 
-    const switcher = (async () => {
-      await enqueueHasInserted
-      return switchAwayFromXero(db, lockIntegrationPluginSelection)
-    })()
-
-    const [, switchMs] = await Promise.all([enqueue, switcher])
-
-    assert.equal(queued, true, 'the unpinned enqueue still writes when its chart IS the active connector')
-    assert.ok(switchMs >= HOLD_MS - SLACK_MS,
-      `the switch committed in ${switchMs}ms while an unpinned enqueue that had inserted was still open. `
-      + 'Since o3d-j625 r13 that enqueue holds the selection lock too, so a switch must not be able to '
-      + `land between its chart read and its commit (it waited ${switchMs}ms of a ${HOLD_MS}ms hold)`)
+    assert.equal(arm1.queued, true, 'the unpinned enqueue still writes when its chart IS the active connector')
+    assertWaitedForHolder(
+      'test 2 arm 1: the switch waited for the open UNPINNED enqueue',
+      arm1.parked, arm1.enqueueReleasedAt, arm1.switched.completedAt,
+      'Since o3d-j625 r13 that enqueue holds the selection lock too, so a switch must not be able to '
+      + 'land between its chart read and its commit',
+    )
 
     // ── ARM 2, THE NEGATIVE CONTROL. It has to come from the FACADE, and finding that out is part of
     //    what r13 established: in `queueAccountingSyncTx` the fence is now unconditional AND FIRST (ahead
@@ -320,35 +433,48 @@ test(
     let offOutcome: { queued: boolean; reason?: string } | null = null
     const offSignal: { fire?: () => void } = {}
     const offSwitchHoldsTheLock = new Promise<void>((resolve) => { offSignal.fire = resolve })
+    // o3d-ohrk3: the switch holds the selection until the enqueue has RETURNED (bounded, so a blocked
+    // enqueue fails the assertion below rather than hanging) — not for a fixed time, so a slow enqueue
+    // is not mistaken for a blocked one. The negative control is: it answered while the switch still held.
+    let offEnqueueReturned!: () => void
+    const offEnqueueDone = new Promise<void>((resolve) => { offEnqueueReturned = resolve })
+    let offEnqueueDoneAt = 0
     const offSwitcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
-      holdMs: HOLD_MS,
       onLockHeld: () => offSignal.fire!(),
+      holdUntil: async () => {
+        await Promise.race([offEnqueueDone, new Promise((resolve) => setTimeout(resolve, UNBLOCKED_CEILING_MS))])
+      },
     })
     const offEnqueue = (async () => {
       await offSwitchHoldsTheLock
-      const startedAt = Date.now()
-      offOutcome = await queueAccountingSync({
-        type: 'ALLOCATION_REVERSAL',
-        referenceType: REFERENCE_TYPE,
-        referenceId: offReferenceId,
-        payload: payloadFor(offReferenceId),
-        chartConnector: 'xero',
-      })
-      return Date.now() - startedAt
+      try {
+        offOutcome = await queueAccountingSync({
+          type: 'ALLOCATION_REVERSAL',
+          referenceType: REFERENCE_TYPE,
+          referenceId: offReferenceId,
+          payload: payloadFor(offReferenceId),
+          chartConnector: 'xero',
+        })
+      } finally {
+        offEnqueueDoneAt = Date.now()
+        offEnqueueReturned()
+      }
     })()
-    const [, offElapsedMs] = await Promise.all([offSwitcher, offEnqueue])
+    const [offSwitched] = await Promise.all([offSwitcher, offEnqueue])
     await setSetting(db, 'xero_sync_enabled', 'true')
 
     assert.equal((offOutcome as unknown as { queued: boolean } | null)?.queued, false,
       'PRECONDITION: with the type switched off nothing is queued')
     assert.deepEqual(await db.accountingSyncLog.findMany({ where: { referenceId: offReferenceId }, select: { id: true } }), [],
       'PRECONDITION: and nothing was written, so this arm really did answer before the fenced write')
-    console.log(`[r13 fence isolation] the fenced arm blocked the switch for ${switchMs}ms; the unfenced `
-      + `(facade, sync-off) arm returned in ${offElapsedMs}ms without waiting out the ${HOLD_MS}ms hold`)
-    assert.ok(offElapsedMs < HOLD_MS - SLACK_MS,
-      `an enqueue answered BEFORE any fenced transaction waited ${offElapsedMs}ms on a switch holding the `
-      + 'selection. It takes no selection lock, so something else is serialising these two — and every '
-      + 'timing in this file would then be evidence of that something else rather than of the fence')
+    console.log(`[r13 fence isolation] the fenced arm waited for the switch (parked, observed); the unfenced `
+      + `(facade, sync-off) arm returned ${offSwitched.releasedAt - offEnqueueDoneAt}ms BEFORE the switch released `
+      + 'the selection')
+    assert.ok(offEnqueueDoneAt > 0 && offEnqueueDoneAt <= offSwitched.releasedAt,
+      `an enqueue answered BEFORE any fenced transaction only returned ${offEnqueueDoneAt - offSwitched.releasedAt}ms `
+      + 'AFTER the switch released the selection it was holding. It takes no selection lock, so something else '
+      + 'is serialising these two — and every timing in this file would then be evidence of that something '
+      + 'else rather than of the fence')
   },
 )
 
@@ -377,31 +503,22 @@ test(
     t.after(cleanup(db, referenceId))
     t.after(() => startFromXeroActive(db))
 
-    const signal: { fire?: () => void } = {}
-    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
-
-    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
-      holdMs: HOLD_MS,
-      onLockHeld: () => signal.fire!(),
-    })
-
-    const enqueue = (async () => {
-      await switchHoldsTheLock
-      const startedAt = Date.now()
-      const outcome = await queueAccountingSync({
-        type: 'UNEARNED_REV_REVERSAL',
-        connector: 'xero',
-        referenceType: REFERENCE_TYPE,
-        referenceId,
-        payload: payloadFor(referenceId),
-        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
-        // passes and the refusal under test is still the LOCKED fence's.
-        chartConnector: 'xero',
-      })
-      return { outcome, elapsedMs: Date.now() - startedAt }
-    })()
-
-    const [, { outcome, elapsedMs }] = await Promise.all([switcher, enqueue])
+    const { switched, enqueue: { outcome }, enqueueDoneAt, parked } = await raceEnqueueBehindSwitch(
+      db, lockIntegrationPluginSelection, 'test 3 (facade, pinned)',
+      async () => {
+        const outcome = await queueAccountingSync({
+          type: 'UNEARNED_REV_REVERSAL',
+          connector: 'xero',
+          referenceType: REFERENCE_TYPE,
+          referenceId,
+          payload: payloadFor(referenceId),
+          // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+          // passes and the refusal under test is still the LOCKED fence's.
+          chartConnector: 'xero',
+        })
+        return { outcome }
+      },
+    )
 
     assert.deepEqual(
       await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } }),
@@ -416,11 +533,13 @@ test(
     assert.equal(outcome.connector, 'xero', 'and the answer is about the ledger the credit was proved on')
 
     // AND IT REALLY WAITED, which is what says the refusal came from the locked read rather than from
-    // a pooled read that happened to be taken late. An unfenced facade returns in milliseconds with a
-    // row written.
-    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
-      `the facade enqueue returned in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms `
-      + 'hold, so its verdict was not taken under the selection lock',
+    // a pooled read that happened to be taken late: the enqueue was OBSERVED parked behind the switch's
+    // lock, and could not answer before the switch released it. An unfenced facade is never parked and
+    // returns with a row written.
+    assertWaitedForHolder(
+      'test 3: the facade enqueue waited under the selection lock',
+      parked, switched.releasedAt, enqueueDoneAt,
+      'so its verdict was not taken under the selection lock',
     )
   },
 )
@@ -459,31 +578,22 @@ test(
     t.after(cleanup(db, referenceId))
     t.after(() => startFromXeroActive(db))
 
-    const signal: { fire?: () => void } = {}
-    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
-
-    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
-      holdMs: HOLD_MS,
-      onLockHeld: () => signal.fire!(),
-    })
-
-    const enqueue = (async () => {
-      await switchHoldsTheLock
-      const startedAt = Date.now()
-      const outcome = await queueAccountingSync({
-        type: 'UNEARNED_REV_REVERSAL',
-        connector: 'xero',
-        referenceType: REFERENCE_TYPE,
-        referenceId,
-        payload: payloadFor(referenceId),
-        // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
-        // passes and the refusal under test is still the LOCKED fence's.
-        chartConnector: 'xero',
-      })
-      return { outcome, elapsedMs: Date.now() - startedAt }
-    })()
-
-    const [, { outcome, elapsedMs }] = await Promise.all([switcher, enqueue])
+    const { switched, enqueue: { outcome }, enqueueDoneAt, parked } = await raceEnqueueBehindSwitch(
+      db, lockIntegrationPluginSelection, 'test 4 (facade, pinned, sync toggle off)',
+      async () => {
+        const outcome = await queueAccountingSync({
+          type: 'UNEARNED_REV_REVERSAL',
+          connector: 'xero',
+          referenceType: REFERENCE_TYPE,
+          referenceId,
+          payload: payloadFor(referenceId),
+          // o3d-j625 r2: required now. Every test here starts from XERO ACTIVE, so the pooled chart check
+          // passes and the refusal under test is still the LOCKED fence's.
+          chartConnector: 'xero',
+        })
+        return { outcome }
+      },
+    )
 
     assert.deepEqual(
       await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } }),
@@ -498,11 +608,13 @@ test(
     assert.equal(outcome.connector, 'xero', 'and the answer is about the ledger the credit was proved on')
 
     // AND IT WAITED. This is the half that separates a fenced answer from a lucky one: an unfenced
-    // queue answers from its own toggle read and never touches the selection lock, so it returns long
-    // before the switch has committed.
-    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
-      `the enqueue answered in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms hold, so `
-      + 'its verdict was taken from the sync toggle rather than from under the selection lock',
+    // queue answers from its own toggle read and never touches the selection lock, so it is never
+    // parked behind the switch and returns long before the switch has committed. Here it was OBSERVED
+    // parked, and could not answer before the switch released the selection.
+    assertWaitedForHolder(
+      'test 4: the toggled-off pinned enqueue waited under the selection lock',
+      parked, switched.releasedAt, enqueueDoneAt,
+      'so its verdict was taken from the sync toggle rather than from under the selection lock',
     )
   },
 )
@@ -551,7 +663,7 @@ test(
       await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true } }),
       [],
     )
-    assert.ok(elapsedMs < HOLD_MS,
+    assert.ok(elapsedMs < UNCONTENDED_BOUND_MS,
       `an uncontended fenced answer took ${elapsedMs}ms — it should acquire, read and release`)
   },
 )
@@ -637,30 +749,22 @@ test(
     await seedDebt(db, referenceId)
     assert.equal(await debtIsOutstanding(db, referenceId), true, 'PRECONDITION: the debt is outstanding')
 
-    const signal: { fire?: () => void } = {}
-    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
-    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
-      holdMs: HOLD_MS,
-      onLockHeld: () => signal.fire!(),
-    })
-
-    const enqueue = (async () => {
-      await switchHoldsTheLock
-      const startedAt = Date.now()
-      // NO `connector`: an unpinned call. It still names the CHART its codes came from (required since
-      // r2), and that chart is what decides the queue — so it is the connector whose continued
-      // servicing this enqueue depends on, pin or no pin.
-      const outcome = await queueAccountingSync({
-        type: 'ALLOCATION_REVERSAL',
-        referenceType: REFERENCE_TYPE,
-        referenceId,
-        payload: payloadFor(referenceId),
-        chartConnector: 'xero',
-      })
-      return { outcome, elapsedMs: Date.now() - startedAt }
-    })()
-
-    const [, { outcome, elapsedMs }] = await Promise.all([switcher, enqueue])
+    const { switched, enqueue: { outcome }, enqueueDoneAt, parked } = await raceEnqueueBehindSwitch(
+      db, lockIntegrationPluginSelection, 'r13 facade (unpinned)',
+      async () => {
+        // NO `connector`: an unpinned call. It still names the CHART its codes came from (required since
+        // r2), and that chart is what decides the queue — so it is the connector whose continued
+        // servicing this enqueue depends on, pin or no pin.
+        const outcome = await queueAccountingSync({
+          type: 'ALLOCATION_REVERSAL',
+          referenceType: REFERENCE_TYPE,
+          referenceId,
+          payload: payloadFor(referenceId),
+          chartConnector: 'xero',
+        })
+        return { outcome }
+      },
+    )
 
     // WHAT THE CRON WILL DO WITH A ROW WRITTEN HERE — established, not asserted by assumption.
     assert.equal(await isIntegrationPluginEnabled('xero'), false,
@@ -669,7 +773,7 @@ test(
       + 'at a single row, so a xero row written now is one nothing will ever process')
 
     const written = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true, status: true } })
-    console.log(`[r13 facade] outcome=${JSON.stringify(outcome)} elapsed=${elapsedMs}ms rows=${JSON.stringify(written)} `
+    console.log(`[r13 facade] outcome=${JSON.stringify(outcome)} elapsed=${enqueueDoneAt - switched.releasedAt}ms-after-release rows=${JSON.stringify(written)} `
       + `debtOutstanding=${await debtIsOutstanding(db, referenceId)}`)
 
     assert.deepEqual(written, [],
@@ -680,10 +784,12 @@ test(
       'THE FINDING, second half: the debt is STILL OUTSTANDING. `queued: true` clears the refusal row '
       + '(r4) and the r12 identity rule then reads that row as proof a posting was queued — so an '
       + 'un-processable row does not merely sit there, it discharges a debt that is owed.')
-    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
-      `the enqueue returned in ${elapsedMs}ms without waiting out the switch's ${HOLD_MS}ms hold, so its `
-      + 'verdict was NOT taken under the selection lock — measured, so "it refused" cannot be a pooled '
-      + 'read that happened to land late')
+    assertWaitedForHolder(
+      'r13 facade (unpinned): the enqueue waited under the selection lock',
+      parked, switched.releasedAt, enqueueDoneAt,
+      'so its verdict was NOT taken under the selection lock — observed, so "it refused" cannot be a '
+      + 'pooled read that happened to land late',
+    )
   },
 )
 
@@ -699,33 +805,24 @@ test(
     t.after(() => startFromXeroActive(db))
     await seedDebt(db, referenceId)
 
-    const signal: { fire?: () => void } = {}
-    const switchHoldsTheLock = new Promise<void>((resolve) => { signal.fire = resolve })
-    const switcher = switchAwayFromXero(db, lockIntegrationPluginSelection, {
-      holdMs: HOLD_MS,
-      onLockHeld: () => signal.fire!(),
-    })
-
     let queued: boolean | null = null
-    const caller = (async () => {
-      await switchHoldsTheLock
-      const startedAt = Date.now()
-      await db.$transaction(async (tx) => {
-        queued = await queueAccountingSyncTx(tx, {
-          type: 'ALLOCATION_REVERSAL',
-          referenceType: REFERENCE_TYPE,
-          referenceId,
-          payload: payloadFor(referenceId),
-          chartConnector: 'xero',
-        })
-      }, TX)
-      return Date.now() - startedAt
-    })()
-
-    const [, elapsedMs] = await Promise.all([switcher, caller])
+    const { switched, enqueueDoneAt, parked } = await raceEnqueueBehindSwitch(
+      db, lockIntegrationPluginSelection, 'r13 tx (unpinned)',
+      async () => {
+        await db.$transaction(async (tx) => {
+          queued = await queueAccountingSyncTx(tx, {
+            type: 'ALLOCATION_REVERSAL',
+            referenceType: REFERENCE_TYPE,
+            referenceId,
+            payload: payloadFor(referenceId),
+            chartConnector: 'xero',
+          })
+        }, TX)
+      },
+    )
 
     const written = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { connector: true, status: true } })
-    console.log(`[r13 tx] queued=${queued} elapsed=${elapsedMs}ms rows=${JSON.stringify(written)} `
+    console.log(`[r13 tx] queued=${queued} elapsed=${enqueueDoneAt - switched.releasedAt}ms-after-release rows=${JSON.stringify(written)} `
       + `debtOutstanding=${await debtIsOutstanding(db, referenceId)}`)
 
     assert.deepEqual(written, [],
@@ -733,9 +830,11 @@ test(
       + 'was set — and the same consequence: a row for an unserviced connector.')
     assert.equal(queued, false, 'and the boolean the caller acts on says nothing was queued')
     assert.equal(await debtIsOutstanding(db, referenceId), true, 'so the debt is kept')
-    assert.ok(elapsedMs >= HOLD_MS - SLACK_MS,
-      `the caller's transaction returned in ${elapsedMs}ms rather than waiting out the ${HOLD_MS}ms hold, `
-      + 'so its verdict was not taken under the selection lock')
+    assertWaitedForHolder(
+      'r13 tx (unpinned): the caller\'s transaction waited under the selection lock',
+      parked, switched.releasedAt, enqueueDoneAt,
+      'so its verdict was not taken under the selection lock',
+    )
   },
 )
 
