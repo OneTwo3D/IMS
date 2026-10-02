@@ -38,7 +38,7 @@ import {
   taxRateProfileSelect,
   type ResolvedTaxRate,
 } from '@/lib/tax/resolve-rate'
-import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
@@ -1014,6 +1014,10 @@ type OrderDefaultTaxCtx = {
 async function resolvePurchaseLineTaxRates(
   lines: Array<{ taxRateId?: string | null }>,
   orderDefault: OrderDefaultTaxCtx,
+  // o3d-fgu3 (Codex HIGH): a caller INSIDE a transaction must pass its `tx`. Reading through the global
+  // pooled client from inside a transaction needs a SECOND connection while the first is held, so
+  // pool-size concurrent callers exhaust the pool and fail on the acquisition timeout after taking locks.
+  client: Pick<typeof db, 'taxRate'> = db,
 ): Promise<ResolvedTaxRate[]> {
   const overrideIds = Array.from(
     new Set(
@@ -1023,7 +1027,7 @@ async function resolvePurchaseLineTaxRates(
     ),
   )
   const overrideRows = overrideIds.length
-    ? await db.taxRate.findMany({ where: { id: { in: overrideIds } }, select: taxRateProfileSelect })
+    ? await client.taxRate.findMany({ where: { id: { in: overrideIds } }, select: taxRateProfileSelect })
     : []
   const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
 
@@ -1340,6 +1344,9 @@ export async function updatePurchaseOrder(
     // anyway. The edit now runs in ONE transaction that takes `purchase_orders` FIRST — then
     // `purchase_order_lines` and `freight_cost_lines`, in `lockPurchaseOrdersWithCostRows`'s single fixed
     // order, exactly as `updateFreightPoCosts` and the fx rebase do — and re-reads the status UNDER that
+    // lock. EVERY read inside the closure goes through `tx` (base currency, tax rates, products, fx): a call on
+    // the global pooled client from in here would need a SECOND connection while this one is held, and
+    // pool-size concurrent edits would exhaust the pool and time out holding locks (Codex HIGH, o3d-fgu3).
     // lock. It touches no cost layer and no stock row, so it is not a participant in the cost_layers vs
     // stock_levels order (o3d-chs1h). A refusal returns before any write; any throw rolls the lot back.
     const edit = await db.$transaction(async (tx) => {
@@ -1361,7 +1368,7 @@ export async function updatePurchaseOrder(
       if (locked.status !== 'DRAFT') return { refused: 'Only DRAFT POs can be edited' }
       const shouldRefreshFxRate = input.currency !== undefined || input.fxRateToBase !== undefined
       const rateOnlyFxRefresh = shouldRefreshFxRate && input.lines === undefined && input.additionalCosts === undefined
-      const baseCurrency = shouldRefreshFxRate ? await getBaseCurrencyCode() : null
+      const baseCurrency = shouldRefreshFxRate ? await resolveBaseCurrencyCode(tx) : null
       const fxRate = shouldRefreshFxRate && !rateOnlyFxRefresh
         ? await resolvePurchaseOrderFxRateToBase(tx, {
             currency: input.currency ?? locked.currency,
@@ -1431,7 +1438,7 @@ export async function updatePurchaseOrder(
         }
 
         // Supplier's Default VAT Rate is authoritative for every line (per-line manual override still wins).
-        const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx)
+        const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx)
 
         // Delete existing lines and recreate
         await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })

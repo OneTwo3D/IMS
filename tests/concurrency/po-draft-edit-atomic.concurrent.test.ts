@@ -378,3 +378,32 @@ test(
     console.log(`# A5b: evaluated ${evaluated} cross-order pairs`)
   },
 )
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+// A6 — POOL SATURATION: EVERY READ INSIDE THE TRANSACTION USES THE TRANSACTION'S CONNECTION (Codex HIGH)
+// ───────────────────────────────────────────────────────────────────────────────────────────────
+test(
+  'A6: DB_POOL_MAX concurrent edits of DIFFERENT orders all complete: no read inside the transaction needs a second pooled connection',
+  SKIP,
+  async () => {
+    const { updatePurchaseOrder } = await import('@/app/actions/purchase-orders')
+    const { DB_POOL_MAX, DB_POOL_ACQUISITION_TIMEOUT_MS } = await import('@/lib/db')
+    // One order per concurrent edit, so none waits on another's parent lock: every edit is ACTIVE, each holds
+    // one connection for its transaction, and any extra pooled read inside it needs a connection that does
+    // not exist once the pool is full.
+    const seeded = []
+    for (let i = 0; i < DB_POOL_MAX; i += 1) seeded.push((await seedDraft(`a6-${i}`, [3, 4])).po)
+    assert.equal(seeded.length, DB_POOL_MAX, 'PRECONDITION: one DRAFT order per pool connection')
+    const started = Date.now()
+    const results = await Promise.all(seeded.map((po) => updatePurchaseOrder(po.poId, editFor(po, [5, 6], {
+      additionalCosts: [{ description: 'freight', amountForeign: 3, vatable: false, distributionMethod: 'BY_VALUE' }],
+    }))))
+    const elapsed = Date.now() - started
+    const failures = results.filter((r) => !r.success).map((r) => (r.error ?? '').slice(0, 140))
+    console.log(`# A6: ${results.length} concurrent edits (pool max ${DB_POOL_MAX}, acquisition timeout ${DB_POOL_ACQUISITION_TIMEOUT_MS}ms) in ${elapsed}ms, failures=${failures.length}`)
+    assert.deepEqual(failures, [], 'no edit may fail (pool-acquisition timeout) under pool-size concurrency')
+    assert.ok(elapsed < DB_POOL_ACQUISITION_TIMEOUT_MS, `the batch must finish inside the acquisition timeout, took ${elapsed}ms`)
+    const lineCounts = await Promise.all(seeded.map(async (po) => (await snapshot(po.poId)).lines.length))
+    assert.ok(lineCounts.every((n) => n === 2), `every edited order has its 2 lines: ${lineCounts.join(',')}`)
+  },
+)
