@@ -261,9 +261,10 @@ export function unresolvedInvoicePaymentAttempts(
     (r.status === 'FAILED' || r.status === 'CANCELLED')
     && (r.paymentId == null || r.paymentId !== paymentId)
     // o3d-kof8: BOTH proofs, through the one reading. `couldHaveReachedLedger !== false` alone let
-    // a CANCELLED row whose payload was complete count as unresolved for ever — right — and let a
-    // CANCELLED row an operator had signed NOT_POSTED count too, which is the resolution this
-    // system records precisely so a stranded receipt has a way out.
+    // a CANCELLED row whose payload was complete count as unresolved for ever — right. (It also let a
+    // CANCELLED row an operator had signed NOT_POSTED count, "the resolution this system records so a
+    // stranded receipt has a way out"; C1 removed that: it is a person's word, so it holds, and the
+    // ledger probe in the decision is what can clear it.)
     && mayHoldLedgerPayment(r))
 }
 
@@ -293,9 +294,9 @@ export function unresolvedInvoicePaymentAttempts(
  * which is what keeps the two from disagreeing. What clears it is the one thing that is actual
  * evidence, and o3d-kof8 corrected what that is: NOT "the row stops being live". Cancelling a row
  * is three different writers' act in this system and only one of them looked at a ledger, so the
- * clearing fact is a RESOLVED cancellation as `cancelledClaimIsResolved` defines it — an operator's
- * audited NOT_POSTED assertion, or a sweep's pre-call proof, and in neither case may the row still
- * name a document the ledger issued. See {@link mayHoldLedgerPayment}.
+ * clearing fact is a PROVEN absence as ledger-standing.ts defines it — a sweep's pre-call proof or a
+ * VERIFIED_REVERSAL, and a document id the ledger issued outranks the sweep's flag. An operator's
+ * NOT_POSTED assertion is NOT such a fact (C1). See {@link mayHoldLedgerPayment}.
  *
  * NOT SILENT, which is what o3d-ekn8 exists to prevent. `selectReceiptsAwaitingRegistration` still
  * SELECTS the receipt, so the guarded decision runs and its refusal is warned about with a nameable

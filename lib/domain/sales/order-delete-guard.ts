@@ -665,8 +665,9 @@ export async function findSalesOrderDeleteBlocker(
     // cascaded away the shipments and stamps the journal was built from.
     //
     // The CANCELLED-with-NO-id row is still deliberately not a blocker here, for the reason the
-    // document query gives at length: that is the shape an audited NOT_POSTED settlement leaves
-    // behind, and re-blocking on it would re-strand every order an operator has settled.
+    // document query gives at length: that is the shape a NOT_POSTED settlement leaves behind, and
+    // re-blocking on it would re-strand every order an operator has settled. (o3d-f709 C1: whether an
+    // ASSERTED one should keep blocking is slice 1c's G1; the census guard declares it PENDING.)
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {
         type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],

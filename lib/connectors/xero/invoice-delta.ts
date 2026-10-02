@@ -2110,9 +2110,10 @@ export function classifyRegisteredPaymentAgainstListing(
     // here collapses the verdict to NOTHING_REGISTERED — which is an ADMITTED reversal, clears
     // `PurchaseInvoice.paidAt`, and re-arms Mark Paid over a payment that may be in the ledger.
     //
-    // The rule is not restated here: only a cancelled row that carries its own proof of a pre-call
-    // abandonment (or an operator's audited NOT_POSTED assertion), and names no document, still
-    // drops out.
+    // The rule is not restated here (ledger-standing.ts): only a row whose standing is PROVEN_NOT_POSTED
+    // - a cancelled row carrying the sweep's own proof of a pre-call abandonment, or a VERIFIED_REVERSAL -
+    // still drops out. An operator's NOT_POSTED assertion does NOT (C1): it is a person's word about a
+    // ledger IMS never read, so the verdict withholds instead of collapsing to NOTHING_REGISTERED.
     if (!mayHaveReachedLedger(row)) continue
     // The completion instant the DATABASE minted, or null when the row cannot prove which clock wrote
     // it — an old build's host-clock stamp is not a fence, it is the defect (round 5, finding 1).
@@ -2429,9 +2430,10 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
  *
  * `mayHaveReachedLedger` is the fail-closed direction here: a row that may be holding a payment
  * counts as having told the ledger, so the receipt is NOT reported unregistered and no reversal is
- * raised on the strength of a registration nobody can speak for. Only a RESOLVED cancellation — an
- * audited NOT_POSTED assertion or a pre-call sweep, neither naming a document — leaves the receipt
- * unregistered, and that is a fact somebody established rather than one inferred from a status.
+ * raised on the strength of a registration nobody can speak for. Only a PROVEN absence — a pre-call
+ * sweep naming no document, or a VERIFIED_REVERSAL — leaves the receipt unregistered, and that is a
+ * fact the system established rather than one inferred from a status (an operator's NOT_POSTED is a
+ * person's word, not proof: C1).
  */
 export function unregisteredLocalReceipts(
   receiptIds: readonly string[],
