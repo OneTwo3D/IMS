@@ -99,6 +99,7 @@ export function skippability(doc: Json): string | null {
   }
   const dflt = (doc.defaults as Json | undefined)?.run
   if (dflt !== undefined) return 'workflow sets defaults.run'
+  if (hasNpmConfigEnv(doc)) return 'workflow sets npm_config_* env'
   const pr = (on as Json).pull_request as Json | null
   if (pr && typeof pr === 'object') {
     if ('branches-ignore' in pr) return 'pull_request has branches-ignore'
@@ -118,16 +119,21 @@ export function skippability(doc: Json): string | null {
   }
   return null
 }
+/** npm_config_script_shell and friends can redirect what `npm run` executes, whatever the command line says. */
+export function hasNpmConfigEnv(node: Json): boolean {
+  const env = node.env
+  return !!env && typeof env === 'object' && Object.keys(env).some((k) => /^npm_config_/i.test(k))
+}
 export function ungatedInvocations(doc: Json, scripts: Record<string, string>): Set<string> {
   const out = new Set<string>()
   if (skippability(doc)) return out
   for (const job of Object.values((doc.jobs ?? {}) as Record<string, Json>)) {
     if (job.if !== undefined || job.needs !== undefined || job['continue-on-error'] !== undefined) continue
-    if ((job.defaults as Json | undefined)?.run !== undefined || job.strategy !== undefined) continue
+    if ((job.defaults as Json | undefined)?.run !== undefined || job.strategy !== undefined || hasNpmConfigEnv(job)) continue
     for (const step of (job.steps ?? []) as Json[]) {
       if (step.if !== undefined || step['continue-on-error'] !== undefined) continue
       if (typeof step.run !== 'string') continue
-      if (step.shell !== undefined || step['working-directory'] !== undefined) continue
+      if (step.shell !== undefined || step['working-directory'] !== undefined || hasNpmConfigEnv(step)) continue
       for (const n of directInvocations(step.run)) out.add(n)
     }
   }
@@ -241,6 +247,10 @@ test('detector: exit-before, custom shell, defaults.run and negated branch patte
   assert.equal(ungatedInvocations(wf({ defaults: { run: { shell: 'bash {0}' } } }), S).size, 0)
   assert.equal(ungatedInvocations(wf({}, { defaults: { run: { shell: 'sh' } } }), S).size, 0)
   assert.equal(ungatedInvocations(wf({}, { strategy: { matrix: {} } }), S).size, 0, 'a job with a strategy/matrix does not count')
+  assert.equal(ungatedInvocations(wf({ env: { npm_config_script_shell: '/bin/true' } }), S).size, 0, 'workflow npm_config_* env')
+  assert.equal(ungatedInvocations(wf({}, { env: { NPM_CONFIG_SCRIPT_SHELL: '/bin/true' } }), S).size, 0, 'job npm_config_* env')
+  assert.equal(ungatedInvocations(wf({}, {}, { env: { npm_config_script_shell: '/bin/true' } }), S).size, 0, 'step npm_config_* env')
+  assert.equal(ungatedInvocations(wf({}, { env: { MIGRATION_CONVENTION_BASE_REF: 'x' } }), S).size, 1, 'other env is fine')
   const neg = wf({ on: { pull_request: { branches: ['development', '!development'] } } })
   assert.match(String(skippability(neg)), /branches/)
   assert.equal(ungatedInvocations(neg, S).size, 0)
@@ -313,4 +323,14 @@ test('detector: two guards in one job are flagged, two in separate jobs are not'
   const twoSteps = wf()
   ;((twoSteps.jobs as Json).j as Json).steps = [{ run: 'npm run check:foo' }, { run: 'npm run check:bar' }]
   assert.equal(jobsHidingFailures(twoSteps).length, 1)
+})
+
+test('static-guards: the migration-conventions job passes an explicit base for BOTH event shapes (a push must not default to origin/development == HEAD)', () => {
+  const doc = yaml.load(readFileSync(join(WF_DIR, 'static-guards.yml'), 'utf8')) as Json
+  const job = (doc.jobs as Record<string, Json>)['migration-conventions']
+  assert.ok(job, 'static-guards.yml must have a migration-conventions job')
+  const expr = String(((job.env ?? {}) as Json).MIGRATION_CONVENTION_BASE_REF ?? '')
+  assert.match(expr, /github\.event\.before/, 'push events must compare the event before..after range')
+  assert.match(expr, /github\.base_ref/, 'pull requests must compare against their base branch')
+  assert.match(expr, /github\.event_name == 'pull_request'/, 'the expression must branch on the event name')
 })

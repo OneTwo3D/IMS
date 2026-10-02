@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
 
 import {
@@ -6,6 +9,8 @@ import {
   MIGRATION_PATTERNS,
   stripSqlCommentsAndLiterals,
 } from '@/scripts/check-migration-conventions.mjs'
+
+import { createTempDirSync } from './temp-dir.ts'
 
 function messages(sql: string): string[] {
   return analyzeMigrationSql(sql).violations.map((violation) => `${violation.pattern}: ${violation.message}`)
@@ -117,4 +122,70 @@ test('migration convention analyzer keeps violation messages useful', () => {
     messages('ALTER TABLE "products" ADD COLUMN "unsafe" TEXT NOT NULL;')[0] ?? '',
     /unsafe/,
   )
+})
+
+// ---- o3d-ok6hk: the BASE-RESOLUTION paths, run end to end against a throwaway git repo ---------------
+// On a push to development the job used to compare origin/development with a HEAD that already was
+// development: identical commits, zero files scanned, a vacuous pass. These run the real script as a
+// subprocess for both event shapes, and for the vacuous shape, so a regression cannot pass by examining nothing.
+const SCRIPT = join(process.cwd(), 'scripts/check-migration-conventions.mjs')
+
+function repoWithMigration(t: import('node:test').TestContext, sql: string) {
+  const dir = createTempDirSync('ims-migconv-', t)
+  const g = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: dir, encoding: 'utf8' }).trim()
+  g('init', '-q', '-b', 'development')
+  writeFileSync(join(dir, 'README'), 'x')
+  g('add', '.')
+  g('commit', '-q', '-m', 'base')
+  const base = g('rev-parse', 'HEAD')
+  mkdirSync(join(dir, 'prisma/migrations/20990101000000_x'), { recursive: true })
+  writeFileSync(join(dir, 'prisma/migrations/20990101000000_x/migration.sql'), sql)
+  g('add', '.')
+  g('commit', '-q', '-m', 'migration')
+  return { dir, base, head: g('rev-parse', 'HEAD'), g }
+}
+
+function run(dir: string, env: Record<string, string>) {
+  const r = spawnSync('node', [SCRIPT], { cwd: dir, encoding: 'utf8', env: { PATH: process.env.PATH ?? '', HOME: '/nonexistent', ...env } })
+  return { status: r.status, out: `${r.stdout}${r.stderr}` }
+}
+
+const RISKY = 'ALTER TABLE "products" DROP COLUMN "old";\n'
+
+test('migration conventions: PULL-REQUEST path (origin/<base> vs HEAD) rejects a risky migration', (t) => {
+  const { dir, base, g } = repoWithMigration(t, RISKY)
+  g('update-ref', 'refs/remotes/origin/development', base)
+  const r = run(dir, { CI: 'true', GITHUB_BASE_REF: 'development' })
+  assert.equal(r.status, 1, r.out)
+  assert.match(r.out, /DROP COLUMN/)
+})
+
+test('migration conventions: PUSH path (event.before as base) rejects a risky migration, and prints what it examined', (t) => {
+  const { dir, base, g } = repoWithMigration(t, RISKY)
+  g('update-ref', 'refs/remotes/origin/development', g('rev-parse', 'HEAD')) // the trap: origin/development == HEAD
+  const r = run(dir, { CI: 'true', MIGRATION_CONVENTION_BASE_REF: base })
+  assert.equal(r.status, 1, r.out)
+  assert.match(r.out, /DROP COLUMN/)
+  const clean = repoWithMigration(t, 'ALTER TABLE "products" ADD COLUMN "n" TEXT;\n')
+  const ok = run(clean.dir, { CI: 'true', MIGRATION_CONVENTION_BASE_REF: clean.base })
+  assert.equal(ok.status, 0, ok.out)
+  assert.match(ok.out, /\(1 migration file\(s\) examined/, 'the pass must say how many migration files it examined')
+})
+
+test('migration conventions: the VACUOUS shape (base == head) fails loudly in CI instead of passing', (t) => {
+  const { dir, head, g } = repoWithMigration(t, RISKY)
+  g('update-ref', 'refs/remotes/origin/development', head)
+  const r = run(dir, { CI: 'true' }) // exactly what the push job did before: default base origin/development
+  assert.equal(r.status, 1, r.out)
+  assert.match(r.out, /comparison range .* is empty/)
+})
+
+test('migration conventions: an all-zero before SHA falls back to the parent commit; an unresolvable base fails', (t) => {
+  const { dir } = repoWithMigration(t, RISKY)
+  const zero = run(dir, { CI: 'true', MIGRATION_CONVENTION_BASE_REF: '0'.repeat(40) })
+  assert.equal(zero.status, 1, zero.out)
+  assert.match(zero.out, /DROP COLUMN/)
+  const bad = run(dir, { CI: 'true', MIGRATION_CONVENTION_BASE_REF: 'deadbeef'.repeat(5) })
+  assert.equal(bad.status, 1, bad.out)
+  assert.match(bad.out, /Cannot resolve the comparison range|Unable to compute merge-base/)
 })

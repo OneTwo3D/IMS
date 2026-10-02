@@ -99,6 +99,11 @@ jobs:
   migration-conventions:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The script's own default base is origin/development, which on a PUSH to development is HEAD itself: an
+    # empty comparison that examined nothing (o3d-ok6hk). A pull request compares against its base branch; a
+    # push compares the event's before..after range. The script fails loudly on an empty or unresolvable range.
+    env:
+      MIGRATION_CONVENTION_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
