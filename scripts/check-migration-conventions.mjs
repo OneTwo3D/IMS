@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const MIN_RATIONALE_LENGTH = 24
@@ -293,11 +294,56 @@ function formatFailures(results) {
   ].join('\n')
 }
 
+/**
+ * o3d-ok6hk: a comparison that cannot say what it compared must not pass. On a push event the base is the
+ * event's `before` SHA (all zeros for a new branch or a force push, which has no usable base, so the parent
+ * of HEAD is used); an unresolvable base fails; and in CI a base that IS the head (origin/development vs a
+ * HEAD that already is development) is an empty comparison that scanned nothing, so it fails loudly.
+ */
+export function resolveBaseRef(baseRef, headRef, { ci = false } = {}) {
+  let base = baseRef
+  if (/^0{7,40}$/.test(base)) {
+    base = `${headRef}^`
+    console.warn(`Base ref is the all-zero SHA (new branch or force push); comparing against ${base}.`)
+  }
+  let baseCommit
+  let headCommit
+  try {
+    baseCommit = git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`])
+    headCommit = git(['rev-parse', '--verify', '--quiet', `${headRef}^{commit}`])
+  } catch {
+    baseCommit = ''
+  }
+  if (!baseCommit || !headCommit) {
+    fail(`Cannot resolve the comparison range ${base}..${headRef}; refusing to pass without comparing anything.`)
+  }
+  if (ci && baseCommit === headCommit) {
+    fail(`The comparison range ${base}..${headRef} is empty (both are ${baseCommit}); no migration would be examined. On a push event pass the event's before SHA via MIGRATION_CONVENTION_BASE_REF.`)
+  }
+  return base
+}
+
+/**
+ * On a `push` event the right base is the event's `before` SHA. Reading it here, when no explicit base was
+ * given, makes every caller correct by default: `npm run validate` (CI=true) calls this with no argument, and
+ * the default `origin/development` is HEAD itself on a push to development (o3d-ok6hk).
+ */
+export function baseFromGithubEvent(env = process.env) {
+  if (env.GITHUB_EVENT_NAME !== 'push' || !env.GITHUB_EVENT_PATH) return undefined
+  try {
+    const before = JSON.parse(readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))?.before
+    return typeof before === 'string' && before ? before : undefined
+  } catch {
+    return undefined
+  }
+}
+
 function main() {
   const baseRef =
     process.argv[2]
     ?? process.env.MIGRATION_CONVENTION_BASE_REF
     ?? process.env.SCHEMA_SCOPE_BASE_REF
+    ?? baseFromGithubEvent()
     ?? (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : 'origin/development')
   const headRef =
     process.argv[3]
@@ -306,8 +352,10 @@ function main() {
     ?? 'HEAD'
 
   warnIfBaseRefLooksStale(baseRef)
+  const resolvedBase = resolveBaseRef(baseRef, headRef, { ci: Boolean(process.env.CI) })
 
-  const migrationSqlFiles = changedFiles(baseRef, headRef)
+  const changed = changedFiles(resolvedBase, headRef)
+  const migrationSqlFiles = changed
     .filter((file) => /^prisma\/migrations\/[^/]+\/migration\.sql$/.test(file))
 
   const results = migrationSqlFiles.map((file) => analyzeMigrationSql(readFileAtRef(headRef, file), file))
@@ -320,7 +368,7 @@ function main() {
   for (const marker of results.flatMap((result) => result.acceptedMarkers)) {
     console.log(`Accepted migration convention marker in ${marker.file}: ${marker.pattern} because ${marker.rationale}`)
   }
-  console.log('Migration convention check passed.')
+  console.log(`Migration convention check passed (${migrationSqlFiles.length} migration file(s) examined, ${changed.length} changed file(s) in ${resolvedBase}..${headRef}).`)
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

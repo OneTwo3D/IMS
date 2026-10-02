@@ -1,0 +1,142 @@
+# o3d-ok6hk — THE STATIC `check:*` GUARDS, RUN UNCONDITIONALLY.
+#
+# A guard that never runs is the same defect as a guard that cannot fail. Before this workflow,
+# `check:documented-env-vars`, `check:wc-sync-row-predicates` and `check:fulfillment-requirement-seam`
+# were in NO workflow at all: they were reachable only through `npm run check:all`, which nothing
+# invokes (the two places that name it are comments). `check:wms-connector-boundary` ran only behind a
+# `paths:` filter, and `check:migration-conventions` only inside the Production Readiness `validate`
+# job, which is conditional on `classify_changes` and skips a diff whose every path is `*.md`,
+# `docs/*`, `.gitignore` or `CHANGELOG.md`. Markdown is exactly the subject of
+# `check:documented-env-vars`, so a docs-only diff was the one diff that could not reach it.
+#
+# This workflow follows archive-seal.yml (o3d-bddq) and server-action-auth-guard.yml (o3d-hic9): no
+# `paths:` filter, no `paths-ignore:`, no `needs:`, no job-level `if:`, no step-level `if:` and no
+# `continue-on-error`. tests/scripts/ci-guard-coverage.test.ts parses this file and fails if any of
+# those appears, or if any `check:*` script in package.json is run by no ungated workflow.
+#
+# The decimal-boundary, connector-fetch-boundary and wms-connector-boundary guards ALSO keep their own
+# path-filtered workflows. Those are not wrong for a code guard, but a hand-kept `paths:` list is a
+# second thing that can go stale (the same defect one level down), and each guard costs seconds. They
+# are repeated here so that coverage does not depend on a path list being right.
+#
+# ONE JOB PER GUARD, deliberately: GitHub skips the later steps of a job after the first failing step,
+# so seven steps in one job would let one red guard hide the other six. Separate jobs are independent;
+# tests/scripts/ci-guard-coverage.test.ts fails if an ungated job runs more than one check:* script.
+#
+# `fetch-depth: 0` is load-bearing for check:migration-conventions, which merge-bases against
+# origin/<base> and fails (does not pass) when it cannot. `npm ci` is needed because the
+# TypeScript-AST guards import `typescript`. No Prisma client, database or build is involved.
+name: Static Guards
+
+on:
+  pull_request:
+    branches:
+      - development
+  push:
+    branches:
+      - development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-guards-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  documented-env-vars:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:documented-env-vars
+  wc-sync-row-predicates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:wc-sync-row-predicates
+  fulfillment-requirement-seam:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:fulfillment-requirement-seam
+  wms-connector-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:wms-connector-boundary
+  migration-conventions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The script's own default base is origin/development, which on a PUSH to development is HEAD itself: an
+    # empty comparison that examined nothing (o3d-ok6hk). A pull request compares against its base branch; a
+    # push compares the event's before..after range. The script fails loudly on an empty or unresolvable range.
+    env:
+      MIGRATION_CONVENTION_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:migration-conventions
+  decimal-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:decimal-boundaries
+  connector-fetch-boundaries:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:connector-fetch-boundaries
