@@ -194,7 +194,7 @@ test('migration conventions: a PUSH event payload alone (no env base) supplies t
   const risky = repoWithMigration(t, RISKY)
   risky.g('update-ref', 'refs/remotes/origin/development', risky.head) // the trap: the default base is HEAD
   const payload = (dir: string, before: string) => {
-    const f = join(dir, '..', `event-${before.slice(0, 7)}.json`)
+    const f = join(dir, 'event.json')
     writeFileSync(f, JSON.stringify({ before }))
     return f
   }
