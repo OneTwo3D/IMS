@@ -30,7 +30,7 @@
  * database or a Xero tenant.
  */
 
-import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS, isOperatorAssertedSettlement } from './sync-row-settlement'
 
 /** The sync type that registers a locally-recorded sales receipt against the ledger invoice. */
 export const PAYMENT_REGISTRATION_TYPE = 'INVOICE_PAYMENT'
@@ -747,7 +747,15 @@ export function sameLedgerAmount(a: unknown, b: unknown): boolean {
  * as though IMS discovered the id by itself.
  */
 export function buildAssertedReversalData(externalId: string, note: string) {
-  return { status: 'CANCELLED' as const, externalTransactionId: trimmed(externalId), errorMessage: note }
+  return {
+    status: 'CANCELLED' as const,
+    externalTransactionId: trimmed(externalId),
+    errorMessage: note,
+    // o3d-f709 (D4): Xero was ASKED and answered DELETED, so this is a verified absence - and it
+    // OVERWRITES any basis the row carried (an operator's earlier assertion is superseded by the
+    // ledger's own answer).
+    settlementBasis: VERIFIED_REVERSAL_SETTLEMENT_BASIS,
+  }
 }
 
 export function assertedReversalNote(externalId: string, invoiceId: string, now: Date): string {
@@ -807,7 +815,12 @@ export function isReversedInLedger(status: string | null | undefined): boolean {
  * that the reversal was ever necessary.
  */
 export function buildVerifiedReversalData(note: string) {
-  return { status: 'CANCELLED' as const, errorMessage: note }
+  return {
+    status: 'CANCELLED' as const,
+    errorMessage: note,
+    // o3d-f709 (D4): the ledger answered DELETED. See buildAssertedReversalData.
+    settlementBasis: VERIFIED_REVERSAL_SETTLEMENT_BASIS,
+  }
 }
 
 export function ledgerReversalNote(externalIds: readonly string[], now: Date): string {

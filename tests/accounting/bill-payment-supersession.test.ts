@@ -561,6 +561,9 @@ test('a reversed bill retires only SYNCED rows that had already posted when the 
   })
   assert.equal((updates[0].data as { status: string }).status, 'CANCELLED')
   assert.equal((updates[0].data as { errorMessage: string }).errorMessage, BILL_PAYMENT_LEDGER_REVERSED_REASON)
+  // o3d-f709 (D4), writer 3 of 3: the poller read the ledger and the payment is gone, so the
+  // retirement records that basis; without it a CANCELLED row that KEEPS its id reads as posted.
+  assert.equal((updates[0].data as { settlementBasis: string }).settlementBasis, 'VERIFIED_REVERSAL')
   // o3d-sref: CANCELLED must never silently assert "nothing was sent" where that is false, so the
   // reason string is what carries the truth — this entry DID post.
   assert.match(BILL_PAYMENT_LEDGER_REVERSED_REASON, /The entry posted/)

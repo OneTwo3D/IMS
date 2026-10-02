@@ -11,6 +11,7 @@ import {
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
 import { MAY_HAVE_REACHED_LEDGER_WHERE, type LedgerStandingRow } from '@/lib/domain/accounting/cancelled-row-evidence'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { payloadAccountingInvoiceId, payloadPaymentId, payloadRegisteredAmount } from '@/lib/domain/accounting/invoice-payment-enqueue'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -746,7 +747,15 @@ export async function retireBillPaymentRegistrationsReversedInLedger(
   // second `syncedAt` predicate here would be the second answer this function just deleted.
   const retired = await client.accountingSyncLog.updateMany({
     where: { ...scope, id: { in: posted.map((row) => row.id) } },
-    data: { status: 'CANCELLED', errorMessage: BILL_PAYMENT_LEDGER_REVERSED_REASON },
+    // o3d-f709 (D4): `settlementBasis` records that THE LEDGER was read and no longer holds this
+    // payment - the one proof that lets a CANCELLED row that KEEPS its external id read as "not in
+    // the ledger" (ledger-standing.ts truth-table row 5). Without it the retirement would read as
+    // CONFIRMED_POSTED and Mark Paid would refuse for ever after a genuine reversal.
+    data: {
+      status: 'CANCELLED',
+      errorMessage: BILL_PAYMENT_LEDGER_REVERSED_REASON,
+      settlementBasis: VERIFIED_REVERSAL_SETTLEMENT_BASIS,
+    },
   })
   return { decided: true, retired: retired.count }
 }

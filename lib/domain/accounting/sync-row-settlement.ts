@@ -259,17 +259,56 @@ export const OPERATOR_ASSERTION_SETTLEMENT_BASIS = 'OPERATOR_ASSERTION'
  */
 export const OPERATOR_RELEASE_SETTLEMENT_BASIS = 'OPERATOR_RELEASE'
 
-export type SettlementBasis = 'CONNECTOR_CONFIRMED' | 'OPERATOR_ASSERTION' | 'OPERATOR_RELEASE'
+/**
+ * o3d-f709 (D4) - THE BASIS FOR A CANCELLATION IMS ITSELF VERIFIED AGAINST THE LEDGER.
+ *
+ * Written, in the same UPDATE as the CANCELLED status, by exactly the three paths that retire a
+ * registration AFTER ASKING the accounting system and being told the payment is gone:
+ *
+ *   `buildVerifiedReversalData`          - deletePayment "Reverse in ledger and delete": Xero was
+ *                                          asked and answered DELETED for the payment id.
+ *   `buildAssertedReversalData`          - the same, for an UNDECIDED row whose payment id the
+ *                                          operator supplied and Xero confirmed was on this invoice
+ *                                          and DELETED.
+ *   `retireBillPaymentRegistrationsReversedInLedger` - the payment poller, in the transaction that
+ *                                          clears paidAt, having just read the bill back from the
+ *                                          ledger and proved the reversal.
+ *
+ * It is the only way, besides the orphan sweep's `abandonedBeforeRemoteCall`, for a CANCELLED row to
+ * read as PROVEN not posted (ledger-standing.ts, truth-table row 5) - and unlike the sweep's flag it
+ * is valid whether or not the row names a document: a verified reversal is "the payment existed and
+ * was undone", which is precisely a CANCELLED row that keeps its id.
+ *
+ * It is NOT an operator claim: OPERATOR_ASSERTION means a person said so; this means the connector
+ * answered.
+ */
+export const VERIFIED_REVERSAL_SETTLEMENT_BASIS = 'VERIFIED_REVERSAL'
+
+export type SettlementBasis =
+  | 'CONNECTOR_CONFIRMED'
+  | 'OPERATOR_ASSERTION'
+  | 'OPERATOR_RELEASE'
+  | 'VERIFIED_REVERSAL'
+  /** A non-null value this build does not recognise. FAILS CLOSED: never read as a confirmation. */
+  | 'UNKNOWN'
 
 /**
  * The basis a row's recorded outcome rests on. Reads the column rather than the errorMessage text:
  * o3d-h2wx established that errorMessage carries no provenance — both connectors overwrite it with
  * the remote system's own words — so a settlement note is not something a reader may key on.
+ *
+ * o3d-f709 (D4): a non-null value that is not one of the three written bases USED TO READ AS
+ * CONNECTOR_CONFIRMED - the one answer that means "the connector told us". A typo, a value from a
+ * newer build or a hand-edited row would therefore have laundered itself into a confirmation. It now
+ * reads UNKNOWN, which no reader treats as a confirmation. NULL is the connector's own writeback and
+ * stays CONNECTOR_CONFIRMED.
  */
 export function settlementBasisOf(settlementBasis: string | null | undefined): SettlementBasis {
+  if (settlementBasis === null || settlementBasis === undefined) return 'CONNECTOR_CONFIRMED'
   if (settlementBasis === OPERATOR_ASSERTION_SETTLEMENT_BASIS) return 'OPERATOR_ASSERTION'
   if (settlementBasis === OPERATOR_RELEASE_SETTLEMENT_BASIS) return 'OPERATOR_RELEASE'
-  return 'CONNECTOR_CONFIRMED'
+  if (settlementBasis === VERIFIED_REVERSAL_SETTLEMENT_BASIS) return 'VERIFIED_REVERSAL'
+  return 'UNKNOWN'
 }
 
 export function isOperatorAssertedSettlement(settlementBasis: string | null | undefined): boolean {
@@ -279,6 +318,11 @@ export function isOperatorAssertedSettlement(settlementBasis: string | null | un
 /** Whether this row's STATUS was reached by an operator release rather than by the connector. */
 export function isOperatorReleasedSettlement(settlementBasis: string | null | undefined): boolean {
   return settlementBasisOf(settlementBasis) === 'OPERATOR_RELEASE'
+}
+
+/** Whether IMS verified this row's cancellation against the ledger (see VERIFIED_REVERSAL_SETTLEMENT_BASIS). */
+export function isVerifiedReversalSettlement(settlementBasis: string | null | undefined): boolean {
+  return settlementBasisOf(settlementBasis) === 'VERIFIED_REVERSAL'
 }
 
 export type SettlementOutcome = 'POSTED' | 'NOT_POSTED'

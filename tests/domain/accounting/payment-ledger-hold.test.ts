@@ -355,6 +355,9 @@ test('an asserted reversal DECIDES the row: it writes the reference on, and says
   assert.match(data.errorMessage, /an operator identified this failed attempt as payment PAY-9/)
   assert.match(data.errorMessage, /IMS confirmed .* it was on invoice INV-abc and was DELETED there/)
   assert.match(data.errorMessage, /2026-08-21T09:00:00\.000Z/)
+  // o3d-f709 (D4): Xero was asked and said DELETED, so the row records THE LEDGER'S answer as its
+  // basis - the proof ledger-standing.ts needs to read "CANCELLED + a kept id" as not-in-the-ledger.
+  assert.equal(data.settlementBasis, 'VERIFIED_REVERSAL', 'writer 2 of 3 (asserted-and-verified reversal)')
 })
 
 test('ledger identifiers compare without case, and never match on emptiness', () => {
@@ -413,6 +416,7 @@ test('a verified reversal cancels the row but NEVER clears the document id', () 
   // reversal was ever necessary.
   assert.ok(!('externalTransactionId' in data))
   assert.match(data.errorMessage, /IMS confirmed it \(PAY-9\) was DELETED there at 2026-08-20T09:00:00\.000Z/)
+  assert.equal(data.settlementBasis, 'VERIFIED_REVERSAL', 'writer 1 of 3 (verified reversal) records the ledger answered')
 })
 
 test('hasPostEvidence ignores whitespace-only ids', () => {
