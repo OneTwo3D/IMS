@@ -20,6 +20,7 @@ import test, { beforeEach, mock } from 'node:test'
 let xeroBodies: Record<string, unknown> = {}
 let xeroServed: string[] = []
 let puts: string[] = []
+let putBodies: Array<{ Allocations: Array<{ Amount: number; Invoice: { InvoiceID: string } }> }> = []
 let salesUpdates = 0
 let activity: Array<Record<string, unknown>> = []
 
@@ -31,7 +32,7 @@ mock.module('@/lib/connectors/xero/api', {
       return { ok: true, status: 200, data: xeroBodies[path] }
     },
     xeroPost: async () => ({ ok: false, status: 500, error: 'not expected' }),
-    xeroPut: async (path: string) => { puts.push(path); return { ok: true, status: 200, data: {} } },
+    xeroPut: async (path: string, body: never) => { puts.push(path); putBodies.push(body); return { ok: true, status: 200, data: {} } },
   },
 })
 mock.module('@/lib/connectors/xero/contacts', { namedExports: { findOrCreateContact: async () => 'contact-1' } })
@@ -61,6 +62,7 @@ beforeEach(() => {
   xeroBodies = {}
   xeroServed = []
   puts = []
+  putBodies = []
   salesUpdates = 0
   activity = []
 })
@@ -295,4 +297,76 @@ test('[o3d-h9pb HIGH r2] an unreadable Allocations collection is a failure, neve
   }
   assert.equal(cases, 10)
   console.log(`# o3d-h9pb HIGH r2 Allocations shapes: ${cases} unreadable cases`)
+})
+
+/* ------- o3d-h9pb (Codex round 4): success ONLY when the bill holds the whole requested amount ------- */
+
+const stateFor = (rc: number, ad: number, allocations: unknown[]) => {
+  xeroBodies = {
+    'CreditNotes/cn-1': { CreditNotes: [{ ...NOTE, RemainingCredit: rc, Allocations: allocations }] },
+    'Invoices/bill-1': { Invoices: [{ ...BILL, AmountDue: ad }] },
+  }
+  puts = []
+  putBodies = []
+}
+const OURS_ = (amount: number) => ({ Amount: amount, Invoice: { InvoiceID: 'bill-1' } })
+
+test('[o3d-h9pb HIGH r4] a PUT capped by the credit is a PARTIAL failure, not success (Codex: 25 / 10 / 25 with another bill)', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  stateFor(10, 25, [{ Amount: 40, Invoice: { InvoiceID: 'bill-OTHER' } }])
+  const result = await allocatePurchaseCreditNote(PARAMS)
+  assert.equal(putBodies.length, 1, 'PRECONDITION: the capped PUT really was sent')
+  assert.equal(putBodies[0]!.Allocations[0]!.Amount, 10, 'and it was the available credit, not the request')
+  assert.equal(result.success, false, JSON.stringify(result))
+  assert.deepEqual(result.partial, { allocatedNow: 10, totalAllocatedToThisBill: 10, requested: 25, shortfall: 15 })
+  assert.match(result.error ?? '', /PARTIAL allocation: 10\.00 was allocated/)
+  assert.match(result.error ?? '', /15\.00 is still outstanding/)
+  assert.match(result.error ?? '', /a retry sends only the remainder/)
+  console.log('# o3d-h9pb HIGH r4 capped PUT: partial reported as failure')
+})
+
+test('[o3d-h9pb HIGH r4] the retry after a capped PUT is idempotent: residual only, then a no-op once complete', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  // 1. first attempt: 10 of 25 goes in
+  stateFor(10, 25, [])
+  const first = await allocatePurchaseCreditNote(PARAMS)
+  assert.deepEqual([first.success, putBodies.map((b) => b.Allocations[0]!.Amount)], [false, [10]])
+  // 2. retry while the credit is still exhausted: nothing sent, still a failure naming the cause
+  stateFor(0, 15, [OURS_(10)])
+  const stuck = await allocatePurchaseCreditNote(PARAMS)
+  assert.equal(stuck.success, false)
+  assert.match(stuck.error ?? '', /no credit remaining/)
+  assert.match(stuck.error ?? '', /10\.00 of the 25\.00 requested/)
+  assert.deepEqual(puts, [], 'no PUT while exhausted')
+  // 3. credit added: ONLY the residual 15 is sent, and now it is success
+  stateFor(20, 15, [OURS_(10)])
+  const done = await allocatePurchaseCreditNote(PARAMS)
+  assert.deepEqual([done.success, putBodies.map((b) => b.Allocations[0]!.Amount)], [true, [15]])
+  // 4. a further retry is a no-op success
+  stateFor(5, 0, [OURS_(25)])
+  const again = await allocatePurchaseCreditNote(PARAMS)
+  assert.deepEqual([again.success, puts.length], [true, 0])
+  console.log('# o3d-h9pb HIGH r4 retry: 4 steps (partial, stuck, residual, no-op)')
+})
+
+test('[o3d-h9pb HIGH r4] exact fit succeeds; and NEVER more than min(remaining credit, amount due, requested - already allocated) is sent', async () => {
+  const { allocatePurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
+  stateFor(25, 25, [])
+  const fit = await allocatePurchaseCreditNote(PARAMS)
+  assert.deepEqual([fit.success, putBodies.map((b) => b.Allocations[0]!.Amount)], [true, [25]], 'exact fit')
+
+  let cells = 0
+  for (const rc of [0, 5, 10, 25, 40]) for (const ad of [0, 5, 10, 25, 40]) for (const a of [0, 10, 25, 30]) {
+    stateFor(rc, ad, a === 0 ? [] : [OURS_(a)])
+    const r = await allocatePurchaseCreditNote(PARAMS)
+    const sent = putBodies.reduce((t, b) => t + b.Allocations[0]!.Amount, 0)
+    const cap = Math.max(0, Math.min(rc, ad, 25 - a))
+    assert.ok(sent <= cap + 1e-9, `rc=${rc} ad=${ad} a=${a}: sent ${sent} exceeds the cap ${cap}`)
+    assert.equal(sent, cap, `rc=${rc} ad=${ad} a=${a}: sends exactly the cap`)
+    // THE PROPERTY: success iff the bill now holds the whole request
+    assert.equal(r.success, a + sent >= 25, `rc=${rc} ad=${ad} a=${a}: success iff allocated(${a + sent}) >= requested(25): ${JSON.stringify(r)}`)
+    cells += 1
+  }
+  assert.equal(cells, 100)
+  console.log(`# o3d-h9pb HIGH r4 grid: ${cells} (RC x AD x A) cells, success iff allocated >= requested, never over-sent`)
 })

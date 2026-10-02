@@ -484,7 +484,13 @@ type XeroInvoiceDueResponse = {
 export async function allocatePurchaseCreditNote(
   params: { creditNoteId: string; invoiceId: string; amount: number; date: string },
   opts?: { idempotencyKey?: string },
-): Promise<{ success: boolean; allocatedAmount?: number; error?: string }> {
+): Promise<{
+  success: boolean
+  allocatedAmount?: number
+  error?: string
+  /** Present when a PUT WAS made but did not cover the whole request. */
+  partial?: { allocatedNow: number; totalAllocatedToThisBill: number; requested: number; shortfall: number }
+}> {
   const cnRes = await xeroGet<XeroCreditNoteRemainingResponse>(`CreditNotes/${params.creditNoteId}`)
   if (!cnRes.ok) {
     return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
@@ -539,5 +545,26 @@ export async function allocatePurchaseCreditNote(
   if (!res.ok) {
     return { success: false, error: res.error ?? 'Failed to allocate credit note to bill' }
   }
-  return { success: true, allocatedAmount: allocateAmount }
+  // o3d-h9pb (Codex round 4): success means the bill now holds the WHOLE requested amount. A PUT capped by
+  // the credit (or the bill's amount due) leaves a shortfall that nothing would otherwise retry or record,
+  // so it is reported as a failure that says a PARTIAL allocation WAS made. The retry is safe: the
+  // residual is computed from the credit note's own Allocations, so it sends only the remainder.
+  const totalCents = allocatedCents + Math.round(allocateAmount * 100)
+  const requestedCents = Math.round(requested * 100)
+  if (totalCents >= requestedCents) return { success: true, allocatedAmount: allocateAmount }
+  const partial = {
+    allocatedNow: allocateAmount,
+    totalAllocatedToThisBill: totalCents / 100,
+    requested,
+    shortfall: (requestedCents - totalCents) / 100,
+  }
+  return {
+    success: false,
+    allocatedAmount: allocateAmount,
+    partial,
+    error: `PARTIAL allocation: ${allocateAmount.toFixed(2)} was allocated to this bill just now (${partial.totalAllocatedToThisBill.toFixed(2)} of the `
+      + `${requested.toFixed(2)} requested is now allocated; ${partial.shortfall.toFixed(2)} is still outstanding) because the credit note's remaining credit `
+      + `(${remainingCredit.toFixed(2)}) or the bill's amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
+      + 'then retry: a retry sends only the remainder.',
+  }
 }
