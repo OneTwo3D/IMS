@@ -1,8 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import {
-  OPERATOR_ASSERTION_SETTLEMENT_BASIS,
-  isOperatorAssertedSettlement,
-} from '@/lib/domain/accounting/sync-row-settlement'
+import { UNPROVEN_CANCELLED_WHERE, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 
 // ---------------------------------------------------------------------------
 // o3d-nepa — AN UNRESOLVED ABANDONED CLAIM, AND WHY AGE IS NOT EVIDENCE THAT IT IS FINISHED.
@@ -45,41 +42,24 @@ import {
 // Xero's Idempotency-Key expires six minutes after the original call, so nothing remote catches the
 // second post either. The local row is the whole of the control.
 //
-// TWO ABANDONMENTS ARE RESOLVED, and they are the reason this predicate is not simply "never delete
-// a CANCELLED row".
+// ONE ABANDONMENT IS RESOLVED, and it is the reason this predicate is not simply "never delete a
+// CANCELLED row".
 //
-//   THE SYSTEM'S OWN PROOF. `cancelOrphanedRowsUnderLock` matches `status = PENDING` only — a
-//   PENDING row is provably PRE-CALL — and writes `abandonedBeforeRemoteCall: true` in the SAME
+//   THE SYSTEM'S OWN PROOF. `cancelOrphanedRowsUnderLock` matches `status = PENDING` only - a
+//   PENDING row is provably PRE-CALL - and writes `abandonedBeforeRemoteCall: true` in the SAME
 //   UPDATE as the status. Nothing was sent, no ledger holds its document, and no reader of it can be
 //   misled.
 //
-//   AN OPERATOR'S ASSERTION (round 4, Codex MEDIUM). `settleAccountingSyncRow` with outcome
-//   NOT_POSTED terminalises the row CANCELLED and stamps `settlementBasis = OPERATOR_ASSERTION` —
-//   a human opened the ledger, looked, and put their name on "nothing posted", with the assertion
-//   itself recorded as an ActivityLog row that this table's retention does not touch. That is a
-//   STRONGER resolution than the flag, not a weaker one: the flag is inferred from a status, the
-//   assertion is a person who checked.
-//
-//   KEYING SOLELY ON THE FLAG WAS THE DEFECT. Only ONE writer ever sets it, so every other cancelled
-//   row was retained for ever as a compacted tombstone — the operator-settled ones INCLUDED, even
-//   though `isOperatorAssertedSettlement` already recognises them and the daily-batch verdict already
-//   imports this module's rule. And cancellation (`cancelPendingSalesInvoiceSyncForOrder`) and the
-//   post-time retirement of a claimed row both write CANCELLED *unflagged*, so the practical effect
-//   was that EVERY cancelled sales order left an undeletable row behind. The file argued
-//   boundedness for the ERROR-level activity-log exemption and never for this one; this is that
-//   argument, made by bounding the set instead.
+//   AN OPERATOR'S NOT_POSTED ASSERTION IS NOT ONE (C1, o3d-f709 - this reverses round 4 of
+//   o3d-nepa). `settleAccountingSyncRow` with outcome NOT_POSTED terminalises the row CANCELLED and
+//   stamps `settlementBasis = OPERATOR_ASSERTION`: a person said "nothing posted" about a ledger IMS
+//   never looked at. That is a statement worth RECORDING and worth reporting, and it is not proof -
+//   a lost response, a late webhook and a hand-post all leave the same row. Treating it as proof
+//   made every such row deletable by age and let every reader that asks "could this have reached
+//   the ledger?" answer no. The row is now retained like any other unresolved abandonment, and the
+//   assertion stays visible on it as `settlementBasis`.
 //
 // Everything else is unresolved.
-//
-// WHY THIS CANNOT LOOSEN THE DAILY-BATCH RECREATE VERDICT, the one reader here that moves money.
-// The arm below fires only on a CANCELLED row carrying an operator assertion AND NO document id,
-// and the only settlement producing that shape is a NOT_POSTED one. `settleableSettlementOutcomes`
-// admits POSTED and nothing else for DAILY_BATCH_*, so no batch row can reach it — and a POSTED
-// settlement writes the document id the operator supplied, which the external-id clause vetoes in
-// any case. Stated as that NARROWING rather than as a blanket "batch rows are never settleable",
-// which is no longer true: the type dimension is a per-outcome answer. The invariant is load-bearing
-// rather than incidental, so it is asserted in tests/accounting/unresolved-abandoned-claim.test.ts
-// rather than left to be noticed.
 //
 // A row that NAMES A DOCUMENT outranks the flag whichever way the flag points: an
 // externalTransactionId exists only because a remote call returned, so it is the ledger's own
@@ -107,73 +87,34 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * Is this cancelled row's abandonment RESOLVED — i.e. does something on it establish that no remote
- * call is unaccounted for?
+ * Is this cancelled row's abandonment RESOLVED - i.e. does something on it PROVE that no remote call
+ * is unaccounted for?
  *
- * The TS half of the same rule `UNRESOLVED_ABANDONED_CLAIM_WHERE` states as a query. Both are
- * exported from here so that retention and the readers cannot drift on what "resolved" means —
- * o3d-550x's rule, applied to this record: name it once, inside the retention delete predicate, via
- * a shared constant.
- *
- * TWO WAYS TO BE RESOLVED, and an external id that vetoes both:
- *
- *   `abandonedBeforeRemoteCall === true` — only `cancelOrphanedRowsUnderLock` ever writes it, and
- *   only over a PENDING (pre-call) row. `null` is not "a call was made", it is "not on record",
- *   which every reader treats as unproved.
- *
- *   `settlementBasis === OPERATOR_ASSERTION` — a human settled the row NOT_POSTED, having looked in
- *   the ledger. Round 4: keying on the flag ALONE made every other cancelled row an immortal
- *   tombstone, this one included.
- *
- * An externalTransactionId outranks both whichever way they point: the id exists only because a
- * remote call returned, so it is the ledger's own receipt and no later abandonment — flagged,
- * asserted or otherwise — undoes it. (`buildCancelledSaleSettlementData` writes exactly that shape:
- * CANCELLED, an operator assertion, AND a document id. It is retained, by this clause.)
+ * THE RULE LIVES IN lib/domain/accounting/ledger-standing.ts (truth-table rows 5 and 8) and is
+ * delegated to, not restated: a CANCELLED row is resolved exactly when its standing is
+ * PROVEN_NOT_POSTED - the orphan sweep's pre-call flag with no document id, or a VERIFIED_REVERSAL
+ * (the ledger was asked). An operator's NOT_POSTED assertion is NOT a resolution (C1, o3d-f709),
+ * and a document id outranks the pre-call flag whichever way it points: the id exists only because a
+ * remote call returned.
  */
 export function cancelledClaimIsResolved(row: {
   abandonedBeforeRemoteCall: boolean | null
   externalTransactionId: string | null
   settlementBasis: string | null
 }): boolean {
-  if (row.externalTransactionId) return false
-  return row.abandonedBeforeRemoteCall === true || isOperatorAssertedSettlement(row.settlementBasis)
+  return ledgerStanding({ status: 'CANCELLED', ...row }) === 'PROVEN_NOT_POSTED'
 }
 
 /**
- * THE RECORD RETENTION MUST NOT DELETE: a CANCELLED row whose abandonment resolves nothing.
+ * THE RECORD RETENTION MUST NOT DELETE: a CANCELLED row whose abandonment resolves nothing -
+ * `UNPROVEN_CANCELLED_WHERE` in ledger-standing.ts, re-exported under retention's historical name.
  *
- * EVERY ARM IS A POSITIVE ALTERNATIVE, never a bare `{ not: <value> }` on a nullable column. This
- * predicate is consumed under a `NOT` (retention's delete) and NOT under one (retention's
- * compaction), and a sub-expression that can evaluate to SQL NULL means those two uses do not
- * partition the population — a `NULL` row would be excluded from BOTH, i.e. neither retained nor
- * compacted, and nothing would say so. So each nullable column is tested as an explicit `IS NULL`
- * arm ORed with the negation, which makes every disjunction total and the negation exact.
- * `settlementBasis` is a free-text column and cannot be enumerated positively, so it gets that same
- * `{ settlementBasis: null } OR NOT { settlementBasis: OPERATOR_ASSERTION }` pair rather than a lone
- * `not`.
+ * EVERY ARM IS A POSITIVE ALTERNATIVE and null-total (see that module): this predicate is consumed
+ * under a `NOT` (retention's delete) and NOT under one (retention's compaction), and a sub-expression
+ * that can evaluate to SQL NULL means those two uses do not partition the population.
  *
  * Deliberately NOT keyed on `processingStartedAt` or on `attemptRevision > 0`, though "abandoned
  * claim" names a claimed row: every canceller NULLS `processingStartedAt` as it retires the row, so
- * the evidence that it was ever claimed is destroyed by the very write that abandons it. Keying on
- * it would exempt exactly nothing. Settlement NULLs it too, for the same reason.
+ * the evidence that it was ever claimed is destroyed by the very write that abandons it.
  */
-export const UNRESOLVED_ABANDONED_CLAIM_WHERE: Prisma.AccountingSyncLogWhereInput = {
-  status: 'CANCELLED',
-  OR: [
-    // The row names a document the ledger returned, which outranks every resolution below.
-    { externalTransactionId: { not: null } },
-    // ...or NOTHING resolved it: neither the orphan sweep's pre-call proof, nor an operator's
-    // NOT_POSTED assertion. Both have to be absent, which is why this is an AND inside the OR.
-    {
-      AND: [
-        { OR: [{ abandonedBeforeRemoteCall: null }, { abandonedBeforeRemoteCall: false }] },
-        {
-          OR: [
-            { settlementBasis: null },
-            { NOT: { settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS } },
-          ],
-        },
-      ],
-    },
-  ],
-}
+export const UNRESOLVED_ABANDONED_CLAIM_WHERE: Prisma.AccountingSyncLogWhereInput = UNPROVEN_CANCELLED_WHERE

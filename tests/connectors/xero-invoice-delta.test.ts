@@ -23,6 +23,7 @@ import {
   type InvoiceFetcher,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 /**
  * o3d-remove-parked-connectors — THE ROUTE THE TWO r16 CASES USED IS ARCHIVED.
  *
@@ -969,7 +970,12 @@ const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
 const postedRegistration = (
   overrides: Partial<Parameters<typeof classifyRegisteredPayment>[1][number]> = {},
 ): Parameters<typeof classifyRegisteredPayment>[1][number] => {
-  const row = { id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides }
+  // o3d-f709: both markers default to null — the shape almost every real cancelled row has, and the
+  // one `mayHaveReachedLedger` refuses to read as "nothing was sent".
+  const row = {
+    id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ,
+    abandonedBeforeRemoteCall: null, settlementBasis: null, ...overrides,
+  }
   // Written by ONE statement of the current build, so the completion time and its provenance marker
   // are the same instant (o3d-clxw round 5). A case that wants an old build's row overrides the
   // marker explicitly — see the mixed-version tests below.
@@ -1034,14 +1040,67 @@ test('a registration this read cannot speak for withholds the whole verdict', ()
     { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_2'] })
 })
 
-test('CANCELLED holds no payment and blocks nothing', () => {
+test('o3d-f709: a CANCELLED registration that resolves nothing is UNDECIDED, not absent', () => {
+  // THE OLD TEST HERE WAS CALLED "CANCELLED holds no payment and blocks nothing" and asserted
+  // NOTHING_REGISTERED for exactly this row. NOTHING_REGISTERED is an ADMITTED reversal: it clears
+  // `PurchaseInvoice.paidAt` and re-arms Mark Paid. `cancelPendingSalesInvoiceSyncForOrder` and the
+  // post-time retirement of a CLAIMED row both write CANCELLED without knowing whether the call
+  // landed, and the processors post before they persist — so the row is evidence of an attempt with
+  // an unknown outcome, which is what UNDECIDED means.
   const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
   assert.deepEqual(
-    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' }), postedRegistration()], READ_AT),
-    { verdict: 'GONE', paymentIds: ['PAY-1'] })
-  assert.deepEqual(
     classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' })], READ_AT),
-    { verdict: 'NOTHING_REGISTERED' })
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
+  // ...and it withholds ALONGSIDE a posted sibling too: one undecided registration beats a proved
+  // absence, because the document is one document.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' }), postedRegistration()], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
+})
+
+test('o3d-f709: a CANCELLED registration that PROVES its abandonment was pre-call still holds nothing', () => {
+  // The other side of the rule, and the reason this is not simply "never skip a cancelled row". The
+  // sweep's pre-call proof must still drop out, or every order the orphan sweep has ever tidied
+  // becomes permanently undecided.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const resolved = { abandonedBeforeRemoteCall: true, settlementBasis: null }
+  const row = postedRegistration({ id: 'log_x', status: 'CANCELLED', externalTransactionId: null, ...resolved })
+  assert.deepEqual([row.status, row.abandonedBeforeRemoteCall, row.externalTransactionId], ['CANCELLED', true, null])
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row, postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] },
+    `a resolved cancelled row must not withhold: ${JSON.stringify(resolved)}`)
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row], READ_AT),
+    { verdict: 'NOTHING_REGISTERED' },
+    `and alone it is still "nothing was registered": ${JSON.stringify(resolved)}`)
+})
+
+test('o3d-f709 C1 (FLIPPED): an operator-ASSERTED NOT_POSTED registration WITHHOLDS the verdict - it is not proof', () => {
+  // This used to sit in the list above and drop out as "resolved": a person typed NOT_POSTED, the
+  // verdict collapsed to NOTHING_REGISTERED, and the poller cleared paidAt. IMS never looked at the
+  // ledger, so the row may stand in front of a real payment; Mark Paid must not be re-armed on it.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const row = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: null,
+    abandonedBeforeRemoteCall: null, settlementBasis: 'OPERATOR_ASSERTION',
+  })
+  assert.deepEqual([row.status, row.settlementBasis, row.externalTransactionId], ['CANCELLED', 'OPERATOR_ASSERTION', null])
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
+})
+
+test('o3d-f709: a DOCUMENT ID on a cancelled row outranks either proof', () => {
+  // `buildCancelledSaleSettlementData` writes CANCELLED + an operator assertion + a document id.
+  // The id exists only because a remote call returned, so the assertion does not undo it.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({
+      id: 'log_x', status: 'CANCELLED', externalTransactionId: 'PAY-TYPED-IN',
+      abandonedBeforeRemoteCall: true, settlementBasis: 'OPERATOR_ASSERTION',
+    })], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
 })
 
 test('a payload that does not list its payments cannot prove ours is absent', () => {
@@ -1150,12 +1209,27 @@ test('a registration that synced at the very instant of the read is undecided, m
 // The witness is the receipt itself, already written in the right transaction. These are the reader.
 // ---------------------------------------------------------------------------
 
+/**
+ * o3d-f709 r3 — A REGISTRATION AS THE READER NOW REQUIRES IT: the status plus the three columns the
+ * shared cancellation rule reads. Defaulted to "nothing recorded" so a case that turns on ONE of
+ * them says so, and never spread over a value a case supplied.
+ */
+const reg = (
+  row: { status: string; paymentId: string | null } & Partial<LedgerStandingRow>,
+): LedgerStandingRow & { paymentId: string | null } => ({
+  externalTransactionId: row.externalTransactionId ?? null,
+  abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+  settlementBasis: row.settlementBasis ?? null,
+  status: row.status,
+  paymentId: row.paymentId,
+})
+
 test('[o3d-psrx] a receipt no registration names is unregistered', () => {
   // MUTATION ROUTE: return `[]` unconditionally and every test below passes vacuously — so each one
   // also asserts the paired case, where the receipt IS named and must NOT be reported.
   assert.deepEqual(unregisteredLocalReceipts(['pay_1'], []), ['pay_1'],
     'no registration at all: the window this issue is about')
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'PENDING', paymentId: 'pay_1' }]), [],
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'PENDING', paymentId: 'pay_1' })]), [],
     'a PENDING registration DOES name it — the ordinary path a moment later')
 })
 
@@ -1164,17 +1238,90 @@ test('[o3d-psrx] a registration for a DIFFERENT receipt leaves this one unregist
   // receipt. A second receipt added to an already-registered order then reads as covered, and the
   // window reopens for it alone — the hardest case to notice, because the order does have a row.
   assert.deepEqual(
-    unregisteredLocalReceipts(['pay_1', 'pay_2'], [{ status: 'SYNCED', paymentId: 'pay_1' }]),
+    unregisteredLocalReceipts(['pay_1', 'pay_2'], [reg({ status: 'SYNCED', paymentId: 'pay_1' })]),
     ['pay_2'],
   )
 })
 
-test('[o3d-psrx] a CANCELLED registration has told the ledger nothing', () => {
-  // CANCELLED asserts that nothing was sent (see classifyRegisteredPayment), so it leaves the
-  // receipt exactly as unregistered as it was before the row existed.
+test('[o3d-psrx] a RESOLVED cancellation has told the ledger nothing', () => {
+  // A cancellation that resolves something — here an operator's audited NOT_POSTED assertion, which
+  // names no document — really does leave the receipt as unregistered as it was before the row
+  // existed, and the reversal pass must still see it.
   //
-  // MUTATION ROUTE: drop the CANCELLED filter and this fails.
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'CANCELLED', paymentId: 'pay_1' }]), ['pay_1'])
+  // MUTATION ROUTE: return `mayHaveReachedLedger`'s answer inverted, or hard-code `true`, and this
+  // fails: the receipt reads as told-about and the window this issue is about reopens.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+    })]),
+    ['pay_1'],
+  )
+})
+
+test('[o3d-f709 M2, C1] an operator-asserted NOT_POSTED registration has NOT told the ledger nothing - the receipt counts as spoken for', () => {
+  // THE FLIP of the M2 reading for the one row a person vouched for: `unregisteredLocalReceipts` is what
+  // decides whether the reversal pass clears paidAt and raises a chargeback credit note, so a receipt
+  // whose only registration may have posted must NOT be reported unregistered.
+  const asserted = reg({ status: 'CANCELLED', paymentId: 'pay_1', settlementBasis: 'OPERATOR_ASSERTION' })
+  console.log(`# precondition M2: ${JSON.stringify(asserted)} => ${JSON.stringify(unregisteredLocalReceipts(['pay_1'], [asserted]))}`)
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [asserted]), [])
+  // ISOLATING ARM: the sweep-proved twin leaves the receipt unregistered, so the answer is the assertion's.
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'CANCELLED', paymentId: 'pay_1', abandonedBeforeRemoteCall: true })]), ['pay_1'])
+})
+
+test('[o3d-f709 M2/M1, D4] a VERIFIED_REVERSAL registration that keeps its payment id has told the ledger nothing NOW', () => {
+  // The ledger was asked and said the payment is gone. The row keeps its id on purpose (an account of a
+  // payment that existed and was undone), and the basis is what lets it read as an absence.
+  const reversed = reg({ status: 'CANCELLED', paymentId: 'pay_1', externalTransactionId: 'PAY-9', settlementBasis: 'VERIFIED_REVERSAL' })
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reversed]), ['pay_1'])
+  // ... and the classifier drops it out of the registration set instead of withholding on it (M1):
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const row = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: 'PAY-9',
+    abandonedBeforeRemoteCall: null, settlementBasis: 'VERIFIED_REVERSAL',
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [row], READ_AT), { verdict: 'NOTHING_REGISTERED' })
+  // ISOLATING ARM: the same row without the basis is a payment that may stand: withheld.
+  const bare = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: 'PAY-9',
+    abandonedBeforeRemoteCall: null, settlementBasis: null,
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [bare], READ_AT), { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
+})
+
+test('[o3d-f709 r3] a CANCELLED registration that still names a payment has NOT told nothing', () => {
+  // THE SIXTEENTH READER (Codex MEDIUM 1). This helper read `status !== 'CANCELLED'` and called
+  // every retired row "never sent". The cross-connector orphan sweep retires a PENDING row —
+  // stamping `abandonedBeforeRemoteCall: true` from that status alone — and a POSTED row is put back
+  // to PENDING whenever follow-up work fails, KEEPING the payment id the ledger issued. So this row
+  // describes a payment that is probably standing in Xero, and reading it as "never told" is what
+  // clears `paidAt` and raises a chargeback credit note against revenue nobody reversed.
+  //
+  // The document id vetoes the sweep's claim (`cancelledClaimIsResolved`), so the receipt counts as
+  // spoken for and no reversal is raised on the strength of it.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: 'PAY-XERO-1',
+    })]),
+    [],
+    'a swept row that still names the ledger payment is not evidence that nothing was sent',
+  )
+  // AND THE PAIRED CASE, so this cannot pass by reporting nothing: the same row with the id cleared
+  // is a resolved cancellation and the receipt IS reported.
+  assert.deepEqual(
+    unregisteredLocalReceipts(['pay_1'], [reg({
+      status: 'CANCELLED',
+      paymentId: 'pay_1',
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: null,
+    })]),
+    ['pay_1'],
+  )
 })
 
 test('[o3d-psrx] a registration that names no receipt clears none', () => {
@@ -1182,7 +1329,7 @@ test('[o3d-psrx] a registration that names no receipt clears none', () => {
   // for an imported order. Naming nothing, it clears nothing — the conservative direction.
   //
   // MUTATION ROUTE: treat a null paymentId as a wildcard and this fails.
-  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [{ status: 'SYNCED', paymentId: null }]), ['pay_1'])
+  assert.deepEqual(unregisteredLocalReceipts(['pay_1'], [reg({ status: 'SYNCED', paymentId: null })]), ['pay_1'])
 })
 
 test('[o3d-psrx] an order with an unregistered receipt is RECEIPT_NOT_REGISTERED, not NOTHING_REGISTERED', () => {

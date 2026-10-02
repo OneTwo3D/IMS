@@ -41,6 +41,7 @@ import {
 } from '@/lib/domain/accounting/back-reference'
 import { followUpObligationRecoveryFor } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { ledgerSalesInvoiceTotalForeign, type PaymentSyncRow } from '@/lib/domain/accounting/settlement-status'
+import type { LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
 import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -61,8 +62,16 @@ const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
  * told about this order's receipts. Scoped to the ACTIVE connector: rows left by a connector that is no
  * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
  * would report a discrepancy against a system that has been switched off.
+ *
+ * o3d-kof8 — AND THE WHOLE {@link LedgerStandingRow}, REQUIRED, WHICH `PaymentSyncRow` LEAVES
+ * OPTIONAL. That type serves the settlement BADGE, where a missing column costs a wrong label; this
+ * one serves `decideInvoicePaymentRegistration`, where it costs a second payment on a customer
+ * invoice. An optional column reads as absent, absent reads as "nothing resolved this cancellation"
+ * in one direction and as the permissive answer in the other, and neither is a verdict a loader
+ * should be able to produce by forgetting a line of a `select`. Requiring them here means the
+ * `select` below cannot lose a column without failing `tsc`.
  */
-export type InvoicePaymentSyncRow = PaymentSyncRow & {
+export type InvoicePaymentSyncRow = PaymentSyncRow & LedgerStandingRow & {
   /**
    * o3d-6abj — WHAT THIS ROW REGISTERED, EXACTLY, IN THE CURRENCY THE CALLER NAMED.
    *
@@ -122,6 +131,12 @@ export async function loadInvoicePaymentSyncRows(
       // PaymentSyncRow, so dropping it in this move would have been a silent regression rather than
       // a type error.
       settlementBasis: true,
+      // o3d-f709: the orphan sweep's pre-call claim, so the settlement badge and the delete refusal
+      // read the SAME classifier on the SAME columns. Without it a row the delete refuses to touch
+      // — a posted payment the sweep retired without clearing its id — was displayed as a plainly
+      // unpaid order with no discrepancy, which is the exact drift o3d-nf9i r3 closed for
+      // `settlementBasis`.
+      abandonedBeforeRemoteCall: true,
       // o3d-r948 r6: `connectionProvenance` and `backReferenceEvidenceCompactedAt` were selected
       // here for r5's exclusion scoping and are not any more — nothing excludes a settlement record
       // on any identity now, so no consumer of these rows needs to know which organisation each was
@@ -143,6 +158,7 @@ export async function loadInvoicePaymentSyncRows(
       // decides whether more money may move. See `InvoicePaymentSyncRow.registeredAmount`.
       registeredAmount: readPayloadRegisteredAmount(r.payload, documentCurrency),
       settlementBasis: r.settlementBasis,
+      abandonedBeforeRemoteCall: r.abandonedBeforeRemoteCall,
       paymentId: payloadPaymentId(r.payload),
       // o3d-hbgo: WHICH ledger invoice this settled. A row against a document the order no longer has
       // (deleted and re-posted) must not be read as bearing on the replacement's settlement.

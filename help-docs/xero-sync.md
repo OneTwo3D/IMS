@@ -1448,7 +1448,7 @@ If any of those does not hold, the receipt is still recorded in the IMS, nothing
 
 **A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
-Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
+Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS never read, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
 
 ### Supplier bills: marking one paid again
 
@@ -1467,10 +1467,12 @@ The payment poller clears **Paid** on a bill whose payment Xero has demonstrably
 |---|---|---|
 | The registration is **being sent now** (claimed by the sync worker) | The request may already be on its way and nothing here can recall it | Wait for that entry to finish — it will end up synced or failed; a dead claim is released after 15 minutes — then check the bill in Xero |
 | The registration is **synced** and no poll has retired it | It posted, and no Xero read has since disproved it | Open the bill in Xero. If the payment is there, the bill is settled. If it is genuinely gone, cancel that sync entry and mark the bill paid again |
-| The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, cancel that sync entry and mark the bill paid again |
+| The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
+| The registration was **settled as "did not post"** by an operator | An operator's "not posted" is a person's word about a ledger the IMS never read — a lost response or a payment made by hand leaves the same row — so it does **not** clear the refusal | Open the bill in Xero. If the payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
+| The registration was **settled as "did post"** by an operator (a payment id typed in) | The IMS never saw that payment, and paying again could pay the supplier twice | Open the bill in Xero and confirm the payment. If it is not there, the record was wrong — pay the bill in Xero directly |
 | The registration **changed status** while the bill was being marked paid | A worker picked it up mid-operation, so its outcome is open | Check that entry, then try again |
 
-A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable.
+A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable. So does a registration the IMS itself retired before it was ever sent (superseded by **Mark as paid**, or cancelled by the sweep while still queued) and one whose payment the poller verified as reversed in Xero.
 
 **When the poller cannot decide, it leaves the bill marked Paid.** The same is true one step further in, on a voided invoice: if a payment registration finished *after* the Xero read the reversal was computed from, that read cannot say whether the payment it created is gone. Clearing **Paid** then would re-arm the button over money that may have moved, so the poll withholds the whole verdict, logs a warning naming the undecidable entries, and counts it on the poll result. The IMS resolves this by itself on the next Xero read that covers those registrations. If it never does, the daily reconcile keeps reporting the bill as a *suspect advance* — settle it in Xero, or cancel the named sync entry by hand.
 
@@ -1987,9 +1989,13 @@ them — now carry a **Settle** control (the gavel icon) beside Retry, both in t
 stranded-rows banner. It records what *you* found in Xero:
 
 - **It DID post** — you supply the Xero document id. The row becomes **Synced** and records that id.
-- **It did NOT post** — the row becomes **Cancelled** and no id is written, which is what lets the
-  order be deleted again and what releases a blocked follow-up (a part-payment, say, where one of two
-  genuine payments failed).
+- **It did NOT post** — the row becomes **Cancelled** and no id is written, which lets the order be
+  deleted again. **It does NOT free the posting to be sent again.** Your statement is your word about
+  a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
+  same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
+  clear a held "paid" flag, it will refuse to delete the receipt it registered, and it keeps the row
+  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **record it in
+  Xero by hand and mark the posting handled** in the refusal inbox.
 
 Read what this is, because it is not a repair. IMS cannot check either statement; the control records
 **your assertion**, logged against your account with the time, and it appears in the Activity log as a
@@ -2014,15 +2020,16 @@ posting, and a settlement that reported success over a contradiction would leave
 disagreeing with nobody told. Check both ids in Xero: if the one already recorded is the real one
 there is nothing to settle, and if it is not, reverse it in Xero before recording the other.
 
-**Settling "it did not post" retires that attempt, not the document — and re-queueing brings the
-mirrored event back.** A "did not post" settlement marks the shared accounting event **Void**, which
-is what stops a finished row leaving work that reconciliation reads as still owed. It is not a
-statement that the document is no longer wanted: settling a row this way is exactly what lets the
-same posting be queued again. When it is, the new attempt takes that Void event back to **Pending**,
-so the ledger view shows the work that is now in flight rather than an abandonment that is no longer
-true. The revival is recorded against the event in its own history.
+**Settling "it did not post" retires that attempt, not the document.** A "did not post" settlement
+marks the shared accounting event **Void**, which is what stops a finished row leaving work that
+reconciliation reads as still owed. It is not a statement that the document is no longer wanted. Since
+IMS no longer treats your statement as proof, the posting is **not** queued again on the strength of it
+(see above): the enqueue is refused and the posting stays owed until you record it in Xero by hand and
+mark it handled. A replacement that arrives some other way — after a row IMS itself retired — takes a
+Void event of this kind back to **Pending**, and the revival is recorded against the event in its own
+history.
 
-Two things are deliberately **not** brought back. An event that already names a Xero document is
+Two things are deliberately **not** brought back by a replacement. An event that already names a Xero document is
 never revived, whatever its status says — a document that exists is not queued work. And an event
 voided because **the order was cancelled** stays voided: that retires the document itself, and a
 later enqueue does not overrule the cancellation. If you see a cancelled order's invoice event still

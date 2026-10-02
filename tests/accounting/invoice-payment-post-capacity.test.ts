@@ -34,7 +34,7 @@ const ENTRY = 'entry-under-test'
  * complete — or unreadable — reports, i.e. the ordinary case, and the only case that is safe to
  * assume when nothing is known. A test that wants the provably-never-sent row has to say so.
  */
-type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted' | 'paymentId'
+type RegDefaults = 'bodyCouldHavePosted' | 'settlementBasis' | 'provenNeverAttempted' | 'paymentId' | 'externalTransactionId' | 'abandonedBeforeRemoteCall'
 
 /**
  * o3d-6abj: the row's amount is a `Decimal` now (`registeredAmount`), and these fixtures state it as
@@ -57,11 +57,15 @@ function reg(
   // o3d-ekn8 r4: `paymentId: null` is the un-attributed row — the shape of everything queued before
   // the payload recorded which receipt it was for. It is the ordinary case and the one that has to
   // read as "possibly this one", so a test about a SPECIFIC receipt has to name it.
+  // o3d-f709 / M16: `externalTransactionId` and `abandonedBeforeRemoteCall` default to null, an
+  // untouched row; a test that means a document id or the sweep's flag has to say so.
   return {
     bodyCouldHavePosted: true,
     settlementBasis: null,
     provenNeverAttempted: false,
     paymentId: null,
+    externalTransactionId: null,
+    abandonedBeforeRemoteCall: null,
     ...rest,
     registeredAmount: amount == null ? null : toDecimal(amount),
   }
@@ -336,10 +340,12 @@ test('[o3d-ekn8 r4] an UN-ATTRIBUTED registration against a retired document ref
   assert.equal(verdict.post === false && verdict.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
-test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is the operator saying they read the ledger', () => {
-  // The only thing that IS evidence. Cancelling the row is a human asserting the ledger no longer
-  // holds that payment, which is the fact this code cannot establish for itself — so the replacement
-  // invoice becomes settleable again, and o3d-ekn8's "never silently unsettled for ever" survives.
+test('[o3d-ekn8 r4] a CANCELLED retired-document row naming NO document does not refuse AT THIS GATE (the enqueue gate judges it)', () => {
+  // o3d-f709 (C1) CHANGED WHAT THIS TEST CLAIMS. It was titled "that is the operator saying they read the
+  // ledger", which is the premise C1 removed. The outcome at THIS gate is unchanged - a CANCELLED row
+  // that names no document is not a payment that demonstrably went - but it is no longer an operator's
+  // word that frees it: the enqueue gate (`mayHoldLedgerPayment`) refuses every cancelled row that
+  // proves nothing, and only a ledger probe or the row's own proof clears it before this point.
   const verdict = decide({
     amount: 100,
     registrations: [
@@ -348,6 +354,50 @@ test('[o3d-ekn8 r4] a CANCELLED retired-document row clears it — that is the o
     ],
   })
   assert.equal(verdict.post, true)
+})
+
+test('[o3d-f709 M16] a CANCELLED row that still NAMES the retired document\'s payment refuses the post - it is not "went away"', () => {
+  // THE SWEPT POSTED PAYMENT, at the one gate no enqueue path can skip. The row was SYNCED against INV-0
+  // and Xero issued PAY-0; follow-up work failed (back to PENDING, id kept) and the orphan sweep
+  // retired it CANCELLED with `abandonedBeforeRemoteCall: true`. This arm read SYNCED only, so the
+  // retired payment was invisible here and a SECOND payment went out against INV-1.
+  const swept = reg({
+    id: 'retired', status: 'CANCELLED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1',
+    externalTransactionId: 'PAY-0', abandonedBeforeRemoteCall: true,
+  })
+  console.log(`# precondition M16: ${JSON.stringify({ status: swept.status, id: swept.externalTransactionId, abandoned: swept.abandonedBeforeRemoteCall })}`)
+  const verdict = decide({
+    amount: 100,
+    registrations: [reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }), swept],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+  assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['retired'])
+})
+
+test('[o3d-f709 M16] ISOLATING ARM: the same row VERIFIED reversed (the ledger was asked) does not refuse', () => {
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }),
+      reg({
+        id: 'retired', status: 'CANCELLED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1',
+        externalTransactionId: 'PAY-0', settlementBasis: 'VERIFIED_REVERSAL',
+      }),
+    ],
+  })
+  assert.equal(verdict.post, true, 'the reversal that fixed the discrepancy must not lock the replacement invoice')
+})
+
+test('[o3d-f709 M16] a FAILED row that names the retired document\'s payment refuses too (post evidence outranks status)', () => {
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: ENTRY, status: 'PENDING', amount: 100, accountingInvoiceId: 'INV-1', paymentId: 'pay-1' }),
+      reg({ id: 'retired', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-0', paymentId: 'pay-1', externalTransactionId: 'PAY-0' }),
+    ],
+  })
+  assert.equal(verdict.post === false && verdict.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
 test('a posted registration naming NO document still counts — unknown reads as possibly this one', () => {

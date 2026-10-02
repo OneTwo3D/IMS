@@ -34,6 +34,7 @@ import {
   SALE_SCOPED_RELEASE_REFERENCE_TYPE,
   type ReleaseSaleState,
 } from '@/lib/domain/accounting/cancelled-sale-release'
+import { cancelOrphanedPendingRows } from '@/lib/domain/accounting/orphan-sweep'
 import { UNCLAIMED_ATTEMPT_REVISION, applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
 import { OPERATOR_RELEASE_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
@@ -399,24 +400,7 @@ async function cancelOrphanedRowsUnderLock(
   const scope = connector ? { connector } : { connector: { not: activeConnector ?? undefined } }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
-  const result = await tx.accountingSyncLog.updateMany({
-    where: { AND: [scope, { status: 'PENDING' as const }] },
-    // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
-    // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
-    //
-    // o3d-o97 r6: and `abandonedBeforeRemoteCall` records the ONE thing this sweep — alone among
-    // the cancellers — can prove. The `status: 'PENDING'` predicate above is exactly the o3d-sref
-    // argument written down: a PENDING row is PRE-CALL, nothing was sent, so its journal is in no
-    // ledger. Every other reader of a cancelled row (the refund's open balance, the A2 un-stage,
-    // the daily-batch recreate sweep) must otherwise treat CANCELLED as unproved, because the
-    // processors post BEFORE persisting SYNCED. Writing the negative HERE, where it is known, is
-    // what lets `recreateMissingDailyBatchLogs` rebuild a genuinely lost batch without guessing
-    // from a status — and refuse on every cancelled row that does not carry it.
-    //
-    // It is set in the SAME UPDATE as the status, under the same predicate, so a row can never
-    // carry the claim without having been cancelled from PENDING by this sweep.
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, abandonedBeforeRemoteCall: true },
-  })
+  const result = { count: await cancelOrphanedPendingRows(tx, scope, reason) }
 
   // Counted, not cancelled — so the activity log explains why the orphan count did not reach zero.
   //

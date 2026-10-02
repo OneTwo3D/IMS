@@ -340,6 +340,7 @@ test('sync success updates mirrored daily batch event to posted with external id
   const data = updates[0].data as Record<string, unknown>
   assert.equal(data.status, 'POSTED')
   assert.equal(data.externalId, 'journal-1')
+  assert.equal(data.postBasis, 'CONNECTOR', 'o3d-f709: an unguarded POSTED write is the connector\'s own answer')
   assert.deepEqual(data.linesJson, groupBLines)
   assert.equal(data.currency, 'GBP', 'the row\'s own currency, never re-derived')
   assert.deepEqual(logs.map((l) => (l.data as { action: string }).action), ['posted_from_sync_log'],
@@ -379,7 +380,8 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
   // one — the clearing is part of the write rather than a separate tidy-up that could be skipped.
   assert.deepEqual(updates, [{
     where: { idempotencyKey: 'accounting-sync:quickbooks:cogs_reversal:sales-order-refund:refund-1:cogs-reversal' },
-    data: { status: 'FAILED', voidBasis: null },
+    // o3d-f709: `postBasis: null` travels with every non-POSTED write, exactly like `voidBasis`.
+    data: { status: 'FAILED', voidBasis: null, postBasis: null },
     select: { id: true },
   }])
   assert.deepEqual(logs, [{
@@ -453,6 +455,7 @@ test('failed daily batch mirror reset moves matching events back to pending', as
     data: {
       status: 'PENDING',
       externalId: null,
+      postBasis: null,
     },
   }])
   assert.deepEqual(createManyArgs, [{
@@ -770,6 +773,25 @@ test('a posted sales invoice revision takes the external id from the invoice eve
       },
     },
   ])
+})
+
+test('o3d-f709: a takeover records the new holder CONNECTOR and CLEARS the post basis of the event it superseded', async () => {
+  // The superseded holder was POSTED and now is not: a basis that outlived the state it describes
+  // would be a confirmation granted by a row that no longer means it. The new holder's POSTED write is
+  // the connector's own (no guard), so it records CONNECTOR.
+  const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+  // The superseded holder starts out carrying a basis, so the clearing is observable (a row that was
+  // already null would pass for the wrong reason).
+  ;(store.table[0] as Record<string, unknown>).postBasis = 'CONNECTOR'
+  console.log(`# precondition takeover: holder postBasis=${String((store.table[0] as Record<string, unknown>).postBasis)}`)
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  const byId = new Map(store.table.map((row) => [row.id, row as unknown as Record<string, unknown>]))
+  assert.equal(byId.get('event-create')?.status, 'SUPERSEDED')
+  assert.equal(byId.get('event-create')?.postBasis, null, 'the superseded event is not POSTED, so it has no post basis')
+  assert.equal(byId.get('event-revision')?.status, 'POSTED')
+  assert.equal(byId.get('event-revision')?.postBasis, 'CONNECTOR')
 })
 
 test('a revision does not take an external id that belongs to a different source document', async () => {

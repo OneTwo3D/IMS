@@ -1,0 +1,32 @@
+-- o3d-f709 / o3d-vzje — HOW A MIRRORED ACCOUNTING EVENT CAME TO BE POSTED.
+--
+-- An AccountingEvent mirrors an AccountingSyncLog row. Status POSTED was written both when a
+-- CONNECTOR answered (the ledger holds the document) and when an OPERATOR asserted POSTED by typing a
+-- document id in (IMS never saw it), and the event recorded one bit for the two. The discount
+-- restatement readers rebuild a posted document from the event's linesJson, which for an asserted row
+-- is enqueue-time INTENT, not what the ledger holds. `postBasis` says which.
+--
+-- NULLABLE WITH NO DEFAULT, NO BACKFILL, AND NULL IS THE SAFE ANSWER. NULL reads as UNRECORDED and
+-- fails closed: a reader that needs a confirmed post treats it as not confirmed. No value is ever
+-- written for an act IMS did not witness, so every event that exists today reads UNRECORDED until the
+-- connector next writes it, and the discount restatement for those documents becomes manual rather
+-- than guessed (acceptable: there is no productive IMS data yet). The column can only ever grant a
+-- reader permission, and only where the writer recorded one.
+--
+-- NO CHECK CONSTRAINT, deliberately. The mirror write is inside the SYNCED transaction
+-- (accounting-event-mirror.ts, updateMirroredAccountingEventStatus): a constraint violation there
+-- would roll back an ACCEPTED post, the sync row would stay unposted, and the retry would post the
+-- document a second time. The vocabulary is enforced in application code (accounting-event-post-basis.ts)
+-- and a value nobody recognises reads as unrecorded.
+--
+-- WHY THIS MIGRATION NEEDS NO prisma/migrations/verification-required.txt ENTRY, as voidBasis
+-- (20260912090000) needed none: the safety argument is not about WHICH BINARY was serving. A
+-- predecessor binary serving across this deploy never writes the column, so its POSTED events stay
+-- NULL = UNRECORDED = the fail-closed reading; it cannot write a value that grants a permission it was
+-- not entitled to, because it does not know the column exists. Nothing about the post-migration state
+-- depends on the predecessor having been stopped.
+--
+-- Named postBasis, not settlementBasis: NULL on a SYNC LOG means the connector confirmed it, while
+-- NULL here means nothing was recorded. Two columns whose NULL means opposite things must not share
+-- a name.
+ALTER TABLE "accounting_events" ADD COLUMN "postBasis" TEXT;

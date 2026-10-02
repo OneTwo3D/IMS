@@ -5,6 +5,7 @@
  * type/status partitioning are where this went wrong before, and both are pure given a fetcher.
  */
 
+import { mayHaveReachedLedger, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import {
   addMoney,
@@ -1496,6 +1497,20 @@ export type RegisteredPaymentRow = {
   /** The ledger's id for the payment this registration created, if it got that far. */
   externalTransactionId: string | null
   /**
+   * o3d-f709 — WHAT THIS ROW'S `CANCELLED`, IF IT IS CANCELLED, IS ALLOWED TO MEAN.
+   *
+   * Both REQUIRED, and required rather than optional on purpose. The classifier below asks
+   * `mayHaveReachedLedger`, whose whole job is to answer "unproved" for a row that carries neither
+   * marker — and `undefined` from a select that forgot the column is indistinguishable from a
+   * genuine NULL. Optional fields would therefore turn "this reader did not load the evidence" into
+   * a silent, correct-looking verdict. Required, a caller that has not loaded them does not compile.
+   *
+   * See lib/domain/accounting/ledger-standing.ts for the rule and
+   * lib/domain/accounting/unresolved-abandoned-claim.ts for the argument behind it.
+   */
+  abandonedBeforeRemoteCall: boolean | null
+  settlementBasis: string | null
+  /**
    * When the registration became complete — CLAIMED. Which clock produced it is not visible here.
    *
    * `stampSyncedAtFromDatabaseClock` writes `clock_timestamp()`, but an application host's `new
@@ -2088,9 +2103,18 @@ export function classifyRegisteredPaymentAgainstListing(
   const unbound: string[] = []
 
   for (const row of registrations) {
-    // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
-    // holds no payment and blocks nothing.
-    if (row.status === 'CANCELLED') continue
+    // o3d-f709 — THE COMMENT THIS REPLACES WAS FALSE, AND IT WAS LOAD-BEARING. It read: "CANCELLED
+    // is the one status this tree only ever asserts where 'nothing was sent' is true, so it holds no
+    // payment and blocks nothing." Two settlement writers and the post-time retirement of a claimed
+    // row all reach CANCELLED without establishing anything of the kind, and dropping such a row
+    // here collapses the verdict to NOTHING_REGISTERED — which is an ADMITTED reversal, clears
+    // `PurchaseInvoice.paidAt`, and re-arms Mark Paid over a payment that may be in the ledger.
+    //
+    // The rule is not restated here (ledger-standing.ts): only a row whose standing is PROVEN_NOT_POSTED
+    // - a cancelled row carrying the sweep's own proof of a pre-call abandonment, or a VERIFIED_REVERSAL -
+    // still drops out. An operator's NOT_POSTED assertion does NOT (C1): it is a person's word about a
+    // ledger IMS never read, so the verdict withholds instead of collapsing to NOTHING_REGISTERED.
+    if (!mayHaveReachedLedger(row)) continue
     // The completion instant the DATABASE minted, or null when the row cannot prove which clock wrote
     // it — an old build's host-clock stamp is not a fence, it is the defect (round 5, finding 1).
     const completedAt = databaseStampedCompletion(row)
@@ -2387,16 +2411,37 @@ export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boo
  * raised by the SALES_INVOICE follow-up for an imported order — names no receipt and so clears none;
  * that is the conservative direction and it is deliberate.
  *
- * CANCELLED REGISTRATIONS DO NOT COUNT AS TELLING THE LEDGER. A retired row asserts nothing was
- * sent, which leaves the receipt exactly as unregistered as it was before the row existed.
+ * o3d-f709 r3 (Codex MEDIUM 1) — AND "CANCELLED REGISTRATIONS DO NOT COUNT AS TELLING THE LEDGER"
+ * WAS THE SIXTEENTH COPY OF THE CLAIM THIS BRANCH EXISTS TO END.
+ *
+ * The sentence that stood here said a retired row "asserts nothing was sent, which leaves the
+ * receipt exactly as unregistered as it was before the row existed". Three of the five writers of
+ * CANCELLED assert no such thing — the orphan sweep, the post-time retirement and the cancelled-sale
+ * settlement — and the first two can retire a row that is already in a ledger, keeping the payment
+ * id the ledger issued. Reading that row as "never told" is what talks a reversal pass into clearing
+ * `paidAt` and raising a chargeback credit note against revenue nobody reversed.
+ *
+ * IT WAS INVISIBLE TO THE CENSUS BECAUSE OF THE SHAPE OF THIS PARAMETER, not because of the
+ * comparison: `{ status: string; paymentId }` is a sync-log row with its evidence columns dropped at
+ * the call site, and this file never names `accountingSyncLog`, so no detector could tell whose
+ * status it was. The parameter is now the full {@link LedgerStandingRow}, REQUIRED — the caller in
+ * payment-reversal.ts already selects all four columns — and the census learnt to follow reduced
+ * rows into helpers so the next one cannot hide the same way.
+ *
+ * `mayHaveReachedLedger` is the fail-closed direction here: a row that may be holding a payment
+ * counts as having told the ledger, so the receipt is NOT reported unregistered and no reversal is
+ * raised on the strength of a registration nobody can speak for. Only a PROVEN absence — a pre-call
+ * sweep naming no document, or a VERIFIED_REVERSAL — leaves the receipt unregistered, and that is a
+ * fact the system established rather than one inferred from a status (an operator's NOT_POSTED is a
+ * person's word, not proof: C1).
  */
 export function unregisteredLocalReceipts(
   receiptIds: readonly string[],
-  registrations: readonly { status: string; paymentId: string | null }[],
+  registrations: readonly (LedgerStandingRow & { paymentId: string | null })[],
 ): string[] {
   const named = new Set(
     registrations
-      .filter((row) => row.status !== 'CANCELLED')
+      .filter((row) => mayHaveReachedLedger(row))
       .map((row) => row.paymentId)
       .filter((id): id is string => typeof id === 'string' && id.length > 0),
   )

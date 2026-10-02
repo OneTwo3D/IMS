@@ -177,8 +177,13 @@ test('o3d-7o0: with no post in flight the sweep still retires the order\'s queue
     claimedRow({ id: 'sync-pending', status: 'PENDING', processingStartedAt: null }),
   ])
   const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
-  assert.equal(retired, 1)
-  assert.equal(calls.updateMany, 1)
+  // o3d-f709: TWO statements now - the never-claimed PENDING stamp, then the general retirement. This
+  // double does not mutate rows, so both match the same row and the sum reads 2; the property here is
+  // that the sweep still retires, not how many statements say so (the real-store tests in
+  // tests/domain/accounting/cancel-order-invoice-sync.test.ts pin who is stamped).
+  assert.ok(retired >= 1)
+  assert.ok(calls.updateMany >= 1)
+  assert.equal(calls.updateManyAndReturn, 1)
 })
 
 // ---------------------------------------------------------------------------

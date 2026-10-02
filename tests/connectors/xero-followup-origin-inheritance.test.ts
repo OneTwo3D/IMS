@@ -64,6 +64,13 @@ const state = {
     status: string
     syncedAt: Date
     payload: Record<string, unknown> | null
+    /**
+     * o3d-f709 / M18: the ledger-standing columns the sweep now selects. Absent in a fixture means the
+     * row an untouched connector writeback leaves (NULL basis, no sweep flag); a case about an
+     * operator-typed id says so.
+     */
+    settlementBasis?: string | null
+    abandonedBeforeRemoteCall?: boolean | null
   }>,
 }
 
@@ -151,7 +158,9 @@ const db = {
             && (status === null || row.status === status))
           // `orderBy: syncedAt desc` — modelled, so "newest row wins" really does pick the newest.
           .sort((a, b) => b.syncedAt.getTime() - a.syncedAt.getTime())
-          .map((row) => ({ ...row }))
+          // Prisma returns every selected column; an omitted fixture column is NULL, never `undefined`
+          // (which ledgerStanding reads as an unrecognised basis: UNKNOWN).
+          .map((row) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...row }))
       }
       if (where.OR) return state.rows.filter((row) => row.status === 'PENDING').map((row) => ({ ...row }))
       return []
@@ -376,6 +385,38 @@ test('audit-w77e: the allocation sweep inherits the credit note post\'s organisa
   const reenqueued = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')
   assert.equal(reenqueued?.level, 'INFO')
   assert.equal((reenqueued?.metadata as { originRecordInherited?: boolean } | undefined)?.originRecordInherited, true)
+})
+
+test('o3d-f709 M18: an OPERATOR-TYPED id on the issuing row means the sweep inherits NOTHING and says so', async () => {
+  reset()
+  state.creditNotes = [{
+    id: 'cn-1',
+    accountingCreditNoteId: 'XCN-TYPED',
+    accountingCreditNoteConnector: 'xero',
+    amountForeign: 40,
+    purchaseInvoice: { accountingInvoiceId: 'XBILL-1', accountingInvoiceConnector: 'xero' },
+  }]
+  // The ONLY row naming the document is one an operator settled POSTED by typing the id in. Its payload
+  // carries the ENQUEUE-time stamp of a post nobody observed.
+  state.creditNotePosts = [{
+    referenceId: 'cn-1',
+    externalTransactionId: 'XCN-TYPED',
+    status: 'SYNCED',
+    syncedAt: new Date('2026-01-01T00:00:00Z'),
+    payload: { [CONNECTION_KEY]: 'xero:tenant-A' },
+    settlementBasis: 'OPERATOR_ASSERTION',
+  }]
+  state.tokenTenantId = 'tenant-B'
+  console.log(`# precondition M18 sweep: issuing row basis=${state.creditNotePosts[0].settlementBasis}`)
+
+  const { reenqueueMissingCreditNoteAllocations } = await import('@/lib/connectors/xero/sync-processor')
+  await reenqueueMissingCreditNoteAllocations()
+
+  assert.equal(state.created.length, 1)
+  assert.equal(CONNECTION_KEY in state.created[0].payload, false, 'the typed id lent the allocation no organisation')
+  const reenqueued = state.activities.find((entry) => entry.action === 'xero_credit_note_allocation_reenqueued')
+  assert.equal(reenqueued?.level, 'WARNING')
+  // ISOLATING ARM: the identical row confirmed by the connector IS inherited (the test above).
 })
 
 test('audit-w77e: with no surviving post to inherit from, the sweep records nothing and SAYS SO', async () => {

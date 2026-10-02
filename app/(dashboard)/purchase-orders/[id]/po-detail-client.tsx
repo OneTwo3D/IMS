@@ -2747,6 +2747,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           {inv.settlement.status === 'OVER_SETTLED' && ' · OVER-PAID IN LEDGER'}
                           {/* o3d-nf9i r3: an operator's assertion is not the ledger's word. */}
                           {inv.settlement.status === 'ASSERTED_UNVERIFIED' && ' · ASSERTED, NOT VERIFIED'}
+                          {/* o3d-f709 r2: retired as if nothing was sent, and still naming the
+                              payment the ledger issued. */}
+                          {inv.settlement.status === 'LEDGER_UNRESOLVED' && ' · RETIRED, PAYMENT UNRESOLVED'}
                           {/* o3d-r948 r2: the registration states a figure IMS will not read, so no
                               amount has been compared against the bill total. */}
                           {inv.settlement.status === 'SETTLEMENT_AMOUNT_UNREADABLE' && ' · AMOUNT NOT CHECKED'}

@@ -45,6 +45,10 @@ const registration = (overrides: Partial<RegisteredPaymentRow> = {}): Registered
   externalTransactionId: 'PAY-1',
   syncedAt: COMPLETED,
   syncedAtDatabaseClock: COMPLETED,
+  // o3d-f709: a registration with NEITHER marker — which is what almost every real cancelled row
+  // looks like, and the shape `mayHaveReachedLedger` now refuses to read as "nothing was sent".
+  abandonedBeforeRemoteCall: null,
+  settlementBasis: null,
   ...overrides,
 })
 
