@@ -40,12 +40,8 @@ export const ALLOWLIST: Record<string, string> = {
     + 'invoking the alias itself in CI would only duplicate them.',
   'check:bom-recipes': 'A DATABASE DATA check (reads recipe rows), not a static guard over the tree. '
     + 'There is no database in a static-guard job, and no workflow here has one wired for it.',
-  'check:server-action-auth-bypass': 'Leaf of the composite check:server-action-guards, which has its own ungated job '
-    + '(server-action-auth-guard.yml); not given its own job here (existing workflow, out of scope for o3d-ok6hk).',
-  'check:server-action-guard-coverage': 'Leaf of the composite check:server-action-guards, which has its own ungated job '
-    + '(server-action-auth-guard.yml); not given its own job here (existing workflow, out of scope for o3d-ok6hk).',
-  'check:server-action-authorization': 'Leaf of the composite check:server-action-guards, which has its own ungated job '
-    + '(server-action-auth-guard.yml); not given its own job here (existing workflow, out of scope for o3d-ok6hk).',
+  'check:server-action-guards': 'Aggregate (&&-chained) of the three server-action halves, kept for local use. CI runs each half '
+    + 'in its own independent job (server-action-auth-guard.yml) so a failing half cannot hide the others.',
 }
 /** Scripts deliberately absent from validate-local.sh. */
 export const LOCAL_ALLOWLIST: Record<string, string> = {
@@ -73,14 +69,14 @@ export function expandNpmRuns(line: string, scripts: Record<string, string>, see
 }
 
 /**
- * AUDITABLE DIRECT INVOCATIONS ONLY. A line counts only if the WHOLE line is `npm run <script>` (optionally
- * `-s`, optionally `-- args`) and it is the ONLY line of its `run:` block. Composites do NOT expand: a script
+ * AUDITABLE DIRECT INVOCATIONS ONLY. A line counts only if the WHOLE line is `npm run <script>` (no flags,
+ * no `-- args`) and it is the ONLY line of its `run:` block. Composites do NOT expand: a script
  * counts as itself only, so every leaf needs its own direct invocation or an allowlist reason. So `echo 'npm run x'`, a `# comment`, quoted text, `npm run x || true`,
  * `npm run x; y`, `a && npm run x`, `if cond; then npm run x` and a line continued with a backslash are NOT
  * invocations. A block that turns errexit off (`set +e`, `set +o errexit`) or traps cannot be trusted to
  * propagate failure, so none of its lines count.
  */
-const DIRECT_RE = /^npm run (?:-s )?(check:[A-Za-z0-9:_-]+)(?: -- .*)?$/
+const DIRECT_RE = /^npm run (check:[A-Za-z0-9:_-]+)$/
 const MASKING_RE = /(^|[\s;&|])(set\s+\+e|set\s+\+o\s+errexit|trap\s)/
 export function directInvocations(body: string): string[] {
   // EXACTLY ONE LINE, nothing else in the block: an `exit 0` or any other line before it can never hide it.
@@ -127,7 +123,7 @@ export function ungatedInvocations(doc: Json, scripts: Record<string, string>): 
   if (skippability(doc)) return out
   for (const job of Object.values((doc.jobs ?? {}) as Record<string, Json>)) {
     if (job.if !== undefined || job.needs !== undefined || job['continue-on-error'] !== undefined) continue
-    if ((job.defaults as Json | undefined)?.run !== undefined) continue
+    if ((job.defaults as Json | undefined)?.run !== undefined || job.strategy !== undefined) continue
     for (const step of (job.steps ?? []) as Json[]) {
       if (step.if !== undefined || step['continue-on-error'] !== undefined) continue
       if (typeof step.run !== 'string') continue
@@ -192,8 +188,10 @@ test('PRECONDITION: the workflows were found and parsed, and the check:* scripts
   assert.ok(local.size > 0, 'validate-local.sh yielded no run_step invocations')
   // Known-good anchors, so a parser that returns a plausible-sized wrong answer still fails.
   assert.ok(ci.has('check:archive-sealed'), 'archive-seal.yml must be seen as ungated')
-  assert.ok(ci.has('check:server-action-guards'), 'the composite is invoked directly by its own ungated job')
-  assert.ok(!ci.has('check:server-action-auth-bypass'), 'composites must NOT expand: a leaf is not covered by its composite')
+  for (const leaf of ['check:server-action-auth-bypass', 'check:server-action-guard-coverage', 'check:server-action-authorization']) {
+    assert.ok(ci.has(leaf), `${leaf} must have its own direct ungated job`)
+  }
+  assert.ok(!ci.has('check:server-action-guards'), 'the && composite is no longer run in CI (it would hide later halves)')
   assert.ok(!ci.has('check:all'), 'check:all is named only in comments, and must not count as invoked')
   console.log(`# ci-guard-coverage examined ${CHECKS.length} check:* scripts across ${workflowFiles.length} workflows; `
     + `${ci.size} npm scripts run ungated in CI, ${local.size} by validate-local.sh`)
@@ -242,6 +240,7 @@ test('detector: exit-before, custom shell, defaults.run and negated branch patte
   assert.equal(ungatedInvocations(wf({}, {}, { shell: 'bash {0}' }), S).size, 0)
   assert.equal(ungatedInvocations(wf({ defaults: { run: { shell: 'bash {0}' } } }), S).size, 0)
   assert.equal(ungatedInvocations(wf({}, { defaults: { run: { shell: 'sh' } } }), S).size, 0)
+  assert.equal(ungatedInvocations(wf({}, { strategy: { matrix: {} } }), S).size, 0, 'a job with a strategy/matrix does not count')
   const neg = wf({ on: { pull_request: { branches: ['development', '!development'] } } })
   assert.match(String(skippability(neg)), /branches/)
   assert.equal(ungatedInvocations(neg, S).size, 0)
@@ -277,7 +276,8 @@ test('detector: findings go red for an unrun guard, a new unrun check:zz, and a 
 
 test('detector: only whole-line direct invocations count (echo, comment, quoted, conditional, masked, continued)', () => {
   assert.deepEqual(directInvocations('npm run check:foo'), ['check:foo'])
-  assert.deepEqual(directInvocations('npm run -s check:foo -- --x'), ['check:foo'])
+  assert.deepEqual(directInvocations('npm run -s check:foo'), [], 'flags are not credited')
+  assert.deepEqual(directInvocations('npm run check:foo -- --x'), [], 'args are not credited')
   assert.deepEqual(directInvocations('npm ci\nnpm run check:foo'), [], 'a multi-line block counts nothing')
   assert.deepEqual(directInvocations('exit 0\nnpm run check:foo'), [])
   assert.deepEqual(directInvocations('npm run build'), [], 'only check:* scripts')
