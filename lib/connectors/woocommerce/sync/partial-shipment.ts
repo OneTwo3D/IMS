@@ -21,6 +21,17 @@ import { validateWooCommerceBaseUrl } from '../url-safety'
 
 const PUSH_TIMEOUT_MS = 15_000
 
+/**
+ * The custom WooCommerce status our own companion plugin moves a SPLIT order to after each WMS part
+ * despatches (lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php, the
+ * `$order->update_status('partial-shipped', ...)` fallback at ~:546-547, and the wphub path beside it).
+ * It has no ShoppingStatusMapping row and no built-in reading, so without this name the completion
+ * rule (completion-eligibility.ts) would read it as an unknown custom status and refuse to complete a
+ * split order whose last part has just despatched (o3d-zvec.15). The ONE literal, here, in the module
+ * whose writeback causes the status.
+ */
+export const WC_PARTIAL_SHIPPED_STATUS = 'partial-shipped'
+
 export type WcPartialShipmentLine = { sku: string; qty: number }
 
 export type WcPartialShipmentPush = {

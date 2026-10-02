@@ -31,7 +31,7 @@ registerCronJobs([
     module: 'woocommerce',
     moduleLabel: 'WooCommerce',
     label: 'WooCommerce Webhook Inbox',
-    description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path.',
+    description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path, and retries any queued WooCommerce order completions (the "completed" push that follows an IMS shipment) that did not land.',
     defaultSchedule: '*/5 * * * *',
     defaultEnabled: true,
   },
