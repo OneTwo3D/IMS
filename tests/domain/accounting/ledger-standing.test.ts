@@ -39,7 +39,11 @@ const REL = 'OPERATOR_RELEASE'
 
 const TABLE: Case[] = [
   { n: 1, name: 'an unrecognised non-null basis (any status)', row: row({ status: 'SYNCED', externalTransactionId: 'X-1', settlementBasis: 'SOMETHING_NEWER' }), expect: 'UNKNOWN' },
+  { n: 1, name: 'an unrecognised basis on a CANCELLED row with no id and the sweep flag (would be row 8 if the basis were read as NULL)', row: row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true, settlementBasis: 'SOMETHING_NEWER' }), expect: 'UNKNOWN' },
   { n: 2, name: 'PENDING + OPERATOR_ASSERTION (no writer)', row: row({ status: 'PENDING', settlementBasis: OA }), expect: 'UNKNOWN' },
+  // Row 2 is only observable on a row that WOULD match row 3 without it: an asserted id on unfinished
+  // work. (Without an id the default arm answers UNKNOWN anyway, so the case above cannot isolate it.)
+  { n: 2, name: 'PROCESSING + OPERATOR_ASSERTION + an id (would be row 3 without row 2)', row: row({ status: 'PROCESSING', externalTransactionId: 'TYPED', settlementBasis: OA }), expect: 'UNKNOWN' },
   { n: 3, name: 'SYNCED POSTED settlement: OPERATOR_ASSERTION + typed id', row: row({ status: 'SYNCED', externalTransactionId: 'TYPED-1', settlementBasis: OA }), expect: 'ASSERTED_POSTED' },
   { n: 3, name: 'CANCELLED cancelled-sale settlement: OPERATOR_ASSERTION + typed id', row: row({ status: 'CANCELLED', externalTransactionId: 'TYPED-2', settlementBasis: OA }), expect: 'ASSERTED_POSTED' },
   { n: 4, name: 'CANCELLED NOT_POSTED settlement: OPERATOR_ASSERTION, no id', row: row({ status: 'CANCELLED', settlementBasis: OA }), expect: 'ASSERTED_NOT_POSTED' },
