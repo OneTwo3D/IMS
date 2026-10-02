@@ -2896,6 +2896,15 @@ model AccountingEvent {
   // the safe side. Written only alongside a VOID status and cleared by any write that leaves the
   // row in another status. See lib/domain/accounting/accounting-event-void-basis.ts.
   voidBasis        String?
+  // o3d-f709: HOW this event came to be POSTED - CONNECTOR (the connector answered; the ledger holds
+  // the document), OPERATOR_ASSERTION (a person typed the document id in; IMS never saw it) or
+  // SYNC_LOG_BACKFILL (the administrative backfill repaired it from a sync log already recorded as
+  // connector-confirmed). Written only beside a POSTED status and cleared (NULL) by every write that
+  // leaves the row in another status, exactly as voidBasis is. NULL = UNRECORDED and is never read as
+  // confirmed: no value is written for an act IMS did not witness, and there is no backfill. Named
+  // postBasis, not settlementBasis, because NULL on the sync log means "connector confirmed" and NULL
+  // here means "nothing recorded". See lib/domain/accounting/accounting-event-post-basis.ts.
+  postBasis        String?
   reversalOfId     String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt

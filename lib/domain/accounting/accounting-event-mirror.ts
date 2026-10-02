@@ -19,6 +19,11 @@ import {
 } from './mirrored-sync-types'
 import type { MirroredAccountingSyncType } from './mirrored-sync-types'
 import { REVIVABLE_VOID_BASES, SOURCE_CANCELLED_VOID_BASIS } from './accounting-event-void-basis'
+import {
+  CONNECTOR_POST_BASIS,
+  OPERATOR_ASSERTION_POST_BASIS,
+  postBasisForSyncLogSettlementBasis,
+} from './accounting-event-post-basis'
 
 // o3d-11rf: the mirrored TYPE LIST now lives in the leaf module ./mirrored-sync-types, because
 // followup-scope-lock.ts needs it too and this module is mocked wholesale by dozens of tests — a
@@ -163,6 +168,37 @@ export function mirroredAccountingEventIdempotencyKeys(params: {
 
 
 export function buildMirroredAccountingEventDraft(params: {
+  syncLogId?: string
+  connector: string
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: unknown
+  currency: string
+  status?: string
+  externalId?: string | null
+  /**
+   * o3d-f709: HOW the source row reached its status - `AccountingSyncLog.settlementBasis`. Used ONLY
+   * when the mirrored status is POSTED, to stamp `postBasis` (null -> CONNECTOR, OPERATOR_ASSERTION ->
+   * OPERATOR_ASSERTION). Absent (`undefined`) records nothing: an unrecorded post fails closed.
+   */
+  settlementBasis?: string | null
+  /** An explicit post basis, which wins over the one derived from `settlementBasis` (the backfill's). */
+  postBasis?: string | null
+}): AccountingEventDraft | null {
+  const draft = buildMirroredAccountingEventDraftBody(params)
+  if (!draft) return null
+  // The post basis exists only beside a POSTED status (the same rule as `voidBasis` beside VOID).
+  if (draft.status !== 'POSTED') return draft
+  const postBasis = params.postBasis !== undefined
+    ? params.postBasis
+    : params.settlementBasis !== undefined
+      ? postBasisForSyncLogSettlementBasis(params.settlementBasis)
+      : null
+  return postBasis === null ? draft : { ...draft, postBasis }
+}
+
+function buildMirroredAccountingEventDraftBody(params: {
   syncLogId?: string
   connector: string
   type: string
@@ -341,7 +377,9 @@ async function reviveMirroredEventForNewAttempt(
     },
     // The basis is SPENT by the revival. It described a state the row is no longer in, and a row
     // that later posts must not carry a stale "this was settled NOT_POSTED" beside its document id.
-    data: { status: 'PENDING', voidBasis: null },
+    // o3d-f709: and the post basis, which describes a POSTED state this row is not in. (Neither arm of
+    // the predicate is POSTED, so it is already null; written so no later widening can leave one.)
+    data: { status: 'PENDING', voidBasis: null, postBasis: null },
   })
   if (revived.count === 0) return
 
@@ -980,7 +1018,8 @@ export async function resolveDocumentRevisionExternalIdClaim(
   // makes this predicate match nothing and the loser re-reads the new reality on its retry.
   const released = await client.accountingEvent.updateMany({
     where: { id: holder.id, externalSystem: params.connector, externalId },
-    data: { status: 'SUPERSEDED', externalId: null },
+    // o3d-f709: SUPERSEDED is not POSTED, so the post basis is cleared with the document id.
+    data: { status: 'SUPERSEDED', externalId: null, postBasis: null },
   })
   if (released.count === 0) return { claim: 'refused', reason: 'claim_moved_concurrently' }
 
@@ -1222,6 +1261,16 @@ export async function updateMirroredAccountingEventStatus(
         // VOID write with no basis stores NULL, which `isRevivableVoidBasis` refuses — a writer
         // that does not say what it retired does not get the benefit of the doubt.
         voidBasis: status === 'VOID' ? (params.voidBasis ?? null) : null,
+        // o3d-f709: HOW this POSTED event came to be posted, and its clearing - the same shape as
+        // `voidBasis` above. Written on EVERY POSTED write: a write made under a settlement GUARD is an
+        // operator's assertion (the settlement and mark-handled paths are the only guarded callers; the
+        // connectors' own writeback is unguarded), anything else is the connector's answer. NULL on
+        // every non-POSTED write, because a basis that outlived the state it describes would be a
+        // confirmation granted by a row that no longer means it. Never a CHECK constraint: a throw here
+        // would roll back an accepted post (see the migration).
+        postBasis: status === 'POSTED'
+          ? (params.guard ? OPERATOR_ASSERTION_POST_BASIS : CONNECTOR_POST_BASIS)
+          : null,
         // The stamp is a true fact about THIS row's write whether or not the row keeps the claim,
         // so the stale path records it too — it is what a later comparison against this row needs.
         //
@@ -1563,6 +1612,8 @@ export async function resetMirroredAccountingEventsToPending(
     data: {
       status: 'PENDING',
       externalId: null,
+      // o3d-f709: PENDING is not POSTED. (The read above is FAILED-only, so this is already null.)
+      postBasis: null,
     },
   })
 
@@ -1617,7 +1668,7 @@ export async function voidMirroredAccountingEventsForOrder(
     // that if the row says so. Recorded here rather than inferred from the audit action below,
     // because `accounting_event_logs.createdAt` is transaction-start time and cannot order two
     // entries written in one transaction.
-    data: { status: 'VOID', externalId: null, voidBasis: SOURCE_CANCELLED_VOID_BASIS },
+    data: { status: 'VOID', externalId: null, voidBasis: SOURCE_CANCELLED_VOID_BASIS, postBasis: null },
   })
   if (updated.count === 0) return
 

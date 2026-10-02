@@ -1,5 +1,9 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
+  CONFIRMED_POST_BASES,
+  OPERATOR_ASSERTION_POST_BASIS,
+} from '@/lib/domain/accounting/accounting-event-post-basis'
+import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   OPERATOR_RELEASE_SETTLEMENT_BASIS,
   VERIFIED_REVERSAL_SETTLEMENT_BASIS,
@@ -318,4 +322,39 @@ export const MAY_HAVE_REACHED_LEDGER_WHERE: Prisma.AccountingSyncLogWhereInput =
  */
 export const WORK_SLOT_OCCUPIED_WHERE: Prisma.AccountingSyncLogWhereInput = {
   status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+}
+
+// ---------------------------------------------------------------------------
+// THE MIRROR HALF - the same question asked of an AccountingEvent.
+// ---------------------------------------------------------------------------
+
+export type MirroredPostStanding =
+  /** POSTED by the connector's own writeback (or a sync-log backfill of one): the ledger holds it. */
+  | 'CONFIRMED'
+  /** POSTED because an operator typed a document id in: `linesJson` is enqueue-time INTENT. */
+  | 'ASSERTED'
+  /** POSTED, but no writer recorded how (every pre-column event; a predecessor binary's writes). */
+  | 'UNRECORDED'
+  /** Not POSTED at all. */
+  | 'NOT_POSTED'
+
+/**
+ * HOW A MIRRORED EVENT CAME TO BE POSTED. The reading every reader that rebuilds a posted document
+ * from the event's `linesJson` needs: only CONFIRMED lines describe what the ledger holds. UNRECORDED
+ * is never CONFIRMED (no backfill; no marker for an act IMS did not witness).
+ *
+ * `externalId` is deliberately not consulted: a POSTED mirror of an id-less type is legitimate, and
+ * the question here is provenance, not presence.
+ */
+export function mirroredPostStanding(event: { status: string; postBasis: string | null }): MirroredPostStanding {
+  if (event.status !== 'POSTED') return 'NOT_POSTED'
+  if ((CONFIRMED_POST_BASES as readonly string[]).includes(event.postBasis ?? '')) return 'CONFIRMED'
+  if (event.postBasis === OPERATOR_ASSERTION_POST_BASIS) return 'ASSERTED'
+  return 'UNRECORDED'
+}
+
+/** The Prisma rendering of `mirroredPostStanding(event) === 'CONFIRMED'`: positive, null-total. */
+export const CONFIRMED_POSTED_EVENT_WHERE: Prisma.AccountingEventWhereInput = {
+  status: 'POSTED',
+  postBasis: { in: [...CONFIRMED_POST_BASES] },
 }

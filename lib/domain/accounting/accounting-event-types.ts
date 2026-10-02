@@ -55,6 +55,11 @@ export type AccountingEventDraft = {
   currency: string
   externalSystem?: string | null
   externalId?: string | null
+  /**
+   * o3d-f709: how a POSTED event came to be posted (accounting-event-post-basis.ts). Present on a
+   * draft only when its status is POSTED; absent/NULL everywhere else.
+   */
+  postBasis?: string | null
   reversalOfId?: string | null
 }
 
