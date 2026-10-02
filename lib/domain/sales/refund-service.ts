@@ -2160,8 +2160,9 @@ async function stageRefundAccountingReversals(
       // o3d-3la07 (M8): "settled" for an AMOUNT is a CONFIRMED, SYNCED row. An operator-asserted
       // reversal is unsettled here - it lands in the existing UNRESOLVED branch below.
       const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
-      const settledRows = reversalRows.filter((row) => journalRowProvesAmount(row))
-      const legible = settledRows.filter((row) => payloadLinesLegible(row.payload))
+      // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
+      // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
+      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either

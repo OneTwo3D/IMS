@@ -433,9 +433,9 @@ test('o3d-f709: the shipped declarations are unique, classed, argued and name be
   console.log(`# declarations: ${keys.size}; by class ${JSON.stringify(Object.fromEntries(classes))}`)
   assert.ok(keys.size >= 100, 'precondition: the declarations are present')
   const pending = [...classes.keys()].filter((c) => c.startsWith('PENDING_CONVERSION:'))
-  assert.ok(pending.length >= 2, 'slices 1b and 1c are named')
+  assert.ok(pending.length >= 2, 'slice 1c and the M17 design decision are named')
   const text = readFileSync(path.join(ROOT, 'scripts/ledger-standing-reader-declarations.mjs'), 'utf8')
-  for (const bead of ['o3d-3la07', 'o3d-1e7sl']) assert.ok(text.includes(`PENDING_CONVERSION:${bead}`), `${bead} is used`)
+  for (const bead of ['o3d-djemh', 'o3d-1e7sl']) assert.ok(text.includes(`PENDING_CONVERSION:${bead}`), `${bead} is used`)
 })
 
 test('o3d-f709: package.json, validate-local.sh and the workflow all name the guard, and the old guard is gone', () => {
