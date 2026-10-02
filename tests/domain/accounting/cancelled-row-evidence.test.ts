@@ -79,22 +79,26 @@ const SHAPES: Array<{ name: string; row: LedgerStandingRow; mayHaveReached: bool
     mayHaveReached: true,
   },
 
-  // ── CANCELLED and RESOLVED. Only these two shapes carry a proof that no remote call is
-  //    unaccounted for, and only these two may be read as "nothing posted".
+  // ── CANCELLED and RESOLVED. Only this shape carries a proof that no remote call is
+  //    unaccounted for, and only this one may be read as "nothing posted".
   {
     name: 'CANCELLED by the orphan sweep, which matched PENDING and so proved the row was pre-call',
     row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true, settlementBasis: null },
     mayHaveReached: false,
   },
+
+  // ── C1 (o3d-f709), FLIPPED. This shape was listed above as RESOLVED (`mayHaveReached: false`):
+  //    "a human opened the ledger and looked". IMS never looked - a person said so - so it is NOT
+  //    proof the ledger was untouched and it MAY have reached it.
   {
-    name: 'shape (b): CANCELLED by an operator asserting NOT_POSTED, no document id',
+    name: 'shape (b), C1: CANCELLED by an operator asserting NOT_POSTED, no document id',
     row: {
       status: 'CANCELLED',
       externalTransactionId: null,
       abandonedBeforeRemoteCall: null,
       settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
     },
-    mayHaveReached: false,
+    mayHaveReached: true,
   },
 
   // ── The external-id veto. A document id exists only because a remote call returned, so it
@@ -142,7 +146,7 @@ test('o3d-f709: the population is not one-sided, so neither assertion above is v
   const admitted = SHAPES.filter((s) => s.mayHaveReached)
   const refused = SHAPES.filter((s) => !s.mayHaveReached)
   assert.ok(admitted.length >= 2, 'population must contain rows the rule admits')
-  assert.ok(refused.length >= 2, 'population must contain rows the rule refuses')
+  assert.ok(refused.length >= 1, 'population must contain rows the rule refuses')
 
   // AND IT MUST SEPARATE THE RULE FROM THE ONE IT REPLACES. At least one shape has to be a row
   // that `status !== 'CANCELLED'` and `mayHaveReachedLedger` answer DIFFERENTLY, or the whole

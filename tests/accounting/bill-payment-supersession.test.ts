@@ -309,8 +309,11 @@ test('o3d-f709: the shortfall re-read asks the SHARED rule, not a hand-written "
     'a row cancelPendingSalesInvoiceSyncForOrder retired proves nothing, so it is still a refusal')
   assert.equal(matchesWhere(cancelled({ abandonedBeforeRemoteCall: true }), MAY_HAVE_REACHED_LEDGER_WHERE), false,
     'the orphan sweep matched PENDING and recorded the fact, so its row is not a refusal')
-  assert.equal(matchesWhere(cancelled({ settlementBasis: 'OPERATOR_ASSERTION' }), MAY_HAVE_REACHED_LEDGER_WHERE), false,
-    'nor is a row an operator settled NOT_POSTED, having looked in the ledger')
+  // C1 (o3d-f709), FLIPPED: this asserted `false` ("nor is a row an operator settled NOT_POSTED,
+  // having looked in the ledger"). An operator's assertion is a statement about a ledger IMS never
+  // looked at, so it is NOT proof the ledger was untouched and the row still counts.
+  assert.equal(matchesWhere(cancelled({ settlementBasis: 'OPERATOR_ASSERTION' }), MAY_HAVE_REACHED_LEDGER_WHERE), true,
+    'an operator-asserted NOT_POSTED row is NOT proof nothing was sent (C1): it still refuses')
   assert.equal(
     matchesWhere(cancelled({ abandonedBeforeRemoteCall: true, externalTransactionId: 'PAY-9' }), MAY_HAVE_REACHED_LEDGER_WHERE),
     true, 'but a document id outranks the proof: the id exists because a call returned')

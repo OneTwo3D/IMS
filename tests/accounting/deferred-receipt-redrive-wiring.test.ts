@@ -447,22 +447,29 @@ test('[o3d-kof8] a SWEPT retired row that still names the ledger payment refuses
   assert.match(refusals[0].description, /INV-1/)
 })
 
-test('[o3d-ekn8 r4] once the retired row is RESOLVED the replacement invoice IS settled, key and all', async () => {
-  // Cancelling it is an operator asserting they read the ledger and the old payment is gone — the one
-  // fact this code cannot establish for itself. o3d-kof8 narrowed what counts as that assertion: the
-  // row must carry an OPERATOR_ASSERTION basis and name no document, which is the audited NOT_POSTED
-  // settlement rather than any row that happens to be CANCELLED. o3d-ekn8's outcome then holds
-  // exactly as before: the replacement is settled rather than left outstanding for ever, under a key
-  // anchored to INV-2 so the retired row can never claim to be this one. The legacy un-anchored key
-  // is used deliberately, because that is the shape production presents and it is what the anchor
-  // exists to defeat.
+test('[o3d-ekn8 r4] once the retired row is PROVEN pre-call the replacement invoice IS settled, key and all', async () => {
+  // C1 (o3d-f709) CHANGED WHAT RESOLVES THIS. It used to be "an operator asserted NOT_POSTED"; an
+  // operator's say-so about a ledger IMS never looked at is not proof (see the next test), so the
+  // clearing fact is now the system's own proof: the orphan sweep matched a PENDING row and wrote
+  // `abandonedBeforeRemoteCall: true` in the same UPDATE, and the row names no document.
+  // o3d-ekn8's outcome then holds exactly as before: the replacement is settled rather than left
+  // outstanding for ever, under a key anchored to INV-2 so the retired row can never claim to be this
+  // one. The legacy un-anchored key is used deliberately, because that is the shape production
+  // presents and it is what the anchor exists to defeat.
   state.order.accountingInvoiceId = 'INV-2'
   state.syncRows = [{
     ...rowForRetiredInvoice('invoice-payment:payment:pay-1'),
     status: 'CANCELLED',
-    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+    externalTransactionId: null,
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: true,
   }]
   state.payments = [...ONE_RECEIPT]
+  // Precondition printed, not assumed: the row under test is the swept pre-call shape.
+  assert.deepEqual(
+    [state.syncRows[0].status, state.syncRows[0].abandonedBeforeRemoteCall, state.syncRows[0].externalTransactionId],
+    ['CANCELLED', true, null],
+  )
 
   await redrive('INV-2')
 
@@ -479,6 +486,32 @@ test('[o3d-ekn8 r4] once the retired row is RESOLVED the replacement invoice IS 
     0,
     'and it is not merely reported as refused — it is actually sent',
   )
+})
+
+test('[o3d-f709 C1] an operator-ASSERTED NOT_POSTED retired row does NOT clear the retired document — it refuses', async () => {
+  // THE FLIP. This is the row the previous test used to be written about. A person said "nothing
+  // posted"; nobody asked the ledger. The first payment may be standing in INV-1's books, and a second
+  // against INV-2 pays the customer's money twice, so the receipt refuses (reported, never silent).
+  state.order.accountingInvoiceId = 'INV-2'
+  state.syncRows = [{
+    ...rowForRetiredInvoice('invoice-payment:payment:pay-1'),
+    status: 'CANCELLED',
+    externalTransactionId: null,
+    abandonedBeforeRemoteCall: null,
+    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+  }]
+  state.payments = [...ONE_RECEIPT]
+  assert.deepEqual(
+    [state.syncRows[0].status, state.syncRows[0].settlementBasis, state.syncRows[0].externalTransactionId],
+    ['CANCELLED', 'OPERATOR_ASSERTION', null],
+  )
+
+  await redrive('INV-2')
+
+  assert.equal(state.queued.length, 0, 'an assertion is not proof: no second payment')
+  const refusals = state.activity.filter((a) => a.action === 'invoice_payment_not_registered')
+  assert.equal(refusals.length, 1, 'and the refusal is REPORTED rather than silent')
+  assert.equal(refusals[0].metadata.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
 test('[o3d-ekn8 r3] a receipt already registered against the CURRENT invoice is still never re-driven', async () => {

@@ -476,12 +476,11 @@ test('[o3d-nepa] a young unresolved abandonment is untouched by both passes — 
   assert.deepEqual(store.accounting[0].payload, { customer: 'A Person' })
 })
 
-test('[o3d-nepa round 4] an operator-SETTLED cancelled row is DELETED, not kept for ever', async () => {
-  // THE DEFECT. "Resolved" was keyed solely on `abandonedBeforeRemoteCall`, and exactly one writer
-  // ever sets it — the orphan sweep, over a PENDING row. An operator who opened the ledger, saw
-  // nothing, and settled the row NOT_POSTED produced a CANCELLED row with `settlementBasis =
-  // OPERATOR_ASSERTION` and NO flag, so retention held it back for ever as a compacted tombstone.
-  // That assertion is a STRONGER resolution than the flag, not a weaker one.
+test('[o3d-nepa round 4, REVERSED by C1 / R1] an operator-SETTLED cancelled row is RETAINED, and only the sweep-proved row is deleted', async () => {
+  // C1 (o3d-f709) FLIPPED THIS TEST. Round 4 held that an operator who settled a row NOT_POSTED had
+  // "opened the ledger, seen nothing" and that the row was therefore deletable by age. IMS never
+  // looked: a person said so. A lost response, a late webhook and a hand-post all leave the same
+  // row, so deleting it destroys the only local record that the question was ever open.
   const purgeExpiredData = await loadPurge()
   seed()
   store.accounting = [
@@ -495,7 +494,18 @@ test('[o3d-nepa round 4] an operator-SETTLED cancelled row is DELETED, not kept 
       settlementBasis: 'OPERATOR_ASSERTION',
       payload: { customer: 'A Person' },
     },
-    // The control, so this is about the assertion and not about the cutoff or the status.
+    // The control that makes the flip about the assertion: the orphan sweep's own pre-call proof
+    // still resolves a row, so this one IS deleted. Without it "everything is retained" would pass.
+    {
+      id: 'sweep-proved',
+      createdAt: OLD,
+      status: 'CANCELLED',
+      type: 'SALES_INVOICE',
+      abandonedBeforeRemoteCall: true,
+      externalTransactionId: null,
+      settlementBasis: null,
+      payload: { customer: 'A Person' },
+    },
     {
       id: 'nobody-resolved',
       createdAt: OLD,
@@ -507,12 +517,14 @@ test('[o3d-nepa round 4] an operator-SETTLED cancelled row is DELETED, not kept 
       payload: { customer: 'A Person' },
     },
   ]
+  // Precondition printed, not assumed.
+  assert.equal(store.accounting.length, 3)
 
   const result = await purgeExpiredData()
 
-  assert.equal(result.syncLogsDeleted, 1)
-  assert.deepEqual(store.accounting.map((row) => row.id), ['nobody-resolved'])
-  assert.equal(result.backReferenceEvidenceCompacted, 1, 'and only the unresolved one becomes a tombstone')
+  assert.equal(result.syncLogsDeleted, 1, 'only the sweep-proved row is deleted')
+  assert.deepEqual(store.accounting.map((row) => row.id).sort(), ['nobody-resolved', 'operator-settled'])
+  assert.equal(result.backReferenceEvidenceCompacted, 2, 'both unresolved rows become tombstones; the assertion stays visible on the row')
 })
 
 test('[o3d-nepa round 4] an operator settlement that NAMES a document is still kept', async () => {

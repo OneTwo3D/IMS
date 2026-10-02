@@ -926,23 +926,30 @@ test('a zero-paid bill whose registration POSTED before the read IS reversed: ou
   assert.ok(state.activity.some((a) => a.action === 'bill_payment_reversal_detected'))
 })
 
-test('o3d-f709: a zero-paid bill whose registration was CANCELLED AND RESOLVED IS reversed', async () => {
+test('o3d-f709 C1 (FLIPPED): a zero-paid bill whose registration an operator SETTLED NOT_POSTED is WITHHELD, not reversed', async () => {
   reset()
   state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
   state.purchaseInvoices = [paidBillRow()]
-  // The operator remedy for a stuck registration is the SETTLEMENT action, and a NOT_POSTED
-  // settlement writes exactly this shape: CANCELLED, no document id, and a `settlementBasis`
-  // recording that a human opened the ledger and looked. THAT is what makes the zero the whole
-  // story — a person checked — and not the status on its own.
+  // THIS TEST USED TO ASSERT THE OPPOSITE (`billsReversed === 1`). A NOT_POSTED settlement writes
+  // exactly this shape: CANCELLED, no document id, and a `settlementBasis` recording that a PERSON
+  // said nothing posted. IMS never read the ledger for it, so the zero is not "the whole story": the
+  // registration may stand in front of a payment that has not landed, and reversing here clears
+  // `paidAt` and re-arms Mark Paid over it - a second supplier payment.
   state.syncLogs = [billRegistration({
     status: 'CANCELLED', externalTransactionId: null, syncedAt: null,
     settlementBasis: 'OPERATOR_ASSERTION',
   })]
+  assert.deepEqual(
+    [state.syncLogs[0].status, state.syncLogs[0].settlementBasis, state.syncLogs[0].externalTransactionId],
+    ['CANCELLED', 'OPERATOR_ASSERTION', null],
+    'precondition: the asserted NOT_POSTED shape',
+  )
 
   const result = await poll()
 
-  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'])
-  assert.equal(result.billsReversed, 1)
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [], 'paidAt must not be cleared on an assertion')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
 })
 
 test('o3d-f709: the same bill with an UNRESOLVED cancellation is WITHHELD, not reversed', async () => {
@@ -1201,12 +1208,13 @@ test('a withheld reversal is asked again on a timer, and a cancelled registratio
   state.invoices = []
   state.activityRows = [withheldMarker()]
   state.purchaseInvoices = [paidBillRow()]
-  // The operator SETTLED the stuck registration NOT_POSTED, which is exactly what the withheld
-  // warning told them to do. o3d-f709: it is the recorded basis — a human opened the ledger and
-  // looked — and not the CANCELLED status on its own, that makes the zero the whole story.
+  // The registration is a CANCELLED row the orphan sweep PROVED pre-call. o3d-f709 C1: this used to
+  // be an operator's NOT_POSTED settlement, which no longer resolves anything (a person's word about a
+  // ledger IMS never read); the sweep's `abandonedBeforeRemoteCall` is the proof that makes the zero
+  // the whole story.
   state.syncLogs = [billRegistration({
     status: 'CANCELLED', externalTransactionId: null, syncedAt: null,
-    settlementBasis: 'OPERATOR_ASSERTION',
+    abandonedBeforeRemoteCall: true,
   })]
   state.recheckInvoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
 

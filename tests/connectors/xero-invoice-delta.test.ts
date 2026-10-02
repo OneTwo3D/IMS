@@ -1059,24 +1059,36 @@ test('o3d-f709: a CANCELLED registration that resolves nothing is UNDECIDED, not
 })
 
 test('o3d-f709: a CANCELLED registration that PROVES its abandonment was pre-call still holds nothing', () => {
-  // The other side of the rule, and the reason this is not simply "never skip a cancelled row".
-  // Two shapes carry the proof; both must still drop out, or every order the orphan sweep has ever
-  // tidied becomes permanently undecided.
+  // The other side of the rule, and the reason this is not simply "never skip a cancelled row". The
+  // sweep's pre-call proof must still drop out, or every order the orphan sweep has ever tidied
+  // becomes permanently undecided.
   const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
-  for (const resolved of [
-    { abandonedBeforeRemoteCall: true, settlementBasis: null },
-    { abandonedBeforeRemoteCall: null, settlementBasis: 'OPERATOR_ASSERTION' },
-  ]) {
-    const row = postedRegistration({ id: 'log_x', status: 'CANCELLED', externalTransactionId: null, ...resolved })
-    assert.deepEqual(
-      classifyRegisteredPayment(invoice, [row, postedRegistration()], READ_AT),
-      { verdict: 'GONE', paymentIds: ['PAY-1'] },
-      `a resolved cancelled row must not withhold: ${JSON.stringify(resolved)}`)
-    assert.deepEqual(
-      classifyRegisteredPayment(invoice, [row], READ_AT),
-      { verdict: 'NOTHING_REGISTERED' },
-      `and alone it is still "nothing was registered": ${JSON.stringify(resolved)}`)
-  }
+  const resolved = { abandonedBeforeRemoteCall: true, settlementBasis: null }
+  const row = postedRegistration({ id: 'log_x', status: 'CANCELLED', externalTransactionId: null, ...resolved })
+  assert.deepEqual([row.status, row.abandonedBeforeRemoteCall, row.externalTransactionId], ['CANCELLED', true, null])
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row, postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] },
+    `a resolved cancelled row must not withhold: ${JSON.stringify(resolved)}`)
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row], READ_AT),
+    { verdict: 'NOTHING_REGISTERED' },
+    `and alone it is still "nothing was registered": ${JSON.stringify(resolved)}`)
+})
+
+test('o3d-f709 C1 (FLIPPED): an operator-ASSERTED NOT_POSTED registration WITHHOLDS the verdict - it is not proof', () => {
+  // This used to sit in the list above and drop out as "resolved": a person typed NOT_POSTED, the
+  // verdict collapsed to NOTHING_REGISTERED, and the poller cleared paidAt. IMS never looked at the
+  // ledger, so the row may stand in front of a real payment; Mark Paid must not be re-armed on it.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const row = postedRegistration({
+    id: 'log_x', status: 'CANCELLED', externalTransactionId: null,
+    abandonedBeforeRemoteCall: null, settlementBasis: 'OPERATOR_ASSERTION',
+  })
+  assert.deepEqual([row.status, row.settlementBasis, row.externalTransactionId], ['CANCELLED', 'OPERATOR_ASSERTION', null])
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [row], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_x'] })
 })
 
 test('o3d-f709: a DOCUMENT ID on a cancelled row outranks either proof', () => {

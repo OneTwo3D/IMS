@@ -566,25 +566,10 @@ test('[o3d-kof8] a CANCELLED row nothing resolved refuses too, id or no id', () 
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
-test('[o3d-ekn8 r4] a RESOLVED cancellation clears it — that is a human saying they read the ledger', () => {
-  // The remedy the refusal names, and it still works: o3d-ekn8's "never silently unsettled for ever"
-  // survives. What changed is what counts as the human's word — an OPERATOR_ASSERTION settlement
-  // naming no document, which is the audited NOT_POSTED assertion, rather than any row at all that
-  // happens to be CANCELLED.
-  const asserted = decideInvoicePaymentRegistration({
-    ...base,
-    accountingInvoiceId: 'INV-2',
-    existing: [live({
-      status: 'CANCELLED',
-      amount: 100,
-      paymentId: 'pay-new',
-      accountingInvoiceId: 'INV-1',
-      settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
-    })],
-  })
-  assert.equal(asserted.register, true, 'the audited NOT_POSTED assertion is the fact IMS cannot establish')
-
-  // And the sweep's pre-call proof, where it is not contradicted by an id, resolves it as well.
+test('[o3d-ekn8 r4] a PROVEN pre-call cancellation clears it; an operator ASSERTION does not (C1)', () => {
+  // The remedy the refusal names, and it still works for the one fact IMS can establish itself: the
+  // sweep's pre-call proof, where it is not contradicted by an id. o3d-ekn8's "never silently
+  // unsettled for ever" survives for that row.
   const swept = decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
@@ -597,6 +582,23 @@ test('[o3d-ekn8 r4] a RESOLVED cancellation clears it — that is a human saying
     })],
   })
   assert.equal(swept.register, true, 'a PENDING row retired with no document id really was pre-call')
+
+  // C1 (o3d-f709), FLIPPED. This used to assert `register === true` for an OPERATOR_ASSERTION
+  // settlement naming no document ("the audited NOT_POSTED assertion is the fact IMS cannot
+  // establish"). It is a person's statement about a ledger nobody looked at, so it no longer clears.
+  const asserted = decideInvoicePaymentRegistration({
+    ...base,
+    accountingInvoiceId: 'INV-2',
+    existing: [live({
+      status: 'CANCELLED',
+      amount: 100,
+      paymentId: 'pay-new',
+      accountingInvoiceId: 'INV-1',
+      settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
+    })],
+  })
+  assert.equal(asserted.register, false, 'an operator assertion is not proof the first payment never posted')
+  assert.equal(asserted.register === false && asserted.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
 test('[o3d-kof8] a FAILED row on a retired document refuses as well — a failure is not a non-call', () => {
