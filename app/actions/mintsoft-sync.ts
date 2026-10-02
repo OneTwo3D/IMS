@@ -85,6 +85,10 @@ import {
 } from '@/lib/domain/inventory/po-line-landed-quantity'
 import { lockPurchaseOrders, lockStockTransfers, lockWmsAsnMaps } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { loadUnreconciledManualReceiptQty } from '@/lib/domain/wms/manual-receipt-pool'
+import {
+  assertPendingAsnReservationStillOurs,
+  PendingAsnFinalizationConflictError,
+} from '@/lib/domain/wms/pending-asn-finalization'
 import { getWmsConnector, isWmsConnectorConfigured } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -2830,7 +2834,7 @@ async function recordUnverifiedMintsoftAsnCreate(
     tag: 'sync',
     action: 'mintsoft_asn_create_unverified',
     level: 'WARNING',
-    description: `Mintsoft ASN ${externalAsnId} exists at the warehouse but does not match what was sent, so IMS recorded nothing for it`,
+    description: `Mintsoft ASN ${externalAsnId} exists at the warehouse and IMS recorded nothing for it (it does not match what was sent, or the reservation it was created for changed while the create was in flight)`,
     metadata: {
       ...source,
       externalAsnId,
@@ -3608,8 +3612,14 @@ export async function createMintsoftPurchaseOrderAsn(
       await disposePendingAsnReservation(tx, {
         parent: { kind: 'PURCHASE_ORDER', id: reservation.poId },
         asnMapId: reservation.asnMapId,
+        // ONLY AN UNCLAIMED, OPEN reservation (o3d-papk, Codex round 2). The claim moves a row to
+        // CREATE_IN_FLIGHT, and a request that has claimed it is about to push it to the warehouse and finalize
+        // it: another request whose revalidation failed must not retire (or delete) that row from under it. A row
+        // that does not match is `absent` here and left alone.
         reservationWhere: {
           connector: 'mintsoft',
+          status: 'CREATE_PENDING',
+          closedAt: null,
           externalAsnId: {
             startsWith: pendingAsnPrefix,
           },
@@ -3660,6 +3670,18 @@ export async function createMintsoftPurchaseOrderAsn(
             select: { id: true },
           },
         },
+      })
+
+      // COMPARE-AND-SET (o3d-papk, Codex round 2). Under the purchase-order and header locks, BEFORE any write: this
+      // is still the reservation this request reserved (open, in the status its own step left it in, the same
+      // lines carrying the same quantities). Otherwise fail closed, and say which remote ASN was left behind.
+      await assertPendingAsnReservationStillOurs(tx, {
+        parent: { kind: 'PURCHASE_ORDER', id: reservation.poId },
+        asnMapId: reservation.asnMapId,
+        expectedStatus: kind === 'created' ? 'CREATE_IN_FLIGHT' : 'CREATE_PENDING',
+        lines: reservation.lines.map((line) => ({ asnLineMapId: line.asnLineMapId, expectedQty: line.outstanding.qtyNumber })),
+        remoteExternalAsnId: createdAsn.externalAsnId,
+        alreadyRecorded: Boolean(conflictingAsn && conflictingAsn.id !== reservation.asnMapId),
       })
 
       if (conflictingAsn && conflictingAsn.id !== reservation.asnMapId) {
@@ -3742,6 +3764,11 @@ export async function createMintsoftPurchaseOrderAsn(
     }, { maxWait: 5000, timeout: 30000 })
   }
 
+  // The row THIS request claimed, if it got that far. The catch below demotes only that row: it used to demote EVERY
+  // in-flight pending row of the parent, so a request that failed for its own reasons (a revalidation mismatch) put
+  // ANOTHER request's claimed row back to CREATE_PENDING while that request was still pushing it (o3d-papk round 2).
+  let claimedAsnMapId: string | null = null
+
   try {
     const connector = getWmsConnector('mintsoft')
     const reserved = await reserveAsn()
@@ -3771,6 +3798,7 @@ export async function createMintsoftPurchaseOrderAsn(
         if (!claimed) {
           throw new Error('Mintsoft ASN creation is already in progress for this purchase order.')
         }
+        claimedAsnMapId = reservation.asnMapId
 
         const recheckedMismatch = await revalidatePendingReservation(reservation)
         if (recheckedMismatch) {
@@ -3905,22 +3933,31 @@ export async function createMintsoftPurchaseOrderAsn(
     // is what looks an existing ASN up, by the reference and the item source line ids.
     // o3d-0xspr: MintsoftAsnStatusUnreadableError carries the id of an ASN that EXISTS at the warehouse and was
     // not recorded, exactly as the verification error does, so it is retained the same way.
-    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError ? error.externalAsnId : null
+    // o3d-papk (round 2): a finalize that failed closed carries the id of the ASN the warehouse DID create, for the same
+    // reason — unless IMS already holds a record for it.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError
+      ? error.externalAsnId
+      : error instanceof PendingAsnFinalizationConflictError && !error.alreadyRecorded
+        ? error.externalAsnId
+        : null
 
-    await db.wmsAsnMap.updateMany({
-      where: {
-        connector: 'mintsoft',
-        sourceType: 'PURCHASE_ORDER',
-        sourceId: parsedId.data,
-        status: 'CREATE_IN_FLIGHT',
-        externalAsnId: {
-          startsWith: pendingAsnPrefix,
+    if (claimedAsnMapId) {
+      await db.wmsAsnMap.updateMany({
+        where: {
+          id: claimedAsnMapId,
+          connector: 'mintsoft',
+          sourceType: 'PURCHASE_ORDER',
+          sourceId: parsedId.data,
+          status: 'CREATE_IN_FLIGHT',
+          externalAsnId: {
+            startsWith: pendingAsnPrefix,
+          },
         },
-      },
-      data: {
-        status: 'CREATE_PENDING',
-      },
-    })
+        data: {
+          status: 'CREATE_PENDING',
+        },
+      })
+    }
 
     await db.wmsSyncJob.update({
       where: { id: job.id },
@@ -4756,8 +4793,12 @@ export async function createMintsoftTransferAsn(
       await disposePendingTransferAsnReservation(tx, {
         transferId: reservation.transferId,
         asnMapId: reservation.asnMapId,
+        // ONLY AN UNCLAIMED, OPEN reservation (o3d-papk, Codex round 2: carried over from the purchase-order creator,
+        // where the defect was found; this creator has the same shape). See there.
         reservationWhere: {
           connector: 'mintsoft',
+          status: 'CREATE_PENDING',
+          closedAt: null,
           externalAsnId: {
             startsWith: pendingAsnPrefix,
           },
@@ -4810,6 +4851,18 @@ export async function createMintsoftTransferAsn(
             select: { id: true },
           },
         },
+      })
+
+      // COMPARE-AND-SET (o3d-papk, Codex round 2: carried over from the purchase-order creator). Under the transfer and header locks, BEFORE any write: this
+      // is still the reservation this request reserved (open, in the status its own step left it in, the same
+      // lines carrying the same quantities). Otherwise fail closed, and say which remote ASN was left behind.
+      await assertPendingAsnReservationStillOurs(tx, {
+        parent: { kind: 'STOCK_TRANSFER', id: reservation.transferId },
+        asnMapId: reservation.asnMapId,
+        expectedStatus: kind === 'created' ? 'CREATE_IN_FLIGHT' : 'CREATE_PENDING',
+        lines: reservation.lines.map((line) => ({ asnLineMapId: line.asnLineMapId, expectedQty: line.outstanding.qtyNumber })),
+        remoteExternalAsnId: createdAsn.externalAsnId,
+        alreadyRecorded: Boolean(conflictingAsn && conflictingAsn.id !== reservation.asnMapId),
       })
 
       if (conflictingAsn && conflictingAsn.id !== reservation.asnMapId) {
@@ -4894,6 +4947,11 @@ export async function createMintsoftTransferAsn(
     }, { maxWait: 5000, timeout: 30000 })
   }
 
+  // The row THIS request claimed, if it got that far. The catch below demotes only that row: it used to demote EVERY
+  // in-flight pending row of the parent, so a request that failed for its own reasons (a revalidation mismatch) put
+  // ANOTHER request's claimed row back to CREATE_PENDING while that request was still pushing it (o3d-papk round 2).
+  let claimedAsnMapId: string | null = null
+
   try {
     const connector = getWmsConnector('mintsoft')
     const reserved = await reserveAsn()
@@ -4923,6 +4981,7 @@ export async function createMintsoftTransferAsn(
         if (!claimed) {
           throw new Error('Mintsoft ASN creation is already in progress for this transfer.')
         }
+        claimedAsnMapId = reservation.asnMapId
 
         const recheckedMismatch = await revalidatePendingReservation(reservation)
         if (recheckedMismatch) {
@@ -5056,22 +5115,31 @@ export async function createMintsoftTransferAsn(
     // is what looks an existing ASN up, by the reference and the item source line ids.
     // o3d-0xspr: as in the purchase-order creator — the unreadable-status error carries an ASN that exists at
     // the warehouse and was not recorded.
-    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError ? error.externalAsnId : null
+    // o3d-papk (round 2): a finalize that failed closed carries the id of the ASN the warehouse DID create, for the same
+    // reason — unless IMS already holds a record for it.
+    const unrecordedExternalAsnId = error instanceof MintsoftAsnCreateVerificationError || error instanceof MintsoftAsnStatusUnreadableError
+      ? error.externalAsnId
+      : error instanceof PendingAsnFinalizationConflictError && !error.alreadyRecorded
+        ? error.externalAsnId
+        : null
 
-    await db.wmsAsnMap.updateMany({
-      where: {
-        connector: 'mintsoft',
-        sourceType: 'STOCK_TRANSFER',
-        sourceId: parsedId.data,
-        status: 'CREATE_IN_FLIGHT',
-        externalAsnId: {
-          startsWith: pendingAsnPrefix,
+    if (claimedAsnMapId) {
+      await db.wmsAsnMap.updateMany({
+        where: {
+          id: claimedAsnMapId,
+          connector: 'mintsoft',
+          sourceType: 'STOCK_TRANSFER',
+          sourceId: parsedId.data,
+          status: 'CREATE_IN_FLIGHT',
+          externalAsnId: {
+            startsWith: pendingAsnPrefix,
+          },
         },
-      },
-      data: {
-        status: 'CREATE_PENDING',
-      },
-    })
+        data: {
+          status: 'CREATE_PENDING',
+        },
+      })
+    }
 
     await db.wmsSyncJob.update({
       where: { id: job.id },

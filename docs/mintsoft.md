@@ -191,6 +191,17 @@ Applied corrections log `mintsoft_align_down_applied` (WARNING) with before/afte
   outstanding is reserved on a NEW reservation with a zero credit; one holding no credit is still deleted or
   resized in place. Operator refusals that can follow a disposal write are returned, not thrown, so the
   retirement commits. The claim also refuses a retired row (`closedAt IS NULL`) for both creators.
+  **Two requests that reserved the same row** (o3d-papk, Codex round 2): the discard only ever disposes of an
+  UNCLAIMED, OPEN reservation (`status = CREATE_PENDING AND closedAt IS NULL`; the claim is what moves a row to
+  `CREATE_IN_FLIGHT`), so a request whose revalidation failed cannot retire the row another request has claimed and
+  is pushing. The finalize is a compare-and-set under the parent and header locks, before any write: the row must
+  still be open, in the status its own step left it in (`CREATE_IN_FLIGHT` after a claim, `CREATE_PENDING` for a
+  duplicate-recovery adoption) and carry the same lines at the quantities that were reserved. If it does not, the
+  finalize FAILS CLOSED: nothing is written to the row (it is not reopened, mapped or resized), and the id of the
+  ASN the warehouse did create is retained on the failed job's summary (`unrecordedExternalAsnId`) and a WARNING
+  activity entry, exactly as for an ASN whose read-back did not verify; the next create attempt is refused by name
+  by the duplicate matcher (or adopts the ASN if the row has come to match it), so no second ASN is created and the
+  orphan is neither lost nor silently adopted. Both creators.
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
@@ -442,7 +453,7 @@ line, while the ASN is still open, is indistinguishable from the same units rece
 
 ### Receipt Review
 
-Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
+Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings. **A callback against a CANCELLED or CLOSED purchase order is one of them** (`parent_not_receivable`, "Purchase order cancelled or closed", approval-blocked: nothing may be received against an order the business has called off, so approval cannot release it; the alignment and the manual receipt refuse the same state). A booked-in status write goes through the purchase-order workflow (`validatePurchaseOrderStatusTransition`), so a late book-in against an INVOICED or returned order lands its stock and landed quantity but never overwrites the status (o3d-yaazk). Events that instead exhaust their retries go `DEAD` and surface in the cross-connector [sync exception inbox](./sync-exceptions.md) (`/sync/exceptions`), which can safely re-queue them.
 
 - Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, missing transfer cost-layer snapshot, an **unreadable remote quantity** and a **missing remote ASN item** (the last two are o3d-btiw: an operator acknowledging a warning cannot supply a quantity the warehouse never served).
 - **`missing_local_line` means the ASN line names a source line IMS does not have — not that there was nothing to do for it (o3d-h66s).** The IMS purchase-order / stock-transfer rows are read for **every** line of the ASN, not only the ones with new quantity to apply, so a line whose remote quantity has not moved since the last callback is recognised as the healthy line it is. Until o3d-h66s that read was restricted to lines with a positive delta, so a zero-delta line reported its own existing IMS line as missing; because the warning is aggregate, that held the **whole** callback in an approval-blocked review and applied nothing for its other lines either. In practice that meant every partially booked ASN, every re-check of an ASN already settled, and any line whose `QuantityBooked` was a readable `0`. A `sourceLineId` that genuinely resolves to no IMS row still raises the warning and still blocks, with or without a delta.

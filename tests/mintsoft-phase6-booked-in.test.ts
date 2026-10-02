@@ -399,3 +399,30 @@ test('buildMintsoftWebhookReplayForAsnWhere includes dead-lettered unprocessed e
     },
   )
 })
+
+test('o3d-papk round 2: a line with something to apply against a CANCELLED/CLOSED parent raises parent_not_receivable; a settled line and a receivable parent do not', () => {
+  const base = {
+    asnLineMapId: 'line-map-1',
+    externalAsnLineId: 'remote-line-1',
+    sourceType: 'PURCHASE_ORDER_LINE',
+    sourceLineId: 'po-line-1',
+    productId: 'product-1',
+    sku: 'SKU-1',
+    expectedQty: 10,
+    manualReceiptPool: NO_POOL,
+    qtyAccountedViaSnapshot: 0,
+    qtyAccountedViaReceipt: 0,
+    lastProcessedReceivedQty: 0,
+    localLineExists: true,
+  }
+  const run = (line: Record<string, unknown>) => buildBookedInDryRun({
+    externalAsnId: 'asn-parent',
+    generatedAt: new Date('2026-10-02T00:00:00.000Z'),
+    lines: [{ ...base, ...line } as never],
+  }).lines[0]!.warnings
+  assert.deepEqual(run({ currentRemoteReceivedQty: 6, parentReceivable: false }), ['parent_not_receivable'], 'something to apply, parent not receivable')
+  assert.deepEqual(run({ currentRemoteReceivedQty: 6, parentReceivable: true }), [], 'receivable parent')
+  assert.deepEqual(run({ currentRemoteReceivedQty: 6 }), [], 'unspecified means not known to be unusable (a transfer line)')
+  assert.deepEqual(run({ currentRemoteReceivedQty: 6, lastProcessedReceivedQty: 6, qtyAccountedViaReceipt: 6, parentReceivable: false }), [], 'a settled line (no delta) does not drag its siblings into review')
+  console.log('# o3d-papk round 2: evaluated 4 dry-run lines')
+})

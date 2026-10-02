@@ -47,6 +47,10 @@ export type BookedInDryRunWarningCode =
   // reporting success, or reads as a regression against earlier state.
   | 'remote_quantity_unreadable'
   | 'missing_remote_line'
+  // o3d-papk: the parent order (purchase order) is CANCELLED or CLOSED, so it expects nothing more. A callback that
+  // would bring units in against it is held for review instead: stock, a cost layer and a journal against an order the
+  // business has called off is a different problem from a late receipt, and approval cannot make it receivable.
+  | 'parent_not_receivable'
 
 /**
  * A remote quantity IMS could not use, and why. o3d-btiw.
@@ -123,6 +127,12 @@ export type BookedInDryRunLineInput = {
   qtyAccountedViaReceipt?: number
   lastProcessedReceivedQty?: number
   localLineExists?: boolean
+  /**
+   * o3d-papk. False when the line's parent order is in a status that expects nothing more (a CANCELLED or CLOSED
+   * purchase order). Absent means "not known to be unusable" (a transfer line, whose status is enforced where it is
+   * locked). Raises `parent_not_receivable` for a line that has something to apply.
+   */
+  parentReceivable?: boolean
   costLayerSnapshot?: unknown
   /**
    * o3d-btiw. Set when the WMS served no usable booked quantity for this line. When it is set,
@@ -341,6 +351,10 @@ export function buildBookedInDryRun(input: {
       && parseCostLayerSnapshot(line.costLayerSnapshot).length === 0
     ) {
       warnings.push('cost_layer_snapshot_missing')
+    }
+
+    if (line.parentReceivable === false && reconciled.newlyProcessedQty > WMS_RECEIPT_QTY_EPSILON) {
+      warnings.push('parent_not_receivable')
     }
 
     return {

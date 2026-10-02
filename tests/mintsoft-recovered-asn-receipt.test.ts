@@ -195,7 +195,8 @@ const wmsAsnMapDelegate = {
   findFirst: async (args: { where: Record<string, unknown> }) => {
     const where = args.where
     const candidates = asnMaps.filter((row) => (
-      (where.connector === undefined || row.connector === where.connector)
+      (where.id === undefined || row.id === where.id)
+      && (where.connector === undefined || row.connector === where.connector)
       && row.sourceType === where.sourceType
       && row.sourceId === where.sourceId
       && (where.closedAt !== null || row.closedAt === null)
@@ -211,7 +212,8 @@ const wmsAsnMapDelegate = {
     })
     const row = matched[0]
     if (!row) return null
-    return { id: row.id, externalAsnId: row.externalAsnId, status: row.status, updatedAt: row.updatedAt, lines: linesOf(row.id) }
+    // `closedAt` is read by the finalize compare-and-set (o3d-papk round 2).
+    return { id: row.id, externalAsnId: row.externalAsnId, status: row.status, closedAt: row.closedAt, updatedAt: row.updatedAt, lines: linesOf(row.id) }
   },
   findUnique: async (args: { where: Record<string, unknown> }) => {
     if ('connector_externalAsnId' in args.where) {

@@ -41,6 +41,15 @@ This repository uses an `x.y.z` release scheme.
   landed quantity under the order lock it already holds (forward only); the manual receipt and the book-in use
   the same derivation.
 
+- **A WMS booked-in callback no longer receives against a cancelled or closed purchase order, and never overwrites an
+  order's status (o3d-papk round 2, o3d-yaazk).** A partly received order cancelled while its ASN stayed open took stock,
+  a cost layer and a journal from a later callback and then had CANCELLED overwritten with PARTIALLY_RECEIVED/RECEIVED. The
+  callback is now held for review with an approval-blocked `parent_not_receivable` warning, and the status is only written
+  along the purchase-order workflow.
+- **Two ASN-create requests that reserved the same row can no longer retire or reopen it under each other (o3d-papk round 2).**
+  The discard only touches an unclaimed, open reservation, and the finalize is a compare-and-set that fails closed (retaining
+  the id of the ASN the warehouse created) instead of reopening a row whose expectation a retirement had rewritten. Both creators.
+
 ### Parked connectors removed (o3d-remove-parked-connectors)
 
 - **Shopify (shopping) and QuickBooks Online (accounting) are no longer shipped.** The owner's

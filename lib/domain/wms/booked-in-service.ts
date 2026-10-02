@@ -29,8 +29,10 @@ import {
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   derivePurchaseOrderReceiptStatus,
+  isPurchaseOrderUsableForWmsReceipt,
   loadPurchaseOrderLineLandedQty,
   requirePoLineLandedQty,
 } from '@/lib/domain/inventory/po-line-landed-quantity'
@@ -94,6 +96,8 @@ const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
   'missing_local_line',
   'unsupported_source_type',
   'cost_layer_snapshot_missing',
+  // o3d-papk: approval cannot make a cancelled or closed purchase order receivable.
+  'parent_not_receivable',
   // o3d-btiw. An operator acknowledging a warning cannot supply a quantity the warehouse never
   // served, so these two must not be approvable: approval would resume with the unknown quantity
   // still unknown. The remedy is to make the WMS serve the quantity (or to correct the mapping) and
@@ -759,6 +763,7 @@ export async function processBookedInEvent(
             qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
             qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
             lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+            parentReceivable: purchaseLine ? isPurchaseOrderUsableForWmsReceipt(purchaseLine.po.status) : undefined,
             localLineExists: line.sourceType === 'PURCHASE_ORDER_LINE'
               ? Boolean(purchaseLine)
               : line.sourceType === 'STOCK_TRANSFER_LINE'
@@ -962,6 +967,14 @@ export async function processBookedInEvent(
 
         if (!po) {
           throw new Error(`Purchase order ${poId} not found for ASN ${lockedEvent.externalAsnId}`)
+        }
+
+        // o3d-papk (Codex round 2, HIGH): the dry run above holds a callback for REVIEW (`parent_not_receivable`,
+        // approval-blocked) before it reaches here, so this is a backstop for the same fact read again under the same
+        // lock: nothing may add stock, a cost layer or a journal against a CANCELLED or CLOSED order. The same predicate
+        // the alignment and the manual receipt use. INTEGRITY ABORT: rolls back on purpose.
+        if (!isPurchaseOrderUsableForWmsReceipt(po.status)) {
+          throw new Error(`Purchase order ${po.reference} is ${po.status} and cannot be received against for ASN ${lockedEvent.externalAsnId}`)
         }
 
         // ─── o3d-8f0p6 r2: ONE COST FOR THE MOVEMENT, THE LAYER AND THE JOURNAL ───
@@ -1261,13 +1274,18 @@ export async function processBookedInEvent(
           landed: requirePoLineLandedQty(updatedLanded, line.id),
         })))
         const allReceived = newStatus === 'RECEIVED'
-        await tx.purchaseOrder.update({
-          where: { id: poId },
-          data: {
-            status: newStatus,
-            ...(allReceived ? { receivedAt: now } : {}),
-          },
-        })
+        // o3d-papk (Codex round 2): a status is only ever WRITTEN along the purchase-order workflow, never over a status
+        // the workflow does not allow it from (it used to overwrite INVOICED, RETURNED and, with no review step,
+        // CANCELLED). Staying where it is is not a regression: the stock and the landed quantity are recorded either way.
+        if (newStatus === po.status || validatePurchaseOrderStatusTransition(po.status, newStatus).success) {
+          await tx.purchaseOrder.update({
+            where: { id: poId },
+            data: {
+              status: newStatus,
+              ...(allReceived && newStatus !== po.status ? { receivedAt: now } : {}),
+            },
+          })
+        }
 
         // ─── o3d-8f0p6: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
         //

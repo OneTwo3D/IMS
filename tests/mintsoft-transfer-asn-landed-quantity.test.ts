@@ -210,6 +210,8 @@ const wmsAsnMapDelegate = {
       id: row.id,
       externalAsnId: row.externalAsnId,
       status: row.status,
+      // Read by the finalize compare-and-set (o3d-papk round 2).
+      closedAt: row.closedAt,
       updatedAt: row.updatedAt,
       lines: linesOf(row.id),
     }

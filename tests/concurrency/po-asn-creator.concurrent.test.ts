@@ -89,6 +89,7 @@ let rawUrl = ''
 
 let modulesReady: Promise<{
   createMintsoftPurchaseOrderAsn: typeof import('@/app/actions/mintsoft-sync').createMintsoftPurchaseOrderAsn
+  createMintsoftTransferAsn: typeof import('@/app/actions/mintsoft-sync').createMintsoftTransferAsn
 }> | null = null
 
 /** Guard FIRST, then the application modules: nothing opens the pool before the guard. */
@@ -151,7 +152,10 @@ function loadModules() {
       },
     })
     const actions = await import('@/app/actions/mintsoft-sync')
-    return { createMintsoftPurchaseOrderAsn: actions.createMintsoftPurchaseOrderAsn }
+    return {
+      createMintsoftPurchaseOrderAsn: actions.createMintsoftPurchaseOrderAsn,
+      createMintsoftTransferAsn: actions.createMintsoftTransferAsn,
+    }
   })()
   return modulesReady
 }
@@ -751,5 +755,273 @@ test(
     }
     console.log(`# B7 soak (retry x book-in): ${SOAK_ROUNDS} rounds, ${deadlocks} deadlock(s)`)
     assert.equal(deadlocks, 0, 'no 40P01 in any round')
+  },
+)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// ROUND 2 (Codex HIGH): TWO REQUESTS THAT RESERVED THE SAME ROW, RACING ACROSS CLAIM, DISCARD AND FINALIZE
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// The interleavings are DRIVEN, not hoped for: the fake warehouse's hooks run at the exact windows in which no
+// database lock is held (after the reservation committed and before the revalidation; after the claim and before
+// the finalize), so a second request can be run to completion inside the first one's window.
+
+async function remoteRowFor(externalAsnId: string) {
+  const { db } = await import('@/lib/db')
+  return db.wmsAsnMap.findUnique({ where: { connector_externalAsnId: { connector: CONNECTOR, externalAsnId } }, select: { id: true } })
+}
+
+async function failedJobSummaries(poId: string) {
+  const { db } = await import('@/lib/db')
+  const jobs = await db.wmsSyncJob.findMany({
+    where: { connector: CONNECTOR, type: 'ASN_CREATE', summary: { path: ['poId'], equals: poId } },
+    select: { status: true, summary: true },
+  })
+  return jobs.filter((job) => job.status === 'FAILED').map((job) => job.summary as Record<string, unknown>)
+}
+
+test(
+  'R2-4: request B reserved the row, request A claims it and is pushing, a quantity change fails B\'s revalidation: B\'s discard leaves the CLAIMED row alone and A finalizes it intact',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const po = await seedPo('r24', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const remoteId = `${uid()}-r24-remote`
+    nextExternalAsnId = remoteId
+
+    let releaseA!: () => void
+    const aMayFinish = new Promise<void>((resolve) => { releaseA = resolve })
+    let aAtPush!: () => void
+    const aReachedPush = new Promise<void>((resolve) => { aAtPush = resolve })
+    const started: { requestA: ReturnType<typeof createMintsoftPurchaseOrderAsn> | null } = { requestA: null }
+    duplicateRecoveryHook = async () => {
+      // Request B is between its reserve and its revalidation. Request A starts NOW, against the same pending row.
+      createAsnHook = async () => { aAtPush(); await aMayFinish }
+      started.requestA = createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+      await aReachedPush // A has reserved, revalidated and CLAIMED the row, and is inside its push
+      const aligned = await fixtures.alignUp(po, line, { delta: 6, imsQty: 0 })
+      assert.equal(aligned.applied, true, `PRECONDITION: alignment credited the claimed row: ${JSON.stringify(aligned)}`)
+      const manual = await receive(po, line, 4)
+      assert.equal(manual.success, true, `PRECONDITION: the manual 4 committed: ${manual.error}`)
+    }
+
+    const requestB = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    assert.ok(started.requestA, 'PRECONDITION: request A was started inside B\'s window and is parked at its push')
+    const midRows = await freshRowsOf(line)
+    assert.equal(requestB.success, false, 'B\'s revalidation failed (the outstanding moved)')
+    assert.match(requestB.error ?? '', /Outstanding quantities changed/, 'PRECONDITION: it is the revalidation refusal, so B reached its discard')
+    assert.equal(midRows.length, 1, 'PRECONDITION: still one row')
+    console.log(`# R2-4: after B's discard: closedAt=${String(midRows[0]!.closedAt)} status=${midRows[0]!.status} expected=${midRows[0]!.expected} snapshot=${midRows[0]!.snapshot}`)
+    assert.equal(midRows[0]!.closedAt, null, 'B\'s discard did not retire the claimed row')
+    assert.equal(midRows[0]!.expected, 10, 'and did not shrink its expectation')
+
+    releaseA()
+    const resultA = await started.requestA!
+    assert.equal(resultA.success, true, `A finalized its claimed row: ${resultA.error}`)
+    const finalRows = await freshRowsOf(line)
+    assert.equal(finalRows.length, 1)
+    const row = finalRows[0]!
+    console.log(`# R2-4: after A's finalize: externalAsnId=${row.externalAsnId === remoteId ? 'A\'s remote id' : row.externalAsnId} closedAt=${String(row.closedAt)} expected=${row.expected} snapshot=${row.snapshot} note=${row.note}`)
+    assert.equal(row.asnId, reservation.asnId, 'the same row')
+    assert.equal(row.externalAsnId, remoteId, 'mapped to the ASN A created')
+    assert.equal(row.closedAt, null)
+    assert.equal(row.expected, 10, 'the expectation is what A pushed (10), not a retirement\'s shrunk figure')
+    assert.equal(row.note, null, 'never retired')
+    assert.equal(row.snapshot, 6, 'the credit the alignment wrote is intact')
+  },
+)
+
+test(
+  'R2-5: the reservation was retired while its create was in flight: the finalize FAILS CLOSED, does not reopen or map it, and the remote ASN\'s id is retained',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('r25', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const remoteId = `${uid()}-r25-remote`
+    nextExternalAsnId = remoteId
+    createAsnHook = async () => {
+      // What a retirement by another request would have left: closed, expectation shrunk.
+      await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { closedAt: new Date() } })
+      await db.wmsAsnLineMap.updateMany({ where: { asnMapId: reservation.asnId }, data: { expectedQty: '6.0000' } })
+    }
+
+    const result = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    const rows = await freshRowsOf(line)
+    const summaries = await failedJobSummaries(po.poId)
+    console.log(`# R2-5: success=${result.success}; row closedAt=${String(rows[0]?.closedAt)} expected=${rows[0]?.expected} externalAsnId=${rows[0]?.externalAsnId.slice(0, 12)}; remote row recorded=${Boolean(await remoteRowFor(remoteId))}; retained=${String(summaries[0]?.unrecordedExternalAsnId)}`)
+    assert.equal(result.success, false, 'the finalize failed closed')
+    assert.match(result.error ?? '', /changed while the create was in flight/, 'PRECONDITION: it is the compare-and-set refusal')
+    assert.equal(rows.length, 1)
+    assert.notEqual(rows[0]!.closedAt, null, 'the retired row stays retired: it was NOT reopened')
+    assert.equal(rows[0]!.expected, 6, 'its shrunk expectation was not overwritten')
+    assert.ok(rows[0]!.externalAsnId.startsWith('pending:'), 'nothing was mapped onto it')
+    assert.equal(await remoteRowFor(remoteId), null, 'no map row was created for the remote ASN')
+    assert.equal(summaries.length, 1, 'one failed job')
+    assert.equal(summaries[0]!.unrecordedExternalAsnId, remoteId, 'the remote ASN that WAS created is retained on the failed job (the operator\'s handle), not orphaned')
+  },
+)
+
+test(
+  'R2-6: a reserved line no longer carries the quantity that was pushed: the finalize FAILS CLOSED on the quantity check alone',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('r26', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const remoteId = `${uid()}-r26-remote`
+    nextExternalAsnId = remoteId
+    createAsnHook = async () => {
+      // Still OPEN and still claimed, but the row says 9 where 10 was reserved and pushed.
+      await db.wmsAsnLineMap.updateMany({ where: { asnMapId: reservation.asnId }, data: { expectedQty: '9.0000' } })
+    }
+
+    const result = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    const rows = await freshRowsOf(line)
+    console.log(`# R2-6: success=${result.success}; error=${(result.error ?? '').slice(0, 140)}`)
+    assert.equal(result.success, false)
+    assert.match(result.error ?? '', /a line now expects 9 where 10 was reserved/, 'PRECONDITION: it is the QUANTITY check that refused')
+    assert.equal(rows[0]!.closedAt, null, 'PRECONDITION: the row is still open, so no other check could have refused')
+    assert.ok(rows[0]!.externalAsnId.startsWith('pending:'), 'nothing was mapped onto it')
+    assert.equal(await remoteRowFor(remoteId), null)
+    assert.equal((await failedJobSummaries(po.poId))[0]?.unrecordedExternalAsnId, remoteId, 'the remote id is retained')
+  },
+)
+
+async function seedCreatableTransfer(label: string) {
+  const { db } = await import('@/lib/db')
+  const tag = `${uid()}-${label}-tr`
+  const destination = await db.warehouse.create({ data: { code: `${uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
+  const connection = await db.wmsConnection.create({ data: { connector: CONNECTOR, label: tag, active: true }, select: { id: true } })
+  await db.externalWmsBinding.create({
+    data: { connectionId: connection.id, warehouseId: destination.id, connector: CONNECTOR, externalWarehouseId: `wh-${tag}`, active: true, stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: new Date() },
+    select: { id: true },
+  })
+  const source = await db.warehouse.create({ data: { code: `${uid()}-S`, name: `${tag} src`, type: 'STANDARD' }, select: { id: true } })
+  const product = await db.product.create({ data: { sku: tag, name: `${label} tr`, type: 'SIMPLE', countryOfOrigin: 'CN' }, select: { id: true } })
+  await db.wmsProductLink.create({ data: { productId: product.id, connector: CONNECTOR, externalProductId: `ext-${tag}` } })
+  const sourceLayer = await db.costLayer.create({
+    data: { productId: product.id, warehouseId: source.id, receivedQty: '10.000000', remainingQty: '0.000000', unitCostBase: fixtures.UNIT_COST },
+    select: { id: true },
+  })
+  const transfer = await db.stockTransfer.create({
+    data: {
+      reference: tag, fromWarehouseId: source.id, toWarehouseId: destination.id, status: 'IN_TRANSIT', dispatchedAt: new Date(),
+      lines: { create: [{ productId: product.id, sku: tag, productName: `${label} tr`, qty: '10.0000', qtyReceived: '0.0000', costLayerSnapshot: [{ costLayerId: sourceLayer.id, qty: '10.000000', unitCostBase: `${fixtures.UNIT_COST}.000000` }] }] },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  return { transferId: transfer.id, lineId: transfer.lines[0]!.id }
+}
+
+async function transferHeader(transferId: string) {
+  const { db } = await import('@/lib/db')
+  return db.wmsAsnMap.findFirstOrThrow({
+    where: { sourceType: 'STOCK_TRANSFER', sourceId: transferId },
+    select: { id: true, externalAsnId: true, status: true, closedAt: true, lines: { select: { expectedQty: true } } },
+  })
+}
+
+test(
+  'R2-7 (transfer creator, same defect): a transfer reservation retired while its create was in flight is not reopened by the finalize',
+  SKIP,
+  async () => {
+    const { createMintsoftTransferAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const transfer = await seedCreatableTransfer('r27')
+    const remoteId = `${uid()}-r27-remote`
+    nextExternalAsnId = remoteId
+    createAsnHook = async () => {
+      const header = await transferHeader(transfer.transferId)
+      await db.wmsAsnMap.update({ where: { id: header.id }, data: { closedAt: new Date() } })
+      await db.wmsAsnLineMap.updateMany({ where: { asnMapId: header.id }, data: { expectedQty: '6.0000' } })
+    }
+
+    const result = await createMintsoftTransferAsn(transfer.transferId, { autoCallback: false })
+    const header = await transferHeader(transfer.transferId)
+    console.log(`# R2-7: success=${result.success}; header closedAt=${String(header.closedAt)} expected=${Number(header.lines[0]!.expectedQty)}`)
+    assert.equal(result.success, false, 'the transfer finalize failed closed')
+    assert.match(result.error ?? '', /changed while the create was in flight/)
+    assert.notEqual(header.closedAt, null, 'the retired transfer reservation was NOT reopened')
+    assert.equal(Number(header.lines[0]!.expectedQty), 6)
+    assert.ok(header.externalAsnId.startsWith('pending:transfer:'), 'nothing was mapped onto it')
+    assert.equal(await remoteRowFor(remoteId), null)
+  },
+)
+
+test(
+  'R2-5b: the reservation was retired with its expectation UNCHANGED (a fully credited row): the finalize refuses on closedAt alone',
+  SKIP,
+  async () => {
+    const { createMintsoftPurchaseOrderAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const po = await seedPo('r25b', [10])
+    const line = po.lines[0]!
+    await makeCreatable(po)
+    const reservation = await addPendingReservation(po, [{ line, expectedQty: 10 }])
+    const remoteId = `${uid()}-r25b-remote`
+    nextExternalAsnId = remoteId
+    createAsnHook = async () => {
+      // Retired, but nothing else about the row moved: its credit equals its expectation, so retirement shrinks nothing.
+      await db.wmsAsnMap.update({ where: { id: reservation.asnId }, data: { closedAt: new Date() } })
+    }
+    const result = await createMintsoftPurchaseOrderAsn(po.poId, { autoCallback: false })
+    const rows = await freshRowsOf(line)
+    console.log(`# R2-5b: success=${result.success}; closedAt=${String(rows[0]?.closedAt)} expected=${rows[0]?.expected}`)
+    assert.equal(result.success, false, 'the finalize failed closed')
+    assert.match(result.error ?? '', /the reservation was retired/, 'PRECONDITION: it is the closedAt check that refused (the quantities still match)')
+    assert.equal(rows[0]!.expected, 10, 'PRECONDITION: the quantity was untouched, so no other check could have refused')
+    assert.notEqual(rows[0]!.closedAt, null, 'not reopened')
+    assert.equal(await remoteRowFor(remoteId), null)
+  },
+)
+
+test(
+  'R2-8 (transfer creator): B reserved, A claimed and is pushing, a quantity change fails B\'s revalidation: B\'s discard leaves the CLAIMED transfer reservation alone',
+  SKIP,
+  async () => {
+    const { createMintsoftTransferAsn } = await loadModules()
+    const { db } = await import('@/lib/db')
+    const transfer = await seedCreatableTransfer('r28')
+    const remoteId = `${uid()}-r28-remote`
+    nextExternalAsnId = remoteId
+    let releaseA!: () => void
+    const aMayFinish = new Promise<void>((resolve) => { releaseA = resolve })
+    let aAtPush!: () => void
+    const aReachedPush = new Promise<void>((resolve) => { aAtPush = resolve })
+    const started: { requestA: ReturnType<typeof createMintsoftTransferAsn> | null } = { requestA: null }
+    duplicateRecoveryHook = async () => {
+      createAsnHook = async () => { aAtPush(); await aMayFinish }
+      started.requestA = createMintsoftTransferAsn(transfer.transferId, { autoCallback: false })
+      await aReachedPush
+      // A manual receipt of one unit: the outstanding moves from 10 to 9.
+      await db.stockTransferLine.update({ where: { id: transfer.lineId }, data: { qtyReceived: '1.0000' } })
+    }
+
+    const requestB = await createMintsoftTransferAsn(transfer.transferId, { autoCallback: false })
+    assert.ok(started.requestA, 'PRECONDITION: request A was started inside B\'s window and is parked at its push')
+    assert.equal(requestB.success, false)
+    assert.match(requestB.error ?? '', /Outstanding quantities changed/, 'PRECONDITION: B reached its discard')
+    const mid = await transferHeader(transfer.transferId)
+    console.log(`# R2-8: after B's discard: status=${mid.status} closedAt=${String(mid.closedAt)} expected=${Number(mid.lines[0]!.expectedQty)}`)
+    assert.equal(mid.closedAt, null, 'B\'s discard did not touch the claimed reservation')
+    assert.equal(mid.status, 'CREATE_IN_FLIGHT')
+    releaseA()
+    const resultA = await started.requestA!
+    assert.equal(resultA.success, true, `A finalized its claimed reservation: ${resultA.error}`)
+    const done = await transferHeader(transfer.transferId)
+    assert.equal(done.externalAsnId, remoteId, 'mapped to the ASN A created')
+    assert.equal(done.closedAt, null)
+    assert.equal(Number(done.lines[0]!.expectedQty), 10)
   },
 )
