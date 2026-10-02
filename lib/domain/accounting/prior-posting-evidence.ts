@@ -4,6 +4,7 @@ import {
   LEDGER_STANDING_SELECT,
   WORK_SLOT_STATUSES,
   workSlotStanding,
+  ledgerStanding,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
 
@@ -52,11 +53,20 @@ import {
  *               that row, or settle it with the per-row settlement action on /sync.
  *
  * WHY AN UNPROVEN CANCELLED ROW IS NOT A BLOCKER, AND WHY AN OPERATOR-SETTLED ONE IS (o3d-f709, C1).
- * A CANCELLED row leaves the partial unique indexes, so its WORK SLOT is free (`workSlotStanding`):
- * the cancel-and-requeue remedy `describeCreateDispatchRemedy` prescribes still works for a row IMS
- * itself retired. That is a statement about the SLOT, not about the ledger - a CANCELLED row with no
- * recorded proof may still have posted, and whether it did is `ledgerStanding`'s separate question
- * (UNKNOWN), tracked as its own work.
+ * A CANCELLED row leaves the partial unique indexes, so the DATABASE no longer stops a same-key retry.
+ * What stops it is this classifier, and it reads the row's standing (o3d-f709 / o3d-kj718):
+ *
+ *   PROVEN_NOT_POSTED  frees the key. Three writers stamp `abandonedBeforeRemoteCall` in the SAME UPDATE as
+ *                      the status, each over a row nobody ever claimed (PENDING, attemptRevision 0, no
+ *                      document id): the cross-connector orphan sweep, the BILL_PAYMENT supersession,
+ *                      and `cancelPendingSalesInvoiceSyncForOrder` for its never-claimed PENDING rows. A
+ *                      verified reversal records VERIFIED_REVERSAL.
+ *   UNKNOWN            REFUSES (`unresolved`). A CLAIMED attempt that was cancelled without proof: the
+ *                      sale-cancel sweep over a FAILED / PROCESSING / retried-PENDING row, the post-time
+ *                      retirement of a claimed row, the capacity refusal, mark-handled.
+ *
+ * (The cancel-and-requeue remedy `describeCreateDispatchRemedy` prescribes therefore no longer works for a
+ * claimed attempt: the operator hand-posts and marks the posting handled.)
  *
  * ONE CANCELLED ROW IS DIFFERENT: the NOT_POSTED settlement (CANCELLED + OPERATOR_ASSERTION, no id).
  * It used to be the way to re-queue work: "the operator looked, nothing posted, free the slot".
@@ -105,7 +115,7 @@ export type PriorAttemptVerdict =
    * automatic re-post.
    */
   | { kind: 'blocked'; syncLogId: string }
-  /** A terminal row with no document id: nothing can say whether its attempt landed. */
+  /** A FAILED row, or a CANCELLED one with no proof, and no document id: nothing can say whether its attempt landed. */
   | { kind: 'unresolved'; syncLogId: string }
 
 function documentId(row: PriorAttemptRow): string | null {
@@ -126,8 +136,7 @@ function documentId(row: PriorAttemptRow): string | null {
  *   4. `unresolved` - a FAILED attempt that cannot be ruled out. Only now does the enqueue refuse for
  *      the older reason.
  *
- * Anything else (a CANCELLED row with no document id and no operator assertion) frees the slot - see
- * the header for why that is a statement about the slot only.
+ * Anything else (a CANCELLED row PROVEN not posted) frees the slot.
  */
 export function classifyPriorAttempts(rows: readonly PriorAttemptRow[]): PriorAttemptVerdict {
   const standings = rows.map((row) => ({ row, slot: workSlotStanding(row), id: documentId(row) }))
@@ -154,8 +163,18 @@ export function classifyPriorAttempts(rows: readonly PriorAttemptRow[]): PriorAt
   const blocked = standings.find((s) => s.slot.slot === 'BLOCKED')
   if (blocked) return { kind: 'blocked', syncLogId: blocked.row.id }
 
-  // FAILED only. An unproven CANCELLED row frees the slot, so it is not one of these.
-  const unresolved = rows.find((row) => row.status === 'FAILED')
+  // FAILED, or a CANCELLED row whose standing is UNKNOWN (o3d-f709 / o3d-kj718, Codex HIGH on #724). The
+  // partial unique index no longer covers a cancelled row, so nothing else stops a same-key retry
+  // writing a SECOND posting beside an attempt that may have reached the ledger. The key is freed ONLY
+  // by a row the module calls PROVEN_NOT_POSTED: the orphan sweep, the supersession, and the sale-cancel
+  // sweep over a PENDING row nobody ever claimed each stamp `abandonedBeforeRemoteCall` in the same
+  // UPDATE; a verified reversal records its basis. A CLAIMED attempt that was cancelled (the sale-cancel
+  // sweep over a FAILED or PROCESSING row, the post-time retirement of a claimed row, the capacity
+  // refusal, an operator's mark-handled) carries no such proof and is refused here.
+  // Read as "the standing is UNKNOWN" (a FAILED row with no id is UNKNOWN by truth-table row 11), not as a
+  // status test: LIVE rows returned above, documented rows above that, so what is left and unproven is
+  // exactly the terminal attempt nobody can speak for.
+  const unresolved = rows.find((row) => ledgerStanding(row) === 'UNKNOWN')
   if (unresolved) return { kind: 'unresolved', syncLogId: unresolved.id }
 
   return { kind: 'none' }
@@ -220,7 +239,8 @@ export function describeUnresolvedPriorAttempt(params: {
   syncLogId: string
 }): string {
   return `NOTHING WAS QUEUED. A previous ${params.type} attempt for ${params.referenceType} `
-    + `${params.referenceId} (sync row ${params.syncLogId}) FAILED without recording a document id, so `
+    + `${params.referenceId} (sync row ${params.syncLogId}) FAILED, or was cancelled without proof that it never `
+    + 'reached the accounting system, and recorded no document id, so '
     + 'IMS cannot tell whether it reached the accounting system — the remote call is made before its '
     + 'result is written back, so a failure does not prove nothing posted. Queueing this posting again '
     + 'would create a SECOND document if the first one landed. REMEDY: resolve that row on /sync — '

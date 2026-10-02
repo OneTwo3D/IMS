@@ -221,6 +221,26 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   // race: it names the rows this statement actually retired, and this transaction now holds their locks,
   // so nothing can move them before the bump lands. The bump is scoped to those ids and to the ones
   // that carry a fence, which is read from the returned rows rather than from a prior read.
+  // o3d-f709 / o3d-kj718 - THE PRE-CALL PROOF, WRITTEN BY THE WRITER THAT KNOWS IT. A PENDING row at
+  // attemptRevision 0 with no document id has never been claimed (a claim mints revision >= 1), so
+  // cancelling it IS the whole event: nothing was ever sent. It is stamped `abandonedBeforeRemoteCall`
+  // in the same UPDATE, exactly as the orphan sweep and the BILL_PAYMENT supersession stamp theirs, so
+  // `ledgerStanding` reads it PROVEN_NOT_POSTED and a same-key re-enqueue is free to proceed. It is a
+  // SEPARATE statement from the general one below, and runs FIRST: the general statement still catches
+  // everything else - a PENDING row already claimed once (revision > 0, revived from FAILED), FAILED,
+  // PROCESSING - and leaves those UNSTAMPED, because a claimed attempt may have reached the ledger. A
+  // claim landing between the two statements moves the row to PROCESSING at revision 1, where the
+  // second statement retires it unstamped: the race resolves toward "unproven", never toward "proven".
+  const neverClaimed = await tx.accountingSyncLog.updateMany({
+    where: {
+      referenceId: orderId,
+      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+      externalTransactionId: null,
+      status: 'PENDING',
+      attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
+    },
+    data: { ...retirement, abandonedBeforeRemoteCall: true },
+  })
   const retired = await tx.accountingSyncLog.updateManyAndReturn({
     where: retirable,
     data: retirement,
@@ -244,7 +264,7 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     reason,
   })
 
-  return retired.length
+  return neverClaimed.count + retired.length
 }
 
 /**

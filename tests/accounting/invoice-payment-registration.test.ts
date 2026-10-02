@@ -601,6 +601,36 @@ test('[o3d-ekn8 r4] a PROVEN pre-call cancellation clears it; an operator ASSERT
   assert.equal(asserted.register === false && asserted.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
+test('[o3d-f709 HIGH #724] an INCOMPLETE stored body does not clear an operator-asserted NOT_POSTED row at the registration decision', () => {
+  // THE PAYLOAD PROOF IS TRUTH-TABLE ROW 10 AND NOTHING WIDER. `couldHaveReachedLedger: false` says THIS
+  // connector would have rejected the stored body before a request. It says nothing about an operator who
+  // hand-posted the payment, so it must not remove the row from the unresolved probe.
+  const settled = live({
+    status: 'CANCELLED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1',
+    settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS, couldHaveReachedLedger: false,
+  })
+  console.log(`# precondition HIGH2: ${JSON.stringify({ status: settled.status, basis: settled.settlementBasis, couldHave: settled.couldHaveReachedLedger })}`)
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([settled], 'pay-new').map((r) => r.paymentId), ['pay-old'],
+    'it stays in the unresolved probe')
+  const decision = decideInvoicePaymentRegistration({ ...base, existing: [settled], ledgerSettlements: null })
+  assert.equal(decision.register, false)
+  assert.equal(decision.register === false && decision.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+
+  // ISOLATING ARM: the same incomplete body on a FAILED row with no assertion and no id IS exempt (row 10).
+  const failed = live({ status: 'FAILED', amount: 100, paymentId: 'pay-old', accountingInvoiceId: 'INV-1', couldHaveReachedLedger: false })
+  assert.deepEqual(unresolvedInvoicePaymentAttempts([failed], 'pay-new'), [])
+  assert.equal(decideInvoicePaymentRegistration({ ...base, existing: [failed] }).register, true)
+})
+
+test('[o3d-f709 HIGH #724] an incomplete stored body does not clear a CANCELLED row that still names the payment, at the retired-document guard', () => {
+  const swept = live({
+    status: 'CANCELLED', amount: 100, paymentId: 'pay-new', accountingInvoiceId: 'INV-1',
+    externalTransactionId: 'PAY-XERO-1', abandonedBeforeRemoteCall: true, couldHaveReachedLedger: false,
+  })
+  const d = decideInvoicePaymentRegistration({ ...base, accountingInvoiceId: 'INV-2', existing: [swept] })
+  assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
+})
+
 test('[o3d-kof8] a FAILED row on a retired document refuses as well — a failure is not a non-call', () => {
   // The same correction reached from the other status. `unresolvedInvoicePaymentAttempts` skips this
   // receipt's OWN rows, so before this gate looked at FAILED rows nothing in the decision saw one.
@@ -619,22 +649,25 @@ test('[o3d-kof8] a FAILED row on a retired document refuses as well — a failur
   assert.equal(d.register === false && d.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
-test('[o3d-kof8] a row whose stored body could never have posted still clears it', () => {
-  // The payload proof, kept: `attemptCouldHaveReachedTheLedger` reports that the connector's own
-  // guard would have rejected the body before any call, and that is a positive fact about a terminal
-  // row. Without this the retired-document gate would strand every receipt behind an incomplete row.
-  const d = decideInvoicePaymentRegistration({
+test('[o3d-kof8] a FAILED row whose stored body could never have posted still clears it (truth-table row 10) - a CANCELLED one no longer does', () => {
+  // The payload proof, kept for the one shape it is sound for: a FAILED row with no assertion and no id.
+  // `attemptCouldHaveReachedTheLedger` reports that the connector's own guard would have rejected the
+  // body before any call. o3d-f709 (Codex HIGH, #724) NARROWED it: it used to clear a CANCELLED row too,
+  // and a cancellation is not an attempt this connector rejected - it may be one an operator hand-posted.
+  const rowWith = (status: string) => decideInvoicePaymentRegistration({
     ...base,
     accountingInvoiceId: 'INV-2',
     existing: [live({
-      status: 'CANCELLED',
+      status: status as 'FAILED' | 'CANCELLED',
       amount: 100,
       paymentId: 'pay-new',
       accountingInvoiceId: 'INV-1',
       couldHaveReachedLedger: false,
     })],
   })
-  assert.equal(d.register, true)
+  assert.equal(rowWith('FAILED').register, true)
+  const cancelled = rowWith('CANCELLED')
+  assert.equal(cancelled.register === false && cancelled.refusal, 'SETTLED_ON_RETIRED_DOCUMENT')
 })
 
 test('[o3d-ekn8 r4] it is asked BEFORE the capacity arithmetic, which cannot see the row at all', () => {

@@ -60,6 +60,9 @@ import {
 //    6  any + (NULL | OPERATOR_RELEASE) + id                                     -> CONFIRMED_POSTED
 //    7  SYNCED + (NULL | OPERATOR_RELEASE) + no id (id-less types)               -> CONFIRMED_POSTED
 //    8  CANCELLED + NULL + no id + abandonedBeforeRemoteCall === true            -> PROVEN_NOT_POSTED
+//       (written, in the SAME UPDATE as the status, by three writers over a row nobody ever claimed:
+//       the orphan sweep, the BILL_PAYMENT supersession, and the sale-cancel sweep over a PENDING row
+//       at attemptRevision 0. A claimed attempt cancelled by anyone else is row 9.)
 //    9  CANCELLED + NULL + no id + abandonedBeforeRemoteCall !== true            -> UNKNOWN
 //   10  FAILED + NULL + no id + couldHaveReachedLedger === false (caller proof)  -> PROVEN_NOT_POSTED
 //   11  FAILED + NULL + no id otherwise                                          -> UNKNOWN

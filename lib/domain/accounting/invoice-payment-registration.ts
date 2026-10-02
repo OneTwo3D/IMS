@@ -197,33 +197,26 @@ export type ExistingInvoicePaymentSync = LedgerStandingRow & {
 /**
  * o3d-kof8 — COULD THIS ROW BE HOLDING A PAYMENT IN THE LEDGER? THE ONE READING, FOR ALL FOUR GATES.
  *
- * Two independent proofs of absence exist for an INVOICE_PAYMENT row, and a gate that consults one
- * and not the other answers the wrong question:
+ * The reading is `ledgerStanding(row, { couldHaveReachedLedger })` and nothing else. The payload proof
+ * (`couldHaveReachedLedger === false`: the stored body was missing a field the connector requires, so
+ * THIS connector rejected it before any request) is truth-table row 10 and applies to a FAILED row with
+ * no assertion and no document id ONLY. It never overrides a recorded success, a document id, a sweep
+ * or reversal proof, or an operator's assertion (a person who hand-posted is not stopped by this
+ * connector's validation).
  *
- *   `couldHaveReachedLedger === false` — the PAYLOAD proof. The stored body was missing a field the
- *   connector requires, so the call was rejected before any HTTP request. Derived by
- *   `attemptCouldHaveReachedTheLedger` from the payload, and this file has always asked it.
- *
- *   `mayHaveReachedLedger(row) === false` — the COLUMN proof, and the one that was missing. A
- *   cancellation resolves only when nothing local contradicts it; a CANCELLED row that still names
- *   the document the ledger issued resolves NOTHING, whatever the sweep stamped on it. The rule is
- *   `cancelledClaimIsResolved`, stated once in ledger-standing.ts.
- *
- * Either proof is sufficient. Neither is available from the STATUS, which is what the four gates
- * used to read, and what let a swept CANCELLED receipt be registered a second time against a
- * replacement invoice (Codex, o3d-f709 round 3 HIGH).
- *
- * AND THE PAYLOAD PROOF IS ASKED ONLY OF A ROW WITH NO LIVE WORK ON IT, which is not a hedge: it is
- * what that proof means. `attemptCouldHaveReachedTheLedger` reads the STORED BODY and reports that
- * the connector's own guard would have rejected it before the call — an argument about an attempt
- * whose outcome was never recorded. A row that is SYNCED says the call happened AND succeeded, and a
- * PENDING or PROCESSING one has not been decided yet; letting a body-completeness heuristic overrule
- * a recorded success would have been a new fail-open, and the redrive fixtures found it immediately.
+ * Neither proof is available from the STATUS, which is what the four gates used to read, and what let
+ * a swept CANCELLED receipt be registered a second time against a replacement invoice (Codex,
+ * o3d-f709 round 3 HIGH).
  */
 function mayHoldLedgerPayment(row: ExistingInvoicePaymentSync): boolean {
-  if (!mayHaveReachedLedger(row)) return false
-  if (hasLiveRegistrationWork(row)) return true
-  return row.couldHaveReachedLedger !== false
+  // o3d-f709 (Codex HIGH, #724): THE PAYLOAD PROOF IS ROW 10 OF THE TRUTH TABLE AND NOTHING WIDER. This
+  // used to be `mayHaveReachedLedger(row)` followed by "else the payload proof clears it", so a CANCELLED
+  // row an operator settled NOT_POSTED, or one that still names a document, was removed from the
+  // unresolved probe, the retired-document guard and the capacity count whenever its stored body was
+  // incomplete. The payload proves only that THIS connector would have rejected the stored body before
+  // a request; it says nothing about an operator who hand-posted, or about a document id. The module
+  // applies it to exactly a FAILED row with no assertion and no post id.
+  return mayHaveReachedLedger(row, { couldHaveReachedLedger: row.couldHaveReachedLedger })
 }
 
 /**

@@ -181,16 +181,30 @@ test('[o3d-d0pd] a FAILED row that NAMES a document reports the counterpart, and
   assert.equal(outcome.reason, 'already-queued', 'and this call wrote nothing, so a roll-back would undo nothing')
 })
 
-test('[o3d-d0pd] an UNPROVEN CANCELLED row does NOT block the slot: cancel-and-re-queue is a documented remedy', async () => {
-  state.existingRow = { id: 'log-cancelled', status: 'CANCELLED', externalTransactionId: null }
+test('[o3d-f709 / o3d-kj718] a CLAIMED attempt that was cancelled without proof REFUSES the same-key retry at the ENQUEUE DECISION', async () => {
+  // The sale-cancel sweep over a FAILED/PROCESSING row, the post-time retirement of a claimed row and
+  // a capacity refusal all leave CANCELLED + no id + NO pre-call stamp. The index does not cover it,
+  // so the enqueue is the only thing between this retry and a second posting.
+  state.existingRow = { id: 'log-claimed-cancelled', status: 'CANCELLED', externalTransactionId: null }
   const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
   const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
 
-  // MUTATION ROUTE: treat CANCELLED as unresolved and this writes nothing - deleting the only exit
-  // `describeCreateDispatchRemedy` offers for a row IMS itself retired.
-  assert.equal(state.created.length, 1)
+  console.log(`# precondition kj718 enqueue: created=${state.created.length} outcome=${JSON.stringify(outcome)} activity=${state.activity.map((a) => a.action)}`)
+  assert.equal(state.created.length, 0, 'no second posting beside a possibly-posted attempt')
+  assert.equal(outcome.queued, false)
+  assert.equal(outcome.reason, 'refused', 'still owed: the caller must not settle on it')
+  assert.deepEqual(state.activity.map((a) => a.action), ['accounting_enqueue_refused_unresolved_attempt'])
+  assert.match(state.activity[0].description, /cancelled without proof/)
+})
+
+test('[o3d-f709 / o3d-kj718] ISOLATING ARM: a NEVER-CLAIMED cancelled row (stamped pre-call) re-enqueues', async () => {
+  state.existingRow = { id: 'log-never-claimed', status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }
+  const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
+  const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
+
+  assert.equal(state.created.length, 1, 'the sale-cancel / supersession / sweep cancellation of an unclaimed row stays re-enqueueable')
   assert.equal(outcome.queued, true)
-  assert.deepEqual(state.activity, [], 'and nothing is reported: this is the ordinary re-queue')
+  assert.deepEqual(state.activity, [])
 })
 
 // ---------------------------------------------------------------------------
@@ -246,8 +260,8 @@ test('[o3d-f709 M11, C1/D1] a CANCELLED row an operator settled NOT_POSTED REFUS
   assert.match(state.activity[0].description, /mark this posting handled/)
 })
 
-test('[o3d-f709 M11] ISOLATING ARM: the identical CANCELLED row WITHOUT the assertion writes the replacement', async () => {
-  state.existingRow = { id: 'log-cancelled', status: 'CANCELLED', externalTransactionId: null, settlementBasis: null }
+test('[o3d-f709 M11] ISOLATING ARM: the identical CANCELLED row WITHOUT the assertion, but PROVEN pre-call, writes the replacement', async () => {
+  state.existingRow = { id: 'log-cancelled', status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }
   const { queueAccountingSyncTxWithOutcome } = await import('@/lib/accounting')
   const outcome = await queueAccountingSyncTxWithOutcome(tx() as never, params)
 

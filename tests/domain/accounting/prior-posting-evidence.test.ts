@@ -71,14 +71,20 @@ test('[o3d-d0pd] a blank document id is not a document', () => {
 // What must NOT become a blocker
 // ---------------------------------------------------------------------------
 
-test('[o3d-d0pd] an UNPROVEN CANCELLED row with no document id frees the SLOT - the cancel-and-re-queue remedy needs it', () => {
-  // `describeCreateDispatchRemedy` prescribes "cancel this row and re-queue the work from the source
-  // document". If a plain CANCELLED blocked, that remedy would be gone. (o3d-f709: the slot is free;
-  // whether such a row may have posted is `ledgerStanding`'s separate question, UNKNOWN.)
-  //
-  // MUTATION ROUTE: add CANCELLED to the unresolved arm and this fails.
-  assert.deepEqual(classifyPriorAttempts([row({ status: 'CANCELLED' })]), { kind: 'none' })
-  assert.deepEqual(classifyPriorAttempts([row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true })]), { kind: 'none' })
+test('[o3d-f709 / o3d-kj718] a CANCELLED row frees the key ONLY when its standing is PROVEN_NOT_POSTED; an unproven one REFUSES', () => {
+  // THE FLIP (Codex HIGH on #724). This test used to assert `none` for a plain CANCELLED row, on the
+  // argument that cancel-and-requeue is a documented remedy. The partial unique index no longer covers
+  // a cancelled row, so a same-key retry beside a CLAIMED attempt that was cancelled without proof the
+  // call failed would write a SECOND posting. Only rows the module calls PROVEN_NOT_POSTED free the key.
+  const unproven = row({ id: 'log_claimed', status: 'CANCELLED' })
+  console.log(`# precondition kj718: ${JSON.stringify(unproven)} => ${classifyPriorAttempts([unproven]).kind}`)
+  assert.deepEqual(classifyPriorAttempts([unproven]), { kind: 'unresolved', syncLogId: 'log_claimed' })
+  assert.equal(classifyPriorAttempts([row({ status: 'CANCELLED', abandonedBeforeRemoteCall: false })]).kind, 'unresolved')
+  assert.equal(classifyPriorAttempts([row({ status: 'CANCELLED', settlementBasis: 'SOMETHING_NEWER' })]).kind, 'unresolved')
+  // ISOLATING ARMS: every PROVEN shape frees it.
+  assert.deepEqual(classifyPriorAttempts([row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true })]), { kind: 'none' },
+    'never claimed: stamped pre-call by the orphan sweep / supersession / sale-cancel sweep')
+  assert.deepEqual(classifyPriorAttempts([row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' })]), { kind: 'none' })
 })
 
 // ---------------------------------------------------------------------------
@@ -94,7 +100,9 @@ test('[o3d-f709 M11, C1] a CANCELLED row an operator settled NOT_POSTED BLOCKS t
   console.log(`# precondition M11 blocked: ${JSON.stringify(settled)}`)
   assert.deepEqual(classifyPriorAttempts([settled]), { kind: 'blocked', syncLogId: 'log_settled' })
   // ISOLATING ARM: the identical row without the assertion frees the slot.
-  assert.deepEqual(classifyPriorAttempts([{ ...settled, settlementBasis: null }]), { kind: 'none' })
+  // (the same row without the assertion is UNKNOWN: it refuses as `unresolved`, and only a PROVEN row frees the key)
+  assert.deepEqual(classifyPriorAttempts([{ ...settled, settlementBasis: null }]), { kind: 'unresolved', syncLogId: 'log_settled' })
+  assert.deepEqual(classifyPriorAttempts([{ ...settled, settlementBasis: null, abandonedBeforeRemoteCall: true }]), { kind: 'none' })
 })
 
 test('[o3d-f709 M11, D2] an operator-typed SYNCED id occupies the slot and the verdict says it is ASSERTED', () => {
