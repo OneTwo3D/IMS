@@ -28,7 +28,6 @@ import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
  * POSTED, and clears it when the event is not. One test per writer; each prints the data it observed.
  */
 
-const GROUP_B_KEY = 'accounting-sync:xero:daily_batch_group_b:dailybatch:b-2026-04-26:2026-04-26'
 const LINES = [
   { accountCode: '210', description: 'Revenue recognition', debit: 10 },
   { accountCode: '400', description: 'Revenue recognition', credit: 10 },
