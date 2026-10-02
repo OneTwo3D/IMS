@@ -333,90 +333,52 @@ function assertedNotPostedRow(overrides: Partial<Parameters<typeof syncLogRow>[0
   })
 }
 
-const RELIANCE_ACTION = 'xero_followup_enqueue_rests_on_operator_assertion'
-
-test('[o3d-anu8] the reliance record is written INSIDE the enqueue, after the row it describes exists', async () => {
+/**
+ * o3d-f709 (M12, C1) - THE FIVE TESTS THAT STOOD HERE ASSERTED THE OPPOSITE.
+ *
+ * They drove an enqueue that PROCEEDED on an operator-settled NOT_POSTED row and asserted that the
+ * "reliance record" was written inside its transaction. The premise was that the assertion cleared
+ * the scope. It does not: an operator's word is not proof the ledger was untouched, so the enqueue
+ * REFUSES and there is no post resting on an assertion to record.
+ */
+test('[o3d-f709 M12] an enqueue behind an operator-settled NOT_POSTED row REFUSES: nothing created, nothing scheduled, the rows named', async () => {
   reset([assertedNotPostedRow()])
+  console.log(`# precondition M12 enqueue: rows=${store.rows.length} asserted=${store.get('log-asserted')?.settlementBasis}`)
 
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
+  const outcome = await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
-  assert.equal(store.rows.length, 2, 'the enqueue really happened')
-  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
-  assert.ok(record, 'and the record went through the durable writer, not the best-effort logger')
-  assert.equal(record.viaTransaction, true, 'through the ENQUEUE\'s transaction client, so it rolls back with the row')
-  assert.equal(record.rowsAtThisPoint, 2, 'written after the created row, so "Enqueued" is a fact when it is stated')
-  assert.equal(record.level, 'WARNING')
-  assert.deepEqual((record.metadata as { assertedNotPostedRowIds?: string[] }).assertedNotPostedRowIds, ['log-asserted'],
-    'and it names the row to go back to')
-  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [],
-    'the best-effort logger must no longer carry it — that is the half that could silently lose it')
+  assert.equal(store.rows.length, 1, 'no follow-up row was created')
+  assert.deepEqual(scheduled, [], 'and nothing was scheduled')
+  const refused = activity.find((entry) => entry.action === 'xero_followup_enqueue_refused')
+  assert.ok(refused, 'the refusal is reported')
+  assert.deepEqual((refused.metadata as { assertedNotPostedRowIds?: string[] }).assertedNotPostedRowIds, ['log-asserted'],
+    'and it names the asserted row that caused it')
+  assert.match(refused.description, /does NOT clear this any more/)
+  assert.doesNotMatch(refused.description, /it did not post\'\)\. The follow-up is enqueued by the next sweep/,
+    'the old remedy ("settle it as did-not-post and the next sweep enqueues") is gone')
+  assert.ok(outcome, 'the refusal is RETURNED to the caller')
+  assert.deepEqual(durableActivity, [], 'no reliance record: no post rests on the assertion')
 })
 
-test('[o3d-anu8] a LEDGER refusal after the plan leaves no record claiming a payment was enqueued', async () => {
-  reset([assertedNotPostedRow()])
-  ledgerVerdict = { clear: false, reason: 'Xero already holds a settlement of 120.00 dated 2026-08-01' }
-
-  await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
-
-  assert.equal(store.rows.length, 1, 'nothing was enqueued')
-  assert.deepEqual(durableActivity.filter((entry) => entry.action === RELIANCE_ACTION), [],
-    'so nothing may say one was — the refusal is the only thing that happened')
-  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [])
-  assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
-})
-
-test('[o3d-anu8 × round 4] a REVISION-0 money reuse target is revived, and the record still lands after the outcome', async () => {
-  // WHAT THIS TEST USED TO BE, AND WHY IT IS NOT THAT ANY MORE. On o3d-anu8 this scenario REFUSED —
-  // `unfenced_reuse_target` — and the assertion was that a refusal writes no reliance record.
-  // o3d-batch-ret round 4 deleted that blanket refusal for MONEY-MOVING types with a reviewed
-  // argument: the CAS carries `attemptRevision: 0`, which is strictly stronger than the `(id, FAILED)`
-  // ABA it replaced, and `ledgerClearsFollowUpRevival` now asks for every money reuse whether the
-  // attempt already committed. (Round 5 restored it for the types that have no ledger to ask —
-  // see `unprobed_unfenced_reuse` below.) So a revision-0 INVOICE_PAYMENT is revived here.
-  //
-  // THE o3d-anu8 GUARD IS UNCHANGED AND IS WHAT THIS STILL ASSERTS: the reliance record is written
-  // on the DURABLE channel and never on the best-effort one. What moved is which outcome this
-  // scenario reaches. The refusal half of the guard — no record for an enqueue that did not happen —
-  // is still covered by the ledger refusal above and by `an unwritable record ABORTS the enqueue`
-  // below; the ordering half by `a REVIVAL cleared by an assertion is recorded too`.
+test('[o3d-f709 M12] a REVISION-0 failed row beside an asserted NOT_POSTED row is NOT revived either', async () => {
+  // This is the scenario the old test called "revived, and the record still lands": the failed row
+  // WAS revived on the strength of the assertion. Now the assertion makes the whole scope refuse.
   reset([assertedNotPostedRow(), failedPaymentRow({ attemptRevision: 0 })])
 
   await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
-  assert.equal(store.get('log-pay')?.status, 'PENDING', 'round 4: the revision-0 money row IS revived')
-  assert.equal(store.get('log-pay')?.attemptRevision, 0, 'and the revival mints no attempt — only a claim does')
-  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
-  assert.ok(record, 'a post cleared by that assertion is recorded, and on the DURABLE channel')
-  assert.equal((record.metadata as { planAction?: string }).planAction, 'reuse')
-  assert.deepEqual(activity.filter((entry) => entry.action === RELIANCE_ACTION), [],
-    'and never on the best-effort channel — that is where it used to be written')
+  assert.equal(store.get('log-pay')?.status, 'FAILED', 'the failed row stays FAILED and visible')
+  assert.deepEqual(scheduled, [])
+  assert.ok(activity.some((entry) => entry.action === 'xero_followup_enqueue_refused'))
 })
 
-test('[o3d-anu8] a REVIVAL cleared by an assertion is recorded too, and after the revival', async () => {
-  reset([assertedNotPostedRow(), failedPaymentRow()])
+test('[o3d-f709 M12] ISOLATING ARM: the same failed row WITHOUT the asserted sibling IS revived (so the refusal is the assertion\'s)', async () => {
+  reset([failedPaymentRow({ attemptRevision: 0 })])
 
   await (await loadEnqueue())('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN)
 
-  assert.equal(store.get('log-pay')?.status, 'PENDING', 'the revival happened')
-  const record = durableActivity.find((entry) => entry.action === RELIANCE_ACTION)
-  assert.ok(record, 'a revived row is as much a post cleared by that assertion as a created one')
-  assert.equal((record.metadata as { planAction?: string }).planAction, 'reuse')
-})
-
-test('[o3d-anu8] an unwritable record ABORTS the enqueue rather than leaving an untraceable money post', async () => {
-  reset([assertedNotPostedRow()])
-  failDurableActivity = true
-
-  const enqueue = await loadEnqueue()
-  await assert.rejects(
-    () => enqueue('INVOICE_PAYMENT', 'SalesOrder', 'order-1', { ...REQUEST }, POSTED_ROW_ORIGIN),
-    /activity log unavailable/,
-    'the failure must propagate — swallowing it is what let the post commit unrecorded',
-  )
-
-  assert.equal(store.rows.length, 1,
-    'and the follow-up row must not survive: the record and the row commit together or neither does')
-  assert.deepEqual(scheduled, [])
+  assert.equal(store.get('log-pay')?.status, 'PENDING', 'without the assertion the revival proceeds')
+  assert.equal(activity.filter((entry) => entry.action === 'xero_followup_enqueue_refused').length, 0)
 })
 
 test('[o3d-anu8] a scope with NO assertion in it writes nothing — this is not a per-enqueue warning', async () => {

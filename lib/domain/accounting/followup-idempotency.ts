@@ -198,19 +198,15 @@ export function withFollowUpIdempotencyKey(identity: FollowUpIdentity): FollowUp
  */
 export type TokenDisposition = 'pinned' | 'rotated'
 
-/**
- * o3d-anu8 — the sync rows an OPERATOR'S ASSERTION cleared out of the way for this plan.
- *
- * Present only on a money-moving `create`/`reuse` that a settled-as-NOT_POSTED row is standing
- * behind. The caller records it, because the alternative is that a money post whose only clearance
- * is a human's belief looks exactly like one the connector's own history cleared.
- */
-export type SettlementAssertionReliance = { assertedNotPostedRowIds: string[] }
-
 export type FollowUpEnqueuePlan =
   | { action: 'skip' }
-  /** An ambiguous history that must not be auto-reposted; the caller warns and stops. */
-  | { action: 'refuse'; reason: string }
+  /**
+   * An ambiguous history that must not be auto-reposted; the caller warns and stops.
+   *
+   * `assertedNotPostedRowIds` (o3d-f709 / M12): present when the refusal is because a row an OPERATOR
+   * settled NOT_POSTED stands in this scope for the same document. Carried so the caller can name them.
+   */
+  | { action: 'refuse'; reason: string; assertedNotPostedRowIds?: string[] }
   | {
       action: 'reuse'
       syncLogId: string
@@ -219,9 +215,8 @@ export type FollowUpEnqueuePlan =
       /** `pinned` = the stored request body was kept; `fresh` = the recomputed one is used. */
       bodyDisposition: 'pinned' | 'fresh'
       divergedFields: string[]
-      restsOnAssertion?: SettlementAssertionReliance
     }
-  | { action: 'create'; payload: FollowUpPayload; restsOnAssertion?: SettlementAssertionReliance }
+  | { action: 'create'; payload: FollowUpPayload }
 
 export type FailedFollowUpRow = {
   id: string
@@ -293,19 +288,18 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
   /** Every surviving FAILED row for this scope, newest first. */
   failedRows: FailedFollowUpRow[]
   /**
-   * o3d-anu8 — rows in this scope an OPERATOR asserted NEVER posted: status CANCELLED,
-   * settlementBasis = OPERATOR_ASSERTION.
+   * o3d-anu8 / o3d-f709 (M12) - rows in this scope an OPERATOR asserted NEVER posted: status
+   * CANCELLED, settlementBasis = OPERATOR_ASSERTION, no document id.
    *
-   * They are deliberately NOT in `failedRows` and must not be: `buildSettlementData` documents that
-   * moving a FAILED row to CANCELLED to drop the distinct-token count is the INTENDED unblock for a
-   * part-payment history that otherwise refuses for ever. What they are here for is the other half
-   * of that — so a plan that only exists because of an assertion can SAY so, instead of being
-   * indistinguishable from one where the connector itself established that nothing was sent.
+   * They are deliberately NOT in `failedRows` (they are not retryable attempts), but since C1 they are
+   * NOT a way out either: for a money-moving type a row about the SAME document makes the plan REFUSE.
+   * Settling NOT_POSTED used to drop the distinct-token count and unblock a part-payment history; an
+   * operator's word is not proof the ledger was untouched, so it no longer does.
    *
    * THE PAYLOAD IS REQUIRED, not decorative (Codex round 2, MEDIUM). The rows arrive scoped to
-   * (connector, type, referenceType, referenceId) — an ORDER — and an order can hold assertions
-   * about a document it no longer has. The planner filters them by document anchor, and it can only
-   * do that if each row brings the payload the anchors are read from.
+   * (connector, type, referenceType, referenceId) - an ORDER - and an order can hold assertions about
+   * a document it no longer has. The planner filters them by document anchor, and it can only do that
+   * if each row brings the payload the anchors are read from.
    */
   assertedNotPostedRows?: readonly { id: string; payload: unknown }[]
 }
@@ -501,43 +495,42 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
 
   const freshAnchors = anchorsOf(input.payload)
 
-  // o3d-anu8 — carried onto every non-refusing plan below. Reaching a `create` or a `reuse` on a
-  // money-moving type while a settled-as-NOT_POSTED row sits in this scope means the ambiguity that
-  // would otherwise have refused was cleared by a HUMAN'S WORD, and the caller records that. It does
-  // not change the decision: freeing this path is the settlement action's stated purpose.
+  // o3d-f709 / M12 (C1) - A ROW AN OPERATOR SETTLED NOT_POSTED DOES NOT CLEAR THE SCOPE; IT BLOCKS IT.
   //
-  // ...AND ONLY ASSERTIONS ABOUT THE DOCUMENT THIS PLAN IS ENQUEUEING (Codex round 2, MEDIUM). The
-  // rows are read per (connector, type, referenceType, referenceId), which is an ORDER, and an order
-  // accumulates assertions about invoices it no longer has: delete and re-post an invoice and the
-  // predecessor's cancelled registrations stay in the scope for ever. Unfiltered, the record written
-  // from this list names rows that had nothing to do with the payment being enqueued — a warning
-  // that tells an operator to reconcile a document this plan never touched, which is the opposite of
-  // what an audit record is for. Worse, on a scope where NO assertion is relevant it manufactures a
-  // reliance out of nothing: `restsOnAssertion` is precisely the claim "this plan only got here
-  // because a human vouched for something", and that would be untrue.
+  // o3d-anu8 treated such a row as the documented unblock - "moving a FAILED row to CANCELLED drops the
+  // distinct-token count" - and merely RECORDED that the resulting post rested on a human's word. The
+  // premise was that the assertion was evidence. It is not: a person said "nothing posted" about a
+  // ledger IMS never read, and a lost response, a late webhook and a hand-post all leave the same row.
+  // A money post that goes out on that word can pay the customer or supplier twice, and a record that
+  // says so afterwards does not take it back. So the row joins the ambiguity set it used to leave, and
+  // the plan REFUSES - visibly, naming the rows.
   //
-  // AND IT USES THE CANONICAL DOCUMENT IDENTITY, NOT A LOCAL SPELLING OF ONE (Codex round 3, MEDIUM).
-  // The round-2 filter reached for `couldHaveCommittedThis`, which compares this module's own
-  // `ANCHOR_FIELDS` — both id fields, for every type — BYTE-EXACTLY. Neither half is how a document
-  // is identified anywhere that decides: XERO MATCHES INVOICE NUMBERS CASE-INSENSITIVELY and its
-  // document ids are GUIDs, so `4d8a…` and `4D8A…` are one invoice, and `creditNoteId` identifies a
-  // credit-note allocation and nothing else. Compared byte-exactly and over the union, an assertion
-  // about THIS document differing only in case was dropped from the record — `restsOnAssertion`
-  // then says nothing rested on a human's word when something did, which is the direction that
-  // loses an audit trail rather than manufacturing one.
+  // ONLY ASSERTIONS ABOUT THE DOCUMENT THIS PLAN IS ENQUEUEING (Codex round 2, MEDIUM, kept). The rows
+  // are read per (connector, type, referenceType, referenceId), which is an ORDER, and an order
+  // accumulates assertions about invoices it no longer has; refusing on those would strand a payment
+  // against a replacement invoice for ever. THE COMPARISON IS THE CANONICAL DOCUMENT IDENTITY, not a
+  // local spelling (Codex round 3, MEDIUM): Xero matches invoice numbers case-insensitively and its
+  // ids are GUIDs, `creditNoteId` identifies an allocation and nothing else. `couldBeTheSameDocument`
+  // is what the money fence itself uses and keeps the same conservative fallback - a payload with no
+  // anchors counts as matching, because unknown must read as "possibly this one".
   //
-  // `couldBeTheSameDocument` is the comparison the MONEY FENCE itself uses (the guard re-exports it
-  // as `attemptCouldBeTheSameDocument`), moved to `money-post-document.ts` so this planner can
-  // import it without the cycle that kept it out (o3d-anu8 r3). It keeps the same conservative
-  // fallback: a payload with no anchors at all counts as matching, because unknown must read as
-  // "possibly this one". There is no third comparison here — the two that already exist are this
-  // module's token-scoped `anchorsOf` and the canonical one, and the record now uses the canonical
-  // one.
+  // MONEY-MOVING TYPES ONLY. For a PDF, an e-mail or a note a re-drive costs a document nobody
+  // received, not money (the open owner line on non-money types under a blocked slot stays open).
   const assertedNotPostedRowIds = (input.assertedNotPostedRows ?? [])
     .filter((row) => couldBeTheSameDocument(input.type, row.payload, input.payload))
     .map((row) => row.id)
-  const restsOnAssertion: SettlementAssertionReliance | undefined =
-    moneyMoving && assertedNotPostedRowIds.length > 0 ? { assertedNotPostedRowIds } : undefined
+  if (moneyMoving && assertedNotPostedRowIds.length > 0) {
+    return {
+      action: 'refuse',
+      assertedNotPostedRowIds,
+      reason: `${assertedNotPostedRowIds.length} earlier ${input.type} row(s) for this reference and document are CANCELLED `
+        + 'because an OPERATOR settled them (as "not posted", or as posted against a cancelled sale). That is a person\'s word about a ledger IMS never '
+        + 'read, not proof - a lost response, a late webhook or a hand-posted payment would leave exactly the same '
+        + 'row - so IMS will not send this money again on the strength of it. Open the document in the accounting '
+        + 'system: if the payment is there, nothing more is owed (settle the row as POSTED with its id if you want '
+        + 'IMS to record it); if it is not, record the payment in the accounting system by hand.',
+    }
+  }
 
   // Narrow the history to attempts that could have committed THIS document. An attempt
   // against a DIFFERENT external document cannot have posted the one we are about to
@@ -662,7 +655,6 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
         tokenDisposition: 'pinned',
         bodyDisposition: 'pinned',
         divergedFields,
-        ...(restsOnAssertion ? { restsOnAssertion } : {}),
       }
     }
 
@@ -680,7 +672,6 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
       tokenDisposition: 'pinned',
       bodyDisposition: 'fresh',
       divergedFields,
-      ...(restsOnAssertion ? { restsOnAssertion } : {}),
     }
   }
 
@@ -783,10 +774,9 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
       tokenDisposition: unchanged ? 'pinned' : 'rotated',
       bodyDisposition: 'fresh',
       divergedFields: stored ? divergedRequestFields(stored, input.payload) : [],
-      ...(restsOnAssertion ? { restsOnAssertion } : {}),
     }
   }
-  return { action: 'create', payload: freshPayload, ...(restsOnAssertion ? { restsOnAssertion } : {}) }
+  return { action: 'create', payload: freshPayload }
 }
 
 /**

@@ -1596,11 +1596,16 @@ test('[o3d-anu8] a NON-money live asserted row still skips — a missed PDF is n
   assert.equal(plan.action, 'skip')
 })
 
-test('[o3d-anu8] a money enqueue cleared by an operator-cancelled row SAYS so on the plan', () => {
-  // Moving a FAILED row to CANCELLED drops the distinct-token count and turns a refusal into this
-  // enqueue — deliberately, it is the documented purpose of the settlement action. What must not
-  // happen is that the resulting money post looks identical to one the connector's own history
-  // cleared, with nothing to lead anybody back to the assertion if it was wrong.
+/** The plan's refusal, as the rows it names (o3d-f709 / M12), or null when the plan did not refuse. */
+function refusedOn(plan: ReturnType<typeof planFollowUpEnqueue>): string[] | null {
+  return plan.action === 'refuse' ? (plan.assertedNotPostedRowIds ?? []) : null
+}
+
+test('[o3d-f709 M12, C1] a money enqueue behind an operator-settled NOT_POSTED row for the SAME document REFUSES', () => {
+  // THE FLIP. This test used to assert `action: 'create'` with a reliance record: "moving a FAILED row
+  // to CANCELLED drops the distinct-token count and turns a refusal into this enqueue - deliberately,
+  // it is the documented purpose of the settlement action". An operator's NOT_POSTED is a person's
+  // word about a ledger IMS never read (C1), so the post goes out on nothing and could pay twice.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1608,27 +1613,48 @@ test('[o3d-anu8] a money enqueue cleared by an operator-cancelled row SAYS so on
     failedRows: [],
     assertedNotPostedRows: [{ id: 'log-settled', payload: { accountingInvoiceId: 'inv-9' } }],
   })
+  console.log(`# precondition M12: plan=${plan.action} rows=${JSON.stringify(refusedOn(plan))}`)
+  assert.equal(plan.action, 'refuse')
+  assert.deepEqual(refusedOn(plan), ['log-settled'])
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /OPERATOR settled/)
+  assert.match(plan.action === 'refuse' ? plan.reason : '', /not proof/)
+})
+
+test('[o3d-f709 M12] ISOLATING ARM: the same enqueue with NO asserted row creates (so the refusal is the assertion\'s)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [],
+  })
   assert.equal(plan.action, 'create')
-  assert.deepEqual(
-    plan.action === 'create' ? plan.restsOnAssertion : undefined,
-    { assertedNotPostedRowIds: ['log-settled'] },
-  )
+})
+
+test('[o3d-f709 M12] a NON-money follow-up is not refused by an asserted row (the open owner line: only money types)', () => {
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    type: 'INVOICE_PDF',
+    payload: { accountingInvoiceId: 'inv-9' },
+    liveRowExists: false,
+    failedRows: [],
+    assertedNotPostedRows: [{ id: 'log-settled', payload: { accountingInvoiceId: 'inv-9' } }],
+  })
+  assert.notEqual(plan.action, 'refuse')
 })
 
 // ---------------------------------------------------------------------------
-// CODEX ROUND 2, MEDIUM — THE RECORD MUST NAME THE ASSERTIONS THAT CLEARED *THIS* PAYMENT.
+// CODEX ROUND 2, MEDIUM - THE FILTER IS BY DOCUMENT, so the refusal does not strand a replacement.
 //
-// `assertedNotPostedRows` is read per (connector, type, referenceType, referenceId) — an ORDER — and
+// `assertedNotPostedRows` is read per (connector, type, referenceType, referenceId) - an ORDER - and
 // an order accumulates cancelled registrations for invoices it no longer has (delete and re-post an
-// invoice and the predecessor's rows stay in the scope for ever). Unfiltered, the reliance record
-// named rows that had nothing to do with the payment being enqueued, and on a scope where none of
-// them was relevant it manufactured a reliance out of nothing: `restsOnAssertion` claims "this plan
-// only got here because a human vouched for something", which would then be untrue.
+// invoice and the predecessor's rows stay in the scope for ever). Refusing on those would block a
+// payment against the replacement invoice for ever, for history that cannot have touched it.
 //
 // The filter is the SAME anchor comparison the live-row lookup and the failed-row history use.
 // ---------------------------------------------------------------------------
 
-test('[o3d-anu8 r2] an assertion about a DIFFERENT document is not part of what cleared this payment', () => {
+test('[o3d-anu8 r2] an assertion about a DIFFERENT document does not refuse this payment', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1637,15 +1663,10 @@ test('[o3d-anu8 r2] an assertion about a DIFFERENT document is not part of what 
     // The order's PREVIOUS invoice. Its cancelled registration says nothing about inv-9.
     assertedNotPostedRows: [{ id: 'log-old-invoice', payload: { accountingInvoiceId: 'inv-1' } }],
   })
-  assert.equal(plan.action, 'create')
-  assert.equal(
-    plan.action === 'create' ? plan.restsOnAssertion : 'unset',
-    undefined,
-    'nothing about inv-9 rested on a human\'s word, so the plan must not claim it did',
-  )
+  assert.equal(plan.action, 'create', 'inv-1\'s history cannot have committed inv-9')
 })
 
-test('[o3d-anu8 r2] the relevant assertions survive the filter and the irrelevant ones do not', () => {
+test('[o3d-anu8 r2] only the relevant assertions are named, and the irrelevant ones are not', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1656,17 +1677,13 @@ test('[o3d-anu8 r2] the relevant assertions survive the filter and the irrelevan
       { id: 'log-this-invoice', payload: { accountingInvoiceId: 'inv-9' } },
     ],
   })
-  assert.deepEqual(
-    plan.action === 'create' ? plan.restsOnAssertion : undefined,
-    { assertedNotPostedRowIds: ['log-this-invoice'] },
-    'the record must lead an operator to the row that actually cleared this post, and to no other',
-  )
+  assert.deepEqual(refusedOn(plan), ['log-this-invoice'],
+    'the refusal must lead an operator to the row that actually blocks this post, and to no other')
 })
 
-test('[o3d-anu8 r2] an UNANCHORED assertion still counts — unknown reads as possibly this one', () => {
-  // The same direction `couldHaveCommittedThis` takes everywhere else, and the reason the comparison
-  // is shared rather than re-derived: a stored payload that names no document cannot be ruled out,
-  // and over-naming a row in a warning is recoverable where under-naming it is not.
+test('[o3d-anu8 r2] an UNANCHORED assertion still refuses - unknown reads as possibly this one', () => {
+  // The same direction `couldHaveCommittedThis` takes everywhere else: a stored payload that names no
+  // document cannot be ruled out.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1674,20 +1691,12 @@ test('[o3d-anu8 r2] an UNANCHORED assertion still counts — unknown reads as po
     failedRows: [],
     assertedNotPostedRows: [{ id: 'log-legacy', payload: {} }],
   })
-  assert.deepEqual(
-    plan.action === 'create' ? plan.restsOnAssertion : undefined,
-    { assertedNotPostedRowIds: ['log-legacy'] },
-  )
+  assert.deepEqual(refusedOn(plan), ['log-legacy'])
 })
 
-test('[o3d-anu8 r3] an assertion about THIS document in a different CASE is still part of what cleared it', () => {
+test('[o3d-anu8 r3] an assertion about THIS document in a different CASE still refuses', () => {
   // Codex round 3, MEDIUM. XERO MATCHES INVOICE NUMBERS CASE-INSENSITIVELY and its document ids are
-  // GUIDs — `4D8A…` and `4d8a…` address ONE invoice — which is why the repository has a canonical,
-  // case-folded money-document comparison and why the money fence uses it. The round-2 filter
-  // reached for this module's own byte-exact `couldHaveCommittedThis` instead, so an assertion about
-  // the very document being enqueued was dropped from the record: `restsOnAssertion` then said
-  // nothing rested on a human's word when something did, and the audit trail back to the operator
-  // who vouched for it was gone.
+  // GUIDs - `4D8A...` and `4d8a...` address ONE invoice.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: '4D8A1F2B-0000-4000-8000-00000000ABCD' },
@@ -1695,19 +1704,10 @@ test('[o3d-anu8 r3] an assertion about THIS document in a different CASE is stil
     failedRows: [],
     assertedNotPostedRows: [{ id: 'log-same-doc', payload: { accountingInvoiceId: '4d8a1f2b-0000-4000-8000-00000000abcd' } }],
   })
-  assert.deepEqual(
-    plan.action === 'create' ? plan.restsOnAssertion : undefined,
-    { assertedNotPostedRowIds: ['log-same-doc'] },
-    'case is not part of a document\'s identity, so this assertion cleared THIS payment',
-  )
+  assert.deepEqual(refusedOn(plan), ['log-same-doc'], 'case is not part of a document\'s identity')
 })
 
-test('[o3d-anu8 r3] a PAYMENT is identified by its invoice — an irrelevant creditNoteId does not split it', () => {
-  // The other half of "canonical". `creditNoteId` identifies a credit-note ALLOCATION and nothing
-  // else: no payment body either connector sends carries it, and neither probe dereferences it on a
-  // payment branch. Comparing the UNION of both anchors — which is what this module's local
-  // comparison does — made a row that happens to hold one come out UNEQUAL to a row that does not,
-  // and the assertion about the same invoice vanished from the record.
+test('[o3d-anu8 r3] a PAYMENT is identified by its invoice - an irrelevant creditNoteId does not split it', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1715,18 +1715,14 @@ test('[o3d-anu8 r3] a PAYMENT is identified by its invoice — an irrelevant cre
     failedRows: [],
     assertedNotPostedRows: [{ id: 'log-with-cn', payload: { accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' } }],
   })
-  assert.deepEqual(
-    plan.action === 'create' ? plan.restsOnAssertion : undefined,
-    { assertedNotPostedRowIds: ['log-with-cn'] },
-    'a payment is identified by the invoice it settles; a stray anchor is not a different document',
-  )
+  assert.deepEqual(refusedOn(plan), ['log-with-cn'],
+    'a payment is identified by the invoice it settles; a stray anchor is not a different document')
 })
 
 test('[o3d-anu8 r3] the assertion filter and the money fence answer with ONE comparison', () => {
-  // The rule the two tests above are instances of, stated directly: the planner must not have a
-  // comparison of its own. `attemptCouldBeTheSameDocument` is what the POST fence judges rival
-  // attempts with, and a record built from a different answer describes a different question from
-  // the one that was decided.
+  // The planner must not have a comparison of its own. `attemptCouldBeTheSameDocument` is what the
+  // POST fence judges rival attempts with, and a refusal built from a different answer describes a
+  // different question from the one that was decided.
   for (const [left, right] of [
     [{ accountingInvoiceId: '4D8A' }, { accountingInvoiceId: '4d8a' }],
     [{ accountingInvoiceId: 'inv-9', creditNoteId: 'cn-3' }, { accountingInvoiceId: 'inv-9' }],
@@ -1740,16 +1736,15 @@ test('[o3d-anu8 r3] the assertion filter and the money fence answer with ONE com
       failedRows: [],
       assertedNotPostedRows: [{ id: 'log-x', payload: left }],
     })
-    const named = plan.action === 'create' && plan.restsOnAssertion !== undefined
     assert.equal(
-      named,
+      plan.action === 'refuse',
       attemptCouldBeTheSameDocument('INVOICE_PAYMENT', left, right),
       `the filter disagreed with the fence about ${JSON.stringify(left)} vs ${JSON.stringify(right)}`,
     )
   }
 })
 
-test('[o3d-anu8] with no operator-cancelled row the plan carries no such claim', () => {
+test('[o3d-anu8] with no operator-cancelled row the plan is unaffected', () => {
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },
@@ -1757,7 +1752,6 @@ test('[o3d-anu8] with no operator-cancelled row the plan carries no such claim',
     failedRows: [],
   })
   assert.equal(plan.action, 'create')
-  assert.equal(plan.action === 'create' ? plan.restsOnAssertion : 'unset', undefined)
 })
 
 test('[o3d-anu8] the Xero connector ASKS for the basis and hands both halves to the planner', async () => {
@@ -1794,6 +1788,10 @@ test('[o3d-anu8] the Xero connector ASKS for the basis and hands both halves to 
   assert.match(planCall, /liveRowAsserted: live\.asserted/)
   assert.match(planCall, /assertedNotPostedRows/)
 
-  assert.match(source, /xero_followup_enqueue_rests_on_operator_assertion/,
-    'a money post cleared by an assertion must leave a record naming the rows that cleared it')
+  // o3d-f709 (M12): the reliance RECORD is gone - a post resting on an assertion no longer happens, the
+  // plan refuses - and the refusal's activity row names the rows that caused it.
+  assert.doesNotMatch(source, /xero_followup_enqueue_rests_on_operator_assertion/,
+    'there is no post resting on an assertion to record any more')
+  assert.match(source, /assertedNotPostedRowIds: plan\.assertedNotPostedRowIds/,
+    'the refusal names the asserted rows that caused it')
 })
