@@ -313,9 +313,11 @@ const tx = {
     }) ?? null,
     // o3d-i0o6: the A2 journal probed by its own id. A missing row is retention, not "no journal",
     // and the reversal refuses either way.
-    findUnique: async ({ where }: { where: { id: string } }) => (
-      state.accountingSyncLogs.find((row) => row.id === where.id) ?? null
-    ),
+    // o3d-3la07: a fixture that names no ledger-standing column means the connector's own writeback.
+    findUnique: async ({ where }: { where: { id: string } }) => {
+      const row = state.accountingSyncLogs.find((candidate) => candidate.id === where.id)
+      return row ? { settlementBasis: null, abandonedBeforeRemoteCall: null, externalTransactionId: null, ...row } : null
+    },
   },
   activityLog: {
     create: async ({ data }: { data: Record<string, unknown> }) => {

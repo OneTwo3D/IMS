@@ -62,6 +62,8 @@ type EventRow = {
   businessDate: string
   createdAt: string
   linesJson: unknown
+  /** o3d-3la07 (AE2): HOW the event came to be POSTED. The default fixture is the connector's own writeback. */
+  postBasis: string | null
 }
 
 /**
@@ -85,6 +87,8 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
       // The DEFAULT is the same connector `postedInvoice()` names, i.e. ONE ledger. Every r9
       // finding 1 fixture departs from that on this field alone.
       externalSystem: 'xero',
+      // o3d-3la07 (AE3): the credit note was confirmed by the connector.
+      postBasis: 'CONNECTOR',
     }))
   return {
     accountingEvent: {
@@ -194,6 +198,8 @@ type CreditNoteEventRow = {
   status: string
   externalId: string | null
   externalSystem: string | null
+  /** o3d-3la07 (AE3): HOW the event came to be POSTED. */
+  postBasis?: string | null
 }
 
 /** A chargeback that MIRRORED the invoice: full goods, and the invoice's discount as a negative leg. */
@@ -239,6 +245,7 @@ function postedInvoice(over: Partial<EventRow> = {}): EventRow {
     businessDate: '2026-05-02',
     createdAt: '2026-05-02T09:00:00.000Z',
     linesJson: documentPayload({ discount: { amount: 10, accountCode: '260' } }),
+    postBasis: 'CONNECTOR',
     ...over,
   }
   // r13 finding 2. DISTINCT by default, derived from what distinguishes the fixture: the column is
@@ -1185,7 +1192,7 @@ test('a VOIDED credit note stops the position netting (o3d-y14 r8 F3)', async ()
   // r7's premise — the persisted lines ARE what the document carried — holds at posting time and
   // says nothing about a document retired afterwards. Here the mirror says it was.
   const voided = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero', postBasis: 'CONNECTOR' },
   ])
   const live = await NETTED_TO_ZERO()
 
@@ -1300,7 +1307,7 @@ test('a parked refund is named in the operator text where a recorded one would b
  * the same answer would prove nothing, which is the trap every earlier round in this file guards.
  */
 const CREDIT_NOTE_IN_QUICKBOOKS: CreditNoteEventRow[] = [
-  { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks' },
+  { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks', postBasis: 'CONNECTOR' },
 ]
 
 test('a Xero invoice is NOT netted against a QuickBooks credit note (o3d-y14 r9 F1)', async () => {
@@ -1414,7 +1421,7 @@ test('a HAND-VOIDED credit note is exactly what that precondition is for (o3d-y1
   // reach an operator without naming the document it depends on. The mirror-visible void (r8 F3) is
   // the same failure IMS happens to be able to see, and it refuses outright:
   const seen = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero', postBasis: 'CONNECTOR' },
   ])
   const unseen = await NETTED_TO_ZERO()
 
@@ -1557,7 +1564,7 @@ const MATRIX: Array<
     'netting withdrawn / credit note not standing',
     () =>
       handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
-        { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
+        { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero', postBasis: 'CONNECTOR' },
       ]),
   ],
   // r10 finding 2. The suppressed netting's counterpart on an UNREFUNDED order, where the remedy
