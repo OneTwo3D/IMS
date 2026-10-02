@@ -1448,7 +1448,7 @@ If any of those does not hold, the receipt is still recorded in the IMS, nothing
 
 **A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
-Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
+Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS never read, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
 
 ### Supplier bills: marking one paid again
 
