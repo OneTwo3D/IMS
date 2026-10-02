@@ -120,13 +120,14 @@ function payloadFor(key: string, writer: 'enqueue' | 'interloper') {
  * `wait_event=advisory`, `SELECT pg_advisory_xact_lock($1)`, nothing on the index. It then wakes after
  * the winner commits and READS the row. The assertion this test always made — the loser's enqueue
  * cannot return before the winner commits — is therefore true and is what is observed below, but the
- * 23505 / savepoint recovery path is NOT what is being waited on any more. Filed rather than folded in:
- * see the bead named in the PR for o3d-ohrk3.
+ * 23505 / savepoint recovery path is NOT what is being waited on any more. That recovery has its own
+ * DETERMINISTIC test below ("a lock-bypassing interloper ..."), which forces the 23505 and asserts it
+ * was reached (o3d-l2nx6).
  */
 const FENCE_WAIT = /pg_advisory_xact_lock/i
 
 test(
-  '[o3d-d0pd r2] a colliding enqueue leaves the outer transaction committable, and the collision is reached',
+  '[o3d-d0pd r2] two enqueues for one key serialise behind each other\'s open transaction, and both commit (the FENCE race; the 23505 recovery is the next test)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const { db, queueAccountingSyncTx } = await loadDeps()
@@ -246,6 +247,110 @@ test(
       `the losing enqueue returned ${park.releasedAt - loser.enqueueDoneAt}ms BEFORE the winner released `
       + 'its transaction, so it never waited behind the winner and the collision was never raced',
     )
+  },
+)
+
+test(
+  '[o3d-l2nx6] a lock-bypassing interloper commits between the enqueue\'s read and its INSERT: the 23505 is raised, recovered under the savepoint, and the SAME transaction still writes and commits',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    /**
+     * THE RECOVERY PATH, FORCED AND NOT RACED (o3d-l2nx6, Codex HIGH on #727).
+     *
+     * Since o3d-j625 r13 two ENQUEUES for one key serialise on advisory locks, so the test above can no
+     * longer make one of them hit the idempotency-key unique index. A writer that takes none of those
+     * locks can: a bare `accountingSyncLog.create` (a script, a repair, an older code path).
+     *
+     * THE ORDER, DRIVEN BY STATE (no sleep, no test seam):
+     *   1. the interloper INSERTS the key in its own transaction and leaves it OPEN — uncommitted, so the
+     *      enqueue's prior-attempt read (READ COMMITTED) cannot see it and finds nothing to dedupe on;
+     *   2. the enqueue passes its fences and prior-attempt read, and its INSERT blocks on the unique index
+     *      behind the interloper — observed through pg_blocking_pids (`wait_event=transactionid`, the
+     *      INSERT statement) before anything is released;
+     *   3. only then does the interloper COMMIT, so the enqueue's INSERT gets its 23505 — the read-and-
+     *      dedupe outcome is NOT available to it.
+     * The enqueue must recover under its savepoint, answer queued, and the caller's next statement and
+     * COMMIT must succeed (without the savepoint both die with 25P02).
+     */
+    const { db, queueAccountingSyncTx } = await loadDeps()
+    await enableXeroCogsReversal(db)
+    const referenceId = probeId('forced')
+    const key = `cogs-reversal:${referenceId}`
+    t.after(async () => {
+      await db.accountingEvent.deleteMany({ where: { sourceEntityId: referenceId } }).catch(() => undefined)
+      await db.accountingSyncLog.deleteMany({ where: { referenceId } })
+      await db.activityLog.deleteMany({ where: { entityId: { startsWith: `${referenceId}:` } } })
+    })
+
+    let interloperInserted!: (pid: number) => void
+    const interloperHasInserted = new Promise<number>((resolve) => { interloperInserted = resolve })
+    let parked: ParkedBackend | null = null
+
+    const interloper = db.$transaction(async (tx) => {
+      const pid = await backendPid(tx)
+      // A BARE insert: no selection fence, no posting-key lock, no follow-up scope lock.
+      await tx.accountingSyncLog.create({
+        data: {
+          connector: 'xero',
+          type: 'COGS_REVERSAL' as const,
+          status: 'PENDING' as const,
+          referenceType: REFERENCE_TYPE,
+          referenceId,
+          payload: payloadFor(key, 'interloper'),
+        },
+      })
+      interloperInserted(pid)
+      // Held open until the enqueue is OBSERVED stuck on the unique index (its INSERT) behind us.
+      parked = await waitUntilParkedBehind(db, {
+        holderPid: pid, waitingOn: /INSERT INTO\s+.*accounting_sync_logs/i, describe: 'forced 23505: the enqueue\'s INSERT',
+      })
+    }, TX)
+
+    let queued: boolean | null = null
+    let outcome: { queued?: boolean; reason?: string } | null = null
+    const enqueue = db.$transaction(async (tx) => {
+      await interloperHasInserted
+      queued = await queueAccountingSyncTx(tx, {
+        type: 'COGS_REVERSAL',
+        referenceType: REFERENCE_TYPE,
+        referenceId,
+        payload: payloadFor(key, 'enqueue'),
+        idempotencyKey: key,
+        chartConnector: 'xero',
+        reportOutcome: (o) => { outcome = o as never },
+      })
+      // THE SUBSEQUENT STATEMENT, in the same transaction, which is what the savepoint exists for.
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SYSTEM', entityId: `${referenceId}:enqueue`, action: 'l2nx6_forced_collision_probe',
+          tag: 'sync', level: 'INFO', description: `enqueue reported queued=${queued}`,
+        },
+      })
+    }, TX)
+
+    const [interloperOutcome, enqueueOutcome] = await Promise.allSettled([interloper, enqueue])
+    // The observer's diagnostic (never parked) is the root cause if there is one.
+    if (interloperOutcome.status === 'rejected') throw interloperOutcome.reason
+    if (enqueueOutcome.status === 'rejected') throw enqueueOutcome.reason
+
+    // PRECONDITION: THE 23505 WAS REACHED. The enqueue's INSERT was observed blocked on the unique index
+    // behind an UNCOMMITTED interloper, so its prior-attempt read had found nothing and it could only
+    // finish by colliding after the interloper committed.
+    assert.ok(parked, 'PRECONDITION: the enqueue INSERT was observed parked behind the interloper')
+    const seen = parked as ParkedBackend
+    console.log(`[o3d-l2nx6 forced 23505] enqueue backend ${seen.pid} observed blocked on the unique index `
+      + `(\`${seen.query.replace(/\s+/g, ' ').slice(0, 50)}\`) after ${seen.observedAfterMs}ms, then the interloper committed`)
+    assert.match(seen.query, /accounting_sync_logs/i)
+
+    assert.equal(queued, true, 'the collision is reported as queued: the counterpart exists')
+    assert.equal((outcome as { reason?: string } | null)?.reason, 'already-queued')
+    // THE POINT OF THE SAVEPOINT: the write AFTER the recovered collision, and the COMMIT, both landed.
+    assert.equal(await db.activityLog.count({ where: { entityId: `${referenceId}:enqueue` } }), 1,
+      'the caller\'s write after the recovered 23505 must be durable: a transaction left in 25P02 cannot commit it')
+    const rows = await db.accountingSyncLog.findMany({ where: { referenceId }, select: { payload: true } })
+    assert.equal(rows.length, 1, 'one row for one key')
+    assert.equal((rows[0].payload as { _probeWriter?: string })._probeWriter, 'interloper',
+      'the surviving row is the interloper\'s: the enqueue\'s own INSERT is the one that collided')
   },
 )
 
