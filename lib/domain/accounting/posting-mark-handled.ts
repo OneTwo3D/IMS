@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import { accountingPostingKeyForRow, postingKeyIsReusedAcrossPostings } from '@/lib/accounting/posting-key'
 import {
   accountingSyncRowCanPostOrHasPosted,
@@ -250,7 +251,12 @@ export function describeSyncRowStanding(sync: LedgerStandingRow): string {
     case 'ASSERTED_NOT_POSTED':
       return `${sync.status}, settled by an operator as NOT posted (an assertion, not proof that it did not post)`
     case 'PROVEN_NOT_POSTED':
-      return `${sync.status}, proven never to have been sent`
+      // Only a RECORDED PRE-CALL proof is "never sent"; a verified reversal may have been posted first (Codex r1).
+      return provenCauseOf(sync) === 'VERIFIED_REVERSAL'
+        ? `${sync.status}, verified reversed in the ledger (it may have been posted earlier)`
+        : provenCauseOf(sync) === 'REJECTED_BEFORE_POSTING'
+          ? `${sync.status}, rejected before posting`
+          : `${sync.status}, never sent (recorded before the remote call)`
     case 'LIVE_WORK':
       return `${sync.status} (queued or in flight)`
     default:

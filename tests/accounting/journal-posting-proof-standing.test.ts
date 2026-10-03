@@ -160,7 +160,10 @@ test('an asserted CANCELLED + id row (the cancelled-sale settlement) is ASSERTED
 // ---------------------------------------------------------------------------------------------
 
 const WORDING: Array<{ standing: string; row: JournalProofRow; says: RegExp; neverNothingDebited: boolean }> = [
-  { standing: 'PROVEN_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' }), says: /PROVEN never to have posted — nothing has been debited/, neverNothingDebited: false },
+  // A recorded PRE-CALL abandonment is the only PROVEN cause that may say "never posted / nothing debited".
+  { standing: 'PROVEN_NOT_POSTED (recorded pre-call)', row: row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true }), says: /PROVEN never to have posted — nothing has been debited/, neverNothingDebited: false },
+  // A VERIFIED REVERSAL can keep the id of a journal that DID post and was later reversed (Codex round 1, o3d-1e7sl).
+  { standing: 'PROVEN_NOT_POSTED (verified reversal)', row: row({ status: 'CANCELLED', externalTransactionId: 'JNL-REAL', settlementBasis: 'VERIFIED_REVERSAL' }), says: /verified reversed in the ledger and is no longer present there\. It may have been posted earlier/, neverNothingDebited: true },
   { standing: 'ASSERTED_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }), says: /UNPROVEN[\s\S]*CHECK Xero for that journal[\s\S]*if it posted[\s\S]*if it did not/, neverNothingDebited: true },
   { standing: 'UNKNOWN (CANCELLED, no proof)', row: row({ status: 'CANCELLED' }), says: /UNPROVEN[\s\S]*CHECK Xero/, neverNothingDebited: true },
   { standing: 'UNKNOWN (FAILED, no id)', row: row({ status: 'FAILED' }), says: /is FAILED, not SYNCED — whether it reached the ledger is UNPROVEN[\s\S]*CHECK Xero/, neverNothingDebited: true },
@@ -174,7 +177,7 @@ for (const testCase of WORDING) {
     assert.equal(proof.kind, 'refused')
     const reason = proof.kind === 'refused' ? proof.reason : ''
     assert.match(reason, testCase.says)
-    if (testCase.neverNothingDebited) assert.doesNotMatch(reason, /nothing has been debited/)
+    if (testCase.neverNothingDebited) assert.doesNotMatch(reason, /nothing has been debited|never to have posted/)
     assert.equal(isAssertedJournalRefusal(reason), false, 'and it does not trigger the asserted-journal remedy')
     console.log(`wording ${testCase.standing}: ${reason.slice(0, 110)}`)
   })

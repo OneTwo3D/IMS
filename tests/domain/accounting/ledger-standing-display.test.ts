@@ -138,3 +138,14 @@ test('[o3d-1e7sl Codex r1] each PROVEN_NOT_POSTED cause has its own label; only 
   assert.doesNotMatch(String(describeDocumentIdClaim(stranded)), /posted as|never sent/)
   assert.equal(describeLedgerStanding(stranded).label, 'verified reversed')
 })
+
+test('[o3d-1e7sl Codex r1] the mark-handled blocking-row wording names the cause too: a verified reversal is never "never sent"', async () => {
+  const { describeSyncRowStanding } = await import('@/lib/domain/accounting/posting-mark-handled')
+  const pre = describeSyncRowStanding(row({ abandonedBeforeRemoteCall: true }))
+  const vr = describeSyncRowStanding(row({ externalTransactionId: 'PAY-REAL-7', settlementBasis: 'VERIFIED_REVERSAL' }))
+  const rejected = describeSyncRowStanding(row({ status: 'FAILED' }), )
+  assert.match(pre, /never sent \(recorded before the remote call\)/)
+  assert.match(vr, /verified reversed in the ledger \(it may have been posted earlier\)/)
+  assert.doesNotMatch(vr, /never sent/)
+  assert.doesNotMatch(rejected, /never sent|rejected before posting/, 'a bare FAILED row is UNKNOWN: nothing proves it')
+})

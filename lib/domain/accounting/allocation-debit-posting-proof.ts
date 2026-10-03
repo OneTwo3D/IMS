@@ -62,6 +62,7 @@
  * caller can reach for the other's answer by accident.
  */
 
+import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import {
   parseAllocationDebitPasses,
   sumAllocationDebitPasses,
@@ -570,6 +571,10 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         kind: 'refused',
         reason: journalRowIsSettled(journal)
           ? 'the A2 journal this order was staged into is SYNCED but its settlement basis is not one this build recognises, so whether it reached the ledger cannot be established'
+          : standing === 'PROVEN_NOT_POSTED' && provenCauseOf(journal) === 'VERIFIED_REVERSAL'
+            // A verified reversal is proof the document is no longer in the ledger, NOT that it never was: it can keep
+            // the id of a journal that posted and was later reversed (Codex round 1, o3d-1e7sl). Say that.
+            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED: it was verified reversed in the ledger and is no longer present there. It may have been posted earlier, so check whether a debit to Allocated Inventory was already reversed before reconciling`
           : standing === 'PROVEN_NOT_POSTED'
             ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
             : standing === 'LIVE_WORK'
