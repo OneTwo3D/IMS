@@ -120,3 +120,17 @@ test('[o3d-1e7sl Codex r1] the sync log, the orphan banner and the stranded-row 
   const display = await source('lib/domain/accounting/ledger-standing-display.ts')
   assert.equal((display.match(/'never sent'/g) ?? []).length, 1, 'exactly one label says "never sent": the recorded pre-call proof')
 })
+
+test('[o3d-1e7sl Codex r2] operator instruction strings never advise an unconditional re-post / reversal on a non-confirmed standing', async () => {
+  const dialog = await source('app/(dashboard)/sync/settle-sync-row-control.tsx')
+  assert.match(dialog, /check the accounting system, and ONLY if the document is not there hand-post it/)
+  assert.doesNotMatch(dialog, /hand-post it in the accounting system and mark the posting handled\. If a document turns up/)
+  const handled = await source('lib/domain/accounting/posting-mark-handled.ts')
+  assert.match(handled, /post it by hand ONLY if '\s*\+ 'it is not there/)
+  const docs = await source('help-docs/xero-sync.md')
+  assert.match(docs, /check Xero first and, only if the document is not there, record it in\s+Xero by hand/)
+  assert.doesNotMatch(docs, /To get the posting into the ledger, \*\*record it in/)
+  const sales = await source('help-docs/sales.md')
+  assert.match(sales, /check the accounting system for that journal and reverse it only if it exists there/)
+  assert.doesNotMatch(sales, /\| Daily batch \| \*\*Finance reverses the batch entry\.\*\*/)
+})

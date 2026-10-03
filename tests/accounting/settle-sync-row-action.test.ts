@@ -695,7 +695,7 @@ test('a mirror that already records a posted document REFUSES the SETTLEMENT —
   assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
   assert.match('error' in result ? result.error : '', /already names document INV-500/)
   // The remedy, not a dead end.
-  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  assert.match('error' in result ? result.error : '', /[Ss]ettle this row as POSTED with that id/)
   // AND NOTHING WAS WRITTEN. The fenced decision had already landed inside the transaction, so a
   // refusal that merely RETURNED would have committed a CANCELLED row and reported a failure.
   assert.deepEqual(
@@ -1237,7 +1237,7 @@ test('a NOT_POSTED assertion is refused by a second key that records a posted do
 
   assert.equal(result.success, false)
   assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
-  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  assert.match('error' in result ? result.error : '', /[Ss]ettle this row as POSTED with that id/)
   assert.equal(stored().status, 'FAILED')
   assert.equal(state.events.find((e) => e.idempotencyKey === PRIMARY_KEY)!.status, 'PENDING')
 })

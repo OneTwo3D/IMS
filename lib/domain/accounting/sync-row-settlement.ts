@@ -936,8 +936,13 @@ export function refuseSettlementContradictedByMirror(
         code: 'contradicts_mirrored_document',
         message:
           `The mirrored accounting event for this row already names document ${mirroredId}, ${basisClause}. `
-          + 'Nothing was settled and nothing was changed. Settle this row as POSTED with that id, '
-          + 'or reverse the document in the accounting system first and settle it afterwards.',
+          + 'Nothing was settled and nothing was changed. '
+          + (provenance === 'confirmed'
+            ? 'Settle this row as POSTED with that id, or reverse the document in the accounting system first and settle it afterwards.'
+            // Not confirmed: the document may not exist, so "reverse it" is conditional on finding it.
+            : 'Check that document in the accounting system. If it exists, settle this row as POSTED with that id (or, if it is the wrong '
+              + 'document, reverse it there first and settle afterwards); if it does not exist there is nothing to reverse - the mirror\'s '
+              + 'record is what is wrong.'),
       }
     }
     if (mirrored.status === 'POSTED') {
@@ -947,8 +952,11 @@ export function refuseSettlementContradictedByMirror(
           'The mirrored accounting event for this row is already recorded as POSTED'
           + `${provenance === 'asserted' ? ' on an operator\'s earlier assertion' : provenance === 'unrecorded' ? ' (how it came to be posted was never recorded)' : ''}, `
           + 'so asserting that nothing posted contradicts that record. Nothing was settled and nothing was '
-          + 'changed. Find the document in the accounting system and settle this row as POSTED with its id, or '
-          + 'reverse it there first.',
+          + 'changed. '
+          + (provenance === 'confirmed'
+            ? 'Find the document in the accounting system and settle this row as POSTED with its id, or reverse it there first.'
+            : 'Look for the document in the accounting system. If it exists, settle this row as POSTED with its id (or reverse it there '
+              + 'first if it is wrong); if there is none, there is nothing to reverse - the mirror\'s record is what is wrong.'),
       }
     }
     return null

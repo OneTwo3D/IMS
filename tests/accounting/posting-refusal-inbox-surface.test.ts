@@ -487,12 +487,12 @@ test('[o3d-1e7sl G6/G7] the inbox classifies the rows under a refused posting by
       reported += 1
       assert.equal(row.retiredUnproven.length, 1, c.name)
       assert.match(row.retiredUnproven[0]!, c.reports, c.name)
-      assert.match(String(row.handPostOrder), /look in the ledger before posting it by hand/, `${c.name}: the order tells the operator to look first`)
+      assert.match(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, `${c.name}: the order tells the operator to look first`)
       // And still offers the act that closes it: a retired row must not turn the remedy into a dead end.
       assert.match(String(row.handPostOrder), /Take for hand posting" FIRST/, c.name)
     } else {
       assert.deepEqual(row.retiredUnproven, [], `${c.name}: nothing unproven to report`)
-      assert.doesNotMatch(String(row.handPostOrder), /look in the ledger before posting it by hand/, c.name)
+      assert.doesNotMatch(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, c.name)
     }
   }
   console.log(`# G7 cases: ${cases.length}; reported-unproven ${reported}`)

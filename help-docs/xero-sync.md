@@ -1997,7 +1997,7 @@ stranded-rows banner. It records what *you* found in Xero:
   a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
   same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
   clear a held "paid" flag, it will refuse to delete the receipt it registered, and it keeps the row
-  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **record it in
+  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **check Xero first and, only if the document is not there, record it in
   Xero by hand and mark the posting handled** in the refusal inbox.
 
 Read what this is, because it is not a repair. IMS cannot check either statement; the control records
@@ -2054,7 +2054,7 @@ Xero. The same rule shapes the rest of the product:
 - **Taking a refused posting for hand posting** is not blocked by a cancelled row (a cancelled row can never post
   again, and hand-posting is the remedy for it) but the inbox, and the log entry written when you take the posting,
   now list every earlier attempt retired without proof — "settled by an operator as NOT posted (an assertion, not
-  proof that it did not post)" — and tell you to **look in Xero before posting by hand**, because a second document is
+  proof that it did not post)" — and tell you to **look in Xero first and post by hand only if the document is not there**, because a second document is
   not undone by marking the posting handled.
 - **Retention** keeps every row an operator typed a document id into, whatever it is keyed to, as a compacted
   tombstone: the personal data in its payload still expires on schedule, the claim (connector, type, reference, status,
@@ -2069,7 +2069,7 @@ Xero. The same rule shapes the rest of the product:
 marks the shared accounting event **Void**, which is what stops a finished row leaving work that
 reconciliation reads as still owed. It is not a statement that the document is no longer wanted. Since
 IMS no longer treats your statement as proof, the posting is **not** queued again on the strength of it
-(see above): the enqueue is refused and the posting stays owed until you record it in Xero by hand and
+(see above): the enqueue is refused and the posting stays owed until you check Xero and, only if the document is not there, record it by hand and
 mark it handled. A replacement that arrives some other way — after a row IMS itself retired — takes a
 Void event of this kind back to **Pending**, and the revival is recorded against the event in its own
 history.

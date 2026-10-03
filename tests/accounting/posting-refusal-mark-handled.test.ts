@@ -388,7 +388,7 @@ test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, an
         reported += 1
         assert.equal(retired.length, 1, c.name)
         assert.match(retired[0]!, c.reports, c.name)
-        assert.match(String((note as unknown as { description?: string }).description), /look in the ledger before posting it by hand/, c.name)
+        assert.match(String((note as unknown as { description?: string }).description), /look in the ledger for it and post it by hand ONLY if it is not there/, c.name)
       } else {
         assert.deepEqual(retired, [], `${c.name}: nothing unproven to report`)
       }

@@ -1644,3 +1644,52 @@ test('[o3d-1e7sl G1] with several rows the confirmed document outranks an unprov
   )
   assert.match(blocker!.message, /is already POSTED as INV-REAL/)
 })
+
+// ---------------------------------------------------------------------------
+// Codex round 2 (HIGH): a reversal is advised UNCONDITIONALLY only for a CONFIRMED_POSTED batch journal.
+// ---------------------------------------------------------------------------
+test('[o3d-1e7sl Codex r2] the daily-batch message says "reverse ONLY if it exists" for every standing but CONFIRMED_POSTED', async () => {
+  const CONDITIONAL = /Check the accounting system for that journal\. Reverse it ONLY if it exists there \(if it does not exist there is nothing to reverse\)/
+  const UNCONDITIONAL = /The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry\./
+  const cases: Array<{ name: string; standing: LedgerStanding; row: Partial<SyncLogRow>; unconditional: boolean }> = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'J-1' }, unconditional: true },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'J-T', settlementBasis: 'OPERATOR_ASSERTION' }, unconditional: false },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }, unconditional: false },
+    // the reachable one: a CLAIMED batch row (revision > 0, PENDING after a failed attempt) retired by the orphan sweep after
+    // a connector switch is CANCELLED with no id; the sweep's pre-call stamp is only true of a row nobody claimed.
+    { name: 'UNKNOWN: a previously CLAIMED PENDING batch row retired after a connector switch', standing: 'UNKNOWN', row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: null }, unconditional: false },
+    { name: 'UNKNOWN: FAILED batch row', standing: 'UNKNOWN', row: { status: 'FAILED' }, unconditional: false },
+    { name: 'LIVE_WORK: queued', standing: 'LIVE_WORK', row: { status: 'PENDING' }, unconditional: false },
+    { name: 'LIVE_WORK: in flight', standing: 'LIVE_WORK', row: { status: 'PROCESSING' }, unconditional: false },
+  ]
+  let unconditionalCount = 0
+  for (const c of cases) {
+    const row = syncLog({ ...c.row, id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20' })
+    assert.equal(ledgerStanding(row as never), c.standing, `fixture is not the standing it names: ${c.name}`)
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT })
+    assert.equal(blocker?.code, 'daily_batch_staged', c.name)
+    const m = blocker!.message
+    console.log(`# r2 batch precondition: ${c.name} => ${c.unconditional ? 'unconditional' : 'conditional'}`)
+    if (c.unconditional) { unconditionalCount += 1; assert.match(m, UNCONDITIONAL, c.name); assert.doesNotMatch(m, /ONLY if it exists/, c.name) }
+    else {
+      assert.match(m, CONDITIONAL, c.name)
+      assert.doesNotMatch(m, UNCONDITIONAL, `${c.name}: no unconditional reversal advice`)
+      // and the ONLY mention of finance reversing is after the existence condition.
+      assert.ok(m.indexOf('ONLY if it exists') < m.indexOf('have finance reverse'), c.name)
+    }
+  }
+  assert.equal(unconditionalCount, 1)
+})
+
+test('[o3d-1e7sl Codex r2] the document-level messages give reversal/credit advice only on a CONFIRMED standing or conditional on existence', async () => {
+  for (const c of STANDING_CASES) {
+    if (!c.blocks) continue
+    const row = syncLog(c.row)
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', STAMPS)
+    const m = blocker!.message
+    if (/reversal|credit note|reverse/i.test(m) && c.standing !== 'CONFIRMED_POSTED') {
+      assert.match(m, /If it is there|if the document is there|Check the (accounting system|connector)|Open it in the accounting system first|depending on the outcome|check the ledger for the document/i, `${c.name}: reversal advice must be conditional on the document existing`)
+    }
+    if (c.standing === 'CONFIRMED_POSTED') assert.match(m, /needs an explicit reversal or credit note/)
+  }
+})

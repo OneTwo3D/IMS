@@ -285,8 +285,8 @@ export function describeRetiredUnproven(notes: readonly string[]): string {
   if (notes.length === 0) return ''
   return ' Earlier attempt(s) at this posting were retired without proof that they never reached the ledger: '
     + `${notes.join('; ')}. `
-    + 'IMS cannot rule out that the document is already there, so look in the ledger before posting it by hand: '
-    + 'a second document is not undone by marking this handled.'
+    + 'IMS cannot rule out that the document is already there, so look in the ledger for it and post it by hand ONLY if '
+    + 'it is not there: a second document is not undone by marking this handled.'
 }
 
 /**

@@ -451,7 +451,7 @@ test('asserting NOT_POSTED over a mirror that NAMES a document is refused as a c
   const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: 'INV-9001' })
   assert.equal(refusal?.code, 'contradicts_mirrored_document')
   assert.match(refusal?.message ?? '', /already names document INV-9001/)
-  assert.match(refusal?.message ?? '', /Settle this row as POSTED with that id/)
+  assert.match(refusal?.message ?? '', /[Ss]ettle this row as POSTED with that id/)
 })
 
 test('asserting NOT_POSTED over a mirror recorded POSTED with no id is still refused', () => {
@@ -586,4 +586,22 @@ test('[o3d-1e7sl D11] the mirror-ownership audit note says whose id the owning s
   assert.match(describeMirrorOwnershipSkip(asserted), /\(SYNCED, names a document an operator typed in - an assertion, never read from the ledger\) maps to the same mirrored event/)
   assert.doesNotMatch(describeMirrorOwnershipSkip(asserted), /carries post evidence/)
   assert.match(describeMirrorOwnershipSkip(live), /\(PENDING\) maps to the same mirrored event/)
+})
+
+test('[o3d-1e7sl Codex r2] a mirror contradiction advises "reverse" unconditionally only for a CONNECTOR-confirmed mirror', () => {
+  for (const [name, postBasis, conditional] of [['CONNECTOR', 'CONNECTOR', false], ['OPERATOR_ASSERTION', 'OPERATOR_ASSERTION', true], ['unrecorded', null, true]] as const) {
+    for (const view of [{ status: 'POSTED', externalId: 'INV-1', postBasis }, { status: 'POSTED', externalId: null, postBasis }]) {
+      const refusal = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, view)
+      assert.ok(refusal, name)
+      const m = refusal!.message
+      console.log(`# r2 mirror precondition: ${name} id=${view.externalId} conditional=${conditional}`)
+      if (conditional) {
+        assert.match(m, /if it does not exist there is nothing to reverse|if there is none, there is nothing to reverse/, name)
+        assert.doesNotMatch(m, /or reverse the document in the accounting system first and settle it afterwards\.$|or reverse it there first\.$/, name)
+      } else {
+        assert.match(m, /reverse (the document in the accounting system|it there) first/, name)
+        assert.doesNotMatch(m, /nothing to reverse/, name)
+      }
+    }
+  }
 })

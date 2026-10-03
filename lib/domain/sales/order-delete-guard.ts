@@ -711,13 +711,20 @@ export async function findSalesOrderDeleteBlocker(
       message:
         `Cannot delete an order included in the ${batch.label} daily accounting batch ` +
         `(${liveBatch.connector} ${liveBatch.referenceId}, ${liveBatch.status}). ` +
-        // C1: a batch row that is neither confirmed nor queued is an unproven claim, and the sentence
-        // says so instead of implying the journal exists or does not.
-        (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN'
-          ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
-            + 'or it was retired with no recorded pre-call proof): check the accounting system for it. '
-          : '') +
-        `The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.`,
+        // C1 / Codex r2: the reversal instruction is UNCONDITIONAL only when the ledger said it posted
+        // (CONFIRMED_POSTED). On every other standing the journal may never have been posted (a claimed row the
+        // orphan sweep retired after a connector switch, an operator's claim either way, queued work), and telling
+        // finance to reverse an entry that does not exist creates an erroneous one - so it is conditional on existence.
+        (batchStanding === 'CONFIRMED_POSTED'
+          ? 'The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.'
+          : (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN'
+            ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
+              + 'or it was retired with no recorded pre-call proof). '
+            : batchStanding === 'ASSERTED_POSTED'
+              ? 'An operator recorded this batch journal as posted by typing its id in; IMS never read it from the ledger. '
+              : 'This batch journal is queued or in flight and has not been confirmed as posted. ')
+            + 'Check the accounting system for that journal. Reverse it ONLY if it exists there (if it does not exist there is '
+            + 'nothing to reverse); a journal cannot be un-posted from here, so then cancel the order and have finance reverse the batch entry.'),
     })
   }
 
