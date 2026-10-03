@@ -208,6 +208,14 @@ If a freight PO is added or updated after goods have already been received, the 
   - When you **recompute a production order**, the recompute fails. A production order cannot carry a negative cost
     line, so the negative cost comes from a component's purchase order: correct the credit there, then recompute.
 
+- **If stock moves while the recalculation is starting, it asks you to retry.** Creating a freight PO, saving a freight
+  PO's costs and cancelling a freight PO each lock every transfer, purchase order and cost layer the revaluation will
+  touch before they change anything. If a transfer is dispatched from one of those layers (or a new layer appears) in
+  the instant between working out that set and locking it, the action stops with the message *"The landed-cost
+  revaluation was NOT applied because stock moved while it was starting ... Retry the action."* Nothing was changed
+  (a freight PO being created is not created, a cancellation leaves the PO active, a cost edit is not kept): just
+  repeat the action.
+
 Each landed-cost adjustment carries the `freightPoId` of the triggering freight PO. This means adjustments from different freight POs against the same primary PO are kept as separate journals — finance can attribute deltas to the right invoice source.
 
 

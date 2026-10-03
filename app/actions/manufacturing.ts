@@ -1698,6 +1698,18 @@ async function recalculateManufacturingCostLayers(
     toDecimal(0),
   )
 
+  // o3d-nrl4 PR A (Codex HIGH on #729): LOCK THE OUTPUT LAYERS BEFORE READING THEIR SOURCE-LINE TOTALS.
+  // `base` below is the sum of `cost_layer_source_lines.totalCostBase`, which landed-cost PROPAGATION bumps
+  // (and bumps the output layer with) while holding this very layer. Reading the totals first and locking
+  // at the first `costLayer.update` lets a propagation commit in between: this recompute then resumes with
+  // the OLD total and overwrites the uplift while the revaluation's journal stays committed.
+  // Same statement shape as the revaluation scope lock's step 6 (ascending id, FOR NO KEY UPDATE), so the
+  // two queue on the same rows. Order this transaction establishes: production_orders (taken by the caller)
+  // -> cost_layers (these) -> snapshot child rows. A production order is not a row the revaluation takes, and
+  // this transaction takes no transfer or purchase order, so it cannot be a link in a cycle with
+  // 2a -> 2b-2d -> 6 (see lib/domain/wms/transfer-asn-lock-order.ts). Everything is READ after this line.
+  await tx.$queryRaw`SELECT id FROM cost_layers WHERE production_order_id = ${productionOrderId} ORDER BY id FOR NO KEY UPDATE`
+
   const layers = await tx.costLayer.findMany({
     where: { productionOrderId },
     select: {

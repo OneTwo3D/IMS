@@ -14,6 +14,9 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *   6. cost_layers
  * ══════════════════════════════════════════════════════════════════════════════
  *
+ * (o3d-nrl4 PR A: the landed-cost REVALUATION takes steps 2a, 2b-2d and 6 over the closure it will
+ * rewrite, in that order, through `lockLandedCostRevaluationScope` below.)
+ *
  * A transaction may skip any step. It may NOT take a later step before an earlier
  * one. Within a step, rows are locked in ascending id order, which is what makes two
  * transactions at the SAME step queue rather than cross.
@@ -99,10 +102,17 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *                                                 neither a participant nor atomic.) It touches no cost
  *                                                 layer or stock row.
  *     · app/actions/purchase-orders.ts:4264       `updateFreightPoCosts` — FIXED IN r3; it used to
- *                                                 delete cost lines first (see below)
+ *                                                 delete cost lines first (see below). Since o3d-nrl4 A it
+ *                                                 takes `lockLandedCostRevaluationScope`: transfers (2a),
+ *                                                 then these orders with their cost rows, then the layers.
+ *     · app/actions/purchase-orders.ts `createFreightPo` — o3d-nrl4 A: it locked NOTHING before its
+ *                                                 recalculation; it now takes the same scope lock FIRST,
+ *                                                 before the freight order and its links are inserted.
  *     · app/actions/supplier-portal.ts:315        parent FOR UPDATE, then lines (:362), then parent
  *     · app/actions/mintsoft-sync.ts:3031, :3388  parent, then the ASN rows
- *     · lib/domain/purchasing/cancellation-service.ts:117  parent only
+ *     · lib/domain/purchasing/cancellation-service.ts:117  o3d-nrl4 A: a FREIGHT cancellation takes the
+ *                                                 whole revaluation scope (it recalculates landed cost);
+ *                                                 a GOODS cancellation keeps the parent-only lock
  *     · lib/domain/wms/booked-in-service.ts       parent at step 2 (`assertParentIsLocked`), then
  *                                                 lines (:1135)
  *     · lib/connectors/mintsoft/sync/stock-sync.ts  alignment — this helper, at step 2
@@ -119,9 +129,17 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *       (:117) and only then the parent (:136), inside one transaction.
  *
  *   NOT DEADLOCK PARTICIPANTS, and why:
- *     · lib/domain/purchasing/landed-cost-service.ts:1184, :1540 — takes NO row locks at all, so it is
- *       BLOCKED by this order rather than cooperating with it, and cannot form a cycle. Two concurrent
- *       recalculations therefore order themselves on nothing: tracked as o3d-t3mbr.
+ *     · app/actions/manufacturing.ts `recalculateManufacturingCostLayers` (via `updateManufacturingCostLines`)
+ *       — o3d-nrl4 A, Codex HIGH on #729: production_orders (caller) -> cost_layers of that order's output
+ *       (FOR NO KEY UPDATE, BEFORE it reads the source-line totals) -> snapshot child rows. It takes no
+ *       transfer/purchase order, and the revaluation never takes a production order, so there is no cycle.
+ *     · lib/domain/purchasing/landed-cost-service.ts `recalculateLandedCosts` / `recalculateDirectLandedCosts`
+ *       — take NO row locks of their own and still do not: their CALLERS hold the scope. Since o3d-nrl4 PR A
+ *       all three production callers of `recalculateLandedCosts` (`updateFreightPoCosts`, `createFreightPo`,
+ *       the freight arm of `cancelPurchaseOrderService`) take `lockLandedCostRevaluationScope` first, so two
+ *       concurrent recalculations over one scope now queue on the same transfer/order/layer rows in the
+ *       same order (closes o3d-t3mbr for those callers). `recalculateDirectLandedCosts` has NO production
+ *       caller today; a future caller must take the same lock (tracked on o3d-nrl4).
  *     · app/actions/purchase-orders.ts:2449 and the supplier-return line writes — covered by the
  *       `createPurchaseReturn` entry above.
  *     · lib/data-retention.ts, app/actions/forecasting.ts — parent only, or newly created rows.
@@ -212,14 +230,30 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * reads the cost and the moment that receipt commits its layer and its journal, so the layer, the
  * movement and the journal cannot be a cost the order no longer has.
  *
- * WHAT IT DOES NOT BUY, stated because the gap is the interesting part: `recalculateLandedCosts` and
- * `recalculateDirectLandedCosts` take NO row locks of their own (checked 2026-09-27 —
- * lib/domain/purchasing/landed-cost-service.ts contains no `FOR UPDATE`). They are therefore
- * BLOCKED by these locks rather than cooperating with them, which is enough for mutual exclusion in
- * one direction but means two concurrent recalculations still order themselves on nothing. Making the
- * recalc paths take this lock is filed separately (o3d-t3mbr); it is a change to four call sites and
- * not to a receipt. Note that their CALLERS now hold the lock in the three cases r3 fixed, so a recalc
- * reached through `updateFreightPoCosts` is covered by its caller's acquisition.
+ * WHAT IT DID NOT BUY AT r6, AND WHAT CLOSED IT LATER: `recalculateLandedCosts` and
+ * `recalculateDirectLandedCosts` take NO row locks of their own (still true: lib/domain/purchasing/
+ * landed-cost-service.ts contains no `FOR UPDATE` of its own). At r6 that meant two concurrent
+ * recalculations ordered themselves on nothing (o3d-t3mbr) and a recalculation read in-transit
+ * transfer state unlocked. Since o3d-nrl4 PR A its three production callers hold
+ * `lockLandedCostRevaluationScope` (below) — the transfers, the orders and the layers it will rewrite —
+ * before the first read, so those callers are mutually exclusive with receipts, alignments and each other.
+ * `recalculateDirectLandedCosts` has no production caller; one added later must take the same lock.
+ *
+ * `recalculateLandedCosts`'S ACQUISITION SEQUENCE (o3d-nrl4 PR A), complete, for the census above:
+ *   `lockLandedCostRevaluationScope`:
+ *       stock_transfers (the transfer closure) → purchase_orders → purchase_order_lines → freight_cost_lines
+ *       (freight order + every primary) → cost_layers (the layer closure, FOR NO KEY UPDATE)
+ *   then, inside the recalculation, only rows that are children of what is already held: shipment /
+ *   allocation / refund / transfer-line snapshot rows (`updateSnapshotsForCostLayerChange`, FOR UPDATE),
+ *   `cost_layer_source_lines`, and its own audit rows. It never waits for a step-2 row after a step-6 row.
+ *   WHY THAT CANNOT CYCLE: a cycle needs a participant that holds a step-6 row (or a snapshot child row)
+ *   while WAITING for a step-2 row. The receipt/cancel paths take 2a → 4 → 5 → 6(insert); book-in 2a/2b →
+ *   3 → 4 → 5 → 6; alignment 2a → 2b-2d → 3 → 4 → 5 → 6; dispatch of its OWN new transfer takes no step-2
+ *   row of anyone else's and then waits only on step-6 rows. None of them waits for a step-2 row while
+ *   holding a step 5/6 row of the closure; a dispatch that holds a source layer's FOR UPDATE and so blocks
+ *   the scope lock does not wait for any transfer/order the scope holds. (`createPurchaseReturn` and
+ *   `receiveStock` take stock/cost layers first on a DIFFERENT purchase order; they hold no transfer and
+ *   no order of the scope's, see the o3d-chs1h residual above.)
  *
  * `wms_asn_maps` IS IN THE ORDER because booked-in-service updates the ASN header
  * after its line rows while the transfer-ASN `finalizePendingAsn`
@@ -325,6 +359,233 @@ export async function lockPurchaseOrdersWithCostRows(
   await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
   await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`
   return ids
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE LANDED-COST REVALUATION SCOPE LOCK (o3d-nrl4 PR A, closes o3d-t3mbr for its three callers)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// WHY IT EXISTS. `recalculateLandedCosts` rewrites, in ONE transaction, every cost layer of every linked
+// primary order, the layers those feed through manufacturing and through transfer receipts (propagation,
+// at most LANDED_COST_PROPAGATION_MAX_DEPTH levels), and every `costLayerSnapshot` that names any of
+// them — including `stock_transfer_lines`. It took NO transfer lock and no layer lock of its own. Every
+// path that LANDS or CANCELS a transfer holds `stock_transfers` (step 2a) before it reads the snapshot or
+// the landed quantity, so a revaluation that reads a transfer's state unlocked can disagree with a receipt
+// committing beside it: a receipt creating the destination layer at the OLD snapshot while the
+// revaluation rewrites the snapshot (or the reverse). The recalculation therefore has to take the
+// transfer locks itself, in the global order, over exactly the set it is about to read and write.
+//
+// THE ORDER IT TAKES (the global order above, ascending id within each step, nothing out of order):
+//
+//   discovery (UNLOCKED, read only) → 2a stock_transfers over the transfer closure
+//   → 2b/2c/2d purchase_orders, purchase_order_lines, freight_cost_lines over the freight order and every
+//   primary → RE-DISCOVERY #1 (a new transfer or order refuses; a new LAYER joins the next statement,
+//   because primaries' layers are final once their order is held and layers are still ahead at step 6)
+//   → 6 cost_layers over the layer closure, FOR NO KEY UPDATE → RE-DISCOVERY #2 under every lock.
+//
+// WHY FOR NO KEY UPDATE AND NOT FOR UPDATE ON THE LAYERS. Dispatch, FIFO consumption and production
+// consumption take `FOR UPDATE` on the layers they draw from (consumeFifoLayers), which conflicts with
+// NO KEY UPDATE, so those writers queue behind the revaluation exactly as they queue behind its own
+// `UPDATE cost_layers`. The weaker mode is deliberate: it is what the revaluation's own UPDATEs would
+// have taken one statement later, so it widens WHEN the lock is taken, not WHAT it excludes.
+// (Checked against the schema, 2026-10-02: `cost_layer_source_lines.sourceCostLayerId` has NO foreign
+// key, so a source-line insert takes no KEY SHARE on the layer at all. The exclusion of a receipt or a
+// production run is therefore the transfer lock / the consumption lock, never the layer lock at insert.)
+//
+// WHY RE-DISCOVER, AND WHY IT REFUSES. The closure is read before any lock is held, so a dispatch from a
+// primary layer, a production run, a receipt or a new layer on a primary line can COMMIT between that
+// read and the locks. Re-reading under the locks sees it (READ COMMITTED). The scope can no longer be
+// extended — acquiring a newly found transfer now would be a step-2 lock taken at step 6, the inversion
+// this module exists to prevent — so the helper throws LandedCostScopeRacedError and the caller's
+// transaction rolls back. Refuse, do not extend (the same call o3d-6nd55 r6 made for the PO set), and
+// do not retry inside the transaction: the operator retries.
+
+/**
+ * Propagation reaches output layers at most this many levels below the revalued layer
+ * (`propagateLandedCostToOutputs` cuts at depth > this). ONE constant, imported by the landed-cost
+ * service, so the closure this module locks and the closure that service walks cannot drift apart.
+ */
+export const LANDED_COST_PROPAGATION_MAX_DEPTH = 20
+
+/**
+ * Thrown when the re-discovery under the locks finds a purchase order, transfer or cost layer the
+ * revaluation would touch that this transaction does not hold. Nothing has been written. The caller's
+ * transaction must roll back and the operator must retry.
+ */
+export class LandedCostScopeRacedError extends Error {
+  override readonly name = 'LandedCostScopeRacedError'
+  readonly unlockedPurchaseOrderIds: string[]
+  readonly unlockedTransferIds: string[]
+  readonly unlockedCostLayerIds: string[]
+
+  constructor(params: {
+    unlockedPurchaseOrderIds: string[]
+    unlockedTransferIds: string[]
+    unlockedCostLayerIds: string[]
+  }) {
+    super(
+      'The landed-cost revaluation was NOT applied because stock moved while it was starting: '
+      + `${params.unlockedTransferIds.length} transfer(s), ${params.unlockedCostLayerIds.length} cost layer(s) `
+      + `and ${params.unlockedPurchaseOrderIds.length} purchase order(s) became part of its scope after the locks `
+      + 'were planned, and taking them now would invert the global lock order. Nothing was changed. '
+      + 'Retry the action.',
+    )
+    this.unlockedPurchaseOrderIds = params.unlockedPurchaseOrderIds
+    this.unlockedTransferIds = params.unlockedTransferIds
+    this.unlockedCostLayerIds = params.unlockedCostLayerIds
+  }
+}
+
+export type LandedCostRevaluationScopeRequest =
+  | { freightPoId: string; primaryPoIds?: undefined }
+  | { primaryPoIds: ReadonlyArray<string>; freightPoId?: undefined }
+
+export type LandedCostRevaluationScope = {
+  /** The freight order (when the request named one) and every primary order, ascending. */
+  purchaseOrderIds: string[]
+  primaryPoIds: string[]
+  transferIds: string[]
+  costLayerIds: string[]
+}
+
+async function discoverLandedCostRevaluationScope(
+  tx: LockClient,
+  request: LandedCostRevaluationScopeRequest,
+): Promise<LandedCostRevaluationScope> {
+  let primaryPoIds: string[]
+  if (request.freightPoId !== undefined) {
+    const links = await tx.$queryRaw<Array<{ primaryPoId: string }>>`
+      SELECT "primaryPoId" FROM landed_cost_links WHERE "freightPoId" = ${request.freightPoId}`
+    primaryPoIds = sortedUnique(links.map((link) => link.primaryPoId))
+  } else {
+    primaryPoIds = sortedUnique(request.primaryPoIds)
+  }
+  const purchaseOrderIds = sortedUnique(request.freightPoId !== undefined
+    ? [request.freightPoId, ...primaryPoIds]
+    : primaryPoIds)
+
+  const layerIds = new Set<string>()
+  if (primaryPoIds.length > 0) {
+    const roots = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT cl.id FROM cost_layers cl
+      INNER JOIN purchase_order_lines pol ON pol.id = cl."poLineId"
+      WHERE pol."poId" = ANY(${primaryPoIds}::text[])`
+    for (const row of roots) layerIds.add(row.id)
+  }
+
+  // Output layers: a transfer receipt's destination layer, a replacement layer from a cancelled dispatch
+  // and a manufactured output all hang off their source layer by `cost_layer_source_lines`, which is
+  // exactly the edge `propagateLandedCostToOutputs` follows. A visited set cuts a cycle; the level bound
+  // is the propagation maximum.
+  let frontier = [...layerIds]
+  for (let level = 1; level <= LANDED_COST_PROPAGATION_MAX_DEPTH && frontier.length > 0; level += 1) {
+    const outputs = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT DISTINCT "costLayerId" AS id FROM cost_layer_source_lines
+      WHERE "sourceCostLayerId" = ANY(${frontier}::text[])`
+    frontier = []
+    for (const row of outputs) {
+      if (layerIds.has(row.id)) continue
+      layerIds.add(row.id)
+      frontier.push(row.id)
+    }
+  }
+
+  const transferIds = new Set<string>()
+  if (layerIds.size > 0) {
+    // EVERY transfer line whose frozen snapshot names a layer in the closure, whatever the transfer's
+    // status: `updateSnapshotsForCostLayerChange` rewrites the snapshot of every matching line, and
+    // `getTransferConsumedQtyForCostLayer` reads it for the exclusion.
+    const patterns = [...layerIds].map((costLayerId) => JSON.stringify([{ costLayerId }]))
+    const transfers = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT DISTINCT stl."transferId" AS id FROM stock_transfer_lines stl
+      WHERE stl."costLayerSnapshot" @> ANY(${patterns}::text[]::jsonb[])`
+    for (const row of transfers) transferIds.add(row.id)
+  }
+
+  return {
+    purchaseOrderIds,
+    primaryPoIds,
+    transferIds: sortedUnique([...transferIds]),
+    costLayerIds: sortedUnique([...layerIds]),
+  }
+}
+
+/**
+ * Take every lock a landed-cost revaluation needs, in the global order, over the scope it will touch.
+ * See the block comment above for the order, the lock modes and the refusal.
+ *
+ * Call it FIRST in the caller's transaction (before any write and before any read the revaluation will
+ * rely on) and let `LandedCostScopeRacedError` roll the transaction back. Everything the caller does
+ * afterwards in that transaction must use `tx`.
+ */
+export async function lockLandedCostRevaluationScope(
+  tx: LockClient,
+  request: LandedCostRevaluationScopeRequest,
+): Promise<LandedCostRevaluationScope> {
+  const planned = await discoverLandedCostRevaluationScope(tx, request)
+
+  await lockStockTransfers(tx, planned.transferIds) // 2a
+  await lockPurchaseOrdersWithCostRows(tx, planned.purchaseOrderIds) // 2b, 2c, 2d
+
+  // RE-DISCOVER #1, UNDER THE ORDER LOCKS. A cost layer on a primary order's line is only ever created or
+  // consumed by a path holding that order (receiveStock, alignment, book-in, cancellation all take the
+  // parent first), so the primaries' own layers are FINAL from here. A layer that appeared while this
+  // transaction was queueing for the order (an alignment committing its receipt) is therefore not a race:
+  // layers are step 6, still ahead of us, so it joins the layer statement below. A TRANSFER or an ORDER
+  // that is new is a race: those are steps 2a/2b, which this transaction has already passed.
+  const underOrders = await discoverLandedCostRevaluationScope(tx, request)
+  assertScopeStillHeld({
+    observed: underOrders,
+    heldTransferIds: planned.transferIds,
+    heldPurchaseOrderIds: planned.purchaseOrderIds,
+    heldCostLayerIds: underOrders.costLayerIds, // layers are not yet locked and may still be added
+  })
+  await lockCostLayersForRevaluation(tx, underOrders.costLayerIds) // 6
+
+  // RE-DISCOVER #2, UNDER EVERY LOCK: whatever committed while the layers were being locked (a dispatch
+  // from a primary layer, a production run consuming one) is visible now and is outside what we hold.
+  const observed = await discoverLandedCostRevaluationScope(tx, request)
+  assertScopeStillHeld({
+    observed,
+    heldTransferIds: planned.transferIds,
+    heldPurchaseOrderIds: planned.purchaseOrderIds,
+    heldCostLayerIds: underOrders.costLayerIds,
+  })
+  return {
+    purchaseOrderIds: planned.purchaseOrderIds,
+    primaryPoIds: planned.primaryPoIds,
+    transferIds: planned.transferIds,
+    costLayerIds: underOrders.costLayerIds,
+  }
+}
+
+/** STEP 6 for a revaluation: one statement, ascending, `FOR NO KEY UPDATE` (see the block comment above). */
+async function lockCostLayersForRevaluation(tx: LockClient, costLayerIds: ReadonlyArray<string>): Promise<void> {
+  const ids = sortedUnique(costLayerIds)
+  if (ids.length === 0) return
+  await tx.$queryRaw`SELECT id FROM cost_layers WHERE id = ANY(${ids}::text[]) ORDER BY id FOR NO KEY UPDATE`
+}
+
+/**
+ * The refusal: anything the revaluation would touch that this transaction does not hold. One function so
+ * both re-discoveries apply the same rule, and so the two ways of getting it wrong (never calling it, or
+ * comparing against the wrong set) are each a one-line change a test can be made to catch.
+ */
+function assertScopeStillHeld(params: {
+  observed: LandedCostRevaluationScope
+  heldTransferIds: ReadonlyArray<string>
+  heldPurchaseOrderIds: ReadonlyArray<string>
+  heldCostLayerIds: ReadonlyArray<string>
+}): void {
+  const heldTransfers = new Set(params.heldTransferIds)
+  const heldLayers = new Set(params.heldCostLayerIds)
+  const heldOrders = new Set(params.heldPurchaseOrderIds)
+  const unlockedTransferIds = params.observed.transferIds.filter((id) => !heldTransfers.has(id))
+  const unlockedCostLayerIds = params.observed.costLayerIds.filter((id) => !heldLayers.has(id))
+  const unlockedPurchaseOrderIds = params.observed.purchaseOrderIds.filter((id) => !heldOrders.has(id))
+  if (unlockedTransferIds.length + unlockedCostLayerIds.length + unlockedPurchaseOrderIds.length > 0) {
+    throw new LandedCostScopeRacedError({ unlockedPurchaseOrderIds, unlockedTransferIds, unlockedCostLayerIds })
+  }
 }
 
 /** STEP 3 — `wms_asn_maps`, the ASN header, before any of its line rows. */

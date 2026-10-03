@@ -8,6 +8,8 @@ import { requirePermission } from '@/lib/auth/server'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
 import {
+  LandedCostScopeRacedError,
+  lockLandedCostRevaluationScope,
   lockPurchaseOrders,
   lockPurchaseOrdersWithCostRows,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
@@ -4627,6 +4629,11 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
     const { po, landedResult } = await db.$transaction(
       async (tx) => {
+        // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): this transaction used to lock NOTHING before
+        // `recalculateLandedCosts` rewrote the primaries' lines, their cost layers and every snapshot
+        // naming them. Lock the scope FIRST — before the freight order and its links are inserted, so
+        // the link insert's KEY SHARE on each primary is taken after, not before, our FOR UPDATE.
+        await lockLandedCostRevaluationScope(tx, { primaryPoIds: input.primaryPoIds })
         const po = await tx.purchaseOrder.create({
           data: {
             reference: freightReference,
@@ -4699,7 +4706,8 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       description: `Failed to create freight PO: ${String(e)}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    // o3d-nrl4 PR A: a scope race rolled the whole creation back; the message tells the operator to retry.
+    return { success: false, error: e instanceof LandedCostScopeRacedError ? e.message : String(e) }
   }
 }
 
@@ -4814,14 +4822,12 @@ export async function updateFreightPoCosts(
       //
       // `lockPurchaseOrdersWithCostRows` takes parent-then-children in one call, so this call site
       // cannot express the order that caused the defect.
-      const linkedPrimaries = await tx.landedCostLink.findMany({
-        where: { freightPoId },
-        select: { primaryPoId: true },
-      })
-      await lockPurchaseOrdersWithCostRows(tx, [
-        freightPoId,
-        ...linkedPrimaries.map((link) => link.primaryPoId),
-      ])
+      //
+      // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): the same lock, now taken through
+      // `lockLandedCostRevaluationScope`, which ALSO takes the stock transfers and cost layers the
+      // recalculation will rewrite (step 2a before the orders, step 6 after them) and refuses with
+      // `LandedCostScopeRacedError` if the scope grew while it was locking. See that function.
+      await lockLandedCostRevaluationScope(tx, { freightPoId })
 
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
@@ -4926,6 +4932,7 @@ export async function updateFreightPoCosts(
       description: `Failed to update freight costs for PO ${freightPoId}: ${String(e)}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    // o3d-nrl4 PR A: a scope race is an instruction to retry, not a crash: nothing was written.
+    return { success: false, error: e instanceof LandedCostScopeRacedError ? e.message : String(e) }
   }
 }
