@@ -723,8 +723,8 @@ export async function findSalesOrderDeleteBlocker(
             : batchStanding === 'ASSERTED_POSTED'
               ? 'An operator recorded this batch journal as posted by typing its id in; IMS never read it from the ledger. '
               : 'This batch journal is queued or in flight and has not been confirmed as posted. ')
-            + 'Check the accounting system for that journal. Reverse it ONLY if it exists there (if it does not exist there is '
-            + 'nothing to reverse); a journal cannot be un-posted from here, so then cancel the order and have finance reverse the batch entry.'),
+            + 'Check the accounting system for that journal. Reverse it ONLY if it exists there; if it does not exist there is '
+            + 'nothing to reverse. Either way, cancel the order instead of deleting it (a posted journal cannot be un-posted from here).'),
     })
   }
 
