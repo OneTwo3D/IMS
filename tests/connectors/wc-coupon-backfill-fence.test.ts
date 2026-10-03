@@ -2533,7 +2533,7 @@ for (const c of STANDING_CASES) {
     assert.equal(LABEL.test(text), c.unconfirmed.length > 0, `label appears in the durable record iff asserted: ${text}`)
     // Never named as confirmed: a labelled id is not followed by a bare mention elsewhere in the headline.
     // The durable record's own 'in the ledger as' clause, not just the headline borrowed from the handoff.
-    if (c.unconfirmed.length) assert.match(store.activity[0].description ?? '', /unlinked invoice\(s\) INV-1 \(asserted, NOT confirmed in the ledger\)/)
+    if (c.unconfirmed.length) assert.match(store.activity[0].description ?? '', /in the ledger as unlinked invoice\(s\) INV-1 \(asserted, NOT confirmed in the ledger\)/)
     assert.deepEqual(
       store.activity[0].metadata.unconfirmedInvoiceExternalIds ?? [],
       c.unconfirmed,
