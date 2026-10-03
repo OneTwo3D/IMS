@@ -2207,7 +2207,7 @@ test('the precondition renderer cannot be called without an invoice position (o3
   })
 
   assert.equal(steps.length, 1)
-  assert.match(steps[0], /SYNCED sales invoice\(s\) \[INV-901\]/)
+  assert.match(steps[0], /invoice id\(s\) claimed on sync rows \[INV-901\]/)
   assert.match(steps[0], /an UNRECOVERABLE posted-document read \(an update never settled\)/)
   assert.match(steps[0], /UNSETTLED SALES_INVOICE_UPDATE xero\/UPD-1 .* status PENDING/)
 })
