@@ -358,6 +358,8 @@ export async function readCreditNoteOrderDiscount(
      * that knows which ids are only claimed (not confirmed by the ledger) supplies a labelling renderer.
      */
     describeCreditNoteIds?: (ids: readonly string[]) => string
+    /** Ids in `postedCreditNoteExternalIds` that are only CLAIMED (not confirmed by the ledger). */
+    unconfirmedCreditNoteIds?: readonly string[]
   },
 ): Promise<CreditNoteOrderDiscountReversal> {
   if (evidence.refundIds.length === 0) {
@@ -430,10 +432,17 @@ export async function readCreditNoteOrderDiscount(
   const backReferenced = [...new Set(legs.map((leg) => leg.externalCreditNoteId).filter((id): id is string => !!id))].sort()
   const inLedger = [...new Set(evidence.postedCreditNoteExternalIds)].sort()
   if (backReferenced.join('|') !== inLedger.join('|')) {
+    const named = (evidence.describeCreditNoteIds ?? ((ids) => ids.join(', ')))(inLedger)
+    const claimed = new Set(evidence.unconfirmedCreditNoteIds ?? [])
     refusals.push(
-      `the credit note id(s) recorded against this order [${(evidence.describeCreditNoteIds ?? ((ids) => ids.join(', ')))(inLedger)}] are not the set this order's refunds ` +
-        `name [${backReferenced.join(', ')}], so what is posted and what IMS recorded do not describe ` +
-        'the same documents',
+      inLedger.some((id) => claimed.has(id))
+        // Status-neutral: a claimed id establishes only that a document MAY exist.
+        ? `the claimed credit-note id(s) [${named}] differ from the refund back-reference set ` +
+            `[${backReferenced.join(', ')}]: check each in the accounting system before netting, because ` +
+            'what is recorded against this order and what IMS recorded do not demonstrably describe the same documents'
+        : `the credit note id(s) recorded against this order [${named}] are not the set this order's refunds ` +
+            `name [${backReferenced.join(', ')}], so what is posted and what IMS recorded do not describe ` +
+            'the same documents',
     )
   }
 

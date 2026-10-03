@@ -219,6 +219,19 @@ export function describeUnconfirmedCause(doc: UnconfirmedDocument): string {
  * is true of each id. An operator "recorded" only the asserted ones; a connector id on a FAILED /
  * PENDING row was never recorded by anyone as posted.
  */
+/**
+ * The report's header for the candidates that carry a linked or CLAIMED document id. Existence is
+ * asserted for NOTHING here: a claimed id establishes only that a document may exist.
+ */
+export function describePostedCandidatesHeader(total: number, withUnconfirmed: number): string {
+  return (
+    `${total} of the candidates carry a LINKED or CLAIMED accounting-document id ` +
+    `(${withUnconfirmed} of them with an id that is NOT CONFIRMED in the ledger: an operator-asserted id, ` +
+    'or an id on a row that never reached SYNCED; check each in the accounting system) ' +
+    'derived from the amount about to change.'
+  )
+}
+
 export function describeUnconfirmedDocumentLines(
   docs: ReadonlyArray<{ kind: 'invoice' | 'credit note'; doc: UnconfirmedDocument }>,
 ): string[] {
@@ -2163,6 +2176,7 @@ export async function buildWcCouponLedgerHandoff(
         postedCreditNoteExternalIds: refunds.postedCreditNoteExternalIds,
         unresolvedRefundParkExternalIds: refunds.unresolvedRefundParkExternalIds,
         describeCreditNoteIds: (ids) => describeLedgerDocumentIds(ids, refunds.unconfirmedCreditNoteDocuments),
+        unconfirmedCreditNoteIds: (refunds.unconfirmedCreditNoteDocuments ?? []).map((doc) => doc.id),
       })
     : NO_CREDIT_NOTE_REVERSAL
 

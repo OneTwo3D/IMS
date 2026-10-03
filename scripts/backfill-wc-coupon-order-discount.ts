@@ -226,6 +226,7 @@ import {
 import {
   buildWcCouponLedgerHandoff,
   describeLedgerDocumentIds,
+  describePostedCandidatesHeader,
   describeUnconfirmedDocumentLines,
   isWcCouponOrderRefunded,
   type WcCouponLedgerHandoff,
@@ -740,13 +741,17 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   if (postedCandidates.length) {
     console.log('')
     console.log(
-      `${LOG} ${postedCandidates.length} of the candidates ALREADY HAVE ACCOUNTING DOCUMENTS derived ` +
-        'from the amount about to change. What each of those documents actually CARRIES is derived ' +
+      `${LOG} ` +
+        describePostedCandidatesHeader(
+          postedCandidates.length,
+          postedCandidates.filter((e) => (e.row.unconfirmedInvoiceDocuments?.length ?? 0) + (e.row.refunds.unconfirmedCreditNoteDocuments?.length ?? 0) > 0).length,
+        ) +
+        ' Where a document is established, what it actually CARRIES is derived ' +
         "below by replaying the connector's own posting rule over the payload that was mirrored — a " +
         'Xero invoice enqueued without a discount account code never had an "Order discount" line ' +
         'appended and needs nothing done to it (o3d-y14 r5). An order that has been REFUNDED is ' +
         'judged on its net position instead and gets NO prescribed remedy, because a credit note ' +
-        'may already have reversed the discrepancy along with the invoice (o3d-y14 r6). This is the ' +
+        'may have reversed the discrepancy along with the invoice (o3d-y14 r6). This is the ' +
         'state AT REPORT TIME; apply ' +
         're-reads it live, refuses any row whose posting state has moved since you reviewed it, and ' +
         're-derives this same handoff from the state at the moment of correction.',
@@ -958,7 +963,7 @@ async function reprint(allowlistPath: string) {
   console.log(
     `${LOG} re-deriving the LEDGER HANDOFF for ${entries.length} order(s) from ${allowlistPath}, ` +
       'against LIVE state. Nothing is written, no lock is taken and no evidence is re-verified — ' +
-      'this reports what the accounting system holds NOW, which is what a plain report cannot do for ' +
+      'this reports what IMS can establish about the accounting documents NOW, which a plain report cannot do for ' +
       'an order that has already been corrected.',
   )
 
@@ -1024,7 +1029,7 @@ async function main() {
     if (!allowlistPath) {
       console.error(
         `${LOG} REFUSING to apply without --allowlist <path>.\n` +
-          'This rewrites the discount on orders whose invoices are already in the ledger, and no field on\n' +
+          'This rewrites the discount on orders whose invoices are, or are claimed to be, in the ledger, and no field on\n' +
           'a row distinguishes a pre-fix import from one corrected by hand or written by the fixed importer\n' +
           'before it stamped its marker. So apply consumes a REVIEWED list of order ids, never a fresh scan.\n' +
           'Produce one with:  --imported-before <ISO> --allowlist-out <path>',

@@ -1722,7 +1722,7 @@ export async function applyWcCouponCorrection(
       level: 'INFO',
       description:
         `o3d-y14 backfill: order-level coupon ${entry.storedOrderDiscount} ${entry.currency} reduced to ` +
-        `${keptOrderLevel} (${liveLines} already carried by the line items)` +
+        `${keptOrderLevel} (${liveLines} carried by the line items)` +
         // Written from the LIVE evidence, not from the reviewed file. This log is the durable record
         // of what still needs adjusting by hand, and a record of the state at REVIEW time would
         // describe a moment that has already passed. The classification travels with it: the

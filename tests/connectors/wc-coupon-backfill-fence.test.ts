@@ -2711,6 +2711,7 @@ test('o3d-djemh: the REPORT reads standing columns, labels asserted ids, and nev
 // ---------------------------------------------------------------------------
 
 const LABEL_PAREN = /\([^)]*NOT confirmed in the ledger\)/g
+const EXISTENCE_PHRASES = /\balready\b|\bexists?\b|\bexisting\b|\bholds?\b|has a document|\bis posted\b|\bare posted\b|in the ledger|what is posted|real document|recorded in the ledger|accounting documents/i
 
 function assertUniversalWording(texts: string[], ids: string[], cause: 'OPERATOR_ASSERTED' | 'UNRECOGNISED_BASIS' | 'NOT_SYNCED', where: string) {
   const all = texts.join('\n')
@@ -2734,6 +2735,15 @@ function assertUniversalWording(texts: string[], ids: string[], cause: 'OPERATOR
       assert.doesNotMatch(windowText, /SYNCED|in the ledger|ledger holds|\bposted\b|operator recorded|\bare in\b/i, `${where}: no certainty claim beside ${id}: ${windowText}`)
       from = at + id.length
     }
+    // EXISTENCE-CLAIM SWEEP: no sentence that names an unconfirmed id may state or imply that a
+    // document exists, is posted, or is held by the ledger ("may exist" is the only permitted form).
+    let sentences = 0
+    for (const sentence of stripped.replace(/may (?:never )?(?:have )?exist/gi, 'MAY-FORM').split(/[.;\n•]/)) {
+      if (!sentence.includes(id)) continue
+      sentences++
+      assert.doesNotMatch(sentence, EXISTENCE_PHRASES, `${where}: an existence claim in a sentence naming ${id}: ${sentence}`)
+    }
+    assert.ok(sentences >= 1, `${where}: precondition, the sweep examined at least one sentence`)
     const label = all.match(new RegExp(`${id} \\(([^)]*NOT confirmed in the ledger)\\)`))?.[1] ?? ''
     assert.equal(/asserted by an operator/.test(label), cause === 'OPERATOR_ASSERTED', `${where}: provenance in the label matches the cause`)
     assert.equal(/not recognised/.test(label), cause === 'UNRECOGNISED_BASIS', where)
@@ -2875,4 +2885,34 @@ test('o3d-djemh universal wording: the NETTING precondition labels every credit 
   assert.ok(mentions >= 2, 'precondition: named in the position and in the netting sentence')
   assert.equal((text.match(/CN-N2 \(asserted by an operator, NOT confirmed in the ledger\)/g) ?? []).length, mentions)
   assert.doesNotMatch(text, /CN-N1 \(/, 'the confirmed one is not labelled')
+})
+
+test('o3d-djemh universal wording: the report header names linked or CLAIMED ids and asserts no existence', async () => {
+  const { describePostedCandidatesHeader } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  for (const [total, unconfirmed] of [[3, 0], [3, 2]] as const) {
+    const header = describePostedCandidatesHeader(total, unconfirmed)
+    console.log(`# o3d-djemh report header (${total}, ${unconfirmed}): ${header.length} chars`)
+    assert.match(header, /LINKED or CLAIMED/)
+    assert.match(header, new RegExp(`${unconfirmed} of them`))
+    const stripped = header.replace(/NOT CONFIRMED in the ledger/g, '')
+    assert.doesNotMatch(stripped, EXISTENCE_PHRASES, `no existence claim in the header: ${header}`)
+  }
+  const src = (await import('node:fs')).readFileSync('scripts/backfill-wc-coupon-order-discount.ts', 'utf8')
+  assert.equal(/ALREADY HAVE ACCOUNTING DOCUMENTS/.test(src), false, 'the old header is gone from the script')
+})
+
+test('o3d-djemh universal wording: the credit-note-set refusal is status-neutral for a claimed id, existence wording only when every id is confirmed', async () => {
+  const { readCreditNoteOrderDiscount } = await import('@/lib/domain/accounting/credit-note-order-discount')
+  const client = { salesOrderRefund: { findMany: async () => [] }, accountingEvent: { findMany: async () => [] } } as never
+  const base = { disposition: 'PARTIAL' as const, refundIds: [] as string[], postedCreditNoteExternalIds: ['CN-R'], unresolvedRefundParkExternalIds: [] as string[] }
+  // refundIds empty short-circuits; use one refund id so the set comparison is reached.
+  const ev = { ...base, refundIds: ['refund-1'] }
+  const claimed = await readCreditNoteOrderDiscount(client, { ...ev, describeCreditNoteIds: (ids) => ids.map((i) => `${i} (asserted by an operator, NOT confirmed in the ledger)`).join(', '), unconfirmedCreditNoteIds: ['CN-R'] })
+  const confirmed = await readCreditNoteOrderDiscount(client, ev)
+  const text = (r: typeof claimed) => (r.ok ? '' : r.detail)
+  console.log(`# o3d-djemh credit-note-set refusal: claimed has CN-R=${text(claimed).includes('CN-R')} confirmed has CN-R=${text(confirmed).includes('CN-R')}`)
+  assert.ok(text(claimed).includes('CN-R') && text(confirmed).includes('CN-R'), 'precondition: both refusals name the id')
+  assert.doesNotMatch(text(claimed).replace(LABEL_PAREN, '').replace(/may (?:never )?exist/gi, ''), EXISTENCE_PHRASES)
+  assert.match(text(claimed), /check each in the accounting system/)
+  assert.match(text(confirmed), /what is posted and what IMS recorded/, 'existence wording is kept when every id is confirmed')
 })
