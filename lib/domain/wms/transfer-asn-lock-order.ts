@@ -129,6 +129,10 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *       (:117) and only then the parent (:136), inside one transaction.
  *
  *   NOT DEADLOCK PARTICIPANTS, and why:
+ *     · app/actions/manufacturing.ts `recalculateManufacturingCostLayers` (via `updateManufacturingCostLines`)
+ *       — o3d-nrl4 A, Codex HIGH on #729: production_orders (caller) -> cost_layers of that order's output
+ *       (FOR NO KEY UPDATE, BEFORE it reads the source-line totals) -> snapshot child rows. It takes no
+ *       transfer/purchase order, and the revaluation never takes a production order, so there is no cycle.
  *     · lib/domain/purchasing/landed-cost-service.ts `recalculateLandedCosts` / `recalculateDirectLandedCosts`
  *       — take NO row locks of their own and still do not: their CALLERS hold the scope. Since o3d-nrl4 PR A
  *       all three production callers of `recalculateLandedCosts` (`updateFreightPoCosts`, `createFreightPo`,
