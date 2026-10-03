@@ -2532,7 +2532,8 @@ for (const c of STANDING_CASES) {
     const text = `${store.activity[0].description ?? ''}\n${(store.activity[0].metadata.handoffLines as string[] | undefined)?.join('\n') ?? ''}`
     assert.equal(LABEL.test(text), c.unconfirmed.length > 0, `label appears in the durable record iff asserted: ${text}`)
     // Never named as confirmed: a labelled id is not followed by a bare mention elsewhere in the headline.
-    if (c.unconfirmed.length) assert.match(store.activity[0].description ?? '', /INV-1 \(asserted, NOT confirmed in the ledger\)/)
+    // The durable record's own 'in the ledger as' clause, not just the headline borrowed from the handoff.
+    if (c.unconfirmed.length) assert.match(store.activity[0].description ?? '', /unlinked invoice\(s\) INV-1 \(asserted, NOT confirmed in the ledger\)/)
     assert.deepEqual(
       store.activity[0].metadata.unconfirmedInvoiceExternalIds ?? [],
       c.unconfirmed,
@@ -2578,6 +2579,13 @@ test('o3d-djemh ISOLATING ARM: an asserted id still triggers the ledger-adjustme
   assert.ok(result.handoff, 'a manual ledger adjustment is owed')
   assert.equal(result.handoff?.needsAccountingAction, true)
   assert.match((result.handoff?.lines ?? []).join('\n'), LABEL, 'and the handoff text calls the id asserted')
+  // UNIVERSAL, not existential: no mention of the id anywhere in the handoff text may be bare. A
+  // labelled mention beside an unlabelled one would satisfy the `match` above.
+  const lines = (result.handoff?.lines ?? []).join('\n')
+  const mentions = (lines.match(/INV-1/g) ?? []).length
+  console.log(`# o3d-djemh handoff mentions of the asserted id: ${mentions}`)
+  assert.ok(mentions >= 1, 'precondition: the handoff names the id at least once')
+  assert.doesNotMatch(lines, /INV-1(?! \(asserted, NOT confirmed in the ledger\))/, 'no bare (confirmed-sounding) mention of an asserted id')
   assert.equal(
     ((store.orders[0].discountRestatement ?? {}) as { ledger?: { postedInvoiceExternalIds?: string[] } }).ledger?.postedInvoiceExternalIds?.join(',') ?? 'none',
     'INV-1',
