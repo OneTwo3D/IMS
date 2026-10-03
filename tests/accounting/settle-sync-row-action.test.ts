@@ -800,7 +800,12 @@ test('[o3d-1e7sl G11] a sibling OWNS the shared mirror per its STANDING: slot-ho
     assert.equal(result.success, true, c.name)
     const mirror = 'mirror' in result ? result.mirror : null
     assert.equal(mirror === 'skipped_owned_by_another_row', c.owns, `${c.name}: mirror ${mirror}`)
-    if (c.owns) owning += 1
+    if (c.owns) {
+      owning += 1
+      // D11: the audit note says whose id the owning sibling carries.
+      const note = String(settlementAudit().at(-1)?.description)
+      assert.equal(/names a document an operator typed in/.test(note), c.standing === 'ASSERTED_POSTED', `${c.name}: audit note ${note}`)
+    }
   }
   console.log(`# G11 action cases: ${cases.length}; sibling owns the mirror in ${owning}`)
   assert.ok(owning > 0 && owning < cases.length)

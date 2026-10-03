@@ -8,6 +8,7 @@ import {
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   buildCancelledSaleSettlementData,
   buildSettlementData,
+  describeMirrorOwnershipSkip,
   describeSettlementCaveat,
   describeSettlementUniqueConflict,
   describeSyncRowSettleability,
@@ -224,12 +225,15 @@ test('the mirror write is compare-and-swapped, so a sibling that posts first kee
  * real `ownsMirroredEvent` over one row per standing - the same composition `settleAccountingSyncRow` runs.
  */
 function candidate(row: Partial<LedgerStandingRow> & { id?: string }, mirrorKeys: string[]): {
-  id: string; status: string; ownsMirror: boolean; posted: boolean; mirrorKeys: string[]
+  id: string; status: string; ownsMirror: boolean; posted: boolean; assertedDocument: boolean; mirrorKeys: string[]
 } {
   const full: LedgerStandingRow = {
     status: 'PENDING', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, ...row,
   }
-  return { id: row.id ?? 'other', status: full.status, ownsMirror: ownsMirroredEvent(full), posted: namesADocument(full), mirrorKeys }
+  return {
+    id: row.id ?? 'other', status: full.status, ownsMirror: ownsMirroredEvent(full), posted: namesADocument(full),
+    assertedDocument: ledgerStanding(full) === 'ASSERTED_POSTED', mirrorKeys,
+  }
 }
 
 test('a live or already-posted sibling sharing a mirror key OWNS the mirror', () => {
@@ -569,4 +573,17 @@ test('[o3d-1e7sl AE4] a NOT_POSTED assertion against a POSTED mirror says whose 
   assert.doesNotMatch(asserted!.message, /a posting IMS has already written down/)
   const confirmed = refuseSettlementContradictedByMirror({ outcome: 'NOT_POSTED' }, { status: 'POSTED', externalId: null, postBasis: 'CONNECTOR' })
   assert.match(confirmed!.message, /already recorded as POSTED, so asserting that nothing posted contradicts that record/)
+})
+
+test('[o3d-1e7sl D11] the mirror-ownership audit note says whose id the owning sibling carries', () => {
+  const mine = ['key-a']
+  const confirmed = findMirrorOwnershipConflict(mine, [candidate({ status: 'SYNCED', externalTransactionId: 'INV-1' }, ['key-a'])])!
+  const asserted = findMirrorOwnershipConflict(mine, [candidate({ status: 'SYNCED', externalTransactionId: 'TYPED', settlementBasis: 'OPERATOR_ASSERTION' }, ['key-a'])])!
+  const live = findMirrorOwnershipConflict(mine, [candidate({ status: 'PENDING' }, ['key-a'])])!
+  assert.equal(confirmed.assertedDocument, false)
+  assert.equal(asserted.assertedDocument, true)
+  assert.match(describeMirrorOwnershipSkip(confirmed), /\(SYNCED, carries post evidence\) maps to the same mirrored event/)
+  assert.match(describeMirrorOwnershipSkip(asserted), /\(SYNCED, names a document an operator typed in - an assertion, never read from the ledger\) maps to the same mirrored event/)
+  assert.doesNotMatch(describeMirrorOwnershipSkip(asserted), /carries post evidence/)
+  assert.match(describeMirrorOwnershipSkip(live), /\(PENDING\) maps to the same mirrored event/)
 })

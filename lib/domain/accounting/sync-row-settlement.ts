@@ -1033,6 +1033,11 @@ export type MirrorClaimCandidate = {
   ownsMirror: boolean
   /** `namesADocument(row)`: whether the other row carries post evidence of its own. */
   posted: boolean
+  /**
+   * o3d-1e7sl (D11): the caller's `ledgerStanding(row) === 'ASSERTED_POSTED'` - the document the other row names
+   * was TYPED IN by an operator, never read from the ledger. Optional: absent reads false (the connector's own).
+   */
+  assertedDocument?: boolean
   /** Every idempotency key the mirror updater would try for that row. */
   mirrorKeys: readonly string[]
 }
@@ -1042,6 +1047,8 @@ export type MirrorOwnershipConflict = {
   status: string
   /** Whether the other row is merely live, or carries post evidence of its own. */
   posted: boolean
+  /** Whether that post evidence is an operator's typed id (D11) rather than the connector's own. */
+  assertedDocument: boolean
   sharedKey: string
 }
 
@@ -1061,7 +1068,12 @@ export function findMirrorOwnershipConflict(
   for (const candidate of candidates) {
     if (!candidate.ownsMirror) continue
     const sharedKey = candidate.mirrorKeys.find((key) => mine.has(key))
-    if (sharedKey) return { syncLogId: candidate.id, status: candidate.status, posted: candidate.posted, sharedKey }
+    if (sharedKey) {
+      return {
+        syncLogId: candidate.id, status: candidate.status, posted: candidate.posted,
+        assertedDocument: candidate.assertedDocument === true, sharedKey,
+      }
+    }
   }
   return null
 }
@@ -1069,7 +1081,13 @@ export function findMirrorOwnershipConflict(
 /** The note recorded on the audit row when the mirror write is skipped. */
 export function describeMirrorOwnershipSkip(conflict: MirrorOwnershipConflict): string {
   return `Mirrored accounting event left untouched: sync row ${conflict.syncLogId} (${conflict.status}`
-    + `${conflict.posted ? ', carries post evidence' : ''}) maps to the same mirrored event and still owns it. `
+    // o3d-1e7sl (D11): "carries post evidence" is true of an id the connector issued. An operator-typed one is
+    // a claim that a document exists, not evidence anyone read - say which.
+    + `${conflict.posted
+      ? (conflict.assertedDocument
+        ? ', names a document an operator typed in - an assertion, never read from the ledger'
+        : ', carries post evidence')
+      : ''}) maps to the same mirrored event and still owns it. `
     + 'Settling this row does not terminalise a document another attempt is responsible for.'
 }
 

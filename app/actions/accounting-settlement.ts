@@ -11,7 +11,7 @@ import {
   updateMirroredAccountingEventStatus,
   type MirroredEventUpdateOutcome,
 } from '@/lib/domain/accounting/accounting-event-mirror'
-import { OWNS_MIRRORED_EVENT_WHERE, namesADocument, ownsMirroredEvent } from '@/lib/domain/accounting/ledger-standing'
+import { OWNS_MIRRORED_EVENT_WHERE, ledgerStanding, namesADocument, ownsMirroredEvent } from '@/lib/domain/accounting/ledger-standing'
 import {
   applyFencedAttemptDecision,
   type AttemptFenceRefusalReason,
@@ -633,6 +633,7 @@ export async function settleAccountingSyncRow(
               status: sibling.status,
               ownsMirror: ownsMirroredEvent(sibling),
               posted: namesADocument(sibling),
+              assertedDocument: ledgerStanding(sibling) === 'ASSERTED_POSTED',
               mirrorKeys: mirroredAccountingEventIdempotencyKeys({
                 connector: row.connector,
                 syncLogId: sibling.id,
