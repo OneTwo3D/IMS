@@ -31,6 +31,7 @@ import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 import type { XeroResponse } from './api'
+import { readSingleXeroDocument } from './single-document'
 
 export type XeroReconcileInvoice = {
   InvoiceID: string
@@ -97,6 +98,8 @@ export type ReconcileVerdict =
  */
 export function classifyDoc(doc: LinkedDoc, xero: XeroReconcileInvoice | undefined): ReconcileVerdict {
   if (!xero) return { kind: 'unknown' }
+  // o3d-h9pb: a document that states no Status is UNKNOWN, not 'unpaid' (which would read as consistent).
+  if (typeof xero.Status !== 'string' || xero.Status === '') return { kind: 'unknown' }
   const paidInXero = xero.Status === 'PAID'
 
   if (paidInXero && !doc.imsPaid) return { kind: 'missed-payment', xero }
@@ -244,8 +247,15 @@ export async function reconcileXeroPayments(opts: { apply: boolean }): Promise<R
     // write if it is STILL paid, has a real settlement date, and is STILL locally unpaid (Codex #496).
     markPaid: async (doc): Promise<ApplyOutcome> => {
       const fresh = await xeroGet<{ Invoices?: XeroReconcileInvoice[] }>(`Invoices/${doc.accountingInvoiceId}`)
-      const inv = fresh.ok ? fresh.data?.Invoices?.[0] : undefined
-      if (!inv) return { applied: false, reason: `could not re-read the invoice from Xero: ${fresh.error ?? fresh.status}` }
+      if (!fresh.ok) return { applied: false, reason: `could not re-read the invoice from Xero: ${fresh.error ?? fresh.status}` }
+      // o3d-h9pb: bound to the document asked for. Unreadable is UNKNOWN, so nothing is written; a
+      // different invoice that happens to be PAID must never stamp THIS document paid.
+      const invRead = readSingleXeroDocument<XeroReconcileInvoice>(fresh.data, 'Invoices', 'InvoiceID', doc.accountingInvoiceId)
+      if (invRead.status === 'unreadable') {
+        return { applied: false, reason: `could not re-read the invoice from Xero: ${invRead.reason}` }
+      }
+      const inv = invRead.document
+      if (typeof inv.Status !== 'string' || inv.Status === '') return { applied: false, reason: 'the invoice re-read from Xero states no Status, so IMS cannot tell whether it is still PAID' }
       if (inv.Status !== 'PAID') return { applied: false, reason: `no longer PAID in Xero (now ${inv.Status}) — the poller or a reversal moved first` }
 
       const settled = parseSettlementDate(inv.FullyPaidOnDate)

@@ -697,6 +697,28 @@ function readIsDemoCompany(organisation: Record<string, unknown>): boolean | nul
   return null
 }
 
+/**
+ * o3d-emus item 1. The connect-time base-currency decision, pure so it can be tested without a network:
+ * null when the connection may proceed, otherwise the operator-facing refusal. The two refusals have
+ * different remedies — "could not be read" is retry/reconnect, "does not match" is a settings problem —
+ * so they are worded apart. A remote currency that is not a non-empty string is UNREADABLE, and an
+ * unreadable currency never passes.
+ */
+export function xeroBaseCurrencyConnectRefusal(remote: string | null, imsBase: string | null | undefined): string | null {
+  const ims = typeof imsBase === 'string' ? imsBase.trim().toUpperCase() : ''
+  if (typeof remote !== 'string' || remote.trim() === '') {
+    return 'Xero did not return the organisation base currency, so IMS cannot confirm it matches the IMS base currency. '
+      + 'Nothing was connected; try again, and if it persists check the Xero organisation settings scope.'
+  }
+  if (ims === '') {
+    return 'The IMS base currency could not be read, so it cannot be compared with the Xero organisation base currency. Nothing was connected.'
+  }
+  if (remote.trim().toUpperCase() !== ims) {
+    return `Xero organisation base currency (${remote.trim().toUpperCase()}) must match the IMS base currency (${ims}).`
+  }
+  return null
+}
+
 async function fetchOrganisationFacts(accessToken: string, tenantId: string): Promise<XeroOrganisationFacts> {
   const unknown: XeroOrganisationFacts = { baseCurrency: null, isDemoCompany: null }
   const res = await connectorFetch(XERO_ORGANISATION_URL, {
@@ -707,7 +729,8 @@ async function fetchOrganisationFacts(accessToken: string, tenantId: string): Pr
     },
   }, { connectorName: 'Xero' })
   if (!res.ok) return unknown
-  const data = await res.json() as Record<string, unknown>
+  const data = await res.json() as Record<string, unknown> | null
+  if (!data || typeof data !== 'object') return unknown
   const organisations =
     (Array.isArray(data.Organisations) ? data.Organisations : null)
     ?? (Array.isArray(data.Organisation) ? data.Organisation : null)
@@ -912,12 +935,11 @@ export async function exchangeCodeForTokens(
       return { success: false, error }
     }
 
-    if (organisation.baseCurrency && organisation.baseCurrency !== imsBaseCurrency) {
-      return {
-        success: false,
-        error: `Xero organisation base currency (${organisation.baseCurrency}) must match the IMS base currency (${imsBaseCurrency}).`,
-      }
-    }
+    // o3d-emus item 1: FAIL CLOSED. "Could not read the base currency" is not "the currency matches" —
+    // the old truthy-only test let a null (non-OK, malformed or empty organisation response) bind the
+    // tenant. The verified currency is deliberately NOT persisted (deferred, owner decision C6).
+    const currencyRefusal = xeroBaseCurrencyConnectRefusal(organisation.baseCurrency, imsBaseCurrency)
+    if (currencyRefusal !== null) return { success: false, error: currencyRefusal }
 
     const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000)
     // ONE write, and the database decides who wins it. Storing the token and pinning the tenant used to

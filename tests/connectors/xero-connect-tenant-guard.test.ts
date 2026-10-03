@@ -116,6 +116,8 @@ let connectionsByCode: Record<string, unknown> = {}
 let accessTokenByCode: Record<string, string> = {}
 let organisationBody: unknown = { Organisations: [{ BaseCurrency: 'GBP' }] }
 let organisationCalls = 0
+/** o3d-emus: answer GET /Organisation with a non-OK status instead of the body. */
+let organisationNotOk = false
 let notifications: Array<{ title: string; message: string }> = []
 let activity: Array<{ action: string; description: string }> = []
 /** Every URL that reached Xero, so a refusal that claims it made no request can be held to it. */
@@ -615,6 +617,7 @@ mock.module('@/lib/security/connector-fetch', {
       if (url.includes('Organisation')) {
         organisationCalls += 1
         if (organisationFetchGate) await organisationFetchGate()
+        if (organisationNotOk) return { ok: false, status: 503, json: async () => ({}), text: async () => '' }
         return jsonResponse(organisationBody)
       }
       throw new Error(`unexpected connectorFetch: ${url}`)
@@ -634,6 +637,7 @@ beforeEach(() => {
   accessTokenByCode = {}
   organisationBody = { Organisations: [{ BaseCurrency: 'GBP' }] }
   organisationCalls = 0
+  organisationNotOk = false
   settingReadGate = null
   organisationFetchGate = null
   resetTokenDeleteGate = null
@@ -2756,4 +2760,82 @@ test('the OTHER writers of both halves take the pin first too', async () => {
   assert.match(statements[0].text, /insert into settings/, 'pin first')
   assert.match(statements[1].text, /update accounting_tokens/, 'then the token row')
   assert.match(statements[2].text, /delete from settings/, 'then the witness')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-emus item 1 (owner decision C6: connect-time guard only, nothing persisted): a base currency that
+// cannot be READ is not a base currency that MATCHES. Before this, a null passed a truthy-only test and
+// the tenant was bound.
+// ---------------------------------------------------------------------------
+
+test('[o3d-emus] an organisation whose base currency cannot be read is REFUSED, and NOTHING is bound', async () => {
+  const { exchangeCodeForTokens } = await loadAuth()
+  // CONTROL first: the same consent with a readable, matching currency binds. Without it every refusal
+  // below could be caused by something else in the path.
+  freshDatabase()
+  connectionsBody = [DEMO]
+  const control = await exchangeCodeForTokens('code-0', 'https://ims.example/cb')
+  assert.equal(control.success, true, 'PRECONDITION: a readable GBP organisation connects')
+  assert.notEqual(tokenRow, null, 'PRECONDITION: and binds a token')
+
+  const unreadable: Array<[string, () => void]> = [
+    ['non-OK response', () => { organisationNotOk = true }],
+    ['null body', () => { organisationBody = null }],
+    ['body is not an object', () => { organisationBody = 'nope' }],
+    ['no Organisations array', () => { organisationBody = {} }],
+    ['empty Organisations array', () => { organisationBody = { Organisations: [] } }],
+    ['organisation without BaseCurrency', () => { organisationBody = { Organisations: [{ Name: 'x' }] } }],
+    ['BaseCurrency is empty', () => { organisationBody = { Organisations: [{ BaseCurrency: '' }] } }],
+    ['BaseCurrency is not a string', () => { organisationBody = { Organisations: [{ BaseCurrency: 826 }] } }],
+  ]
+  let cases = 0
+  for (const [name, arrange] of unreadable) {
+    freshDatabase()
+    connectionsBody = [DEMO]
+    organisationNotOk = false
+    organisationBody = { Organisations: [{ BaseCurrency: 'GBP' }] }
+    arrange()
+    const callsBefore = organisationCalls
+    const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+    assert.equal(organisationCalls, callsBefore + 1, `PRECONDITION (${name}): the organisation read was reached`)
+    assert.equal(result.success, false, `${name}: ${JSON.stringify(result)}`)
+    assert.equal(tokenRow, null, `${name}: no token row was written`)
+    assert.equal(settings.xero_expected_tenant_id, undefined, `${name}: no tenant was pinned`)
+    cases += 1
+    assert.match(result.error ?? '', /did not return the organisation base currency/, `${name}: the refusal says it could not be READ`)
+  }
+  assert.equal(cases, 8)
+  console.log(`# o3d-emus connect guard: ${cases} unreadable-currency cases refused, nothing bound + 1 control`)
+})
+
+test('[o3d-emus] a MISMATCHED base currency is still refused, with the "does not match" wording', async () => {
+  freshDatabase()
+  connectionsBody = [DEMO]
+  organisation({ BaseCurrency: 'USD' })
+  const { exchangeCodeForTokens } = await loadAuth()
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.match(result.error ?? '', /\(USD\) must match the IMS base currency \(GBP\)/)
+  assert.doesNotMatch(result.error ?? '', /did not return/, 'the two failures have different remedies and say different things')
+})
+
+test('[o3d-emus] xeroBaseCurrencyConnectRefusal: unreadable never passes, a match passes', async () => {
+  const { xeroBaseCurrencyConnectRefusal } = await loadAuth()
+  let cases = 0
+  for (const remote of [null, '', '   '] as const) {
+    assert.match(xeroBaseCurrencyConnectRefusal(remote, 'GBP') ?? '', /did not return the organisation base currency/)
+    cases += 1
+  }
+  for (const ims of [null, undefined, '', ' ']) {
+    assert.match(xeroBaseCurrencyConnectRefusal('GBP', ims) ?? '', /IMS base currency could not be read/)
+    cases += 1
+  }
+  assert.match(xeroBaseCurrencyConnectRefusal('USD', 'GBP') ?? '', /must match/)
+  cases += 1
+  assert.equal(xeroBaseCurrencyConnectRefusal('GBP', 'GBP'), null)
+  assert.equal(xeroBaseCurrencyConnectRefusal('gbp', ' GBP '), null, 'case and padding are not a mismatch')
+  cases += 2
+  assert.equal(cases, 10)
+  console.log(`# o3d-emus xeroBaseCurrencyConnectRefusal: ${cases} cases`)
 })

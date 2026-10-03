@@ -85,6 +85,13 @@ const state = {
   /** An `ok` response listing no invoice at all. */
   xeroInvoiceMissing: false,
   xeroCalls: [] as string[],
+  /**
+   * o3d-h9pb: a RAW response body for the Payments/{id} or Invoices/{id} GET, served exactly as given
+   * (including null and non-objects). `served` counts how many times one was handed out, so an arm can
+   * assert that the shape it meant to test really reached the production code.
+   */
+  xeroRaw: {} as { payment?: { body: unknown }; invoice?: { body: unknown } },
+  xeroRawServed: 0,
   /** Runs once inside the transaction, right after the order lock, to move the world under the write. */
   mutateUnderLock: null as (() => void) | null,
   /**
@@ -214,6 +221,14 @@ mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroGet: async (path: string) => {
       state.xeroCalls.push(path)
+      if (path.startsWith('Invoices/') && state.xeroRaw.invoice) {
+        state.xeroRawServed += 1
+        return { ok: true, status: 200, data: state.xeroRaw.invoice.body }
+      }
+      if (path.startsWith('Payments/') && state.xeroRaw.payment) {
+        state.xeroRawServed += 1
+        return { ok: true, status: 200, data: state.xeroRaw.payment.body }
+      }
       if (path.startsWith('Invoices/')) {
         if (state.xeroInvoiceError) return { ok: false, status: 0, error: state.xeroInvoiceError }
         if (state.xeroInvoiceMissing) return { ok: true, status: 200, data: { Invoices: [] } }
@@ -335,6 +350,8 @@ test.beforeEach(() => {
   state.xeroInvoiceError = null
   state.xeroInvoiceMissing = false
   state.xeroCalls = []
+  state.xeroRaw = {}
+  state.xeroRawServed = 0
   state.mutateUnderLock = null
   state.mutateAfterRegistrationRead = null
 })
@@ -1217,4 +1234,118 @@ test('[o3d-psrx r18] CONTROL: a removal the remaining receipts still cover leave
   assert.notEqual(state.order.paidAt, null,
     'an over-payment being removed does not unsettle a document the rest of the receipts still cover '
     + '— a rule that cleared here would re-arm Mark Paid over money that has already moved')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-h9pb: every Xero by-id read here is bound to the document that was ASKED FOR, and an unreadable
+// answer is UNKNOWN — refused as a failed lookup — never "reversed", never "absent", never a match.
+//
+// Three sites, three isolating arms. Each arm varies ONE response and leaves the other two ordinary, so
+// a site that stops checking is caught by its own arm and by no other's.
+// ---------------------------------------------------------------------------
+
+function shapesFor(key: 'Payments' | 'Invoices', idField: string, id: string, good: Record<string, unknown>) {
+  return [
+    { name: 'wrong id', body: { [key]: [{ ...good, [idField]: `OTHER-${id}` }] }, reason: /answered the request for .* with OTHER-/ },
+    { name: 'empty array', body: { [key]: [] }, reason: /no \w+ document for that id/ },
+    { name: 'multiple documents', body: { [key]: [good, { ...good, [idField]: `OTHER-${id}` }] }, reason: /with 2 \w+ documents/ },
+    { name: 'missing key', body: {}, reason: /no \w+ collection/ },
+    { name: 'malformed body', body: 'not-an-object', reason: /not an object/ },
+    { name: 'null', body: null, reason: /not an object/ },
+  ]
+}
+
+test('[o3d-h9pb site 1: reverseLedgerPayment ledger-hold read] a payment other than the one asked for is not an answer', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  // CONTROL: the correct document, reversed, lets the delete through — so the refusals below are about
+  // the SHAPE and not about an unrelated reason the path would refuse anyway.
+  state.xeroPayments.set('PAY-9', 'DELETED')
+  const control = await reverseLedgerPayment('pay-1', 'order-1')
+  assert.equal((control as { success: boolean }).success, true, JSON.stringify(control))
+  assert.ok(!paymentStillThere(), 'PRECONDITION: the control really deleted the receipt')
+
+  let cases = 0
+  const good = { PaymentID: 'PAY-9', Status: 'DELETED' }
+  for (const shape of shapesFor('Payments', 'PaymentID', 'PAY-9', good)) {
+    state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: 'GBP' }]
+    state.syncRows = [syncRow()]
+    state.xeroCalls = []
+    state.xeroRawServed = 0
+    state.xeroRaw = { payment: { body: shape.body } }
+    const result = await reverseLedgerPayment('pay-1', 'order-1') as { success: boolean; code?: string; error?: string }
+    assert.equal(state.xeroRawServed, 1, `PRECONDITION (${shape.name}): the raw shape reached the production read`)
+    assert.equal(result.success, false, `${shape.name}: ${JSON.stringify(result)}`)
+    assert.equal(result.code, 'ledger_lookup_failed', `${shape.name}: UNKNOWN, not "reversed"`)
+    assert.match(result.error ?? '', shape.reason, `${shape.name}: names what came back`)
+    assert.ok(paymentStillThere(), `${shape.name}: the receipt must survive`)
+    cases += 1
+  }
+  assert.equal(cases, 6)
+  console.log(`# o3d-h9pb site 1 (sales.ts ledger-hold payment read): ${cases} unreadable cases + 1 correct-document control`)
+})
+
+test('[o3d-h9pb site 2: operator-named payment read] a different payment of the same value does not stand in for it', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  const arrange = () => {
+    state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: 'GBP' }]
+    state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+    state.xeroPayments.set('PAY-42', 'DELETED')
+    state.xeroCalls = []
+    state.xeroRawServed = 0
+  }
+  arrange()
+  const control = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((control as { success: boolean }).success, true, JSON.stringify(control))
+  assert.ok(!paymentStillThere(), 'PRECONDITION: the control really deleted the receipt')
+
+  let cases = 0
+  // Everything else about the payment is RIGHT (on this order's invoice, this amount, DELETED), so the
+  // only thing that can refuse the wrong-id arm is the binding to the reference that was typed.
+  const good = { PaymentID: 'PAY-42', Status: 'DELETED', Amount: 100, Invoice: { InvoiceID: 'INV-abc', CurrencyCode: 'GBP' } }
+  for (const shape of shapesFor('Payments', 'PaymentID', 'PAY-42', good)) {
+    arrange()
+    state.xeroRaw = { payment: { body: shape.body } }
+    const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+    assert.equal(state.xeroRawServed, 1, `PRECONDITION (${shape.name}): the raw shape reached the production read`)
+    assert.equal((result as { code?: string }).code, 'ledger_lookup_failed', `${shape.name}: ${JSON.stringify(result)}`)
+    assert.match((result as { error: string }).error, /did not return exactly the payment with that reference/, `${shape.name}: refused at THIS site`)
+    assert.match((result as { error: string }).error, shape.reason, `${shape.name}: names what came back`)
+    assert.ok(paymentStillThere(), `${shape.name}: the receipt must survive`)
+    assert.deepEqual(state.xeroCalls, ['Payments/PAY-42'], `${shape.name}: refused before the invoice was asked`)
+    cases += 1
+  }
+  assert.equal(cases, 6)
+  console.log(`# o3d-h9pb site 2 (sales.ts operator-named payment read): ${cases} unreadable cases + 1 correct-document control`)
+})
+
+test('[o3d-h9pb site 3: invoice standing-payments read] a different invoice cannot answer "nothing is standing here"', async () => {
+  const { reverseLedgerPayment } = await loadActions()
+  const arrange = () => {
+    state.payments = [{ id: 'pay-1', orderId: 'order-1', refundId: null, amount: 100, currency: 'GBP' }]
+    state.syncRows = [syncRow({ id: 'log-7', status: 'FAILED', externalTransactionId: null })]
+    state.xeroPayments.set('PAY-42', 'DELETED')
+    state.xeroCalls = []
+    state.xeroRawServed = 0
+  }
+  arrange()
+  const control = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+  assert.equal((control as { success: boolean }).success, true, JSON.stringify(control))
+  assert.ok(!paymentStillThere(), 'PRECONDITION: the control really deleted the receipt')
+
+  let cases = 0
+  // The invoice a wrong-id body carries would pass every later check (currency GBP, nothing standing),
+  // so only the binding to the requested invoice id can refuse it.
+  const good = { InvoiceID: 'INV-abc', CurrencyCode: 'GBP', Payments: [] }
+  for (const shape of shapesFor('Invoices', 'InvoiceID', 'INV-abc', good)) {
+    arrange()
+    state.xeroRaw = { invoice: { body: shape.body } }
+    const result = await reverseLedgerPayment('pay-1', 'order-1', 'PAY-42')
+    assert.equal(state.xeroRawServed, 1, `PRECONDITION (${shape.name}): the raw shape reached the production read`)
+    assert.equal((result as { code?: string }).code, 'ledger_lookup_failed', `${shape.name}: ${JSON.stringify(result)}`)
+    assert.match((result as { error: string }).error, /did not list the payments standing on that invoice/, `${shape.name}: refused at THIS site`)
+    assert.ok(paymentStillThere(), `${shape.name}: the receipt must survive`)
+    cases += 1
+  }
+  assert.equal(cases, 6)
+  console.log(`# o3d-h9pb site 3 (sales.ts invoice standing-payments read): ${cases} unreadable cases + 1 correct-document control`)
 })
