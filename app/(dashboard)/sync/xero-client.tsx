@@ -1167,7 +1167,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 variant="outline"
                                 data-standing={standing.standing}
                                 className={`ml-1 text-[10px] ${
-                                  standing.tone === 'proven-unsent'
+                                  standing.tone === 'proven'
                                     ? 'border-muted-foreground text-muted-foreground'
                                     : 'border-amber-500 text-amber-600 dark:text-amber-400'
                                 }`}

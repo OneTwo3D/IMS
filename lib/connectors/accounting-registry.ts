@@ -67,7 +67,7 @@ export type AccountingSyncLogRow = {
   /**
    * o3d-1e7sl: whether the canceller PROVED the row pre-call. REQUIRED beside the basis, for the same
    * reason: the page reads a row's standing (`ledgerStanding`) from status + id + basis + this flag, and a
-   * view that cannot see the flag would badge a proven-unsent row as unproven.
+   * view that cannot see the flag would badge a proven row (never sent / verified reversed) as unproven.
    */
   abandonedBeforeRemoteCall: boolean | null
   syncedAt: string | null

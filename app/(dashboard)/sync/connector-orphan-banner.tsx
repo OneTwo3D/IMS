@@ -309,7 +309,7 @@ export function ConnectorOrphanBanner({
                           {/*
                             o3d-1e7sl (D4): said by STANDING, not as an unqualified "posted as". A typed
                             document id and a connector-issued one are not the same claim, and a retired row
-                            that names nothing is not thereby "never sent".
+                            that names nothing is not thereby proven unsent.
                           */}
                           {describeDocumentIdClaim(row) !== null && (
                             <div className="opacity-70">{describeDocumentIdClaim(row)}</div>

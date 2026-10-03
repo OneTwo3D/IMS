@@ -104,3 +104,19 @@ test('[o3d-1e7sl D3/D4] the orphan banner names an id by standing and the strand
   assert.match(loader.slice(at, at + 2600), /settlementBasis: true/)
   assert.match(loader.slice(at, at + 2600), /abandonedBeforeRemoteCall: true/)
 })
+
+test('[o3d-1e7sl Codex r1] the sync log, the orphan banner and the stranded-row source pass the WHOLE row (basis + flag + id) so a verified reversal is never badged "never sent"', async () => {
+  const client = await source('app/(dashboard)/sync/xero-client.tsx')
+  const at = client.indexOf('const standingRow = {')
+  const block = client.slice(at, at + 700)
+  for (const column of ['status: log.status', 'externalTransactionId: log.externalTransactionId', 'settlementBasis: log.settlementBasis', 'abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall']) {
+    assert.ok(block.includes(column), `sync log passes ${column}`)
+  }
+  assert.match(client, /standing\.tone === 'proven'/)
+  assert.doesNotMatch(client, /['"`]\s*(proven unsent|never sent)/, 'the page hardcodes no "never sent" wording: it all comes from the display module')
+  const banner = await source('app/(dashboard)/sync/connector-orphan-banner.tsx')
+  assert.match(banner, /describeLedgerStanding\(row\)/)
+  assert.doesNotMatch(banner, /['"`]\s*never sent/)
+  const display = await source('lib/domain/accounting/ledger-standing-display.ts')
+  assert.equal((display.match(/'never sent'/g) ?? []).length, 1, 'exactly one label says "never sent": the recorded pre-call proof')
+})

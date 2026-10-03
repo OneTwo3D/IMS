@@ -2040,9 +2040,11 @@ page say which of these a row is:
 | **asserted** | An operator typed that document id in; IMS never read the document or its amount | that Xero holds it |
 | **asserted: not posted** | An operator settled the row "did not post". A claim, not proof | that nothing reached Xero — a lost response or a late webhook leaves the same row |
 | **unproven** | A failed row, or one retired by something that could not tell whether a request had already been sent | that nothing was sent |
-| **proven unsent** | The row was retired before any request was made (recorded at the time), or IMS asked Xero and it reported the document gone | — |
+| **never sent** | The row was retired before any request was made, and that was recorded at the time (orphan sweep, supersession) | — |
+| **verified reversed** | IMS asked Xero and it reported the payment gone. It may have been posted earlier; the id on the row is kept for the audit trail | that it was never sent |
+| **rejected before posting** | The row's own stored request is missing something the connector requires, so it was refused before any request could be accepted | — |
 
-Only **proven unsent** is ever described as not sent. An unproven or asserted-not-posted row always says to look in
+Only **never sent** (a pre-call abandonment recorded at the time) is ever described as not sent; a **verified reversed** row may well have been posted first. An unproven or asserted-not-posted row always says to look in
 Xero. The same rule shapes the rest of the product:
 
 - **Deleting an order** is refused while any of its accounting rows may have reached Xero — that now includes a
