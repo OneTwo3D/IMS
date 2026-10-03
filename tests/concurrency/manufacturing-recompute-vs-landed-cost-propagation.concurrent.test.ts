@@ -227,8 +227,10 @@ test('o3d-nrl4 PR A: a manufacturing cost edit locks the output layers before it
     const mid = await db.costLayer.findUniqueOrThrow({ where: { id: world.outputId }, select: { unitCostBase: true } })
 
     let finished = false
+    // accountCode given explicitly: this tier shares ONE database, and an earlier file may have switched accounting
+    // posting on, in which case an edit with no account code is refused for want of a default overhead account.
     let early: unknown = null
-    const editing = updateManufacturingCostLines(world.productionId, [{ description: 'overhead', amountForeign: 6 }])
+    const editing = updateManufacturingCostLines(world.productionId, [{ description: 'overhead', amountForeign: 6, accountCode: '700' }])
       .then((r) => { early = r; return r })
       .finally(() => { finished = true })
     const blocked = await waitForBlocked(probe, { blockedBy: revaluationPid, waitingOn: /cost_layers/i, describe: 'manufacturing edit', finished: () => finished })
