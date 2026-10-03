@@ -1986,10 +1986,11 @@ async function markRefundAccountingRetryRequired(
 async function clearRefundAccountingRetryState(
   refundId: string,
   settlement: RefundAccountingSettlement,
-): Promise<void> {
-  // o3d-fj4m: ONE statement (lib/domain/sales/refund-accounting-discharge.ts) - it also writes down the
-  // relief staging recorded for a reversal the hand-off settled as "will never exist".
-  await dischargeRefundAccountingObligation(db, refundId, settlement)
+): Promise<Awaited<ReturnType<typeof dischargeRefundAccountingObligation>>> {
+  // o3d-fj4m: ONE transaction (lib/domain/sales/refund-accounting-discharge.ts) - it also writes down the
+  // relief staging recorded for a reversal the hand-off settled as "will never exist", but only when no
+  // earlier attempt for that reversal may have posted; otherwise it discharges nothing and says why.
+  return dischargeRefundAccountingObligation(db, refundId, settlement)
 }
 
 async function queueRefundAccountingActions(input: {
@@ -2549,7 +2550,21 @@ export async function createRefund(
     // of the reversal, while `allocatedReliefAmount` stood. The refund's own retry replays the recorded syncs
     // and is what clears it; a replay discharges nothing it did not hand off.
     if (!accountingWarning && !refundResult.replayed && handOffSettlement) {
-      await clearRefundAccountingRetryState(refundResult.createdRefund.id, handOffSettlement)
+      const discharge = await clearRefundAccountingRetryState(refundResult.createdRefund.id, handOffSettlement)
+      if (!discharge.discharged) {
+        // The flag stays set (nothing was discharged); say so on the row and in the result.
+        accountingWarning = discharge.reason
+        await markRefundAccountingRetryRequired(refundResult.createdRefund.id, discharge.reason)
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: orderId,
+          action: 'refund_accounting_warning',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: discharge.reason,
+          metadata: { orderNumber: refundResult.refundOrderRef, refundId: refundResult.createdRefund.id },
+        })
+      }
     }
 
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
@@ -3081,7 +3096,19 @@ export async function retryRefundAccounting(
     // three attempts at one came apart. That is a deployment change and it is filed as o3d-2sm1.1.
     // o3d-fj4m: through the one discharge write, which also zeroes the relief recorded for a reversal this
     // hand-off settled as "will never exist".
-    await clearRefundAccountingRetryState(result.refundId, handOffSettlement)
+    const discharge = await clearRefundAccountingRetryState(result.refundId, handOffSettlement)
+    if (!discharge.discharged) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: result.orderId,
+        action: 'refund_accounting_retry_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: discharge.reason,
+        metadata: { refundId, orderNumber: result.refundOrderRef },
+      })
+      return { success: false, error: discharge.reason }
+    }
 
     for (const row of result.returnedRows) {
       await logActivity({

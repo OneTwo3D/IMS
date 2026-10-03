@@ -65,6 +65,8 @@ export type RefundAccountingObligation = {
 export type RefundAccountingSettlement = {
   /** Obligations settled because the pinned configuration decided the posting will never exist. */
   readonly decidedNeverToPost: readonly RefundAccountingObligation[]
+  /** The connector this hand-off pinned (the one whose enqueues take the posting-key lock). */
+  readonly pinnedConnector: string | null
 }
 
 export class RefundAccountingObligationsUnmet extends Error {
@@ -190,7 +192,7 @@ export async function openRefundAccountingObligationLedger(
         )
       }
       if (unmet.length > 0) throw new RefundAccountingObligationsUnmet(unmet)
-      return { decidedNeverToPost: [...decidedNeverToPost] }
+      return { decidedNeverToPost: [...decidedNeverToPost], pinnedConnector }
     },
   }
 }

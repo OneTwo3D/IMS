@@ -1,6 +1,9 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { RefundAccountingSettlement } from '@/lib/domain/sales/refund-accounting-obligations'
-import type { RefundServiceClient } from '@/lib/domain/sales/refund-service'
+import type { db } from '@/lib/db'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { PRIOR_ATTEMPT_SELECT } from '@/lib/domain/accounting/prior-posting-evidence'
 
 /**
  * THE ONE WRITE THAT DISCHARGES A REFUND'S ACCOUNTING OBLIGATION (o3d-fj4m).
@@ -13,18 +16,26 @@ import type { RefundServiceClient } from '@/lib/domain/sales/refund-service'
  *   `allocatedReliefAmount` staging recorded for it - "what the journal this refund is about to queue
  *   WILL raise" - is a claim about a posting with no counterpart. It is written down to 0 here, in the
  *   same statement that clears the flag, because the next refund of the order reads an ABSENT journal
- *   as "retention deleted it" (the o3d-o97 r3/r6 reading, sound while every enqueue wrote something)
- *   and counts the recorded amount as relief it never was: it under-credits Allocated Inventory by
- *   exactly those pounds. 0 is the vocabulary the reader already has - a recorded zero is "this refund
- *   raised no CR Allocated line at all" - so no column and no new reading is needed.
+ *   as "retention deleted it" and counts the recorded amount as relief it never was. 0 is the vocabulary
+ *   the reader already has - a recorded zero is "this refund raised no CR Allocated line at all".
  *
- * WHAT IT DELIBERATELY DOES NOT DO: it never touches the amount when the reversal was QUEUED (the
- * journal exists, and the reader resolves the amount against it), and it is never called for a refund
- * whose hand-off refused or threw (the flag stays set; the next refund is blocked by scjz.22 and the
- * reader refuses a flagged refund's relief outright).
+ * BUT "DECIDED NEVER" IS A VERDICT ABOUT THE CONFIGURATION NOW, NOT ABOUT WHAT ALREADY HAPPENED (Codex
+ * HIGH on #733). The enqueue asks "is posting enabled" BEFORE it looks for a prior journal, so a refund
+ * whose reversal was queued (or posted) and whose process died before this discharge, retried after the
+ * sync was switched off, reads "decided never" for a journal that EXISTS. Zeroing then makes the next
+ * refund skip that journal and credit the whole open balance a second time. So before zeroing, every
+ * prior attempt for THIS refund's reversal is read - under the same follow-up scope lock the enqueue
+ * takes, in the same transaction as the write, so there is no check-then-act gap - and classified by the
+ * ledger-standing module. Only when every attempt is PROVEN_NOT_POSTED, or none exists, is the relief
+ * written down. Any other standing (LIVE_WORK, CONFIRMED_POSTED, ASSERTED_*, UNKNOWN) means a journal
+ * exists or may have posted: the relief is KEPT and the obligation is left UNRESOLVED (nothing is
+ * discharged; the flag stays), so a retry once posting is back on settles against the real row.
+ *
+ * WHAT IT DOES NOT DO: it never touches the amount when the reversal was QUEUED, and it is never called
+ * for a refund whose hand-off refused or threw.
  *
  * ONE STATEMENT, NOT TWO: clearing the flag first and zeroing afterwards would leave a window in which
- * the refund no longer blocks the next one and its relief still stands.
+ * the refund no longer blocks the next one and its relief stands.
  */
 export function refundReversalDecidedNeverToPost(
   refundId: string,
@@ -37,18 +48,48 @@ export function refundReversalDecidedNeverToPost(
   ))
 }
 
+export type RefundDischargeResult =
+  | { discharged: true; reliefWrittenDown: boolean }
+  | { discharged: false; reason: string }
+
 export async function dischargeRefundAccountingObligation(
-  client: Pick<RefundServiceClient, 'salesOrderRefund'>,
+  client: Pick<typeof db, '$transaction'>,
   refundId: string,
   settlement: RefundAccountingSettlement,
-): Promise<void> {
-  await client.salesOrderRefund.update({
-    where: { id: refundId },
-    data: {
-      accountingRetryRequired: false,
-      accountingWarning: null,
-      accountingRetrySyncs: Prisma.DbNull,
-      ...(refundReversalDecidedNeverToPost(refundId, settlement) ? { allocatedReliefAmount: 0 } : {}),
-    },
+): Promise<RefundDischargeResult> {
+  const decidedNever = refundReversalDecidedNeverToPost(refundId, settlement)
+  return client.$transaction(async (tx) => {
+    let zero = false
+    if (decidedNever) {
+      const where = { type: 'UNEARNED_REV_REVERSAL' as const, referenceType: 'SalesOrderRefund', referenceId: refundId }
+      // Lock every connector an enqueue for this posting could take the scope lock under: the pinned one
+      // (a concurrent enqueue) and each one a prior row sits on. Then read under the locks.
+      const seen = await tx.accountingSyncLog.findMany({ where, select: { connector: true } })
+      const connectors = new Set<string>(seen.map((row) => row.connector))
+      if (settlement.pinnedConnector) connectors.add(settlement.pinnedConnector)
+      for (const connector of [...connectors].sort()) {
+        await lockFollowUpScope(tx, { connector, type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: refundId })
+      }
+      const rows = await tx.accountingSyncLog.findMany({ where, select: PRIOR_ATTEMPT_SELECT })
+      const standings = rows.map((row) => ledgerStanding(row))
+      const mayExist = standings.filter((standing) => standing !== 'PROVEN_NOT_POSTED')
+      if (mayExist.length > 0) {
+        return {
+          discharged: false as const,
+          reason: `the reversal journal for refund ${refundId} was settled as "will never post" under the current configuration, but ${mayExist.length} earlier attempt(s) for it exist (${[...new Set(mayExist)].join(', ')}): it may have posted, so its recorded relief is kept and the refund's accounting stays outstanding until it is retried with posting enabled`,
+        }
+      }
+      zero = true
+    }
+    await tx.salesOrderRefund.update({
+      where: { id: refundId },
+      data: {
+        accountingRetryRequired: false,
+        accountingWarning: null,
+        accountingRetrySyncs: Prisma.DbNull,
+        ...(zero ? { allocatedReliefAmount: 0 } : {}),
+      },
+    })
+    return { discharged: true as const, reliefWrittenDown: zero }
   })
 }
