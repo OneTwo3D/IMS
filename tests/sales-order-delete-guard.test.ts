@@ -6,6 +6,7 @@ import {
   dailyBatchReferenceWhere,
   findSalesOrderDeleteBlocker,
 } from '@/lib/domain/sales/order-delete-guard'
+import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
   matchesWhere as matches,
   shoppingSyncLogFake,
@@ -24,6 +25,8 @@ type SyncLogRow = {
   externalTransactionId?: string | null
   /** o3d-anu8: NULL = the connector's own writeback; 'OPERATOR_ASSERTION' = a human's claim. */
   settlementBasis?: string | null
+  /** o3d-1e7sl: the canceller's pre-call proof. `null` = not flagged (the database's reading of a missing column). */
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 /**
@@ -134,6 +137,10 @@ function syncLog(overrides: Partial<SyncLogRow>): SyncLogRow {
     referenceId: 'order-1',
     externalTransactionId: null,
     settlementBasis: null,
+    // o3d-1e7sl: EXPLICIT null, because the evaluator reads an absent key as `undefined` and `undefined !== null`
+    // - so a fixture that omitted it matched none of the `IS NULL` arms the real database matches, and every
+    // "a retired row does not block" test below was true of the double and false of the system.
+    abandonedBeforeRemoteCall: null,
     ...overrides,
   }
 }
@@ -362,12 +369,14 @@ test('an in-flight (PROCESSING) and an already-posted (SYNCED) invoice both bloc
   }
 })
 
-test('a CANCELLED sync row does not block — it was deliberately retired', async () => {
-  const blocker = await findSalesOrderDeleteBlocker(
-    makeTx({ syncLogs: [syncLog({ status: 'CANCELLED' })] }),
-    'order-1',
-    STAMPS,
-  )
+test('a CANCELLED sync row that PROVED it was never sent does not block - the orphan sweep stamped it pre-call', async () => {
+  // o3d-1e7sl (G1): this test used to read "a CANCELLED sync row does not block - it was deliberately
+  // retired" over a row with NO proof at all. A cancellation is not evidence of anything; only the row that
+  // carries its own pre-call proof (abandonedBeforeRemoteCall, written in the same UPDATE as the status by
+  // the orphan sweep, the BILL_PAYMENT supersession and the never-claimed sale-cancel sweep) stops blocking.
+  const row = syncLog({ status: 'CANCELLED', abandonedBeforeRemoteCall: true })
+  assert.equal(ledgerStanding(row as never), 'PROVEN_NOT_POSTED', 'precondition: this row is the proven shape')
+  const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', STAMPS)
   assert.equal(blocker, null)
 })
 
@@ -498,7 +507,8 @@ test('[o3d-f709] a CANCELLED A2 batch row that CARRIES THE JOURNAL ID still bloc
 })
 
 test('o3d-i0o6 r2: and it is a lookup, not a blanket refusal — a retired A2 journal still lets the order go', async () => {
-  // The control. The id is present and names a row that is CANCELLED, which is not a live claim on
+  // The control. The id is present and names a row that is CANCELLED AND PROVED PRE-CALL (o3d-1e7sl: a bare
+  // cancellation proves nothing, so the row carries the orphan sweep's stamp), which is not a live claim on
   // this order's value, so nothing is blocked. Without this the test above would pass for an order
   // that merely carries an id.
   const blocker = await findSalesOrderDeleteBlocker(
@@ -509,6 +519,7 @@ test('o3d-i0o6 r2: and it is a lookup, not a blanket refusal — a retired A2 jo
         status: 'CANCELLED',
         referenceType: 'DailyBatch',
         referenceId: 'A2-2026-07-20-1a2b3c4d',
+        abandonedBeforeRemoteCall: true,
       })],
     }),
     'order-1',
@@ -517,16 +528,17 @@ test('o3d-i0o6 r2: and it is a lookup, not a blanket refusal — a retired A2 jo
   assert.equal(blocker, null)
 })
 
-test('[o3d-f709] a CANCELLED A2 batch row naming NO journal still does not block', async () => {
-  // The other half, and the reason this is an OR and not "drop the status test". A cancelled batch
-  // row with no document id is the pre-call/settled shape the file argues at length must stay
-  // deletable — re-blocking on it would re-strand every order an operator has settled.
+test('[o3d-f709] a CANCELLED A2 batch row naming NO journal that PROVED it was pre-call still does not block', async () => {
+  // The other half, and the reason the match is "may have reached the ledger" and not "any status": a
+  // cancelled batch row carrying its own pre-call proof (the orphan sweep stamps daily-batch rows too) is
+  // PROVEN_NOT_POSTED. o3d-1e7sl: the same row WITHOUT the proof now blocks - see the matrix below.
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
       syncLogs: [syncLog({
         id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
         referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20',
         externalTransactionId: null,
+        abandonedBeforeRemoteCall: true,
       })],
     }),
     'order-1',
@@ -640,7 +652,7 @@ test("o3d-i0o6 r3: an earlier pass's BATCH REFERENCE is an alternative too, for 
   assert.equal(blocker?.code, 'daily_batch_staged')
 })
 
-test('o3d-i0o6 r3: THE CONTROL — a pass history whose every journal is retired lets the order go', async () => {
+test('o3d-i0o6 r3: THE CONTROL — a pass history whose every journal is retired (and proved pre-call) lets the order go', async () => {
   // Without this the three above would pass for an order that merely carries a pass history.
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
@@ -648,10 +660,12 @@ test('o3d-i0o6 r3: THE CONTROL — a pass history whose every journal is retired
         syncLog({
           id: 'a2-log-1', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
           referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d',
+          abandonedBeforeRemoteCall: true,
         }),
         syncLog({
           id: 'a2-log-2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'CANCELLED',
           referenceType: 'DailyBatch', referenceId: 'A2-2026-07-21-9f8e7d6c',
+          abandonedBeforeRemoteCall: true,
         }),
       ],
     }),
@@ -966,14 +980,18 @@ test('a POSTED row wins over a QUEUED one when both exist (o3d-v7sy)', async () 
   assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
 })
 
-test('a CANCELLED row with NO external id still does not block', async () => {
-  // The widened match must not turn every retired row into a blocker.
-  const blocker = await findSalesOrderDeleteBlocker(
-    makeTx({ syncLogs: [syncLog({ status: 'CANCELLED' })] }),
-    'order-1',
-    STAMPS,
-  )
-  assert.equal(blocker, null)
+test('a CANCELLED row with NO external id and NO recorded proof BLOCKS (o3d-1e7sl, G1)', async () => {
+  // THE REVERSAL OF THIS FILE'S OLDEST ASSUMPTION. This test said "the widened match must not turn every
+  // retired row into a blocker" and passed a row with no id and no proof. That row is UNKNOWN: a claimed
+  // attempt retired by something that could not see whether the call had already landed (the sale-cancel
+  // sweep over a FAILED/PROCESSING row, the post-time retirement). It keeps blocking, like the FAILED row it
+  // was before it was cancelled. The rows that stay deletable are the PROVEN ones (test above).
+  const row = syncLog({ status: 'CANCELLED' })
+  assert.equal(ledgerStanding(row as never), 'UNKNOWN', 'precondition: no id, no basis, no pre-call proof')
+  const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', STAMPS)
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  assert.match(blocker!.message, /UNPROVEN/)
+  assert.doesNotMatch(blocker!.message, /nothing was posted|never reached/i)
 })
 
 
@@ -1482,4 +1500,147 @@ test('o3d-2k5r r4: an AMBIGUOUS_CREATE park blocks the delete, and does not pres
   assert.equal(blocker?.code, 'wms_order_push_link', 'the delete is refused')
   assert.match(blocker!.message, /no recorded outcome/i)
   assert.doesNotMatch(blocker!.message, /so the WMS order is withdrawn/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-1e7sl (G1, slice 1c of o3d-f709) - THE DELETE GUARD ASKS THE LEDGER-STANDING MODULE, ONE CASE PER STANDING.
+//
+// The guard blocks on every row that MAY HAVE REACHED THE LEDGER (`MAY_HAVE_REACHED_LEDGER_WHERE`): anything
+// except a row PROVEN never to have been sent. The rows below are one per standing, for the document query
+// (rows keyed to the order) and the daily-batch query (rows keyed to the batch the order was staged into).
+// Each case asserts the standing of the fixture BEFORE asserting the decision, so a fixture that drifted into
+// another shape fails on the precondition rather than passing for the wrong reason.
+// ---------------------------------------------------------------------------
+
+type StandingCase = {
+  name: string
+  standing: LedgerStanding
+  row: Partial<SyncLogRow>
+  blocks: boolean
+  /** What the message must say (when it blocks). */
+  says?: RegExp
+  /** What it must NOT say - the sentences that would claim a ledger state the standing does not prove. */
+  neverSays?: RegExp
+}
+
+const NOT_A_FACT = /nothing was posted|never reached|was never sent|nothing has been debited/i
+const STANDING_CASES: StandingCase[] = [
+  {
+    name: 'CONFIRMED_POSTED (SYNCED with the connector\'s id)', standing: 'CONFIRMED_POSTED',
+    row: { status: 'SYNCED', externalTransactionId: 'INV-C' }, blocks: true, says: /is already POSTED as INV-C/, neverSays: /UNPROVEN/,
+  },
+  {
+    name: 'ASSERTED_POSTED (SYNCED with an operator-typed id)', standing: 'ASSERTED_POSTED',
+    row: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, blocks: true,
+    says: /an OPERATOR\s+recorded as POSTED \(INV-T\)/, neverSays: /is already POSTED as/,
+  },
+  {
+    name: 'ASSERTED_NOT_POSTED (operator settled NOT_POSTED: CANCELLED, no id)', standing: 'ASSERTED_NOT_POSTED',
+    row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }, blocks: true,
+    says: /settled as NOT POSTED[\s\S]*assertion, not proof[\s\S]*UNPROVEN/, neverSays: NOT_A_FACT,
+  },
+  {
+    name: 'PROVEN_NOT_POSTED (orphan sweep stamped it pre-call)', standing: 'PROVEN_NOT_POSTED',
+    row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true }, blocks: false,
+  },
+  {
+    name: 'PROVEN_NOT_POSTED (verified reversal, id kept)', standing: 'PROVEN_NOT_POSTED',
+    row: { status: 'CANCELLED', externalTransactionId: 'PAY-9', settlementBasis: 'VERIFIED_REVERSAL' }, blocks: false,
+  },
+  {
+    name: 'UNKNOWN (CANCELLED by a canceller that recorded nothing)', standing: 'UNKNOWN',
+    row: { status: 'CANCELLED' }, blocks: true, says: /UNPROVEN/, neverSays: NOT_A_FACT,
+  },
+  {
+    name: 'UNKNOWN (FAILED, nothing else)', standing: 'UNKNOWN',
+    row: { status: 'FAILED' }, blocks: true, says: /is FAILED[\s\S]*does not prove nothing was posted/,
+  },
+  {
+    name: 'UNKNOWN (a basis this build does not recognise, on SYNCED)', standing: 'UNKNOWN',
+    row: { status: 'SYNCED', externalTransactionId: 'INV-N', settlementBasis: 'SOMETHING_NEWER' }, blocks: true, says: /UNPROVEN/, neverSays: /is already POSTED as/,
+  },
+  {
+    name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK',
+    row: { status: 'PENDING' }, blocks: true, says: /queued to xero/,
+  },
+  {
+    name: 'LIVE_WORK (PROCESSING)', standing: 'LIVE_WORK',
+    row: { status: 'PROCESSING' }, blocks: true, says: /IN FLIGHT/,
+  },
+]
+
+test('[o3d-1e7sl G1] the document query: one case per standing, the standing asserted first', async () => {
+  let blocking = 0
+  let free = 0
+  for (const c of STANDING_CASES) {
+    const row = syncLog(c.row)
+    const standing = ledgerStanding(row as never)
+    console.log(`# G1 document precondition: ${c.name}: ${JSON.stringify(c.row)} => ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', STAMPS)
+    assert.equal(blocker !== null, c.blocks, c.name)
+    if (!c.blocks) { free += 1; continue }
+    blocking += 1
+    assert.equal(blocker!.code, 'accounting_sync_live', c.name)
+    if (c.says) assert.match(blocker!.message, c.says, c.name)
+    if (c.neverSays) assert.doesNotMatch(blocker!.message, c.neverSays, c.name)
+  }
+  console.log(`# G1 document cases: ${STANDING_CASES.length} (${blocking} block, ${free} stay deletable)`)
+  assert.ok(blocking > 0 && free > 0, 'the decision splits both ways, so the agreement is not vacuous')
+  assert.deepEqual(
+    [...new Set(STANDING_CASES.map((c) => c.standing))].sort(),
+    ['ASSERTED_NOT_POSTED', 'ASSERTED_POSTED', 'CONFIRMED_POSTED', 'LIVE_WORK', 'PROVEN_NOT_POSTED', 'UNKNOWN'],
+    'every standing is exercised',
+  )
+})
+
+test('[o3d-1e7sl G1] the daily-batch query: the same standings decide the same way', async () => {
+  let blocking = 0
+  for (const c of STANDING_CASES) {
+    const row = syncLog({
+      ...c.row,
+      id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20',
+    })
+    assert.equal(ledgerStanding(row as never), c.standing, `precondition: ${c.name}`)
+    const blocker = await findSalesOrderDeleteBlocker(
+      makeTx({ syncLogs: [row] }),
+      'order-1',
+      { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
+    )
+    assert.equal(blocker !== null, c.blocks, `batch: ${c.name}`)
+    if (!c.blocks) continue
+    blocking += 1
+    assert.equal(blocker!.code, 'daily_batch_staged', c.name)
+    // A batch row that is neither confirmed nor queued is an unproven claim and must say so.
+    if (c.standing === 'ASSERTED_NOT_POSTED' || (c.standing === 'UNKNOWN' && c.row.status === 'CANCELLED')) {
+      assert.match(blocker!.message, /UNPROVEN/, c.name)
+    }
+    assert.doesNotMatch(blocker!.message, NOT_A_FACT, c.name)
+  }
+  console.log(`# G1 batch cases: ${STANDING_CASES.length}, ${blocking} block`)
+  assert.ok(blocking > 0)
+})
+
+test('[o3d-1e7sl G1] an order whose invoice sync an operator settled NOT_POSTED can no longer be hard-deleted (C1)', async () => {
+  // The headline user-visible effect, isolated: this is the exact row the old comment called "the one place
+  // in this guard where a human's word, and not evidence, is what lets a delete through".
+  const row = syncLog({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' })
+  assert.equal(ledgerStanding(row as never), 'ASSERTED_NOT_POSTED')
+  const blocker = await findSalesOrderDeleteBlocker(makeTx({ syncLogs: [row] }), 'order-1', STAMPS)
+  assert.equal(blocker?.code, 'accounting_sync_live')
+  // and the remedy is one the operator can perform: cancel instead of delete.
+  assert.match(blocker!.message, /cancel\s+the order instead/i)
+})
+
+test('[o3d-1e7sl G1] with several rows the confirmed document outranks an unproven retirement', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ syncLogs: [
+      syncLog({ id: 'unproven', status: 'CANCELLED' }),
+      syncLog({ id: 'asserted-not-posted', status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }),
+      syncLog({ id: 'confirmed', status: 'SYNCED', externalTransactionId: 'INV-REAL' }),
+    ] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.match(blocker!.message, /is already POSTED as INV-REAL/)
 })

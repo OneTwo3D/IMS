@@ -19,6 +19,8 @@ type Refusal = {
 type SyncRow = {
   id: string; connector: string; type: string; referenceType: string; referenceId: string; status: string
   attemptRevision: number; externalTransactionId: string | null; payload: unknown; errorMessage?: string | null
+  /** o3d-1e7sl: absent = NULL (the connector's own writeback), as the double's `findMany` fills in. */
+  settlementBasis?: string | null; abandonedBeforeRemoteCall?: boolean | null
 }
 const refusals: Refusal[] = []
 const syncRows: SyncRow[] = []
@@ -158,7 +160,11 @@ let onSyncRead: (() => void) | null = null
 const syncTable = {
   findMany: async ({ where }: { where: Record<string, unknown> }) => {
     onSyncRead?.()
-    return syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
+    // o3d-1e7sl: the standing columns default to the connector's own writeback (NULL basis, no flag) - what
+    // every row in this file has always meant - so a fixture that does not say reads as confirmed/unflagged.
+    return syncRows
+      .filter((row) => matches(row as unknown as Record<string, unknown>, where))
+      .map((row) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...row }))
   },
   updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
     const hits = syncRows.filter((row) => matches(row as unknown as Record<string, unknown>, where))
@@ -317,6 +323,85 @@ for (const [label, overrides] of [
     assert.equal(syncRows[0]!.status, overrides.status, 'and the sync row is untouched')
   })
 }
+
+/**
+ * o3d-1e7sl (G5, slice 1c of o3d-f709) - THE MARK-HANDLED GUARD READS THE LEDGER-STANDING MODULE, ONE ROW PER STANDING.
+ *
+ * "May IMS already have posted this, or be posting it now?" is asked of every sync row under the posting key.
+ * A row that can still post (PENDING / PROCESSING / FAILED) or holds the slot (SYNCED) is a CANDIDATE; a
+ * RETIRED row (CANCELLED) can never post again, so it does not block - hand-posting and marking the posting
+ * handled is the remedy for an asserted-not-posted or unresolved attempt (D1), and refusing it would be a
+ * dead end. But a retired row that is not PROVEN unsent is not "nothing": the claim REPORTS it, so the
+ * operator is told to look in the ledger first. Each case asserts the row's standing before its decision.
+ */
+test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, and reports an unproven retirement', async () => {
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  type Case = {
+    name: string
+    standing: string
+    row: Partial<SyncRow>
+    claims: boolean
+    cancelled?: boolean
+    reports?: RegExp
+    refuses?: RegExp
+  }
+  const cases: Case[] = [
+    { name: 'LIVE_WORK: PENDING never claimed (provably unsent) is CANCELLED by the claim', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 0 }, claims: true, cancelled: true },
+    { name: 'LIVE_WORK: PENDING already claimed once may have been sent', standing: 'LIVE_WORK', row: { status: 'PENDING', attemptRevision: 2 }, claims: false, refuses: /is PENDING \(queued or in flight\)/ },
+    // THE ISOLATING ARM for "provably unsent" going through the module: a PENDING, never-claimed row with NO id
+    // that carries an operator basis is UNKNOWN (truth-table row 2: no writer produces it). A test that only had
+    // a null-basis row could not tell the module's LIVE_WORK from the old `!externalTransactionId`.
+    { name: 'UNKNOWN: PENDING never claimed but carrying an operator basis is NOT provably unsent', standing: 'UNKNOWN', row: { status: 'PENDING', attemptRevision: 0, settlementBasis: 'OPERATOR_ASSERTION' }, claims: false, refuses: /nothing on the row says whether it reached the ledger/ },
+    { name: 'LIVE_WORK: PROCESSING', standing: 'LIVE_WORK', row: { status: 'PROCESSING', attemptRevision: 1 }, claims: false, refuses: /is PROCESSING \(queued or in flight\)/ },
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-C', attemptRevision: 1 }, claims: false, refuses: /is SYNCED with document DOC-C \(confirmed by the connector\)/ },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-T', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, claims: false, refuses: /TYPED IN BY AN OPERATOR/ },
+    { name: 'UNKNOWN: FAILED, nothing else', standing: 'UNKNOWN', row: { status: 'FAILED', attemptRevision: 1 }, claims: false, refuses: /nothing on the row says whether it reached the ledger/ },
+    { name: 'ASSERTED_NOT_POSTED: retired, does not block, REPORTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, claims: true, reports: /settled by an operator as NOT posted \(an assertion, not proof that it did not post\)/ },
+    { name: 'UNKNOWN: retired with no proof, does not block, REPORTED', standing: 'UNKNOWN', row: { status: 'CANCELLED', attemptRevision: 1 }, claims: true, reports: /nothing on the row says whether it reached the ledger/ },
+    { name: 'PROVEN_NOT_POSTED: retired with its pre-call proof, nothing to report', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true, attemptRevision: 0 }, claims: true },
+  ]
+  let claimed = 0
+  let refused = 0
+  let reported = 0
+  for (const [i, c] of cases.entries()) {
+    refusals.length = 0
+    syncRows.length = 0
+    activity.length = 0
+    refusals.push(refusal(`g5-${i}`, 'stock_receipt_journal'))
+    const row = sync(`s-${i}`, refusals[0]!, c.row)
+    syncRows.push(row)
+    const standing = ledgerStanding({
+      status: row.status, externalTransactionId: row.externalTransactionId,
+      settlementBasis: row.settlementBasis ?? null, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G5 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    const result = await claimAccountingPostingRefusalForHandPostingAction(`g5-${i}`)
+    assert.equal(ok(result), c.claims, c.name)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting')
+    if (c.claims) {
+      claimed += 1
+      assert.equal(syncRows[0]!.status === 'CANCELLED', c.cancelled === true || c.row.status === 'CANCELLED', `${c.name}: only a provably unsent row is cancelled by the claim`)
+      const retired = (note?.metadata?.retiredUnproven ?? []) as string[]
+      if (c.reports) {
+        reported += 1
+        assert.equal(retired.length, 1, c.name)
+        assert.match(retired[0]!, c.reports, c.name)
+        assert.match(String((note as unknown as { description?: string }).description), /look in the ledger before posting it by hand/, c.name)
+      } else {
+        assert.deepEqual(retired, [], `${c.name}: nothing unproven to report`)
+      }
+    } else {
+      refused += 1
+      assert.match(errorOf(result), c.refuses!, c.name)
+      assert.equal(syncRows[0]!.status, c.row.status, `${c.name}: a refused claim writes nothing`)
+    }
+  }
+  console.log(`# G5 cases: ${cases.length}; claimed ${claimed}; refused ${refused}; reported-unproven ${reported}`)
+  assert.ok(claimed > 0 && refused > 0 && reported === 2)
+  assert.equal(cases.length, 10)
+})
 
 test('[o3d-j625 r7] a processor claiming the row between the read and the cancel makes the mark fail, not cancel a row in flight', async () => {
   const row = refusal('r4', 'landed_cost_cogs_journal', { type: 'COGS_JOURNAL' })

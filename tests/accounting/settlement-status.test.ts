@@ -10,6 +10,7 @@ import {
   type PaymentSyncRow,
 } from '@/lib/domain/accounting/settlement-status'
 import { registrationLedgerStanding } from '@/lib/domain/accounting/payment-ledger-hold'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInvoicePaymentSyncRows } from '@/lib/domain/accounting/invoice-payment-enqueue'
 
 /**
@@ -597,6 +598,40 @@ test('[o3d-anu8, C1] a CANCELLED row an operator asserted NEVER posted is LEDGER
   // and on the not-paid-locally path too
   const unpaid = settlementStatus({ ...base, paidLocally: false, payment: settled })
   assert.equal(unpaid.status, 'LEDGER_UNDECIDED')
+})
+
+test('[o3d-1e7sl D9] the verdict states its BASIS for every standing, on the paid-locally AND the not-paid-locally branch - and an asserted NOT_POSTED is the same sentence on both', () => {
+  // The not-paid-locally branch kept the FAILED-attempt wording ("ATTEMPTED in the ledger but the outcome was
+  // never recorded", basis NONE) for an asserted NOT_POSTED row. Nobody attempted anything on the record - a
+  // person SAID nothing posted. One standing, one account, whichever side of "paid locally" the order is.
+  type Case = { name: string; standing: string; payment: PaymentSyncRow; paidLocally: boolean; status: string; basis: string; says?: RegExp; never?: RegExp }
+  const asserted = row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })
+  const cases: Case[] = [
+    { name: 'ASSERTED_NOT_POSTED, paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: true, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS never read/, never: /ATTEMPTED|never told/ },
+    { name: 'ASSERTED_NOT_POSTED, NOT paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: false, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS never read/, never: /ATTEMPTED|never told|outcome was never recorded/ },
+    { name: 'ASSERTED_POSTED (SYNCED typed id), NOT paid locally', standing: 'ASSERTED_POSTED', payment: row({ settlementBasis: 'OPERATOR_ASSERTION' }), paidLocally: false, status: 'LEDGER_UNMATCHED', basis: 'OPERATOR_ASSERTION', says: /OPERATOR ASSERTION/, never: /ledger shows it settled/ },
+    { name: 'CONFIRMED_POSTED (SYNCED connector id), NOT paid locally', standing: 'CONFIRMED_POSTED', payment: row({}), paidLocally: false, status: 'LEDGER_UNMATCHED', basis: 'LEDGER_CONFIRMED', says: /ledger shows it settled/ },
+    { name: 'UNKNOWN (FAILED, no id), NOT paid locally', standing: 'UNKNOWN', payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'socket hang up' }), paidLocally: false, status: 'LEDGER_UNDECIDED', basis: 'NONE', says: /ATTEMPTED[\s\S]*not proof that nothing posted/ },
+    { name: 'PROVEN_NOT_POSTED (verified reversal), NOT paid locally', standing: 'PROVEN_NOT_POSTED', payment: row({ status: 'CANCELLED', externalTransactionId: 'PAY-9', settlementBasis: 'VERIFIED_REVERSAL' }), paidLocally: false, status: 'UNPAID', basis: 'NONE' },
+    { name: 'LIVE_WORK (PENDING), paid locally', standing: 'LIVE_WORK', payment: row({ status: 'PENDING', externalTransactionId: null }), paidLocally: true, status: 'AWAITING_LEDGER', basis: 'NONE' },
+  ]
+  let withBasis = 0
+  for (const c of cases) {
+    const standing = ledgerStanding({
+      status: c.payment.status, externalTransactionId: c.payment.externalTransactionId ?? null,
+      settlementBasis: c.payment.settlementBasis ?? null, abandonedBeforeRemoteCall: c.payment.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# D9 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const v = settlementStatus({ ...base, paidLocally: c.paidLocally, payment: c.payment, totalForeign: 100 })
+    assert.equal(v.status, c.status, c.name)
+    assert.equal(v.basis, c.basis, c.name)
+    if (c.basis !== 'NONE') withBasis += 1
+    if (c.says) assert.match(v.detail, c.says, c.name)
+    if (c.never) assert.doesNotMatch(v.detail, c.never, c.name)
+  }
+  console.log(`# D9 cases: ${cases.length}; verdicts naming a basis: ${withBasis}`)
+  assert.ok(withBasis >= 3)
 })
 
 test('[o3d-anu8] an ordinary connector cancellation is unchanged', () => {

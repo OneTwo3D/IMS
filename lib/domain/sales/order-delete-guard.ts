@@ -2,7 +2,11 @@ import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-d
 import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
 import { provesNoRemoteWmsCall } from '@/lib/domain/wms/order-push-sweep'
-import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import {
+  MAY_HAVE_REACHED_LEDGER_WHERE,
+  ledgerStanding,
+  type LedgerStanding,
+} from '@/lib/domain/accounting/ledger-standing'
 import {
   UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
   UNRESOLVED_WC_ORDER_ROW_FAMILIES,
@@ -49,8 +53,11 @@ import {
  * than merely protected from deletion) are tracked separately.
  */
 
-/**
- * Sync-log statuses that must block an irreversible delete.
+/*
+ * Which sync-log rows must block an irreversible delete: every row that MAY HAVE REACHED THE LEDGER
+ * (`MAY_HAVE_REACHED_LEDGER_WHERE` in lib/domain/accounting/ledger-standing.ts) - everything except a
+ * row PROVEN never to have been sent. (o3d-1e7sl / o3d-f709: this used to be a status list plus a
+ * "carries an external id" arm, and a CANCELLED row without an id fell through both.)
  *
  * PENDING / PROCESSING / SYNCED are "queued, in flight, or already in the external ledger" —
  * obviously blocking.
@@ -71,7 +78,6 @@ import {
  * operation, and the blocker message says so. Recording pre-call rejection distinctly — so it
  * can be safely ignored here — is the rest of o3d-ju8t.
  */
-export const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] as const
 
 /**
  * o3d-v7sy — the reference types this guard reads as evidence, re-exported from the constant
@@ -440,110 +446,134 @@ export async function findSalesOrderDeleteBlocker(
   if (shipmentIds.length > 0) {
     orderKeyed.push({ referenceType: SHIPMENT_REFERENCE_TYPE, referenceId: { in: shipmentIds } })
   }
-  // externalTransactionId is the POST evidence, and status is not a proxy for it: Xero reverts an
-  // already-posted row to PENDING when follow-up work fails, KEEPING the external id, and
-  // cancelOrphanedAccountingSyncRows can then move that row to CANCELLED without clearing it.
-  // So the STATUS FILTER cannot come first — a posted-but-cancelled row would not even be
-  // selected, and if the back-reference also failed there is no accountingInvoiceId either. The
-  // match is therefore "live status OR carries an external id", whatever the status (o3d-v7sy).
+  // WHICH ROWS BLOCK: every row that MAY HAVE REACHED THE LEDGER, asked of the ledger-standing module
+  // (`MAY_HAVE_REACHED_LEDGER_WHERE`), not of a status list (o3d-1e7sl, slice 1c of o3d-f709).
   //
-  // DELIBERATELY NOT COVERED (o3d-anu8): a row an OPERATOR settled as NOT_POSTED. It lands CANCELLED
-  // with externalTransactionId left NULL, so it matches neither arm above and the blocker for it
-  // disappears — and that is the intended consequence, not an oversight. `buildSettlementData` says
-  // so in as many words where it explains why the NOT_POSTED patch must never WRITE and never CLEAR
-  // an external id: "leaving the column untouched leaves it NULL, which is what makes the order
-  // deletable again". The alternative is the state o3d-nf9i exists to end, where a FAILED row that
-  // nothing can resolve blocks the delete for ever. What makes it acceptable is that the assertion is
-  // an audited act with a person's name on it (app/actions/accounting-settlement.ts), not that the
-  // system has established anything — so this is the one place in this guard where a human's word,
-  // and not evidence, is what lets a delete through.
+  // The predicate this replaced was "a live status OR carries an external id", and it was the
+  // laundering this module exists to end. A CANCELLED row with NO id matched neither arm, so the
+  // blocker for it disappeared - and three different things leave that shape:
   //
-  // NOT COVERED (o3d-sref): a STALE PROCESSING claim that the orphan sweep retires to CANCELLED
-  // before its worker wrote a result. There is no external id yet, so nothing here can see it,
-  // and a late remote success then strands the document. Closing that needs the orphan sweep to
-  // keep such rows ambiguous rather than retired, and the processors to fence their writeback on
-  // the claim they hold — the guard cannot do it alone.
+  //   * a row an OPERATOR settled as NOT_POSTED (ASSERTED_NOT_POSTED). The old comment here called that
+  //     "the one place in this guard where a human's word, and not evidence, is what lets a delete
+  //     through". It is no longer: C1 says a person's NOT_POSTED is not proof (a lost response, a late
+  //     webhook and a hand-post all leave the same row), so it KEEPS BLOCKING.
+  //   * a FAILED row that a sale cancellation retired. FAILED itself blocks (o3d-ju8t: "failed" does
+  //     not mean "not posted"), and cancelling it cannot have established otherwise.
+  //   * a claimed PROCESSING row that was retired while its worker may have been mid-post (o3d-sref).
+  //
+  // What stays deletable is exactly what the ledger-standing module PROVES unsent: the orphan sweep's
+  // stamped pre-call cancellations, a never-claimed PENDING row retired by a sale cancellation, a
+  // BILL_PAYMENT supersession, and a payment IMS verified gone from the ledger (VERIFIED_REVERSAL).
+  //
+  // The id half of the old predicate is subsumed: a posted-then-cancelled row KEEPS the id Xero issued
+  // (a failed follow-up reverts a posted row to PENDING keeping it, and the orphan sweep can then
+  // retire it), and it is still matched, because a CANCELLED row naming a document is not proven
+  // absent from the ledger unless it was VERIFIED_REVERSAL (o3d-v7sy).
+  //
+  // NOT COVERED (o3d-sref): a STALE PROCESSING claim retired to CANCELLED before its worker wrote a
+  // result is now UNKNOWN (no pre-call stamp) and therefore blocks; a late remote success is no longer
+  // stranded by a vanished blocker. The processors fencing their writeback is the rest of that issue.
   const candidateDocuments = await tx.accountingSyncLog.findMany({
     where: {
       OR: orderKeyed,
-      AND: [{
-        OR: [
-          { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
-          { externalTransactionId: { not: null } },
-        ],
-      }],
+      AND: [MAY_HAVE_REACHED_LEDGER_WHERE],
     },
-    // o3d-anu8: settlementBasis, because SYNCED-plus-an-external-id is written by TWO things — the
-    // connector's own writeback after the ledger answered, and an operator typing a document id into
-    // the settlement dialog. This guard reports the first as fact; without this column it reports the
-    // second as fact too.
-    select: { id: true, connector: true, type: true, status: true, externalTransactionId: true, settlementBasis: true },
+    // o3d-anu8 / o3d-1e7sl: every column `ledgerStanding` reads, because SYNCED-plus-an-external-id
+    // is written by TWO things - the connector's own writeback after the ledger answered, and an
+    // operator typing a document id into the settlement dialog - and CANCELLED-plus-no-id by three.
+    select: {
+      id: true, connector: true, type: true, status: true, externalTransactionId: true,
+      settlementBasis: true, abandonedBeforeRemoteCall: true,
+    },
   })
 
   // Order matters: with several rows, findFirst could return a merely QUEUED one ahead of a
   // POSTED one and advise cancelling a document that is already in the ledger. Posted evidence
-  // wins, then FAILED (unknown), then in-flight, then queued — most severe remedy first.
+  // wins, then asserted claims, then unproven (FAILED / CANCELLED-without-proof), then in-flight,
+  // then queued - most severe remedy first.
   //
-  // o3d-anu8 splits the top rank in two. An operator-ASSERTED post still blocks the delete and still
-  // needs a reversal, so it stays above FAILED; but where a connector-confirmed row exists as well,
-  // that is the one to show, because its instruction rests on something the ledger said.
-  const rank = (row: { status: string; externalTransactionId: string | null; settlementBasis: string | null }): number => {
-    const posted = Boolean(row.externalTransactionId) || row.status === 'SYNCED'
-    if (posted) return isOperatorAssertedSettlement(row.settlementBasis) ? 1 : 0
-    if (row.status === 'FAILED') return 2
-    if (row.status === 'PROCESSING') return 3
-    return 4
+  // A connector-CONFIRMED row ranks above an operator-ASSERTED post (o3d-anu8): both block, but the
+  // confirmed one is the row to show, because its instruction rests on something the ledger said.
+  const rank = (standing: LedgerStanding, status: string): number => {
+    if (standing === 'CONFIRMED_POSTED') return 0
+    if (standing === 'ASSERTED_POSTED') return 1
+    if (standing === 'ASSERTED_NOT_POSTED') return 2
+    // UNKNOWN covers a FAILED row and a CANCELLED row nobody proved pre-call.
+    if (standing === 'UNKNOWN' || standing === 'PROVEN_NOT_POSTED') return 3
+    return status === 'PROCESSING' ? 4 : 5
   }
-  const liveDocument = [...candidateDocuments].sort((a, b) => rank(a) - rank(b))[0] ?? null
-  if (liveDocument) {
+  const standings = candidateDocuments.map((row) => ({ row, standing: ledgerStanding(row) }))
+  const ranked = [...standings].sort((a, b) => rank(a.standing, a.row.status) - rank(b.standing, b.row.status))[0] ?? null
+  const liveDocument = ranked?.row ?? null
+  if (liveDocument && ranked) {
+    const documentStanding = ranked.standing
+    const named = liveDocument.externalTransactionId?.trim() ?? ''
     blockers.push({
       code: 'accounting_sync_live',
-      // The remedy depends on whether the document is ALREADY IN THE LEDGER, which is what
-      // externalTransactionId records — not on status alone. cancelOrderInvoiceSync retires
-      // PENDING / FAILED / stale-PROCESSING rows and explicitly leaves SYNCED alone, because a
-      // cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
-      // document leaves a live receivable against a CANCELLED order.
-      message: (liveDocument.status === 'SYNCED' || liveDocument.externalTransactionId)
-        // o3d-anu8: SAY WHOSE CLAIM IT IS. "is already POSTED as X" is a statement about the ledger,
-        // and on a settled row nobody has read the ledger: a human typed X in, IMS made no call and
-        // compared no figure. The blocker is the same (the order must not be deleted while a document
-        // may stand against it) but the instruction is not — "reverse it" assumes the document exists,
-        // which is the very thing that has not been established.
-        ? isOperatorAssertedSettlement(liveDocument.settlementBasis)
+      message: documentStanding === 'CONFIRMED_POSTED'
+        // The remedy depends on whether the document is ALREADY IN THE LEDGER. cancelOrderInvoiceSync
+        // retires PENDING / FAILED / stale-PROCESSING rows and explicitly leaves SYNCED alone, because
+        // a cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
+        // document leaves a live receivable against a CANCELLED order.
+        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+          + `is already POSTED${named ? ` as ${named}` : ''}. `
+          + 'It needs an explicit reversal or credit note in the accounting system — '
+          + 'cancelling the order does NOT reverse a posted document.'
+        : documentStanding === 'ASSERTED_POSTED'
+          // o3d-anu8: SAY WHOSE CLAIM IT IS. "is already POSTED as X" is a statement about the ledger,
+          // and on a settled row nobody has read the ledger: a human typed X in, IMS made no call and
+          // compared no figure. The blocker is the same (the order must not be deleted while a document
+          // may stand against it) but the instruction is not - "reverse it" assumes the document exists,
+          // which is the very thing that has not been established.
           ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
-            + `recorded as POSTED${liveDocument.externalTransactionId ? ` (${liveDocument.externalTransactionId})` : ''}. `
+            + `recorded as POSTED${named ? ` (${named})` : ''}. `
             + 'That is an assertion, not a confirmation: IMS never made the call and never read the document, so this id '
             + 'is what somebody typed in. Open it in the accounting system first. If the document is there it needs an '
             + 'explicit reversal or credit note — cancelling the order does NOT reverse a posted document; if it is not '
             + 'there, the settlement was recorded in error and that is what has to be corrected before anything is deleted.'
-          : `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-            + `is already POSTED${liveDocument.externalTransactionId ? ` as ${liveDocument.externalTransactionId}` : ''}. `
-            + 'It needs an explicit reversal or credit note in the accounting system — '
-            + 'cancelling the order does NOT reverse a posted document.'
-        : liveDocument.status === 'FAILED'
-          ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
-            + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
-            + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
-          : liveDocument.status === 'PROCESSING'
-            // A claimed PROCESSING row is deliberately NOT retired by cancellation — the remote call
-            // may be in flight — so promising a cancel would be wrong here too.
-            //
-            // "Wait for it to settle" is only true while the row's connector is ENABLED. Since
-            // o3d-sref the orphan sweep no longer retires a stale claim, so a row belonging to a
-            // switched-off connector stays PROCESSING indefinitely: no processor runs for it, and
-            // nothing else terminalises it. Telling that operator to wait is advice that provably
-            // cannot work, which is how a blocker becomes a dead end — so both cases are named.
-            ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
-              + `is IN FLIGHT. If ${liveDocument.connector} is still the active accounting connector, wait `
-              + 'for it to settle, then delete or reverse depending on the outcome. If it has been '
-              + 'switched off, this will NOT settle on its own: it can only be reclaimed by making '
-              + `${liveDocument.connector} the EXCLUSIVELY active connector again — enabling it alongside `
-              + 'another one is not enough, because only one accounting connector is ever dispatched to. '
-              + 'If that is not possible, this order cannot currently be deleted (o3d-osl8): check the '
-              + 'ledger for the document, because whether it exists decides whether deleting the order '
-              + 'would strand it.'
-            : `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
-              + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`,
+          : documentStanding === 'ASSERTED_NOT_POSTED'
+            // o3d-1e7sl (C1): a person's "NOT POSTED" is a claim, not proof, and it KEEPS BLOCKING. Say
+            // that it is a claim, that IMS has not checked, and never that nothing was posted.
+            ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
+              + 'settled as NOT POSTED. That is an assertion, not proof: IMS never asked the accounting system, and a lost '
+              + 'response or a late webhook leaves the same row behind, so whether the document reached the ledger is '
+              + 'UNPROVEN. Check the accounting system for it. If it is there it needs an explicit reversal or credit note; '
+              + 'if it is not, this order still cannot be hard-deleted from here (nothing records that check yet) — cancel '
+              + 'the order instead, which keeps the record.'
+            : liveDocument.status === 'FAILED'
+              ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
+                + 'A failed sync does not prove nothing was posted — the remote call happens before the result is written back, '
+                + 'so the document may exist in the ledger. Check the connector, then resolve the sync log.'
+              : liveDocument.status === 'PROCESSING'
+                // A claimed PROCESSING row is deliberately NOT retired by cancellation — the remote call
+                // may be in flight — so promising a cancel would be wrong here too.
+                //
+                // "Wait for it to settle" is only true while the row's connector is ENABLED. Since
+                // o3d-sref the orphan sweep no longer retires a stale claim, so a row belonging to a
+                // switched-off connector stays PROCESSING indefinitely: no processor runs for it, and
+                // nothing else terminalises it. Telling that operator to wait is advice that provably
+                // cannot work, which is how a blocker becomes a dead end — so both cases are named.
+                ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+                  + `is IN FLIGHT. If ${liveDocument.connector} is still the active accounting connector, wait `
+                  + 'for it to settle, then delete or reverse depending on the outcome. If it has been '
+                  + 'switched off, this will NOT settle on its own: it can only be reclaimed by making '
+                  + `${liveDocument.connector} the EXCLUSIVELY active connector again — enabling it alongside `
+                  + 'another one is not enough, because only one accounting connector is ever dispatched to. '
+                  + 'If that is not possible, this order cannot currently be deleted (o3d-osl8): check the '
+                  + 'ledger for the document, because whether it exists decides whether deleting the order '
+                  + 'would strand it.'
+                : documentStanding === 'LIVE_WORK'
+                  ? `Cannot delete an order with accounting documents queued to ${liveDocument.connector} `
+                    + `(${liveDocument.type}, ${liveDocument.status}). Cancel the order instead so the document is retired before it posts.`
+                  // UNKNOWN on a row that is neither FAILED nor in flight: a CANCELLED row no writer proved
+                  // pre-call (the cancellation may have retired a request already on the wire), or a row
+                  // whose basis this build does not recognise. Never "nothing was posted".
+                  : `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}, `
+                    + `${liveDocument.status}) is not PROVEN to have stayed out of the accounting system: the row was `
+                    + 'retired or settled without a recorded pre-call proof, and a cancellation may have retired a request '
+                    + 'that was already on the wire. Whether the document exists is UNPROVEN - check the accounting system '
+                    + `for it. If it is there it needs an explicit reversal or credit note${named ? ` (${named})` : ''}; `
+                    + 'if it is not, cancel the order instead - this one cannot be hard-deleted from here.',
     })
   }
 
@@ -651,23 +681,14 @@ export async function findSalesOrderDeleteBlocker(
       ? null
       : alternatives.length === 1 ? alternatives[0] : { OR: alternatives }
     if (!batchWhere) continue
-    // o3d-f709 — THE SAME "live status OR post evidence" MATCH AS THE DOCUMENT QUERY ABOVE, and it
-    // was an AND until this issue. The status set was the sole test and it sat at the top level of
-    // the `where`, so it was conjoined with the type and reference clauses: a CANCELLED batch row
-    // was excluded outright, EVEN ONE CARRYING THE JOURNAL ID XERO ISSUED.
+    // o3d-f709 / o3d-1e7sl - THE SAME "MAY HAVE REACHED THE LEDGER" MATCH AS THE DOCUMENT QUERY ABOVE.
     //
-    // That is reachable by exactly the route the document query's own comment (above) already
-    // describes, and nothing about it is specific to sales-invoice rows: a posted row is put BACK to
-    // PENDING when follow-up work fails, KEEPING its external id (`postedRowRetryColumns`, and
-    // Xero's single-statement recovery write), and `cancelOrphanedRowsUnderLock` then matches
-    // `status = 'PENDING'` — with NO type filter at all — and retires it to CANCELLED without
-    // clearing that id. The journal is in the ledger; the blocker vanished; the hard delete
-    // cascaded away the shipments and stamps the journal was built from.
-    //
-    // The CANCELLED-with-NO-id row is still deliberately not a blocker here, for the reason the
-    // document query gives at length: that is the shape a NOT_POSTED settlement leaves behind, and
-    // re-blocking on it would re-strand every order an operator has settled. (o3d-f709 C1: whether an
-    // ASSERTED one should keep blocking is slice 1c's G1; the census guard declares it PENDING.)
+    // It was an AND of a status set until o3d-f709: a CANCELLED batch row was excluded outright, EVEN
+    // ONE CARRYING THE JOURNAL ID XERO ISSUED (a posted row put BACK to PENDING by a failed follow-up
+    // keeps its id, and `cancelOrphanedRowsUnderLock` retired it to CANCELLED without clearing it). Slice
+    // 1c closes the other half: a CANCELLED row with NO id was still "deliberately not a blocker" because
+    // that is the shape a NOT_POSTED settlement leaves, and C1 says that assertion is not proof. The
+    // orphan sweep's own cancellation of a batch row is stamped pre-call and stays deletable.
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {
         type: batch.type as Prisma.AccountingSyncLogWhereInput['type'],
@@ -676,21 +697,26 @@ export async function findSalesOrderDeleteBlocker(
         // may bring its own top-level `OR` (the alternatives, or dailyBatchReferenceWhere), so a
         // sibling `OR` key here would be OVERWRITTEN by it - silently, and in the permissive direction.
         ...batchWhere,
-        AND: [{
-          OR: [
-            { status: { in: [...LIVE_ACCOUNTING_SYNC_STATUSES] } },
-            { externalTransactionId: { not: null } },
-          ],
-        }],
+        AND: [MAY_HAVE_REACHED_LEDGER_WHERE],
       },
-      select: { id: true, connector: true, referenceId: true, status: true },
+      select: {
+        id: true, connector: true, referenceId: true, status: true, externalTransactionId: true,
+        settlementBasis: true, abandonedBeforeRemoteCall: true,
+      },
     })
     if (!liveBatch) continue
+    const batchStanding = ledgerStanding(liveBatch)
     blockers.push({
       code: 'daily_batch_staged',
       message:
         `Cannot delete an order included in the ${batch.label} daily accounting batch ` +
         `(${liveBatch.connector} ${liveBatch.referenceId}, ${liveBatch.status}). ` +
+        // C1: a batch row that is neither confirmed nor queued is an unproven claim, and the sentence
+        // says so instead of implying the journal exists or does not.
+        (batchStanding === 'ASSERTED_NOT_POSTED' || batchStanding === 'UNKNOWN'
+          ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
+            + 'or it was retired with no recorded pre-call proof): check the accounting system for it. '
+          : '') +
         `The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.`,
     })
   }

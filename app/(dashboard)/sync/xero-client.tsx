@@ -49,6 +49,7 @@ import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { describeSyncRowSettleability, isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
+import { describeDocumentIdClaim, describeLedgerStanding, documentIdText } from '@/lib/domain/accounting/ledger-standing-display'
 import { SettleSyncRowControl } from './settle-sync-row-control'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
@@ -1142,34 +1143,50 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                       // Read from the COLUMN — the note the settlement writes into errorMessage shows
                       // two cells over, but it is free text and both connectors overwrite that field.
                       const assertedBasis = isOperatorAssertedSettlement(log.settlementBasis)
+                      // o3d-1e7sl (D2): THE ROW'S STANDING, not only whose id it is. A CANCELLED badge reads as
+                      // "nothing was sent" whether the orphan sweep PROVED it or an operator merely said so (C1: a
+                      // person's NOT_POSTED is a claim), and an id reads as "the ledger holds it" whether the connector
+                      // wrote it or somebody typed it. One function says which (`describeLedgerStanding`), so this
+                      // page and every other cannot describe one row two ways.
+                      const standingRow = {
+                        status: log.status,
+                        externalTransactionId: log.externalTransactionId,
+                        settlementBasis: log.settlementBasis,
+                        abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall,
+                      }
+                      const standing = describeLedgerStanding(standingRow)
+                      const idClaim = describeDocumentIdClaim(standingRow)
                       return (
                         <TableRow key={log.id}>
                           <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
                           <TableCell>
                             <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
                             {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
-                            {assertedBasis && (
+                            {standing.label !== null && (
                               <Badge
                                 variant="outline"
-                                className="ml-1 text-[10px] border-amber-500 text-amber-600 dark:text-amber-400"
-                                title={
-                                  'Recorded by an OPERATOR, not confirmed by Xero. IMS made no call, read no document and '
-                                  + 'compared no amount — the external id beside this row is one somebody typed in. Verify it '
-                                  + 'in the accounting system.'
-                                }
+                                data-standing={standing.standing}
+                                className={`ml-1 text-[10px] ${
+                                  standing.tone === 'proven-unsent'
+                                    ? 'border-muted-foreground text-muted-foreground'
+                                    : 'border-amber-500 text-amber-600 dark:text-amber-400'
+                                }`}
+                                title={standing.detail}
                               >
-                                asserted
+                                {standing.label}
                               </Badge>
                             )}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
                           <TableCell
                             className={`font-mono text-xs ${assertedBasis ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}
-                            title={assertedBasis && log.externalTransactionId
-                              ? `${log.externalTransactionId} — asserted by an operator, not confirmed by Xero.`
-                              : log.externalTransactionId ?? undefined}
+                            title={idClaim === null
+                              ? undefined
+                              : assertedBasis
+                                ? `${idClaim} - asserted by an operator, not confirmed by Xero.`
+                                : idClaim}
                           >
-                            {log.externalTransactionId?.slice(0, 12) ?? '—'}
+                            {idClaim === null ? '—' : documentIdText(standingRow).slice(0, 12)}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{formatDateTime(log.createdAt)}</TableCell>
                           <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
@@ -1223,7 +1240,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                               */}
                               {log.status === 'CANCELLED'
                                 && log.referenceType === 'SalesOrder'
-                                && log.externalTransactionId
+                                && idClaim !== null
                                 && !assertedBasis && (
                                 <Button
                                   variant="ghost"

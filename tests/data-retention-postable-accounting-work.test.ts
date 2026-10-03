@@ -696,24 +696,98 @@ test('[o3d-v7sy] the exemption is NOT blanket — a SYNCED row no such reader lo
   assert.ok(!store.accounting.some((row) => row.id === 'cancelled'))
 })
 
-test('[o3d-v7sy] every status the delete guard blocks on is one retention cannot delete', async () => {
-  // THE JOIN BETWEEN THE TWO HALVES, asserted rather than left to be noticed. Retention keeps the
-  // guard's evidence through TWO clauses that know nothing of each other: POSTABLE_ACCOUNTING_SYNC_
-  // STATUSES (o3d-y14) and EXTERNAL_DOCUMENT_EVIDENCE_WHERE's SYNCED arm. If a status is ever added
-  // to LIVE_ACCOUNTING_SYNC_STATUSES and to neither of those, the guard blocks on rows retention
-  // deletes and nothing else in this suite would say so.
-  const { LIVE_ACCOUNTING_SYNC_STATUSES } = await import('@/lib/domain/sales/order-delete-guard')
-  const { EXTERNAL_DOCUMENT_EVIDENCE_STATUS } = await import(
-    '@/lib/domain/accounting/external-document-evidence'
+test('[o3d-v7sy / o3d-1e7sl] EVERY row the delete guard blocks on is one retention cannot delete - the cross product', async () => {
+  // THE JOIN BETWEEN THE TWO HALVES, asserted rather than left to be noticed. It used to compare two status
+  // lists (the guard's LIVE_ACCOUNTING_SYNC_STATUSES against retention's postable set + SYNCED). Since
+  // o3d-1e7sl the guard blocks on `MAY_HAVE_REACHED_LEDGER_WHERE` - everything except a row PROVEN never to
+  // have been sent - so the join is over ROWS: build every status x id x basis x pre-call-flag combination,
+  // keyed to the order (a reference type the guard reads), run the REAL purge over them, and assert that no
+  // row the guard's own predicate matches was deleted. A blocking row retention deletes is the whole of
+  // o3d-v7sy: the guard would then answer "nothing posted" about an order whose document stands.
+  const { MAY_HAVE_REACHED_LEDGER_WHERE } = await import('@/lib/domain/accounting/ledger-standing')
+  const { matchesWhere } = await import('@/tests/helpers/shopping-sync-log-fake')
+  const purgeExpiredData = await loadPurge()
+  store.settingRows = [{ key: 'retention_sync_logs_months', value: '6' }]
+  const population: SyncRow[] = []
+  let n = 0
+  for (const status of ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED', 'CANCELLED']) {
+    for (const externalTransactionId of [null, '', 'DOC-1']) {
+      for (const settlementBasis of [null, 'OPERATOR_ASSERTION', 'OPERATOR_RELEASE', 'VERIFIED_REVERSAL', 'SOMETHING_NEWER']) {
+        for (const abandonedBeforeRemoteCall of [null, false, true]) {
+          n += 1
+          population.push({
+            id: `row-${n}`, createdAt: OLD, status, type: 'SALES_INVOICE', referenceType: 'SalesOrder',
+            externalTransactionId, settlementBasis, abandonedBeforeRemoteCall, backReferenceCheckedAt: new Date(),
+            payload: { name: 'A Person' },
+          })
+        }
+      }
+    }
+  }
+  store.accounting = population.map((row) => ({ ...row }))
+  const blocking = population.filter((row) => matchesWhere(row as unknown as Record<string, unknown>, MAY_HAVE_REACHED_LEDGER_WHERE as Record<string, unknown>))
+  await purgeExpiredData()
+  const survivors = new Set(store.accounting.map((row) => row.id))
+  const deletedBlocking = blocking.filter((row) => !survivors.has(row.id))
+  const deletedFree = population.filter((row) => !blocking.includes(row) && !survivors.has(row.id))
+  console.log(`# retention join: population ${population.length}; guard blocks on ${blocking.length}; blocking rows deleted: ${deletedBlocking.length}; free rows deleted: ${deletedFree.length}`)
+  assert.deepEqual(deletedBlocking.map((row) => row.id), [], 'a blocking row retention can delete is the whole of o3d-v7sy')
+  assert.equal(population.length, 5 * 3 * 5 * 3)
+  assert.ok(blocking.length > 0 && deletedFree.length > 0, 'the population splits both ways: retention is not blanket and the guard is not empty')
+})
+
+test('[o3d-1e7sl R3 / D5] an operator-ASSERTED posted row survives the purge whatever it is keyed to, and is COMPACTED, never deleted', async () => {
+  // THE GAP. Retention's "only local record of a document" set was keyed on three reference types. An
+  // asserted SYNCED row keyed to anything else (a credit note, a bill, a stock journal...) aged out, and an
+  // operator-typed document id - which the back-reference sweep refuses to write onto the document it belongs
+  // to - disappeared with it: the sync row is the WHOLE of the record. D5: retained as a compacted tombstone.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting.push(
+    {
+      id: 'asserted-cogs', createdAt: OLD, status: 'SYNCED', type: 'COGS_JOURNAL', referenceType: 'CogsEntry',
+      externalTransactionId: 'TYPED-1', settlementBasis: 'OPERATOR_ASSERTION', payload: { customer: 'A Person' },
+    },
+    {
+      id: 'asserted-cancelled-sale', createdAt: OLD, status: 'CANCELLED', type: 'COGS_JOURNAL', referenceType: 'CogsEntry',
+      externalTransactionId: 'TYPED-2', settlementBasis: 'OPERATOR_ASSERTION', payload: { customer: 'A Person' },
+    },
   )
+  console.log(`# R3 precondition: rows before the purge ${store.accounting.length}; asserted rows seeded 2; control 'synced' (same reference type, connector basis) present: ${store.accounting.some((row) => row.id === 'synced')}`)
+  assert.ok(store.accounting.some((row) => row.id === 'synced'), 'precondition: the control row is in the store before the purge')
+  const result = await purgeExpiredData()
+  const kept = store.accounting.find((row) => row.id === 'asserted-cogs')
+  assert.ok(kept, 'the asserted SYNCED row survives the age-based delete')
+  assert.ok(store.accounting.some((row) => row.id === 'asserted-cancelled-sale'), 'and so does the cancelled-sale settlement that names a typed id')
+  assert.deepEqual(kept.payload, {}, 'its content expires on the schedule the settings UI promises')
+  assert.equal(kept.externalTransactionId, 'TYPED-1', 'while the claim - connector, type, reference, status, id, basis - stays')
+  assert.equal(kept.settlementBasis, 'OPERATOR_ASSERTION')
+  assert.ok(result.backReferenceEvidenceCompacted >= 2, `compacted: ${result.backReferenceEvidenceCompacted}`)
+  // THE CONTROL, isolating the new arm: the same shape with the CONNECTOR's basis still expires.
+  assert.ok(!store.accounting.some((row) => row.id === 'synced'), 'a connector-confirmed row of the same reference type still expires')
+})
 
-  const retained = new Set<string>([
-    ...POSTABLE_ACCOUNTING_SYNC_STATUSES,
-    EXTERNAL_DOCUMENT_EVIDENCE_STATUS,
-  ])
-  const uncovered = LIVE_ACCOUNTING_SYNC_STATUSES.filter((status) => !retained.has(status))
-
-  assert.deepEqual(uncovered, [], 'a blocking status retention can delete is the whole of o3d-v7sy')
+test('[o3d-1e7sl R3 / D5] the asserted arm is bounded: an asserted row on UNFINISHED work is not a claim of anything, and young ones are untouched', async () => {
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting.push(
+    // No writer produces PENDING + OPERATOR_ASSERTION (truth-table row 2: UNKNOWN). It is still PENDING, so the
+    // postable clause keeps it WHOLE - the asserted arm must not reach it and blank the work.
+    {
+      id: 'asserted-pending', createdAt: OLD, status: 'PENDING', type: 'COGS_JOURNAL', referenceType: 'CogsEntry',
+      externalTransactionId: 'TYPED-3', settlementBasis: 'OPERATOR_ASSERTION', payload: { lines: 3 },
+    },
+    {
+      id: 'asserted-young', createdAt: new Date(), status: 'SYNCED', type: 'COGS_JOURNAL', referenceType: 'CogsEntry',
+      externalTransactionId: 'TYPED-4', settlementBasis: 'OPERATOR_ASSERTION', payload: { lines: 3 },
+    },
+  )
+  await purgeExpiredData()
+  const pending = store.accounting.find((row) => row.id === 'asserted-pending')
+  assert.ok(pending)
+  assert.deepEqual(pending.payload, { lines: 3 }, 'unfinished work is retained WHOLE: the payload is the job')
+  const young = store.accounting.find((row) => row.id === 'asserted-young')
+  assert.deepEqual(young?.payload, { lines: 3 }, 'inside the retention period nothing is compacted either')
 })
 
 test('[o3d-v7sy] the reference types retention keeps are the ones the delete guard queries with', async () => {

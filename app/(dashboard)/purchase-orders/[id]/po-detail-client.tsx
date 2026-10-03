@@ -2195,6 +2195,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     {' '}
                     {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {formatDateTime(sync.createdAt)}
                     {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
+                    {' '}{sync.standingNote}
                   </li>
                 ))}
               </ul>

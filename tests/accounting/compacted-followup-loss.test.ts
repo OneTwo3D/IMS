@@ -271,3 +271,26 @@ test('[o3d-bqw7 r2] the warning names what the ROW recorded, and says which basi
   assert.equal(legacy.metadata.classificationBasis, 'type-table',
     'a reader must be able to tell an answer from a fallback without guessing')
 })
+
+test('[o3d-1e7sl D7] the discard warning says whose id the tombstone names - connector or operator', () => {
+  const base = {
+    id: 'sync-1', type: 'SALES_INVOICE' as const, referenceType: 'SalesOrder', referenceId: 'so-1',
+    externalTransactionId: 'INV-9', backReferenceEvidenceCompactedAt: new Date('2026-01-01T00:00:00.000Z'),
+  }
+  const confirmed = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero', activityActionPrefix: 'xero', phase: 'repaired',
+    row: { ...base, settlementBasis: null },
+  })
+  assert.match(confirmed.description, /linked to external id INV-9\./)
+  assert.doesNotMatch(confirmed.description, /typed in/)
+  const asserted = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero', activityActionPrefix: 'xero', phase: 'repaired',
+    row: { ...base, settlementBasis: 'OPERATOR_ASSERTION' },
+  })
+  assert.match(asserted.description, /linked to external id INV-9 \(an id an OPERATOR typed in - an assertion, never read from the ledger\)\./)
+  // A row that does not say (an older caller) reads as the connector's own writeback, exactly as before.
+  const silent = buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero', activityActionPrefix: 'xero', phase: 'repaired', row: base,
+  })
+  assert.equal(silent.description, confirmed.description)
+})

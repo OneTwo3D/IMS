@@ -421,8 +421,13 @@ test('"it did NOT post" cancels the row and leaves externalTransactionId NULL', 
   assert.equal('settledStatus' in result ? result.settledStatus : null, 'CANCELLED')
   const row = stored()
   assert.equal(row.status, 'CANCELLED')
-  assert.equal(row.externalTransactionId, null, 'never writes an id — that is what unblocks the delete guard')
-  assert.match(String(row.errorMessage), /verified NOT POSTED/)
+  assert.equal(row.externalTransactionId, null, 'never writes an id - and never clears one, which would destroy post evidence')
+  // o3d-1e7sl (C1): the note says it is a CLAIM. It no longer says "verified NOT POSTED ... nothing reached the
+  // accounting system" in IMS's voice, and the row no longer unblocks the order delete (the guard reads it
+  // ASSERTED_NOT_POSTED and keeps blocking).
+  assert.match(String(row.errorMessage), /recorded as NOT POSTED/)
+  assert.match(String(row.errorMessage), /UNPROVEN/)
+  assert.doesNotMatch(String(row.errorMessage), /nothing reached the accounting system/)
   assert.match(String(row.errorMessage), /no matching payment in the org/)
 })
 

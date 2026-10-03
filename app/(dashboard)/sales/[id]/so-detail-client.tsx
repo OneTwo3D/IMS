@@ -1465,6 +1465,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     {' '}
                     {ACCOUNTING_SYNC_TYPE_LABEL[sync.type]} failed on {formatDateTime(sync.createdAt)}
                     {sync.retryCount > 0 ? ` after ${sync.retryCount} retries` : ''}: {sync.errorMessage}
+                    {' '}{sync.standingNote}
                   </li>
                 ))}
               </ul>

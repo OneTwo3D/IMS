@@ -251,9 +251,12 @@ function SettleSyncRowDialog({
                   placeholder="e.g. no matching document in the Xero org"
                 />
                 <p className="text-[11px] text-muted-foreground">
-                  The row is CANCELLED with no external id. For a payment or allocation this also removes it
-                  from the ambiguous-retry set, so the remaining attempt can be re-driven. If a document turns
-                  up after all, the connector records its id on this row anyway and the order stays blocked —
+                  The row is CANCELLED with no external id and recorded as YOUR assertion: IMS does not take it
+                  as proof that nothing posted (a lost response or a late webhook leaves the same row), and it
+                  shows as &quot;asserted: not posted&quot; wherever the row appears. It does NOT free the order for
+                  deletion (cancel the order instead), and IMS will not queue the same posting again behind it -
+                  hand-post it in the accounting system and mark the posting handled. If a document turns up
+                  after all, the connector records its id on this row anyway and the order stays blocked —
                   evidence outranks an assertion.
                 </p>
               </div>

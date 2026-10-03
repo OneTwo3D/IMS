@@ -4,6 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { withSavepoint } from '@/lib/db/savepoint'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
+import { accountingSyncRowCanPostOrHasPosted } from '@/lib/domain/accounting/postable-sync-statuses'
 import { recordHandPostDeferral, runUnderPostingKeyLock, type PostingKeyLockClient, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { enqueueProvisionalPostingRefusal } from '@/lib/domain/accounting/posting-refusal-provisional'
 import type { IntegrationOutboxClient } from '@/lib/domain/integrations/outbox'
@@ -118,8 +119,14 @@ export type PostingRefusalClient = {
 type SyncLogReader = {
   findMany?(args: {
     where: Record<string, unknown>
-    select: { id: true; payload: true }
-  }): Promise<Array<{ id: string; payload: unknown }>>
+    select: { id: true; payload: true; status: true; settlementBasis: true; externalTransactionId: true; abandonedBeforeRemoteCall: true }
+  }): Promise<Array<{
+    id: string; payload: unknown
+    // o3d-1e7sl: the columns the ledger-standing module needs to say whether a row is a posting that
+    // can still post / has posted (`live`) or a retired one.
+    status: string; settlementBasis: string | null; externalTransactionId: string | null
+    abandonedBeforeRemoteCall: boolean | null
+  }>>
 }
 
 /** The key of the posting a row is about — produced by `accountingPostingKey` in lib/accounting.ts. */
@@ -368,13 +375,14 @@ async function readPostingRowIdsForKey(
       type: key.type,
       referenceType: key.referenceType,
       referenceId: key.referenceId,
-      // A CANCELLED row is not a queued posting — and it IS part of a baseline, because it can be put
-      // back in front of the connector under the same id.
-      ...(statuses === 'live' ? { status: { not: 'CANCELLED' } } : {}),
     },
-    select: { id: true, payload: true },
+    // EVERY row is read and `live` is decided in TypeScript through `accountingSyncRowCanPostOrHasPosted`
+    // (o3d-1e7sl), not by `status: { not: 'CANCELLED' }`: a CANCELLED row is not a queued posting - and it
+    // IS part of a baseline, because it can be put back in front of the connector under the same id.
+    select: { id: true, payload: true, status: true, settlementBasis: true, externalTransactionId: true, abandonedBeforeRemoteCall: true },
   })
   return rows
+    .filter((row) => statuses === 'every' || accountingSyncRowCanPostOrHasPosted(row))
     .filter((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
     .filter((row) => typeof row.id === 'string')
     .map((row) => row.id)
@@ -406,11 +414,11 @@ async function seesEveryCommittedRow(client: PostingKeyLockClient): Promise<bool
 }
 
 /** The postings that are queued or posted for this key right now. */
-const readLiveQueuedPostings = (client: PostingRefusalClient, key: PostingRefusalKey) =>
+export const readLiveQueuedPostings = (client: PostingRefusalClient, key: PostingRefusalKey) =>
   readPostingRowIdsForKey(client, key, 'live')
 
 /** Every row this key has, whatever its status — what a baseline must know about. */
-const readEveryPostingRowForKey = (client: PostingRefusalClient, key: PostingRefusalKey) =>
+export const readEveryPostingRowForKey = (client: PostingRefusalClient, key: PostingRefusalKey) =>
   readPostingRowIdsForKey(client, key, 'every')
 
 /**

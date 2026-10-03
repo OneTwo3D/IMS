@@ -1,3 +1,5 @@
+import { mayHaveReachedLedger, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
+
 /**
  * The accounting sync statuses from which a remote document CAN STILL BE POSTED.
  *
@@ -28,3 +30,26 @@ export type PostableAccountingSyncStatus = (typeof POSTABLE_ACCOUNTING_SYNC_STAT
 export function isPostableAccountingSyncStatus(status: string): boolean {
   return (POSTABLE_ACCOUNTING_SYNC_STATUSES as readonly string[]).includes(status)
 }
+
+/**
+ * COULD THIS ROW STILL POST, OR HAS IT POSTED? (o3d-1e7sl, slice 1c of o3d-f709)
+ *
+ * The question "is this row a candidate for being THE posting under a key?" that three readers asked as
+ * `status: { not: 'CANCELLED' }` (the mark-handled guard, the exception inbox's queued-row classifier, the
+ * inbox's `live` baseline). A RETIRED row (CANCELLED) can never post again - "outcomes, not work" - so it
+ * is not a candidate; every other row either can still post (PENDING / PROCESSING / FAILED) or already
+ * holds the work slot (SYNCED, `workSlotStanding`).
+ *
+ * This is NOT "did it reach the ledger": a retired row can have, and `mayHaveReachedLedger` is what says
+ * whether one might. The readers that drop retired rows from the candidate set REPORT the unproven ones
+ * (`retiredUnprovenRows`) instead of dropping them in silence.
+ */
+export function accountingSyncRowCanPostOrHasPosted(row: LedgerStandingRow): boolean {
+  return isPostableAccountingSyncStatus(row.status) || workSlotStanding(row).slot === 'OCCUPIED'
+}
+
+/** The retired rows (not candidates) that are NOT proven never to have reached the ledger. */
+export function retiredUnprovenRows<T extends LedgerStandingRow>(rows: readonly T[]): T[] {
+  return rows.filter((row) => !accountingSyncRowCanPostOrHasPosted(row) && mayHaveReachedLedger(row))
+}
+

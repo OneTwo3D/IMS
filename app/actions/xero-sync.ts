@@ -511,6 +511,12 @@ export type XeroSyncLogRow = {
    * rather than written back by Xero. NULL is the ordinary connector confirmation.
    */
   settlementBasis: string | null
+  /**
+   * o3d-1e7sl (D2): whether the canceller PROVED the row pre-call. With `settlementBasis`, `status` and the
+   * external id it is what lets the page say which standing a retired row has (proven unsent, asserted
+   * not posted, or merely unproven) instead of letting a CANCELLED badge read as "nothing was sent".
+   */
+  abandonedBeforeRemoteCall: boolean | null
   syncedAt: string | null
   createdAt: string
 }
@@ -534,6 +540,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
     retryCount: r.retryCount,
     attemptRevision: r.attemptRevision,
     settlementBasis: r.settlementBasis,
+    abandonedBeforeRemoteCall: r.abandonedBeforeRemoteCall,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))

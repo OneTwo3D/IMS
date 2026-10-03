@@ -71,6 +71,9 @@ function sourceRow(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> 
     // o3d-e2mz: a claimed attempt, so the default fixture describes a row an operator COULD settle.
     // Rows at 0 are covered explicitly where that matters.
     attemptRevision: 3,
+    // o3d-1e7sl (D4): the standing columns, required on the source row. NULL / NULL = the connector's own record.
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
     ...over,
   }
 }
@@ -123,6 +126,8 @@ function stranded(
       errorMessage: 'HTTP 500 from QuickBooks',
       createdAt: new Date('2026-08-04T10:00:00.000Z'),
       attemptRevision: 3,
+      settlementBasis: null,
+      abandonedBeforeRemoteCall: null,
       ...over,
     },
     NOW,
@@ -177,9 +182,9 @@ test('the described row now carries its settlement affordance — o3d-osl8 item 
   // explanation, reads as "there is nothing to do here".
   const row = stranded() as Record<string, unknown>
   assert.deepEqual(Object.keys(row).sort(), [
-    'ageDays', 'attemptRevision', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
+    'abandonedBeforeRemoteCall', 'ageDays', 'attemptRevision', 'connector', 'createdAt', 'errorMessage', 'externalTransactionId',
     'id', 'notSettleableReason', 'referenceId', 'referenceType', 'requiresAttemptAdoption', 'settleable',
-    'settleableOutcomes', 'settlementCaveat', 'status', 'type',
+    'settleableOutcomes', 'settlementBasis', 'settlementCaveat', 'status', 'type',
   ])
 })
 
@@ -301,4 +306,13 @@ test('[round 5] a FENCED row is unaffected — the fence, not the toggle, is wha
   const row = stranded({ status: 'FAILED', attemptRevision: 3 }, STILL_CLAIMABLE)
   assert.equal(row.settleable, true)
   assert.equal(row.notSettleableReason, null)
+})
+
+test('[o3d-1e7sl D4] the stranded row CARRIES the standing columns through, so the banner can show whose word an id is', () => {
+  const asserted = stranded({ status: 'PROCESSING', externalTransactionId: 'TYPED-1', settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null })
+  assert.equal(asserted.settlementBasis, 'OPERATOR_ASSERTION')
+  assert.equal(asserted.abandonedBeforeRemoteCall, null)
+  const swept = stranded({ status: 'FAILED', abandonedBeforeRemoteCall: true })
+  assert.equal(swept.abandonedBeforeRemoteCall, true)
+  assert.equal(swept.settlementBasis, null)
 })

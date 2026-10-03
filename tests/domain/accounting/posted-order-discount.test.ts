@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { buildChargebackRefundLines } from '@/lib/domain/sales/refund-service'
 import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
+import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
   decideChargebackOrderDiscount,
   readPostedDocumentDiscount,
@@ -65,6 +66,9 @@ type SyncLogRow = {
   type: string
   status: string
   externalTransactionId: string | null
+  /** o3d-1e7sl (G17): the standing columns. Absent = the connector's own writeback, as every older fixture means. */
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 type Calls = { eventCount: number; findMany: number; syncLogCount: number }
@@ -83,10 +87,13 @@ function matches(rowValue: unknown, predicate: unknown, field: string): boolean 
     let ok = true
     if ('in' in clauses) ok &&= (clauses.in as unknown[]).includes(rowValue)
     if ('notIn' in clauses) ok &&= !(clauses.notIn as unknown[]).includes(rowValue)
-    // The only `not` production uses is `{ not: null }` — "this column is populated".
+    // The only `not` production uses is `{ not: null }` — "this column is populated" - and (o3d-1e7sl, the
+    // ledger-standing module's paired id arms) `{ not: '' }`.
     if ('not' in clauses) {
-      if (clauses.not !== null) throw new Error(`the double only implements { not: null } on ${field}`)
-      ok &&= rowValue !== null && rowValue !== undefined
+      if (clauses.not !== null && clauses.not !== '') throw new Error(`the double only implements { not: null } and { not: '' } on ${field}`)
+      ok &&= clauses.not === null
+        ? rowValue !== null && rowValue !== undefined
+        : rowValue !== ''
     }
     return ok
   }
@@ -95,6 +102,8 @@ function matches(rowValue: unknown, predicate: unknown, field: string): boolean 
 
 function whereMatches(row: Record<string, unknown>, where: Record<string, unknown>): boolean {
   return Object.entries(where).every(([field, predicate]) => {
+    // o3d-1e7sl: `NAMES_A_DOCUMENT_WHERE` is an AND of its paired id arms.
+    if (field === 'AND') return (predicate as Array<Record<string, unknown>>).every((clause) => whereMatches(row, clause))
     if (!(field in row)) throw new Error(`the double has no ${field} column to filter on`)
     return matches(row[field], predicate, field)
   })
@@ -148,6 +157,13 @@ function makeClient(
       count: async ({ where }: { where: Record<string, unknown> }) => {
         calls.syncLogCount += 1
         return syncLogs.filter((log) => whereMatches(log as unknown as Record<string, unknown>, where)).length
+      },
+      // o3d-1e7sl (G17): the unlinked-document read is now a findMany so it can say whose word each row is.
+      findMany: async ({ where }: { where: Record<string, unknown> }) => {
+        calls.syncLogCount += 1
+        return syncLogs
+          .map((log) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...log }))
+          .filter((log) => whereMatches(log as unknown as Record<string, unknown>, where))
       },
     },
   } as unknown as PostedOrderDiscountClient
@@ -618,6 +634,49 @@ test('a SYNCED row with NO external id is not a posted document, so the column s
 
   assert.equal(resolved.source, 'ORDER')
   assert.equal(resolved.source === 'ORDER' && resolved.amount, 5)
+})
+
+test('[o3d-1e7sl G17] the unlinked-document read, one sync row per standing: a NAMED document refuses and is described by whose word it is', async () => {
+  // EXISTENCE (D2): any row that names a sales-invoice document keeps the answer UNRECOVERABLE - the column
+  // denies a document somebody claims exists. It widened from `SYNCED` to every status that names one (a FAILED
+  // or cancelled row naming an invoice is a document that exists, o3d-ju8t). A row naming NOTHING does not.
+  const base = { referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE' }
+  const cases: Array<{ name: string; standing: LedgerStanding; row: Partial<SyncLogRow> & { status: string }; refuses: boolean; says?: RegExp }> = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-C' }, refuses: true, says: /1 confirmed by the connector, 0 typed in/ },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, refuses: true, says: /0 confirmed by the connector, 1 typed in by an operator and never read from the ledger/ },
+    { name: 'FAILED row naming a document (CONFIRMED_POSTED)', standing: 'CONFIRMED_POSTED', row: { status: 'FAILED', externalTransactionId: 'INV-F' }, refuses: true, says: /1 confirmed by the connector/ },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, refuses: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, refuses: false },
+    { name: 'UNKNOWN (FAILED, no id)', standing: 'UNKNOWN', row: { status: 'FAILED', externalTransactionId: null }, refuses: false },
+    { name: 'LIVE_WORK', standing: 'LIVE_WORK', row: { status: 'PENDING', externalTransactionId: null }, refuses: false },
+  ]
+  let refused = 0
+  for (const c of cases) {
+    const row = { ...base, externalTransactionId: null as string | null, settlementBasis: null as string | null, abandonedBeforeRemoteCall: null as boolean | null, ...c.row }
+    const standing = ledgerStanding({
+      status: row.status, externalTransactionId: row.externalTransactionId,
+      settlementBasis: row.settlementBasis, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
+    })
+    console.log(`# G17 precondition: ${c.name}: ${JSON.stringify(c.row)} => ${standing}`)
+    assert.equal(standing, c.standing, c.name)
+    const { client } = makeClient({ syncLogs: [row] })
+    const resolved = await resolvePostedOrderDiscount(client, {
+      ...RESTATED_ORDER,
+      discountAmount: 5,
+      accountingInvoiceId: null,
+      discountRestatement: restatement({ accountingInvoiceId: null }),
+    })
+    if (c.refuses) {
+      refused += 1
+      assert.equal(resolved.source, 'UNRECOVERABLE', c.name)
+      assert.match(resolved.detail, c.says!, c.name)
+      assert.doesNotMatch(resolved.detail, /posted sales invoice\(s\) exist/, `${c.name}: the unqualified "posted ... exist" sentence is gone`)
+    } else {
+      assert.equal(resolved.source, 'ORDER', c.name)
+    }
+  }
+  console.log(`# G17 cases: ${cases.length}; refusing: ${refused}`)
+  assert.ok(refused > 0 && refused < cases.length)
 })
 
 test('EVIDENCE-FREE is not UNPOSTED: a row restated while an invoice existed refuses (o3d-y14 r4 F1)', async () => {

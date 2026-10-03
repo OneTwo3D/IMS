@@ -11,12 +11,12 @@ import {
   updateMirroredAccountingEventStatus,
   type MirroredEventUpdateOutcome,
 } from '@/lib/domain/accounting/accounting-event-mirror'
+import { OWNS_MIRRORED_EVENT_WHERE, namesADocument, ownsMirroredEvent } from '@/lib/domain/accounting/ledger-standing'
 import {
   applyFencedAttemptDecision,
   type AttemptFenceRefusalReason,
 } from '@/lib/domain/accounting/sync-log-attempt'
 import {
-  MIRROR_OWNING_SYNC_STATUSES,
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   buildCancelledSaleSettlementData,
   buildSettlementData,
@@ -314,7 +314,7 @@ async function refusalFromMirroredDocument(
   for (const key of mirrorKeys) {
     const event = await tx.accountingEvent.findUnique({
       where: { idempotencyKey: key },
-      select: { status: true, externalId: true },
+      select: { status: true, externalId: true, postBasis: true },
     })
     if (!event) continue
     const refusal = refuseSettlementContradictedByMirror(assertion, event)
@@ -561,9 +561,11 @@ export async function settleAccountingSyncRow(
         //     but ONLY a void that retired an attempt, which is why the write below records
         //     `voidBasis`. See lib/domain/accounting/accounting-event-void-basis.ts.
         //
-        //     Nor is it only a race: `classifyPriorAttempts` reads a CANCELLED attempt as asserting
-        //     nothing was sent, so settling a row NOT_POSTED is exactly what LETS a replacement be
-        //     enqueued — days later, with no concurrency at all, onto the same VOID mirror.
+        //     Nor is it only a race, historically: `classifyPriorAttempts` used to read a CANCELLED
+        //     attempt as asserting nothing was sent, so settling a row NOT_POSTED was exactly what LET a
+        //     replacement be enqueued onto the same VOID mirror. Since o3d-1e7sl (C1) it no longer does -
+        //     an operator's NOT_POSTED is a BLOCKED work slot, and the enqueue refuses - but the scope lock
+        //     stays: a PROVEN_NOT_POSTED sibling (the orphan sweep's stamped rows) still frees the key.
         await lockFollowUpScope(tx, {
           connector: row.connector,
           type: row.type,
@@ -613,21 +615,24 @@ export async function settleAccountingSyncRow(
               type: row.type,
               referenceType: row.referenceType,
               referenceId: row.referenceId,
-              // Live (may still post) OR carrying post evidence of its own — a FAILED row with an
-              // external id is a document that exists (o3d-ju8t), so it owns its mirror too.
-              OR: [
-                { status: { in: [...MIRROR_OWNING_SYNC_STATUSES] } },
-                { externalTransactionId: { not: null } },
-              ],
+              // Holds the work slot (may still post, or has) OR names a document - a FAILED row with
+              // an external id is a document that exists (o3d-ju8t), so it owns its mirror too, and so
+              // does an operator-typed one (an existence reading, D2). The module's own wording
+              // (`ownsMirroredEvent`, o3d-1e7sl), not a status list and an id test restated here.
+              ...OWNS_MIRRORED_EVENT_WHERE,
             },
-            select: { id: true, status: true, externalTransactionId: true, payload: true },
+            select: {
+              id: true, status: true, externalTransactionId: true, payload: true,
+              settlementBasis: true, abandonedBeforeRemoteCall: true,
+            },
           })
           mirrorConflict = findMirrorOwnershipConflict(
             mirrorKeys,
             siblings.map((sibling) => ({
               id: sibling.id,
               status: sibling.status,
-              externalTransactionId: sibling.externalTransactionId,
+              ownsMirror: ownsMirroredEvent(sibling),
+              posted: namesADocument(sibling),
               mirrorKeys: mirroredAccountingEventIdempotencyKeys({
                 connector: row.connector,
                 syncLogId: sibling.id,
