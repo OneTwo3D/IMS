@@ -188,7 +188,10 @@ const tx = {
       if (!log) return null
       const projected: Record<string, unknown> = {}
       for (const key of Object.keys(select ?? { status: true })) {
+        // o3d-3la07: the ledger-standing columns the proof now selects. A fixture that does not name one
+        // means the connector's own writeback (NULL), the same as a real unsettled-by-hand row.
         projected[key] = (log as unknown as Record<string, unknown>)[key]
+          ?? (['settlementBasis', 'abandonedBeforeRemoteCall', 'externalTransactionId'].includes(key) ? null : undefined)
       }
       return projected
     },
@@ -547,7 +550,7 @@ test('o3d-i0o6 r4: a journal row that names NO ledger is refused, not read as a 
       findUnique: async ({ where }: { where: { id: string } }) => {
         const log = state.syncLogs.find((row) => row.id === where.id)
         if (!log) return null
-        return { status: log.status, connector: null, payload: log.payload }
+        return { status: log.status, connector: null, payload: log.payload, externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null }
       },
     },
   }

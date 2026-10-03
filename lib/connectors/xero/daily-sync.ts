@@ -88,10 +88,16 @@ import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-b
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
+  UNEARNED_REVERSAL_NETTING_WHERE,
+  countedUnearnedReversalRows,
+  describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
+  unearnedReversalStandingReport,
+  type UnearnedReversalSyncRow,
 } from '@/lib/domain/accounting/deferred-trueup'
+import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
@@ -2075,27 +2081,40 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         select: { id: true, orderId: true },
       })
       const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
+      // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
+      // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED
+      // rows that may have reached the ledger so the per-order warning can name them. No arithmetic moves.
       const reversalSyncs = await tx.accountingSyncLog.findMany({
         where: {
-          connector: 'xero',
-          type: 'UNEARNED_REV_REVERSAL',
-          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-          OR: [
-            { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
-            { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
+          AND: [
+            { connector: 'xero', type: 'UNEARNED_REV_REVERSAL' },
+            UNEARNED_REVERSAL_NETTING_WHERE,
+            {
+              OR: [
+                { referenceType: 'SalesOrder', referenceId: { in: orderIds } },
+                { referenceType: 'SalesOrderRefund', referenceId: { in: refunds.map((refund) => refund.id) } },
+              ],
+            },
           ],
         },
-        select: { referenceType: true, referenceId: true, payload: true },
+        select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
       })
       const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+      const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
       for (const sync of reversalSyncs) {
         const targetOrderId = sync.referenceType === 'SalesOrder'
           ? sync.referenceId
           : refundIdToOrderId.get(sync.referenceId)
         if (!targetOrderId) continue
-        const list = reversalSyncsByOrder.get(targetOrderId) ?? []
-        list.push({ payload: sync.payload })
-        reversalSyncsByOrder.set(targetOrderId, list)
+        const allRows = reversalStandingRowsByOrder.get(targetOrderId) ?? []
+        allRows.push(sync)
+        reversalStandingRowsByOrder.set(targetOrderId, allRows)
+      }
+      for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
+        reversalSyncsByOrder.set(
+          targetOrderId,
+          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+        )
       }
 
       const shippedRowsByOrder = new Map<string, Array<{ lineId: string; productId: string; qty: number }>>()
@@ -2203,6 +2222,24 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           reversalSyncsByOrder.get(orderId) ?? [],
           settings.xero_unearned_revenue_account,
         )
+        // o3d-3la07 (M5, D3): say which rows the netting rests on that are not ledger facts.
+        const unearnedStanding = unearnedReversalStandingReport(reversalStandingRowsByOrder.get(orderId) ?? [])
+        const unearnedReport = describeUnearnedReversalReport(
+          firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8),
+          unearnedStanding,
+        )
+        if (unearnedReport) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: 'daily_batch_unearned_reversal_netting_unproven',
+            tag: 'sync',
+            level: 'WARNING',
+            description: unearnedReport,
+            metadata: { orderId, ...unearnedStanding },
+            resolveUser: false,
+          }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
+        }
         const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
 

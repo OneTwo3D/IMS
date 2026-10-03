@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
 
 /**
  * o3d-y14 r7 finding 4 — WHAT A POSTED CREDIT NOTE REVERSED OF THE ORDER-LEVEL DISCOUNT.
@@ -204,6 +205,11 @@ type MirroredCreditNote = {
   externalId: string | null
   /** The connector that posted the document — the ledger it lives in (r9 finding 1). */
   externalSystem: string | null
+  /**
+   * o3d-3la07 (AE3): HOW the event came to be POSTED. A POSTED mirror's lines are what the ledger holds
+   * only when the connector confirmed the post (`mirroredPostStanding` CONFIRMED).
+   */
+  postBasis: string | null
 }
 
 /**
@@ -259,6 +265,22 @@ export function creditNoteDocumentStanding(
     }
   }
   const [posted] = events
+  // o3d-3la07 (AE3): A POSTED mirror IS NOT A LEDGER FACT UNLESS THE CONNECTOR SAID SO. For an operator
+  // asserted post the persisted refund lines this standing vouches for are enqueue-time intent (the
+  // mirror's `linesJson`), and a pre-column mirror records no basis at all; neither establishes what the
+  // credit note carries, so the leg refuses (the position goes manual) rather than netting from it.
+  const postStanding = mirroredPostStanding(posted)
+  if (postStanding !== 'CONFIRMED') {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id}'s mirrored CREDIT_NOTE is POSTED but ` +
+        (postStanding === 'ASSERTED'
+          ? 'only because an OPERATOR asserted it was posted'
+          : 'with no record that the connector confirmed it') +
+        ', so its persisted lines are what was queued, not proven to be what the credit note carries',
+    }
+  }
   if (posted.externalId && refund.accountingCreditNoteId && posted.externalId !== refund.accountingCreditNoteId) {
     return {
       ok: false,
@@ -366,7 +388,7 @@ export async function readCreditNoteOrderDiscount(
       sourceEntityId: { in: [...evidence.refundIds] },
       type: CREDIT_NOTE_EVENT_TYPE,
     },
-    select: { sourceEntityId: true, status: true, externalId: true, externalSystem: true },
+    select: { sourceEntityId: true, status: true, externalId: true, externalSystem: true, postBasis: true },
   })) as MirroredCreditNote[]
   const mirroredByRefund = new Map<string, MirroredCreditNote[]>()
   for (const event of mirrored) {

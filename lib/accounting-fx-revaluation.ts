@@ -3,6 +3,12 @@ import { db } from '@/lib/db'
 import { getAccountingSettings, queueAccountingSync, type AccountingSettings } from '@/lib/accounting'
 import { postingIsOwed } from '@/lib/domain/accounting/enqueue-outcome'
 import {
+  LEDGER_STANDING_SELECT,
+  WORK_SLOT_OCCUPIED_WHERE,
+  ledgerStanding,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
+import {
   buildRealisedFxJournal,
   computeRealisedFx,
   reverseJournalLines,
@@ -13,8 +19,6 @@ import {
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { addMoney, multiplyMoney, subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
-
-const ACTIVE_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
 
 type JournalLine = {
   accountCode: string
@@ -165,14 +169,60 @@ async function getPriorRevaluations(valuationDate: string): Promise<PriorRevalua
   const logs = await db.accountingSyncLog.findMany({
     where: {
       type: 'UNREALISED_FX_JOURNAL',
-      status: { in: [...ACTIVE_SYNC_STATUSES] },
+      // o3d-3la07 (M10): the work slot's own statuses (PENDING / PROCESSING / SYNCED), stated once in
+      // the ledger-standing module rather than re-spelled here.
+      ...WORK_SLOT_OCCUPIED_WHERE,
     },
     orderBy: { createdAt: 'asc' },
     // o3d-j625 r2 (Codex MEDIUM 1): `connector` is SELECTED. Without it the reversal had no way to say
     // whose chart of accounts its lines were, and attributed them to the current settings object.
-    select: { id: true, connector: true, payload: true },
+    select: { id: true, connector: true, payload: true, ...LEDGER_STANDING_SELECT },
   })
+  // o3d-3la07 (M10, D2): an operator-typed document id still COUNTS here (the journal is claimed to
+  // exist, so it is reversed / counted as reversed and never posted a second time) but the run says so:
+  // the figures being reversed are the queued payload's, which is intent for an asserted row.
+  await reportAssertedRevaluationRows(
+    logs.filter((log) => isRevaluationOrReversal(log.payload)),
+    'prior-revaluation-read',
+    valuationDate,
+  )
   return selectPriorRevaluationsToReverse(logs, valuationDate)
+}
+
+function isRevaluationOrReversal(payload: unknown): boolean {
+  return isActivePayload(payload) && (payload.kind === 'revaluation' || payload.kind === 'reversal')
+}
+
+/**
+ * o3d-3la07 (M10, D2) - AN UNREALISED-FX ROW THE RUN RELIED ON RESTS ON A PERSON'S WORD.
+ *
+ * "Has this journal been posted?" is an EXISTENCE question, so a SYNCED row with an operator-typed id
+ * (ASSERTED_POSTED) still answers it (the alternative posts the journal twice), but never silently: one
+ * WARNING per such row per run. Rows that are CONFIRMED_POSTED or live work are not reported.
+ */
+export async function reportAssertedRevaluationRows(
+  rows: Array<LedgerStandingRow & { id: string }>,
+  read: 'prior-revaluation-read' | 'same-date-check',
+  valuationDate: string,
+): Promise<number> {
+  const asserted = rows.filter((row) => ledgerStanding(row) === 'ASSERTED_POSTED')
+  if (asserted.length === 0) return 0
+  const { logActivity } = await import('@/lib/activity-log')
+  for (const row of asserted) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'unrealised_fx_relied_on_operator_assertion',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `The unrealised FX run for ${valuationDate} relied on sync log ${row.id}, which an OPERATOR settled `
+        + `as posted under the document id '${row.externalTransactionId ?? ''}'. IMS never saw that document: `
+        + 'the run counted it as existing (so no second journal is raised) but the figures it reverses are '
+        + 'the queued payload, not what the ledger holds. Check the journal in the accounting system.',
+      metadata: { syncLogId: row.id, read, valuationDate, settlementBasis: row.settlementBasis },
+    }).catch(() => { /* a report that cannot be written must not abort the rest of the run */ })
+  }
+  return asserted.length
 }
 
 /**
@@ -211,19 +261,22 @@ async function hasRevaluationForDate(
   const logs = await db.accountingSyncLog.findMany({
     where: {
       type: 'UNREALISED_FX_JOURNAL',
-      status: { in: [...ACTIVE_SYNC_STATUSES] },
+      ...WORK_SLOT_OCCUPIED_WHERE,
       // o3d-j625 r3 (Codex HIGH 4): the whole point — another connector's revaluation for this date
       // does not relieve this connector of writing its own.
       connector,
     },
-    select: { payload: true },
+    select: { id: true, payload: true, ...LEDGER_STANDING_SELECT },
   })
-  return logs.some((log) => {
+  const matching = logs.filter((log) => {
     const payload = log.payload
     return isActivePayload(payload) &&
       payload.kind === 'revaluation' &&
       payload.valuationDate === valuationDate
   })
+  // o3d-3la07 (M10, D2): existence question - an asserted row still counts, and is reported.
+  await reportAssertedRevaluationRows(matching, 'same-date-check', valuationDate)
+  return matching.length > 0
 }
 
 async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> {

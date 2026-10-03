@@ -64,6 +64,8 @@ type CreditNoteEventRow = {
   externalId: string | null
   /** r9 finding 1: WHICH LEDGER the document was posted to. */
   externalSystem: string | null
+  /** o3d-3la07 (AE3): HOW the event came to be POSTED. The default fixture is the connector's own writeback. */
+  postBasis: string | null
 }
 
 function standingCreditNote(refund: RefundRow): CreditNoteEventRow {
@@ -73,6 +75,7 @@ function standingCreditNote(refund: RefundRow): CreditNoteEventRow {
     status: 'POSTED',
     externalId: refund.accountingCreditNoteId,
     externalSystem: 'xero',
+    postBasis: 'CONNECTOR',
   }
 }
 
@@ -410,7 +413,7 @@ test('the standing check is PURE and reachable from a plain value, in both direc
   const refund = { id: 'refund-1', accountingCreditNoteId: 'CN-501' }
   assert.deepEqual(
     creditNoteDocumentStanding(refund, [
-      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero' },
+      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero', postBasis: 'CONNECTOR' },
     ]),
     { ok: true, externalSystem: 'xero' },
   )
@@ -419,7 +422,7 @@ test('the standing check is PURE and reachable from a plain value, in both direc
   // shape the rest of this file is careful to keep derivable.
   assert.deepEqual(
     creditNoteDocumentStanding(refund, [
-      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: null, externalSystem: 'xero' },
+      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: null, externalSystem: 'xero', postBasis: 'CONNECTOR' },
     ]),
     { ok: true, externalSystem: 'xero' },
   )
@@ -521,4 +524,41 @@ test('the ledger check is PURE and reachable from plain legs, in every direction
     ok: true,
     externalSystem: 'xero',
   })
+})
+
+// ---------------------------------------------------------------------------
+// o3d-3la07 (AE3) - A POSTED CREDIT-NOTE MIRROR VOUCHES FOR ITS LINES ONLY WHEN THE CONNECTOR CONFIRMED IT
+// ---------------------------------------------------------------------------
+
+const CREDIT_NOTE_MIRROR_STANDINGS: Array<{ standing: string; postBasis: string | null; standing_ok: boolean }> = [
+  { standing: 'CONFIRMED (connector)', postBasis: 'CONNECTOR', standing_ok: true },
+  { standing: 'CONFIRMED (sync-log backfill, D6)', postBasis: 'SYNC_LOG_BACKFILL', standing_ok: true },
+  { standing: 'ASSERTED', postBasis: 'OPERATOR_ASSERTION', standing_ok: false },
+  { standing: 'UNRECORDED', postBasis: null, standing_ok: false },
+]
+
+for (const testCase of CREDIT_NOTE_MIRROR_STANDINGS) {
+  test(`[o3d-3la07 AE3] creditNoteDocumentStanding: a POSTED mirror that is ${testCase.standing} ${testCase.standing_ok ? 'stands' : 'REFUSES (the position goes manual)'}`, () => {
+    const refund = { id: 'refund-1', accountingCreditNoteId: 'CN-501' }
+    const result = creditNoteDocumentStanding(refund, [
+      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero', postBasis: testCase.postBasis },
+    ])
+    assert.equal(result.ok, testCase.standing_ok)
+    if (!testCase.standing_ok) {
+      assert.match(!result.ok ? result.detail : '', /mirrored CREDIT_NOTE is POSTED but (only because an OPERATOR asserted|with no record that the connector confirmed)/)
+    }
+    console.log(`AE3 ${testCase.standing}: ok=${result.ok}`)
+  })
+}
+
+test('[o3d-3la07 AE3] through the real read: an ASSERTED credit-note mirror leaves the leg without an amount, and the whole reversal refuses', async () => {
+  const refund = mirroringChargeback()
+  const asserted = [{ ...standingCreditNote(refund as never), postBasis: 'OPERATOR_ASSERTION' }]
+  const result = await read([refund as never], {}, asserted)
+  assert.equal(result.ok, false)
+  assert.equal(result.legs[0].amount, null)
+  assert.match(result.legs[0].detail, /only because an OPERATOR asserted it was posted/)
+  // The control: the same refund with a CONFIRMED mirror reads.
+  const confirmed = await read([refund as never])
+  assert.equal(confirmed.ok, true)
 })

@@ -66,11 +66,134 @@ import {
   parseAllocationDebitPasses,
   sumAllocationDebitPasses,
 } from '@/lib/domain/accounting/allocation-debit-passes'
+import { roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import {
+  LEDGER_STANDING_SELECT,
+  ledgerStanding,
+  type LedgerStandingRow,
+} from '@/lib/domain/accounting/ledger-standing'
 
 export type JournalLedgerProof =
   | { kind: 'proved'; amount: number }
   | { kind: 'illegible' }
-  | { kind: 'unproved'; statuses: string }
+  /**
+   * `asserted` (o3d-3la07): at least one row is SYNCED only because an OPERATOR typed a document id
+   * (ASSERTED_POSTED). The journal is claimed to exist, but its `payload` lines are what was QUEUED,
+   * not a figure anybody read in the ledger, so it proves no AMOUNT (D2).
+   */
+  | { kind: 'unproved'; statuses: string; asserted?: boolean }
+
+/** A journal row as the amount proof reads it: the ledger-standing columns plus the payload. */
+export type JournalProofRow = LedgerStandingRow & { payload: unknown }
+
+/**
+ * o3d-3la07 (M8/M9) - A ROW THAT CAN PROVE AN AMOUNT: SETTLED (SYNCED) AND A LEDGER FACT.
+ *
+ * `ledgerStanding(row) === 'CONFIRMED_POSTED'` is the module's answer to "did the connector answer?";
+ * SYNCED is kept beside it because the proof reads the journal's own lines as what the ledger holds,
+ * and truth-table row 6 admits a non-SYNCED row that merely carries a connector id (this proof has
+ * always refused those, and the conversion does not widen it). An operator-typed id (ASSERTED_POSTED)
+ * is refused: AMOUNT questions never count it (D2).
+ */
+export function journalRowProvesAmount(row: LedgerStandingRow): boolean {
+  return journalRowIsSettled(row) && ledgerStanding(row) === 'CONFIRMED_POSTED'
+}
+
+/** SETTLED: the row reached SYNCED. Says nothing about WHO settled it - `ledgerStanding` does. */
+export function journalRowIsSettled(row: { status: string }): boolean {
+  return row.status === 'SYNCED'
+}
+
+/**
+ * True when a refund's unresolved-basis reason was produced by an operator-asserted journal (every wording
+ * in this module and in refund-service names the OPERATOR / an operator's assertion; no other reason does).
+ */
+export function isAssertedJournalRefusal(reason: string): boolean {
+  return /operator/i.test(reason)
+}
+
+/**
+ * o3d-3la07 - WHAT AN OPERATOR CAN DO TODAY about a refund withheld on an operator-asserted journal.
+ *
+ * There is no supported action that records confirmed amount evidence for an asserted journal or clears the
+ * withheld reversal (filed as a bead with the options). Until one exists the finding is LOUD (a critical
+ * accounting invariant, `sales_order_refund_allocation_basis_unresolved`, plus a WARNING ActivityLog row at the
+ * moment of the refusal) and the reversal is raised by hand. Said exactly, because on a FULL refund there is no
+ * "next refund" that could resolve it.
+ */
+/**
+ * THE OPEN ALLOCATED-INVENTORY BALANCE: the A2 debit that is PROVED (or, for the remedy text, RECORDED) less the
+ * relief already credited, rounded to pence and floored at zero. ONE expression, used by the refund's normal
+ * posting path AND by the manual remedy text, so the figure an operator is told to credit and the figure the
+ * posting would have been capped at cannot diverge.
+ */
+export function allocationOpenBalance(debit: DecimalInput, relieved: DecimalInput): number {
+  const open = subtractMoney(toDecimal(debit), toDecimal(relieved))
+  return open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
+}
+
+/** THE CAP: a credit is the LESSER of what the lines value and the open balance. Shared, as above. */
+export function cappedAllocationCredit(lineBasis: Decimal, openBalance: number): Decimal {
+  return lineBasis.gt(toDecimal(openBalance)) ? toDecimal(openBalance) : lineBasis
+}
+
+export type OpenBalanceFigures = { recordedDebit: number; relieved: number; open: number }
+
+const DEDUCT = ' If you already applied a manual credit for this order, deduct it.'
+
+export function assertedJournalRemedy(params: {
+  full: boolean
+  withheldAmount: number | null
+  /** The recorded A2 debit, the relief already credited, and their difference; null when it cannot be established. */
+  openBalance: OpenBalanceFigures | null
+}): string {
+  const tail =
+    'The IMS has no screen yet that records that credit or clears this finding, and checking the journal does not change what the IMS stored, ' +
+    'so a later refund does not resolve it: the finding stays listed under the critical accounting finding sales_order_refund_allocation_basis_unresolved'
+  const ob = params.openBalance
+  const balanceText = ob
+    ? `open A2 balance £${ob.open.toFixed(2)} (recorded debit £${ob.recordedDebit.toFixed(2)} less relief already credited £${ob.relieved.toFixed(2)})`
+    : null
+  if (params.full) {
+    // A FULL refund closes both batch windows for ever: the whole open balance is what is stranded.
+    return ob
+      ? 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
+        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail
+      : 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail
+  }
+  // A PARTIAL refund: the rest of the order's A2 debit belongs to units the customer still holds.
+  if (ob && params.withheldAmount !== null && params.withheldAmount > 0.005) {
+    const credit = Math.min(params.withheldAmount, ob.open)
+    return (
+      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
+      `Refunded units value £${params.withheldAmount.toFixed(2)}; ${balanceText}; credit the LESSER: DR Inventory / CR Allocated Inventory £${credit.toFixed(2)}. ` +
+      "Do NOT credit more than the open balance and do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded." +
+      DEDUCT + ' ' + tail
+    )
+  }
+  return (
+    'WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
+    'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines and the order\'s open A2 balance (recorded debit less relief already credited), credit the lesser, and do NOT credit the order\'s whole A2 debit ' +
+    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail
+  )
+}
+
+/** The status word for a row the amount proof refused, naming an operator assertion where there is one. */
+export function describeJournalRowState(row: LedgerStandingRow): string {
+  return ledgerStanding(row) === 'ASSERTED_POSTED' ? `${row.status} on an operator's assertion` : row.status
+}
+
+/**
+ * The tail of a refusal sentence for an unproved journal: "is FAILED, not SYNCED" for a row that did
+ * not settle, and an explicit assertion wording for one that settled only on an operator's say-so.
+ * (The string the refusal tests assert for the status rows is unchanged.)
+ */
+export function unprovedJournalClause(proof: { statuses: string; asserted?: boolean }): string {
+  return proof.asserted
+    ? `${proof.statuses} (a document id an operator typed in - IMS never read the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
+    : `${proof.statuses}, not SYNCED`
+}
 
 function boundaryNumber(value: unknown): number {
   if (value === null || value === undefined) return 0
@@ -126,13 +249,18 @@ export function payloadLinesLegible(payload: unknown): boolean {
 }
 
 export function proveJournalPosting(
-  rows: Array<{ status: string; payload: unknown }>,
+  rows: JournalProofRow[],
   accountCode: string,
   side: 'credit' | 'debit',
 ): JournalLedgerProof {
   if (rows.length === 0) return { kind: 'unproved', statuses: 'absent' }
-  if (rows.some((row) => row.status !== 'SYNCED')) {
-    return { kind: 'unproved', statuses: rows.map((row) => row.status).join('/') }
+  // o3d-3la07 (M8/M9): an AMOUNT is proved by a CONFIRMED row only (see journalRowProvesAmount).
+  if (rows.some((row) => !journalRowProvesAmount(row))) {
+    return {
+      kind: 'unproved',
+      statuses: rows.map((row) => describeJournalRowState(row)).join('/'),
+      asserted: rows.some((row) => ledgerStanding(row) === 'ASSERTED_POSTED'),
+    }
   }
   if (rows.some((row) => !payloadLinesLegible(row.payload))) return { kind: 'illegible' }
   if (!accountCode) return { kind: 'unproved', statuses: 'no Allocated Inventory account configured' }
@@ -249,8 +377,8 @@ export type AllocationDebitPostingProofClient = {
   accountingSyncLog: {
     findUnique(args: {
       where: { id: string }
-      select: { status: true; connector: true; payload: true }
-    }): Promise<{ status: string; connector: string | null; payload: unknown } | null>
+      select: { status: true; connector: true; payload: true } & typeof LEDGER_STANDING_SELECT
+    }): Promise<(JournalProofRow & { connector: string | null }) | null>
   }
 }
 
@@ -407,7 +535,7 @@ export async function proveAllocationDebitPosting<C extends string = string>(
   for (const [journalId, share] of byJournal) {
     const journal = await client.accountingSyncLog.findUnique({
       where: { id: journalId },
-      select: { status: true, connector: true, payload: true },
+      select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
     })
     if (!journal) {
       return {
@@ -432,10 +560,23 @@ export async function proveAllocationDebitPosting<C extends string = string>(
           : `the A2 journal this order was staged into names no ledger, so whether its pounds are in the books this ${target.activeConnector} reversal would credit cannot be established`,
       }
     }
-    if (journal.status !== 'SYNCED') {
+    // o3d-3la07 (M9): THIS IS THE EXISTENCE QUESTION ("is there a journal at all?") and an
+    // operator-asserted one answers it (D2): the journal is claimed to exist, so the refusal below is
+    // not "nothing was debited" - it is the AMOUNT proof's, which never counts an assertion. Anything
+    // else that did not settle keeps the original refusal.
+    const standing = ledgerStanding(journal)
+    if (standing !== 'ASSERTED_POSTED' && !journalRowProvesAmount(journal)) {
       return {
         kind: 'refused',
-        reason: `the A2 journal this order was staged into is ${journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`,
+        reason: journalRowIsSettled(journal)
+          ? 'the A2 journal this order was staged into is SYNCED but its settlement basis is not one this build recognises, so whether it reached the ledger cannot be established'
+          : standing === 'PROVEN_NOT_POSTED'
+            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
+            : standing === 'LIVE_WORK'
+              ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED — it is still queued or in flight, so nothing has been confirmed as debited yet`
+              // ASSERTED_NOT_POSTED, UNKNOWN, or a row naming a connector id that never settled: UNPROVEN either way
+              // (C1: a person's "did not post", a cancellation or a failure does not prove the ledger was untouched).
+              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling: if it posted, the debit to Allocated Inventory stands and has to be reversed by hand; if it did not, there is nothing to reverse`,
       }
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole
@@ -461,7 +602,9 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         kind: 'refused',
         reason: proof.kind === 'illegible'
           ? `the A2 journal this order was staged into has settled but its lines are no longer readable (evidence compaction), so whether it debited Allocated Inventory (${target.allocatedInventoryAccount}) at all — let alone the £${share.toFixed(2)} recorded against this order — cannot be established`
-          : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
+          : proof.asserted
+            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but nobody read its lines in the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
+            : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
       }
     }
     if (proof.amount <= 0) {

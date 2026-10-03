@@ -73,6 +73,8 @@ type EventRow = {
   businessDate: string
   createdAt: string
   linesJson: unknown
+  /** o3d-3la07 (AE2): HOW the event came to be POSTED. The default fixture is the connector's own writeback. */
+  postBasis?: string | null
 }
 
 /** o3d-y14 r7 finding 1 — a WooCommerce refund that ARRIVED and could not be recorded. */
@@ -112,6 +114,8 @@ type Store = {
     externalId: string | null
     /** o3d-y14 r9 finding 1 — WHICH LEDGER it stands in. A netting needs both sides in one. */
     externalSystem?: string | null
+    /** o3d-3la07 (AE3): HOW the event came to be POSTED. */
+    postBasis?: string | null
   }>
   activity: Array<{ id?: string; action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
 }
@@ -1435,6 +1439,7 @@ function invoicedStore(over: Partial<Store> = {}): Store {
       externalId: 'INV-778',
       businessDate: '2026-05-02',
       createdAt: '2026-05-02T09:00:00.000Z',
+      postBasis: 'CONNECTOR',
       linesJson: {
         kind: 'accounting-document',
         schemaVersion: 1,
@@ -1933,7 +1938,7 @@ function nettedToZeroStore(): Store {
     },
   ]
   store.creditNoteEvents = [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero', postBasis: 'CONNECTOR' },
   ]
   return store
 }
@@ -2000,7 +2005,7 @@ test('the netted position is recorded on the ActivityLog, so "nobody could tell"
   reset()
   const crossLedger = nettedToZeroStore()
   crossLedger.creditNoteEvents = [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks', postBasis: 'CONNECTOR' },
   ]
   await applyWcCouponCorrection(makeTx(crossLedger), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
 

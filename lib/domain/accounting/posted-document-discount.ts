@@ -24,6 +24,8 @@
  * chargeback depend on a mirror existing is a far larger blast radius than the bug being fixed.
  */
 
+import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
+
 export type PostedDocumentDiscount =
   /** No POSTED document event for this order — nothing to read; caller falls back. */
   | { known: false; unreadable?: false }
@@ -137,8 +139,19 @@ type PostedDocumentEventReader = {
       status: string
     }
     orderBy: { createdAt: 'desc' }
-    select: { linesJson: true }
-  }): Promise<{ linesJson: unknown } | null>
+    select: { linesJson: true; status: true; postBasis: true }
+  }): Promise<{ linesJson: unknown; status: string; postBasis: string | null } | null>
+}
+
+/** The unreadable verdict for a POSTED mirror whose lines are not confirmed as the ledger's own. */
+export function unconfirmedMirrorDiscount(standing: 'ASSERTED' | 'UNRECORDED' | 'NOT_POSTED'): PostedDocumentDiscount {
+  return {
+    known: false,
+    unreadable: true,
+    reason: standing === 'ASSERTED'
+      ? 'the posted document is recorded from an OPERATOR-asserted post, so its stored lines are what was queued, not what the ledger holds'
+      : 'the posted document records no confirmation that the connector accepted it (a mirror written before IMS recorded how a post was confirmed), so its stored lines are not proven to be what the ledger holds',
+  }
 }
 
 export const POSTED_SALES_INVOICE_EVENT_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
@@ -152,7 +165,7 @@ export async function readPostedSalesInvoiceDiscountForOrder(
   accountingEvent: PostedDocumentEventReader,
   orderId: string,
 ): Promise<PostedDocumentDiscount> {
-  let row: { linesJson: unknown } | null
+  let row: { linesJson: unknown; status: string; postBasis: string | null } | null
   try {
     row = await accountingEvent.findFirst({
       where: {
@@ -162,11 +175,19 @@ export async function readPostedSalesInvoiceDiscountForOrder(
         status: 'POSTED',
       },
       orderBy: { createdAt: 'desc' },
-      select: { linesJson: true },
+      select: { linesJson: true, status: true, postBasis: true },
     })
   } catch (error) {
     return { known: false, unreadable: true, reason: `the accounting event could not be read (${String(error)})` }
   }
   if (!row) return { known: false }
+  // o3d-3la07 (AE1): A POSTED MIRROR'S `linesJson` IS WHAT THE LEDGER HOLDS ONLY WHEN THE CONNECTOR SAID SO.
+  // For an operator-asserted post it is the lines queued at enqueue time (accounting-event-mirror.ts), and
+  // a pre-column mirror records no basis at all. The LATEST POSTED row is the one that describes the
+  // document standing now, so when it is not CONFIRMED the answer is "unreadable" - NOT "fall back to an
+  // older row" (that would describe a superseded document) and NOT "no posted document" (which restates
+  // the discount from the live setting). The caller turns unreadable into a manual decision.
+  const standing = mirroredPostStanding(row)
+  if (standing !== 'CONFIRMED') return unconfirmedMirrorDiscount(standing)
   return readPostedDocumentDiscount(row.linesJson)
 }
