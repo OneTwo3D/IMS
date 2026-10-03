@@ -169,7 +169,7 @@ async function seedWorld(label: string) {
     data: {
       reference: `MO-${tag}`, bomId: bom.id, outputProductId: finished.id, warehouseId: w1.id, qtyPlanned: OUTPUT_QTY, qtyProduced: OUTPUT_QTY,
       status: 'COMPLETED', completedAt: now,
-      manufacturingCostLines: { create: [{ description: 'overhead', amountForeign: 4, amountBase: 4, sortOrder: 0 }] },
+      manufacturingCostLines: { create: [{ description: 'overhead', amountForeign: 4, amountBase: 4, accountCode: '700', sortOrder: 0 }] },
     },
     select: { id: true },
   })
