@@ -1670,6 +1670,11 @@ test('[o3d-1e7sl Codex r2] the daily-batch message says "reverse ONLY if it exis
     assert.equal(blocker?.code, 'daily_batch_staged', c.name)
     const m = blocker!.message
     console.log(`# r2 batch precondition: ${c.name} => ${c.unconditional ? 'unconditional' : 'conditional'}`)
+    // each standing states its own account before the instruction: whose word, or that it is unproven, or that it is queued.
+    const lead = c.standing === 'ASSERTED_POSTED' ? /typing its id in; IMS never read it from the ledger/
+      : c.standing === 'LIVE_WORK' ? /queued or in flight and has not been confirmed as posted/
+      : c.standing === 'CONFIRMED_POSTED' ? null : /UNPROVEN/
+    if (lead) assert.match(m, lead, `${c.name}: its own account precedes the instruction`)
     if (c.unconditional) { unconditionalCount += 1; assert.match(m, UNCONDITIONAL, c.name); assert.doesNotMatch(m, /ONLY if it exists/, c.name) }
     else {
       assert.match(m, CONDITIONAL, c.name)
