@@ -353,6 +353,11 @@ export async function readCreditNoteOrderDiscount(
     refundIds: string[]
     postedCreditNoteExternalIds: string[]
     unresolvedRefundParkExternalIds: string[]
+    /**
+     * How a credit-note id is NAMED in the refusal text (o3d-djemh). Default: the bare id. The caller
+     * that knows which ids are only claimed (not confirmed by the ledger) supplies a labelling renderer.
+     */
+    describeCreditNoteIds?: (ids: readonly string[]) => string
   },
 ): Promise<CreditNoteOrderDiscountReversal> {
   if (evidence.refundIds.length === 0) {
@@ -426,7 +431,7 @@ export async function readCreditNoteOrderDiscount(
   const inLedger = [...new Set(evidence.postedCreditNoteExternalIds)].sort()
   if (backReferenced.join('|') !== inLedger.join('|')) {
     refusals.push(
-      `the credit note(s) in the ledger [${inLedger.join(', ')}] are not the set this order's refunds ` +
+      `the credit note id(s) recorded against this order [${(evidence.describeCreditNoteIds ?? ((ids) => ids.join(', ')))(inLedger)}] are not the set this order's refunds ` +
         `name [${backReferenced.join(', ')}], so what is posted and what IMS recorded do not describe ` +
         'the same documents',
     )

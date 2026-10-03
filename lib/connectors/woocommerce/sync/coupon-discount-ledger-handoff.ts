@@ -197,14 +197,57 @@ import {
  * if IMS had seen it in the ledger. This is the one place the wording lives, so the console report,
  * the handoff lines and the ActivityLog cannot disagree about it.
  */
-export const UNCONFIRMED_DOCUMENT_LABEL = 'asserted, NOT confirmed in the ledger'
+export type UnconfirmedCause = 'OPERATOR_ASSERTED' | 'UNRECOGNISED_BASIS' | 'NOT_SYNCED'
+
+/** A claimed document id that the ledger has not confirmed, and WHY (provenance; label only). */
+export type UnconfirmedDocument = { id: string; cause: UnconfirmedCause; status: string }
+
+/** The label for one unconfirmed id. Says only what is TRUE of that cause. */
+export function describeUnconfirmedCause(doc: UnconfirmedDocument): string {
+  switch (doc.cause) {
+    case 'OPERATOR_ASSERTED':
+      return 'asserted by an operator, NOT confirmed in the ledger'
+    case 'UNRECOGNISED_BASIS':
+      return 'settlement basis not recognised by this build, NOT confirmed in the ledger'
+    default:
+      return `on a ${doc.status} sync row, NOT confirmed in the ledger`
+  }
+}
+
+/**
+ * The REPORT's per-id lines for unconfirmed documents (no log prefix). Per-CAUSE wording: only what
+ * is true of each id. An operator "recorded" only the asserted ones; a connector id on a FAILED /
+ * PENDING row was never recorded by anyone as posted.
+ */
+export function describeUnconfirmedDocumentLines(
+  docs: ReadonlyArray<{ kind: 'invoice' | 'credit note'; doc: UnconfirmedDocument }>,
+): string[] {
+  return docs.map(({ kind, doc }) => {
+    const why =
+      doc.cause === 'OPERATOR_ASSERTED'
+        ? 'an operator recorded this as posted by typing the id in; IMS never saw it in the ledger'
+        : doc.cause === 'UNRECOGNISED_BASIS'
+          ? 'the row records a settlement basis this build does not recognise, so how the id was established is unknown'
+          : `the id sits on a ${doc.status} sync row, which never completed as a confirmed posting`
+    return (
+      `${kind} ${doc.id} (${describeUnconfirmedCause(doc)}): ${why}. It is still treated as a ` +
+      'possibly-existing document (so the ledger-adjustment handoff applies); check it in the accounting ' +
+      'system before relying on it.'
+    )
+  })
+}
 
 export function describeLedgerDocumentIds(
   ids: readonly string[],
-  unconfirmed: readonly string[] | undefined,
+  unconfirmed: readonly UnconfirmedDocument[] | undefined,
 ): string {
-  const flagged = new Set(unconfirmed ?? [])
-  return ids.map((id) => (flagged.has(id) ? `${id} (${UNCONFIRMED_DOCUMENT_LABEL})` : id)).join(', ')
+  const flagged = new Map((unconfirmed ?? []).map((doc) => [doc.id, doc]))
+  return ids
+    .map((id) => {
+      const doc = flagged.get(id)
+      return doc ? `${id} (${describeUnconfirmedCause(doc)})` : id
+    })
+    .join(', ')
 }
 
 /**
@@ -253,7 +296,7 @@ export type WcCouponRefundEvidence = {
    * or of unrecorded origin). LABEL ONLY: derived from the sync rows at read time, never persisted,
    * never compared (o3d-djemh).
    */
-  unconfirmedCreditNoteExternalIds?: string[]
+  unconfirmedCreditNoteDocuments?: UnconfirmedDocument[]
   /**
    * External WooCommerce refund ids that are PARKED unresolved against this order (r7 finding 1):
    * refunds that arrived and could not be recorded. Sorted.
@@ -266,7 +309,7 @@ export type WcCouponLedgerEvidence = {
   accountingInvoiceId: string | null
   postedInvoiceExternalIds: string[]
   /** Subset of `postedInvoiceExternalIds` not confirmed by the ledger. LABEL ONLY (o3d-djemh). */
-  unconfirmedInvoiceExternalIds?: string[]
+  unconfirmedInvoiceDocuments?: UnconfirmedDocument[]
   revenueDeferredBatchRef: string | null
   unearnedRevenueAmount?: number | null
   /**
@@ -374,7 +417,7 @@ export type WcCouponDocumentPosition = {
   accountingInvoiceId: string | null
   postedInvoiceExternalIds: string[]
   /** Subset of `postedInvoiceExternalIds` not confirmed by the ledger. LABEL ONLY: never compared. */
-  unconfirmedInvoiceExternalIds?: string[]
+  unconfirmedInvoiceDocuments?: UnconfirmedDocument[]
   revenueDeferredBatchRef: string | null
   unearnedRevenueAmount: number | null
   document: WcCouponMirroredDocumentPosition
@@ -389,8 +432,8 @@ export function buildWcCouponDocumentPosition(
     currency: input.currency,
     accountingInvoiceId: input.evidence.accountingInvoiceId,
     postedInvoiceExternalIds: [...input.evidence.postedInvoiceExternalIds],
-    ...(input.evidence.unconfirmedInvoiceExternalIds?.length
-      ? { unconfirmedInvoiceExternalIds: [...input.evidence.unconfirmedInvoiceExternalIds] }
+    ...(input.evidence.unconfirmedInvoiceDocuments?.length
+      ? { unconfirmedInvoiceDocuments: [...input.evidence.unconfirmedInvoiceDocuments] }
       : {}),
     revenueDeferredBatchRef: input.evidence.revenueDeferredBatchRef,
     unearnedRevenueAmount: input.evidence.unearnedRevenueAmount ?? null,
@@ -503,7 +546,7 @@ export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosit
   const set = [...position.document.documentSet].sort()
   return (
     `accountingInvoiceId=${position.accountingInvoiceId ?? 'none'}, ` +
-    `SYNCED sales invoice(s) [${describeLedgerDocumentIds([...position.postedInvoiceExternalIds].sort(), position.unconfirmedInvoiceExternalIds)}], ` +
+    `invoice id(s) claimed on sync rows [${describeLedgerDocumentIds([...position.postedInvoiceExternalIds].sort(), position.unconfirmedInvoiceDocuments)}], ` +
     `revenue-deferral batch ${position.revenueDeferredBatchRef ?? 'none'} of ` +
     `${position.unearnedRevenueAmount ?? 'nothing'}, and ${documentPart}` +
     `, over the mirrored event(s) {${set.length ? set.join(' | ') : 'none'}}`
@@ -840,7 +883,7 @@ function perDocument(documentCount: number): string {
 function describeLedgerReference(evidence: WcCouponLedgerEvidence): string | null {
   if (evidence.accountingInvoiceId) return `invoice ${evidence.accountingInvoiceId}`
   if (evidence.postedInvoiceExternalIds.length) {
-    return `posted-but-unlinked invoice(s) ${describeLedgerDocumentIds(evidence.postedInvoiceExternalIds, evidence.unconfirmedInvoiceExternalIds)}`
+    return `invoice id(s) on sync rows, not linked on the order: ${describeLedgerDocumentIds(evidence.postedInvoiceExternalIds, evidence.unconfirmedInvoiceDocuments)}`
   }
   return null
 }
@@ -1027,7 +1070,7 @@ export function classifyWcCouponInvoiceHandoff(input: {
   if (reference) {
     return {
       case: 'DOCUMENT_UNVERIFIED',
-      detail: `the ledger holds ${reference} for this order but no posted accounting event records what it charged`,
+      detail: `${evidence.accountingInvoiceId ? 'the ledger holds' : 'this order carries'} ${reference} for this order but no posted accounting event records what it charged`,
       documentRef: reference,
       documentCount: null,
       externalIds: [],
@@ -1184,7 +1227,7 @@ function describeRefundPrecondition(refunds: WcCouponRefundEvidence): string {
     `refundStatus ${refunds.disposition}`,
     refunds.refundIds.length ? `refund(s) ${refunds.refundIds.join(', ')}` : null,
     refunds.postedCreditNoteExternalIds.length
-      ? `credit note(s) ${describeLedgerDocumentIds(refunds.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteExternalIds)}`
+      ? `credit note(s) ${describeLedgerDocumentIds(refunds.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteDocuments)}`
       : null,
     refunds.unresolvedRefundParkExternalIds.length
       ? `unrecorded WooCommerce refund(s) ${refunds.unresolvedRefundParkExternalIds.join(', ')}`
@@ -1256,7 +1299,7 @@ export function wcCouponPreconditionSteps(input: {
     // column was tried and reverted, o3d-gt8r/o3d-s36z). Both are one glance for the operator, who is
     // being sent to open both documents anyway.
     steps.push(
-      `THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE(S) ${input.nettedAgainst.join(', ')}. ` +
+      `THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE(S) ${describeLedgerDocumentIds(input.nettedAgainst, input.validAgainst.unconfirmedCreditNoteDocuments)}. ` +
         `CONFIRM IN ${systemName(input.externalSystem)} THAT THEY ARE STILL POSTED AND UNCHANGED, AND ` +
         'THAT THEY AND THE INVOICE ARE IN THE SAME ORGANISATION: a credit note voided or edited by ' +
         'hand writes nothing back to IMS, and IMS records which CONNECTOR posted each document but ' +
@@ -1459,7 +1502,9 @@ function describeRefundEvidence(refunds: WcCouponRefundEvidence): string {
       ? `${refunds.refundIds.length} refund(s) recorded in IMS`
       : 'no refund row recorded in IMS',
     refunds.postedCreditNoteExternalIds.length
-      ? `credit note(s) ${refunds.postedCreditNoteExternalIds.join(', ')} in the ledger`
+      ? refunds.unconfirmedCreditNoteDocuments?.length
+        ? `credit note id(s) ${describeLedgerDocumentIds(refunds.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteDocuments)}`
+        : `credit note(s) ${refunds.postedCreditNoteExternalIds.join(', ')} in the ledger`
       : 'no credit note of theirs recorded in the ledger',
   ]
   // r7 finding 1. Named SEPARATELY and last, because it is the one signal that is not a statement
@@ -1511,7 +1556,7 @@ function refundNetPositionSteps(
   if (refunds.postedCreditNoteExternalIds.length) {
     steps.push(
       `• open ${documentRef ?? 'the sales invoice'} and credit note(s) ` +
-        `${refunds.postedCreditNoteExternalIds.join(', ')}, and read what this customer was actually ` +
+        `${describeLedgerDocumentIds(refunds.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteDocuments)}, and read what this customer was actually ` +
         'charged and actually refunded;',
     )
   } else {
@@ -2117,6 +2162,7 @@ export async function buildWcCouponLedgerHandoff(
         refundIds: refunds.refundIds,
         postedCreditNoteExternalIds: refunds.postedCreditNoteExternalIds,
         unresolvedRefundParkExternalIds: refunds.unresolvedRefundParkExternalIds,
+        describeCreditNoteIds: (ids) => describeLedgerDocumentIds(ids, refunds.unconfirmedCreditNoteDocuments),
       })
     : NO_CREDIT_NOTE_REVERSAL
 

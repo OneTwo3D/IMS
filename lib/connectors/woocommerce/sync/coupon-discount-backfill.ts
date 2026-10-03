@@ -114,6 +114,8 @@ import {
   buildWcCouponLedgerHandoff,
   describeLedgerDocumentIds,
   describeWcCouponDocumentPosition,
+  type UnconfirmedCause,
+  type UnconfirmedDocument,
   isWcCouponOrderRefunded,
   sameWcCouponDocumentPosition,
   wcCouponRemedySteps,
@@ -168,9 +170,9 @@ export const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'
  * reviewer saw), and D2 says an ASSERTED_POSTED row counts for those. Dropping it would make an
  * order whose invoice an operator claims posted look UNPOSTED, and the correction would rewrite the
  * discount with no ledger-adjustment handoff: the unsafe direction. What an asserted id must never
- * be is NAMED AS A CONFIRMED LEDGER DOCUMENT, so the rows also yield `unconfirmedIds`, the subset
- * whose standing is not CONFIRMED_POSTED (an operator's assertion, or a basis this build cannot
- * read). That subset is derived here, from the sync rows, every time the evidence is read: it is
+ * be is NAMED AS A CONFIRMED LEDGER DOCUMENT, so the rows also yield `unconfirmed`, the subset
+ * that is not a confirmed SYNCED posting, each with its CAUSE (an operator's assertion, a basis this
+ * build cannot read, or a connector id on a row that never reached SYNCED). That subset is derived here, from the sync rows, every time the evidence is read: it is
  * LABEL ONLY, never persisted in the reviewed file and never part of any comparison.
  *
  * Every row that carries an id counts unless the module PROVES it did not reach the ledger. (The
@@ -179,20 +181,41 @@ export const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'
  */
 export function classifyPostedDocumentRows(
   rows: ReadonlyArray<LedgerStandingRow>,
-): { ids: string[]; unconfirmedIds: string[] } {
+): { ids: string[]; unconfirmed: UnconfirmedDocument[] } {
   const confirmed = new Set<string>()
-  const other = new Set<string>()
+  const other = new Map<string, UnconfirmedDocument>()
+  const rank: Record<UnconfirmedCause, number> = { OPERATOR_ASSERTED: 0, UNRECOGNISED_BASIS: 1, NOT_SYNCED: 2 }
   for (const row of rows) {
     const id = (row.externalTransactionId ?? '').trim()
     if (id.length === 0) continue
     const standing = ledgerStanding(row)
     if (standing === 'PROVEN_NOT_POSTED') continue
-    ;(standing === 'CONFIRMED_POSTED' ? confirmed : other).add(row.externalTransactionId as string)
+    // WHY an id is not confirmed, so the wording says only what is true of it: an operator typed it,
+    // the row's basis is one this build cannot read, or it sits on a row that never reached SYNCED
+    // (a connector id on a FAILED / PENDING / CANCELLED row is a claim a document exists, not a
+    // statement that a posting completed).
+    const cause: UnconfirmedCause | null =
+      standing === 'ASSERTED_POSTED'
+        ? 'OPERATOR_ASSERTED'
+        : standing !== 'CONFIRMED_POSTED'
+          ? 'UNRECOGNISED_BASIS'
+          : row.status !== 'SYNCED'
+            ? 'NOT_SYNCED'
+            : null
+    const key = row.externalTransactionId as string
+    if (cause === null) {
+      confirmed.add(key)
+      continue
+    }
+    const known = other.get(key)
+    if (!known || rank[cause] < rank[known.cause]) other.set(key, { id: key, cause, status: row.status })
   }
-  const unconfirmedIds = [...other].filter((id) => !confirmed.has(id))
+  const unconfirmed = [...other.values()]
+    .filter((doc) => !confirmed.has(doc.id))
+    .sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0))
   return {
-    ids: sortedPostedInvoiceIds([...confirmed, ...other]),
-    unconfirmedIds: sortedPostedInvoiceIds(unconfirmedIds),
+    ids: sortedPostedInvoiceIds([...confirmed, ...other.keys()]),
+    unconfirmed,
   }
 }
 
@@ -230,7 +253,7 @@ export function sortedWcCouponRefundEvidence(refunds: WcCouponRefundEvidence): W
     refundIds: sortedPostedInvoiceIds(refunds.refundIds),
     postedCreditNoteExternalIds: sortedPostedInvoiceIds(refunds.postedCreditNoteExternalIds),
     unresolvedRefundParkExternalIds: sortedPostedInvoiceIds(refunds.unresolvedRefundParkExternalIds ?? []),
-    // `unconfirmedCreditNoteExternalIds` is deliberately NOT carried: this canonical form is what is
+    // `unconfirmedCreditNoteDocuments` is deliberately NOT carried: this canonical form is what is
     // written to the reviewed file, and the label is never persisted (o3d-djemh).
   }
 }
@@ -256,7 +279,7 @@ export function describeWcCouponRefundEvidence(refunds: WcCouponRefundEvidence):
   const canonical = sortedWcCouponRefundEvidence(refunds)
   return (
     `refundStatus=${canonical.disposition}, refund(s) [${canonical.refundIds.join(', ')}], ` +
-    `credit note(s) [${describeLedgerDocumentIds(canonical.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteExternalIds)}], ` +
+    `credit note(s) [${describeLedgerDocumentIds(canonical.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteDocuments)}], ` +
     `unrecorded WooCommerce refund(s) [${canonical.unresolvedRefundParkExternalIds.join(', ')}]`
   )
 }
@@ -711,7 +734,7 @@ export type WcCouponBackfillRow = {
    */
   postedInvoiceExternalIds: string[]
   /** Subset of `postedInvoiceExternalIds` not confirmed by the ledger. LABEL ONLY: never written to the reviewed file. */
-  unconfirmedInvoiceExternalIds?: string[]
+  unconfirmedInvoiceDocuments?: UnconfirmedDocument[]
   discountModel: string | null
   importedAt: Date | null
   /** An earlier run already corrected this order (the ActivityLog marker). */
@@ -1120,7 +1143,7 @@ export type WcCouponPostedEvidence = {
    * the id, or the row's origin is unrecorded). LABEL ONLY: derived from the sync rows at read time,
    * never persisted in the reviewed file, never compared (o3d-djemh).
    */
-  unconfirmedInvoiceExternalIds?: string[]
+  unconfirmedInvoiceDocuments?: UnconfirmedDocument[]
   /** The Group A1 batch that deferred this order's revenue from the pre-correction amount. */
   revenueDeferredBatchRef: string | null
   /** What that batch stamped. Not recomputed by this backfill, so it stays stale until adjusted. */
@@ -1261,7 +1284,7 @@ async function readLiveInvoiceEvidence(
     accountingInvoiceId: order.accountingInvoiceId,
     postedInvoiceExternalIds: invoiceDocuments.ids,
     // Label only (see `classifyPostedDocumentRows`); absent when every id is confirmed.
-    ...(invoiceDocuments.unconfirmedIds.length ? { unconfirmedInvoiceExternalIds: invoiceDocuments.unconfirmedIds } : {}),
+    ...(invoiceDocuments.unconfirmed.length ? { unconfirmedInvoiceDocuments: invoiceDocuments.unconfirmed } : {}),
     revenueDeferredBatchRef: order.revenueDeferredBatchRef,
     unearnedRevenueAmount:
       order.unearnedRevenueAmount === null || order.unearnedRevenueAmount === undefined
@@ -1312,7 +1335,7 @@ async function readLiveRefundEvidence(
   })
   const creditNoteDocuments = classifyPostedDocumentRows(creditNoteRows)
   const linkedCreditNoteIds = new Set(sortedPostedInvoiceIds(rows.map((refund) => refund.accountingCreditNoteId)))
-  const unconfirmedCreditNotes = creditNoteDocuments.unconfirmedIds.filter((id) => !linkedCreditNoteIds.has(id))
+  const unconfirmedCreditNotes = creditNoteDocuments.unconfirmed.filter((doc) => !linkedCreditNoteIds.has(doc.id))
   return {
     disposition,
     refundIds,
@@ -1320,7 +1343,7 @@ async function readLiveRefundEvidence(
     unresolvedRefundParkExternalIds: parks,
     // Label only. A credit note the order's own back-reference column names is not unconfirmed on a
     // sync row's say-so.
-    ...(unconfirmedCreditNotes.length ? { unconfirmedCreditNoteExternalIds: unconfirmedCreditNotes } : {}),
+    ...(unconfirmedCreditNotes.length ? { unconfirmedCreditNoteDocuments: unconfirmedCreditNotes } : {}),
   }
 }
 
@@ -1593,9 +1616,10 @@ export async function applyWcCouponCorrection(
       outcome: 'DECLINED',
       reason: 'POSTING_CHANGED',
       detail:
-        `the SYNCED sales invoice(s) for this order are now [${describeLedgerDocumentIds(livePostedIds, posted.unconfirmedInvoiceExternalIds)}], not the ` +
-        `[${reviewedPostedIds.join(', ')}] this row was reviewed with — a ledger document is real ` +
-        'even when accountingInvoiceId denies it (o3d-9kek). Re-run the report to review it again.',
+        `the invoice id(s) claimed for this order are now [${describeLedgerDocumentIds(livePostedIds, posted.unconfirmedInvoiceDocuments)}], not the ` +
+        `[${reviewedPostedIds.join(', ')}] this row was reviewed with (the reviewed file does not record how each id ` +
+        'was established) — an invoice id on a sync row means a document MAY exist even when accountingInvoiceId ' +
+        'denies it (o3d-9kek). Re-run the report to review it again.',
     }
   }
 
@@ -1705,11 +1729,11 @@ export async function applyWcCouponCorrection(
         // ActivityLog is what anyone reads back months later, and "needs a manual credit" recorded
         // against an invoice that was always correct is the r5 defect made permanent.
         (handoff
-          ? ' — in the ledger as ' +
+          ? ' — recorded against this order as ' +
             [
               posted.accountingInvoiceId ? `invoice ${posted.accountingInvoiceId}` : null,
               posted.postedInvoiceExternalIds.length
-                ? `unlinked invoice(s) ${describeLedgerDocumentIds(posted.postedInvoiceExternalIds, posted.unconfirmedInvoiceExternalIds)}`
+                ? `unlinked invoice(s) ${describeLedgerDocumentIds(posted.postedInvoiceExternalIds, posted.unconfirmedInvoiceDocuments)}`
                 : null,
               posted.revenueDeferredBatchRef
                 ? `revenue deferral ${posted.revenueDeferredBatchRef} of ${posted.unearnedRevenueAmount}`
@@ -1717,7 +1741,7 @@ export async function applyWcCouponCorrection(
               // r6 finding 1: a credit note is a ledger document derived from the same amount, and
               // on this order it is the one that decides no remedy may be named.
               posted.refunds.postedCreditNoteExternalIds.length
-                ? `credit note(s) ${describeLedgerDocumentIds(posted.refunds.postedCreditNoteExternalIds, posted.refunds.unconfirmedCreditNoteExternalIds)}`
+                ? `credit note(s) ${describeLedgerDocumentIds(posted.refunds.postedCreditNoteExternalIds, posted.refunds.unconfirmedCreditNoteDocuments)}`
                 : null,
               // r7 finding 1: not a ledger document, but the reason there may not be one — a refund
               // that arrived and could not be recorded. It belongs in the durable record for the
@@ -1744,8 +1768,8 @@ export async function applyWcCouponCorrection(
         postedInvoiceExternalIds: posted.postedInvoiceExternalIds,
         // The subset of the ids above that is NOT confirmed by the ledger (an operator's assertion).
         // Only when there is one, so a confirmed-only record is byte-identical to before.
-        ...(posted.unconfirmedInvoiceExternalIds?.length
-          ? { unconfirmedInvoiceExternalIds: posted.unconfirmedInvoiceExternalIds }
+        ...(posted.unconfirmedInvoiceDocuments?.length
+          ? { unconfirmedInvoiceDocuments: posted.unconfirmedInvoiceDocuments }
           : {}),
         revenueDeferredBatchRef: posted.revenueDeferredBatchRef,
         unearnedRevenueAmount: posted.unearnedRevenueAmount,
@@ -1758,8 +1782,8 @@ export async function applyWcCouponCorrection(
         refundDisposition: posted.refunds.disposition,
         refundIds: posted.refunds.refundIds,
         postedCreditNoteExternalIds: posted.refunds.postedCreditNoteExternalIds,
-        ...(posted.refunds.unconfirmedCreditNoteExternalIds?.length
-          ? { unconfirmedCreditNoteExternalIds: posted.refunds.unconfirmedCreditNoteExternalIds }
+        ...(posted.refunds.unconfirmedCreditNoteDocuments?.length
+          ? { unconfirmedCreditNoteDocuments: posted.refunds.unconfirmedCreditNoteDocuments }
           : {}),
         unresolvedRefundParkExternalIds: posted.refunds.unresolvedRefundParkExternalIds,
         refunded: handoff ? handoff.refunded : isWcCouponOrderRefunded(posted.refunds),

@@ -42,6 +42,8 @@ export const DECLARATIONS = [
     reason: "G7 (plan section 3): classifyQueuedRowsForRefusals hand-writes status != CANCELLED. Slice 1c routes it through the module." },
   { key: "app/actions/sync-exceptions.ts::classifyQueuedRowsForRefusals::where-admits-synced#1", class: "PENDING_CONVERSION:o3d-1e7sl",
     reason: "G7 (plan section 3): classifyQueuedRowsForRefusals hand-writes status != CANCELLED. Slice 1c routes it through the module." },
+  { key: "lib/connectors/woocommerce/sync/coupon-discount-backfill.ts::classifyPostedDocumentRows::cmp-synced#1", class: "DISPLAY",
+    reason: "o3d-djemh M17: wording only. A connector id on a row that never reached SYNCED is still COUNTED as a claimed document (existence, by ledgerStanding); this comparison only picks the label cause ('on a FAILED sync row, NOT confirmed') so the text never calls it a SYNCED posting. It never changes the id set or any comparison." },
   { key: "lib/accounting.ts::queueAccountingSyncTx::id-read#1", class: "DISPLAY",
     reason: "M11 (converted in slice 1a): names the document id of the asserted row in the operator-facing report of a suppressed enqueue; the verdict was reached by classifyPriorAttempts." },
   { key: "lib/connectors/xero/daily-sync.ts::dailyBatchRecreateVerdict::id-read#1", class: "DISPLAY",

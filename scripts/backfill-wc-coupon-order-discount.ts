@@ -45,11 +45,13 @@
  *     invoice enqueued without a discount account code carries no order-level discount line at all
  *     (o3d-y14 r5). Read the classification, not the column.
  *   • `postedInvoiceExternalIds` — invoice sync rows that name a document the order does NOT carry.
- *     An id an OPERATOR typed in counts (an existence claim) but the report prints it as NOT
- *     CONFIRMED and the CSV lists it in `unconfirmedPostedDocuments`; that label is never written to
+ *     An id an OPERATOR typed in, an id on a row that never reached SYNCED, and an id on a row with
+ *     an unrecognised basis all count (an existence claim) but the report prints each as NOT
+ *     CONFIRMED, with its own cause, and the CSV lists it in `unconfirmedPostedDocuments`; that label is never written to
  *     this file (o3d-djemh).
  *     A post can succeed and then fail to write its id back (o3d-9kek), so a non-empty list here
- *     with a null `accountingInvoiceId` is a REAL ledger document the column denies. It is
+ *     with a null `accountingInvoiceId` is a document the column denies (REAL when confirmed; the report
+ *     marks an id that is not). It is
  *     classified exactly like `accountingInvoiceId`, and approving the entry is you saying you have
  *     seen it. Apply compares this list against live state and refuses if it has moved, so approving
  *     the row is what unsticks it — there is no separate repair to run first.
@@ -224,6 +226,7 @@ import {
 import {
   buildWcCouponLedgerHandoff,
   describeLedgerDocumentIds,
+  describeUnconfirmedDocumentLines,
   isWcCouponOrderRefunded,
   type WcCouponLedgerHandoff,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
@@ -649,7 +652,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     const linkedCreditNoteIds = new Set(
       sortedPostedInvoiceIds((refundRows.get(order.id) ?? []).map((refund) => refund.accountingCreditNoteId)),
     )
-    const unconfirmedCreditNotes = creditNoteDocuments.unconfirmedIds.filter((id) => !linkedCreditNoteIds.has(id))
+    const unconfirmedCreditNotes = creditNoteDocuments.unconfirmed.filter((doc) => !linkedCreditNoteIds.has(doc.id))
     const row: WcCouponBackfillRow = {
       orderId: order.id,
       orderNumber: order.orderNumber ?? '',
@@ -661,7 +664,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       postedInvoiceExternalIds: invoiceDocuments.ids,
       // LABEL ONLY, for the console and CSV below: `buildWcCouponAllowlistEntry` copies named fields,
       // so this never reaches the reviewed file (o3d-djemh).
-      ...(invoiceDocuments.unconfirmedIds.length ? { unconfirmedInvoiceExternalIds: invoiceDocuments.unconfirmedIds } : {}),
+      ...(invoiceDocuments.unconfirmed.length ? { unconfirmedInvoiceDocuments: invoiceDocuments.unconfirmed } : {}),
       discountModel: order.discountModel,
       importedAt: order.shoppingLinks[0]?.createdAt ?? null,
       alreadyBackfilled: alreadyBackfilled.has(order.id),
@@ -679,7 +682,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         // signals above, so without this the order reads as unrefunded and gets the full remedy.
         unresolvedRefundParkExternalIds: refundParks.get(order.id) ?? [],
         }),
-        ...(unconfirmedCreditNotes.length ? { unconfirmedCreditNoteExternalIds: unconfirmedCreditNotes } : {}),
+        ...(unconfirmedCreditNotes.length ? { unconfirmedCreditNoteDocuments: unconfirmedCreditNotes } : {}),
       },
     }
     rows.push({ row, decision: decideWcCouponBackfill(row, { importedBefore }) })
@@ -753,24 +756,13 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     // assertion, never as a document IMS saw in the ledger.
     for (const { row } of postedCandidates) {
       const unconfirmed = [
-        ...(row.unconfirmedInvoiceExternalIds ?? []),
-        ...(row.refunds.unconfirmedCreditNoteExternalIds ?? []),
+        ...(row.unconfirmedInvoiceDocuments ?? []).map((doc) => ({ kind: 'invoice' as const, doc })),
+        ...(row.refunds.unconfirmedCreditNoteDocuments ?? []).map((doc) => ({ kind: 'credit note' as const, doc })),
       ]
       if (unconfirmed.length === 0) continue
-      console.log(
-        `${LOG}   ${row.orderNumber || row.orderId} — NOT CONFIRMED: ` +
-          [
-            row.postedInvoiceExternalIds.length
-              ? `invoice(s) ${describeLedgerDocumentIds(row.postedInvoiceExternalIds, row.unconfirmedInvoiceExternalIds)}`
-              : null,
-            row.refunds.postedCreditNoteExternalIds.length
-              ? `credit note(s) ${describeLedgerDocumentIds(row.refunds.postedCreditNoteExternalIds, row.refunds.unconfirmedCreditNoteExternalIds)}`
-              : null,
-          ].filter(Boolean).join('; ') +
-          '. An operator recorded these as posted; IMS never saw them in the ledger. They are still ' +
-          'treated as existing documents (so the ledger-adjustment handoff applies), but check each in ' +
-          'the accounting system before relying on it.',
-      )
+      // PER-CAUSE wording (see describeUnconfirmedDocumentLines): only what is true of each id.
+      console.log(`${LOG}   ${row.orderNumber || row.orderId} — NOT CONFIRMED:`)
+      for (const line of describeUnconfirmedDocumentLines(unconfirmed)) console.log(`${LOG}     ${line}`)
     }
     // ONE PAIR OF QUERIES PER POSTED CANDIDATE, and only for the posted ones. The candidate set is
     // already capped at WC_COUPON_MAX_CANDIDATES and this defect affects tens of orders, so the
@@ -786,7 +778,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
           // (o3d-9kek) is a different thing for the reviewer to check than a linked invoice — and it
           // is the one apply used to refuse forever.
           postedInvoiceExternalIds: row.postedInvoiceExternalIds,
-          unconfirmedInvoiceExternalIds: row.unconfirmedInvoiceExternalIds,
+          unconfirmedInvoiceDocuments: row.unconfirmedInvoiceDocuments,
           revenueDeferredBatchRef: row.revenueDeferredBatchRef,
           // o3d-y14 r6 finding 1. Passed, never defaulted: the handoff prescribes a DIFFERENT job
           // for a refunded order, and an omitted refund position here would print the unrefunded
@@ -878,7 +870,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         decision.action === 'CORRECT' ? decision.clearedBy : '',
         decision.action === 'CORRECT' ? '' : JSON.stringify(decision.detail),
         // Appended LAST so no existing column moves. Ids that rest on an operator's assertion.
-        [...(row.unconfirmedInvoiceExternalIds ?? []), ...(row.refunds.unconfirmedCreditNoteExternalIds ?? [])].join(' '),
+        [...(row.unconfirmedInvoiceDocuments ?? []), ...(row.refunds.unconfirmedCreditNoteDocuments ?? [])].map((doc) => `${doc.id}:${doc.cause}`).join(' '),
       ].join(','),
     )
     writeFileSync(csvPath, [header, ...body].join('\n') + '\n')
