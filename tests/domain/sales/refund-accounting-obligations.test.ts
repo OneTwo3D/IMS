@@ -579,3 +579,58 @@ test('o3d-2sm1 r9: the ledger asks for the verdict explicitly, and the hand-off 
     'the explicit-connector verdict must answer about the connector it was given',
   )
 })
+
+/* --------------------------------------------------------------------------------------------
+ * o3d-fj4m — settle() SAYS WHICH OBLIGATIONS IT SETTLED BY "WILL NEVER EXIST".
+ *
+ * A clean settle() is two different situations: every obligation became a durable row, or an
+ * obligation was settled by the pinned configuration's decision that the posting will never exist.
+ * The caller that discharges the flag must be able to tell them apart (the relief staging recorded
+ * for a journal that will not exist has to be written down). Each case prints what it measured.
+ * ------------------------------------------------------------------------------------------ */
+
+const UNEARNED_REVERSAL: RefundAccountingObligation = {
+  type: 'UNEARNED_REV_REVERSAL',
+  referenceType: 'SalesOrderRefund',
+  referenceId: 'refund-1',
+}
+
+test('o3d-fj4m: an obligation settled by the pinned "will never exist" decision is REPORTED, through both arms', async () => {
+  const off = { activeConnector: async () => 'xero', isTypeEnabledFor: async () => false }
+  const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, UNEARNED_REVERSAL, COGS_REVERSAL], off)
+  ledger.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
+  ledger.account(UNEARNED_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
+  const settlement = ledger.settle()
+  console.log(`o3d-fj4m settle(): decidedNeverToPost=${settlement.decidedNeverToPost.map((o) => o.type).join(',')}`)
+  assert.deepEqual(
+    settlement.decidedNeverToPost.map((o) => o.type).sort(),
+    ['COGS_REVERSAL', 'CREDIT_NOTE', 'UNEARNED_REV_REVERSAL'],
+    'all three were settled by the decision, in both the facade arm and the in-transaction arm',
+  )
+})
+
+test('o3d-fj4m: obligations that became durable rows are NOT reported as decided-never (the control)', async () => {
+  const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, UNEARNED_REVERSAL, COGS_REVERSAL], postingEnabled())
+  ledger.account(CREDIT_NOTE, { queued: true, connector: 'xero' })
+  ledger.account(UNEARNED_REVERSAL, { queued: true, reason: 'already-queued', connector: 'xero' })
+  ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: 'xero' })
+  const settlement = ledger.settle()
+  console.log(`o3d-fj4m settle() control: decidedNeverToPost=${settlement.decidedNeverToPost.length}`)
+  assert.deepEqual(settlement.decidedNeverToPost, [])
+})
+
+test('o3d-fj4m: only the DECIDED obligation is reported when the others are queued (isolating: one type off, two on)', async () => {
+  const unearnedOff = { activeConnector: async () => 'xero', isTypeEnabledFor: async (_c: string, type: AccountingSyncType) => type !== 'UNEARNED_REV_REVERSAL' }
+  const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, UNEARNED_REVERSAL], unearnedOff)
+  ledger.account(CREDIT_NOTE, { queued: true, connector: 'xero' })
+  ledger.account(UNEARNED_REVERSAL, { queued: false, reason: 'not-configured', connector: 'xero' })
+  const settlement = ledger.settle()
+  assert.deepEqual(settlement.decidedNeverToPost.map((o) => o.type), ['UNEARNED_REV_REVERSAL'])
+})
+
+test('o3d-fj4m: a REFUSED obligation is not "decided never" - it throws, so nothing is discharged', async () => {
+  const ledger = await openRefundAccountingObligationLedger([UNEARNED_REVERSAL], postingEnabled())
+  ledger.account(UNEARNED_REVERSAL, { queued: false, reason: 'refused', connector: 'xero' })
+  assert.throws(() => ledger.settle(), RefundAccountingObligationsUnmet)
+})

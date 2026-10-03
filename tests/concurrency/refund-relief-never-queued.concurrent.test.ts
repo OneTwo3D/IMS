@@ -426,6 +426,31 @@ test(
   },
 )
 
+test(
+  '[o3d-fj4m E] the RETRY path is the second discharge: a retry settled by "will never exist" leaves no relief standing either',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const r = await rig(t)
+    const { id: id1 } = await stageFirstRefundRefused(r, 'E')
+
+    // The operator switches the connector's sync off and retries refund #1: the replayed reversal settles by
+    // "this posting will never exist", the flag clears, and no journal is ever written.
+    await setSetting(r.db, 'xero_sync_enabled', 'false')
+    const retried = await r.deps.retryRefundAccounting(id1)
+    await setSetting(r.db, 'xero_sync_enabled', 'true')
+    const row = await r.db.salesOrderRefund.findUniqueOrThrow({ where: { id: id1 }, select: { accountingRetryRequired: true, accountingRetrySyncs: true, allocatedReliefAmount: true } })
+    const rows = await reversalRows(r.db, id1)
+    console.log(`PRECONDITION E: retry success=${retried.success} ${retried.error ?? ''} flag=${row.accountingRetryRequired} relief=${row.allocatedReliefAmount} reversalRows=${rows.length}`)
+    assert.equal(retried.success, true, 'PRECONDITION: the retry succeeded')
+    assert.equal(row.accountingRetryRequired, false, 'PRECONDITION: the retry cleared the flag')
+    assert.equal(rows.length, 0, 'PRECONDITION: no journal exists for refund #1 and none ever will')
+
+    assert.equal(Number(row.allocatedReliefAmount), 0, 'the retry\'s discharge writes the relief down too')
+    const second = await secondRefund(r, 'E')
+    assert.equal(second.credit, 40, 'refund #1 raised nothing, so refund #2 credits the whole £40')
+  },
+)
+
 /** How many backends are blocked behind `holderPid` right now. */
 async function blockedBehind(db: Db, holderPid: number): Promise<number> {
   const rows = await db.$queryRaw<Array<{ n: number }>>`
