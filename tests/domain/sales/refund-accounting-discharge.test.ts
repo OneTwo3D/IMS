@@ -19,21 +19,28 @@ import type { RefundAccountingObligation, RefundAccountingSettlement } from '@/l
  */
 
 const unearned = (refundId: string): RefundAccountingObligation => ({ type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: refundId })
-const none: RefundAccountingSettlement = { decidedNeverToPost: [] }
+const none: RefundAccountingSettlement = { decidedNeverToPost: [], pinnedConnector: 'xero' }
+const never = (refundId: string): RefundAccountingSettlement => ({ decidedNeverToPost: [unearned(refundId)], pinnedConnector: 'xero' })
 
-function recorder() {
+type Row = { id: string; connector: string; status: string; externalTransactionId: string | null; abandonedBeforeRemoteCall: boolean | null; settlementBasis: string | null }
+
+function recorder(rows: Row[] = []) {
   const updates: Array<{ where: unknown; data: Record<string, unknown> }> = []
-  const client = {
-    salesOrderRefund: {
-      update: async (args: { where: unknown; data: Record<string, unknown> }) => { updates.push(args); return {} },
-    },
+  const locks: unknown[][] = []
+  const tx = {
+    $executeRaw: async (...args: unknown[]) => { locks.push(args); return 0 },
+    accountingSyncLog: { findMany: async () => rows },
+    salesOrderRefund: { update: async (args: { where: unknown; data: Record<string, unknown> }) => { updates.push(args); return {} } },
   }
-  return { client: client as unknown as Parameters<typeof dischargeRefundAccountingObligation>[0], updates }
+  const client = { $transaction: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx) }
+  return { client: client as unknown as Parameters<typeof dischargeRefundAccountingObligation>[0], updates, locks }
 }
+const row = (over: Partial<Row>): Row => ({ id: 'row-1', connector: 'xero', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null, ...over })
 
 test('o3d-fj4m: a reversal decided never to post is discharged with relief 0 in the SAME single update', async () => {
   const { client, updates } = recorder()
-  await dischargeRefundAccountingObligation(client, 'r1', { decidedNeverToPost: [unearned('r1')] })
+  const result = await dischargeRefundAccountingObligation(client, 'r1', never('r1'))
+  assert.deepEqual(result, { discharged: true, reliefWrittenDown: true })
   console.log(`o3d-fj4m discharge (never-post): updates=${updates.length} data=${JSON.stringify(updates[0]?.data)}`)
   assert.equal(updates.length, 1, 'ONE statement, not a clear followed by a zeroing')
   assert.equal(updates[0].data.accountingRetryRequired, false)
@@ -52,16 +59,59 @@ test('o3d-fj4m: a QUEUED reversal leaves the relief untouched (the control: the 
 })
 
 test('o3d-fj4m: only THIS refund\'s UNEARNED_REV_REVERSAL counts (isolating: another refund, another type)', () => {
-  assert.equal(refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [unearned('r1')] }), true)
-  assert.equal(refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [unearned('r2')] }), false, 'another refund\'s decision says nothing about this one')
+  assert.equal(refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [unearned('r1')], pinnedConnector: 'xero' }), true)
+  assert.equal(refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [unearned('r2')], pinnedConnector: 'xero' }), false, 'another refund\'s decision says nothing about this one')
   assert.equal(
-    refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [{ type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'r1' }] }),
+    refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [{ type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'r1' }], pinnedConnector: 'xero' }),
     false,
     'a COGS or credit-note decision does not touch the allocation relief',
   )
   assert.equal(
-    refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [{ type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrder', referenceId: 'r1' }] }),
+    refundReversalDecidedNeverToPost('r1', { decidedNeverToPost: [{ type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrder', referenceId: 'r1' }], pinnedConnector: 'xero' }),
     false,
     'an order-scoped row is not this refund\'s journal',
   )
+})
+
+/* The crash gap (Codex HIGH on #733): the reversal was queued or posted, the process died before the
+ * discharge, sync was switched off, the retry settles it as "will never post". Each standing below is
+ * one arm; the precondition (the standing the module reports) is asserted and printed per arm. */
+const STANDING_ARMS: Array<{ name: string; row: Row; standing: string; zeroes: boolean }> = [
+  { name: 'LIVE_WORK', row: row({ status: 'PENDING' }), standing: 'LIVE_WORK', zeroes: false },
+  { name: 'CONFIRMED_POSTED', row: row({ status: 'SYNCED', externalTransactionId: 'JNL-1' }), standing: 'CONFIRMED_POSTED', zeroes: false },
+  { name: 'ASSERTED_POSTED', row: row({ status: 'SYNCED', externalTransactionId: 'TYPED', settlementBasis: 'OPERATOR_ASSERTION' }), standing: 'ASSERTED_POSTED', zeroes: false },
+  { name: 'ASSERTED_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }), standing: 'ASSERTED_NOT_POSTED', zeroes: false },
+  { name: 'UNKNOWN (FAILED, no id)', row: row({ status: 'FAILED' }), standing: 'UNKNOWN', zeroes: false },
+  { name: 'PROVEN_NOT_POSTED', row: row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true }), standing: 'PROVEN_NOT_POSTED', zeroes: true },
+]
+for (const arm of STANDING_ARMS) {
+  test(`o3d-fj4m crash gap: a prior attempt standing ${arm.name} ${arm.zeroes ? 'still lets the relief be written down' : 'KEEPS the relief and leaves the obligation unresolved'}`, async () => {
+    const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+    assert.equal(ledgerStanding(arm.row), arm.standing, 'PRECONDITION: the fixture has the standing the arm names')
+    const { client, updates, locks } = recorder([arm.row])
+    const result = await dischargeRefundAccountingObligation(client, 'r1', never('r1'))
+    console.log(`o3d-fj4m crash-gap ${arm.name}: result=${JSON.stringify(result).slice(0, 80)} updates=${updates.length} lockStatements=${locks.length}`)
+    assert.ok(locks.length >= 1, 'the follow-up scope lock is taken before the read')
+    if (arm.zeroes) {
+      assert.deepEqual(result, { discharged: true, reliefWrittenDown: true })
+      assert.equal(updates[0].data.allocatedReliefAmount, 0)
+    } else {
+      assert.equal(result.discharged, false)
+      assert.equal(updates.length, 0, 'nothing is written: the flag stays, the relief stays')
+    }
+  })
+}
+
+test('o3d-fj4m crash gap: ONE unproven attempt among proven-not-posted ones is enough to keep the relief (isolating)', async () => {
+  const { client, updates } = recorder([row({ id: 'a', status: 'CANCELLED', abandonedBeforeRemoteCall: true }), row({ id: 'b', status: 'SYNCED', externalTransactionId: 'J' })])
+  const result = await dischargeRefundAccountingObligation(client, 'r1', never('r1'))
+  assert.equal(result.discharged, false)
+  assert.equal(updates.length, 0)
+})
+
+test('o3d-fj4m crash gap: the check applies only to a decided-never reversal (a queued one is discharged normally even with a live row)', async () => {
+  const { client, updates } = recorder([row({ status: 'PENDING' })])
+  const result = await dischargeRefundAccountingObligation(client, 'r1', none)
+  assert.deepEqual(result, { discharged: true, reliefWrittenDown: false })
+  assert.equal('allocatedReliefAmount' in updates[0].data, false)
 })

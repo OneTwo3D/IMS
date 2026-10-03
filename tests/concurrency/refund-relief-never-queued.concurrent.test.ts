@@ -451,6 +451,92 @@ test(
   },
 )
 
+/**
+ * THE CRASH GAP (Codex HIGH on #733). Refund #1's reversal was QUEUED (or posted) and the process died before
+ * the discharge, so the refund is still flagged. The operator then switches the connector's sync off and
+ * retries: the enqueue asks "is posting enabled" BEFORE it looks for the prior journal, so the retry settles
+ * the reversal as "will never post" - for a journal that EXISTS. Zeroing the relief there makes refund #2 skip
+ * that journal and credit the whole open balance a second time.
+ *
+ * The crash is modelled by seeding the row the queue would have written onto a refund whose hand-off was
+ * refused (so it is flagged with its syncs recorded): same state a crash between the enqueue commit and the
+ * discharge leaves. Each arm names the standing of the seeded row and asserts it, and prints the precondition.
+ */
+async function crashGap(t: Parameters<typeof rig>[0], label: string, seeded: { status: 'PENDING' | 'SYNCED' | 'CANCELLED'; externalTransactionId?: string; abandonedBeforeRemoteCall?: boolean } | null) {
+  const r = await rig(t)
+  const { id: id1 } = await stageFirstRefundRefused(r, label)
+  if (seeded) {
+    const ledgerStandingMod = await import('../../lib/domain/accounting/ledger-standing.ts')
+    const created = await r.db.accountingSyncLog.create({
+      data: {
+        connector: 'xero',
+        type: 'UNEARNED_REV_REVERSAL',
+        status: seeded.status,
+        referenceType: 'SalesOrderRefund',
+        referenceId: id1,
+        externalTransactionId: seeded.externalTransactionId ?? null,
+        abandonedBeforeRemoteCall: seeded.abandonedBeforeRemoteCall ?? null,
+        syncedAt: seeded.status === 'SYNCED' ? new Date() : null,
+        payload: { _idempotencyKey: `sales-order-refund:${id1}:unearned-reversal`, lines: [{ accountCode: '1200', debit: 10 }, { accountCode: ALLOCATED_ACCOUNT, credit: 10 }] },
+      },
+      select: { id: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true },
+    })
+    console.log(`PRECONDITION ${label}: seeded prior attempt standing=${ledgerStandingMod.ledgerStanding(created)}`)
+  }
+  // sync OFF, then the retry
+  await setSetting(r.db, 'xero_sync_enabled', 'false')
+  const retried = await r.deps.retryRefundAccounting(id1)
+  await setSetting(r.db, 'xero_sync_enabled', 'true')
+  const row = await r.db.salesOrderRefund.findUniqueOrThrow({ where: { id: id1 }, select: { accountingRetryRequired: true, accountingRetrySyncs: true, allocatedReliefAmount: true } })
+  console.log(`${label}: retry(sync off) success=${retried.success} flag=${row.accountingRetryRequired} relief=${row.allocatedReliefAmount}`)
+  return { r, id1, retried, row }
+}
+
+test(
+  '[o3d-fj4m F1] crash gap, prior attempt LIVE_WORK: relief KEPT, obligation unresolved, then the remainder only',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { r, id1, retried, row } = await crashGap(t, 'F1', { status: 'PENDING' })
+    assert.equal(retried.success, false, 'the retry reports the obligation unresolved')
+    assert.equal(row.accountingRetryRequired, true, 'the flag stays')
+    assert.equal(Number(row.allocatedReliefAmount), 10, 'the relief stays: the journal exists')
+    // With posting back on the retry settles against the real row, and the journal drains.
+    const again = await r.deps.retryRefundAccounting(id1)
+    assert.equal(again.success, true, `retry with posting enabled settles against the existing row (${again.error ?? ''})`)
+    assert.equal((await reversalRows(r.db, id1)).length, 1, 'no second reversal row')
+    await drainReversal(r.db, id1)
+    const second = await secondRefund(r, 'F1')
+    assert.equal(second.credit, 30, 'the remainder only: 40 - 10, never 40 (a second credit of #1\'s £10)')
+  },
+)
+
+test(
+  '[o3d-fj4m F2] crash gap, prior attempt CONFIRMED_POSTED: relief KEPT, obligation unresolved, then the remainder only',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { r, id1, retried, row } = await crashGap(t, 'F2', { status: 'SYNCED', externalTransactionId: 'FJ4M-JNL-1' })
+    assert.equal(retried.success, false)
+    assert.equal(row.accountingRetryRequired, true)
+    assert.equal(Number(row.allocatedReliefAmount), 10)
+    const again = await r.deps.retryRefundAccounting(id1)
+    assert.equal(again.success, true, `retry with posting enabled settles (${again.error ?? ''})`)
+    const second = await secondRefund(r, 'F2')
+    assert.equal(second.credit, 30, 'the posted £10 is relief once: 30, never 40')
+  },
+)
+
+test(
+  '[o3d-fj4m F3] (control) crash gap, the only prior attempt is PROVEN_NOT_POSTED: the relief IS written down and #2 credits the whole £40',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { r, row } = await crashGap(t, 'F3', { status: 'CANCELLED', abandonedBeforeRemoteCall: true })
+    assert.equal(row.accountingRetryRequired, false, 'nothing could have posted, so the obligation discharges')
+    assert.equal(Number(row.allocatedReliefAmount), 0)
+    const second = await secondRefund(r, 'F3')
+    assert.equal(second.credit, 40)
+  },
+)
+
 /** How many backends are blocked behind `holderPid` right now. */
 async function blockedBehind(db: Db, holderPid: number): Promise<number> {
   const rows = await db.$queryRaw<Array<{ n: number }>>`
