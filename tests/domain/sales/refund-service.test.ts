@@ -573,6 +573,12 @@ function createClient(state: State): RefundServiceClient {
                 // makes every prior refund look like one that restocked nothing.
                 returnWarehouseId: refund.returnWarehouseId,
                 allocatedReliefAmount: refund.allocatedReliefAmount ?? null,
+                // o3d-fj4m: HONOURS THE SELECT, like the A2 read below. A double that returned the flag whether
+                // or not the production query asked for it would let `accountingRetryRequired: true` be deleted
+                // from the select and fail nothing (an unselected column reads undefined, i.e. "settled").
+                ...((select.refunds as { select?: { accountingRetryRequired?: boolean } } | undefined)?.select?.accountingRetryRequired
+                  ? { accountingRetryRequired: refund.accountingRetryRequired ?? false }
+                  : {}),
                 lines: state.refundLines.filter((line) => line.refundId === refund.id),
             })),
           }
@@ -9431,4 +9437,108 @@ test('[Codex r3 HIGH] FULL refund states the open balance with its figures (reco
   assert.match(note, /CR Allocated Inventory £10\.00: the open A2 balance £10\.00 \(recorded debit £20\.00 less relief already credited £10\.00\); do not credit more than the open balance/)
   assert.match(note, /deduct it/)
   console.log('r3 full: open 10.00 = debit 20.00 less relief 10.00')
+})
+
+/* --------------------------------------------------------------------------------------------
+ * o3d-fj4m - A PRIOR REFUND THAT STILL OWES ITS ACCOUNTING HAS NO "JOURNAL RETENTION DELETED".
+ *
+ * `allocatedReliefAmount` is written at STAGING, before any enqueue. The reader of a later refund treats
+ * "recorded relief, no journal on record" as retention having deleted a terminal row, and counts it. For a
+ * prior refund whose `accountingRetryRequired` is still set that reading is wrong: the journal was never
+ * queued (or its queue never answered), and counting the amount credits Allocated Inventory against relief
+ * that was never raised. The refund is refused (the order's open balance is unresolved) until that refund's
+ * accounting is retried.
+ *
+ * Reached through the RETRY of the current refund: a NEW refund is blocked while a prior one owes its
+ * accounting (scjz.22), so these drive the re-stage a retry performs. Every case asserts and prints its
+ * precondition; the three isolate the flag from the journal.
+ * ------------------------------------------------------------------------------------------ */
+
+function priorRefundOwingState(options: { priorFlag: boolean; priorRow?: 'synced' }): State {
+  const state = a2StagedFourUnitState()
+  seedPriorAllocationRefund(state)
+  const prior = state.refunds.find((refund) => refund.id === 'refund-prior')!
+  prior.allocatedReliefAmount = 10
+  prior.accountingRetryRequired = options.priorFlag
+  if (options.priorRow === 'synced') {
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      connector: 'xero',
+      type: 'UNEARNED_REV_REVERSAL',
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-prior',
+      status: 'SYNCED',
+      payload: { lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '1210', credit: 10 }] },
+    }]
+  }
+  // THE CURRENT refund: a full monetary refund whose staging is being re-derived by a retry.
+  state.orders[0].refundStatus = 'FULL'
+  state.refunds.push({
+    id: 'refund-2',
+    orderId: 'order-1',
+    creditNoteNumber: 'CN-000002',
+    externalRefundId: null,
+    reason: 'Goodwill full refund',
+    totalForeign: 75,
+    totalBase: 75,
+    returnWarehouseId: null,
+    totalsBasis: 'NET',
+    accountingRetryRequired: true,
+    accountingRetrySyncs: null,
+    reversalStagingState: REVERSAL_STAGING_NOT_STAGED,
+  })
+  state.refundLines.push({
+    id: 'refund-2-line-1',
+    refundId: 'refund-2',
+    salesOrderLineId: null,
+    productId: null,
+    description: 'Monetary refund',
+    qty: 0,
+    unitPriceForeign: 0,
+    unitPriceBase: 0,
+    totalForeign: 75,
+    totalBase: 75,
+  })
+  return state
+}
+
+async function retryRefund2(state: State) {
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-2',
+    accountingSettings,
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(result.success, true, 'PRECONDITION: the retry re-staged the current refund')
+  const sync = result.success ? result.accountingSyncs.find((entry) => entry.type === 'UNEARNED_REV_REVERSAL') : undefined
+  const lines = (sync?.payload as { lines?: Array<{ accountCode?: string; credit?: number }> } | undefined)?.lines ?? []
+  const credit = lines.find((line) => line.accountCode === accountingSettings.allocatedInventoryAccount && line.credit != null)?.credit ?? null
+  return { credit, note: String(state.refunds.find((refund) => refund.id === 'refund-2')!.allocationBasisUnresolved ?? '') }
+}
+
+test('[o3d-fj4m] a prior refund that STILL OWES its accounting, with no journal on record, is REFUSED as relief - not counted as retention', async () => {
+  const state = priorRefundOwingState({ priorFlag: true })
+  const prior = state.refunds.find((refund) => refund.id === 'refund-prior')!
+  assert.equal(prior.accountingRetryRequired, true)
+  assert.equal(state.accountingSyncLogs?.some((row) => row.referenceId === 'refund-prior'), false, 'PRECONDITION: no journal row exists for the prior refund')
+  const { credit, note } = await retryRefund2(state)
+  console.log(`o3d-fj4m reader (flagged, no row): credit=${credit} note=${note.slice(0, 120)}`)
+  assert.equal(credit, null, 'nothing is credited against an open balance that cannot be established')
+  assert.match(note, /prior refund refund-prior recorded £10\.00 of Allocated Inventory relief and STILL OWES its accounting/)
+  assert.doesNotMatch(note, /no longer on record \(retention\)/, 'it is not read as retention')
+})
+
+test('[o3d-fj4m] (control) the SAME prior refund with the flag CLEARED is still counted from its record, with the retention note', async () => {
+  const state = priorRefundOwingState({ priorFlag: false })
+  assert.equal(state.refunds.find((refund) => refund.id === 'refund-prior')!.accountingRetryRequired, false)
+  const { credit, note } = await retryRefund2(state)
+  console.log(`o3d-fj4m reader (cleared, no row): credit=${credit}`)
+  assert.equal(credit, 30, '£40 posted less the £10 the earlier refund RECORDED it credited (the o3d-o97 r3 reading is unchanged)')
+  assert.match(note, /counted from its own record because its reversal journal is no longer on record \(retention\)/)
+})
+
+test('[o3d-fj4m] (isolating) a flagged prior refund WITH its journal on record is resolved against the journal, not refused', async () => {
+  const state = priorRefundOwingState({ priorFlag: true, priorRow: 'synced' })
+  const { credit, note } = await retryRefund2(state)
+  console.log(`o3d-fj4m reader (flagged, SYNCED row): credit=${credit}`)
+  assert.equal(credit, 30, 'the journal exists and is legible: £40 less its own £10')
+  assert.doesNotMatch(note, /STILL OWES/, 'the flag does not override a journal that stands')
 })

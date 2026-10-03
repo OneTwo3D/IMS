@@ -67,7 +67,9 @@ import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib
 import {
   openRefundAccountingObligationLedger,
   type RefundAccountingObligation,
+  type RefundAccountingSettlement,
 } from '@/lib/domain/sales/refund-accounting-obligations'
+import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-accounting-discharge'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -1981,15 +1983,14 @@ async function markRefundAccountingRetryRequired(
  * obligation was queued, already standing, or decided by the PINNED configuration to be a posting
  * that will never exist. See lib/domain/sales/refund-accounting-obligations.ts.
  */
-async function clearRefundAccountingRetryState(refundId: string): Promise<void> {
-  await db.salesOrderRefund.update({
-    where: { id: refundId },
-    data: {
-      accountingRetryRequired: false,
-      accountingWarning: null,
-      accountingRetrySyncs: Prisma.DbNull,
-    },
-  })
+async function clearRefundAccountingRetryState(
+  refundId: string,
+  settlement: RefundAccountingSettlement,
+): Promise<Awaited<ReturnType<typeof dischargeRefundAccountingObligation>>> {
+  // o3d-fj4m: ONE transaction (lib/domain/sales/refund-accounting-discharge.ts) - it also writes down the
+  // relief staging recorded for a reversal the hand-off settled as "will never exist", but only when no
+  // earlier attempt for that reversal may have posted; otherwise it discharges nothing and says why.
+  return dischargeRefundAccountingObligation(db, refundId, settlement)
 }
 
 async function queueRefundAccountingActions(input: {
@@ -2001,7 +2002,7 @@ async function queueRefundAccountingActions(input: {
   lines: CreatedRefundLine[]
   accountingSyncs: RefundAccountingSyncRequest[]
   accountingSettings?: AccountingSettings
-}): Promise<void> {
+}): Promise<RefundAccountingSettlement> {
   const [settings, orderForCN, baseCurrency] = await Promise.all([
     input.accountingSettings ? Promise.resolve(input.accountingSettings) : getAccountingSettings(),
     db.salesOrder.findUnique({
@@ -2192,7 +2193,9 @@ async function queueRefundAccountingActions(input: {
 
   // NOTHING BELOW THIS LINE MAY DISCHARGE THE OBLIGATION UNLESS THIS RETURNS. It throws when any
   // recorded posting was not queued, including when one of them was never handed to an enqueue.
-  ledger.settle()
+  // o3d-fj4m: and it says which obligations were settled by "will never exist" rather than by a row, so the
+  // caller that discharges the flag can write down the relief staging recorded for a journal that will not exist.
+  return ledger.settle()
 }
 
 async function loadRefundAccountingQueueInput(
@@ -2490,8 +2493,9 @@ export async function createRefund(
     }
 
     let accountingWarning = refundResult.accountingWarning
+    let handOffSettlement: RefundAccountingSettlement | null = null
     try {
-      await queueRefundAccountingActions({
+      handOffSettlement = await queueRefundAccountingActions({
         orderId,
         refundId: refundResult.createdRefund.id,
         creditNoteNumber: refundResult.creditNoteNumber,
@@ -2538,8 +2542,29 @@ export async function createRefund(
     // enqueue's dedupe (unchanged by this branch, which touches neither queue module nor the retry
     // path), which this window merely makes easier to reach; it is filed as o3d-d0pd and is not
     // fixed here.
-    if (!accountingWarning) {
-      await clearRefundAccountingRetryState(refundResult.createdRefund.id)
+    //
+    // o3d-fj4m: NOT FOR A REPLAY. A replayed refund (WooCommerce redelivering the same refund id) stages
+    // nothing and hands off only the credit note, which is idempotent: `accountingSyncs` is `[]`. The flag it
+    // finds standing is the FIRST delivery's - set because that delivery's reversal was refused or never
+    // reached the queue - and this call would erase it together with `accountingRetrySyncs`, the only record
+    // of the reversal, while `allocatedReliefAmount` stood. The refund's own retry replays the recorded syncs
+    // and is what clears it; a replay discharges nothing it did not hand off.
+    if (!accountingWarning && !refundResult.replayed && handOffSettlement) {
+      const discharge = await clearRefundAccountingRetryState(refundResult.createdRefund.id, handOffSettlement)
+      if (!discharge.discharged) {
+        // The flag stays set (nothing was discharged); say so on the row and in the result.
+        accountingWarning = discharge.reason
+        await markRefundAccountingRetryRequired(refundResult.createdRefund.id, discharge.reason)
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: orderId,
+          action: 'refund_accounting_warning',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: discharge.reason,
+          metadata: { orderNumber: refundResult.refundOrderRef, refundId: refundResult.createdRefund.id },
+        })
+      }
     }
 
     // Propagate the refund to a WMS the order was already pushed to. The push sweep drives
@@ -3052,7 +3077,7 @@ export async function retryRefundAccounting(
       return result
     }
 
-    await queueRefundAccountingActions({
+    const handOffSettlement = await queueRefundAccountingActions({
       ...await loadRefundAccountingQueueInput(result.refundId, result.accountingSyncs),
       accountingSettings,
     })
@@ -3069,14 +3094,21 @@ export async function retryRefundAccounting(
     // recorded sync list behind it. It is NOT safe in the predecessor, and nothing in this branch
     // makes it so — a rule in the database would have to span the release window, which is where
     // three attempts at one came apart. That is a deployment change and it is filed as o3d-2sm1.1.
-    await db.salesOrderRefund.update({
-      where: { id: result.refundId },
-      data: {
-        accountingRetryRequired: false,
-        accountingWarning: null,
-        accountingRetrySyncs: Prisma.DbNull,
-      },
-    })
+    // o3d-fj4m: through the one discharge write, which also zeroes the relief recorded for a reversal this
+    // hand-off settled as "will never exist".
+    const discharge = await clearRefundAccountingRetryState(result.refundId, handOffSettlement)
+    if (!discharge.discharged) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: result.orderId,
+        action: 'refund_accounting_retry_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: discharge.reason,
+        metadata: { refundId, orderNumber: result.refundOrderRef },
+      })
+      return { success: false, error: discharge.reason }
+    }
 
     for (const row of result.returnedRows) {
       await logActivity({
