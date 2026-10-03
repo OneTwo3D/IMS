@@ -11,7 +11,9 @@ import { describeMirrorOwnershipSkip, refuseSettlementContradictedByMirror, sett
 import { failedUpdateStandingNote } from '@/lib/domain/accounting/rejected-sync-warnings'
 import { allocationDebitForeignLedgerReports } from '@/lib/domain/accounting/allocation-debit-passes'
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
-import { unconditionalMoneySentences } from '../helpers/unconditional-instruction'
+import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
+import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
+import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences } from '../helpers/unconditional-instruction'
 
 /**
  * o3d-1e7sl Codex round 3 - THE SAME UNIVERSAL-ABSENCE CHECK OVER EVERY OPERATOR STRING THIS PR TOUCHES.
@@ -98,9 +100,43 @@ for (const label of ['| Retired document that is **not proven never-sent**', '| 
   add(`help-docs/sales.md row ${label}`, flat(line))
 }
 
+// Codex round 4: the inbox's "what to do first" text, every claim state x queued-row state x with/without a retired-unproven attempt.
+for (const retiredUnproven of [[], ['row s-1 (CANCELLED, no proof)']]) {
+  for (const queuedRow of [null, 'unsent', 'may-be-sent'] as const) {
+    for (const claim of [null, { at: 'now', byName: 'Sam', mine: false }, { at: 'now', byName: null, mine: true }]) {
+      for (const earlierPostings of [[], ['INV-9']]) {
+        if (retiredUnproven.length === 0) continue // a posting with NO retired attempt is a known-outstanding obligation; its plain "post it" is the baseline, not a non-confirmed standing
+        add(`inbox hand-post order: retired=${retiredUnproven.length} queued=${queuedRow} claim=${claim ? (claim.mine ? 'mine' : 'other') : 'none'} earlier=${earlierPostings.length}`,
+          handPostOrderFor({ queuedRow, earlierPostings, retiredUnproven, claim }))
+      }
+    }
+  }
+}
+for (const [name, text] of Object.entries(refusalCopy)) if (typeof text === 'string') add(`refusal copy: ${name}`, text)
+
+test('[o3d-1e7sl Codex r4] the widened checker CAN fail: the unconditional hand-post shape and the round-2 shape are both flagged', () => {
+  assert.equal(unconditionalMoneySentences(ROUND_4_SHAPE).length, 1)
+  assert.equal(unconditionalMoneySentences(ROUND_2_SHAPE).length, 1)
+  assert.equal(unconditionalMoneySentences('Look in the ledger and then post it by hand.').length, 1)
+  assert.equal(unconditionalMoneySentences('Check the ledger for that document first; post it ONLY if it is absent.').length, 0)
+  assert.equal(unconditionalMoneySentences('Posting again could create a SECOND document; it did not post.').length, 0)
+})
+
+test('[o3d-1e7sl Codex r4] a retired-unproven hand-post order, claimed or not, makes the post conditional on the document being absent and never says "post it in the ledger now"', () => {
+  for (const claim of [null, { at: 'now', byName: null, mine: true }]) {
+    const text = handPostOrderFor({ queuedRow: null, earlierPostings: [], retiredUnproven: ['row s-1 (CANCELLED, no proof)'], claim })
+    assert.doesNotMatch(text, /post it in the ledger now/i)
+    assert.doesNotMatch(text, /Then post it,/)
+    assert.match(text, /check the ledger for that document first; post it ONLY if it is absent\. If it exists, do not post again/i)
+    assert.deepEqual(unconditionalMoneySentences(text), [])
+  }
+  // and the plain (no retired attempt) order is unchanged
+  assert.match(handPostOrderFor({ queuedRow: null, earlierPostings: [], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
+})
+
 test('[o3d-1e7sl Codex r3] every operator string for a non-CONFIRMED standing is free of unconditional reverse / credit / void / re-post instructions', () => {
   console.log(`# r3 universal strings checked: ${strings.length}`)
-  assert.ok(strings.length >= 50, 'the population is not vacuous')
+  assert.ok(strings.length >= 80, 'the population is not vacuous')
   const offenders = strings.map((s) => ({ where: s.where, bad: unconditionalMoneySentences(s.text) })).filter((o) => o.bad.length > 0)
   assert.deepEqual(offenders, [], 'unconditional money instruction(s) on a non-confirmed standing')
 })

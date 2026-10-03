@@ -1996,7 +1996,7 @@ stranded-rows banner. It records what *you* found in Xero:
   be sent again.** (The order's Delete stays refused — cancel the order instead, which keeps the record.) Your statement is your word about
   a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
   same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
-  clear a held "paid" flag, it will refuse to delete the receipt it registered, and it keeps the row
+  clear a held "paid" flag, it will refuse deletion of the receipt it registered, and it keeps the row
   (aged-out rows are compacted, never deleted). To get the posting into the ledger, **check Xero first and, only if the document is not there, record it in
   Xero by hand and mark the posting handled** in the refusal inbox.
 

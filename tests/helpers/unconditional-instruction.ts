@@ -11,6 +11,15 @@
  */
 const MONEY_WORD = /\b(reverse|reversed|reversal|credit|void|re-?post|repost)\b/i
 const CONDITIONAL = /only if|if it exists?\b/i
+/**
+ * Codex round 4: the round-3 verb list could not see "post it in the ledger now". The POST-class verbs are matched
+ * where they are AN INSTRUCTION (clause start, after a colon / comma / bracket, or after then / and / or / to / must /
+ * should / can / may / just / now / you), never where they DESCRIBE ("did not post", "could post a second document",
+ * "nothing will ever raise it"). Such a clause must say it applies ONLY if the document is absent, name the check
+ * first, or be a prohibition ("do not post again"): a prohibition cannot create an entry.
+ */
+const POST_VERB = /(?:^|[:,(]\s*|\b(?:then|and|or|to|must|should|can|may|just|now|please|you|ONLY)\s+)(?:post|hand-post|raise|record|enter|book|remove|delete|adjust|write[- ]off|clear|re-?send|resend|retry)\b/i
+const POST_CONDITIONAL = /only if|if it exists?\b|if (it is |it's |the document is |that is )?(absent|not there|missing)|if (it|the document|that|this) (is not|isn't|does not|doesn't)\b|unless|check[^.;]*\bfirst\b|first check|\bdo not\b|\bdon't\b|\bif the document is already\b/i
 /** The cause LABEL (a status name, not an instruction) is not a money word: "verified reversed". */
 const LABELS = /verified reversed/gi
 
@@ -23,12 +32,30 @@ export function sentencesOf(text: string): string[] {
   return text.split(/(?<=[.!?;])\s+|\s+[—–]\s+|\s+-\s+(?=[a-z])|,\s+so\s+(?:then\s+)?/).map((sentence) => sentence.trim()).filter(Boolean)
 }
 
+/**
+ * A POST-class instruction is one whose verb is NOT negated within the four words before it, or by IMS as the subject ("not going to post",
+ * "decide not to post", "nothing can post", "will not post"): a negated verb is a prohibition or a description.
+ */
+function postInstruction(text: string): boolean {
+  const match = POST_VERB.exec(text)
+  if (!match) return false
+  const before = text.slice(0, match.index + match[0].length)
+  return !/\b(not|never|nothing|cannot|can't|won't|n't|refuse|refuses|IMS)\b(\W+\w+){0,4}\W+\w+$/i.test(before)
+}
+
 /** The sentences that give a money instruction without conditioning it on the document existing. */
 export function unconditionalMoneySentences(text: string): string[] {
-  return sentencesOf(text).filter((sentence) => MONEY_WORD.test(sentence.replace(LABELS, 'verified-gone')) && !CONDITIONAL.test(sentence))
+  return sentencesOf(text).filter((sentence) => {
+    const text1 = sentence.replace(LABELS, 'verified-gone')
+    return (MONEY_WORD.test(text1) && !CONDITIONAL.test(sentence)) || (postInstruction(text1) && !POST_CONDITIONAL.test(sentence))
+  })
 }
 
 /** A negative control: proves the checker CAN fail (it flags the round-2 shape). */
+/** Round-4 negative control: the unconditional hand-post shape the round-3 verb list could not see. */
+export const ROUND_4_SHAPE =
+  'IMS will not queue this posting while you hold it: post it in the ledger now, then press "Mark as handled".'
+
 export const ROUND_2_SHAPE =
   'Reverse it ONLY if it exists there (if it does not exist there is nothing to reverse); a journal cannot be un-posted '
   + 'from here, so then cancel the order and have finance reverse the batch entry.'

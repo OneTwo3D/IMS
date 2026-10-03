@@ -740,10 +740,13 @@ export function allocationDebitForeignLedgerReports(input: {
         + 'evidence that nothing reached the ledger — a failed attempt can have posted before it '
         + 'failed, and a cancellation is a local decision about the row, not about the remote books'
       : `and that journal is NOT on record: ${detail}`
+    // Codex round 4: "NOT on record" is a statement about IMS's own rows, not the foreign ledger, so BOTH remedies
+    // check first and post only for a genuinely absent journal.
     const remedy = ambiguous
       ? `CHECK ${connector} FIRST for a journal covering this batch, and post DR Allocated Inventory `
         + `by hand there ONLY if it is genuinely absent`
-      : `Post it in ${connector} by hand from the orders' own pass history`
+      : `CHECK ${connector} FIRST for a journal covering this batch, and post it there by hand from the orders' own `
+        + 'pass history ONLY if it is genuinely absent'
     return (
       `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
       + `was debited to Allocated Inventory on ${connector}, ${standing}. `

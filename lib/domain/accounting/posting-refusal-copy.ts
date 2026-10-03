@@ -80,7 +80,8 @@ export const ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING =
   'Take this posting to settle it by hand. From the moment you do, IMS will NOT queue it — not on a sweep, not '
   + 'from another operator saving the document — so nothing can post it while you are in the ledger. Any queued '
   + 'row nothing has picked up is cancelled now; if a row may ALREADY have been sent you will be told instead and '
-  + 'nothing is changed. Then post it in the ledger and press "Mark as handled". If you decide not to post it, '
+  + 'nothing is changed. Then check the ledger for that document first, post it ONLY if it is absent (if it exists, '
+  + 'do not post again), and press "Mark as handled". If you decide not to post it, '
   + 'press "Release" so IMS can queue it again.'
 
 /** o3d-j625 r16: what Release tells the operator, because it is the one act that re-opens the window. */

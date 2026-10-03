@@ -244,8 +244,9 @@ export function describeUnresolvedPriorAttempt(params: {
     + 'IMS cannot tell whether it reached the accounting system — the remote call is made before its '
     + 'result is written back, so a failure does not prove nothing posted. Queueing this posting again '
     + 'would create a SECOND document if the first one landed. REMEDY: resolve that row on /sync — '
-    + 'retry it, or record its document id with the per-row settlement action if the document is '
-    + 'already in the ledger. This posting is still outstanding until you do.'
+    + 'check the accounting system for that document first. Retry the row ONLY if the document is absent there; if '
+    + 'it exists, record its document id with the per-row settlement action instead of retrying. This posting is still '
+    + 'outstanding until you do.'
 }
 
 /**
