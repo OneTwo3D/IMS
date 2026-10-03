@@ -748,11 +748,12 @@ async function applyTransferLineReceipt(
   // aborts this transaction rather than let the stock increment above commit
   // alone. Do NOT wrap this call in a try or a savepoint.
   //
-  // It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed
-  // while these units were in transit had no layer to journal against and IMS
-  // persisted no obligation for it; creating the layer now does not discharge it,
-  // and the delta is still sitting in the transit clearing account. That gap is
-  // open and tracked as o3d-nrl4 — see the contract on
+  // It posts NOTHING to the ledger, by design (o3d-nrl4 PR B). A landed-cost
+  // revaluation that landed while these units were in transit already capitalised
+  // their share at revaluation time (DR Inventory / CR Transit, via
+  // capitaliseInTransitResidue) and rewrote the snapshot this slice is costed from,
+  // so the layer created here is at the revalued cost and nothing is owed: a transfer
+  // posts no entry, so the units never left GL Inventory. See the contract on
   // STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
   //
   // `bookedQty` is the stock increment made immediately above, and the helper's
@@ -1331,11 +1332,12 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
         // than let the restore above commit alone. Do NOT wrap this call in a try
         // or a savepoint.
         //
-        // A cancellation is the OTHER way in-transit units come to rest, and it
-        // settles no deferred reclass either (Codex round-4 LOW): a revaluation that
-        // landed mid-transit was never persisted as an obligation, so nothing here
-        // discharges it and the delta stays in the transit clearing account. Open,
-        // tracked as o3d-nrl4.
+        // A cancellation is the OTHER way in-transit units come to rest, and it posts
+        // nothing either, by design (o3d-nrl4 PR B): a revaluation that landed mid-transit
+        // already capitalised these units' share at revaluation time (DR Inventory / CR
+        // Transit, via capitaliseInTransitResidue) and rewrote the snapshot the
+        // replacement layers are costed from, so there is nothing owed. From here on the
+        // units are in the replacement layers, which propagation reaches.
         //
         // `bookedQty` is the restore increment above (Codex round-8 HIGH-1). This
         // path restores the FULL outstanding line quantity, and the snapshot can

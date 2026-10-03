@@ -657,7 +657,7 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
     }
   })
 
-  await t.test('G: golden — taking the lock changes none of the recalculation\'s results (no accounting change in this PR)', async () => {
+  await t.test('G: golden — taking the lock changes none of the recalculation\'s results (the lock adds no accounting change of its own)', async () => {
     const { recalculateLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
     const plain = await seedWorld('gplain')
     const locked = await seedWorld('glocked')
@@ -678,8 +678,10 @@ test('o3d-nrl4 PR A: the landed-cost revaluation scope lock', { skip }, async (t
     console.log(`G PRECONDITION: unlocked = ${JSON.stringify(a)}; locked = ${JSON.stringify(b)}`)
     assert.deepEqual(b, a, 'identical results with and without the scope lock')
     // And the literal golden, so "identical" cannot mean "identically wrong": 6 on hand x (7.00 - 5.00) =
-    // 12.00 inventory; the 4 in transit are excluded from COGS and (still, until PR B) post nothing.
-    assert.deepEqual(a.inventory.map((x) => x.totalDelta), [12])
+    // 12.00 inventory on hand, PLUS (o3d-nrl4 PR B) the 4 units still in transit x (7.00 - 5.00) = 8.00 capitalised
+    // at revaluation time = 20.00; the 4 in transit are excluded from COGS. PR A posted 12 here and PR B's whole
+    // point is the 8, so this literal moved by exactly the in-transit share and nothing else.
+    assert.deepEqual(a.inventory.map((x) => x.totalDelta), [20])
     assert.deepEqual(a.cogs, [])
     for (const world of [plain, locked]) {
       assert.equal(await layerUnitCost(world.layerId), 7)

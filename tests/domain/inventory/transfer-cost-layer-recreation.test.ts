@@ -27,9 +27,9 @@ import {
  *    wraps the call in something that could swallow the refusal.
  *
  * The helper does NOT settle a revaluation that landed while the units were in
- * transit — that machinery was withdrawn from this branch (o3d-nrl4), so there are
- * no settlement tests here. See the contract on
- * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT for what is still open.
+ * transit, and posts nothing: such a revaluation capitalised their share at revaluation
+ * time (o3d-nrl4 PR B), so there are no settlement tests here. See the contract on
+ * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
  */
 
 /** What Postgres says once a statement in the transaction has failed. */
@@ -653,7 +653,10 @@ test('every transfer-snapshot recreation goes through the shared helper (6oyu.19
   assert.ok(files.length > 100, `precondition: the walk must actually reach the source tree (saw ${files.length} files)`)
 
   const slicers: string[] = []
+  const measured: string[] = []
   const offenders: string[] = []
+  /** Files that slice a snapshot only to count what is still in transit (o3d-nrl4 PR B). */
+  const MEASUREMENT_ONLY_SLICERS = ['lib/domain/purchasing/landed-cost-service.ts']
   for (const file of files) {
     const source = readFileSync(file, 'utf8')
     // The helper's own module and the slicer's own definition are not call sites.
@@ -661,10 +664,21 @@ test('every transfer-snapshot recreation goes through the shared helper (6oyu.19
     if (file.endsWith('asn-reconciliation.ts')) continue
     if (!source.includes('sliceTransferSnapshotForReceipt(')) continue
     slicers.push(file)
+    if (MEASUREMENT_ONLY_SLICERS.includes(file)) {
+      // o3d-nrl4 PR B: the landed-cost residue slices the snapshot past the LANDED quantity to COUNT the
+      // units still in transit. It builds nothing, so it must not create layers (that would be a fifth
+      // open-coded recreation) and must not reach for the recreation helper either.
+      measured.push(file)
+      if (/\bcreateCostLayer\(|costLayer\.create\(|recreateTransferCostLayersFromSnapshotSlice\(/.test(source)) {
+        offenders.push(`${file}: is allowed to slice a dispatch snapshot only to MEASURE it, but it creates layers`)
+      }
+      continue
+    }
     if (!source.includes('recreateTransferCostLayersFromSnapshotSlice(')) {
       offenders.push(`${file}: slices a dispatch snapshot but never calls the shared recreation helper`)
     }
   }
+  assert.deepEqual(measured, MEASUREMENT_ONLY_SLICERS, 'precondition: the measurement-only slicer was reached by the walk')
 
   assert.deepEqual(offenders, [], offenders.join('\n'))
   assert.deepEqual(
@@ -672,6 +686,7 @@ test('every transfer-snapshot recreation goes through the shared helper (6oyu.19
     [
       'app/actions/transfers.ts',
       'lib/connectors/mintsoft/sync/stock-sync.ts',
+      'lib/domain/purchasing/landed-cost-service.ts',
       'lib/domain/wms/booked-in-service.ts',
     ],
     'the set of snapshot-slicing files changed — a new one must route through the helper (and be listed here)',
@@ -752,7 +767,7 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
  * A third regex would fail the same way, so the subject is closed instead — these four
  * blocks, verbatim. ANY edit to a call-site comment fails this test, which is the
  * point: the claim a maintainer reads there is the one thing that decided, twice, that
- * the in-transit gap (o3d-nrl4) was handled when it is not.
+ * the in-transit gap (o3d-nrl4) was handled when it was not (it is now: at revaluation time).
  *
  * WHAT THIS DOES NOT COVER, stated rather than implied: prose about the helper
  * ELSEWHERE — in these files, in the helper's own module comment, in docs/ — is not
@@ -760,15 +775,15 @@ test('copyCostLayerSourceLinesProportionally has no unguarded caller left (6oyu.
  * Updating a block below is a normal, expected edit; it just has to be a deliberate one.
  */
 const ALLOWED_CALL_SITE_COMMENTS: Record<string, string[]> = {
-  'app/actions/transfers.ts': [
-    "Recreate FIFO layers at the destination from the unconsumed slice of the dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the next qtyToReceive units). The shared helper GUARANTEES two things about the layers it creates — each is reachable by propagateLandedCostToOutputs, and together they cover the slice's whole quantity — so never open-code this. It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and aborts this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NOTHING (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit had no layer to journal against and IMS persisted no obligation for it; creating the layer now does not discharge it, and the delta is still sitting in the transit clearing account. That gap is open and tracked as o3d-nrl4 — see the contract on STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT. `bookedQty` is the stock increment made immediately above, and the helper's coverage postcondition is measured against IT, not against the slice (Codex round-8 HIGH-1). cogs-audit scjz.5's £0 balancing layer for an under-recording dispatch snapshot is now the helper's `BALANCE_AT_ZERO_COST` policy: it used to be built here, and the three other call sites — which increment stock the same way — did not build one at all.",
-    "Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the destination recreation in receiveTransfer, targeting fromWarehouseId). Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this creates equivalent replacement layers (same cost basis + source-line provenance), so source quantity reconciles with cost layers. Same shared helper as the receipt path, for the same two guarantees: each replacement layer is reachable by propagation, and the layers cover the whole restored quantity (this path has no balancing step of its own, so a layer the helper declined would leave the restored stock unlayered — Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the restore above commit alone. Do NOT wrap this call in a try or a savepoint. A cancellation is the OTHER way in-transit units come to rest, and it settles no deferred reclass either (Codex round-4 LOW): a revaluation that landed mid-transit was never persisted as an obligation, so nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is the restore increment above (Codex round-8 HIGH-1). This path restores the FULL outstanding line quantity, and the snapshot can cover less than that — a source that dispatched legacy/uncosted stock is the ordinary case, and `linesMissingCostLayers` above counts only the TOTALLY uncovered one. A partial shortfall used to pass the helper's slice-scoped check and leave restored stock unlayered at the source.",
+  "app/actions/transfers.ts": [
+    "Recreate FIFO layers at the destination from the unconsumed slice of the dispatch snapshot (the slicer walks past alreadyReceivedQty and returns the next qtyToReceive units). The shared helper GUARANTEES two things about the layers it creates — each is reachable by propagateLandedCostToOutputs, and together they cover the slice's whole quantity — so never open-code this. It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f): nothing downstream can carry the sign, so it creates nothing and aborts this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It posts NOTHING to the ledger, by design (o3d-nrl4 PR B). A landed-cost revaluation that landed while these units were in transit already capitalised their share at revaluation time (DR Inventory / CR Transit, via capitaliseInTransitResidue) and rewrote the snapshot this slice is costed from, so the layer created here is at the revalued cost and nothing is owed: a transfer posts no entry, so the units never left GL Inventory. See the contract on STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT. `bookedQty` is the stock increment made immediately above, and the helper's coverage postcondition is measured against IT, not against the slice (Codex round-8 HIGH-1). cogs-audit scjz.5's £0 balancing layer for an under-recording dispatch snapshot is now the helper's `BALANCE_AT_ZERO_COST` policy: it used to be built here, and the three other call sites — which increment stock the same way — did not build one at all.",
+    "Recreate FIFO layers at the SOURCE from the snapshot slice (mirrors the destination recreation in receiveTransfer, targeting fromWarehouseId). Note: the ORIGINAL layers consumed at dispatch are NOT un-consumed; this creates equivalent replacement layers (same cost basis + source-line provenance), so source quantity reconciles with cost layers. Same shared helper as the receipt path, for the same two guarantees: each replacement layer is reachable by propagation, and the layers cover the whole restored quantity (this path has no balancing step of its own, so a layer the helper declined would leave the restored stock unlayered — Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the restore above commit alone. Do NOT wrap this call in a try or a savepoint. A cancellation is the OTHER way in-transit units come to rest, and it posts nothing either, by design (o3d-nrl4 PR B): a revaluation that landed mid-transit already capitalised these units' share at revaluation time (DR Inventory / CR Transit, via capitaliseInTransitResidue) and rewrote the snapshot the replacement layers are costed from, so there is nothing owed. From here on the units are in the replacement layers, which propagation reaches. `bookedQty` is the restore increment above (Codex round-8 HIGH-1). This path restores the FULL outstanding line quantity, and the snapshot can cover less than that — a source that dispatched legacy/uncosted stock is the ordinary case, and `linesMissingCostLayers` above counts only the TOTALLY uncovered one. A partial shortfall used to pass the helper's slice-scoped check and leave restored stock unlayered at the source.",
   ],
-  'lib/connectors/mintsoft/sync/stock-sync.ts': [
-    "6oyu.19: same omission as the WMS webhook receipt path — the created layer had no costLayerSourceLine whenever the source was a plain PO-derived layer, stranding the landed-cost delta. Routed through the shared helper so the link is guaranteed, not remembered — and so is the quantity: stock is incremented for this allocation below, and an entry the helper declined would leave it unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the allocation's stock increment commit alone. Do NOT wrap this call in a try or a savepoint. Note this alignment does NOT change the transfer's status, so a transfer can be IN_TRANSIT with these units fully layered and propagatable. What is still uncovered is a revaluation that landed while units were in transit: nothing here discharges it and the delta stays in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is `allocation.qty`, the stock increment made below, and the helper's coverage postcondition is measured against IT (Codex round-8 HIGH-1). The old postcondition compared the created layers with the SLICE, and the slice is only as long as the snapshot allowed — a ten-unit allocation over a six-unit remaining snapshot compared six with six and passed, then incremented stock by ten. `REFUSE` rather than `BALANCE_AT_ZERO_COST`, and it is a backstop rather than a route: the plan above is already capped by `remainingCostableSnapshotQty`, so a shortfall here means the cap and the slicer have come to disagree. Alignment is an OPTIONAL auto-correction of a WMS/IMS discrepancy — unlike the three receipt paths, nothing is physically waiting to be booked — so inventing £0 units to push an optional correction through would be strictly worse than leaving the discrepancy where an operator can see it.",
+  "lib/connectors/mintsoft/sync/stock-sync.ts": [
+    "6oyu.19: same omission as the WMS webhook receipt path — the created layer had no costLayerSourceLine whenever the source was a plain PO-derived layer, stranding the landed-cost delta. Routed through the shared helper so the link is guaranteed, not remembered — and so is the quantity: stock is incremented for this allocation below, and an entry the helper declined would leave it unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the allocation's stock increment commit alone. Do NOT wrap this call in a try or a savepoint. Note this alignment does NOT change the transfer's status, so a transfer can be IN_TRANSIT with these units fully layered and propagatable. A revaluation that landed while units were in transit capitalised their share itself at revaluation time (DR Inventory / CR Transit, o3d-nrl4 PR B: capitaliseInTransitResidue, measured past this credit as LANDED quantity), so nothing is owed here and this posts nothing. `bookedQty` is `allocation.qty`, the stock increment made below, and the helper's coverage postcondition is measured against IT (Codex round-8 HIGH-1). The old postcondition compared the created layers with the SLICE, and the slice is only as long as the snapshot allowed — a ten-unit allocation over a six-unit remaining snapshot compared six with six and passed, then incremented stock by ten. `REFUSE` rather than `BALANCE_AT_ZERO_COST`, and it is a backstop rather than a route: the plan above is already capped by `remainingCostableSnapshotQty`, so a shortfall here means the cap and the slicer have come to disagree. Alignment is an OPTIONAL auto-correction of a WMS/IMS discrepancy — unlike the three receipt paths, nothing is physically waiting to be booked — so inventing £0 units to push an optional correction through would be strictly worse than leaving the discrepancy where an operator can see it.",
   ],
-  'lib/domain/wms/booked-in-service.ts': [
-    "6oyu.19: this loop used to create the destination layer and call copyCostLayerSourceLinesProportionally IGNORING its result, which is 0 for an ordinary PO-derived source layer (it has no sourceLines of its own). The layer was therefore left with no costLayerSourceLine, so the revaluation exclusion removed these units from COGS while propagation had nowhere to carry the delta. The shared helper makes the link a postcondition, and the quantity too — this path increments stock immediately above and has no balancing layer, so an entry the helper declined would leave the booked-in units unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It settles NO deferred transit reclass (Codex round-4 LOW). A landed-cost revaluation that landed while these units were in transit was never persisted as an obligation, so creating the layer does not discharge it; the delta remains in the transit clearing account. Open, tracked as o3d-nrl4. `bookedQty` is `stockQtyToAdd`, the increment made immediately above, and the helper's coverage postcondition is measured against IT rather than against the slice (Codex round-8 HIGH-1). The two differ whenever the dispatch snapshot has fewer unconsumed costed units than the WMS has booked in, and this path has no balancing step of its own, so the difference used to go on hand unlayered. BALANCE_AT_ZERO_COST rather than REFUSE because the goods are physically in the warehouse — refusing would fail a real receipt that Mintsoft has already completed — and because the movement written above already values them at the slice's total, i.e. it has already priced the shortfall at zero.",
+  "lib/domain/wms/booked-in-service.ts": [
+    "6oyu.19: this loop used to create the destination layer and call copyCostLayerSourceLinesProportionally IGNORING its result, which is 0 for an ordinary PO-derived source layer (it has no sourceLines of its own). The layer was therefore left with no costLayerSourceLine, so the revaluation exclusion removed these units from COGS while propagation had nowhere to carry the delta. The shared helper makes the link a postcondition, and the quantity too — this path increments stock immediately above and has no balancing layer, so an entry the helper declined would leave the booked-in units unlayered (Codex round-4 HIGH). It REFUSES a snapshot entry whose unit cost is negative (Codex round-5 HIGH, o3d-gd2f), creating nothing and aborting this transaction rather than let the stock increment above commit alone. Do NOT wrap this call in a try or a savepoint. It posts NOTHING to the ledger, by design (o3d-nrl4 PR B). A landed-cost revaluation that landed while these units were in transit already capitalised their share at revaluation time (DR Inventory / CR Transit, capitaliseInTransitResidue); creating the layer from the snapshot it rewrote owes nothing. `bookedQty` is `stockQtyToAdd`, the increment made immediately above, and the helper's coverage postcondition is measured against IT rather than against the slice (Codex round-8 HIGH-1). The two differ whenever the dispatch snapshot has fewer unconsumed costed units than the WMS has booked in, and this path has no balancing step of its own, so the difference used to go on hand unlayered. BALANCE_AT_ZERO_COST rather than REFUSE because the goods are physically in the warehouse — refusing would fail a real receipt that Mintsoft has already completed — and because the movement written above already values them at the slice's total, i.e. it has already priced the shortfall at zero.",
   ],
 }
 
@@ -802,12 +817,13 @@ test('each call site says exactly what it is allowed to say about the helper (Co
       blocks,
       ALLOWED_CALL_SITE_COMMENTS[file],
       `${file}: a call-site comment changed. Re-read it against what the helper actually does — it ` +
-      `creates propagation links and refuses a negative basis; it settles nothing and completes nothing ` +
-      `(o3d-nrl4 is still open) — then update ALLOWED_CALL_SITE_COMMENTS deliberately.`,
+      `creates propagation links and refuses a negative basis; it posts nothing to the ledger and settles ` +
+      `nothing, by design: a revaluation made while the units were in transit already capitalised their share ` +
+      `at revaluation time (o3d-nrl4 PR B) — then update ALLOWED_CALL_SITE_COMMENTS deliberately.`,
     )
     assert.ok(
       readFileSync(file, 'utf8').includes('o3d-nrl4'),
-      `${file}: must name the still-open in-transit gap rather than leaving the reader to assume it is handled`,
+      `${file}: must name o3d-nrl4, where the in-transit capitalisation is recorded, rather than leaving the reader to assume the helper settles it`,
     )
   }
 })
