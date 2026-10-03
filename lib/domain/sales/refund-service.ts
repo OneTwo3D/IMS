@@ -463,8 +463,14 @@ async function runInTransaction<T>(
   client: RefundServiceClient,
   callback: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
+  // o3d-fpzhm: A COPY, NEVER THE SHARED OBJECT. A Prisma transaction client exposes `$transaction` at
+  // runtime, so this takes the NESTED path when `client` is already a transaction (the staging transaction
+  // calls it that way), and Prisma's `_transactionWithCallback` stamps `options.newTxId` ONTO THE OBJECT IT IS
+  // GIVEN. Handed the module-level constant, every later top-level call in the process started with the id of
+  // a transaction that had long since committed and failed with P2028 ("A start cannot be executed on a
+  // committed transaction") - refund #2, a storefront replay and an accounting retry alike.
   return canRunTransaction(client)
-    ? client.$transaction(callback, REFUND_TX_OPTIONS)
+    ? client.$transaction(callback, { ...REFUND_TX_OPTIONS })
     : callback(client)
 }
 
