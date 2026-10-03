@@ -83,6 +83,12 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
       if (!branches.some((branch) => matches(row, branch))) return false
       continue
     }
+    // o3d-1e7sl: the ledger-standing module's `NAMES_A_DOCUMENT_WHERE` is an AND of its paired id arms.
+    if (key === 'AND') {
+      const branches = condition as Array<Record<string, unknown>>
+      if (!branches.every((branch) => matches(row, branch))) return false
+      continue
+    }
     const value = row[key]
     if (condition !== null && typeof condition === 'object') {
       const test = condition as Record<string, unknown>
@@ -760,6 +766,42 @@ test('a live sibling sharing the mirror keeps it — the settlement skips, and s
   const audit = settlementAudit()[0]
   assert.equal((audit.metadata as Record<string, unknown>).mirrorConflictSyncLogId, 'log-2')
   assert.match(String(audit.description), /still owns it/)
+})
+
+test('[o3d-1e7sl G11] a sibling OWNS the shared mirror per its STANDING: slot-holders and any row naming a document do, a retired unproven row or one proven unsent does not', async () => {
+  // EXISTENCE (D2): an operator-typed id owns its mirror exactly as the connector's does. The action asks the
+  // module's `OWNS_MIRRORED_EVENT_WHERE` / `ownsMirroredEvent`; a status list and an id test restated here would
+  // disagree with it on the first new standing. One sibling per standing, the standing asserted first.
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  const cases: Array<{ name: string; standing: string; over: Partial<SyncRow>; owns: boolean }> = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'INV-1' }, owns: true },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, owns: true },
+    { name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK', over: { status: 'PENDING', attemptRevision: 0 }, owns: true },
+    { name: 'UNKNOWN (FAILED naming a document: CONFIRMED_POSTED)', standing: 'CONFIRMED_POSTED', over: { status: 'FAILED', externalTransactionId: 'INV-F' }, owns: true },
+    { name: 'UNKNOWN (FAILED, no id)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null }, owns: false },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, owns: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, owns: false },
+  ]
+  let owning = 0
+  for (const c of cases) {
+    const settle = await loadAction()
+    const sibling = syncRow({ id: 'log-2', ...MIRRORED, attemptRevision: 4, abandonedBeforeRemoteCall: null, ...c.over })
+    state.rows = [syncRow({ ...MIRRORED }), sibling]
+    state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+    const standing = ledgerStanding({
+      status: sibling.status, externalTransactionId: sibling.externalTransactionId,
+      settlementBasis: sibling.settlementBasis ?? null, abandonedBeforeRemoteCall: sibling.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G11 action precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const result = await settle('log-1', notPosted())
+    assert.equal(result.success, true, c.name)
+    const mirror = 'mirror' in result ? result.mirror : null
+    assert.equal(mirror === 'skipped_owned_by_another_row', c.owns, `${c.name}: mirror ${mirror}`)
+    if (c.owns) owning += 1
+  }
+  console.log(`# G11 action cases: ${cases.length}; sibling owns the mirror in ${owning}`)
+  assert.ok(owning > 0 && owning < cases.length)
 })
 
 // ---------------------------------------------------------------------------
