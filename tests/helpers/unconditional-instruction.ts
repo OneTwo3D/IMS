@@ -11,14 +11,21 @@
  */
 const MONEY_WORD = /\b(reverse|reversed|reversal|credit|void|re-?post|repost)\b/i
 const CONDITIONAL = /only if|if it exists?\b/i
+/** The cause LABEL (a status name, not an instruction) is not a money word: "verified reversed". */
+const LABELS = /verified reversed/gi
 
+/**
+ * Split into CLAUSES, not only sentences: a semicolon or a dash can join a conditional clause to an unconditional
+ * one ("Reverse it ONLY if it exists; ... so then have finance reverse it"), and a sentence-level check would call
+ * that whole sentence conditional - which is exactly the round-2 miss.
+ */
 export function sentencesOf(text: string): string[] {
-  return text.split(/(?<=[.!?])\s+(?=[A-Z"'(])/).map((sentence) => sentence.trim()).filter(Boolean)
+  return text.split(/(?<=[.!?;])\s+|\s+[—–]\s+|\s+-\s+(?=[a-z])|,\s+so\s+(?:then\s+)?/).map((sentence) => sentence.trim()).filter(Boolean)
 }
 
 /** The sentences that give a money instruction without conditioning it on the document existing. */
 export function unconditionalMoneySentences(text: string): string[] {
-  return sentencesOf(text).filter((sentence) => MONEY_WORD.test(sentence) && !CONDITIONAL.test(sentence))
+  return sentencesOf(text).filter((sentence) => MONEY_WORD.test(sentence.replace(LABELS, 'verified-gone')) && !CONDITIONAL.test(sentence))
 }
 
 /** A negative control: proves the checker CAN fail (it flags the round-2 shape). */

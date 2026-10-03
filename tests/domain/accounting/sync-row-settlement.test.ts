@@ -432,7 +432,7 @@ test('asserting POSTED as one document over a mirror naming a DIFFERENT one is r
   assert.match(refusal?.message ?? '', /already names document INV-7777/)
   assert.match(refusal?.message ?? '', /asserts INV-9001/)
   // A refusal needs a remedy the operator can perform.
-  assert.match(refusal?.message ?? '', /reverse it there before recording the other/)
+  assert.match(refusal?.message ?? '', /Reverse it there ONLY if it exists and is the wrong document, before recording the other/)
 })
 
 test('re-asserting the SAME document over the mirror is idempotent, not a contradiction', () => {
@@ -596,11 +596,11 @@ test('[o3d-1e7sl Codex r2] a mirror contradiction advises "reverse" unconditiona
       const m = refusal!.message
       console.log(`# r2 mirror precondition: ${name} id=${view.externalId} conditional=${conditional}`)
       if (conditional) {
-        assert.match(m, /if it does not exist there is nothing to reverse|if there is none, there is nothing to reverse/, name)
+        assert.match(m, /otherwise there is nothing to undo|if there is none, there is nothing to undo/, name)
         assert.doesNotMatch(m, /or reverse the document in the accounting system first and settle it afterwards\.$|or reverse it there first\.$/, name)
       } else {
         assert.match(m, /reverse (the document in the accounting system|it there) first/, name)
-        assert.doesNotMatch(m, /nothing to reverse/, name)
+        assert.doesNotMatch(m, /nothing to (reverse|undo)/, name)
       }
     }
   }

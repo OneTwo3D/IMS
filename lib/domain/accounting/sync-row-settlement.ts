@@ -941,7 +941,7 @@ export function refuseSettlementContradictedByMirror(
             ? 'Settle this row as POSTED with that id, or reverse the document in the accounting system first and settle it afterwards.'
             // Not confirmed: the document may not exist, so "reverse it" is conditional on finding it.
             : 'Check that document in the accounting system. If it exists, settle this row as POSTED with that id (or, if it is the wrong '
-              + 'document, reverse it there first and settle afterwards); if it does not exist there is nothing to reverse - the mirror\'s '
+              + 'document, reverse it there first and settle afterwards); otherwise there is nothing to undo - the mirror\'s '
               + 'record is what is wrong.'),
       }
     }
@@ -956,7 +956,7 @@ export function refuseSettlementContradictedByMirror(
           + (provenance === 'confirmed'
             ? 'Find the document in the accounting system and settle this row as POSTED with its id, or reverse it there first.'
             : 'Look for the document in the accounting system. If it exists, settle this row as POSTED with its id (or reverse it there '
-              + 'first if it is wrong); if there is none, there is nothing to reverse - the mirror\'s record is what is wrong.'),
+              + 'first if it is wrong); if there is none, there is nothing to undo - the mirror\'s record is what is wrong.'),
       }
     }
     return null
@@ -970,8 +970,8 @@ export function refuseSettlementContradictedByMirror(
         `The mirrored accounting event for this row already names document ${mirroredId}, and this settlement `
         + `asserts ${asserted}. Two different documents cannot both be this posting, so nothing was settled and `
         + 'nothing was changed — the row still names whatever it named before. Check BOTH ids in the accounting '
-        + `system: if ${mirroredId} is the real one there is nothing to settle, and if it is not, reverse it there `
-        + 'before recording the other.',
+        + `system. If ${mirroredId} is the real one there is nothing to settle. Reverse it there ONLY if it exists and is the wrong `
+        + 'document, before recording the other.',
     }
   }
   return null

@@ -2062,7 +2062,7 @@ Xero. The same rule shapes the rest of the product:
 - **The health page** no longer shows a batch whose journal id was typed in as a plain green SYNCED; it reads
   "SYNCED (asserted by an operator, not confirmed)" and warns. **Reconciliation** says whose post a "posted event has
   no external ID" finding is, and the **invariant check** logs an info finding for each posting that counts as
-  evidence only on an operator's assertion. A discount/credit decision that finds an invoice row naming a document
+  evidence only on an operator's assertion. A discount or restatement decision that finds an invoice row naming a document
   says how many rest on the connector and how many on an operator's word.
 
 **Settling "it did not post" retires that attempt, not the document.** A "did not post" settlement

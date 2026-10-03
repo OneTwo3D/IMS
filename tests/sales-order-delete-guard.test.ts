@@ -7,6 +7,7 @@ import {
   findSalesOrderDeleteBlocker,
 } from '@/lib/domain/sales/order-delete-guard'
 import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { ROUND_2_SHAPE, unconditionalMoneySentences } from './helpers/unconditional-instruction'
 import {
   matchesWhere as matches,
   shoppingSyncLogFake,
@@ -1649,7 +1650,7 @@ test('[o3d-1e7sl G1] with several rows the confirmed document outranks an unprov
 // Codex round 2 (HIGH): a reversal is advised UNCONDITIONALLY only for a CONFIRMED_POSTED batch journal.
 // ---------------------------------------------------------------------------
 test('[o3d-1e7sl Codex r2] the daily-batch message says "reverse ONLY if it exists" for every standing but CONFIRMED_POSTED', async () => {
-  const CONDITIONAL = /Check the accounting system for that journal\. Reverse it ONLY if it exists there \(if it does not exist there is nothing to reverse\)/
+  const CONDITIONAL = /Check the accounting system for that journal\. Reverse it ONLY if it exists there; otherwise there is nothing to undo\. Either way, cancel the order instead of deleting it/
   const UNCONDITIONAL = /The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry\./
   const cases: Array<{ name: string; standing: LedgerStanding; row: Partial<SyncLogRow>; unconditional: boolean }> = [
     { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'J-1' }, unconditional: true },
@@ -1680,7 +1681,7 @@ test('[o3d-1e7sl Codex r2] the daily-batch message says "reverse ONLY if it exis
       assert.match(m, CONDITIONAL, c.name)
       assert.doesNotMatch(m, UNCONDITIONAL, `${c.name}: no unconditional reversal advice`)
       // and the ONLY mention of finance reversing is after the existence condition.
-      assert.ok(m.indexOf('ONLY if it exists') < m.indexOf('have finance reverse'), c.name)
+      assert.doesNotMatch(m, /have finance reverse/, `${c.name}: the trailing unconditional clause is gone`)
     }
   }
   assert.equal(unconditionalCount, 1)
@@ -1697,4 +1698,45 @@ test('[o3d-1e7sl Codex r2] the document-level messages give reversal/credit advi
     }
     if (c.standing === 'CONFIRMED_POSTED') assert.match(m, /needs an explicit reversal or credit note/)
   }
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 3 (HIGH): the check is UNIVERSAL over the COMPLETE rendered message, not a regex a conditional clause can satisfy.
+// ---------------------------------------------------------------------------
+test('[o3d-1e7sl Codex r3] the checker can fail: the round-2 shape (conditional clause then an unconditional one) is flagged', () => {
+  assert.equal(unconditionalMoneySentences(ROUND_2_SHAPE).length, 1)
+  assert.equal(unconditionalMoneySentences('Reverse it ONLY if it exists there. Cancel the order instead.').length, 0)
+  assert.equal(unconditionalMoneySentences('The batch journal cannot be un-posted from here — cancel the order and have finance reverse the batch entry.').length, 1)
+})
+
+test('[o3d-1e7sl Codex r3] no rendering for a non-CONFIRMED standing has an unconditional reverse / credit / void / re-post sentence - document AND batch queries, every standing', async () => {
+  let rendered = 0
+  let confirmed = 0
+  for (const query of ['document', 'batch'] as const) {
+    for (const c of STANDING_CASES) {
+      if (!c.blocks) continue
+      const base = query === 'batch'
+        ? { ...c.row, id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20' }
+        : c.row
+      const row = syncLog(base)
+      assert.equal(ledgerStanding(row as never), c.standing, `precondition (${query}): ${c.name}`)
+      const blocker = await findSalesOrderDeleteBlocker(
+        makeTx({ syncLogs: [row] }), 'order-1',
+        query === 'batch' ? { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT } : STAMPS,
+      )
+      assert.ok(blocker, `${query}: ${c.name} blocks`)
+      const offending = unconditionalMoneySentences(blocker!.message)
+      rendered += 1
+      console.log(`# r3 universal (${query}) ${c.name}: ${offending.length} unconditional sentence(s)`)
+      if (c.standing === 'CONFIRMED_POSTED') {
+        confirmed += 1
+        assert.ok(offending.length >= 1, `${query}: the CONFIRMED_POSTED rendering keeps its unconditional reversal instruction`)
+      } else {
+        assert.deepEqual(offending, [], `${query}: ${c.name}: unconditional money instruction(s) on a non-confirmed standing`)
+      }
+    }
+  }
+  console.log(`# r3 universal: ${rendered} renderings, ${confirmed} confirmed`)
+  assert.equal(confirmed, 2)
+  assert.ok(rendered >= 16)
 })

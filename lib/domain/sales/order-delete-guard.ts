@@ -528,17 +528,17 @@ export async function findSalesOrderDeleteBlocker(
           ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
             + `recorded as POSTED${named ? ` (${named})` : ''}. `
             + 'That is an assertion, not a confirmation: IMS never made the call and never read the document, so this id '
-            + 'is what somebody typed in. Open it in the accounting system first. If the document is there it needs an '
-            + 'explicit reversal or credit note — cancelling the order does NOT reverse a posted document; if it is not '
-            + 'there, the settlement was recorded in error and that is what has to be corrected before anything is deleted.'
+            + 'is what somebody typed in. Open it in the accounting system first. If it exists there, it needs an '
+            + 'explicit reversal or credit note, and cancelling the order does not undo a posted document. If it does not '
+            + 'exist there, the settlement was recorded in error and that is what has to be corrected before anything is deleted.'
           : documentStanding === 'ASSERTED_NOT_POSTED'
             // o3d-1e7sl (C1): a person's "NOT POSTED" is a claim, not proof, and it KEEPS BLOCKING. Say
             // that it is a claim, that IMS has not checked, and never that nothing was posted.
             ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
               + 'settled as NOT POSTED. That is an assertion, not proof: IMS never asked the accounting system, and a lost '
               + 'response or a late webhook leaves the same row behind, so whether the document reached the ledger is '
-              + 'UNPROVEN. Check the accounting system for it. If it is there it needs an explicit reversal or credit note; '
-              + 'if it is not, this order still cannot be hard-deleted from here (nothing records that check yet) — cancel '
+              + 'UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or credit note. '
+              + 'If it does not exist, this order still cannot be hard-deleted from here (nothing records that check yet): cancel '
               + 'the order instead, which keeps the record.'
             : liveDocument.status === 'FAILED'
               ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) is FAILED. `
@@ -555,7 +555,7 @@ export async function findSalesOrderDeleteBlocker(
                 // cannot work, which is how a blocker becomes a dead end — so both cases are named.
                 ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
                   + `is IN FLIGHT. If ${liveDocument.connector} is still the active accounting connector, wait `
-                  + 'for it to settle, then delete or reverse depending on the outcome. If it has been '
+                  + 'for it to settle, then delete the order, or reverse the document ONLY if it posted. If it has been '
                   + 'switched off, this will NOT settle on its own: it can only be reclaimed by making '
                   + `${liveDocument.connector} the EXCLUSIVELY active connector again — enabling it alongside `
                   + 'another one is not enough, because only one accounting connector is ever dispatched to. '
@@ -572,8 +572,8 @@ export async function findSalesOrderDeleteBlocker(
                     + `${liveDocument.status}) is not PROVEN to have stayed out of the accounting system: the row was `
                     + 'retired or settled without a recorded pre-call proof, and a cancellation may have retired a request '
                     + 'that was already on the wire. Whether the document exists is UNPROVEN - check the accounting system '
-                    + `for it. If it is there it needs an explicit reversal or credit note${named ? ` (${named})` : ''}; `
-                    + 'if it is not, cancel the order instead - this one cannot be hard-deleted from here.',
+                    + `for it. If it exists there, it needs an explicit reversal or credit note${named ? ` (${named})` : ''}. `
+                    + 'If it does not exist, cancel the order instead: this one cannot be hard-deleted from here.',
     })
   }
 
@@ -723,8 +723,8 @@ export async function findSalesOrderDeleteBlocker(
             : batchStanding === 'ASSERTED_POSTED'
               ? 'An operator recorded this batch journal as posted by typing its id in; IMS never read it from the ledger. '
               : 'This batch journal is queued or in flight and has not been confirmed as posted. ')
-            + 'Check the accounting system for that journal. Reverse it ONLY if it exists there; if it does not exist there is '
-            + 'nothing to reverse. Either way, cancel the order instead of deleting it (a posted journal cannot be un-posted from here).'),
+            + 'Check the accounting system for that journal. Reverse it ONLY if it exists there; otherwise there is '
+            + 'nothing to undo. Either way, cancel the order instead of deleting it (a posted journal cannot be un-posted from here).'),
     })
   }
 

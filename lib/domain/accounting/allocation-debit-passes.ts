@@ -748,7 +748,7 @@ export function allocationDebitForeignLedgerReports(input: {
       `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
       + `was debited to Allocated Inventory on ${connector}, ${standing}. `
       + 'This sweep must not rebuild another ledger\'s pounds into its own accounts — that is a duplicate '
-      + `debit no refund could ever reverse — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
+      + `debit no refund could ever undo — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
       + `so nothing will ever raise it. ${remedy}, `
       + `or re-enable ${connector}'s daily batch long enough for its own sweep to rebuild it.`
     )

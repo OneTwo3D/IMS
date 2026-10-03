@@ -574,14 +574,14 @@ export async function proveAllocationDebitPosting<C extends string = string>(
           : standing === 'PROVEN_NOT_POSTED' && provenCauseOf(journal) === 'VERIFIED_REVERSAL'
             // A verified reversal is proof the document is no longer in the ledger, NOT that it never was: it can keep
             // the id of a journal that posted and was later reversed (Codex round 1, o3d-1e7sl). Say that.
-            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED: it was verified reversed in the ledger and is no longer present there. It may have been posted earlier, so check whether a debit to Allocated Inventory was already reversed before reconciling`
+            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED: it was verified reversed in the ledger and is no longer present there. It may have been posted earlier, so check whether a debit to Allocated Inventory still stands before reconciling`
           : standing === 'PROVEN_NOT_POSTED'
             ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
             : standing === 'LIVE_WORK'
               ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED — it is still queued or in flight, so nothing has been confirmed as debited yet`
               // ASSERTED_NOT_POSTED, UNKNOWN, or a row naming a connector id that never settled: UNPROVEN either way
               // (C1: a person's "did not post", a cancellation or a failure does not prove the ledger was untouched).
-              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling: if it posted, the debit to Allocated Inventory stands and has to be reversed by hand; if it did not, there is nothing to reverse`,
+              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling. If it exists there, the debit to Allocated Inventory stands and has to be reversed by hand. If it does not exist, there is nothing to undo`,
       }
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole

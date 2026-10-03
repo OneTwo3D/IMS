@@ -332,7 +332,7 @@ export function settlementStatus(input: {
             (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
             (asserted
               ? '. That is an OPERATOR ASSERTION, not something the ledger confirmed — nobody has checked the '
-                + 'document or its amount. Verify it in the accounting system, then reverse the payment there or '
+                + 'document or its amount. Verify it in the accounting system. If it exists there, reverse the payment there or '
                 + 'restore the receipt here.'
               : '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.'),
           basis: asserted ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
