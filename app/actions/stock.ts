@@ -5,7 +5,6 @@ import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -23,7 +22,7 @@ import {
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
+import { adjustmentJournalMayHaveReachedLedger, calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
 import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
@@ -501,15 +500,7 @@ export async function updateAdjustmentMovement(
       // ledger: the processors post BEFORE they persist SYNCED, so a row abandoned after it was
       // claimed may already carry a journal. The rule is stated once in `ledger-standing.ts`;
       // only a row carrying its own proof of a pre-call abandonment stops blocking the edit.
-      const postedJournal = await tx.accountingSyncLog.findFirst({
-        where: {
-          referenceType: 'StockMovement',
-          referenceId: id,
-          type: 'INVENTORY_ADJUSTMENT',
-          ...MAY_HAVE_REACHED_LEDGER_WHERE,
-        },
-        select: { id: true },
-      })
+      const postedJournal = await adjustmentJournalMayHaveReachedLedger(tx, id)
       if (postedJournal) {
         throw new Error(
           'This adjustment has been posted to accounting. Create a reversing adjustment ' +

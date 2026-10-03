@@ -25,6 +25,8 @@
  * post under the real number creates a SECOND invoice instead of replacing the first.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import type { WcFullOrder, WcMeta } from './types'
 
 /** The meta key WooCommerce PDF Invoices & Packing Slips writes, and the one xeroom reads. */
@@ -191,7 +193,10 @@ export function decideStoredInvoiceNumberUpdate(params: {
   incomingInvoiceNumber: string
   /** SalesOrder.accountingInvoiceId — non-null means a ledger document exists for this order. */
   accountingInvoiceId: string | null | undefined
-  /** How many SALES_INVOICE / SALES_INVOICE_UPDATE sync rows exist for this order, non-CANCELLED. */
+  /**
+   * How many SALES_INVOICE / SALES_INVOICE_UPDATE sync rows for this order MAY HAVE REACHED THE LEDGER
+   * (`countSalesInvoiceRowsThatMayHavePosted`): every row except one proven never to have been sent.
+   */
   salesInvoiceSyncRowCount: number
 }): StoredInvoiceNumberUpdate {
   const incoming = params.incomingInvoiceNumber.trim()
@@ -211,4 +216,28 @@ export function decideStoredInvoiceNumberUpdate(params: {
   }
   if (committed) return { action: 'refuse-correction', from: stored, to: incoming, reason: committed }
   return { action: 'correct', from: stored, to: incoming }
+}
+
+/**
+ * How many of this order's sales-invoice sync rows MAY HAVE REACHED THE LEDGER (o3d-f709 G4 / o3d-1e7sl).
+ *
+ * The count `decideStoredInvoiceNumberUpdate` refuses a number correction on: a row carrying its own number in
+ * its payload that is queued, in flight, failed ("a lost response looks exactly like a failure"), posted, or
+ * retired WITHOUT proof it never left - a cancellation that recorded no pre-call proof, or an operator's
+ * NOT_POSTED settlement (a claim, not proof - C1). A row the orphan sweep or a never-claimed sale-cancel sweep
+ * stamped pre-call (PROVEN_NOT_POSTED) does not count. The rule is the ledger-standing module's
+ * (`MAY_HAVE_REACHED_LEDGER_WHERE`); this only names the question for the importer and its test.
+ */
+export async function countSalesInvoiceRowsThatMayHavePosted(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  orderId: string,
+): Promise<number> {
+  return tx.accountingSyncLog.count({
+    where: {
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] },
+      ...MAY_HAVE_REACHED_LEDGER_WHERE,
+    },
+  })
 }
