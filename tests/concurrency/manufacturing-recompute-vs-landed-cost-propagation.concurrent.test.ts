@@ -227,9 +227,12 @@ test('o3d-nrl4 PR A: a manufacturing cost edit locks the output layers before it
     const mid = await db.costLayer.findUniqueOrThrow({ where: { id: world.outputId }, select: { unitCostBase: true } })
 
     let finished = false
+    let early: unknown = null
     const editing = updateManufacturingCostLines(world.productionId, [{ description: 'overhead', amountForeign: 6 }])
+      .then((r) => { early = r; return r })
       .finally(() => { finished = true })
     const blocked = await waitForBlocked(probe, { blockedBy: revaluationPid, waitingOn: /cost_layers/i, describe: 'manufacturing edit', finished: () => finished })
+      .catch(async (error) => { throw new Error(`${String(error)} ACTION RESULT: ${JSON.stringify(await editing.catch((e) => String(e)))}`) })
     console.log(`MFG PRECONDITION: edit backend ${blocked.pid} parked behind the propagation (pid ${revaluationPid}) on [${blocked.query.slice(0, 90)}]`)
     assert.match(blocked.query, /SELECT id FROM cost_layers[\s\S]*FOR NO KEY UPDATE/i,
       'the edit must park on the output-layer LOCK statement, i.e. before it has read any source-line total')
