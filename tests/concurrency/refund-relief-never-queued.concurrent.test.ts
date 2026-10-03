@@ -296,14 +296,14 @@ async function rig(t: { after: (fn: () => Promise<void>) => void }) {
   const restore = await configureXero(db)
   const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
   const disarm: Array<() => Promise<void>> = []
-  let fx: Fixture | undefined
+  const seeded: { fx?: Fixture } = {}
   t.after(async () => {
     for (const d of disarm) await d().catch(() => {})
-    await cleanup(db, fx)
+    await cleanup(db, seeded.fx)
     await restore()
   })
-  fx = await seed(db, suffix)
-  return { deps, db, fx, suffix, disarm }
+  seeded.fx = await seed(db, suffix)
+  return { deps, db, fx: seeded.fx, suffix, disarm }
 }
 type Rig = Awaited<ReturnType<typeof rig>>
 
