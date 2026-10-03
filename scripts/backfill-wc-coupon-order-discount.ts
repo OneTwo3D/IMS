@@ -44,7 +44,10 @@
  *     below by replaying the connector's own posting rule over what was actually sent, and a Xero
  *     invoice enqueued without a discount account code carries no order-level discount line at all
  *     (o3d-y14 r5). Read the classification, not the column.
- *   • `postedInvoiceExternalIds` — SYNCED invoice jobs whose external id the order does NOT carry.
+ *   • `postedInvoiceExternalIds` — invoice sync rows that name a document the order does NOT carry.
+ *     An id an OPERATOR typed in counts (an existence claim) but the report prints it as NOT
+ *     CONFIRMED and the CSV lists it in `unconfirmedPostedDocuments`; that label is never written to
+ *     this file (o3d-djemh).
  *     A post can succeed and then fail to write its id back (o3d-9kek), so a non-empty list here
  *     with a null `accountingInvoiceId` is a REAL ledger document the column denies. It is
  *     classified exactly like `accountingInvoiceId`, and approving the entry is you saying you have
@@ -193,8 +196,8 @@ import {
   WC_COUPON_MAX_CANDIDATES,
   WC_COUPON_SCAN_PAGE_SIZE,
   CREDIT_NOTE_SYNC_TYPES,
+  classifyPostedDocumentRows,
   LIVE_SALES_INVOICE_STATUSES,
-  POSTED_SALES_INVOICE_STATUSES,
   SALES_INVOICE_SYNC_TYPES,
   WC_COUPON_REFUND_PARK_WHERE,
   applyWcCouponCorrection,
@@ -220,10 +223,12 @@ import {
 } from '../lib/connectors/woocommerce/sync/coupon-discount-backfill'
 import {
   buildWcCouponLedgerHandoff,
+  describeLedgerDocumentIds,
   isWcCouponOrderRefunded,
   type WcCouponLedgerHandoff,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
 import { liveDailyBatchDeferralWhere } from '../lib/domain/accounting/daily-batch-discount-fence'
+import { LEDGER_STANDING_SELECT, type LedgerStandingRow } from '../lib/domain/accounting/ledger-standing'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
 // process.env.DATABASE_URL at IMPORT time (see scripts/backfill-refund-basis.ts).
@@ -551,24 +556,21 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   // that succeeded and then failed to write its id back — lives entirely in these rows and is
   // invisible in `accountingInvoiceId`, which is exactly why the previous revision re-proposed those
   // orders forever and refused them every time.
-  const postedInvoiceIds = new Map<string, string[]>()
+  // Every row of the order's invoice types is read WITH its ledger-standing columns and classified
+  // by `classifyPostedDocumentRows` (o3d-djemh): an operator-asserted id still counts as a posted
+  // document (existence/identity, D2) and is carried in `unconfirmed...` so the report labels it.
+  const invoiceRowsByOrder = new Map<string, LedgerStandingRow[]>()
   for (const batch of chunkWcCouponIds(orderIds)) {
     const syncedRows = await db.accountingSyncLog.findMany({
       where: {
         referenceType: 'SalesOrder',
         referenceId: { in: batch },
         type: { in: [...SALES_INVOICE_SYNC_TYPES] },
-        status: { in: [...POSTED_SALES_INVOICE_STATUSES] },
-        externalTransactionId: { not: null },
       },
-      select: { referenceId: true, externalTransactionId: true },
+      select: { referenceId: true, ...LEDGER_STANDING_SELECT },
     })
     for (const row of syncedRows) {
-      if (!row.externalTransactionId) continue
-      postedInvoiceIds.set(row.referenceId, [
-        ...(postedInvoiceIds.get(row.referenceId) ?? []),
-        row.externalTransactionId,
-      ])
+      invoiceRowsByOrder.set(row.referenceId, [...(invoiceRowsByOrder.get(row.referenceId) ?? []), row])
     }
   }
 
@@ -609,25 +611,20 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
 
   const refundIdToOrderId = new Map<string, string>()
   for (const [orderId, rows] of refundRows) for (const row of rows) refundIdToOrderId.set(row.id, orderId)
-  const syncedCreditNoteIds = new Map<string, string[]>()
+  const creditNoteRowsByOrder = new Map<string, LedgerStandingRow[]>()
   for (const batch of chunkWcCouponIds([...refundIdToOrderId.keys()])) {
     const rows = await db.accountingSyncLog.findMany({
       where: {
         referenceType: 'SalesOrderRefund',
         referenceId: { in: batch },
         type: { in: [...CREDIT_NOTE_SYNC_TYPES] },
-        status: { in: [...POSTED_SALES_INVOICE_STATUSES] },
-        externalTransactionId: { not: null },
       },
-      select: { referenceId: true, externalTransactionId: true },
+      select: { referenceId: true, ...LEDGER_STANDING_SELECT },
     })
     for (const row of rows) {
       const orderId = refundIdToOrderId.get(row.referenceId)
-      if (!orderId || !row.externalTransactionId) continue
-      syncedCreditNoteIds.set(orderId, [
-        ...(syncedCreditNoteIds.get(orderId) ?? []),
-        row.externalTransactionId,
-      ])
+      if (!orderId) continue
+      creditNoteRowsByOrder.set(orderId, [...(creditNoteRowsByOrder.get(orderId) ?? []), row])
     }
   }
 
@@ -647,6 +644,12 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
 
   const rows: Array<{ row: WcCouponBackfillRow; decision: WcCouponBackfillDecision }> = []
   for (const order of orders) {
+    const invoiceDocuments = classifyPostedDocumentRows(invoiceRowsByOrder.get(order.id) ?? [])
+    const creditNoteDocuments = classifyPostedDocumentRows(creditNoteRowsByOrder.get(order.id) ?? [])
+    const linkedCreditNoteIds = new Set(
+      sortedPostedInvoiceIds((refundRows.get(order.id) ?? []).map((refund) => refund.accountingCreditNoteId)),
+    )
+    const unconfirmedCreditNotes = creditNoteDocuments.unconfirmedIds.filter((id) => !linkedCreditNoteIds.has(id))
     const row: WcCouponBackfillRow = {
       orderId: order.id,
       orderNumber: order.orderNumber ?? '',
@@ -655,7 +658,10 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       storedOrderDiscount: Number(order.discountAmount),
       lineDiscountTotal: sumLineDiscounts(order.lines),
       accountingInvoiceId: order.accountingInvoiceId,
-      postedInvoiceExternalIds: sortedPostedInvoiceIds(postedInvoiceIds.get(order.id) ?? []),
+      postedInvoiceExternalIds: invoiceDocuments.ids,
+      // LABEL ONLY, for the console and CSV below: `buildWcCouponAllowlistEntry` copies named fields,
+      // so this never reaches the reviewed file (o3d-djemh).
+      ...(invoiceDocuments.unconfirmedIds.length ? { unconfirmedInvoiceExternalIds: invoiceDocuments.unconfirmedIds } : {}),
       discountModel: order.discountModel,
       importedAt: order.shoppingLinks[0]?.createdAt ?? null,
       alreadyBackfilled: alreadyBackfilled.has(order.id),
@@ -664,17 +670,17 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       liveBatchDeferralJobs: order.revenueDeferredBatchRef
         ? (liveBatchCounts.get(order.revenueDeferredBatchRef) ?? 0)
         : 0,
-      refunds: sortedWcCouponRefundEvidence({
+      refunds: {
+        ...sortedWcCouponRefundEvidence({
         disposition: normalizeWcCouponRefundDisposition(order.refundStatus),
         refundIds: (refundRows.get(order.id) ?? []).map((refund) => refund.id),
-        postedCreditNoteExternalIds: [
-          ...(refundRows.get(order.id) ?? []).map((refund) => refund.accountingCreditNoteId),
-          ...(syncedCreditNoteIds.get(order.id) ?? []),
-        ].filter((id): id is string => !!id),
+        postedCreditNoteExternalIds: [...linkedCreditNoteIds, ...creditNoteDocuments.ids],
         // r7 finding 1. A refund that ARRIVED and could not be recorded produces none of the three
         // signals above, so without this the order reads as unrefunded and gets the full remedy.
         unresolvedRefundParkExternalIds: refundParks.get(order.id) ?? [],
-      }),
+        }),
+        ...(unconfirmedCreditNotes.length ? { unconfirmedCreditNoteExternalIds: unconfirmedCreditNotes } : {}),
+      },
     }
     rows.push({ row, decision: decideWcCouponBackfill(row, { importedBefore }) })
   }
@@ -742,6 +748,30 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         're-reads it live, refuses any row whose posting state has moved since you reviewed it, and ' +
         're-derives this same handoff from the state at the moment of correction.',
     )
+    // o3d-djemh (M17 option B / D2). An id an operator typed in still counts as a posted document
+    // (it triggers the handoff and is part of the set apply compares), but it is NAMED here as an
+    // assertion, never as a document IMS saw in the ledger.
+    for (const { row } of postedCandidates) {
+      const unconfirmed = [
+        ...(row.unconfirmedInvoiceExternalIds ?? []),
+        ...(row.refunds.unconfirmedCreditNoteExternalIds ?? []),
+      ]
+      if (unconfirmed.length === 0) continue
+      console.log(
+        `${LOG}   ${row.orderNumber || row.orderId} — NOT CONFIRMED: ` +
+          [
+            row.postedInvoiceExternalIds.length
+              ? `invoice(s) ${describeLedgerDocumentIds(row.postedInvoiceExternalIds, row.unconfirmedInvoiceExternalIds)}`
+              : null,
+            row.refunds.postedCreditNoteExternalIds.length
+              ? `credit note(s) ${describeLedgerDocumentIds(row.refunds.postedCreditNoteExternalIds, row.refunds.unconfirmedCreditNoteExternalIds)}`
+              : null,
+          ].filter(Boolean).join('; ') +
+          '. An operator recorded these as posted; IMS never saw them in the ledger. They are still ' +
+          'treated as existing documents (so the ledger-adjustment handoff applies), but check each in ' +
+          'the accounting system before relying on it.',
+      )
+    }
     // ONE PAIR OF QUERIES PER POSTED CANDIDATE, and only for the posted ones. The candidate set is
     // already capped at WC_COUPON_MAX_CANDIDATES and this defect affects tens of orders, so the
     // bound is the operator list rather than the catalogue.
@@ -756,6 +786,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
           // (o3d-9kek) is a different thing for the reviewer to check than a linked invoice — and it
           // is the one apply used to refuse forever.
           postedInvoiceExternalIds: row.postedInvoiceExternalIds,
+          unconfirmedInvoiceExternalIds: row.unconfirmedInvoiceExternalIds,
           revenueDeferredBatchRef: row.revenueDeferredBatchRef,
           // o3d-y14 r6 finding 1. Passed, never defaulted: the handoff prescribes a DIFFERENT job
           // for a refunded order, and an omitted refund position here would print the unrefunded
@@ -815,7 +846,8 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     const header =
       'salesOrderId,orderNumber,externalOrderNumber,currency,storedOrderDiscount,lineDiscountTotal,' +
       'importedAt,nearCutoff,discountModel,accountingInvoiceId,postedInvoiceExternalIds,liveInvoiceJobs,revenueDeferredBatchRef,' +
-      'liveBatchDeferralJobs,refundStatus,refundIds,postedCreditNoteExternalIds,unresolvedRefundParks,action,reason,keptOrderLevel,clearedBy,detail'
+      'liveBatchDeferralJobs,refundStatus,refundIds,postedCreditNoteExternalIds,unresolvedRefundParks,action,reason,keptOrderLevel,clearedBy,detail,' +
+      'unconfirmedPostedDocuments'
     const body = rows.map(({ row, decision }) =>
       [
         row.orderId,
@@ -845,6 +877,8 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         decision.action === 'CORRECT' ? decision.keptOrderLevel : '',
         decision.action === 'CORRECT' ? decision.clearedBy : '',
         decision.action === 'CORRECT' ? '' : JSON.stringify(decision.detail),
+        // Appended LAST so no existing column moves. Ids that rest on an operator's assertion.
+        [...(row.unconfirmedInvoiceExternalIds ?? []), ...(row.refunds.unconfirmedCreditNoteExternalIds ?? [])].join(' '),
       ].join(','),
     )
     writeFileSync(csvPath, [header, ...body].join('\n') + '\n')

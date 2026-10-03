@@ -190,6 +190,24 @@ import {
  */
 
 /**
+ * HOW A LEDGER DOCUMENT ID IS NAMED TO AN OPERATOR (o3d-djemh, M17 option B / D2).
+ *
+ * An id that rests on an operator's assertion (or on a row whose origin is unrecorded) still counts
+ * as a document for the handoff trigger and the review-to-apply comparison, and is NEVER written as
+ * if IMS had seen it in the ledger. This is the one place the wording lives, so the console report,
+ * the handoff lines and the ActivityLog cannot disagree about it.
+ */
+export const UNCONFIRMED_DOCUMENT_LABEL = 'asserted, NOT confirmed in the ledger'
+
+export function describeLedgerDocumentIds(
+  ids: readonly string[],
+  unconfirmed: readonly string[] | undefined,
+): string {
+  const flagged = new Set(unconfirmed ?? [])
+  return ids.map((id) => (flagged.has(id) ? `${id} (${UNCONFIRMED_DOCUMENT_LABEL})` : id)).join(', ')
+}
+
+/**
  * WHAT HAS ALREADY BEEN CREDITED BACK TO THIS CUSTOMER (o3d-y14 r6 finding 1, r7 finding 1).
  *
  * FOUR signals, taken as a UNION rather than one preferred field, because each can be true while
@@ -231,6 +249,12 @@ export type WcCouponRefundEvidence = {
   /** Credit notes for those refunds that are in the ledger, sorted. */
   postedCreditNoteExternalIds: string[]
   /**
+   * The subset of `postedCreditNoteExternalIds` not confirmed by the ledger (asserted by an operator
+   * or of unrecorded origin). LABEL ONLY: derived from the sync rows at read time, never persisted,
+   * never compared (o3d-djemh).
+   */
+  unconfirmedCreditNoteExternalIds?: string[]
+  /**
    * External WooCommerce refund ids that are PARKED unresolved against this order (r7 finding 1):
    * refunds that arrived and could not be recorded. Sorted.
    */
@@ -241,6 +265,8 @@ export type WcCouponRefundEvidence = {
 export type WcCouponLedgerEvidence = {
   accountingInvoiceId: string | null
   postedInvoiceExternalIds: string[]
+  /** Subset of `postedInvoiceExternalIds` not confirmed by the ledger. LABEL ONLY (o3d-djemh). */
+  unconfirmedInvoiceExternalIds?: string[]
   revenueDeferredBatchRef: string | null
   unearnedRevenueAmount?: number | null
   /**
@@ -347,6 +373,8 @@ export type WcCouponDocumentPosition = {
   currency: string
   accountingInvoiceId: string | null
   postedInvoiceExternalIds: string[]
+  /** Subset of `postedInvoiceExternalIds` not confirmed by the ledger. LABEL ONLY: never compared. */
+  unconfirmedInvoiceExternalIds?: string[]
   revenueDeferredBatchRef: string | null
   unearnedRevenueAmount: number | null
   document: WcCouponMirroredDocumentPosition
@@ -361,6 +389,9 @@ export function buildWcCouponDocumentPosition(
     currency: input.currency,
     accountingInvoiceId: input.evidence.accountingInvoiceId,
     postedInvoiceExternalIds: [...input.evidence.postedInvoiceExternalIds],
+    ...(input.evidence.unconfirmedInvoiceExternalIds?.length
+      ? { unconfirmedInvoiceExternalIds: [...input.evidence.unconfirmedInvoiceExternalIds] }
+      : {}),
     revenueDeferredBatchRef: input.evidence.revenueDeferredBatchRef,
     unearnedRevenueAmount: input.evidence.unearnedRevenueAmount ?? null,
     document: document.ok
@@ -472,7 +503,7 @@ export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosit
   const set = [...position.document.documentSet].sort()
   return (
     `accountingInvoiceId=${position.accountingInvoiceId ?? 'none'}, ` +
-    `SYNCED sales invoice(s) [${[...position.postedInvoiceExternalIds].sort().join(', ')}], ` +
+    `SYNCED sales invoice(s) [${describeLedgerDocumentIds([...position.postedInvoiceExternalIds].sort(), position.unconfirmedInvoiceExternalIds)}], ` +
     `revenue-deferral batch ${position.revenueDeferredBatchRef ?? 'none'} of ` +
     `${position.unearnedRevenueAmount ?? 'nothing'}, and ${documentPart}` +
     `, over the mirrored event(s) {${set.length ? set.join(' | ') : 'none'}}`
@@ -809,7 +840,7 @@ function perDocument(documentCount: number): string {
 function describeLedgerReference(evidence: WcCouponLedgerEvidence): string | null {
   if (evidence.accountingInvoiceId) return `invoice ${evidence.accountingInvoiceId}`
   if (evidence.postedInvoiceExternalIds.length) {
-    return `posted-but-unlinked invoice(s) ${evidence.postedInvoiceExternalIds.join(', ')}`
+    return `posted-but-unlinked invoice(s) ${describeLedgerDocumentIds(evidence.postedInvoiceExternalIds, evidence.unconfirmedInvoiceExternalIds)}`
   }
   return null
 }
@@ -1153,7 +1184,7 @@ function describeRefundPrecondition(refunds: WcCouponRefundEvidence): string {
     `refundStatus ${refunds.disposition}`,
     refunds.refundIds.length ? `refund(s) ${refunds.refundIds.join(', ')}` : null,
     refunds.postedCreditNoteExternalIds.length
-      ? `credit note(s) ${refunds.postedCreditNoteExternalIds.join(', ')}`
+      ? `credit note(s) ${describeLedgerDocumentIds(refunds.postedCreditNoteExternalIds, refunds.unconfirmedCreditNoteExternalIds)}`
       : null,
     refunds.unresolvedRefundParkExternalIds.length
       ? `unrecorded WooCommerce refund(s) ${refunds.unresolvedRefundParkExternalIds.join(', ')}`
