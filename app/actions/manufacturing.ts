@@ -1708,7 +1708,7 @@ async function recalculateManufacturingCostLayers(
   // -> cost_layers (these) -> snapshot child rows. A production order is not a row the revaluation takes, and
   // this transaction takes no transfer or purchase order, so it cannot be a link in a cycle with
   // 2a -> 2b-2d -> 6 (see lib/domain/wms/transfer-asn-lock-order.ts). Everything is READ after this line.
-  await tx.$queryRaw`SELECT id FROM cost_layers WHERE "productionOrderId" = ${productionOrderId} ORDER BY id FOR NO KEY UPDATE`
+  await tx.$queryRaw`SELECT id FROM cost_layers WHERE production_order_id = ${productionOrderId} ORDER BY id FOR NO KEY UPDATE`
 
   const layers = await tx.costLayer.findMany({
     where: { productionOrderId },
