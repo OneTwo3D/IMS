@@ -189,7 +189,9 @@ mock.module('@/lib/security/connector-fetch', {
           headers: { get: () => null },
           json: async () => ({
             Invoices: [{
-              InvoiceID: 'INV-1',
+              // o3d-h9pb: echoes the id that was ASKED FOR. A fixed 'INV-1' here answered a request for a
+              // different document, which the probe now (correctly) refuses as an unreadable answer.
+              InvoiceID: decodeURIComponent(url.split('/Invoices/')[1]!.split('?')[0]!),
               CurrencyCode: 'GBP',
               Total: 250,
               AmountDue: 250,

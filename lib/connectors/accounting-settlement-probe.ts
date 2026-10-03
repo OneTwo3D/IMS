@@ -33,6 +33,7 @@ import {
 // o3d-r948: the completeness refusals print figures, and a KWD shortfall of one fil is `0.00` at two
 // places. The rule for showing a money figure without rounding away what the verdict turned on is
 // already written down for the classifier's own sentences, so it is the same function.
+import { readSingleXeroDocument } from '@/lib/connectors/xero/single-document'
 import { formatLedgerMoney } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import {
@@ -1165,32 +1166,19 @@ async function resolveCreditNoteRefunds(
           + `note from Xero (${res.error ?? `HTTP ${res.status}`})`),
       }
     }
-    const returned = res.data?.Payments ?? []
-    if (returned.length === 0) {
-      return {
-        inclusions,
-        unresolved,
-        refusal: cannotTellAboutRefund(`Xero returned no payment for ${paymentId} against this credit note`),
-      }
+    // o3d-h9pb: the checks that used to be written out here are `readSingleXeroDocument` now.
+    const paymentRead = readSingleXeroDocument<NonNullable<XeroPaymentLookupResponse['Payments']>[number]>(
+      res.data, 'Payments', 'PaymentID', paymentId)
+    if (paymentRead.status === 'unreadable') {
+      const detail = paymentRead.problem === 'multiple-documents'
+        ? `Xero answered the request for payment ${paymentId} against this credit note with ${paymentRead.count} payments`
+        : paymentRead.problem === 'id-mismatch' || paymentRead.problem === 'id-missing'
+          ? `Xero answered the request for payment ${paymentId} against this credit note with `
+            + `${paymentRead.returnedId === null ? 'a payment it did not identify' : `payment ${paymentRead.returnedId}`}`
+          : `Xero returned no payment for ${paymentId} against this credit note (${paymentRead.reason})`
+      return { inclusions, unresolved, refusal: cannotTellAboutRefund(detail) }
     }
-    if (returned.length > 1) {
-      return {
-        inclusions,
-        unresolved,
-        refusal: cannotTellAboutRefund(`Xero answered the request for payment ${paymentId} against this `
-          + `credit note with ${returned.length} payments`),
-      }
-    }
-    const full = returned[0]!
-    const returnedId = str(full.PaymentID)
-    if (returnedId.toLowerCase() !== paymentId.toLowerCase()) {
-      return {
-        inclusions,
-        unresolved,
-        refusal: cannotTellAboutRefund(`Xero answered the request for payment ${paymentId} against this `
-          + `credit note with ${returnedId === '' ? 'a payment it did not identify' : `payment ${returnedId}`}`),
-      }
-    }
+    const full = paymentRead.document
     const association = str(full.CreditNote?.CreditNoteID)
     if (association !== '' && association.toLowerCase() !== creditNoteId.toLowerCase()) {
       return {
@@ -1276,25 +1264,29 @@ export async function probeXeroSettlement(
      * their documents the same unbound way. That is one change about all three rather than a rider on
      * this one, and it is filed rather than smuggled in — see the round's bd issue.
      */
-    const returnedNotes = res.data?.CreditNotes ?? []
-    if (returnedNotes.length === 0) return { ok: false, reason: 'Xero returned no credit note for that id' }
-    if (returnedNotes.length > 1) {
-      return {
-        ok: false,
-        reason: `Xero answered the request for credit note ${creditNoteId} with ${returnedNotes.length} `
-          + 'credit notes, so IMS cannot tell how much of the credit is already allocated',
+    // o3d-h9pb: the three checks above are `readSingleXeroDocument` now, shared with every other by-id
+    // read; every `unreadable` outcome is UNKNOWN here (refusal), never an empty record list.
+    const noteRead = readSingleXeroDocument<NonNullable<XeroCreditNoteResponse['CreditNotes']>[number]>(
+      res.data, 'CreditNotes', 'CreditNoteID', creditNoteId)
+    if (noteRead.status === 'unreadable') {
+      if (noteRead.problem === 'multiple-documents') {
+        return {
+          ok: false,
+          reason: `Xero answered the request for credit note ${creditNoteId} with ${noteRead.count} `
+            + 'credit notes, so IMS cannot tell how much of the credit is already allocated',
+        }
       }
-    }
-    const note = returnedNotes[0]!
-    const notedId = str(note.CreditNoteID)
-    if (notedId.toLowerCase() !== creditNoteId.toLowerCase()) {
-      return {
-        ok: false,
-        reason: `Xero answered the request for credit note ${creditNoteId} with `
-          + `${notedId === '' ? 'a credit note it did not identify' : `credit note ${notedId}`}, so IMS `
-          + 'cannot tell how much of the credit is already allocated',
+      if (noteRead.problem === 'id-mismatch' || noteRead.problem === 'id-missing') {
+        return {
+          ok: false,
+          reason: `Xero answered the request for credit note ${creditNoteId} with `
+            + `${noteRead.returnedId === null ? 'a credit note it did not identify' : `credit note ${noteRead.returnedId}`}, so IMS `
+            + 'cannot tell how much of the credit is already allocated',
+        }
       }
+      return { ok: false, reason: `Xero returned no credit note for that id (${noteRead.reason})` }
     }
+    const note = noteRead.document
     const allocations = note.Allocations ?? []
     // o3d-r948: hoisted, because the completeness arithmetic below is sized by it too — the note's
     // OWN currency, which is what its allocation amounts are stated in.
@@ -1821,8 +1813,18 @@ export async function probeXeroSettlement(
   // from a document with no payments at all — the exact false CLEAR this probe exists to prevent.
   const res = await xeroGet<XeroPaymentsResponse>(`Invoices/${encodeURIComponent(invoiceId)}`)
   if (!res.ok) return { ok: false, reason: res.error ?? `HTTP ${res.status}` }
-  const invoice = res.data?.Invoices?.[0]
-  if (!invoice) return { ok: false, reason: 'Xero returned no document for that id' }
+  // o3d-h9pb: bound to the request like the credit-note and payment arms. A different, untouched
+  // invoice would otherwise answer `provedComplete: true` over an empty record list, which is `clear`.
+  const invoiceRead = readSingleXeroDocument<NonNullable<XeroPaymentsResponse['Invoices']>[number]>(
+    res.data, 'Invoices', 'InvoiceID', invoiceId)
+  if (invoiceRead.status === 'unreadable') {
+    return {
+      ok: false,
+      reason: `Xero returned no usable document for that id (${invoiceRead.reason}), so IMS cannot tell `
+        + 'what is already settled',
+    }
+  }
+  const invoice = invoiceRead.document
   const invoiceCurrency = ledgerCurrencyCode(invoice.CurrencyCode)
   // o3d-78rq: the wire figures, kept for the completeness arithmetic below and for NOTHING ELSE. That
   // cross-check asks whether the COLLECTION is complete, not whether a figure in it can be compared

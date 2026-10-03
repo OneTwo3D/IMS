@@ -20,12 +20,14 @@ import test, { mock } from 'node:test'
 
 const xeroCalls: string[] = []
 let xeroResponse: unknown = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+/** o3d-h9pb: a per-path answer, because a response for a DIFFERENT document is now (correctly) refused. */
+const xeroResponseByPath: Record<string, unknown> = {}
 
 mock.module('@/lib/connectors/xero/api', {
   namedExports: {
     xeroGet: async (p: string) => {
       xeroCalls.push(p)
-      return { ok: true, status: 200, data: xeroResponse }
+      return { ok: true, status: 200, data: p in xeroResponseByPath ? xeroResponseByPath[p] : xeroResponse }
     },
   },
 })
@@ -875,6 +877,7 @@ test('rows for DIFFERENT documents do not serialize against each other (o3d-0m56
   // 6) — a different invoice is.
   xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const otherDocument = { accountingInvoiceId: 'inv-2', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
+  xeroResponseByPath['Invoices/inv-2'] = { Invoices: [{ InvoiceID: 'inv-2', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
   const { db } = dbDouble([
     { id: 'log-a', remoteAttemptedAt: null },
     { id: 'log-b', remoteAttemptedAt: null, scope: 'INVOICE_PAYMENT SalesOrder so-2', payload: otherDocument },
@@ -904,6 +907,7 @@ test('rows for DIFFERENT documents do not serialize against each other (o3d-0m56
   assert.deepEqual(contended, [], 'a different document is a different lock')
   assert.equal(second.success, true)
   assert.deepEqual(posts.sort(), ['log-a', 'log-b'])
+  delete xeroResponseByPath['Invoices/inv-2']
 })
 
 test('a non-money post takes no lock and no reading (o3d-0m56 r4)', async () => {
