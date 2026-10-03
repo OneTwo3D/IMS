@@ -31,6 +31,8 @@ type SyncRow = {
   payload: unknown
   /** o3d-nf9i r3: how a terminal status was reached. NULL = the connector's own writeback. */
   settlementBasis: string | null
+  /** o3d-1e7sl: the canceller's pre-call proof. Optional: absent reads as not flagged (NULL), as every older fixture means. */
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 type EventRow = { id: string; idempotencyKey: string; status: string; externalId: string | null }
@@ -81,6 +83,12 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
     if (key === 'OR') {
       const branches = condition as Array<Record<string, unknown>>
       if (!branches.some((branch) => matches(row, branch))) return false
+      continue
+    }
+    // o3d-1e7sl: the ledger-standing module's `NAMES_A_DOCUMENT_WHERE` is an AND of its paired id arms.
+    if (key === 'AND') {
+      const branches = condition as Array<Record<string, unknown>>
+      if (!branches.every((branch) => matches(row, branch))) return false
       continue
     }
     const value = row[key]
@@ -421,8 +429,13 @@ test('"it did NOT post" cancels the row and leaves externalTransactionId NULL', 
   assert.equal('settledStatus' in result ? result.settledStatus : null, 'CANCELLED')
   const row = stored()
   assert.equal(row.status, 'CANCELLED')
-  assert.equal(row.externalTransactionId, null, 'never writes an id — that is what unblocks the delete guard')
-  assert.match(String(row.errorMessage), /verified NOT POSTED/)
+  assert.equal(row.externalTransactionId, null, 'never writes an id - and never clears one, which would destroy post evidence')
+  // o3d-1e7sl (C1): the note says it is a CLAIM. It no longer says "verified NOT POSTED ... nothing reached the
+  // accounting system" in IMS's voice, and the row no longer unblocks the order delete (the guard reads it
+  // ASSERTED_NOT_POSTED and keeps blocking).
+  assert.match(String(row.errorMessage), /recorded as NOT POSTED/)
+  assert.match(String(row.errorMessage), /UNPROVEN/)
+  assert.doesNotMatch(String(row.errorMessage), /nothing reached the accounting system/)
   assert.match(String(row.errorMessage), /no matching payment in the org/)
 })
 
@@ -682,7 +695,7 @@ test('a mirror that already records a posted document REFUSES the SETTLEMENT —
   assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
   assert.match('error' in result ? result.error : '', /already names document INV-500/)
   // The remedy, not a dead end.
-  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  assert.match('error' in result ? result.error : '', /[Ss]ettle this row as POSTED with that id/)
   // AND NOTHING WAS WRITTEN. The fenced decision had already landed inside the transaction, so a
   // refusal that merely RETURNED would have committed a CANCELLED row and reported a failure.
   assert.deepEqual(
@@ -755,6 +768,47 @@ test('a live sibling sharing the mirror keeps it — the settlement skips, and s
   const audit = settlementAudit()[0]
   assert.equal((audit.metadata as Record<string, unknown>).mirrorConflictSyncLogId, 'log-2')
   assert.match(String(audit.description), /still owns it/)
+})
+
+test('[o3d-1e7sl G11] a sibling OWNS the shared mirror per its STANDING: slot-holders and any row naming a document do, a retired unproven row or one proven unsent does not', async () => {
+  // EXISTENCE (D2): an operator-typed id owns its mirror exactly as the connector's does. The action asks the
+  // module's `OWNS_MIRRORED_EVENT_WHERE` / `ownsMirroredEvent`; a status list and an id test restated here would
+  // disagree with it on the first new standing. One sibling per standing, the standing asserted first.
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  const cases: Array<{ name: string; standing: string; over: Partial<SyncRow>; owns: boolean }> = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'INV-1' }, owns: true },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', over: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, owns: true },
+    { name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK', over: { status: 'PENDING', attemptRevision: 0 }, owns: true },
+    { name: 'UNKNOWN (FAILED naming a document: CONFIRMED_POSTED)', standing: 'CONFIRMED_POSTED', over: { status: 'FAILED', externalTransactionId: 'INV-F' }, owns: true },
+    { name: 'UNKNOWN (FAILED, no id)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null }, owns: false },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, owns: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, owns: false },
+  ]
+  let owning = 0
+  for (const c of cases) {
+    const settle = await loadAction()
+    const sibling = syncRow({ id: 'log-2', ...MIRRORED, attemptRevision: 4, abandonedBeforeRemoteCall: null, ...c.over })
+    state.rows = [syncRow({ ...MIRRORED }), sibling]
+    state.events = [{ id: 'evt-1', idempotencyKey: mirrorKeyFor(), status: 'PENDING', externalId: null }]
+    const standing = ledgerStanding({
+      status: sibling.status, externalTransactionId: sibling.externalTransactionId,
+      settlementBasis: sibling.settlementBasis ?? null, abandonedBeforeRemoteCall: sibling.abandonedBeforeRemoteCall ?? null,
+    })
+    console.log(`# G11 action precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const result = await settle('log-1', notPosted())
+    assert.equal(result.success, true, c.name)
+    const mirror = 'mirror' in result ? result.mirror : null
+    assert.equal(mirror === 'skipped_owned_by_another_row', c.owns, `${c.name}: mirror ${mirror}`)
+    if (c.owns) {
+      owning += 1
+      // D11: the audit note says whose id the owning sibling carries.
+      const note = String(settlementAudit().at(-1)?.description)
+      assert.equal(/names a document an operator typed in/.test(note), c.standing === 'ASSERTED_POSTED', `${c.name}: audit note ${note}`)
+    }
+  }
+  console.log(`# G11 action cases: ${cases.length}; sibling owns the mirror in ${owning}`)
+  assert.ok(owning > 0 && owning < cases.length)
 })
 
 // ---------------------------------------------------------------------------
@@ -1183,7 +1237,7 @@ test('a NOT_POSTED assertion is refused by a second key that records a posted do
 
   assert.equal(result.success, false)
   assert.equal('code' in result ? result.code : null, 'contradicts_mirrored_document')
-  assert.match('error' in result ? result.error : '', /Settle this row as POSTED with that id/)
+  assert.match('error' in result ? result.error : '', /[Ss]ettle this row as POSTED with that id/)
   assert.equal(stored().status, 'FAILED')
   assert.equal(state.events.find((e) => e.idempotencyKey === PRIMARY_KEY)!.status, 'PENDING')
 })

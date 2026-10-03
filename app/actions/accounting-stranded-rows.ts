@@ -97,6 +97,9 @@ export async function getStrandedAccountingSyncRows(limit = 50): Promise<Strande
       // o3d-e2mz: the attempt a settlement of this row would have to name. Selected here rather than
       // defaulted in the mapper so a row that has never been fence-claimed reports its real 0.
       attemptRevision: true,
+      // o3d-1e7sl (D4): the standing columns, so the banner never shows a typed id as "posted as".
+      settlementBasis: true,
+      abandonedBeforeRemoteCall: true,
     },
   })
   // WHETHER ANYTHING CAN STILL CLAIM THESE ROWS, asked of the installation rather than assumed from

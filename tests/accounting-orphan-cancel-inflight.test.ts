@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { LIVE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/sales/order-delete-guard'
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { matchesWhere } from './helpers/shopping-sync-log-fake'
 
 // o3d-sref. cancelOrphanedAccountingSyncRows retires an orphaned connector's queue. It cancelled
 // PENDING and stale PROCESSING rows alike — but they are not the same fact:
@@ -25,16 +26,25 @@ import { LIVE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/sales/order-delete-g
 // every behaviour it added was inert where it mattered — and that the operator path it claimed did
 // not exist. The lesson pinned here: prefer removing a false assertion over adding a true one.
 
-test('PROCESSING is in the delete guard\'s live set, so leaving it there is sufficient (o3d-sref)', () => {
-  const live: readonly string[] = LIVE_ACCOUNTING_SYNC_STATUSES
+test('PROCESSING is in the delete guard\'s blocking set, so leaving it there is sufficient (o3d-sref)', () => {
+  // o3d-1e7sl: the guard's set is `MAY_HAVE_REACHED_LEDGER_WHERE` (everything except a row PROVEN unsent), no
+  // longer a status list, so the property is asserted on the predicate the guard really runs.
+  const blocks = (over: Record<string, unknown>) => matchesWhere(
+    { status: 'PROCESSING', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, ...over },
+    MAY_HAVE_REACHED_LEDGER_WHERE as Record<string, unknown>,
+  )
 
   assert.ok(
-    live.includes('PROCESSING'),
+    blocks({ status: 'PROCESSING' }),
     'the entire fix rests on this: a PROCESSING row already blocks the delete, so not retiring it is enough',
   )
   assert.ok(
-    !live.includes('CANCELLED'),
-    'and CANCELLED does not block — which is exactly why retiring a possibly-sent row was the bug',
+    !blocks({ status: 'CANCELLED', abandonedBeforeRemoteCall: true }),
+    'a CANCELLED row that PROVED it was pre-call (what this sweep stamps over a PENDING row) does not block',
+  )
+  assert.ok(
+    blocks({ status: 'CANCELLED' }),
+    'and a bare CANCELLED row now blocks as well (o3d-1e7sl): retiring a possibly-sent row was the bug, and the guard no longer lets it be a green light',
   )
 })
 

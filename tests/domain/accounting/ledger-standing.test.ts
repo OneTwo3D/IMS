@@ -2,14 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  ASSERTED_POSTED_WHERE,
+  CLAIMS_TO_HAVE_POSTED_WHERE,
   LEDGER_STANDING_SELECT,
   MAY_HAVE_REACHED_LEDGER_WHERE,
+  NAMES_A_DOCUMENT_WHERE,
+  OWNS_MIRRORED_EVENT_WHERE,
   PROVEN_LEDGER_FACT_WHERE,
   UNPROVEN_CANCELLED_WHERE,
   WORK_SLOT_OCCUPIED_WHERE,
+  claimsToHavePosted,
   isProvenLedgerFact,
   ledgerStanding,
   mayHaveReachedLedger,
+  namesADocument,
+  ownsMirroredEvent,
   workSlotStanding,
   type LedgerStanding,
   type LedgerStandingRow,
@@ -164,6 +171,49 @@ test('o3d-f709: WORK_SLOT_OCCUPIED_WHERE agrees with workSlotStanding on EVERY r
   }
 })
 
+test('[o3d-1e7sl] the EXISTENCE fragments agree with their TypeScript on EVERY row of the cross product', () => {
+  const counts = { names: 0, asserted: 0, claims: 0, owns: 0 }
+  for (const r of population()) {
+    const names = namesADocument(r)
+    assert.equal(where(r, NAMES_A_DOCUMENT_WHERE), names, `NAMES_A_DOCUMENT_WHERE: ${JSON.stringify(r)}`)
+    const asserted = ledgerStanding(r) === 'ASSERTED_POSTED'
+    assert.equal(where(r, ASSERTED_POSTED_WHERE), asserted, `ASSERTED_POSTED_WHERE vs the standing: ${JSON.stringify(r)}`)
+    const claims = claimsToHavePosted(r)
+    assert.equal(where(r, CLAIMS_TO_HAVE_POSTED_WHERE), claims, `CLAIMS_TO_HAVE_POSTED_WHERE: ${JSON.stringify(r)}`)
+    const owns = ownsMirroredEvent(r)
+    assert.equal(where(r, OWNS_MIRRORED_EVENT_WHERE), owns, `OWNS_MIRRORED_EVENT_WHERE: ${JSON.stringify(r)}`)
+    if (names) counts.names += 1
+    if (asserted) counts.asserted += 1
+    if (claims) counts.claims += 1
+    if (owns) counts.owns += 1
+  }
+  console.log(`# cross product (225 rows): names a document ${counts.names}; asserted posted ${counts.asserted}; claims to have posted ${counts.claims}; owns the mirror ${counts.owns}`)
+  assert.ok(counts.asserted > 0 && counts.asserted < counts.names, 'asserted is a strict subset of "names a document"')
+  assert.ok(counts.names < counts.claims, 'an id-less SYNCED row claims to have posted without naming a document')
+  assert.ok(counts.claims < counts.owns, 'a PENDING/PROCESSING row owns the mirror without claiming to have posted')
+})
+
+test('[o3d-1e7sl] the existence readings have the shapes their callers rely on (spot check by name)', () => {
+  const cases: Array<[string, LedgerStandingRow, { names: boolean; claims: boolean; owns: boolean; assertedPosted: boolean }]> = [
+    ['connector SYNCED with an id', row({ status: 'SYNCED', externalTransactionId: 'D' }), { names: true, claims: true, owns: true, assertedPosted: false }],
+    ['asserted SYNCED with a typed id', row({ status: 'SYNCED', externalTransactionId: 'D', settlementBasis: OA }), { names: true, claims: true, owns: true, assertedPosted: true }],
+    ['id-less SYNCED (an id-less type)', row({ status: 'SYNCED' }), { names: false, claims: true, owns: true, assertedPosted: false }],
+    ['FAILED naming a document', row({ status: 'FAILED', externalTransactionId: 'D' }), { names: true, claims: true, owns: true, assertedPosted: false }],
+    ['cancelled-sale settlement (asserted id on CANCELLED)', row({ status: 'CANCELLED', externalTransactionId: 'D', settlementBasis: OA }), { names: true, claims: true, owns: true, assertedPosted: true }],
+    ['asserted NOT_POSTED', row({ settlementBasis: OA }), { names: false, claims: false, owns: false, assertedPosted: false }],
+    ['PROCESSING asserted with an id (row 2: UNKNOWN, not asserted-posted)', row({ status: 'PROCESSING', externalTransactionId: 'D', settlementBasis: OA }), { names: true, claims: true, owns: true, assertedPosted: false }],
+    ['PENDING, nothing else', row({ status: 'PENDING' }), { names: false, claims: false, owns: true, assertedPosted: false }],
+    ['swept pre-call', row({ abandonedBeforeRemoteCall: true }), { names: false, claims: false, owns: false, assertedPosted: false }],
+  ]
+  for (const [name, r, expected] of cases) {
+    assert.equal(namesADocument(r), expected.names, `${name}: names`)
+    assert.equal(claimsToHavePosted(r), expected.claims, `${name}: claims`)
+    assert.equal(ownsMirroredEvent(r), expected.owns, `${name}: owns`)
+    assert.equal(ledgerStanding(r) === 'ASSERTED_POSTED', expected.assertedPosted, `${name}: asserted posted`)
+    assert.equal(where(r, ASSERTED_POSTED_WHERE), expected.assertedPosted, `${name}: ASSERTED_POSTED_WHERE`)
+  }
+})
+
 test('o3d-f709: the fragments are consistent with the table on the rows that matter to money (spot check by name)', () => {
   const cases: Array<[string, LedgerStandingRow, boolean]> = [
     ['asserted NOT_POSTED is in MAY_HAVE', row({ settlementBasis: OA }), true],
@@ -178,7 +228,7 @@ test('o3d-f709: the fragments are consistent with the table on the rows that mat
 test('o3d-f709: the fragments are not the complement of anything - they contain no NOT of a nullable column', () => {
   // A negation over a NULLABLE column is SQL NULL for a NULL row and drops it from both sides of a
   // split. The only `not` operators allowed are the paired ones; `NOT` objects are forbidden.
-  const text = JSON.stringify([MAY_HAVE_REACHED_LEDGER_WHERE, PROVEN_LEDGER_FACT_WHERE, UNPROVEN_CANCELLED_WHERE])
+  const text = JSON.stringify([MAY_HAVE_REACHED_LEDGER_WHERE, PROVEN_LEDGER_FACT_WHERE, UNPROVEN_CANCELLED_WHERE, ASSERTED_POSTED_WHERE, CLAIMS_TO_HAVE_POSTED_WHERE, OWNS_MIRRORED_EVENT_WHERE, NAMES_A_DOCUMENT_WHERE])
   assert.equal(/"NOT"/.test(text), false, 'no top-level NOT object in any fragment')
   console.log(`# fragment text length: ${text.length}`)
 })

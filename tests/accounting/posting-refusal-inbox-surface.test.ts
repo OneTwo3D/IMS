@@ -188,10 +188,12 @@ const db = new Proxy({
   accountingSyncLog: {
     ...emptyModel,
     findMany: async ({ where }: { where?: Record<string, unknown> } = {}) => (
-      // Only the classification's read is answered: it is the one that excludes CANCELLED rows. Every
+      // Only the classification's read is answered. o3d-1e7sl: it used to be recognised by its
+      // `status: { not: 'CANCELLED' }` clause, which is gone - the read now takes EVERY row for the postings
+      // (an OR of the refusals' keys) and classifies in TypeScript through the ledger-standing module. Every
       // other read of this table in the inbox stays empty, so each section's count stays attributable.
-      where && typeof where.status === 'object' && where.status !== null && 'not' in (where.status as object)
-        ? liveSyncRows
+      where && Array.isArray(where.OR)
+        ? liveSyncRows.map((row) => ({ settlementBasis: null, abandonedBeforeRemoteCall: null, ...row }))
         : []
     ),
   },
@@ -445,6 +447,56 @@ test('[o3d-j625 r14] a refusal whose posting has an UNSENT queued row is told to
   // The affordance must STILL be offered: it is the safe first step now, so removing it would leave the
   // operator with the unsafe one.
   assert.equal(row.clearing, 'retried', 'and the hand-posting affordance is still offered')
+})
+
+test('[o3d-1e7sl G6/G7] the inbox classifies the rows under a refused posting by STANDING: retired rows never block the remedy, and an unproven one is REPORTED', async () => {
+  // C1 / D1. A CANCELLED row cannot post again, so it does not make the instruction "do not post by hand" - the
+  // remedy for an asserted-not-posted or unresolved attempt IS to take the posting, hand-post and mark it
+  // handled. But a retired row that is not PROVEN unsent is not "nothing": the order names it and tells the
+  // operator to look in the ledger first. The classification is made in TypeScript over EVERY row for the
+  // posting (the `status: { not: 'CANCELLED' }` read it replaces dropped these rows without a trace).
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  type Case = { name: string; standing: string; row: Record<string, unknown>; queuedRow: 'unsent' | 'may-be-sent' | null; reports: RegExp | null }
+  const cases: Case[] = [
+    { name: 'LIVE_WORK never claimed', standing: 'LIVE_WORK', row: {}, queuedRow: 'unsent', reports: null },
+    { name: 'LIVE_WORK claimed before', standing: 'LIVE_WORK', row: { attemptRevision: 3 }, queuedRow: 'may-be-sent', reports: null },
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-C', attemptRevision: 1 }, queuedRow: 'may-be-sent', reports: null },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'DOC-T', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, queuedRow: 'may-be-sent', reports: null },
+    { name: 'UNKNOWN FAILED', standing: 'UNKNOWN', row: { status: 'FAILED', attemptRevision: 1 }, queuedRow: 'may-be-sent', reports: null },
+    { name: 'ASSERTED_NOT_POSTED (retired)', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, queuedRow: null, reports: /settled by an operator as NOT posted \(an assertion, not proof that it did not post\)/ },
+    { name: 'UNKNOWN CANCELLED (retired, no proof)', standing: 'UNKNOWN', row: { status: 'CANCELLED', attemptRevision: 1 }, queuedRow: null, reports: /nothing on the row says whether it reached the ledger/ },
+    { name: 'PROVEN_NOT_POSTED (retired, proven)', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', abandonedBeforeRemoteCall: true }, queuedRow: null, reports: null },
+  ]
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  let reported = 0
+  for (const c of cases) {
+    liveSyncRows.length = 0
+    const live = liveRowFor(c.row)
+    liveSyncRows.push(live)
+    const standing = ledgerStanding({
+      status: String(live.status), externalTransactionId: (live.externalTransactionId as string | null) ?? null,
+      settlementBasis: ((c.row.settlementBasis as string | undefined) ?? null), abandonedBeforeRemoteCall: ((c.row.abandonedBeforeRemoteCall as boolean | undefined) ?? null),
+    })
+    console.log(`# G7 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const data = await getExceptionInboxData()
+    const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-1')
+    assert.ok(row, `${c.name}: the debt is still listed`)
+    assert.equal(row.queuedRow, c.queuedRow, c.name)
+    if (c.reports) {
+      reported += 1
+      assert.equal(row.retiredUnproven.length, 1, c.name)
+      assert.match(row.retiredUnproven[0]!, c.reports, c.name)
+      assert.match(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, `${c.name}: the order tells the operator to look first`)
+      // And still offers the act that closes it: a retired row must not turn the remedy into a dead end.
+      assert.match(String(row.handPostOrder), /Take for hand posting" FIRST/, c.name)
+    } else {
+      assert.deepEqual(row.retiredUnproven, [], `${c.name}: nothing unproven to report`)
+      assert.doesNotMatch(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, c.name)
+    }
+  }
+  console.log(`# G7 cases: ${cases.length}; reported-unproven ${reported}`)
+  assert.equal(reported, 2)
 })
 
 test('[o3d-j625 r14] a refusal whose queued row MAY ALREADY HAVE POSTED is sent to the sync log, not to the ledger', async () => {

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import {
   collectAccountingInvariantRows,
   evaluateAccountingInvariantRows,
@@ -71,7 +72,7 @@ function cleanRows(): AccountingInvariantRows {
         errorMessage: null,
         retryCount: 0,
         createdAt: A1_DATE,
-        syncedAt: A1_DATE,
+        syncedAt: A1_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'daily-a2',
@@ -85,7 +86,7 @@ function cleanRows(): AccountingInvariantRows {
         errorMessage: null,
         retryCount: 0,
         createdAt: A2_DATE,
-        syncedAt: A2_DATE,
+        syncedAt: A2_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'daily-b',
@@ -99,7 +100,7 @@ function cleanRows(): AccountingInvariantRows {
         errorMessage: null,
         retryCount: 0,
         createdAt: B_DATE,
-        syncedAt: B_DATE,
+        syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'credit-note',
@@ -113,7 +114,7 @@ function cleanRows(): AccountingInvariantRows {
         errorMessage: null,
         retryCount: 0,
         createdAt: B_DATE,
-        syncedAt: B_DATE,
+        syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'cogs-reversal',
@@ -127,7 +128,7 @@ function cleanRows(): AccountingInvariantRows {
         errorMessage: null,
         retryCount: 0,
         createdAt: B_DATE,
-        syncedAt: B_DATE,
+        syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
     ],
     // o3d-o97 r4: the refusals arrive as their OWN row set, loaded by a query with none of the
@@ -160,6 +161,48 @@ test('digest-suffixed daily-batch logs satisfy the bare-key sync-evidence check 
   const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
   assert.ok(!codes.includes('shipment_posted_without_sync_evidence'),
     'digest-suffixed Group-B log should satisfy the sync-evidence check')
+})
+
+test('[o3d-1e7sl D5] the Group-B evidence check and the operator-asserted report, one batch log per standing', () => {
+  // EXISTENCE (D2): the shipment is "evidenced" iff its batch log holds the work slot (PENDING / PROCESSING /
+  // SYNCED) - an operator-typed SYNCED log counts, and is REPORTED once as `accounting_sync_evidence_operator_asserted`
+  // (info) so the claim is never silent. A FAILED row, an asserted-not-posted CANCELLED row and a proven-unsent
+  // one are not evidence of a posting at all.
+  type Case = { name: string; standing: string; over: Record<string, unknown>; evidenced: boolean; reported: boolean }
+  const cases: Case[] = [
+    { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', over: {}, evidenced: true, reported: false },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', over: { settlementBasis: 'OPERATOR_ASSERTION' }, evidenced: true, reported: true },
+    { name: 'LIVE_WORK (PENDING)', standing: 'LIVE_WORK', over: { status: 'PENDING', externalTransactionId: null }, evidenced: true, reported: false },
+    { name: 'UNKNOWN (FAILED)', standing: 'UNKNOWN', over: { status: 'FAILED', externalTransactionId: null }, evidenced: false, reported: false },
+    { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, evidenced: false, reported: false },
+    { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', over: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, evidenced: false, reported: false },
+  ]
+  let reported = 0
+  for (const c of cases) {
+    const rows = cleanRows()
+    rows.syncLogs = rows.syncLogs.map((log) => (log.type === 'DAILY_BATCH_GROUP_B' ? { ...log, ...c.over } : log))
+    const group = rows.syncLogs.find((log) => log.type === 'DAILY_BATCH_GROUP_B')!
+    const standing = ledgerStanding({
+      status: String(group.status), externalTransactionId: group.externalTransactionId,
+      settlementBasis: group.settlementBasis, abandonedBeforeRemoteCall: group.abandonedBeforeRemoteCall,
+    })
+    console.log(`# D5 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const findings = evaluateAccountingInvariantRows(rows)
+    const codes = findings.map((f) => f.code)
+    assert.equal(!codes.includes('shipment_posted_without_sync_evidence'), c.evidenced, `${c.name}: evidence`)
+    const report = findings.filter((f) => f.code === 'accounting_sync_evidence_operator_asserted')
+    assert.equal(report.length, c.reported ? 1 : 0, `${c.name}: operator-asserted report`)
+    if (c.reported) {
+      reported += 1
+      assert.equal(report[0]!.severity, 'info')
+      assert.equal(report[0]!.syncLogId, group.id)
+      assert.match(report[0]!.message, /only on an operator's assertion[\s\S]*never read it from the ledger/)
+      assert.equal((report[0]!.details as { standing?: string }).standing, 'ASSERTED_POSTED')
+    }
+  }
+  console.log(`# D5 cases: ${cases.length}; reported ${reported}`)
+  assert.equal(reported, 1)
 })
 
 test('still flags a posted shipment with no Group-B sync evidence at all (scjz.37)', () => {
@@ -259,7 +302,7 @@ test('flags a live accounting journal whose debits and credits do not balance', 
     errorMessage: null,
     retryCount: 0,
     createdAt: B_DATE,
-    syncedAt: B_DATE,
+    syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
   })
 
   const finding = evaluateAccountingInvariantRows(rows).find((f) => f.code === 'accounting_sync_journal_unbalanced')
@@ -289,7 +332,7 @@ test('does not flag a balanced journal or a non-journal metadata payload', () =>
       errorMessage: null,
       retryCount: 0,
       createdAt: B_DATE,
-      syncedAt: B_DATE,
+      syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
   )
 
@@ -317,7 +360,7 @@ test('does not balance-check a failed (unposted) journal', () => {
     errorMessage: 'boom',
     retryCount: 1,
     createdAt: B_DATE,
-    syncedAt: null,
+    syncedAt: null, settlementBasis: null, abandonedBeforeRemoteCall: null,
   })
 
   const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
@@ -390,7 +433,7 @@ test('sync logs report missing reference metadata, missing idempotency keys, and
       errorMessage: null,
       retryCount: 0,
       createdAt: B_DATE,
-      syncedAt: null,
+      syncedAt: null, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
     {
       id: 'missing-idempotency',
@@ -404,7 +447,7 @@ test('sync logs report missing reference metadata, missing idempotency keys, and
       errorMessage: null,
       retryCount: 0,
       createdAt: B_DATE,
-      syncedAt: null,
+      syncedAt: null, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
     {
       id: 'failed-no-error',
@@ -418,7 +461,7 @@ test('sync logs report missing reference metadata, missing idempotency keys, and
       errorMessage: '',
       retryCount: 5,
       createdAt: B_DATE,
-      syncedAt: null,
+      syncedAt: null, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
   )
 
@@ -568,12 +611,12 @@ test('o3d-2sm1 r6: a refund that finished cleanly under the new ordering is not 
     {
       id: 'cn-clean', connector: 'xero', type: 'CREDIT_NOTE', status: 'SYNCED',
       referenceType: 'SalesOrderRefund', referenceId: 'refund-clean', externalTransactionId: 'xero-cn-1',
-      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:credit-note' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:credit-note' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
     {
       id: 'cogs-clean', connector: 'xero', type: 'COGS_REVERSAL', status: 'SYNCED',
       referenceType: 'SalesOrderRefund', referenceId: 'refund-clean', externalTransactionId: 'xero-j-1',
-      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:cogs-reversal' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+      payload: { _idempotencyKey: 'sales-order-refund:refund-clean:cogs-reversal' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
     },
   )
   // And it is not in the reversal set either, because the query is bounded by the flag it cleared.
@@ -749,17 +792,17 @@ function fullyShippedNoRefundRows(): AccountingInvariantRows {
       {
         id: 'a1', connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'SYNCED',
         referenceType: 'DailyBatch', referenceId: 'A1-2026-01-01', externalTransactionId: 'j-a1',
-        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A1_DATE, syncedAt: A1_DATE,
+        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A1_DATE, syncedAt: A1_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'a2', connector: 'xero', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
         referenceType: 'DailyBatch', referenceId: 'A2-2026-01-01', externalTransactionId: 'j-a2',
-        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A2_DATE, syncedAt: A2_DATE,
+        payload: { date: '2026-01-01' }, errorMessage: null, retryCount: 0, createdAt: A2_DATE, syncedAt: A2_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
       {
         id: 'b', connector: 'xero', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
         referenceType: 'DailyBatch', referenceId: 'B-2026-01-02', externalTransactionId: 'j-b',
-        payload: { date: '2026-01-02' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE,
+        payload: { date: '2026-01-02' }, errorMessage: null, retryCount: 0, createdAt: B_DATE, syncedAt: B_DATE, settlementBasis: null, abandonedBeforeRemoteCall: null,
       },
     ],
     unresolvedAllocationBasisRefunds: [],

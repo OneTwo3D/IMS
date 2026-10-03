@@ -13,7 +13,7 @@ import {
 // `undefined`. A `text[]` parameter that silently became `undefined` would widen this query to every
 // sync type rather than fail.
 import { MIRRORED_ACCOUNTING_SYNC_TYPES } from './mirrored-sync-types'
-import { isOperatorAssertedSettlement } from './sync-row-settlement'
+import { mirroredPostStanding, workSlotStanding } from './ledger-standing'
 
 /**
  * o3d-11rf r3 — the sync-row statuses that CONTRADICT a VOID mirror, i.e. work still owed.
@@ -309,6 +309,13 @@ type AccountingSyncLogRow = {
    * parse of it has no way to say "I could not tell".
    */
   settlementBasis: string | null
+  /**
+   * o3d-1e7sl (D6): the canceller's pre-call proof, the fourth column `ledgerStanding` reads. Optional here
+   * because the only reading this report makes of a sync row (`workSlotStanding`) never consults it; the
+   * loader selects it anyway so the row is a COMPLETE `LedgerStandingRow` and the next reader cannot get a
+   * silently weaker verdict from a partial one.
+   */
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 type AccountingEventRow = {
@@ -332,6 +339,11 @@ type AccountingEventRow = {
    * NULL here, deliberately: both are "no writer said", which is the whole condition being reported.
    */
   voidBasis?: string | null
+  /**
+   * o3d-1e7sl (D6): HOW the event came to be POSTED (`mirroredPostStanding`). Optional for the fixtures that
+   * predate the column; `collectAccountingReconciliationRows` always selects it. Absent reads UNRECORDED.
+   */
+  postBasis?: string | null
 }
 
 /**
@@ -682,7 +694,6 @@ export const MAX_UNMIRRORED_SYNC_LOGS = MAX_RECONCILIATION_FINDINGS_PER_RUN
 const TERMINAL_SALES_ORDER_STATUSES = ['CANCELLED', 'COMPLETED', 'DELIVERED'] as const
 // PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
 // "queued but not mirrored" from "no accounting path was ever scheduled".
-const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
 
 // Document sync events are mirrorable, but their source checks are document-specific rather than DailyBatch source-key checks.
 const SOURCE_TRACKED_EVENT_TYPES = new Set([
@@ -813,13 +824,23 @@ function syncLogHasLiveEvidence(
   syncLogs: AccountingSyncLogRow[],
   params: { type: string; referenceType: string; referenceId: string },
 ): boolean {
-  return syncLogs.some((log) => (
-    log.type === params.type &&
-    log.referenceType === params.referenceType &&
-    log.referenceId === params.referenceId &&
-    LIVE_SYNC_STATUSES.has(log.status) &&
-    !isOperatorAssertedSettlement(log.settlementBasis)
-  ))
+  return syncLogs.some((log) => {
+    if (
+      log.type !== params.type ||
+      log.referenceType !== params.referenceType ||
+      log.referenceId !== params.referenceId
+    ) return false
+    // o3d-1e7sl (D6): ASKED OF THE LEDGER-STANDING MODULE. A row is evidence when it holds the work slot (PENDING /
+    // PROCESSING / SYNCED) AND the claim is not an operator's: `asserted` is true exactly when the occupant's
+    // standing rests on a typed id. The two halves used to be a hand-written status set beside a basis test.
+    const slot = workSlotStanding({
+      status: log.status,
+      externalTransactionId: log.externalTransactionId,
+      settlementBasis: log.settlementBasis,
+      abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
+    })
+    return slot.slot === 'OCCUPIED' && !slot.asserted
+  })
 }
 
 function refundLabel(refund: SourceRefundRow): string {
@@ -1276,17 +1297,26 @@ export function evaluateAccountingReconciliationRows(
   addUnmirroredSyncLogFindings(findings, rows)
 
   for (const event of rows.accountingEvents) {
-    if (event.status === 'POSTED' && !event.externalId?.trim()) {
+    const postStanding = mirroredPostStanding({ status: event.status, postBasis: event.postBasis ?? null })
+    if (postStanding !== 'NOT_POSTED' && !event.externalId?.trim()) {
       findings.push({
         severity: 'critical',
         code: 'posted_event_without_external_id',
         accountingEventId: event.id,
-        message: `Posted accounting event ${event.id} has no external ID`,
+        message: `Posted accounting event ${event.id} has no external ID`
+          // o3d-1e7sl (D6): SAY WHOSE POST IT IS. "Posted" on a mirror an operator's typed id made POSTED, or
+          // one whose basis nobody recorded, is not the connector's answer.
+          + (postStanding === 'ASSERTED'
+            ? ' (it was marked POSTED on an operator\'s assertion, never read from the ledger)'
+            : postStanding === 'UNRECORDED'
+              ? ' (how it came to be POSTED was never recorded)'
+              : ''),
         details: {
           type: event.type,
           sourceEntityType: event.sourceEntityType,
           sourceEntityId: event.sourceEntityId,
           externalSystem: event.externalSystem,
+          postStanding,
         },
       })
     }
@@ -2070,6 +2100,8 @@ export async function collectAccountingReconciliationRows(
         // not fail a type-check anywhere the field is optional — it just makes every asserted row
         // arrive looking connector-confirmed, which is the defect this reads it to avoid.
         settlementBasis: true,
+        // o3d-1e7sl (D6): and the pre-call proof, so the row is a complete `LedgerStandingRow`.
+        abandonedBeforeRemoteCall: true,
       },
     }),
     client.accountingEvent.findMany({
@@ -2094,6 +2126,9 @@ export async function collectAccountingReconciliationRows(
         // o3d-11rf r3: read so a VOID mirror NO WRITER EXPLAINED can be told apart from one a
         // cancellation or a settlement did explain. Only the unexplained ones are reported.
         voidBasis: true,
+        // o3d-1e7sl (D6): HOW a POSTED event came to be POSTED - asked for explicitly, because absent
+        // reads UNRECORDED and every event would then be described as one nobody can vouch for.
+        postBasis: true,
       },
     }),
     // o3d-cvj9 r7: the handovers the live mirror made on an order nothing established. Selected on

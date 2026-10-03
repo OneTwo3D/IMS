@@ -1991,12 +1991,13 @@ them — now carry a **Settle** control (the gavel icon) beside Retry, both in t
 stranded-rows banner. It records what *you* found in Xero:
 
 - **It DID post** — you supply the Xero document id. The row becomes **Synced** and records that id.
-- **It did NOT post** — the row becomes **Cancelled** and no id is written, which lets the order be
-  deleted again. **It does NOT free the posting to be sent again.** Your statement is your word about
+- **It did NOT post** — the row becomes **Cancelled** and no id is written, and it is shown everywhere as
+  **asserted: not posted**. **It does NOT make the order deletable again, and it does NOT free the posting to
+  be sent again.** (The order's Delete stays refused — cancel the order instead, which keeps the record.) Your statement is your word about
   a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
   same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
   clear a held "paid" flag, it will refuse to delete the receipt it registered, and it keeps the row
-  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **record it in
+  (aged-out rows are compacted, never deleted). To get the posting into the ledger, **check Xero first and, only if the document is not there, record it in
   Xero by hand and mark the posting handled** in the refusal inbox.
 
 Read what this is, because it is not a repair. IMS cannot check either statement; the control records
@@ -2029,11 +2030,46 @@ there is nothing to settle, and if it is not, reverse it in Xero before recordin
 - **The unrealised FX run** still treats a journal you typed in as existing (so it does not post it twice) and logs a warning for each one it relied on.
 - **A discount restated or reversed from a posted document** (chargebacks, the restated-discount handoff, credit-note netting) goes to **manual** when the posted document's mirror records only your assertion, or records no confirmation at all (every mirror written before the IMS recorded how a post was confirmed). Raise the credit note or adjustment by hand.
 
+**What the sync pages now show: whose word a row rests on.** A row's badge and its document id are no longer
+left to be read as "Xero holds it". The sync log, the stranded-rows banner, the exceptions inbox and the health
+page say which of these a row is:
+
+| Shown as | What it means | What it does NOT mean |
+| --- | --- | --- |
+| *(no badge), "posted as INV-1"* | Xero answered and returned that document | — |
+| **asserted** | An operator typed that document id in; IMS never read the document or its amount | that Xero holds it |
+| **asserted: not posted** | An operator settled the row "did not post". A claim, not proof | that nothing reached Xero — a lost response or a late webhook leaves the same row |
+| **unproven** | A failed row, or one retired by something that could not tell whether a request had already been sent | that nothing was sent |
+| **never sent** | The row was retired before any request was made, and that was recorded at the time (orphan sweep, supersession) | — |
+| **verified reversed** | IMS asked Xero and it reported the payment gone. It may have been posted earlier; the id on the row is kept for the audit trail | that it was never sent |
+| **rejected before posting** | The row's own stored request is missing something the connector requires, so it was refused before any request could be accepted | — |
+
+Only **never sent** (a pre-call abandonment recorded at the time) is ever described as not sent; a **verified reversed** row may well have been posted first. An unproven or asserted-not-posted row always says to look in
+Xero. The same rule shapes the rest of the product:
+
+- **Deleting an order** is refused while any of its accounting rows may have reached Xero — that now includes a
+  cancelled row nobody proved was unsent, and a row settled "did not post". The message says the document is
+  *unproven*, to check Xero, and to **cancel the order instead**. The orphan sweep's own cancellations (stamped
+  before any request) and a payment IMS verified gone from Xero still let the order go.
+- **Taking a refused posting for hand posting** is not blocked by a cancelled row (a cancelled row can never post
+  again, and hand-posting is the remedy for it) but the inbox, and the log entry written when you take the posting,
+  now list every earlier attempt retired without proof — "settled by an operator as NOT posted (an assertion, not
+  proof that it did not post)" — and tell you to **look in Xero first and post by hand only if the document is not there**, because a second document is
+  not undone by marking the posting handled.
+- **Retention** keeps every row an operator typed a document id into, whatever it is keyed to, as a compacted
+  tombstone: the personal data in its payload still expires on schedule, the claim (connector, type, reference, status,
+  id, basis) is never deleted.
+- **The health page** no longer shows a batch whose journal id was typed in as a plain green SYNCED; it reads
+  "SYNCED (asserted by an operator, not confirmed)" and warns. **Reconciliation** says whose post a "posted event has
+  no external ID" finding is, and the **invariant check** logs an info finding for each posting that counts as
+  evidence only on an operator's assertion. A discount or restatement decision that finds an invoice row naming a document
+  says how many rest on the connector and how many on an operator's word.
+
 **Settling "it did not post" retires that attempt, not the document.** A "did not post" settlement
 marks the shared accounting event **Void**, which is what stops a finished row leaving work that
 reconciliation reads as still owed. It is not a statement that the document is no longer wanted. Since
 IMS no longer treats your statement as proof, the posting is **not** queued again on the strength of it
-(see above): the enqueue is refused and the posting stays owed until you record it in Xero by hand and
+(see above): the enqueue is refused and the posting stays owed until you check Xero and, only if the document is not there, record it by hand and
 mark it handled. A replacement that arrives some other way — after a row IMS itself retired — takes a
 Void event of this kind back to **Pending**, and the revival is recorded against the event in its own
 history.

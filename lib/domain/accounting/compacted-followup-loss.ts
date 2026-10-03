@@ -1,6 +1,7 @@
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 import { payloadMayOweInvoicePayment } from '@/lib/domain/accounting/followup-enqueue-outcome'
+import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 
 /**
  * THE ONE WORDING FOR "this row's follow-ups cannot be rebuilt, because retention compacted it"
@@ -51,6 +52,12 @@ export type CompactedFollowUpLossRow = {
    * was owed from. `null`/absent means no record: read the type table instead, which over-reports.
    */
   followUpObligations?: unknown
+  /**
+   * o3d-1e7sl (D7): HOW the row reached the id it names. Optional: absent reads as the connector's own
+   * writeback (NULL), which is the case for every row that predates the column. When it is an operator's
+   * assertion the warning says so instead of calling the id "linked".
+   */
+  settlementBasis?: string | null
 }
 
 /**
@@ -297,8 +304,10 @@ export function followUpObligationsOwedBy(row: {
   externalTransactionId: string | null
   payload: unknown
 }): FollowUpObligationKey[] {
-  // No document id means nothing posted, so every branch of `enqueueFollowUps` returns before it
-  // enqueues anything — the row owes nothing whatever its payload says.
+  // No document id means the connector has nothing to build a follow-up FROM, so every branch of
+  // `enqueueFollowUps` returns before it enqueues anything — the row owes no follow-up whatever its payload
+  // says. (That is a statement about follow-ups. It is NOT "nothing posted": ledger-standing.ts is where a row's
+  // standing is read, and a row with no id may well have reached the ledger.)
   if ((row.externalTransactionId ?? '').trim() === '') return []
   const payload = (row.payload && typeof row.payload === 'object' && !Array.isArray(row.payload)
     ? row.payload
@@ -475,7 +484,7 @@ export function buildCompactedFollowUpLossActivity(input: {
     level: 'WARNING',
     description: `${preamble} ${discarded} can no longer be `
       + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
-      + `to external id ${row.externalTransactionId}. Nothing here authorises settling that by hand: the pass this row `
+      + `to external id ${row.externalTransactionId}${isOperatorAssertedSettlement(row.settlementBasis) ? ' (an id an OPERATOR typed in - an assertion, never read from the ledger)' : ''}. Nothing here authorises settling that by hand: the pass this row `
       + 'was interrupted in enqueues each follow-up as its OWN local sync row, so one for the part named above may '
       + 'ALREADY be sitting PENDING or FAILED in the queue, and no request id can deduplicate a payment or an '
       + `attachment a human created afterwards. READ the document in ${connectorLabel}, record what is actually `

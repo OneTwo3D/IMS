@@ -67,6 +67,7 @@ import {
   allocationDebitForeignLedgerReports,
   buildAllocationDebitOrderUpdate,
   foldA2RecreateOrder,
+  foreignJournalStateOf,
   newA2RecreateSummary,
   repointAllocationDebitPassesToRecreatedJournal,
   type A2RecreateSummary,
@@ -97,7 +98,7 @@ import {
   unearnedReversalStandingReport,
   type UnearnedReversalSyncRow,
 } from '@/lib/domain/accounting/deferred-trueup'
-import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
@@ -969,7 +970,7 @@ export async function recreateMissingDailyBatchLogs(
   // like a deleted one and the report told an operator the journal was not on record and to post it
   // by hand. Neither status establishes that nothing reached the remote ledger, so that advice can
   // duplicate a posting. The status is carried instead, and the report distinguishes the two.
-  const foreignJournalStatusById = new Map<string, string>()
+  const foreignJournalRowById = new Map<string, LedgerStandingRow>()
   let scheduledSweepConnector: string | null = null
   if (foreignPasses.length > 0) {
     scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
@@ -977,17 +978,17 @@ export async function recreateMissingDailyBatchLogs(
     if (foreignJournalIds.length > 0) {
       const rows = await db.accountingSyncLog.findMany({
         where: { id: { in: foreignJournalIds } },
-        select: { id: true, status: true },
+        // o3d-1e7sl (G15): the standing columns, because an operator-typed SYNCED journal is `asserted`, not
+        // `live` - it still counts as existing (D2) but is reported.
+        select: { id: true, ...LEDGER_STANDING_SELECT },
       })
-      for (const row of rows) foreignJournalStatusById.set(row.id, row.status)
+      for (const row of rows) foreignJournalRowById.set(row.id, row)
     }
   }
   const foreignJournalState = (syncLogId: string | null): ForeignJournalState => {
     // A pass that named no journal raised none: unambiguously nothing in the other ledger.
     if (syncLogId == null) return 'absent'
-    const status = foreignJournalStatusById.get(syncLogId)
-    if (status === undefined) return 'absent'
-    return (LIVE_DAILY_BATCH_STATUSES as readonly string[]).includes(status) ? 'live' : 'unsettled'
+    return foreignJournalStateOf(foreignJournalRowById.get(syncLogId))
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {

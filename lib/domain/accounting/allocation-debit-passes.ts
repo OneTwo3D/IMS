@@ -42,6 +42,7 @@
 
 import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { parseDailyBatchReference } from '@/lib/domain/accounting/daily-batch-reference'
+import { ledgerStanding, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 
 /** One Group A2 pass's own contribution to an order's cumulative Allocated Inventory debit. */
 export type AllocationDebitPass = {
@@ -650,7 +651,11 @@ export function allocationDebitRecreateTargets(
 /**
  * o3d-i0o6 r7 (Codex round 6, MEDIUM) — WHAT IS KNOWN ABOUT A FOREIGN PASS'S JOURNAL.
  *
- *   'live'       PENDING / PROCESSING / SYNCED. Queued, in flight, or in the ledger: nothing owed.
+ *   'live'       PENDING / PROCESSING / SYNCED, on the CONNECTOR's own word. Queued, in flight, or in the
+ *                ledger: nothing owed.
+ *   'asserted'   (o3d-1e7sl, G15, D2) a SYNCED row an OPERATOR typed a document id into. It still counts as the
+ *                journal existing - rebuilding it would post it twice - but it is REPORTED, never silent: the
+ *                pounds are in the books on somebody's say-so and nothing has read them.
  *   'absent'     no row at all, or the pass named no journal to begin with. Inside the retention
  *                window — which is the only window this sweep runs in — a daily-batch log that is
  *                absent never posted, so posting it by hand is SAFE.
@@ -663,7 +668,19 @@ export function allocationDebitRecreateTargets(
  *                decision that says nothing about the remote side at all. Following that advice can
  *                post a SECOND journal for pounds already in the books.
  */
-export type ForeignJournalState = 'live' | 'absent' | 'unsettled'
+export type ForeignJournalState = 'live' | 'absent' | 'unsettled' | 'asserted'
+
+/**
+ * The state of a foreign pass's journal row, asked of the ledger-standing module (o3d-1e7sl, G15). `undefined`
+ * is "no such row" (absent). An operator-typed SYNCED row is `asserted` (D2: it counts for EXISTENCE - never
+ * posted a second time - and is reported); any other row holding the work slot is `live`; FAILED / CANCELLED
+ * rows are `unsettled`, exactly as before.
+ */
+export function foreignJournalStateOf(row: LedgerStandingRow | undefined): ForeignJournalState {
+  if (row === undefined) return 'absent'
+  if (ledgerStanding(row) === 'ASSERTED_POSTED' && workSlotStanding(row).slot === 'OCCUPIED') return 'asserted'
+  return workSlotStanding(row).slot === 'OCCUPIED' ? 'live' : 'unsettled'
+}
 
 export function allocationDebitForeignLedgerReports(input: {
   /** The batch being rebuilt, for the report. */
@@ -682,13 +699,28 @@ export function allocationDebitForeignLedgerReports(input: {
     .map((pass) => ({ pass, state: input.journalState(pass.syncLogId) }))
     .filter((entry) => entry.state !== 'live' && entry.pass.connector !== input.scheduledSweepConnector)
   if (abandoned.length === 0) return []
+  // o3d-1e7sl (G15, D2): journals that exist ONLY on an operator's word are described apart from the
+  // abandoned ones. They are not "owed" (a second journal would double the debit) but they are not confirmed
+  // either, and a report that stayed silent about them would be exactly the laundering D2 forbids.
+  const assertedEntries = abandoned.filter((entry) => entry.state === 'asserted')
+  const owedEntries = abandoned.filter((entry) => entry.state !== 'asserted')
+  const assertedReports = assertedEntries.length === 0 ? [] : [
+    `Daily batch DAILY_BATCH_INVENTORY_ALLOC ${input.referenceId}: `
+    + assertedEntries
+      .map(({ pass }) => `${pass.order} £${pass.amount.toFixed(2)} under journal ${pass.syncLogId} on ${pass.connector} (account ${pass.accountCode})`)
+      .join('; ')
+    + ' - an OPERATOR recorded that journal as posted by typing its id in. IMS counts it as existing (it will not rebuild '
+    + 'it, which would double the debit) but never read it from the ledger, so the amount is UNCONFIRMED: open it in the '
+    + 'accounting system and check it covers these pounds.',
+  ]
+  if (owedEntries.length === 0) return assertedReports
   const byConnector = new Map<string, Array<{ pass: AllocationDebitForeignPass; state: ForeignJournalState }>>()
-  for (const entry of abandoned) {
+  for (const entry of owedEntries) {
     const entries = byConnector.get(entry.pass.connector)
     if (entries) entries.push(entry)
     else byConnector.set(entry.pass.connector, [entry])
   }
-  return [...byConnector].map(([connector, entries]) => {
+  return [...assertedReports, ...[...byConnector].map(([connector, entries]) => {
     const total = entries.reduce((sum, entry) => sum + entry.pass.amount, 0)
     const detail = entries
       .map(({ pass, state }) => (
@@ -716,11 +748,11 @@ export function allocationDebitForeignLedgerReports(input: {
       `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
       + `was debited to Allocated Inventory on ${connector}, ${standing}. `
       + 'This sweep must not rebuild another ledger\'s pounds into its own accounts — that is a duplicate '
-      + `debit no refund could ever reverse — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
+      + `debit no refund could ever undo — and ${input.scheduledSweepConnector ? `the daily batch runs ${input.scheduledSweepConnector}'s sweep, not ${connector}'s` : 'no daily-batch sweep is scheduled at all'}, `
       + `so nothing will ever raise it. ${remedy}, `
       + `or re-enable ${connector}'s daily batch long enough for its own sweep to rebuild it.`
     )
-  })
+  })]
 }
 
 export function allocationDebitRecreateRefusal(referenceId: string, reasons: readonly string[]): string {

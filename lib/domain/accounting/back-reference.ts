@@ -1,5 +1,6 @@
 import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { NAMES_A_DOCUMENT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
@@ -491,7 +492,12 @@ export async function resolvePurchaseOrderBackReference(
       type: 'PURCHASE_INVOICE',
       referenceType: 'PurchaseOrder',
       referenceId: params.purchaseOrderId,
-      externalTransactionId: { not: null },
+      // Rows that NAME a document, in any status and on any basis (o3d-1e7sl). An EXISTENCE reading
+      // (D2): a competitor claims a bill for this PO whether the ledger issued its id or an operator
+      // typed it, so an operator-asserted competitor counts - dropping it would read ambiguity as
+      // certainty, the direction this count must never err in. The module's wording of "names a
+      // document" (`NAMES_A_DOCUMENT_WHERE`), not a hand-written `{ not: null }`.
+      ...NAMES_A_DOCUMENT_WHERE,
     },
   })
   // EXACTLY one, not "at most one". Zero used to fall through to `unique`, which meant the

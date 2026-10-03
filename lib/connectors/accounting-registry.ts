@@ -64,6 +64,12 @@ export type AccountingSyncLogRow = {
    * operator can edit and both connectors overwrite it with the remote system's own words.
    */
   settlementBasis: string | null
+  /**
+   * o3d-1e7sl: whether the canceller PROVED the row pre-call. REQUIRED beside the basis, for the same
+   * reason: the page reads a row's standing (`ledgerStanding`) from status + id + basis + this flag, and a
+   * view that cannot see the flag would badge a proven row (never sent / verified reversed) as unproven.
+   */
+  abandonedBeforeRemoteCall: boolean | null
   syncedAt: string | null
   createdAt: string
 }
@@ -286,6 +292,7 @@ const ACCOUNTING_CONNECTOR_FACTORIES: {
         retryCount: row.retryCount,
         attemptRevision: row.attemptRevision,
         settlementBasis: row.settlementBasis,
+        abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall,
         syncedAt: row.syncedAt,
         createdAt: row.createdAt,
       }))
