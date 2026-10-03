@@ -369,3 +369,108 @@ export async function revaluationRuns(goodsId: string) {
     where: { primaryPoId: goodsId }, orderBy: { createdAt: 'desc' }, select: { id: true, afterJson: true, accountingJson: true },
   })
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Race helpers. NOTHING orders anything by a wall-clock sleep: every ordering is a LOCK another session holds, and
+// every "the path is now blocked" is read from pg_stat_activity / pg_blocking_pids with BOTH ends named (the holder's
+// pid and the statement the blocked backend is running) under a polling deadline that FAILS LOUD. The 25 ms pause
+// inside the poll is a poll interval, not an ordering.
+// ---------------------------------------------------------------------------------------------------------
+
+export const TX_OPTIONS = { timeout: 60_000, maxWait: 10_000 }
+/** Long enough to survive a loaded box, short enough to fail rather than hang. */
+export const BLOCK_WAIT_MS = 20_000
+
+export function deferred<T = void>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+export type RawClient = {
+  query: (sql: string, values?: unknown[]) => Promise<{ rows: Array<Record<string, unknown>> }>
+  end: () => Promise<void>
+}
+
+/** A dedicated connection (used only to OBSERVE pg_stat_activity). */
+export async function rawSession(databaseUrl: string): Promise<RawClient> {
+  const { default: pg } = await import('pg')
+  const client = new pg.Client({ connectionString: databaseUrl })
+  await client.connect()
+  return client as unknown as RawClient
+}
+
+/** The pid of the backend an interactive transaction is pinned to (Prisma pins one for its whole life). */
+export async function txPid(tx: unknown): Promise<number> {
+  const rows = await (tx as { $queryRawUnsafe: <T>(sql: string) => Promise<T> })
+    .$queryRawUnsafe<Array<{ pid: number }>>('SELECT pg_backend_pid() AS pid')
+  const pid = Number(rows[0]?.pid)
+  assert.ok(Number.isInteger(pid) && pid > 0, `pg_backend_pid() returned no usable pid: ${JSON.stringify(rows)}`)
+  return pid
+}
+
+/**
+ * Wait until a backend BLOCKED BY `blockedBy` is running a statement matching `waitingOn`. Both ends named; a
+ * deadline that throws; and an immediate failure when the path under test has already finished (a block that can
+ * no longer happen).
+ */
+export async function waitForBlocked(probe: RawClient, params: {
+  blockedBy: number
+  waitingOn: RegExp
+  describe: string
+  finished?: () => boolean
+}): Promise<{ pid: number; query: string }> {
+  const deadline = Date.now() + BLOCK_WAIT_MS
+  for (;;) {
+    const { rows } = await probe.query(
+      `SELECT a.pid::int AS pid, coalesce(a.query, '') AS query
+         FROM pg_stat_activity a
+        WHERE a.datname = current_database()
+          AND a.pid <> pg_backend_pid()
+          AND a.wait_event_type = 'Lock'
+          AND $1::int = ANY(pg_blocking_pids(a.pid))
+        ORDER BY a.pid`,
+      [params.blockedBy],
+    )
+    const hit = rows.find((row) => params.waitingOn.test(String(row.query)))
+    if (hit) return { pid: Number(hit.pid), query: String(hit.query) }
+    if (params.finished?.()) {
+      throw new Error(`${params.describe}: the path under test FINISHED without ever blocking on ${params.waitingOn} behind pid ${params.blockedBy}, so no lock ordering was exercised.`)
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`${params.describe}: no backend blocked by pid ${params.blockedBy} was running a statement matching ${params.waitingOn} within ${BLOCK_WAIT_MS} ms. Rows blocked by it: ${JSON.stringify(rows)}. The path never reached that lock, so this arm proves nothing about acquisition order.`)
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+/**
+ * THE IMS VALUE OF THE WORLD'S PRODUCT: every unit is on a cost layer or still on a truck.
+ *   Σ remaining x unit cost over the product's cost layers
+ * + Σ over IN_TRANSIT transfer lines of the product: (qty - LANDED) x the snapshot's unit cost,
+ * where LANDED = qtyReceived + the unabsorbed WMS alignment credit (the one definition, re-spelled here in SQL so
+ * the invariant does not borrow the code under test).
+ * A transfer posts no ledger entry, so this is the figure the GL's Inventory account should track.
+ */
+export async function imsValue(world: Pick<World, 'productId'>): Promise<number> {
+  const { db } = await import('@/lib/db')
+  const layers = await db.costLayer.findMany({ where: { productId: world.productId }, select: { remainingQty: true, unitCostBase: true } })
+  let value = layers.reduce((sum, layer) => sum + Number(layer.remainingQty) * Number(layer.unitCostBase), 0)
+  const lines = await db.$queryRawUnsafe<Array<{ id: string; qty: string; qtyReceived: string; snapshot: Array<{ qty: string; unitCostBase: string }>; credit: string }>>(
+    `SELECT stl.id, stl.qty::text AS qty, stl."qtyReceived"::text AS "qtyReceived", stl."costLayerSnapshot" AS snapshot,
+            coalesce((SELECT sum(greatest(m."qtyAccountedViaSnapshot" - m."qtyAccountedViaReceipt", 0))
+                        FROM wms_asn_line_maps m
+                       WHERE m."sourceType" = 'STOCK_TRANSFER_LINE' AND m."sourceLineId" = stl.id), 0)::text AS credit
+       FROM stock_transfer_lines stl JOIN stock_transfers st ON st.id = stl."transferId"
+      WHERE st.status = 'IN_TRANSIT' AND stl."productId" = $1`,
+    world.productId,
+  )
+  for (const line of lines) {
+    const landed = Number(line.qtyReceived) + Number(line.credit)
+    const inTransit = Math.max(0, Number(line.qty) - landed)
+    // single-entry snapshots in these worlds: the unit cost is the entry's
+    value += inTransit * Number(line.snapshot[0]!.unitCostBase)
+  }
+  return value
+}
