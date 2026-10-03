@@ -31,6 +31,8 @@ type SyncRow = {
   payload: unknown
   /** o3d-nf9i r3: how a terminal status was reached. NULL = the connector's own writeback. */
   settlementBasis: string | null
+  /** o3d-1e7sl: the canceller's pre-call proof. Optional: absent reads as not flagged (NULL), as every older fixture means. */
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 type EventRow = { id: string; idempotencyKey: string; status: string; externalId: string | null }
