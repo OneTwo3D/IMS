@@ -246,6 +246,11 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *   then, inside the recalculation, only rows that are children of what is already held: shipment /
  *   allocation / refund / transfer-line snapshot rows (`updateSnapshotsForCostLayerChange`, FOR UPDATE),
  *   `cost_layer_source_lines`, and its own audit rows. It never waits for a step-2 row after a step-6 row.
+ *   o3d-nrl4 PR B adds READS ONLY, all under the held transfer locks and none of them locking: the
+ *   in-transit transfer lines naming a layer (`getInTransitTransferLinesForCostLayer`) and the
+ *   `wms_asn_line_maps` credit counters (`loadTransferLineLandedQty`), both through `tx`. They are what
+ *   `capitaliseInTransitResidue` measures the units still on a truck from, and they are consistent because
+ *   every writer of `qtyReceived` / the alignment credit holds the transfer first (2a), which this scope holds.
  *   WHY THAT CANNOT CYCLE: a cycle needs a participant that holds a step-6 row (or a snapshot child row)
  *   while WAITING for a step-2 row. The receipt/cancel paths take 2a → 4 → 5 → 6(insert); book-in 2a/2b →
  *   3 → 4 → 5 → 6; alignment 2a → 2b-2d → 3 → 4 → 5 → 6; dispatch of its OWN new transfer takes no step-2
