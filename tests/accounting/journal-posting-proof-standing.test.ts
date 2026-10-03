@@ -184,21 +184,49 @@ for (const testCase of WORDING) {
 // Codex round 2 (HIGH 1): the remedy for a PARTIAL refund names only what that refund withheld.
 // ---------------------------------------------------------------------------------------------
 
-test('[Codex r2 HIGH 1] assertedJournalRemedy: FULL = the whole open balance; PARTIAL = the withheld figure ONLY; PARTIAL with no figure = reconcile, no figure', () => {
-  const full = assertedJournalRemedy({ full: true, withheldAmount: null })
-  assert.match(full, /amount still open: the recorded A2 debit less relief already credited/)
-  assert.doesNotMatch(full, /REFUNDED UNITS ONLY/)
+const FIGURES = { recordedDebit: 24, relieved: 4, open: 20 }
 
-  const partial = assertedJournalRemedy({ full: false, withheldAmount: 10 })
-  assert.match(partial, /REFUNDED UNITS ONLY: DR Inventory \/ CR Allocated Inventory £10\.00, which is exactly what this refund withheld/)
-  assert.match(partial, /Do NOT credit anything else/)
-  assert.doesNotMatch(partial, /recorded A2 debit less relief/, 'never prescribes the order\'s open balance')
+test('[Codex r3 HIGH] assertedJournalRemedy: partial prescribes the LESSER of the withheld figure and the open balance, and states all three', () => {
+  // Binding cap: lines value 40, open balance 24 -> credit 24, never 40.
+  const binding = assertedJournalRemedy({ full: false, withheldAmount: 40, openBalance: { recordedDebit: 24, relieved: 0, open: 24 } })
+  assert.match(binding, /Refunded units value £40\.00; open A2 balance £24\.00 \(recorded debit £24\.00 less relief already credited £0\.00\); credit the LESSER: DR Inventory \/ CR Allocated Inventory £24\.00/)
+  assert.match(binding, /do NOT credit more than the open balance/i)
+  assert.match(binding, /If you already applied a manual credit for this order, deduct it/)
+  assert.doesNotMatch(binding, /CR Allocated Inventory £40/)
+  // Non-binding: 10 of 40 -> 10.
+  const loose = assertedJournalRemedy({ full: false, withheldAmount: 10, openBalance: { recordedDebit: 40, relieved: 0, open: 40 } })
+  assert.match(loose, /Refunded units value £10\.00; open A2 balance £40\.00[^;]*; credit the LESSER: DR Inventory \/ CR Allocated Inventory £10\.00/)
+  // Open balance already zero -> credit nothing.
+  assert.match(assertedJournalRemedy({ full: false, withheldAmount: 10, openBalance: { recordedDebit: 10, relieved: 10, open: 0 } }), /CR Allocated Inventory £0\.00/)
+  console.log('remedy: binding cap -> 24 (not 40); non-binding -> 10; exhausted -> 0')
+})
 
-  for (const none of [null, 0, 0.004]) {
-    const unknown = assertedJournalRemedy({ full: false, withheldAmount: none })
-    assert.match(unknown, /could not establish the figure for this refund, so none is given/, `withheld=${String(none)}`)
-    assert.match(unknown, /do NOT credit the order's whole A2 debit/)
-    assert.doesNotMatch(unknown, /£\d/, 'no figure is prescribed')
+test('[Codex r3 HIGH] assertedJournalRemedy: no figure when the withheld amount or the open balance cannot be established (partial); full states the open balance', () => {
+  for (const params of [
+    { full: false, withheldAmount: null, openBalance: FIGURES },
+    { full: false, withheldAmount: 0.004, openBalance: FIGURES },
+    { full: false, withheldAmount: 10, openBalance: null },
+    { full: false, withheldAmount: null, openBalance: null },
+  ]) {
+    const text = assertedJournalRemedy(params)
+    assert.match(text, /could not establish the figure for this refund, so none is given/)
+    assert.match(text, /credit the lesser, and do NOT credit the order's whole A2 debit/)
+    assert.doesNotMatch(text, /£\d/, `no figure: ${JSON.stringify(params)}`)
+    assert.match(text, /deduct it/)
   }
-  console.log('remedy branches: full, partial(10.00), partial(null|0|0.004)')
+  const full = assertedJournalRemedy({ full: true, withheldAmount: null, openBalance: FIGURES })
+  assert.match(full, /CR Allocated Inventory £20\.00: the open A2 balance £20\.00 \(recorded debit £24\.00 less relief already credited £4\.00\); do not credit more than the open balance/)
+  const fullUnknown = assertedJournalRemedy({ full: true, withheldAmount: null, openBalance: null })
+  assert.match(fullUnknown, /the open balance could not be established here, so none is given/)
+  assert.doesNotMatch(fullUnknown, /£\d/)
+})
+
+test('allocationOpenBalance and cappedAllocationCredit are the posting path\'s own expressions', async () => {
+  const { allocationOpenBalance, cappedAllocationCredit } = await import('@/lib/domain/accounting/allocation-debit-posting-proof')
+  const { toDecimal } = await import('@/lib/domain/math/decimal')
+  assert.equal(allocationOpenBalance(24, 4), 20)
+  assert.equal(allocationOpenBalance(10, 30), 0, 'floored at zero')
+  assert.equal(allocationOpenBalance(40, 0.01), 39.99)
+  assert.equal(cappedAllocationCredit(toDecimal(40), 24).toNumber(), 24)
+  assert.equal(cappedAllocationCredit(toDecimal(10), 40).toNumber(), 10)
 })

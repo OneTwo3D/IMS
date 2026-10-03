@@ -50,7 +50,9 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
+  allocationOpenBalance,
   assertedJournalRemedy,
+  cappedAllocationCredit,
   describeJournalRowState,
   extractPayloadNetMovement,
   isAssertedJournalRefusal,
@@ -2874,10 +2876,9 @@ async function stageRefundAccountingReversals(
       addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
       toDecimal(allocationReversalRelief),
     )
-    const openBeforeRefusal = subtractMoney(toDecimal(provedAllocationDebit), relieved)
     const openAllocatedContra: number = allocationBasisUnresolved != null
       ? 0
-      : openBeforeRefusal.gt(0) ? roundQuantity(openBeforeRefusal, 2).toNumber() : 0
+      : allocationOpenBalance(provedAllocationDebit, relieved)
 
     // o3d-o97 r3 — THE DEBIT CAP. The line-driven reversal reverses whatever the refund's lines
     // consumed; nothing bounded it by what the account actually holds. Even at the posted basis a
@@ -2901,9 +2902,7 @@ async function stageRefundAccountingReversals(
     const lineAllocationBasis = sumCostLayerSnapshot(allocationRefundSnapshot)
     const cappedLineBasis = allocationBasisUnresolved != null
       ? toDecimal(0)
-      : lineAllocationBasis.gt(toDecimal(openAllocatedContra))
-        ? toDecimal(openAllocatedContra)
-        : lineAllocationBasis
+      : cappedAllocationCredit(lineAllocationBasis, openAllocatedContra)
     const lineAllocationReversal = roundQuantity(lineAllocationBasis, 2).toNumber()
     const cappedLineAllocationReversal = roundQuantity(cappedLineBasis, 2).toNumber()
     // A full refund closes BOTH batch windows for ever (`refundStatus: { not: 'FULL' }` on Group A2
@@ -3002,6 +3001,17 @@ async function stageRefundAccountingReversals(
             ? assertedJournalRemedy({
                 full: params.newStatus === 'REFUNDED',
                 withheldAmount: refusalWithheldLineReversal ? lineAllocationReversal : null,
+                // The open balance by the SAME expression the posting path caps at, from the RECORDED debit (the
+                // proved one is zero under a refusal). Only when no relief reader is itself unresolved: an
+                // unresolved relief means the figure cannot be established, and none is given.
+                openBalance: groupBReliefUnresolved == null && priorRefundReliefUnresolved == null
+                  && allocationReversalReliefUnresolved == null && postedAllocationDebit > 0.005
+                  ? {
+                      recordedDebit: postedAllocationDebit,
+                      relieved: roundQuantity(relieved, 2).toNumber(),
+                      open: allocationOpenBalance(postedAllocationDebit, relieved),
+                    }
+                  : null,
               })
             : null,
         ].filter((part): part is string => !!part).join('. ')

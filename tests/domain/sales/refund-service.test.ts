@@ -9351,33 +9351,84 @@ test('[o3d-3la07 HIGH] an OPERATOR-ASSERTED A2 BATCH JOURNAL on a FULL refund is
 })
 
 
-// Codex round 2 (HIGH 1): a PARTIAL refund withheld on an asserted A2 journal prescribes ONLY its own withheld figure.
-test('[Codex r2 HIGH 1] a PARTIAL refund withheld on an asserted A2 journal names ONLY the refunded units\' £10.00, never the order\'s £40 open debit', async () => {
-  const run = async (columns: { settlementBasis: string | null; externalTransactionId: string | null }) => {
-    const state = a2StagedFourUnitState()
-    const a2 = state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
-    assert.ok(a2, 'PRECONDITION: the fixture seeds an A2 batch journal')
-    Object.assign(a2, columns)
-    const result = await createSalesOrderRefund(createClient(state), {
-      ...COMPLETE_REFUND,
-      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 25 }],
-    })
-    assert.equal(result.success, true)
-    return { state, result }
-  }
-  const confirmed = await run({ settlementBasis: null, externalTransactionId: 'JNL-A2' })
-  assert.notEqual(confirmed.state.orders[0].refundStatus, 'FULL', 'PRECONDITION: a PARTIAL refund')
-  assert.equal(findAllocatedInventoryCredit(confirmed.result), 10, 'control: confirmed journal credits the one unit')
-  assert.equal(assertedWithheldLogs(confirmed.state).length, 0)
+// Codex round 3 (HIGH): a PARTIAL refund withheld on an asserted A2 journal prescribes the LESSER of what its lines value
+// and the open balance (recorded debit less relief), by the same expressions the posting path caps with.
+async function partialAssertedRun(opts: { a2Amount?: number; lineQty: number; refundTotal: number }) {
+  const state = a2StagedFourUnitState()
+  if (opts.a2Amount !== undefined) state.orders[0].allocationBatchAmount = opts.a2Amount
+  const a2 = state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+  assert.ok(a2, 'PRECONDITION: the fixture seeds an A2 batch journal')
+  Object.assign(a2, { settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
+  const result = await createSalesOrderRefund(createClient(state), {
+    ...COMPLETE_REFUND,
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: opts.lineQty, totalBase: opts.refundTotal }],
+  })
+  assert.equal(result.success, true)
+  assert.notEqual(state.orders[0].refundStatus, 'FULL', 'PRECONDITION: a PARTIAL refund')
+  return { state, note: String(state.refunds[0].allocationBasisUnresolved) }
+}
 
-  const asserted = await run({ settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
-  assert.notEqual(asserted.state.orders[0].refundStatus, 'FULL')
-  assert.equal(findAllocatedInventoryCredit(asserted.result), null)
-  const note = String(asserted.state.refunds[0].allocationBasisUnresolved)
-  assert.match(note, /REFUNDED UNITS ONLY: DR Inventory \/ CR Allocated Inventory £10\.00, which is exactly what this refund withheld/)
-  assert.match(note, /Do NOT credit anything else/)
-  assert.doesNotMatch(note, /amount still open: the recorded A2 debit less relief/, 'the FULL-refund wording is not used')
-  assert.doesNotMatch(note, /CR Allocated Inventory £40/, 'the order\'s whole debit is never prescribed')
-  assert.equal(assertedWithheldLogs(asserted.state).length, 1)
-  console.log('partial refund: remedy names £10.00 only (order debit £40 not prescribed)')
+test('[Codex r3 HIGH] NON-binding: a partial refund of 1 unit (£10) against a £40 open balance prescribes £10.00', async () => {
+  const { note, state } = await partialAssertedRun({ lineQty: 1, refundTotal: 25 })
+  assert.match(note, /Refunded units value £10\.00; open A2 balance £40\.00 \(recorded debit £40\.00 less relief already credited £0\.00\); credit the LESSER: DR Inventory \/ CR Allocated Inventory £10\.00/)
+  assert.match(note, /Do NOT credit more than the open balance/)
+  assert.match(note, /deduct it/)
+  assert.equal(assertedWithheldLogs(state).length, 1)
+  console.log('r3 non-binding: credit 10.00 of open 40.00')
+})
+
+test('[Codex r3 HIGH] BINDING cap: lines value £40 but the A2 debit was only £24 -> prescribes £24.00, never £40.00', async () => {
+  const { note } = await partialAssertedRun({ a2Amount: 24, lineQty: 4, refundTotal: 25 })
+  assert.match(note, /Refunded units value £40\.00; open A2 balance £24\.00 \(recorded debit £24\.00 less relief already credited £0\.00\); credit the LESSER: DR Inventory \/ CR Allocated Inventory £24\.00/)
+  assert.doesNotMatch(note, /CR Allocated Inventory £40/, 'never the uncapped figure')
+  console.log('r3 binding: lines 40, A2 24 -> credit 24.00')
+})
+
+test('[Codex r3 HIGH] relief already credited reduces the open balance the text states (partial with prior relief)', async () => {
+  const state = a2StagedFourUnitState()
+  seedPriorAllocationRefund(state)
+  state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+    connector: 'xero', type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'refund-prior', status: 'SYNCED',
+    payload: { lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '1210', credit: 10 }] },
+  }]
+  const a2 = state.accountingSyncLogs.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+  Object.assign(a2 as object, { settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
+  const result = await createSalesOrderRefund(createClient(state), {
+    ...COMPLETE_REFUND,
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 25 }],
+  })
+  assert.equal(result.success, true)
+  const note = String(state.refunds.find((refund) => refund.id !== 'refund-prior')?.allocationBasisUnresolved)
+  assert.match(note, /open A2 balance £30\.00 \(recorded debit £40\.00 less relief already credited £10\.00\)/)
+  assert.match(note, /credit the LESSER: DR Inventory \/ CR Allocated Inventory £10\.00/)
+})
+
+test('[Codex r3 HIGH] NO FIGURE: a relief that is itself unresolved (asserted reversal) -> the partial remedy prescribes no figure', async () => {
+  const state = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(state, 'SYNCED', { externalTransactionId: 'TYPED-R1', settlementBasis: 'OPERATOR_ASSERTION' })
+  const result = await createSalesOrderRefund(createClient(state), {
+    ...COMPLETE_REFUND,
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 25 }],
+  })
+  assert.equal(result.success, true)
+  assert.notEqual(state.orders[0].refundStatus, 'FULL', 'PRECONDITION: partial')
+  const note = String(state.refunds[0].allocationBasisUnresolved)
+  assert.match(note, /could not establish the figure for this refund, so none is given/)
+  assert.doesNotMatch(note, /credit the LESSER: DR/)
+  assert.equal(assertedWithheldLogs(state).length, 1)
+  console.log('r3 no figure: relief unresolved -> no figure prescribed')
+})
+
+test('[Codex r3 HIGH] FULL refund states the open balance with its figures (recorded debit less relief already credited)', async () => {
+  const state = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(state, 'SYNCED', { externalTransactionId: 'JNL-R1' })
+  const a2 = state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+  Object.assign(a2 as object, { settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
+  const result = await createSalesOrderRefund(createClient(state), { ...COMPLETE_REFUND })
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL')
+  const note = String(state.refunds[0].allocationBasisUnresolved)
+  assert.match(note, /CR Allocated Inventory £10\.00: the open A2 balance £10\.00 \(recorded debit £20\.00 less relief already credited £10\.00\); do not credit more than the open balance/)
+  assert.match(note, /deduct it/)
+  console.log('r3 full: open 10.00 = debit 20.00 less relief 10.00')
 })

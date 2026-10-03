@@ -66,6 +66,7 @@ import {
   parseAllocationDebitPasses,
   sumAllocationDebitPasses,
 } from '@/lib/domain/accounting/allocation-debit-passes'
+import { roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   LEDGER_STANDING_SELECT,
   ledgerStanding,
@@ -120,29 +121,61 @@ export function isAssertedJournalRefusal(reason: string): boolean {
  * moment of the refusal) and the reversal is raised by hand. Said exactly, because on a FULL refund there is no
  * "next refund" that could resolve it.
  */
-export function assertedJournalRemedy(params: { full: boolean; withheldAmount: number | null }): string {
+/**
+ * THE OPEN ALLOCATED-INVENTORY BALANCE: the A2 debit that is PROVED (or, for the remedy text, RECORDED) less the
+ * relief already credited, rounded to pence and floored at zero. ONE expression, used by the refund's normal
+ * posting path AND by the manual remedy text, so the figure an operator is told to credit and the figure the
+ * posting would have been capped at cannot diverge.
+ */
+export function allocationOpenBalance(debit: DecimalInput, relieved: DecimalInput): number {
+  const open = subtractMoney(toDecimal(debit), toDecimal(relieved))
+  return open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
+}
+
+/** THE CAP: a credit is the LESSER of what the lines value and the open balance. Shared, as above. */
+export function cappedAllocationCredit(lineBasis: Decimal, openBalance: number): Decimal {
+  return lineBasis.gt(toDecimal(openBalance)) ? toDecimal(openBalance) : lineBasis
+}
+
+export type OpenBalanceFigures = { recordedDebit: number; relieved: number; open: number }
+
+const DEDUCT = ' If you already applied a manual credit for this order, deduct it.'
+
+export function assertedJournalRemedy(params: {
+  full: boolean
+  withheldAmount: number | null
+  /** The recorded A2 debit, the relief already credited, and their difference; null when it cannot be established. */
+  openBalance: OpenBalanceFigures | null
+}): string {
   const tail =
     'The IMS has no screen yet that records that credit or clears this finding, and checking the journal does not change what the IMS stored, ' +
     'so a later refund does not resolve it: the finding stays listed under the critical accounting finding sales_order_refund_allocation_basis_unresolved'
+  const ob = params.openBalance
+  const balanceText = ob
+    ? `open A2 balance £${ob.open.toFixed(2)} (recorded debit £${ob.recordedDebit.toFixed(2)} less relief already credited £${ob.relieved.toFixed(2)})`
+    : null
   if (params.full) {
     // A FULL refund closes both batch windows for ever: the whole open balance is what is stranded.
-    return (
-      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
-      'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited). ' + tail
-    )
+    return ob
+      ? 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
+        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail
+      : 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail
   }
   // A PARTIAL refund: the rest of the order's A2 debit belongs to units the customer still holds.
-  if (params.withheldAmount !== null && params.withheldAmount > 0.005) {
+  if (ob && params.withheldAmount !== null && params.withheldAmount > 0.005) {
+    const credit = Math.min(params.withheldAmount, ob.open)
     return (
-      `WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY: ` +
-      `DR Inventory / CR Allocated Inventory £${params.withheldAmount.toFixed(2)}, which is exactly what this refund withheld. ` +
-      "Do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded. " + tail
+      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
+      `Refunded units value £${params.withheldAmount.toFixed(2)}; ${balanceText}; credit the LESSER: DR Inventory / CR Allocated Inventory £${credit.toFixed(2)}. ` +
+      "Do NOT credit more than the open balance and do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded." +
+      DEDUCT + ' ' + tail
     )
   }
   return (
     'WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
-    'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines, and do NOT credit the order\'s whole A2 debit ' +
-    '(the rest covers units the customer still holds). ' + tail
+    'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines and the order\'s open A2 balance (recorded debit less relief already credited), credit the lesser, and do NOT credit the order\'s whole A2 debit ' +
+    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail
   )
 }
 
