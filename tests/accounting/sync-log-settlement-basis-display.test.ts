@@ -97,7 +97,7 @@ test('[o3d-1e7sl D2] the connector-agnostic row, the Xero reader and the registr
 test('[o3d-1e7sl D3/D4] the orphan banner names an id by standing and the stranded loader selects the columns', async () => {
   const banner = await source('app/(dashboard)/sync/connector-orphan-banner.tsx')
   assert.match(banner, /describeDocumentIdClaim\(row\)/)
-  assert.match(banner, /describeLedgerStanding\(row\)\.label/)
+  assert.match(banner, /describeLedgerStanding\(row\)\.label !== null && \(/)
   assert.doesNotMatch(banner, /posted as \{row\.externalTransactionId\}/, 'the unqualified "posted as <id>" sentence is gone')
   const loader = await source('app/actions/accounting-stranded-rows.ts')
   const at = loader.indexOf('export async function getStrandedAccountingSyncRows')
