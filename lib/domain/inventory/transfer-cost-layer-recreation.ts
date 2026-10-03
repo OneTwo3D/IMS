@@ -116,17 +116,19 @@
  *    UNMEASURED, which is the whole of o3d-e65p; that census is what says whether
  *    this refusal will ever fire on a real receipt.
  *
- * WHAT THIS FUNCTION DOES NOT DO (6oyu.19 split, o3d-nrl4). It does not settle a
- * landed-cost revaluation that happened while these units were IN TRANSIT. That
- * revaluation has no layer to journal against, and IMS currently posts nothing for
- * it — the delta stays in the transit clearing account. An earlier revision of this
- * branch persisted a `PendingTransferLandedCostReclass` and discharged it here; that
- * settlement machinery was withdrawn on Codex round-2 review (four HIGH findings,
- * including per-transfer rather than per-revaluation obligations and settlement on a
- * disabled connector) and is tracked as o3d-nrl4 on branch
- * `o3d-6oyu19-deferred-transit-reclass-withdrawn` (commit 89a124f5). This function
- * is the natural settlement point when that work returns; it deliberately does not
- * pretend to be one today.
+ * WHAT THIS FUNCTION DOES NOT DO, ON PURPOSE (o3d-nrl4 PR B). It posts nothing to the
+ * ledger and settles nothing. A landed-cost revaluation that happened while these
+ * units were IN TRANSIT capitalised their share AT REVALUATION TIME
+ * (`capitaliseInTransitResidue` in lib/domain/purchasing/landed-cost-service.ts: DR
+ * Inventory / CR Transit, because a transfer posts no entry and the units never left
+ * GL Inventory) and rewrote the dispatch snapshot this function costs the new layer
+ * from. So the layer created here is at the revalued cost and nothing is owed: this is
+ * not a settlement point, and no obligation is persisted anywhere for it to discharge.
+ * A second revaluation, a reversal or a freight cancellation each post their own signed
+ * difference when they happen. (An earlier design persisted a
+ * `PendingTransferLandedCostReclass` and settled it here; it was withdrawn on Codex
+ * round-2 review and replaced by this one, which needs no table, no migration and no
+ * ledger reader.)
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'

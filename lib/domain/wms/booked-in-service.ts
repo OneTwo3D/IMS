@@ -1552,11 +1552,11 @@ export async function processBookedInEvent(
               // transaction rather than let the stock increment above commit alone.
               // Do NOT wrap this call in a try or a savepoint.
               //
-              // It settles NO deferred transit reclass (Codex round-4 LOW). A
+              // It posts NOTHING to the ledger, by design (o3d-nrl4 PR B). A
               // landed-cost revaluation that landed while these units were in transit
-              // was never persisted as an obligation, so creating the layer does not
-              // discharge it; the delta remains in the transit clearing account.
-              // Open, tracked as o3d-nrl4.
+              // already capitalised their share at revaluation time (DR Inventory /
+              // CR Transit, capitaliseInTransitResidue); creating the layer from the
+              // snapshot it rewrote owes nothing.
               //
               // `bookedQty` is `stockQtyToAdd`, the increment made immediately
               // above, and the helper's coverage postcondition is measured against

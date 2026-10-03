@@ -8,6 +8,7 @@ import {
   createCostLayer,
   getReturnedQtyForCostLayer,
   getSupplierReturnedQtyForCostLayer,
+  getInTransitTransferLinesForCostLayer,
   getTransferConsumedQtyForCostLayer,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
@@ -800,6 +801,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getManufacturingConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getTransferConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getInTransitTransferLinesForCostLayer: async () => [],
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
@@ -1745,6 +1747,8 @@ function createLandedCostWorld(init: {
   costLayers: WorldCostLayer[]
   sourceLines?: WorldSourceLine[]
   transferLines?: WorldTransferLine[]
+  /** wms_asn_line_maps rows (STOCK_TRANSFER_LINE) for the alignment credit arm. */
+  alignmentCredits?: Array<{ sourceLineId: string; qtyAccountedViaSnapshot: number; qtyAccountedViaReceipt: number }>
 }) {
   const costLayers = new Map(init.costLayers.map((layer) => [layer.id, { ...layer }]))
   const sourceLines: WorldSourceLine[] = [...(init.sourceLines ?? [])]
@@ -1776,7 +1780,15 @@ function createLandedCostWorld(init: {
     $executeRawUnsafe: async (_sql: string) => 0,
     $queryRawUnsafe: async (sql: string, containment: string, statuses: unknown) => {
       const rows = snapshotRows(sql, containment, statuses)
-      return rows.map((line) => ({ costLayerSnapshot: line.snapshot }))
+      // The residue query also selects the line id and qtyReceived; the consumed-qty query ignores them.
+      return rows.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived, costLayerSnapshot: line.snapshot }))
+    },
+    // loadTransferLineLandedQty's one query: the WMS alignment credits a line may carry (o3d-nrl4 PR B).
+    wmsAsnLineMap: {
+      findMany: async ({ where }: { where: { sourceLineId: { in: string[] } } }) =>
+        (init.alignmentCredits ?? [])
+          .filter((credit) => where.sourceLineId.in.includes(credit.sourceLineId))
+          .map((credit) => ({ sourceLineId: credit.sourceLineId, qtyAccountedViaSnapshot: credit.qtyAccountedViaSnapshot, qtyAccountedViaReceipt: credit.qtyAccountedViaReceipt })),
     },
     purchaseOrderLine: { update: async (args: unknown) => args },
     landedCostRevaluationRun: { create: async () => ({ id: 'audit-1' }) },
@@ -1850,6 +1862,7 @@ function createLandedCostWorld(init: {
 function worldDeps(world: ReturnType<typeof createLandedCostWorld>): LandedCostServiceDeps {
   return noopDeps({
     getTransferConsumedQtyForCostLayer: (tx, id) => getTransferConsumedQtyForCostLayer(tx, id) as never,
+    getInTransitTransferLinesForCostLayer: (tx, id) => getInTransitTransferLinesForCostLayer(tx, id) as never,
     getDependentOutputSourceLines: async (tx, sourceCostLayerId) => {
       const rows = await tx.costLayerSourceLine.findMany({
         where: { sourceCostLayerId },
@@ -2058,4 +2071,115 @@ test('o3d-c08y r2: both recalc paths read PO lines and cost layers in a DETERMIN
       `recalc path ${index} reads cost layers with no deterministic order (o3d-c08y)`,
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nrl4 PR B: IN-TRANSIT RESIDUE CAPITALISATION (unit arms; the DB tier proves the journals)
+//
+// Every arm prints its precondition (how many in-transit lines the residue query found) so a green run
+// cannot be a run that examined nothing.
+// ---------------------------------------------------------------------------
+
+function inTransitWorldPo(layerId: string, over: { layerUnitCost?: number; freight?: Array<{ amountBase: number; distributionMethod: string }> } = {}) {
+  const po = transferredPo(layerId)
+  return {
+    ...po,
+    lines: [{ ...po.lines[0], costLayers: [{ id: layerId, unitCostBase: over.layerUnitCost ?? 10, receivedQty: 100, remainingQty: 0 }] }],
+    freightCostLines: over.freight ?? po.freightCostLines,
+  }
+}
+
+async function runResidueWorld(init: Parameters<typeof createLandedCostWorld>[0], over: Parameters<typeof inTransitWorldPo>[1] = {}) {
+  const world = createLandedCostWorld(init)
+  const tx = { ...world.tx, purchaseOrder: { findUnique: async () => inTransitWorldPo('layer-a', over) } }
+  const residueLines = await getInTransitTransferLinesForCostLayer(tx as never, 'layer-a')
+  console.log(`RESIDUE PRECONDITION: in-transit residue lines found = ${residueLines.length} (ids ${JSON.stringify(residueLines.map((l) => l.id))})`)
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', worldDeps(world), TEST_AUDIT_OPTIONS)
+  return { world, result, residueLines }
+}
+
+const L_A = { id: 'layer-a', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }
+const snap100 = [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 10 }]
+
+test('U1 (S1): 100 units all in transit -> the whole +£1/unit (£100) is capitalised, zero COGS', async () => {
+  const { result, residueLines } = await runResidueWorld({
+    costLayers: [L_A],
+    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: snap100 }],
+  })
+  assert.equal(residueLines.length, 1)
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100)
+  assert.equal(totalOf(result.cogsAdjustments), 0)
+})
+
+test('U2: a partial manual receipt of 40 -> 40 propagated + 60 residue = £100 (ignoring the landed quantity would give £140)', async () => {
+  const { world, result } = await runResidueWorld({
+    costLayers: [L_A, { id: 'layer-dest', unitCostBase: '10', receivedQty: '40', remainingQty: '40' }],
+    sourceLines: [{ id: 'sl-1', costLayerId: 'layer-dest', sourceProductId: 'prod-1', sourceCostLayerId: 'layer-a', qty: '40', unitCostBase: '10', totalCostBase: '400' }],
+    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 40, snapshot: snap100 }],
+  })
+  assert.equal(world.costLayers.get('layer-dest')?.unitCostBase, '11', 'precondition: the landed 40 were propagated')
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100)
+})
+
+test('U3: an alignment credit of 40 with qtyReceived 0 -> residue 60 (offsetting by qtyReceived alone would give £140)', async () => {
+  const { result } = await runResidueWorld({
+    costLayers: [L_A, { id: 'layer-dest', unitCostBase: '10', receivedQty: '40', remainingQty: '40' }],
+    sourceLines: [{ id: 'sl-1', costLayerId: 'layer-dest', sourceProductId: 'prod-1', sourceCostLayerId: 'layer-a', qty: '40', unitCostBase: '10', totalCostBase: '400' }],
+    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: snap100 }],
+    alignmentCredits: [{ sourceLineId: 'tl-1', qtyAccountedViaSnapshot: 40, qtyAccountedViaReceipt: 0 }],
+  })
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100)
+})
+
+test('U5: a cost DECREASE while in transit posts the NEGATIVE share (freight cancelled / cut)', async () => {
+  const { result } = await runResidueWorld({
+    costLayers: [{ ...L_A, unitCostBase: '11' }],
+    transferLines: [{ id: 'tl-1', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-a', qty: '100', unitCostBase: 11 }] }],
+  }, { layerUnitCost: 11, freight: [] })
+  assert.equal(totalOf(result.inventoryTransitAdjustments), -100)
+})
+
+test('U8: a CANCELLED dispatch contributes ZERO residue (its units are in the replacement layer, posted once by propagation)', async () => {
+  const { world, result, residueLines } = await runResidueWorld({
+    costLayers: [L_A, { id: 'layer-replacement', unitCostBase: '10', receivedQty: '100', remainingQty: '100' }],
+    sourceLines: [{ id: 'sl-1', costLayerId: 'layer-replacement', sourceProductId: 'prod-1', sourceCostLayerId: 'layer-a', qty: '100', unitCostBase: '10', totalCostBase: '1000' }],
+    transferLines: [{ id: 'tl-1', status: 'CANCELLED', qty: 100, qtyReceived: 0, snapshot: snap100 }],
+  })
+  assert.equal(residueLines.length, 0, 'the residue query does not read a CANCELLED transfer')
+  assert.equal(world.costLayers.get('layer-replacement')?.unitCostBase, '11')
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100, 'posted once, by propagation — not twice')
+})
+
+test('a RECEIVED transfer contributes ZERO residue (destination layer, propagation)', async () => {
+  const { result, residueLines } = await runResidueWorld({
+    costLayers: [L_A, { id: 'layer-dest', unitCostBase: '10', receivedQty: '100', remainingQty: '100' }],
+    sourceLines: [{ id: 'sl-1', costLayerId: 'layer-dest', sourceProductId: 'prod-1', sourceCostLayerId: 'layer-a', qty: '100', unitCostBase: '10', totalCostBase: '1000' }],
+    transferLines: [{ id: 'tl-1', status: 'RECEIVED', qty: 100, qtyReceived: 100, snapshot: snap100 }],
+  })
+  assert.equal(residueLines.length, 0)
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100)
+})
+
+test('U6 (unit): a chained transfer — the residue of an OUTPUT layer reached by propagation is capitalised too', async () => {
+  // layer-a (100 @10) -> T1 RECEIVED -> layer-dest (100, linked) -> T2 IN_TRANSIT out of layer-dest (remaining 0).
+  const { world, result, residueLines } = await runResidueWorld({
+    costLayers: [L_A, { id: 'layer-dest', unitCostBase: '10', receivedQty: '100', remainingQty: '0' }],
+    sourceLines: [{ id: 'sl-1', costLayerId: 'layer-dest', sourceProductId: 'prod-1', sourceCostLayerId: 'layer-a', qty: '100', unitCostBase: '10', totalCostBase: '1000' }],
+    transferLines: [
+      { id: 'tl-1', status: 'RECEIVED', qty: 100, qtyReceived: 100, snapshot: snap100 },
+      { id: 'tl-2', status: 'IN_TRANSIT', qty: 100, qtyReceived: 0, snapshot: [{ costLayerId: 'layer-dest', qty: '100', unitCostBase: 10 }] },
+    ],
+  })
+  assert.equal(residueLines.length, 0, 'precondition: the ROOT layer has no in-transit line (only the output has)')
+  assert.equal(world.costLayers.get('layer-dest')?.unitCostBase, '11')
+  assert.equal(totalOf(result.inventoryTransitAdjustments), 100, 'the output layer\'s in-transit share is posted by the recursion')
+})
+
+test('the in-transit residue is computed by ONE function reached from EVERY revaluation site (o3d-nrl4 PR B)', () => {
+  const source = readFileSync('lib/domain/purchasing/landed-cost-service.ts', 'utf8')
+  assert.match(source, /export async function capitaliseInTransitResidue\(/, 'precondition: the shared helper must exist in the file read')
+  const calls = source.match(/capitaliseInTransitResidue\(/g) ?? []
+  assert.equal(calls.length, 4, `expected the definition plus its three call sites, found ${calls.length}`)
+  const reads = source.match(/deps\.getInTransitTransferLinesForCostLayer\(/g) ?? []
+  assert.equal(reads.length, 1, 'the in-transit reader is invoked only inside the shared helper')
 })

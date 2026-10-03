@@ -6,6 +6,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { logActivity } from '@/lib/activity-log'
 import {
   getDependentOutputSourceLines,
+  getInTransitTransferLinesForCostLayer,
   getManufacturingConsumedQtyForCostLayer,
   getReturnedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
@@ -21,7 +22,9 @@ import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { loadTransferLineLandedQty, requireLandedQty } from '@/lib/domain/inventory/transfer-landed-quantity'
 import { LANDED_COST_PROPAGATION_MAX_DEPTH } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
@@ -149,7 +152,10 @@ type PropagatedOutputLayerAudit = {
   newUnitCostBase: string
   consumedQty: string
   cogsDelta: string
+  /** On-hand delta PLUS the in-transit residue below: the whole inventory/transit amount this output contributes. */
   inventoryDelta: string
+  /** o3d-nrl4 PR B: the portion of `inventoryDelta` that belongs to units of this output still in transit. */
+  inTransitResidue: InTransitResidueEntry[]
 }
 
 type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
@@ -170,6 +176,8 @@ export type LandedCostServiceDeps = {
   getManufacturingConsumedQtyForCostLayer: typeof getManufacturingConsumedQtyForCostLayer
   getReversalConsumedQtyForCostLayer: typeof getReversalConsumedQtyForCostLayer
   getTransferConsumedQtyForCostLayer: typeof getTransferConsumedQtyForCostLayer
+  /** o3d-nrl4 PR B: the transfer lines whose units may still be in transit (see capitaliseInTransitResidue). */
+  getInTransitTransferLinesForCostLayer: typeof getInTransitTransferLinesForCostLayer
   getDependentOutputSourceLines: typeof getDependentOutputSourceLines
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
@@ -185,6 +193,7 @@ const defaultDeps: LandedCostServiceDeps = {
   getManufacturingConsumedQtyForCostLayer,
   getReversalConsumedQtyForCostLayer,
   getTransferConsumedQtyForCostLayer,
+  getInTransitTransferLinesForCostLayer,
   getDependentOutputSourceLines,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -330,33 +339,111 @@ async function loadLayerConsumptionExclusions(
 }
 
 /**
- * KNOWN GAP, recorded here rather than silently absent (o3d-nrl4, ex-6oyu.19).
- *
- * calculateLayerAdjustmentDeltas correctly keeps transferred units out of COGS —
- * they moved warehouse, they were not sold — and for a RECEIVED or CANCELLED
- * transfer propagateLandedCostToOutputs then carries the delta to the layer holding
- * them. What is uncovered is the portion of a dispatched line that has NOT yet
- * landed anywhere — qty less the line's LANDED quantity, per
- * lib/domain/inventory/transfer-landed-quantity, which counts a WMS stock-sync
- * alignment credit that `qtyReceived` alone does not (6oyu.19 Codex r6): no layer holds it, so propagation finds
- * nothing, inventoryDelta is zero because the source layer's remainingQty is zero,
- * and this recalc queues NO journal for it. The freight debit stays in the transit
- * clearing account with inventory understated, and the 6oyu.4 transit-vs-GL sweep
- * cannot see it because a MISSING posting is absent from both sides of the
- * comparison it makes.
- *
- * Note this is NOT "every transfer whose status is IN_TRANSIT" (Codex round-4
- * MEDIUM): a partial receipt or a WMS book-in/alignment creates fully linked
- * destination layers without moving the status off IN_TRANSIT, and the delta does
- * reach those units.
- *
- * Closing it needs an obligation persisted at revaluation time and discharged by the
- * receipt or dispatch cancellation that creates the layer. That was implemented,
- * reviewed and withdrawn from this branch on four HIGH findings; it is tracked as
- * o3d-nrl4 and preserved on `o3d-6oyu19-deferred-transit-reclass-withdrawn`
- * (commit 89a124f5). The classification that names the gap is
- * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
+ * One in-transit residue line: which transfer line, how many of its units were still in transit at the
+ * moment of the revaluation, and the signed amount posted for them (o3d-nrl4 PR B).
  */
+export type InTransitResidueEntry = {
+  costLayerId: string
+  transferLineId: string
+  qty: string
+  unitDelta: string
+  delta: string
+}
+
+type InTransitResidue = {
+  /** unitDelta x quantity still in transit, signed. Added to the inventory/transit adjustment. */
+  delta: Prisma.Decimal
+  qty: Prisma.Decimal
+  entries: InTransitResidueEntry[]
+}
+
+function noInTransitResidue(): InTransitResidue {
+  return { delta: new Prisma.Decimal(0), qty: new Prisma.Decimal(0), entries: [] }
+}
+
+/**
+ * THE IN-TRANSIT RESIDUE (o3d-nrl4 PR B, ex-6oyu.19): the share of a revaluation that belongs to units of
+ * this cost layer which are on a transfer and have NOT landed anywhere yet.
+ *
+ * calculateLayerAdjustmentDeltas correctly keeps transferred units out of COGS (they moved warehouse, they
+ * were not sold), and for a RECEIVED or CANCELLED transfer propagateLandedCostToOutputs carries the delta
+ * to the layer holding them. For a unit still in transit nothing holds it: the layer's remainingQty is 0
+ * (so inventoryDelta is 0) and no cost-layer source line exists yet, so before this function the delta
+ * reached nothing and the recalculation queued NO journal for it, leaving the freight debit in Stock in
+ * Transit and Inventory understated, invisibly.
+ *
+ * THE DECISION (D1). Transfers post no GL entry, so those units are still in GL Inventory, and their
+ * share is the entry on-hand units get: DR Inventory / CR Transit AT REVALUATION TIME (reversed for a
+ * decrease). The snapshot the revaluation rewrites is what the later receipt or cancellation costs its
+ * layer from, and that posts nothing. Each revaluation measures the state at ITS moment, so a second
+ * revaluation, a reversal and a freight cancellation each post their own signed difference: there is no
+ * obligation to persist or settle and no ledger to read.
+ *
+ * WHAT COUNTS. For every line of an IN_TRANSIT transfer whose snapshot names the layer
+ * (TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE: RECEIVED and CANCELLED contribute zero, their units are in
+ * layers propagation reaches), the snapshot is sliced PAST the line's LANDED quantity with
+ * `sliceTransferSnapshotForReceipt` (the receipts' own slicer, so the residue and the layer a receipt will
+ * create walk past the same units) and the entries naming this layer are summed. LANDED is
+ * `loadTransferLineLandedQty`'s definition: manual and WMS-webhook receipts (`qtyReceived`) AND an
+ * unabsorbed alignment credit (`qtyAccountedViaSnapshot`), which `qty - qtyReceived` would miss and so
+ * overstate the residue (6oyu.19 Codex r6).
+ *
+ * `consumedQty` is the layer's received - remaining: units in transit were consumed from the layer at
+ * dispatch, so a layer with nothing consumed cannot have any, and the JSONB containment query is skipped
+ * (the same short-circuit loadLayerConsumptionExclusions makes).
+ *
+ * EVERYTHING reads through `tx` (no pooled client inside the revaluation transaction), and the caller
+ * holds the transfers (lockLandedCostRevaluationScope), so a receipt, an alignment or a cancellation
+ * cannot move units between this read and the commit.
+ *
+ * It must be called at EVERY site that revalues a layer and journals its inventory delta: the root loop of
+ * recalculateLandedCosts, recalculateDirectLandedCosts and the output recursion of
+ * propagateLandedCostToOutputs. A site that skips it silently strands that site's in-transit share, which
+ * is exactly the defect; tests/domain/purchasing/in-transit-residue-census.test.ts reads the source and
+ * fails when one stops calling it.
+ *
+ * @internal Exported for tests; production callers reach it through the three revaluation sites.
+ */
+export async function capitaliseInTransitResidue(
+  tx: Prisma.TransactionClient,
+  deps: LandedCostServiceDeps,
+  costLayerId: string,
+  unitDelta: Prisma.Decimal,
+  consumedQty: Prisma.Decimal,
+): Promise<InTransitResidue> {
+  if (unitDelta.abs().lte(LANDED_COST_DELTA_EPSILON)) return noInTransitResidue()
+  if (consumedQty.lte(LANDED_COST_DELTA_EPSILON)) return noInTransitResidue()
+  const lines = await deps.getInTransitTransferLinesForCostLayer(tx, costLayerId)
+  if (lines.length === 0) return noInTransitResidue()
+  const landedByLineId = await loadTransferLineLandedQty(tx, lines)
+
+  const entries: InTransitResidueEntry[] = []
+  let totalQty = new Prisma.Decimal(0)
+  let totalDelta = new Prisma.Decimal(0)
+  for (const line of lines) {
+    const inTransit = sliceTransferSnapshotForReceipt({
+      snapshot: line.costLayerSnapshot,
+      alreadyLanded: requireLandedQty(landedByLineId, line.id),
+      // Everything the snapshot still holds past the landed units: the slicer takes up to this many.
+      qtyReceived: Number.MAX_SAFE_INTEGER,
+    })
+    const qty = inTransit
+      .filter((entry) => entry.costLayerId === costLayerId)
+      .reduce((sum, entry) => sum.add(decimal(entry.qty)), new Prisma.Decimal(0))
+    if (qty.lte(LANDED_COST_DELTA_EPSILON)) continue
+    const delta = unitDelta.mul(qty)
+    entries.push({
+      costLayerId,
+      transferLineId: line.id,
+      qty: qty.toString(),
+      unitDelta: unitDelta.toString(),
+      delta: delta.toString(),
+    })
+    totalQty = totalQty.add(qty)
+    totalDelta = totalDelta.add(delta)
+  }
+  return { delta: totalDelta, qty: totalQty, entries }
+}
 
 // BOM nesting is shallow in practice; this is a runaway/cycle backstop only. The constant lives in
 // transfer-asn-lock-order.ts because `lockLandedCostRevaluationScope` locks exactly the closure this walk
@@ -390,7 +477,7 @@ export async function propagateLandedCostToOutputs(
   accumulate: (
     cogsDelta: Prisma.Decimal,
     inventoryDelta: Prisma.Decimal,
-    audit: { sourceCostLayerId: string; outputCostLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; consumedQty: string },
+    audit: { sourceCostLayerId: string; outputCostLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; consumedQty: string; inTransitResidue: InTransitResidueEntry[] },
   ) => void,
   ancestors: Set<string>,
   depth: number,
@@ -482,12 +569,19 @@ export async function propagateLandedCostToOutputs(
       outputShipmentRevalDelta = shipmentRefresh.cogsRevaluationDelta
       await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, outputCostLayerId)
     }
-    accumulate(outDeltas.cogsDelta.sub(outputShipmentRevalDelta), outDeltas.inventoryDelta, {
+    // o3d-nrl4 PR B (site 3 of 3): units of THIS output layer that are on an IN_TRANSIT transfer have no
+    // layer for the delta to reach (a chained transfer, or a manufactured output dispatched before it
+    // landed), so their share is capitalised here, exactly as at the root.
+    const outputResidue = await capitaliseInTransitResidue(
+      tx, deps, outputCostLayerId, outDeltas.costDelta, outputReceivedQty.sub(outputRemainingQty),
+    )
+    accumulate(outDeltas.cogsDelta.sub(outputShipmentRevalDelta), outDeltas.inventoryDelta.add(outputResidue.delta), {
       sourceCostLayerId,
       outputCostLayerId,
       oldUnitCostBase: oldOutputUnitCost.toString(),
       newUnitCostBase: newOutputUnitCost.toString(),
       consumedQty: consumedQty.toString(),
+      inTransitResidue: outputResidue.entries,
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
@@ -1211,6 +1305,9 @@ export async function recalculateLandedCosts(
     // audit-e7h8: itemised record of the BOM-cascade so the journal total (which
     // includes propagated output-layer deltas) is substantiated in the audit run.
     const propagatedOutputLayers: PropagatedOutputLayerAudit[] = []
+    // o3d-nrl4 PR B: every in-transit residue line this run capitalised (root layers and propagated outputs),
+    // itemised so the journal total is substantiated in the audit run. A new JSON key, no schema change.
+    const inTransitResidue: InTransitResidueEntry[] = []
     const afterLines: Array<{
       lineId: string
       qty: string
@@ -1280,9 +1377,16 @@ export async function recalculateLandedCosts(
           remainingQty,
           ...exclusions,
         })
+        // o3d-nrl4 PR B (site 1 of 3): the units of this layer still in transit post their own share.
+        const residue = await capitaliseInTransitResidue(tx, serviceDeps, cl.id, deltas.costDelta, consumedQty)
+        inTransitResidue.push(...residue.entries)
         totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
-        totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
-        if (deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON) || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
+        totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta).add(residue.delta)
+        if (
+          deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+          || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+          || residue.delta.abs().gt(LANDED_COST_DELTA_EPSILON)
+        ) {
           adjustmentLayers.push({
             costLayerId: cl.id,
             oldUnitCost,
@@ -1313,6 +1417,7 @@ export async function recalculateLandedCosts(
           (cogsD, invD, audit) => {
             totalCogsDelta = totalCogsDelta.add(cogsD)
             totalInventoryDelta = totalInventoryDelta.add(invD)
+            inTransitResidue.push(...audit.inTransitResidue)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
           },
           new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
@@ -1403,6 +1508,7 @@ export async function recalculateLandedCosts(
           purchaseOrder: { id: primaryPo.id, reference: primaryPo.reference },
           lines: afterLines,
           propagatedOutputLayers,
+          inTransitResidue,
         }),
         accountingJson: toJsonInputValue(revaluationAccountingJson({
           primaryPoId,
@@ -1567,6 +1673,9 @@ export async function recalculateDirectLandedCosts(
   // audit-e7h8: itemised record of the BOM-cascade so the journal total (which
   // includes propagated output-layer deltas) is substantiated in the audit run.
   const propagatedOutputLayers: PropagatedOutputLayerAudit[] = []
+  // o3d-nrl4 PR B: every in-transit residue line this run capitalised (root layers and propagated outputs),
+  // itemised so the journal total is substantiated in the audit run. A new JSON key, no schema change.
+  const inTransitResidue: InTransitResidueEntry[] = []
   const afterLines: Array<{
     lineId: string
     qty: string
@@ -1636,9 +1745,16 @@ export async function recalculateDirectLandedCosts(
         remainingQty,
         ...exclusions,
       })
+      // o3d-nrl4 PR B (site 2 of 3): the units of this layer still in transit post their own share.
+      const residue = await capitaliseInTransitResidue(tx, serviceDeps, cl.id, deltas.costDelta, consumedQty)
+      inTransitResidue.push(...residue.entries)
       totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
-      totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
-      if (deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON) || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
+      totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta).add(residue.delta)
+      if (
+        deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+        || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+        || residue.delta.abs().gt(LANDED_COST_DELTA_EPSILON)
+      ) {
         adjustmentLayers.push({
           costLayerId: cl.id,
           oldUnitCost,
@@ -1669,6 +1785,7 @@ export async function recalculateDirectLandedCosts(
         (cogsD, invD, audit) => {
           totalCogsDelta = totalCogsDelta.add(cogsD)
           totalInventoryDelta = totalInventoryDelta.add(invD)
+          inTransitResidue.push(...audit.inTransitResidue)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
         },
         new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
@@ -1748,6 +1865,7 @@ export async function recalculateDirectLandedCosts(
         purchaseOrder: { id: po.id, reference: po.reference },
         lines: afterLines,
         propagatedOutputLayers,
+        inTransitResidue,
       }),
       accountingJson: toJsonInputValue(revaluationAccountingJson({
         primaryPoId: poId,

@@ -139,7 +139,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *       the freight arm of `cancelPurchaseOrderService`) take `lockLandedCostRevaluationScope` first, so two
  *       concurrent recalculations over one scope now queue on the same transfer/order/layer rows in the
  *       same order (closes o3d-t3mbr for those callers). `recalculateDirectLandedCosts` has NO production
- *       caller today; a future caller must take the same lock (tracked on o3d-nrl4).
+ *       caller today; a future caller must take the same lock (tracked as o3d-wny2j).
  *     · app/actions/purchase-orders.ts:2449 and the supplier-return line writes — covered by the
  *       `createPurchaseReturn` entry above.
  *     · lib/data-retention.ts, app/actions/forecasting.ts — parent only, or newly created rows.
