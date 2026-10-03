@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  assertedJournalRemedy,
+  isAssertedJournalRefusal,
   proveAllocationDebitPosting,
   proveJournalPosting,
   type JournalProofRow,
@@ -151,4 +153,52 @@ test('an asserted CANCELLED + id row (the cancelled-sale settlement) is ASSERTED
   const proof = await proveWith(cancelledWithId)
   assert.equal(proof.kind, 'refused')
   assert.match(proof.kind === 'refused' ? proof.reason : '', /OPERATOR typing in a document id/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// Codex round 2 (HIGH 2): "nothing was debited" is said ONLY of a PROVEN_NOT_POSTED journal.
+// ---------------------------------------------------------------------------------------------
+
+const WORDING: Array<{ standing: string; row: JournalProofRow; says: RegExp; neverNothingDebited: boolean }> = [
+  { standing: 'PROVEN_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' }), says: /PROVEN never to have posted — nothing has been debited/, neverNothingDebited: false },
+  { standing: 'ASSERTED_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }), says: /UNPROVEN[\s\S]*CHECK Xero for that journal[\s\S]*if it posted[\s\S]*if it did not/, neverNothingDebited: true },
+  { standing: 'UNKNOWN (CANCELLED, no proof)', row: row({ status: 'CANCELLED' }), says: /UNPROVEN[\s\S]*CHECK Xero/, neverNothingDebited: true },
+  { standing: 'UNKNOWN (FAILED, no id)', row: row({ status: 'FAILED' }), says: /is FAILED, not SYNCED — whether it reached the ledger is UNPROVEN[\s\S]*CHECK Xero/, neverNothingDebited: true },
+  { standing: 'CONFIRMED_POSTED but never settled (FAILED + connector id)', row: row({ status: 'FAILED', externalTransactionId: 'JNL-9' }), says: /UNPROVEN[\s\S]*CHECK Xero/, neverNothingDebited: true },
+  { standing: 'LIVE_WORK', row: row({ status: 'PENDING' }), says: /still queued or in flight, so nothing has been confirmed as debited yet/, neverNothingDebited: true },
+]
+
+for (const testCase of WORDING) {
+  test(`[Codex r2 HIGH 2] A2 refusal wording for ${testCase.standing}: ${testCase.neverNothingDebited ? 'never claims "nothing was debited"' : 'may say it, because it is PROVEN'}`, async () => {
+    const proof = await proveWith(testCase.row)
+    assert.equal(proof.kind, 'refused')
+    const reason = proof.kind === 'refused' ? proof.reason : ''
+    assert.match(reason, testCase.says)
+    if (testCase.neverNothingDebited) assert.doesNotMatch(reason, /nothing has been debited/)
+    assert.equal(isAssertedJournalRefusal(reason), false, 'and it does not trigger the asserted-journal remedy')
+    console.log(`wording ${testCase.standing}: ${reason.slice(0, 110)}`)
+  })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex round 2 (HIGH 1): the remedy for a PARTIAL refund names only what that refund withheld.
+// ---------------------------------------------------------------------------------------------
+
+test('[Codex r2 HIGH 1] assertedJournalRemedy: FULL = the whole open balance; PARTIAL = the withheld figure ONLY; PARTIAL with no figure = reconcile, no figure', () => {
+  const full = assertedJournalRemedy({ full: true, withheldAmount: null })
+  assert.match(full, /amount still open: the recorded A2 debit less relief already credited/)
+  assert.doesNotMatch(full, /REFUNDED UNITS ONLY/)
+
+  const partial = assertedJournalRemedy({ full: false, withheldAmount: 10 })
+  assert.match(partial, /REFUNDED UNITS ONLY: DR Inventory \/ CR Allocated Inventory £10\.00, which is exactly what this refund withheld/)
+  assert.match(partial, /Do NOT credit anything else/)
+  assert.doesNotMatch(partial, /recorded A2 debit less relief/, 'never prescribes the order\'s open balance')
+
+  for (const none of [null, 0, 0.004]) {
+    const unknown = assertedJournalRemedy({ full: false, withheldAmount: none })
+    assert.match(unknown, /could not establish the figure for this refund, so none is given/, `withheld=${String(none)}`)
+    assert.match(unknown, /do NOT credit the order's whole A2 debit/)
+    assert.doesNotMatch(unknown, /£\d/, 'no figure is prescribed')
+  }
+  console.log('remedy branches: full, partial(10.00), partial(null|0|0.004)')
 })

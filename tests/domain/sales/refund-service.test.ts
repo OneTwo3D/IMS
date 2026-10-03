@@ -9349,3 +9349,35 @@ test('[o3d-3la07 HIGH] an OPERATOR-ASSERTED A2 BATCH JOURNAL on a FULL refund is
   assert.equal(assertedWithheldLogs(asserted.state).length, 1)
   console.log('HIGH A2 journal: confirmed credit 20, no row; asserted FULL refund -> note with steps + 1 WARNING row')
 })
+
+
+// Codex round 2 (HIGH 1): a PARTIAL refund withheld on an asserted A2 journal prescribes ONLY its own withheld figure.
+test('[Codex r2 HIGH 1] a PARTIAL refund withheld on an asserted A2 journal names ONLY the refunded units\' £10.00, never the order\'s £40 open debit', async () => {
+  const run = async (columns: { settlementBasis: string | null; externalTransactionId: string | null }) => {
+    const state = a2StagedFourUnitState()
+    const a2 = state.accountingSyncLogs?.find((log) => log.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.ok(a2, 'PRECONDITION: the fixture seeds an A2 batch journal')
+    Object.assign(a2, columns)
+    const result = await createSalesOrderRefund(createClient(state), {
+      ...COMPLETE_REFUND,
+      lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 25 }],
+    })
+    assert.equal(result.success, true)
+    return { state, result }
+  }
+  const confirmed = await run({ settlementBasis: null, externalTransactionId: 'JNL-A2' })
+  assert.notEqual(confirmed.state.orders[0].refundStatus, 'FULL', 'PRECONDITION: a PARTIAL refund')
+  assert.equal(findAllocatedInventoryCredit(confirmed.result), 10, 'control: confirmed journal credits the one unit')
+  assert.equal(assertedWithheldLogs(confirmed.state).length, 0)
+
+  const asserted = await run({ settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: 'TYPED-A2' })
+  assert.notEqual(asserted.state.orders[0].refundStatus, 'FULL')
+  assert.equal(findAllocatedInventoryCredit(asserted.result), null)
+  const note = String(asserted.state.refunds[0].allocationBasisUnresolved)
+  assert.match(note, /REFUNDED UNITS ONLY: DR Inventory \/ CR Allocated Inventory £10\.00, which is exactly what this refund withheld/)
+  assert.match(note, /Do NOT credit anything else/)
+  assert.doesNotMatch(note, /amount still open: the recorded A2 debit less relief/, 'the FULL-refund wording is not used')
+  assert.doesNotMatch(note, /CR Allocated Inventory £40/, 'the order\'s whole debit is never prescribed')
+  assert.equal(assertedWithheldLogs(asserted.state).length, 1)
+  console.log('partial refund: remedy names £10.00 only (order debit £40 not prescribed)')
+})

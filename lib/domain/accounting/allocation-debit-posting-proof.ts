@@ -120,11 +120,31 @@ export function isAssertedJournalRefusal(reason: string): boolean {
  * moment of the refusal) and the reversal is raised by hand. Said exactly, because on a FULL refund there is no
  * "next refund" that could resolve it.
  */
-export const ASSERTED_JOURNAL_REMEDY =
-  'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
-  "in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited). " +
-  'The IMS has no screen yet that records that credit or clears this finding, and checking the journal does not change what the IMS stored, ' +
-  'so a later refund does not resolve it: the finding stays listed under the critical accounting finding sales_order_refund_allocation_basis_unresolved'
+export function assertedJournalRemedy(params: { full: boolean; withheldAmount: number | null }): string {
+  const tail =
+    'The IMS has no screen yet that records that credit or clears this finding, and checking the journal does not change what the IMS stored, ' +
+    'so a later refund does not resolve it: the finding stays listed under the critical accounting finding sales_order_refund_allocation_basis_unresolved'
+  if (params.full) {
+    // A FULL refund closes both batch windows for ever: the whole open balance is what is stranded.
+    return (
+      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+      'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited). ' + tail
+    )
+  }
+  // A PARTIAL refund: the rest of the order's A2 debit belongs to units the customer still holds.
+  if (params.withheldAmount !== null && params.withheldAmount > 0.005) {
+    return (
+      `WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY: ` +
+      `DR Inventory / CR Allocated Inventory £${params.withheldAmount.toFixed(2)}, which is exactly what this refund withheld. ` +
+      "Do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded. " + tail
+    )
+  }
+  return (
+    'WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
+    'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines, and do NOT credit the order\'s whole A2 debit ' +
+    '(the rest covers units the customer still holds). ' + tail
+  )
+}
 
 /** The status word for a row the amount proof refused, naming an operator assertion where there is one. */
 export function describeJournalRowState(row: LedgerStandingRow): string {
@@ -517,7 +537,13 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         kind: 'refused',
         reason: journalRowIsSettled(journal)
           ? 'the A2 journal this order was staged into is SYNCED but its settlement basis is not one this build recognises, so whether it reached the ledger cannot be established'
-          : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — nothing has been debited to Allocated Inventory for this order to reverse`,
+          : standing === 'PROVEN_NOT_POSTED'
+            ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED, and it is PROVEN never to have posted — nothing has been debited to Allocated Inventory for this order to reverse`
+            : standing === 'LIVE_WORK'
+              ? `the A2 journal this order was staged into is ${journal.status}, not SYNCED — it is still queued or in flight, so nothing has been confirmed as debited yet`
+              // ASSERTED_NOT_POSTED, UNKNOWN, or a row naming a connector id that never settled: UNPROVEN either way
+              // (C1: a person's "did not post", a cancellation or a failure does not prove the ledger was untouched).
+              : `the A2 journal this order was staged into is ${journal.status}, not SYNCED — whether it reached the ledger is UNPROVEN (a cancelled row, a failed row or a settled "did not post" can still have posted). CHECK Xero for that journal before reconciling: if it posted, the debit to Allocated Inventory stands and has to be reversed by hand; if it did not, there is nothing to reverse`,
       }
     }
     // o3d-o97 r5 — AND SYNCED IS STILL NOT A STATEMENT ABOUT POUNDS. The batch journal covers a whole

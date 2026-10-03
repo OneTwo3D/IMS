@@ -50,7 +50,7 @@ import {
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
-  ASSERTED_JOURNAL_REMEDY,
+  assertedJournalRemedy,
   describeJournalRowState,
   extractPayloadNetMovement,
   isAssertedJournalRefusal,
@@ -2828,11 +2828,9 @@ async function stageRefundAccountingReversals(
       allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved ?? allocationReversalReliefUnresolved
     }
     // o3d-3la07: a reversal withheld because a journal rests on an operator's assertion has no supported
-    // resolving action yet, so the reason carries the exact manual steps (see ASSERTED_JOURNAL_REMEDY).
+    // resolving action yet; the note below carries the exact manual steps (assertedJournalRemedy), worded
+    // for a FULL refund (the whole open balance) or a PARTIAL one (only what this refund withheld).
     const withheldOnAssertedJournal = allocationBasisUnresolved != null && isAssertedJournalRefusal(allocationBasisUnresolved)
-    if (withheldOnAssertedJournal && allocationBasisUnresolved != null) {
-      allocationBasisUnresolved = `${allocationBasisUnresolved}. ${ASSERTED_JOURNAL_REMEDY}`
-    }
     // o3d-o97 r6: the apportionment prices only SOME of the pool's unrecorded units and this refund
     // is PARTIAL, so neither of the two things that make the blend safe applies — the cap only bites
     // above the open balance and the residue only runs on a full refund, and a strict subset of a
@@ -2997,6 +2995,15 @@ async function stageRefundAccountingReversals(
             ? 'some refunded units came from allocation rows carrying no posted A2 basis of their own (re-pinned after the order was staged, or staged before the per-row basis was recorded), so they were valued by apportioning the order\'s recorded debit rather than from any posted figure of their own'
             : null,
           `Recorded A2 debit £${postedAllocationDebit.toFixed(2)}; this refund credited Allocated Inventory £${allocationReversal.toFixed(2)}.`,
+          // o3d-3la07: the manual steps, for an asserted journal only. FULL: the whole open balance. PARTIAL:
+          // ONLY the figure this refund itself withheld (its lines' allocated basis), never the order's
+          // whole open A2 debit, which also covers units the customer still holds.
+          withheldOnAssertedJournal
+            ? assertedJournalRemedy({
+                full: params.newStatus === 'REFUNDED',
+                withheldAmount: refusalWithheldLineReversal ? lineAllocationReversal : null,
+              })
+            : null,
         ].filter((part): part is string => !!part).join('. ')
       : null
 
@@ -3010,7 +3017,7 @@ async function stageRefundAccountingReversals(
           action: 'refund_allocation_reversal_withheld_asserted_journal',
           tag: 'accounting',
           level: 'WARNING',
-          description: `Refund ${params.refundId} withheld its Allocated Inventory reversal because a journal it depends on was settled as posted by an operator: ${allocationBasisUnresolved}`,
+          description: `Refund ${params.refundId} withheld its Allocated Inventory reversal because a journal it depends on was settled as posted by an operator: ${unresolvedNote}`,
           metadata: { orderId: params.orderId, refundId: params.refundId, newStatus: params.newStatus },
         },
       })
