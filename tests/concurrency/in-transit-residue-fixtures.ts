@@ -277,3 +277,95 @@ export async function netInventoryJournalDelta(goodsId: string): Promise<number>
   }
   return net
 }
+
+/** A second transfer OUT of `layerId` (units dispatched from a layer that is itself a transfer's destination). */
+export async function addTransferOut(world: World, layerId: string, qty: number, unitCost: number, status: 'IN_TRANSIT' | 'RECEIVED' | 'CANCELLED' = 'IN_TRANSIT', fromWarehouse?: string, toWarehouse?: string) {
+  const { db } = await import('@/lib/db')
+  const transfer = await db.stockTransfer.create({
+    data: {
+      reference: `T2-${world.tag}-${uid()}`, fromWarehouseId: fromWarehouse ?? world.w2, toWarehouseId: toWarehouse ?? world.w1, status, dispatchedAt: new Date(),
+      lines: {
+        create: [{
+          productId: world.productId, sku: world.tag, productName: world.tag, qty: `${qty}.0000`, qtyReceived: '0.0000',
+          costLayerSnapshot: [{ costLayerId: layerId, qty: `${qty}.000000`, unitCostBase: `${unitCost}.000000` }],
+        }],
+      },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  return { transferId: transfer.id, transferLineId: transfer.lines[0]!.id }
+}
+
+/**
+ * A manufactured OUTPUT layer fed by the world's goods layer: a PRODUCTION_OUT movement and its COGS entry
+ * consume `consumedQty` of the goods layer (so it is excluded from COGS as manufacturing-consumed), and the
+ * output layer names the goods layer through a cost-layer source line.
+ */
+export async function addProductionOutput(world: World, params: { consumedQty: number; outputQty: number; outputRemaining: number }) {
+  const { db } = await import('@/lib/db')
+  // The outbound-evidence trigger is DEFERRED to commit: the movement and its COGS entry must land together.
+  await db.$transaction(async (tx) => {
+    const movement = await tx.stockMovement.create({
+      data: {
+        type: 'PRODUCTION_OUT', productId: world.productId, fromWarehouseId: world.w1, qty: params.consumedQty,
+        referenceType: 'ProductionOrder', referenceId: `NRL4B-PROD-${uid()}`,
+        unitCostBase: world.unitCost, totalValueBase: params.consumedQty * world.unitCost,
+      },
+      select: { id: true },
+    })
+    await tx.cogsEntry.create({
+      data: { costLayerId: world.layerId, movementId: movement.id, qty: params.consumedQty, unitCostBase: world.unitCost, totalCostBase: params.consumedQty * world.unitCost },
+    })
+  })
+  const output = await db.costLayer.create({
+    data: { productId: world.productId, warehouseId: world.w1, receivedQty: params.outputQty, remainingQty: params.outputRemaining, unitCostBase: (params.consumedQty * world.unitCost) / params.outputQty },
+    select: { id: true },
+  })
+  await db.costLayerSourceLine.create({
+    data: {
+      costLayerId: output.id, sourceProductId: world.productId, sourceCostLayerId: world.layerId,
+      qty: params.consumedQty, unitCostBase: world.unitCost, totalCostBase: params.consumedQty * world.unitCost,
+    },
+  })
+  return { outputLayerId: output.id }
+}
+
+/** The replacement layer a dispatch cancellation books at the source, linked back to the original layer. */
+export async function addReplacementLayer(world: World, qty: number) {
+  const { db } = await import('@/lib/db')
+  const replacement = await db.costLayer.create({
+    data: { productId: world.productId, warehouseId: world.w1, receivedQty: qty, remainingQty: qty, unitCostBase: world.unitCost },
+    select: { id: true },
+  })
+  await db.costLayerSourceLine.create({
+    data: { costLayerId: replacement.id, sourceProductId: world.productId, sourceCostLayerId: world.layerId, qty, unitCostBase: world.unitCost, totalCostBase: qty * world.unitCost },
+  })
+  return { replacementLayerId: replacement.id }
+}
+
+/** Every ledger-side row that exists for the order and its transfer (sync logs and transit subledger rows). */
+export async function ledgerRowCount(world: Pick<World, 'goodsId' | 'transferId'>): Promise<{ syncLogs: number; subledger: number }> {
+  const { db } = await import('@/lib/db')
+  const syncLogs = await db.accountingSyncLog.count({ where: { referenceId: { in: [world.goodsId, world.transferId] } } })
+  const subledger = await db.transitSubledgerMovement.count({ where: { sourceRef: { in: [world.goodsId, world.transferId] } } })
+  return { syncLogs, subledger }
+}
+
+/** The number of IN_TRANSIT transfer lines naming the layer (the precondition every arm prints). */
+export async function inTransitLineCount(layerId: string): Promise<number> {
+  const { db } = await import('@/lib/db')
+  const rows = await db.$queryRawUnsafe<Array<{ n: number }>>(
+    `SELECT count(*)::int AS n FROM stock_transfer_lines stl JOIN stock_transfers st ON st.id = stl."transferId"
+      WHERE st.status = 'IN_TRANSIT' AND stl."costLayerSnapshot" @> $1::jsonb`,
+    JSON.stringify([{ costLayerId: layerId }]),
+  )
+  return Number(rows[0]!.n)
+}
+
+/** The audit run row a recalculation wrote for the goods order, newest first. */
+export async function revaluationRuns(goodsId: string) {
+  const { db } = await import('@/lib/db')
+  return db.landedCostRevaluationRun.findMany({
+    where: { primaryPoId: goodsId }, orderBy: { createdAt: 'desc' }, select: { id: true, afterJson: true, accountingJson: true },
+  })
+}
