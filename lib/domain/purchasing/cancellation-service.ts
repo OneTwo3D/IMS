@@ -21,6 +21,7 @@ import {
   type LandedCostRecalcResult,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
 
 const PURCHASE_ORDER_CANCELLATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -59,6 +60,8 @@ export type CancelPurchaseOrderServiceDeps = {
   readPurchaseOrderConsumedCostForCancellation: typeof readPurchaseOrderConsumedCostForCancellation
   recalculateLandedCosts: typeof recalculateLandedCosts
   queueLandedCostAdjustmentJournals: typeof queueLandedCostAdjustmentJournals
+  /** o3d-nrl4 PR A: the freight-cancellation scope lock. Optional so a fake-tx unit test need not name it. */
+  lockLandedCostRevaluationScope?: typeof lockLandedCostRevaluationScope
 }
 
 // Production dependencies are captured at module load; tests that need
@@ -78,6 +81,7 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   readPurchaseOrderConsumedCostForCancellation,
   recalculateLandedCosts,
   queueLandedCostAdjustmentJournals,
+  lockLandedCostRevaluationScope,
 }
 
 async function logPurchaseOrderCancellationNoop(
@@ -122,7 +126,20 @@ export async function cancelPurchaseOrderService(
       // gate state so a concurrent bill create/credit-note post can't change the
       // predicate between the read and the CANCELLED write. createInvoice takes the
       // same row lock, so the two serialise.
-      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      //
+      // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): a FREIGHT cancellation runs
+      // `recalculateLandedCosts` below, which rewrites every linked primary's lines, cost layers and
+      // snapshots (including in-transit transfer lines), and used to lock only this parent. It now takes
+      // the whole revaluation scope in the global order (transfers, then this order and the primaries with
+      // their cost rows, then the cost layers) and refuses with LandedCostScopeRacedError if the scope grew
+      // while it was locking. The type is immutable, so reading it before the lock is safe; every other
+      // read waits for the lock. A GOODS cancellation keeps its parent-only lock (it recalculates nothing).
+      const typeProbe = await tx.purchaseOrder.findUnique({ where: { id }, select: { type: true } })
+      if (typeProbe?.type === 'FREIGHT') {
+        await (deps.lockLandedCostRevaluationScope ?? lockLandedCostRevaluationScope)(tx, { freightPoId: id })
+      } else {
+        await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      }
       const existing = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {

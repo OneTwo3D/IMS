@@ -21,6 +21,7 @@ import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { LANDED_COST_PROPAGATION_MAX_DEPTH } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
@@ -357,8 +358,10 @@ async function loadLayerConsumptionExclusions(
  * STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.
  */
 
-// BOM nesting is shallow in practice; this is a runaway/cycle backstop only.
-const MAX_LANDED_COST_PROPAGATION_DEPTH = 20
+// BOM nesting is shallow in practice; this is a runaway/cycle backstop only. The constant lives in
+// transfer-asn-lock-order.ts because `lockLandedCostRevaluationScope` locks exactly the closure this walk
+// can reach (o3d-nrl4 PR A): one number, so the lock and the walk cannot drift apart.
+const MAX_LANDED_COST_PROPAGATION_DEPTH = LANDED_COST_PROPAGATION_MAX_DEPTH
 
 /**
  * Propagate a retrospective per-unit cost change on `sourceCostLayerId` into the
