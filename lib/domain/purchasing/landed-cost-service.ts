@@ -429,7 +429,7 @@ export async function capitaliseInTransitResidue(
     })
     const qty = inTransit
       .filter((entry) => entry.costLayerId === costLayerId)
-      .reduce((sum, entry) => sum.add(decimal(entry.qty)), new Prisma.Decimal(0))
+      .reduce((sum, entry) => sum.add(new Prisma.Decimal(String(entry.qty ?? 0))), new Prisma.Decimal(0))
     if (qty.lte(LANDED_COST_DELTA_EPSILON)) continue
     const delta = unitDelta.mul(qty)
     entries.push({

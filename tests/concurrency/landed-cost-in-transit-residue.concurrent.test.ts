@@ -143,7 +143,7 @@ test('o3d-nrl4 PR B: in-transit residue capitalisation', { skip }, async (t) => 
 
     const before = await ledgerRowCount(world)
     const received = await receiveTransfer(world.transferId)
-    assert.equal(received.success, true, `the receipt must succeed: ${received.error}`)
+    assert.equal(received.success, true, `the receipt must succeed: ${received.message}`)
     const after = await ledgerRowCount(world)
     const destination = await db.costLayer.findFirst({ where: { productId: world.productId, warehouseId: world.w2 }, select: { unitCostBase: true, receivedQty: true } })
     console.log(`U4: ledger rows before receipt ${JSON.stringify(before)}, after ${JSON.stringify(after)}; destination layer ${JSON.stringify(destination)}`)
