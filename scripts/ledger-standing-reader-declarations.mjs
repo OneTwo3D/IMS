@@ -12,7 +12,7 @@
 // 1c: o3d-1e7sl (converted the guard and display readers - order delete guard, mark-handled, exception inbox,
 // mirror ownership, back-reference competitors, retention R3, posted-order-discount, invariants, reconciliation,
 // the sync log / orphan banner - and re-declared the ones whose reading holds as GUARD / DISPLAY with a reason; no
-// PENDING_CONVERSION:o3d-1e7sl entry remains); o3d-2by1 owns the re-settleability authority question and o3d-djemh
+// slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question and o3d-djemh
 // the coupon-backfill (M17) design decision.
 
 export const DECLARATIONS = [
