@@ -257,6 +257,11 @@ test('no status-level export may claim IN_TRANSIT has no destination layer (Code
   for (const [name, value] of Object.entries(movementCogsRelevance)) {
     if (!Array.isArray(value)) continue
     if (name === 'TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION') continue
+    // o3d-nrl4 PR B: the one export that DOES single IN_TRANSIT out, and not by claiming a layer is
+    // missing: it says which statuses can still hold units on a truck (the rest are in a destination or
+    // replacement layer). It is derived from the classification, never spelled, and the per-line
+    // quantity is measured past the LANDED quantity afterwards — pinned positively below.
+    if (name === 'TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE') continue
     assert.notDeepEqual(
       [...value].sort(),
       ['IN_TRANSIT'],
@@ -272,7 +277,8 @@ test('no status-level export may claim IN_TRANSIT has no destination layer (Code
     /NO layer holds these units/,
     'a partly-received transfer is IN_TRANSIT with some of its units fully layered',
   )
-  assert.match(note, /o3d-nrl4/, 'the residue that IS uncovered must still be named and tracked')
+  assert.match(note, /o3d-nrl4/, 'the residue capitalisation must still be named and tracked')
+  assert.match(note, /capitaliseInTransitResidue/, 'and the note must say WHERE the in-transit share is posted')
 })
 
 test('the transfer-status list is NOT derived from the transfer state machine (6oyu.19)', () => {
@@ -417,4 +423,24 @@ test('the retired-value census would FAIL if the value came back (not vacuous)',
   assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.startsWith('OUTSTANDING_'))
   assert.ok(RETIRED_IN_TRANSIT_CONSUMPTION.endsWith('_DESTINATION_LAYER'))
   assert.notEqual(RETIRED_IN_TRANSIT_CONSUMPTION, STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION.IN_TRANSIT.consumption)
+})
+
+test('o3d-nrl4 PR B: the in-transit residue statuses are DERIVED from the classification, and RECEIVED / CANCELLED contribute none', () => {
+  const derived = (Object.keys(STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION) as Array<keyof typeof STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION>)
+    .filter((status) => STOCK_TRANSFER_SOURCE_LAYER_CONSUMPTION[status].consumption === 'OUTSTANDING_DESTINATION_LAYER_NOT_ASSURED')
+    .sort()
+  console.log(`residue statuses derived from the registry = ${JSON.stringify(derived)}`)
+  assert.ok(derived.length >= 1, 'precondition: the classification names at least one status')
+  assert.deepEqual([...movementCogsRelevance.TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE].sort(), derived)
+  for (const status of ['RECEIVED', 'CANCELLED', 'DRAFT'] as const) {
+    assert.ok(
+      !movementCogsRelevance.TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE.includes(status),
+      `${status} must contribute ZERO residue: its units are in a layer propagation reaches (or were never dispatched)`,
+    )
+  }
+  // The residue statuses are a subset of the statuses whose consumption is outstanding (excluded from COGS):
+  // a status must not post a residue for units it does not also keep out of COGS.
+  for (const status of movementCogsRelevance.TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE) {
+    assert.ok(movementCogsRelevance.TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION.includes(status))
+  }
 })

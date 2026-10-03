@@ -8,6 +8,18 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased
 
+### Late landed cost on stock in transit between warehouses now reaches Inventory (o3d-nrl4)
+
+- **A freight order added, edited or cancelled after the goods were bought now posts the share that belongs
+  to units still on a warehouse transfer.** The revaluation used to move only the on-hand units' share out of
+  Stock in Transit and queued nothing for units dispatched but not yet received (or aligned by the WMS), so
+  the freight debit stayed in Stock in Transit and Inventory stayed understated, in a way no reconciliation
+  showed. The landed-cost reclass journal (`STOCK_IN_TRANSIT`) now includes those units at the moment the landed
+  cost changes (DR Inventory / CR Stock in Transit, reversed for a decrease); the later receipt or dispatch
+  cancellation posts nothing. A manual receipt, a WMS book-in and a WMS alignment credit all count as landed.
+  The revaluation audit run lists the amounts under `inTransitResidue`. No migration. Amounts left in transit by
+  revaluations made before this change are not repaired.
+
 ### Purchase-order lines have a landed-quantity definition (o3d-papk, first half)
 
 - **A manual purchase-order receipt can no longer be booked on top of units the WMS stock-sync

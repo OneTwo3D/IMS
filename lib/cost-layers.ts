@@ -12,7 +12,10 @@ import type { Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { accountingPostingVerdictForChart, getAccountingSettings, isDailyBatchPostingEnabledForChart, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { isClientInsideTransaction, openSavepointDepth } from '@/lib/db/savepoint'
-import { TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION } from '@/lib/domain/inventory/movement-cogs-relevance'
+import {
+  TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE,
+  TRANSFER_STATUSES_WITH_OUTSTANDING_SOURCE_CONSUMPTION,
+} from '@/lib/domain/inventory/movement-cogs-relevance'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import {
@@ -1226,6 +1229,41 @@ export async function getTransferConsumedQtyForCostLayer(
   }
 
   return transferredQty
+}
+
+/**
+ * The transfer LINES whose dispatch snapshot names `costLayerId` and whose transfer may still have units
+ * IN TRANSIT (o3d-nrl4 PR B): the input `capitaliseInTransitResidue` measures the residue from.
+ *
+ * The status predicate is TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE, derived from the same registry as
+ * `getTransferConsumedQtyForCostLayer`'s, so a RECEIVED or CANCELLED transfer (its units are in a
+ * destination / replacement layer propagation already reaches) is never read here. Rows only: the quantity
+ * that is still in transit is NOT `qty` and NOT `qty - qtyReceived`; it is the snapshot past the line's
+ * LANDED quantity, worked out by the caller with `loadTransferLineLandedQty` and `sliceTransferSnapshotForReceipt`.
+ *
+ * Read through `tx` and, under the landed-cost revaluation scope lock, with the transfers already held, so
+ * a receipt or alignment cannot land units between this read and the recalculation's commit.
+ */
+export async function getInTransitTransferLinesForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<Array<{ id: string; qtyReceived: Decimal; costLayerSnapshot: unknown }>> {
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
+  const rows = await tx.$queryRawUnsafe<Array<{ id: string; qtyReceived: Decimal | string | number; costLayerSnapshot: unknown }>>(
+    `SELECT stl.id, stl."qtyReceived", stl."costLayerSnapshot"
+       FROM "stock_transfer_lines" stl
+       INNER JOIN "stock_transfers" st ON st.id = stl."transferId"
+      WHERE st.status = ANY($2::"StockTransferStatus"[])
+        AND stl."costLayerSnapshot" @> $1::jsonb
+      ORDER BY stl.id`,
+    containsCostLayer,
+    TRANSFER_STATUSES_WITH_IN_TRANSIT_RESIDUE,
+  )
+  return rows.map((row) => ({
+    id: row.id,
+    qtyReceived: toDecimal(row.qtyReceived),
+    costLayerSnapshot: row.costLayerSnapshot,
+  }))
 }
 
 /**

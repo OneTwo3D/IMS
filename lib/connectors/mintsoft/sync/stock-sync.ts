@@ -2101,10 +2101,11 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // call in a try or a savepoint.
         //
         // Note this alignment does NOT change the transfer's status, so a transfer
-        // can be IN_TRANSIT with these units fully layered and propagatable. What is
-        // still uncovered is a revaluation that landed while units were in transit:
-        // nothing here discharges it and the delta stays in the transit clearing
-        // account. Open, tracked as o3d-nrl4.
+        // can be IN_TRANSIT with these units fully layered and propagatable. A
+        // revaluation that landed while units were in transit capitalised their share
+        // itself at revaluation time (DR Inventory / CR Transit, o3d-nrl4 PR B:
+        // capitaliseInTransitResidue, measured past this credit as LANDED quantity),
+        // so nothing is owed here and this posts nothing.
         //
         // `bookedQty` is `allocation.qty`, the stock increment made below, and the
         // helper's coverage postcondition is measured against IT (Codex round-8
