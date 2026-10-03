@@ -204,6 +204,12 @@ test('o3d-nrl4 PR A: a manufacturing cost edit locks the output layers before it
   const { db } = await import('@/lib/db')
   const { updateManufacturingCostLines } = await import('@/app/actions/manufacturing')
 
+  // This tier shares ONE database and runs files serially; an earlier file may have left accounting posting
+  // switched on with a partial chart, which makes the edit throw at its journal stage and roll back. The arm is
+  // about LOCK ORDER, not journals, so it states the connector as off. (Later files set what they need themselves.)
+  for (const key of ['plugin_xero_enabled', 'xero_sync_enabled']) {
+    await db.setting.upsert({ where: { key }, create: { key, value: 'false' }, update: { value: 'false' } })
+  }
   const world = await seedWorld('m1')
   const probe = await rawSession(databaseUrl)
   const propagated = deferred<number>()
