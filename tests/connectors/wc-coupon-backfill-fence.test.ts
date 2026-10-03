@@ -2846,3 +2846,33 @@ test('o3d-djemh universal wording: the report lines are per cause and say only w
   assert.match(lines[2], /on a PENDING sync row/)
   assert.match(lines[3], /not recognise/)
 })
+
+test('o3d-djemh universal wording: the NETTING precondition labels every credit note it names', async () => {
+  // The netting branch needs a FULL chargeback with mirrored credit-note events; its renderer is a
+  // pure function, so it is driven directly.
+  const { wcCouponPreconditionSteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const refunds = {
+    disposition: 'FULL' as const,
+    refundIds: ['refund-1'],
+    postedCreditNoteExternalIds: ['CN-N1', 'CN-N2'],
+    unconfirmedCreditNoteDocuments: [{ id: 'CN-N2', cause: 'OPERATOR_ASSERTED' as const, status: 'SYNCED' }],
+    unresolvedRefundParkExternalIds: [] as string[],
+  }
+  const documents = {
+    currency: 'GBP',
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: [] as string[],
+    revenueDeferredBatchRef: null,
+    unearnedRevenueAmount: null,
+    document: { ok: false as const, reason: 'NO_POSTED_EVENT' as const, detail: null, documentCount: null, externalIds: [] as string[], documentSet: [] as string[] },
+  }
+  const text = wcCouponPreconditionSteps({
+    heading: 'REMEDY (Xero)', beforeWhat: 'POSTING', externalSystem: 'XERO', validAgainst: refunds,
+    validAgainstDocuments: documents, derivedAt: '2026-10-03T00:00:00.000Z', nettedAgainst: ['CN-N1', 'CN-N2'], whatIsVoid: 'this remedy',
+  } as never).join('\n')
+  const mentions = (text.match(/CN-N2/g) ?? []).length
+  console.log(`# o3d-djemh netting precondition: CN-N2 mentions=${mentions}`)
+  assert.ok(mentions >= 2, 'precondition: named in the position and in the netting sentence')
+  assert.equal((text.match(/CN-N2 \(asserted by an operator, NOT confirmed in the ledger\)/g) ?? []).length, mentions)
+  assert.doesNotMatch(text, /CN-N1 \(/, 'the confirmed one is not labelled')
+})
