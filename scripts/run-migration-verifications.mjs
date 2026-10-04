@@ -295,19 +295,11 @@ async function main() {
     return
   }
 
-  // THE ADMIN CONNECTION WINS WHEN THERE IS ONE (o3d-2sm1.5, Codex r4 HIGH).
-  //
-  // The deploy scripts invoke this INSIDE the connection fence, with DATABASE_URL set to the
-  // privileged URL — and this line then preferred DIRECT_URL, which on the day anyone sets it
-  // is the APPLICATION role: the very role whose CONNECT the fence had just revoked. The step
-  // would die with "permission denied for database" after the stop, on a deploy that had done
-  // everything right. scripts/fence-db-connections.mjs already refuses that fallback; its
-  // callers did not.
-  //
-  // Outside a fenced window DEPLOY_ADMIN_DATABASE_URL is simply the same database by another
-  // role, and these checks read nothing the application role could not read anyway.
-  const connectionString =
-    process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
+  // THIS CONNECTS THROUGH DATABASE_URL AND NOTHING ELSE (owner decision C3). Inside a fenced window
+  // the deploy hands this script the MIGRATION URL as DATABASE_URL; it must never read the deploy
+  // admin credential, which application-owned code may not hold. DIRECT_URL is not consulted either:
+  // on the day anyone sets it, it is the application role, whose CONNECT the fence has just revoked.
+  const connectionString = process.env.DATABASE_URL
   if (!connectionString) {
     console.error('DATABASE_URL is not set — cannot run the migrations\' verification checks.')
     process.exit(1)

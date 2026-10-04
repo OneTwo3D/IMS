@@ -34,9 +34,11 @@
 //                          connection and asks the same questions.
 //   --plan                 what a fence WOULD revoke, printed as one line of JSON on stdout.
 //                          Revokes nothing, terminates nothing and WRITES NOTHING AT ALL. It is
-//                          the unprivileged half of raising a fence: this process runs as the
-//                          application account, so the record a `--release` builds GRANTs out of
-//                          cannot be authored here (o3d-secops r23, Codex CRITICAL). The caller
+//                          the first half of raising a fence: the record a `--release` builds
+//                          GRANTs out of is not authored here (o3d-secops r23, Codex CRITICAL).
+//                          Since owner decision C3 this process runs as root too (it holds the
+//                          admin credential, and the application account never does), and the
+//                          validator below is kept regardless. The caller
 //                          — root — validates this plan field by field and publishes the
 //                          authority itself, durably, before --fence is invoked.
 //   --fence                revoke CONNECT, drain the existing backends, prove it is quiet.
@@ -60,9 +62,15 @@
 //                          license "released" — and only one whose provenance holds: see
 //                          classifyStateProvenance(). The record is not removed from here; root
 //                          clears it, because the directory it lives in is root's.
-//   --print-migration-url  the admin URL with `options=-c role=<app role>` merged in — the
-//                          connection the migration must run through. See "WHO THE
-//                          MIGRATION RUNS AS" below. No database connection is opened.
+//   --print-migration-url  the connection the migration must run through: the MIGRATION ROLE's
+//                          login (a NOSUPERUSER role, see assessMigrationRoleAttributes()) with
+//                          a password minted for this window and `options=-c role=<app role>`
+//                          merged in. It connects as the admin to check the role's attributes
+//                          and set that password, and the admin login NEVER appears in the URL.
+//                          See "WHO THE MIGRATION RUNS AS" below.
+//   --ensure-migration-role  create the migration role (NOLOGIN, no privilege of its own beyond
+//                          membership of the application role and a direct CONNECT grant) if it
+//                          does not exist, and refuse if it exists with attributes it must not have.
 //
 // WHAT THIS CANNOT DO, said here rather than implied away:
 //
@@ -88,10 +96,18 @@
 //     so nothing in the pipeline could see it: the deploy reported success and every
 //     request touching the new table failed with `permission denied`.
 //
-//     So the migration CONNECTS as the admin and RUNS AS the application role:
-//     buildMigrationConnectionString() adds `options=-c role=<app role>` to the admin URL,
+//     (SUPERSEDED, owner decision C3: the migration no longer connects as the ADMIN. `options=-c
+//     role=` is a session DEFAULT and not a boundary -- any statement on that connection can
+//     `RESET ROLE` and become the login -- so a migration connecting as a superuser admin handed
+//     superuser to every byte of app-owned code that ran inside the window. It now connects as the
+//     MIGRATION ROLE, a role with no privilege of its own, and the admin credential stays with
+//     root. The paragraph below is the original reasoning for connecting as a role other than the
+//     application's and running as the application; only WHICH role logs in has changed.)
+//
+//     So the migration CONNECTS as a login that survives the fence and RUNS AS the application role:
+//     buildMigrationConnectionString() adds `options=-c role=<app role>` to the URL,
 //     which Postgres applies at connection start. Authentication — and therefore the
-//     CONNECT check the fence revokes — happens as the admin, so the fence still holds;
+//     CONNECT check the fence revokes — happens as that login, so the fence still holds;
 //     everything the migration then creates is owned by the application role, exactly as
 //     an unfenced migration would leave it. That is the whole point: the fenced path and
 //     the unfenced path leave the database in the SAME state.
@@ -153,7 +169,7 @@
 // than the fenced snapshot.
 // =============================================================================
 
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto'
 import { lstatSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -921,8 +937,20 @@ export function planConnectionFence(facts) {
     appRoleHasConnect,
     appRoleHasEffectiveConnect,
     directConnectGrantees = [],
+    // THE MIGRATION ROLE (owner decision C3). Like the admin it is a login the migration window
+    // needs and the fence must therefore not close -- but unlike the admin it has no privilege of
+    // its own (assessMigrationRoleAttributes() proves that from the server), so exempting it
+    // gives the application's own bytes nothing a RESET ROLE can use. Empty when the caller names none.
+    migrationRole = '',
   } = facts
 
+  if (migrationRole && (migrationRole === appRole || migrationRole === adminRole)) {
+    return {
+      fenceable: false,
+      reason: `the migration role ${migrationRole} is the same role as the ${migrationRole === appRole ? 'application' : 'deploy admin'}, so exempting it from the revoke would exempt that role too. The migration login must be a role of its own.`,
+      revoke: [],
+    }
+  }
   if (!appRole) {
     return { fenceable: false, reason: '--app-user names no role, so there is nothing to revoke CONNECT from.', revoke: [] }
   }
@@ -961,6 +989,7 @@ export function planConnectionFence(facts) {
   for (const grantee of directConnectGrantees) {
     if (grantee === PUBLIC_GRANTEE || grantee === '') continue
     if (grantee === adminRole) continue
+    if (migrationRole && grantee === migrationRole) continue
     if (!revoke.includes(grantee)) revoke.push(grantee)
   }
   if (appRoleHasConnect && !revoke.includes(appRole)) revoke.push(appRole)
@@ -1013,6 +1042,111 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
     usable: false,
     reason: `the deploy connects as ${adminRole}, which is neither a superuser nor a member of ${appRole}, so the migration cannot SET ROLE to ${appRole}. Everything it created would be owned by ${adminRole} with no grant to the application, and the deploy would report success while every request touching a new table failed with "permission denied". Grant ${adminRole} membership of ${appRole} (GRANT ${appRole} TO ${adminRole}) and re-run.`,
   }
+}
+
+/**
+ * Pure: may this role be the login a migration window runs on, and can the admin set its password?
+ *
+ * THE POINT OF THE WHOLE ROLE (owner decision C3, o3d-1bgr). The migration runs application-owned
+ * bytes -- prisma from the app's node_modules, the migration SQL in the checkout, package scripts --
+ * over a connection whose login is this role. `options=-c role=<app>` is a session default, so
+ * anything on that connection can `RESET ROLE` and become the LOGIN. The login therefore must be a
+ * role that is worth nothing: not a superuser, nothing that creates roles or databases, no
+ * replication, no row-security bypass, and a member of nothing the application role is not. The
+ * facts come from the server (readMigrationRoleFacts), never from configuration, because a role
+ * somebody pre-created under that name with other attributes is exactly the case this exists for.
+ *
+ * AND THE OTHER DIRECTION: the application role must NOT be a member of the migration role, or the
+ * application would inherit whatever the migration role is ever granted (and its CONNECT through
+ * the fence). The admin must be able to ALTER it (superuser, or CREATEROLE with ADMIN on it from
+ * PostgreSQL 16 on) because the password is minted per window.
+ *
+ * @param {object} f the row readMigrationRoleFacts() returns, plus `directConnect` (does the role
+ *   hold CONNECT in its own right on this database -- the fence never revokes it, a grant through
+ *   membership of the application role would be revoked with the application's)
+ * @returns {{ usable: boolean, reason: string }}
+ */
+export function assessMigrationRoleAttributes(f) {
+  const name = f.migrationRole
+  const refuse = (why) => ({ usable: false, reason: `the migration role ${name} ${why}` })
+  if (!name) return { usable: false, reason: 'no migration role was named (--migration-role), so the migration has no login that is not the deploy admin.' }
+  if (!f.exists) {
+    return refuse(`does not exist. Create it (the installer does, and \`node scripts/fence-db-connections.mjs --ensure-migration-role\` does as the admin): CREATE ROLE ${quoteIdent(name)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT ${quoteIdent(f.appRole)} TO ${quoteIdent(name)}${f.serverVersionNum >= 160000 ? ' WITH INHERIT TRUE, SET TRUE' : ''}; GRANT CONNECT ON DATABASE <database> TO ${quoteIdent(name)};`)
+  }
+  const forbidden = []
+  if (f.rolsuper) forbidden.push('SUPERUSER')
+  if (f.rolcreaterole) forbidden.push('CREATEROLE')
+  if (f.rolcreatedb) forbidden.push('CREATEDB')
+  if (f.rolreplication) forbidden.push('REPLICATION')
+  if (f.rolbypassrls) forbidden.push('BYPASSRLS')
+  if (forbidden.length > 0) {
+    return refuse(`holds ${forbidden.join(', ')}. A migration login with any of those is a login every byte of application-owned code in the window can use after \`RESET ROLE\`. Remove it with ALTER ROLE ${quoteIdent(name)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, or name another role.`)
+  }
+  if (f.reachesOtherRoles) {
+    return refuse(`is a member of a role the application role is not a member of, so \`RESET ROLE\` on a migration connection reaches privilege the application itself does not hold. Its only membership may be ${f.appRole}.`)
+  }
+  if (!f.canSetAppRole) {
+    return refuse(`cannot SET ROLE to ${f.appRole}, so the migration could not run as it and everything it created would be owned by ${name}. GRANT ${quoteIdent(f.appRole)} TO ${quoteIdent(name)}${f.serverVersionNum >= 160000 ? ' WITH INHERIT TRUE, SET TRUE' : ''}.`)
+  }
+  if (f.appIsMember) {
+    return refuse(`has the application role ${f.appRole} as a member, so the application would inherit it. Revoke that membership.`)
+  }
+  if (!f.directConnect) {
+    return refuse(`holds no CONNECT of its own on this database. The fence revokes CONNECT from the application role, and a role that holds it only through membership of that role is locked out with it. GRANT CONNECT ON DATABASE ${quoteIdent(f.database)} TO ${quoteIdent(name)}.`)
+  }
+  if (!f.adminIsSuperuser && !(f.adminCreaterole && (f.serverVersionNum < 160000 || f.adminHasAdminOption))) {
+    return refuse(`cannot be administered by ${f.adminRole}, which is neither a superuser nor a CREATEROLE role${f.serverVersionNum >= 160000 ? ' holding ADMIN OPTION on it' : ''}. A fresh password is set on it for every window, so the admin must be able to ALTER it.`)
+  }
+  return { usable: true, reason: '' }
+}
+
+/**
+ * A PostgreSQL SCRAM-SHA-256 verifier for `password`, computed here (RFC 5802 / RFC 7677, the
+ * format PostgreSQL stores in pg_authid). Sending the VERIFIER with ALTER ROLE ... PASSWORD makes
+ * the server store it as given, so the plaintext never reaches a server log, pg_stat_statements or
+ * a log_statement=all record. The verifier is itself enough to verify guesses offline, which is why
+ * the password it hides is 256 random bits and not something a person chose.
+ */
+export function scramSha256Verifier(password, salt = randomBytes(16), iterations = 4096) {
+  const salted = pbkdf2Sync(Buffer.from(String(password), 'utf8'), salt, iterations, 32, 'sha256')
+  const clientKey = createHmac('sha256', salted).update('Client Key').digest()
+  const storedKey = createHash('sha256').update(clientKey).digest()
+  const serverKey = createHmac('sha256', salted).update('Server Key').digest()
+  return `SCRAM-SHA-256$${iterations}:${salt.toString('base64')}$${storedKey.toString('base64')}:${serverKey.toString('base64')}`
+}
+
+/** `ALTER ROLE ... LOGIN PASSWORD '<verifier>'`, the statement that opens the window's login. */
+export function buildMigrationLoginStatement(migrationRole, verifier) {
+  return `ALTER ROLE ${quoteIdent(migrationRole)} LOGIN PASSWORD '${String(verifier).replace(/'/g, "''")}'`
+}
+
+/** The statement that closes it again (release): no login, no password left to guess. */
+export function buildMigrationLogoutStatement(migrationRole) {
+  return `ALTER ROLE ${quoteIdent(migrationRole)} NOLOGIN PASSWORD NULL`
+}
+
+/**
+ * Pure: the migration connection string. The ADMIN's userinfo is replaced -- not merged -- by the
+ * migration role's, so the admin login and password are never in the string, and then the role
+ * option and the binding stamp are merged in by buildMigrationConnectionString(). Host, port,
+ * database and every other query parameter (sslmode and friends) stay the admin URL's, which is
+ * what keeps the bind, witness and pin gates comparing the same server.
+ */
+export function buildMigrationLoginUrl(adminConnectionString, migrationRole, password, appRole, migrationNonce = '') {
+  if (!migrationRole) throw new Error('No migration role, so there is no login to compose a migration URL for.')
+  if (!password) throw new Error('No migration password, so the migration URL would not authenticate.')
+  if (/[\s]/.test(String(migrationRole))) {
+    throw new Error(`The migration role name ${JSON.stringify(String(migrationRole))} contains whitespace; refusing to compose a URL for it.`)
+  }
+  let url
+  try {
+    url = new URL(adminConnectionString)
+  } catch {
+    throw new Error('The admin connection string cannot be parsed as a URL, so the migration login cannot be substituted into it.')
+  }
+  url.username = String(migrationRole)
+  url.password = String(password)
+  return buildMigrationConnectionString(url.toString(), appRole, migrationNonce)
 }
 
 /**
@@ -1181,7 +1315,8 @@ export function verifyRelease(privileges, grantees) {
 
 export function parseArgs(argv) {
   // THE OWNER THE AUTHORITY RECORD MUST HAVE, AND WHY IT HAS A DEFAULT AT ALL (o3d-secops r23).
-  // This process runs as ${APP_USER}; the record it obeys is published by the privileged account
+  // (Until owner decision C3 this process ran as ${APP_USER}; it runs as root now, and the rule is
+  // unchanged.) The record it obeys is published by the privileged account
   // that runs the cutover, which on every real host is uid 0. The default is therefore the safe
   // one and a caller has to ASK for anything else — which only root's own argv can do, since
   // every invocation of this file is composed by a root-owned script or a root-owned wrapper.
@@ -1194,12 +1329,16 @@ export function parseArgs(argv) {
     witnessNonce: '', witnessLock: '', witnessChallenge: '',
     // o3d-secops r32: the stamp `--print-migration-url` puts on every backend the migration window
     // opens, and that `--bind-migration` then reads back off its own connection.
-    migrationNonce: '', holdStamp: false }
+    migrationNonce: '', holdStamp: false,
+    // The role the migration logs in as. Not a secret, so it is an argument; the root-owned
+    // library appends it to every invocation from ONE place (db_fence_exec_root).
+    migrationRole: '' }
   for (const arg of argv) {
     // `--audit-authority` (o3d-secops r26) is here with the rest and not behind a flag of its own:
     // it is a MODE, it is read-only, and a mode that is spelled differently from its siblings is a
     // mode somebody forgets to hold to the same identity requirements.
-    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority' || arg === '--witness' || arg === '--bind-migration') options.mode = arg.slice(2)
+    if (arg === '--fence' || arg === '--release' || arg === '--preflight' || arg === '--print-migration-url' || arg === '--plan' || arg === '--audit-authority' || arg === '--witness' || arg === '--bind-migration' || arg === '--ensure-migration-role') options.mode = arg.slice(2)
+    else if (arg.startsWith('--migration-role=')) options.migrationRole = arg.slice('--migration-role='.length)
     else if (arg.startsWith('--state-file=')) options.stateFile = arg.slice('--state-file='.length)
     else if (arg.startsWith('--state-owner=')) options.stateOwnerUid = Number(arg.slice('--state-owner='.length))
     else if (arg.startsWith('--app-role=')) options.appRole = arg.slice('--app-role='.length)
@@ -1848,7 +1987,55 @@ async function otherClientBackends(client) {
  * is deliberate: a preflight that asks a DIFFERENT question is a preflight that passes and
  * then fails after the stop.
  */
-async function assessFence(client, appRole) {
+/**
+ * What the SERVER says about the migration role, in the terms assessMigrationRoleAttributes() takes.
+ * `exists: false` when there is no such role. One query, so the answer is one snapshot.
+ */
+async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
+  const { rows } = await client.query(
+    `SELECT r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
+            current_setting('server_version_num')::int AS server_version_num,
+            -- 'SET' is a PostgreSQL 16 mode of pg_has_role(); before it, MEMBER is what answers
+            -- "may SET ROLE". The CASE keeps the unknown mode from ever being evaluated on 15.
+            CASE WHEN current_setting('server_version_num')::int >= 160000
+                 THEN pg_has_role(r.oid, a.oid, 'SET')
+                 ELSE pg_has_role(r.oid, a.oid, 'MEMBER') END AS can_set_app_role,
+            pg_has_role(a.oid, r.oid, 'MEMBER') AS app_is_member,
+            -- A membership the application role does not itself have. Reaching any such role is
+            -- what a RESET ROLE on a migration connection must not buy.
+            EXISTS (SELECT 1 FROM pg_roles x
+                     WHERE x.oid <> r.oid
+                       AND pg_has_role(r.oid, x.oid, 'MEMBER')
+                       AND NOT (x.oid = a.oid OR pg_has_role(a.oid, x.oid, 'MEMBER'))) AS reaches_other_roles,
+            adm.rolsuper AS admin_is_superuser, adm.rolcreaterole AS admin_createrole,
+            EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.roleid = r.oid AND m.member = adm.oid AND m.admin_option) AS admin_has_admin_option
+       FROM pg_roles r, pg_roles a, pg_roles adm
+      WHERE r.rolname = $1 AND a.rolname = $2 AND adm.rolname = current_user`,
+    [migrationRole, appRole],
+  )
+  const row = rows[0]
+  const serverVersionNum = Number((await client.query(`SELECT current_setting('server_version_num')::int AS v`)).rows[0]?.v ?? 0)
+  const base = { migrationRole, appRole, database: facts.database, adminRole: facts.admin_role, serverVersionNum }
+  if (!row) return { ...base, exists: false }
+  return {
+    ...base,
+    exists: true,
+    rolsuper: row.rolsuper === true,
+    rolcreaterole: row.rolcreaterole === true,
+    rolcreatedb: row.rolcreatedb === true,
+    rolreplication: row.rolreplication === true,
+    rolbypassrls: row.rolbypassrls === true,
+    canSetAppRole: row.can_set_app_role === true,
+    appIsMember: row.app_is_member === true,
+    reachesOtherRoles: row.reaches_other_roles === true,
+    adminIsSuperuser: row.admin_is_superuser === true,
+    adminCreaterole: row.admin_createrole === true,
+    adminHasAdminOption: row.admin_has_admin_option === true,
+    directConnect: granteeHasConnect(facts.datacl_privileges, migrationRole),
+  }
+}
+
+async function assessFence(client, appRole, migrationRole = '') {
   const facts = await readFacts(client, appRole)
   const effective = await readEffectiveConnect(client, appRole)
   const plan = planConnectionFence({
@@ -1861,6 +2048,7 @@ async function assessFence(client, appRole) {
     appRoleHasConnect: granteeHasConnect(facts.datacl_privileges, appRole),
     appRoleHasEffectiveConnect: effective.stillConnects,
     directConnectGrantees: listDirectConnectGrantees(facts.datacl_privileges),
+    migrationRole,
   })
   const role = assessMigrationRole({
     adminRole: facts.admin_role,
@@ -1868,7 +2056,12 @@ async function assessFence(client, appRole) {
     adminIsSuperuser: facts.admin_is_superuser === true,
     adminCanSetAppRole: facts.admin_can_set_app_role === true,
   })
-  return { facts, plan, role }
+  // THE MIGRATION LOGIN, asked of the server (owner decision C3). null when the caller named none:
+  // the entrypoints always do, through db_fence_exec_root().
+  const migration = migrationRole
+    ? assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, facts))
+    : null
+  return { facts, plan, role, migration }
 }
 
 /** Shared by --preflight and --fence: the admin URL is the ONLY connection either may use. */
@@ -1966,7 +2159,7 @@ export async function probeApplicationConnection(connectionString) {
  */
 async function doPreflight(client, options) {
   const appRole = options.appRole || options.appUser
-  const { facts, plan, role } = await assessFence(client, appRole)
+  const { facts, plan, role, migration } = await assessFence(client, appRole, options.migrationRole)
 
   // THE SAME QUESTIONS ARE ONLY THE SAME QUESTIONS IF THEY ARE ASKED OF THE SAME DATABASE.
   // Asked here as well as in --fence for the reason this whole mode exists: a preflight that
@@ -1985,10 +2178,18 @@ async function doPreflight(client, options) {
     console.error(`NOT FENCED: ${role.reason}`)
     return EXIT_NOT_FENCEABLE
   }
+  if (migration && !migration.usable) {
+    console.error(`NOT FENCED: ${migration.reason}`)
+    return EXIT_NOT_FENCEABLE
+  }
 
   console.error(`Preflight: ${facts.database} is fenceable.`)
   console.error(`  CONNECT would be revoked from: ${plan.revoke.join(', ')}`)
-  console.error(`  the migration would connect as ${facts.admin_role} and RUN AS ${appRole}, so what it creates is owned by ${appRole}.`)
+  if (options.migrationRole) {
+    console.error(`  the migration would connect as ${options.migrationRole} (no privilege of its own; ${facts.admin_role} stays with root) and RUN AS ${appRole}, so what it creates is owned by ${appRole}.`)
+  } else {
+    console.error(`  the migration would connect as ${facts.admin_role} and RUN AS ${appRole}, so what it creates is owned by ${appRole}.`)
+  }
   console.error('  Nothing was revoked, terminated or written by this check.')
   return EXIT_OK
 }
@@ -2015,7 +2216,7 @@ async function assessFenceRequest(client, options, prefix) {
   }
 
   const appRole = options.appRole || options.appUser
-  const { facts, plan: freshPlan, role } = await assessFence(client, appRole)
+  const { facts, plan: freshPlan, role, migration } = await assessFence(client, appRole, options.migrationRole)
 
   // BEFORE ANYTHING IS REVOKED (o3d-2sm1.5, Codex r13 CRITICAL). A fence raised on a database
   // that is not the application's locks other people's clients out of somewhere else while the
@@ -2033,6 +2234,12 @@ async function assessFenceRequest(client, options, prefix) {
   // itself and leave every new object unusable by the application (o3d-2sm1.5).
   if (!role.usable) {
     console.error(`${prefix}: ${role.reason}`)
+    return { exitCode: EXIT_NOT_FENCEABLE }
+  }
+  // AND THE MIGRATION LOGIN, for the same reason: a fence raised while the login the migration
+  // needs is missing, privileged or locked out by the revoke is a window with no way through it.
+  if (migration && !migration.usable) {
+    console.error(`${prefix}: ${migration.reason}`)
     return { exitCode: EXIT_NOT_FENCEABLE }
   }
 
@@ -2625,8 +2832,8 @@ export async function doFence(client, options) {
     console.error(`NOT FENCED: there is no connection-fence authority at ${options.stateFile || '<no --state-file was given>'}, so nothing has recorded what this fence would revoke.`)
     console.error('A REVOKE survives a power cut and this file is the only thing that undoes it, so the record is')
     console.error('published — by root, durably — BEFORE any revoke is issued, and this mode executes what it says.')
-    console.error('It is not written from here: this process runs as the application account, and a record that')
-    console.error('account can write is a list of roles it chooses to hand CONNECT back to.')
+    console.error('It is not written from here: the record is published by the validator, and a record that')
+    console.error('anything else can write is a list of roles it chooses to hand CONNECT back to.')
     console.error('Run the plan-and-publish step first; the entrypoints do it on every fence.')
     return EXIT_NOT_FENCEABLE
   }
@@ -3547,6 +3754,117 @@ export async function doAuditAuthority(client, options) {
   return EXIT_FENCE_UNPROVEN
 }
 
+/**
+ * --print-migration-url: open the window's login and print the connection string for it.
+ *
+ * THE ADMIN CREDENTIAL IS USED HERE, BY ROOT, AND NOWHERE ELSE IN THE WINDOW'S REACH (owner decision
+ * C3, o3d-1bgr). This connects as the admin, proves from the server that the migration role is
+ * worth nothing (assessMigrationRoleAttributes), gives it a password minted for this window and
+ * prints a URL that contains that role and that password and not the admin login. The password is
+ * 256 random bits sent as a SCRAM verifier, so it is in no server log, and `--release` closes the
+ * login again. An interrupted window leaves a password nobody holds: the next run mints another.
+ */
+export async function doPrintMigrationUrl(client, options, adminUrl) {
+  const appRole = options.appRole || options.appUser
+  if (!appRole) {
+    console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the migration login.')
+    return EXIT_ERROR
+  }
+  if (!options.migrationRole) {
+    console.error('NO MIGRATION URL: --migration-role names no role. Refusing to fall back to the admin login: that is the credential this exists to keep out of the migration.')
+    return EXIT_ERROR
+  }
+  const facts = await readFacts(client, appRole)
+  if (!facts) {
+    console.error('NO MIGRATION URL: the connection did not report the database it is attached to.')
+    return EXIT_ERROR
+  }
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NO MIGRATION URL', options)) return EXIT_ERROR
+  if (!facts.app_role_exists) {
+    console.error(`NO MIGRATION URL: the role ${appRole} named by --app-user does not exist on this server.`)
+    return EXIT_ERROR
+  }
+  if (options.migrationRole === facts.admin_role || options.migrationRole === appRole) {
+    console.error(`NO MIGRATION URL: the migration role ${options.migrationRole} is the ${options.migrationRole === appRole ? 'application' : 'deploy admin'} role. The migration login must be a role of its own.`)
+    return EXIT_ERROR
+  }
+  const verdict = assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, options.migrationRole, facts))
+  if (!verdict.usable) {
+    console.error(`NO MIGRATION URL: ${verdict.reason}`)
+    return EXIT_ERROR
+  }
+  const password = randomBytes(32).toString('hex')
+  await client.query(buildMigrationLoginStatement(options.migrationRole, scramSha256Verifier(password)))
+  MACHINE_CHANNEL.write(`${buildMigrationLoginUrl(adminUrl, options.migrationRole, password, appRole, options.migrationNonce)}\n`)
+  console.error(`The migration connects as ${options.migrationRole} (a fresh password for this window; no privilege of its own) and RUNS AS ${appRole}. The deploy admin login is not in that URL.`)
+  return EXIT_OK
+}
+
+/**
+ * --ensure-migration-role: create the migration role if it is missing and prove it is what it must be.
+ *
+ * Idempotent, and it never ALTERs a role that already exists: one that carries a privilege it must not
+ * have is REFUSED by name, not quietly demoted, because a role somebody else made under this name is
+ * a fact an operator should know about. Allowed under a standing fence (the role is exempt from it).
+ */
+export async function doEnsureMigrationRole(client, options) {
+  const appRole = options.appRole || options.appUser
+  const migrationRole = options.migrationRole
+  if (!appRole || !migrationRole) {
+    console.error('NOT ENSURED: both --app-user and --migration-role are required.')
+    return EXIT_ERROR
+  }
+  const facts = await readFacts(client, appRole)
+  if (!facts) {
+    console.error('NOT ENSURED: the connection did not report the database it is attached to.')
+    return EXIT_ERROR
+  }
+  if (!requireBoundDatabaseIdentity(attachmentOf(facts), 'NOT ENSURED', options)) return EXIT_ERROR
+  if (!facts.app_role_exists) {
+    console.error(`NOT ENSURED: the role ${appRole} named by --app-user does not exist on this server.`)
+    return EXIT_ERROR
+  }
+  if (migrationRole === appRole || migrationRole === facts.admin_role) {
+    console.error(`NOT ENSURED: the migration role ${migrationRole} is the ${migrationRole === appRole ? 'application' : 'deploy admin'} role.`)
+    return EXIT_ERROR
+  }
+  const modern = Number((await client.query(`SELECT current_setting('server_version_num')::int AS v`)).rows[0]?.v ?? 0) >= 160000
+  const { rows } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [migrationRole])
+  if (rows.length === 0) {
+    await client.query(`CREATE ROLE ${quoteIdent(migrationRole)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`)
+    console.error(`Created the role ${migrationRole}.`)
+  }
+  await client.query(`GRANT ${quoteIdent(appRole)} TO ${quoteIdent(migrationRole)}${modern ? ' WITH INHERIT TRUE, SET TRUE' : ''}`)
+  await client.query(`GRANT CONNECT ON DATABASE ${quoteIdent(facts.database)} TO ${quoteIdent(migrationRole)}`)
+  const after = await readFacts(client, appRole)
+  const verdict = assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, after))
+  if (!verdict.usable) {
+    console.error(`NOT ENSURED: ${verdict.reason}`)
+    return EXIT_ERROR
+  }
+  console.error(`The migration role ${migrationRole} is in place and has no privilege of its own.`)
+  return EXIT_OK
+}
+
+/**
+ * The end of the window: close the migration login. Best effort and ADVISORY -- the release itself
+ * already succeeded, and the next window mints a different password in any case -- so a failure here
+ * is a line on stderr and never a change to the exit status. Without the admin connection (a release
+ * that fell back to the application's own URL) the ALTER is refused by the server, which is the same
+ * advisory line.
+ */
+export async function retireMigrationLogin(client, migrationRole) {
+  if (!migrationRole) return
+  try {
+    const { rows } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [migrationRole])
+    if (rows.length === 0) return
+    await client.query(buildMigrationLogoutStatement(migrationRole))
+    console.error(`The migration login ${migrationRole} is closed (NOLOGIN, no password).`)
+  } catch (error) {
+    console.error(`ADVISORY: could not close the migration login ${migrationRole} (${error instanceof Error ? error.message : String(error)}). The fence is released; the next window sets a different password on it. To close it by hand: ${buildMigrationLogoutStatement(migrationRole)};`)
+  }
+}
+
 async function main() {
   // THE MACHINE CHANNEL IS SEALED BEFORE A SINGLE LINE IS PRINTED (o3d-secops r32, Codex HIGH 1).
   // From here `console.log` writes to stderr, so stdout carries the machine lines this file writes
@@ -3574,9 +3892,9 @@ async function main() {
   // opened is proven against the connection itself (assessDatabaseIdentity, and the postmaster
   // stamp in --release).
   const options = parseArgs(process.argv.slice(2))
-  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority', 'witness', 'bind-migration']
+  const modes = ['plan', 'fence', 'release', 'preflight', 'print-migration-url', 'audit-authority', 'witness', 'bind-migration', 'ensure-migration-role']
   if (!modes.includes(options.mode)) {
-    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--witness|--bind-migration|--print-migration-url) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--timeout-seconds=N] [--witness-nonce=HEX] [--witness-lock=HEX] [--witness-challenge=HEX] [--migration-nonce=HEX]')
+    console.error('Usage: node scripts/fence-db-connections.mjs (--preflight|--plan|--fence|--release|--audit-authority|--witness|--bind-migration|--print-migration-url|--ensure-migration-role) --app-host=HOST --app-port=PORT --app-user=ROLE --app-database=NAME [--state-file=PATH] [--state-owner=UID] [--app-role=ROLE] [--migration-role=ROLE] [--timeout-seconds=N] [--witness-nonce=HEX] [--witness-lock=HEX] [--witness-challenge=HEX] [--migration-nonce=HEX]')
     process.exit(EXIT_ERROR)
   }
 
@@ -3600,19 +3918,21 @@ async function main() {
     `The application connects to ${supplied.identity.database} at ${supplied.identity.host}:${supplied.identity.port} as ${supplied.identity.user}, as supplied by the caller. Nothing here infers it.`,
   )
 
-  // Opens no connection: it is pure string work over two environment variables, and the
-  // caller needs it BEFORE the migration runs, from a shell that cannot parse a URL safely.
+  // Connects as the ADMIN, once, to open the migration role's login for this window (see
+  // doPrintMigrationUrl). It never falls back to another URL: the admin is the one credential this
+  // mode exists to keep out of what it prints.
   if (options.mode === 'print-migration-url') {
     if (!process.env.DEPLOY_ADMIN_DATABASE_URL) {
-      console.error('DEPLOY_ADMIN_DATABASE_URL is not set — there is no privileged connection to compose a migration URL from.')
+      console.error('DEPLOY_ADMIN_DATABASE_URL is not set — there is no privileged connection to open the migration login with.')
       process.exit(EXIT_ERROR)
     }
-    const appRole = options.appRole || options.appUser
-    if (!appRole) {
-      console.error('--app-user names no role, so the migration has no role to run as. Refusing to emit a URL that would create objects owned by the admin.')
-      process.exit(EXIT_ERROR)
+    const urlClient = new pg.Client({ connectionString: process.env.DEPLOY_ADMIN_DATABASE_URL, application_name: 'ims-deploy-fence' })
+    await urlClient.connect()
+    try {
+      process.exitCode = await doPrintMigrationUrl(urlClient, options, process.env.DEPLOY_ADMIN_DATABASE_URL)
+    } finally {
+      await urlClient.end().catch(() => {})
     }
-    MACHINE_CHANNEL.write(`${buildMigrationConnectionString(process.env.DEPLOY_ADMIN_DATABASE_URL, appRole, options.migrationNonce)}\n`)
     return
   }
 
@@ -3645,11 +3965,11 @@ async function main() {
   // fence is up" into "the audit could not run", which is the one reading that must not be
   // produced by the situation it is there to diagnose.
   const connectionString =
-    options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'audit-authority' || options.mode === 'witness'
+    options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'audit-authority' || options.mode === 'witness' || options.mode === 'ensure-migration-role'
       ? process.env.DEPLOY_ADMIN_DATABASE_URL
       : process.env.DEPLOY_ADMIN_DATABASE_URL || process.env.DIRECT_URL || process.env.DATABASE_URL
   if (!connectionString) {
-    if (options.mode === 'preflight' || options.mode === 'plan') {
+    if (options.mode === 'preflight' || options.mode === 'plan' || options.mode === 'ensure-migration-role') {
       requireAdminUrl('this deploy')
       process.exit(EXIT_NOT_FENCEABLE)
     }
@@ -3709,7 +4029,14 @@ async function main() {
     // READ-ONLY, and it is the one mode that neither fences nor releases: it reports what the ACL
     // says about a record nothing on the filesystem can settle. See doAuditAuthority().
     else if (options.mode === 'audit-authority') process.exitCode = await doAuditAuthority(client, options)
-    else process.exitCode = await doRelease(client, options)
+    else if (options.mode === 'ensure-migration-role') process.exitCode = await doEnsureMigrationRole(client, options)
+    else {
+      process.exitCode = await doRelease(client, options)
+      // Released, or already released: the window is over, so its login is closed.
+      if (process.exitCode === EXIT_OK || process.exitCode === EXIT_ALREADY_RELEASED) {
+        await retireMigrationLogin(client, options.migrationRole)
+      }
+    }
   } finally {
     await client.end()
   }
