@@ -106,14 +106,14 @@ test('one grant is no grant for another connector; a grant names a destination, 
   }
   // The Xero and Mintsoft writes are not unlocked by the WooCommerce grant.
   assert.equal(outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url: 'https://api.xero.com/x', headers: { 'xero-tenant-id': TENANT }, env })?.code, 'no_grant')
-  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', mintsoftClientId: '89', env })?.code, 'no_grant')
+  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', writeScopeId: '89', env })?.code, 'no_grant')
 })
 
 test('Mintsoft grant covers a base path (the local fake) and refuses a sibling path', () => {
   const env = { MINTSOFT_WRITE_ALLOWED: 'http://127.0.0.1:3100/api/e2e/mintsoft|89' }
-  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/e2e/mintsoft/api/Order', mintsoftClientId: '89', env }), null)
-  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/Order', mintsoftClientId: '89', env })?.code, 'destination_mismatch')
-  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/e2e/mintsoft-evil/api/Order', mintsoftClientId: '89', env })?.code, 'destination_mismatch')
+  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/e2e/mintsoft/api/Order', writeScopeId: '89', env }), null)
+  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/Order', writeScopeId: '89', env })?.code, 'destination_mismatch')
+  assert.equal(outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'http://127.0.0.1:3100/api/e2e/mintsoft-evil/api/Order', writeScopeId: '89', env })?.code, 'destination_mismatch')
 })
 
 test('outbound:status grant states come from the environment only and cover every connector', () => {

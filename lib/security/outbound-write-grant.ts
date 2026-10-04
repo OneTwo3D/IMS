@@ -299,7 +299,7 @@ export type OutboundRequestFacts = {
   /** The request body as it will be sent, when it is a string (Mintsoft's ClientId is checked in JSON bodies). */
   body?: unknown
   /** The ClientId Mintsoft is configured with, supplied by the Mintsoft client for every request. */
-  mintsoftClientId?: string | number | null
+  writeScopeId?: string | number | null
   env?: OutboundEnv
 }
 
@@ -407,9 +407,9 @@ export function outboundWriteRefusal(facts: OutboundRequestFacts): OutboundWrite
       const isAuthLogin = method === 'POST' && relativePath === '/api/Auth'
       if (isAuthLogin) return null
 
-      const configured = facts.mintsoftClientId === null || facts.mintsoftClientId === undefined
+      const configured = facts.writeScopeId === null || facts.writeScopeId === undefined
         ? ''
-        : String(facts.mintsoftClientId).trim()
+        : String(facts.writeScopeId).trim()
       if (configured === '') return refusal(classification, method, url, 'client_unproven', grant.clientId, null)
       if (configured !== grant.clientId) return refusal(classification, method, url, 'client_mismatch', grant.clientId, configured)
       for (const explicit of explicitMintsoftClientIds(url, facts.body)) {

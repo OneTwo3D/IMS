@@ -70,7 +70,7 @@ async function sendMintsoftRequest<T>(
   }, {
     connectorName: 'Mintsoft',
     allowE2eLocalHttp: true,
-    outboundWriteContext: { mintsoftClientId: clientId },
+    outboundWriteContext: { writeScopeId: clientId },
   })
 
   if (!response.ok) {

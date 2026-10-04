@@ -111,7 +111,7 @@ async function send(testCase: Case, origin: string, grant: Record<string, string
     connectorName: testCase.connectorName,
     allowE2eLocalHttp: true,
     env: env(grant ?? {}),
-    outboundWriteContext: { mintsoftClientId: testCase.mintsoftClientId ?? null },
+    outboundWriteContext: { writeScopeId: testCase.mintsoftClientId ?? null },
   })
 }
 
@@ -172,7 +172,7 @@ test('(b) MINTSOFT BY PATH, NOT METHOD: a GET to /Cancel is refused even though 
   assert.equal(listener.received.length, 1)
 
   await assert.rejects(
-    connectorFetch(target, { method: 'GET' }, { connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(), outboundWriteContext: { mintsoftClientId: '89' } }),
+    connectorFetch(target, { method: 'GET' }, { connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(), outboundWriteContext: { writeScopeId: '89' } }),
     isOutboundWriteHeldError,
   )
   assert.equal(listener.received.length, 1, 'the GET /Cancel reached nothing: only the control read arrived')
@@ -223,7 +223,7 @@ test('(d) UNREADABLE GRANT = DENY: a list, a path, credentials, a bare host, a f
   for (const value of msBad) {
     await assert.rejects(connectorFetch(`${o}/api/Order`, { method: 'PUT', body: '{"ClientId":89}' }, {
       connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env({ MINTSOFT_WRITE_ALLOWED: value }),
-      outboundWriteContext: { mintsoftClientId: '89' },
+      outboundWriteContext: { writeScopeId: '89' },
     }), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'unreadable_grant', `Mintsoft ${value}`)
     refused += 1
   }
@@ -242,7 +242,7 @@ test('Mintsoft ClientId: a grant for ClientId 89 refuses a write configured for 
   const listener = await startListener()
   const grant = { MINTSOFT_WRITE_ALLOWED: `${listener.origin}|89` }
   const attempt = (body: string, clientId: string | null) => connectorFetch(`${listener.origin}/api/Order`, { method: 'PUT', body }, {
-    connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(grant), outboundWriteContext: { mintsoftClientId: clientId },
+    connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(grant), outboundWriteContext: { writeScopeId: clientId },
   })
   console.log('precondition (clientid): grant names ClientId 89 on the listener base')
   await assert.rejects(attempt('{}', '101'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_mismatch')

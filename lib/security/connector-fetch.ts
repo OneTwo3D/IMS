@@ -22,12 +22,12 @@ export type ConnectorFetchOptions = Pick<
 > & {
   lookup?: ConnectorDnsLookup
   /**
-   * Facts the outbound-write hold needs that the request itself does not carry. Mintsoft scopes writes
-   * by ClientId; the Mintsoft client passes the ClientId it is configured with so the hold can compare
-   * it with the granted one. Absent means "not established", which the hold treats as a refusal for any
-   * Mintsoft write that is not the key-minting login.
+   * Facts the outbound-write hold needs that the request itself does not carry. A connector whose writes
+   * are scoped by an account-like id (a 3PL client id) passes the id it is configured with so the hold can
+   * compare it with the granted one. Absent means "not established", which the hold treats as a refusal
+   * for any scoped write except the one that mints credentials.
    */
-  outboundWriteContext?: { mintsoftClientId?: string | number | null }
+  outboundWriteContext?: { writeScopeId?: string | number | null }
 }
 
 const MAX_REDIRECTS = 5
@@ -413,7 +413,7 @@ export async function connectorFetch(
         url,
         headers,
         body,
-        mintsoftClientId: options.outboundWriteContext?.mintsoftClientId,
+        writeScopeId: options.outboundWriteContext?.writeScopeId,
         env: options.env,
       })
       if (heldRefusal) {
