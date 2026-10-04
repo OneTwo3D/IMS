@@ -11,7 +11,7 @@ import { precondition } from './helpers.ts'
 const enc = (text: string) => new TextEncoder().encode(text)
 
 test('strict CSV: a UTF-8 BOM is stripped and reported, CRLF and embedded newlines keep line numbers', (t) => {
-  const parsed = parseCsvStrict('﻿a,b\r\n1,"x\ny"\r\n\r\n2,3\r\n')
+  const parsed = parseCsvStrict('\ufeffa,b\r\n1,"x\ny"\r\n\r\n2,3\r\n')
   precondition(t, 'records', parsed.rows.length)
   assert.equal(parsed.hadBom, true)
   assert.deepEqual(parsed.header, ['a', 'b'])
@@ -31,7 +31,7 @@ test('strict CSV: round trip through the writer is exact for commas, quotes and 
   const parsed = parseCsvStrict(text)
   precondition(t, 'cells', rows[0].length)
   assert.deepEqual(parsed.rows[0].cells, rows[0])
-  assert.ok(!text.startsWith('﻿'), 'no BOM is ever written')
+  assert.ok(!text.startsWith('\ufeff'), 'no BOM is ever written')
   assert.ok(text.endsWith('\r\n'))
 })
 
@@ -113,7 +113,7 @@ test('column map: expectedHeaders pins the sample header against export drift; a
 test('decimal parsing: accepted and refused forms', (t) => {
   const limits = { maxIntDigits: 8, maxDp: 6 }
   const accepted = ['0', '12', '12.5', '0.000001', '007', '99999999.999999']
-  const refused = ['', ' ', '1,5', '1.5.5', '1e3', 'NaN', 'Infinity', '٣', '1_000', '- 1', '12345678.1234567', '100000000']
+  const refused = ['', ' ', '1,5', '1.5.5', '1e3', 'NaN', 'Infinity', '\u0663', '1_000', '- 1', '12345678.1234567', '100000000']
   precondition(t, 'forms', accepted.length + refused.length)
   for (const text of accepted) assert.equal(parseDecimal(text, 'x', limits).ok, true, text)
   for (const text of refused) assert.equal(parseDecimal(text, 'x', limits).ok, false, text)

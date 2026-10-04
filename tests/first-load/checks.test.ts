@@ -23,7 +23,7 @@ test('SKU normalisation: outer whitespace is trimmed and other datasets resolve 
 
 test('SKU collisions, forbidden characters and "#" are rejected, and ALL colliding rows are rejected (no arbitrary winner)', (t) => {
   const collision = run({ products: ds('products', [product('abc'), product('ABC'), product('other')]) })
-  const bad = run({ products: ds('products', [product('#hash'), product('with nbsp'), product('ok')]) })
+  const bad = run({ products: ds('products', [product('#hash'), product('with\u00a0nbsp'), product('ok')]) })
   precondition(t, 'collision cases', 2)
   assert.deepEqual(rejectedCodes(collision, 'products'), ['SKU_CASE_COLLISION', 'SKU_CASE_COLLISION'])
   assert.deepEqual(rejectedCodes(bad, 'products'), ['BAD_SKU', 'BAD_SKU'])

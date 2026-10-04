@@ -1,10 +1,10 @@
 /**
  * Strict CSV reading and plain CSV writing for the first-load tools.
  *
- * WHY NOT `lib/csv.ts`. Its `parseCsv` is written for forgiving operator uploads: it keeps a UTF-8 BOM glued to the
- * first header (so the column "sku" becomes "<BOM>sku"), pads a short row with empty strings, ignores any row whose first
- * cell starts with "#", and accepts a quote in the middle of a field. Every one of those turns a damaged input into a
- * quietly different row. This reader rejects them instead, and reports the physical line of every record.
+ * WHY NOT `lib/csv.ts`. Its `parseCsv` is written for forgiving operator uploads: it pads a short row with empty strings
+ * and drops the extra cells of a long one, ignores any row whose first cell starts with "#", and accepts a quote in the
+ * middle of a field. Each of those turns a damaged input into a quietly different row. (A leading BOM is harmless there:
+ * its header `trim()` removes it.) This reader rejects them instead, and reports the physical line of every record.
  *
  * The WRITER emits exactly what the importers' own parser reads back: RFC 4180 quoting, CRLF, no BOM, and none of
  * `lib/csv.ts`'s formula-prefix rewriting (the importers do not strip it, so it would alter the data).
