@@ -1072,7 +1072,7 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs">{row.connector}</TableCell>
                   <TableCell className="text-xs">{row.type} <span className="text-muted-foreground">({row.status})</span></TableCell>
                   <TableCell className="text-xs font-mono">{row.referenceType}/{row.referenceId}</TableCell>
-                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalTransactionId ?? '—'}{row.standingLabel ? <span className="ml-1 text-amber-700 dark:text-amber-400" data-testid="backlog-standing">({row.standingLabel})</span> : null}</TableCell>
                   <TableCell className="text-xs">{row.owedSince ? new Date(row.owedSince).toLocaleString() : '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.blockedBy} — {row.operatorRemedy}</TableCell>
                 </TableRow>

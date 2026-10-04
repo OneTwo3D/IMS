@@ -1699,6 +1699,11 @@ function HistoryEntryRow({
             <div className="text-[10px] mt-0.5">
               {STATUS_BADGE[entry.status]?.label ?? entry.status}
             </div>
+            {entry.standingLabel && (
+              <div className="text-[10px] mt-0.5 text-amber-700 dark:text-amber-400" title={entry.standingDetail} data-testid="batch-history-standing">
+                {entry.standingLabel}
+              </div>
+            )}
           </div>
           {canRetry && (
             <Button

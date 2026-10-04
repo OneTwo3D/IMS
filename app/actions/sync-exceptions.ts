@@ -53,7 +53,10 @@ import {
   accountingSyncRowIsProvablyUnsent,
   accountingSyncRowPostedAnEarlierPosting,
   claimPostingForHandPosting,
+  describeEarlierPostings,
   describeRetiredUnproven,
+  earlierPostingOf,
+  type EarlierPosting,
   retiredUnprovenNotes,
   markPostingHandled,
   MarkHandledRaceError,
@@ -554,6 +557,8 @@ export type AccountingFollowUpObligationRow = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /** Codex round 6: null for a confirmed or queued row; set when the id rests on an operator (asserted) or nothing proves it (unproven). */
+  standingLabel: string | null
   owedSince: string | null
   blockedBy: string
   operatorRemedy: string
@@ -625,6 +630,8 @@ export type AccountingPostingRefusalRow = {
    * hand REPLACES it rather than joining it.
    */
   earlierPostings: string[]
+  /** Codex round 6: each earlier posting WITH ITS STANDING (confirmed by the connector, or an id an operator typed in). */
+  earlierPostingDetails: EarlierPosting[]
   /**
    * o3d-1e7sl (C1) — EARLIER ATTEMPTS IMS RETIRED WITHOUT PROOF THAT THEY NEVER REACHED THE LEDGER.
    *
@@ -1266,6 +1273,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         referenceType: true,
         referenceId: true,
         externalTransactionId: true,
+        settlementBasis: true,
+        abandonedBeforeRemoteCall: true,
         backReferenceFollowUpsPendingAt: true,
         // r8: the AGE columns, and both are stamped by the DATABASE. `owedSince` is the claim's own
         // clock_timestamp() stamp, else createdAt (a database now() default). NOT the marker, which
@@ -1637,6 +1646,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
           )
           const queuedRow = classified?.queuedRow ?? null
           const earlierPostings = classified?.earlierPostings ?? []
+          const earlierPostingDetails = classified?.earlierPostingDetails ?? []
           const retiredUnproven = classified?.retiredUnproven ?? []
           const handPostClaim = row.handPostClaimedAt
             ? {
@@ -1655,6 +1665,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             unconfirmed: false,
             queuedRow,
             earlierPostings,
+            earlierPostingDetails,
             retiredUnproven,
             handPostClaim,
             handPostDeferredEdits: row.handPostDeferredCount,
@@ -1673,7 +1684,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             remedy: row.remedy,
             handPostOrder: clearing === null || clearing === 'auto'
               ? null
-              : handPostOrderFor({ queuedRow, earlierPostings, retiredUnproven, claim: handPostClaim }),
+              : handPostOrderFor({ queuedRow, earlierPostingDetails, retiredUnproven, claim: handPostClaim }),
           }
         })
       })(),
@@ -1752,6 +1763,7 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     // claim (a provisional claim is not yet known to be owed, so it may not be settled by hand at all), and
     // therefore no order of operations. Its own remedy is the whole of what it can say.
     earlierPostings: [],
+    earlierPostingDetails: [],
     retiredUnproven: [],
     handPostClaim: null,
     handPostOrder: null,
@@ -1789,7 +1801,7 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
  * the same function the row-creating primitive keys its clear on — decides whether a row belongs to this
  * refusal's posting or to a different one sharing the reference.
  */
-type QueuedRowClassification = { queuedRow: 'unsent' | 'may-be-sent' | null; earlierPostings: string[]; retiredUnproven: string[] }
+type QueuedRowClassification = { queuedRow: 'unsent' | 'may-be-sent' | null; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
 
 async function classifyQueuedRowsForRefusals(
   refusals: Array<{ type: string; referenceType: string; referenceId: string; scope: string }>,
@@ -1818,14 +1830,14 @@ async function classifyQueuedRowsForRefusals(
   for (const row of retiredUnproven) {
     const key = accountingPostingKeyForRow(row)
     const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
-    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], retiredUnproven: [] }
+    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
     classification.set(id, at)
     at.retiredUnproven.push(...retiredUnprovenNotes([row]))
   }
   for (const row of live) {
     const key = accountingPostingKeyForRow(row)
     const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
-    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], retiredUnproven: [] }
+    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
     classification.set(id, at)
     /**
      * o3d-j625 r16 (Codex round 15, HIGH 2) — A COMPLETED POSTING OF AN EARLIER EDIT IS NOT A ROW THAT
@@ -1842,6 +1854,7 @@ async function classifyQueuedRowsForRefusals(
      */
     if (accountingSyncRowPostedAnEarlierPosting(row)) {
       at.earlierPostings.push(row.externalTransactionId ?? `${row.status} row`)
+      at.earlierPostingDetails.push(earlierPostingOf(row))
       continue
     }
     // 'may-be-sent' WINS over 'unsent' when a key has both: the instruction has to be safe for the worst
@@ -2155,15 +2168,14 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
         + (result.cancelledSyncRows.length > 0
           ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.`
           : '.')
-        + (result.earlierPostings.length > 0
-          ? ` IMS records the ledger as already holding ${result.earlierPostings.join(', ')} for this obligation from an earlier `
-            + 'version of the document; the hand posting replaces it.'
-          : '')
+        // Codex round 6: carries each earlier posting's STANDING; "replaces" is only ever said of a CONFIRMED document.
+        + describeEarlierPostings(result.earlierPostingDetails)
         + describeRetiredUnproven(result.retiredUnproven),
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,
         earlierPostings: result.earlierPostings,
+        earlierPostingDetails: result.earlierPostingDetails,
         retiredUnproven: result.retiredUnproven,
         claimedAt: result.claimedAt.toISOString(),
       },

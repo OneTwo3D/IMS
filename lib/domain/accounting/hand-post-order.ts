@@ -1,4 +1,4 @@
-import { describeRetiredUnproven } from '@/lib/domain/accounting/posting-mark-handled'
+import { describeEarlierPostings, describeRetiredUnproven, type EarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 
 /**
  * ── o3d-j625 r16 — WHAT TO DO *FIRST*, for a refusal a person can close by hand ──
@@ -14,15 +14,11 @@ import { describeRetiredUnproven } from '@/lib/domain/accounting/posting-mark-ha
  */
 export function handPostOrderFor(state: {
   queuedRow: 'unsent' | 'may-be-sent' | null
-  earlierPostings: string[]
+  earlierPostingDetails: EarlierPosting[]
   retiredUnproven: string[]
   claim: { at: string; byName: string | null; mine: boolean } | null
 }): string {
-  const earlier = state.earlierPostings.length > 0
-    ? ' IMS records the ledger as ALREADY holding '
-      + `${state.earlierPostings.join(', ')} for this obligation (a settled record, not something IMS re-read), from an earlier version of this document — `
-      + 'your hand posting REPLACES that document; do not raise a second one.'
-    : ''
+  const earlier = describeEarlierPostings(state.earlierPostingDetails)
   // o3d-1e7sl (C1): earlier attempts retired without proof are never "nothing posted". Appended to every
   // branch the operator can still act on, because each of them ends in a hand posting.
   const retired = describeRetiredUnproven(state.retiredUnproven)
@@ -30,9 +26,14 @@ export function handPostOrderFor(state: {
   // retired attempt may have reached the ledger, so "post it now" would raise a DUPLICATE; the check comes first and
   // the post is ONLY for an absent document. (An appended caution after an unconditional "post it" is not a condition.)
   const hasRetired = state.retiredUnproven.length > 0
+  // Codex round 6: an earlier posting the ledger did NOT confirm is the same hazard from the other side: the hand posting
+  // REPLACES it only if it exists. The primary instruction is conditional on that too.
+  const hasUnverifiedEarlier = state.earlierPostingDetails.some((e) => e.standing !== 'CONFIRMED_POSTED')
   const postStep = hasRetired
     ? 'check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again - just'
-    : 'post it in the ledger now, then'
+    : hasUnverifiedEarlier
+      ? 'check the ledger for the earlier document first. If it exists there, update that document rather than raising a second one; if it is absent, post this as a new document. Then'
+      : 'post it in the ledger now, then'
   if (state.claim?.mine) {
     return 'YOU are settling this by hand. IMS will not queue this posting while you hold it, so take your '
       + `time: ${postStep} press "Mark as handled" to confirm it and close this row. If `
@@ -62,7 +63,9 @@ export function handPostOrderFor(state: {
     + 'while you are in the ledger. '
     + (hasRetired
       ? 'Then check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again - just press "Mark as handled".'
-      : 'Then post it, then press "Mark as handled".')
+      : hasUnverifiedEarlier
+        ? 'Then check the ledger for the earlier document first. If it exists there, update that document rather than raising a second one; if it is absent, post this as a new document. Then press "Mark as handled".'
+        : 'Then post it, then press "Mark as handled".')
     + earlier
     + retired
 }

@@ -644,9 +644,30 @@ test('[o3d-j625 r16 HIGH 2] an EARLIER edit\'s completed row leaves the newly re
   assert.ok(row.handPostOrder)
   assert.match(row.handPostOrder, /Take for hand posting" FIRST/,
     'so the way forward is the ordinary one — take it, post it, confirm it')
-  assert.match(row.handPostOrder, /ALREADY holding INV-EDIT-1/,
+  assert.match(row.handPostOrder, /ALREADY holds INV-EDIT-1/,
     'with what the ledger holds stated, so the operator edits that document instead of raising a second one')
   assert.equal(row.remedy, invoiceUpdateRefusal.remedy, 'and the site\'s own remedy is verbatim')
+})
+
+test('[o3d-1e7sl Codex r6] an earlier edit whose document id an OPERATOR typed in keeps its standing in the inbox order: not "REPLACES", not "post it now"', async (t) => {
+  liveSyncRows.length = 0
+  liveSyncRows.push({
+    type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-2', payload: {},
+    status: 'SYNCED', attemptRevision: 1, externalTransactionId: 'INV-TYPED-1', settlementBasis: 'OPERATOR_ASSERTION',
+  })
+  allRows.push({ ...invoiceUpdateRefusal, resolvedAt: null })
+  t.after(() => {
+    allRows.splice(allRows.findIndex((row) => row.id === invoiceUpdateRefusal.id), 1)
+    liveSyncRows.length = 0
+  })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === invoiceUpdateRefusal.id)
+  assert.ok(row)
+  assert.deepEqual(row.earlierPostingDetails, [{ ref: 'INV-TYPED-1', standing: 'ASSERTED_POSTED' }], 'the standing survives into the inbox row')
+  assert.match(row.handPostOrder ?? '', /INV-TYPED-1 \(an id an operator typed in\) as posted/)
+  assert.match(row.handPostOrder ?? '', /has NOT verified it: check the ledger for it first. If it exists there, your hand posting REPLACES it/)
+  assert.doesNotMatch(row.handPostOrder ?? '', /ALREADY holds|REPLACES that document|post it in the ledger now|Then post it,/)
 })
 
 test('[o3d-j625 r16 HIGH 2 CONTROL] on a key that names ONE posting for ever, a completed row STILL blocks', async (t) => {

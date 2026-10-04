@@ -6,7 +6,7 @@ import {
   isPostableAccountingSyncStatus,
   retiredUnprovenRows,
 } from '@/lib/domain/accounting/postable-sync-statuses'
-import { ledgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
@@ -281,6 +281,38 @@ export function retiredUnprovenNotes(rows: ReadonlyArray<LedgerStandingRow & { i
  * The notes as an operator-facing sentence, or '' when there are none (o3d-1e7sl). Never says the ledger is
  * clear: the point of the sentence is that IMS cannot say.
  */
+/**
+ * Codex round 6: a completed posting of an EARLIER edit, WITH ITS STANDING. Reducing the row to an id dropped the one fact
+ * the operator needs: whether the ledger CONFIRMED that document or an operator merely typed its id in (an asserted SYNCED
+ * row is an "earlier posting" on a reused key too). The ref is for display; the standing decides the wording.
+ */
+export type EarlierPosting = { ref: string; standing: LedgerStanding }
+
+export function earlierPostingOf(row: LedgerStandingRow & { id?: string }): EarlierPosting {
+  return { ref: row.externalTransactionId ?? `${row.status} row`, standing: ledgerStanding(row) }
+}
+
+/**
+ * The earlier postings as an operator-facing sentence ('' when none). CONFIRMED rows keep the plain statement; every other
+ * standing is "recorded, NOT verified": the hand posting replaces the document ONLY if the ledger has it, and is a new
+ * document if it does not. Never says a hand posting "replaces" a document IMS did not verify without that condition.
+ */
+export function describeEarlierPostings(earlier: readonly EarlierPosting[]): string {
+  if (earlier.length === 0) return ''
+  const confirmed = earlier.filter((e) => e.standing === 'CONFIRMED_POSTED')
+  const unverified = earlier.filter((e) => e.standing !== 'CONFIRMED_POSTED')
+  const note = (e: EarlierPosting) => `${e.ref}${e.standing === 'ASSERTED_POSTED' ? ' (an id an operator typed in)' : ' (unproven)'}`
+  return (confirmed.length > 0
+    ? ` The ledger ALREADY holds ${confirmed.map((e) => e.ref).join(', ')} for this obligation (confirmed by the connector), `
+      + 'from an earlier version of this document - your hand posting REPLACES that document; do not raise a second one.'
+    : '')
+    + (unverified.length > 0
+      ? ` IMS records ${unverified.map(note).join(', ')} as posted for this obligation, from an earlier version of this `
+        + 'document, and has NOT verified it: check the ledger for it first. If it exists there, your hand posting REPLACES it '
+        + 'and you must not raise a second one; if it is absent, post this as a new document.'
+      : '')
+}
+
 export function describeRetiredUnproven(notes: readonly string[]): string {
   if (notes.length === 0) return ''
   return ' Earlier attempt(s) at this posting were retired without proof that they never reached the ledger: '
@@ -433,7 +465,7 @@ function claimedByOther(row: LoadedRefusal): Extract<MarkHandledResult, { ok: fa
  * interval and can be given back; a mark cannot.
  */
 export type HandPostClaimResult =
-  | { ok: true; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[]; retiredUnproven: string[] }
+  | { ok: true; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
   | Extract<MarkHandledResult, { ok: false }>
 
 export async function claimPostingForHandPosting(
@@ -447,7 +479,7 @@ export async function claimPostingForHandPosting(
   if (row.handPostClaimedAt) {
     // Idempotent for the holder: pressing it twice must not read as somebody else's claim.
     if (row.handPostClaimedBy === params.userId) {
-      return { ok: true, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [], retiredUnproven: [] }
+      return { ok: true, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
     }
     return claimedByOther(row)
   }
@@ -481,6 +513,7 @@ export async function claimPostingForHandPosting(
     cancelledSyncRows,
     claimedAt: now,
     earlierPostings: rows.earlier.map((sync) => sync.externalTransactionId ?? sync.id),
+    earlierPostingDetails: rows.earlier.map(earlierPostingOf),
     retiredUnproven: retiredUnprovenNotes(rows.retiredUnproven),
   }
 }

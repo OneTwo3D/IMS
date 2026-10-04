@@ -12,6 +12,8 @@ import { failedUpdateStandingNote } from '@/lib/domain/accounting/rejected-sync-
 import { allocationDebitForeignLedgerReports } from '@/lib/domain/accounting/allocation-debit-passes'
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
+import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
 import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
 
@@ -123,10 +125,10 @@ for (const label of ['| Retired document that is **not proven never-sent**', '| 
 for (const retiredUnproven of [[], ['row s-1 (CANCELLED, no proof)']]) {
   for (const queuedRow of [null, 'unsent', 'may-be-sent'] as const) {
     for (const claim of [null, { at: 'now', byName: 'Sam', mine: false }, { at: 'now', byName: null, mine: true }]) {
-      for (const earlierPostings of [[], ['INV-9']]) {
-        if (retiredUnproven.length === 0) continue // a posting with NO retired attempt is a known-outstanding obligation; its plain "post it" is the baseline, not a non-confirmed standing
-        add(`inbox hand-post order: retired=${retiredUnproven.length} queued=${queuedRow} claim=${claim ? (claim.mine ? 'mine' : 'other') : 'none'} earlier=${earlierPostings.length}`,
-          handPostOrderFor({ queuedRow, earlierPostings, retiredUnproven, claim }))
+      for (const earlierPostingDetails of [[], [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' as const }], [{ ref: 'INV-9', standing: 'ASSERTED_POSTED' as const }], [{ ref: 'INV-9', standing: 'UNKNOWN' as const }]]) {
+        if (retiredUnproven.length === 0 && !earlierPostingDetails.some((e) => e.standing !== 'CONFIRMED_POSTED')) continue // a posting with NO retired attempt is a known-outstanding obligation; its plain "post it" is the baseline, not a non-confirmed standing
+        add(`inbox hand-post order: retired=${retiredUnproven.length} queued=${queuedRow} claim=${claim ? (claim.mine ? 'mine' : 'other') : 'none'} earlier=${earlierPostingDetails.map((e) => e.standing).join('+') || 'none'}`,
+          handPostOrderFor({ queuedRow, earlierPostingDetails, retiredUnproven, claim }))
       }
     }
   }
@@ -143,14 +145,44 @@ test('[o3d-1e7sl Codex r4] the widened checker CAN fail: the unconditional hand-
 
 test('[o3d-1e7sl Codex r4] a retired-unproven hand-post order, claimed or not, makes the post conditional on the document being absent and never says "post it in the ledger now"', () => {
   for (const claim of [null, { at: 'now', byName: null, mine: true }]) {
-    const text = handPostOrderFor({ queuedRow: null, earlierPostings: [], retiredUnproven: ['row s-1 (CANCELLED, no proof)'], claim })
+    const text = handPostOrderFor({ queuedRow: null, earlierPostingDetails: [], retiredUnproven: ['row s-1 (CANCELLED, no proof)'], claim })
     assert.doesNotMatch(text, /post it in the ledger now/i)
     assert.doesNotMatch(text, /Then post it,/)
     assert.match(text, /check the ledger for that document first; post it ONLY if it is absent\. If it exists, do not post again/i)
     assert.deepEqual(unconditionalMoneySentences(text), [])
   }
   // and the plain (no retired attempt) order is unchanged
-  assert.match(handPostOrderFor({ queuedRow: null, earlierPostings: [], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
+  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
+})
+
+// Codex round 6: the claim log and the earlier-posting sentence, per standing.
+for (const standing of ['ASSERTED_POSTED', 'UNKNOWN', 'ASSERTED_NOT_POSTED', 'LIVE_WORK'] as LedgerStanding[]) {
+  add(`earlier-posting sentence / claim log: ${standing}`, describeEarlierPostings([{ ref: 'INV-9', standing }]))
+}
+
+test('[o3d-1e7sl Codex r6] an UNVERIFIED earlier posting (asserted / unproven) keeps its standing in the hand-post order and the claim log: no unconditional "replaces", no "post it in the ledger now"', () => {
+  const unconditionalReplaces = (text: string) => text.split(/(?<=[.;])\s+/).filter((c) => /\bREPLACES\b/i.test(c) && !/if it exists/i.test(c))
+  for (const standing of ['ASSERTED_POSTED', 'UNKNOWN'] as const) {
+    for (const claim of [null, { at: 'now', byName: null, mine: true }, { at: 'now', byName: 'Sam', mine: false }]) {
+      for (const queuedRow of [null, 'unsent'] as const) {
+        const text = handPostOrderFor({ queuedRow, earlierPostingDetails: [{ ref: 'INV-9', standing }], retiredUnproven: [], claim })
+        assert.match(text, /NOT verified/, `${standing}: says IMS has not verified the earlier document`)
+        assert.match(text, /If it exists there, your hand posting REPLACES it/)
+        assert.match(text, /if it is absent, post this as a new document/)
+        assert.deepEqual(unconditionalReplaces(text), [], `${standing}: "replaces" only ever under "if it exists"`)
+        assert.doesNotMatch(text, /ALREADY holds|REPLACES that document/, `${standing}: the confirmed-document sentence is not used`)
+        if (claim === null || claim.mine) assert.doesNotMatch(text, /post it in the ledger now|Then post it,/i)
+        assert.deepEqual(unconditionalMoneySentences(text), [])
+      }
+    }
+    const log = describeEarlierPostings([{ ref: 'INV-9', standing }])
+    assert.match(log, /NOT verified/)
+    assert.deepEqual(unconditionalReplaces(log), [])
+  }
+  // a CONFIRMED earlier document keeps the existing wording
+  const confirmed = describeEarlierPostings([{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }])
+  assert.match(confirmed, /The ledger ALREADY holds INV-9 for this obligation \(confirmed by the connector\).*REPLACES that document/)
+  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
 })
 
 test('[o3d-1e7sl Codex r3] every operator string for a non-CONFIRMED standing is free of unconditional reverse / credit / void / re-post instructions', () => {
@@ -168,4 +200,20 @@ test('[o3d-1e7sl Codex r5] no rendered string states a history claim its standin
   assert.deepEqual(unlicensedHistoryClaims('A failed sync does not prove nothing was posted.', null), [], 'control: a negated / hedged form is not a claim')
   const offenders = strings.map((s) => ({ where: s.where, bad: unlicensedHistoryClaims(s.text, s.allowed) })).filter((o) => o.bad.length > 0)
   assert.deepEqual(offenders, [], 'a string claims a history its cause does not prove')
+})
+
+// Codex round 6 - CALL-GRAPH SWEEP. Every function that reduces a sync row to an id / status / amount and then renders or decides
+// must carry the STANDING through, or say why not. The reduced-row-shape census in `check:ledger-standing-readers` lists them
+// (25); the ones that render or decide on an id without carrying the basis were: the earlier-postings reduction (hand-post
+// order, claim log), the follow-up obligation backlog row, and the daily-batch history entry. Each keeps its standing now.
+test('[o3d-1e7sl Codex r6] reductions that render an id carry the standing: follow-up backlog row and daily-batch history entry', () => {
+  const base = { id: 'r1', connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: 'so-1',
+    externalTransactionId: 'INV-1', backReferenceFollowUpsPendingAt: null, backReferenceFollowUpsClaimedAtDatabaseClock: null, createdAt: new Date() }
+  assert.equal(describeFollowUpObligationBacklogRow({ ...base, settlementBasis: 'OPERATOR_ASSERTION' }).standingLabel, 'asserted', 'an operator-typed id is labelled in the backlog')
+  assert.equal(describeFollowUpObligationBacklogRow({ ...base, settlementBasis: null }).standingLabel, null, 'a confirmed id needs no label')
+  const history = read('app/actions/xero-daily-batch.ts')
+  assert.match(history, /standingLabel: describeLedgerStanding\(row\)\.label/, 'the daily-batch history entry carries the standing label')
+  assert.match(read('app/actions/accounting-batch.ts'), /standingLabel: entry\.standingLabel/, 'and the generic mapper passes it through')
+  assert.match(read('app/(dashboard)/sync/xero-client.tsx'), /entry\.standingLabel &&/, 'and the panel renders it')
+  assert.match(read('app/(dashboard)/sync/exceptions/exceptions-client.tsx'), /row\.standingLabel \?/, 'the backlog table renders it')
 })
