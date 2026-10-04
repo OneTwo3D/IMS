@@ -6,7 +6,10 @@ import { Prisma } from '@/app/generated/prisma/client'
 import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
+  FreightEditRefusedError,
   FreightNetCreditError,
+  planFreightCostLineEdit,
+  type StoredFreightCostLine,
   freightTotalIsNegative,
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
@@ -218,4 +221,71 @@ test('T11 total: the payable total (net PLUS VAT) is what must not be negative, 
   assert.equal(freightTotalIsNegative(fine), false)
   // Exactly zero is allowed.
   assert.equal(freightTotalIsNegative(buildFreightCostLineRows([line({ amountForeign: 5 }), line({ amountForeign: -5 })], 1, 0)), false)
+})
+
+// ─── planFreightCostLineEdit: id matching, billed rows, no-ids replacement, tax ─────────────────────────
+
+const stored = (id: string, amount: number, over: Partial<StoredFreightCostLine> = {}): StoredFreightCostLine => ({
+  id, description: `d-${id}`, amountForeign: new Prisma.Decimal(amount), vatable: false, distributionMethod: 'BY_VALUE', billed: false, ...over,
+})
+const submittedRow = (id: string | undefined, amount: number, over: Partial<FreightCostLineInput> = {}): FreightCostLineInput => ({
+  ...(id ? { id } : {}), description: `d-${id ?? 'new'}`, amountForeign: amount, vatable: false, distributionMethod: 'BY_VALUE', ...over,
+})
+const plan = (storedLines: StoredFreightCostLine[], submitted: FreightCostLineInput[], taxChanged = false) =>
+  planFreightCostLineEdit(storedLines, submitted, buildFreightCostLineRows(submitted, 1, 0).rows, taxChanged)
+
+test('plan: rows are matched by ID, never by position', () => {
+  const rows = [stored('a', 10), stored('b', 20)]
+  // Reordered but unchanged: a position match would see two edits; matching by id sees none.
+  const reordered = plan(rows, [submittedRow('b', 20), submittedRow('a', 10)])
+  console.log(`plan PRECONDITION: reordered unchanged save => ${reordered.kind}`)
+  assert.equal(reordered.kind, 'noop')
+  // Remove the FIRST line and keep the second: the second must still be matched to ITS row, and only 'a' deleted.
+  const removed = plan(rows, [submittedRow('b', 20)])
+  assert.deepEqual(removed, { kind: 'apply', updates: [], deletes: ['a'], creates: [] })
+  // Edit one by id while reordering.
+  const edited = plan(rows, [submittedRow('b', 25), submittedRow('a', 10)])
+  assert.equal(edited.kind === 'apply' && edited.updates.map((u) => u.id).join(), 'b')
+  // A new row has no id and is created; an unknown or repeated id is refused.
+  const created = plan(rows, [submittedRow('a', 10), submittedRow('b', 20), submittedRow(undefined, 5)])
+  assert.equal(created.kind === 'apply' && created.creates.length, 1)
+  assert.throws(() => plan(rows, [submittedRow('zzz', 10)]), FreightEditRefusedError)
+  assert.throws(() => plan(rows, [submittedRow('a', 10), submittedRow('a', 10)]), FreightEditRefusedError)
+})
+
+test('plan: a BILLED row is never modified or removed (an unchanged billed row is fine)', () => {
+  const rows = [stored('a', 10, { billed: true }), stored('b', 20)]
+  assert.equal(plan(rows, [submittedRow('a', 10), submittedRow('b', 21)]).kind, 'apply')
+  assert.throws(() => plan(rows, [submittedRow('a', 11), submittedRow('b', 20)]), /billed and cannot be changed/)
+  assert.throws(() => plan(rows, [submittedRow('b', 20)]), /billed and cannot be removed/)
+  // And the no-ids replacement refuses to delete it too.
+  assert.throws(() => plan(rows, [submittedRow(undefined, 99)]), /billed and cannot be replaced/)
+  console.log('plan PRECONDITION: 3 billed-row refusals raised, 1 unchanged billed save accepted')
+})
+
+test('plan: a caller with NO ids is a full replacement, a no-op only when exactly identical and the tax is unchanged', () => {
+  const rows = [stored('a', 10), stored('b', 20)]
+  assert.equal(plan(rows, [submittedRow(undefined, 10, { description: 'd-a' }), submittedRow(undefined, 20, { description: 'd-b' })]).kind, 'noop')
+  const changed = plan(rows, [submittedRow(undefined, 10, { description: 'd-a' }), submittedRow(undefined, 21, { description: 'd-b' })])
+  assert.equal(changed.kind === 'apply' && changed.deletes.length, 2)
+  assert.equal(changed.kind === 'apply' && changed.creates.length, 2)
+  assert.equal(plan(rows, [submittedRow(undefined, 10, { description: 'd-a' }), submittedRow(undefined, 20, { description: 'd-b' })], true).kind, 'apply', 'a tax-rate change alone is an edit')
+})
+
+test('plan: a tax-rate change alone is a real edit even when every line is unchanged', () => {
+  const rows = [stored('a', 10)]
+  assert.equal(plan(rows, [submittedRow('a', 10)]).kind, 'noop')
+  const taxOnly = plan(rows, [submittedRow('a', 10)], true)
+  assert.deepEqual(taxOnly, { kind: 'apply', updates: [], deletes: [], creates: [] })
+})
+
+test('UI census: the freight dialog sends the stored ids and sends credit/zero lines back instead of dropping them', () => {
+  const ui = readFileSync('app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx', 'utf8')
+  const start = ui.indexOf('function EditFreightCostsDialog')
+  const dialog = ui.slice(start, ui.indexOf('\nfunction ', start + 10) === -1 ? undefined : ui.indexOf('\nfunction ', start + 10))
+  console.log(`UI PRECONDITION: dialog source ${dialog.length} chars; lockedLines mentions: ${(dialog.match(/lockedLines/g) ?? []).length}`)
+  assert.ok(dialog.length > 500)
+  assert.ok((dialog.match(/lockedLines/g) ?? []).length >= 4, 'locked (credit/zero) lines are kept, shown and sent back')
+  assert.match(dialog, /\.\.\.\(cl\.id \? \{ id: cl\.id \} : \{\}\)/, 'editable lines carry their id')
+  assert.match(dialog, /id: cl\.id,\n\s+description: cl\.description,/, 'locked lines are sent with their id')
 })

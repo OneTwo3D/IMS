@@ -320,7 +320,7 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
 
   // A CHANGE updates in place: the untouched line keeps its id, the changed one keeps its id too, and it revalues.
   const aIdsBefore = (await db.freightCostLine.findMany({ where: { poId: a.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
-  await save(a.poId, asInput(['89401.8989', '-27039.1416']))
+  await save(a.poId, asInput(['89401.8989', '-27039.1416']).map((line, index) => ({ ...line, id: aIdsBefore[index]! })))
   const aIdsAfter = (await db.freightCostLine.findMany({ where: { poId: a.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
   const changed = await snapshot()
   console.log(`re-save PRECONDITION: after one real edit ids ${aIdsBefore.join(',') === aIdsAfter.join(',') ? 'kept' : 'CHANGED'}, runs ${legacyAfter.runs} -> ${changed.runs}`)
@@ -377,4 +377,130 @@ test('preview badge: the tense follows what is RECEIVED (future before, both whi
   assert.match(full, /valued those units/)
   assert.doesNotMatch(full, /will value/)
   assert.match(full, /could not absorb 1\.00/)
+})
+
+// ─── Round 2: VAT survives an edit, credit lines survive the dialog payload, billed rows are untouchable ──
+
+test('VAT: a real edit KEEPS the stored rate when none is passed, a tax-only edit is a real edit, an unchanged save is a no-op, a legacy order derives its rate', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const goods = await seedGoodsPo('vat2', 4, 10)
+  const { createFreightPo, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  const created = await createFreightPo({ supplierId: goods.supplierId, currency: 'GBP', fxRateToBase: 1, primaryPoIds: [goods.poId], taxRateValue: 0.2, costLines: [{ description: 'freight', amountForeign: 100, vatable: true, distributionMethod: 'BY_VALUE' }] })
+  assert.equal(created.success, true, String(created.error))
+  const poId = created.po!.id
+  const header = async () => db.purchaseOrder.findUniqueOrThrow({ where: { id: poId }, select: { taxForeign: true, totalForeign: true, taxRatePercent: true } })
+  const runs = () => db.landedCostRevaluationRun.count({ where: { primaryPoId: goods.poId } })
+  const line = async () => db.freightCostLine.findFirstOrThrow({ where: { poId }, select: { id: true } })
+  const first = await header()
+  console.log(`VAT PRECONDITION: created tax ${first.taxForeign}, stored rate ${first.taxRatePercent}`)
+  assert.equal(first.taxForeign.toString(), '20')
+  assert.equal(first.taxRatePercent?.toString(), '0.2')
+
+  // The UI shape: ids, NO tax rate. A real edit (100 -> 110) must keep 20% => tax 22, not zero it.
+  const id = (await line()).id
+  assert.equal((await updateFreightPoCosts(poId, [{ id, description: 'freight', amountForeign: 110, vatable: true, distributionMethod: 'BY_VALUE' }])).success, true)
+  const edited = await header()
+  console.log(`VAT PRECONDITION: after a real edit with no rate passed: tax ${edited.taxForeign}, total ${edited.totalForeign}`)
+  assert.equal(edited.taxForeign.toString(), '22')
+  assert.equal(edited.totalForeign.toString(), '132')
+
+  // Unchanged with no rate: a no-op.
+  const before = await runs()
+  assert.equal((await updateFreightPoCosts(poId, [{ id, description: 'freight', amountForeign: 110, vatable: true, distributionMethod: 'BY_VALUE' }])).success, true)
+  assert.equal(await runs(), before, 'unchanged lines and rate: nothing revalued')
+
+  // Tax-only edit (same lines, new rate): a REAL edit, the totals move.
+  assert.equal((await updateFreightPoCosts(poId, [{ id, description: 'freight', amountForeign: 110, vatable: true, distributionMethod: 'BY_VALUE' }], 0.1)).success, true)
+  const taxOnly = await header()
+  console.log(`VAT PRECONDITION: tax-only edit to 10%: tax ${taxOnly.taxForeign}, rate ${taxOnly.taxRatePercent}`)
+  assert.equal(taxOnly.taxForeign.toString(), '11')
+  assert.equal(taxOnly.taxRatePercent?.toString(), '0.1')
+
+  // A legacy order (no stored rate, tax 20 on a vatable 100) derives 20% and keeps it.
+  const legacy = await seedFreightWithLines(goods.poId, goods.supplierId, [100], 'PO_SENT', { vatable: true })
+  await db.purchaseOrder.update({ where: { id: legacy.poId }, data: { taxForeign: 20, taxBase: 20, totalForeign: 120, totalBase: 120, taxRatePercent: null } })
+  const legacyId = (await db.freightCostLine.findFirstOrThrow({ where: { poId: legacy.poId }, select: { id: true } })).id
+  assert.equal((await updateFreightPoCosts(legacy.poId, [{ id: legacyId, description: 'freight 0', amountForeign: 150, vatable: true, distributionMethod: 'BY_VALUE' }])).success, true)
+  const legacyAfter = await db.purchaseOrder.findUniqueOrThrow({ where: { id: legacy.poId }, select: { taxForeign: true } })
+  console.log(`VAT PRECONDITION: legacy order (no stored rate) edited to 150: tax ${legacyAfter.taxForeign}`)
+  assert.equal(legacyAfter.taxForeign.toString(), '30')
+})
+
+test('credit lines: saving with the dialog payload (stored ids, credit echoed back) keeps the credit row; omitting it is an explicit removal', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const goods = await seedGoodsPo('cred', 4, 10)
+  const freight = await seedFreightWithLines(goods.poId, goods.supplierId, [20, -5])
+  const { updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  const rows = await db.freightCostLine.findMany({ where: { poId: freight.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true, description: true, amountForeign: true } })
+  const dialogPayload = (positive: number) => [
+    { id: rows[0]!.id, description: rows[0]!.description, amountForeign: positive, vatable: false, distributionMethod: 'BY_VALUE' },
+    { id: rows[1]!.id, description: rows[1]!.description, amountForeign: -5, vatable: false, distributionMethod: 'BY_VALUE' },
+  ]
+  const saved = await updateFreightPoCosts(freight.poId, dialogPayload(25))
+  assert.equal(saved.success, true, String(saved.error))
+  const after = await db.freightCostLine.findMany({ where: { poId: freight.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true, amountForeign: true } })
+  console.log(`credit PRECONDITION: stored ${rows.length} lines (+20, -5); after the dialog save: ${after.map((r) => `${r.id === rows[0]!.id || r.id === rows[1]!.id ? 'same-id' : 'NEW-ID'}:${r.amountForeign}`).join(', ')}`)
+  assert.deepEqual(after.map((r) => [r.id, r.amountForeign.toString()]), [[rows[0]!.id, '25'], [rows[1]!.id, '-5']])
+  // The old dialog dropped the credit; the server treats an omitted stored row as an explicit removal.
+  const dropped = await updateFreightPoCosts(freight.poId, [dialogPayload(25)[0]!])
+  assert.equal(dropped.success, true, String(dropped.error))
+  assert.equal(await db.freightCostLine.count({ where: { poId: freight.poId } }), 1)
+})
+
+test('billed cost lines: a reordered or removed submission can neither reassign nor delete a row that has been invoiced', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  const goods = await seedGoodsPo('billed', 4, 10)
+  const freight = await seedFreightWithLines(goods.poId, goods.supplierId, [30, 20])
+  const { updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  const rows = await db.freightCostLine.findMany({ where: { poId: freight.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true, description: true, amountForeign: true } })
+  await db.purchaseInvoice.create({
+    data: {
+      poId: freight.poId, invoiceDate: new Date(), totalForeign: 30, totalBase: 30, fxRateToBase: 1,
+      lines: { create: [{ costLineId: rows[0]!.id, description: 'billed freight', qtyBilled: 1, unitCostForeign: 30, totalForeign: 30, totalBase: 30 }] },
+    },
+  })
+  const snapshot = async () => JSON.stringify(await db.freightCostLine.findMany({ where: { poId: freight.poId }, orderBy: { id: 'asc' }, select: { id: true, amountForeign: true, description: true } }))
+  const before = await snapshot()
+  const line = (r: (typeof rows)[number], amount: number) => ({ id: r.id, description: r.description, amountForeign: amount, vatable: false, distributionMethod: 'BY_VALUE' })
+  // Reordered, UNCHANGED amounts: fine, and nothing is rewritten.
+  const reordered = await updateFreightPoCosts(freight.poId, [line(rows[1]!, 20), line(rows[0]!, 30)])
+  // Changing the billed row: refused.
+  const changeBilled = await updateFreightPoCosts(freight.poId, [line(rows[0]!, 31), line(rows[1]!, 20)])
+  // Removing the billed row: refused.
+  const removeBilled = await updateFreightPoCosts(freight.poId, [line(rows[1]!, 20)])
+  // Submitting WITHOUT ids (pre-id contract) cannot replace it either.
+  const noIds = await updateFreightPoCosts(freight.poId, [{ description: 'x', amountForeign: 99, vatable: false, distributionMethod: 'BY_VALUE' }])
+  console.log(`billed PRECONDITION: reordered=${reordered.success}, change=${JSON.stringify(changeBilled.error)}, remove=${JSON.stringify(removeBilled.error)}, noIds=${JSON.stringify(noIds.error)}`)
+  assert.equal(reordered.success, true)
+  assert.equal(changeBilled.success, false)
+  assert.match(String(changeBilled.error), /billed and cannot be changed/)
+  assert.equal(removeBilled.success, false)
+  assert.match(String(removeBilled.error), /billed and cannot be removed/)
+  assert.equal(noIds.success, false)
+  assert.match(String(noIds.error), /billed and cannot be replaced/)
+  assert.equal(await snapshot(), before, 'no stored row was changed, moved or deleted')
+  // An UNBILLED row may still change.
+  assert.equal((await updateFreightPoCosts(freight.poId, [line(rows[0]!, 30), line(rows[1]!, 21)])).success, true)
+})
+
+test('preview badge: units landed by a WMS alignment count as RECEIVED for the tense', SKIP, async () => {
+  loadEnv()
+  const { getPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const { addAsn } = await import('./po-landed-fixtures')
+  const goods = await seedGoodsPo('aligned', 2, 1)
+  await seedFreightWithLines(goods.poId, goods.supplierId, [-3])
+  const before = (await getPurchaseOrder(goods.poId))?.landedCostFloors[0]?.message ?? ''
+  await addAsn(
+    { tag: 't', poId: goods.poId, warehouseId: goods.warehouseId, lines: [], binding: {} } as never,
+    { poLineId: goods.poLineId, productId: goods.productId, sku: goods.sku, qty: 2 },
+    { expectedQty: 2, viaSnapshot: 1 },
+  )
+  const after = (await getPurchaseOrder(goods.poId))?.landedCostFloors[0]?.message ?? ''
+  console.log(`aligned PRECONDITION:\n  before alignment: ${before.slice(0, 120)}\n  after 1 unit aligned (qtyReceived still 0): ${after.slice(0, 260)}`)
+  assert.doesNotMatch(before, /\(\d+ received\)/)
+  assert.match(after, /\(1 received\)/)
+  assert.match(after, /\(1 not yet received\)/)
 })

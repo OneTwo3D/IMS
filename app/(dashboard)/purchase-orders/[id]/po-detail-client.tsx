@@ -1646,6 +1646,8 @@ function PayBillDialog({
 
 type FreightCostEditLine = {
   key: string
+  /** The stored cost line this row edits (absent for a line added in this dialog). The server matches by it. */
+  id?: string
   description: string
   amountForeign: number
   vatable: boolean
@@ -1679,10 +1681,15 @@ function EditFreightCostsDialog({
   // Initialize from existing linked freight data (we get cost lines from linkedFreightPos)
   // For a FREIGHT type PO we need to fetch its own cost lines — but we don't have them directly
   // We'll use the PO's direct freight info and allow editing
+  // This dialog is positive-only (credits are entered as supplier credit notes). A stored line that is zero or a
+  // credit is therefore NOT editable here: it is listed read-only and sent back to the server unchanged, so saving
+  // never silently deletes it.
+  const lockedLines = po.freightCostLines.filter((cl) => cl.amountForeign <= 0)
   const [costLines, setCostLines] = useState<FreightCostEditLine[]>(() => {
     if (po.freightCostLines.length > 0) {
-      return po.freightCostLines.map((cl) => ({
+      return po.freightCostLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
         key: Math.random().toString(36).slice(2),
+        id: cl.id,
         description: cl.description,
         amountForeign: cl.amountForeign,
         vatable: cl.vatable,
@@ -1695,7 +1702,7 @@ function EditFreightCostsDialog({
     return []
   })
 
-  const subtotal = costLines.reduce((s, cl) => s + cl.amountForeign, 0)
+  const subtotal = costLines.reduce((s, cl) => s + cl.amountForeign, 0) + lockedLines.reduce((s, cl) => s + cl.amountForeign, 0)
 
   function handleSave() {
     setError('')
@@ -1703,12 +1710,22 @@ function EditFreightCostsDialog({
     startTransition(async () => {
       const result = await updateFreightPoCosts(
         po.id,
-        costLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
-          description: cl.description,
-          amountForeign: cl.amountForeign,
-          vatable: cl.vatable,
-          distributionMethod: cl.distributionMethod,
-        })),
+        [
+          ...costLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
+            ...(cl.id ? { id: cl.id } : {}),
+            description: cl.description,
+            amountForeign: cl.amountForeign,
+            vatable: cl.vatable,
+            distributionMethod: cl.distributionMethod,
+          })),
+          ...lockedLines.map((cl) => ({
+            id: cl.id,
+            description: cl.description,
+            amountForeign: cl.amountForeign,
+            vatable: cl.vatable,
+            distributionMethod: cl.distributionMethod,
+          })),
+        ],
       )
       if (result.success) {
         router.refresh()
@@ -1781,6 +1798,15 @@ function EditFreightCostsDialog({
           >
             <Plus className="h-3 w-3 mr-1" />Add Cost Line
           </Button>
+
+          {lockedLines.length > 0 && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+              <p className="font-medium">Credit and zero lines cannot be edited here and are kept as they are:</p>
+              {lockedLines.map((cl) => (
+                <p key={cl.id} className="font-mono">{cl.description || '(no description)'}: {fMoney(cl.amountForeign)}</p>
+              ))}
+            </div>
+          )}
 
           <div className="flex justify-end text-sm font-medium">
             <span>Total: {fMoney(subtotal)}</span>
