@@ -875,7 +875,7 @@ DB_FENCE_REFENCE_CMD="${DB_FENCE_SUDO_PREFIX}${DB_FENCE_REFENCE_WRAPPER}"
 resolve_fence_script() {
   local script
   script="$(db_fence_script_in_use)" || return 1
-  db_fence_publish_operator_wrappers "${APP_USER}" "${APP_DIR_REAL}/.env" "${DB_FENCE_STATE}" "${LOCK_FILE}" \
+  db_fence_publish_operator_wrappers "${APP_USER}" "${DB_ADMIN_CREDENTIAL_FILE}" "${DB_FENCE_STATE}" "${LOCK_FILE}" \
     "${DB_FENCE_IDENTITY_ARGS[@]:-}" \
     || echo "The recovery wrappers at ${DB_FENCE_RELEASE_WRAPPER} and ${DB_FENCE_REFENCE_WRAPPER} could not be refreshed for this run. Anything printed below that names them may be a previous run's copy; check it before running it." >&2
   printf '%s' "$script"
@@ -938,7 +938,12 @@ valid_tcp_port "${PORT}" || die "IMS_PORT must be a decimal TCP port in 1-65535,
 # as the admin is what keeps the fence effective; running as the application role is what
 # stops every object the migration creates being owned by a superuser the application has no
 # grant from (o3d-2sm1.5).
-DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL:-$(env_file_value DEPLOY_ADMIN_DATABASE_URL "${APP_DIR_REAL}/.env")}"
+# THE ADMIN CREDENTIAL IS ROOT'S, AND IS NOT READ FROM ${APP_DIR_REAL}/.env (owner decision C3).
+# db_admin_credential_load() takes the invocation first and ${DB_ADMIN_CREDENTIAL_FILE} second,
+# REFUSES a copy of it left in the application's .env (before anything is stopped), and un-exports
+# the variable so a value typed on `sudo env DEPLOY_ADMIN_DATABASE_URL=...` is not inherited by
+# every command this script runs as ${APP_USER}.
+db_admin_credential_load "${APP_DIR_REAL}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
 MIGRATION_DATABASE_URL=""
 
 # ---------------------------------------------------------------------------
@@ -2573,16 +2578,15 @@ remove_db_identity_snapshot() {
   return 0
 }
 
-# HOW THIS ENTRYPOINT DROPS TO ${APP_USER} TO RUN THE FENCE HELPER (o3d-secops r23).
+# HOW THIS ENTRYPOINT RUNS THE FENCE HELPER: AS ROOT (owner decision C3, replacing o3d-secops r23).
 #
 # db_fence_raise() in lib/db-fence-protected.sh owns the ORDER -- plan, authorise and publish as
-# root, then execute -- and this is the one part of it that cannot be written down once: the three
-# entrypoints drop privilege in three different ways with three different environments. It takes
-# the script to run and the helper own arguments, and nothing else.
+# root, then execute. The helper itself used to be dropped to ${APP_USER}, with the admin credential
+# in its environment, which handed the account the fence defends against the credential it defends
+# with. It now runs through db_fence_exec_root(), the library's ONE spelling of that: root, scrubbed
+# environment, `/` as cwd, nothing secret on any argv.
 db_fence_helper() {
-  local fence_script="$1"
-  shift
-  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" node "${fence_script}" "$@"
+  db_fence_exec_root "$@"
 }
 
 # THE SAME DROP TO ${APP_USER}, WITH THE MIGRATION'S OWN CONNECTION STRING IN THE ENVIRONMENT
@@ -2591,10 +2595,7 @@ db_fence_helper() {
 # and it is passed the same way as_app_user_db() passes it to prisma, the drift check and the
 # verification hook, because binding a string the consumers are not given would bind nothing.
 db_fence_migration_helper() {
-  local fence_script="$1"
-  shift
-  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    DATABASE_URL="${MIGRATION_DATABASE_URL}" node "${fence_script}" "$@"
+  DB_FENCE_EXEC_DATABASE_URL="${MIGRATION_DATABASE_URL}" db_fence_exec_root_with_database_url "$@"
 }
 
 # THE GATE BEFORE ANY DDL (o3d-secops r32, Codex HIGH 2 / o3d-mzcp). See the section above
@@ -2821,14 +2822,13 @@ fence_db_connections() {
       local migration_nonce=""
       migration_nonce="$(db_fence_witness_nonce)" || die \
         "The connection fence is up and this run could not mint the nonce that binds the migration to the server it fenced (no readable randomness). Refusing to migrate on a connection nothing can place. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
-      MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-        node "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
-        "The connection fence is up but the migration URL could not be composed, so the migration would run as the deploy admin and create objects the application cannot use. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
+      MIGRATION_DATABASE_URL="$(db_fence_exec_root "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || die \
+        "The connection fence is up but the migration URL could not be composed, so there is no migration login to run the migration as (the deploy admin is never used for it). Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
         "The connection fence is up but --print-migration-url produced nothing. Nothing has been migrated; release the fence with: ${DB_FENCE_RELEASE_CMD}"
       bind_migration_to_fenced_server
       ok "Connection fence up: new application connections are refused for the window."
-      ok "The migration will connect as the deploy admin and RUN AS the application role, so what it creates is owned by the application."
+      ok "The migration will connect as the migration role (no privilege of its own; the deploy admin stays with root) and RUN AS the application role, so what it creates is owned by the application."
       ;;
     3)
       # EXIT 3 IS "CONNECT WAS NOT REVOKED", AND IT ABORTS (o3d-2sm1.4, Codex r3 HIGH).
@@ -2840,7 +2840,7 @@ fence_db_connections() {
       # is not a degraded fence, it is no fence — and the earlier reasoning that a missing
       # admin connection should not block a deploy traded a configuration problem for the
       # data-loss window this whole script exists to close.
-      die "THE DATABASE COULD NOT BE FENCED (exit 3): CONNECT was NOT revoked, so nothing stops a client attaching between now and the end of the migration. Refusing to migrate — the reason is printed above. Fix it (usually: set DEPLOY_ADMIN_DATABASE_URL to a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL, see docs/installation.md) and re-run. Nothing has been migrated."
+      die "THE DATABASE COULD NOT BE FENCED (exit 3): CONNECT was NOT revoked, so nothing stops a client attaching between now and the end of the migration. Refusing to migrate — the reason is printed above. Fix it (usually: the deploy admin credential must be a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL, and the migration role must exist and hold nothing of its own; see docs/installation.md) and re-run. $(db_admin_credential_instruction where) Nothing has been migrated."
       ;;
     5)
       # EXIT 5 IS A FENCE THAT IS STANDING RIGHT NOW (o3d-2sm1.5, Codex r13 HIGH).
@@ -2907,11 +2907,24 @@ require_fenceable_database() {
       warn "$probe_line"
     done <<<"$probe_report"
 
-    if [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]] || { [[ ! -f "$DB_FENCE_SCRIPT" ]] && [[ ! -f "$DB_FENCE_SCRIPT_COPY" ]]; } || [[ ! -f "$DB_OBJECT_ACCESS_SCRIPT" ]]; then
+    if [[ -z "$DEPLOY_ADMIN_DATABASE_URL" ]]; then
+      # CONDITIONAL ON WHO IS ASKING (owner decision C3). The credential is root's: a dry run as any
+      # other account cannot see it, so "not set" would be a claim about a file it never looked at.
+      if [[ $EUID -ne 0 ]]; then
+        warn "THE FENCE PREFLIGHT WAS NOT RUN: $(db_admin_credential_instruction nonroot)"
+        warn "Nothing has been changed by this dry run."
+      else
+        warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
+        warn "$(db_admin_credential_instruction absent)"
+        warn "Nothing has been changed by this dry run."
+      fi
+      return 0
+    fi
+    if { [[ ! -f "$DB_FENCE_SCRIPT" ]] && [[ ! -f "$DB_FENCE_SCRIPT_COPY" ]]; } || [[ ! -f "$DB_OBJECT_ACCESS_SCRIPT" ]]; then
       warn "A REAL RUN WOULD BE REFUSED HERE: the migration window cannot be fenced."
-      warn "DEPLOY_ADMIN_DATABASE_URL is not set (or ${DB_FENCE_SCRIPT##*/} is missing), so CONNECT"
-      warn "could not be revoked for the window and nothing would stop a client attaching across"
-      warn "the migration. See docs/installation.md. Nothing has been changed by this dry run."
+      warn "${DB_FENCE_SCRIPT##*/} or ${DB_OBJECT_ACCESS_SCRIPT##*/} is missing, so CONNECT could not be"
+      warn "revoked for the window or the result could not be checked. See docs/installation.md."
+      warn "Nothing has been changed by this dry run."
       return 0
     fi
     if ! require_db_identity; then
@@ -2944,13 +2957,12 @@ require_fenceable_database() {
     # vulnerability (o3d-2sm1.5 r34, Codex CRITICAL), and a non-empty ${DB_FENCE_PROBE_REASON}
     # after the call means exactly "nothing was executed".
     local dry_rc=0
-    db_fence_preflight warn -- as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-      || dry_rc=$?
+    db_fence_preflight warn || dry_rc=$?
     if [[ -n "$DB_FENCE_PROBE_REASON" ]]; then
       warn "A REAL RUN WOULD NOT PREFLIGHT THE DATABASE FROM HERE, AND NEITHER DID THIS ONE:"
       warn "${DB_FENCE_PROBE_REASON}"
       warn "The preflight is the only part of a dry run that opens the admin connection, so nothing"
-      warn "was executed with DEPLOY_ADMIN_DATABASE_URL. Nothing has been changed by this dry run."
+      warn "was executed with the admin credential. Nothing has been changed by this dry run."
       return 0
     fi
     if [[ "$dry_rc" -eq 0 ]]; then
@@ -2962,7 +2974,7 @@ require_fenceable_database() {
     return 0
   fi
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || die \
-    "DEPLOY_ADMIN_DATABASE_URL is not set, so this deploy has no privileged connection that would survive revoking CONNECT from the application role — the database cannot be held closed for the migration window. Set it (a superuser or database-owner connection as a DIFFERENT role from DATABASE_URL; docs/installation.md) and re-run. Nothing has been stopped and nothing has been migrated."
+    "This deploy has no privileged connection that would survive revoking CONNECT from the application role, so the database cannot be held closed for the migration window. $(db_admin_credential_instruction absent) Nothing has been stopped and nothing has been migrated."
   [[ -f "$DB_FENCE_SCRIPT" || -f "$DB_FENCE_SCRIPT_COPY" ]] || die \
     "Neither ${DB_FENCE_SCRIPT} nor the root-owned copy at ${DB_FENCE_SCRIPT_COPY} exists, so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
   [[ -f "$DB_OBJECT_ACCESS_SCRIPT" ]] || die \
@@ -2987,8 +2999,7 @@ require_fenceable_database() {
   local rc=0 preflight_script
   preflight_script="$(resolve_fence_script)" || die \
     "This run has no fence script it is willing to execute (the reason is printed above), so the migration window cannot be fenced. Nothing has been stopped and nothing has been migrated."
-  as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$preflight_script" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
+  db_fence_exec_root "$preflight_script" --preflight "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   [[ "$rc" -eq 0 ]] || die \
     "The migration window could NOT be fenced (fence preflight exit ${rc}); the reason is printed above. Refusing to migrate. Nothing has been stopped and nothing has been migrated."
 
@@ -3274,11 +3285,10 @@ refence_db_connections() {
   # and a stamp carried over from a previous window would name a lock that is gone.
   local url_rc=0 migration_nonce=""
   migration_nonce="$(db_fence_witness_nonce)" || migration_nonce=""
-  MIGRATION_DATABASE_URL="$(as_app_user env DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" \
-    node "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
+  MIGRATION_DATABASE_URL="$(db_fence_exec_root "$fence_script" --print-migration-url --migration-nonce="${migration_nonce}" "${DB_FENCE_IDENTITY_ARGS[@]:-}")" || url_rc=$?
   if [[ "$url_rc" -ne 0 || -z "$MIGRATION_DATABASE_URL" ]]; then
     MIGRATION_DATABASE_URL=""
-    warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to DEPLOY_ADMIN_DATABASE_URL. The fence is up."
+    warn "--print-migration-url refused to compose a migration URL (exit ${url_rc}); NOT falling back to the deploy admin login. The fence is up."
     return 0
   fi
   bind_migration_to_fenced_server advisory
@@ -3297,7 +3307,7 @@ refence_db_connections() {
 adopt_db_connections() {
   if $DRY_RUN; then
     echo -e "${YELLOW}[DRY]${RESET}   would re-apply and re-drain the standing connection fence and run the"
-    echo -e "${YELLOW}[DRY]${RESET}   recovery through DEPLOY_ADMIN_DATABASE_URL"
+    echo -e "${YELLOW}[DRY]${RESET}   recovery through the root-held admin credential"
     return 0
   fi
   if [[ ! -f "$DB_FENCE_STATE" ]]; then
@@ -3319,15 +3329,15 @@ adopt_db_connections() {
     return 0
   fi
   [[ -n "$DEPLOY_ADMIN_DATABASE_URL" ]] || die \
-    "A connection fence is standing (${DB_FENCE_STATE}) but DEPLOY_ADMIN_DATABASE_URL is not set, so this run has no connection that survives it. Set it, or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
+    "A connection fence is standing (${DB_FENCE_STATE}) but this run has no admin credential, so it has no connection that survives it. $(db_admin_credential_instruction absent) Or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
 
   warn "The previous run had already started migrating: HOLDING the connection fence."
   warn "The application stays shut out of its own database until this run has migrated,"
   warn "checked for drift and passed every declared verification."
   fence_db_connections
   [[ -n "$MIGRATION_DATABASE_URL" ]] || die \
-    "The standing connection fence could not be re-established, and this run therefore has no privileged connection to recover through. Fix DEPLOY_ADMIN_DATABASE_URL, or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
-  ok "Connection fence adopted; the recovery runs through DEPLOY_ADMIN_DATABASE_URL."
+    "The standing connection fence could not be re-established, and this run therefore has no privileged connection to recover through. Fix the admin credential ($(db_admin_credential_instruction where)), or release the fence by hand: ${DB_FENCE_RELEASE_CMD}"
+  ok "Connection fence adopted; the recovery runs through the root-held admin credential."
 }
 
 # --- cron ------------------------------------------------------------------
@@ -3729,15 +3739,18 @@ resume_from_interrupted_arming() {
 
 # Run a node/npx step through the connection that survives the fence.
 #
-# DEPLOY_ADMIN_DATABASE_URL is passed alongside DATABASE_URL because the helper scripts
-# (check-db-writers.mjs, run-migration-verifications.mjs, check-app-db-object-access.mjs) take
-# it as "the connection that survives the fence"; without it in the environment they fall back
-# to DIRECT_URL, which on the day anyone sets it is the very role the fence just shut out
-# (o3d-2sm1.5, Codex r4 HIGH).
+# DATABASE_URL IS THE ONLY CONNECTION HANDED OVER, and inside the window it is the MIGRATION URL: a
+# login with no privilege of its own that survives the fence. The deploy admin credential is not
+# passed (owner decision C3): the helper scripts (check-db-writers.mjs,
+# run-migration-verifications.mjs, check-app-db-object-access.mjs) are application-owned code and
+# read DATABASE_URL alone.
 as_app_user_db() {
   if [[ -n "$MIGRATION_DATABASE_URL" ]]; then
-    as_app_user env DATABASE_URL="$MIGRATION_DATABASE_URL" \
-      DEPLOY_ADMIN_DATABASE_URL="${DEPLOY_ADMIN_DATABASE_URL}" "$@"
+    # THE CONNECTION STRING TRAVELS IN THE ENVIRONMENT, NOT ON AN ARGV (owner decision C3). `env
+    # DATABASE_URL=... cmd` puts it in the command line of the parent runuser for the life of the
+    # step, readable by every local account. It is exported inside this subshell only, so it dies
+    # with it, and runuser keeps the environment.
+    ( export DATABASE_URL="$MIGRATION_DATABASE_URL"; as_app_user "$@" )
   else
     as_app_user "$@"
   fi
@@ -3965,7 +3978,7 @@ on_exit() {
           echo -e "${RED}  half-applied. The application role has no CONNECT on this database and${RESET}" >&2
           echo -e "${RED}  must not get it back until a re-run has migrated, checked drift and passed${RESET}" >&2
           echo -e "${RED}  every declared verification. A re-run adopts this fence and recovers${RESET}" >&2
-          echo -e "${RED}  through DEPLOY_ADMIN_DATABASE_URL.${RESET}" >&2
+          echo -e "${RED}  through the root-held admin credential (${DB_ADMIN_CREDENTIAL_FILE}).${RESET}" >&2
           echo -e "${RED}  To release it by hand instead (only once you know the schema is sound):${RESET}" >&2
           echo -e "${RED}    ${DB_FENCE_RELEASE_CMD}${RESET}" >&2
         else

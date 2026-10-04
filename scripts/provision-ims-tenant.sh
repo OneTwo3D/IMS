@@ -466,6 +466,22 @@ END
 SELECT 'CREATE DATABASE ${DB_NAME}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='${DB_NAME}') \gexec
 GRANT ALL PRIVILEGES ON DATABASE "${DB_NAME}" TO "${DB_USER}";
 ALTER DATABASE "${DB_NAME}" OWNER TO "${DB_USER}";
+-- THE MIGRATION ROLE the cutover's fence preflight asks for (owner decision C3): a login worth
+-- nothing, that the migration window connects as in place of this admin. NOLOGIN until a window
+-- opens it; a member of the application role only; CONNECT of its own, which the fence exempts.
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}_migrator') THEN
+    CREATE ROLE "${DB_USER}_migrator" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+  IF current_setting('server_version_num')::int >= 160000 THEN
+    EXECUTE 'GRANT "${DB_USER}" TO "${DB_USER}_migrator" WITH INHERIT TRUE, SET TRUE';
+  ELSE
+    EXECUTE 'GRANT "${DB_USER}" TO "${DB_USER}_migrator"';
+  END IF;
+END
+\$\$;
+GRANT CONNECT ON DATABASE "${DB_NAME}" TO "${DB_USER}_migrator";
 EOSQL
   success "External PostgreSQL database is ready."
 fi
