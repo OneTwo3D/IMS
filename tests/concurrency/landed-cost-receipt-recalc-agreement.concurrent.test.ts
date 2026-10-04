@@ -273,16 +273,16 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
   const { updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
   // The order-sensitive fixture from the allocation test: summing these shares in another order moves a 6dp cost.
   const goods = await seedGoodsPo('rs', 25, 3.01, [{ qty: 6, unit: 19.58 }, { qty: 8, unit: 6.46 }, { qty: 17, unit: 10.74 }])
-  const a = await seedFreightWithLines(goods.poId, goods.supplierId, ['89401.8989'], 'PO_SENT', { method: 'BY_QUANTITY' })
-  const b = await seedFreightWithLines(goods.poId, goods.supplierId, ['-27040.1416', '18605.9624'], 'PO_SENT', { method: 'BY_QUANTITY' })
+  const a = await seedFreightWithLines(goods.poId, goods.supplierId, ['89401.8989', '-27040.1416'], 'PO_SENT', { method: 'BY_QUANTITY' })
+  const b = await seedFreightWithLines(goods.poId, goods.supplierId, ['18605.9624'], 'PO_SENT', { method: 'BY_QUANTITY' })
   const save = async (poId: string, lines: Parameters<typeof updateFreightPoCosts>[1]) => {
     const outcome = await updateFreightPoCosts(poId, lines)
     assert.equal(outcome.success, true, `PRECONDITION: the save must succeed: ${outcome.error}`)
   }
   const asInput = (amounts: string[]) => amounts.map((amount, index) => ({ description: `freight ${index}`, amountForeign: Number(amount), vatable: false, distributionMethod: 'BY_QUANTITY' }))
   // A first real change establishes the stored landed costs (then the original amount is restored).
-  await save(a.poId, asInput(['89402.8989']))
-  await save(a.poId, asInput(['89401.8989']))
+  await save(a.poId, asInput(['89402.8989', '-27040.1416']))
+  await save(a.poId, asInput(['89401.8989', '-27040.1416']))
   const snapshot = async () => {
     const lines = await db.purchaseOrderLine.findMany({ where: { poId: goods.poId }, orderBy: { sortOrder: 'asc' }, select: { landedUnitCostBase: true } })
     const ids = await db.freightCostLine.findMany({ where: { poId: { in: [a.poId, b.poId] } }, orderBy: [{ poId: 'asc' }, { sortOrder: 'asc' }], select: { id: true } })
@@ -296,8 +296,8 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
   }
   const before = await snapshot()
   for (let i = 0; i < 6; i += 1) {
-    await save(b.poId, asInput(['-27040.1416', '18605.9624']))
-    await save(a.poId, asInput(['89401.8989']))
+    await save(b.poId, asInput(['18605.9624']))
+    await save(a.poId, asInput(['89401.8989', '-27040.1416']))
   }
   const after = await snapshot()
   console.log(`re-save PRECONDITION: 12 unchanged saves across 2 freight orders; runs ${before.runs} -> ${after.runs}; landed ${before.landed.join('/')} -> ${after.landed.join('/')}; ids unchanged: ${before.ids === after.ids}`)
@@ -319,12 +319,12 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
   assert.equal(legacyAfter.runs, legacyBefore.runs)
 
   // A CHANGE updates in place: the untouched line keeps its id, the changed one keeps its id too, and it revalues.
-  const bIdsBefore = (await db.freightCostLine.findMany({ where: { poId: b.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
-  await save(b.poId, asInput(['-27040.1416', '18606.9624']))
-  const bIdsAfter = (await db.freightCostLine.findMany({ where: { poId: b.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
+  const aIdsBefore = (await db.freightCostLine.findMany({ where: { poId: a.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
+  await save(a.poId, asInput(['89401.8989', '-27039.1416']))
+  const aIdsAfter = (await db.freightCostLine.findMany({ where: { poId: a.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
   const changed = await snapshot()
-  console.log(`re-save PRECONDITION: after one real edit ids ${bIdsBefore.join(',') === bIdsAfter.join(',') ? 'kept' : 'CHANGED'}, runs ${legacyAfter.runs} -> ${changed.runs}`)
-  assert.deepEqual(bIdsAfter, bIdsBefore, 'a changed save keeps the ids of the lines it edits in place')
+  console.log(`re-save PRECONDITION: after one real edit ids ${aIdsBefore.join(',') === aIdsAfter.join(',') ? 'kept' : 'CHANGED'}, runs ${legacyAfter.runs} -> ${changed.runs}`)
+  assert.deepEqual(aIdsAfter, aIdsBefore, 'a changed save keeps the ids of the lines it edits in place')
   assert.equal(changed.runs, legacyAfter.runs + 1, 'and a real edit does revalue')
 })
 
