@@ -512,15 +512,16 @@ test('the report READS the posted-but-unlinked invoice evidence apply compares a
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
 
-  assert.match(src, /POSTED_SALES_INVOICE_STATUSES/, 'the report reads SYNCED sales-invoice rows')
-  assert.match(
+  assert.match(src, /classifyPostedDocumentRows\(invoiceRowsByOrder/, 'the report classifies the sales-invoice rows by ledger standing (o3d-djemh)')
+  assert.match(src, /select: \{ referenceId: true, \.\.\.LEDGER_STANDING_SELECT \}/, 'reading the standing columns with them')
+  assert.doesNotMatch(
     src,
     /externalTransactionId: \{ not: null \}/,
-    'and only those carrying an external id — a SYNCED row without one is not a document',
+    'the document-id filter is the classifier\'s (a row without an id is not a document), not a hand-written where',
   )
   assert.match(
     src,
-    /postedInvoiceExternalIds: sortedPostedInvoiceIds\(/,
+    /postedInvoiceExternalIds: invoiceDocuments\.ids/,
     'and the ids reach the row the proposal is built from, sorted as apply compares them',
   )
 })
