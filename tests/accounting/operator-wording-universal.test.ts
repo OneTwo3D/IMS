@@ -64,6 +64,7 @@ const PROVEN_ROWS: Array<[string, LedgerStandingRow, RegExp]> = [
 for (const [cause, provenRow, allowed] of PROVEN_ROWS) {
   if (ledgerStanding(provenRow) !== 'PROVEN_NOT_POSTED') continue
   add(`display badge: PROVEN_NOT_POSTED / ${cause}`, describeLedgerStanding(provenRow).detail, allowed)
+  add(`display LABEL: PROVEN_NOT_POSTED / ${cause}`, describeLedgerStanding(provenRow).label ?? '', allowed)
 }
 const enq = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1', syncLogId: 'row-1' }
 add('enqueue refusal: unresolved (UNKNOWN)', describeUnresolvedPriorAttempt(enq))
