@@ -1242,3 +1242,29 @@ test('[o3d-1e7sl Codex r13] the kinds help text says "Mark as handled also stops
     if (def.clearing === 'manual') assert.equal(postingKeyIsReusedAcrossPostings(def.type), false, `${kind}: a manual kind promised "stops IMS ever posting it" must not be a reused-key type`)
   }
 })
+
+test('[o3d-1e7sl Codex r15] a deferred edit the operator ALREADY posted by hand before the Mark: the notice, the log and the release notice carry the ledger check, never an unconditional re-save or post', async () => {
+  const { AFTER_DECLINE_STEP, CHECK_AFTERWARDS } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction, releaseAccountingPostingRefusalHandPostClaimAction } = await import('@/app/actions/sync-exceptions')
+  for (const [mode, deferred, unaccounted] of [['counted', 2, false], ['unaccounted', 0, true]] as const) {
+    for (const [type, kind] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update'], ['BILL_PAYMENT', 'realised_fx_bill_payment']] as const) {
+      refusals.length = 0; syncRows.length = 0; activity.length = 0
+      refusals.push(refusal(`r15-${mode}-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${mode}-${type}`, scope: '' }))
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r15-${mode}-${type}`)), true, 'claim')
+      // the operator posts the CURRENT version by hand while holding the claim; IMS meanwhile declines a later enqueue
+      ;(refusals[0] as unknown as Record<string, unknown>).handPostDeferredCount = deferred
+      ;(refusals[0] as unknown as Record<string, unknown>).handPostDeclineUncountedAt = unaccounted ? new Date() : null
+      const result = await markAccountingPostingRefusalHandledAction(`r15-${mode}-${type}`, 'posted the current version by hand')
+      const notice = String((result as { notice?: string }).notice)
+      const log = String((activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string })?.description)
+      for (const [name, text] of [['notice', notice], ['activity log', log]] as const) {
+        assert.ok(text.includes(AFTER_DECLINE_STEP), `${mode}/${type}: the ${name} carries the conditional ledger check`)
+        assert.ok(text.includes(CHECK_AFTERWARDS), `${mode}/${type}: and the pointer to the list`)
+        // the ledger check PRECEDES any re-save / post-by-hand instruction in the same text
+        assert.ok(text.indexOf('Check whether the current version is already in the accounting system') < text.search(/re-save the document or post the current version by hand/), `${mode}/${type}: ${name}: the check comes first`)
+        assert.match(text, /Only if it is absent, re-save the document or post the current version by hand\./, `${mode}/${type}: ${name}: the re-save / post is conditional on absence`)
+        assert.doesNotMatch(text, /(^|\. )Re-save it|Compare the document with the ledger; re-save/i, `${mode}/${type}: ${name}: no unconditional re-save`)
+      }
+    }
+  }
+})

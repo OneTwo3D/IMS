@@ -70,6 +70,14 @@ export const MARK_ACTION_NOW = 'Marking this records your confirmation and cance
 export const CLAIM_ACTION_NOW = 'While you hold the claim, IMS does not queue this posting.'
 /** The tail every refusing site's remedy uses after "mark this row handled" (Codex round 14: no prediction of what marking leads to). */
 export const MARK_REMEDY_TAIL = `Marking the row handled cancels IMS's own queued retry of it. ${CHECK_AFTERWARDS}`
+/**
+ * Codex round 15: after a mark or a release that leaves a refusal outstanding, the operator may ALREADY have posted the current version by hand
+ * while holding the claim, so "re-save it or post it" can duplicate it. Never an instruction to post without the ledger check first.
+ */
+export const AFTER_DECLINE_STEP =
+  'Check whether the current version is already in the accounting system. If it is, take a fresh claim and mark the outstanding refusal handled. '
+  + 'Only if it is absent, re-save the document or post the current version by hand.'
+export const LEDGER_CHECK_FIRST = 'Check whether the current version is already in the accounting system. Only if it is absent: '
 export const RELEASE_ACTION_NOW = 'Releasing gives up your claim on this posting.'
 export const TAKE_TOAST = `Taken for hand posting. ${CLAIM_ACTION_NOW}`
 export const RELEASE_TOAST = `Released. ${CHECK_AFTERWARDS}`
@@ -305,20 +313,20 @@ export function releaseLogDescription(args: { unaccounted: boolean; deferredEdit
 
 export function releaseNotice(args: { unaccounted: boolean; deferredEdits: number }): string | null {
   const declined = declinedWhileHeld(args.unaccounted, args.deferredEdits)
-  return declined === '' ? null : `Released.${declined} Compare the document with the ledger. ${CHECK_AFTERWARDS}`
+  return declined === '' ? null : `Released.${declined} ${AFTER_DECLINE_STEP} ${CHECK_AFTERWARDS}`
 }
 
 export function markLogDescription(args: { kind: string; cancelledCount: number; stillOutstanding: boolean; unaccounted: boolean; deferredEdits: number }): string {
   return `Marked a refused ${args.kind} posting as handled: the operator confirmed the current version is in the ledger (posted by hand, or already there); IMS did not read the ledger. `
     + `${MARK_ACTION_NOW}`
     + (args.cancelledCount > 0 ? ` ${args.cancelledCount} unsent queued row(s) for it were cancelled.` : '')
-    + (args.stillOutstanding ? ` This row is STILL OUTSTANDING.${declinedWhileHeld(args.unaccounted, args.deferredEdits)} Compare the document with the ledger; re-save it or post the current version by hand.` : '')
+    + (args.stillOutstanding ? ` This row is STILL OUTSTANDING.${declinedWhileHeld(args.unaccounted, args.deferredEdits)} ${AFTER_DECLINE_STEP}` : '')
     + ` ${CHECK_AFTERWARDS}`
 }
 
 export function markNotice(args: { unaccounted: boolean; deferredEdits: number }): string {
   return `Your confirmation is recorded. This row is STILL OUTSTANDING.${declinedWhileHeld(args.unaccounted, args.deferredEdits)} `
-    + `Compare the document with the ledger; re-save it or post the current version by hand. ${CHECK_AFTERWARDS}`
+    + `${AFTER_DECLINE_STEP} ${CHECK_AFTERWARDS}`
 }
 
 /** Wording for surfaces that know no row state: what a refusing site's remedy / the not-claimed refusal / the help text say. */
@@ -386,7 +394,7 @@ export function renderHandPostSettlementDoc(): string {
     '',
     '  **If the document is saved again while you hold the claim.** IMS declines to queue that posting, including a later version of the same document '
       + '(an invoice update, a bill update, a bill payment). Each decline is counted on the row and shown in the claims section as *postponed behind it*. '
-      + `When you press *Mark as handled* after that, the page tells you whether the row is still outstanding. ${CHECK_AFTERWARDS}`,
+      + `When you press *Mark as handled* after that, the page tells you whether the row is still outstanding. ${AFTER_DECLINE_STEP} ${CHECK_AFTERWARDS}`,
     '',
     '  **An earlier version of the same document.** For the postings where successive versions share one entry (an invoice update, a bill update, '
       + 'a bill payment) the ledger may already hold the previous version. IMS names that document on the row and does not stop you taking the posting. '

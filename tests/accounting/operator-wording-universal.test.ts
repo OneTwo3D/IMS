@@ -15,7 +15,7 @@ import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
-import { HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
+import { AFTER_DECLINE_STEP, LEDGER_CHECK_FIRST, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
 import { REUSED_POSTING_KEY_TYPES } from '@/lib/accounting/posting-key'
 import { GENERIC_HAND_POST_STEP, PAYMENT_POSTING_TYPES, UPDATE_POSTING_TYPES, handPostStepFor, NOT_LOADED_HAND_POST_INPUT, handPostInputOf, renderHandPostInstructionDoc, claimWarningFor, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
@@ -420,4 +420,40 @@ test('[o3d-1e7sl Codex r14] the help doc carries the generated blocks exactly on
   const client = read('app/(dashboard)/sync/exceptions/exceptions-client.tsx')
   for (const symbol of ['TAKE_TOAST', 'RELEASE_TOAST', 'MARKED_TOAST', 'INCOMPLETE_HISTORY_BANNER']) assert.ok(client.includes(symbol), `exceptions-client.tsx renders ${symbol}`)
   for (const f of ['lib/accounting.ts', 'lib/domain/sales/sales-invoice-update-sync.ts', 'lib/domain/purchasing/landed-cost-service.ts']) assert.ok(read(f).includes('MARK_REMEDY_TAIL'), `${f} ends its remedies with the shared tail`)
+})
+
+// Codex round 15: NEVER AN INSTRUCTION TO RE-SAVE OR POST BY HAND WITHOUT THE LEDGER CHECK. In the modules that render the post-mark / post-release /
+// refusal-remedy surfaces and in the generated doc blocks, every sentence that tells the operator to re-save a document or to post a version by hand
+// must have a ledger check ("check whether ... already ... accounting system", "check the ledger") in the SAME sentence or the sentence before it.
+test('[o3d-1e7sl Codex r15] no re-save / post-by-hand instruction appears without the ledger check in the same sentence group', () => {
+  const MODULES = [
+    'lib/domain/accounting/hand-post-instruction.ts', 'lib/domain/accounting/posting-refusal-copy.ts', 'lib/domain/sales/sales-invoice-update-sync.ts',
+    'lib/domain/accounting/posting-mark-handled.ts', 'lib/domain/accounting/posting-suppression.ts', 'lib/domain/accounting/posting-refusal-inbox.ts',
+    'app/actions/sync-exceptions.ts', 'app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'lib/accounting.ts', 'lib/domain/purchasing/landed-cost-service.ts',
+  ]
+  const INSTRUCTION = /\bre-?save (it|the (document|order|bill|invoice))\b|\bpost (it|that|the current version|its current version)\b[^.]{0,40}\bby hand\b/i
+  const CHECK = /check whether the current version is already in the accounting system|check the ledger|check for that document|the ledger for (the|that)|check Sync > Exceptions|check the accounting system/i
+  // the shared constants are identifiers in the source; substitute their text so the check sees what the operator reads
+  const expand = (source: string) => source.replace(/\bLEDGER_CHECK_FIRST\b/g, JSON.stringify(LEDGER_CHECK_FIRST)).replace(/\bAFTER_DECLINE_STEP\b/g, JSON.stringify(AFTER_DECLINE_STEP))
+  const sentencesOfLiterals = (file: string) => stringLiterals(expand(read(file))).join(' ').replace(/['"`]\s*\+?\s*['"`]/g, '').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
+  const sources: Array<[string, string[]]> = [
+    ...MODULES.map((f) => [f, sentencesOfLiterals(f)] as [string, string[]]),
+    ['generated doc blocks', [renderHandPostInstructionDoc(), renderHandPostSettlementDoc()].join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)],
+  ]
+  const offenders: string[] = []
+  let instructions = 0
+  for (const [name, sentences] of sources) {
+    sentences.forEach((sentence, i) => {
+      if (!INSTRUCTION.test(sentence)) return
+      instructions += 1
+      // the remedies that already name a CURRENT-version check inside the typed step carry it in the sentence; others need the previous sentence to
+      if (CHECK.test(sentence) || CHECK.test(sentences[i - 1] ?? '') || CHECK.test(sentences[i - 2] ?? '')) return
+      offenders.push(`${name}: ${sentence.slice(0, 150)}`)
+    })
+  }
+  console.log(`# r15 re-save / post-by-hand instructions checked: ${instructions}`)
+  assert.ok(instructions >= 4, 'the census finds instructions to check (not vacuous)')
+  assert.deepEqual(offenders, [], 'a re-save / post-by-hand instruction without the ledger check before it')
+  // control: the checker flags an unconditional one
+  assert.ok(INSTRUCTION.test('Compare the document with the ledger; re-save it or post the current version by hand.') && !CHECK.test('Compare the document with the ledger; re-save it or post the current version by hand.'), 'control: the old notice would be flagged')
 })
