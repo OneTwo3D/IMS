@@ -27,9 +27,11 @@ import { PRIOR_ATTEMPT_SELECT } from '@/lib/domain/accounting/prior-posting-evid
  * prior attempt for THIS refund's reversal is read - under the same follow-up scope lock the enqueue
  * takes, in the same transaction as the write, so there is no check-then-act gap - and classified by the
  * ledger-standing module. Only when every attempt is PROVEN_NOT_POSTED, or none exists, is the relief
- * written down. Any other standing (LIVE_WORK, CONFIRMED_POSTED, ASSERTED_*, UNKNOWN) means a journal
- * exists or may have posted: the relief is KEPT and the obligation is left UNRESOLVED (nothing is
- * discharged; the flag stays), so a retry once posting is back on settles against the real row.
+ * written down. A CONFIRMED_POSTED attempt means the journal posted: the obligation is DISCHARGED (the flag
+ * and the staged record come down) and the relief is KEPT. Any other standing (LIVE_WORK, ASSERTED_*,
+ * UNKNOWN) means a journal may have posted or may still post: the relief is KEPT and the obligation is left
+ * UNRESOLVED (nothing is discharged; the flag stays), so a retry once posting is back on settles against the
+ * real row.
  *
  * WHAT IT DOES NOT DO: it never touches the amount when the reversal was QUEUED, and it is never called
  * for a refund whose hand-off refused or threw.
@@ -72,14 +74,23 @@ export async function dischargeRefundAccountingObligation(
       }
       const rows = await tx.accountingSyncLog.findMany({ where, select: PRIOR_ATTEMPT_SELECT })
       const standings = rows.map((row) => ledgerStanding(row))
-      const mayExist = standings.filter((standing) => standing !== 'PROVEN_NOT_POSTED')
-      if (mayExist.length > 0) {
+      // CONFIRMED_POSTED is a settled fact: the journal posted, so the obligation IS met even though posting is
+      // off now (Codex round 2 on #733). It discharges - the flag and the staged record come down, so the refund
+      // stops blocking the order (scjz.22) - and the relief is PRESERVED, never zeroed. PROVEN_NOT_POSTED rows
+      // alongside it are irrelevant. Everything else may have posted or may still post and stays unresolved.
+      const unsettled = standings.filter((standing) => standing !== 'PROVEN_NOT_POSTED' && standing !== 'CONFIRMED_POSTED')
+      if (unsettled.length > 0) {
+        const live = unsettled.includes('LIVE_WORK')
         return {
           discharged: false as const,
-          reason: `the reversal journal for refund ${refundId} was settled as "will never post" under the current configuration, but ${mayExist.length} earlier attempt(s) for it exist (${[...new Set(mayExist)].join(', ')}): it may have posted, so its recorded relief is kept and the refund's accounting stays outstanding until it is retried with posting enabled`,
+          reason: `the reversal journal for refund ${refundId} was settled as "will never post" under the current configuration, but ${unsettled.length} earlier attempt(s) for it exist (${[...new Set(unsettled)].join(', ')}): it may have posted or may still post, so its recorded relief is kept and the refund's accounting stays outstanding. `
+            + (live
+              ? 'A queued row drains once posting is enabled again; if the connector has been retired, settle that row from the sync exceptions list (per-row settlement) after checking the ledger, then retry. '
+              : 'Check the ledger for that journal and settle the row from the sync exceptions list (per-row settlement), then retry. ')
+            + 'Until then this refund blocks further refunds on the order.',
         }
       }
-      zero = true
+      zero = !standings.includes('CONFIRMED_POSTED')
     }
     await tx.salesOrderRefund.update({
       where: { id: refundId },
