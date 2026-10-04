@@ -1094,5 +1094,6 @@ test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unprove
   assert.equal(ok(result), true)
   const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
   assert.match(note.description, /The ledger ALREADY holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed wording')
+  assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not the earlier version\): if the current version is there, do not post again; if only the earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
   assert.match(note.description, /look in the ledger for the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\) and post it by hand ONLY if it is not there/, 'the retired attempt is checked against the CURRENT version, not the earlier one')
 })
