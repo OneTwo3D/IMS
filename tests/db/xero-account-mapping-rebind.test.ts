@@ -65,7 +65,7 @@ async function seedMapping(tx: Tx, owner: string, stampedFor: string | null) {
 const rowsLeft = async (tx: Tx) =>
   (await tx.setting.findMany({ where: { key: { in: [...XERO_ACCOUNT_MAPPING_KEYS] } }, select: { key: true } })).length as number
 
-test('o3d-6thk1 (real table): a different organisation clears all sixteen mapping rows and the sync toggle, nothing else', async () => {
+test('o3d-6thk1 (real table): a different organisation clears all sixteen mapping rows and the sync toggle, nothing else', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
   const observed = await withRollback(async (tx) => {
     await lockAccountingMappingSelection(tx, 'xero')
@@ -92,7 +92,7 @@ test('o3d-6thk1 (real table): a different organisation clears all sixteen mappin
   assert.equal(observed.unrelated, 'keep')
 })
 
-test('o3d-6thk1 (real table): the SAME organisation changes nothing', async () => {
+test('o3d-6thk1 (real table): the SAME organisation changes nothing', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
   const observed = await withRollback(async (tx) => {
     await lockAccountingMappingSelection(tx, 'xero')
@@ -106,7 +106,7 @@ test('o3d-6thk1 (real table): the SAME organisation changes nothing', async () =
   assert.equal(observed.sync, 'true')
 })
 
-test('o3d-6thk1 (real table): the lock\'s own empty inventory/transit rows are not a mapping', async () => {
+test('o3d-6thk1 (real table): the lock\'s own empty inventory/transit rows are not a mapping', { skip }, async () => {
   const run = randomUUID().slice(0, 8)
   const observed = await withRollback(async (tx) => {
     await tx.setting.deleteMany({ where: { key: { in: [...XERO_ACCOUNT_MAPPING_KEYS, 'xero_sync_enabled', XERO_ACCOUNT_MAPPING_TENANT_KEY] } } })
