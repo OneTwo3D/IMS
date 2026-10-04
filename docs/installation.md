@@ -1282,6 +1282,7 @@ Each cron endpoint requires `Authorization: Bearer ${CRON_SECRET}` in the reques
 - [ ] Remote upload (S3 or SFTP) configured under Settings > Backup. Local-only backups are vulnerable to the same incident that takes down the application server.
 - [ ] Restore round-trip tested on a staging environment — confirm the manifest validation passes and the database is functional after restore.
 - [ ] `DATABASE_RESTORE_MAX_FILE_BYTES` raised if your typical backup exceeds 50MB.
+- [ ] A [fresh-install rehearsal](#fresh-install-rehearsal) is GREEN for the commit being deployed — it demonstrates the dump-and-restore round trip on a throwaway cluster before any data is loaded.
 
 ### Integrations
 
@@ -1358,6 +1359,64 @@ above is the single enforcement point.
 - [ ] Email notifications working — admin recipients receive critical-finding notifications from the invariant check cron.
 - [ ] Application logs are being collected (stdout/journald → your log aggregator).
 
+
+## Fresh-install rehearsal
+
+`npm run rehearse:first-install` rehearses the **first install of a production instance** — `prisma migrate deploy`, `npm run db:seed`, `scripts/provision-instance.mjs` — on a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a readiness report. It does **not** run `scripts/install.sh`, `update.sh` or `deploy.sh`, touches no service, and never connects to the database the checkout's `.env` names. It is the rehearsal behind o3d-zjsb5.2 (provision production, AC2–AC6) and o3d-zjsb5.3 (the base currency is fixed before any data exists), and the restore drill the opening-stock load depends on.
+
+```bash
+# As the account that owns the checkout (NOT root), with PostgreSQL server binaries installed
+# (Debian: apt-get install postgresql) and `npx prisma generate` already run:
+npm run rehearse:first-install
+# Optional: --root <dir> (parent of the throwaway cluster, default /var/tmp) and
+#           --report-dir <dir> (default /var/tmp/ims-rehearsal-reports).
+```
+
+A first measured run, 279 migrations, took 18 seconds. It runs one `tsx`, `prisma` or `npm` process at a time beside the cluster; on a memory-constrained shared host take the same lock the test tiers take.
+
+### What it builds, and what it refuses to touch
+
+- **A cluster of its own** in a fresh `ims-rehearsal-*` directory under `--root`, on a private loopback TCP port, with `scram-sha-256` password authentication exactly as CI configures it (the report records that the stored password is a SCRAM verifier and that every `host` rule in `pg_hba.conf` is scram). `--root` is refused when it is on a RAM-backed file system (`tmpfs`, `ramfs`): the cluster and its dump would be held in memory. Every run creates a new directory, so a re-run never meets the previous run's cluster.
+- **Its own superuser role** with a random password. The password and the other generated secrets live in a mode-600 `rehearsal.env` inside the run directory and in the environment of the child processes — never on a command line, so they are not visible in `ps`. The file is shredded in the teardown (`shred -u`; on a copy-on-write file system an overwrite is not a guarantee, which is acceptable because the cluster it unlocks is deleted in the same breath).
+- **No inherited database.** The script never reads `DATABASE_URL` from the environment it was started in; if one is set the report says it was ignored. Every child process gets a **whitelisted** environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `NODE_OPTIONS`, `npm_config_cache`) plus the throwaway cluster's own values, and immediately before a child is spawned or a connection opened the URL it would use is checked against the cluster's host, port, role and database names — anything else is refused, and so is an environment carrying `SMTP_*`, a connector credential or outbound grant, `NOTIFICATION_EMAIL`, or a libpq override (`PGHOST`, `PGPORT`, …). `IMS_SKIP_ENV_FILE=1` is set for the children so that `scripts/prisma-dev-db.sh` (behind `npm run validate:db`) does not source the checkout's `.env.local` / `.env` over the rehearsal's `DATABASE_URL`.
+- **No email, no connectors, no network.** SMTP stays unset, so `provision-instance.mjs` logs that it skipped the provisioning email (the rehearsal asserts that line and the absence of "Provisioning email sent"); no WooCommerce, Mintsoft, Xero or other credential exists in any environment; nothing leaves the loopback interface.
+
+### Exit codes
+
+This table is the only place the codes are documented; `REHEARSAL_EXIT` in `lib/ops/first-install-rehearsal.ts` is its source and `tests/scripts/rehearse-first-install.test.ts` fails if the two disagree.
+
+| Code | Meaning |
+| --- | --- |
+| 0 | GREEN: every required step passed and the teardown left nothing behind. |
+| 1 | RED: a required step failed, was skipped, or threw. The report says which. |
+| 2 | Refused to start: bad arguments, no PostgreSQL server binaries, run as root, or the work directory is on a RAM-backed file system. Nothing was created. |
+| 3 | The teardown could not remove everything it created (cluster, env file, directory or a process). The report names what is left. Takes precedence over RED. |
+
+### The readiness report
+
+Two files per run, `readiness-report.json` and `readiness-report.md`, under `<report-dir>/<run id>/` (the Markdown is also printed). The JSON carries `verdict`, `exitCode`, one entry per step (`id`, `item`, `required`, `status`, `reason`, `detail`) and the `teardown` record; a consumer needs only `verdict === "GREEN"` and, for the detail, `steps[].status`.
+
+| Item | Step | What a PASS means |
+| --- | --- | --- |
+| 1 | `prisma migrate deploy`, `prisma migrate status` | Every migration directory on disk is recorded as applied (the count is in the report) and `migrate status` says the schema is up to date. |
+| 2 | Seeded rows | Exactly one Organisation, `default`, with base currency **GBP** and country GB; the `DEFAULT` warehouse, flagged default and the only one; at least four tax rates including the default `UK Standard Rate (20%)`; the six seeded currencies; one active admin from `provision-instance.mjs`; no SMTP settings. **A non-GBP base currency makes the report RED.** |
+| 3 | `isBaseCurrencyLocked()` | Asked of the application's own code (`scripts/lib/first-install-probe.ts`, run against the throwaway database) after the six tables the lock reads were counted at zero and the `base_currency_locked` setting was found absent: the answer must be `false`. |
+| 4 | `system_identifier` | Read from `pg_control_system()` and recorded, so a later restore or clone can be told apart from the cluster that produced the report. |
+| 5 | `npm run preflight:production` | Exits 0. It checks **infrastructure** readiness only (secrets, URLs, writable directories, the push-state enum); it is not a data check. Warnings are listed in the report. |
+| 6 | `npm run validate:db` | Exits 0, which includes the check that the non-negative and `reservedQty <= quantity` constraints are installed and fire. The concurrency tier inside it is skipped unless `IMS_CONCURRENCY_SCRATCH_DB` is set, and the report says so. |
+| 7 | `npm run invariant-check:preflight` | Exits 0: no critical invariant findings on the freshly provisioned database. |
+| 8 | `npm run outbound:status` | **Optional while `package.json` has no `outbound:status` script** (the step is recorded as skipped, with the reason, and does not make the report RED); **required the moment the script exists**: it must exit 0, say `held` and report no connector as granted, open or writing. The matching rule (`assessOutboundStatus`) is deliberately loose because the script's output format is owned by the outbound-hold work. |
+| 9 | Restore drill | `pg_dump -Fc` of the installed database, `pg_restore` into a **second** database on the same cluster, then for **every** table of either side the row count and an md5 over the sorted per-row digests must be identical. A table missing from or invented by the restore is a mismatch. A comparison that saw no tables, or only empty ones, fails as vacuous. The report also lists any table whose content changed between provisioning and the dump (informational). It compares the `public` schema's tables; it does not compare sequences, roles or large objects. |
+
+A step that does not run because an earlier prerequisite failed (`migrate deploy`, `db:seed`, `provision-instance.mjs`) is recorded as **skipped** and, being required, keeps the report RED. Every step in the catalogue appears in every report, so an aborted run cannot read as green.
+
+### The teardown
+
+It runs in a `finally`, whether a step failed, a step threw, the script was interrupted by SIGINT or SIGTERM, or the cluster never finished starting. It stops the cluster, shreds the env file, removes the run directory, and then looks for what is left: any process that was a descendant of the postmaster this run started, and any process whose command line names the run directory. Processes are stopped only by the PID this run captured — never by name — and survivors are listed as **orphan PIDs** in the report and turn the exit code to 3.
+
+### How it feeds the go/no-go gate
+
+The go/no-go gate (o3d-zjsb5.18) wants evidence that a fresh install of **this build** provisions cleanly and that a backup taken before any load restores to an identical database. A GREEN report from the commit being deployed is that evidence for items 1–7 and 9; item 8 joins it once the outbound hold exists. Attach the JSON, not a paraphrase of it. The rehearsal does not replace the gate's data checks (the invariant preflight against the **real** database, the reconciliation pack) and says nothing about the real host: `install.sh`, the service account, nginx and the production `.env` are outside it.
 
 ## Updating
 
