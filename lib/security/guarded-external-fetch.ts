@@ -16,6 +16,7 @@
  */
 
 import { OutboundWriteHeldError, outboundWriteRefusal, type OutboundEnv } from './outbound-write-grant'
+import { stripOutboundHoldReferences } from './outbound-write-hold-constants'
 
 const MAX_REDIRECTS = 5
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
@@ -36,7 +37,8 @@ export async function guardedExternalFetch(
   let url = input instanceof URL ? input : new URL(input)
   let method = (init.method ?? 'GET').toUpperCase()
   let headers = new Headers(init.headers)
-  let body = init.body
+  // No hold text reaches a destination (see connectorFetch): strip reference tokens from a string body.
+  let body = typeof init.body === 'string' ? stripOutboundHoldReferences(init.body) : init.body
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const refusal = outboundWriteRefusal({

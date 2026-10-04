@@ -380,6 +380,25 @@ test('a text a vendor chose can never be recognised as a hold: recognition needs
     assert.equal(isOutboundWriteHeldText(text), false, text)
     assert.equal(isOutboundMaybeSentRefusalText(text), false, text)
   }
-  assert.match(outboundHoldReferenceSuffix('held'), /^ \[hold-ref [0-9a-f]{18}\]$/)
-  assert.notEqual(outboundHoldReferenceSuffix('held'), outboundHoldReferenceSuffix('maybe-sent'), 'per kind')
+  assert.match(outboundHoldReferenceSuffix('held', 'x'), /^ \[hold-ref [0-9a-f]{18}\]$/)
+  assert.notEqual(outboundHoldReferenceSuffix('held', 'x'), outboundHoldReferenceSuffix('maybe-sent', 'x'), 'per kind')
+  assert.notEqual(outboundHoldReferenceSuffix('held', 'x'), outboundHoldReferenceSuffix('held', 'y'), 'per text')
+})
+
+test('no hold text reaches a destination: reference tokens are stripped from an outgoing body by connectorFetch and by guardedExternalFetch', async () => {
+  const { guardedExternalFetch } = await import('../../lib/security/guarded-external-fetch.ts')
+  const real = new OutboundWriteHeldError({ connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.com/x', granted: null, attempted: null, basis: 'b' }, 0).message
+  assert.match(real, /\[hold-ref /, 'precondition: the text carries a token (a valid SETTINGS_ENCRYPTION_KEY is set, as in CI)')
+  const listener = await startListener()
+  const payload = JSON.stringify({ note: `Order comment copied from an error: ${real}`, other: 'kept' })
+  console.log('precondition (strip): a granted write whose body embeds a real hold text, sent through both transports')
+  const env1 = env({ WC_WRITEBACK_ALLOWED_ORIGIN: listener.origin })
+  await connectorFetch(`${listener.origin}/wp-json/wc/v3/orders/1/notes`, { method: 'POST', body: payload }, { connectorName: 'WooCommerce', allowE2eLocalHttp: true, env: env1 })
+  await guardedExternalFetch(`${listener.origin}/wp-json/wc/v3/orders/1/notes`, { method: 'POST', body: payload }, { connectorName: 'WooCommerce', env: env1 })
+  assert.equal(listener.received.length, 2)
+  for (const request of listener.received) {
+    assert.equal(request.body.includes('[hold-ref'), false, 'no reference token left IMS')
+    assert.equal(JSON.parse(request.body).other, 'kept', 'the rest of the payload is untouched')
+    assert.ok(request.body.includes('Outbound write HELD'), 'only the token is removed')
+  }
 })

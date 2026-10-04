@@ -50,13 +50,18 @@ export const OUTBOUND_HELD_TEXT_PREFIX = 'Outbound write HELD'
  * `Message`, a WooCommerce error body). A vendor that sent "Outbound write HELD (" would otherwise be read
  * as proof that nothing was sent.
  *
- * So every text this module builds ends with a reference that is an HMAC-SHA256 (truncated) of the text's
- * KIND, keyed by the installation's settings encryption key (SETTINGS_ENCRYPTION_KEY, which every process
- * of an installation - web, workers, scripts - already has and no vendor ever sees). It is therefore:
- *  - STABLE: the same in every process and across restarts and deploys, so a hold text written by one
- *    process (and persisted in an outbox row, sync log or link) is recognised by another;
- *  - UNFORGEABLE by vendor text: computing it needs the key;
- *  - PER KIND: a "held" reference cannot be replayed to make a maybe-sent text look held, or the reverse.
+ * So every text this module builds ends with a reference that is an HMAC-SHA256 (truncated) over the text's
+ * KIND and the EXACT human text that precedes it, keyed by the installation's settings encryption key
+ * (SETTINGS_ENCRYPTION_KEY, which every process of an installation - web, workers, scripts - already has and
+ * no vendor ever sees). It is therefore:
+ *  - STABLE for a given text: the same in every process and across restarts and deploys, so a hold text
+ *    written by one process (and persisted in an outbox row, sync log or link) is recognised by another;
+ *  - UNFORGEABLE: computing it needs the key;
+ *  - BOUND TO ITS TEXT: recognition recomputes the HMAC over the text that precedes the token, so a valid
+ *    token COPIED onto different text, or onto a vendor-chosen message, does not verify. (Replaying a whole
+ *    text verbatim would verify, which is why no hold text may ever reach a destination: connectorFetch and
+ *    guardedExternalFetch strip every token from an outgoing body with stripOutboundHoldReferences.)
+ *  - PER KIND: a "held" reference does not verify as "maybe-sent", or the reverse.
  *
  * FAIL-SAFE: if the key is absent or unreadable the reference cannot be computed, so NOTHING is recognised
  * as a hold (each queue then treats the failure as an ordinary one, the cautious direction), the texts say
@@ -66,7 +71,8 @@ type HoldReferenceKind = 'held' | 'maybe-sent'
 
 let reportedMissingKey = false
 
-function holdReference(kind: HoldReferenceKind): string | null {
+/** The reference for ONE exact text: HMAC over the kind and the whole human text that precedes the token. */
+function holdReferenceFor(kind: HoldReferenceKind, body: string): string | null {
   const key = resolveAesEncryptionKey()
   if (!key) {
     if (!reportedMissingKey) {
@@ -79,18 +85,39 @@ function holdReference(kind: HoldReferenceKind): string | null {
     }
     return null
   }
-  return createHmac('sha256', key).update(`outbound-write-hold/v1/${kind}`).digest('hex').slice(0, 18)
+  return createHmac('sha256', key).update(`outbound-write-hold/v2/${kind}\n${body}`).digest('hex').slice(0, 18)
 }
 
-/** The suffix every hold / maybe-sent refusal text carries. */
-export function outboundHoldReferenceSuffix(kind: HoldReferenceKind): string {
-  const reference = holdReference(kind)
-  return ` [hold-ref ${reference ?? 'unavailable'}]`
+/** `body` + this suffix is a complete hold text. The token is bound to `body`, so it cannot be moved. */
+export function outboundHoldReferenceSuffix(kind: HoldReferenceKind, body: string): string {
+  return ` [hold-ref ${holdReferenceFor(kind, body) ?? 'unavailable'}]`
 }
 
-function carriesHoldReference(text: string, kind: HoldReferenceKind): boolean {
-  const reference = holdReference(kind)
-  return reference !== null && text.includes(`[hold-ref ${reference}]`)
+const HOLD_TOKEN = / \[hold-ref ([0-9a-f]{18}|unavailable)\]/g
+
+/** Remove every hold reference token (single-sourced: used before any text can reach a destination). */
+export function stripOutboundHoldReferences(text: string): string {
+  return text.replace(HOLD_TOKEN, '')
+}
+
+/**
+ * Does `text` contain a hold text of this kind: one of `prefixes` followed by a body that runs to a token
+ * whose reference is the HMAC of (kind, exactly that body)? Wrappers around the hold text are fine; a token
+ * copied onto different text, or onto a vendor-chosen text, fails because it is recomputed over the text
+ * that precedes it.
+ */
+function carriesHoldReference(text: string, kind: HoldReferenceKind, prefixes: readonly string[]): boolean {
+  for (const token of text.matchAll(HOLD_TOKEN)) {
+    const claimed = token[1]!
+    if (claimed === 'unavailable') continue
+    const head = text.slice(0, token.index)
+    for (const prefix of prefixes) {
+      for (let start = head.indexOf(prefix); start !== -1; start = head.indexOf(prefix, start + 1)) {
+        if (holdReferenceFor(kind, head.slice(start)) === claimed) return true
+      }
+    }
+  }
+  return false
 }
 
 /**
@@ -139,7 +166,7 @@ export const OUTBOUND_HELD_RETRY_DELAY_MS = 15 * 60_000
  * callers wrap the text ("Contact error: ...", "Failed to push ...: ...").
  */
 export function isOutboundWriteHeldText(text: string | null | undefined): boolean {
-  return typeof text === 'string' && text.includes(`${OUTBOUND_HELD_TEXT_PREFIX} (`) && carriesHoldReference(text, 'held')
+  return typeof text === 'string' && carriesHoldReference(text, 'held', [`${OUTBOUND_HELD_TEXT_PREFIX} (`])
 }
 
 /**
@@ -154,15 +181,15 @@ export const OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX = 'Outbound write REFUSED A
  * prefix is removed from the detail, so isOutboundWriteHeldText cannot recognise the result.
  */
 export function outboundTextAfterEarlierSend(heldText: string, label: string): string {
-  const detail = heldText.split(`${OUTBOUND_HELD_TEXT_PREFIX} (`).join('refusal (')
-  return `${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (${label}): an earlier request in this same operation HAD ALREADY been sent to ${label} and may have taken effect, and a later request was then refused by this installation's outbound-write hold; the earlier outcome is unknown, so this is not treated as a hold and nothing may be repeated blindly. Detail: ${detail}${outboundHoldReferenceSuffix('maybe-sent')}`
+  const detail = stripOutboundHoldReferences(heldText.split(`${OUTBOUND_HELD_TEXT_PREFIX} (`).join('refusal ('))
+  const body = `${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (${label}): an earlier request in this same operation HAD ALREADY been sent to ${label} and may have taken effect, and a later request was then refused by this installation's outbound-write hold; the earlier outcome is unknown, so this is not treated as a hold and nothing may be repeated blindly. Detail: ${detail}`
+  return `${body}${outboundHoldReferenceSuffix('maybe-sent', body)}`
 }
 
 /** Whether a failure text is a refusal of a request that FOLLOWED a sent one: a maybe-applied operation. */
 export function isOutboundMaybeSentRefusalText(text: string | null | undefined): boolean {
   return typeof text === 'string'
-    && (text.includes(`${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (`) || text.includes(`${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (`))
-    && carriesHoldReference(text, 'maybe-sent')
+    && carriesHoldReference(text, 'maybe-sent', [`${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (`, `${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (`])
 }
 
 export type OutboundRefusalReasonInput = {
@@ -223,9 +250,11 @@ export function outboundHeldMessage(input: OutboundHeldMessageInput): string {
   const reason = outboundRefusalReason(input)
   const remedy = outboundRemedyText(input.connector)
   if (input.hop === 0) {
-    return `${OUTBOUND_HELD_TEXT_PREFIX} (${label}): ${reason} ${input.method} ${input.target} was refused before it left IMS, so nothing was sent to ${label}. This is a hold on this installation, not a rejection by ${label}. ${remedy}${outboundHoldReferenceSuffix('held')}`
+    const body = `${OUTBOUND_HELD_TEXT_PREFIX} (${label}): ${reason} ${input.method} ${input.target} was refused before it left IMS, so nothing was sent to ${label}. This is a hold on this installation, not a rejection by ${label}. ${remedy}`
+    return `${body}${outboundHoldReferenceSuffix('held', body)}`
   }
-  return `${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (${label}): ${reason} Redirect hop ${input.hop} (${input.method} ${input.target}) was refused before it left IMS, but the request that was redirected HAD ALREADY been sent to ${label} and may have taken effect: check ${label} for its effect before repeating it. It is treated as a failure whose outcome is unknown, not as a hold. ${remedy}${outboundHoldReferenceSuffix('maybe-sent')}`
+  const body = `${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (${label}): ${reason} Redirect hop ${input.hop} (${input.method} ${input.target}) was refused before it left IMS, but the request that was redirected HAD ALREADY been sent to ${label} and may have taken effect: check ${label} for its effect before repeating it. It is treated as a failure whose outcome is unknown, not as a hold. ${remedy}`
+  return `${body}${outboundHoldReferenceSuffix('maybe-sent', body)}`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -290,7 +319,7 @@ export const OUTBOUND_DOC_BLOCKS: Record<OutboundDocBlockId, string> = {
     'Each variable names exactly one destination. A list, a wildcard, a boolean or a value in any other shape is unreadable and grants nothing. Changing the store URL, the Mintsoft base URL or the Xero organisation in Settings revokes the permission instead of inheriting it, because the comparison is against the destination of the request that is actually being made. Setting a variable changes what the installation may do; it does not start any writer.',
   ].join('\n'),
   'held-meaning': [
-    'A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Every such message ends with a short reference in square brackets (`[hold-ref ...]`) that is derived from the settings encryption key of the installation, so every process agrees on it and it survives restarts; it is how IMS tells its own hold text from text a destination sent, so a destination can never make a sent request look like a hold. Without that key no failure is recognised as a hold, and the log says so once. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent and may have taken effect. That refusal begins "Outbound write REFUSED AFTER A REDIRECT", is not a hold, and is treated like any other failure of unknown outcome: it spends an attempt and can be dead-lettered for an operator to check.',
+    'A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Every such message ends with a short reference in square brackets (`[hold-ref ...]`) that is derived from the settings encryption key of the installation, so every process agrees on it and it survives restarts; it is bound to the exact text it ends, so it cannot be copied onto another message, and IMS removes every such reference from anything it sends to a destination. It is how IMS tells its own hold text from text a destination sent, so a destination can never make a sent request look like a hold. Without that key no failure is recognised as a hold, and the log says so once. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent and may have taken effect. That refusal begins "Outbound write REFUSED AFTER A REDIRECT", is not a hold, and is treated like any other failure of unknown outcome: it spends an attempt and can be dead-lettered for an operator to check.',
     '',
     'Mintsoft\'s key-minting login (`POST /api/Auth`, which issues a new tenant API key and invalidates the old one) is a write and is held. It is granted only by a third part of the Mintsoft variable, `|login=<username>`, and only for requests that carry exactly that username (and the granted ClientId). An installation that authenticates to Mintsoft with a username and password and has no such grant cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero\'s token exchange (`POST https://identity.xero.com/connect/token`, https only, exactly that path, on every redirect hop) is allowed as a deliberate exception: it rotates IMS\'s own Xero credentials but changes no accounting data, and every Xero read depends on it. Every Xero write must reach `api.xero.com` on every hop; a redirect to any other origin is refused before the body is sent.',
   ].join('\n'),

@@ -118,3 +118,26 @@ test('FAIL-SAFE: with no key texts say unavailable, nothing throws, and exactly 
   assert.deepEqual(out, { unavailable: true, verdicts: [false, false, false] })
   assert.equal((stderr.match(/SETTINGS_ENCRYPTION_KEY is absent or unreadable/g) ?? []).length, 1, 'exactly one loud message')
 })
+
+test('REPLAY: a valid token moved onto altered text or onto vendor text is NOT recognised; the same text with its own token, even wrapped, is', () => {
+  const { out: written } = inProcess(KEY_A, {}, WRITE)
+  const real = String(written.held)
+  const token = /( \[hold-ref [0-9a-f]{18}\])$/.exec(real)![1]!
+  const body = real.slice(0, real.length - token.length)
+  const texts = {
+    same: real,
+    wrapped: `Contact error: ${real}`,
+    alteredOneChar: `${body.replace('refused before', 'refused befor3')}${token}`,
+    alteredDestination: `${body.replace('WooCommerce', 'Xero')}${token}`,
+    vendorMessage: `Outbound write HELD (Mintsoft): Order already exists, nothing was sent.${token}`,
+    vendorPrefixedReal: `Mintsoft says: ${body.slice(body.indexOf(' ') + 1)}${token}`,
+    truncatedBody: `${body.slice(0, body.length - 20)}${token}`,
+  }
+  console.log(`precondition (replay): one real held text and its token; ${Object.keys(texts).length - 2} replays of that token onto other text`)
+  const verdict = inProcess(KEY_A, { texts }, READ).out as Record<string, { held: boolean }>
+  assert.equal(verdict.same!.held, true)
+  assert.equal(verdict.wrapped!.held, true, 'a wrapper around the real text does not matter')
+  for (const name of ['alteredOneChar', 'alteredDestination', 'vendorMessage', 'vendorPrefixedReal', 'truncatedBody']) {
+    assert.equal(verdict[name]!.held, false, `${name}: a token copied onto different text must not verify`)
+  }
+})
