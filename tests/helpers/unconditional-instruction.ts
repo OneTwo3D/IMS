@@ -69,7 +69,7 @@ export const ROUND_2_SHAPE =
  * was lost. Negated and hedged forms ("does not prove nothing was posted", "may have been posted") are not claims.
  */
 const HISTORY_CLAIM = /\b(made no call|no call (was|has been) made|never (made|asked|sent|read|called|queried|reached|posted|saw)|(was|were|is|are|has been|have been) not (sent|posted|made|asked|read)|did not (reach|make|ask|read|send|call)|nothing (was|has been) (sent|posted|debited|made))\b/i
-const NOT_A_CLAIM = /(not|never|no) (proof|proven|prove|evidence)[^.;]*|does not (prove|say|show)[^.;]*|cannot (say|tell|rule)[^.;]*|can(not)? (still )?have[^.;]*|may (well )?have[^.;]*|would leave[^.;]*|without proof[^.;]*|not proof[^.;]*|if (it|the document)[^.;]*|could (not )?[^.;]*/gi
+const NOT_A_CLAIM = /(not|never|no) (proof|proven|prove|evidence)[^.;:,—]*|does not (prove|say|show)[^.;:,—]*|cannot (say|tell|rule)[^.;:,—]*|can(not)? (still )?have[^.;:,—]*|may (well )?have[^.;:,—]*|would leave[^.;:,—]*|without proof[^.;:,—]*|not proof[^.;:,—]*|if (it|the document)[^.;:,—]*|could (not )?[^.;:,—]*/gi
 
 /** The history claims a string makes that its cause does not license. `allowed` is the cause's licensed phrasing, or null for none. */
 export function unlicensedHistoryClaims(text: string, allowed: RegExp | null): string[] {
