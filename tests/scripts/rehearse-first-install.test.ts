@@ -696,8 +696,10 @@ test('ISOLATION ARM: a hostile user npm configuration in the caller HOME is neve
 
 test('INTERRUPTION: SIGTERM mid-run still produces a RED report with a teardown record and exit 1', { timeout: TIMEOUT }, async (t) => {
   const parent = scratchParent(t)
-  const child = spawn(join(REPO, 'node_modules/.bin/tsx'), ['scripts/rehearse-first-install.ts', '--root', parent, '--report-dir', join(parent, 'reports')], {
-    cwd: REPO, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+  // `node --import tsx`, not the `tsx` launcher: the launcher is a second process that relays signals
+  // and can exit before the script has finished its teardown, which would make this a race.
+  const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/rehearse-first-install.ts', '--root', parent, '--report-dir', join(parent, 'reports')], {
+    cwd: REPO, stdio: ['ignore', 'pipe', 'pipe'],
     env: { PATH: process.env.PATH, HOME: process.env.HOME } as unknown as NodeJS.ProcessEnv,
   })
   let stderr = ''
@@ -710,7 +712,7 @@ test('INTERRUPTION: SIGTERM mid-run still produces a RED report with a teardown 
     while (!stderr.includes('cluster up') && Date.now() - began < 120_000) await new Promise((resolve) => setTimeout(resolve, 100))
     assert.ok(stderr.includes('cluster up'), 'precondition: the run was in flight (cluster up) when the signal was sent')
     await new Promise((resolve) => setTimeout(resolve, 1500))
-    process.kill(-(child.pid as number), 'SIGTERM')
+    process.kill(child.pid as number, 'SIGTERM')
     const code = await exited
     console.log(`# exit code after SIGTERM: ${code}`)
     const dirs = readdirSync(join(parent, 'reports'))
@@ -725,7 +727,7 @@ test('INTERRUPTION: SIGTERM mid-run still produces a RED report with a teardown 
     assert.deepEqual(runDirsIn(parent), [])
     assert.match(stdout, /Fresh-install rehearsal: RED/)
   } finally {
-    try { process.kill(-(child.pid as number), 'SIGKILL') } catch { /* already exited */ }
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL') // the process this test spawned
   }
 })
 
