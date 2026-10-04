@@ -1,8 +1,0 @@
-{
-  "formatVersion": 1,
-  "source": "mintsoft",
-  "datasets": {
-    "mintsoft-products": { "columns": { "sku": "SKU", "mintsoftProductId": "Product Id" } },
-    "mintsoft-stock": { "columns": { "sku": "SKU", "warehouseCode": "Warehouse", "qty": "Free Qty" } }
-  }
-}

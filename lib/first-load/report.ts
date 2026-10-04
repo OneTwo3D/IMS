@@ -117,9 +117,9 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
   out.push('### Zero on hand (the extract has a row and it says zero)', '', s.zeroOnHand.length === 0 ? 'None.' : `${s.zeroOnHand.length} SKU(s): ${s.zeroOnHand.slice(0, MAX_LISTED).join(', ')}${s.zeroOnHand.length > MAX_LISTED ? ', ...' : ''}`, '')
   out.push('### Missing from the extract (no row at all)', '')
   if (s.missingFromExtract.length === 0) out.push('None.', '')
-  else out.push(...table(['SKU', 'Holds stock in Mintsoft', 'Mintsoft quantity'], s.missingFromExtract.slice(0, MAX_LISTED).map((m) => [m.sku, m.holdsStockElsewhere === null ? 'unknown (Mintsoft stock not supplied)' : m.holdsStockElsewhere ? 'YES' : 'no', m.mintsoftQty ?? '-'])), '')
+  else out.push(...table(['SKU', 'Holds stock in the 3PL', '3PL quantity'], s.missingFromExtract.slice(0, MAX_LISTED).map((m) => [m.sku, m.holdsStockElsewhere === null ? 'unknown (3PL stock not supplied)' : m.holdsStockElsewhere ? 'YES' : 'no', m.wmsQty ?? '-'])), '')
 
-  out.push('## R14 four-way SKU coverage', '', 'Q = Qoblex products, M = Mintsoft, W = WooCommerce, I = SKUs already in IMS.', '')
+  out.push('## R14 four-way SKU coverage', '', 'Q = Qoblex products, L = the 3PL (WMS), W = WooCommerce, I = SKUs already in IMS.', '')
   if (report.coverage.patterns.length === 0) out.push('Not run.', '')
   else {
     out.push(...table(['Present in', 'SKUs', 'First SKUs'], report.coverage.patterns.map((p) => [p.pattern, p.count, `${p.skus.slice(0, MAX_SKUS_PER_PATTERN).join(', ')}${p.skus.length > MAX_SKUS_PER_PATTERN ? ', ...' : ''}`])), '')

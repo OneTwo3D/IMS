@@ -149,7 +149,7 @@ export interface PrepareReport {
     groups: StockGroupReport[]
     totals: { lotQty: string; lotTotalBase: string; collapsedTotalBase: string; roundingResidualBase: string; openingQty: string; openingValueBase: string }
     zeroOnHand: string[]
-    missingFromExtract: Array<{ sku: string; holdsStockElsewhere: boolean | null; mintsoftQty: string | null }>
+    missingFromExtract: Array<{ sku: string; holdsStockElsewhere: boolean | null; wmsQty: string | null }>
   }
   coverage: {
     patterns: Array<{ pattern: string; count: number; skus: string[] }>
@@ -301,8 +301,8 @@ class Run {
   transferOutputs: Array<{ key: string; rows: string[][] }> = []
   poOutputs: Array<{ key: string; rows: string[][] }> = []
   poOrdersNothingOutstanding = 0
-  mintsoftQty = new Map<string, Dec>()
-  mintsoftSkus = new Map<string, string>()
+  wmsQty = new Map<string, Dec>()
+  wmsSkus = new Map<string, string>()
   wooSkus = new Map<string, string>()
 
   constructor(readonly input: PrepareInput) {}
@@ -1091,7 +1091,7 @@ function loadCoverageDatasets(run: Run): void {
       if (withQty) {
         const qty = parseDecimal(v.qty, 'qty', NUMERIC_LIMITS.stockQty)
         if (!qty.ok) { run.add(name, row.line, sku.sku, 'REJECTED', 'BAD_QTY', qty.reason); continue }
-        run.mintsoftQty.set(sku.key, (run.mintsoftQty.get(sku.key) ?? new D(0)).add(qty.value))
+        run.wmsQty.set(sku.key, (run.wmsQty.get(sku.key) ?? new D(0)).add(qty.value))
       }
       if (!target.has(sku.key)) target.set(sku.key, sku.sku)
       variants.set(sku.key, (variants.get(sku.key) ?? new Set<string>()).add(sku.sku))
@@ -1101,8 +1101,8 @@ function loadCoverageDatasets(run: Run): void {
     if (clashing.length > 0) run.find('WARNING', 'SKU_CASE_VARIANTS_IN_SOURCE', `${name} spells ${clashing.length} SKU(s) in more than one letter case; they are treated as one SKU for coverage`, name, clashing)
     if (withoutSku > 0) run.find('WARNING', 'COVERAGE_ROW_WITHOUT_SKU', `${name} has ${withoutSku} row(s) without a SKU; they cannot take part in the coverage check`, name)
   }
-  rowsOf('mintsoft-products', run.mintsoftSkus, false)
-  rowsOf('mintsoft-stock', run.mintsoftSkus, true)
+  rowsOf('wms-products', run.wmsSkus, false)
+  rowsOf('wms-stock', run.wmsSkus, true)
   rowsOf('woo-products', run.wooSkus, false)
 }
 
@@ -1117,7 +1117,7 @@ function computeCoverage(run: Run): CoverageResult {
   for (const [key, sku] of run.catAnyParsed) q.set(key, sku)
   const sources: Array<[string, Map<string, string>]> = [
     ['Q', q],
-    ['M', run.mintsoftSkus],
+    ['L', run.wmsSkus],
     ['W', run.wooSkus],
     ['I', new Map([...run.ims.entries()].map(([k, v]) => [k, v.sku]))],
   ]
@@ -1131,7 +1131,7 @@ function computeCoverage(run: Run): CoverageResult {
   const loaded = new Set<string>([...run.cat.keys(), ...run.ims.keys()])
   const notLoaded: string[] = []
   const excludedAccepted: string[] = []
-  const subjects = new Set<string>([...q.keys(), ...run.mintsoftSkus.keys(), ...run.wooSkus.keys()])
+  const subjects = new Set<string>([...q.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys()])
   for (const key of [...subjects].sort(cmp)) {
     if (loaded.has(key)) continue
     if (run.exclusions.has(key)) {
@@ -1149,28 +1149,28 @@ function computeCoverage(run: Run): CoverageResult {
 }
 
 function checkCoverage(run: Run): CoverageResult | null {
-  const anyCoverage = run.has('products') || run.has('mintsoft-products') || run.has('mintsoft-stock') || run.has('woo-products')
+  const anyCoverage = run.has('products') || run.has('wms-products') || run.has('wms-stock') || run.has('woo-products')
   if (!anyCoverage) return null
-  if (!run.has('products') && (run.has('mintsoft-products') || run.has('mintsoft-stock') || run.has('woo-products'))) {
-    run.find('ERROR', 'R14_NEEDS_CATALOGUE', 'Mintsoft or WooCommerce SKUs were supplied but the Qoblex products dataset was not: four-way SKU coverage cannot be established', 'products')
+  if (!run.has('products') && (run.has('wms-products') || run.has('wms-stock') || run.has('woo-products'))) {
+    run.find('ERROR', 'R14_NEEDS_CATALOGUE', '3PL (WMS) or WooCommerce SKUs were supplied but the Qoblex products dataset was not: four-way SKU coverage cannot be established', 'products')
     return null
   }
   const result = computeCoverage(run)
   if (result.notLoaded.length > 0) {
-    run.find('ERROR', 'R14_SKU_NOT_LOADED', `${result.notLoaded.length} SKU(s) exist in Qoblex, Mintsoft or WooCommerce but will not exist in IMS and are not on the exclusion list (R14 must have zero one-sided SKUs). Fix the data or add a reasoned exclusion.`, undefined, result.notLoaded)
+    run.find('ERROR', 'R14_SKU_NOT_LOADED', `${result.notLoaded.length} SKU(s) exist in Qoblex, the 3PL (WMS) or WooCommerce but will not exist in IMS and are not on the exclusion list (R14 must have zero one-sided SKUs). Fix the data or add a reasoned exclusion.`, undefined, result.notLoaded)
   }
-  const everything = new Set<string>([...run.catAnyParsed.keys(), ...run.mintsoftSkus.keys(), ...run.wooSkus.keys(), ...run.ims.keys()])
+  const everything = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys(), ...run.ims.keys()])
   const stale = [...run.exclusions.entries()].filter(([key]) => !everything.has(key)).map(([, v]) => v.sku)
   if (stale.length > 0) run.find('WARNING', 'STALE_EXCLUSION', 'SKU(s) on the exclusion list appear in no input: the exclusion does nothing', 'sku-exclusions', stale)
-  const sourceKeys = new Set<string>([...run.catAnyParsed.keys(), ...run.mintsoftSkus.keys(), ...run.wooSkus.keys()])
+  const sourceKeys = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys()])
   const imsOnly = [...run.ims.entries()].filter(([key]) => !sourceKeys.has(key)).map(([, v]) => v.sku)
-  if (imsOnly.length > 0) run.find('WARNING', 'IMS_ONLY_SKU', 'SKU(s) already in IMS are in none of Qoblex, Mintsoft or WooCommerce', 'ims-skus', imsOnly)
+  if (imsOnly.length > 0) run.find('WARNING', 'IMS_ONLY_SKU', 'SKU(s) already in IMS are in none of Qoblex, the 3PL (WMS) or WooCommerce', 'ims-skus', imsOnly)
   return result
 }
 
 interface StockSplit {
   zero: string[]
-  missing: Array<{ sku: string; holdsStockElsewhere: boolean | null; mintsoftQty: string | null }>
+  missing: Array<{ sku: string; holdsStockElsewhere: boolean | null; wmsQty: string | null }>
 }
 
 /**
@@ -1184,30 +1184,30 @@ function splitZeroAndMissing(run: Run): StockSplit | null {
   const positive = new Set([...run.stockGroups.values()].map((g) => g.key))
   const zero: string[] = []
   const missing: StockSplit['missing'] = []
-  const haveMintsoft = run.has('mintsoft-stock')
+  const haveWms = run.has('wms-stock')
   for (const entry of expected.sort((a, b) => cmp(a.key, b.key))) {
     const stated = run.stockStated.has(entry.key)
     if (run.zeroStated.has(entry.key) && !positive.has(entry.key) && !run.stockRejected.has(entry.key)) zero.push(entry.sku)
     if (!stated) {
-      const qty = run.mintsoftQty.get(entry.key) ?? new D(0)
+      const qty = run.wmsQty.get(entry.key) ?? new D(0)
       missing.push({
         sku: entry.sku,
-        holdsStockElsewhere: haveMintsoft ? qty.gt(0) : null,
-        mintsoftQty: haveMintsoft ? fmt(qty) : null,
+        holdsStockElsewhere: haveWms ? qty.gt(0) : null,
+        wmsQty: haveWms ? fmt(qty) : null,
       })
     }
   }
   const dangerous = missing.filter((m) => m.holdsStockElsewhere === true)
   if (dangerous.length > 0) {
-    run.find('ERROR', 'MISSING_SKU_HOLDS_STOCK', `${dangerous.length} SKU(s) are missing from the Qoblex stock extract but hold stock in Mintsoft: the extract is incomplete and those balances would not be loaded`, 'stock-lots', dangerous.map((m) => `${m.sku} (Mintsoft ${m.mintsoftQty})`))
+    run.find('ERROR', 'MISSING_SKU_HOLDS_STOCK', `${dangerous.length} SKU(s) are missing from the Qoblex stock extract but hold stock in the 3PL (WMS): the extract is incomplete and those balances would not be loaded`, 'stock-lots', dangerous.map((m) => `${m.sku} (3PL ${m.wmsQty})`))
   }
   const quiet = missing.filter((m) => m.holdsStockElsewhere !== true)
   if (quiet.length > 0) {
-    run.find('WARNING', 'MISSING_FROM_STOCK_EXTRACT', `${quiet.length} stock-bearing SKU(s) have no row in the Qoblex stock extract${haveMintsoft ? ' (and no stock in Mintsoft)' : ' (Mintsoft stock was not supplied, so whether they hold stock elsewhere is UNKNOWN)'}. This is different from a stated zero.`, 'stock-lots', quiet.map((m) => m.sku))
+    run.find('WARNING', 'MISSING_FROM_STOCK_EXTRACT', `${quiet.length} stock-bearing SKU(s) have no row in the Qoblex stock extract${haveWms ? ' (and no stock in the 3PL)' : ' (3PL stock was not supplied, so whether they hold stock elsewhere is UNKNOWN)'}. This is different from a stated zero.`, 'stock-lots', quiet.map((m) => m.sku))
   }
-  if (haveMintsoft) {
-    const zeroButHeld = zero.filter((sku) => (run.mintsoftQty.get(skuKey(sku)) ?? new D(0)).gt(0))
-    if (zeroButHeld.length > 0) run.find('WARNING', 'ZERO_IN_QOBLEX_STOCK_IN_MINTSOFT', 'SKU(s) show zero on hand in the Qoblex extract but hold stock in Mintsoft (reconciliation R1/R2 will not pass for them)', 'stock-lots', zeroButHeld)
+  if (haveWms) {
+    const zeroButHeld = zero.filter((sku) => (run.wmsQty.get(skuKey(sku)) ?? new D(0)).gt(0))
+    if (zeroButHeld.length > 0) run.find('WARNING', 'ZERO_IN_QOBLEX_STOCK_IN_WMS', 'SKU(s) show zero on hand in the Qoblex extract but hold stock in the 3PL (reconciliation R1/R2 will not pass for them)', 'stock-lots', zeroButHeld)
   }
   return { zero, missing }
 }
@@ -1432,7 +1432,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   const checks: PrepareReport['checks'] = [
     { check: 'row accounting identity', status: 'RAN', note: 'every record read has exactly one disposition' },
     split ? { check: 'zero on-hand versus missing from extract', status: 'RAN', note: 'stock-lots and products supplied' } : { check: 'zero on-hand versus missing from extract', status: 'NOT RUN', note: 'needs the products and stock-lots datasets' },
-    coverage ? { check: 'R14 four-way SKU coverage', status: 'RAN', note: `sides supplied: ${['products', 'mintsoft', 'woo', 'ims'].filter((s) => (s === 'products' ? run.has('products') : s === 'mintsoft' ? run.has('mintsoft-products') || run.has('mintsoft-stock') : s === 'woo' ? run.has('woo-products') : run.has('ims-skus'))).join(', ')}` } : { check: 'R14 four-way SKU coverage', status: 'NOT RUN', note: 'needs the products dataset' },
+    coverage ? { check: 'R14 four-way SKU coverage', status: 'RAN', note: `sides supplied: ${['products', 'wms', 'woo', 'ims'].filter((s) => (s === 'products' ? run.has('products') : s === 'wms' ? run.has('wms-products') || run.has('wms-stock') : s === 'woo' ? run.has('woo-products') : run.has('ims-skus'))).join(', ')}` } : { check: 'R14 four-way SKU coverage', status: 'NOT RUN', note: 'needs the products dataset' },
     run.has('recipe-lines') ? { check: 'recipe graph is acyclic', status: 'RAN', note: 'detectBomItemCycleInEdges over every valid recipe line' } : { check: 'recipe graph is acyclic', status: 'NOT RUN', note: 'recipe-lines not supplied' },
     run.has('stock-lots') ? { check: 'multi-lot collapse to one weighted average', status: 'RAN', note: 'exact decimal arithmetic, rounded once to 6 dp' } : { check: 'multi-lot collapse to one weighted average', status: 'NOT RUN', note: 'stock-lots not supplied' },
     run.has('transfers') ? { check: 'in-transit quantity counted once', status: 'RAN', note: `convention ${config.inTransitConvention}` } : { check: 'in-transit quantity counted once', status: 'NOT RUN', note: 'transfers not supplied' },

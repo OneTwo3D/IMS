@@ -139,9 +139,11 @@ export function serializeCsvLine(cells: readonly string[]): string {
   return cells.map(escapeCell).join(',')
 }
 
+const CRLF = '\r\n'
+
 /** CRLF line endings and a final CRLF. Deterministic: depends only on its arguments. */
 export function serializeCsv(header: readonly string[], rows: ReadonlyArray<readonly string[]>): string {
-  return [serializeCsvLine(header), ...rows.map(serializeCsvLine)].map((line) => `${line}\r\n`).join('')
+  return [...[header, ...rows].map((cells) => serializeCsvLine(cells)), ''].join(CRLF)
 }
 
 /**

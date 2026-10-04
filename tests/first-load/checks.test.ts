@@ -260,19 +260,19 @@ test('the exclusion list: needs a reason, flags stock it would drop, and a stale
   assert.deepEqual(rowsOf(stockDropped, 'opening-stock').length, 0, 'a blocked run has no files')
 })
 
-test('R14: a SKU in Mintsoft or WooCommerce that is neither loaded nor excluded blocks; an IMS-existing or excluded SKU does not', (t) => {
+test('R14: a SKU in the 3PL or WooCommerce that is neither loaded nor excluded blocks; an IMS-existing or excluded SKU does not', (t) => {
   const result = run({
     products: ds('products', [product('A')]),
-    'mintsoft-products': ds('mintsoft-products', [{ sku: 'A' }, { sku: 'M-ONLY' }, { sku: 'IN-IMS' }]),
+    'wms-products': ds('wms-products', [{ sku: 'A' }, { sku: 'M-ONLY' }, { sku: 'IN-IMS' }]),
     'woo-products': ds('woo-products', [{ sku: 'a' }, { sku: 'W-ONLY' }, { sku: 'W-EXCLUDED' }]),
     'ims-skus': ds('ims-skus', [{ sku: 'IN-IMS', type: 'SIMPLE' }]),
     'sku-exclusions': ds('sku-exclusions', [{ sku: 'W-EXCLUDED', reason: 'sample' }]),
   })
   precondition(t, 'SKUs subject to coverage', 6)
   const finding = result.report.findings.find((f) => f.code === 'R14_SKU_NOT_LOADED')
-  assert.deepEqual(finding?.keys, ['M-ONLY (M)', 'W-ONLY (W)'])
+  assert.deepEqual(finding?.keys, ['M-ONLY (L)', 'W-ONLY (W)'])
   assert.deepEqual(result.report.coverage.excludedAccepted, ['W-EXCLUDED'])
-  const noCatalogue = run({ 'mintsoft-products': ds('mintsoft-products', [{ sku: 'A' }]) })
+  const noCatalogue = run({ 'wms-products': ds('wms-products', [{ sku: 'A' }]) })
   assert.ok(findingCodes(noCatalogue, 'ERROR').includes('R14_NEEDS_CATALOGUE'))
 })
 

@@ -132,12 +132,12 @@ test('arm (c): a SKU missing from the extract that holds stock elsewhere is repo
   const result = run({
     products: ds('products', [product('MISSING-HELD'), product('MISSING-QUIET'), product('STATED-ZERO'), product('HAS-STOCK')]),
     'stock-lots': ds('stock-lots', [lot('STATED-ZERO', '0', '1.00'), lot('HAS-STOCK', '5', '2.00')]),
-    'mintsoft-stock': ds('mintsoft-stock', [{ sku: 'MISSING-HELD', qty: '7' }, { sku: 'HAS-STOCK', qty: '5' }]),
+    'wms-stock': ds('wms-stock', [{ sku: 'MISSING-HELD', qty: '7' }, { sku: 'HAS-STOCK', qty: '5' }]),
   })
   const missing = result.report.stock.missingFromExtract
   precondition(t, 'SKUs in the missing bucket', missing.length)
   precondition(t, 'SKUs in the zero bucket', result.report.stock.zeroOnHand.length)
-  assert.deepEqual(missing.map((m) => [m.sku, m.holdsStockElsewhere, m.mintsoftQty]), [['MISSING-HELD', true, '7'], ['MISSING-QUIET', false, '0']])
+  assert.deepEqual(missing.map((m) => [m.sku, m.holdsStockElsewhere, m.wmsQty]), [['MISSING-HELD', true, '7'], ['MISSING-QUIET', false, '0']])
   assert.deepEqual(result.report.stock.zeroOnHand, ['STATED-ZERO'])
   assert.ok(!missing.some((m) => m.sku === 'STATED-ZERO'), 'a stated zero is never "missing"')
   assert.ok(!result.report.stock.zeroOnHand.includes('MISSING-HELD'), 'a missing SKU is never "zero"')
@@ -148,7 +148,7 @@ test('arm (c): a SKU missing from the extract that holds stock elsewhere is repo
   assert.equal(result.blocking, true)
 })
 
-test('arm (c): without Mintsoft stock the answer is UNKNOWN, not "no"', (t) => {
+test('arm (c): without 3PL stock the answer is UNKNOWN, not "no"', (t) => {
   const result = run({
     products: ds('products', [product('MISSING')]),
     'stock-lots': ds('stock-lots', [lot('OTHER', '1', '1')]),

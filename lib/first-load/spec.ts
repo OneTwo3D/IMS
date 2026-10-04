@@ -204,7 +204,12 @@ export const IMPORT_TARGETS: Record<ImporterTarget, {
 // Canonical input datasets
 // ---------------------------------------------------------------------------
 
-export const SOURCES = ['qoblex', 'mintsoft', 'woocommerce'] as const
+/**
+ * The three kinds of source system. `wms` is the 3PL's own export. The code never names a connector: the generic-layer guard
+ * (check:wms-connector-boundary) keeps connector literals out of lib/, and nothing here needs one, because a column map
+ * says what the columns are. See docs/first-load-input-spec.md for which 3PL that is today.
+ */
+export const SOURCES = ['qoblex', 'wms', 'woocommerce'] as const
 export type SourceName = (typeof SOURCES)[number]
 
 export const DATASET_NAMES = [
@@ -214,8 +219,8 @@ export const DATASET_NAMES = [
   'suppliers',
   'purchase-order-lines',
   'transfers',
-  'mintsoft-products',
-  'mintsoft-stock',
+  'wms-products',
+  'wms-stock',
   'woo-products',
   'sku-exclusions',
   'ims-skus',
@@ -282,17 +287,17 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     sources: ['qoblex'],
     purpose: 'Stock transfers with shipped and received quantity. Only the in-transit remainder is emitted (the transfers import file).',
   },
-  'mintsoft-products': {
-    columns: ['sku', 'mintsoftProductId'],
+  'wms-products': {
+    columns: ['sku', 'wmsProductId'],
     required: ['sku'],
-    sources: ['mintsoft'],
-    purpose: 'Mintsoft product list. Used only for the four-way SKU coverage check (R14).',
+    sources: ['wms'],
+    purpose: 'The 3PL (WMS) product list. Used only for the four-way SKU coverage check (R14).',
   },
-  'mintsoft-stock': {
+  'wms-stock': {
     columns: ['sku', 'warehouseCode', 'qty'],
     required: ['sku', 'qty'],
-    sources: ['mintsoft'],
-    purpose: 'Mintsoft stock levels. Used for R14 coverage and to find a SKU that holds stock in Mintsoft but is missing from the Qoblex stock extract.',
+    sources: ['wms'],
+    purpose: 'The 3PL (WMS) stock levels. Used for R14 coverage and to find a SKU that holds stock there but is missing from the Qoblex stock extract.',
   },
   'woo-products': {
     columns: ['sku', 'wooProductId', 'type'],

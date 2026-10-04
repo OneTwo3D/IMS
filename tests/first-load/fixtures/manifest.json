@@ -12,8 +12,8 @@
     { "dataset": "suppliers", "file": "qoblex/suppliers.csv", "columnMap": "maps/qoblex.map.json" },
     { "dataset": "purchase-order-lines", "file": "qoblex/purchase-orders.csv", "columnMap": "maps/qoblex.map.json" },
     { "dataset": "transfers", "file": "qoblex/transfers.csv", "columnMap": "maps/qoblex.map.json" },
-    { "dataset": "mintsoft-products", "file": "mintsoft/products.csv", "columnMap": "maps/mintsoft.map.json" },
-    { "dataset": "mintsoft-stock", "file": "mintsoft/stock.csv", "columnMap": "maps/mintsoft.map.json" },
+    { "dataset": "wms-products", "file": "wms/products.csv", "columnMap": "maps/wms.map.json" },
+    { "dataset": "wms-stock", "file": "wms/stock.csv", "columnMap": "maps/wms.map.json" },
     { "dataset": "woo-products", "file": "woocommerce/products.csv", "columnMap": "maps/woocommerce.map.json" },
     { "dataset": "sku-exclusions", "file": "canonical/sku-exclusions.csv" },
     { "dataset": "ims-skus", "file": "canonical/ims-skus.csv" }

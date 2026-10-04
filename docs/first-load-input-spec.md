@@ -188,18 +188,18 @@ Only the in-transit remainder is emitted.
 | `dispatchDate` | no | YYYY-MM-DD. Only used for a warning against `asOf`. |
 | `notes` | no | Passed through as given (trimmed). |
 
-### Dataset: mintsoft-products
+### Dataset: wms-products
 
-Used only for the four-way SKU coverage check.
+Used only for the four-way SKU coverage check. This is the 3PL's product export (today Mintsoft).
 
 | Column | Required | Meaning |
 | --- | --- | --- |
 | `sku` | yes | Passed through as given (trimmed). |
-| `mintsoftProductId` | no | Passed through as given (trimmed). |
+| `wmsProductId` | no | Passed through as given (trimmed). |
 
-### Dataset: mintsoft-stock
+### Dataset: wms-stock
 
-Used for coverage and to find a SKU that holds stock in Mintsoft but is missing from the Qoblex stock extract.
+Used for coverage and to find a SKU that holds stock in the 3PL but is missing from the Qoblex stock extract. This is the 3PL's stock-level export (today Mintsoft).
 
 | Column | Required | Meaning |
 | --- | --- | --- |
@@ -238,7 +238,7 @@ SKUs that already exist in the target IMS (from `/api/export/products`). The fou
 ## Column maps
 
 A column map is JSON, one file per **source**, with one entry per dataset that source feeds. Qoblex feeds products, recipe-lines, stock-lots, suppliers,
-purchase-order-lines and transfers; Mintsoft feeds mintsoft-products and mintsoft-stock; WooCommerce feeds woo-products.
+purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products and wms-stock and is named `"source": "wms"` in a column map; WooCommerce feeds woo-products.
 
 ```json
 {
@@ -311,11 +311,12 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
   and the rounding residual per group and in total. A non-base currency lot needs `fxRateToBase`.
 - **Types that hold no stock.** KIT, VARIABLE and NON_INVENTORY stock rows are excluded and reported (with a warning when they hold a quantity). The products themselves are still loaded.
 - **Zero versus missing.** A SKU whose stock rows all say zero is **zero on hand** (excluded: no opening layer is created). A stock-bearing SKU (SIMPLE, VARIANT, BOM) with no stock row at all is **missing from the extract**, listed
-  separately. If Mintsoft stock is supplied and the missing SKU holds stock there, that is an error; if Mintsoft stock is not supplied the answer is reported as unknown.
+  separately. If the 3PL stock dataset is supplied and the missing SKU holds stock there, that is an error; if it is not supplied the answer is reported as unknown.
 - **Open purchase orders.** Outstanding quantity per line is ordered minus received, never negative. Fully received lines, closed orders and over-received lines are excluded; an over-received line is also a warning. Lines of one order must agree on
   supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
-- **R14 four-way SKU coverage.** Every SKU in Qoblex, Mintsoft or WooCommerce must exist in IMS after the load (loaded now, or already in IMS) or be on the exclusion list; otherwise it is an error. The report prints a presence matrix (Q, M, W, I).
+- **R14 four-way SKU coverage.** Every SKU in Qoblex, the 3PL or WooCommerce must exist in IMS after the load (loaded now, or already in IMS) or be on the exclusion list; otherwise it is an error. The report prints a presence matrix (Q = Qoblex, L = the 3PL, W = WooCommerce, I = already in IMS).
   A SKU only in IMS, or an exclusion that matches nothing, is a warning.
+  The 3PL's SKUs are compared case-insensitively like every other SKU; the column map, not the code, says which file is which, so nothing in the tool is Mintsoft-specific.
 - **Chunking.** At most 9,999 data rows and 9,999,999 bytes per file, which is stricter than the importers (they accept 10,000 rows and 10 MiB and **silently drop** every row beyond the row cap). The 10,001st row lands in the second file.
 - **Encoding.** Input must be valid UTF-8. A leading byte-order mark is stripped (and reported). Output never has one.
 

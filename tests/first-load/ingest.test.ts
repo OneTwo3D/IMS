@@ -67,7 +67,7 @@ test('column map: every ambiguous or sloppy shape is refused with a message nami
     ['mapped and constant', supplierMap({ constants: { name: 'X' } }), /both mapped to a column and given a constant/],
     ['required column absent', map({ suppliers: { columns: { currency: 'Cur' } } }), /required canonical column "name"/],
     ['decimal comma declared', supplierMap({ decimalSeparator: ',' }), /decimal commas are rejected/],
-    ['wrong source for the dataset', JSON.stringify({ formatVersion: 1, source: 'mintsoft', datasets: { products: { columns: { sku: 'a', name: 'b', type: 'c' } } } }), /cannot feed this dataset/],
+    ['wrong source for the dataset', JSON.stringify({ formatVersion: 1, source: 'wms', datasets: { products: { columns: { sku: 'a', name: 'b', type: 'c' } } } }), /cannot feed this dataset/],
     ['bad format version', JSON.stringify({ formatVersion: 2, source: 'qoblex', datasets: {} }), /formatVersion must be 1/],
     ['not JSON', '{', /not valid JSON/],
   ]

@@ -1,0 +1,8 @@
+{
+  "formatVersion": 1,
+  "source": "wms",
+  "datasets": {
+    "wms-products": { "columns": { "sku": "SKU", "wmsProductId": "Product Id" } },
+    "wms-stock": { "columns": { "sku": "SKU", "warehouseCode": "Warehouse", "qty": "Free Qty" } }
+  }
+}
