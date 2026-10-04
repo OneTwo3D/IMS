@@ -1058,3 +1058,28 @@ function seedFiftyOnePlusAnOlderUnclaimed(): { shownOnPageOne: string[]; olderUn
   }
   return { shownOnPageOne: [], olderUnclaimedId: 'a-older-unclaimed' }
 }
+
+test('[o3d-1e7sl Codex r6] the claim log carries the STANDING of an earlier posting: an operator-typed earlier document is "NOT verified", never an unconditional "replaces"', async () => {
+  const cases = [
+    { name: 'ASSERTED_POSTED earlier', row: { status: 'SYNCED', externalTransactionId: 'INV-TYPED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }, unverified: true },
+    { name: 'CONFIRMED earlier', row: { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 }, unverified: false },
+  ]
+  for (const [i, c] of cases.entries()) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r6-${i}`, 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: `so-r6-${i}`, scope: '' }))
+    syncRows.push(sync(`s-r6-${i}`, refusals[0]!, c.row as never))
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    const result = await claimAccountingPostingRefusalForHandPostingAction(`r6-${i}`)
+    assert.equal(ok(result), true, `${c.name}: the claim goes through (an earlier completed posting does not block)`)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string; metadata?: Record<string, unknown> }
+    assert.ok(note, c.name)
+    if (c.unverified) {
+      assert.match(note.description, /INV-TYPED \(an id an operator typed in\) as posted/, c.name)
+      assert.match(note.description, /has NOT verified it: check the ledger for it first\. If it exists there, your hand posting REPLACES it/, c.name)
+      assert.doesNotMatch(note.description, /already holds|REPLACES that document/, c.name)
+    } else {
+      assert.match(note.description, /The ledger ALREADY holds INV-REAL for this obligation \(confirmed by the connector\)/, c.name)
+    }
+    assert.deepEqual(note.metadata?.earlierPostingDetails, [{ ref: c.unverified ? 'INV-TYPED' : 'INV-REAL', standing: c.unverified ? 'ASSERTED_POSTED' : 'CONFIRMED_POSTED' }], `${c.name}: the standing is in the log metadata too`)
+  }
+})
