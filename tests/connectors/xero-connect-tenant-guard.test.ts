@@ -309,6 +309,13 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         const value = visibleSetting(where.key)
         return value == null ? null : { key: where.key, value }
       },
+      // o3d-6thk1: the binding now reads the account-mapping rows it may have to clear, through the same
+      // READ COMMITTED view findUnique has.
+      findMany: async ({ where }: { where: { key: { in: string[] } } }): Promise<SettingRow[]> =>
+        where.key.in.flatMap((key) => {
+          const value = visibleSetting(key)
+          return value == null ? [] : [{ key, value }]
+        }),
       create: async ({ data }: { data: SettingRow }) => {
         // The primary key. This is the statement the whole fix rests on: the loser of the race is
         // rejected here, by the database, not by anything the process checked earlier.
@@ -372,6 +379,8 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
       },
     },
     accountingToken: {
+      // o3d-6thk1: the previous organisation is read from the token row BEFORE the binding overwrites it.
+      findUnique: async () => (stagedToken === undefined ? tokenRow : stagedToken),
       // The row lock, taken by a delete exactly as it is by a write: from here until this transaction
       // ends, every writer outside it waits.
       //
@@ -536,6 +545,8 @@ mock.module('@/lib/db', {
 mock.module('@/lib/settings-store', {
   namedExports: {
     getSettingValue: async (key: string) => settings[key] ?? null,
+    // o3d-6thk1: lib/connectors/xero/settings.ts (the account-mapping key list) imports it.
+    getSettingValues: async (keys: string[]) => new Map(keys.flatMap((key) => (settings[key] == null ? [] : [[key, settings[key]] as [string, string]]))),
     serializeSettingValue: (_key: string, value: string) => value,
     deserializeSettingValue: (_key: string, value: string) => value,
   },
@@ -588,6 +599,9 @@ mock.module('@/lib/destructive-action-confirm', {
 mock.module('@/lib/integration-plugin-selection-lock', {
   namedExports: {
     lockIntegrationPluginSelection: async () => ({ xero: false, quickbooks: false, woocommerce: false }),
+    // o3d-6thk1: the binding takes the mapping lock before reading who the mapping belongs to. Inert here
+    // (the lock has its own tests); what this file measures is what the binding then does with the rows.
+    lockAccountingMappingSelection: async () => {},
   },
 })
 mock.module('@/lib/connectors/xero/api', {
@@ -2838,4 +2852,163 @@ test('[o3d-emus] xeroBaseCurrencyConnectRefusal: unreadable never passes, a matc
   cases += 2
   assert.equal(cases, 10)
   console.log(`# o3d-emus xeroBaseCurrencyConnectRefusal: ${cases} cases`)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-6thk1: a tenant rebind must not leave the account mapping on the PREVIOUS organisation.
+//
+// The mapping is one organisation's chart; the pin and the egress tenant check say nothing about it. So a
+// deliberate rebind (disconnect, then connect elsewhere) used to leave every document raised afterwards
+// posting the previous organisation's account codes under the NEW tenant's stamp.
+// ---------------------------------------------------------------------------
+
+const OTHER = { id: 'c-other', tenantId: '7a1c0e22-other-org', tenantName: 'Other Trading Ltd', tenantType: 'ORGANISATION' }
+
+/** The fifteen account roles, derived from the settings module's own list so a sixteenth is covered. */
+async function accountRoleKeys(): Promise<string[]> {
+  const { XERO_SETTING_KEYS } = await import('@/lib/connectors/xero/settings')
+  return XERO_SETTING_KEYS.filter((key) => key.startsWith('xero_') && key.endsWith('_account'))
+}
+
+/** An instance configured for `conn`: pinned, mapped, sync on, stamped. */
+async function mappedFor(conn: typeof DEMO, options: { stamp?: boolean } = {}) {
+  pinnedTo(conn)
+  for (const key of await accountRoleKeys()) settings[key] = `code-of-${conn.tenantName}-${key}`
+  settings.accounting_payment_account_map = JSON.stringify({ 'card:GBP': `bank-of-${conn.tenantName}` })
+  settings.xero_sync_enabled = 'true'
+  settings.xero_sync_sales_invoice = 'submitted'
+  if (options.stamp !== false) settings.xero_account_mapping_tenant_id = conn.tenantId
+}
+
+const mappingRowsPresent = async () =>
+  [...await accountRoleKeys(), 'accounting_payment_account_map'].filter((key) => settings[key] != null)
+
+test('[o3d-6thk1] a rebind to a DIFFERENT organisation after a disconnect clears the old mapping, switches sync off and says so', async () => {
+  await mappedFor(DEMO)
+  const roles = await accountRoleKeys()
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [OTHER]
+
+  // PRECONDITION, printed: a real disconnect has removed the token row AND the pin (the only other
+  // records of who the mapping was for), and the whole mapping is still there to be inherited.
+  const before = await mappingRowsPresent()
+  console.log(`# o3d-6thk1 rebind: account roles=${roles.length}, mapping rows before=${before.length}, token=${tokenRow === null ? 'gone' : 'present'}, pin=${settings.xero_expected_tenant_id ?? 'gone'}, stamp=${settings.xero_account_mapping_tenant_id}`)
+  assert.equal(roles.length, 15, 'PRECONDITION: fifteen account roles')
+  assert.equal(before.length, 16, 'PRECONDITION: the fifteen roles and the payment map are all present')
+  assert.equal(tokenRow, null)
+  assert.equal(settings.xero_expected_tenant_id, undefined)
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal((tokenRow as TokenRow | null)?.tenantId, OTHER.tenantId, 'the new organisation is bound')
+  assert.deepEqual(await mappingRowsPresent(), [], 'no account role and no payment map survives from the previous organisation')
+  assert.equal(settings.xero_sync_enabled, undefined, 'sync is off (absent is the default, "false"): nothing posts until re-mapped')
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId, 'the stamp names the organisation just bound')
+  assert.equal(settings.xero_sync_sales_invoice, 'submitted', 'unrelated settings are untouched')
+  assert.equal(settings.xero_client_id, 'client-id')
+  assert.match(result.accountMappingResetNotice ?? '', /re-mapped/)
+  assert.match(result.accountMappingResetNotice ?? '', new RegExp(DEMO.tenantId))
+  assert.equal(activity.filter((entry) => entry.action === 'xero_account_mapping_reset').length, 1, 'recorded for whoever is not watching the redirect')
+})
+
+test('[o3d-6thk1] reconnecting to the SAME organisation (even after a disconnect) keeps the mapping and sync', async () => {
+  await mappedFor(DEMO)
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [DEMO]
+  const before = await mappingRowsPresent()
+  assert.equal(before.length, 16, 'PRECONDITION: mapping present, token and pin gone')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+  assert.deepEqual(await mappingRowsPresent(), before, 'every mapping row is untouched')
+  assert.equal(settings.xero_sync_enabled, 'true')
+  assert.equal(result.accountMappingResetNotice, undefined)
+  assert.equal(activity.some((entry) => entry.action === 'xero_account_mapping_reset'), false)
+})
+
+test('[o3d-6thk1] an in-place re-consent to the pinned organisation keeps the mapping, and a pre-stamp instance is stamped', async () => {
+  await mappedFor(DEMO, { stamp: false })
+  connectionsBody = [DEMO]
+  const { exchangeCodeForTokens } = await loadAuth()
+  assert.equal(settings.xero_account_mapping_tenant_id, undefined, 'PRECONDITION: bound before the stamp existed')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId, 'PRECONDITION: the token row names the organisation the mapping is for')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal((await mappingRowsPresent()).length, 16)
+  assert.equal(settings.xero_sync_enabled, 'true')
+  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId, 'the stamp is written so the NEXT rebind has an answer after a disconnect')
+})
+
+test('[o3d-6thk1] a mapping with NO record of whose it is is treated as a different organisation, not assumed to be this one', async () => {
+  // No token row, no pin, no stamp: an instance that was disconnected before the stamp existed. "Same
+  // organisation" cannot be shown, and assuming it is what the defect did.
+  await mappedFor(DEMO, { stamp: false })
+  tokenRow = null
+  delete settings.xero_expected_tenant_id
+  connectionsBody = [OTHER]
+  const { exchangeCodeForTokens } = await loadAuth()
+  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present with no provenance')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.deepEqual(await mappingRowsPresent(), [])
+  assert.equal(settings.xero_sync_enabled, undefined)
+  assert.match(result.accountMappingResetNotice ?? '', /no record of/)
+})
+
+test('[o3d-6thk1] a different organisation with NOTHING mapped has nothing to clear: no reset, no notice, sync untouched', async () => {
+  pinnedTo(DEMO)
+  settings.xero_account_mapping_tenant_id = DEMO.tenantId
+  settings.xero_sync_enabled = 'true'
+  settings.accounting_payment_account_map = '{}'
+  tokenRow = null
+  delete settings.xero_expected_tenant_id
+  connectionsBody = [OTHER]
+  const { exchangeCodeForTokens } = await loadAuth()
+  assert.deepEqual(await mappingRowsPresent(), ['accounting_payment_account_map'], 'PRECONDITION: only the empty default map exists')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(result.accountMappingResetNotice, undefined, "an empty '{}' map is not a mapping")
+  assert.equal(settings.xero_sync_enabled, 'true')
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId)
+})
+
+test('[o3d-6thk1] a connect that is REFUSED clears nothing', async () => {
+  await mappedFor(DEMO)
+  connectionsBody = [OTHER]
+  const { exchangeCodeForTokens } = await loadAuth()
+  const before = JSON.stringify(settings)
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId, 'PRECONDITION: pinned to the organisation the mapping is for')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, false, 'the pin refuses the other organisation')
+  assert.equal(JSON.stringify(settings), before, 'no setting was touched')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+})
+
+test('[o3d-6thk1] a binding that FAILS part-way rolls the clear back with it', async () => {
+  await mappedFor(DEMO)
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [OTHER]
+  const before = JSON.stringify(settings)
+  bindingTokenWriteGate = async () => { throw new Error('token write failed (injected)') }
+  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null, 'nothing was bound')
+  assert.equal(JSON.stringify(settings), before, 'and the previous organisation\'s mapping is exactly as it was: clear and bind are one transaction')
 })

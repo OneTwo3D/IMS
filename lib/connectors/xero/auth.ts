@@ -15,7 +15,14 @@ import { deserializeSettingValue, getSettingValue, serializeSettingValue } from 
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { orderedAccountingBindingWrites, runOrderedAccountingBindingWrites } from '@/lib/connectors/accounting-binding-lock-order'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 import { clearXeroReferenceCache } from './api'
+import {
+  readPreviousMappingOrganisation,
+  resetAccountMappingForOrganisationChange,
+  xeroAccountMappingResetMessage,
+  type AccountMappingResetOutcome,
+} from './account-mapping-rebind'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
   demoOrgConnectRefusal, nameOnlyGuardWarning, parseXeroReleaseWitness, readXeroTenantAllowList,
@@ -397,12 +404,21 @@ async function getExpectedTenantId(): Promise<string | null> {
 async function bindXeroTenant(params: {
   connection: XeroConnectionSummary
   token: StoredTokenWrite
-}): Promise<{ ok: true } | { ok: false; error: string }> {
+}): Promise<{ ok: true; accountMappingReset?: Extract<AccountMappingResetOutcome, { reset: true }> } | { ok: false; error: string }> {
   const { connection, token } = params
   const pinValue = serializeSettingValue(XERO_EXPECTED_TENANT_KEY, token.tenantId)
+  let accountMappingReset: AccountMappingResetOutcome = { reset: false }
 
   try {
     await db.$transaction(async (tx) => {
+      // o3d-6thk1: the account mapping belongs to ONE organisation, so a binding to a different one must
+      // not inherit it. Serialised against in-flight postings and mapping saves by the same lock
+      // saveXeroSettings takes (selection advisory lock first, then the mapping rows), acquired BEFORE the
+      // binding rows: nothing that holds a mapping row ever waits for the pin or the token, so this adds
+      // no edge to the pin, token, witness order. The previous organisation is read now because the token
+      // upsert below overwrites the only other record of it. See account-mapping-rebind.ts.
+      await lockAccountingMappingSelection(tx, 'xero')
+      const previousOrganisation = await readPreviousMappingOrganisation(tx, XERO_CONNECTOR)
       // THE THREE ACQUISITIONS, THROUGH THE ONE ORDERING (o3d-2w2j). This transaction is interactive
       // — it reads, branches and throws between its writes — so the steps are thunks and the runner
       // awaits them in `ACCOUNTING_BINDING_ROW_ORDER`. The pin step must still be the one that throws
@@ -461,8 +477,12 @@ async function bindXeroTenant(params: {
           await tx.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } })
         },
       })
+      accountMappingReset = await resetAccountMappingForOrganisationChange(tx, {
+        previous: previousOrganisation,
+        newTenantId: token.tenantId,
+      })
     })
-    return { ok: true }
+    return accountMappingReset.reset ? { ok: true, accountMappingReset } : { ok: true }
   } catch (error) {
     if (!(error instanceof XeroBindingRace)) throw error
     const boundTo = await readBoundTenant(error.boundTenantId)
@@ -860,7 +880,7 @@ export async function consumeXeroOAuthState(state: string): Promise<OAuthStatePa
 export async function exchangeCodeForTokens(
   code: string,
   redirectUri: string,
-): Promise<{ success: boolean; tenantName?: string; error?: string }> {
+): Promise<{ success: boolean; tenantName?: string; error?: string; accountMappingResetNotice?: string }> {
   try {
     const [clientId, clientSecret] = await Promise.all([
       getSettingValue('xero_client_id'),
@@ -968,7 +988,34 @@ export async function exchangeCodeForTokens(
       return { success: false, error: bound.error }
     }
 
-    return { success: true, tenantName: conn.tenantName }
+    // o3d-6thk1: the binding cleared an account mapping that described a DIFFERENT organisation. Said to
+    // whoever is watching the callback AND recorded, because the redirect only reaches the browser that
+    // happens to be open. Best-effort: a logging failure must not turn a completed binding into a 500.
+    let accountMappingResetNotice: string | undefined
+    if (bound.accountMappingReset) {
+      accountMappingResetNotice = xeroAccountMappingResetMessage({ tenantName: conn.tenantName, outcome: bound.accountMappingReset })
+      try {
+        await logActivity({
+          entityType: 'SYSTEM',
+          tag: 'sync',
+          action: 'xero_account_mapping_reset',
+          level: 'WARNING',
+          description: accountMappingResetNotice,
+          metadata: {
+            connector: XERO_CONNECTOR,
+            previousTenantId: bound.accountMappingReset.previous.tenantId,
+            previousBasis: bound.accountMappingReset.previous.basis,
+            newTenantId: conn.tenantId,
+            clearedKeys: bound.accountMappingReset.clearedKeys,
+            syncWasEnabled: bound.accountMappingReset.syncWasEnabled,
+          },
+        })
+      } catch {
+        // Best-effort only.
+      }
+    }
+
+    return { success: true, tenantName: conn.tenantName, ...(accountMappingResetNotice ? { accountMappingResetNotice } : {}) }
   } catch (e) {
     return { success: false, error: String(e) }
   }

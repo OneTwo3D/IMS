@@ -50,6 +50,19 @@ So:
   organisations in Xero is the quicker one if you only ever want the single organisation.
 - **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
   before. Disconnecting clears the pin.
+- **Connecting to a different organisation clears the account mapping.** The account codes (all fifteen
+  roles under *Account Mapping*) and the Payment Account Mapping describe one organisation's chart of
+  accounts. When a connect binds an organisation other than the one the mapping was set up for, IMS clears
+  them in the same transaction that writes the new binding and switches **Xero sync off**, so nothing posts
+  to the new organisation under the old one's codes. It is not an automatic re-map (matching old codes to a
+  new chart would be a guess) and nothing already stored is rewritten. The callback message and the
+  activity log (`xero_account_mapping_reset`) say so; open Sync settings, choose each account from the new
+  organisation, then switch sync back on (the readiness check lists any role still missing). Reconnecting
+  to the **same** organisation, including after **Disconnect**, keeps the mapping and the sync switch. IMS
+  remembers which organisation the mapping is for in `xero_account_mapping_tenant_id`; where that is
+  unknown (an instance disconnected before it existed) a mapping with no provenance is treated as
+  belonging to a different organisation. The stored chart of accounts used by the account pickers is
+  not refreshed by this: see o3d-fgrcx.
 - **Two connections at once bind one organisation, not two.** The pin and the stored token are written
   in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
   flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them
