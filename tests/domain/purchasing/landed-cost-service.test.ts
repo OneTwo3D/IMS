@@ -2281,7 +2281,7 @@ function recalcPoFor(fixture: RecalcFixture, mode: 'direct' | 'linked') {
   }
 }
 
-async function runRecalc(fixture: RecalcFixture, mode: 'direct' | 'linked', depsOverride: Partial<LandedCostServiceDeps> = {}) {
+async function runRecalc(fixture: RecalcFixture, mode: 'direct' | 'linked', depsOverride: Partial<LandedCostServiceDeps> = {}, priorRunAfterJson: unknown = null) {
   const po = recalcPoFor(fixture, mode)
   const costLayerUpdates: Array<{ where: { id: string }; data: { unitCostBase: Prisma.Decimal } }> = []
   const lineUpdates: Array<{ where: { id: string }; data: { landedUnitCostBase: Prisma.Decimal } }> = []
@@ -2297,7 +2297,10 @@ async function runRecalc(fixture: RecalcFixture, mode: 'direct' | 'linked', deps
     purchaseOrder: { findUnique: async () => po },
     purchaseOrderLine: { update: async (args: never) => { lineUpdates.push(args); return args } },
     costLayer: { update: async (args: never) => { costLayerUpdates.push(args); return args } },
-    landedCostRevaluationRun: { create: async (args: never) => { runs.push(args); return { id: `audit-${runs.length}` } } },
+    landedCostRevaluationRun: {
+      findFirst: async () => (priorRunAfterJson ? { afterJson: priorRunAfterJson } : null),
+      create: async (args: never) => { runs.push(args); return { id: `audit-${runs.length}` } },
+    },
   }
   const result = mode === 'direct'
     ? await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(depsOverride), TEST_AUDIT_OPTIONS)
@@ -2389,7 +2392,10 @@ test('T9: a second recalculation of a floored layer posts NOTHING, repeats the w
       purchaseOrder: { findUnique: async () => po },
       purchaseOrderLine: { update: async () => ({}) },
       costLayer: { update: async () => ({}) },
-      landedCostRevaluationRun: { create: async (args: never) => { runs.push(args); return { id: 'audit-2' } } },
+      landedCostRevaluationRun: {
+        findFirst: async () => ({ afterJson: (first.runs[0] as { data: { afterJson: unknown } }).data.afterJson }),
+        create: async (args: never) => { runs.push(args); return { id: 'audit-2' } },
+      },
     }
     const second = mode === 'direct'
       ? await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
@@ -2429,4 +2435,50 @@ test('T8: propagation floors an output layer whose cost would round to -0.000001
   assert.equal(audits.length, 1, 'the propagation reached the output layer')
   assert.equal(updates['out-1'], '0', 'floored, never -0.000001')
   assert.equal(audits[0].unabsorbedBase, '0.000002', 'the residue is reported: 0.000001 x 2 units')
+})
+
+test('T9b: a floored layer already at zero whose RESIDUE grows (credit -3 -> -5) DOES get a new activity entry', async () => {
+  const base: RecalcFixture = {
+    name: 'floor',
+    lines: [fixtureLine('a', 1, 1)],
+    direct: [{ id: 'c1', amountBase: -3, distributionMethod: 'BY_VALUE' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: true,
+  }
+  for (const mode of ['direct', 'linked'] as const) {
+    const first = await runRecalc(base, mode)
+    const priorAfter = (first.runs[0] as { data: { afterJson: unknown } }).data.afterJson
+    // The same credit again: residue 2 == previous 2, layer already settled at 0 -> no entry.
+    const settledPo = { ...base, lines: [fixtureLine('a', 1, 1)] }
+    const grown: RecalcFixture = { ...settledPo, direct: [{ id: 'c1', amountBase: -5, distributionMethod: 'BY_VALUE' }] }
+    const poFor = (fixture: RecalcFixture) => {
+      const po = recalcPoFor(fixture, mode)
+      po.lines[0].costLayers[0].unitCostBase = 0
+      po.lines[0].landedUnitCostBase = 0
+      return po
+    }
+    const run = async (fixture: RecalcFixture) => {
+      const po = poFor(fixture)
+      const tx = {
+        landedCostLink: {
+          findMany: async ({ where }: { where: { freightPoId?: string } }) => (where.freightPoId ? [{ primaryPoId: 'po-1' }] : []),
+          updateMany: async () => ({ count: 1 }),
+        },
+        purchaseOrder: { findUnique: async () => po },
+        purchaseOrderLine: { update: async () => ({}) },
+        costLayer: { update: async () => ({}) },
+        landedCostRevaluationRun: { findFirst: async () => ({ afterJson: priorAfter }), create: async () => ({ id: 'audit-x' }) },
+      }
+      return mode === 'direct'
+        ? recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
+        : recalculateLandedCosts(tx as never, 'f-1', noopDeps(), TEST_AUDIT_OPTIONS)
+    }
+    const same = await run(settledPo)
+    const bigger = await run(grown)
+    console.log(`T9b PRECONDITION (${mode}): layer stays 0 in both; same residue activities=${same.creditFloorActivities?.length}, grown residue (2 -> 4) activities=${bigger.creditFloorActivities?.length}`)
+    assert.equal(same.creditFloorActivities?.length, 0)
+    assert.equal(bigger.creditFloorActivities?.length, 1, 'a changed residue is an event')
+    assert.match(bigger.creditFloorActivities![0].entries[0].unabsorbedBase.toString(), /^4$/)
+  }
 })

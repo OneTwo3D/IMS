@@ -51,6 +51,29 @@ export const FreightCostLinesSchema = z.array(FreightCostLineInputSchema).superR
   if (net.lt(0)) context.addIssue({ code: 'custom', message: FREIGHT_NET_CREDIT_MESSAGE })
 })
 
+/** Thrown by `assertFreightTotalNotNegative`; the actions report its message as the refusal reason. */
+export class FreightNetCreditError extends Error {
+  constructor() {
+    super(FREIGHT_NET_CREDIT_MESSAGE)
+    this.name = 'FreightNetCreditError'
+  }
+}
+
+/**
+ * The order's PAYABLE total is what a freight order must not drive below zero, not just the sum of its lines:
+ * VAT is charged per vatable line INCLUDING a negative one, so +100 non-vatable and -100 vatable lines have a
+ * zero subtotal but, at 20%, a total of -20. Checked on the BUILT figures (exact Decimal) before either action
+ * writes anything. VAT on a negative vatable line is left as the builder computes it (a negative tax): the
+ * rule is only that neither the net nor the total may be negative.
+ */
+export function freightTotalIsNegative(built: Pick<FreightCostLineRows, 'subtotalForeign' | 'totalForeign'>): boolean {
+  return built.subtotalForeign.lt(0) || built.totalForeign.lt(0)
+}
+
+export function assertFreightTotalNotNegative(built: Pick<FreightCostLineRows, 'subtotalForeign' | 'totalForeign'>): void {
+  if (freightTotalIsNegative(built)) throw new FreightNetCreditError()
+}
+
 export const CreateFreightPoInputSchema = z.object({
   supplierId: z.string().min(1, 'Select a supplier'),
   currency: z.string().min(1, 'Currency is required'),

@@ -4,7 +4,10 @@ import test, { mock } from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  assertFreightTotalNotNegative,
   buildFreightCostLineRows,
+  FreightNetCreditError,
+  freightTotalIsNegative,
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
   FreightCostLinesSchema,
@@ -197,4 +200,22 @@ test('T11 census: both actions parse with the shared boundary and build rows wit
   assert.equal(/export type FreightCostLineInput = \{/.test(source), false)
   assert.equal(/export type \{[^}]*(FreightCostLineInput|CreateFreightPoInput)/.test(source), false, "a type re-export in a 'use server' file fails the Turbopack build")
   assert.equal(/export type CreateFreightPoInput = \{/.test(source), false)
+})
+
+test('T11 total: the payable total (net PLUS VAT) is what must not be negative, with exact Decimal math', () => {
+  const lines = [
+    line({ amountForeign: 100, vatable: false }),
+    line({ amountForeign: -100, vatable: true }),
+  ]
+  const built = buildFreightCostLineRows(lines, 1, 0.2)
+  console.log(`T11 PRECONDITION: subtotal=${built.subtotalForeign}, tax=${built.taxForeign}, total=${built.totalForeign} (the line-sum rule alone passes this: ${FreightCostLinesSchema.safeParse(lines).success})`)
+  assert.equal(FreightCostLinesSchema.safeParse(lines).success, true, 'the line-sum rule cannot see VAT')
+  assert.equal(built.totalForeign.toString(), '-20')
+  assert.equal(freightTotalIsNegative(built), true)
+  assert.throws(() => assertFreightTotalNotNegative(built), FreightNetCreditError)
+  const fine = buildFreightCostLineRows([line({ amountForeign: 100 }), line({ amountForeign: -50, vatable: true })], 1, 0.2)
+  assert.equal(fine.totalForeign.toString(), '40')
+  assert.equal(freightTotalIsNegative(fine), false)
+  // Exactly zero is allowed.
+  assert.equal(freightTotalIsNegative(buildFreightCostLineRows([line({ amountForeign: 5 }), line({ amountForeign: -5 })], 1, 0)), false)
 })

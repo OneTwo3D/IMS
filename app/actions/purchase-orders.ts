@@ -81,8 +81,12 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
+  assertFreightTotalNotNegative,
   buildFreightCostLineRows,
   CreateFreightPoInputSchema,
+  FREIGHT_NET_CREDIT_MESSAGE,
+  FreightNetCreditError,
+  freightTotalIsNegative,
   FreightCostLinesSchema,
   type CreateFreightPoInput as CreateFreightPoInputShape,
   type FreightCostLineInput as FreightCostLineInputShape,
@@ -852,21 +856,29 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   const grossUnitCostBaseByLine = landedAllocation.grossUnitCostBaseByLine
   const landedCostFloors = landedAllocation.floors.map((floor) => {
     const poLine = po.lines.find((line) => line.id === floor.lineId)
-    const unabsorbedBase = unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, floor.qty)
+    const label = poLine?.product?.sku ?? floor.lineId
+    // Units already received were laid at the floored cost (past tense); units still to come will be (future).
+    // The residue is split over the same two quantities, so the sentence never describes more units than it names.
+    const received = Prisma.Decimal.min(new Prisma.Decimal(poLine?.qtyReceived ?? 0), floor.qty)
+    const outstanding = floor.qty.sub(received)
+    const entryFor = (qty: Prisma.Decimal): FlooredLandedCreditEntry => ({
+      label,
+      unabsorbedBase: unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, qty),
+      unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+    })
+    const parts: string[] = []
+    if (received.gt(0)) {
+      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${received.toString()} received)`, entries: [entryFor(received)], tense: 'applied' }))
+    }
+    if (outstanding.gt(0)) {
+      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${outstanding.toString()} not yet received)`, entries: [entryFor(outstanding)], tense: 'pending' }))
+    }
     return {
       lineId: floor.lineId,
-      sku: poLine?.product?.sku ?? floor.lineId,
+      sku: label,
       unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toNumber(),
-      unabsorbedBase: unabsorbedBase.toNumber(),
-      message: describeFlooredLandedCredit({
-        tense: 'pending', // nothing is received yet: the preview says what IMS WILL do and claims nothing happened
-        context: `PO ${po.reference}`,
-        entries: [{
-          label: poLine?.product?.sku ?? floor.lineId,
-          unabsorbedBase,
-          unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
-        }],
-      }),
+      unabsorbedBase: entryFor(floor.qty).unabsorbedBase.toNumber(),
+      message: parts.join(' '),
     }
   })
 
@@ -4676,6 +4688,8 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     const fxRate = input.fxRateToBase
     // The ONE row builder, shared with updateFreightPoCosts: the same input persists the same rows.
     const built = buildFreightCostLineRows(input.costLines, fxRate, input.taxRateValue ?? 0)
+    // The payable TOTAL (net plus VAT), not only the sum of the lines, must not be negative.
+    if (freightTotalIsNegative(built)) return { success: false, error: FREIGHT_NET_CREDIT_MESSAGE }
     const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
     const costLineData = built.rows
 
@@ -4911,11 +4925,53 @@ export async function updateFreightPoCosts(
 
       // The ONE row builder, shared with createFreightPo: the same input persists the same rows.
       const built = buildFreightCostLineRows(costLines, new Prisma.Decimal(po.fxRateToBase), taxRateValue ?? 0)
+      // The payable total (net plus VAT) must not be negative: refused before anything is written.
+      assertFreightTotalNotNegative(built)
       const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
 
-      await tx.freightCostLine.deleteMany({ where: { poId: freightPoId } })
-      if (built.rows.length > 0) {
-        await tx.freightCostLine.createMany({ data: built.rows.map((row) => ({ ...row, poId: freightPoId })) })
+      // A RE-SAVE OF UNCHANGED LINES IS A NO-OP. The lines used to be deleted and recreated on every save, which
+      // gave them new ids; the allocation sums shares in (sourceRank, id) order, so a save that changed no amount
+      // could still move a cost line past another freight order's lines and change a 6dp unit cost, producing a
+      // layer adjustment and journals for nothing. "Unchanged" compares what the operator controls (description,
+      // amount, vatable, method) against what is stored, NOT the derived base amount: a legacy row stored by the
+      // old float builder (0.0654 where HALF_UP gives 0.0655) must not read as an edit.
+      const existing = await tx.freightCostLine.findMany({
+        where: { poId: freightPoId },
+        orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+        select: { id: true, description: true, amountForeign: true, vatable: true, distributionMethod: true },
+      })
+      const unchanged = existing.length === built.rows.length && built.rows.every((row, index) => {
+        const stored = existing[index]!
+        return stored.description === row.description
+          && new Prisma.Decimal(stored.amountForeign).eq(row.amountForeign)
+          && stored.vatable === row.vatable
+          && stored.distributionMethod === row.distributionMethod
+      })
+      if (unchanged) return { reference: po.reference, landedResult: null }
+
+      // CHANGED: update rows IN PLACE so unchanged-position lines keep their ids (and so does any invoice line
+      // that points at one), delete the surplus, create the extras.
+      for (const [index, row] of built.rows.entries()) {
+        const stored = existing[index]
+        if (stored) {
+          await tx.freightCostLine.update({
+            where: { id: stored.id },
+            data: {
+              description: row.description,
+              amountForeign: row.amountForeign,
+              amountBase: row.amountBase,
+              vatable: row.vatable,
+              distributionMethod: row.distributionMethod,
+              sortOrder: row.sortOrder,
+            },
+          })
+        }
+      }
+      if (existing.length > built.rows.length) {
+        await tx.freightCostLine.deleteMany({ where: { id: { in: existing.slice(built.rows.length).map((row) => row.id) } } })
+      }
+      if (built.rows.length > existing.length) {
+        await tx.freightCostLine.createMany({ data: built.rows.slice(existing.length).map((row) => ({ ...row, poId: freightPoId })) })
       }
 
       await tx.purchaseOrder.update({
@@ -4939,6 +4995,9 @@ export async function updateFreightPoCosts(
       })
       return { reference: po.reference, landedResult }
     }, STOCK_TX_OPTIONS)
+
+    // Unchanged lines: nothing was written and nothing was revalued, so there is nothing to journal or report.
+    if (!landedResult) return { success: true }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)
@@ -4984,6 +5043,7 @@ export async function updateFreightPoCosts(
       metadata: null,
     })
     // o3d-nrl4 PR A: a scope race is an instruction to retry, not a crash: nothing was written.
+    if (e instanceof FreightNetCreditError) return { success: false, error: e.message }
     return { success: false, error: e instanceof LandedCostScopeRacedError ? e.message : String(e) }
   }
 }

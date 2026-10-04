@@ -727,12 +727,34 @@ function captureAllocationEvents(
  * The floor's footprint on one revaluation: the per-layer audit keys, and the single warning the run
  * carries. `activityDue` is true only when a floored layer's unit cost actually CHANGED in this run, so a
  * no-op recalculation repeats the warning in `warningsJson` (state) without writing another activity entry
- * (event). A change of the unabsorbed AMOUNT while the layer stays at zero is therefore recorded in
- * `warningsJson` and `afterJson` only.
+ * (event). A change of the unabsorbed AMOUNT while the layer stays at zero is an event too: the callers
+ * compare it with the previous run's record (`previousFloorResidue`) and set `activityDue`.
  */
 type FloorFootprint = {
   entries: FlooredLandedCreditEntry[]
   activityDue: boolean
+}
+
+/**
+ * What the PREVIOUS revaluation of this order recorded as unabsorbed (the sum of `unabsorbedBase` over its
+ * layers in `afterJson`), or zero when it floored nothing or there was no run. The floor's residue can change
+ * while every floored layer stays at 0.00 (a credit that grows), so "did the unit cost change" cannot tell a
+ * repeat from a new amount; the previous run's own record can. Read only when this run floored something.
+ */
+async function previousFloorResidue(tx: Prisma.TransactionClient, primaryPoId: string): Promise<Prisma.Decimal> {
+  const run = await tx.landedCostRevaluationRun.findFirst({
+    where: { primaryPoId },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: { afterJson: true },
+  })
+  const lines = (run?.afterJson as { lines?: Array<{ costLayers?: Array<{ unabsorbedBase?: string }> }> } | null | undefined)?.lines ?? []
+  let total = new Prisma.Decimal(0)
+  for (const line of lines) {
+    for (const layer of line.costLayers ?? []) {
+      if (layer.unabsorbedBase) total = total.add(new Prisma.Decimal(layer.unabsorbedBase))
+    }
+  }
+  return total
 }
 
 function recordFlooredLandedCredit(
@@ -1463,6 +1485,11 @@ export async function recalculateLandedCosts(
       })
     }
 
+    if (floorFootprint.entries.length > 0 && !floorFootprint.activityDue) {
+      // The layer cost did not change; a changed RESIDUE still deserves a new entry.
+      const residueNow = floorFootprint.entries.reduce((sum, entry) => sum.add(entry.unabsorbedBase), new Prisma.Decimal(0))
+      if (!(await previousFloorResidue(tx, primaryPoId)).eq(residueNow)) floorFootprint.activityDue = true
+    }
     recordFlooredLandedCredit(
       result, runWarnings, primaryPoId, `recalculateLandedCosts:${primaryPo.reference}`, floorFootprint,
     )
@@ -1793,6 +1820,10 @@ export async function recalculateDirectLandedCosts(
     })
   }
 
+  if (floorFootprint.entries.length > 0 && !floorFootprint.activityDue) {
+    const residueNow = floorFootprint.entries.reduce((sum, entry) => sum.add(entry.unabsorbedBase), new Prisma.Decimal(0))
+    if (!(await previousFloorResidue(tx, poId)).eq(residueNow)) floorFootprint.activityDue = true
+  }
   recordFlooredLandedCredit(result, runWarnings, poId, `recalculateDirectLandedCosts:${po.reference}`, floorFootprint)
   result.revalidatePoIds.push(poId)
   const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers, recalcRunId)
