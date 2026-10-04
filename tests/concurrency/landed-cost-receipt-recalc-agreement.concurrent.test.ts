@@ -106,7 +106,7 @@ async function journalRows(poId: string, type: string) {
 
 // ─── T5: the headline — receipt then a recalculation with the SAME cost lines posts nothing ─────────────
 
-test('T5: receive a PO whose linked freight has +20 and -5, then re-save the SAME lines: zero reclass, zero COGS, layer unchanged', SKIP, async () => {
+test('T5: receive a PO whose linked freight has +20 and -5, then recalculate with the SAME lines: zero reclass, zero COGS, layer unchanged', SKIP, async () => {
   loadEnv()
   const { db } = await import('@/lib/db')
   await enableStockReceiptPosting()
@@ -115,7 +115,7 @@ test('T5: receive a PO whose linked freight has +20 and -5, then re-save the SAM
   const goods = await seedGoodsPo('t5', QTY, UNIT)
   const freight = await seedFreightWithLines(goods.poId, goods.supplierId, [20, -5])
 
-  const { receivePurchaseOrder, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
   const received = await receivePurchaseOrder(goods.poId, [{ poLineId: goods.poLineId, qtyReceived: QTY, warehouseId: goods.warehouseId }])
   assert.equal(received.success, true, `PRECONDITION: the receipt must succeed: ${received.error}`)
 
@@ -129,18 +129,19 @@ test('T5: receive a PO whose linked freight has +20 and -5, then re-save the SAM
   const debit = ((receiptJournal?.payload as { lines?: Array<{ debit?: number }> } | null)?.lines ?? []).find((l) => typeof l.debit === 'number')?.debit
   assert.equal(debit, QTY * 13.75, 'the receipt journal carries the credited cost')
 
-  // Re-save the freight order with the very same lines through the real action.
-  const resaved = await updateFreightPoCosts(freight.poId, [
-    { description: 'freight 0', amountForeign: 20, vatable: false, distributionMethod: 'BY_VALUE' },
-    { description: 'freight 1', amountForeign: -5, vatable: false, distributionMethod: 'BY_VALUE' },
-  ])
-  assert.equal(resaved.success, true, `PRECONDITION: the re-save must succeed: ${resaved.error}`)
+  // Revalue with the SAME cost lines through the real recalculation (a save of unchanged lines is now a no-op, so
+  // it would not reach the recalculation at all; this drives the recalculation itself).
+  const { recalculateLandedCosts, queueLandedCostAdjustmentJournals } = await import('@/lib/domain/purchasing/landed-cost-service')
+  const recalculated = await db.$transaction((tx) => recalculateLandedCosts(tx, freight.poId, undefined, {
+    triggeredById: null, reason: 'freight_purchase_order_costs_updated', scheduleAdjustmentJournals: true,
+  }), { timeout: 60_000, maxWait: 10_000 })
+  await queueLandedCostAdjustmentJournals(recalculated)
   const runs = await db.landedCostRevaluationRun.count({ where: { primaryPoId: goods.poId } })
   const layerAfter = await db.costLayer.findUniqueOrThrow({ where: { id: layerAtReceipt.id }, select: { unitCostBase: true } })
   const reclass = await journalRows(goods.poId, 'STOCK_IN_TRANSIT')
   const cogs = await journalRows(goods.poId, 'COGS_JOURNAL')
   console.log(`T5 PRECONDITION: recalculation runs recorded: ${runs}, layer after: ${layerAfter.unitCostBase}, STOCK_IN_TRANSIT rows: ${reclass}, COGS_JOURNAL rows: ${cogs}`)
-  assert.equal(runs >= 1, true, 'the recalculation really ran (a re-save that never revalued would prove nothing)')
+  assert.equal(runs >= 1, true, 'the recalculation really ran (a recalculation that never revalued would prove nothing)')
   assert.equal(Number(layerAfter.unitCostBase), 13.75, 'layer unchanged')
   assert.equal(reclass, 0, 'a recalculation of unchanged cost lines posts NO inventory/transit reclass')
   assert.equal(cogs, 0, 'and no COGS adjustment')
@@ -196,6 +197,10 @@ test('T11 (DB): createFreightPo and updateFreightPoCosts persist IDENTICAL rows 
     return JSON.stringify({ po, lines })
   }
   const viaCreate = await snapshot(created.po!.id)
+  // Two REAL changes (a save of unchanged lines is a no-op and would prove nothing): bump the amount, then restore
+  // it, so the rows the update builder writes are compared with the rows the create builder wrote.
+  const bumped = await updateFreightPoCosts(created.po!.id, [{ ...input[0]!, amountForeign: 0.2309 }], 0.2)
+  assert.equal(bumped.success, true, `PRECONDITION: the bump must succeed: ${bumped.error}`)
   const updated = await updateFreightPoCosts(created.po!.id, input, 0.2)
   assert.equal(updated.success, true, `PRECONDITION: updateFreightPoCosts must succeed: ${updated.error}`)
   const viaUpdate = await snapshot(created.po!.id)
@@ -270,10 +275,14 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
   const goods = await seedGoodsPo('rs', 25, 3.01, [{ qty: 6, unit: 19.58 }, { qty: 8, unit: 6.46 }, { qty: 17, unit: 10.74 }])
   const a = await seedFreightWithLines(goods.poId, goods.supplierId, ['89401.8989'], 'PO_SENT', { method: 'BY_QUANTITY' })
   const b = await seedFreightWithLines(goods.poId, goods.supplierId, ['-27040.1416', '18605.9624'], 'PO_SENT', { method: 'BY_QUANTITY' })
+  const save = async (poId: string, lines: Parameters<typeof updateFreightPoCosts>[1]) => {
+    const outcome = await updateFreightPoCosts(poId, lines)
+    assert.equal(outcome.success, true, `PRECONDITION: the save must succeed: ${outcome.error}`)
+  }
   const asInput = (amounts: string[]) => amounts.map((amount, index) => ({ description: `freight ${index}`, amountForeign: Number(amount), vatable: false, distributionMethod: 'BY_QUANTITY' }))
   // A first real change establishes the stored landed costs (then the original amount is restored).
-  assert.equal((await updateFreightPoCosts(a.poId, asInput(['89402.8989']))).success, true)
-  assert.equal((await updateFreightPoCosts(a.poId, asInput(['89401.8989']))).success, true)
+  await save(a.poId, asInput(['89402.8989']))
+  await save(a.poId, asInput(['89401.8989']))
   const snapshot = async () => {
     const lines = await db.purchaseOrderLine.findMany({ where: { poId: goods.poId }, orderBy: { sortOrder: 'asc' }, select: { landedUnitCostBase: true } })
     const ids = await db.freightCostLine.findMany({ where: { poId: { in: [a.poId, b.poId] } }, orderBy: [{ poId: 'asc' }, { sortOrder: 'asc' }], select: { id: true } })
@@ -287,8 +296,8 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
   }
   const before = await snapshot()
   for (let i = 0; i < 6; i += 1) {
-    assert.equal((await updateFreightPoCosts(b.poId, asInput(['-27040.1416', '18605.9624']))).success, true)
-    assert.equal((await updateFreightPoCosts(a.poId, asInput(['89401.8989']))).success, true)
+    await save(b.poId, asInput(['-27040.1416', '18605.9624']))
+    await save(a.poId, asInput(['89401.8989']))
   }
   const after = await snapshot()
   console.log(`re-save PRECONDITION: 12 unchanged saves across 2 freight orders; runs ${before.runs} -> ${after.runs}; landed ${before.landed.join('/')} -> ${after.landed.join('/')}; ids unchanged: ${before.ids === after.ids}`)
@@ -311,7 +320,7 @@ test('re-save: unchanged freight lines revalue NOTHING (order-sensitive lines on
 
   // A CHANGE updates in place: the untouched line keeps its id, the changed one keeps its id too, and it revalues.
   const bIdsBefore = (await db.freightCostLine.findMany({ where: { poId: b.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
-  assert.equal((await updateFreightPoCosts(b.poId, asInput(['-27040.1416', '18606.9624']))).success, true)
+  await save(b.poId, asInput(['-27040.1416', '18606.9624']))
   const bIdsAfter = (await db.freightCostLine.findMany({ where: { poId: b.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true } })).map((r) => r.id)
   const changed = await snapshot()
   console.log(`re-save PRECONDITION: after one real edit ids ${bIdsBefore.join(',') === bIdsAfter.join(',') ? 'kept' : 'CHANGED'}, runs ${legacyAfter.runs} -> ${changed.runs}`)
