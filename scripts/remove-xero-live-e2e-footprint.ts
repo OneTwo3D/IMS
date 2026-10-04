@@ -43,6 +43,7 @@ import { createInterface } from 'node:readline'
 import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
+import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
@@ -266,14 +267,22 @@ async function xero<T>(token: Token, method: 'GET' | 'POST' | 'DELETE', path: st
   if (wait > 0) await sleep(wait)
   callCount++; lastCallAt = Date.now()
 
-  const res = await fetch(`${XERO_API_BASE}/${path}`, {
+  const requestUrl = `${XERO_API_BASE}/${path}`
+  const requestHeaders = {
+    'Authorization': `Bearer ${token.accessToken}`,
+    'Xero-Tenant-Id': token.tenantId,
+    'Accept': 'application/json',
+    ...(body ? { 'Content-Type': 'application/json' } : {}),
+  }
+  // THE OUTBOUND-WRITE HOLD applies to this script like any other IMS process: this raw fetch is outside
+  // connectorFetch, so the same decision is taken here, before the request. A POST or DELETE is sent only
+  // if XERO_WRITE_ALLOWED_TENANT in THIS process's environment names the tenant being written to.
+  const heldRefusal = outboundWriteRefusal({ connectorName: 'Xero', method, url: requestUrl, headers: requestHeaders, body: body ? JSON.stringify(body) : undefined })
+  if (heldRefusal) throw new OutboundWriteHeldError(heldRefusal, 0)
+
+  const res = await fetch(requestUrl, {
     method,
-    headers: {
-      'Authorization': `Bearer ${token.accessToken}`,
-      'Xero-Tenant-Id': token.tenantId,
-      'Accept': 'application/json',
-      ...(body ? { 'Content-Type': 'application/json' } : {}),
-    },
+    headers: requestHeaders,
     ...(body ? { body: JSON.stringify(body) } : {}),
   })
 
