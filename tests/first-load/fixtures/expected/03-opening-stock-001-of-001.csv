@@ -1,0 +1,8 @@
+sku,warehouseCode,qty,unitCostBase,productName,type,stockUnit,warehouseName,reserved,available,inventoryValueBase
+LEG-01,MAIN,8,12.000000,Table leg,BOM,,,0,8,96
+OAK-BOARD,MAIN,60,5.333333,"Oak board, 18mm",SIMPLE,,,0,60,319.99998
+OAK-BOARD,OVER,5,4.500000,"Oak board, 18mm",SIMPLE,,,0,5,22.5
+TABLE-01,MAIN,2,60.000000,Oak table,BOM,,,0,2,120
+TSHIRT-M,MAIN,4,3.000000,T-shirt medium,VARIANT,,,0,4,12
+TSHIRT-S,MAIN,7,2.400000,T-shirt small,VARIANT,,,0,7,16.8
+widget-9,MAIN,17,1.323529,Widget 9,SIMPLE,,,0,17,22.499993
