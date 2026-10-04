@@ -31,6 +31,13 @@ export type WcAttemptFence = {
   signal: AbortSignal
   /** True while this worker still owns its outbox row (status PROCESSING under its own lock token). */
   stillOwned: () => Promise<boolean>
+  /**
+   * OPTIONAL (o3d-6ldlj): true while IMS still wants this write. A cancel or hold is an IMS decision an operator
+   * can reverse (a hold released, say) while the attempt is inside a WooCommerce request, so the cancel/hold
+   * runner re-reads the IMS order immediately before the PUT as well as at the start of the attempt. Absent for
+   * the completion job, whose rule is the WooCommerce reading alone.
+   */
+  stillWanted?: () => Promise<boolean>
 }
 
 const storage = new AsyncLocalStorage<WcAttemptFence>()
@@ -56,6 +63,9 @@ export async function assertWcAttemptMayWrite(): Promise<void> {
   }
   if (!(await fence.stillOwned())) {
     throw new Error('this worker no longer owns the completion job (it was parked or replayed), so the status write was not sent')
+  }
+  if (fence.stillWanted && !(await fence.stillWanted())) {
+    throw new Error('the IMS order is no longer in the status being pushed, so the status write was not sent')
   }
   // The ownership read takes time of its own.
   if (fence.signal.aborted) {

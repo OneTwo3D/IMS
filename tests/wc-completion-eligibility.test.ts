@@ -44,6 +44,10 @@ const ROWS: Row[] = [
   { name: 'pending MAPPED to PROCESSING', reading: { slug: 'pending', imsStatus: 'PROCESSING', handledBy: null }, expected: 'ineligible-not-ready' },
   { name: 'failed MAPPED to PICKING', reading: { slug: 'failed', imsStatus: 'PICKING', handledBy: null }, expected: 'ineligible-not-ready' },
   { name: 'refunded MAPPED to PACKING', reading: { slug: 'refunded', imsStatus: 'PACKING', handledBy: 'refund-sync' }, expected: 'ineligible-finalised' },
+  // o3d-6ldlj sweep: `processing` is WooCommerce's own in-flight status whatever the mapping says.
+  { name: 'processing MAPPED to CANCELLED', reading: { slug: 'processing', imsStatus: 'CANCELLED', handledBy: null }, expected: 'eligible' },
+  { name: 'processing MAPPED to ON_HOLD', reading: { slug: 'processing', imsStatus: 'ON_HOLD', handledBy: null }, expected: 'eligible' },
+  { name: 'processing MAPPED to DELIVERED', reading: { slug: 'processing', imsStatus: 'DELIVERED', handledBy: null }, expected: 'eligible' },
   { name: 'unmapped custom status', reading: { slug: 'foo', imsStatus: null, handledBy: null }, expected: 'ineligible-unknown' },
   { name: 'empty status', reading: { slug: '', imsStatus: null, handledBy: null }, expected: 'ineligible-unknown' },
 ]
@@ -56,7 +60,7 @@ test('o3d-zvec.15 (arm 1): the completion eligibility table', () => {
     evaluated++
   }
   assert.equal(evaluated, ROWS.length)
-  assert.ok(evaluated >= 21, `the table must have been walked in full, evaluated ${evaluated}`)
+  assert.ok(evaluated >= 24, `the table must have been walked in full, evaluated ${evaluated}`)
 })
 
 test('o3d-zvec.15 (arm 1): the target is a parameter — a non-default target is judged against it', () => {

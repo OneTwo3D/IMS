@@ -126,9 +126,9 @@ test('o3d-zvec.15 (c3): an order WooCommerce already holds as completed is not r
   assert.deepEqual(state.puts, [])
 })
 
-test('o3d-zvec.15 (c4): the guard is scoped to PROMOTION — a cancel push still goes to a held order', async () => {
-  // Isolates the guard from a blanket "never write unless processing": cancel/hold behaviour is
-  // unchanged by this work, and the guard must not have swallowed it.
+test('o3d-zvec.15 (c4): the completion guard is scoped to PROMOTION — a cancel push still goes to a held order', async () => {
+  // Isolates the completion guard from a blanket "never write unless processing". Cancel/hold now have their OWN
+  // guard (o3d-6ldlj, tests/wc-ims-status-push-guard.test.ts), under which an on-hold order is cancellable.
   state.wcStatus = 'on-hold'
   await push('CANCELLED')
   assert.equal(state.fetches.length, 1, 'precondition: the status was read')
