@@ -32,7 +32,7 @@ test('SKU collisions, forbidden characters and "#" are rejected, and ALL collidi
 
 test('duplicate keys: identical duplicates collapse, conflicting duplicates are all rejected', (t) => {
   const identical = run({ products: ds('products', [product('A'), product('A')]), suppliers: ds('suppliers', [{ name: 'Acme' }, { name: 'Acme' }]) })
-  const conflicting = run({ products: ds('products', [product('A'), product('A', 'SIMPLE', { name: 'Different' })]), suppliers: ds('suppliers', [{ name: 'Acme', currency: 'GBP' }, { name: 'acme', currency: 'EUR' }]) })
+  const conflicting = run({ products: ds('products', [product('A'), product('A', 'SIMPLE', { name: 'Different' })]), suppliers: ds('suppliers', [{ name: 'Acme', currency: 'GBP' }, { name: 'Acme', currency: 'EUR' }]) })
   precondition(t, 'duplicate groups', 4)
   assert.equal(identical.blocking, false)
   assert.deepEqual(dispositionCodes(identical, 'products', 'EXCLUDED'), ['DUPLICATE_ROW'])
@@ -448,4 +448,51 @@ test('the report lists the apply-time checks the tool cannot prove (FX availabil
   const fx = result.report.applyTimeChecks.find((c) => c.id === 'po-fx-rate')
   assert.ok(fx?.check.includes('within 2%'))
   assert.ok(findingCodes(result).length > 0)
+})
+
+test('lookup sweep: a supplier name that collides under EITHER importer matching rule rejects every colliding row, and a PO naming it', (t) => {
+  const sup = (...names: string[]) => run({
+    products: ds('products', [product('A')]),
+    suppliers: ds('suppliers', [...names.map((name) => ({ name })), { name: 'Fine Ltd' }]),
+    'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: names[0] }), poLine({ orderKey: 'O2', supplierName: 'Fine Ltd' })]),
+  })
+  const sameData = sup('Acme', 'ACME')
+  const upperOnly = sup('Stra\u00dfe', 'STRASSE') // upper-case rule: ss, lower-case rule: they differ
+  const lowerOnly = sup('Zeta\u212a', 'Zetak') // lower-case rule: k, upper-case rule: they differ
+  precondition(t, 'collision cases', 3)
+  for (const [name, result] of [['same data', sameData], ['upper rule only', upperOnly], ['lower rule only', lowerOnly]] as const) {
+    assert.deepEqual(rejectedCodes(result, 'suppliers'), ['SUPPLIER_NAME_COLLISION', 'SUPPLIER_NAME_COLLISION'], name)
+    assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['SUPPLIER_ROW_REJECTED'], `${name}: the PO naming a colliding supplier is refused, the other order is not`)
+    assert.equal(result.blocking, true)
+  }
+  assert.ok(sameData.report.dispositions.some((d) => d.code === 'SUPPLIER_NAME_COLLISION' && d.reason.includes('"ACME"')), 'the report names the colliding spellings')
+  assert.equal(sup('Solo Ltd').blocking, false)
+})
+
+test('lookup sweep: a tax rate NAME and a numeric value on one line are refused (the tool cannot show they agree); either alone passes', (t) => {
+  const line = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine(extra)]) })
+  precondition(t, 'cases', 3)
+  assert.deepEqual(rejectedCodes(line({ taxRateName: 'Standard', taxRateValue: '20' }), 'purchase-order-lines'), ['TAX_NAME_AND_VALUE'])
+  assert.equal(line({ taxRateName: 'Standard' }).blocking, false)
+  assert.equal(line({ taxRateValue: '20' }).blocking, false)
+})
+
+test('lookup sweep: a catalogue SKU that differs only by case from a SKU already in IMS is refused; the same spelling updates it', (t) => {
+  const withIms = (sku: string) => run({ products: ds('products', [product(sku)]), 'ims-skus': ds('ims-skus', [{ sku: 'ABC', type: 'SIMPLE' }]) })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(withIms('abc'), 'products'), ['SKU_CASE_DIFFERS_FROM_IMS'])
+  assert.equal(withIms('ABC').blocking, false)
+})
+
+test('lookup sweep: categories are cleaned and compared as the importer does (length after cleaning, merged spellings, HTML entities)', (t) => {
+  const result = run({ products: ds('products', [
+    product('A', 'SIMPLE', { category: 'Caf\u00e9  Tables' }),
+    product('B', 'SIMPLE', { category: 'cafe tables' }),
+    product('C', 'SIMPLE', { category: 'Tools &amp; Dies' }),
+    product('D', 'SIMPLE', { category: 'x'.repeat(101) }),
+  ]) })
+  precondition(t, 'category cases', 4)
+  assert.deepEqual(rejectedCodes(result, 'products'), ['CATEGORY_TOO_LONG'])
+  assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_SPELLINGS_MERGED'))
+  assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_HTML_ENTITY'))
 })

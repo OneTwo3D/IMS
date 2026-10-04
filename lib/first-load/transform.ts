@@ -480,7 +480,10 @@ function validateProductRow(row: CanonRow): { ok: true; entry: CatEntry } | { ok
     if (!(LIFECYCLE_STATUSES as readonly string[]).includes(status)) return fail('BAD_LIFECYCLE', `lifecycleStatus ${JSON.stringify(v.lifecycleStatus)} is not one of ${LIFECYCLE_STATUSES.join(', ')}`)
     cells.lifecycleStatus = status
   }
-  if (v.category.length > CATEGORY_MAX) return fail('CATEGORY_TOO_LONG', `category is longer than ${CATEGORY_MAX} characters`)
+  // The importer cleans the name (HTML entities, NFKC, control characters, whitespace runs) BEFORE its length check; this
+  // mirrors the part that can be done without lib/products/categories (which imports the database).
+  const categoryCleaned = v.category.normalize('NFKC').replace(/\s+/g, ' ').trim()
+  if (categoryCleaned.length > CATEGORY_MAX) return fail('CATEGORY_TOO_LONG', `category is longer than ${CATEGORY_MAX} characters once cleaned`)
   for (const column of ['description', 'barcode', 'mpn', 'countryOfOrigin', 'stockUnit', 'imageUrl', 'category'] as const) {
     if (v[column] !== '') cells[column] = v[column]
   }
@@ -522,8 +525,16 @@ function loadCatalogue(run: Run): void {
     survivors.push(list[0])
   }
 
-  const afterExclusion: Candidate[] = []
+  const afterIms: Candidate[] = []
   for (const c of survivors) {
+    const existing = run.ims.get(c.entry.key)
+    if (existing && existing.sku !== c.entry.sku) {
+      run.add('products', c.row.line, c.entry.sku, 'REJECTED', 'SKU_CASE_DIFFERS_FROM_IMS', `IMS already has ${JSON.stringify(existing.sku)}, which differs only by letter case: the products importer matches exactly and would create a second product, and the opening-stock, transfer and purchase-order importers could not tell them apart`)
+      run.catStatus.set(c.entry.key, 'rejected')
+    } else afterIms.push(c)
+  }
+  const afterExclusion: Candidate[] = []
+  for (const c of afterIms) {
     const excluded = run.exclusions.get(c.entry.key)
     if (excluded) {
       run.add('products', c.row.line, c.entry.sku, 'EXCLUDED', 'EXCLUDED_BY_LIST', `on the accepted exclusion list: ${excluded.reason}`)
@@ -546,6 +557,20 @@ function loadCatalogue(run: Run): void {
     }
   }
   const remaining = afterExclusion.filter((c) => !barcodeLoser.has(c.entry.key))
+
+  const categorySpellings = new Map<string, Set<string>>()
+  const entityCategories: string[] = []
+  for (const c of remaining) {
+    const raw = c.entry.cells.category
+    if (!raw) continue
+    const spelling = raw.normalize('NFKC').replace(/\s+/g, ' ').trim()
+    const key = spelling.normalize('NFKD').replace(/\p{M}/gu, '').toLocaleLowerCase('en-US')
+    categorySpellings.set(key, (categorySpellings.get(key) ?? new Set<string>()).add(spelling))
+    if (/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/i.test(raw)) entityCategories.push(spelling)
+  }
+  const merged = [...categorySpellings.values()].filter((set) => set.size > 1).map((set) => [...set].sort(cmp).join(' / '))
+  if (merged.length > 0) run.find('WARNING', 'CATEGORY_SPELLINGS_MERGED', 'category spellings that differ only by case, accents or whitespace are ONE category to the importer: they will be merged into whichever it creates first', 'products', merged)
+  if (entityCategories.length > 0) run.find('WARNING', 'CATEGORY_HTML_ENTITY', 'the importer decodes HTML entities in a category name, so the stored name will differ from this text', 'products', entityCategories)
 
   const typeOf = new Map(remaining.map((c) => [c.entry.key, c.entry.type]))
   for (const c of remaining) {
@@ -691,10 +716,30 @@ function loadSuppliers(run: Run): void {
     const key = name.toUpperCase()
     groups.set(key, [...(groups.get(key) ?? []), { row, name, cells }])
   }
+  // The importers look a supplier up by NAME with two different rules: the purchase-order importer by `toUpperCase()`, the
+  // supplier importer by trimmed `toLowerCase()`. Two spellings that collide under EITHER rule are one supplier to one importer
+  // and two to the other, and a Map keeps the last, silently. Every row of every colliding spelling is rejected.
+  const spellingsByLower = new Map<string, Set<string>>()
+  for (const list of groups.values()) for (const c of list) spellingsByLower.set(c.name.toLowerCase(), (spellingsByLower.get(c.name.toLowerCase()) ?? new Set<string>()).add(c.name))
+  const collided = new Set<string>()
+  for (const [key, list] of groups) {
+    const spellings = new Set(list.map((c) => c.name))
+    for (const name of spellings) if (spellings.size > 1 || (spellingsByLower.get(name.toLowerCase())?.size ?? 0) > 1) collided.add(name)
+    void key
+  }
   for (const [key, list] of [...groups.entries()]) {
+    if (list.some((c) => collided.has(c.name))) {
+      for (const c of list) {
+        const rivals = [...new Set([...list.map((x) => x.name), ...(spellingsByLower.get(c.name.toLowerCase()) ?? [])])].filter((n) => n !== c.name).sort(cmp)
+        run.add('suppliers', c.row.line, c.name, 'REJECTED', 'SUPPLIER_NAME_COLLISION', `supplier name ${JSON.stringify(c.name)} collides with ${rivals.map((n) => JSON.stringify(n)).join(', ') || 'another spelling'} under the importers' name matching (upper-case in the purchase-order importer, lower-case in the supplier importer); it would resolve to the wrong supplier`)
+      }
+      run.supplierStatus.set(key, 'rejected')
+      for (const c of list) run.supplierStatus.set(c.name.toUpperCase(), 'rejected')
+      continue
+    }
     const signatures = new Set(list.map((c) => JSON.stringify(c.cells)))
     if (signatures.size > 1) {
-      for (const c of list) run.add('suppliers', c.row.line, c.name, 'REJECTED', 'DUPLICATE_SUPPLIER_CONFLICT', `the supplier name appears ${list.length} times (ignoring letter case) with different data`)
+      for (const c of list) run.add('suppliers', c.row.line, c.name, 'REJECTED', 'DUPLICATE_SUPPLIER_CONFLICT', `the supplier name appears ${list.length} times with different data`)
       run.supplierStatus.set(key, 'rejected')
       continue
     }
@@ -1030,6 +1075,10 @@ function loadPurchaseOrders(run: Run): void {
     const vat = parseBool(v.pricesIncludeVat)
     if (vat === null) { reject('BAD_BOOLEAN', `pricesIncludeVat ${JSON.stringify(v.pricesIncludeVat)} is not TRUE/FALSE`); continue }
     if (v.expectedDelivery !== '' && parseIsoDate(v.expectedDelivery) === null) { reject('BAD_DATE', `expectedDelivery ${JSON.stringify(v.expectedDelivery)} is not YYYY-MM-DD`); continue }
+    if (v.taxRateName !== '' && v.taxRateValue !== '') {
+      reject('TAX_NAME_AND_VALUE', `the line gives both a tax rate name (${JSON.stringify(v.taxRateName)}) and a value (${v.taxRateValue}); the importer resolves the NAME first and falls back to the value, and this tool cannot read IMS's named rates to show they agree. Give one or the other`)
+      continue
+    }
     let taxRateValue = ''
     if (v.taxRateValue !== '') {
       const t = parseDecimal(v.taxRateValue, 'taxRateValue', { maxIntDigits: 3, maxDp: 6 })

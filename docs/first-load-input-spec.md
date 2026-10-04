@@ -83,7 +83,7 @@ Qoblex is authoritative. Becomes the products import file.
 | `name` | yes | Product name. |
 | `type` | yes | One of SIMPLE, VARIABLE, VARIANT, KIT, BOM, NON_INVENTORY. The type is never defaulted. |
 | `parentSku` | no | Required for a VARIANT (a loaded VARIABLE product); refused on any other type. |
-| `category` | no | Category name (at most 100 characters). |
+| `category` | no | Category name, at most 100 characters once cleaned. The importer cleans it (HTML entities, NFKC, whitespace) and merges spellings that differ only by case, accents or whitespace into one category; the report warns about both. |
 | `description` | no | Passed through as given (trimmed). |
 | `barcode` | no | Text; leading zeros are kept. A barcode shared by two products rejects both. |
 | `mpn` | no | Passed through as given (trimmed). |
@@ -134,7 +134,7 @@ genuine deposit suppliers, and let IMS resolve the contact id.
 
 | Column | Required | Meaning |
 | --- | --- | --- |
-| `name` | yes | Matched case-insensitively. Two rows that differ only in case are one supplier: identical data loads once, differing data rejects both. |
+| `name` | yes | Looked up by name, case-insensitively (upper-case in the purchase-order importer, lower-case in the supplier importer). An exact duplicate row with identical data loads once; the same name with different data, or two spellings that collide under either rule (`Acme` / `ACME`, `Straße` / `STRASSE`), reject every row involved, and so does any purchase order line naming them. |
 | `contactName` | no | Passed through as given (trimmed). |
 | `email` | no | Passed through as given (trimmed). |
 | `phone` | no | Passed through as given (trimmed). |
@@ -166,7 +166,7 @@ Reduced to the outstanding quantity per line.
 | `qtyOrdered` | yes | At most 4 decimal places. |
 | `qtyReceived` | yes | At most 4 decimal places. |
 | `unitCostForeign` | yes | At most 6 decimal places and 9 integer digits. |
-| `taxRateName` | no | Passed through as given (trimmed). |
+| `taxRateName` | no | Matched to an IMS tax rate case-insensitively. A line gives a name OR a `taxRateValue`, never both (the importer resolves the name first and falls back to the value; the tool cannot read IMS to show they agree). |
 | `taxRateValue` | no | Percent or fraction as the importer reads it (above 1 means percent); as a fraction at most 4 decimal places (Decimal(5,4)) and not above `maxPurchaseTaxRate`. |
 | `pricesIncludeVat` | no | TRUE or FALSE. |
 | `supplierRef` | no | Passed through as given (trimmed). |
@@ -398,7 +398,8 @@ Every importer rejection rule that depends on what is in IMS. The importers' CSV
 | opening-stock-empty | opening-stock | The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable). |
 | po-supplier-exists | purchase-orders | Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first. |
 | po-fx-rate | purchase-orders | For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this. |
-| po-tax-rate | purchase-orders | Each taxRateName resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. |
+| po-tax-rate | purchase-orders | Each line's taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree. |
+| lookup-keys-unique-in-ims | all | In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers' case-insensitive matching: they build a Map and the last duplicate wins silently. |
 | po-reference-free | purchase-orders | No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated). |
 | po-product-lifecycle | purchase-orders | Products that exist in IMS but not in the products file are ACTIVE or DRAFT (the file's own products are checked here). |
 | transfer-reference-free | transfers | No existing transfer already has a prefixed transferKey as its reference. |
