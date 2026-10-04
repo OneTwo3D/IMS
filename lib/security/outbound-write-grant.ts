@@ -13,7 +13,7 @@
  *
  *  1. DEFAULT DENY. No variable, no write. An unreadable variable (a list, a wildcard, a boolean, a
  *     path, credentials, a malformed id) is no variable.
- *  2. ENVIRONMENT ONLY. Never a settings row. A pg_restore, a clone, a scratch database or a new
+ *  2. ENVIRONMENT ONLY. Never a settings row. A database restore, a clone, a scratch database or a new
  *     worktree carries no environment, so none of them can inherit a grant made for another install.
  *  3. IT NAMES THE DESTINATION. A boolean would be satisfied by any URL, which is exactly the bug it
  *     replaces; this compares the grant with the destination of the request actually being made, so
