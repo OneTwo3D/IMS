@@ -77,14 +77,14 @@ async function withRig(body: (rig: Rig) => Promise<void>, setup: (rig: Rig) => v
 }
 
 /** The shipped helper, run as a real process. The admin URL goes in the ENVIRONMENT, never argv. */
-function helper(rig: Rig, args: string[], extra: { migrationRole?: string | null; script?: string } = {}) {
+function helper(rig: Rig, args: string[], extra: { migrationRole?: string | null; script?: string; env?: Record<string, string> } = {}) {
   const migrationRole = extra.migrationRole === undefined ? 'imsapp_migrator' : extra.migrationRole
   const run = spawnSync(
     'node',
     [extra.script ?? SCRIPT, ...args, ...rig.identity, ...(migrationRole ? [`--migration-role=${migrationRole}`] : [])],
     {
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: rig.adminUrl } as unknown as NodeJS.ProcessEnv,
+      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: rig.adminUrl, ...(extra.env ?? {}) } as unknown as NodeJS.ProcessEnv,
       cwd: rig.root,
     },
   )
@@ -155,6 +155,22 @@ test('[o3d-1bgr] RESET ROLE on the migration URL gives no superuser and CREATE R
       console.log(`control (admin login): ${JSON.stringify(control)}`)
       assert.equal(control.none.superuser, true, 'control: the admin login IS a superuser')
     })
+  })
+})
+
+test('[o3d-1bgr] the role option is the SUPPLIED --app-user, whatever PGUSER and DATABASE_URL say', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const run = helper(rig, ['--print-migration-url', `--migration-nonce=${NONCE}`], {
+      env: { PGUSER: 'deployrole', DATABASE_URL: 'postgresql://127.0.0.1:5432/ims' },
+    })
+    assert.equal(run.status, 0, run.stderr)
+    const url = run.stdout.trim()
+    console.log(`options=${new URL(url).searchParams.get('options')}`)
+    assert.equal(new URL(url).searchParams.get('options'), '-c role=imsapp', 'the migration runs as the SUPPLIED role')
+    assert.ok(!url.includes('deployrole'), 'and a shell variable such as PGUSER reaches nothing the migration runs through')
+    assert.ok(!run.stdout.includes('supplied by the caller'), 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
+    assert.match(run.stderr, /as supplied by the caller/, 'and the diagnostic goes to stderr')
   })
 })
 

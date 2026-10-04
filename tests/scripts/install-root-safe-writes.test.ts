@@ -1711,8 +1711,10 @@ const ENTRYPOINTS = ['scripts/install.sh', 'scripts/deploy.sh', 'scripts/update.
  *  root. */
 const SHIPPED_PUBLICATIONS: Readonly<Record<string, { readonly callSites: number, readonly targets: readonly string[] }>> = {
   'scripts/install.sh': {
-    callSites: 9,
+    callSites: 10,
     targets: [
+      // owner decision C3: the root credential file install.sh records the admin URL in, root:root 0600.
+      '${DB_ADMIN_CREDENTIAL_FILE}',
       '$(db_ca_generation_file abc123)',
       '${DB_ROLE_ROTATION_JOURNAL}',
       '${FENCE_FILE}',
@@ -1752,6 +1754,8 @@ const PUBLICATION_CONSTANTS = [
   'DB_ENV_SNAPSHOT_DIR', 'DB_ENV_SNAPSHOT_FILE', 'DB_CA_PUBLISH_DIR',
   'DB_CA_GENERATION_PREFIX', 'DB_CA_GENERATION_SUFFIX', 'DB_ROLE_ROTATION_JOURNAL',
   'DEPLOY_META_FILE', 'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE',
+  // owner decision C3: the root credential file's directory and path, composed in that order.
+  'DB_ADMIN_CREDENTIAL_DIR', 'DB_ADMIN_CREDENTIAL_FILE',
 ]
 
 /** The same set plus the staging directory every publication is written through. */
@@ -1766,6 +1770,8 @@ const PROTECTED_CONSTANTS = [...PUBLICATION_CONSTANTS, 'PUBLISH_STAGE_DIRNAME']
 const SHIPPED_ROOTS = new Set([
   '/opt/one-two-inventory', '/var/lib/one-two-inventory', '/root/ims/onetwo3d-ims',
   '/etc/ims-cutover', '/etc/ims-cutover-state', '/etc/ims-db-ca', '/etc/ims-cutover-recovery',
+  // owner decision C3: the root-only home of the deploy admin credential, which install.sh publishes into.
+  '/etc/ims-db-admin',
 ])
 
 const FENCE_LIBRARY = 'scripts/lib/db-fence-protected.sh'
@@ -1810,6 +1816,11 @@ const FENCE_LIB = readFileSync(join(REPO, FENCE_LIBRARY), 'utf8')
 const PROTECTED_LIBRARY_CONSTANTS = [
   'DB_FENCE_RECOVERY_DIR', 'DB_FENCE_IDENTITY_FILE', 'DB_FENCE_PROTECTED_APP_DIR',
   'DB_FENCE_SCRIPT_COPY',
+  // owner decision C3: where the deploy admin credential lives, and the directory the ownership walk
+  // up from it stops at. The mechanism reads the credential out of the file at DB_ADMIN_CREDENTIAL_FILE
+  // and judges it against the walk, so a re-aimed path is a credential read from somewhere else and a
+  // re-aimed trust root is a walk that stops short of the directories it exists to check.
+  'DB_ADMIN_CREDENTIAL_DIR', 'DB_ADMIN_CREDENTIAL_FILE', 'DB_ADMIN_CREDENTIAL_TRUST_ROOT',
   // o3d-xi3w: the two fixed names a publication used (`.app.staged`, `.app.retired`) are GONE -- one
   // name per KIND is what let a second privileged run refill the first run's staging tree between
   // assembling it and hashing it. What replaces them is one `mktemp -d` per run plus these, which decide
@@ -4764,6 +4775,7 @@ function backupRun(backupDir: string, block: string, opts: { idStub?: string, ex
     'APP_USER="ims-app"',
     'MIGRATION_DATABASE_URL="postgresql://example/db"',
     'pg_dump() { printf "THE WHOLE DATABASE, AS ROOT READ IT FROM %s\\n" "$1"; }',
+    'db_pg_dump_through_url() { pg_dump "$1"; }',
     'gzip() { cat; }',
     'pin_migration_window() { :; }',
     // Stubbed for the reason the r4 rig stubs it (o3d-z5be r7): what is measured here is WHERE the
@@ -4941,6 +4953,7 @@ test('[o3d-ov60 r4] THE WITHDRAWN SHAPE, EXERCISED: a helper replaced mid-cutove
         'die() { error "$*"; exit 1; }',
         'MIGRATION_DATABASE_URL="postgresql://example/db"',
         'pg_dump() { printf %s "DUMP-OF-$1"; }',
+        'db_pg_dump_through_url() { pg_dump "$1"; }',
         'gzip() { cat; }',
         'success() { printf "SUCCESS: %s\\n" "$*"; }',
         'pin_migration_window() { :; }',
@@ -7272,7 +7285,10 @@ test('[o3d-secops] the gate is the first line of the run that names any of the t
   // as it stood before this round. The first mention is then the run's first READ of ${APP_DIR}.
   const withoutGate = lines.filter((line) => line !== GATE_APP && line !== GATE_DATA && line !== GATE_LOG)
   assert.equal(withoutGate.length, lines.length - 3, 'the mutation must remove exactly the three gate calls')
-  assert.equal(mentions(withoutGate)[0].line, 'load_existing_env "${APP_DIR}/.env"',
+  // owner decision C3: db_admin_credential_load() is the first statement after the three gates that names
+  // a root (it reads the application .env only to REFUSE a copy of the admin credential in it), so it is
+  // the first mention once the gate is taken away; load_existing_env comes after it.
+  assert.match(mentions(withoutGate)[0].line, /^db_admin_credential_load "\$\{APP_DIR\}\/\.env" \|\| die /,
     'without the gate the run reaches a root before anything has proved it — which is what this test exists to fail on')
 })
 

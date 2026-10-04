@@ -81,6 +81,7 @@ import {
   assessMigrationRole,
   parseConnectionIdentity,
   buildMigrationConnectionString,
+  buildMigrationLoginUrl,
   listDirectConnectGrantees,
   buildGrantStatements,
   buildRevokeStatements,
@@ -600,10 +601,13 @@ test('a connection string with no role has nothing to run the migration as', () 
   assert.equal(verdict.usable, false)
 })
 
-test('the migration URL authenticates as the admin and runs as the application role', () => {
+test('the migration URL composer keeps the login it is given and runs as the application role', () => {
+  // Owner decision C3: the login it is given in production is the MIGRATION ROLE's (buildMigrationLoginUrl()
+  // substitutes it for the admin's before this runs); this pure composer only adds the role option and
+  // the stamp, and leaves authentication alone, which is what keeps the fence's CONNECT check meaningful.
   const url = buildMigrationConnectionString('postgresql://deployadmin:pw@127.0.0.1:5432/ims', 'imsapp')
   const parsed = new URL(url)
-  assert.equal(parsed.username, 'deployadmin', 'authentication stays the admin, which is what keeps the fence effective')
+  assert.equal(parsed.username, 'deployadmin', 'authentication stays whatever login the caller put in the URL')
   assert.equal(parsed.pathname, '/ims')
   assert.equal(parsed.searchParams.get('options'), '-c role=imsapp', 'and the session runs as the application role')
 })
@@ -3689,27 +3693,25 @@ test('o3d-2sm1.5 r19: an ambient PG* that DIFFERS from the supplied value is not
     restore()
   }
 
-  // END TO END, IN THE SHIPPED SCRIPT: --print-migration-url derives the role the migration RUNS
-  // AS. A hostile PGUSER in this shell, and a DATABASE_URL naming no role at all, used to decide
-  // it; the supplied --app-user does now.
+  // THE ROLE THE MIGRATION RUNS AS IS THE SUPPLIED --app-user, not PGUSER or DATABASE_URL. This used to
+  // be asserted by running `--print-migration-url` with no database, because that mode only composed a
+  // string. Since owner decision C3 it opens the admin connection to mint the migration role's login, so
+  // the end-to-end form of this assertion lives with the real-cluster arms in
+  // tests/scripts/migration-role-custody.test.ts ("the role option is the SUPPLIED --app-user"); what is
+  // asserted here is the composition itself, over the same supplied value.
   //
   // MUTATION ROUTE: put `parseRoleFromConnectionString(process.env.DATABASE_URL)` back in front of
-  // `options.appUser` in main(). The emitted URL becomes `-c role=deployrole` — this shell's
-  // variable deciding what the migration runs as, on a box where the service has never heard of
-  // that role — and the last three assertions fail.
-  const result = runFenceScript(['--print-migration-url'], {
-    DEPLOY_ADMIN_DATABASE_URL: 'postgresql://deployadmin@127.0.0.1:5432/ims',
-    DATABASE_URL: 'postgresql://127.0.0.1:5432/ims',
-    PGUSER: 'deployrole',
-    DIRECT_URL: '',
-  })
-  assert.equal(result.status, 0, result.output)
-  const emitted = result.stdout.trim().split('\n').at(-1) ?? ''
-  assert.match(emitted, /^postgresql:\/\//, 'the last line is the URL the deploy captures')
+  // `options.appUser` in doPrintMigrationUrl(). The emitted URL becomes `-c role=deployrole` and the
+  // cluster arm fails.
+  const emitted = buildMigrationLoginUrl(
+    'postgresql://deployadmin@127.0.0.1:5432/ims',
+    'imsapp_migrator',
+    'minted-password',
+    suppliedIdentity({ appDatabase: 'ims' }).appUser,
+  )
+  assert.match(emitted, /^postgresql:\/\//, 'the string the deploy captures is a URL')
   assert.match(emitted, /options=-c\+role%3Dimsapp|options=-c%20role%3Dimsapp/, 'the migration runs as the SUPPLIED role')
-  assert.doesNotMatch(emitted, /deployrole/, 'and this shell\'s PGUSER reaches nothing the migration runs through')
-  assert.doesNotMatch(result.stdout, /supplied by the caller/, 'stdout carries the URL and nothing else: the deploy captures it with $(...)')
-  assert.match(result.stderr, /as supplied by the caller/, 'and the diagnostic goes to stderr')
+  assert.doesNotMatch(emitted, /deployrole/, 'and a shell variable such as PGUSER reaches nothing the migration runs through')
 })
 
 test('o3d-2sm1.5 r19: --release will not read "the application can connect" off another cluster', () => {
@@ -3796,7 +3798,7 @@ test('o3d-2sm1.5 r19: every entrypoint supplies the four values, and refuses whe
     // AND THE ONE INVOCATION THAT MOVED INTO THE LIBRARY STILL CARRIES IT.
     const libInvocations = library.split('\n')
       .filter((line) => !/^\s*#/.test(line))
-      .filter((line) => /^\s*"\$@" node /.test(line))
+      .filter((line) => /^\s*db_fence_exec_root "\$\{probe\}" /.test(line))
     assert.equal(libInvocations.length, 1, `the library runs the helper in exactly one place:\n${libInvocations.join('\n')}`)
     assert.ok(libInvocations[0].includes('DB_FENCE_IDENTITY_ARGS[@]'),
       `and it passes the identity — ${libInvocations[0].trim()}`)
@@ -3919,7 +3921,7 @@ test('o3d-2sm1.5 r19/r32: the four options are parsed, and no file is read from 
     // o3d-secops r32: and the migration nonce, on the same terms -- `--print-migration-url` given
     // '' composes exactly the URL it composed before that round, with no `application_name` at all.
     { mode: 'release', stateFile: '/x', stateOwnerUid: 0, appRole: '', timeoutSeconds: 30, appHost: 'db.internal', appPort: '6432', appUser: 'imsapp', appDatabase: 'imsdb',
-      witnessNonce: '', witnessLock: '', witnessChallenge: '', migrationNonce: '', holdStamp: false },
+      witnessNonce: '', witnessLock: '', witnessChallenge: '', migrationNonce: '', holdStamp: false, migrationRole: '' },
   )
   // AND THE THREE ARE READ WHEN THEY ARE GIVEN (o3d-secops r31). MUTATION ROUTE: drop any of the
   // three `--witness-*` arms from parseArgs() and the matching field stays '' here.
@@ -5015,6 +5017,10 @@ test('o3d-2sm1.5 r23: the trap re-fences the database it migrated even when the 
         // and the one adapter each entrypoint supplies for itself.
         shellFunction(CUTOVER_NS_LIB_SOURCE, 'dir_is_private_to_this_run'),
         shellFunction(source, 'db_fence_helper'),
+        // Since owner decision C3 the helper is reached through the library's root exec, not through
+        // the entrypoint's privilege-dropping runner; the runner stub below is where the process
+        // boundary is recorded, so the exec function is routed into it.
+        `db_fence_exec_root() { ${runner} root-no-longer-drops node "$@"; }`,
         // THE STILL-PRESENT DISAGREEMENT: the unit acquired another environment source and the
         // gate keeps saying so, exactly as it does upstream.
         `require_env_file_is_sole_definition() { ${soleOk ? 'return 0' : 'return 1'}; }`,

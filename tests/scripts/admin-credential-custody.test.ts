@@ -198,7 +198,7 @@ test('[o3d-1bgr] the operator text comes from one function, is conditional, and 
   }
   assert.match(absent, /was not supplied on this invocation and there is no/, 'absent says nothing was found')
   assert.match(absent, /umask 077/, 'and says how to write the file without the password on a command line')
-  assert.match(refused, /was NOT read: its mode is 640/, 'refused carries the reason')
+  assert.match(refused, /was NOT used: its mode is 640/, 'refused carries the reason')
   assert.match(envCopy, /\/opt\/app\/\.env still defines DEPLOY_ADMIN_DATABASE_URL/, 'env-copy names the file that holds the copy')
   assert.match(envCopy, /will not use or move it/, 'and says the value is not adopted')
   assert.match(nonroot, /not root/, 'nonroot says who cannot read it')

@@ -2924,13 +2924,6 @@ NEW_BUILD_ID=""
 # the connection fence engages, because the fence shuts the application role out and
 # the migration must not be shut out with it.
 MIGRATION_DATABASE_URL=""
-# THE ADMIN CREDENTIAL IS ROOT'S AND IS NEVER READ FROM ${APP_DIR}/.env (owner decision C3).
-# db_admin_credential_load() takes the invocation first and ${DB_ADMIN_CREDENTIAL_FILE} second,
-# REFUSES a copy of it left in the application's .env (naming the file to move it to, never using
-# the value) and un-exports the variable, so a value typed on `sudo env DEPLOY_ADMIN_DATABASE_URL=...`
-# is not inherited by every command this run starts as ${APP_USER}.
-DEPLOY_ADMIN_DATABASE_URL=""
-db_admin_credential_load "${APP_DIR}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
 
 # Every node/npm/next process whose working directory IS this app directory. Scoped by
 # /proc/<pid>/cwd rather than by a bare pgrep pattern, so a second instance serving a
@@ -7549,6 +7542,15 @@ header "Pre-flight checks"
 require_real_service_root "${APP_DIR}"  "the application directory"
 require_real_service_root "${DATA_DIR}" "the state directory"
 require_real_service_root "${LOG_DIR}"  "the log directory"
+
+# THE ADMIN CREDENTIAL IS ROOT'S AND IS NEVER READ FROM ${APP_DIR}/.env (owner decision C3). Loaded here, after the
+# privilege check and the three root gates and before anything in the run acts on a root or stops anything:
+# db_admin_credential_load() takes the invocation first and ${DB_ADMIN_CREDENTIAL_FILE} second,
+# REFUSES a copy of it left in the application's .env (naming the file to move it to, never using
+# the value) and un-exports the variable, so a value typed on `sudo env DEPLOY_ADMIN_DATABASE_URL=...`
+# is not inherited by every command this run starts as ${APP_USER}.
+DEPLOY_ADMIN_DATABASE_URL=""
+db_admin_credential_load "${APP_DIR}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
 
 if [[ -f /etc/os-release ]]; then
   . /etc/os-release

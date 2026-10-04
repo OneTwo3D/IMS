@@ -3926,6 +3926,14 @@ async function main() {
       console.error('DEPLOY_ADMIN_DATABASE_URL is not set — there is no privileged connection to open the migration login with.')
       process.exit(EXIT_ERROR)
     }
+    // A string that is not a URL cannot have the migration login substituted into it, and handing it to
+    // the driver would only fail later and elsewhere (as a DNS lookup). Refused here, by name.
+    try {
+      new URL(process.env.DEPLOY_ADMIN_DATABASE_URL)
+    } catch {
+      console.error('The admin connection string cannot be parsed as a URL, so the migration login cannot be substituted into it. Refusing to compose a migration URL.')
+      process.exit(EXIT_ERROR)
+    }
     const urlClient = new pg.Client({ connectionString: process.env.DEPLOY_ADMIN_DATABASE_URL, application_name: 'ims-deploy-fence' })
     await urlClient.connect()
     try {

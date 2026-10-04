@@ -145,7 +145,7 @@ test('[o3d-1bgr] a wrapper refuses a credential file another account could have 
     console.log(`0640 credential: exit ${run.status}; ${run.output.split('\n')[0].slice(0, 160)}`)
     assert.equal(run.status, 1)
     assert.ok(!existsSync(helperLog), 'the helper was never reached')
-    assert.match(run.output, /was NOT read: its mode is 640/)
+    assert.match(run.output, /was NOT used: its mode is 640/)
     assert.ok(run.output.includes(credential))
     assert.ok(!run.output.includes('canary-admin'), 'and the credential is not echoed')
   }))

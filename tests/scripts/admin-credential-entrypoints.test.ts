@@ -120,9 +120,10 @@ test('[o3d-1bgr] each entrypoint loads the credential once, at top level, ahead 
   for (const file of ENTRYPOINTS) {
     const lines = readFileSync(join(ROOT, file), 'utf8').split('\n')
     const loads = lines.flatMap((text, index) => (/^db_admin_credential_load\s/.test(text) ? [index + 1] : []))
-    // The first thing each entrypoint DOES: install.sh's first top-level `header`, and the first
-    // phase marker of deploy.sh and update.sh (install.sh's markers sit on function definitions).
-    const firstPhase = lines.findIndex((text) => (file.endsWith('install.sh') ? /^header /.test(text) : /^# @deploy-phase:/.test(text))) + 1
+    // The first thing each entrypoint DOES: install.sh's first read of the application's .env (the
+    // first statement after the privilege check and the three root gates that acts on a root), and the
+    // first phase marker of deploy.sh and update.sh (install.sh's markers sit on function definitions).
+    const firstPhase = lines.findIndex((text) => (file.endsWith('install.sh') ? /^load_existing_env /.test(text) : /^# @deploy-phase:/.test(text))) + 1
     console.log(`${file}: loads at ${JSON.stringify(loads)}; first action at ${firstPhase}`)
     assert.equal(loads.length, 1, `${file} loads the credential exactly once`)
     assert.ok(firstPhase > 0, `${file} has a first action to compare against (precondition)`)

@@ -4179,7 +4179,7 @@ db_admin_credential_instruction() {
       printf '%s' "DEPLOY_ADMIN_DATABASE_URL was not supplied on this invocation and there is no ${file}. It is the root-only credential of a superuser or database-owner login that is a DIFFERENT role from the application's, and it lives in that file (root:root, mode 0600, in ${dir}, mode 0700) -- never in the application's environment file, which the application account can write. Supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command> (that puts it on a command line for the length of the run; the file does not). To keep it, create ${dir} as root (owned by root, mode 0700) and put DEPLOY_ADMIN_DATABASE_URL=postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE in ${file} with an editor as root under umask 077, so the password is never on a command line. See docs/installation.md."
       ;;
     refused)
-      printf '%s' "${file} exists but was NOT read: ${detail}. It must be a regular file (not a link) owned by root, readable by nobody else (mode 0600), inside directories only root can write. Fix that as root (the file must belong to root:root with mode 0600, and ${dir} to root:root with mode 0700); nothing is read from it until it is right."
+      printf '%s' "${file} exists but was NOT used: ${detail}. It must be a regular file (not a link) owned by root, readable by nobody else (mode 0600), inside directories only root can write. Fix that as root (the file must belong to root:root with mode 0600, and ${dir} to root:root with mode 0700); nothing is taken from it until it is right."
       ;;
     env-copy)
       printf '%s' "${detail} still defines DEPLOY_ADMIN_DATABASE_URL. That file belongs to the application account, which must never hold the admin credential, and this run will not use or move it (it would be adopting an application-owned value as a root credential). Remove the line from ${detail} and put it in ${file} instead (root:root, mode 0600, in ${dir}, mode 0700, written as root under umask 077), or supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command>. Nothing has been stopped and nothing has been changed."
@@ -4188,7 +4188,7 @@ db_admin_credential_instruction() {
       printf '%s' "the admin credential is root-only (${file}, or sudo env DEPLOY_ADMIN_DATABASE_URL=... on the invocation) and this account is not root, so this run cannot use or even inspect it. Re-run as root."
       ;;
     *)
-      printf '%s' "DEPLOY_ADMIN_DATABASE_URL is read from the root-owned credential file ${file} (root:root, mode 0600, in ${dir}, mode 0700), or from the invocation (sudo env DEPLOY_ADMIN_DATABASE_URL=... <command>), which takes precedence. It is never read from the application's environment file."
+      printf '%s' "DEPLOY_ADMIN_DATABASE_URL is taken from the root-owned credential file ${file} (root:root, mode 0600, in ${dir}, mode 0700), or from the invocation (sudo env DEPLOY_ADMIN_DATABASE_URL=... <command>), which takes precedence. It is never taken from the application's environment file."
       ;;
   esac
 }
@@ -4244,7 +4244,7 @@ db_admin_credential_check() {
     return 1
   fi
   if (( (8#${mode} & 0077) != 0 )); then
-    printf 'its mode is %s: anything but 0600 or stricter lets another account read the credential' "${mode}"
+    printf 'its mode is %s: anything but 0600 or stricter lets another account see the credential' "${mode}"
     return 1
   fi
   dir="${file%/*}"
@@ -4279,14 +4279,14 @@ db_admin_credential_read() {
     return 2
   fi
   if [[ "${rc}" -ne 0 ]]; then
-    echo "REFUSING to read ${file}: ${why}. $(db_admin_credential_instruction refused "${why}")" >&2
+    echo "REFUSING to use ${file}: ${why}. $(db_admin_credential_instruction refused "${why}")" >&2
     return 1
   fi
   before="$(LC_ALL=C stat -c '%i' -- "${file}" 2>/dev/null)" || before=""
   # A failed `exec` redirection can end a non-interactive shell (and a refusal that kills the caller is
   # not the refusal this function owes it), so readability is asked first.
   if [[ ! -r "${file}" ]] || ! exec {fd}<"${file}"; then
-    echo "REFUSING to read ${file}: it could not be opened. $(db_admin_credential_instruction refused "it could not be opened")" >&2
+    echo "REFUSING to use ${file}: it could not be opened. $(db_admin_credential_instruction refused "it could not be opened")" >&2
     return 1
   fi
   after="$(LC_ALL=C stat -L -c '%F|%u|%a|%i' "/proc/self/fd/${fd}" 2>/dev/null)" || after=""
@@ -4295,7 +4295,7 @@ db_admin_credential_read() {
   if [[ ( "${fkind}" != "regular file" && "${fkind}" != "regular empty file" ) || "${fowner}" != "${want_uid}" || -z "${fmode}" ]] \
      || (( (8#${fmode} & 0077) != 0 )) || [[ -z "${before}" || "${finode}" != "${before}" ]]; then
     exec {fd}<&-
-    echo "REFUSING to read ${file}: the file opened is not the one that was checked (${after:-unreadable}). $(db_admin_credential_instruction refused "it changed between the check and the open")" >&2
+    echo "REFUSING to use ${file}: the file opened is not the one that was checked (${after:-unreadable}). $(db_admin_credential_instruction refused "it changed between the check and the open")" >&2
     return 1
   fi
   content="$(cat <&"${fd}")"
@@ -4323,7 +4323,9 @@ db_admin_credential_refuse_env_copy() {
 # ${1} is the application's .env, only to refuse a copy of the credential in it. Returns 1 (message
 # on stderr) when the .env holds a copy or the file exists and may not be read. An absent credential
 # is NOT a failure here: each entrypoint refuses, in the place and words that suit it, when it needs one.
-DB_MIGRATION_ROLE=""
+# (DB_MIGRATION_ROLE, which this sets, is deliberately NOT declared at script scope here: it reaches an
+# argument of a root `node`, so it may not be a mutable library-scope name, and every reader of it
+# defaults it with ${DB_MIGRATION_ROLE:-}.)
 db_admin_credential_load() {
   # ${2}-${4} are the file, the uid it must belong to and the directory the ancestry walk stops at:
   # the installed defaults, and parameters only so a test can run the real code unprivileged.
@@ -4358,7 +4360,7 @@ db_migration_role_for() {
   if [[ -z "${role}" ]]; then
     for arg in "$@"; do
       case "${arg}" in
-        --app-user=*) role="${arg#--app-user=}_migrator" ;;
+        --app-user=*) printf -v role '%s_migrator' "${arg#--app-user=}" ;;
       esac
     done
   fi
@@ -4434,7 +4436,8 @@ db_fence_exec_root_with_database_url() {
 db_pg_dump_through_url() {
   local url="$1" dir rc=0
   dir="$(mktemp -d)" || return 1
-  if ! ( umask 077; DB_PG_SERVICE_URL="${url}" node -e '
+  if ! ( umask 077; export DB_PG_SERVICE_URL="${url}"; env -u NODE_OPTIONS -u NODE_PATH -u NODE_REPL_EXTERNAL_MODULE \
+    node -e '
 const fs = require("node:fs")
 const u = new URL(process.env.DB_PG_SERVICE_URL)
 const kv = {}
