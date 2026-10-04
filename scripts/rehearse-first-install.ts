@@ -169,11 +169,23 @@ export function processIsAlive(pid: number): boolean {
 /** A postmaster as this run identified it: pid AND start time AND data directory, so a reused pid is not mistaken for it. */
 export type PostmasterIdentity = { pid: number; startTicks: string; dataDir: string }
 
-function readStartTicks(pid: number): string | null {
+export function readStartTicks(pid: number): string | null {
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
     const tokens = raw.slice(raw.lastIndexOf(')') + 2).split(' ')
     return tokens[19] ?? null // field 22, `starttime`
+  } catch {
+    return null
+  }
+}
+
+/** A process's start time as seconds since the epoch, from /proc (boot time + starttime ticks / 100). */
+export function processStartEpochSeconds(pid: number): number | null {
+  const ticks = readStartTicks(pid)
+  if (ticks === null) return null
+  try {
+    const btime = /^btime (\d+)$/m.exec(readFileSync('/proc/stat', 'utf8'))
+    return btime ? Number(btime[1]) + Number(ticks) / 100 : null
   } catch {
     return null
   }
@@ -201,8 +213,18 @@ export function capturePostmaster(dataDir: string): PostmasterIdentity | null {
   }
   const pid = Number(lines[0])
   if (!Number.isInteger(pid) || pid <= 1 || lines[1] !== dataDir || !processIsAlive(pid)) return null
+  // It must BE a postmaster started on this directory: argv[0] is `postgres` and `-D <dir>` is among
+  // its arguments. A process that merely mentions the directory (a shell, an editor) is not one.
+  const argv = cmdlineOf(pid).split(' ')
+  const dFlag = argv.indexOf('-D')
+  if (path.basename(argv[0] ?? '') !== 'postgres' || dFlag === -1 || argv[dFlag + 1] !== dataDir) return null
+  // And the pid file's own start record must agree with when that process actually started, so a
+  // stale file whose pid was reused cannot be mistaken for its writer.
+  const recorded = Number(lines[2])
+  const actual = processStartEpochSeconds(pid)
+  if (!Number.isFinite(recorded) || actual === null || Math.abs(recorded - actual) > 3) return null
   const startTicks = readStartTicks(pid)
-  if (startTicks === null || !cmdlineOf(pid).includes(dataDir)) return null
+  if (startTicks === null) return null
   return { pid, startTicks, dataDir }
 }
 
@@ -260,12 +282,14 @@ function tail(text: string, bytes = OUTPUT_TAIL_BYTES): string {
  * `--import` in the caller's NODE_OPTIONS runs code in every node child before it starts, past every
  * guard in this file. The one NODE_OPTIONS a child gets is the rehearsal's own (below).
  */
-const WHITELISTED_PARENT_ENV = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'npm_config_cache'] as const
+const WHITELISTED_PARENT_ENV = ['PATH', 'LANG', 'LC_ALL', 'TZ'] as const
 const CHILD_NODE_OPTIONS = '--max-old-space-size=3072'
 
 /** The only part of this process's environment a child inherits. Not DATABASE_URL, not PG*, not a credential. */
-export function inheritedEnv(): Record<string, string> {
-  const env: Record<string, string> = {}
+export function inheritedEnv(scratchRoot: string): Record<string, string> {
+  // HOME is the run directory's, not the caller's: npm reads a user .npmrc from HOME (script-shell,
+  // node options, registries) and that file is outside every guard here.
+  const env: Record<string, string> = { HOME: path.join(scratchRoot, 'home'), npm_config_cache: path.join(scratchRoot, 'npm-cache') }
   for (const name of WHITELISTED_PARENT_ENV) {
     const value = process.env[name]
     if (value !== undefined) env[name] = value
@@ -401,25 +425,20 @@ function teardownRun(state: RunState): TeardownResult {
   let orphanPids: number[] = []
 
   const family = pid === null ? [] : [pid, ...descendantsOf(pid)]
-  if (state.cluster) {
-    try {
-      state.cluster.stop()
-    } catch (error) {
-      errors.push(`cluster stop threw: ${error instanceof Error ? error.message : String(error)}`)
-    }
-  }
+  // Stop ONLY the process this run identified, and only after confirming it still is that process.
+  // pg_ctl resolves its target from the data directory's CURRENT postmaster.pid, so running it against
+  // a directory a replacement now owns would stop the replacement; there is no unconditional stop here
+  // and no numeric-pid SIGKILL (a pid can be reused between any check and the signal): a postmaster
+  // that cannot be stopped this way is reported as an orphan and the exit code says so.
   if (identity !== null && postmasterIsStillOurs(identity)) {
     try {
       execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
     } catch (error) {
-      errors.push(`pg_ctl stop by data directory failed: ${error instanceof Error ? error.message : String(error)}`)
+      errors.push(`pg_ctl stop failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-  }
-  // Last resort: signal ONLY while the process is still the one captured (same start time, same data
-  // directory); a pid the OS has since reused is left alone.
-  if (identity !== null && postmasterIsStillOurs(identity)) {
-    try { process.kill(identity.pid, 'SIGKILL') } catch { /* gone in the meantime */ }
-    for (let i = 0; i < 50 && postmasterIsStillOurs(identity); i += 1) execFileSync('sleep', ['0.1'])
+    if (postmasterIsStillOurs(identity)) errors.push(`postmaster ${identity.pid} is still running after pg_ctl stop; it is left alone and reported as an orphan`)
+  } else if (state.cluster) {
+    errors.push('the postmaster this run started no longer matches its captured identity; it was not stopped, because whatever owns the data directory now is not ours to stop')
   }
 
   const envFileShredded = shredFile(state.envFile)
@@ -427,7 +446,10 @@ function teardownRun(state: RunState): TeardownResult {
 
   let rootRemoved = false
   const base = path.basename(state.root)
-  if (base.startsWith(RUN_DIR_PREFIX) && path.isAbsolute(state.root)) {
+  const stillRunningHere = processesNaming(state.root)
+  if (stillRunningHere.length > 0) {
+    errors.push(`not removing ${state.root}: process(es) ${stillRunningHere.join(', ')} still run from it`)
+  } else if (base.startsWith(RUN_DIR_PREFIX) && path.isAbsolute(state.root)) {
     try {
       rmSync(state.root, { recursive: true, force: true })
     } catch (error) {
@@ -519,16 +541,27 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   let scramVerified = false
   let port: number | null = null
 
+  // An interruption is recorded, the running child is stopped, and the normal path finishes: the
+  // remaining steps become `skipped`, the teardown runs in the `finally`, and a RED report is written
+  // with exit code 1 (an unrun required step is RED; no signal-specific code exists). A SECOND signal
+  // gives up on the report and only tears down.
+  let interrupted: string | null = null
   const onSignal = (signal: NodeJS.Signals) => {
-    log(`[rehearsal] ${signal}: tearing down before exit`)
-    if (currentChild?.pid) {
-      try { process.kill(-currentChild.pid, 'SIGKILL') } catch { /* gone */ }
+    if (interrupted === null) {
+      interrupted = signal
+      notes.push(`The rehearsal was interrupted by ${signal}: the running step was stopped and the remaining steps were not run.`)
+      log(`[rehearsal] ${signal}: stopping the running step; the report and teardown will still complete`)
+      if (currentChild?.pid) {
+        try { process.kill(-currentChild.pid, 'SIGKILL') } catch { /* gone */ }
+      }
+      return
     }
-    const result = teardownRun(state)
-    process.exit(result.errors.length === 0 && result.orphanPids.length === 0 ? 130 : REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
+    log(`[rehearsal] second ${signal}: tearing down now, without a report`)
+    teardownRun(state)
+    process.exit(REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
   }
-  process.once('SIGINT', onSignal)
-  process.once('SIGTERM', onSignal)
+  process.on('SIGINT', onSignal)
+  process.on('SIGTERM', onSignal)
 
   const redact = (text: string) => redactSecrets(text, state.secrets)
   const included = (def: StepDefinition) => (options.only ? options.only.has(def.id) : true)
@@ -565,6 +598,8 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     // The children's scratch space is inside the run directory: disk-backed (never the caller's
     // tmpfs) and removed with it.
     mkdirSync(path.join(root, 'tmp'), { recursive: true })
+    mkdirSync(path.join(root, 'home'), { recursive: true })
+    mkdirSync(path.join(root, 'npm-cache'), { recursive: true })
     for (const sub of ['public/avatars', 'public/branding', 'private/invoices', 'private/quarantine/invoices', 'invoices', 'backups']) {
       mkdirSync(path.join(stateDir, sub), { recursive: true })
     }
@@ -623,7 +658,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
 
     // ---- Steps ----
     const stepEnv = (id: StepId, extra: Record<string, string> = {}): Record<string, string> => {
-      const env = { ...inheritedEnv(), ...fileEnv, ...extra }
+      const env = { ...inheritedEnv(root), ...fileEnv, ...extra }
       hooks.tamperStepEnv?.(id, env)
       assertThrowawayDatabaseUrl(env.DATABASE_URL, target)
       assertNoConnectorEnv(env)
@@ -803,7 +838,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
             detail: { scriptPresent: false },
           }
         }
-        const run = await childIn('outbound-status', 'npm', ['run', OUTBOUND_STATUS_SCRIPT])
+        const run = await childIn('outbound-status', 'npm', ['run', OUTBOUND_STATUS_SCRIPT, '--', '--json', '--expect-held'])
         const assessment = assessOutboundStatus(run)
         return {
           status: assessment.ok ? 'passed' : 'failed',
@@ -859,6 +894,19 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     let prerequisiteFailed: string | null = null
     for (const definition of STEP_CATALOGUE) {
       if (!included(definition)) continue
+      if (interrupted !== null) {
+        results.push({
+          id: definition.id,
+          item: definition.item,
+          title: definition.title,
+          required: true,
+          status: 'skipped',
+          reason: `not run: interrupted by ${interrupted}`,
+          detail: {},
+          durationMs: 0,
+        })
+        continue
+      }
       if (prerequisiteFailed) {
         results.push({
           id: definition.id,
@@ -933,9 +981,12 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     writeFileSync(json, `${JSON.stringify(report, null, 2)}\n`)
     writeFileSync(markdown, renderMarkdown(report))
   } catch (error) {
-    // The run happened; its verdict must not be lost with the files. The caller prints the report.
+    // The run happened; its verdict must not be lost with the files, and what is printed must not
+    // say GREEN about a run that produced nothing attachable: amend the report itself.
     const reportWriteError = error instanceof Error ? error.message : String(error)
-    return { exitCode: report.exitCode === REHEARSAL_EXIT.OK ? REHEARSAL_EXIT.RED : report.exitCode, report, runRoot: root, reportWriteError }
+    const exitCode = report.exitCode === REHEARSAL_EXIT.OK ? REHEARSAL_EXIT.RED : report.exitCode
+    const amended: RehearsalReport = { ...report, verdict: 'RED', exitCode, notes: [...report.notes, `The report could not be written (${reportWriteError}); this copy is the only record.`] }
+    return { exitCode, report: amended, runRoot: root, reportWriteError }
   }
   return { exitCode: report.exitCode, report, reportPaths: { json, markdown }, runRoot: root }
 }

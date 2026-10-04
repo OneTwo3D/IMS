@@ -308,29 +308,54 @@ export function outboundStatusScriptPresent(scripts: Record<string, string> | un
 }
 
 /**
- * The connectors an outbound hold must account for, one `held` line each.
+ * The connectors an outbound hold must account for, exactly once each.
  */
 // wms-connector-boundary-ok: o3d-zjsb5.2: the list of connectors the outbound hold covers; names no connector flow
 export const EXPECTED_OUTBOUND_CONNECTORS = ['woocommerce', 'mintsoft', 'xero'] as const
 
 /**
- * ALL HELD means: the command exits 0, EVERY expected connector has a line that names it and says
- * `held`, and no line pairs a state with `granted`, `open` or `writing`. A connector the output does
- * not mention is not evidence of anything, and a generic "held" accounts for none. The exact output
- * format belongs to the outbound-hold work and is not fixed on this tree, so this reads a line per
- * connector rather than a structure; tighten it when that script lands.
+ * ALL HELD, read strictly from `npm run outbound:status -- --json --expect-held`.
+ *
+ * The report is parsed as JSON (the npm banner before it and the trailing "Exit code" line are
+ * ignored) and the verdict is a per-connector EQUALITY: every expected connector appears exactly once
+ * and its `state` is exactly `held`. `granted`, `unreadable`, `not held`, an unknown state, a missing,
+ * duplicated or unknown connector, `anyGranted: true`, a missing report or a non-zero exit each fail.
+ * Free text is never searched for the word "held", so a negation cannot satisfy it.
  */
 export function assessOutboundStatus(run: { exitCode: number | null; stdout: string }): Assessment {
   const failures: string[] = []
   if (run.exitCode !== 0) failures.push(`outbound:status exited ${run.exitCode}`)
-  const lines = run.stdout.split('\n')
-  for (const connector of EXPECTED_OUTBOUND_CONNECTORS) {
-    if (!lines.some((line) => line.toLowerCase().includes(connector) && /\bheld\b/i.test(line))) {
-      failures.push(`outbound:status has no 'held' line for ${connector}`)
+
+  const text = run.stdout
+  const start = text.search(/^\{\s*$/m)
+  let parsed: unknown = null
+  if (start !== -1) {
+    const end = text.indexOf('\n}', start)
+    if (end !== -1) {
+      try {
+        parsed = JSON.parse(text.slice(start, end + 2))
+      } catch {
+        parsed = null
+      }
     }
   }
-  const open = lines.filter((line) => /\b(granted|open|writing)\b/i.test(line) && !/\b(not|no|un)[ -]?(granted|open|writing)\b/i.test(line))
-  if (open.length > 0) failures.push(`outbound:status reports a connector that is not held: ${open.slice(0, 3).map((line) => line.trim()).join(' | ')}`)
+  const connectors = (parsed as { connectors?: unknown } | null)?.connectors
+  if (parsed === null || typeof parsed !== 'object' || !Array.isArray(connectors)) {
+    failures.push('outbound:status output is not a JSON report with a connectors list')
+    return { ok: false, failures }
+  }
+
+  const entries = connectors as Array<{ connector?: unknown; state?: unknown }>
+  for (const connector of EXPECTED_OUTBOUND_CONNECTORS) {
+    const mine = entries.filter((entry) => entry.connector === connector)
+    if (mine.length === 0) failures.push(`outbound:status has no entry for ${connector}`)
+    else if (mine.length > 1) failures.push(`outbound:status lists ${connector} more than once`)
+    else if (mine[0]!.state !== 'held') failures.push(`outbound:status says ${connector} is ${JSON.stringify(mine[0]!.state)}, not held`)
+  }
+  for (const entry of entries) {
+    if (!(EXPECTED_OUTBOUND_CONNECTORS as readonly unknown[]).includes(entry.connector)) failures.push(`outbound:status lists an unknown connector ${String(entry.connector)}`)
+  }
+  if ((parsed as { anyGranted?: unknown }).anyGranted !== false) failures.push('outbound:status does not say anyGranted is false')
   return { ok: failures.length === 0, failures }
 }
 

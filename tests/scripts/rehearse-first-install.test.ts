@@ -3,7 +3,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
-import { startCluster } from './real-postgres-cluster.ts'
+import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
 
 import {
   REHEARSAL_EXIT,
@@ -25,7 +25,7 @@ import {
   rehearsalExitCode,
   type SeededRowFacts,
 } from '@/lib/ops/first-install-rehearsal'
-import { capturePostmaster, inheritedEnv, postmasterIsStillOurs, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
+import { capturePostmaster, inheritedEnv, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
@@ -151,17 +151,30 @@ test('the outbound:status step is optional while the script is absent and requir
   assert.equal(outboundStatusScriptPresent({ 'outbound:status': '  ' }), false)
   assert.equal(outboundStatusScriptPresent({ 'outbound:status': 'tsx scripts/outbound-status.ts' }), true)
 
-  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: held\nxero: held\n' }).ok, true)
-  assert.equal(assessOutboundStatus({ exitCode: 1, stdout: 'woocommerce: held\n' }).ok, false, 'a non-zero exit is red')
-  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'nothing to report\n' }).ok, false, 'no `held` anywhere is red')
-  const open = assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: granted\n' })
-  assert.equal(open.ok, false, 'a connector reporting itself granted is red')
-  assert.match(open.failures.join(' '), /mintsoft: granted/)
-  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: held\nxero: held (not granted)\n' }).ok, true, '"not granted" is held')
-  const missing = assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: held\n' })
-  assert.equal(missing.ok, false, 'a connector the output does not mention is not evidence it is held')
-  assert.match(missing.failures.join(' '), /no 'held' line for xero/)
-  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'everything held\n' }).ok, false, 'a generic held line accounts for no connector')
+  const report = (states: Record<string, string>, extra: Record<string, unknown> = {}) => `> onetwoinventory@2.0.0 outbound:status\n> tsx scripts/outbound-status.ts --json --expect-held\n\n${JSON.stringify({
+    generatedAt: '2026-10-04T00:00:00.000Z', windowHours: 24, anyGranted: false, anyUnreadable: false, countsAvailable: true, exitCode: 0,
+    connectors: Object.entries(states).map(([connector, state]) => ({ connector, label: connector, state })), ...extra,
+  }, null, 2)}\nExit code 0.\n`
+  const allHeld = { woocommerce: 'held', mintsoft: 'held', xero: 'held' }
+  const ok = assessOutboundStatus({ exitCode: 0, stdout: report(allHeld) })
+  console.log(`# all-held report accepted: ${ok.ok}`)
+  assert.equal(ok.ok, true, 'precondition: the real shape (npm banner, JSON, trailing line) with every connector held passes')
+  const bad: Array<[string, string, RegExp]> = [
+    ['a connector whose state is "not held"', report({ ...allHeld, woocommerce: 'not held' }), /woocommerce.*"not held"/],
+    ['a granted connector', report({ ...allHeld, xero: 'granted' }, { anyGranted: true }), /xero.*"granted"/],
+    ['an unreadable grant', report({ ...allHeld, mintsoft: 'unreadable' }, { anyUnreadable: true }), /mintsoft.*"unreadable"/],
+    ['a missing connector', report({ woocommerce: 'held', mintsoft: 'held' }), /no entry for xero/],
+    ['a duplicated connector', report(allHeld).replace('"connector": "xero"', '"connector": "mintsoft"'), /mintsoft.*more than once/],
+    ['an unknown connector', report({ ...allHeld, acme: 'held' }), /unknown connector acme/],
+    ['mixed states on one connector line of a text report', 'woocommerce: held, not granted, open\nmintsoft: held\nxero: held\n', /not a JSON report/],
+    ['anyGranted true although every state says held', report(allHeld, { anyGranted: true }), /anyGranted/],
+    ['a non-zero exit', report(allHeld).replace('Exit code 0', 'Exit code 3'), /exited 3/],
+  ]
+  for (const [name, stdout, pattern] of bad) {
+    const result = assessOutboundStatus({ exitCode: name === 'a non-zero exit' ? 3 : 0, stdout })
+    assert.equal(result.ok, false, name)
+    assert.match(result.failures.join(' | '), pattern, name)
+  }
 })
 
 function step(id: StepId, status: StepResult['status'], required = true): StepResult {
@@ -521,27 +534,38 @@ test('ARM (d): a DATABASE_URL that is not the throwaway cluster, and a connector
   assertTornDown(parent, outcome)
 })
 
-test('the fallback kill is bound to the captured identity: a process with another start time or another data directory is not ours', async (t) => {
+test('the captured identity is a PostgreSQL postmaster of THIS directory with the pid file\'s start time: an unrelated process that merely names the directory is not captured', async (t) => {
   const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-identity-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const dataDir = join(dir, 'data')
   mkdirSync(dataDir)
-  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', dataDir], { stdio: 'ignore' })
-  const pid = child.pid as number
+  const spawnIt = (argv0: string | undefined, args: string[]) => spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', '--', ...args], { stdio: 'ignore', ...(argv0 ? { argv0 } : {}) })
+  const lookalike = spawnIt('postgres', ['-D', dataDir])
+  const unrelated = spawnIt(undefined, [dataDir])
+  const pids = [lookalike.pid as number, unrelated.pid as number]
   try {
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    writeFileSync(join(dataDir, 'postmaster.pid'), `${pid}\n${dataDir}\n`)
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    const pidFile = (pid: number, startEpoch: number) => writeFileSync(join(dataDir, 'postmaster.pid'), `${pid}\n${dataDir}\n${startEpoch}\n5432\n`)
+    const epoch = processStartEpochSeconds(pids[0]!)
+    assert.ok(epoch !== null, 'precondition: the start time of a live process can be read')
+    pidFile(pids[0]!, epoch)
     const identity = capturePostmaster(dataDir)
-    console.log(`# captured identity of pid ${pid}: ${JSON.stringify(identity)}`)
-    assert.ok(identity, 'precondition: a live process running from the directory is captured')
+    console.log(`# postgres-named process with -D <dir> and the matching start record: ${JSON.stringify(identity)}`)
+    assert.ok(identity, 'a process named postgres, started with -D <dir>, whose start time matches the pid file, is captured')
     assert.equal(postmasterIsStillOurs(identity), true)
     assert.equal(postmasterIsStillOurs({ ...identity, startTicks: `${identity.startTicks}0` }), false, 'a reused pid has another start time')
-    assert.equal(postmasterIsStillOurs({ ...identity, dataDir: join(dir, 'elsewhere') }), false, 'a process not running from the directory is not ours')
-    writeFileSync(join(dataDir, 'postmaster.pid'), `${pid}\n${join(dir, 'other')}\n`)
-    assert.equal(capturePostmaster(dataDir), null, 'a postmaster.pid that names another directory captures nothing')
+    assert.equal(postmasterIsStillOurs({ ...identity, dataDir: join(dir, 'elsewhere') }), false)
+    pidFile(pids[0]!, epoch + 3600)
+    assert.equal(capturePostmaster(dataDir), null, 'a pid file whose start record disagrees with the process captures nothing')
+    pidFile(pids[1]!, processStartEpochSeconds(pids[1]!) as number)
+    assert.equal(capturePostmaster(dataDir), null, 'a process that only names the directory (not postgres -D <dir>) captures nothing, even with a matching start record')
+    writeFileSync(join(dataDir, 'postmaster.pid'), `${pids[0]}\n${join(dir, 'other')}\n${epoch}\n`)
+    assert.equal(capturePostmaster(dataDir), null, 'a pid file that names another directory captures nothing')
   } finally {
-    child.kill('SIGKILL')
-    await new Promise((resolve) => child.once('exit', resolve))
+    for (const child of [lookalike, unrelated]) {
+      child.kill('SIGKILL')
+      if (child.exitCode === null && child.signalCode === null) await new Promise((resolve) => child.once('exit', resolve))
+    }
   }
 })
 
@@ -550,9 +574,10 @@ test('ISOLATION: a caller NODE_OPTIONS / NODE_PATH / loader / proxy variable nev
   const previous = Object.fromEntries(Object.keys(planted).map((k) => [k, process.env[k]]))
   Object.assign(process.env, planted)
   try {
-    const env = inheritedEnv()
+    const env = inheritedEnv('/var/tmp/ims-rehearsal-x')
     console.log(`# inherited keys with ${Object.keys(planted).length} hostile variables planted: ${Object.keys(env).sort().join(',')}`)
     assert.ok(env.PATH, 'precondition: the whitelist still carries PATH')
+    assert.equal(env.HOME, '/var/tmp/ims-rehearsal-x/home', 'HOME is the run directory\'s, not the caller\'s')
     for (const key of Object.keys(planted)) assert.equal(key in env && key !== 'NODE_OPTIONS', false, key)
     assert.equal(env.NODE_OPTIONS, '--max-old-space-size=3072', 'the only NODE_OPTIONS a child gets is the rehearsal\'s own')
   } finally {
@@ -608,6 +633,118 @@ test('TEARDOWN: a cluster start that throws AFTER the postmaster forked is still
   } finally {
     if (forkedPid > 0 && processIsAlive(forkedPid)) process.kill(forkedPid, 'SIGKILL') // the one this test's own hook started
   }
+})
+
+test('TEARDOWN: a replacement postmaster that took over the data directory is NOT stopped, and the directory is not removed under it', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const bin = pgBinDir()
+  let originalPid = 0
+  let replacementPid = 0
+  let dataDir = ''
+  const hooks: RehearsalHooks = {
+    afterClusterStart: () => {
+      const run = readdirSync(parent).find((name) => name.startsWith('ims-rehearsal-') && name !== 'reports')!
+      dataDir = join(parent, run, 'pg', 'data')
+      const lines = readFileSync(join(dataDir, 'postmaster.pid'), 'utf8').split('\n')
+      originalPid = Number(lines[0])
+      const port = lines[3]!
+      execFileSync(join(bin, 'pg_ctl'), ['-D', dataDir, '-m', 'fast', '-w', 'stop'], { stdio: 'pipe' })
+      execFileSync(join(bin, 'pg_ctl'), ['-D', dataDir, '-l', join(parent, run, 'pg2.log'), '-o', `-p ${port} -k ${join(parent, run, 'pg', 'sock')} -c listen_addresses=127.0.0.1`, '-w', 'start'], { stdio: 'pipe' })
+      replacementPid = Number(readFileSync(join(dataDir, 'postmaster.pid'), 'utf8').split('\n')[0])
+    },
+  }
+  const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, hooks, only: new Set<StepId>(['system-identifier']) })
+  try {
+    console.log(`# original postmaster ${originalPid} replaced by ${replacementPid}; replacement alive after the run: ${processIsAlive(replacementPid)}`)
+    assert.ok(originalPid > 0 && replacementPid > 0 && originalPid !== replacementPid, 'precondition: a different postmaster owns the directory')
+    assert.equal(processIsAlive(replacementPid), true, 'the replacement the rehearsal did not start was left running')
+    assert.equal(outcome.exitCode, REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
+    assert.equal(existsSync(dataDir), true, 'the directory was not removed under a live process')
+  } finally {
+    if (replacementPid > 0 && processIsAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL') // started by this test's own hook
+  }
+})
+
+test('ISOLATION ARM: a hostile user npm configuration in the caller HOME is never read by a rehearsal child', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const marker = join(parent, 'script-shell-ran')
+  const shell = join(parent, 'canary-shell.sh')
+  writeFileSync(shell, `#!/bin/sh\necho ran >> ${marker}\nexec /bin/sh "$@"\n`)
+  chmodSync(shell, 0o755)
+  const hostileHome = join(parent, 'hostile-home')
+  mkdirSync(hostileHome)
+  writeFileSync(join(hostileHome, '.npmrc'), `script-shell=${shell}\n`)
+  const previous = process.env.HOME
+  process.env.HOME = hostileHome
+  try {
+    const probe = join(parent, 'probe')
+    mkdirSync(probe)
+    writeFileSync(join(probe, 'package.json'), JSON.stringify({ name: 'probe', version: '1.0.0', scripts: { x: 'true' } }))
+    execFileSync('npm', ['run', 'x'], { cwd: probe, env: { PATH: process.env.PATH, HOME: hostileHome } as unknown as NodeJS.ProcessEnv, stdio: 'pipe' })
+    assert.equal(existsSync(marker), true, 'precondition: the hostile .npmrc DOES make npm run the canary shell when HOME is inherited')
+    rmSync(marker)
+    const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['migrate-deploy', 'seed', 'provision', 'invariant-preflight']) })
+    assert.ok(outcome.report)
+    assert.deepEqual(outcome.report.steps.filter((x) => x.status !== 'passed').map((x) => `${x.id}: ${x.reason}`), [], 'precondition: the `npm run` step ran')
+    console.log(`# canary shell marker present after the run: ${existsSync(marker)}`)
+    assert.equal(existsSync(marker), false)
+  } finally {
+    if (previous === undefined) delete process.env.HOME
+    else process.env.HOME = previous
+  }
+})
+
+test('INTERRUPTION: SIGTERM mid-run still produces a RED report with a teardown record and exit 1', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const child = spawn(join(REPO, 'node_modules/.bin/tsx'), ['scripts/rehearse-first-install.ts', '--root', parent, '--report-dir', join(parent, 'reports')], {
+    cwd: REPO, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH, HOME: process.env.HOME } as unknown as NodeJS.ProcessEnv,
+  })
+  let stderr = ''
+  let stdout = ''
+  child.stderr!.on('data', (c: Buffer) => { stderr += c.toString() })
+  child.stdout!.on('data', (c: Buffer) => { stdout += c.toString() })
+  const exited = new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)))
+  try {
+    const began = Date.now()
+    while (!stderr.includes('cluster up') && Date.now() - began < 120_000) await new Promise((resolve) => setTimeout(resolve, 100))
+    assert.ok(stderr.includes('cluster up'), 'precondition: the run was in flight (cluster up) when the signal was sent')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    process.kill(-(child.pid as number), 'SIGTERM')
+    const code = await exited
+    console.log(`# exit code after SIGTERM: ${code}`)
+    const dirs = readdirSync(join(parent, 'reports'))
+    assert.equal(dirs.length, 1, 'a report was written')
+    const report = JSON.parse(readFileSync(join(parent, 'reports', dirs[0]!, 'readiness-report.json'), 'utf8')) as { verdict: string; exitCode: number; notes: string[]; teardown: { rootRemoved: boolean; orphanPids: number[] } }
+    assert.equal(code, REHEARSAL_EXIT.RED)
+    assert.equal(report.verdict, 'RED')
+    assert.equal(report.exitCode, REHEARSAL_EXIT.RED)
+    assert.ok(report.notes.some((note) => /interrupted by SIGTERM/.test(note)))
+    assert.equal(report.teardown.rootRemoved, true)
+    assert.deepEqual(report.teardown.orphanPids, [])
+    assert.deepEqual(runDirsIn(parent), [])
+    assert.match(stdout, /Fresh-install rehearsal: RED/)
+  } finally {
+    try { process.kill(-(child.pid as number), 'SIGKILL') } catch { /* already exited */ }
+  }
+})
+
+test('REPORT WRITE FAILURE: the report that is printed and returned says RED, with the real exit code and the write error', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const reportDir = join(parent, 'reports')
+  const outcome = await runRehearsal({
+    parentDir: parent, reportDir, log: () => undefined, only: new Set<StepId>(['system-identifier']),
+    hooks: { afterClusterStart: () => chmodSync(reportDir, 0o500) },
+  })
+  t.after(() => { try { chmodSync(reportDir, 0o700) } catch { /* already removed with the parent */ } })
+  assert.ok(outcome.report)
+  console.log(`# every step passed: ${outcome.report.steps.every((x) => x.status === 'passed')}; write error: ${outcome.reportWriteError}; report verdict: ${outcome.report.verdict}; outcome exit ${outcome.exitCode}`)
+  assert.ok(outcome.report.steps.every((x) => x.status === 'passed'), 'precondition: the run itself was clean')
+  assert.ok(outcome.reportWriteError, 'precondition: the report write failed')
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.equal(outcome.report.verdict, 'RED')
+  assert.equal(outcome.report.exitCode, outcome.exitCode)
+  assert.ok(outcome.report.notes.some((note) => /report could not be written/.test(note)))
 })
 
 test('ARM (e): a step that throws is a failed step, later steps still run, and the teardown still happens', { timeout: TIMEOUT }, async (t) => {
