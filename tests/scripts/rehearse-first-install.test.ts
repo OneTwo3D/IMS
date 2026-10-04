@@ -253,6 +253,17 @@ test('a RAM-backed --root is refused before anything is created', () => {
   })
 })
 
+test('an unwritable --report-dir is refused before a cluster is created', async (t) => {
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-reportdir-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const blocker = join(dir, 'a-file')
+  writeFileSync(blocker, 'not a directory')
+  const outcome = await runRehearsal({ parentDir: dir, reportDir: join(blocker, 'reports'), log: () => undefined })
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.REFUSED)
+  assert.match(outcome.refusal ?? '', /--report-dir .* cannot be created or written/)
+  assert.deepEqual(readdirSync(dir).filter((name) => name.startsWith('ims-rehearsal-')), [], 'no run directory was created')
+})
+
 // ---------------------------------------------------------------------------------------------
 // Real clusters. Each of these brings one up, runs the installer steps against it, and tears it down.
 // ---------------------------------------------------------------------------------------------

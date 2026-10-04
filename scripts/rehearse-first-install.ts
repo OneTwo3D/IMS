@@ -34,7 +34,9 @@
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
+  accessSync,
   chmodSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -115,6 +117,8 @@ export type RehearsalOutcome = {
   report: RehearsalReport | null
   refusal?: string
   reportPaths?: { json: string; markdown: string }
+  /** The run completed but its report files could not be written; the exit code is then at least RED. */
+  reportWriteError?: string
   runRoot?: string
 }
 
@@ -406,6 +410,14 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   }
   if (RAM_BACKED.has(parentType)) {
     return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
+  }
+  // The report directory is checked BEFORE the cluster exists: a run that cannot write its report
+  // has produced nothing, and finding that out after the teardown would waste the whole rehearsal.
+  try {
+    mkdirSync(reportDir, { recursive: true })
+    accessSync(reportDir, fsConstants.W_OK)
+  } catch (error) {
+    return refuse(`--report-dir ${reportDir} cannot be created or written: ${error instanceof Error ? error.message : String(error)}`)
   }
   for (const needed of ['prisma/schema.prisma', 'node_modules/.bin/prisma', 'node_modules/.bin/tsx', 'scripts/provision-instance.mjs']) {
     if (!existsSync(path.join(repoRoot, needed))) return refuse(`${needed} not found under ${repoRoot}: run from an IMS checkout with its dependencies installed and prisma generated`)
@@ -839,11 +851,17 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   })
 
   const outDir = path.join(reportDir, runId)
-  mkdirSync(outDir, { recursive: true })
   const json = path.join(outDir, 'readiness-report.json')
   const markdown = path.join(outDir, 'readiness-report.md')
-  writeFileSync(json, `${JSON.stringify(report, null, 2)}\n`)
-  writeFileSync(markdown, renderMarkdown(report))
+  try {
+    mkdirSync(outDir, { recursive: true })
+    writeFileSync(json, `${JSON.stringify(report, null, 2)}\n`)
+    writeFileSync(markdown, renderMarkdown(report))
+  } catch (error) {
+    // The run happened; its verdict must not be lost with the files. The caller prints the report.
+    const reportWriteError = error instanceof Error ? error.message : String(error)
+    return { exitCode: report.exitCode === REHEARSAL_EXIT.OK ? REHEARSAL_EXIT.RED : report.exitCode, report, runRoot: root, reportWriteError }
+  }
   return { exitCode: report.exitCode, report, reportPaths: { json, markdown }, runRoot: root }
 }
 
@@ -889,8 +907,12 @@ async function main(): Promise<number> {
     return outcome.exitCode
   }
   console.log(renderMarkdown(outcome.report))
-  console.log(`Report: ${outcome.reportPaths!.json}`)
-  console.log(`Report: ${outcome.reportPaths!.markdown}`)
+  if (outcome.reportPaths) {
+    console.log(`Report: ${outcome.reportPaths.json}`)
+    console.log(`Report: ${outcome.reportPaths.markdown}`)
+  } else {
+    console.error(`The report could not be written (${outcome.reportWriteError}); it is printed above.`)
+  }
   return outcome.exitCode
 }
 
