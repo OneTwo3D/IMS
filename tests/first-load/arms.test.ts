@@ -267,17 +267,30 @@ test('arm (f): the same input twice gives the identical full report, and no outp
 // (h) KIT, VARIABLE and NON_INVENTORY exclusion
 // ---------------------------------------------------------------------------
 test('arm (h): KIT, VARIABLE and NON_INVENTORY stock rows are excluded and reported; the products themselves are still loaded', (t) => {
+  const catalogue = {
+    products: ds('products', [product('KITTED', 'KIT'), product('PARENT', 'VARIABLE'), product('SERVICE', 'NON_INVENTORY'), product('REAL'), product('PART')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'KITTED', componentSku: 'PART', qty: '1' }]),
+  }
+  const result = run({ ...catalogue, 'stock-lots': ds('stock-lots', [lot('KITTED', '0', '1'), lot('PARENT', '0', '1'), lot('SERVICE', '0', '1'), lot('REAL', '2', '1')]) })
+  const excluded = result.report.dispositions.filter((d) => d.dataset === 'stock-lots' && d.code === 'EXCLUDED_TYPE')
+  precondition(t, 'excluded-by-type stock rows', excluded.length)
+  assert.equal(excluded.length, 3)
+  assert.equal(result.blocking, false)
+  assert.deepEqual(rowsOf(result, 'opening-stock').map((r) => r.sku), ['REAL'])
+  assert.equal(rowsOf(result, 'products').length, 5, 'KIT, VARIABLE and NON_INVENTORY products are still loaded as products')
+})
+
+test('arm (h): POSITIVE stock on a KIT, VARIABLE or NON_INVENTORY product blocks the run (it would silently vanish from the load)', (t) => {
   const result = run({
     products: ds('products', [product('KITTED', 'KIT'), product('PARENT', 'VARIABLE'), product('SERVICE', 'NON_INVENTORY'), product('REAL'), product('PART')]),
     'recipe-lines': ds('recipe-lines', [{ parentSku: 'KITTED', componentSku: 'PART', qty: '1' }]),
     'stock-lots': ds('stock-lots', [lot('KITTED', '5', '1'), lot('PARENT', '3', '1'), lot('SERVICE', '9', '1'), lot('REAL', '2', '1')]),
   })
-  const excluded = result.report.dispositions.filter((d) => d.dataset === 'stock-lots' && d.code === 'EXCLUDED_TYPE')
-  precondition(t, 'excluded-by-type stock rows', excluded.length)
-  assert.equal(excluded.length, 3)
-  assert.deepEqual(rowsOf(result, 'opening-stock').map((r) => r.sku), ['REAL'])
-  assert.equal(rowsOf(result, 'products').length, 5, 'KIT, VARIABLE and NON_INVENTORY products are still loaded as products')
-  assert.deepEqual(result.report.findings.filter((f) => f.code === 'EXCLUDED_TYPE_HOLDS_STOCK').length, 3, 'each holds stock in the source, so each is also a warning')
+  const errors = result.report.findings.filter((f) => f.code === 'EXCLUDED_TYPE_HOLDS_STOCK' && f.severity === 'ERROR')
+  precondition(t, 'positive-quantity rows on excluded types', errors.reduce((n, f) => n + (f.keys?.length ?? 0), 0))
+  assert.deepEqual(errors.flatMap((f) => f.keys ?? []).sort(), ['KITTED (5)', 'PARENT (3)', 'SERVICE (9)'])
+  assert.equal(result.blocking, true)
+  assert.equal(result.outputs.length, 0)
 })
 
 // ---------------------------------------------------------------------------

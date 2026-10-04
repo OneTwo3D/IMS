@@ -696,6 +696,11 @@ function loadSuppliers(run: Run): void {
 // Stock lots -> one weighted-average opening-stock row per SKU x warehouse
 // ---------------------------------------------------------------------------
 
+/** True when |value| needs more than `digits` integer digits. */
+function exceedsIntDigits(value: Dec, digits: number): boolean {
+  return value.abs().gte(new D(10).pow(digits))
+}
+
 function stockGroupKey(key: string, warehouse: string): string {
   return `${key}\u0000${warehouse}`
 }
@@ -742,7 +747,7 @@ function loadStock(run: Run): void {
     if (res.type === null) { reject('TYPE_UNKNOWN', `SKU ${sku.sku} exists only in IMS and its type is not known; give the type in the ims-skus file`); continue }
     if (!STOCK_BEARING_TYPES.has(res.type)) {
       run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'EXCLUDED_TYPE', `${res.type} products cannot receive opening stock (only SIMPLE, VARIANT and BOM hold stock and cost layers)`)
-      if (qty.value.gt(0)) run.find('WARNING', 'EXCLUDED_TYPE_HOLDS_STOCK', `${res.type} SKU ${sku.sku} has quantity ${fmt(qty.value)} in the stock extract; it is excluded from the opening-stock file by type. Confirm that is intended.`, 'stock-lots', [sku.sku])
+      if (qty.value.gt(0)) run.find('ERROR', 'EXCLUDED_TYPE_HOLDS_STOCK', `${res.type} SKU ${sku.sku} has quantity ${fmt(qty.value)} in the stock extract but ${res.type} products cannot hold opening stock, so those units would be absent from every import file. Resolve it in the source (correct the type, or remove the stock row once the quantity is written off).`, 'stock-lots', [`${sku.sku} (${fmt(qty.value)})`])
       continue
     }
     if (qty.value.isZero()) {
@@ -757,7 +762,12 @@ function loadStock(run: Run): void {
     if (v.unitCost === '') { reject('MISSING_UNIT_COST', 'a lot with stock on hand has no unit cost'); continue }
     const cost = parseDecimal(v.unitCost, 'unitCost', NUMERIC_LIMITS.lotUnitCost)
     if (!cost.ok) { reject('BAD_UNIT_COST', cost.reason); continue }
-    lots.push({ row, sku: res.sku, key: sku.key, warehouse: warehouse.code, qty: qty.value, unitCostBase: cost.value.mul(fx.fx), lotRef: v.lotRef, date: v.receivedDate })
+    const converted = cost.value.mul(fx.fx)
+    if (exceedsIntDigits(converted, NUMERIC_LIMITS.unitCost.maxIntDigits)) {
+      reject('BAD_UNIT_COST', `unit cost ${v.unitCost} ${currency} x rate ${fx.text} = ${fmt(converted)} in the base currency, which has more than ${NUMERIC_LIMITS.unitCost.maxIntDigits} integer digits (the cost column or the importer's number type cannot hold it exactly)`)
+      continue
+    }
+    lots.push({ row, sku: res.sku, key: sku.key, warehouse: warehouse.code, qty: qty.value, unitCostBase: converted, lotRef: v.lotRef, date: v.receivedDate })
   }
 
   // The same lot twice (same reference) is a duplicated export row, not two lots: refuse it.
@@ -776,6 +786,12 @@ function loadStock(run: Run): void {
   const identical: string[] = []
   for (const [gk, list] of [...groups.entries()]) {
     const collapsed = collapseLots(list.map((l) => ({ qty: l.qty, unitCostBase: l.unitCostBase })))
+    if (exceedsIntDigits(collapsed.qty, NUMERIC_LIMITS.stockQty.maxIntDigits) || exceedsIntDigits(collapsed.average, NUMERIC_LIMITS.unitCost.maxIntDigits)) {
+      for (const lot of list) {
+        run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'COLLAPSED_OUT_OF_RANGE', `the ${list.length} lot(s) of ${lot.sku} in ${lot.warehouse} collapse to quantity ${fmt(collapsed.qty)} at ${fmtFixed(collapsed.average, AVERAGE_COST_DP)}, beyond what the stock quantity (8 integer digits) or cost (9 integer digits) can hold`)
+      }
+      continue
+    }
     for (const lot of list) run.add('stock-lots', lot.row.line, lot.sku, 'EMITTED', 'LOT_COLLAPSED', `collapsed into one weighted-average opening row for ${lot.sku} in ${lot.warehouse}`)
     const noRef = list.filter((l) => l.lotRef === '').map((l) => `${fmt(l.qty)}|${l.unitCostBase.toFixed()}|${l.date}`)
     if (noRef.length !== new Set(noRef).size) identical.push(list[0].sku)
@@ -895,7 +911,7 @@ function loadTransfers(run: Run): void {
     const group = run.stockGroups.get(gk)
     if (convention === 'counted-in-source') {
       if (!group || group.lotQty.lt(need)) failedSources.add(gk)
-    } else if (!group) failedSources.add(gk)
+    } else if (!group || exceedsIntDigits(group.lotQty.add(need), NUMERIC_LIMITS.stockQty.maxIntDigits)) failedSources.add(gk)
   }
   const transferGroups = new Map<string, Line[]>()
   for (const l of live) {
@@ -903,10 +919,13 @@ function loadTransfers(run: Run): void {
     if (failedSources.has(gk)) {
       const group = run.stockGroups.get(gk)
       const need = needBySource.get(gk)!
-      const reason = convention === 'counted-in-source'
+      const overflow = convention === 'excluded-from-source' && !!group && exceedsIntDigits(group.lotQty.add(need), NUMERIC_LIMITS.stockQty.maxIntDigits)
+      const reason = overflow
+        ? `adding the ${fmt(need)} in transit to the ${fmt(group!.lotQty)} on hand for ${l.sku} in ${l.from} gives an opening quantity beyond what the stock quantity column can hold (8 integer digits)`
+        : convention === 'counted-in-source'
         ? `source stock for ${l.sku} in ${l.from} is ${group ? fmt(group.lotQty) : 'absent from the stock extract'} but ${fmt(need)} is in transit from it; with the "counted-in-source" convention the source quantity must cover the in-transit quantity or the importer cannot dispatch it`
         : `no stock row with cost for ${l.sku} in ${l.from}: under the "excluded-from-source" convention the in-transit units are added to the source opening balance at its weighted-average cost, and there is none to use`
-      run.add('transfers', l.line, `${l.transferKey}/${l.sku}`, 'REJECTED', convention === 'counted-in-source' ? 'IN_TRANSIT_EXCEEDS_SOURCE_STOCK' : 'NO_COST_BASIS_AT_SOURCE', reason)
+      run.add('transfers', l.line, `${l.transferKey}/${l.sku}`, 'REJECTED', overflow ? 'OPENING_QTY_OUT_OF_RANGE' : convention === 'counted-in-source' ? 'IN_TRANSIT_EXCEEDS_SOURCE_STOCK' : 'NO_COST_BASIS_AT_SOURCE', reason)
       continue
     }
     run.add('transfers', l.line, `${l.transferKey}/${l.sku}`, 'EMITTED', 'IN_TRANSIT', 'the outstanding quantity is in the transfers import file')

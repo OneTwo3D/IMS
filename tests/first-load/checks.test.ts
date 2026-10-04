@@ -324,3 +324,21 @@ test('a CR or CRLF inside a quoted value is written as LF, which is exactly what
   const parsed = parseCsv(result.outputs[0].content)
   assert.equal(parsed[0].description, 'line one\nline two\nline three')
 })
+
+test('stock ranges: a collapsed quantity, a converted cost and an in-transit addition that the target columns cannot hold are rejected, not emitted', (t) => {
+  const products = ds('products', [product('A'), product('B'), product('C')])
+  const sumOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '60000000', '1', { lotRef: 'L1' }), lot('A', '60000000', '1', { lotRef: 'L2' })]) })
+  const fxOver = run({ products, 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', fxRateToBase: '5' })]) })
+  const inTransitOver = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('C', '99999999', '1')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C', qtyShipped: '5', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'excluded-from-source' })
+  precondition(t, 'over-range cases', 3)
+  assert.deepEqual(rejectedCodes(sumOver, 'stock-lots'), ['COLLAPSED_OUT_OF_RANGE', 'COLLAPSED_OUT_OF_RANGE'])
+  assert.deepEqual(rejectedCodes(fxOver, 'stock-lots'), ['BAD_UNIT_COST'])
+  assert.deepEqual(rejectedCodes(inTransitOver, 'transfers'), ['OPENING_QTY_OUT_OF_RANGE'])
+  for (const result of [sumOver, fxOver, inTransitOver]) assert.equal(result.blocking, true)
+  const edge = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999.999999', '999999999.999999')]) })
+  assert.equal(edge.blocking, false, 'the largest storable values still pass')
+})
