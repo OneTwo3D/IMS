@@ -51,6 +51,24 @@ export type RefundAccountingObligation = {
   referenceId: string
 }
 
+/**
+ * WHAT A CLEAN `settle()` DID NOT QUEUE (o3d-fj4m).
+ *
+ * `settle()` returns normally in two different situations: every obligation was written (or already
+ * stood) as a durable row, or an obligation was settled by the ONE no-op the ledger accepts - the pinned
+ * configuration decided that posting will never exist. The caller that clears `accountingRetryRequired`
+ * must be able to tell them apart, because a refund's `allocatedReliefAmount` is recorded at STAGING,
+ * before any enqueue, as "what the journal this refund is about to queue WILL raise": for a journal that
+ * is decided never to exist, that amount is a claim about a posting that has no counterpart anywhere, and
+ * the next refund of the order reads its absence as "retention deleted it" and counts it as relief.
+ */
+export type RefundAccountingSettlement = {
+  /** Obligations settled because the pinned configuration decided the posting will never exist. */
+  readonly decidedNeverToPost: readonly RefundAccountingObligation[]
+  /** The connector this hand-off pinned (the one whose enqueues take the posting-key lock). */
+  readonly pinnedConnector: string | null
+}
+
 export class RefundAccountingObligationsUnmet extends Error {
   readonly unmet: readonly string[]
   constructor(unmet: string[]) {
@@ -74,8 +92,11 @@ export type RefundAccountingObligationLedger = {
    * the enqueue's own resolved connector out without changing the boolean its other call sites read.
    */
   accountInTransaction(obligation: RefundAccountingObligation, outcome: AccountingEnqueueOutcome): void
-  /** Throws unless EVERY recorded obligation was handed to an enqueue and accounted for. */
-  settle(): void
+  /**
+   * Throws unless EVERY recorded obligation was handed to an enqueue and accounted for. Returns which of
+   * them were settled by the "will never exist" decision rather than by a durable row (o3d-fj4m).
+   */
+  settle(): RefundAccountingSettlement
 }
 
 export async function openRefundAccountingObligationLedger(
@@ -99,6 +120,7 @@ export async function openRefundAccountingObligationLedger(
   }
 
   const unmet: string[] = []
+  const decidedNeverToPost: RefundAccountingObligation[] = []
   let accounted = 0
   const name = (obligation: RefundAccountingObligation) =>
     `${obligation.type} for ${obligation.referenceType} ${obligation.referenceId}`
@@ -118,7 +140,10 @@ export async function openRefundAccountingObligationLedger(
       if (outcome.queued) return
       // THE ONLY NO-OP THAT SETTLES AN OBLIGATION: the pinned configuration already said this
       // posting will never exist, so there is nothing left outstanding for it to leave behind.
-      if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) return
+      if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) {
+        decidedNeverToPost.push(obligation)
+        return
+      }
       unmet.push(
         `${name(obligation)} (${outcome.reason === 'not-configured'
           ? 'the enqueue reported this posting switched off, though it was enabled when the hand-off began'
@@ -148,7 +173,10 @@ export async function openRefundAccountingObligationLedger(
       if (outcome.queued) return
       // THE ONLY NO-OP THAT SETTLES AN OBLIGATION, exactly as in `account`: the pinned configuration
       // already said this posting will never exist, so nothing is left outstanding for it.
-      if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) return
+      if (outcome.reason === 'not-configured' && willPost.get(obligation.type) === false) {
+        decidedNeverToPost.push(obligation)
+        return
+      }
       unmet.push(
         `${name(obligation)} (${outcome.reason === 'not-configured'
           ? 'the in-transaction enqueue reported this posting switched off, though it was enabled when '
@@ -164,6 +192,7 @@ export async function openRefundAccountingObligationLedger(
         )
       }
       if (unmet.length > 0) throw new RefundAccountingObligationsUnmet(unmet)
+      return { decidedNeverToPost: [...decidedNeverToPost], pinnedConnector }
     },
   }
 }
