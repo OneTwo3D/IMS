@@ -1,5 +1,5 @@
 import { getSettingValues } from '@/lib/settings-store'
-import { connectorFetch } from '@/lib/security/connector-fetch'
+import { isWooCommerceWritebackRefusal, wooCommerceConnectorFetch } from './transport'
 import type { ConnectorCredentials } from '../types'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentials } from './credentials'
 import { validateWooCommerceBaseUrl } from './url-safety'
@@ -213,11 +213,11 @@ export async function wcFetch(
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
-  const res = await connectorFetch(url, {
+  const res = await wooCommerceConnectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
     signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
-    connectorName: 'WooCommerce',
+    purpose: `WC REST read ${path}`,
   })
 
   if (!res.ok) {
@@ -256,14 +256,24 @@ export async function wcPost(
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
-  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
-  }, {
-    connectorName: 'WooCommerce',
-  })
+  // o3d-zvec.3: the writeback fence lives in ./transport.ts and REFUSES rather than returning a
+  // failed response, so it is turned into this function's ordinary error shape here. Callers
+  // already report an `error`; what they must not do is mistake it for a transient HTTP failure,
+  // which is why the message says REFUSED and names both origins.
+  let res: Response
+  try {
+    res = await wooCommerceConnectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
+    }, {
+      purpose: `WC REST POST ${path}`,
+    })
+  } catch (error) {
+    if (isWooCommerceWritebackRefusal(error)) return { data: null, error: error.message }
+    throw error
+  }
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)
@@ -287,14 +297,24 @@ export async function wcPut(
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
-  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
-    method: 'PUT',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
-  }, {
-    connectorName: 'WooCommerce',
-  })
+  // o3d-zvec.3: the writeback fence lives in ./transport.ts and REFUSES rather than returning a
+  // failed response, so it is turned into this function's ordinary error shape here. Callers
+  // already report an `error`; what they must not do is mistake it for a transient HTTP failure,
+  // which is why the message says REFUSED and names both origins.
+  let res: Response
+  try {
+    res = await wooCommerceConnectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
+      method: 'PUT',
+      headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
+    }, {
+      purpose: `WC REST PUT ${path}`,
+    })
+  } catch (error) {
+    if (isWooCommerceWritebackRefusal(error)) return { data: null, error: error.message }
+    throw error
+  }
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)

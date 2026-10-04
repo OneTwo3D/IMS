@@ -15,8 +15,8 @@
 import { createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
-import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
+import { isWooCommerceWritebackRefusal, wooCommerceConnectorFetch } from '../transport'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 
 const PUSH_TIMEOUT_MS = 15_000
@@ -94,12 +94,12 @@ export async function pushPartialShipmentToWc(
   const endpoint = `${validatedUrl.normalizedUrl}/wp-json/oti/v1/order/${encodeURIComponent(link.externalOrderId)}/partial-shipment`
 
   try {
-    const res = await connectorFetch(endpoint, {
+    const res = await wooCommerceConnectorFetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-OTI-Signature': signature },
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
-    }, { connectorName: 'WooCommerce' })
+    }, { purpose: 'partial-shipment push' })
 
     if (!res.ok) {
       const text = await res.text().catch(() => '')
@@ -108,6 +108,9 @@ export async function pushPartialShipmentToWc(
     const json = (await res.json().catch(() => ({}))) as { ok?: boolean; all_done?: boolean; duplicate?: boolean }
     return { supported: true, ok: json.ok !== false, allDone: json.all_done, duplicate: json.duplicate }
   } catch (e) {
+    // o3d-zvec.3: a writeback-fence refusal arrives here as an exception. It is NOT transient and
+    // must not read like a network blip, so it is reported with its own message verbatim.
+    if (isWooCommerceWritebackRefusal(e)) return { supported: true, ok: false, error: e.message }
     return { supported: true, ok: false, error: String(e) }
   }
 }

@@ -18,9 +18,9 @@
 import { createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
-import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import type { FxRatePush, FxRatePushResult } from '../types'
+import { isWooCommerceWritebackRefusal, wooCommerceConnectorFetch } from './transport'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
@@ -53,7 +53,7 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
   const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
 
   try {
-    const res = await connectorFetch(endpoint, {
+    const res = await wooCommerceConnectorFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -62,7 +62,7 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     }, {
-      connectorName: 'WooCommerce',
+      purpose: 'FX rate push',
     })
 
     if (!res.ok) {
@@ -77,6 +77,9 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
     const json = (await res.json().catch(() => ({}))) as { pushed?: number; ok?: boolean }
     return { supported: true, pushed: Number(json.pushed ?? rates.length), errors: [] }
   } catch (e) {
+    // o3d-zvec.3: a writeback-fence refusal is reported verbatim, not as `String(e)`, so the
+    // operator is told which store was declared and which one was attempted.
+    if (isWooCommerceWritebackRefusal(e)) return { supported: true, pushed: 0, errors: [e.message] }
     return { supported: true, pushed: 0, errors: [String(e)] }
   }
 }
@@ -119,7 +122,7 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
 
   let res: Response | null = null
   try {
-    res = await connectorFetch(endpoint, {
+    res = await wooCommerceConnectorFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -128,9 +131,13 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     }, {
-      connectorName: 'WooCommerce',
+      purpose: 'FX helper-plugin probe',
     })
   } catch (e) {
+    // o3d-zvec.3: the probe is a POST to the store, so it is fenced like any other write. That is
+    // deliberate rather than incidental — an undeclared installation must not reach the live
+    // store's REST surface at all, not even with a knowingly-invalid signature.
+    if (isWooCommerceWritebackRefusal(e)) return { status: 'NOT_CONFIGURED', message: e.message }
     return {
       status: 'UNREACHABLE',
       message: `Could not reach ${endpoint}: ${String(e).slice(0, 200)}`,
