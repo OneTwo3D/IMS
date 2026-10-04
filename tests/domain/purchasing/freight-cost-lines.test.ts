@@ -195,5 +195,6 @@ test('T11 census: both actions parse with the shared boundary and build rows wit
   assert.equal(/input\.fxRateToBase \|\| 1/.test(source), false, 'the silent `|| 1` exchange-rate default is gone')
   // The input types are DERIVED from the schema, not restated.
   assert.equal(/export type FreightCostLineInput = \{/.test(source), false)
+  assert.equal(/export type \{[^}]*(FreightCostLineInput|CreateFreightPoInput)/.test(source), false, "a type re-export in a 'use server' file fails the Turbopack build")
   assert.equal(/export type CreateFreightPoInput = \{/.test(source), false)
 })

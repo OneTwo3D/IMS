@@ -84,8 +84,8 @@ import {
   buildFreightCostLineRows,
   CreateFreightPoInputSchema,
   FreightCostLinesSchema,
-  type CreateFreightPoInput,
-  type FreightCostLineInput,
+  type CreateFreightPoInput as CreateFreightPoInputShape,
+  type FreightCostLineInput as FreightCostLineInputShape,
 } from '@/lib/domain/purchasing/freight-cost-lines'
 import { describeFlooredLandedCredit, type FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
@@ -4285,8 +4285,11 @@ export async function markBillPaid(
 // ---------------------------------------------------------------------------
 
 // The input shapes are DERIVED from the boundary schema (lib/domain/purchasing/freight-cost-lines.ts), so
-// the type the UIs compile against and the validation the actions run cannot drift apart.
-export type { FreightCostLineInput, CreateFreightPoInput }
+// the type the UIs compile against and the validation the actions run cannot drift apart. Declared as type
+// ALIASES, not `export type { ... }` re-exports: Turbopack treats a re-export in a 'use server' file as a
+// runtime export and the build fails ("Export ... doesn't exist in target module"), which tsc cannot see.
+export type FreightCostLineInput = FreightCostLineInputShape
+export type CreateFreightPoInput = CreateFreightPoInputShape
 
 // audit-g5u2.3: record a supplier credit note (DRAFT) against a billed (freight)
 // PO — e.g. crediting a duplicate freight bill. POSTED later via
