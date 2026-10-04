@@ -317,7 +317,7 @@ function countMigrationDirectories(repoRoot: string): number {
 // Teardown. Synchronous on purpose: it must be able to finish inside a signal handler.
 // ---------------------------------------------------------------------------------------------
 
-function shredFile(file: string): boolean {
+export function shredFile(file: string): boolean {
   if (!existsSync(file)) return true
   try {
     execFileSync('shred', ['-u', '-n', '1', file], { stdio: 'pipe' })

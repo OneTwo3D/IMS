@@ -24,7 +24,7 @@ import {
   rehearsalExitCode,
   type SeededRowFacts,
 } from '@/lib/ops/first-install-rehearsal'
-import { parseArgs, processIsAlive, processesNaming, runRehearsal, type RehearsalHooks } from '@/scripts/rehearse-first-install'
+import { parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
@@ -228,6 +228,17 @@ test('IMS_SKIP_ENV_FILE=1 keeps scripts/prisma-dev-db.sh from sourcing .env over
   console.log(`# without the flag: ${without}; with the flag: ${withSkip}`)
   assert.equal(without, 'DATABASE_URL=postgresql://env:file@127.0.0.1:1/from_dot_env', 'precondition: the script DOES source .env when not told otherwise')
   assert.equal(withSkip, `DATABASE_URL=${callerUrl}`)
+})
+
+test('shredFile removes a mode-600 file that holds a secret, and reports a file that is already gone as gone', (t) => {
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-shred-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const file = join(dir, 'rehearsal.env')
+  writeFileSync(file, 'DATABASE_URL=postgresql://role:secret@127.0.0.1:1/x\n', { mode: 0o600 })
+  assert.equal(existsSync(file), true, 'precondition: the file exists before the shred')
+  assert.equal(shredFile(file), true)
+  assert.equal(existsSync(file), false)
+  assert.equal(shredFile(file), true, 'a second shred of a missing file is a success, not an error')
 })
 
 test('a RAM-backed --root is refused before anything is created', () => {
