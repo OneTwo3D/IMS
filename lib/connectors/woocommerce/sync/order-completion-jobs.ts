@@ -28,7 +28,7 @@ import {
   markIntegrationOutboxSuccess,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
-import { wcOrderStatusClaimGate } from './order-status-claim-gate'
+import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW, wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
@@ -139,25 +139,41 @@ export async function processWcOrderCompletionJobs(options?: {
   now?: Date
   /** Test seam: the attempt deadline. Production uses WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS. */
   attemptDeadlineMs?: number
+  /** Test seams: the clock the drain budget and the claims read, and the budget itself. */
+  clock?: () => Date
+  drainBudgetMs?: number
 }): Promise<WcOrderCompletionRunSummary> {
   const summary: WcOrderCompletionRunSummary = { claimed: 0, succeeded: 0, retried: 0, deadLettered: 0, skipped: 0, errors: [] }
   if (options?.idempotencyKeys?.length === 0) return summary
   const now = options?.now
   // The cron drain (no explicit keys) also surfaces claims whose worker died.
   if (!options?.idempotencyKeys) summary.deadLettered += await parkStaleWcOrderCompletionClaims(now ?? new Date())
-  const jobs = await claimIntegrationOutboxWork({
-    connector: CONNECTOR,
-    operation: OPERATION,
-    idempotencyKeys: options?.idempotencyKeys,
-    limit: options?.limit ?? 25,
-    workerId: WORKER_ID,
-    maxAttempts: WC_ORDER_COMPLETION_MAX_ATTEMPTS,
-    now,
-    // One writer of an order's WooCommerce status at a time (order-status-claim-gate.ts, o3d-6ldlj).
-    claimGate: wcOrderStatusClaimGate,
-  })
+  const clock = options?.clock ?? (() => new Date())
+  const startedAt = clock().getTime()
+  const budgetMs = options?.drainBudgetMs ?? WC_DRAIN_CLAIM_BUDGET_MS
+  const maxJobs = options?.limit ?? 25
+  const attempted: string[] = []
 
-  for (const job of jobs) {
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME, with a wall-clock budget (order-status-claim-gate.ts, o3d-6ldlj): a
+  // job is claimed only when its attempt is about to start, so its lockedAt is never older than one attempt deadline
+  // at the write, and the stale-claim park and the per-order gate stay sound.
+  while (attempted.length < maxJobs) {
+    if (clock().getTime() - startedAt > budgetMs) break
+    const [job] = await claimIntegrationOutboxWork({
+      connector: CONNECTOR,
+      operation: OPERATION,
+      idempotencyKeys: options?.idempotencyKeys,
+      limit: WC_DRAIN_SCAN_WINDOW,
+      claimLimit: 1,
+      excludeIds: attempted,
+      workerId: WORKER_ID,
+      maxAttempts: WC_ORDER_COMPLETION_MAX_ATTEMPTS,
+      now: now ?? clock(),
+      // One writer of an order's WooCommerce status at a time (order-status-claim-gate.ts, o3d-6ldlj).
+      claimGate: wcOrderStatusClaimGate,
+    })
+    if (!job) break
+    attempted.push(job.id)
     summary.claimed++
     if (!job.lockedAt) {
       summary.errors.push(`WooCommerce order-completion job ${job.id} was claimed without lockedAt`)

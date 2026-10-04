@@ -87,6 +87,16 @@ export type ClaimIntegrationOutboxOptions = {
    * both pass. A candidate that may not claim is skipped untouched (no attempt consumed, still due, so the next
    * drain finds it). Needs the default client (a real database), never a caller-supplied one.
    */
+  /**
+   * o3d-6ldlj: claim ONE job at a time, at the moment its attempt is about to start. `limit` is then only the SCAN
+   * window (how many due candidates are looked at, oldest first) and the call returns as soon as `claimLimit` jobs
+   * were actually claimed. Claiming a whole batch up front stamps every job with the same `lockedAt` while the
+   * worker processes them one after another, so a job at the back can age past the drain lease before its attempt
+   * starts and be parked as "dead" while live.
+   */
+  claimLimit?: number
+  /** Rows to skip (already attempted by this drain). */
+  excludeIds?: string[]
   claimGate?: {
     keyOf: (row: IntegrationOutboxRow) => string | null
     mayClaim: (tx: IntegrationOutboxClient, row: IntegrationOutboxRow, now: Date) => Promise<boolean>
@@ -434,16 +444,19 @@ export async function claimIntegrationOutboxWork(
   const now = options.now ?? new Date()
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
+  const baseWhere = claimableWhere({
+    connector: options.connector,
+    operation: options.operation,
+    idempotencyKeys: options.idempotencyKeys,
+    now,
+    staleLockMs,
+    maxAttempts,
+    staleReclaimScope: integrationOutboxStaleReclaimScope(options.connector, options.operation),
+  })
   const candidates = await client.integrationOutbox.findMany({
-    where: claimableWhere({
-      connector: options.connector,
-      operation: options.operation,
-      idempotencyKeys: options.idempotencyKeys,
-      now,
-      staleLockMs,
-      maxAttempts,
-      staleReclaimScope: integrationOutboxStaleReclaimScope(options.connector, options.operation),
-    }),
+    where: options.excludeIds && options.excludeIds.length > 0
+      ? { AND: [baseWhere, { id: { notIn: [...options.excludeIds] } }] }
+      : baseWhere,
     orderBy: { createdAt: 'asc' },
     take: positiveLimit(options.limit),
   })
@@ -471,6 +484,7 @@ export async function claimIntegrationOutboxWork(
         return result.count > 0
       })
       if (won) claimed.push(await requireOutboxRow(client, row.id))
+      if (options.claimLimit !== undefined && claimed.length >= options.claimLimit) break
     }
     return claimed
   }
@@ -485,6 +499,7 @@ export async function claimIntegrationOutboxWork(
     })
     if (result.count === 0) continue
     claimed.push(await requireOutboxRow(client, row.id))
+    if (options.claimLimit !== undefined && claimed.length >= options.claimLimit) break
   }
 
   return claimed

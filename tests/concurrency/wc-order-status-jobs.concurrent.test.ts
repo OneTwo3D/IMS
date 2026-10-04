@@ -55,6 +55,8 @@ const wc = {
   putGate: null as Gate | null,
   /** The store answers a PUT with 200 but keeps/does not hold the requested status. */
   unconfirmed: false,
+  /** Runs at the top of every status push, before anything else (the slow-storefront / injected-clock seam). */
+  onPush: null as null | ((orderId: string) => Promise<void>),
 }
 const activity: Array<Record<string, unknown>> = []
 /** When set, logActivity THROWS for this action: models the process failing after the transaction committed. */
@@ -113,6 +115,7 @@ mock.module('@/lib/shopping', {
     pushSalesOrderStatus: async (orderId: string, status: string): Promise<FacadeResult> => {
       wc.events.push(`status:${orderId}:${status}`)
       wc.gets++ // every attempt re-reads the storefront
+      if (wc.onPush) await wc.onPush(orderId)
       if (wc.statusOverride) return wc.statusOverride
       const gate = wc.gate
       if (gate) {
@@ -186,6 +189,7 @@ function resetWc() {
   wc.gate = null
   wc.putGate = null
   wc.unconfirmed = false
+  wc.onPush = null
   activity.length = 0
   activityFault.action = null
 }
@@ -1241,4 +1245,105 @@ test('o3d-6ldlj (arm 28): needs-operator text is CAUSE-SPECIFIC for every class,
     }
   }
   assert.equal(evaluated, 6)
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 4: claim each job WHEN ITS ATTEMPT STARTS; a drain is bounded by a wall-clock budget.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** A clock only the test moves, and a storefront whose every request "takes" `stepMs` of it. */
+function slowStorefront(deps: Deps, stepMs: number) {
+  let nowMs = Date.now()
+  const rig = {
+    clock: () => new Date(nowMs),
+    /** For every push: how long ago the row's claim was stamped, on the injected clock, at the moment of the write. */
+    staleness: [] as number[],
+  }
+  wc.onPush = async (orderId) => {
+    const row = await deps.db.integrationOutbox.findFirst({
+      where: { status: 'PROCESSING', payloadJson: { path: ['orderId'], equals: orderId } },
+      select: { lockedAt: true },
+    })
+    assert.ok(row?.lockedAt, `precondition: the job for ${orderId} is PROCESSING with a claim when its request starts`)
+    rig.staleness.push(nowMs - row.lockedAt.getTime())
+    nowMs += stepMs // the slow request
+  }
+  return rig
+}
+
+test('o3d-6ldlj (arm 29): a drain whose cumulative time exceeds the LEASE never runs a job on a stale claim, parks nothing live, leaves nothing PROCESSING, and the gate still holds', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const { INTEGRATION_OUTBOX_DRAIN_LEASES_MS } = await import('@/lib/domain/integrations/outbox-leases')
+  const [cancel] = kindsOf(deps)
+  resetWc()
+  wc.staysAtStatus = true // the model is one store: keep it at `processing` so every job really PUTs
+  const STEP = 150_000 // each WooCommerce request "takes" 2.5 minutes
+  const rig = slowStorefront(deps, STEP)
+  const keys: string[] = []
+  const orders: string[] = []
+  for (let i = 0; i < 5; i++) {
+    const seeded = await newRow(deps, cancel, `lease-batch-${i}`)
+    keys.push(seeded.key)
+    orders.push(seeded.orderId)
+  }
+  // A budget large enough for ALL five: cumulative 5 x 150 s = 12.5 minutes, past the 10 minute lease.
+  const summary = await cancel.process({ idempotencyKeys: keys, clock: rig.clock, drainBudgetMs: 60 * 60_000 })
+  const cumulative = STEP * 5
+  assert.ok(cumulative > INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default, `precondition: the drain's cumulative time (${cumulative} ms) exceeds the lease (${INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default} ms)`)
+  assert.equal(summary.claimed, 5, 'precondition: all five jobs were attempted in the one drain')
+  assert.equal(rig.staleness.length, 5)
+  assert.ok(Math.max(...rig.staleness) < 120_000, `every write started within one attempt deadline of its claim (max ${Math.max(...rig.staleness)} ms)`)
+  assert.equal(await deps.parkStaleWcOrderStatusClaims(rig.clock()), 0, 'the park finds nothing to park: nothing live was left claimed')
+  const rows = await Promise.all(keys.map((k) => rowOf(deps, k)))
+  assert.deepEqual(rows.map((r) => r.status), Array(5).fill('SUCCEEDED'))
+  assert.equal(wc.puts, 5)
+  console.log(`cumulative drain time ${cumulative} ms vs lease ${INTEGRATION_OUTBOX_DRAIN_LEASES_MS.default} ms: ${summary.claimed} jobs, max claim age at write ${Math.max(...rig.staleness)} ms`)
+})
+
+test('o3d-6ldlj (arm 29b): the claim count per drain is BOUNDED by the wall-clock budget; the rest is left untouched for the next drain, and nothing is left PROCESSING', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [cancel] = kindsOf(deps)
+  resetWc()
+  const rig = slowStorefront(deps, 150_000)
+  const keys: string[] = []
+  for (let i = 0; i < 5; i++) keys.push((await newRow(deps, cancel, `budget-${i}`)).key)
+  const summary = await cancel.process({ idempotencyKeys: keys, clock: rig.clock, drainBudgetMs: 240_000 })
+  // job 1 starts at 0 s, job 2 at 150 s, and at 300 s the 240 s budget is spent.
+  assert.equal(summary.claimed, 2, 'exactly the jobs that could START inside the budget were claimed')
+  const rows = await Promise.all(keys.map((k) => rowOf(deps, k)))
+  assert.deepEqual(rows.map((r) => r.status), ['SUCCEEDED', 'SUCCEEDED', 'PENDING', 'PENDING', 'PENDING'])
+  assert.deepEqual(rows.slice(2).map((r) => r.attempts), [0, 0, 0], 'the unclaimed rest consumed no attempt')
+  assert.equal(await deps.db.integrationOutbox.count({ where: { idempotencyKey: { in: keys }, status: 'PROCESSING' } }), 0, 'nothing left PROCESSING')
+  assert.equal(await deps.parkStaleWcOrderStatusClaims(new Date(rig.clock().getTime() + 3_600_000)), 0, 'even an hour later nothing is parked: nothing was claimed and abandoned')
+  // The next drain picks the rest up.
+  const next = await cancel.process({ idempotencyKeys: keys, clock: rig.clock, drainBudgetMs: 240_000 })
+  assert.equal(next.claimed, 2)
+})
+
+test('o3d-6ldlj (arm 29c): the order.complete drain behaves the same — claimed one at a time, bounded by the budget, never a stale claim, nothing left PROCESSING', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const { processWcOrderCompletionJobs } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
+  resetWc()
+  wc.statusOverride = { success: true, outcome: { kind: 'pushed' } }
+  const rig = slowStorefront(deps, 150_000)
+  const keys: string[] = []
+  for (let i = 0; i < 5; i++) {
+    const orderId = await newOrder(deps, `completion-batch-${i}`, 'SHIPPED')
+    const key = deps.buildOutboxIdempotencyKey('woocommerce', 'order.complete', orderId, String(1_760_004_000_000 + i))
+    await deps.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'order.complete', idempotencyKey: key, payloadJson: { orderId }, nextAttemptAt: null })
+    keys.push(key)
+  }
+  const bounded = await processWcOrderCompletionJobs({ idempotencyKeys: keys, clock: rig.clock, drainBudgetMs: 240_000 })
+  assert.equal(bounded.claimed, 2, 'bounded by the budget')
+  assert.deepEqual((await Promise.all(keys.map((k) => rowOf(deps, k)))).map((r) => r.status), ['SUCCEEDED', 'SUCCEEDED', 'PENDING', 'PENDING', 'PENDING'])
+  const rest = await processWcOrderCompletionJobs({ idempotencyKeys: keys, clock: rig.clock, drainBudgetMs: 60 * 60_000 })
+  assert.equal(rest.claimed, 3, 'the rest, in a drain whose cumulative time passes the lease')
+  assert.equal(rig.staleness.length, 5)
+  assert.ok(Math.max(...rig.staleness) < 120_000, `no completion ran on a stale claim (max ${Math.max(...rig.staleness)} ms)`)
+  assert.equal(await deps.db.integrationOutbox.count({ where: { idempotencyKey: { in: keys }, status: 'PROCESSING' } }), 0)
+  assert.equal(await deps.parkStaleWcOrderStatusClaims(new Date(rig.clock().getTime() + 60_000)), 0)
+  assert.deepEqual((await Promise.all(keys.map((k) => rowOf(deps, k)))).map((r) => r.status), Array(5).fill('SUCCEEDED'))
 })
