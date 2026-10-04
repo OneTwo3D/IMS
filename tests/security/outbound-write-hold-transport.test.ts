@@ -364,7 +364,7 @@ test('finding 4: a redirect-hop refusal is NOT a hold - its text is not recognis
   assert.doesNotMatch(hop1.message, /Outbound write HELD/)
 })
 
-test('a text a vendor chose can never be recognised as a hold: recognition needs the per-process reference', async () => {
+test('a text a vendor chose can never be recognised as a hold: recognition needs the keyed reference', async () => {
   const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText, outboundHoldReferenceSuffix } = await import('../../lib/security/outbound-write-hold-constants.ts')
   const real = new OutboundWriteHeldError({ connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.com/x', granted: null, attempted: null, basis: 'b' }, 0).message
   const forged = [
@@ -380,6 +380,6 @@ test('a text a vendor chose can never be recognised as a hold: recognition needs
     assert.equal(isOutboundWriteHeldText(text), false, text)
     assert.equal(isOutboundMaybeSentRefusalText(text), false, text)
   }
-  assert.match(outboundHoldReferenceSuffix(), /^ \[hold-ref [0-9a-f]{18}\]$/)
-  assert.equal(outboundHoldReferenceSuffix(), outboundHoldReferenceSuffix(), 'stable within the process')
+  assert.match(outboundHoldReferenceSuffix('held'), /^ \[hold-ref [0-9a-f]{18}\]$/)
+  assert.notEqual(outboundHoldReferenceSuffix('held'), outboundHoldReferenceSuffix('maybe-sent'), 'per kind')
 })
