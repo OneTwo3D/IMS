@@ -13,7 +13,7 @@ import { allocationDebitForeignLedgerReports } from '@/lib/domain/accounting/all
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
-import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences } from '../helpers/unconditional-instruction'
+import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
 
 /**
  * o3d-1e7sl Codex round 3 - THE SAME UNIVERSAL-ABSENCE CHECK OVER EVERY OPERATOR STRING THIS PR TOUCHES.
@@ -36,8 +36,8 @@ const NON_CONFIRMED: Array<{ name: string; standing: LedgerStanding; row: Ledger
   { name: 'LIVE_WORK', standing: 'LIVE_WORK', row: row({ status: 'PENDING' }) },
 ]
 
-const strings: Array<{ where: string; text: string }> = []
-const add = (where: string, text: string) => strings.push({ where, text })
+const strings: Array<{ where: string; text: string; allowed: RegExp | null }> = []
+const add = (where: string, text: string, allowed: RegExp | null = null) => strings.push({ where, text, allowed })
 
 for (const c of NON_CONFIRMED) {
   assert.equal(ledgerStanding(c.row), c.standing, `precondition ${c.name}`)
@@ -48,6 +48,22 @@ for (const c of NON_CONFIRMED) {
 }
 for (const [name, id] of [['asserted-not-posted', 'OPERATOR_ASSERTION'], ['unknown', null]] as const) {
   void name; void id
+}
+// Codex round 5: the sync-page tooltips for a FAILED attempt whose remote outcome is unknown, and every PROVEN cause with the history it alone licenses.
+add('display badge: ASSERTED_POSTED on a FAILED-then-settled attempt', describeLedgerStanding(row({ status: 'SYNCED', externalTransactionId: 'T-9', settlementBasis: 'OPERATOR_ASSERTION', errorMessage: 'socket hang up' } as never)).detail)
+add('display badge: ASSERTED_NOT_POSTED on a FAILED-then-settled attempt', describeLedgerStanding(row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION', errorMessage: 'socket hang up' } as never)).detail)
+add('display badge: UNKNOWN on a FAILED attempt, remote outcome unknown', describeLedgerStanding(row({ status: 'FAILED', errorMessage: 'socket hang up' } as never)).detail)
+assert.equal(ledgerStanding(row({ status: 'SYNCED', externalTransactionId: 'T-9', settlementBasis: 'OPERATOR_ASSERTION' })), 'ASSERTED_POSTED', 'precondition: the failed-then-settled tooltip rows have the standings they are named for')
+assert.equal(ledgerStanding(row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' })), 'ASSERTED_NOT_POSTED')
+assert.equal(ledgerStanding(row({ status: 'FAILED' })), 'UNKNOWN')
+const PROVEN_ROWS: Array<[string, LedgerStandingRow, RegExp]> = [
+  ['RECORDED_PRE_CALL', row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true } as never), /never sent|before the remote call|before any request was made/i],
+  ['VERIFIED_REVERSAL', row({ status: 'CANCELLED', settlementBasis: 'VERIFIED_REVERSAL' } as never), /verified reversed|never made/i],
+  ['REJECTED_BEFORE_POSTING', row({ status: 'FAILED', errorMessage: 'missing field' } as never), /before posting|before any request/i],
+]
+for (const [cause, provenRow, allowed] of PROVEN_ROWS) {
+  if (ledgerStanding(provenRow) !== 'PROVEN_NOT_POSTED') continue
+  add(`display badge: PROVEN_NOT_POSTED / ${cause}`, describeLedgerStanding(provenRow).detail, allowed)
 }
 const enq = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1', syncLogId: 'row-1' }
 add('enqueue refusal: unresolved (UNKNOWN)', describeUnresolvedPriorAttempt(enq))
@@ -82,6 +98,8 @@ for (const [name, payment] of payRows) {
   }
 }
 // the settle dialog's NOT_POSTED help text and the operator-facing docs, extracted from source
+/** The docs table describes every cause side by side, so it may NAME the licensed phrasings ("never sent" is the pre-call cause; "that it was never sent" is the verified-reversal row's does-not-prove cell). */
+const DOCS_ALLOWED = /never sent|never-sent|before any request/i
 const dialog = flat(read('app/(dashboard)/sync/settle-sync-row-control.tsx'))
 const dialogText = dialog.match(/The row is CANCELLED with no external id and recorded as YOUR assertion[\s\S]*?evidence outranks an assertion\./)
 assert.ok(dialogText, 'precondition: the settle dialog NOT_POSTED paragraph was extracted')
@@ -91,7 +109,7 @@ const section = xeroDocs.slice(xeroDocs.indexOf('**What the sync pages now show:
 assert.ok(section.length > 500, 'precondition: the standing section of xero-sync.md was extracted')
 const didNotPost = xeroDocs.slice(xeroDocs.indexOf('- **It did NOT post**'), xeroDocs.indexOf('Read what this is, because it is not a repair.'))
 assert.ok(didNotPost.length > 300, 'precondition: the did-not-post bullet was extracted')
-add('help-docs/xero-sync.md standing section', flat(section))
+add('help-docs/xero-sync.md standing section', flat(section), DOCS_ALLOWED)
 add('help-docs/xero-sync.md did-not-post bullet', flat(didNotPost))
 const sales = read('help-docs/sales.md')
 for (const label of ['| Retired document that is **not proven never-sent**', '| Daily batch |']) {
@@ -112,7 +130,7 @@ for (const retiredUnproven of [[], ['row s-1 (CANCELLED, no proof)']]) {
     }
   }
 }
-for (const [name, text] of Object.entries(refusalCopy)) if (typeof text === 'string') add(`refusal copy: ${name}`, text)
+for (const [name, text] of Object.entries(refusalCopy)) if (typeof text === 'string') add(`refusal copy: ${name}`, text, name === 'ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL' ? /Nothing was sent/ : null) // a refusal's own statement: the refusal happened before any send
 
 test('[o3d-1e7sl Codex r4] the widened checker CAN fail: the unconditional hand-post shape and the round-2 shape are both flagged', () => {
   assert.equal(unconditionalMoneySentences(ROUND_4_SHAPE).length, 1)
@@ -139,4 +157,13 @@ test('[o3d-1e7sl Codex r3] every operator string for a non-CONFIRMED standing is
   assert.ok(strings.length >= 80, 'the population is not vacuous')
   const offenders = strings.map((s) => ({ where: s.where, bad: unconditionalMoneySentences(s.text) })).filter((o) => o.bad.length > 0)
   assert.deepEqual(offenders, [], 'unconditional money instruction(s) on a non-confirmed standing')
+})
+
+test('[o3d-1e7sl Codex r5] no rendered string states a history claim its standing / cause does not license (cause -> allowed history table)', () => {
+  assert.deepEqual(unlicensedHistoryClaims('IMS made no call, read no document and compared no amount.', null).length, 1, 'control: "made no call" on an asserted standing is flagged')
+  assert.deepEqual(unlicensedHistoryClaims('IMS never asked the accounting system.', null).length, 1, 'control: "never asked" is flagged')
+  assert.deepEqual(unlicensedHistoryClaims('Never sent (recorded before the remote call).', /never sent|before the remote call/i), [], 'control: licensed by the pre-call stamp')
+  assert.deepEqual(unlicensedHistoryClaims('A failed sync does not prove nothing was posted.', null), [], 'control: a negated / hedged form is not a claim')
+  const offenders = strings.map((s) => ({ where: s.where, bad: unlicensedHistoryClaims(s.text, s.allowed) })).filter((o) => o.bad.length > 0)
+  assert.deepEqual(offenders, [], 'a string claims a history its cause does not prove')
 })

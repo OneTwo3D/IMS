@@ -1227,7 +1227,7 @@ export async function enqueueFollowUpSyncLog(
       // o3d-anu8: the SAME query widened rather than a second one, because the two row sets answer
       // one question between them. FAILED rows are the ambiguity set. o3d-f709 (M12, C1): a CANCELLED
       // row carrying OPERATOR_ASSERTION is NOT a row that left that set on evidence - it is a person's
-      // word about a ledger IMS never read - so it is read here only so the planner can REFUSE on it.
+      // word about a ledger IMS did not check - so it is read here only so the planner can REFUSE on it.
       OR: [
         { status: 'FAILED' },
         { status: 'CANCELLED', settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS },
@@ -1293,7 +1293,7 @@ export async function enqueueFollowUpSyncLog(
       + 'document in Xero and establish which attempt actually landed. If one did, record it with Settle on the '
       + 'accounting sync log (\'it posted, here is the id\'). If none did, record the payment in Xero by hand: '
       + 'settling a row as \'it did not post\' does NOT clear this any more, because that is an operator\'s word '
-      + 'about a ledger IMS never read and IMS will not send money again on the strength of it.'
+      + 'about a ledger IMS did not check and IMS will not send money again on the strength of it.'
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_followup_enqueue_refused',

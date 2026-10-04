@@ -486,7 +486,7 @@ test('an operator-asserted payment whose amount MATCHES the total is NOT settled
   assert.equal(v.status, 'ASSERTED_UNVERIFIED')
   assert.equal(v.basis, 'OPERATOR_ASSERTION')
   assert.equal(v.discrepancy, true)
-  assert.match(v.detail, /never made the call/)
+  assert.match(v.detail, /did not verify that settlement against the ledger/)
   assert.match(v.detail, /PAY-1/)
   // The remedy is nameable and an operator can perform it — no refusal may be a dead end.
   assert.match(v.detail, /confirm its amount against the/)
@@ -593,7 +593,7 @@ test('[o3d-anu8, C1] a CANCELLED row an operator asserted NEVER posted is LEDGER
   console.log(`# precondition settlement-status C1: ${JSON.stringify({ status: settled.status, basis: settled.settlementBasis })} => ${v.status}/${v.basis}`)
   assert.equal(v.status, 'LEDGER_UNDECIDED')
   assert.equal(v.basis, 'OPERATOR_ASSERTION', 'the verdict still names whose word it is')
-  assert.match(v.detail, /person's word about a ledger IMS never read/)
+  assert.match(v.detail, /person's word about a ledger IMS did not check/)
   assert.doesNotMatch(v.detail, /never told/)
   // and on the not-paid-locally path too
   const unpaid = settlementStatus({ ...base, paidLocally: false, payment: settled })
@@ -607,8 +607,8 @@ test('[o3d-1e7sl D9] the verdict states its BASIS for every standing, on the pai
   type Case = { name: string; standing: string; payment: PaymentSyncRow; paidLocally: boolean; status: string; basis: string; says?: RegExp; never?: RegExp }
   const asserted = row({ status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' })
   const cases: Case[] = [
-    { name: 'ASSERTED_NOT_POSTED, paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: true, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS never read/, never: /ATTEMPTED|never told/ },
-    { name: 'ASSERTED_NOT_POSTED, NOT paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: false, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS never read/, never: /ATTEMPTED|never told|outcome was never recorded/ },
+    { name: 'ASSERTED_NOT_POSTED, paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: true, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS did not check/, never: /ATTEMPTED|never told/ },
+    { name: 'ASSERTED_NOT_POSTED, NOT paid locally', standing: 'ASSERTED_NOT_POSTED', payment: asserted, paidLocally: false, status: 'LEDGER_UNDECIDED', basis: 'OPERATOR_ASSERTION', says: /person's word about a ledger IMS did not check/, never: /ATTEMPTED|never told|outcome was never recorded/ },
     { name: 'ASSERTED_POSTED (SYNCED typed id), NOT paid locally', standing: 'ASSERTED_POSTED', payment: row({ settlementBasis: 'OPERATOR_ASSERTION' }), paidLocally: false, status: 'LEDGER_UNMATCHED', basis: 'OPERATOR_ASSERTION', says: /OPERATOR ASSERTION/, never: /ledger shows it settled/ },
     { name: 'CONFIRMED_POSTED (SYNCED connector id), NOT paid locally', standing: 'CONFIRMED_POSTED', payment: row({}), paidLocally: false, status: 'LEDGER_UNMATCHED', basis: 'LEDGER_CONFIRMED', says: /ledger shows it settled/ },
     { name: 'UNKNOWN (FAILED, no id), NOT paid locally', standing: 'UNKNOWN', payment: row({ status: 'FAILED', externalTransactionId: null, errorMessage: 'socket hang up' }), paidLocally: false, status: 'LEDGER_UNDECIDED', basis: 'NONE', says: /ATTEMPTED[\s\S]*not proof that nothing posted/ },

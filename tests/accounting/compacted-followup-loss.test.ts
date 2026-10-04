@@ -287,7 +287,7 @@ test('[o3d-1e7sl D7] the discard warning says whose id the tombstone names - con
     connectorLabel: 'Xero', activityActionPrefix: 'xero', phase: 'repaired',
     row: { ...base, settlementBasis: 'OPERATOR_ASSERTION' },
   })
-  assert.match(asserted.description, /linked to external id INV-9 \(an id an OPERATOR typed in - an assertion, never read from the ledger\)\./)
+  assert.match(asserted.description, /linked to external id INV-9 \(an id an OPERATOR typed in - an assertion, not verified against the ledger\)\./)
   // A row that does not say (an older caller) reads as the connector's own writeback, exactly as before.
   const silent = buildCompactedFollowUpLossActivity({
     connectorLabel: 'Xero', activityActionPrefix: 'xero', phase: 'repaired', row: base,

@@ -484,7 +484,7 @@ export function buildCompactedFollowUpLossActivity(input: {
     level: 'WARNING',
     description: `${preamble} ${discarded} can no longer be `
       + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
-      + `to external id ${row.externalTransactionId}${isOperatorAssertedSettlement(row.settlementBasis) ? ' (an id an OPERATOR typed in - an assertion, never read from the ledger)' : ''}. Nothing here authorises settling that by hand: the pass this row `
+      + `to external id ${row.externalTransactionId}${isOperatorAssertedSettlement(row.settlementBasis) ? ' (an id an OPERATOR typed in - an assertion, not verified against the ledger)' : ''}. Nothing here authorises settling that by hand: the pass this row `
       + 'was interrupted in enqueues each follow-up as its OWN local sync row, so one for the part named above may '
       + 'ALREADY be sitting PENDING or FAILED in the queue, and no request id can deduplicate a payment or an '
       + `attachment a human created afterwards. READ the document in ${connectorLabel}, record what is actually `

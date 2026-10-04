@@ -1753,7 +1753,7 @@ async function stageRefundAccountingReversals(
           action: 'refund_unearned_reversal_rests_on_operator_assertion',
           tag: 'accounting',
           level: 'WARNING',
-          description: `${assertedUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order were settled as posted by an OPERATOR typing in a document id, and this refund counted their queued payload as unearned revenue already reversed (£${priorUnearnedReversed.toFixed(2)} in total, all rows). IMS never read those journals in the ledger: check the unearned revenue account for this order.`,
+          description: `${assertedUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order were settled as posted by an OPERATOR typing in a document id, and this refund counted their queued payload as unearned revenue already reversed (£${priorUnearnedReversed.toFixed(2)} in total, all rows). IMS did not verify those journals against the ledger: check the unearned revenue account for this order.`,
           metadata: {
             orderId: params.orderId,
             refundId: params.refundId,
@@ -2000,7 +2000,7 @@ async function stageRefundAccountingReversals(
       // says why (the existing `priorRefundReliefUnresolved` branch), exactly as for a prior refund's
       // own journal below. Queued (PENDING/PROCESSING) rows keep counting, as they always have.
       if (ledgerStanding(row) === 'ASSERTED_POSTED') {
-        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS never read it in the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
       priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')

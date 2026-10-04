@@ -355,7 +355,7 @@ export function describeAttemptUndecidedRefusal(
   const settledByOperator = undecided.some((row) => row.status === 'CANCELLED')
   const operatorNote = settledByOperator
     ? '\n\nAn operator settled one of these entries as "not posted". That is a person\'s word about an '
-      + 'accounting system IMS never read, not proof - the payment may still be there - so it does not '
+      + 'accounting system IMS did not check, not proof - the payment may still be there - so it does not '
       + 'free this receipt for deletion.'
     : ''
   return {

@@ -423,7 +423,7 @@ export function detectPaymentReversals<T extends ReversalCandidate>(
  * o3d-f709 / C1: CANCELLED IS NO LONGER "HARMLESS". This paragraph used to end "every writer of that
  * status in this tree asserts it only where 'nothing was sent' is TRUE" - false for three of the
  * seven cancellers, and false for an operator's NOT_POSTED settlement, which is a person's word about
- * a ledger IMS never read. The planner below asks `ledgerStanding` (ledger-standing.ts): a CANCELLED
+ * a ledger IMS did not check. The planner below asks `ledgerStanding` (ledger-standing.ts): a CANCELLED
  * row blocks unless it PROVES its abandonment (the orphan sweep's `abandonedBeforeRemoteCall`, or a
  * VERIFIED_REVERSAL the poller wrote after reading the ledger). The supersession's own CANCEL below
  * therefore writes that proof, so a superseded row does not lock the bill for ever.
@@ -936,7 +936,7 @@ export function billPaymentRefusalMessage(refusal: BillPaymentSupersessionRefusa
       return 'A payment registration for this bill FAILED, or was cancelled without proof that nothing '
         + 'was sent, and that is NOT proof that nothing reached the accounting connector - the payment '
         + 'may have been created and the response lost. (An operator marking the entry "not posted" '
-        + 'is a person\'s word about a ledger IMS never read, so it does not clear this either.) IMS '
+        + 'is a person\'s word about a ledger IMS did not check, so it does not clear this either.) IMS '
         + 'therefore cannot tell whether this bill is already settled, and will not guess with a '
         + 'supplier payment. Nothing was changed. Open the bill in the connector: if the payment is '
         + 'there, the bill is settled and nothing more is needed; if it is not, pay the bill in the '

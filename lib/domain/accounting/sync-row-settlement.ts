@@ -680,7 +680,7 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
  * gathers, which turned a `refuse` into a `create`/`reuse` for a money-moving type, and it freed the
  * work slot so the same posting could be queued again. That was the settlement action's stated
  * purpose, and its premise was that the assertion was evidence. It is not: a person said "nothing
- * posted" about a ledger IMS never read, and a lost response, a late webhook and a hand-post all
+ * posted" about a ledger IMS did not check, and a lost response, a late webhook and a hand-post all
  * leave the same row. So:
  *
  *   - `planFollowUpEnqueue` REFUSES a money follow-up while a settled-NOT_POSTED row for the same
@@ -929,7 +929,7 @@ export function refuseSettlementContradictedByMirror(
     const basisClause = provenance === 'confirmed'
       ? 'which is evidence it DID post'
       : provenance === 'asserted'
-        ? 'which an OPERATOR earlier recorded as posted (an assertion IMS never read from the ledger, not a confirmation)'
+        ? 'which an OPERATOR earlier recorded as posted (an assertion IMS did not verify against the ledger, not a confirmation)'
         : 'whose basis was never recorded (IMS cannot say whether the connector or a person made it POSTED)'
     if (mirroredId) {
       return {
@@ -1043,7 +1043,7 @@ export type MirrorClaimCandidate = {
   posted: boolean
   /**
    * o3d-1e7sl (D11): the caller's `ledgerStanding(row) === 'ASSERTED_POSTED'` - the document the other row names
-   * was TYPED IN by an operator, never read from the ledger. Optional: absent reads false (the connector's own).
+   * was TYPED IN by an operator, not verified against the ledger. Optional: absent reads false (the connector's own).
    */
   assertedDocument?: boolean
   /** Every idempotency key the mirror updater would try for that row. */
@@ -1093,7 +1093,7 @@ export function describeMirrorOwnershipSkip(conflict: MirrorOwnershipConflict): 
     // a claim that a document exists, not evidence anyone read - say which.
     + `${conflict.posted
       ? (conflict.assertedDocument
-        ? ', names a document an operator typed in - an assertion, never read from the ledger'
+        ? ', names a document an operator typed in - an assertion, not verified against the ledger'
         : ', carries post evidence')
       : ''}) maps to the same mirrored event and still owns it. `
     + 'Settling this row does not terminalise a document another attempt is responsible for.'

@@ -1592,7 +1592,7 @@ test('[o3d-1e7sl D6] "Posted event has no external ID" says whose POST it was - 
   const cases: Array<{ name: string; postBasis: string | null | undefined; standing: string; suffix: RegExp | null }> = [
     { name: 'CONNECTOR', postBasis: 'CONNECTOR', standing: 'CONFIRMED', suffix: null },
     { name: 'SYNC_LOG_BACKFILL', postBasis: 'SYNC_LOG_BACKFILL', standing: 'CONFIRMED', suffix: null },
-    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', standing: 'ASSERTED', suffix: /marked POSTED on an operator's assertion, never read from the ledger/ },
+    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', standing: 'ASSERTED', suffix: /marked POSTED on an operator's assertion, not verified against the ledger/ },
     { name: 'NULL (unrecorded)', postBasis: null, standing: 'UNRECORDED', suffix: /how it came to be POSTED was never recorded/ },
     { name: 'absent (fixture predates the column)', postBasis: undefined, standing: 'UNRECORDED', suffix: /never recorded/ },
   ]

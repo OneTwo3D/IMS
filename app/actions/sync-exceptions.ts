@@ -2156,7 +2156,7 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
           ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.`
           : '.')
         + (result.earlierPostings.length > 0
-          ? ` The ledger already holds ${result.earlierPostings.join(', ')} for this obligation from an earlier `
+          ? ` IMS records the ledger as already holding ${result.earlierPostings.join(', ')} for this obligation from an earlier `
             + 'version of the document; the hand posting replaces it.'
           : '')
         + describeRetiredUnproven(result.retiredUnproven),

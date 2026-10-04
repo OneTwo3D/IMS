@@ -659,8 +659,8 @@ export async function guardInvoicePaymentCapacity(
       case 'ASSERTED_REGISTRATION':
         return head
           + `a payment already registered against this invoice (sync ${verdict.ambiguousIds.join(', ')}) was `
-          + `recorded on an OPERATOR'S ASSERTION, not confirmed by the accounting connector: IMS never made `
-          + `that call, never read the document and never compared the amount, so the figure it holds for it `
+          + `recorded on an OPERATOR'S ASSERTION, not confirmed by the accounting connector: IMS did not verify `
+          + `that settlement against the ledger: it read no document and compared no amount, so the figure it holds for it `
           + `is what it MEANT to send. How much of this invoice is already settled therefore cannot be `
           + `measured, and IMS will not guess with money. Nothing was sent. Open that payment in the ledger, `
           + `confirm what it actually settled, and register any balance genuinely owed there by hand.`

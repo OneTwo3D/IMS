@@ -843,8 +843,8 @@ export async function resolvePostedOrderDiscount(
       source: 'UNRECOVERABLE',
       detail:
         `${postedButUnlinked} sales invoice row(s) name a document for this order with no accountingInvoiceId ` +
-        `written back (${confirmed} confirmed by the connector, ${asserted} typed in by an operator and never ` +
-        `read from the ledger, ${postedButUnlinked - confirmed - asserted} neither), ` +
+        `written back (${confirmed} confirmed by the connector, ${asserted} typed in by an operator and not ` +
+        `verified against the ledger, ${postedButUnlinked - confirmed - asserted} neither), ` +
         'and no posted accounting event records what they charged',
     }
   }

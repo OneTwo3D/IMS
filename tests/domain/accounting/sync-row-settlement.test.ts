@@ -553,9 +553,9 @@ test('[o3d-1e7sl AE4] a NOT_POSTED assertion against a POSTED mirror says whose 
   // person typed the id; NULL = nobody recorded. "evidence it DID post" and "a posting IMS has already
   // written down" are true of the first only. Each still REFUSES (two assertions cannot both stand).
   const cases: Array<{ name: string; postBasis: string | null | undefined; says: RegExp; never: RegExp }> = [
-    { name: 'CONNECTOR', postBasis: 'CONNECTOR', says: /which is evidence it DID post/, never: /assertion IMS never read/ },
-    { name: 'SYNC_LOG_BACKFILL', postBasis: 'SYNC_LOG_BACKFILL', says: /which is evidence it DID post/, never: /assertion IMS never read/ },
-    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', says: /an OPERATOR earlier recorded as posted \(an assertion IMS never read from the ledger, not a confirmation\)/, never: /evidence it DID post/ },
+    { name: 'CONNECTOR', postBasis: 'CONNECTOR', says: /which is evidence it DID post/, never: /assertion IMS did not verify/ },
+    { name: 'SYNC_LOG_BACKFILL', postBasis: 'SYNC_LOG_BACKFILL', says: /which is evidence it DID post/, never: /assertion IMS did not verify/ },
+    { name: 'OPERATOR_ASSERTION', postBasis: 'OPERATOR_ASSERTION', says: /an OPERATOR earlier recorded as posted \(an assertion IMS did not verify against the ledger, not a confirmation\)/, never: /evidence it DID post/ },
     { name: 'NULL (unrecorded)', postBasis: null, says: /basis was never recorded/, never: /evidence it DID post/ },
     { name: 'absent (caller did not say)', postBasis: undefined, says: /basis was never recorded/, never: /evidence it DID post/ },
   ]
@@ -583,7 +583,7 @@ test('[o3d-1e7sl D11] the mirror-ownership audit note says whose id the owning s
   assert.equal(confirmed.assertedDocument, false)
   assert.equal(asserted.assertedDocument, true)
   assert.match(describeMirrorOwnershipSkip(confirmed), /\(SYNCED, carries post evidence\) maps to the same mirrored event/)
-  assert.match(describeMirrorOwnershipSkip(asserted), /\(SYNCED, names a document an operator typed in - an assertion, never read from the ledger\) maps to the same mirrored event/)
+  assert.match(describeMirrorOwnershipSkip(asserted), /\(SYNCED, names a document an operator typed in - an assertion, not verified against the ledger\) maps to the same mirrored event/)
   assert.doesNotMatch(describeMirrorOwnershipSkip(asserted), /carries post evidence/)
   assert.match(describeMirrorOwnershipSkip(live), /\(PENDING\) maps to the same mirrored event/)
 })

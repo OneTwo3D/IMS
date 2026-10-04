@@ -61,8 +61,8 @@ const DETAILS: Record<Exclude<LedgerStanding, 'PROVEN_NOT_POSTED'>, StandingDisp
     tone: 'asserted',
     label: 'asserted',
     detail:
-      'Recorded by an OPERATOR, not confirmed by the accounting system. IMS made no call, read no document and '
-      + 'compared no amount - the document id beside this row is one somebody typed in. Verify it in the accounting system.',
+      'Recorded by an OPERATOR, not confirmed by the accounting system. IMS did not verify this settlement against the ledger: it read no document and '
+      + 'compared no amount when it was recorded - the document id beside this row is one somebody typed in. Verify it in the accounting system.',
   },
   ASSERTED_NOT_POSTED: {
     standing: 'ASSERTED_NOT_POSTED',
@@ -70,7 +70,7 @@ const DETAILS: Record<Exclude<LedgerStanding, 'PROVEN_NOT_POSTED'>, StandingDisp
     tone: 'unproven',
     label: 'asserted: not posted',
     detail:
-      'An OPERATOR settled this as NOT posted. That is a claim, not proof: IMS never asked the accounting system, and '
+      'An OPERATOR settled this as NOT posted. That is a claim, not proof: IMS did not verify the settlement against the accounting system, and '
       + 'a lost response or a late webhook would leave the same row. Whether it reached the ledger is UNPROVEN - check '
       + 'the accounting system for it.',
   },

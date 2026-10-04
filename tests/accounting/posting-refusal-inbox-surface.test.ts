@@ -644,7 +644,7 @@ test('[o3d-j625 r16 HIGH 2] an EARLIER edit\'s completed row leaves the newly re
   assert.ok(row.handPostOrder)
   assert.match(row.handPostOrder, /Take for hand posting" FIRST/,
     'so the way forward is the ordinary one — take it, post it, confirm it')
-  assert.match(row.handPostOrder, /ALREADY holds INV-EDIT-1/,
+  assert.match(row.handPostOrder, /ALREADY holding INV-EDIT-1/,
     'with what the ledger holds stated, so the operator edits that document instead of raising a second one')
   assert.equal(row.remedy, invoiceUpdateRefusal.remedy, 'and the site\'s own remedy is verbatim')
 })

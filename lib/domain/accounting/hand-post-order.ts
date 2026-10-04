@@ -19,8 +19,8 @@ export function handPostOrderFor(state: {
   claim: { at: string; byName: string | null; mine: boolean } | null
 }): string {
   const earlier = state.earlierPostings.length > 0
-    ? ' The ledger ALREADY holds '
-      + `${state.earlierPostings.join(', ')} for this obligation, from an earlier version of this document — `
+    ? ' IMS records the ledger as ALREADY holding '
+      + `${state.earlierPostings.join(', ')} for this obligation (a settled record, not something IMS re-read), from an earlier version of this document — `
       + 'your hand posting REPLACES that document; do not raise a second one.'
     : ''
   // o3d-1e7sl (C1): earlier attempts retired without proof are never "nothing posted". Appended to every

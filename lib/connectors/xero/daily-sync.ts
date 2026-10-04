@@ -769,8 +769,8 @@ async function dailyBatchRecreateVerdict(
       refusal:
         `Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
         '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
-        'system; IMS never read the document, never checked which organisation holds it and never ' +
-        'compared its lines. The batch is deliberately NOT recreated, because if the journal really is ' +
+        'system; IMS did not verify the document, which organisation holds it or its lines.' +
+        ' The batch is deliberately NOT recreated, because if the journal really is ' +
         'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
         'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
         'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +

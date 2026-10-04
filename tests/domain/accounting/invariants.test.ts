@@ -197,7 +197,7 @@ test('[o3d-1e7sl D5] the Group-B evidence check and the operator-asserted report
       reported += 1
       assert.equal(report[0]!.severity, 'info')
       assert.equal(report[0]!.syncLogId, group.id)
-      assert.match(report[0]!.message, /only on an operator's assertion[\s\S]*never read it from the ledger/)
+      assert.match(report[0]!.message, /only on an operator's assertion[\s\S]*did not verify it against the ledger/)
       assert.equal((report[0]!.details as { standing?: string }).standing, 'ASSERTED_POSTED')
     }
   }

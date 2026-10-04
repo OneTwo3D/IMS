@@ -1605,7 +1605,7 @@ test('[o3d-f709 M12, C1] a money enqueue behind an operator-settled NOT_POSTED r
   // THE FLIP. This test used to assert `action: 'create'` with a reliance record: "moving a FAILED row
   // to CANCELLED drops the distinct-token count and turns a refusal into this enqueue - deliberately,
   // it is the documented purpose of the settlement action". An operator's NOT_POSTED is a person's
-  // word about a ledger IMS never read (C1), so the post goes out on nothing and could pay twice.
+  // word about a ledger IMS did not check (C1), so the post goes out on nothing and could pay twice.
   const plan = planFollowUpEnqueue({
     ...ORDER,
     payload: { accountingInvoiceId: 'inv-9' },

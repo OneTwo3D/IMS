@@ -643,7 +643,7 @@ test('[o3d-1e7sl G17] the unlinked-document read, one sync row per standing: a N
   const base = { referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE' }
   const cases: Array<{ name: string; standing: LedgerStanding; row: Partial<SyncLogRow> & { status: string }; refuses: boolean; says?: RegExp }> = [
     { name: 'CONFIRMED_POSTED', standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-C' }, refuses: true, says: /1 confirmed by the connector, 0 typed in/ },
-    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, refuses: true, says: /0 confirmed by the connector, 1 typed in by an operator and never read from the ledger/ },
+    { name: 'ASSERTED_POSTED', standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-T', settlementBasis: 'OPERATOR_ASSERTION' }, refuses: true, says: /0 confirmed by the connector, 1 typed in by an operator and not verified against the ledger/ },
     { name: 'FAILED row naming a document (CONFIRMED_POSTED)', standing: 'CONFIRMED_POSTED', row: { status: 'FAILED', externalTransactionId: 'INV-F' }, refuses: true, says: /1 confirmed by the connector/ },
     { name: 'ASSERTED_NOT_POSTED', standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }, refuses: false },
     { name: 'PROVEN_NOT_POSTED', standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, refuses: false },

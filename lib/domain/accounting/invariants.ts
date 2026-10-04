@@ -531,7 +531,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
         code: 'accounting_sync_evidence_operator_asserted',
         syncLogId: log.id,
         message: `Accounting sync log ${log.id} counts as evidence of a posting only on an operator's assertion `
-          + `(document ${log.externalTransactionId?.trim() || 'id not recorded'} was typed in; IMS never read it from the ledger)`,
+          + `(document ${log.externalTransactionId?.trim() || 'id not recorded'} was typed in; IMS did not verify it against the ledger)`,
         details: {
           connector: log.connector,
           type: log.type,

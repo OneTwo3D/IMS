@@ -7,7 +7,7 @@ import {
   findSalesOrderDeleteBlocker,
 } from '@/lib/domain/sales/order-delete-guard'
 import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
-import { ROUND_2_SHAPE, unconditionalMoneySentences } from './helpers/unconditional-instruction'
+import { ROUND_2_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from './helpers/unconditional-instruction'
 import {
   matchesWhere as matches,
   shoppingSyncLogFake,
@@ -1672,7 +1672,7 @@ test('[o3d-1e7sl Codex r2] the daily-batch message says "reverse ONLY if it exis
     const m = blocker!.message
     console.log(`# r2 batch precondition: ${c.name} => ${c.unconditional ? 'unconditional' : 'conditional'}`)
     // each standing states its own account before the instruction: whose word, or that it is unproven, or that it is queued.
-    const lead = c.standing === 'ASSERTED_POSTED' ? /typing its id in; IMS never read it from the ledger/
+    const lead = c.standing === 'ASSERTED_POSTED' ? /typing its id in; IMS did not verify it against the ledger/
       : c.standing === 'LIVE_WORK' ? /queued or in flight and has not been confirmed as posted/
       : c.standing === 'CONFIRMED_POSTED' ? null : /UNPROVEN/
     if (lead) assert.match(m, lead, `${c.name}: its own account precedes the instruction`)
@@ -1733,6 +1733,7 @@ test('[o3d-1e7sl Codex r3] no rendering for a non-CONFIRMED standing has an unco
         assert.ok(offending.length >= 1, `${query}: the CONFIRMED_POSTED rendering keeps its unconditional reversal instruction`)
       } else {
         assert.deepEqual(offending, [], `${query}: ${c.name}: unconditional money instruction(s) on a non-confirmed standing`)
+        assert.deepEqual(unlicensedHistoryClaims(blocker!.message, null), [], `${query}: ${c.name}: a history claim (IMS "did not verify that settlement against the ledger" / "never asked" ...) its standing does not license (Codex r5)`)
       }
     }
   }

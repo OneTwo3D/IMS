@@ -467,7 +467,7 @@ test('[o3d-anu8, C1] a CANCELLED registration an OPERATOR asserted HOLDS (with a
   )
   // THE FLIP (C1 / M15). The NOT_POSTED settlement, which names no document, used to read NOTHING:
   // "that assertion IS nothing posted, audited with a person's name, and giving a stranded receipt a
-  // way out is what the settlement action exists for". A person's word about a ledger IMS never read
+  // way out is what the settlement action exists for". A person's word about a ledger IMS did not check
   // is not proof, so it is an attempt nobody can speak for.
   const settled = { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION' }
   console.log(`# precondition M15: ${JSON.stringify(settled)} => ${registrationLedgerStanding(settled)}`)
@@ -492,7 +492,7 @@ test('[o3d-f709 M15] the undecided refusal does not call an operator-settled row
     'SO-1001',
   )
   assert.match(refusal.message, /settled one of these entries as "not posted"/)
-  assert.match(refusal.message, /person's word about an accounting system IMS never read/)
+  assert.match(refusal.message, /person's word about an accounting system IMS did not check/)
   // and the ordinary FAILED text carries no such paragraph
   const failed = describeAttemptUndecidedRefusal([reg({ id: 'log-7', status: 'FAILED' })], 'SO-1001')
   assert.doesNotMatch(failed.message, /settled one of these entries/)

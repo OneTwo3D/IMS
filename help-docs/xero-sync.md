@@ -1450,7 +1450,7 @@ If any of those does not hold, the receipt is still recorded in the IMS, nothing
 
 **A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
-Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS never read, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
+Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there. A receipt whose registration an operator settled as **"did not post"** is refused too: that settlement is a person's word about a ledger the IMS did not check, so the registration is treated as an attempt nobody can speak for — look at the invoice in Xero and, if a payment is on it, reverse it and enter its reference (the IMS then checks that exact payment before deleting anything).
 
 ### Supplier bills: marking one paid again
 
@@ -1470,8 +1470,8 @@ The payment poller clears **Paid** on a bill whose payment Xero has demonstrably
 | The registration is **being sent now** (claimed by the sync worker) | The request may already be on its way and nothing here can recall it | Wait for that entry to finish — it will end up synced or failed; a dead claim is released after 15 minutes — then check the bill in Xero |
 | The registration is **synced** and no poll has retired it | It posted, and no Xero read has since disproved it | Open the bill in Xero. If the payment is there, the bill is settled. If it is genuinely gone, cancel that sync entry and mark the bill paid again |
 | The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
-| The registration was **settled as "did not post"** by an operator | An operator's "not posted" is a person's word about a ledger the IMS never read — a lost response or a payment made by hand leaves the same row — so it does **not** clear the refusal | Open the bill in Xero. If the payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
-| The registration was **settled as "did post"** by an operator (a payment id typed in) | The IMS never saw that payment, and paying again could pay the supplier twice | Open the bill in Xero and confirm the payment. If it is not there, the record was wrong — pay the bill in Xero directly |
+| The registration was **settled as "did not post"** by an operator | An operator's "not posted" is a person's word about a ledger the IMS did not check — a lost response or a payment made by hand leaves the same row — so it does **not** clear the refusal | Open the bill in Xero. If the payment is there, the bill is settled. If it is not, pay the bill in Xero directly |
+| The registration was **settled as "did post"** by an operator (a payment id typed in) | The IMS did not verify that payment, and paying again could pay the supplier twice | Open the bill in Xero and confirm the payment. If it is not there, the record was wrong — pay the bill in Xero directly |
 | The registration **changed status** while the bill was being marked paid | A worker picked it up mid-operation, so its outcome is open | Check that entry, then try again |
 
 A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable. So does a registration the IMS itself retired before it was ever sent (superseded by **Mark as paid**, or cancelled by the sweep while still queued) and one whose payment the poller verified as reversed in Xero.
@@ -1994,7 +1994,7 @@ stranded-rows banner. It records what *you* found in Xero:
 - **It did NOT post** — the row becomes **Cancelled** and no id is written, and it is shown everywhere as
   **asserted: not posted**. **It does NOT make the order deletable again, and it does NOT free the posting to
   be sent again.** (The order's Delete stays refused — cancel the order instead, which keeps the record.) Your statement is your word about
-  a ledger IMS never read — a lost response, a late webhook or a payment made by hand all leave the
+  a ledger IMS did not check — a lost response, a late webhook or a payment made by hand all leave the
   same row — so IMS treats the row as *possibly posted*: it will not queue a replacement, it will not
   clear a held "paid" flag, it will refuse deletion of the receipt it registered, and it keeps the row
   (aged-out rows are compacted, never deleted). To get the posting into the ledger, **check Xero first and, only if the document is not there, record it in
@@ -2037,7 +2037,7 @@ page say which of these a row is:
 | Shown as | What it means | What it does NOT mean |
 | --- | --- | --- |
 | *(no badge), "posted as INV-1"* | Xero answered and returned that document | — |
-| **asserted** | An operator typed that document id in; IMS never read the document or its amount | that Xero holds it |
+| **asserted** | An operator typed that document id in; IMS did not verify the document or its amount | that Xero holds it |
 | **asserted: not posted** | An operator settled the row "did not post". A claim, not proof | that nothing reached Xero — a lost response or a late webhook leaves the same row |
 | **unproven** | A failed row, or one retired by something that could not tell whether a request had already been sent | that nothing was sent |
 | **never sent** | The row was retired before any request was made, and that was recorded at the time (orphan sweep, supersession) | — |

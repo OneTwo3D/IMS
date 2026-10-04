@@ -1001,7 +1001,7 @@ export function describeInvoicePaymentRefusal(params: {
         description:
           `Recorded ${amount} against ${params.orderReference}, but a payment already registered against this `
           + `invoice (${refused.detail ?? 'unnamed'}) was recorded on an OPERATOR'S ASSERTION rather than confirmed by `
-          + `the accounting connector — IMS never made that call and never read the document, so the amount it holds `
+          + `the accounting connector — IMS did not verify that settlement against the ledger and read no document, so the amount it holds `
           + `for it is what it MEANT to send, not what the ledger recorded. How much of the invoice is still `
           + `outstanding therefore cannot be computed, and this receipt was not sent. Open that payment in the `
           + `accounting system and confirm what it actually settled. ${remedy}`,

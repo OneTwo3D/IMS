@@ -59,3 +59,23 @@ export const ROUND_4_SHAPE =
 export const ROUND_2_SHAPE =
   'Reverse it ONLY if it exists there (if it does not exist there is nothing to reverse); a journal cannot be un-posted '
   + 'from here, so then cancel the order and have finance reverse the batch entry.'
+
+/**
+ * o3d-1e7sl Codex round 5 - FACTUAL HISTORY CLAIMS. A string may state what IMS or the connector did or did not do
+ * ("made no call", "never asked", "never sent", "was not sent", "did not reach", "nothing was sent") ONLY when the
+ * standing's cause PROVES it: the pre-call stamp (RECORDED_PRE_CALL), the row's own stored request (REJECTED_BEFORE_POSTING),
+ * a verified reversal. Every other standing (asserted, unproven, queued, confirmed) licenses NO history claim about the
+ * original attempt: an operator can settle a FAILED or PROCESSING attempt whose remote call SUCCEEDED and whose response
+ * was lost. Negated and hedged forms ("does not prove nothing was posted", "may have been posted") are not claims.
+ */
+const HISTORY_CLAIM = /\b(made no call|no call (was|has been) made|never (made|asked|sent|read|called|queried|reached|posted|saw)|(was|were|is|are|has been|have been) not (sent|posted|made|asked|read)|did not (reach|make|ask|read|send|call)|nothing (was|has been) (sent|posted|debited|made))\b/i
+const NOT_A_CLAIM = /(not|never|no) (proof|proven|prove|evidence)[^.;]*|does not (prove|say|show)[^.;]*|cannot (say|tell|rule)[^.;]*|can(not)? (still )?have[^.;]*|may (well )?have[^.;]*|would leave[^.;]*|without proof[^.;]*|not proof[^.;]*|if (it|the document)[^.;]*|could (not )?[^.;]*/gi
+
+/** The history claims a string makes that its cause does not license. `allowed` is the cause's licensed phrasing, or null for none. */
+export function unlicensedHistoryClaims(text: string, allowed: RegExp | null): string[] {
+  return sentencesOf(text.replace(NOT_A_CLAIM, ' ')).filter((clause) => {
+    const m = HISTORY_CLAIM.exec(clause)
+    if (!m) return false
+    return !(allowed && allowed.test(clause))
+  })
+}

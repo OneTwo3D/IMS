@@ -247,7 +247,7 @@ export function describeSyncRowStanding(sync: LedgerStandingRow): string {
     case 'CONFIRMED_POSTED':
       return `${sync.status}${id ? ` with document ${id}` : ''} (confirmed by the connector)`
     case 'ASSERTED_POSTED':
-      return `${sync.status} with document ${id}, TYPED IN BY AN OPERATOR (an assertion; IMS never read it from the ledger)`
+      return `${sync.status} with document ${id}, TYPED IN BY AN OPERATOR (an assertion; IMS did not verify it against the ledger)`
     case 'ASSERTED_NOT_POSTED':
       return `${sync.status}, settled by an operator as NOT posted (an assertion, not proof that it did not post)`
     case 'PROVEN_NOT_POSTED':

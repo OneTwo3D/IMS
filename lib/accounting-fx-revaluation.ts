@@ -216,7 +216,7 @@ export async function reportAssertedRevaluationRows(
       level: 'WARNING',
       description:
         `The unrealised FX run for ${valuationDate} relied on sync log ${row.id}, which an OPERATOR settled `
-        + `as posted under the document id '${row.externalTransactionId ?? ''}'. IMS never saw that document: `
+        + `as posted under the document id '${row.externalTransactionId ?? ''}'. IMS did not verify that document: `
         + 'the run counted it as existing (so no second journal is raised) but the figures it reverses are '
         + 'the queued payload, not what the ledger holds. Check the journal in the accounting system.',
       metadata: { syncLogId: row.id, read, valuationDate, settlementBasis: row.settlementBasis },

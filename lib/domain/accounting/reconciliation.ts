@@ -1307,7 +1307,7 @@ export function evaluateAccountingReconciliationRows(
           // o3d-1e7sl (D6): SAY WHOSE POST IT IS. "Posted" on a mirror an operator's typed id made POSTED, or
           // one whose basis nobody recorded, is not the connector's answer.
           + (postStanding === 'ASSERTED'
-            ? ' (it was marked POSTED on an operator\'s assertion, never read from the ledger)'
+            ? ' (it was marked POSTED on an operator\'s assertion, not verified against the ledger)'
             : postStanding === 'UNRECORDED'
               ? ' (how it came to be POSTED was never recorded)'
               : ''),

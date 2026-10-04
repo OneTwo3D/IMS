@@ -92,7 +92,7 @@ test('o3d-f709: every one of the twelve rows is exercised, and the table is not 
 test('o3d-f709 C1: an operator-asserted NOT_POSTED is NOT proof - it may have reached the ledger and is not a fact', () => {
   const asserted = row({ status: 'CANCELLED', settlementBasis: OA })
   assert.equal(ledgerStanding(asserted), 'ASSERTED_NOT_POSTED')
-  assert.equal(mayHaveReachedLedger(asserted), true, 'a person\'s word about a ledger IMS never read')
+  assert.equal(mayHaveReachedLedger(asserted), true, 'a person\'s word about a ledger IMS did not check')
   assert.equal(isProvenLedgerFact(asserted), false)
   // and the control, so the assertion is about the assertion: the sweep's own proof still resolves.
   assert.equal(mayHaveReachedLedger(row({ abandonedBeforeRemoteCall: true })), false)

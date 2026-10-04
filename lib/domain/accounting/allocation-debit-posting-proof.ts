@@ -192,7 +192,7 @@ export function describeJournalRowState(row: LedgerStandingRow): string {
  */
 export function unprovedJournalClause(proof: { statuses: string; asserted?: boolean }): string {
   return proof.asserted
-    ? `${proof.statuses} (a document id an operator typed in - IMS never read the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
+    ? `${proof.statuses} (a document id an operator typed in - IMS did not verify it against the ledger, and the journal's lines are what was queued, not a ledger figure), not a connector-confirmed posting`
     : `${proof.statuses}, not SYNCED`
 }
 

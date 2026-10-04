@@ -527,7 +527,7 @@ export async function findSalesOrderDeleteBlocker(
           // which is the very thing that has not been established.
           ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
             + `recorded as POSTED${named ? ` (${named})` : ''}. `
-            + 'That is an assertion, not a confirmation: IMS never made the call and never read the document, so this id '
+            + 'That is an assertion, not a confirmation: IMS did not verify this settlement against the ledger and read no document, so this id '
             + 'is what somebody typed in. Open it in the accounting system first. If it exists there, it needs an '
             + 'explicit reversal or credit note, and cancelling the order does not undo a posted document. If it does not '
             + 'exist there, the settlement was recorded in error and that is what has to be corrected before anything is deleted.'
@@ -535,7 +535,7 @@ export async function findSalesOrderDeleteBlocker(
             // o3d-1e7sl (C1): a person's "NOT POSTED" is a claim, not proof, and it KEEPS BLOCKING. Say
             // that it is a claim, that IMS has not checked, and never that nothing was posted.
             ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) an OPERATOR `
-              + 'settled as NOT POSTED. That is an assertion, not proof: IMS never asked the accounting system, and a lost '
+              + 'settled as NOT POSTED. That is an assertion, not proof: IMS did not verify the settlement against the accounting system, and a lost '
               + 'response or a late webhook leaves the same row behind, so whether the document reached the ledger is '
               + 'UNPROVEN. Check the accounting system for it. If it exists there, it needs an explicit reversal or credit note. '
               + 'If it does not exist, this order still cannot be hard-deleted from here (nothing records that check yet): cancel '
@@ -721,7 +721,7 @@ export async function findSalesOrderDeleteBlocker(
             ? 'Whether this batch journal reached the accounting system is UNPROVEN (an operator settled it as not posted, '
               + 'or it was retired with no recorded pre-call proof). '
             : batchStanding === 'ASSERTED_POSTED'
-              ? 'An operator recorded this batch journal as posted by typing its id in; IMS never read it from the ledger. '
+              ? 'An operator recorded this batch journal as posted by typing its id in; IMS did not verify it against the ledger. '
               : 'This batch journal is queued or in flight and has not been confirmed as posted. ')
             + 'Check the accounting system for that journal. Reverse it ONLY if it exists there; otherwise there is '
             + 'nothing to undo. Either way, cancel the order instead of deleting it (a posted journal cannot be un-posted from here).'),

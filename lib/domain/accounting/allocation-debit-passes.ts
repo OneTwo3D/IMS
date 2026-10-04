@@ -710,7 +710,7 @@ export function allocationDebitForeignLedgerReports(input: {
       .map(({ pass }) => `${pass.order} £${pass.amount.toFixed(2)} under journal ${pass.syncLogId} on ${pass.connector} (account ${pass.accountCode})`)
       .join('; ')
     + ' - an OPERATOR recorded that journal as posted by typing its id in. IMS counts it as existing (it will not rebuild '
-    + 'it, which would double the debit) but never read it from the ledger, so the amount is UNCONFIRMED: open it in the '
+    + 'it, which would double the debit) but did not verify it against the ledger, so the amount is UNCONFIRMED: open it in the '
     + 'accounting system and check it covers these pounds.',
   ]
   if (owedEntries.length === 0) return assertedReports
@@ -726,7 +726,7 @@ export function allocationDebitForeignLedgerReports(input: {
       .map(({ pass, state }) => (
         `${pass.order} £${pass.amount.toFixed(2)}`
         + (pass.syncLogId
-          ? ` under journal ${pass.syncLogId}${state === 'unsettled' ? ', whose row is on record but never reached SYNCED' : ''}`
+          ? ` under journal ${pass.syncLogId}${state === 'unsettled' ? ', whose row is on record but is not SYNCED' : ''}`
           : ', which raised no journal at all')
         + ` (account ${pass.accountCode})`
       ))

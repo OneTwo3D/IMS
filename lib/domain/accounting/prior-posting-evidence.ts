@@ -70,7 +70,7 @@ import {
  *
  * ONE CANCELLED ROW IS DIFFERENT: the NOT_POSTED settlement (CANCELLED + OPERATOR_ASSERTION, no id).
  * It used to be the way to re-queue work: "the operator looked, nothing posted, free the slot".
- * C1: an operator's word about a ledger IMS never read is not proof, so the slot is BLOCKED - the
+ * C1: an operator's word about a ledger IMS did not check is not proof, so the slot is BLOCKED - the
  * enqueue refuses, and the operator hand-posts and marks the posting handled. And a SYNCED row an
  * operator typed a document id into still occupies the slot (the document is claimed to exist) but
  * the suppression is REPORTED, never silent.
@@ -265,7 +265,7 @@ export function describeAssertedPriorAttempt(params: {
   return `NOTHING WAS QUEUED, ON AN OPERATOR'S WORD. A ${params.type} for ${params.referenceType} `
     + `${params.referenceId} was not raised because sync row ${params.syncLogId} was settled by an operator as `
     + `posted${params.externalTransactionId ? ` (document ${params.externalTransactionId})` : ''} - a document id typed in `
-    + 'by hand, which IMS never saw in the accounting system. Raising it again could post a second document if '
+    + 'by hand, which IMS did not verify in the accounting system. Raising it again could post a second document if '
     + 'the operator is right; not raising it leaves the posting missing if they are wrong. Open that document in '
     + 'the accounting system and confirm it exists.'
 }
@@ -283,7 +283,7 @@ export function describeBlockedPriorAttempt(params: {
 }): string {
   return `NOTHING WAS QUEUED. A previous ${params.type} attempt for ${params.referenceType} ${params.referenceId} `
     + `(sync row ${params.syncLogId}) was settled by an operator as "not posted". That is a person's word about an `
-    + 'accounting system IMS never read - a lost response, a late webhook or a hand-posted document would leave the '
+    + 'accounting system IMS did not check - a lost response, a late webhook or a hand-posted document would leave the '
     + 'same row - so IMS will not post this again on the strength of it, and posting again could create a SECOND '
     + 'document. REMEDY: open the accounting system. If the document is there, nothing more is owed. If it is not, '
     + 'post it there by hand and mark this posting handled in the refusal inbox. This posting is still outstanding '
