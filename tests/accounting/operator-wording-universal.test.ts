@@ -404,6 +404,7 @@ test('[o3d-1e7sl Codex r9] a missing / not-loaded input can never select the pla
   }
   // the row mapping every dialog uses: only a row the server marked 'loaded' (with its arrays) reads as loaded
   assert.equal(handPostInputOf({ type: 'SALES_INVOICE' }).state, 'not-loaded', 'a row without the flag')
+  assert.equal(handPostInputOf({ type: 'SALES_INVOICE', earlierPostingDetails: [], retiredUnproven: [] }).state, 'not-loaded', 'arrays present but the server never said they were loaded')
   assert.equal(handPostInputOf({ type: 'SALES_INVOICE', handPostState: 'not-loaded', earlierPostingDetails: [], retiredUnproven: [] }).state, 'not-loaded', 'a provisional row, whose empty arrays are not a statement')
   assert.equal(handPostInputOf({ type: 'SALES_INVOICE', handPostState: 'loaded' }).state, 'not-loaded', 'loaded but arrays missing')
   assert.equal(handPostInputOf({ type: 'SALES_INVOICE', handPostState: 'loaded', earlierPostingDetails: [], retiredUnproven: [] }).state, 'loaded', 'positively asserted')
