@@ -51,6 +51,8 @@ const wc = {
   gate: null as Gate | null,
 }
 const activity: Array<Record<string, unknown>> = []
+/** When set, logActivity THROWS for this action: models the process failing after the transaction committed. */
+const activityFault = { action: null as string | null }
 
 function newGate(mode: Gate['mode']): Gate {
   return { mode, reached: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() }
@@ -58,7 +60,11 @@ function newGate(mode: Gate['mode']): Gate {
 
 mock.module('@/lib/activity-log', {
   namedExports: {
-    logActivity: async (entry: Record<string, unknown>) => { activity.push(entry) },
+    logActivity: async (entry: Record<string, unknown>) => {
+      // Only the INFO audit row written after the commit: the action's own error handler logs the same action at ERROR.
+      if (activityFault.action !== null && entry.action === activityFault.action && entry.level !== 'ERROR') throw new Error('forced failure after the commit')
+      activity.push(entry)
+    },
     logActivityInTransaction: async () => {},
   },
 })
@@ -154,6 +160,7 @@ function resetWc() {
   wc.statusOverride = null
   wc.gate = null
   activity.length = 0
+  activityFault.action = null
 }
 
 function loadEnv() {
@@ -313,8 +320,8 @@ test('o3d-6ldlj (arm 8): IMS SUPERSESSION — a hold that was released, or an or
     assert.equal(wc.gets, 0, `${c.name}: ZERO WooCommerce reads`)
     assert.equal(wc.puts, 0, `${c.name}: ZERO WooCommerce writes`)
     assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED', `${c.name}: superseded is a settled outcome`)
-    assert.equal(activity.filter((a) => a.action === 'wc_status_push_superseded').length, 1, `${c.name}: recorded, and says nothing was sent`)
-    assert.match(String(activity.find((a) => a.action === 'wc_status_push_superseded')?.description), /Nothing was sent to WooCommerce/)
+    assert.equal(activity.filter((a) => a.action === 'wc_status_push_superseded').length, 1, `${c.name}: recorded, and says only that THIS attempt sent nothing`)
+    assert.match(String(activity.find((a) => a.action === 'wc_status_push_superseded')?.description), /This attempt sent nothing to WooCommerce/)
     evaluated++
   }
   assert.equal(evaluated, 2)
@@ -394,7 +401,7 @@ test('o3d-6ldlj (arm 9): a FINALISED storefront order is left alone — success,
       const warn = activity.filter((a) => a.action === 'wc_status_push_left_alone')
       assert.equal(warn.length, 1, `${kind.name}/${slug}: a WARNING says the two systems may disagree`)
       assert.equal(warn[0].level, 'WARNING')
-      assert.match(String(warn[0].description), /WooCommerce was not changed/)
+      assert.match(String(warn[0].description), /did not change WooCommerce/)
       evaluated++
     }
   }
@@ -417,7 +424,7 @@ test('o3d-6ldlj (arm 10): a partial-shipped / withdrawal order NEEDS AN OPERATOR
     assert.equal(row.status, 'PERMANENT_FAILED', `${kind.name}: straight to the exception inbox`)
     assert.equal(row.attempts, 1, 'not retried: retrying cannot change a stable refusal')
     assert.match(String(row.lastError), /part-shipped or EU-withdrawal/)
-    assert.match(String(row.lastError), /WooCommerce was not changed/, 'accurate: the connector refused BEFORE any PUT')
+    assert.match(String(row.lastError), /this attempt did not change WooCommerce/, 'accurate: the connector refused BEFORE any PUT of this attempt, and says no more than that')
     assert.equal(activity.filter((a) => a.action === `wc_${kind.name}_dead_lettered` && a.level === 'ERROR').length, 1)
 
     // The operator resolves it in the storefront and presses Replay: the retry re-reads and pushes.
@@ -498,11 +505,14 @@ test('o3d-6ldlj (arm 12): exactly one sender per row however many workers race (
     const drain = () => deps.processWcOrderStatusJobs({ idempotencyKeys: [key] })
     const cronDrain = () => deps.processWcOrderStatusJobs() // what the cron calls: no keys
     const all = Array.from({ length: WORKERS }, (_, i) => (i === 0 ? cronDrain() : drain()))
+    const settled = new Set<number>()
+    all.forEach((promise, i) => { void promise.then(() => settled.add(i)) })
     await gate.reached.promise
-    const losers = await Promise.all(all.slice(1))
+    // Whoever won the claim is parked inside its request; the other seven return without sending.
+    await until(async () => settled.size === WORKERS - 1, 'the seven losing workers to return')
     gate.release.resolve()
-    const winner = await all[0]
-    const claimed = [winner, ...losers].reduce((sum, r) => sum + r.claimed, 0)
+    const results = await Promise.all(all)
+    const claimed = results.reduce((sum, r) => sum + r.claimed, 0)
     assert.ok(claimed >= 1, 'precondition: someone claimed it')
     assert.equal(claimed, 1, `${kind.name}: exactly one worker claimed the row (claimed=${claimed})`)
     assert.equal(wc.puts, 1, `${kind.name}: and exactly one PUT was sent`)
@@ -692,7 +702,7 @@ test('o3d-6ldlj (arm 17b): a slow worker that finishes while the park is waiting
     }, { timeout: 30_000 })
     const holderPid = await holderReady.promise
 
-    const parking = deps.parkStaleWcOrderStatusClaims(t0, [kind === kindsOf(deps)[0] ? deps.WC_ORDER_CANCEL_JOB : deps.WC_ORDER_HOLD_JOB])
+    const parking = deps.parkStaleWcOrderStatusClaims(t0, [kind.name === 'cancel' ? deps.WC_ORDER_CANCEL_JOB : deps.WC_ORDER_HOLD_JOB])
     // Release the holder only once the park's UPDATE is demonstrably blocked behind it.
     const parked = await waitUntilParkedBehind(deps.db, { holderPid, waitingOn: /integration_outbox/i, describe: `${kind.name} park behind the slow worker` })
     assert.ok(parked.pid > 0, 'precondition: the park really was waiting on the row the slow worker holds')
@@ -874,6 +884,36 @@ test('o3d-6ldlj (arm 22): the enqueue is atomic with the flip — a commit that 
     assert.deepEqual(retry, { success: true })
     assert.equal((await rowsForOrder(deps, orderId)).length, 1, `${c.target}: control: the same call writes its row when the commit succeeds`)
     await until(async () => (await rowsForOrder(deps, orderId))[0].status === 'SUCCEEDED', `${c.target} control attempt`)
+    evaluated++
+  }
+  assert.equal(evaluated, 2)
+})
+
+test('o3d-6ldlj (arm 22b): the row is DURABLE WITH THE FLIP — a failure AFTER the commit (before any attempt) leaves the flip and the row, and the cron drain pushes it', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  let evaluated = 0
+  for (const c of [{ target: 'CANCELLED', operation: 'order.cancel', wc: 'cancelled' }, { target: 'ON_HOLD', operation: 'order.hold', wc: 'on-hold' }]) {
+    resetWc()
+    const orderId = await newOrder(deps, `post-commit-fail-${c.target}`, 'PROCESSING')
+    // The action's own post-commit audit row throws: the action reports failure although the transaction committed,
+    // and the process "dies" before the post-commit attempt is made.
+    activityFault.action = 'status_changed'
+    const result = await transition(deps, orderId, c.target, { pushStatusToWooCommerce: true })
+    activityFault.action = null
+    assert.equal(result.success, false, `${c.target}: precondition: the action failed AFTER committing`)
+    assert.match(String(result.error), /forced failure after the commit/)
+    assert.equal((await deps.db.salesOrder.findUniqueOrThrow({ where: { id: orderId } })).status, c.target, `${c.target}: the flip is committed`)
+    const rows = await rowsForOrder(deps, orderId)
+    assert.equal(rows.length, 1, `${c.target}: and so is the durable row (enqueued INSIDE the transaction, not after it)`)
+    assert.equal(rows[0].operation, c.operation)
+    assert.equal(rows[0].status, 'PENDING', 'precondition: nothing attempted it')
+    assert.equal(wc.gets, 0)
+
+    const drain = await deps.processWcOrderStatusJobs() // the cron
+    assert.ok(drain.claimed >= 1)
+    assert.equal(wc.status, c.wc, `${c.target}: the drain pushed it`)
+    assert.equal((await rowsForOrder(deps, orderId))[0].status, 'SUCCEEDED')
     evaluated++
   }
   assert.equal(evaluated, 2)

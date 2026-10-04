@@ -224,8 +224,8 @@ async function attemptWcOrderStatusPush(descriptor: WcOrderStatusJobDescriptor, 
     await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_push_superseded', tag: 'sync', level: 'INFO',
       description: imsStatus === null
-        ? `The WooCommerce ${descriptor.noun} push for order ${orderId} was dropped: the order no longer exists in IMS. Nothing was sent to WooCommerce.`
-        : `The WooCommerce ${descriptor.noun} push for order ${orderId} was dropped: the order is now ${imsStatus} in IMS, not ${descriptor.imsTarget}. Nothing was sent to WooCommerce.`,
+        ? `The WooCommerce ${descriptor.noun} push for order ${orderId} was dropped: the order no longer exists in IMS. This attempt sent nothing to WooCommerce.`
+        : `The WooCommerce ${descriptor.noun} push for order ${orderId} was dropped: the order is now ${imsStatus} in IMS, not ${descriptor.imsTarget}. This attempt sent nothing to WooCommerce.`,
       resolveUser: false,
     }).catch(() => {})
     return { kind: 'done' }
@@ -260,14 +260,14 @@ async function attemptWcOrderStatusPush(descriptor: WcOrderStatusJobDescriptor, 
           // Left alone on purpose: IMS must not overwrite a settled storefront order. A WARNING, NOT an exception.
           await logActivity({
             entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_push_left_alone', tag: 'sync', level: 'WARNING',
-            description: `IMS ${descriptor.imsTarget === 'CANCELLED' ? 'cancelled' : 'held'} order ${orderId} but the WooCommerce order is "${outcome.wcStatus}", which IMS never overwrites, so the ${descriptor.noun} was NOT pushed and WooCommerce was not changed. Check whether the two systems should agree.`,
+            description: `IMS ${descriptor.imsTarget === 'CANCELLED' ? 'cancelled' : 'held'} order ${orderId} but the WooCommerce order is "${outcome.wcStatus}", which IMS never overwrites, so this attempt did not push the ${descriptor.noun} and did not change WooCommerce. Check whether the two systems should agree.`,
             resolveUser: false,
           }).catch(() => {})
           return { kind: 'done' }
         case 'needs-operator':
           return {
             kind: 'needs-operator',
-            reason: `WooCommerce order is "${outcome.wcStatus}" (a part-shipped or EU-withdrawal status). IMS does not push a ${descriptor.noun} over it automatically and WooCommerce was not changed: decide what the ${descriptor.noun} should mean for that order in the storefront and apply it there. Replay only re-checks the order.`,
+            reason: `WooCommerce order is "${outcome.wcStatus}" (a part-shipped or EU-withdrawal status). IMS does not push a ${descriptor.noun} over it automatically and this attempt did not change WooCommerce: decide what the ${descriptor.noun} should mean for that order in the storefront and apply it there. Replay only re-checks the order.`,
           }
         case 'unknown':
           return { kind: 'retry', reason: `WooCommerce order is "${outcome.wcStatus}", a status IMS has no reading of; add a status mapping for it, then the ${descriptor.noun} can be pushed` }

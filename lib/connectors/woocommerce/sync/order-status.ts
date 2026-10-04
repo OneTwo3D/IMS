@@ -242,7 +242,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       if (currentWc.error) {
         await logActivity({
           entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_push_skipped', tag: 'sync', level: 'WARNING',
-          description: `Did not push ${externalStatus} to WC order #${wcRef}: could not read its current status (${currentWc.error}), so nothing was sent and the push will be retried`,
+          description: `Did not push ${externalStatus} to WC order #${wcRef}: could not read its current status (${currentWc.error}), so this attempt sent nothing and the push will be retried`,
           resolveUser: false,
         })
         return { kind: 'read-failed', error: String(currentWc.error) }

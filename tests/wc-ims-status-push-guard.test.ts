@@ -135,7 +135,7 @@ test('o3d-6ldlj (b, DEFECT A): an UNREADABLE WooCommerce status sends NO PUT and
     const skipped = state.activity.filter((a) => a.action === 'wc_status_push_skipped')
     assert.equal(skipped.length, 1, status)
     assert.equal(skipped[0].level, 'WARNING')
-    assert.match(String(skipped[0].description), /nothing was sent/, `${status}: true here, because the read failed before any PUT (puts asserted 0 above)`)
+    assert.match(String(skipped[0].description), /this attempt sent nothing/, `${status}: true here, because the read failed before any PUT (puts asserted 0 above)`)
     evaluated++
   }
   assert.equal(evaluated, 2)
