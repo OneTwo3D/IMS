@@ -701,6 +701,12 @@ function exceedsIntDigits(value: Dec, digits: number): boolean {
   return value.abs().gte(new D(10).pow(digits))
 }
 
+/** The opening row after an in-transit addition: its quantity and its value (quantity x average cost) must both be storable. */
+function openingOutOfRange(group: StockGroup, need: Dec): boolean {
+  const qty = group.lotQty.add(need)
+  return exceedsIntDigits(qty, NUMERIC_LIMITS.stockQty.maxIntDigits) || exceedsIntDigits(group.average.mul(qty), NUMERIC_LIMITS.stockValue.maxIntDigits)
+}
+
 function stockGroupKey(key: string, warehouse: string): string {
   return `${key}\u0000${warehouse}`
 }
@@ -786,9 +792,9 @@ function loadStock(run: Run): void {
   const identical: string[] = []
   for (const [gk, list] of [...groups.entries()]) {
     const collapsed = collapseLots(list.map((l) => ({ qty: l.qty, unitCostBase: l.unitCostBase })))
-    if (exceedsIntDigits(collapsed.qty, NUMERIC_LIMITS.stockQty.maxIntDigits) || exceedsIntDigits(collapsed.average, NUMERIC_LIMITS.unitCost.maxIntDigits)) {
+    if (exceedsIntDigits(collapsed.qty, NUMERIC_LIMITS.stockQty.maxIntDigits) || exceedsIntDigits(collapsed.average, NUMERIC_LIMITS.unitCost.maxIntDigits) || exceedsIntDigits(collapsed.average.mul(collapsed.qty), NUMERIC_LIMITS.stockValue.maxIntDigits)) {
       for (const lot of list) {
-        run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'COLLAPSED_OUT_OF_RANGE', `the ${list.length} lot(s) of ${lot.sku} in ${lot.warehouse} collapse to quantity ${fmt(collapsed.qty)} at ${fmtFixed(collapsed.average, AVERAGE_COST_DP)}, beyond what the stock quantity (8 integer digits) or cost (9 integer digits) can hold`)
+        run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'COLLAPSED_OUT_OF_RANGE', `the ${list.length} lot(s) of ${lot.sku} in ${lot.warehouse} collapse to quantity ${fmt(collapsed.qty)} at ${fmtFixed(collapsed.average, AVERAGE_COST_DP)}, beyond what the stock quantity (8 integer digits), cost (9) or movement value (quantity x cost, 12) can hold`)
       }
       continue
     }
@@ -911,7 +917,7 @@ function loadTransfers(run: Run): void {
     const group = run.stockGroups.get(gk)
     if (convention === 'counted-in-source') {
       if (!group || group.lotQty.lt(need)) failedSources.add(gk)
-    } else if (!group || exceedsIntDigits(group.lotQty.add(need), NUMERIC_LIMITS.stockQty.maxIntDigits)) failedSources.add(gk)
+    } else if (!group || openingOutOfRange(group, need)) failedSources.add(gk)
   }
   const transferGroups = new Map<string, Line[]>()
   for (const l of live) {
@@ -919,9 +925,9 @@ function loadTransfers(run: Run): void {
     if (failedSources.has(gk)) {
       const group = run.stockGroups.get(gk)
       const need = needBySource.get(gk)!
-      const overflow = convention === 'excluded-from-source' && !!group && exceedsIntDigits(group.lotQty.add(need), NUMERIC_LIMITS.stockQty.maxIntDigits)
+      const overflow = convention === 'excluded-from-source' && !!group && openingOutOfRange(group, need)
       const reason = overflow
-        ? `adding the ${fmt(need)} in transit to the ${fmt(group!.lotQty)} on hand for ${l.sku} in ${l.from} gives an opening quantity beyond what the stock quantity column can hold (8 integer digits)`
+        ? `adding the ${fmt(need)} in transit to the ${fmt(group!.lotQty)} on hand for ${l.sku} in ${l.from} gives an opening quantity or value (quantity x average cost) beyond what the stock quantity (8 integer digits) or movement value (12) columns can hold`
         : convention === 'counted-in-source'
         ? `source stock for ${l.sku} in ${l.from} is ${group ? fmt(group.lotQty) : 'absent from the stock extract'} but ${fmt(need)} is in transit from it; with the "counted-in-source" convention the source quantity must cover the in-transit quantity or the importer cannot dispatch it`
         : `no stock row with cost for ${l.sku} in ${l.from}: under the "excluded-from-source" convention the in-transit units are added to the source opening balance at its weighted-average cost, and there is none to use`
@@ -1070,6 +1076,20 @@ function loadPurchaseOrders(run: Run): void {
     const shapes = new Set(list.map((l) => JSON.stringify([l.supplierName.toUpperCase(), l.currency, l.fxText, l.warehouse, l.pricesIncludeVat, l.supplierRef, l.expectedDelivery, l.notes, l.taxRateName, l.taxRateValue])))
     if (shapes.size > 1) {
       for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'REJECTED', 'INCONSISTENT_ORDER_FIELDS', 'open lines of one orderKey differ in supplier, currency, fx rate, warehouse, VAT flag, supplier reference, delivery date, notes or tax rate; the importer refuses such an order')
+      continue
+    }
+    const fx = new D(list[0].fxText)
+    const taxText = list[0].taxRateValue
+    const taxRate = taxText === '' ? new D(0) : new D(taxText).gt(1) ? new D(taxText).div(100) : new D(taxText)
+    const subtotalForeign = sum(list.map((l) => l.qty.mul(l.unitCost)))
+    const grossForeign = subtotalForeign.mul(new D(1).add(taxRate))
+    const grossBase = grossForeign.mul(fx)
+    if (
+      exceedsIntDigits(grossForeign, NUMERIC_LIMITS.orderValue.maxIntDigits)
+      || exceedsIntDigits(grossBase, NUMERIC_LIMITS.orderValue.maxIntDigits)
+      || list.some((l) => exceedsIntDigits(l.unitCost.mul(fx), NUMERIC_LIMITS.unitCostBaseColumn.maxIntDigits))
+    ) {
+      for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'REJECTED', 'ORDER_VALUE_OUT_OF_RANGE', `the order's value (${fmt(grossForeign)} foreign, ${fmt(grossBase)} base, tax included) or a base unit cost is beyond what the purchase order columns can hold (14 integer digits for totals, 12 for a unit cost)`)
       continue
     }
     for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'EMITTED', 'PO_LINE', 'outstanding quantity is in the purchase-orders import file')

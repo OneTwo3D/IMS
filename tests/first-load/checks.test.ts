@@ -339,6 +339,43 @@ test('stock ranges: a collapsed quantity, a converted cost and an in-transit add
   assert.deepEqual(rejectedCodes(fxOver, 'stock-lots'), ['BAD_UNIT_COST'])
   assert.deepEqual(rejectedCodes(inTransitOver, 'transfers'), ['OPENING_QTY_OUT_OF_RANGE'])
   for (const result of [sumOver, fxOver, inTransitOver]) assert.equal(result.blocking, true)
-  const edge = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999.999999', '999999999.999999')]) })
-  assert.equal(edge.blocking, false, 'the largest storable values still pass')
+  const edge = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999.999999', '9999.999999')]) })
+  assert.equal(edge.blocking, false, 'the largest storable VALUE (quantity x cost just under 12 integer digits) still passes')
+})
+
+test('stock value: quantity and cost that each fit but whose product (the movement value) does not are rejected, with and without an in-transit addition', (t) => {
+  const products = ds('products', [product('A'), product('B')])
+  const valueOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999', '10000.5')]) })
+  const inTransitValueOver = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('B', '90000000', '10500')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'B', qtyShipped: '9000000', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'excluded-from-source' })
+  const inTransitFits = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('B', '90000000', '10500')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'B', qtyShipped: '9000000', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'counted-in-source' })
+  precondition(t, 'value cases', 3)
+  assert.deepEqual(rejectedCodes(valueOver, 'stock-lots'), ['COLLAPSED_OUT_OF_RANGE'])
+  assert.deepEqual(rejectedCodes(inTransitValueOver, 'transfers'), ['OPENING_QTY_OUT_OF_RANGE'])
+  assert.equal(inTransitFits.blocking, false, 'the same stock with the in-transit units already inside it fits')
+})
+
+test('purchase order values: a line total, an order total (tax included) or a base unit cost that the columns cannot hold rejects the whole order', (t) => {
+  const products = ds('products', [product('A')])
+  const order = (key: string, extra: Record<string, string>) => poLine({ orderKey: key, sku: 'A', ...extra })
+  const result = run({
+    products,
+    'purchase-order-lines': ds('purchase-order-lines', [
+      order('BIG', { qtyOrdered: '99999999', unitCostForeign: '999999999' }),
+      order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999', taxRateValue: '20' }),
+      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '5000' }),
+      order('OK', { qtyOrdered: '1000', unitCostForeign: '1000' }),
+    ]),
+  })
+  precondition(t, 'orders', 4)
+  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
+  const emitted = result.report.accountingByCode.find((r) => r.code === 'PO_LINE')
+  assert.equal(emitted?.count, 1)
 })

@@ -347,6 +347,12 @@ export const NUMERIC_LIMITS = {
   /** A lot's cost may carry more decimals; only the collapsed average is rounded (to 6 dp). */
   lotUnitCost: { maxIntDigits: 9, maxDp: 10 },
   fx: { maxIntDigits: 6, maxDp: 10 },
+  /** StockMovement.totalValueBase Decimal(18,6), written by opening stock (quantity x average cost): 12 integer digits. */
+  stockValue: { maxIntDigits: 12 },
+  /** PurchaseOrder subtotal/total and line totals Decimal(18,4): 14 integer digits, foreign and base. */
+  orderValue: { maxIntDigits: 14 },
+  /** PurchaseOrderLine.unitCostBase Decimal(18,6): 12 integer digits after the rate is applied. */
+  unitCostBaseColumn: { maxIntDigits: 12 },
   dimension: { maxIntDigits: 9, maxDp: 6 },
 } as const
 
