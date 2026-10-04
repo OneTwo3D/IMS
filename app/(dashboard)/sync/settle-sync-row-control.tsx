@@ -255,7 +255,7 @@ function SettleSyncRowDialog({
                   as proof that nothing posted (a lost response or a late webhook leaves the same row), and it
                   shows as &quot;asserted: not posted&quot; wherever the row appears. It does NOT free the order for
                   deletion (cancel the order instead), and IMS will not queue the same posting again behind it -
-                  check the accounting system, and ONLY if the document is not there hand-post it and mark the posting handled. If a document turns up
+                  check the accounting system, and ONLY if the document is not there hand-post it and mark the posting handled (for an invoice or bill update, check for the CURRENT version, not an earlier one). If a document turns up
                   after all, the connector records its id on this row anyway and the order stays blocked —
                   evidence outranks an assertion.
                 </p>

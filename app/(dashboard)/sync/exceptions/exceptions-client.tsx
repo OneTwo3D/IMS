@@ -2,10 +2,7 @@
 
 import { Fragment, useState, useTransition } from 'react'
 import {
-  ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING,
   ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
-  ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING,
-  ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_LONGEST_HELD_DETAIL,
   ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT,
@@ -13,6 +10,14 @@ import {
   ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL,
   ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL,
 } from '@/lib/domain/accounting/posting-refusal-copy'
+import {
+  claimWarningFor,
+  handPostInputOf,
+  markHandledWarningFor,
+  releaseWarningFor,
+  STATE_UNKNOWN_HAND_POST_INPUT,
+  type HandPostInput,
+} from '@/lib/domain/accounting/hand-post-instruction'
 import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
@@ -93,14 +98,14 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
   const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
   // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
-  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [markingRefusal, setMarkingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
   const [markingNote, setMarkingNote] = useState('')
   /**
    * o3d-j625 r16 (Codex round 15, HIGH 1): the two halves of settling a posting by hand that are NOT the
    * acknowledgement — taking it (which is what stops IMS queueing it) and giving it back.
    */
-  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string } | null>(null)
-  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string } | null>(null)
+  const [claimingRefusal, setClaimingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
+  const [releasingRefusal, setReleasingRefusal] = useState<{ id: string; label: string; input: HandPostInput } | null>(null)
   /**
    * o3d-j625 r20 (Codex round 19, HIGH) — THE CLAIMS SECTION IS A WALK, NOT A CAP.
    *
@@ -209,7 +214,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Take {claimingRefusal.label} for hand posting</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{claimWarningFor(claimingRefusal.input)}</p>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => setClaimingRefusal(null)}>Cancel</Button>
               <Button
@@ -236,7 +241,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Release {releasingRefusal.label}</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{releaseWarningFor(releasingRefusal.input)}</p>
             <DialogFooter>
               <Button type="button" variant="outline" disabled={isPending} onClick={() => setReleasingRefusal(null)}>Cancel</Button>
               <Button
@@ -264,7 +269,7 @@ export function ExceptionsClient({ data }: Props) {
             <DialogHeader>
               <DialogTitle>Mark {markingRefusal.label} as handled</DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-muted-foreground">{ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING}</p>
+            <p className="text-sm text-muted-foreground">{markHandledWarningFor(markingRefusal.input)}</p>
             <div className="space-y-1">
               <Label htmlFor="refusal-handled-note">Note (optional) — e.g. the ledger journal number</Label>
               <Input
@@ -1118,7 +1123,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: STATE_UNKNOWN_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>
@@ -1194,7 +1199,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}` })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: STATE_UNKNOWN_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>
@@ -1297,7 +1302,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                        onClick={() => setClaimingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) })}
                       >
                         <PencilLine className="h-3 w-3 mr-1" />Take for hand posting
                       </Button>
@@ -1313,7 +1318,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` }) }}
+                        onClick={() => { setMarkingNote(''); setMarkingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) }) }}
                       >
                         <CheckCircle2 className="h-3 w-3 mr-1" />Mark as handled
                       </Button>
@@ -1324,7 +1329,7 @@ export function ExceptionsClient({ data }: Props) {
                         variant="outline"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}` })}
+                        onClick={() => setReleasingRefusal({ id: row.id, label: `${row.type} ${row.referenceType}/${row.referenceId}`, input: handPostInputOf(row) })}
                       >
                         <XCircle className="h-3 w-3 mr-1" />Release
                       </Button>

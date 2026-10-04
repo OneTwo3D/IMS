@@ -6,6 +6,7 @@ import {
   isPostableAccountingSyncStatus,
   retiredUnprovenRows,
 } from '@/lib/domain/accounting/postable-sync-statuses'
+import { describeEarlierPostings, describeRetiredUnproven, GENERIC_HAND_POST_STEP, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -286,44 +287,11 @@ export function retiredUnprovenNotes(rows: ReadonlyArray<LedgerStandingRow & { i
  * the operator needs: whether the ledger CONFIRMED that document or an operator merely typed its id in (an asserted SYNCED
  * row is an "earlier posting" on a reused key too). The ref is for display; the standing decides the wording.
  */
-export type EarlierPosting = { ref: string; standing: LedgerStanding }
+
+export { describeEarlierPostings, describeRetiredUnproven, type EarlierPosting }
 
 export function earlierPostingOf(row: LedgerStandingRow & { id?: string }): EarlierPosting {
   return { ref: row.externalTransactionId ?? `${row.status} row`, standing: ledgerStanding(row) }
-}
-
-/**
- * The earlier postings as an operator-facing sentence ('' when none). CONFIRMED rows keep the plain statement; every other
- * standing is "recorded, NOT verified": the hand posting replaces the document ONLY if the ledger has it, and is a new
- * document if it does not. Never says a hand posting "replaces" a document IMS did not verify without that condition.
- */
-export function describeEarlierPostings(earlier: readonly EarlierPosting[]): string {
-  if (earlier.length === 0) return ''
-  const confirmed = earlier.filter((e) => e.standing === 'CONFIRMED_POSTED')
-  const unverified = earlier.filter((e) => e.standing !== 'CONFIRMED_POSTED')
-  const note = (e: EarlierPosting) => `${e.ref}${e.standing === 'ASSERTED_POSTED' ? ' (an id an operator typed in)' : ' (unproven)'}`
-  return (confirmed.length > 0
-    ? ` The ledger ALREADY holds ${confirmed.map((e) => e.ref).join(', ')} for this obligation (confirmed by the connector), `
-      + 'from an earlier version of this document - your hand posting REPLACES that document; do not raise a second one.'
-    : '')
-    + (unverified.length > 0
-      ? ` IMS records ${unverified.map(note).join(', ')} as posted for this obligation, from an earlier version of this `
-        + 'document, and has NOT verified it: check the ledger for it first. If it exists there, your hand posting REPLACES it '
-        + 'and you must not raise a second one; if it is absent, post this as a new document.'
-      : '')
-}
-
-export function describeRetiredUnproven(notes: readonly string[], options: { earlierDocumentExists?: boolean } = {}): string {
-  if (notes.length === 0) return ''
-  // Codex round 7: when an EARLIER version of the document is also in the ledger, "the document is there" is ambiguous: the
-  // retired attempt may have posted THE CURRENT update, and an earlier version being there does NOT satisfy that.
-  const target = options.earlierDocumentExists
-    ? 'the CURRENT version (the update this refused posting would have made - an earlier version being there is not enough)'
-    : 'it'
-  return ' Earlier attempt(s) at this posting were retired without proof that they never reached the ledger: '
-    + `${notes.join('; ')}. `
-    + `IMS cannot rule out that the document is already there, so look in the ledger for ${target} and post it by hand ONLY if `
-    + 'it is not there: a second document is not undone by marking this handled.'
 }
 
 /**
@@ -470,7 +438,7 @@ function claimedByOther(row: LoadedRefusal): Extract<MarkHandledResult, { ok: fa
  * interval and can be given back; a mark cannot.
  */
 export type HandPostClaimResult =
-  | { ok: true; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
+  | { ok: true; type: string; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
   | Extract<MarkHandledResult, { ok: false }>
 
 export async function claimPostingForHandPosting(
@@ -484,7 +452,7 @@ export async function claimPostingForHandPosting(
   if (row.handPostClaimedAt) {
     // Idempotent for the holder: pressing it twice must not read as somebody else's claim.
     if (row.handPostClaimedBy === params.userId) {
-      return { ok: true, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
+      return { ok: true, type: key.type, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
     }
     return claimedByOther(row)
   }
@@ -515,6 +483,7 @@ export async function claimPostingForHandPosting(
   if (claimed.count === 0) throw new MarkHandledRaceError()
   return {
     ok: true,
+    type: key.type,
     cancelledSyncRows,
     claimedAt: now,
     earlierPostings: rows.earlier.map((sync) => sync.externalTransactionId ?? sync.id),
@@ -630,7 +599,7 @@ export async function markPostingHandled(
       message:
         'Take this posting for hand posting FIRST — that is what stops IMS queueing it while you are in the '
         + 'ledger. Press "Take for hand posting" (it cancels any queued row that nothing has picked up, and '
-        + 'refuses if one may already have been sent), then post it, then mark it handled. If you have '
+        + `refuses if one may already have been sent), then ${GENERIC_HAND_POST_STEP}, then mark it handled. If you have `
         + 'already posted it, take it now and check the accounting sync log for a row IMS queued meanwhile.',
     }
   }

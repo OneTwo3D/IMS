@@ -1,3 +1,4 @@
+import { GENERIC_HAND_POST_STEP } from '@/lib/domain/accounting/hand-post-instruction'
 import { POSTING_REFUSAL_KINDS, type PostingRefusalKind, type RefusalClearing } from '@/lib/domain/accounting/posting-refusal-kinds'
 
 /**
@@ -14,8 +15,8 @@ const HEADINGS: Record<RefusalClearing, string> = {
   // o3d-j625 r16 (Codex round 15, HIGH 1): the order of operations is TAKE, post, confirm — the taking is
   // what stops IMS queueing the posting while the operator is in the ledger, and it is the step the previous
   // wording left out entirely.
-  retried: '**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS\'s own queued attempt and stops it queueing another), then post it by hand, then *Mark as handled*.',
-  manual: '**Nothing in IMS posts it again** — press *Take for hand posting* first, then post it by hand, then *Mark as handled* (which also stops IMS ever posting it).',
+  retried: `**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS\'s own queued attempt and stops it queueing another), then ${GENERIC_HAND_POST_STEP}, then *Mark as handled*.`,
+  manual: `**Nothing in IMS posts it again** — press *Take for hand posting* first, then ${GENERIC_HAND_POST_STEP}, then *Mark as handled* (which also stops IMS ever posting it).`,
 }
 
 export function renderPostingRefusalKindsDoc(): string {

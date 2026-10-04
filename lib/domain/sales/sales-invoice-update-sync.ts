@@ -321,7 +321,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was already queued`
       : enqueued.reason === 'handled-by-hand'
         ? `Sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId} was NOT queued: `
-          + 'it is marked handled — posted by hand in the ledger — so IMS does not post it too'
+          + 'it is marked handled (an operator confirmed the current version is in the ledger) so IMS does not post it too'
         : `Queued sales invoice update for ${params.orderNumber} against accounting invoice ${params.accountingInvoiceId}`,
     metadata: {
       accountingInvoiceId: params.accountingInvoiceId,

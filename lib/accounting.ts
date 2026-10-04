@@ -2,6 +2,7 @@
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
  */
 
+import { GENERIC_HAND_POST_STEP } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -654,8 +655,8 @@ async function refuseUnattributableChart(params: {
       + `built from ${params.chartConnector}'s chart of accounts, and the active accounting connector `
       + `is now ${activeLabel}, so queueing it would write a row no scheduled sync `
       + 'reads. This posting is still OUTSTANDING: switching back to '
-      + `${params.chartConnector} lets IMS's own retry of it (where it has one) post it; otherwise post it by `
-      + 'hand in the ledger it belongs to and mark it handled in the exception inbox.',
+      + `${params.chartConnector} lets IMS's own retry of it (where it has one) post it; otherwise ${GENERIC_HAND_POST_STEP} `
+      + 'in the ledger it belongs to, then mark it handled in the exception inbox.',
     metadata: {
       chartConnector: params.chartConnector,
       // The other end of the switch. Without it this record says a posting was refused and cannot say
@@ -678,7 +679,7 @@ async function refuseUnattributableChart(params: {
     // posting is closed by marking the row handled (which stops IMS posting it too).
     remedy:
       `Switch the accounting connector back to ${params.chartConnector} so IMS's own retry of this posting (where `
-      + 'it has one) can post it. Otherwise post it by hand in the ledger it belongs to and mark this row handled — '
+      + `it has one) can post it. Otherwise ${GENERIC_HAND_POST_STEP} in the ledger it belongs to, then mark this row handled - `
       + 'that cancels IMS\'s retry, so it is not posted twice.',
   })
   return {

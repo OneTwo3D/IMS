@@ -66,7 +66,7 @@ import {
   type MarkHandledClient,
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
-import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
+import { handPostInstruction, handPostOrderFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -2170,7 +2170,9 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
           : '.')
         // Codex round 6: carries each earlier posting's STANDING; "replaces" is only ever said of a CONFIRMED document.
         + describeEarlierPostings(result.earlierPostingDetails)
-        + describeRetiredUnproven(result.retiredUnproven, { earlierDocumentExists: result.earlierPostingDetails.length > 0 }),
+        + describeRetiredUnproven(result.retiredUnproven, { earlierDocumentExists: result.earlierPostingDetails.length > 0 })
+        // Codex round 8: the instruction the operator was given, from the SAME structure as the row text and the dialogs.
+        + ` Instruction shown: ${handPostInstruction({ type: result.type, earlierPostingDetails: result.earlierPostingDetails, retiredUnproven: result.retiredUnproven }).step}.`,
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,
@@ -2318,7 +2320,7 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
       action: 'accounting_posting_refusal_marked_handled',
       level: 'INFO',
       description:
-        `Marked a refused ${result.kind} posting as handled — posted by hand in the ledger. `
+        `Marked a refused ${result.kind} posting as handled: the operator confirmed the current version is in the ledger (posted by hand, or already there); IMS did not read the ledger. `
         // o3d-j625 r13 (independent review, HIGH) — SAY WHICH OF THE TWO THIS WAS.
         //
         // "IMS will not post it" was written for a suppression that covers ONE posting for ever, and it

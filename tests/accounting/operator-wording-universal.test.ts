@@ -15,7 +15,7 @@ import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
-import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
+import { renderHandPostInstructionDoc, claimWarningFor, handPostInputOf, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
 
 /**
@@ -153,7 +153,7 @@ test('[o3d-1e7sl Codex r4] a retired-unproven hand-post order, claimed or not, m
     assert.deepEqual(unconditionalMoneySentences(text), [])
   }
   // and the plain (no retired attempt) order is unchanged
-  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
+  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/i)
 })
 
 // Codex round 6: the claim log and the earlier-posting sentence, per standing.
@@ -183,7 +183,7 @@ test('[o3d-1e7sl Codex r6] an UNVERIFIED earlier posting (asserted / unproven) k
   // a CONFIRMED earlier document keeps the existing wording
   const confirmed = describeEarlierPostings([{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }])
   assert.match(confirmed, /The ledger ALREADY holds INV-9 for this obligation \(confirmed by the connector\).*REPLACES that document/)
-  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/)
+  assert.match(handPostOrderFor({ queuedRow: null, earlierPostingDetails: [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }], retiredUnproven: [], claim: { at: 'n', byName: null, mine: true } }), /post it in the ledger now/i)
 })
 
 test('[o3d-1e7sl Codex r3] every operator string for a non-CONFIRMED standing is free of unconditional reverse / credit / void / re-post instructions', () => {
@@ -255,13 +255,13 @@ test('[o3d-1e7sl Codex r7] combined-state matrix: earlier standing x retired x c
           if (combined) {
             combinedCells += 1
             const what = type === 'BILL_PAYMENT' ? 'payment' : 'version'
-            assert.match(text, new RegExp(`check the ledger for the CURRENT ${what}`), `${where}: asks for the CURRENT ${what}`)
+            assert.match(text, new RegExp(`check the ledger for the CURRENT ${what}`, 'i'), `${where}: asks for the CURRENT ${what}`)
             // (a) the earlier document alone never satisfies "do not post again"
             assert.ok(doNotPostAgain.length >= 1 && doNotPostAgain.every((c) => new RegExp(`if the current ${what} is there`, 'i').test(c)), `${where}: "do not post again" only under "if the current ${what} is there"`)
             assert.doesNotMatch(text, /If it exists, do not post again/i, `${where}: the old document-exists shape is gone`)
             assert.match(text, new RegExp(`if only the earlier ${what} is there`), `${where}: the earlier-only branch exists`)
-            assert.match(text, /if nothing is there, post it as a new/, `${where}: the nothing-there branch exists`)
-            assert.match(text, /only once the CURRENT version is in the ledger/, `${where}: Mark as handled waits for the current version`)
+            assert.match(text, /if nothing is there, post it as a new/i, `${where}: the nothing-there branch exists`)
+            assert.match(text, new RegExp(`only once the CURRENT ${what} is in the ledger`), `${where}: Mark as handled waits for the current version`)
             if (retiredUnproven.length > 0) assert.match(text, /the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\)/, `${where}: the retired-attempt sentence names the CURRENT version`)
             assert.doesNotMatch(text, /post it in the ledger now|Then post it,/i, `${where}: no unconditional post`)
           } else if (retiredUnproven.length > 0) {
@@ -280,4 +280,94 @@ test('[o3d-1e7sl Codex r7] combined-state matrix: earlier standing x retired x c
   }
   console.log(`# r7 matrix: ${cells} cells, ${combinedCells} combined`)
   assert.ok(cells >= 40 && combinedCells >= 16, 'the matrix is not vacuous')
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 8: ONE instruction, EVERY surface. The row text, the claim dialog, the mark-handled dialog, the release dialog and the
+// claim log are all rendered from `handPostInstruction`; this renders every cell of the combined matrix through all of them and
+// derives the expectation from the SAME table (never a second spelling).
+// ---------------------------------------------------------------------------
+test('[o3d-1e7sl Codex r8] every surface (row, claim dialog, mark dialog, release dialog, claim log) carries the SAME conditional structure for every cell of the combined matrix', () => {
+  const EARLIER: Array<[string, Array<{ ref: string; standing: LedgerStanding }>]> = [
+    ['no earlier', []],
+    ['confirmed earlier', [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }]],
+    ['asserted earlier', [{ ref: 'INV-9', standing: 'ASSERTED_POSTED' }]],
+    ['unknown earlier', [{ ref: 'INV-9', standing: 'UNKNOWN' }]],
+  ]
+  const FLOWS: Array<[string, boolean]> = [['SALES_INVOICE_UPDATE', true], ['PURCHASE_INVOICE_UPDATE', true], ['BILL_PAYMENT', true], ['SALES_INVOICE', false], ['STOCK_RECEIPT', false]]
+  const lower = (t: string) => t.toLowerCase()
+  let cells = 0
+  for (const [type, reused] of FLOWS) {
+    for (const [earlierName, earlierPostingDetails] of EARLIER) {
+      if (earlierPostingDetails.length > 0 && !reused) continue
+      for (const retiredUnproven of [[], ['row s-1 (CANCELLED, no proof)']]) {
+        const input = { type, earlierPostingDetails, retiredUnproven }
+        const where = `${type} / ${earlierName} / retired=${retiredUnproven.length}`
+        const i = handPostInstruction(input)
+        const claimed = handPostOrderFor({ ...input, queuedRow: null, claim: { at: 'now', byName: null, mine: true } })
+        const unclaimed = handPostOrderFor({ ...input, queuedRow: null, claim: null })
+        const claimDialog = claimWarningFor(input)
+        const markDialog = markHandledWarningFor(input)
+        const releaseDialog = releaseWarningFor(input)
+        cells += 1
+        // the SAME instruction text, derived from the one structure, on the surfaces that tell the operator what to do
+        for (const [name, text] of [['claimed row', claimed], ['unclaimed row', unclaimed], ['claim dialog', claimDialog]] as const) {
+          assert.ok(lower(text).includes(lower(i.step)), `${where}: ${name} carries the shared step`)
+          assert.ok(text.includes(`only once ${i.markHandledCondition}`), `${where}: ${name} gates Mark as handled on the shared condition`)
+        }
+        assert.ok(markDialog.includes(`ONLY if ${i.markHandledConfirms}`), `${where}: the mark dialog asks for the shared confirmation`)
+        assert.ok(releaseDialog.includes(`release it if ${i.alreadyDone}`), `${where}: the release dialog names the shared already-done state`)
+        if (i.mode === 'combined') {
+          // no surface says "that document" without the CURRENT version when an earlier document exists
+          for (const [name, text] of [['claimed row', claimed], ['unclaimed row', unclaimed], ['claim dialog', claimDialog], ['mark dialog', markDialog], ['release dialog', releaseDialog]] as const) {
+            assert.doesNotMatch(text, /check the ledger for that document/i, `${where}: ${name} must not say "that document"`)
+            assert.doesNotMatch(text, /If it exists, do not post again/i, `${where}: ${name}: the earlier document alone never satisfies "do not post again"`)
+            assert.match(text, /CURRENT/, `${where}: ${name} names the CURRENT version`)
+          }
+          for (const [name, text] of [['claimed row', claimed], ['unclaimed row', unclaimed], ['claim dialog', claimDialog]] as const) {
+            assert.deepEqual(text.split(/(?<=[.;])\s+/).filter((c) => /do not post again/i.test(c) && !/if the current (version|payment) is there/i.test(c)), [], `${where}: ${name}: "do not post again" only under the current-version condition`)
+          }
+        }
+        // (b) no unconditional action, (c) no unlicensed history claim, on every dialog
+        for (const [name, text] of [['claim dialog', claimDialog], ['mark dialog', markDialog], ['release dialog', releaseDialog]] as const) {
+          if (i.mode !== 'plain') assert.deepEqual(unconditionalMoneySentences(text), [], `${where}: ${name}: unconditional action`)
+          assert.deepEqual(unlicensedHistoryClaims(text, null), [], `${where}: ${name}: history claim`)
+        }
+      }
+    }
+  }
+  assert.ok(cells >= 20, 'the matrix is not vacuous')
+})
+
+// A source census: advice about WHEN to hand-post or mark handled is rendered ONLY by the single source. Another surface that
+// spells "press Mark as handled" / "then post it" / "post it in the ledger" is a second rendering that can disagree with it.
+test('[o3d-1e7sl Codex r8] census: no surface renders hand-post / mark-handled advice outside lib/domain/accounting/hand-post-instruction.ts', () => {
+  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
+  const walk = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
+    const rel = path.join(dir, name)
+    if (name === 'generated' || name === 'node_modules' || name === '.next') return []
+    return statSync(path.join(ROOT, rel)).isDirectory() ? walk(rel) : /\.(ts|tsx)$/.test(name) ? [rel] : []
+  })
+  const SINGLE = 'lib/domain/accounting/hand-post-instruction.ts'
+  const FORBIDDEN = /press "Mark as handled"|then post it\b|post it in the ledger|post it by hand in the ledger|post it in the accounting system, then mark/i
+  const sources = ['app', 'lib', 'components'].flatMap((d) => (() => { try { return walk(d) } catch { return [] } })())
+  assert.ok(sources.length > 500, `the census reads the source tree (${sources.length} files)`)
+  const offenders = sources.filter((f) => f !== SINGLE).filter((f) => FORBIDDEN.test(readFileSync(path.join(ROOT, f), 'utf8').replace(/^\s*(\/\/|\*|\/\*).*$/gm, '')))
+  assert.deepEqual(offenders, [], 'hand-post / mark-handled advice is rendered outside the single source')
+  // and the consumers really route through it
+  for (const [file, symbol] of [
+    ['app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'claimWarningFor'],
+    ['app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'markHandledWarningFor'],
+    ['app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'releaseWarningFor'],
+    ['app/actions/sync-exceptions.ts', 'handPostOrderFor'],
+    ['app/actions/sync-exceptions.ts', 'handPostInstruction'],
+    ['lib/accounting.ts', 'GENERIC_HAND_POST_STEP'],
+    ['lib/domain/accounting/posting-mark-handled.ts', 'GENERIC_HAND_POST_STEP'],
+    ['lib/domain/accounting/posting-refusal-kinds-doc.ts', 'GENERIC_HAND_POST_STEP'],
+  ] as const) assert.ok(read(file).includes(symbol), `${file} renders through ${symbol}`)
+  // the help text is GENERATED from the same function
+  const doc = read('help-docs/xero-sync.md')
+  const blocks = doc.split('<!-- hand-post-instruction:begin -->').slice(1).map((b) => `<!-- hand-post-instruction:begin -->${b.slice(0, b.indexOf('<!-- hand-post-instruction:end -->'))}<!-- hand-post-instruction:end -->`)
+  assert.ok(blocks.length >= 1, 'the help doc carries the generated instruction table')
+  for (const b of blocks) assert.equal(b, renderHandPostInstructionDoc(), 'the help doc disagrees with the single source - regenerate it')
 })

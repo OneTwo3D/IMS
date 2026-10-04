@@ -63,32 +63,12 @@ export const ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL = {
   manual: 'Nothing in IMS will post this. ',
 } as const
 
-/** o3d-j625 r6/r7: what the Mark-as-handled dialog tells the operator before they confirm. */
-export const ACCOUNTING_POSTING_REFUSAL_MARK_HANDLED_WARNING =
-  'Mark this handled ONLY if you have posted it by hand in the ledger. Marking it means: "I posted this by hand; '
-  + 'IMS will not post it." IMS cancels its own retry of this posting and will refuse to post it from then on, so '
-  + 'it cannot reach the ledger twice. If IMS may already have posted it, you will be told, and nothing is changed.'
-
 /**
- * o3d-j625 r16 (Codex round 15, HIGH 1): what "Take for hand posting" tells the operator before they take it.
- *
- * It is the FIRST step now, not the second, and the dialog says why in the operator's own terms: until they
- * take it, IMS is free to queue and post this posting while they are in the ledger typing it, and no wording
- * on the page can change that.
+ * Codex round 8: the Mark-as-handled, Take-for-hand-posting and Release dialogs are NOT constants any more. Each is a function of
+ * the row's state (`markHandledWarningFor`, `claimWarningFor`, `releaseWarningFor` in `hand-post-instruction.ts`), rendered from
+ * the same structure as the inbox row text, because a static dialog could not say "check the CURRENT version" for a posting whose
+ * earlier version is in the ledger.
  */
-export const ACCOUNTING_POSTING_REFUSAL_CLAIM_WARNING =
-  'Take this posting to settle it by hand. From the moment you do, IMS will NOT queue it — not on a sweep, not '
-  + 'from another operator saving the document — so nothing can post it while you are in the ledger. Any queued '
-  + 'row nothing has picked up is cancelled now; if a row may ALREADY have been sent you will be told instead and '
-  + 'nothing is changed. Then check the ledger for that document first, post it ONLY if it is absent (if it exists, '
-  + 'do not post again), and press "Mark as handled". If you decide not to post it, '
-  + 'press "Release" so IMS can queue it again.'
-
-/** o3d-j625 r16: what Release tells the operator, because it is the one act that re-opens the window. */
-export const ACCOUNTING_POSTING_REFUSAL_RELEASE_WARNING =
-  'Release this posting. IMS may queue and post it again from now on, and the refusal stays outstanding. Do NOT '
-  + 'release it if you have already posted it by hand — press "Mark as handled" instead, or the ledger can get it '
-  + 'twice. Releasing somebody else\'s claim is allowed, and recorded.'
 
 /** o3d-j625 r6 (review H4): the heading detail of the recently-resolved list. */
 export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
