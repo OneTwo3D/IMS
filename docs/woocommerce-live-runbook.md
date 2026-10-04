@@ -13,6 +13,23 @@ Use this runbook for scoped stage/live WooCommerce verification after connector 
   - the stage WooCommerce Action Scheduler may not auto-drain webhook jobs reliably
   - when that happens, force only the generated action IDs for the specific test event
 
+## Writeback hold: before IMS may write to a store
+
+<!-- outbound-write-hold:overview -->
+IMS refuses every request that could change something in WooCommerce, Mintsoft or Xero unless the environment of this installation names the one destination it may write to. The refusal is made at the HTTP boundary that every connector request goes through, on every request and on every redirect hop, and the default is to refuse. The permission is read from environment variables only and never from the database, so a restored backup, a cloned installation or a new checkout does not inherit a permission that was granted to a different installation. A value that cannot be read is not a permission. Reading is never held: only requests that could change something are.
+<!-- /outbound-write-hold:overview -->
+
+<!-- outbound-write-hold:wc-grant -->
+Before IMS may write to a WooCommerce store, set WC_WRITEBACK_ALLOWED_ORIGIN to the origin of that one store (exactly one store origin, for example https://shop.example.com) in the environment of the installation that owns writeback for it, and restart that installation. An installation that must not write to the live store - every development, stage, end-to-end and rehearsal installation, and the production installation during the period in which IMS only reads - leaves it unset. The origin is compared with the store URL of each request, including after a redirect, so pointing an installation at a different store does not carry the permission across.
+<!-- /outbound-write-hold:wc-grant -->
+
+<!-- outbound-write-hold:held-meaning -->
+A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent, and the text says so.
+
+Mintsoft's key-minting login (`POST /api/Auth`) is a write and is held. An installation that authenticates to Mintsoft with a username and password cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero's token exchange is allowed, because it only lets IMS read.
+<!-- /outbound-write-hold:held-meaning -->
+
+
 ## 1. WC → IMS product create/update
 
 1. Create or edit a product in WooCommerce with a stable SKU.

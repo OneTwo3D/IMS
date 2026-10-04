@@ -312,6 +312,29 @@ test('create: the 5th consecutive failure dead-letters', async () => {
   assert.equal(upserts[0].update.attempts, 5)
 })
 
+test('outbound-write hold: a HELD create spends no attempt and never dead-letters, even as the 5th failure; an ordinary one still does', async () => {
+  const { outboundWriteRefusal, OutboundWriteHeldError } = await import('../lib/security/outbound-write-grant')
+  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', mintsoftClientId: '89', env: {} })
+  assert.ok(refusal, 'precondition: the real refusal path refused the create')
+  // mintsoftRequest turns the hold into a returned error and createOrder rethrows it as a plain Error.
+  const heldText = new OutboundWriteHeldError(refusal, 0).message
+  console.log('precondition (held create): order is on its 5th attempt (pushAttempts 4), where an ordinary failure dead-letters')
+
+  const held = connector({ pushOrder: async () => { throw new Error(heldText) } })
+  const heldPort = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
+  const heldResult = await runWmsOrderPushSweepCore(held, 'mintsoft', heldPort.port, { now: NOW })
+  assert.equal(heldResult.deadLettered, 0)
+  assert.equal(heldResult.failed, 1)
+  assert.equal(heldPort.upserts[0].update.state, 'PENDING_CREATE')
+  assert.equal(heldPort.upserts[0].update.attempts, 4, 'no attempt was spent')
+  assert.match(String(heldPort.upserts[0].update.lastError), /Outbound write HELD/)
+
+  const ordinary = connector({ pushOrder: async () => { throw new Error('still down') } })
+  const controlPort = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
+  const controlResult = await runWmsOrderPushSweepCore(ordinary, 'mintsoft', controlPort.port, { now: NOW })
+  assert.equal(controlResult.deadLettered, 1, 'the control: the same order with an ordinary failure dead-letters')
+})
+
 test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, no remote call, no dead letter', async () => {
   // This test used to assert the order was DEAD_LETTERED. That was the bug: buildPushInput ran
   // after the claim, so a purely LOCAL failure left a PENDING_CREATE claim that aged into

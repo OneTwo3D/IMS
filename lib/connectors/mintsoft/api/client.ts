@@ -9,6 +9,7 @@ import {
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { connectorFetch } from '@/lib/security/connector-fetch'
+import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   extractMintsoftArrayPayload,
@@ -25,6 +26,11 @@ export type MintsoftRequestResult<T> = {
   data: T | null
   error?: string
   status: number
+  /**
+   * True when the outbound-write hold refused the request before it left IMS (error carries the hold's
+   * text). Mintsoft did not see it, so it is neither a Mintsoft rejection nor a network fault.
+   */
+  held?: true
 }
 
 function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
@@ -52,6 +58,7 @@ async function sendMintsoftRequest<T>(
   baseUrl: string,
   apiKey: string,
   init: RequestInit | undefined,
+  clientId: string,
 ): Promise<MintsoftRequestResult<T>> {
   const response = await connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
     ...init,
@@ -63,6 +70,7 @@ async function sendMintsoftRequest<T>(
   }, {
     connectorName: 'Mintsoft',
     allowE2eLocalHttp: true,
+    outboundWriteContext: { mintsoftClientId: clientId },
   })
 
   if (!response.ok) {
@@ -101,7 +109,7 @@ export async function mintsoftRequest<T>(
 
   try {
     const apiKey = await getMintsoftAccessToken()
-    const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init)
+    const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init, config.clientId ?? '')
     if (firstAttempt.status !== 401) {
       return firstAttempt
     }
@@ -124,8 +132,11 @@ export async function mintsoftRequest<T>(
 
     await invalidateMintsoftAccessToken()
     const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
-    return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init)
+    return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init, config.clientId ?? '')
   } catch (error) {
+    if (isOutboundWriteHeldError(error)) {
+      return { data: null, error: error.message, status: 500, held: true }
+    }
     return {
       data: null,
       error: error instanceof Error ? error.message : 'Mintsoft request failed',

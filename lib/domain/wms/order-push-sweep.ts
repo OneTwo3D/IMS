@@ -1,3 +1,4 @@
+import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -1761,8 +1762,11 @@ export async function runWmsOrderPushSweepCore(
           )
         }
       } catch (error) {
-        const attempts = order.pushAttempts + 1
-        const dead = attempts >= MAX_ATTEMPTS
+        // A held write (outbound-write hold) spends no attempt and can never dead-letter: the order did
+        // not fail to push, this installation has not been granted the WMS.
+        const heldByOutboundHold = push === null && isOutboundWriteHeldText(error instanceof Error ? error.message : String(error))
+        const attempts = heldByOutboundHold ? order.pushAttempts : order.pushAttempts + 1
+        const dead = !heldByOutboundHold && attempts >= MAX_ATTEMPTS
         const message = scrubWmsError(error, 'WMS order push failed')
         if (dead) result.deadLettered += 1
         else result.failed += 1

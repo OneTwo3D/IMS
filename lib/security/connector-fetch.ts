@@ -11,6 +11,8 @@ import {
   validateExternalResolvedAddress,
 } from './external-url-safety'
 import { parsePositiveIntegerEnv } from '@/lib/env'
+import { OutboundWriteHeldError, outboundWriteRefusal } from './outbound-write-grant'
+import { recordOutboundWriteRefusal } from './outbound-write-refusal-log'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -19,6 +21,13 @@ export type ConnectorFetchOptions = Pick<
   'connectorName' | 'allowE2eLocalHttp' | 'privateIpAllowlist' | 'env'
 > & {
   lookup?: ConnectorDnsLookup
+  /**
+   * Facts the outbound-write hold needs that the request itself does not carry. Mintsoft scopes writes
+   * by ClientId; the Mintsoft client passes the ClientId it is configured with so the hold can compare
+   * it with the granted one. Absent means "not established", which the hold treats as a refusal for any
+   * Mintsoft write that is not the key-minting login.
+   */
+  outboundWriteContext?: { mintsoftClientId?: string | number | null }
 }
 
 const MAX_REDIRECTS = 5
@@ -393,6 +402,25 @@ export async function connectorFetch(
     // redirect hops. Caller-supplied cancellation is composed with that budget
     // so it cannot accidentally disable the connector safety net.
     for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+      // THE OUTBOUND-WRITE HOLD (lib/security/outbound-write-grant.ts). Evaluated for THIS hop's method,
+      // URL, headers and body, on every pass of the loop, and it is the last decision before the request
+      // is sent: nothing is awaited between it and `sendConnectorRequest`, so what it judged is what
+      // leaves. A permission checked once before the loop would be spent on a different request after a
+      // redirect. Synchronous and pure; only the refusal path awaits (to record it).
+      const heldRefusal = outboundWriteRefusal({
+        connectorName: options.connectorName,
+        method,
+        url,
+        headers,
+        body,
+        mintsoftClientId: options.outboundWriteContext?.mintsoftClientId,
+        env: options.env,
+      })
+      if (heldRefusal) {
+        const held = new OutboundWriteHeldError(heldRefusal, redirectCount)
+        await recordOutboundWriteRefusal(held)
+        throw held
+      }
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
       const nextUrl = redirectLocation(response, url)
       if (!nextUrl) return response

@@ -1,3 +1,4 @@
+import { grantXeroWrites } from '../helpers/outbound-grants'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
@@ -65,7 +66,10 @@ const postedBodies: unknown[] = []
 
 mock.module('@/lib/connectors/xero/auth', {
   namedExports: {
-    getAccessToken: async () => auth,
+    getAccessToken: async () => {
+      if (auth) grantXeroWrites(auth.tenantId)
+      return auth
+    },
     getStoredTenantBlockReason: async () => null,
   },
 })

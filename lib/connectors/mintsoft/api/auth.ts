@@ -258,7 +258,23 @@ export async function getMintsoftConnectionRecord() {
   })
 }
 
-export async function getMintsoftApiConfiguration() {
+export type MintsoftApiConfiguration = {
+  baseUrl: string
+  authMode: MintsoftAuthMode
+  staticApiKey: string
+  username: string
+  password: string
+  webhookSecret: string
+  /**
+   * The configured ClientId, handed to the outbound-write hold so it can compare it with the granted
+   * one. Optional on purpose: absent or blank means "not established", which the hold treats as a
+   * refusal for any write, never as permission.
+   */
+  clientId?: string
+  orderLookupConnector: string | null
+}
+
+export async function getMintsoftApiConfiguration(): Promise<MintsoftApiConfiguration> {
   const [connection, settings] = await Promise.all([
     getMintsoftConnectionRecord(),
     getMintsoftSettings(),
@@ -277,6 +293,7 @@ export async function getMintsoftApiConfiguration() {
     username: settings.mintsoft_username.trim(),
     password: settings.mintsoft_password.trim(),
     webhookSecret: settings.mintsoft_webhook_secret.trim(),
+    clientId: (settings.mintsoft_client_id ?? '').trim(),
     orderLookupConnector: connection?.orderLookupConnector ?? null,
   }
 }

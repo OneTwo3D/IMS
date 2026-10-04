@@ -4539,6 +4539,42 @@ where each of those actually lives (o3d-esha).
 
 IMS-session invoice PDF links intentionally bind to the current session and client IP. This limits copied-link replay, but users who switch networks, reconnect a VPN, or resume a tab after their IP changes may need to return to the invoice page and request a fresh link. Customer-facing shopping invoice downloads avoid this IMS session/IP binding by using the shopping platform ownership check plus the short-lived `/api/shopping/{connector}/invoice-pdf` server-to-server handoff.
 
+### Outbound-write hold: which destinations IMS may write to
+
+<!-- outbound-write-hold:overview -->
+IMS refuses every request that could change something in WooCommerce, Mintsoft or Xero unless the environment of this installation names the one destination it may write to. The refusal is made at the HTTP boundary that every connector request goes through, on every request and on every redirect hop, and the default is to refuse. The permission is read from environment variables only and never from the database, so a restored backup, a cloned installation or a new checkout does not inherit a permission that was granted to a different installation. A value that cannot be read is not a permission. Reading is never held: only requests that could change something are.
+<!-- /outbound-write-hold:overview -->
+
+<!-- outbound-write-hold:grants -->
+| Variable | Connector | Value |
+|---|---|---|
+| `WC_WRITEBACK_ALLOWED_ORIGIN` | WooCommerce | exactly one store origin, for example https://shop.example.com |
+| `MINTSOFT_WRITE_ALLOWED` | Mintsoft | the Mintsoft base URL and the ClientId separated by one vertical bar, for example https://api.mintsoft.co.uk|89 |
+| `XERO_WRITE_ALLOWED_TENANT` | Xero | exactly one Xero tenant id (a UUID) |
+
+Each variable names exactly one destination. A list, a wildcard, a boolean or a value in any other shape is unreadable and grants nothing. Changing the store URL, the Mintsoft base URL or the Xero organisation in Settings revokes the permission instead of inheriting it, because the comparison is against the destination of the request that is actually being made. Setting a variable changes what the installation may do; it does not start any writer.
+<!-- /outbound-write-hold:grants -->
+
+<!-- outbound-write-hold:held-meaning -->
+A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent, and the text says so.
+
+Mintsoft's key-minting login (`POST /api/Auth`) is a write and is held. An installation that authenticates to Mintsoft with a username and password cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero's token exchange is allowed, because it only lets IMS read.
+<!-- /outbound-write-hold:held-meaning -->
+
+<!-- outbound-write-hold:status-command -->
+`npm run outbound:status` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours. Pass `--json` for a machine-readable report and `--expect-held` to fail when any connector may write.
+
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | ok | the report was produced, every grant variable is absent or readable, and the refusal counts were read; a fully held installation is a success |
+| 1 | unreadable-grant | a grant variable is set but unreadable; it is treated as no grant (held) but it is an operator error to fix |
+| 2 | counts-unavailable | the grant states were printed but the recent refusal counts could not be read from the database |
+| 3 | usage | an unknown argument was given; nothing was evaluated |
+| 4 | expected-held-violated | `--expect-held` was given and at least one connector has a readable grant (IMS may write to something) |
+| 5 | failed | the report could not be produced because of an unexpected error |
+<!-- /outbound-write-hold:status-command -->
+
+
 ### Connection pooling in front of `DATABASE_URL` is not supported
 
 **IMS does not support a transaction-pooling proxy — PgBouncer `pool_mode = transaction`, Odyssey

@@ -1580,3 +1580,25 @@ test('the effects mintsoft declares outside its guard are really outside it', ()
     assert.ok(declared.includes(name), `the registry entry must name ${name} as an effect outside its guard`)
   }
 })
+
+test('outbound-write hold: a HELD write spends no attempt and is never dead-lettered, however many attempts the row already has', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const heldText = 'The WooCommerce order.cancel push for order 1 failed: Outbound write HELD (WooCommerce): WC_WRITEBACK_ALLOWED_ORIGIN is not set, so this installation has declared no WooCommerce destination it may write to. PUT https://shop.example.com/wp-json/wc/v3/orders/1 was refused before it left IMS, so nothing was sent to WooCommerce.'
+  const atBudget = (id: string) => makeRow({ id, status: INTEGRATION_OUTBOX_STATUS.PROCESSING, attempts: 7, lockedAt: now, lockedBy: 'worker-1' })
+  const { client } = makeClient([atBudget('held-job'), atBudget('control-job')])
+  console.log('precondition (held outbox): both rows have 7 attempts and maxAttempts is 8, so one ordinary failure would dead-letter')
+
+  const held = await markIntegrationOutboxRetryableFailure({
+    client, id: 'held-job', workerId: 'worker-1', lockedAt: now, error: heldText, now, attemptsBeforeFailure: 7, maxAttempts: 8,
+  })
+  assert.equal(held.status, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED, 'a held write stays retryable')
+  assert.equal(held.attempts, 7, 'and spends no attempt')
+  assert.deepEqual(held.nextAttemptAt, new Date(now.getTime() + 15 * 60_000), 'and is offered again after the hold delay')
+  assert.equal(held.lockedBy, null)
+  assert.equal(held.lastError, heldText.slice(0, held.lastError?.length ?? 0))
+
+  const control = await markIntegrationOutboxRetryableFailure({
+    client, id: 'control-job', workerId: 'worker-1', lockedAt: now, error: 'WC API PUT error: 500 boom', now, attemptsBeforeFailure: 7, maxAttempts: 8,
+  })
+  assert.equal(control.status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED, 'the control: the same row with an ordinary failure DOES dead-letter')
+})
