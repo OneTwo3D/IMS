@@ -293,7 +293,7 @@ function assertTornDown(parent: string, outcome: Awaited<ReturnType<typeof rehea
 }
 
 test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach argv, the report is written and the teardown is clean', { timeout: TIMEOUT }, async (t) => {
-  const seen: { mode?: number; passwordInArgv?: number; scanned?: number; control?: number } = {}
+  const seen: { mode?: number; passwordInArgv?: number; scanned?: number; control?: number; skipEnvFile?: string; tmpdir?: string } = {}
   const parent = scratchParent(t)
   const hooks: RehearsalHooks = {
     beforeStep: (id) => {
@@ -304,6 +304,8 @@ test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach 
       const file = envFiles[0]!
       seen.mode = statSync(file).mode & 0o777
       const env = Object.fromEntries(readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]))
+      seen.skipEnvFile = env.IMS_SKIP_ENV_FILE
+      seen.tmpdir = env.TMPDIR
       const password = new URL(env.DATABASE_URL!).password
       assert.ok(password.length >= 32)
       const secrets = [password, env.AUTH_SECRET!, env.CRON_SECRET!, env.SETTINGS_ENCRYPTION_KEY!, env.DEFAULT_ADMIN_PASSWORD!]
@@ -337,6 +339,8 @@ test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach 
   const report = outcome.report
   console.log(`# env file mode ${seen.mode?.toString(8)}; scanned ${seen.scanned} command lines, secrets found in argv: ${seen.passwordInArgv}; positive control found: ${seen.control}`)
   assert.equal(seen.mode, 0o600)
+  assert.equal(seen.skipEnvFile, '1', 'the children are told not to source a checkout .env over the rehearsal DATABASE_URL')
+  assert.ok(seen.tmpdir?.startsWith(parent), 'the children scratch space is inside the run directory, not the caller tmpfs')
   assert.ok((seen.scanned ?? 0) > 10)
   assert.ok((seen.control ?? 0) >= 1, 'the scan can find a secret that is on argv')
   assert.equal(seen.passwordInArgv, 0)
