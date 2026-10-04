@@ -644,8 +644,9 @@ test('[o3d-j625 r16 HIGH 2] an EARLIER edit\'s completed row leaves the newly re
   assert.ok(row.handPostOrder)
   assert.match(row.handPostOrder, /Take for hand posting" FIRST/,
     'so the way forward is the ordinary one — take it, post it, confirm it')
-  assert.match(row.handPostOrder, /ALREADY holds INV-EDIT-1/,
-    'with what the ledger holds stated, so the operator edits that document instead of raising a second one')
+  assert.match(row.handPostOrder, /The ledger holds INV-EDIT-1 for this obligation \(confirmed by the connector\)/, 'with what the ledger holds stated')
+  assert.match(row.handPostOrder, /check the ledger for the CURRENT version/, 'and the instruction is the CURRENT-version check, so the operator updates that document instead of raising a second one or stopping at the earlier one')
+  assert.doesNotMatch(row.handPostOrder, /post it in the ledger now/i, 'Codex r9: an earlier document exists, so the plain wording is unreachable')
   assert.equal(row.remedy, invoiceUpdateRefusal.remedy, 'and the site\'s own remedy is verbatim')
 })
 
@@ -666,8 +667,9 @@ test('[o3d-1e7sl Codex r6] an earlier edit whose document id an OPERATOR typed i
   assert.ok(row)
   assert.deepEqual(row.earlierPostingDetails, [{ ref: 'INV-TYPED-1', standing: 'ASSERTED_POSTED' }], 'the standing survives into the inbox row')
   assert.match(row.handPostOrder ?? '', /INV-TYPED-1 \(an id an operator typed in\) as posted/)
-  assert.match(row.handPostOrder ?? '', /has NOT verified it: check the ledger for it first. If it exists there, your hand posting REPLACES it/)
-  assert.doesNotMatch(row.handPostOrder ?? '', /ALREADY holds|REPLACES that document|post it in the ledger now|Then post it,/)
+  assert.match(row.handPostOrder ?? '', /has NOT verified it\./)
+  assert.match(row.handPostOrder ?? '', /check the ledger for the CURRENT version/)
+  assert.doesNotMatch(row.handPostOrder ?? '', /ALREADY holds|REPLACES|post it in the ledger now|Then post it,/i)
 })
 
 test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED state (retired unproven attempt AND confirmed earlier invoice): the earlier invoice never satisfies "do not post again"', async (t) => {

@@ -632,6 +632,8 @@ export type AccountingPostingRefusalRow = {
   earlierPostings: string[]
   /** Codex round 6: each earlier posting WITH ITS STANDING (confirmed by the connector, or an id an operator typed in). */
   earlierPostingDetails: EarlierPosting[]
+  /** Codex round 9: 'loaded' only when the server read the posting key's rows; a dialog reads anything else as not loaded. */
+  handPostState: 'loaded' | 'not-loaded'
   /**
    * o3d-1e7sl (C1) — EARLIER ATTEMPTS IMS RETIRED WITHOUT PROOF THAT THEY NEVER REACHED THE LEDGER.
    *
@@ -1666,6 +1668,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             queuedRow,
             earlierPostings,
             earlierPostingDetails,
+            // Codex round 9: the server's positive statement that it loaded this posting key's rows (classifyQueuedRowsForRefusals reads
+            // EVERY row for every refusal, so no entry for a key means none exist). Anything else reads as not loaded.
+            handPostState: 'loaded' as const,
             retiredUnproven,
             handPostClaim,
             handPostDeferredEdits: row.handPostDeferredCount,
@@ -1684,7 +1689,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             remedy: row.remedy,
             handPostOrder: clearing === null || clearing === 'auto'
               ? null
-              : handPostOrderFor({ queuedRow, earlierPostingDetails, retiredUnproven, type: row.type, claim: handPostClaim }),
+              : handPostOrderFor({ queuedRow, state: 'loaded', earlierPostingDetails, retiredUnproven, type: row.type, claim: handPostClaim }),
           }
         })
       })(),
@@ -1765,6 +1770,8 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     earlierPostings: [],
     earlierPostingDetails: [],
     retiredUnproven: [],
+    // Codex round 9: NOT loaded - a provisional row has no established posting key, so these empty arrays are not a statement.
+    handPostState: 'not-loaded' as const,
     handPostClaim: null,
     handPostOrder: null,
     // o3d-j625 r18: an unconfirmed claim has no established posting key and cannot be taken for hand posting
@@ -2172,7 +2179,7 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
         + describeEarlierPostings(result.earlierPostingDetails)
         + describeRetiredUnproven(result.retiredUnproven, { earlierDocumentExists: result.earlierPostingDetails.length > 0 })
         // Codex round 8: the instruction the operator was given, from the SAME structure as the row text and the dialogs.
-        + ` Instruction shown: ${handPostInstruction({ type: result.type, earlierPostingDetails: result.earlierPostingDetails, retiredUnproven: result.retiredUnproven }).step}.`,
+        + ` Instruction shown: ${handPostInstruction({ type: result.type, state: 'loaded', earlierPostingDetails: result.earlierPostingDetails, retiredUnproven: result.retiredUnproven }).step}.`,
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,

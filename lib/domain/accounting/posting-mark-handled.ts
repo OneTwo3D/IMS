@@ -452,7 +452,19 @@ export async function claimPostingForHandPosting(
   if (row.handPostClaimedAt) {
     // Idempotent for the holder: pressing it twice must not read as somebody else's claim.
     if (row.handPostClaimedBy === params.userId) {
-      return { ok: true, type: key.type, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
+      // Codex round 9: a repeated Take RELOADS the posting key's rows and returns their standing - the caller writes an operator-facing
+      // log entry from this, and empty arrays here would have logged the plain "post it now" instruction over an asserted earlier
+      // posting or an unproven retired attempt. ONE code path for claim and re-claim: nothing is cancelled on a re-claim.
+      const held = await postingKeyRows(tx, key)
+      return {
+        ok: true,
+        type: key.type,
+        cancelledSyncRows: [],
+        claimedAt: row.handPostClaimedAt,
+        earlierPostings: held.earlier.map((sync) => sync.externalTransactionId ?? sync.id),
+        earlierPostingDetails: held.earlier.map(earlierPostingOf),
+        retiredUnproven: retiredUnprovenNotes(held.retiredUnproven),
+      }
     }
     return claimedByOther(row)
   }

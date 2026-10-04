@@ -2409,8 +2409,9 @@ Three things about those rows:
 |---|---|---|
 | Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
 | An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document exists AND the current one is in doubt (invoice or bill update) | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->
 
   **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
@@ -2493,8 +2494,9 @@ Three things about those rows:
   **An earlier version of the same document does not block you.** For the postings where successive versions
   share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
   *previous* version. IMS names that document on the row; it does not stop you taking the posting, because that
-  entry has already been made and is never going to be made again. When the ledger confirmed that earlier
-  document, your hand posting **replaces** it: edit the document the ledger holds; do not raise a second one.
+  entry has already been made and is never going to be made again. Whatever its standing, the
+  earlier document alone never closes the debt: IMS tells you to check the ledger for the CURRENT version and, if only
+  the earlier version is there, to update that document (not raise a second one).
   When IMS only has an id an operator typed in, or a retired attempt may have posted the CURRENT version, IMS
   says so and tells you to check the ledger for the CURRENT version first (the table above): finding the
   earlier version alone never closes the debt.
@@ -2697,8 +2699,9 @@ Rows staged before this was introduced have no reference recorded, and are still
 |---|---|---|
 | Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
 | An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document exists AND the current one is in doubt (invoice or bill update) | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->Books Online was removed in 2026-09.** Xero is the only accounting connector One Two
 > Inventory ships. This page still mentions QuickBooks in places — every one of those mentions is
 > **historical**, and is kept for one reason: most of them explain why a rule on the Xero side is
@@ -5108,8 +5111,9 @@ Three things about those rows:
 |---|---|---|
 | Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
 | An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document exists AND the current one is in doubt (invoice or bill update) | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->
 
   **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
@@ -5192,8 +5196,9 @@ Three things about those rows:
   **An earlier version of the same document does not block you.** For the postings where successive versions
   share one entry — an invoice update, a bill update, a bill payment — the ledger may already hold the
   *previous* version. IMS names that document on the row; it does not stop you taking the posting, because that
-  entry has already been made and is never going to be made again. When the ledger confirmed that earlier
-  document, your hand posting **replaces** it: edit the document the ledger holds; do not raise a second one.
+  entry has already been made and is never going to be made again. Whatever its standing, the
+  earlier document alone never closes the debt: IMS tells you to check the ledger for the CURRENT version and, if only
+  the earlier version is there, to update that document (not raise a second one).
   When IMS only has an id an operator typed in, or a retired attempt may have posted the CURRENT version, IMS
   says so and tells you to check the ledger for the CURRENT version first (the table above): finding the
   earlier version alone never closes the debt.

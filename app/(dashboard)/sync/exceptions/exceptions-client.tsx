@@ -15,7 +15,7 @@ import {
   handPostInputOf,
   markHandledWarningFor,
   releaseWarningFor,
-  STATE_UNKNOWN_HAND_POST_INPUT,
+  NOT_LOADED_HAND_POST_INPUT,
   type HandPostInput,
 } from '@/lib/domain/accounting/hand-post-instruction'
 import { POSTING_REFUSAL_NOTE_MAX_LENGTH } from '@/lib/domain/accounting/posting-refusal-kinds'
@@ -1123,7 +1123,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: STATE_UNKNOWN_HAND_POST_INPUT })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: NOT_LOADED_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>
@@ -1199,7 +1199,7 @@ export function ExceptionsClient({ data }: Props) {
                       variant="outline"
                       size="sm"
                       disabled={isPending}
-                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: STATE_UNKNOWN_HAND_POST_INPUT })}
+                      onClick={() => setReleasingRefusal({ id: claim.refusalId, label: `${claim.type} ${claim.referenceType}/${claim.referenceId}`, input: NOT_LOADED_HAND_POST_INPUT })}
                     >
                       <XCircle className="h-3 w-3 mr-1" />Release
                     </Button>

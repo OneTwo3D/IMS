@@ -1075,10 +1075,13 @@ test('[o3d-1e7sl Codex r6] the claim log carries the STANDING of an earlier post
     assert.ok(note, c.name)
     if (c.unverified) {
       assert.match(note.description, /INV-TYPED \(an id an operator typed in\) as posted/, c.name)
-      assert.match(note.description, /has NOT verified it: check the ledger for it first\. If it exists there, your hand posting REPLACES it/, c.name)
-      assert.doesNotMatch(note.description, /already holds|REPLACES that document/, c.name)
+      assert.match(note.description, /has NOT verified it\./, c.name)
+      assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, c.name)
+      assert.doesNotMatch(note.description, /already holds|REPLACES|post it in the ledger now/i, c.name)
     } else {
-      assert.match(note.description, /The ledger ALREADY holds INV-REAL for this obligation \(confirmed by the connector\)/, c.name)
+      assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, c.name)
+      assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, c.name)
+      assert.doesNotMatch(note.description, /post it in the ledger now/i, `${c.name}: Codex r9 - an earlier document exists, so the plain wording is unreachable`)
     }
     assert.deepEqual(note.metadata?.earlierPostingDetails, [{ ref: c.unverified ? 'INV-TYPED' : 'INV-REAL', standing: c.unverified ? 'ASSERTED_POSTED' : 'CONFIRMED_POSTED' }], `${c.name}: the standing is in the log metadata too`)
   }
@@ -1093,7 +1096,42 @@ test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unprove
   const result = await claimAccountingPostingRefusalForHandPostingAction('r7-1')
   assert.equal(ok(result), true)
   const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
-  assert.match(note.description, /The ledger ALREADY holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed wording')
+  assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed standing')
   assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not the earlier version\): if the current version is there, do not post again; if only the earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
   assert.match(note.description, /look in the ledger for the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\) and post it by hand ONLY if it is not there/, 'the retired attempt is checked against the CURRENT version, not the earlier one')
+})
+
+test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the standing: the second log entry carries it for every earlier standing x retired', async () => {
+  const earlierRows = [
+    ['no earlier', null],
+    ['confirmed earlier', { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 }],
+    ['asserted earlier', { status: 'SYNCED', externalTransactionId: 'INV-TYPED', settlementBasis: 'OPERATOR_ASSERTION', attemptRevision: 1 }],
+  ] as const
+  let n = 0
+  for (const [earlierName, earlierRow] of earlierRows) {
+    for (const retired of [false, true]) {
+      n += 1
+      refusals.length = 0; syncRows.length = 0; activity.length = 0
+      refusals.push(refusal(`r9-${n}`, 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: `so-r9-${n}`, scope: '' }))
+      if (earlierRow) syncRows.push(sync(`s-r9-e-${n}`, refusals[0]!, earlierRow as never))
+      if (retired) syncRows.push(sync(`s-r9-r-${n}`, refusals[0]!, { status: 'CANCELLED', attemptRevision: 1 } as never))
+      const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+      const where = `${earlierName} / retired=${retired}`
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r9-${n}`)), true, `${where}: first take`)
+      activity.length = 0
+      assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r9-${n}`)), true, `${where}: the repeated take is idempotent`)
+      const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string } | undefined
+      assert.ok(note, `${where}: the repeated take writes a fresh operator-facing log entry (so the entry must carry the standing)`)
+      if (earlierRow) {
+        assert.doesNotMatch(note!.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over an earlier document`)
+        assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, `${where}: carries the current-version instruction`)
+        assert.match(note.description, (earlierRow as { settlementBasis?: string }).settlementBasis ? /INV-TYPED \(an id an operator typed in\) as posted/ : /The ledger holds INV-REAL/, `${where}: carries the earlier row's standing`)
+      } else if (retired) {
+        assert.doesNotMatch(note.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over a retired attempt`)
+        assert.match(note.description, /Instruction shown: check the ledger for that document first; post it ONLY if it is absent/, `${where}: carries the retired-attempt check`)
+      } else {
+        assert.match(note.description, /Instruction shown: post it in the ledger now/, `${where}: with nothing earlier and nothing retired the plain wording is the right one`)
+      }
+    }
+  }
 })
