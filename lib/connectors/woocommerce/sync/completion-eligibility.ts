@@ -15,6 +15,7 @@
  * Pure: the caller supplies the reading and the withdrawal statuses, so this decides nothing from I/O.
  */
 import { canTransitionSalesOrder } from '@/lib/domain/workflows/sales-order-state'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import type { WcOrderStatusReading } from './status-mapping'
 import { WC_PARTIAL_SHIPPED_STATUS } from './partial-shipment'
 
@@ -75,4 +76,93 @@ export async function readWcCompletionEligibility(
   const reading = await readWcOrderStatus(wcStatus)
   const withdrawal = await getWithdrawalStatuses()
   return { eligibility: classifyWcCompletionEligibility({ reading, withdrawal, target }), slug: reading.slug }
+}
+
+// ---------------------------------------------------------------------------
+// CANCEL / HOLD (o3d-6ldlj)
+// ---------------------------------------------------------------------------
+
+/**
+ * MAY IMS PUSH `cancelled` / `on-hold` ONTO THIS WOOCOMMERCE ORDER?
+ *
+ * The completion rule above asks "is the order still in flight?". A cancel or hold is the opposite kind of
+ * write — it is a DEMOTION that IMS already decided — so the question is "has the storefront moved this order
+ * somewhere IMS must not overwrite?":
+ *
+ *  - `completed` / `refunded` (`handledBy`) are never overwritten, for every target. An IMS cancel PUT over a
+ *    completed order would fire WooCommerce's cancel handling (including its own restock; the store's
+ *    configuration is UNVERIFIED). They are left alone, with a WARNING, and are NOT an exception.
+ *  - For an on-hold push, WooCommerce's own `cancelled` is finalised too (a hold must not resurrect a
+ *    cancelled order's email machinery).
+ *  - `partial-shipped` (our own plugin's status for a split order that has part shipped) and the EU-withdrawal
+ *    statuses are NEVER pushed over automatically: someone has to decide what a cancel of a part-shipped or
+ *    withdrawn order means in the storefront. `ineligible-needs-operator`.
+ *  - Otherwise the importer's own reading decides, through the order state machine, so a custom in-flight
+ *    status mapped to PROCESSING/ALLOCATED/PICKING/PACKING can be cancelled or held exactly because the importer
+ *    treats it as in flight. A status IMS has no reading of is `ineligible-unknown` (retried: add a mapping).
+ *
+ * WooCommerce's OWN slugs are decided BEFORE the configurable mapping is read (the #719 lesson: the
+ * status-mapping action accepts any slug and maps it to any IMS status, so a row sending `cancelled` to
+ * PROCESSING would otherwise make an on-hold push eligible over a cancelled order).
+ *
+ * Pure: the caller supplies the reading and the withdrawal statuses.
+ */
+export type WcStatusPushEligibility =
+  | 'eligible'
+  | 'already-at-target'
+  | 'ineligible-finalised'
+  | 'ineligible-needs-operator'
+  | 'ineligible-unknown'
+
+export type WcStatusPushTarget = { wc: 'cancelled'; ims: 'CANCELLED' } | { wc: 'on-hold'; ims: 'ON_HOLD' }
+
+/** WooCommerce's own not-yet-fulfilled slugs, read as these IMS statuses WHATEVER the mapping table says. */
+const CANONICAL_PRE_FULFILMENT_READINGS: Readonly<Record<string, SalesOrderStatus>> = {
+  'on-hold': 'ON_HOLD',
+  pending: 'PENDING_PAYMENT',
+  failed: 'PENDING_PAYMENT',
+}
+/** IMS statuses a cancel or hold must never be pushed over: the order has left (or is leaving) the building. */
+const NEVER_OVERWRITE_IMS_STATUSES: ReadonlySet<string> = new Set(['CANCELLED', 'SHIPPED', 'COMPLETED', 'DELIVERED'])
+
+export function classifyWcStatusPushEligibility(input: {
+  reading: Pick<WcOrderStatusReading, 'slug' | 'imsStatus' | 'handledBy'>
+  withdrawal: { submitted: string; approved: string }
+  target: WcStatusPushTarget
+}): WcStatusPushEligibility {
+  const { reading, withdrawal, target } = input
+  const slug = reading.slug
+
+  if (slug === target.wc) return 'already-at-target'
+  // `completed` and `refunded` (the built-in map reads `refunded` as PROCESSING, so ONLY this check refuses it).
+  if (reading.handledBy !== null) return 'ineligible-finalised'
+  // A hold never goes over a cancelled order. (For a cancel push `cancelled` was already-at-target above.)
+  if (slug === 'cancelled') return 'ineligible-finalised'
+  if (slug === WC_PARTIAL_SHIPPED_STATUS || slug === withdrawal.submitted || slug === withdrawal.approved) {
+    return 'ineligible-needs-operator'
+  }
+
+  // WooCommerce's own pre-fulfilment slugs ignore the mapping table entirely.
+  const imsStatus = Object.hasOwn(CANONICAL_PRE_FULFILMENT_READINGS, slug)
+    ? CANONICAL_PRE_FULFILMENT_READINGS[slug]
+    : reading.imsStatus
+  if (imsStatus === null) return 'ineligible-unknown'
+  // The importer already reads this custom status as the state IMS wants to put the order in.
+  if (imsStatus === target.ims) return 'already-at-target'
+  if (NEVER_OVERWRITE_IMS_STATUSES.has(imsStatus)) return 'ineligible-finalised'
+  return canTransitionSalesOrder(imsStatus, target.ims) ? 'eligible' : 'ineligible-unknown'
+}
+
+/** The classifier over the live reading: the importer's own mapping lookup plus the withdrawal settings. */
+export async function readWcStatusPushEligibility(
+  wcStatus: unknown,
+  target: WcStatusPushTarget,
+): Promise<{ eligibility: WcStatusPushEligibility; slug: string }> {
+  const [{ readWcOrderStatus }, { getWithdrawalStatuses }] = await Promise.all([
+    import('./status-mapping'),
+    import('./withdrawal'),
+  ])
+  const reading = await readWcOrderStatus(wcStatus)
+  const withdrawal = await getWithdrawalStatuses()
+  return { eligibility: classifyWcStatusPushEligibility({ reading, withdrawal, target }), slug: reading.slug }
 }

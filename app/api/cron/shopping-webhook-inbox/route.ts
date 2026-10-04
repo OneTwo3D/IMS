@@ -74,6 +74,25 @@ async function drainOrderCompletions(): Promise<ConnectorTickResult> {
   }
 }
 
+/**
+ * Drain the durable storefront CANCEL / HOLD pushes (o3d-6ldlj), and surface any whose worker died. Same gate as
+ * the completion drain: the plugin being enabled, NOT `wc_sync_enabled` (an IMS cancellation must not stay
+ * unpushed because inbound sync is switched off). Separate from the completion drain so one failing never
+ * hides the other. Never throws.
+ */
+async function drainOrderStatusPushes(): Promise<ConnectorTickResult> {
+  try {
+    if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+      return { skipped: true, reason: 'woocommerce_plugin_disabled' }
+    }
+    const { processShoppingOrderStatusPushes } = await import('@/lib/shopping')
+    return { ...(await processShoppingOrderStatusPushes()) }
+  } catch (error) {
+    console.warn('[shopping-webhook-inbox] order-status-push drain failed', { error: normalizeCronError(error) })
+    return { skipped: false, error: normalizeCronError(error) }
+  }
+}
+
 async function getWcSyncEnabled(): Promise<boolean> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
   return enabled?.value === 'true'
@@ -106,8 +125,9 @@ export async function GET(request: Request) {
       ])
 
       const orderCompletions = await drainOrderCompletions()
+      const orderStatusPushes = await drainOrderStatusPushes()
 
-      return { connectors: { woocommerce: { ...woocommerce, orderCompletions } } } as Record<string, unknown>
+      return { connectors: { woocommerce: { ...woocommerce, orderCompletions, orderStatusPushes } } } as Record<string, unknown>
     },
   })
 

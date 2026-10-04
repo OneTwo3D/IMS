@@ -357,6 +357,27 @@ export async function processShoppingOrderCompletions(options?: { idempotencyKey
 }
 
 /**
+ * Durably schedule the storefront CANCEL or HOLD push for an order, INSIDE the transaction that flips it
+ * (o3d-6ldlj). Connector-neutral: each connector that pushes these owns its own jobs. Returns the job's
+ * reference for the post-commit immediate attempt, or null when no connector has anything to push.
+ */
+export async function scheduleShoppingOrderStatusPush(
+  tx: Parameters<typeof import('@/lib/connectors/woocommerce/sync/order-status-jobs').scheduleWcOrderCancel>[0],
+  input: { orderId: string; target: 'CANCELLED' | 'ON_HOLD'; flippedAt: Date },
+): Promise<import('@/lib/connectors/woocommerce/sync/order-status-jobs').WcOrderStatusJobRef | null> {
+  const { scheduleWcOrderCancel, scheduleWcOrderHold } = await import('@/lib/connectors/woocommerce/sync/order-status-jobs')
+  return input.target === 'CANCELLED'
+    ? scheduleWcOrderCancel(tx, input)
+    : scheduleWcOrderHold(tx, input)
+}
+
+/** Drain/attempt the scheduled storefront cancel/hold pushes (post-commit immediate attempt and the cron). */
+export async function processShoppingOrderStatusPushes(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcOrderStatusJobs } = await import('@/lib/connectors/woocommerce/sync/order-status-jobs')
+  return processWcOrderStatusJobs(options)
+}
+
+/**
  * Fan the current FX rate set out to every configured shopping connector so the
  * storefront, IMS and the accounting platform share one rate. Each connector
  * owns its own push + telemetry (e.g. WooCommerce records fxRatePushLog +

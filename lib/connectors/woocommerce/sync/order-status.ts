@@ -11,6 +11,7 @@ import { wcFetch, wcPut } from '../api'
 import { assertWcAttemptMayWrite } from '../attempt-fence'
 import type { WcFullOrder } from './types'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
+import type { WcStatusPushTarget } from './completion-eligibility'
 
 type SalesOrderStatus = string
 
@@ -154,8 +155,13 @@ export type WcStatusPushOutcome =
   | { kind: 'already-at-target' }
   /** No WooCommerce equivalent for this IMS status, the order is missing, or it is not a WooCommerce order. */
   | { kind: 'not-applicable' }
-  /** WooCommerce holds the order in a status IMS must not promote from. `class` says why. */
-  | { kind: 'ineligible'; wcStatus: string; class: 'finalised' | 'not-ready' | 'unknown' }
+  /**
+   * WooCommerce holds the order in a status IMS must not push over. `class` says why: `finalised` (settled,
+   * left alone), `not-ready` (a completion onto an order not in flight), `unknown` (a status IMS has no reading
+   * of) and `needs-operator` (a cancel/hold onto a partial-shipped or EU-withdrawal order, which is never pushed
+   * automatically: someone has to decide what it means in the storefront).
+   */
+  | { kind: 'ineligible'; wcStatus: string; class: 'finalised' | 'not-ready' | 'unknown' | 'needs-operator' }
   | { kind: 'read-failed'; error: string }
   | { kind: 'write-failed'; error: string }
   | { kind: 'error'; error: string }
@@ -197,8 +203,8 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     // order the storefront still holds in flight — decided by classifyWcCompletionEligibility from the
     // importer's own reading of the status, NOT by a literal `processing`, so a custom ready status
     // mapped to PROCESSING still completes. An unreadable status FAILS CLOSED and is reported as
-    // `read-failed` (never as success) so the caller retries. Cancel/hold pushes are not promotions and
-    // are left as they were.
+    // `read-failed` (never as success) so the caller retries. Cancel/hold pushes are guarded by the
+    // generalised rule (classifyWcStatusPushEligibility) just below (o3d-6ldlj).
     if (externalStatus === 'completed') {
       if (currentWc.error) {
         await logActivity({
@@ -220,6 +226,44 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
           resolveUser: false,
         })
         return { kind: 'ineligible', wcStatus: slug, class: cls }
+      }
+    }
+
+    // CANCEL / HOLD (o3d-6ldlj). This used to have NO guard: a failed GET was ignored and the PUT went out BLIND,
+    // and an IMS cancel PUT `cancelled` over a WooCommerce order that was completed or refunded (firing
+    // WooCommerce's own cancel handling). Now the same two rules as a completion: an unreadable status FAILS
+    // CLOSED (`read-failed`, so the caller retries) and the classifier decides from the importer's reading.
+    // The activity rows for a refusal are written by the caller (the durable job), which knows which attempt
+    // of how many this is; only the unreadable status is logged here, as the completion path does.
+    const statusPushTarget: WcStatusPushTarget | null = externalStatus === 'cancelled'
+      ? { wc: 'cancelled', ims: 'CANCELLED' }
+      : (externalStatus === 'on-hold' ? { wc: 'on-hold', ims: 'ON_HOLD' } : null)
+    if (statusPushTarget) {
+      if (currentWc.error) {
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_push_skipped', tag: 'sync', level: 'WARNING',
+          description: `Did not push ${externalStatus} to WC order #${wcRef}: could not read its current status (${currentWc.error}), so nothing was sent and the push will be retried`,
+          resolveUser: false,
+        })
+        return { kind: 'read-failed', error: String(currentWc.error) }
+      }
+      const { readWcStatusPushEligibility } = await import('./completion-eligibility')
+      const { eligibility, slug } = await readWcStatusPushEligibility(wcStatus, statusPushTarget)
+      switch (eligibility) {
+        case 'eligible':
+          break
+        case 'already-at-target':
+          return { kind: 'already-at-target' }
+        case 'ineligible-finalised':
+          return { kind: 'ineligible', wcStatus: slug, class: 'finalised' }
+        case 'ineligible-needs-operator':
+          return { kind: 'ineligible', wcStatus: slug, class: 'needs-operator' }
+        case 'ineligible-unknown':
+          return { kind: 'ineligible', wcStatus: slug, class: 'unknown' }
+        default: {
+          const unhandled: never = eligibility
+          throw new Error(`unhandled status-push eligibility ${String(unhandled)}`)
+        }
       }
     }
 
