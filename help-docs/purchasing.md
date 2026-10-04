@@ -203,13 +203,15 @@ If a freight PO is added or updated after goods have already been received, the 
   stock is reported, not redistributed onto other lines and not posted by IMS: the purchase order detail shows a
   warning beside the line, the receipt result lists it, the recalculation's audit run records it (the
   `landed_cost_credit_floored` warning, with the unfloored unit cost and the amount per layer), and a **WARNING** entry
-  (`landed_cost_credit_floored`) is written to the activity log. IMS queues no journal for that amount, so it is for
+  (`landed_cost_credit_floored`) is written to the activity log whenever the unit cost or the unabsorbed amount changes. IMS queues no journal for that amount, so it is for
   you to establish what it corresponds to in the ledger. Because cost can no longer go below zero from landed cost,
   an already-journaled shipment is never revalued below zero by a freight change.
 - **Freight orders accept an individual credit line, but not a net credit.** A freight order whose cost lines total
-  less than zero is refused with a message that a net credit from the supplier belongs on a supplier credit note. A
-  zero line, a zero total, and a negative line inside a non-negative total are accepted. The cost-line forms themselves
-  still accept positive amounts only.
+  less than zero, or whose total including VAT is less than zero (VAT is charged on a negative vatable line too), is
+  refused with a message that a net credit from the supplier belongs on a supplier credit note. A zero line, a zero
+  total, and a negative line inside a non-negative total are accepted. The cost-line forms themselves still accept
+  positive amounts only. Saving a freight order's costs again **without changing any line** does nothing: no
+  recalculation, no journal; a real edit updates the lines in place.
 - **A safeguard remains underneath.** Revaluing an already-journaled shipment below zero is still refused (nothing is
   changed and an **ERROR** entry, `landed_cost_revaluation_refused_journaled_shipment`, is written to the activity
   log) because IMS cannot post a negative COGS. Landed cost can no longer cause it; it stays in case another source
