@@ -76,16 +76,16 @@ test('o3d-fj4m: only THIS refund\'s UNEARNED_REV_REVERSAL counts (isolating: ano
 /* The crash gap (Codex HIGH on #733): the reversal was queued or posted, the process died before the
  * discharge, sync was switched off, the retry settles it as "will never post". Each standing below is
  * one arm; the precondition (the standing the module reports) is asserted and printed per arm. */
-const STANDING_ARMS: Array<{ name: string; row: Row; standing: string; zeroes: boolean }> = [
+const STANDING_ARMS: Array<{ name: string; row: Row; standing: string; zeroes: boolean; discharges?: boolean }> = [
   { name: 'LIVE_WORK', row: row({ status: 'PENDING' }), standing: 'LIVE_WORK', zeroes: false },
-  { name: 'CONFIRMED_POSTED', row: row({ status: 'SYNCED', externalTransactionId: 'JNL-1' }), standing: 'CONFIRMED_POSTED', zeroes: false },
+  { name: 'CONFIRMED_POSTED', row: row({ status: 'SYNCED', externalTransactionId: 'JNL-1' }), standing: 'CONFIRMED_POSTED', zeroes: false, discharges: true },
   { name: 'ASSERTED_POSTED', row: row({ status: 'SYNCED', externalTransactionId: 'TYPED', settlementBasis: 'OPERATOR_ASSERTION' }), standing: 'ASSERTED_POSTED', zeroes: false },
   { name: 'ASSERTED_NOT_POSTED', row: row({ status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' }), standing: 'ASSERTED_NOT_POSTED', zeroes: false },
   { name: 'UNKNOWN (FAILED, no id)', row: row({ status: 'FAILED' }), standing: 'UNKNOWN', zeroes: false },
   { name: 'PROVEN_NOT_POSTED', row: row({ status: 'CANCELLED', abandonedBeforeRemoteCall: true }), standing: 'PROVEN_NOT_POSTED', zeroes: true },
 ]
 for (const arm of STANDING_ARMS) {
-  test(`o3d-fj4m crash gap: a prior attempt standing ${arm.name} ${arm.zeroes ? 'still lets the relief be written down' : 'KEEPS the relief and leaves the obligation unresolved'}`, async () => {
+  test(`o3d-fj4m crash gap: a prior attempt standing ${arm.name} ${arm.zeroes ? 'still lets the relief be written down' : arm.discharges ? 'DISCHARGES the obligation and PRESERVES the relief' : 'KEEPS the relief and leaves the obligation unresolved'}`, async () => {
     const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
     assert.equal(ledgerStanding(arm.row), arm.standing, 'PRECONDITION: the fixture has the standing the arm names')
     const { client, updates, locks } = recorder([arm.row])
@@ -95,6 +95,10 @@ for (const arm of STANDING_ARMS) {
     if (arm.zeroes) {
       assert.deepEqual(result, { discharged: true, reliefWrittenDown: true })
       assert.equal(updates[0].data.allocatedReliefAmount, 0)
+    } else if (arm.discharges) {
+      assert.deepEqual(result, { discharged: true, reliefWrittenDown: false })
+      assert.equal(updates[0].data.accountingRetryRequired, false, 'the journal posted, so the flag and record come down')
+      assert.equal('allocatedReliefAmount' in updates[0].data, false, 'and the relief is never zeroed')
     } else {
       assert.equal(result.discharged, false)
       assert.equal(updates.length, 0, 'nothing is written: the flag stays, the relief stays')
@@ -102,8 +106,15 @@ for (const arm of STANDING_ARMS) {
   })
 }
 
-test('o3d-fj4m crash gap: ONE unproven attempt among proven-not-posted ones is enough to keep the relief (isolating)', async () => {
+test('o3d-fj4m crash gap: a CONFIRMED_POSTED row beside a PROVEN_NOT_POSTED one discharges and preserves the relief (mixed)', async () => {
   const { client, updates } = recorder([row({ id: 'a', status: 'CANCELLED', abandonedBeforeRemoteCall: true }), row({ id: 'b', status: 'SYNCED', externalTransactionId: 'J' })])
+  const result = await dischargeRefundAccountingObligation(client, 'r1', never('r1'))
+  assert.deepEqual(result, { discharged: true, reliefWrittenDown: false })
+  assert.equal('allocatedReliefAmount' in updates[0].data, false)
+})
+
+test('o3d-fj4m crash gap: ONE unproven attempt among settled ones is enough to stay unresolved (isolating)', async () => {
+  const { client, updates } = recorder([row({ id: 'a', status: 'CANCELLED', abandonedBeforeRemoteCall: true }), row({ id: 'c', status: 'SYNCED', externalTransactionId: 'J' }), row({ id: 'b', status: 'FAILED' })])
   const result = await dischargeRefundAccountingObligation(client, 'r1', never('r1'))
   assert.equal(result.discharged, false)
   assert.equal(updates.length, 0)

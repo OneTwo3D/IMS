@@ -462,10 +462,10 @@ test(
  * refused (so it is flagged with its syncs recorded): same state a crash between the enqueue commit and the
  * discharge leaves. Each arm names the standing of the seeded row and asserts it, and prints the precondition.
  */
-async function crashGap(t: Parameters<typeof rig>[0], label: string, seeded: { status: 'PENDING' | 'SYNCED' | 'CANCELLED'; externalTransactionId?: string; abandonedBeforeRemoteCall?: boolean } | null) {
+async function crashGap(t: Parameters<typeof rig>[0], label: string, seededRows: Array<{ status: 'PENDING' | 'SYNCED' | 'CANCELLED'; externalTransactionId?: string; abandonedBeforeRemoteCall?: boolean; settlementBasis?: string }>) {
   const r = await rig(t)
   const { id: id1 } = await stageFirstRefundRefused(r, label)
-  if (seeded) {
+  for (const seeded of seededRows) {
     const ledgerStandingMod = await import('../../lib/domain/accounting/ledger-standing.ts')
     const created = await r.db.accountingSyncLog.create({
       data: {
@@ -476,6 +476,7 @@ async function crashGap(t: Parameters<typeof rig>[0], label: string, seeded: { s
         referenceId: id1,
         externalTransactionId: seeded.externalTransactionId ?? null,
         abandonedBeforeRemoteCall: seeded.abandonedBeforeRemoteCall ?? null,
+        settlementBasis: seeded.settlementBasis ?? null,
         syncedAt: seeded.status === 'SYNCED' ? new Date() : null,
         payload: { _idempotencyKey: `sales-order-refund:${id1}:unearned-reversal`, lines: [{ accountCode: '1200', debit: 10 }, { accountCode: ALLOCATED_ACCOUNT, credit: 10 }] },
       },
@@ -496,7 +497,7 @@ test(
   '[o3d-fj4m F1] crash gap, prior attempt LIVE_WORK: relief KEPT, obligation unresolved, then the remainder only',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { r, id1, retried, row } = await crashGap(t, 'F1', { status: 'PENDING' })
+    const { r, id1, retried, row } = await crashGap(t, 'F1', [{ status: 'PENDING' }])
     assert.equal(retried.success, false, 'the retry reports the obligation unresolved')
     assert.equal(row.accountingRetryRequired, true, 'the flag stays')
     assert.equal(Number(row.allocatedReliefAmount), 10, 'the relief stays: the journal exists')
@@ -511,17 +512,41 @@ test(
 )
 
 test(
-  '[o3d-fj4m F2] crash gap, prior attempt CONFIRMED_POSTED: relief KEPT, obligation unresolved, then the remainder only',
+  '[o3d-fj4m F2] crash gap, prior attempt CONFIRMED_POSTED, posting DISABLED: the retry DISCHARGES, relief KEPT, refund #2 credits only the remainder',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { r, id1, retried, row } = await crashGap(t, 'F2', { status: 'SYNCED', externalTransactionId: 'FJ4M-JNL-1' })
+    const { r, retried, row } = await crashGap(t, 'F2', [{ status: 'SYNCED', externalTransactionId: 'FJ4M-JNL-1' }])
+    assert.equal(retried.success, true, `the journal posted, so the obligation is met even with posting off (${retried.error ?? ''})`)
+    assert.equal(row.accountingRetryRequired, false, 'the flag and the record come down: the refund no longer blocks the order')
+    assert.equal(Number(row.allocatedReliefAmount), 10, 'the relief is preserved, never zeroed')
+    const second = await secondRefund(r, 'F2')
+    assert.equal(second.credit, 30, 'the posted £10 is relief once: 30, never 40, and never blocked')
+  },
+)
+
+test(
+  '[o3d-fj4m F4] crash gap, CONFIRMED_POSTED beside a PROVEN_NOT_POSTED row (mixed): discharges, relief KEPT, #2 credits 30',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { r, retried, row } = await crashGap(t, 'F4', [
+      { status: 'CANCELLED', abandonedBeforeRemoteCall: true },
+      { status: 'SYNCED', externalTransactionId: 'FJ4M-JNL-4' },
+    ])
+    assert.equal(retried.success, true)
+    assert.equal(row.accountingRetryRequired, false)
+    assert.equal(Number(row.allocatedReliefAmount), 10)
+    assert.equal((await secondRefund(r, 'F4')).credit, 30)
+  },
+)
+
+test(
+  '[o3d-fj4m F5] crash gap, prior attempt ASSERTED_POSTED: still unresolved and blocked while posting is off',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async (t) => {
+    const { retried, row } = await crashGap(t, 'F5', [{ status: 'SYNCED', externalTransactionId: 'TYPED-1', settlementBasis: 'OPERATOR_ASSERTION' }])
     assert.equal(retried.success, false)
     assert.equal(row.accountingRetryRequired, true)
     assert.equal(Number(row.allocatedReliefAmount), 10)
-    const again = await r.deps.retryRefundAccounting(id1)
-    assert.equal(again.success, true, `retry with posting enabled settles (${again.error ?? ''})`)
-    const second = await secondRefund(r, 'F2')
-    assert.equal(second.credit, 30, 'the posted £10 is relief once: 30, never 40')
   },
 )
 
@@ -529,7 +554,7 @@ test(
   '[o3d-fj4m F3] (control) crash gap, the only prior attempt is PROVEN_NOT_POSTED: the relief IS written down and #2 credits the whole £40',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
-    const { r, row } = await crashGap(t, 'F3', { status: 'CANCELLED', abandonedBeforeRemoteCall: true })
+    const { r, row } = await crashGap(t, 'F3', [{ status: 'CANCELLED', abandonedBeforeRemoteCall: true }])
     assert.equal(row.accountingRetryRequired, false, 'nothing could have posted, so the obligation discharges')
     assert.equal(Number(row.allocatedReliefAmount), 0)
     const second = await secondRefund(r, 'F3')
