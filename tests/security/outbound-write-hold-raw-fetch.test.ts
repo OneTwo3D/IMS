@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 import ts from 'typescript'
@@ -127,7 +127,6 @@ test('the scanner can fail: it flags an alias, a member call, a spread, a quoted
     http: "import https from 'node:https'\nhttps.request('https://shop.example.com/x')",
   }
   let flagged = 0
-  const { mkdirSync, writeFileSync, rmSync } = require('node:fs') as typeof import('node:fs')
   mkdirSync(dir, { recursive: true })
   try {
     for (const [name, code] of Object.entries(cases)) {
