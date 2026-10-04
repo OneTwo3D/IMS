@@ -4250,6 +4250,13 @@ db_admin_credential_check() {
   dir="${file%/*}"
   while :; do
     [[ -n "${dir}" ]] || dir="/"
+    # A COMPONENT THAT IS A LINK IS JUDGED BY ITS TARGET'S OWNER AND NOT BY THE DIRECTORY IT SITS IN,
+    # so a root-owned target reached through a link placed in a directory somebody else may write
+    # would pass every test below while the NAME stayed theirs to re-point. No component may be one.
+    if [[ -L "${dir}" ]]; then
+      printf 'the path component %s is a symbolic link' "${dir}"
+      return 1
+    fi
     meta="$(LC_ALL=C stat -c '%u|%a' -- "${dir}" 2>/dev/null)" || { printf 'the directory %s could not be examined' "${dir}"; return 1; }
     IFS='|' read -r owner mode <<<"${meta}"
     if [[ "${owner}" != "${want_uid}" ]]; then
@@ -4397,7 +4404,11 @@ _db_fence_scrub_environment() {
 }
 
 db_fence_exec_root() {
-  local fence_script="$1" role admin="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  # The APPLICATION's own DATABASE_URL travels too (empty when the caller has none): `--release` with no
+  # record connects AS THE APPLICATION to prove it can get in, and it did that with this value when the
+  # helper ran as the application account. It is the application's credential, which root already holds
+  # (the entrypoints read it out of .env), and it is not the admin's.
+  local fence_script="$1" role admin="${DEPLOY_ADMIN_DATABASE_URL:-}" app_url="${DATABASE_URL:-}"
   shift
   role="$(db_migration_role_for "$@")" || {
     echo "The migration role name could not be determined or is not a plain identifier, so the fence helper was not run. Nothing has been changed." >&2
@@ -4406,6 +4417,7 @@ db_fence_exec_root() {
   (
     _db_fence_scrub_environment
     export DEPLOY_ADMIN_DATABASE_URL="${admin}"
+    if [[ -n "${app_url}" ]]; then export DATABASE_URL="${app_url}"; fi
     cd / || exit 1
     exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}
   )

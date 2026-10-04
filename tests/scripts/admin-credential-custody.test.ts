@@ -127,6 +127,11 @@ test('[o3d-1bgr] the reader refuses a 0640 file, a symlink, a foreign owner and 
     refused('group-writable ancestor', readCredential(SHIPPED_LIBRARY, file, UID, trust), /writable by group or other/, file)
     chmodSync(trust, 0o700)
 
+    // 6. A DIRECTORY COMPONENT THAT IS A LINK, to a perfectly good 0700 directory: the target's owner is
+    //    right and the NAME is still somebody else's to re-point.
+    symlinkSync(cred, join(trust, 'linked-cred'))
+    refused('symlinked directory component', readCredential(SHIPPED_LIBRARY, join(trust, 'linked-cred', 'deploy-admin.env'), UID, trust), /symbolic link/, join(trust, 'linked-cred', 'deploy-admin.env'))
+
     // AND THE CONTROL: with every fault undone the same file reads, so each refusal above was about
     // the fault and not about the rig.
     assert.equal(readCredential(SHIPPED_LIBRARY, file, UID, trust).stdout, URL_VALUE)
@@ -234,9 +239,18 @@ function nodeStub(dir: string): string {
     '    pid="$(awk \'/^PPid:/ {print $2}\' "/proc/${pid}/status")"',
     '  done',
     '  echo "--ALL-CMDLINES--"',
+    // EVERY PROCESS IN THE RIG'S OWN TREE, not every process on the box: another agent's run of an unrelated
+    // test on this shared host must not be able to make this scan report a hit that is not this rig's.
+    // The rig is the OUTERMOST `bash -c` among the stub's ancestors (a forked subshell shares its command line).
+    '  rig=""; pid=$$',
+    '  while [[ "${pid}" -gt 1 ]]; do',
+    '    c="$(tr "\\0" " " < "/proc/${pid}/cmdline" 2>/dev/null)"',
+    '    case "${c}" in "bash -c "*) rig="${pid}";; esac',
+    '    pid="$(awk \'/^PPid:/ {print $2}\' "/proc/${pid}/status")"',
+    '  done',
     '  scanned=0; hits=0',
-    '  for f in /proc/[0-9]*/cmdline; do',
-    '    c="$(tr "\\0" " " < "$f" 2>/dev/null)" || continue',
+    '  for pid in $(ps -eo pid=,ppid= | awk -v root="${rig}" \'{p[$1]=$2} END {for (i in p) {x=i; while (x > 1) {if (x == root) {print i; break} x=p[x]}}}\'); do',
+    '    c="$(tr "\\0" " " < "/proc/${pid}/cmdline" 2>/dev/null)" || continue',
     '    scanned=$((scanned + 1))',
     '    case "$c" in *canary-admin*) hits=$((hits + 1));; esac',
     '  done',
@@ -312,6 +326,29 @@ test('[o3d-1bgr] MUTATION env-scrub: without the unset loop the planted NODE_OPT
   }
 })
 
+test('[o3d-1bgr] db_fence_exec_root also carries the APPLICATION\'s own DATABASE_URL (the record-less --release connects with it), and nothing else', () => {
+  const dir = workdir()
+  try {
+    const bin = nodeStub(dir)
+    const script = [
+      'source "$1"',
+      'export NODE_OPTIONS="--require /tmp/planted.js"',
+      'DEPLOY_ADMIN_DATABASE_URL="${RIG_ADMIN}"',
+      'DATABASE_URL="postgresql://imsapp:app-password@127.0.0.1:5432/imsdb"',
+      'db_fence_exec_root /protected/fence-db-connections.mjs --release --app-user=imsapp',
+    ].join('\n')
+    const run = bash(script, [SHIPPED_LIBRARY], { PATH: `${bin}:${process.env.PATH ?? ''}`, RIG_ADMIN: 'postgresql://deployadmin:canary-admin@127.0.0.1:5432/imsdb' })
+    assert.equal(run.status, 0, run.stderr)
+    const report = readFileSync(join(dir, 'node-report.txt'), 'utf8')
+    const names = section(report, 'ENV', 'CANARY-IN-ENV')
+    console.log(`names seen: ${names.join(' ')}`)
+    assert.ok(names.includes('DATABASE_URL') && names.includes('DEPLOY_ADMIN_DATABASE_URL'), 'both connection strings arrive, by name')
+    assert.deepEqual(names.filter((name) => !ALLOWED_ENV.has(name)), [], 'and nothing else does')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('[o3d-1bgr] db_fence_exec_root_with_database_url exports the migration URL and NOT the admin credential', () => {
   const dir = workdir()
   try {
@@ -336,9 +373,9 @@ test('[o3d-1bgr] the credential is on no argv: not the helper\'s, an ancestor\'s
     const ancestry = section(report, 'ANCESTRY', 'ALL-CMDLINES')
     const scanned = Number(/^SCANNED=(\d+)$/m.exec(report)?.[1] ?? 0)
     const hits = Number(/^HITS=(\d+)$/m.exec(report)?.[1] ?? -1)
-    console.log(`precondition: ${ancestry.length} ancestor command lines and ${scanned} process command lines scanned; canary hits ${hits}`)
-    assert.ok(ancestry.length >= 2 && scanned > 5, 'the scan examined real processes')
-    assert.equal(hits, 0, 'no process on the box carried the canary credential on its command line')
+    console.log(`precondition: ${ancestry.length} ancestor command lines and ${scanned} processes in the rig's own tree scanned; canary hits ${hits}`)
+    assert.ok(ancestry.length >= 2 && scanned >= 2, 'the scan examined real processes of the rig\'s own tree')
+    assert.equal(hits, 0, 'no process in the rig\'s tree carried the canary credential on its command line')
     assert.ok(!ancestry.some((line) => line.includes('canary-admin')), 'nor an ancestor')
     assert.equal(section(report, 'CANARY-IN-ENV', 'ANCESTRY')[0], '1', 'while it IS in the environment of the helper: the scan can see it where it is')
   } finally {
@@ -351,8 +388,8 @@ test('[o3d-1bgr] MUTATION argv: passing the credential as an argument puts it on
   try {
     const mutated = mutatedLibrary(
       dir,
-      '    export DEPLOY_ADMIN_DATABASE_URL="${admin}"\n    cd / || exit 1\n    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}\n  )\n}\n\n# THE SAME, FOR THE MODES',
-      '    export DEPLOY_ADMIN_DATABASE_URL="${admin}"\n    cd / || exit 1\n    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"} "--admin=${admin}"\n  )\n}\n\n# THE SAME, FOR THE MODES',
+      '    cd / || exit 1\n    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}\n  )\n}\n\n# THE SAME, FOR THE MODES',
+      '    cd / || exit 1\n    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"} "--admin=${admin}"\n  )\n}\n\n# THE SAME, FOR THE MODES',
       'argv-credential',
     )
     const { report } = execRoot(mutated, dir)

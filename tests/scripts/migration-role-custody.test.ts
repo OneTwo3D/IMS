@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -13,7 +13,7 @@ import {
   planConnectionFence,
   scramSha256Verifier,
 } from '../../scripts/fence-db-connections.mjs'
-import { freePort, startCluster } from './real-postgres-cluster.ts'
+import { freePort, pgBinDir, startCluster } from './real-postgres-cluster.ts'
 import type { Cluster } from './real-postgres-cluster.ts'
 
 /**
@@ -524,5 +524,36 @@ test('[o3d-1bgr] MUTATION plaintext-password: sending the password itself puts i
       await new Promise((resolve) => setTimeout(resolve, 100))
     }
     assert.ok(text.includes(password), 'the mutated helper leaks the plaintext into the server log: the real arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] pg_dump through the migration URL: the dump is taken as the migration login and the URL is on no command line', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const url = printUrl(rig)
+    await session(url, async (client) => { await client.query('CREATE TABLE dump_probe (id int primary key)') })
+    const password = decodeURIComponent(new URL(url).password)
+
+    // A pg_dump on PATH that records its own argv (what `ps` would show) and then runs the real one.
+    const bin = join(rig.root, 'dumpbin')
+    mkdirSync(bin)
+    const argvLog = join(rig.root, 'pg_dump.argv')
+    writeFileSync(join(bin, 'pg_dump'), ['#!/bin/bash', `echo "$*" >> ${JSON.stringify(argvLog)}`, `exec ${JSON.stringify(join(pgBinDir(), 'pg_dump'))} "$@"`].join('\n') + '\n')
+    chmodSync(join(bin, 'pg_dump'), 0o755)
+
+    const library = join(process.cwd(), 'scripts/lib/db-fence-protected.sh')
+    const run = spawnSync('bash', ['-c', 'source "$1"; db_pg_dump_through_url "${RIG_URL}"', 'rig', library], {
+      encoding: 'utf8',
+      env: { PATH: `${bin}:${process.env.PATH ?? ''}`, RIG_URL: url, TMPDIR: rig.root } as unknown as NodeJS.ProcessEnv,
+    })
+    const argv = readFileSync(argvLog, 'utf8')
+    console.log(`pg_dump exit ${run.status}; its argv: ${JSON.stringify(argv.trim())}; dump bytes ${run.stdout.length}`)
+    assert.equal(run.status, 0, run.stderr)
+    assert.match(run.stdout, /CREATE TABLE public\.dump_probe/, 'the dump is of the database the URL names, taken over the service file')
+    assert.ok(!argv.includes(password) && !argv.includes('imsapp_migrator'), 'the URL (its login and password) is on no command line')
+    assert.match(argv, /service=ims_migration/, 'precondition: the recorded argv is the service form')
+    assert.equal(existsSync(join(rig.root, 'service.conf')), false)
+    const leftovers = spawnSync('bash', ['-c', 'ls -A "$1" | grep -c "^tmp\\." || true', 'rig', rig.root], { encoding: 'utf8' }).stdout.trim()
+    assert.equal(leftovers, '0', 'and the directory holding the service file is gone')
   })
 })

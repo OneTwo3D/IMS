@@ -2970,7 +2970,9 @@ already published a release on one host uses to require byte-identity on the nex
 * **The process it runs as.** The helper is executed **as root** on every path (owner decision C3),
   through one library function, `db_fence_exec_root()`: a subshell that un-exports every variable
   but `PATH`, `LANG` and `LC_ALL` (so `NODE_OPTIONS`, `NODE_PATH` and `PG*` from the invoking shell
-  never reach it), exports the credential **by name** into that clean process, runs from `/` and
+  never reach it), exports the credential **by name** into that clean process (with the
+  application's own `DATABASE_URL`, which the record-less `--release` connects with to prove the application
+  can get in), runs from `/` and
   `exec`s `node` with nothing secret on any command line. Until then it ran as the application
   user with `DEPLOY_ADMIN_DATABASE_URL` in its environment, which handed the account the fence
   defends against the credential it defends with. `HOME` is unset in that process, so `pg` resolves
