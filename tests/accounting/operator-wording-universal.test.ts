@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -15,7 +15,7 @@ import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
-import { renderHandPostInstructionDoc, claimWarningFor, handPostInputOf, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
+import { renderHandPostInstructionDoc, claimWarningFor, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
 
 /**
@@ -342,7 +342,6 @@ test('[o3d-1e7sl Codex r8] every surface (row, claim dialog, mark dialog, releas
 // A source census: advice about WHEN to hand-post or mark handled is rendered ONLY by the single source. Another surface that
 // spells "press Mark as handled" / "then post it" / "post it in the ledger" is a second rendering that can disagree with it.
 test('[o3d-1e7sl Codex r8] census: no surface renders hand-post / mark-handled advice outside lib/domain/accounting/hand-post-instruction.ts', () => {
-  const { readdirSync, statSync } = require('node:fs') as typeof import('node:fs')
   const walk = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
     const rel = path.join(dir, name)
     if (name === 'generated' || name === 'node_modules' || name === '.next') return []
