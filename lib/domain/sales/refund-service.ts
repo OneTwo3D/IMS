@@ -2183,11 +2183,15 @@ async function stageRefundAccountingReversals(
         : 0
       // o3d-3la07 (M8): "settled" for an AMOUNT is a CONFIRMED, SYNCED row. An operator-asserted
       // reversal is unsettled here - it lands in the existing UNRESOLVED branch below.
-      // o3d-fj4m (round 3): attempts PROVEN never to have reached the ledger are not part of what posted.
-      const unsettled = rowsThatMayHaveReachedLedger(reversalRows).filter((row) => !journalRowProvesAmount(row))
+      // o3d-fj4m (round 3) AUDIT: deliberately NOT narrowed by `rowsThatMayHaveReachedLedger`. These are DIFFERENT
+      // order-level reversals, not attempts at one posting, and the order's recorded reversal total
+      // (`allocationReversalAmount`) already counts a PROVEN_NOT_POSTED one, so dropping its row would leave its
+      // pounds counted as assumed relief for a journal that never posted. 1b pins this refusal
+      // (`[o3d-3la07 M8] ALLOCATION_REVERSAL PROVEN_NOT_POSTED: the refund is UNRESOLVED`).
+      const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
-      const legible = rowsThatMayHaveReachedLedger(reversalRows).filter((row) => payloadLinesLegible(row.payload))
+      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either
