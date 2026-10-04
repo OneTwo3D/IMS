@@ -203,3 +203,27 @@ test('[o3d-6thk1] READINESS: an unstamped mapping on a bound organisation report
   assert.equal(logged?.entityId, 'test-user', 'who')
   assert.equal((logged?.metadata as { tenantId?: string } | null)?.tenantId, A, 'for which organisation')
 })
+
+test('[o3d-6thk1] the ACCOUNT-ROLE save (saveXeroSettings) obeys the same lock and organisation check, and stamps ownership', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const run = randomUUID().slice(0, 8)
+  const [A, B] = [`tenant-A-${run}`, `tenant-B-${run}`]
+  await seedBoundTo(deps.db, A, run)
+  const { saveXeroSettings } = await import('../../app/actions/xero-sync.ts')
+  const salesNow = async () => (await deps.db.setting.findUnique({ where: { key: 'xero_sales_account' } }))?.value ?? null
+
+  const binding = await startBinding(deps, B, run)
+  const stale = saveXeroSettings({ xero_sales_account: `OLD-ORG-SALES-${run}` }, A)
+  await waitUntilParkedBehind(deps.db as never, { holderPid: binding.pid, waitingOn: /pg_advisory_xact_lock/, describe: 'saveXeroSettings vs the binding' })
+  binding.release()
+  await binding.done
+  const staleResult = await stale
+  assert.equal(staleResult.success, false, 'a page composed for the old organisation is refused')
+  assert.equal(await salesNow(), null, 'and its account code is not written over the cleared mapping')
+
+  const fresh = await saveXeroSettings({ xero_sales_account: `NEW-ORG-SALES-${run}` }, B)
+  console.log(`# o3d-6thk1 role save: stale=${staleResult.success}, fresh=${fresh.success}, stamp=${await stampNow(deps.db)}`)
+  assert.equal(fresh.success, true)
+  assert.equal(await salesNow(), `NEW-ORG-SALES-${run}`)
+  assert.equal(await stampNow(deps.db), B, 'owned by the bound organisation')
+})
