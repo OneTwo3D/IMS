@@ -438,7 +438,7 @@ test('[o3d-1e7sl Codex r15] no re-save / post-by-hand instruction appears withou
   // Sentence windows are applied within ONE string expression (the chunks a `,` at a line end or a blank line separates), never across unrelated literals.
   const sentenceGroupsOf = (file: string): string[][] => expand(read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
     .split(/,\s*\n|\n\s*\n/)
-    .map((chunk) => stringLiterals(chunk).map((l) => l.slice(1, -1)).join('').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
+    .map((chunk) => stringLiterals(chunk).map((l) => l.slice(1, -1)).join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
     .filter((group) => group.length > 0)
   const docSentences = [renderHandPostInstructionDoc(), renderHandPostSettlementDoc()].join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
   const sources: Array<[string, string[]]> = [
