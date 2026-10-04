@@ -1,4 +1,4 @@
-import { isOutboundRedirectRefusedText } from '@/lib/security/outbound-write-hold-constants'
+import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText, outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import type {
   WmsOrderCancelResult,
   WmsOrderPushInput,
@@ -202,11 +202,24 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // maybe-sent path instead: look the order up (a scoped READ) and bind it ONLY if it is provably this
   // order (below). If it cannot be proven the error is re-thrown unchanged (an attempt is spent, as for a
   // timeout, and the link parks AMBIGUOUS_CREATE for an operator).
+  // Whether ANY create request in this push has been handed to the WMS. A hold that arrives on a LATER
+  // request (the courier-fallback PUT) after an earlier one was sent is not "nothing sent": the earlier
+  // PUT may have created the order. Its text is converted so nothing downstream reads it as a hold.
+  let anyCreateSent = false
   const createOrReconcile = async (payload: Record<string, unknown>) => {
     try {
-      return await createOrder(payload)
+      const result = await createOrder(payload)
+      anyCreateSent = true
+      return result
     } catch (error) {
-      if (!isOutboundRedirectRefusedText(error instanceof Error ? error.message : String(error))) throw error
+      const text = error instanceof Error ? error.message : String(error)
+      if (isOutboundWriteHeldText(text)) {
+        // A hop-0 hold: THIS request sent nothing. Only if an earlier one did is it maybe-sent overall.
+        if (anyCreateSent) throw new Error(outboundTextAfterEarlierSend(text, 'Mintsoft'))
+        throw error
+      }
+      anyCreateSent = true // any other failure of a create may have reached the WMS
+      if (!isOutboundMaybeSentRefusalText(text)) throw error
       const existing = await findExistingByReference(input, clientId)
       // PROVABLY OURS OR NOT AT ALL. The scoped search matches the order number OR the external reference,
       // so a single hit can be ANOTHER order of ours that shares a number. Only a row carrying THIS order's

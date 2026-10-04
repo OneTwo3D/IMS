@@ -88,9 +88,26 @@ export function isOutboundWriteHeldText(text: string | null | undefined): boolea
   return typeof text === 'string' && text.includes(`${OUTBOUND_HELD_TEXT_PREFIX} (`)
 }
 
-/** Whether a failure text is a redirect-hop refusal: a request that WAS sent and whose outcome is unknown. */
-export function isOutboundRedirectRefusedText(text: string | null | undefined): boolean {
-  return typeof text === 'string' && text.includes(`${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (`)
+/**
+ * A refusal that came AFTER an earlier request in the SAME logical operation had already been sent (a
+ * login refused after a 401 on a request that was sent; a second create refused after the first was sent).
+ * Like a redirect-hop refusal it is NOT a hold: the earlier request may have taken effect.
+ */
+export const OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX = 'Outbound write REFUSED AFTER AN EARLIER REQUEST WAS SENT'
+
+/**
+ * Re-word a hold's text for the case where an earlier request in the same operation WAS sent. The hold
+ * prefix is removed from the detail, so isOutboundWriteHeldText cannot recognise the result.
+ */
+export function outboundTextAfterEarlierSend(heldText: string, label: string): string {
+  const detail = heldText.split(`${OUTBOUND_HELD_TEXT_PREFIX} (`).join('refusal (')
+  return `${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (${label}): an earlier request in this same operation HAD ALREADY been sent to ${label} and may have taken effect, and a later request was then refused by this installation's outbound-write hold; the earlier outcome is unknown, so this is not treated as a hold and nothing may be repeated blindly. Detail: ${detail}`
+}
+
+/** Whether a failure text is a refusal of a request that FOLLOWED a sent one: a maybe-applied operation. */
+export function isOutboundMaybeSentRefusalText(text: string | null | undefined): boolean {
+  return typeof text === 'string'
+    && (text.includes(`${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (`) || text.includes(`${OUTBOUND_AFTER_EARLIER_SEND_TEXT_PREFIX} (`))
 }
 
 export type OutboundRefusalReasonInput = {

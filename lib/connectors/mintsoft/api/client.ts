@@ -10,6 +10,7 @@ import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
+import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   extractMintsoftArrayPayload,
@@ -107,8 +108,12 @@ export async function mintsoftRequest<T>(
     }
   }
 
+  // Set as soon as the first request has been handed to the transport. A hold on a LATER step of this
+  // same call (the key refresh after a 401) then follows a request that WAS sent: it is not "nothing sent".
+  let requestSent = false
   try {
     const apiKey = await getMintsoftAccessToken()
+    requestSent = true
     const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init, config.clientId ?? '')
     if (firstAttempt.status !== 401) {
       return firstAttempt
@@ -134,6 +139,11 @@ export async function mintsoftRequest<T>(
     const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
     return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init, config.clientId ?? '')
   } catch (error) {
+    if (isOutboundWriteHeldError(error) && requestSent && error.nothingSent) {
+      // The first request of this call was sent; this hold refused a later step. Re-worded so no queue
+      // reads it as a hold (and clears a create dispatch stamp over a request that may have landed).
+      return { data: null, error: outboundTextAfterEarlierSend(error.message, 'Mintsoft'), status: 500 }
+    }
     if (isOutboundWriteHeldError(error)) {
       return error.nothingSent
         ? { data: null, error: error.message, status: 500, held: true }
