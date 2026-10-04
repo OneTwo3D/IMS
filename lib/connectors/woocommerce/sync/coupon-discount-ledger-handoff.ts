@@ -1008,6 +1008,30 @@ export function classifyWcCouponInvoiceHandoff(input: {
   const { document, evidence, keptOrderLevel } = input
 
   if (document.ok) {
+    // A CONFIRMED MIRRORED DOCUMENT SPEAKS FOR ITSELF AND FOR NOTHING ELSE (o3d-djemh round 3). The
+    // claimed id set (every sync row that names a document: confirmed, operator-asserted, on a
+    // FAILED / PENDING / CANCELLED row) is read separately from the mirror. If one confirmed mirrored
+    // invoice agrees with the corrected amount while ANOTHER, distinct id is claimed on a sync row
+    // and no confirmed mirrored document matches it, "the document agrees, no action" would be said
+    // about an order with an unverified document. Any unmatched claimed id therefore forces the
+    // verification variant for every ok case: no remedy, no "no action", no net.
+    const confirmedIds = new Set(document.externalIds)
+    const unmatched = [...new Set(evidence.postedInvoiceExternalIds)].filter((id) => !confirmedIds.has(id)).sort()
+    if (unmatched.length > 0) {
+      const named = describeLedgerDocumentIds(unmatched, evidence.unconfirmedInvoiceDocuments)
+      return {
+        case: 'DOCUMENT_UNVERIFIED',
+        detail:
+          `IMS can read ${describePostedDocuments(document, evidence)} from its mirrored event(s), ` +
+          `but ${unmatched.length > 1 ? 'these ids are' : 'this id is'} named on sync rows and matched by NO confirmed ` +
+          `mirrored document, so nothing IMS holds says what ${unmatched.length > 1 ? 'they carry' : 'it carries'}: ` +
+          'check each in the accounting system before concluding anything about this order',
+        documentRef: `invoice id(s) ${named}`,
+        documentCount: null,
+        externalIds: [],
+        postedDocuments: { count: 0, externalIds: [] },
+      }
+    }
     const posted = money(document.amount)
     const kept = money(keptOrderLevel)
     const netting = wcCouponNettingBasis(document)
