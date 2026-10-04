@@ -126,7 +126,7 @@ test('[o3d-1e7sl Codex r2] operator instruction strings never advise an uncondit
   assert.match(dialog, /check the accounting system, and ONLY if the document is not there hand-post it/)
   assert.doesNotMatch(dialog, /hand-post it in the accounting system and mark the posting handled\. If a document turns up/)
   const handled = await source('lib/domain/accounting/posting-mark-handled.ts')
-  assert.match(handled, /post it by hand ONLY if '\s*\+ 'it is not there/)
+  assert.match(handled, /post it by hand ONLY if [`']\s*\+ 'it is not there/)
   const docs = await source('help-docs/xero-sync.md')
   assert.match(docs, /check Xero first and, only if the document is not there, record it in\s+Xero by hand/)
   assert.doesNotMatch(docs, /To get the posting into the ledger, \*\*record it in/)
