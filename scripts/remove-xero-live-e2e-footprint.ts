@@ -43,7 +43,7 @@ import { createInterface } from 'node:readline'
 import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
-import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
+import { guardedExternalFetch } from '@/lib/security/guarded-external-fetch'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
@@ -274,17 +274,14 @@ async function xero<T>(token: Token, method: 'GET' | 'POST' | 'DELETE', path: st
     'Accept': 'application/json',
     ...(body ? { 'Content-Type': 'application/json' } : {}),
   }
-  // THE OUTBOUND-WRITE HOLD applies to this script like any other IMS process: this raw fetch is outside
-  // connectorFetch, so the same decision is taken here, before the request. A POST or DELETE is sent only
-  // if XERO_WRITE_ALLOWED_TENANT in THIS process's environment names the tenant being written to.
-  const heldRefusal = outboundWriteRefusal({ connectorName: 'Xero', method, url: requestUrl, headers: requestHeaders, body: body ? JSON.stringify(body) : undefined })
-  if (heldRefusal) throw new OutboundWriteHeldError(heldRefusal, 0)
-
-  const res = await fetch(requestUrl, {
+  // THE OUTBOUND-WRITE HOLD applies to this script like any other IMS process, on EVERY hop: a POST or DELETE
+  // is sent only if XERO_WRITE_ALLOWED_TENANT in THIS process's environment names the tenant being written to,
+  // and a redirect cannot carry it to another origin (redirects are followed by hand, each re-checked).
+  const res = await guardedExternalFetch(requestUrl, {
     method,
     headers: requestHeaders,
     ...(body ? { body: JSON.stringify(body) } : {}),
-  })
+  }, { connectorName: 'Xero' })
 
   if (res.status === 429) {
     const retryAfter = Number(res.headers.get('Retry-After') ?? '0')

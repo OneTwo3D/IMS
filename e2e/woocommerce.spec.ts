@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import { guardedExternalFetch } from '../lib/security/guarded-external-fetch'
 import type { Page } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
 import { addStockAdjustment } from './helpers'
@@ -50,14 +51,14 @@ async function wcRequest(path: string, init?: RequestInit) {
   if (!wcUrl || !wcKey || !wcSecret) throw new Error('WooCommerce credentials are not configured in settings')
 
   const auth = Buffer.from(`${wcKey}:${wcSecret}`).toString('base64')
-  const res = await fetch(`${wcUrl.replace(/\/$/, '')}/wp-json/wc/v3${path}`, {
+  const res = await guardedExternalFetch(`${wcUrl.replace(/\/$/, '')}/wp-json/wc/v3${path}`, {
     ...init,
     headers: {
       Authorization: `Basic ${auth}`,
       'Content-Type': 'application/json',
       ...(init?.headers ?? {}),
     },
-  })
+  }, { connectorName: 'WooCommerce' })
 
   if (!res.ok) {
     throw new Error(`WC API ${init?.method ?? 'GET'} ${path} failed: ${res.status} ${res.statusText} ${await res.text()}`)

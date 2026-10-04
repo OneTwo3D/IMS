@@ -12,6 +12,7 @@
  * bug this tier exists to catch.
  */
 import { Client } from 'pg'
+import { guardedExternalFetch } from '../../../lib/security/guarded-external-fetch'
 import { runTag, taggedSku } from './tag.ts'
 
 export type WcCreds = { url: string; key: string; secret: string; webhookSecret: string }
@@ -38,10 +39,10 @@ export async function wcCreds(): Promise<WcCreds> {
 
 export async function wcRequest<T = unknown>(c: WcCreds, path: string, init?: RequestInit): Promise<T> {
   const auth = Buffer.from(`${c.key}:${c.secret}`).toString('base64')
-  const res = await fetch(`${c.url}/wp-json/wc/v3${path}`, {
+  const res = await guardedExternalFetch(`${c.url}/wp-json/wc/v3${path}`, {
     ...init,
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-  })
+  }, { connectorName: 'WooCommerce' })
   const text = await res.text()
   if (!res.ok) {
     throw new Error(`WC ${init?.method ?? 'GET'} ${path} -> ${res.status} ${res.statusText}: ${text.slice(0, 400)}`)
