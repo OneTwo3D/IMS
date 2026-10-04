@@ -352,7 +352,7 @@ test('[o3d-1e7sl Codex r8] census: no surface renders hand-post / mark-handled a
   const FORBIDDEN = /press "Mark as handled"|then post it\b|post it in the ledger|post it by hand in the ledger|post it in the accounting system, then mark/i
   const sources = ['app', 'lib', 'components'].flatMap((d) => (() => { try { return walk(d) } catch { return [] } })())
   assert.ok(sources.length > 500, `the census reads the source tree (${sources.length} files)`)
-  const offenders = sources.filter((f) => f !== SINGLE).filter((f) => FORBIDDEN.test(readFileSync(path.join(ROOT, f), 'utf8').replace(/^\s*(\/\/|\*|\/\*).*$/gm, '')))
+  const offenders = sources.filter((f) => f !== SINGLE).filter((f) => FORBIDDEN.test(readFileSync(path.join(ROOT, f), 'utf8').replace(/^\s*(\/\/|\*|\/\*).*$/gm, '').replace(/['"`]\s*\+?\s*\n?\s*\+?\s*['"`]/g, '')))
   assert.deepEqual(offenders, [], 'hand-post / mark-handled advice is rendered outside the single source')
   // and the consumers really route through it
   for (const [file, symbol] of [
