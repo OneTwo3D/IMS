@@ -435,10 +435,15 @@ test('[o3d-1e7sl Codex r15] no re-save / post-by-hand instruction appears withou
   const CHECK = /check whether the current version is already in the accounting system|check the ledger|check for that document|the ledger for (the|that)|check Sync > Exceptions|check the accounting system/i
   // the shared constants are identifiers in the source; substitute their text so the check sees what the operator reads
   const expand = (source: string) => source.replace(/\bLEDGER_CHECK_FIRST\b/g, JSON.stringify(LEDGER_CHECK_FIRST)).replace(/\bAFTER_DECLINE_STEP\b/g, JSON.stringify(AFTER_DECLINE_STEP))
-  const sentencesOfLiterals = (file: string) => stringLiterals(expand(read(file))).join(' ').replace(/['"`]\s*\+?\s*['"`]/g, '').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
+  // Sentence windows are applied within ONE string expression (the chunks a `,` at a line end or a blank line separates), never across unrelated literals.
+  const sentenceGroupsOf = (file: string): string[][] => expand(read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
+    .split(/,\s*\n|\n\s*\n/)
+    .map((chunk) => stringLiterals(chunk).map((l) => l.slice(1, -1)).join('').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
+    .filter((group) => group.length > 0)
+  const docSentences = [renderHandPostInstructionDoc(), renderHandPostSettlementDoc()].join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
   const sources: Array<[string, string[]]> = [
-    ...MODULES.map((f) => [f, sentencesOfLiterals(f)] as [string, string[]]),
-    ['generated doc blocks', [renderHandPostInstructionDoc(), renderHandPostSettlementDoc()].join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)],
+    ...MODULES.flatMap((f) => sentenceGroupsOf(f).map((g) => [f, g] as [string, string[]])),
+    ['generated doc blocks', docSentences],
   ]
   const offenders: string[] = []
   let instructions = 0
@@ -446,7 +451,6 @@ test('[o3d-1e7sl Codex r15] no re-save / post-by-hand instruction appears withou
     sentences.forEach((sentence, i) => {
       if (!INSTRUCTION.test(sentence)) return
       instructions += 1
-      // the remedies that already name a CURRENT-version check inside the typed step carry it in the sentence; others need the previous sentence to
       if (CHECK.test(sentence) || CHECK.test(sentences[i - 1] ?? '') || CHECK.test(sentences[i - 2] ?? '')) return
       offenders.push(`${name}: ${sentence.slice(0, 150)}`)
     })
