@@ -25,6 +25,8 @@ const state = {
   linked: true,
   mappings: [] as Array<{ externalStatus: string; imsStatus: string }>,
   fetchThrows: false,
+  /** How the store answers a successful PUT: as asked, with another status, or with none. */
+  putAnswer: 'as-asked' as 'as-asked' | 'rewrites-to-processing' | 'no-status' | 'prefixed',
 }
 
 mock.module('@/lib/activity-log', {
@@ -60,6 +62,9 @@ mock.module('@/lib/connectors/woocommerce/api', {
     wcPut: async (path: string, body: Row) => {
       state.puts.push({ path, body })
       if (state.putError) return { data: null, error: state.putError }
+      if (state.putAnswer === 'rewrites-to-processing') return { data: { status: 'processing', date_modified_gmt: '2026-10-04T10:00:05' } }
+      if (state.putAnswer === 'no-status') return { data: { date_modified_gmt: '2026-10-04T10:00:05' } }
+      if (state.putAnswer === 'prefixed') return { data: { status: `wc-${String(body.status)}`, date_modified_gmt: '2026-10-04T10:00:05' } }
       return { data: { status: body.status, date_modified_gmt: '2026-10-04T10:00:05' } }
     },
   },
@@ -76,9 +81,10 @@ beforeEach(() => {
   state.linked = true
   state.mappings = []
   state.fetchThrows = false
+  state.putAnswer = 'as-asked'
 })
 
-async function push(status: 'CANCELLED' | 'ON_HOLD') {
+async function push(status: 'CANCELLED' | 'ON_HOLD' | 'SHIPPED') {
   const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
   return pushImsStatusToWc('so-1', status)
 }
@@ -192,7 +198,8 @@ test('o3d-6ldlj (e): partial-shipped and EU-withdrawal statuses are never pushed
       state.mappings = [{ externalStatus: slug, imsStatus: 'PROCESSING' }] // the mapping must not make it pushable
       const outcome = await push(status)
       assert.equal(state.fetches.length, 1, `${status}/${slug}: precondition — read`)
-      assert.deepEqual(outcome, { kind: 'ineligible', wcStatus: slug, class: 'needs-operator' }, `${status}/${slug}`)
+      assert.equal(outcome.kind, 'ineligible', `${status}/${slug}`)
+      if (outcome.kind === 'ineligible') assert.deepEqual({ wcStatus: outcome.wcStatus, class: outcome.class, hasDetail: typeof outcome.detail === 'string' }, { wcStatus: slug, class: 'needs-operator', hasDetail: true }, `${status}/${slug}`)
       assert.deepEqual(state.puts, [], `${status}/${slug}`)
       evaluated++
     }
@@ -286,7 +293,8 @@ test('o3d-6ldlj (j): a mapping row can NOT make IMS skip the PUT: processing map
     state.mappings = [{ externalStatus: 'voided-custom', imsStatus: mapped }]
     const custom = await push(status)
     assert.equal(state.fetches.length, 1)
-    assert.deepEqual(custom, { kind: 'ineligible', wcStatus: 'voided-custom', class: 'needs-operator' }, `${status}: custom slug mapped to the target`)
+    assert.equal(custom.kind, 'ineligible', `${status}: custom slug mapped to the target`)
+    if (custom.kind === 'ineligible') assert.equal(custom.class, 'needs-operator')
     assert.deepEqual(state.puts, [])
     evaluated++
   }
@@ -302,4 +310,62 @@ test('o3d-6ldlj (j2): a REAL-slug already-at-target is still a success with ZERO
   state.mappings = [{ externalStatus: 'on-hold', imsStatus: 'PROCESSING' }]
   assert.deepEqual(await push('ON_HOLD'), { kind: 'already-at-target' })
   assert.deepEqual(state.puts, [])
+})
+
+test('o3d-6ldlj (k, round 2): a 200 whose echoed status is NOT the requested slug is UNCONFIRMED: nothing recorded as pushed, WARNING logged, never `pushed` — cancel, hold AND the shared completion push', async () => {
+  let evaluated = 0
+  for (const [status, wcTarget] of [['CANCELLED', 'cancelled'], ['ON_HOLD', 'on-hold'], ['SHIPPED', 'completed']] as const) {
+    for (const answer of ['rewrites-to-processing', 'no-status'] as const) {
+      state.puts.length = 0
+      state.fetches.length = 0
+      state.syncLogs.length = 0
+      state.activity.length = 0
+      state.wcStatus = 'processing'
+      state.putAnswer = answer
+      const outcome = await push(status)
+      assert.equal(state.puts.length, 1, `${status}/${answer}: precondition — the PUT was sent and answered 200`)
+      assert.equal(outcome.kind, 'unconfirmed', `${status}/${answer}`)
+      if (outcome.kind === 'unconfirmed') {
+        assert.equal(outcome.requested, wcTarget)
+        assert.match(outcome.error, answer === 'no-status' ? /without a status instead of/ : new RegExp(`answered with status processing instead of ${wcTarget}`))
+      }
+      assert.deepEqual(state.syncLogs, [], `${status}/${answer}: no SYNCED row (the echo log must not claim a push that did not hold)`)
+      assert.equal(state.activity.filter((a) => a.action === 'wc_status_push_unconfirmed' && a.level === 'WARNING').length, 1, `${status}/${answer}`)
+      assert.equal(state.activity.filter((a) => a.action === 'wc_status_pushed').length, 0)
+      evaluated++
+    }
+    // The control: the same call answered as asked (also with a wc- prefix) is pushed and recorded.
+    for (const answer of ['as-asked', 'prefixed'] as const) {
+      state.puts.length = 0
+      state.syncLogs.length = 0
+      state.putAnswer = answer
+      assert.deepEqual(await push(status), { kind: 'pushed' }, `${status}/${answer}`)
+      assert.equal(state.syncLogs.length, 1)
+      evaluated++
+    }
+  }
+  assert.equal(evaluated, 12)
+})
+
+test('o3d-6ldlj (l, round 2): needs-operator carries the SPECIFIC cause, per class, and no other class\'s words', async () => {
+  const cases: Array<{ name: string; slug: string; mapping: string | null; status: 'CANCELLED' | 'ON_HOLD'; must: RegExp; mustNot: RegExp[] }> = [
+    { name: 'partial-shipped', slug: 'partial-shipped', mapping: null, status: 'CANCELLED', must: /"partial-shipped": part of the order has already shipped/, mustNot: [/withdrawal/i, /Status Mapping/] },
+    { name: 'withdrawal submitted', slug: 'pending-wdraw', mapping: 'PROCESSING', status: 'ON_HOLD', must: /"pending-wdraw": the customer has submitted an EU right-of-withdrawal request/, mustNot: [/part of the order/, /Status Mapping/] },
+    { name: 'withdrawal approved', slug: 'withdrawn', mapping: 'PROCESSING', status: 'CANCELLED', must: /"withdrawn": an EU right-of-withdrawal request was approved/, mustNot: [/part of the order/, /Status Mapping/] },
+    { name: 'custom mapped to CANCELLED', slug: 'voided-custom', mapping: 'CANCELLED', status: 'CANCELLED', must: /custom status "voided-custom", which your Status Mapping reads as CANCELLED/, mustNot: [/part of the order/, /withdrawal/i] },
+    { name: 'custom mapped to ON_HOLD', slug: 'awaiting-custom', mapping: 'ON_HOLD', status: 'ON_HOLD', must: /custom status "awaiting-custom", which your Status Mapping reads as ON_HOLD/, mustNot: [/part of the order/, /withdrawal/i] },
+  ]
+  for (const c of cases) {
+    state.puts.length = 0
+    state.wcStatus = c.slug
+    state.mappings = c.mapping ? [{ externalStatus: c.slug, imsStatus: c.mapping }] : []
+    const outcome = await push(c.status)
+    assert.equal(outcome.kind, 'ineligible', c.name)
+    if (outcome.kind !== 'ineligible') continue
+    assert.equal(outcome.class, 'needs-operator', c.name)
+    assert.match(String(outcome.detail), c.must, c.name)
+    for (const bad of c.mustNot) assert.doesNotMatch(String(outcome.detail), bad, c.name)
+    assert.deepEqual(state.puts, [], c.name)
+  }
+  console.log(`needs-operator causes rendered: ${cases.length}`)
 })

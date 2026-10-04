@@ -12,6 +12,7 @@ import { assertWcAttemptMayWrite } from '../attempt-fence'
 import type { WcFullOrder } from './types'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
 import type { WcStatusPushTarget } from './completion-eligibility'
+import { normaliseWcOrderStatus } from '../order-status-filter'
 
 type SalesOrderStatus = string
 
@@ -161,7 +162,13 @@ export type WcStatusPushOutcome =
    * of) and `needs-operator` (a cancel/hold onto a partial-shipped or EU-withdrawal order, which is never pushed
    * automatically: someone has to decide what it means in the storefront).
    */
-  | { kind: 'ineligible'; wcStatus: string; class: 'finalised' | 'not-ready' | 'unknown' | 'needs-operator' }
+  | { kind: 'ineligible'; wcStatus: string; class: 'finalised' | 'not-ready' | 'unknown' | 'needs-operator'; detail?: string }
+  /**
+   * The PUT returned without an HTTP error but the order it echoes is NOT in the requested status (or carries none):
+   * a store plugin rewrote or rejected the transition while answering 200. The write is NOT confirmed, so it is
+   * neither recorded as pushed nor counted as done; the caller retries and the next attempt re-reads the store.
+   */
+  | { kind: 'unconfirmed'; requested: string; observed: string | null; error: string }
   | { kind: 'read-failed'; error: string }
   | { kind: 'write-failed'; error: string }
   | { kind: 'error'; error: string }
@@ -248,7 +255,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         return { kind: 'read-failed', error: String(currentWc.error) }
       }
       const { readWcStatusPushEligibility } = await import('./completion-eligibility')
-      const { eligibility, slug } = await readWcStatusPushEligibility(wcStatus, statusPushTarget)
+      const { eligibility, slug, cause } = await readWcStatusPushEligibility(wcStatus, statusPushTarget)
       switch (eligibility) {
         case 'eligible':
           break
@@ -257,7 +264,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         case 'ineligible-finalised':
           return { kind: 'ineligible', wcStatus: slug, class: 'finalised' }
         case 'ineligible-needs-operator':
-          return { kind: 'ineligible', wcStatus: slug, class: 'needs-operator' }
+          return { kind: 'ineligible', wcStatus: slug, class: 'needs-operator', ...(cause ? { detail: cause } : {}) }
         case 'ineligible-unknown':
           return { kind: 'ineligible', wcStatus: slug, class: 'unknown' }
         default: {
@@ -281,6 +288,23 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         resolveUser: false,
       })
       return { kind: 'write-failed', error: String(error) }
+    }
+
+    // CONFIRM THE WRITE (o3d-6ldlj round 2): a 200 is not proof the status changed. A store plugin can rewrite or
+    // reject a transition and still answer 200 with the order as it stands. Require the echoed status to BE the
+    // requested slug; otherwise report `unconfirmed` and record nothing as pushed.
+    const echoedStatus = (pushedOrder as { status?: unknown } | null)?.status
+    const observedSlug = typeof echoedStatus === 'string' && echoedStatus.trim() !== '' ? normaliseWcOrderStatus(echoedStatus) : null
+    if (observedSlug !== externalStatus) {
+      const message = observedSlug === null
+        ? `WooCommerce answered without a status instead of ${externalStatus}`
+        : `WooCommerce answered with status ${observedSlug} instead of ${externalStatus}`
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_push_unconfirmed', tag: 'sync', level: 'WARNING',
+        description: `Pushed status ${newStatus} → ${externalStatus} to WC order #${wcRef} but it was not confirmed: ${message}. The next attempt re-reads the order first.`,
+        resolveUser: false,
+      })
+      return { kind: 'unconfirmed', requested: externalStatus, observed: observedSlug, error: message }
     }
 
     // Record WHEN our write landed, straight from WooCommerce's own clock.

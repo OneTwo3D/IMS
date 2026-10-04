@@ -44,11 +44,17 @@ const wc = {
   gets: 0,
   puts: 0,
   events: [] as string[],
+  /** The status of every PUT that was APPLIED, in order. */
+  putLog: [] as string[],
   /** The status push resolves to this shape instead of the storefront model. */
   statusOverride: null as FacadeResult | null,
   /** A PAUSED WooCommerce request, consumed by the first status push only. `honour` ends when the attempt signal
    *  aborts (as a real aborted fetch does); `ignore` models a request that does not notice. */
   gate: null as Gate | null,
+  /** Pauses the FIRST PUT after every pre-write check has passed (the write is on the wire, not yet applied). */
+  putGate: null as Gate | null,
+  /** The store answers a PUT with 200 but keeps/does not hold the requested status. */
+  unconfirmed: false,
 }
 const activity: Array<Record<string, unknown>> = []
 /** When set, logActivity THROWS for this action: models the process failing after the transaction committed. */
@@ -82,7 +88,9 @@ function classify(status: string, target: 'cancelled' | 'on-hold'): FacadeResult
   if (status === 'completed' || status === 'refunded' || (status === 'cancelled' && target === 'on-hold')) {
     return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'finalised' } }
   }
-  if (status === 'partial-shipped') return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'needs-operator' } }
+  if (status === 'partial-shipped') return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'needs-operator', detail: 'it is "partial-shipped": part of the order has already shipped' } }
+  if (status === 'pending-wdraw') return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'needs-operator', detail: 'it is "pending-wdraw": the customer has submitted an EU right-of-withdrawal request' } }
+  if (status === 'voided-custom') return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'needs-operator', detail: `it is the custom status "voided-custom", which your Status Mapping reads as ${target.toUpperCase().replace('-', '_').replace('CANCELLED', 'CANCELLED')}, the state IMS is pushing, so IMS cannot tell what your store does with that status` } }
   if (status === 'weird-custom') return { success: true, outcome: { kind: 'ineligible', wcStatus: status, class: 'unknown' } }
   return null
 }
@@ -137,12 +145,28 @@ mock.module('@/lib/shopping', {
         const message = (error as Error).message
         return { success: false, error: message, outcome: { kind: 'error', error: message } }
       }
+      const putGate = wc.putGate
+      if (putGate) {
+        wc.putGate = null
+        putGate.reached.resolve()
+        await putGate.release.promise // the write is on the wire; nothing can stop it now
+      }
       wc.puts++
+      wc.putLog.push(target)
+      if (wc.unconfirmed) {
+        return { success: false, error: `WooCommerce answered with status processing instead of ${target}`, outcome: { kind: 'unconfirmed', requested: target, observed: 'processing', error: `WooCommerce answered with status processing instead of ${target}` } }
+      }
       if (!wc.staysAtStatus) wc.status = target
       return { success: true, outcome: { kind: 'pushed' } }
     },
   },
 })
+
+function pausePut(): Gate {
+  const gate = newGate('ignore')
+  wc.putGate = gate
+  return gate
+}
 
 function pauseNextRequest(mode: Gate['mode']): Gate {
   const gate = newGate(mode)
@@ -157,8 +181,11 @@ function resetWc() {
   wc.gets = 0
   wc.puts = 0
   wc.events.length = 0
+  wc.putLog.length = 0
   wc.statusOverride = null
   wc.gate = null
+  wc.putGate = null
+  wc.unconfirmed = false
   activity.length = 0
   activityFault.action = null
 }
@@ -423,7 +450,8 @@ test('o3d-6ldlj (arm 10): a partial-shipped / withdrawal order NEEDS AN OPERATOR
     const row = await rowOf(deps, key)
     assert.equal(row.status, 'PERMANENT_FAILED', `${kind.name}: straight to the exception inbox`)
     assert.equal(row.attempts, 1, 'not retried: retrying cannot change a stable refusal')
-    assert.match(String(row.lastError), /part-shipped or EU-withdrawal/)
+    assert.match(String(row.lastError), /because it is "partial-shipped": part of the order has already shipped/)
+    assert.doesNotMatch(String(row.lastError), /part-shipped or EU-withdrawal|withdrawal/i, 'the text names THIS cause, not a list of causes')
     assert.match(String(row.lastError), /this attempt did not change WooCommerce/, 'accurate: the connector refused BEFORE any PUT of this attempt, and says no more than that')
     assert.equal(activity.filter((a) => a.action === `wc_${kind.name}_dead_lettered` && a.level === 'ERROR').length, 1)
 
@@ -449,6 +477,7 @@ test('o3d-6ldlj (arm 11): skipped / not-applicable / no outcome / failures / unk
     { name: 'write-failed outcome', result: { success: false, error: 'HTTP 500', outcome: { kind: 'write-failed', error: 'HTTP 500' } } },
     { name: 'a success:true that carries a read-failed outcome (isolates the outcome switch from the success flag)', result: { success: true, outcome: { kind: 'read-failed', error: 'HTTP 503' } } },
     { name: 'a success:true that carries an error outcome', result: { success: true, outcome: { kind: 'error', error: 'boom' } } },
+    { name: 'a success:true that carries an unconfirmed outcome', result: { success: true, outcome: { kind: 'unconfirmed', requested: 'cancelled', observed: 'processing', error: 'WooCommerce answered with status processing instead of cancelled' } } },
     { name: 'unknown status class', result: { success: true, outcome: { kind: 'ineligible', wcStatus: 'foo', class: 'unknown' } } },
     { name: 'not-ready class', result: { success: true, outcome: { kind: 'ineligible', wcStatus: 'foo', class: 'not-ready' } } },
   ]
@@ -943,4 +972,241 @@ test('o3d-6ldlj (arm 23): the enqueue happens under the ORDER LOCK — a transit
   const rows = await rowsForOrder(deps, orderId)
   assert.equal(rows.length, 1, 'the row appears with the flip, once the lock was obtained')
   await until(async () => (await rowsForOrder(deps, orderId))[0].status === 'SUCCEEDED', 'the immediate attempt')
+})
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 2: ONE WRITER OF AN ORDER'S WOOCOMMERCE STATUS AT A TIME; the write must be CONFIRMED; the cause is SPECIFIC.
+// ---------------------------------------------------------------------------------------------------------------
+
+test('o3d-6ldlj (arm 24): DELAYED INTERLEAVING — a hold PUT on the wire when IMS cancels cannot land after the cancel PUT: the cancel waits, then WooCommerce ends CANCELLED and both jobs are consistent', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [cancel, hold] = kindsOf(deps)
+  resetWc()
+  const orderId = await newOrder(deps, 'interleave', 'ON_HOLD')
+  const holdRef = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_000_300_000) }))
+  assert.ok(holdRef)
+  const putGate = pausePut()
+
+  const holdRun = hold.process({ idempotencyKeys: [holdRef.key], attemptDeadlineMs: 600_000 })
+  await putGate.reached.promise
+  assert.equal(wc.puts, 0, 'precondition: the hold PUT is on the wire, not applied')
+  assert.equal((await rowOf(deps, holdRef.key)).status, 'PROCESSING')
+
+  // IMS cancels while the hold PUT is delayed, and the cancel job is due at once.
+  await setImsStatus(deps, orderId, 'CANCELLED')
+  const cancelRef = await deps.db.$transaction((tx) => cancel.schedule(tx, { orderId, flippedAt: new Date(1_760_000_400_000) }))
+  assert.ok(cancelRef)
+  const early = await cancel.process({ idempotencyKeys: [cancelRef.key] })
+  assert.equal(early.claimed, 0, 'the cancel job is DEFERRED while the hold PUT is in flight (same order)')
+  assert.equal(wc.puts, 0, 'and sent nothing')
+  const waiting = await rowOf(deps, cancelRef.key)
+  assert.equal(waiting.status, 'PENDING', 'untouched')
+  assert.equal(waiting.attempts, 0, 'deferral burns NO attempt')
+
+  putGate.release.resolve() // the delayed hold PUT lands
+  const holdSummary = await holdRun
+  assert.equal(holdSummary.claimed, 1)
+  assert.equal(wc.status, 'on-hold', 'precondition: the hold landed first')
+  const holdRow = await rowOf(deps, holdRef.key)
+  assert.equal(holdRow.status, 'RETRYABLE_FAILED', 'the hold job does NOT report done: IMS no longer wants on-hold')
+  assert.match(String(holdRow.lastError), /IMS order is now CANCELLED/)
+
+  // The cancel now runs: it re-reads WooCommerce (on-hold) and writes cancelled.
+  const run = await cancel.process({ idempotencyKeys: [cancelRef.key] })
+  assert.equal(run.claimed, 1)
+  assert.equal(wc.status, 'cancelled', 'FINAL WooCommerce status is the latest IMS intent')
+  assert.equal((await rowOf(deps, cancelRef.key)).status, 'SUCCEEDED')
+  assert.deepEqual(wc.putLog, ['on-hold', 'cancelled'], 'the PUTs were sequenced: hold first, cancel last')
+
+  // The hold job's retry finds it superseded and sends nothing.
+  const getsBefore = wc.gets
+  await hold.process({ idempotencyKeys: [holdRef.key], now: new Date(holdRow.nextAttemptAt!.getTime() + 1) })
+  assert.equal(wc.gets, getsBefore, 'superseded: zero WooCommerce requests')
+  assert.deepEqual([(await rowOf(deps, holdRef.key)).status, (await rowOf(deps, cancelRef.key)).status], ['SUCCEEDED', 'SUCCEEDED'])
+  assert.equal(wc.status, 'cancelled')
+})
+
+test('o3d-6ldlj (arm 24b): CONVERGENCE — a write that succeeded while IMS moved on is NOT done: retry, then superseded', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [, hold] = kindsOf(deps)
+  resetWc()
+  const { orderId, key } = await newRow(deps, hold, 'converge')
+  const putGate = pausePut()
+  const run = hold.process({ idempotencyKeys: [key], attemptDeadlineMs: 600_000 })
+  await putGate.reached.promise
+  await setImsStatus(deps, orderId, 'PROCESSING') // released while the PUT is on the wire
+  putGate.release.resolve()
+  await run
+  assert.equal(wc.puts, 1, 'precondition: the write went out')
+  const row = await rowOf(deps, key)
+  assert.equal(row.status, 'RETRYABLE_FAILED', 'not SUCCEEDED')
+  assert.match(String(row.lastError), /written, but the IMS order is now PROCESSING/)
+})
+
+test('o3d-6ldlj (arm 25): LEASE-BOUNDED — a stale PROCESSING claim of the same order does not block it for ever; a live one does; a completion row counts too', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [cancel, hold] = kindsOf(deps)
+  resetWc()
+  const orderId = await newOrder(deps, 'lease', 'CANCELLED')
+  const holdRef = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_000_500_000) }))
+  const cancelRef = await deps.db.$transaction((tx) => cancel.schedule(tx, { orderId, flippedAt: new Date(1_760_000_600_000) }))
+  assert.ok(holdRef && cancelRef)
+  const t0 = new Date()
+  await claimAndAge(deps, hold, holdRef.key, t0, 60_000) // claimed one minute ago: INSIDE the 10 minute lease
+  const blocked = await cancel.process({ idempotencyKeys: [cancelRef.key], now: t0 })
+  assert.equal(blocked.claimed, 0, 'a live claim of the same order blocks')
+  assert.equal(wc.gets, 0)
+
+  await deps.db.integrationOutbox.update({ where: { idempotencyKey: holdRef.key }, data: { lockedAt: new Date(t0.getTime() - 3_600_000) } })
+  assert.equal((await rowOf(deps, holdRef.key)).status, 'PROCESSING', 'precondition: still PROCESSING, but past the lease')
+  const freed = await cancel.process({ idempotencyKeys: [cancelRef.key], now: t0 })
+  assert.equal(freed.claimed, 1, 'a claim older than the lease does not block the order')
+  assert.equal(wc.puts, 1)
+  assert.equal((await rowOf(deps, cancelRef.key)).status, 'SUCCEEDED')
+
+  // An order.complete row in flight blocks a hold on the same order, and a hold in flight blocks the completion claim.
+  const other = await newOrder(deps, 'lease-complete', 'ON_HOLD')
+  const completionKey = deps.buildOutboxIdempotencyKey('woocommerce', 'order.complete', other, '1760000700000')
+  await deps.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'order.complete', idempotencyKey: completionKey, payloadJson: { orderId: other }, nextAttemptAt: null })
+  const otherHold = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId: other, flippedAt: new Date(1_760_000_800_000) }))
+  assert.ok(otherHold)
+  const [claimedCompletion] = await deps.claimIntegrationOutboxWork({ connector: 'woocommerce', operation: 'order.complete', idempotencyKeys: [completionKey], limit: 1, workerId: 'woocommerce-order-completion', maxAttempts: 8, now: t0 })
+  assert.ok(claimedCompletion, 'precondition: the completion row is PROCESSING')
+  const holdBlocked = await hold.process({ idempotencyKeys: [otherHold.key], now: t0 })
+  assert.equal(holdBlocked.claimed, 0, 'a completion in flight blocks the hold of the same order')
+  await deps.markIntegrationOutboxSuccess({ id: claimedCompletion.id, workerId: 'woocommerce-order-completion', lockedAt: claimedCompletion.lockedAt! })
+  const holdFreed = await hold.process({ idempotencyKeys: [otherHold.key], now: t0 })
+  assert.equal(holdFreed.claimed, 1, 'once the completion settled the hold may run')
+  await deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: completionKey } })
+
+  // And the other way round, through the REAL completion drain: a hold in flight defers the completion claim.
+  const third = await newOrder(deps, 'lease-complete2', 'ON_HOLD')
+  const completionKey2 = deps.buildOutboxIdempotencyKey('woocommerce', 'order.complete', third, '1760000900000')
+  await deps.enqueueIntegrationOutbox({ connector: 'woocommerce', operation: 'order.complete', idempotencyKey: completionKey2, payloadJson: { orderId: third }, nextAttemptAt: null })
+  const thirdHold = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId: third, flippedAt: new Date(1_760_001_000_000) }))
+  assert.ok(thirdHold)
+  await claimAndAge(deps, hold, thirdHold.key, new Date(), 1_000)
+  const { processWcOrderCompletionJobs } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
+  const deferred = await processWcOrderCompletionJobs({ idempotencyKeys: [completionKey2] })
+  assert.equal(deferred.claimed, 0, 'a hold in flight defers the order.complete claim')
+  assert.equal((await rowOf(deps, completionKey2)).attempts, 0)
+  await deps.db.integrationOutbox.deleteMany({ where: { idempotencyKey: completionKey2 } })
+})
+
+test('o3d-6ldlj (arm 26): the claim is SERIALISED per order — while a hold is in flight, 8 concurrent drains of the cancel for the SAME order all claim nothing and leave it untouched', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [cancel, hold] = kindsOf(deps)
+  resetWc()
+  const orderId = await newOrder(deps, 'serialised', 'ON_HOLD')
+  const holdRef = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_001_100_000) }))
+  const cancelRef = await deps.db.$transaction((tx) => cancel.schedule(tx, { orderId, flippedAt: new Date(1_760_001_200_000) }))
+  assert.ok(holdRef && cancelRef)
+  const gate = pauseNextRequest('ignore')
+  const holdRun = hold.process({ idempotencyKeys: [holdRef.key], attemptDeadlineMs: 600_000 })
+  await gate.reached.promise
+  assert.equal((await rowOf(deps, holdRef.key)).status, 'PROCESSING', 'precondition: the hold is in flight')
+
+  const drains = await Promise.all(Array.from({ length: 8 }, () => cancel.process({ idempotencyKeys: [cancelRef.key] })))
+  assert.equal(drains.length, 8, 'precondition: every drain ran')
+  assert.equal(drains.reduce((n, d) => n + d.claimed, 0), 0, 'not one drain claimed the cancel while the hold was in flight')
+  const cancelRow = await rowOf(deps, cancelRef.key)
+  assert.deepEqual([cancelRow.status, cancelRow.attempts], ['PENDING', 0], 'and the cancel is untouched (a claim would have settled it as superseded)')
+  gate.release.resolve()
+  await holdRun
+  assert.equal((await rowOf(deps, holdRef.key)).status, 'SUCCEEDED')
+})
+
+test('o3d-6ldlj (arm 26b): two jobs of one order CLAIMED AT THE SAME INSTANT are still serialised — exactly one is in flight, the other is refused untouched (repeated: a race, not a schedule)', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [, hold] = kindsOf(deps)
+  const ROUNDS = 12
+  for (let round = 0; round < ROUNDS; round++) {
+    resetWc()
+    const orderId = await newOrder(deps, `claim-race-${round}`, 'ON_HOLD')
+    const first = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_002_000_000 + round * 10) }))
+    const second = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_002_000_001 + round * 10) }))
+    assert.ok(first && second && first.key !== second.key, 'precondition: two distinct rows of ONE order')
+    const gate = pauseNextRequest('ignore')
+    const runs = [hold.process({ idempotencyKeys: [first.key], attemptDeadlineMs: 600_000 }), hold.process({ idempotencyKeys: [second.key], attemptDeadlineMs: 600_000 })]
+    await gate.reached.promise
+    const settled = new Set<number>()
+    runs.forEach((p, i) => { void p.then(() => settled.add(i)) })
+    await until(async () => settled.size === 1, 'the refused claimer to return')
+    const inFlight = await deps.db.integrationOutbox.count({ where: { idempotencyKey: { in: [first.key, second.key] }, status: 'PROCESSING' } })
+    assert.equal(inFlight, 1, `round ${round}: exactly ONE of the two jobs of the order is in flight`)
+    gate.release.resolve()
+    await Promise.all(runs)
+  }
+  console.log(`claim races run: ${ROUNDS}`)
+})
+
+test('o3d-6ldlj (arm 27): an UNCONFIRMED write (200 with another status) is not done: retried, then dead-lettered with the cause', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  let evaluated = 0
+  for (const kind of kindsOf(deps)) {
+    resetWc()
+    const { key } = await newRow(deps, kind, `unconfirmed-${kind.name}`)
+    wc.unconfirmed = true
+    let now = new Date()
+    for (let attempt = 1; attempt <= deps.WC_ORDER_STATUS_PUSH_MAX_ATTEMPTS + 1; attempt++) {
+      const summary = await kind.process({ idempotencyKeys: [key], now })
+      if (summary.claimed === 0) break
+      const row = await rowOf(deps, key)
+      if (row.status === 'RETRYABLE_FAILED') {
+        assert.match(String(row.lastError), /answered with status processing instead of/, 'the cause is kept')
+        now = new Date(row.nextAttemptAt!.getTime() + 1)
+      }
+    }
+    const row = await rowOf(deps, key)
+    assert.equal(wc.puts, deps.WC_ORDER_STATUS_PUSH_MAX_ATTEMPTS, `${kind.name}: PUT each attempt (the store never held it)`)
+    assert.equal(row.status, 'PERMANENT_FAILED', `${kind.name}: never SUCCEEDED`)
+    assert.match(String(row.lastError), new RegExp(`WooCommerce answered with status processing instead of ${kind.wcTarget}`))
+    // The retry re-reads first: once the store DOES hold the target it is already-at-target and nothing is sent.
+    await deps.db.integrationOutbox.update({ where: { idempotencyKey: key }, data: { status: 'PENDING', attempts: 0, lastError: null } })
+    wc.unconfirmed = false
+    wc.status = kind.wcTarget
+    const putsBefore = wc.puts
+    await kind.process({ idempotencyKeys: [key] })
+    assert.equal(wc.puts, putsBefore, 'already-at-target after the store caught up: zero PUTs')
+    assert.equal((await rowOf(deps, key)).status, 'SUCCEEDED')
+    evaluated++
+  }
+  assert.equal(evaluated, 2)
+})
+
+test('o3d-6ldlj (arm 28): needs-operator text is CAUSE-SPECIFIC for every class, never the old fixed list, and carries no unconditional destructive instruction', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const cases = [
+    { slug: 'partial-shipped', must: /because it is "partial-shipped": part of the order has already shipped/ },
+    { slug: 'pending-wdraw', must: /because it is "pending-wdraw": the customer has submitted an EU right-of-withdrawal request/ },
+    { slug: 'voided-custom', must: /because it is the custom status "voided-custom", which your Status Mapping reads as/ },
+  ]
+  let evaluated = 0
+  for (const kind of kindsOf(deps)) {
+    for (const c of cases) {
+      resetWc()
+      wc.status = c.slug
+      const { key } = await newRow(deps, kind, `cause-${kind.name}-${c.slug}`)
+      await kind.process({ idempotencyKeys: [key] })
+      assert.equal(wc.gets, 1, `${kind.name}/${c.slug}: precondition: read`)
+      const row = await rowOf(deps, key)
+      assert.equal(row.status, 'PERMANENT_FAILED', `${kind.name}/${c.slug}`)
+      const text = String(row.lastError)
+      assert.match(text, c.must, `${kind.name}/${c.slug}`)
+      for (const other of cases.filter((o) => o.slug !== c.slug)) {
+        assert.doesNotMatch(text, new RegExp(`"${other.slug}"`), `${kind.name}/${c.slug}: names no other class's status`)
+      }
+      assert.match(text, /this attempt did not change WooCommerce/)
+      assert.doesNotMatch(text, /\b(reverse|credit|void|re-post|delete)\b/i, 'no destructive instruction')
+      evaluated++
+    }
+  }
+  assert.equal(evaluated, 6)
 })

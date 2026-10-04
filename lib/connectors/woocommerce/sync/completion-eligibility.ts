@@ -168,16 +168,48 @@ export function classifyWcStatusPushEligibility(input: {
   return canTransitionSalesOrder(imsStatus, target.ims) ? 'eligible' : 'ineligible-unknown'
 }
 
+/**
+ * WHY a status needs an operator, in words specific to the cause (o3d-6ldlj round 2): three different situations
+ * share the class, and an exception that always says "part-shipped or EU-withdrawal" misdescribes the third.
+ * `null` unless the classifier says needs-operator.
+ */
+export function describeWcStatusPushOperatorCause(input: {
+  reading: Pick<WcOrderStatusReading, 'slug' | 'imsStatus'>
+  withdrawal: { submitted: string; approved: string }
+  target: WcStatusPushTarget
+}): string | null {
+  const { reading, withdrawal, target } = input
+  const slug = reading.slug
+  if (slug === WC_PARTIAL_SHIPPED_STATUS) {
+    return `it is "${slug}": part of the order has already shipped`
+  }
+  if (slug === withdrawal.submitted) {
+    return `it is "${slug}": the customer has submitted an EU right-of-withdrawal request`
+  }
+  if (slug === withdrawal.approved) {
+    return `it is "${slug}": an EU right-of-withdrawal request was approved`
+  }
+  if (reading.imsStatus === target.ims) {
+    return `it is the custom status "${slug}", which your Status Mapping reads as ${target.ims}, the state IMS is pushing, so IMS cannot tell what your store does with that status`
+  }
+  return null
+}
+
 /** The classifier over the live reading: the importer's own mapping lookup plus the withdrawal settings. */
 export async function readWcStatusPushEligibility(
   wcStatus: unknown,
   target: WcStatusPushTarget,
-): Promise<{ eligibility: WcStatusPushEligibility; slug: string }> {
+): Promise<{ eligibility: WcStatusPushEligibility; slug: string; cause: string | null }> {
   const [{ readWcOrderStatus }, { getWithdrawalStatuses }] = await Promise.all([
     import('./status-mapping'),
     import('./withdrawal'),
   ])
   const reading = await readWcOrderStatus(wcStatus)
   const withdrawal = await getWithdrawalStatuses()
-  return { eligibility: classifyWcStatusPushEligibility({ reading, withdrawal, target }), slug: reading.slug }
+  const eligibility = classifyWcStatusPushEligibility({ reading, withdrawal, target })
+  return {
+    eligibility,
+    slug: reading.slug,
+    cause: eligibility === 'ineligible-needs-operator' ? describeWcStatusPushOperatorCause({ reading, withdrawal, target }) : null,
+  }
 }

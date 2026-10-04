@@ -34,6 +34,7 @@ import {
   markIntegrationOutboxSuccess,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
+import { wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
@@ -245,9 +246,22 @@ async function attemptWcOrderStatusPush(descriptor: WcOrderStatusJobDescriptor, 
   // (3) THE CLOSED RESULT SWITCH. Success is exactly: pushed, already at the target, or a finalised order left
   // alone. Everything else retries (and dead-letters visibly after the bound) or needs an operator.
   switch (outcome.kind) {
-    case 'pushed':
+    case 'pushed': {
+      // CONVERGENCE: the write succeeded, but IMS may have moved on while it was in flight (a hold released or
+      // cancelled). Reporting done would leave WooCommerce on a status IMS no longer wants with nothing to say so.
+      // Retry instead: the next attempt re-reads IMS (superseded) and, per order, the job for the LATEST intent
+      // reads WooCommerce afresh and writes it.
+      const after = await readImsStatus(orderId)
+      if (after !== descriptor.imsTarget) {
+        return { kind: 'retry', reason: `the ${descriptor.noun} was written, but the IMS order is now ${after ?? 'gone'}, not ${descriptor.imsTarget}; WooCommerce is being re-checked for the latest status` }
+      }
+      return { kind: 'done' }
+    }
     case 'already-at-target':
       return { kind: 'done' }
+    case 'unconfirmed':
+      // The store answered 200 but did not hold the requested status: NOT done. The next attempt re-reads it.
+      return { kind: 'retry', reason: outcome.error }
     case 'not-applicable':
       return { kind: 'retry', reason: `the order has no WooCommerce link or no pushable status, so the ${descriptor.noun} was not pushed` }
     case 'read-failed':
@@ -267,7 +281,7 @@ async function attemptWcOrderStatusPush(descriptor: WcOrderStatusJobDescriptor, 
         case 'needs-operator':
           return {
             kind: 'needs-operator',
-            reason: `WooCommerce order is "${outcome.wcStatus}" (a part-shipped or EU-withdrawal status). IMS does not push a ${descriptor.noun} over it automatically and this attempt did not change WooCommerce: decide what the ${descriptor.noun} should mean for that order in the storefront and apply it there. Replay only re-checks the order.`,
+            reason: `IMS did not push the ${descriptor.noun} to this WooCommerce order because ${outcome.detail ?? `its status is "${outcome.wcStatus}"`}. IMS never pushes a ${descriptor.noun} over that automatically and this attempt did not change WooCommerce: decide what the ${descriptor.noun} should mean for that order in the storefront and apply it there. Replay only re-checks the order.`,
           }
         case 'unknown':
           return { kind: 'retry', reason: `WooCommerce order is "${outcome.wcStatus}", a status IMS has no reading of; add a status mapping for it, then the ${descriptor.noun} can be pushed` }
@@ -304,6 +318,9 @@ export async function runFencedWcOrderJob(
     workerId: descriptor.workerId,
     maxAttempts: WC_ORDER_STATUS_PUSH_MAX_ATTEMPTS,
     now,
+    // ONE WRITER OF AN ORDER'S WOOCOMMERCE STATUS AT A TIME (order-status-claim-gate.ts): a cancel waits for a hold
+    // PUT that is in flight instead of racing it.
+    claimGate: wcOrderStatusClaimGate,
   })
 
   for (const job of jobs) {

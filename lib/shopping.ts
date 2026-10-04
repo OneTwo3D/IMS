@@ -313,7 +313,7 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
         // A failed read, a refused write and a thrown error are FAILURES (o3d-zvec.15): this used to report
         // success unconditionally, so no caller could log or retry them. An ineligible order (cancelled
         // by hand, say) is not a failure — the connector left it alone on purpose — and `outcome` says so.
-        if (outcome.kind === 'read-failed' || outcome.kind === 'write-failed' || outcome.kind === 'error') {
+        if (outcome.kind === 'read-failed' || outcome.kind === 'write-failed' || outcome.kind === 'unconfirmed' || outcome.kind === 'error') {
           return { connector, result: { success: false, error: outcome.error, outcome } }
         }
         return { connector, result: { success: true, outcome } }

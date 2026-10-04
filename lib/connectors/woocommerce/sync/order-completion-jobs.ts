@@ -28,6 +28,7 @@ import {
   markIntegrationOutboxSuccess,
   type IntegrationOutboxClient,
 } from '@/lib/domain/integrations/outbox'
+import { wcOrderStatusClaimGate } from './order-status-claim-gate'
 import { runWithWcAttemptFence, WC_ORDER_COMPLETION_ATTEMPT_DEADLINE_MS } from '../attempt-fence'
 import {
   INTEGRATION_OUTBOX_OPERATIONS,
@@ -152,6 +153,8 @@ export async function processWcOrderCompletionJobs(options?: {
     workerId: WORKER_ID,
     maxAttempts: WC_ORDER_COMPLETION_MAX_ATTEMPTS,
     now,
+    // One writer of an order's WooCommerce status at a time (order-status-claim-gate.ts, o3d-6ldlj).
+    claimGate: wcOrderStatusClaimGate,
   })
 
   for (const job of jobs) {

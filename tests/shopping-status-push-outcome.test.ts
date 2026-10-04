@@ -33,12 +33,13 @@ mock.module('@/lib/connectors/woocommerce/sync/order-status', {
 
 beforeEach(() => { state.outcome = { kind: 'pushed' }; state.calls = 0; state.configured = true })
 
-test('o3d-zvec.15 (arm 3): read-failed, write-failed and error are FAILURES; everything else is success with the outcome attached', async () => {
+test('o3d-zvec.15 (arm 3): read-failed, write-failed, unconfirmed and error are FAILURES; everything else is success with the outcome attached', async () => {
   const { pushSalesOrderStatus } = await import('@/lib/shopping')
   const failures: Outcome[] = [
     { kind: 'read-failed', error: 'HTTP 503' },
     { kind: 'write-failed', error: 'HTTP 500' },
     { kind: 'error', error: 'socket hang up' },
+    { kind: 'unconfirmed', error: 'WooCommerce answered with status processing instead of cancelled' },
   ]
   const successes: Outcome[] = [
     { kind: 'pushed' },
@@ -65,7 +66,7 @@ test('o3d-zvec.15 (arm 3): read-failed, write-failed and error are FAILURES; eve
     assert.deepEqual(result.outcome, outcome)
     evaluated++
   }
-  assert.equal(evaluated, 8)
+  assert.equal(evaluated, 9)
 })
 
 test('o3d-zvec.15 (arm 3): no runnable connector is a skipped success, the pusher is never reached', async () => {
