@@ -29,7 +29,7 @@ test('the login carries the configured ClientId: unproven and foreign are refuse
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
   const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`
   process.env.E2E_TEST_MODE = '1'
-  process.env.MINTSOFT_WRITE_ALLOWED = `${origin}|89`
+  process.env.MINTSOFT_WRITE_ALLOWED = `${origin}|89|login=u`
   try {
     const { testMintsoftConnectionSettings } = await import('../lib/connectors/mintsoft/api/auth')
     console.log(`precondition (auth caller): grant ${origin}|89; configured ClientId varies: blank, 101, 89`)

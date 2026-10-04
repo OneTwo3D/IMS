@@ -32,7 +32,7 @@ export const OUTBOUND_GRANT_ENV: Record<OutboundConnector, string> = {
 /** What each variable must look like, in operator words. */
 export const OUTBOUND_GRANT_FORMAT: Record<OutboundConnector, string> = {
   woocommerce: 'exactly one store origin, for example https://shop.example.com',
-  mintsoft: 'the Mintsoft base URL and the ClientId separated by one vertical bar, for example https://api.mintsoft.co.uk|89',
+  mintsoft: 'the Mintsoft base URL and the ClientId separated by one vertical bar, for example https://api.mintsoft.co.uk|89; to also allow key-minting logins append a third part naming the one username, for example https://api.mintsoft.co.uk|89|login=ims-service',
   xero: 'exactly one Xero tenant id (a UUID)',
 }
 
@@ -56,6 +56,7 @@ export type OutboundWriteRefusalCode =
   | 'destination_mismatch'
   | 'client_mismatch'
   | 'client_unproven'
+  | 'login_not_granted'
   | 'tenant_unproven'
   | 'unparseable_target'
 
@@ -65,6 +66,7 @@ export const OUTBOUND_REFUSAL_CODES: readonly OutboundWriteRefusalCode[] = [
   'destination_mismatch',
   'client_mismatch',
   'client_unproven',
+  'login_not_granted',
   'tenant_unproven',
   'unparseable_target',
 ]
@@ -84,6 +86,11 @@ export const OUTBOUND_HELD_RETRY_DELAY_MS = 15 * 60_000
  */
 export function isOutboundWriteHeldText(text: string | null | undefined): boolean {
   return typeof text === 'string' && text.includes(`${OUTBOUND_HELD_TEXT_PREFIX} (`)
+}
+
+/** Whether a failure text is a redirect-hop refusal: a request that WAS sent and whose outcome is unknown. */
+export function isOutboundRedirectRefusedText(text: string | null | undefined): boolean {
+  return typeof text === 'string' && text.includes(`${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (`)
 }
 
 export type OutboundRefusalReasonInput = {
@@ -113,6 +120,8 @@ export function outboundRefusalReason(input: OutboundRefusalReasonInput): string
       return `the ${label} ClientId this request is for could not be established, so it cannot be shown to be the granted ClientId ${input.granted ?? '(nothing readable)'}.`
     case 'tenant_unproven':
       return `the ${label} tenant this request is for could not be established, so it cannot be shown to be the granted tenant ${input.granted ?? '(nothing readable)'}.`
+    case 'login_not_granted':
+      return `${label} key-minting logins (POST /api/Auth, which issues a NEW tenant API key and invalidates the old one) are granted only for the one username named in ${env} (a third part, login=<username>), and this request ${input.attempted ? `is for username ${input.attempted}` : 'does not name a username'}${input.granted ? `, but the grant names ${input.granted}` : ', and the grant names none'}.`
     case 'unparseable_target':
       return `the request target has no comparable destination, so it cannot be shown to be the granted ${label} destination.`
     default: {
@@ -211,7 +220,7 @@ export const OUTBOUND_DOC_BLOCKS: Record<OutboundDocBlockId, string> = {
   'held-meaning': [
     'A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent and may have taken effect. That refusal begins "Outbound write REFUSED AFTER A REDIRECT", is not a hold, and is treated like any other failure of unknown outcome: it spends an attempt and can be dead-lettered for an operator to check.',
     '',
-    'Mintsoft\'s key-minting login (`POST /api/Auth`) is a write and is held. An installation that authenticates to Mintsoft with a username and password cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero\'s token exchange (`POST https://identity.xero.com/connect/token`, https only, exactly that path, on every redirect hop) is allowed as a deliberate exception: it rotates IMS\'s own Xero credentials but changes no accounting data, and every Xero read depends on it. Every Xero write must reach `api.xero.com` on every hop; a redirect to any other origin is refused before the body is sent.',
+    'Mintsoft\'s key-minting login (`POST /api/Auth`, which issues a new tenant API key and invalidates the old one) is a write and is held. It is granted only by a third part of the Mintsoft variable, `|login=<username>`, and only for requests that carry exactly that username (and the granted ClientId). An installation that authenticates to Mintsoft with a username and password and has no such grant cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero\'s token exchange (`POST https://identity.xero.com/connect/token`, https only, exactly that path, on every redirect hop) is allowed as a deliberate exception: it rotates IMS\'s own Xero credentials but changes no accounting data, and every Xero read depends on it. Every Xero write must reach `api.xero.com` on every hop; a redirect to any other origin is refused before the body is sent.',
   ].join('\n'),
   'status-command': [
     `\`${OUTBOUND_STATUS_COMMAND}\` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours (a lower bound: refusals the rate limit suppressed are added only when the next entry is written). Pass \`--json\` for a machine-readable report and \`--expect-held\` to fail when any connector may write.`,

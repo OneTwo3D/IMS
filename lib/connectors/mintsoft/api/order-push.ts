@@ -1,3 +1,4 @@
+import { isOutboundRedirectRefusedText } from '@/lib/security/outbound-write-hold-constants'
 import type {
   WmsOrderCancelResult,
   WmsOrderPushInput,
@@ -196,7 +197,22 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     : input.courierService ? { kind: 'name' }
     : defaultId != null ? { kind: 'defaultId', courierServiceId: defaultId }
     : { kind: 'name' }
-  let created = await createOrder(buildPushPayload(input, initialCourier))
+  // A create refused on a REDIRECT HOP (the outbound-write hold) has ALREADY been sent: the first
+  // request may have created the order. It must not be answered by a blind second PUT. It goes down the
+  // maybe-sent path instead: look the order up by its reference (a scoped READ), and if it exists, take
+  // the "already exists" reconcile branch below, which re-reads it under our ClientId and binds it.
+  // If it cannot be found the error is re-thrown unchanged (an attempt is spent, as for a timeout).
+  const createOrReconcile = async (payload: Record<string, unknown>) => {
+    try {
+      return await createOrder(payload)
+    } catch (error) {
+      if (!isOutboundRedirectRefusedText(error instanceof Error ? error.message : String(error))) throw error
+      const existing = await findExistingByReference(input, clientId)
+      if (!existing) throw error
+      return { ok: false, data: null, message: 'Order already exists (found by lookup after a refused redirect)' }
+    }
+  }
+  let created = await createOrReconcile(buildPushPayload(input, initialCourier))
 
   // Courier the WMS couldn't resolve → retry with the configured default id
   // (unless we already used it). Mintsoft requires a resolvable courier. A default id
@@ -208,7 +224,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     && defaultId != null && initialCourier.kind !== 'defaultId'
   ) {
     courierFallback = true
-    created = await createOrder(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
+    created = await createOrReconcile(buildPushPayload(input, { kind: 'defaultId', courierServiceId: defaultId }))
   }
 
   // A create that unambiguously succeeded binds the id Mintsoft minted for it —

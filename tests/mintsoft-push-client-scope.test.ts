@@ -22,6 +22,7 @@ let clientIdSetting = String(CLIENT)
 let searchRows: unknown = []
 let details = new Map<string, unknown>()
 let createResult: unknown = null
+let createError: string | null = null
 let itemRows: unknown[] = []
 // Ids whose detail request answers 2xx with NO readable order body (the client
 // renders a 204 that way) — an UNKNOWN state, not an authoritative "not found".
@@ -53,7 +54,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       calls.push(path)
       const method = init?.method ?? 'GET'
       const pathname = path.split('?')[0]
-      if (pathname === '/api/Order' && method === 'PUT') return { data: createResult, status: 200 }
+      if (pathname === '/api/Order' && method === 'PUT') {
+        if (createError) return { data: null, error: createError, status: 500 }
+        return { data: createResult, status: 200 }
+      }
       if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
       if (method !== 'GET') {
         writes.push({ path, method })
@@ -86,6 +90,7 @@ function reset() {
   searchRows = []
   details = new Map()
   createResult = null
+  createError = null
   itemRows = []
   emptyDetailIds = new Set()
   calls = []
@@ -306,4 +311,29 @@ test('[o3d-bjc.6] an owned NEW order amends its items and posts the update — t
   const itemsRead = calls.find((path) => path.startsWith('/api/Order/900/Items?'))
   assert.ok(itemsRead, 'the items read ran')
   assert.equal(new URLSearchParams(itemsRead.split('?')[1]).get('ClientId'), String(CLIENT))
+})
+
+test('outbound-write hold: a create refused on a REDIRECT HOP (already sent) is reconciled by lookup, never blindly re-PUT', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const refusal = { connector: 'mintsoft', code: 'destination_mismatch', method: 'PUT', target: 'https://other.example.test/api/Order', granted: 'a', attempted: 'b', basis: 'b' } as const
+  const { pushMintsoftOrder } = await push()
+
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = [{ ID: 900, OrderNumber: 'WC-1001', ExternalOrderReference: 'REF-1001', ClientId: CLIENT }]
+  console.log('precondition (redirect create): the first PUT answered with a hop-1 refusal; the order exists at the WMS under our ClientId')
+  const found = await pushMintsoftOrder(INPUT)
+  assert.equal(found.externalOrderId, '900', 'the order that may have been created is found by lookup and bound')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'exactly ONE PUT: no blind replay')
+
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = []
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /REFUSED AFTER A REDIRECT/, 'not found: the maybe-sent failure is surfaced unchanged')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'and still no second PUT')
+
+  reset()
+  createError = new OutboundWriteHeldError({ ...refusal, code: 'no_grant' }, 0).message
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /Outbound write HELD/, 'control: a hop-0 hold is not reconciled by lookup')
+  assert.equal(calls.some((path) => path.startsWith('/api/Order/Search')), false, 'no lookup for a hold that sent nothing')
 })

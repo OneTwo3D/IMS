@@ -97,7 +97,7 @@ const WRITE_CASES: Case[] = [
   { name: 'Mintsoft GET /api/Order/5/Cancel', connectorName: 'Mintsoft', method: 'GET', path: '/api/Order/5/Cancel', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
   { name: 'Mintsoft GET /api/Order/5/MarkAwaitingConfirmation', connectorName: 'Mintsoft', method: 'GET', path: '/api/Order/5/MarkAwaitingConfirmation', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
   { name: 'Mintsoft POST /api/Order/5/Comments', connectorName: 'Mintsoft', method: 'POST', path: '/api/Order/5/Comments', body: '{}', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
-  { name: 'Mintsoft POST /api/Auth (key-minting login)', connectorName: 'Mintsoft', method: 'POST', path: '/api/Auth', body: '{}', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
+  { name: 'Mintsoft POST /api/Auth (key-minting login)', connectorName: 'Mintsoft', method: 'POST', path: '/api/Auth', body: '{"Username":"ims-service","Password":"p"}', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89|login=ims-service` }) },
   { name: 'Xero POST journal', connectorName: 'Xero', method: 'POST', path: '/api.xro/2.0/ManualJournals', body: '{}', headers: { 'Xero-Tenant-Id': TENANT }, grant: () => ({ XERO_WRITE_ALLOWED_TENANT: TENANT }) },
   { name: 'Xero PUT contact', connectorName: 'Xero', method: 'PUT', path: '/api.xro/2.0/Contacts', body: '{}', headers: { 'Xero-Tenant-Id': TENANT }, grant: () => ({ XERO_WRITE_ALLOWED_TENANT: TENANT }) },
 ]
@@ -292,17 +292,21 @@ test('refusals are rate-limited per connector and code, and the suppressed count
   assert.deepEqual(suppressed, [0, 0, 3], 'the entry after the window carries the 3 suppressed refusals')
 })
 
-test('finding 2: key-minting POST /api/Auth is bound to the granted ClientId like every other Mintsoft write', async () => {
+test('finding 2: key-minting POST /api/Auth is granted only for the one username the grant names, and still for the configured ClientId', async () => {
   const listener = await startListener()
-  const grant = { MINTSOFT_WRITE_ALLOWED: `${listener.origin}|89` }
-  const login = (clientId: string | null) => connectorFetch(`${listener.origin}/api/Auth`, { method: 'POST', body: '{"Username":"u","Password":"p"}' }, {
-    connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(grant), outboundWriteContext: { writeScopeId: clientId },
-  })
-  console.log('precondition (finding 2): grant names ClientId 89; login attempted with configured ClientId unknown, 101 and 89')
-  await assert.rejects(login(null), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_unproven')
-  await assert.rejects(login('101'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_mismatch')
-  assert.equal(listener.received.length, 0, 'no credentials left for an unproven or foreign ClientId')
-  assert.equal((await login('89')).status, 200)
+  const withLogin = { MINTSOFT_WRITE_ALLOWED: `${listener.origin}|89|login=ims-service` }
+  const withoutLogin = { MINTSOFT_WRITE_ALLOWED: `${listener.origin}|89` }
+  const login = (grant: Record<string, string>, username: string | null, clientId: string | null) => connectorFetch(`${listener.origin}/api/Auth`, {
+    method: 'POST', body: username === null ? '{}' : JSON.stringify({ Username: username, Password: 'p' }),
+  }, { connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(grant), outboundWriteContext: { writeScopeId: clientId } })
+  console.log('precondition (finding 2): grant names ClientId 89; with and without a login=ims-service part')
+  await assert.rejects(login(withoutLogin, 'ims-service', '89'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'login_not_granted', 'no username in the grant')
+  await assert.rejects(login(withLogin, 'someone-else', '89'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'login_not_granted', 'a different username')
+  await assert.rejects(login(withLogin, null, '89'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'login_not_granted', 'no username in the body')
+  await assert.rejects(login(withLogin, 'ims-service', null), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_unproven')
+  await assert.rejects(login(withLogin, 'ims-service', '101'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_mismatch')
+  assert.equal(listener.received.length, 0, 'no credentials left in any refused case')
+  assert.equal((await login(withLogin, 'IMS-Service', '89')).status, 200, 'the named username (case-insensitive) with the granted ClientId is sent')
   assert.equal(listener.received.length, 1)
 })
 

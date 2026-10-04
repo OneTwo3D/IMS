@@ -39,7 +39,7 @@ import {
   type OutboundConnector,
   type OutboundWriteRefusalCode,
 } from './outbound-write-hold-constants'
-import { classifyMintsoftRequest } from '@/lib/connectors/mintsoft/api/read-allowlist'
+import { classifyMintsoftRequest, mintsoftRelativePath } from '@/lib/connectors/mintsoft/api/read-allowlist'
 
 export type OutboundEnv = Record<string, string | undefined>
 
@@ -140,7 +140,7 @@ export function classifyOutboundRequest(params: {
 export type GrantReadFailure = { ok: false; reason: 'absent' | 'unreadable'; detail: string }
 
 export type WooCommerceGrant = { ok: true; origin: string }
-export type MintsoftGrant = { ok: true; origin: string; pathPrefix: string; baseUrl: string; clientId: string }
+export type MintsoftGrant = { ok: true; origin: string; pathPrefix: string; baseUrl: string; clientId: string; loginUsername: string | null }
 export type XeroGrant = { ok: true; tenantId: string }
 
 function isLoopbackHostname(hostname: string): boolean {
@@ -210,11 +210,17 @@ export function readMintsoftGrant(env: OutboundEnv = process.env): MintsoftGrant
   const raw = rawValue(env, name)
   if (raw === null) return absent(name)
   const parts = raw.split('|')
-  if (parts.length !== 2) {
-    return unreadable(name, 'must be <base URL>|<ClientId> with exactly one vertical bar')
+  if (parts.length !== 2 && parts.length !== 3) {
+    return unreadable(name, 'must be <base URL>|<ClientId>, optionally followed by |login=<username>, with no other separators')
   }
-  const [base, clientId] = parts.map((part) => part.trim()) as [string, string]
+  const [base, clientId, loginPart] = parts.map((part) => part.trim()) as [string, string, string | undefined]
   if (!CLIENT_ID_RE.test(clientId)) return unreadable(name, 'the ClientId must be a positive integer without leading zeros')
+  let loginUsername: string | null = null
+  if (loginPart !== undefined) {
+    const match = /^login=([A-Za-z0-9._@+-]{1,128})$/.exec(loginPart)
+    if (!match) return unreadable(name, 'the optional third part must be login=<one username>')
+    loginUsername = match[1]!
+  }
   const parsed = parseDestinationUrl(name, base, true)
   if (!parsed.ok) return parsed
   return {
@@ -223,6 +229,7 @@ export function readMintsoftGrant(env: OutboundEnv = process.env): MintsoftGrant
     pathPrefix: parsed.pathPrefix,
     baseUrl: `${parsed.url.origin}${parsed.pathPrefix}`,
     clientId,
+    loginUsername,
   }
 }
 
@@ -259,7 +266,7 @@ export function readOutboundGrantStates(env: OutboundEnv = process.env): Outboun
       states.push(describe(connector, envName, grant, (g) => g.origin))
     } else if (connector === 'mintsoft') {
       const grant = readMintsoftGrant(env)
-      states.push(describe(connector, envName, grant, (g) => `${g.baseUrl} (ClientId ${g.clientId})`))
+      states.push(describe(connector, envName, grant, (g) => `${g.baseUrl} (ClientId ${g.clientId}${g.loginUsername ? `, key-minting login allowed for ${g.loginUsername}` : ''})`))
     } else {
       const grant = readXeroGrant(env)
       states.push(describe(connector, envName, grant, (g) => `tenant ${g.tenantId}`))
@@ -324,6 +331,25 @@ function parseTarget(url: string | URL): URL | null {
 
 function targetText(url: URL | null): string | null {
   return url ? `${url.origin}${url.pathname}` : null
+}
+
+function explicitMintsoftLoginUsername(body: unknown): string | null {
+  if (typeof body !== 'string') return null
+  try {
+    const parsed: unknown = JSON.parse(body)
+    if (parsed && typeof parsed === 'object') {
+      for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (key.toLowerCase() === 'username' && typeof value === 'string' && value.trim() !== '') return value.trim()
+      }
+    }
+  } catch {
+    // not JSON: no username can be established
+  }
+  return null
+}
+
+function relativeMintsoftPathOf(url: URL, pathPrefix: string): string {
+  return mintsoftRelativePath(url.pathname.slice(pathPrefix.length) || '/')
 }
 
 /** Reads ClientId from the query and from a JSON body, wherever it is explicit. */
@@ -411,6 +437,16 @@ export function outboundWriteRefusal(facts: OutboundRequestFacts): OutboundWrite
         && (grant.pathPrefix === '' || url.pathname === grant.pathPrefix || url.pathname.startsWith(`${grant.pathPrefix}/`))
       if (!underBase) return refusal(classification, method, url, 'destination_mismatch', grant.baseUrl, `${url.origin}${url.pathname}`)
 
+      // KEY MINTING (POST /api/Auth) issues a NEW tenant key and invalidates the old one, for whichever
+      // account the credentials in the BODY belong to - the configured ClientId says nothing about that.
+      // So it is granted only for the one username the grant names, compared with the Username actually
+      // being sent; no username in the grant, or a different one, refuses it.
+      if (method === 'POST' && relativeMintsoftPathOf(url, grant.pathPrefix) === '/api/Auth') {
+        const sent = explicitMintsoftLoginUsername(facts.body)
+        if (grant.loginUsername === null || sent === null || sent.toLowerCase() !== grant.loginUsername.toLowerCase()) {
+          return refusal(classification, method, url, 'login_not_granted', grant.loginUsername, sent)
+        }
+      }
       const configured = facts.writeScopeId === null || facts.writeScopeId === undefined
         ? ''
         : String(facts.writeScopeId).trim()
@@ -426,9 +462,9 @@ export function outboundWriteRefusal(facts: OutboundRequestFacts): OutboundWrite
       if (!grant.ok) return refusal(classification, method, url, grant.reason === 'absent' ? 'no_grant' : 'unreadable_grant', null, null)
       // THE DESTINATION OF A XERO WRITE IS XERO, ON EVERY HOP. The tenant header alone would let a
       // redirect carry an accounting payload (method, body and tenant header intact) to any host, so the
-      // origin must be Xero's API origin - or, only under the non-production e2e loopback allowance, the
+      // origin must be Xero's API origin (never the identity origin: the one identity request that is allowed is the token exchange, classified above and never a write) - or, only under the non-production e2e loopback allowance, the
       // origin the request was first aimed at (`pinnedOrigin`, supplied by the transport).
-      const xeroOrigins = new Set<string>(['https://api.xero.com', 'https://identity.xero.com'])
+      const xeroOrigins = new Set<string>(['https://api.xero.com'])
       if (facts.pinnedOrigin) xeroOrigins.add(facts.pinnedOrigin)
       if (!xeroOrigins.has(url.origin)) {
         return refusal(classification, method, url, 'destination_mismatch', 'https://api.xero.com', url.origin)

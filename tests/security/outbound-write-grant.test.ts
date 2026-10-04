@@ -123,12 +123,27 @@ test('outbound:status grant states come from the environment only and cover ever
   assert.deepEqual(states.map((s) => s.envName), OUTBOUND_CONNECTORS.map((c) => OUTBOUND_GRANT_ENV[c]))
 })
 
-test('finding 2 (decision level): the key-minting login has no exemption; with a grant it needs the granted ClientId', () => {
-  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.co.uk|89' }
-  const login = (writeScopeId: string | null) => outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId, env })
-  assert.equal(login(null)?.code, 'client_unproven')
-  assert.equal(login('101')?.code, 'client_mismatch')
-  assert.equal(login('89'), null)
+test('finding 2 (decision level): key minting needs the granted username AND the granted ClientId; there is no exemption', () => {
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.co.uk|89|login=svc' }
+  const login = (username: string | null, writeScopeId: string | null, e: Record<string, string> = env) => outboundWriteRefusal({
+    connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId,
+    body: username === null ? '{}' : JSON.stringify({ Username: username, Password: 'p' }), env: e,
+  })
+  assert.equal(login('svc', '89'), null)
+  assert.equal(login('other', '89')?.code, 'login_not_granted')
+  assert.equal(login(null, '89')?.code, 'login_not_granted')
+  assert.equal(login('svc', null)?.code, 'client_unproven')
+  assert.equal(login('svc', '101')?.code, 'client_mismatch')
+  assert.equal(login('svc', '89', { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.co.uk|89' })?.code, 'login_not_granted')
+  for (const bad of ['https://a.example|89|svc', 'https://a.example|89|login=', 'https://a.example|89|login=a b', 'https://a.example|89|login=a|b']) {
+    assert.equal(readMintsoftGrant({ MINTSOFT_WRITE_ALLOWED: bad }).ok, false, bad)
+  }
+})
+
+test('medium: a Xero WRITE aimed at the identity origin is refused (only the token exchange is allowed there)', () => {
+  const env = { XERO_WRITE_ALLOWED_TENANT: TENANT }
+  assert.equal(outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url: 'https://identity.xero.com/connect/revocation', headers: { 'xero-tenant-id': TENANT }, env })?.code, 'destination_mismatch')
+  assert.equal(outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url: 'https://identity.xero.com/connect/token', env: {} }), null)
 })
 
 test('finding 3 (decision level): a Xero write must target api.xero.com even with the right tenant header', () => {
