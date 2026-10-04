@@ -62,28 +62,15 @@ const OWNERS = [
 
 /**
  * The readers that still expand the current graph, each with the issue that owns it and the EXACT
- * number of calls it makes today.
+ * number of calls it makes today. The count is what stops an entry from being a licence: an extra
+ * call in an allowlisted file fails this check, and so does a removed one.
  *
- * Both were found by o3d-4gh9 and deliberately not changed by it: one posts to an accounting ledger
- * and one decides whether a fulfilment is short, so each is a reported-figures or a posting change
- * that belongs to its own issue rather than being buried in this one. The count is what stops the
- * entry from being a licence: a third call in either file fails this check.
+ * EMPTY since o3d-4gw0. Its two entries (the external-fulfilment shortfall, a sales line and a refund
+ * line) now go through the seam; the o3d-moc9 entry went with the archived QuickBooks daily-sync.
+ * The mechanism stays so a future deferral is enumerated with a count and a ticket rather than waived
+ * by a comment. Entry shape: `{ file, calls, issue, why }`.
  */
-const KNOWN_CURRENT_GRAPH_READERS = [
-  {
-    file: 'lib/fulfillment/external-fulfillment.ts',
-    calls: 2,
-    issue: 'o3d-4gw0',
-    why: 'the shortfall calculation expands a sales line AND an unlinked refund line; the refund line '
-      + 'has no pin of its own and reaching its sales line is a threading change with a shipment-refusal '
-      + 'blast radius.',
-  },
-  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/daily-sync.ts` was the second entry here
-  // (1 call, o3d-moc9: the Group B revenue split reading the current graph instead of the pin, a
-  // CROSS-PORT divergence because Xero's port of the same computation already read the pin). The file
-  // is archived, so the divergence is closed by removal. The allowlist REFUSES a stale entry, so it
-  // has to go in the same commit — and o3d-moc9's remaining subject, if any, is now Xero-only.
-]
+const KNOWN_CURRENT_GRAPH_READERS = []
 
 function listFiles(dir, out) {
   for (const entry of readdirSync(dir)) {

@@ -3,7 +3,11 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import {
+  lineFulfillmentRequirementQuantities,
+  refundLineResolvableLine,
+} from '@/lib/products/fulfillment-requirement-snapshot'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsConnectorId } from '@/lib/connectors/wms/types'
@@ -425,6 +429,9 @@ export async function findExternalFulfillmentShortfall(
         qty: true,
         sku: true,
         description: true,
+        // o3d-4gw0: the pin. The shortfall is judged against the recipe the order was allocated and
+        // will be dispatched from (shipment-service reads the same column), never the current graph.
+        fulfillmentRequirements: true,
         product: { select: { type: true } },
       },
     }),
@@ -500,12 +507,13 @@ export async function findExternalFulfillmentShortfall(
   const graph = await loadFulfillmentProductGraph(db, productIds)
 
   const key = (lineId: string, productId: string) => `${lineId}|${productId}`
+  const orderLineById = new Map(orderLines.map((line) => [line.id, line]))
 
   const demandByLeaf = new Map<string, Prisma.Decimal>()
   const labelByLine = new Map<string, string>()
   for (const line of shippableLines) {
     labelByLine.set(line.id, line.sku ?? line.description ?? line.id)
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
+    for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(line, toDecimal(line.qty), graph)) {
       const leafKey = key(line.id, componentId)
       demandByLeaf.set(leafKey, (demandByLeaf.get(leafKey) ?? new Prisma.Decimal(0)).add(componentQty))
     }
@@ -531,7 +539,13 @@ export async function findExternalFulfillmentShortfall(
     // A chargeback, or a restock whose movements are still owed: the mark stands for the whole
     // refund, so none of it nets (round 3's rule, kept where it is still the best evidence).
     if (marked && refundLine.refund && refundGoodsLeftIsUnmeasured(refundLine.refund)) continue
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), graph)) {
+    // o3d-4gw0: through the line the refund names, so it nets against the SAME pinned recipe the
+    // demand above was built from (see `refundLineResolvableLine`).
+    const refundedResolvable = refundLineResolvableLine(
+      { salesOrderLineId: refundLine.salesOrderLineId, productId: refundLine.productId },
+      orderLineById,
+    )
+    for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(refundedResolvable, toDecimal(refundLine.qty), graph)) {
       const leafKey = key(refundLine.salesOrderLineId, componentId)
       const current = demandByLeaf.get(leafKey)
       if (current === undefined) continue

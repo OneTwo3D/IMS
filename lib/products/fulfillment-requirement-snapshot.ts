@@ -289,6 +289,27 @@ export function lineFulfillmentRequirementQuantities(
   return scaleFulfillmentRequirements(snapshot.requirements, qty)
 }
 
+/**
+ * THE LINE A REFUND LINE IS EXPANDED THROUGH (o3d-4gw0) — one accessor for every reader that nets
+ * refunds against ordered quantity, so a refund can never be judged against a different recipe than
+ * the demand it is netted from.
+ *
+ * Refunding N units of a line reverses N times what THAT LINE requires, and the line is the thing
+ * carrying the pin, so a refund line resolves to the sales line it names. A refund line carries no pin
+ * of its own. When the line it names is absent from `orderLineById`, or references a different product
+ * than the refund line does, the pin is not about this refund (a data anomaly with no pinned answer),
+ * so it resolves to the refund line's own product with no pin, which expands the current graph.
+ */
+export function refundLineResolvableLine<L extends SnapshotResolvableLine>(
+  refundLine: { salesOrderLineId: string; productId: string },
+  orderLineById: ReadonlyMap<string, L>,
+): SnapshotResolvableLine {
+  const refundedLine = orderLineById.get(refundLine.salesOrderLineId)
+  return refundedLine?.productId === refundLine.productId
+    ? refundedLine
+    : { id: refundLine.salesOrderLineId, productId: refundLine.productId }
+}
+
 /** Every leaf product any of these lines can require, snapshot-aware. Mirrors `listFulfillmentLeafProductIds`. */
 export function lineFulfillmentLeafProductIds(
   lines: SnapshotResolvableLine[],
