@@ -726,6 +726,28 @@ test('REPORT PUBLICATION: if the Markdown cannot be written, no artefact on disk
   if (verdicts.length > 0) assert.ok(verdicts.every((v) => /RED/.test(v)), 'every artefact that exists says RED')
 })
 
+test('REPORT PUBLICATION (isolating arm): when the Markdown can NEVER be written, the amended retry cannot save the day, and still no GREEN file is left behind', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const outcome = await runRehearsal({
+    parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['system-identifier']),
+    hooks: {
+      writeReportFile: (file, data) => {
+        if (file.includes('readiness-report.md')) throw new Error('injected: the Markdown can never be written')
+        writeFileSync(file, data)
+      },
+    },
+  })
+  assert.ok(outcome.report)
+  const dirs = existsSync(join(parent, 'reports')) ? readdirSync(join(parent, 'reports')) : []
+  const files = dirs.flatMap((d) => readdirSync(join(parent, 'reports', d)))
+  console.log(`# every step passed: ${outcome.report.steps.every((x) => x.status === 'passed')}; files left on disk: ${JSON.stringify(files)}; reportPaths: ${JSON.stringify(outcome.reportPaths ?? null)}; exit ${outcome.exitCode}`)
+  assert.ok(outcome.report.steps.every((x) => x.status === 'passed'), 'precondition: the run itself was clean')
+  assert.deepEqual(files, [], 'nothing is left on disk: neither a GREEN JSON nor a temporary file')
+  assert.equal(outcome.reportPaths, undefined)
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.equal(outcome.report.verdict, 'RED')
+})
+
 test('INTERRUPTION during the last, asynchronous step (no child to kill) still makes the report RED', { timeout: TIMEOUT }, async (t) => {
   const before = new Set(process.listeners('SIGTERM'))
   const outcome = await rehearse(t, {
