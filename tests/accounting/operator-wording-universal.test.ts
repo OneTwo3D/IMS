@@ -351,3 +351,39 @@ test('[o3d-1e7sl Codex r12] the help text (both copies) states the Mark-as-handl
   assert.equal((doc.match(/a later save of the document may queue a new posting or be refused again/g) ?? []).length, 2, 'both copies say a later save may be refused again')
   assert.doesNotMatch(doc, /a later save of the document queues a new one|closes THIS refusal but does \*\*not\*\*/, 'no guaranteed closure or guaranteed later posting')
 })
+
+// ---------------------------------------------------------------------------
+// Codex round 13: THE CLASS - every string describing the OUTCOME of Mark as handled / Take / a later save, across the WHOLE tree
+// (lib, app, components, help-docs), must not guarantee a closure, a suppression or a later posting that some branch of the server does not
+// deliver. A universal absence of the guaranteeing shapes; the one sanctioned source of the outcome sentences is hand-post-instruction.ts.
+// ---------------------------------------------------------------------------
+test('[o3d-1e7sl Codex r13] universal absence over lib/ app/ components/ help-docs/: no string guarantees the outcome of a mark, a claim or a later save', () => {
+  const walkAll = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
+    const rel = path.join(dir, name)
+    if (name === 'generated' || name === 'node_modules' || name === '.next') return []
+    return statSync(path.join(ROOT, rel)).isDirectory() ? walkAll(rel) : /\.(ts|tsx|md)$/.test(name) ? [rel] : []
+  })
+  const files = ['app', 'lib', 'components', 'help-docs'].flatMap((d) => { try { return walkAll(d) } catch { return [] } })
+  assert.ok(files.length > 500, `the census reads the tree (${files.length} files)`)
+  // each guaranteeing shape, with the scoping that makes a use legitimate
+  const FORBIDDEN: Array<[RegExp, string]> = [
+    [/will be queued as usual/i, 'a later edit is guaranteed to queue'],
+    [/queues a new one, which is what the ledger needs/i, 'a later save is guaranteed to queue'],
+    [/will not re-post this edit, and a LATER edit/i, 'the old mark log outcome'],
+    [/This closes THIS refusal(?! and)/i, 'the mark is guaranteed to close the refusal'],
+    [/the row closes when they confirm(?! depends)|when they confirm it the row\s+closes/i, 'the other operator\'s confirm is guaranteed to close the row'],
+    [/cannot become an exception again/i, 'a handled posting can never be an exception again'],
+    [/nothing is owed and nothing was recorded/i, 'the old suppressed-refusal wording'],
+  ]
+  const offenders: string[] = []
+  for (const f of files) {
+    const text = read(f).replace(/^\s*(\/\/|\*|\/\*).*$/gm, '').replace(/['"`]\s*\+?\s*\n?\s*\+?\s*['"`]/g, '').replace(/\s+/g, ' ')
+    for (const [re, why] of FORBIDDEN) if (re.test(text)) offenders.push(`${f}: ${why}`)
+  }
+  assert.deepEqual(offenders, [], 'a string guarantees an outcome some branch does not deliver')
+  // the help doc's "stays handled" statements are scoped to a key that names ONE posting for ever
+  const doc = read('help-docs/xero-sync.md').replace(/\s+/g, ' ')
+  for (const m of doc.matchAll(/A posting marked handled stays handled[^*]*\*\*/g)) assert.match(m[0], /for a posting whose key names ONE posting for ever/, 'scoped')
+  assert.equal((doc.match(/A posting marked handled stays handled - for a posting whose key names ONE posting for ever\./g) ?? []).length, 2, 'both copies scope it')
+  assert.equal((doc.match(/a later refusal of the same document \(for example while its invoice belongs to a connector that is no longer active\) is recorded and listed again as new work/g) ?? []).length, 2, 'and both say a reused key can be listed again')
+})

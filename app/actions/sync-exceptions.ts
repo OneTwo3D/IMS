@@ -66,7 +66,7 @@ import {
   type MarkHandledClient,
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
-import { handPostInstruction, handPostOrderFor } from '@/lib/domain/accounting/hand-post-instruction'
+import { MARK_LOG_OUTCOME_REUSED_KEY, MARK_LOG_OUTCOME_SUPPRESSED, handPostInstruction, handPostOrderFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -2335,10 +2335,7 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
         // a bill payment) it was also false about the future: the same sentence covered every LATER edit
         // of that document, silently. Those kinds no longer suppress at all, so the copy now states which
         // of the two happened rather than implying the stronger one.
-        + (result.suppressed
-          ? 'IMS will not post this posting again'
-          : 'IMS will not re-post this edit, and a LATER edit of this document will be queued as usual — '
-            + 'this posting key is one successive edits share')
+        + (result.suppressed ? MARK_LOG_OUTCOME_SUPPRESSED : MARK_LOG_OUTCOME_REUSED_KEY)
         + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.')
         /**
          * o3d-j625 r18 (Codex round 17, HIGH 1) — AND WHETHER THE DEBT IS ACTUALLY DISCHARGED.

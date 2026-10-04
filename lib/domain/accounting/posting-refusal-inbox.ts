@@ -775,8 +775,8 @@ export async function recordAccountingPostingRefusal(
       tag: 'accounting',
       level: 'INFO',
       description:
-        `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled — `
-        + `posted by hand — on ${outcome.at.toISOString()}. Nothing is owed and nothing was recorded.`,
+        `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled (an operator confirmed it) `
+        + `on ${outcome.at.toISOString()} and this posting key is suppressed for ever. Nothing was recorded.`,
       metadata: { ...key, reason: record.reason },
     }).catch(() => { /* nothing else to try */ })
     return outcome

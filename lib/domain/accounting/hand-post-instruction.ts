@@ -211,6 +211,21 @@ export function describeRetiredUnproven(notes: readonly string[]): string {
 }
 
 /** The inbox row's "what to do first" text. */
+/**
+ * THE OUTCOME OF A MARK, as the activity log states it (Codex round 13: the log said a LATER edit "will be queued as usual").
+ * Only what holds in every branch: a one-posting key is suppressed; a reused key suppresses nothing, and a later edit may be queued
+ * or refused again.
+ */
+export const MARK_LOG_OUTCOME_SUPPRESSED = 'IMS will not post this posting again'
+export const MARK_LOG_OUTCOME_REUSED_KEY =
+  'IMS cancelled its own queued retry of this edit; it suppressed nothing, so a LATER edit of this document may be queued or may be refused '
+  + 'again (this posting key is one successive edits share)'
+
+/** What the Mark does to the row when ANOTHER operator holds the claim, stated for every outcome. ONE sentence for the inbox row and the refusal. */
+export const OTHER_OPERATOR_CLAIM_OUTCOME =
+  'IMS will not queue it while they hold it. Whether the row closes when they confirm depends on whether a later posting was declined while '
+  + 'they held it. If they are not going to finish, release their claim first.'
+
 export function handPostOrderFor(state: HandPostInput & {
   queuedRow: 'unsent' | 'may-be-sent' | null
   claim: { at: string; byName: string | null; mine: boolean } | null
@@ -232,8 +247,7 @@ export function handPostOrderFor(state: HandPostInput & {
   }
   if (state.claim) {
     return `${state.claim.byName ?? 'Another operator'} is settling this by hand (taken ${state.claim.at}). `
-      + 'Do NOT post it as well. IMS will not queue it while they hold it, and the row closes when they '
-      + 'confirm. If they are not going to finish, release their claim first.'
+      + `Do NOT post it as well. ${OTHER_OPERATOR_CLAIM_OUTCOME}`
       + earlier
   }
   if (state.queuedRow === 'may-be-sent') {

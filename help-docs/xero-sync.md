@@ -2524,7 +2524,7 @@ Three things about those rows:
   IMS records the posting you really made, **and leaves the row outstanding**, because you posted the version
   you had and the ledger still does not hold the current one. The page says so instead of "marked as handled".
   Releasing the claim does the same: the postponed attempts are added to the row's count and its clock moves
-  to now. Nothing re-queues them by itself — **re-save the document** and IMS queues its current version, or
+  to now. Nothing re-queues them by itself — **re-save the document**: IMS then queues its current version, or refuses it again (and lists that refusal) if the original cause still stands; or
   post that current version by hand and mark it again. On every other kind of posting the entry names one
   posting for ever, so a declined attempt was a *retry* of what you just posted by hand: those rows close and
   suppress exactly as before.
@@ -2538,10 +2538,13 @@ Three things about those rows:
   When IMS only has an id an operator typed in, or a retired attempt may have posted the CURRENT version, IMS
   says so and tells you to check the ledger for the CURRENT version first (the table above): finding the
   earlier version alone never closes the debt.
-* **A posting marked handled stays handled.** If the same posting is refused again later it is logged
-  (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
-  IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
-* **And that holds when the two happen at the same moment.** Marking a posting handled, queueing it, and
+* **A posting marked handled stays handled - for a posting whose key names ONE posting for ever.** If the same posting is refused again
+  later it is logged (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed.
+  For an invoice update, a bill update or a bill payment the key is shared by successive versions and marking suppresses
+  nothing: a later refusal of the same document (for example while its invoice belongs to a connector that is no longer
+  active) is recorded and listed again as new work. A row IMS cleared by queueing the posting, refused again later, comes
+  back as new work and is aged from the new gap.
+* **And that holds when the two happen at the same moment (for a posting whose key names one posting for ever).** Marking a posting handled, queueing it, and
   recording a refusal of it all take the same lock on that one posting, so a refusal cannot land in the gap
   between your *Mark as handled* and its save and put the row back on the list — which would have asked you
   to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being
@@ -5232,7 +5235,7 @@ Three things about those rows:
   IMS records the posting you really made, **and leaves the row outstanding**, because you posted the version
   you had and the ledger still does not hold the current one. The page says so instead of "marked as handled".
   Releasing the claim does the same: the postponed attempts are added to the row's count and its clock moves
-  to now. Nothing re-queues them by itself — **re-save the document** and IMS queues its current version, or
+  to now. Nothing re-queues them by itself — **re-save the document**: IMS then queues its current version, or refuses it again (and lists that refusal) if the original cause still stands; or
   post that current version by hand and mark it again. On every other kind of posting the entry names one
   posting for ever, so a declined attempt was a *retry* of what you just posted by hand: those rows close and
   suppress exactly as before.
@@ -5246,10 +5249,13 @@ Three things about those rows:
   When IMS only has an id an operator typed in, or a retired attempt may have posted the CURRENT version, IMS
   says so and tells you to check the ledger for the CURRENT version first (the table above): finding the
   earlier version alone never closes the debt.
-* **A posting marked handled stays handled.** If the same posting is refused again later it is logged
-  (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed. A row
-  IMS cleared by queueing the posting, refused again later, comes back as new work and is aged from the new gap.
-* **And that holds when the two happen at the same moment.** Marking a posting handled, queueing it, and
+* **A posting marked handled stays handled - for a posting whose key names ONE posting for ever.** If the same posting is refused again
+  later it is logged (`accounting_posting_refused_after_handled_by_hand`) and not listed again, because nothing is owed.
+  For an invoice update, a bill update or a bill payment the key is shared by successive versions and marking suppresses
+  nothing: a later refusal of the same document (for example while its invoice belongs to a connector that is no longer
+  active) is recorded and listed again as new work. A row IMS cleared by queueing the posting, refused again later, comes
+  back as new work and is aged from the new gap.
+* **And that holds when the two happen at the same moment (for a posting whose key names one posting for ever).** Marking a posting handled, queueing it, and
   recording a refusal of it all take the same lock on that one posting, so a refusal cannot land in the gap
   between your *Mark as handled* and its save and put the row back on the list — which would have asked you
   to post, by hand, something you had just posted by hand. A refusal that arrives while the posting is being

@@ -1218,3 +1218,39 @@ test('[o3d-1e7sl Codex r12] a later save on a reused key can be refused AGAIN (t
     else assert.match(dialog, /will refuse to post it from then on/, `${type}: the dialog promises the suppression the server applied`)
   }
 })
+
+test('[o3d-1e7sl Codex r13] ANOTHER operator holding the claim: the refusal and the inbox row never promise the row closes, and the real claim action says it depends', async () => {
+  const { OTHER_OPERATOR_CLAIM_OUTCOME, handPostOrderFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  refusals.length = 0; syncRows.length = 0; activity.length = 0
+  refusals.push(refusal('r13-other', 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-r13', scope: '', handPostClaimedAt: new Date('2026-10-01T10:00:00Z'), handPostClaimedBy: 'user-9' }))
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
+  for (const result of [await claimAccountingPostingRefusalForHandPostingAction('r13-other'), await markAccountingPostingRefusalHandledAction('r13-other', 'x')]) {
+    assert.equal(ok(result), false, 'the other operator\'s claim refuses both')
+    assert.ok(errorOf(result).includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'the refusal carries the shared outcome sentence')
+    assert.doesNotMatch(errorOf(result), /the row\s+closes\.|and when they confirm it the row/i, 'it never promises the closure')
+  }
+  const row = handPostOrderFor({ type: 'SALES_INVOICE_UPDATE', state: 'not-loaded', queuedRow: null, claim: { at: 'now', byName: 'Sam', mine: false } })
+  assert.ok(row.includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'and so does the inbox row')
+  assert.match(row, /Whether the row closes when they confirm depends on whether a later posting was declined/)
+})
+
+test('[o3d-1e7sl Codex r13] the mark activity log states only what holds in every branch (reused key: nothing suppressed, a later edit may be queued or refused again; one-posting key: suppressed)', async () => {
+  const { MARK_LOG_OUTCOME_REUSED_KEY, MARK_LOG_OUTCOME_SUPPRESSED } = await import('@/lib/domain/accounting/hand-post-instruction')
+  for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r13-log-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r13-log-${type}`)), true, type)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string }
+    assert.ok(note.description.includes(reused ? MARK_LOG_OUTCOME_REUSED_KEY : MARK_LOG_OUTCOME_SUPPRESSED), `${type}: the log carries the shared outcome`)
+    assert.doesNotMatch(note.description, /will be queued as usual|will not re-post this edit/, `${type}: no guarantee that a later edit queues`)
+    assert.equal(refusals[0]!.suppressedAt instanceof Date, !reused, `${type}: and the log matches what the server wrote`)
+  }
+})
+
+test('[o3d-1e7sl Codex r13] the kinds help text says "Mark as handled also stops IMS ever posting it" only for kinds whose key names ONE posting for ever', async () => {
+  const { POSTING_REFUSAL_KINDS } = await import('@/lib/domain/accounting/posting-refusal-kinds')
+  const { postingKeyIsReusedAcrossPostings } = await import('@/lib/accounting/posting-key')
+  for (const [kind, def] of Object.entries(POSTING_REFUSAL_KINDS) as Array<[string, { type: string; clearing: string }]>) {
+    if (def.clearing === 'manual') assert.equal(postingKeyIsReusedAcrossPostings(def.type), false, `${kind}: a manual kind promised "stops IMS ever posting it" must not be a reused-key type`)
+  }
+})

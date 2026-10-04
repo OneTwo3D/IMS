@@ -505,8 +505,8 @@ export async function reportSuppressedPosting(key: PostingRefusalKey, suppressio
         + `settle by hand at ${suppression.at.toISOString()} and still holds it, so queueing it now is how the `
         + 'ledger would get it twice. It stays outstanding in the exception inbox until they confirm it or '
         + 'release the claim.'
-      : `IMS did NOT post ${key.type} for ${key.referenceType} ${key.referenceId}: it was marked handled — posted `
-        + `by hand in the ledger — on ${suppression.at.toISOString()}, so posting it again would post it twice.`,
+      : `IMS did NOT post ${key.type} for ${key.referenceType} ${key.referenceId}: it was marked handled (an operator `
+        + `confirmed it is in the ledger) on ${suppression.at.toISOString()}, so posting it again would post it twice.`,
     metadata: { ...key, basis: suppression.basis, suppressedAt: suppression.at.toISOString(), markedBy: suppression.by },
   }).catch(() => { /* a report that cannot be written must not turn a suppression into a post */ })
 }

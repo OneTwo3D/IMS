@@ -6,7 +6,7 @@ import {
   isPostableAccountingSyncStatus,
   retiredUnprovenRows,
 } from '@/lib/domain/accounting/postable-sync-statuses'
-import { describeEarlierPostings, describeRetiredUnproven, handPostStepFor, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
+import { describeEarlierPostings, describeRetiredUnproven, handPostStepFor, OTHER_OPERATOR_CLAIM_OUTCOME, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -383,8 +383,7 @@ function claimedByOther(row: LoadedRefusal): Extract<MarkHandledResult, { ok: fa
     message:
       'Another operator is settling this posting by hand — they took it '
       + `${row.handPostClaimedAt ? `at ${row.handPostClaimedAt.toISOString()}` : 'already'}. `
-      + 'Do not post it as well: while they hold it IMS will not queue it, and when they confirm it the row '
-      + 'closes. If they are not going to, release their claim first.',
+      + `Do not post it as well. ${OTHER_OPERATOR_CLAIM_OUTCOME}`,
   }
 }
 
