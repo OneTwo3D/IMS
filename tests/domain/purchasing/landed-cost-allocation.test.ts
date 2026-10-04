@@ -166,26 +166,47 @@ test('T10b: the floor is applied AFTER rounding — a -0.0000005 tie rounds away
 // ─── Determinism: the order the shares are summed in must not depend on the read ────────────────────────
 
 test('T6: the allocation is independent of the order its inputs arrive in (cost lines and lines are sorted)', () => {
-  const lines = [line('L1', 3, 7), line('L2', 11, 13), line('L3', 5, 1)]
-  const costLines = [
-    cost('100000000.0001', 'BY_VALUE', 0, 'a'),
-    cost('0.0001', 'BY_QUANTITY', 0, 'b'),
-    cost('0.0003', 'BY_VALUE', 1, 'c'),
-    cost('-0.0001', 'EQUAL_SPLIT', 1, 'd'),
+  // A fixture found by search on which the ORDER the shares are summed in changes the 6dp answer: Decimal
+  // division and addition round to 20 significant digits, so (a+b)+c and (c+b)+a can land on opposite sides of
+  // a 6dp HALF_UP boundary. Without the (sourceRank, id) sort a database read with no ORDER BY could therefore
+  // move a stored unit cost by one micro-unit between two otherwise identical runs.
+  const lines = [
+    { id: 'L0', qty: 25, unitCostBase: 3.01, totalBase: 75.25, weight: null },
+    { id: 'L1', qty: 6, unitCostBase: 19.58, totalBase: 117.48, weight: null },
+    { id: 'L2', qty: 8, unitCostBase: 6.46, totalBase: 51.68, weight: null },
+    { id: 'L3', qty: 17, unitCostBase: 10.74, totalBase: 182.58, weight: null },
   ]
-  const baseline = allocateLandedCost(lines, costLines)
+  const costLines = [
+    cost('89401.8989', 'BY_QUANTITY', 0, 'c1'),
+    cost('-27040.1416', 'BY_QUANTITY', 0, 'c2'),
+    cost('18605.9624', 'BY_QUANTITY', 0, 'c3'),
+  ]
   const render = (a: ReturnType<typeof allocateLandedCost>) => JSON.stringify([
     [...a.grossUnitCostBaseByLine].map(([id, v]) => [id, v.toString()]),
     [...a.landedAmountByLine].map(([id, v]) => [id, v.toString()]),
   ])
-  const permutations: number[][] = [[3, 2, 1, 0], [1, 0, 3, 2], [2, 0, 3, 1], [0, 3, 1, 2]]
-  let permutationsRun = 0
+  const baseline = allocateLandedCost(lines, costLines)
+
+  // PRECONDITION: the fixture really IS order-sensitive. Summing the same shares in c3,c2,c1 order BY HAND
+  // gives a different 6dp cost for L3, so an unsorted core would differ between the two input orders.
+  const byHand = (order: LandedAllocationCostLine[]) => {
+    const total = lines.reduce((sum, l) => sum.add(l.qty), new Prisma.Decimal(0))
+    let landed = new Prisma.Decimal(0)
+    for (const c of order) landed = landed.add(new Prisma.Decimal(c.amountBase).mul(17).div(total))
+    return new Prisma.Decimal(10.74).add(landed.div(17)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toString()
+  }
+  const forward = byHand(costLines)
+  const backward = byHand([...costLines].reverse())
+  console.log(`T6 PRECONDITION: L3 cost summed c1,c2,c3 = ${forward}; summed c3,c2,c1 = ${backward}; the core says ${baseline.grossUnitCostBaseByLine.get('L3')}`)
+  assert.notEqual(forward, backward, 'the fixture must be order-sensitive or this arm proves nothing')
+  assert.equal(baseline.grossUnitCostBaseByLine.get('L3')?.toString(), forward, 'the core sums in (sourceRank, id) order')
+
+  const permutations: number[][] = [[2, 1, 0], [1, 0, 2], [2, 0, 1], [0, 2, 1]]
   for (const order of permutations) {
     const shuffled = allocateLandedCost([...lines].reverse(), order.map((i) => costLines[i]))
     assert.equal(render(shuffled), render(baseline), `permutation ${order.join(',')} changed the allocation`)
-    permutationsRun += 1
   }
-  console.log(`T6 PRECONDITION: permutations compared: ${permutationsRun}, landed amounts: ${[...baseline.landedAmountByLine].map(([id, v]) => `${id}=${v}`).join(' ')}`)
+  console.log(`T6 PRECONDITION: permutations compared: ${permutations.length}`)
 })
 
 // ─── Warnings ────────────────────────────────────────────────────────────────────────────────────────────
@@ -232,6 +253,13 @@ test('T12: the operator text is facts only, names the residue and the line, and 
   assert.equal(totalUnabsorbedBase(entries).toString(), '6.0002')
   assert.match(text, /IMS queued no journal for that amount/)
   assert.deepEqual(unconditionalInstructions(text), [], 'a facts-only sentence has no instruction and no ledger-history claim')
+  // The PREVIEW tense claims nothing happened: no past-tense "valued" / "queued" for units not yet received.
+  const pending = describeFlooredLandedCredit({ context: 'PO PO-1', entries, tense: 'pending' })
+  console.log(`T12 PRECONDITION: pending-tense text: ${pending}`)
+  assert.match(pending, /will value those units at 0\.00/)
+  assert.match(pending, /will queue no journal/)
+  assert.doesNotMatch(pending, /\b(valued|queued|was larger)\b/)
+  assert.deepEqual(unconditionalInstructions(pending), [])
   // The checker CAN fail: it flags both an instruction and a history claim.
   const controls = [
     'Post the difference to the inventory revaluation account.',
@@ -313,7 +341,7 @@ test('census: every writer of a PO-derived layer cost takes it from the one allo
 
 test('census: the operator sentence is written in ONE place', () => {
   const builder = 'lib/domain/purchasing/landed-cost-floor-text.ts'
-  const PHRASE = /valued those units at/
+  const PHRASE = /valued those units at|will value those units at/
   const holders = SOURCES.filter((file) => PHRASE.test(read(file)))
   console.log(`census: files containing the floor sentence: ${holders.join(', ')}`)
   assert.deepEqual(holders, [builder])

@@ -32,12 +32,23 @@ export function totalUnabsorbedBase(entries: FlooredLandedCreditEntry[]): Prisma
 export function describeFlooredLandedCredit(params: {
   context: string
   entries: FlooredLandedCreditEntry[]
+  /**
+   * `applied` (default): units were laid at the floored cost, so this says what IMS DID. `pending`: nothing has
+   * been received yet (the read-only PO preview), so it says what IMS WILL do and claims nothing happened.
+   */
+  tense?: 'applied' | 'pending'
 }): string {
   const { context, entries } = params
   const detail = entries
     .map((entry) => `${entry.label}: ${money(entry.unabsorbedBase)} (unit cost would have been ${entry.unflooredGrossUnitCostBase.toFixed(6)})`)
     .join('; ')
-  return `${context}: a negative landed cost was larger than the goods cost of ${entries.length} line(s), `
-    + `so IMS valued those units at 0.00 each and could not absorb ${money(totalUnabsorbedBase(entries))} of it into stock `
+  const lead = `${context}: a negative landed cost is larger than the goods cost of ${entries.length} line(s)`
+  const total = money(totalUnabsorbedBase(entries))
+  if (params.tense === 'pending') {
+    return `${lead}, so IMS will value those units at 0.00 each when they are received and cannot absorb ${total} of it into stock `
+      + `[${detail}]. IMS will queue no journal for that amount.`
+  }
+  return `${lead.replace(' is larger', ' was larger')}, `
+    + `so IMS valued those units at 0.00 each and could not absorb ${total} of it into stock `
     + `[${detail}]. IMS queued no journal for that amount.`
 }

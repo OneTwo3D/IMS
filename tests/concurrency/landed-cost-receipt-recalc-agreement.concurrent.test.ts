@@ -248,6 +248,6 @@ test('preview: getPurchaseOrder costs a credit like the receipt, ignores CANCELL
   assert.equal(flooredDetail?.landedCostFloors.length, 1)
   assert.equal(flooredDetail?.landedCostFloors[0].unabsorbedBase, 1)
   assert.equal(flooredDetail?.landedCostFloors[0].unflooredGrossUnitCostBase, -0.5)
-  assert.match(flooredDetail?.landedCostFloors[0].message ?? '', /could not absorb 1\.00 of it into stock/)
+  assert.match(flooredDetail?.landedCostFloors[0].message ?? '', /cannot absorb 1\.00 of it into stock/)
   assert.equal(after, before, 'the read-only preview must not write an activity entry')
 })

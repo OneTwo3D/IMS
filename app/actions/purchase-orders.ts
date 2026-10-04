@@ -859,6 +859,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toNumber(),
       unabsorbedBase: unabsorbedBase.toNumber(),
       message: describeFlooredLandedCredit({
+        tense: 'pending', // nothing is received yet: the preview says what IMS WILL do and claims nothing happened
         context: `PO ${po.reference}`,
         entries: [{
           label: poLine?.product?.sku ?? floor.lineId,
