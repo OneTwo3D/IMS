@@ -41,6 +41,9 @@ type SyncLogRow = {
   type: string
   status: string
   externalTransactionId?: string | null
+  /** o3d-djemh: the ledger-standing columns. Absent = the connector's own writeback (CONFIRMED). */
+  settlementBasis?: string | null
+  abandonedBeforeRemoteCall?: boolean | null
 }
 
 type OrderRow = {
@@ -274,22 +277,30 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
           referenceType: string
           referenceId: string | { in: string[] }
           type: { in: string[] }
-          status: { in: string[] }
-          externalTransactionId: { not: null }
+          status?: { in: string[] }
+          externalTransactionId?: { not: null }
         }
       }) => {
         const refs = typeof where.referenceId === 'string' ? [where.referenceId] : where.referenceId.in
         events.push(`findMany:${where.referenceType}:${refs.join('|')}`)
+        // o3d-djemh: the production read no longer filters on status or id; it reads every row of the
+        // type WITH its ledger-standing columns and classifies in TypeScript. The double still honours
+        // either predicate when a caller supplies one, and returns the standing columns.
         return store.syncLogs
           .filter(
             (log) =>
               log.referenceType === where.referenceType &&
               refs.includes(log.referenceId) &&
               where.type.in.includes(log.type) &&
-              where.status.in.includes(log.status) &&
+              (!where.status || where.status.in.includes(log.status)) &&
               (!('externalTransactionId' in where) || !!log.externalTransactionId),
           )
-          .map((log) => ({ externalTransactionId: log.externalTransactionId ?? null }))
+          .map((log) => ({
+            status: log.status,
+            externalTransactionId: log.externalTransactionId ?? null,
+            abandonedBeforeRemoteCall: log.abandonedBeforeRemoteCall ?? null,
+            settlementBasis: log.settlementBasis ?? null,
+          }))
       },
       update: async () => {
         throw new Error('the backfill must never mutate a queued payload (o3d-5ct)')
@@ -2124,7 +2135,7 @@ test('a back-reference repair after the correction withdraws it as well (o3d-9ke
 
   assert.equal(revalidated.outcome, 'SUPERSEDED')
   assert.equal(revalidated.handoff.remedy, null)
-  assert.match(revalidated.detail, /SYNCED sales invoice\(s\) \[INV-901\]/)
+  assert.match(revalidated.detail, /invoice id\(s\) claimed on sync rows \[INV-901\]/)
   assert.doesNotMatch(revalidated.detail, /REFUND position is now/)
 })
 
@@ -2460,4 +2471,612 @@ test('a RE-MIRRORED document withdraws it too, though nothing it says changed (o
   assert.equal(revalidated.handoff.remedy, null)
   assert.match(revalidated.detail, /over the mirrored event\(s\)/, 'and the withdrawal SAYS what moved')
   assert.match(revalidated.detail, /2026-06-09T09:00:00\.000Z/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-djemh (M17, option B / D2): an operator-ASSERTED document id still counts for EXISTENCE and
+// IDENTITY (the handoff trigger, the review-to-apply set comparison, the restatement ledger record)
+// and is LABELLED asserted wherever it is named. One set; the label is derived from the sync rows at
+// read time and is never part of the reviewed file or of any comparison.
+// ---------------------------------------------------------------------------
+
+const ASSERTION_BASIS = 'OPERATOR_ASSERTION'
+const LABEL = /NOT confirmed in the ledger/
+
+type StandingCase = {
+  standing: string
+  row: Partial<SyncLogRow> & { status: string }
+  /** The ids the live evidence must hold, and which of them must be labelled. */
+  ids: string[]
+  unconfirmed: string[]
+}
+
+const STANDING_CASES: StandingCase[] = [
+  { standing: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-1' }, ids: ['INV-1'], unconfirmed: [] },
+  { standing: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'INV-1', settlementBasis: ASSERTION_BASIS }, ids: ['INV-1'], unconfirmed: ['INV-1'] },
+  // A cancelled sale an operator settled by typing the invoice id: still a claimed document.
+  { standing: 'ASSERTED_POSTED (cancelled-sale settlement)', row: { status: 'CANCELLED', externalTransactionId: 'INV-1', settlementBasis: ASSERTION_BASIS }, ids: ['INV-1'], unconfirmed: ['INV-1'] },
+  { standing: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: ASSERTION_BASIS }, ids: [], unconfirmed: [] },
+  { standing: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true }, ids: [], unconfirmed: [] },
+  { standing: 'UNKNOWN (no id)', row: { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: null }, ids: [], unconfirmed: [] },
+  // An id on a row whose basis this build cannot read is still an id: counted, never called confirmed.
+  { standing: 'UNKNOWN (id, unrecognised basis)', row: { status: 'SYNCED', externalTransactionId: 'INV-1', settlementBasis: 'FUTURE_BASIS' }, ids: ['INV-1'], unconfirmed: ['INV-1'] },
+]
+
+function standingStore(row: StandingCase['row']): Store {
+  return makeStore({
+    syncLogs: [{ id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', ...row }],
+  })
+}
+
+for (const c of STANDING_CASES) {
+  test(`o3d-djemh: ${c.standing} -> id set ${JSON.stringify(c.ids)}, labelled ${JSON.stringify(c.unconfirmed)}, handoff ${c.ids.length ? 'owed' : 'none'}`, async () => {
+    const { applyWcCouponCorrection } = await load()
+    reset()
+    const store = standingStore(c.row)
+    // PRECONDITION, printed: the row under test really is on the store the correction will read.
+    console.log(`# o3d-djemh precondition: standing=${c.standing} syncLogs=${store.syncLogs.length} row=${JSON.stringify(c.row)}`)
+    assert.equal(store.syncLogs.length, 1)
+
+    // The reviewer saw exactly the set this standing yields, so the comparison passes and what is
+    // observed is the evidence and the handoff.
+    const result = await applyWcCouponCorrection(makeTx(store), { ...entry, postedInvoiceExternalIds: c.ids })
+
+    assert.equal(result.outcome, 'CORRECTED')
+    if (result.outcome !== 'CORRECTED') return
+    assert.deepEqual(result.posted?.postedInvoiceExternalIds, c.ids)
+    assert.deepEqual((result.posted?.unconfirmedInvoiceDocuments ?? []).map((d) => d.id), c.unconfirmed)
+    // THE TRIGGER: any counted invoice id => a manual ledger adjustment is owed. Existence is existence.
+    assert.equal(result.handoff !== null, c.ids.length > 0, 'handoff iff a document id counts')
+    assert.equal(store.activity[0].metadata.posted, c.ids.length > 0)
+    const text = `${store.activity[0].description ?? ''}\n${(store.activity[0].metadata.handoffLines as string[] | undefined)?.join('\n') ?? ''}`
+    assert.equal(LABEL.test(text), c.unconfirmed.length > 0, `label appears in the durable record iff asserted: ${text}`)
+    // Never named as confirmed: a labelled id is not followed by a bare mention elsewhere in the headline.
+    // The durable record's own 'in the ledger as' clause, not just the headline borrowed from the handoff.
+    if (c.unconfirmed.length) assert.match(store.activity[0].description ?? '', /recorded against this order as unlinked invoice\(s\) INV-1 \([^)]*NOT confirmed in the ledger\)/)
+    assert.deepEqual(
+      ((store.activity[0].metadata.unconfirmedInvoiceDocuments ?? []) as Array<{ id: string }>).map((d) => d.id),
+      c.unconfirmed,
+      'the ActivityLog metadata records which ids are asserted',
+    )
+  })
+}
+
+test('o3d-djemh: LIVE_WORK (a PENDING invoice, no id) holds the order; it is never read as "nothing posted"', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = standingStore({ status: 'PENDING', externalTransactionId: null })
+  console.log(`# o3d-djemh precondition: standing=LIVE_WORK syncLogs=${store.syncLogs.length}`)
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+  assert.equal(result.outcome, 'DECLINED')
+  assert.equal(store.orders[0].discountAmount, 10, 'nothing rewritten')
+})
+
+test('o3d-djemh ISOLATING ARM: an asserted invoice id the reviewer did not see is DECLINED (it never reads as "no document")', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-ASSERTED', settlementBasis: ASSERTION_BASIS })
+  console.log(`# o3d-djemh precondition: asserted row present=${store.syncLogs.length}, reviewed set=[]`)
+  assert.equal(store.syncLogs.length, 1)
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.match(result.outcome === 'DECLINED' ? result.detail : '', /INV-ASSERTED \(asserted by an operator, NOT confirmed in the ledger\)/)
+  assert.equal(store.orders[0].discountAmount, 10, 'the discount was NOT rewritten')
+})
+
+test('o3d-djemh ISOLATING ARM: an asserted id still triggers the ledger-adjustment handoff on a reviewed correction', async () => {
+  // The unsafe direction, pinned. If the asserted id were dropped from the set the order would look
+  // UNPOSTED: with the reviewer's set [INV-1] the comparison would refuse; with the live set empty
+  // and the reviewer's empty the correction would run with handoff === null. Both are asserted here.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-1', settlementBasis: ASSERTION_BASIS })
+  const result = await applyWcCouponCorrection(makeTx(store), { ...entry, postedInvoiceExternalIds: ['INV-1'] })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  assert.ok(result.handoff, 'a manual ledger adjustment is owed')
+  assert.equal(result.handoff?.needsAccountingAction, true)
+  assert.match((result.handoff?.lines ?? []).join('\n'), LABEL, 'and the handoff text calls the id asserted')
+  // UNIVERSAL, not existential: no mention of the id anywhere in the handoff text may be bare. A
+  // labelled mention beside an unlabelled one would satisfy the `match` above.
+  const lines = (result.handoff?.lines ?? []).join('\n')
+  const mentions = (lines.match(/INV-1/g) ?? []).length
+  console.log(`# o3d-djemh handoff mentions of the asserted id: ${mentions}`)
+  assert.ok(mentions >= 1, 'precondition: the handoff names the id at least once')
+  assert.doesNotMatch(lines, /INV-1(?! \([^)]*NOT confirmed in the ledger\))/, 'no bare (confirmed-sounding) mention of an asserted id')
+  assert.equal(
+    ((store.orders[0].discountRestatement ?? {}) as { ledger?: { postedInvoiceExternalIds?: string[] } }).ledger?.postedInvoiceExternalIds?.join(',') ?? 'none',
+    'INV-1',
+    'the restatement ledger record keeps the id (identity)',
+  )
+})
+
+test('o3d-djemh: the review->apply comparison does not move when only the LABEL changes', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  // The SAME reviewed entry, evaluated against a confirmed row and against an asserted row carrying
+  // the same id: identical outcome, identical id set; only the label differs.
+  const confirmed = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-1' })
+  const asserted = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-1', settlementBasis: ASSERTION_BASIS })
+  console.log(`# o3d-djemh precondition: reviewed set=[INV-1]; rows confirmed=${confirmed.syncLogs.length} asserted=${asserted.syncLogs.length}`)
+  const a = await applyWcCouponCorrection(makeTx(confirmed), { ...entry, postedInvoiceExternalIds: ['INV-1'] })
+  const b = await applyWcCouponCorrection(makeTx(asserted), { ...entry, postedInvoiceExternalIds: ['INV-1'] })
+  assert.equal(a.outcome, 'CORRECTED')
+  assert.equal(b.outcome, 'CORRECTED')
+  assert.deepEqual(
+    a.outcome === 'CORRECTED' ? a.posted?.postedInvoiceExternalIds : null,
+    b.outcome === 'CORRECTED' ? b.posted?.postedInvoiceExternalIds : null,
+  )
+  // ...and a SET change (the id differs) is still refused, asserted or not.
+  const moved = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-2', settlementBasis: ASSERTION_BASIS })
+  const c = await applyWcCouponCorrection(makeTx(moved), { ...entry, postedInvoiceExternalIds: ['INV-1'] })
+  assert.equal(c.outcome === 'DECLINED' && c.reason, 'POSTING_CHANGED')
+})
+
+test('o3d-djemh GOLDEN: a CONFIRMED-only order reports exactly what it reported before (no label keys anywhere)', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = standingStore({ status: 'SYNCED', externalTransactionId: 'INV-1' })
+  const result = await applyWcCouponCorrection(makeTx(store), { ...entry, postedInvoiceExternalIds: ['INV-1'] })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  assert.deepEqual(result.posted, {
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: ['INV-1'],
+    revenueDeferredBatchRef: null,
+    unearnedRevenueAmount: null,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
+  })
+  assert.equal('unconfirmedInvoiceDocuments' in store.activity[0].metadata, false)
+  assert.doesNotMatch(`${store.activity[0].description}\n${(result.handoff?.lines ?? []).join('\n')}`, /asserted/i)
+})
+
+test('o3d-djemh: an asserted CREDIT NOTE id counts as a posted credit note (refunded) and is labelled; confirmed is not', async () => {
+  const { applyWcCouponCorrection } = await load()
+  for (const [name, basis, labelled] of [['confirmed', null, false], ['asserted', ASSERTION_BASIS, true]] as const) {
+    reset()
+    const store = makeStore({
+      orders: [
+        { id: 'order-1', discountAmount: 10, discountModel: null, lines: [{ discountAmount: 10 }], importedAt: IMPORTED_AT, refundStatus: 'PARTIAL', refunds: [{ id: 'refund-1', accountingCreditNoteId: null }] },
+      ],
+      syncLogs: [
+        { id: 'cn-1', referenceType: 'SalesOrderRefund', referenceId: 'refund-1', type: 'CREDIT_NOTE', status: 'SYNCED', externalTransactionId: 'CN-1', settlementBasis: basis },
+      ],
+    })
+    console.log(`# o3d-djemh precondition: credit note ${name}; rows=${store.syncLogs.length}`)
+    const refunds = { disposition: 'PARTIAL' as const, refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-1'], unresolvedRefundParkExternalIds: [] as string[] }
+    const result = await applyWcCouponCorrection(makeTx(store), { ...entry, refunds })
+    assert.equal(result.outcome, 'CORRECTED', name)
+    if (result.outcome !== 'CORRECTED') return
+    assert.deepEqual(result.posted?.refunds.postedCreditNoteExternalIds, ['CN-1'])
+    assert.deepEqual((result.posted?.refunds.unconfirmedCreditNoteDocuments ?? []).map((d) => d.id), labelled ? ['CN-1'] : [], name)
+    assert.equal(/CN-1 \(asserted by an operator, NOT confirmed in the ledger\)/.test(store.activity[0].description ?? ''), labelled, name)
+  }
+})
+
+test('o3d-djemh: classifyPostedDocumentRows and the label wording (the report row, per standing)', async () => {
+  const { classifyPostedDocumentRows } = await load()
+  const { describeLedgerDocumentIds } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const base = { abandonedBeforeRemoteCall: null, settlementBasis: null as string | null }
+  const rows = [
+    { ...base, status: 'SYNCED', externalTransactionId: 'A-CONF' },
+    { ...base, status: 'SYNCED', externalTransactionId: 'B-ASSERT', settlementBasis: ASSERTION_BASIS },
+    { ...base, status: 'CANCELLED', externalTransactionId: null, settlementBasis: ASSERTION_BASIS },
+    { ...base, status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true },
+    { ...base, status: 'PENDING', externalTransactionId: null },
+    { ...base, status: 'SYNCED', externalTransactionId: '  ' },
+  ]
+  console.log(`# o3d-djemh precondition: ${rows.length} rows classified`)
+  const out = classifyPostedDocumentRows(rows)
+  assert.deepEqual(out, { ids: ['A-CONF', 'B-ASSERT'], unconfirmed: [{ id: 'B-ASSERT', cause: 'OPERATOR_ASSERTED', status: 'SYNCED' }] })
+  // The same id confirmed on one row and asserted on another is confirmed.
+  assert.deepEqual(
+    classifyPostedDocumentRows([
+      { ...base, status: 'SYNCED', externalTransactionId: 'X' },
+      { ...base, status: 'SYNCED', externalTransactionId: 'X', settlementBasis: ASSERTION_BASIS },
+    ]),
+    { ids: ['X'], unconfirmed: [] },
+  )
+  assert.equal(describeLedgerDocumentIds(out.ids, out.unconfirmed), 'A-CONF, B-ASSERT (asserted by an operator, NOT confirmed in the ledger)')
+  assert.equal(describeLedgerDocumentIds(['A'], undefined), 'A')
+})
+
+test('o3d-djemh: the REPORT reads standing columns, labels asserted ids, and never writes the label to the reviewed file', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+  const lib = readFileSync(join(process.cwd(), 'lib/connectors/woocommerce/sync/coupon-discount-backfill.ts'), 'utf8')
+  const hits = (re: RegExp) => (src.match(re) ?? []).length
+  console.log(`# o3d-djemh report source: classify=${hits(/classifyPostedDocumentRows\(/g)} label-note=${hits(/NOT CONFIRMED:/g)} csv=${hits(/unconfirmedPostedDocuments/g)}`)
+  assert.ok(hits(/classifyPostedDocumentRows\(/g) >= 2, 'invoices and credit notes are both classified')
+  assert.ok(hits(/NOT CONFIRMED:/g) >= 1, 'the report names asserted ids as NOT CONFIRMED')
+  assert.ok(hits(/unconfirmedPostedDocuments/g) >= 1, 'and the CSV carries them')
+  // The reviewed-file entry copies NAMED fields only: the label key must not be among them.
+  const start = lib.indexOf('export function buildWcCouponAllowlistEntry(')
+  const entryFn = lib.slice(start, lib.indexOf('\n}\n', start))
+  console.log(`# o3d-djemh entry builder located: ${start >= 0} (${entryFn.length} chars)`)
+  assert.ok(start >= 0 && entryFn.length > 200)
+  assert.equal(/unconfirmed/i.test(entryFn), false, 'no label field is persisted in the reviewed file')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-djemh Codex round 1: UNIVERSAL wording. Render EVERYTHING an operator can read for each cause
+// (handoff lines, ActivityLog description + stored handoffLines, the POSTING_CHANGED / refund-position
+// refusals) and assert that EVERY occurrence of an unconfirmed id is labelled with its own cause and
+// that no sentence naming it claims SYNCED, "in the ledger", "posted" or an operator's act it did not
+// have. An existential `match` is satisfied by one labelled mention beside a bare one; these are
+// absence checks over all of them.
+// ---------------------------------------------------------------------------
+
+const LABEL_PAREN = /\([^)]*NOT confirmed in the ledger\)/g
+const EXISTENCE_PHRASES = /\balready\b|\bexists?\b|\bexisting\b|\bholds?\b|has a document|\bis posted\b|\bare posted\b|in the ledger|what is posted|real document|recorded in the ledger|accounting documents/i
+
+function assertUniversalWording(texts: string[], ids: string[], cause: 'OPERATOR_ASSERTED' | 'UNRECOGNISED_BASIS' | 'NOT_SYNCED', where: string) {
+  const all = texts.join('\n')
+  for (const id of ids) {
+    const mentions = (all.match(new RegExp(id.replace(/[-]/g, '\\-'), 'g')) ?? []).length
+    const labelled = (all.match(new RegExp(`${id} \\([^)]*NOT confirmed in the ledger\\)`, 'g')) ?? []).length
+    console.log(`# o3d-djemh universal [${where}] ${id}: ${mentions} mention(s), ${labelled} labelled`)
+    assert.ok(mentions >= 1, `${where}: precondition, the id is named at all`)
+    assert.equal(labelled, mentions, `${where}: every mention of ${id} is labelled:\n${all}`)
+    const stripped = all.replace(LABEL_PAREN, '')
+    // A WINDOW around each mention (the clause it sits in), not the whole sentence: a neighbouring
+    // clause about a mirrored event is not a claim about this id.
+    let from = 0
+    for (;;) {
+      const at = stripped.indexOf(id, from)
+      if (at < 0) break
+      // Back to the start of the clause (a sentence, bullet or line break), at most 90 characters.
+      const before = stripped.slice(Math.max(0, at - 90), at)
+      const clauseStart = Math.max(before.lastIndexOf('.'), before.lastIndexOf(';'), before.lastIndexOf('•'), before.lastIndexOf('\n')) + 1
+      const windowText = before.slice(clauseStart) + stripped.slice(at, at + id.length + 25)
+      assert.doesNotMatch(windowText, /SYNCED|in the ledger|ledger holds|\bposted\b|operator recorded|\bare in\b/i, `${where}: no certainty claim beside ${id}: ${windowText}`)
+      from = at + id.length
+    }
+    // EXISTENCE-CLAIM SWEEP: no sentence that names an unconfirmed id may state or imply that a
+    // document exists, is posted, or is held by the ledger ("may exist" is the only permitted form).
+    let sentences = 0
+    for (const sentence of stripped.replace(/may (?:never )?(?:have )?exist/gi, 'MAY-FORM').split(/[.;\n•]/)) {
+      if (!sentence.includes(id)) continue
+      sentences++
+      assert.doesNotMatch(sentence, EXISTENCE_PHRASES, `${where}: an existence claim in a sentence naming ${id}: ${sentence}`)
+    }
+    assert.ok(sentences >= 1, `${where}: precondition, the sweep examined at least one sentence`)
+    const label = all.match(new RegExp(`${id} \\(([^)]*NOT confirmed in the ledger)\\)`))?.[1] ?? ''
+    assert.equal(/asserted by an operator/.test(label), cause === 'OPERATOR_ASSERTED', `${where}: provenance in the label matches the cause`)
+    assert.equal(/not recognised/.test(label), cause === 'UNRECOGNISED_BASIS', where)
+    assert.equal(/sync row/.test(label), cause === 'NOT_SYNCED', where)
+  }
+}
+
+const UNIVERSAL_INVOICE_ARMS: Array<{ name: string; row: Partial<SyncLogRow> & { status: string }; cause: 'OPERATOR_ASSERTED' | 'UNRECOGNISED_BASIS' | 'NOT_SYNCED' }> = [
+  { name: 'asserted invoice', row: { status: 'SYNCED', externalTransactionId: 'INV-U', settlementBasis: ASSERTION_BASIS }, cause: 'OPERATOR_ASSERTED' },
+  { name: 'invoice id on a CANCELLED row', row: { status: 'CANCELLED', externalTransactionId: 'INV-U' }, cause: 'NOT_SYNCED' },
+  { name: 'invoice id, unrecognised basis', row: { status: 'SYNCED', externalTransactionId: 'INV-U', settlementBasis: 'FUTURE_BASIS' }, cause: 'UNRECOGNISED_BASIS' },
+]
+
+for (const arm of UNIVERSAL_INVOICE_ARMS) {
+  test(`o3d-djemh universal wording: ${arm.name}: handoff, record and refusal`, async () => {
+    const { applyWcCouponCorrection } = await load()
+    reset()
+    const store = standingStore(arm.row)
+    console.log(`# o3d-djemh precondition: ${arm.name} row=${JSON.stringify(arm.row)}`)
+    const ok = await applyWcCouponCorrection(makeTx(store), { ...entry, postedInvoiceExternalIds: ['INV-U'] })
+    assert.equal(ok.outcome, 'CORRECTED')
+    if (ok.outcome !== 'CORRECTED') return
+    assert.ok(ok.handoff)
+    const activity = store.activity[0]
+    assertUniversalWording(
+      [...(ok.handoff?.lines ?? []), activity.description ?? '', ...((activity.metadata.handoffLines as string[] | undefined) ?? [])],
+      ['INV-U'],
+      arm.cause,
+      `${arm.name} / handoff`,
+    )
+    // The refusal (reviewer saw nothing): same universal rule.
+    reset()
+    const refused = await applyWcCouponCorrection(makeTx(standingStore(arm.row)), entry)
+    assert.equal(refused.outcome === 'DECLINED' && refused.reason, 'POSTING_CHANGED')
+    assertUniversalWording([refused.outcome === 'DECLINED' ? refused.detail : ''], ['INV-U'], arm.cause, `${arm.name} / refusal`)
+  })
+}
+
+for (const disposition of ['PARTIAL', 'FULL'] as const) {
+  for (const arm of [
+    { name: 'asserted credit note', row: { status: 'SYNCED', externalTransactionId: 'CN-U', settlementBasis: ASSERTION_BASIS }, cause: 'OPERATOR_ASSERTED' as const },
+    { name: 'credit note id on a FAILED row', row: { status: 'FAILED', externalTransactionId: 'CN-U' }, cause: 'NOT_SYNCED' as const },
+    { name: 'credit note id on a PENDING row', row: { status: 'PENDING', externalTransactionId: 'CN-U' }, cause: 'NOT_SYNCED' as const },
+    { name: 'credit note id, unrecognised basis', row: { status: 'SYNCED', externalTransactionId: 'CN-U', settlementBasis: 'FUTURE_BASIS' }, cause: 'UNRECOGNISED_BASIS' as const },
+  ]) {
+    test(`o3d-djemh universal wording: ${arm.name} (${disposition} refund): handoff, record and refusal`, async () => {
+      const { applyWcCouponCorrection } = await load()
+      const mk = () => makeStore({
+        orders: [
+          { id: 'order-1', discountAmount: 10, discountModel: null, lines: [{ discountAmount: 10 }], importedAt: IMPORTED_AT, refundStatus: disposition, refunds: [{ id: 'refund-1', accountingCreditNoteId: null }] },
+        ],
+        syncLogs: [{ id: 'cn-1', referenceType: 'SalesOrderRefund', referenceId: 'refund-1', type: 'CREDIT_NOTE', ...arm.row }],
+      })
+      const refunds = { disposition, refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-U'], unresolvedRefundParkExternalIds: [] as string[] }
+      reset()
+      const store = mk()
+      console.log(`# o3d-djemh precondition: ${arm.name} ${disposition} row=${JSON.stringify(arm.row)}`)
+      const ok = await applyWcCouponCorrection(makeTx(store), { ...entry, refunds })
+      assert.equal(ok.outcome, 'CORRECTED')
+      if (ok.outcome !== 'CORRECTED') return
+      assert.ok(ok.handoff)
+      const activity = store.activity[0]
+      assertUniversalWording(
+        [...(ok.handoff?.lines ?? []), activity.description ?? '', ...((activity.metadata.handoffLines as string[] | undefined) ?? [])],
+        ['CN-U'],
+        arm.cause,
+        `${arm.name} ${disposition} / handoff`,
+      )
+      // Refund-position refusal: the reviewer saw no credit note.
+      reset()
+      const refused = await applyWcCouponCorrection(makeTx(mk()), { ...entry, refunds: { ...refunds, postedCreditNoteExternalIds: [] } })
+      assert.equal(refused.outcome, 'DECLINED')
+      assertUniversalWording([refused.outcome === 'DECLINED' ? refused.detail : ''], ['CN-U'], arm.cause, `${arm.name} ${disposition} / refusal`)
+    })
+  }
+}
+
+test('o3d-djemh universal wording: a CONFIRMED invoice and credit note are never labelled (control)', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    orders: [{ id: 'order-1', discountAmount: 10, discountModel: null, lines: [{ discountAmount: 10 }], importedAt: IMPORTED_AT, refundStatus: 'PARTIAL', refunds: [{ id: 'refund-1', accountingCreditNoteId: null }] }],
+    syncLogs: [
+      { id: 'j', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-C' },
+      { id: 'cn', referenceType: 'SalesOrderRefund', referenceId: 'refund-1', type: 'CREDIT_NOTE', status: 'SYNCED', externalTransactionId: 'CN-C' },
+    ],
+  })
+  const refunds = { disposition: 'PARTIAL' as const, refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-C'], unresolvedRefundParkExternalIds: [] as string[] }
+  const ok = await applyWcCouponCorrection(makeTx(store), { ...entry, postedInvoiceExternalIds: ['INV-C'], refunds })
+  assert.equal(ok.outcome, 'CORRECTED')
+  const text = `${store.activity[0].description}\n${ok.outcome === 'CORRECTED' ? (ok.handoff?.lines ?? []).join('\n') : ''}`
+  console.log(`# o3d-djemh control: mentions INV-C=${(text.match(/INV-C/g) ?? []).length} CN-C=${(text.match(/CN-C/g) ?? []).length}`)
+  assert.match(text, /INV-C/)
+  assert.doesNotMatch(text, /NOT confirmed/)
+})
+
+test('o3d-djemh universal wording: the report lines are per cause and say only what is true', async () => {
+  const { describeUnconfirmedDocumentLines } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const lines = describeUnconfirmedDocumentLines([
+    { kind: 'invoice', doc: { id: 'I-A', cause: 'OPERATOR_ASSERTED', status: 'SYNCED' } },
+    { kind: 'credit note', doc: { id: 'C-F', cause: 'NOT_SYNCED', status: 'FAILED' } },
+    { kind: 'invoice', doc: { id: 'I-P', cause: 'NOT_SYNCED', status: 'PENDING' } },
+    { kind: 'invoice', doc: { id: 'I-U', cause: 'UNRECOGNISED_BASIS', status: 'SYNCED' } },
+  ])
+  console.log(`# o3d-djemh report lines: ${lines.length}`)
+  assert.equal(lines.length, 4)
+  assert.match(lines[0], /operator recorded this as posted/)
+  for (const i of [1, 2, 3]) assert.doesNotMatch(lines[i], /operator/i, `line ${i} makes no claim about an operator`)
+  assert.match(lines[1], /on a FAILED sync row/)
+  assert.match(lines[2], /on a PENDING sync row/)
+  assert.match(lines[3], /not recognise/)
+})
+
+test('o3d-djemh universal wording: the NETTING precondition labels every credit note it names', async () => {
+  // The netting branch needs a FULL chargeback with mirrored credit-note events; its renderer is a
+  // pure function, so it is driven directly.
+  const { wcCouponPreconditionSteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const refunds = {
+    disposition: 'FULL' as const,
+    refundIds: ['refund-1'],
+    postedCreditNoteExternalIds: ['CN-N1', 'CN-N2'],
+    unconfirmedCreditNoteDocuments: [{ id: 'CN-N2', cause: 'OPERATOR_ASSERTED' as const, status: 'SYNCED' }],
+    unresolvedRefundParkExternalIds: [] as string[],
+  }
+  const documents = {
+    currency: 'GBP',
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: [] as string[],
+    revenueDeferredBatchRef: null,
+    unearnedRevenueAmount: null,
+    document: { ok: false as const, reason: 'NO_POSTED_EVENT' as const, detail: null, documentCount: null, externalIds: [] as string[], documentSet: [] as string[] },
+  }
+  const text = wcCouponPreconditionSteps({
+    heading: 'REMEDY (Xero)', beforeWhat: 'POSTING', externalSystem: 'XERO', validAgainst: refunds,
+    validAgainstDocuments: documents, derivedAt: '2026-10-03T00:00:00.000Z', nettedAgainst: ['CN-N1', 'CN-N2'], whatIsVoid: 'this remedy',
+  } as never).join('\n')
+  const mentions = (text.match(/CN-N2/g) ?? []).length
+  console.log(`# o3d-djemh netting precondition: CN-N2 mentions=${mentions}`)
+  assert.ok(mentions >= 2, 'precondition: named in the position and in the netting sentence')
+  assert.equal((text.match(/CN-N2 \(asserted by an operator, NOT confirmed in the ledger\)/g) ?? []).length, mentions)
+  assert.doesNotMatch(text, /CN-N1 \(/, 'the confirmed one is not labelled')
+})
+
+test('o3d-djemh universal wording: the report header names linked or CLAIMED ids and asserts no existence', async () => {
+  const { describePostedCandidatesHeader } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  for (const [total, unconfirmed] of [[3, 0], [3, 2]] as const) {
+    const header = describePostedCandidatesHeader(total, unconfirmed)
+    console.log(`# o3d-djemh report header (${total}, ${unconfirmed}): ${header.length} chars`)
+    assert.match(header, /LINKED or CLAIMED/)
+    assert.match(header, new RegExp(`${unconfirmed} of them`))
+    const stripped = header.replace(/NOT CONFIRMED in the ledger/g, '')
+    assert.doesNotMatch(stripped, EXISTENCE_PHRASES, `no existence claim in the header: ${header}`)
+  }
+  const src = (await import('node:fs')).readFileSync('scripts/backfill-wc-coupon-order-discount.ts', 'utf8')
+  assert.equal(/ALREADY HAVE ACCOUNTING DOCUMENTS/.test(src), false, 'the old header is gone from the script')
+})
+
+test('o3d-djemh universal wording: the credit-note-set refusal is status-neutral for a claimed id, existence wording only when every id is confirmed', async () => {
+  const { readCreditNoteOrderDiscount } = await import('@/lib/domain/accounting/credit-note-order-discount')
+  const client = { salesOrderRefund: { findMany: async () => [] }, accountingEvent: { findMany: async () => [] } } as never
+  const base = { disposition: 'PARTIAL' as const, refundIds: [] as string[], postedCreditNoteExternalIds: ['CN-R'], unresolvedRefundParkExternalIds: [] as string[] }
+  // refundIds empty short-circuits; use one refund id so the set comparison is reached.
+  const ev = { ...base, refundIds: ['refund-1'] }
+  const claimed = await readCreditNoteOrderDiscount(client, { ...ev, describeCreditNoteIds: (ids) => ids.map((i) => `${i} (asserted by an operator, NOT confirmed in the ledger)`).join(', '), unconfirmedCreditNoteIds: ['CN-R'] })
+  const confirmed = await readCreditNoteOrderDiscount(client, ev)
+  const text = (r: typeof claimed) => (r.ok ? '' : r.detail)
+  console.log(`# o3d-djemh credit-note-set refusal: claimed has CN-R=${text(claimed).includes('CN-R')} confirmed has CN-R=${text(confirmed).includes('CN-R')}`)
+  assert.ok(text(claimed).includes('CN-R') && text(confirmed).includes('CN-R'), 'precondition: both refusals name the id')
+  assert.doesNotMatch(text(claimed).replace(LABEL_PAREN, '').replace(/may (?:never )?exist/gi, ''), EXISTENCE_PHRASES)
+  assert.match(text(claimed), /check each in the accounting system/)
+  assert.match(text(confirmed), /what is posted and what IMS recorded/, 'existence wording is kept when every id is confirmed')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-djemh Codex round 3: a CONFIRMED mirrored invoice that agrees with the corrected amount must
+// not say "no action" while ANOTHER, distinct id is claimed on a sync row and no confirmed mirrored
+// document matches it. The claimed set and the mirrored set are compared before DOCUMENT_AGREES (or
+// any netting / "nothing to do") may stand.
+// ---------------------------------------------------------------------------
+
+// Case-sensitive for the UPPER-CASE conclusions (a hypothetical "IF ... the two errors cancel" is a
+// condition the operator must check, not a conclusion); case-insensitive for the plain ones.
+const NO_ACTION_WORDING = /NO ACCOUNTING ACTION|NOTHING TO DO|THE TWO ERRORS CANCEL|THE POSITION NETS|(?:no accounting action|nothing to do|do not adjust the ledger|needs nothing done|is square)/
+/**
+ * The ONLY "nothing to do" the verification variant may carry is the conditional bullet that follows
+ * "Open the document and read its order-level discount line, then:" (the operator's own reading
+ * decides it). Everything else is forbidden, so the universal check strips exactly that bullet.
+ */
+const CONDITIONAL_NOTHING_TO_DO = /• it carries no order-level discount line at all — nothing to do;/g
+/** ...and the manual-net bullet "if the two already net to nothing", conditional on the operator's own reading. */
+const CONDITIONAL_NET_BULLET = /• if the two already net to nothing, there is NOTHING TO DO[^\n]*/g
+const withoutConditional = (text: string) => text.replace(CONDITIONAL_NOTHING_TO_DO, '').replace(CONDITIONAL_NET_BULLET, '')
+
+/** A confirmed mirrored invoice that carries NO order-level discount: it AGREES with a corrected 0. */
+function agreeingInvoiceStore(extraSyncLogs: SyncLogRow[], extraEvents: number[] = []): Store {
+  const store = invoicedStore()
+  const { discount: _discount, ...noDiscountDoc } = (store.events![0].linesJson as Record<string, unknown>)
+  void _discount
+  store.events![0].linesJson = noDiscountDoc
+  for (const n of extraEvents) {
+    store.events!.push({ ...store.events![0], externalId: `INV-77${n}`, createdAt: `2026-05-02T09:0${n}:00.000Z` })
+  }
+  store.syncLogs = [
+    { id: 'job-confirmed', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-778' },
+    ...extraSyncLogs,
+  ]
+  return store
+}
+
+const claimedRow = (over: Partial<SyncLogRow> & { status: string }): SyncLogRow => ({
+  id: 'job-claimed', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', externalTransactionId: 'INV-CLAIMED', ...over,
+})
+
+test('o3d-djemh r3 CONTROL: one confirmed agreeing invoice, nothing else claimed -> DOCUMENT_AGREES, no action', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = agreeingInvoiceStore([])
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778'] })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  console.log(`# o3d-djemh r3 control: case=${result.handoff?.invoice.case} needsAction=${result.handoff?.needsAccountingAction}`)
+  assert.equal(result.handoff?.invoice.case, 'DOCUMENT_AGREES')
+  assert.equal(result.handoff?.needsAccountingAction, false)
+})
+
+test('o3d-djemh r3 CONTROL: the SAME id also claimed (asserted) on another sync row is matched, no false alarm', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = agreeingInvoiceStore([claimedRow({ status: 'SYNCED', externalTransactionId: 'INV-778', settlementBasis: ASSERTION_BASIS })])
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778'] })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  assert.equal(result.handoff?.invoice.case, 'DOCUMENT_AGREES')
+})
+
+test('o3d-djemh r3 CONTROL: two confirmed agreeing invoices, both matched -> DOCUMENT_AGREES', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = agreeingInvoiceStore([
+    { id: 'job-2', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE_UPDATE', status: 'SYNCED', externalTransactionId: 'INV-771' },
+  ], [1])
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-771', 'INV-778'] })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  console.log(`# o3d-djemh r3 two-confirmed control: case=${result.handoff?.invoice.case} documents=${result.handoff?.invoice.case === 'DOCUMENT_AGREES' ? result.handoff.invoice.documentCount : 'n/a'}`)
+  assert.equal(result.handoff?.invoice.case, 'DOCUMENT_AGREES')
+})
+
+for (const arm of [
+  { name: 'distinct ASSERTED id', row: { status: 'SYNCED', settlementBasis: ASSERTION_BASIS } },
+  { name: 'distinct CANCELLED id', row: { status: 'CANCELLED' } },
+  { name: 'distinct unrecognised-basis id', row: { status: 'SYNCED', settlementBasis: 'FUTURE_BASIS' } },
+] as Array<{ name: string; row: Partial<SyncLogRow> & { status: string } }>) {
+  test(`o3d-djemh r3: confirmed agreeing invoice + ${arm.name} -> verification variant, never "no action"`, async () => {
+    const { applyWcCouponCorrection } = await load()
+    reset()
+    const store = agreeingInvoiceStore([claimedRow(arm.row)])
+    console.log(`# o3d-djemh r3 precondition: ${arm.name}; confirmed mirrored INV-778 agrees; claimed INV-CLAIMED rows=${store.syncLogs.length}`)
+    const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778', 'INV-CLAIMED'] })
+    assert.equal(result.outcome, 'CORRECTED')
+    if (result.outcome !== 'CORRECTED') return
+    assert.equal(result.handoff?.invoice.case, 'DOCUMENT_UNVERIFIED')
+    assert.equal(result.handoff?.needsAccountingAction, true)
+    const text = [...(result.handoff?.lines ?? []), store.activity[0].description ?? '', ...((store.activity[0].metadata.handoffLines as string[]) ?? [])].join('\n')
+    assert.match(text, /INV-CLAIMED \([^)]*NOT confirmed in the ledger\)/)
+    assert.match(text, /check each in the accounting system/)
+    assert.doesNotMatch(withoutConditional(text), NO_ACTION_WORDING, `no "no action" wording:\n${text}`)
+    assert.equal(store.activity[0].metadata.needsAccountingAction, true)
+  })
+}
+
+for (const status of ['FAILED', 'PENDING'] as const) {
+  test(`o3d-djemh r3: confirmed agreeing invoice + distinct ${status} id (pure classifier; apply declines live jobs first)`, async () => {
+    const { classifyWcCouponInvoiceHandoff } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+    const document = { ok: true as const, amount: 0, documentType: 'SALES_INVOICE', documentCount: 1, externalId: 'INV-778', externalIds: ['INV-778'], externalSystem: 'xero', taxBasis: 'EXCLUSIVE', documentSet: [] as string[] }
+    const base = { accountingInvoiceId: 'INV-778', revenueDeferredBatchRef: null, unearnedRevenueAmount: null, refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[], unresolvedRefundParkExternalIds: [] as string[] } }
+    const control = classifyWcCouponInvoiceHandoff({ document: document as never, evidence: { ...base, postedInvoiceExternalIds: ['INV-778'] }, keptOrderLevel: 0 })
+    const claimed = classifyWcCouponInvoiceHandoff({
+      document: document as never,
+      evidence: { ...base, postedInvoiceExternalIds: ['INV-778', 'INV-CLAIMED'], unconfirmedInvoiceDocuments: [{ id: 'INV-CLAIMED', cause: 'NOT_SYNCED', status }] },
+      keptOrderLevel: 0,
+    })
+    console.log(`# o3d-djemh r3 pure ${status}: control=${control.case} claimed=${claimed.case}`)
+    assert.equal(control.case, 'DOCUMENT_AGREES')
+    assert.equal(claimed.case, 'DOCUMENT_UNVERIFIED')
+    assert.match(claimed.case === 'DOCUMENT_UNVERIFIED' ? claimed.documentRef ?? '' : '', new RegExp(`INV-CLAIMED \\(on a ${status} sync row, NOT confirmed in the ledger\\)`))
+  })
+}
+
+test('o3d-djemh r3: a netted-to-zero REFUNDED order loses "THE TWO ERRORS CANCEL" when a distinct invoice id is claimed', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = nettedToZeroStore()
+  store.syncLogs = [
+    { id: 'j-conf', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-778' },
+    { id: 'j-cl', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-CLAIMED', settlementBasis: ASSERTION_BASIS },
+  ]
+  // control first: without the claimed row it nets to zero
+  const controlStore = nettedToZeroStore()
+  controlStore.syncLogs = [store.syncLogs[0]]
+  const control = await applyWcCouponCorrection(makeTx(controlStore), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778'], refunds: NETTED_ZERO_REFUNDS })
+  assert.match(control.outcome === 'CORRECTED' ? (control.handoff?.lines.join('\n') ?? '') : '', /THE TWO ERRORS CANCEL/, 'precondition: the control nets to nothing')
+  reset()
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778', 'INV-CLAIMED'], refunds: NETTED_ZERO_REFUNDS })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  assert.equal(result.handoff?.netPosition, null)
+  assert.equal(result.handoff?.needsAccountingAction, true)
+  assert.doesNotMatch(withoutConditional(result.handoff?.lines.join('\n') ?? ''), NO_ACTION_WORDING)
+})
+
+test('o3d-djemh r3: CREDIT NOTES - a distinct claimed credit-note id refuses the netting and says no "no action"', async () => {
+  const { applyWcCouponCorrection } = await load()
+  const mk = (extra: SyncLogRow[]) => {
+    const store = nettedToZeroStore()
+    store.syncLogs = [
+      { id: 'j-conf', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-778' },
+      ...extra,
+    ]
+    return store
+  }
+  reset()
+  const control = await applyWcCouponCorrection(makeTx(mk([])), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778'], refunds: NETTED_ZERO_REFUNDS })
+  assert.match(control.outcome === 'CORRECTED' ? (control.handoff?.lines.join('\n') ?? '') : '', /THE TWO ERRORS CANCEL/, 'precondition: the control nets to nothing')
+  reset()
+  const store = mk([{ id: 'cn-x', referenceType: 'SalesOrderRefund', referenceId: 'refund-1', type: 'CREDIT_NOTE', status: 'SYNCED', externalTransactionId: 'CN-CLAIMED', settlementBasis: ASSERTION_BASIS }])
+  const refunds = { ...NETTED_ZERO_REFUNDS, postedCreditNoteExternalIds: ['CN-501', 'CN-CLAIMED'] }
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, postedInvoiceExternalIds: ['INV-778'], refunds })
+  assert.equal(result.outcome, 'CORRECTED')
+  if (result.outcome !== 'CORRECTED') return
+  assert.equal(result.handoff?.netPosition, null)
+  assert.equal(result.handoff?.needsAccountingAction, true)
+  const text = result.handoff?.lines.join('\n') ?? ''
+  assert.match(text, /CN-CLAIMED \([^)]*NOT confirmed in the ledger\)/)
+  assert.doesNotMatch(withoutConditional(text), NO_ACTION_WORDING, `no "no action" wording:\n${text}`)
 })
