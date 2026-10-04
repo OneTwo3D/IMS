@@ -20,7 +20,7 @@ import type { Cluster } from './real-postgres-cluster.ts'
  * THE MIGRATION LOGIN IS A ROLE WORTH NOTHING (owner decision C3, o3d-1bgr).
  *
  * The migration used to connect as the deploy ADMIN with `options=-c role=<app>`. That option is a
- * session default, not a boundary: any statement on that connection can `RESET ROLE` and be the
+ * session default, not a boundary: any statement on that connection can `SET ROLE NONE` and be the
  * superuser the admin normally is, and the connection is handed to application-owned bytes (prisma
  * from the app's node_modules, the migration SQL, package scripts). These tests run the SHIPPED
  * helper against a real cluster of their own and ask the server what the URL it prints can do.
@@ -114,7 +114,7 @@ function printUrl(rig: Rig): string {
   return url
 }
 
-test('[o3d-1bgr] RESET ROLE on the migration URL gives no superuser and CREATE ROLE is refused (core property; red on trunk)', async () => {
+test('[o3d-1bgr] SET ROLE NONE on the migration URL gives no superuser and CREATE ROLE is refused (core property; red on trunk)', async () => {
   await withRig(async (rig) => {
     ensure(rig)
     const url = printUrl(rig)
@@ -474,14 +474,33 @@ test('[o3d-1bgr] MUTATION drop-exemption: revoking CONNECT from the migration ro
   })
 })
 
-test('[o3d-1bgr] MUTATION no-superuser-check: a superuser migration role passes the preflight (preflight arm would be red)', async () => {
+test('[o3d-1bgr] MUTATION no-superuser-check: TWO checks refuse a superuser migration role (its flag and its implicit membership of every role), so each is shown alone and then both removed', async () => {
   await withRig(async (rig) => {
     ensure(rig)
     rig.cluster.psql(['-c', 'ALTER ROLE imsapp_migrator SUPERUSER'])
-    const script = mutatedHelper(rig, "  if (f.rolsuper) forbidden.push('SUPERUSER')\n", '', 'no-superuser-check')
-    const run = helper(rig, ['--preflight'], { script })
-    console.log(`mutated preflight over a SUPERUSER migration role: exit ${run.status}`)
-    assert.equal(run.status, 0, 'the mutated preflight accepts a superuser migration login: the real arm above would be red')
+    // ISOLATING ARM: with the SUPERUSER-flag check removed the preflight STILL refuses, because a superuser is
+    // a member of every role and so "reaches a role the application role is not". That is the second mechanism,
+    // and it is the reason deleting only the first line proves nothing.
+    const flagOnly = mutatedHelper(rig, "  if (f.rolsuper) forbidden.push('SUPERUSER')\n", '', 'no-superuser-flag-check')
+    const stillRefused = helper(rig, ['--preflight'], { script: flagOnly })
+    console.log(`flag check removed: preflight exit ${stillRefused.status}; ${stillRefused.stderr.split('\n').find((l) => /NOT FENCED/.test(l))?.slice(0, 140)}`)
+    assert.equal(stillRefused.status, 3)
+    assert.match(stillRefused.stderr, /member of a role the application role is not/, 'refused by the membership check, a mechanism of its own')
+
+    // THE NAMED MUTATION: both removed. Only now does a superuser migration login pass the preflight.
+    const original = readFileSync(SCRIPT, 'utf8')
+    const both = original
+      .replace("  if (f.rolsuper) forbidden.push('SUPERUSER')\n", '')
+      .replace('  if (f.reachesOtherRoles) {', '  if (false) {')
+    assert.notEqual(both, original, 'precondition: the mutation applies')
+    const dir = join(rig.root, 'mutant-no-superuser-checks')
+    mkdirSync(join(dir, 'scripts'), { recursive: true })
+    symlinkSync(join(process.cwd(), 'node_modules'), join(dir, 'node_modules'))
+    const copy = join(dir, 'scripts', 'fence-db-connections.mjs')
+    writeFileSync(copy, both)
+    const accepted = helper(rig, ['--preflight'], { script: copy })
+    console.log(`both checks removed: preflight over a SUPERUSER migration role exits ${accepted.status}`)
+    assert.equal(accepted.status, 0, 'with both gone the preflight accepts a superuser migration login: the real arm above would be red')
   })
 })
 
@@ -555,5 +574,33 @@ test('[o3d-1bgr] pg_dump through the migration URL: the dump is taken as the mig
     assert.equal(existsSync(join(rig.root, 'service.conf')), false)
     const leftovers = spawnSync('bash', ['-c', 'ls -A "$1" | grep -c "^tmp\\." || true', 'rig', rig.root], { encoding: 'utf8' }).stdout.trim()
     assert.equal(leftovers, '0', 'and the directory holding the service file is gone')
+  })
+})
+
+test('[o3d-1bgr] the repo\'s real migrations (prisma migrate deploy) run over the migration URL as a NOSUPERUSER login, and every object is the application\'s', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const url = printUrl(rig)
+    // The environment carries only what prisma needs; the URL is in it, never on an argv.
+    const migrate = spawnSync('npx', ['prisma', 'migrate', 'deploy', '--schema', join(process.cwd(), 'prisma/schema.prisma')], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '/tmp', npm_config_cache: process.env.npm_config_cache ?? '', DATABASE_URL: url } as unknown as NodeJS.ProcessEnv,
+      cwd: process.cwd(),
+    })
+    const applied = (migrate.stdout + migrate.stderr).split('\n').filter((line) => /migrations? found|successfully applied/.test(line)).join(' | ')
+    console.log(`prisma migrate deploy over the migration URL: exit ${migrate.status}; ${applied}`)
+    assert.equal(migrate.status, 0, migrate.stdout + migrate.stderr)
+    assert.match(applied, /successfully applied/, 'precondition: migrations were actually applied')
+    const owners = rig.cluster.psql(['-c', "SELECT count(*) FILTER (WHERE tableowner = 'imsapp'), count(*) FILTER (WHERE tableowner <> 'imsapp') FROM pg_tables WHERE schemaname = 'public'"], { database: 'imsdb' })
+    console.log(`public tables owned by imsapp | by anyone else: ${owners}`)
+    const [mine, others] = owners.split('|').map(Number)
+    assert.ok(mine > 50, `precondition: the real schema landed (${mine} tables)`)
+    assert.equal(others, 0, 'and every table is owned by the application role, not by the migration login')
+    const access = spawnSync('node', [join(process.cwd(), 'scripts/check-app-db-object-access.mjs'), '--app-role=imsapp'], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', DATABASE_URL: url } as unknown as NodeJS.ProcessEnv,
+    })
+    assert.equal(access.status, 0, access.stdout + access.stderr)
+    assert.match(access.stdout, /can use all \d+ schema/, 'and the object-access check passes over the same URL')
   })
 })

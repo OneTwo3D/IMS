@@ -98,7 +98,7 @@
 //
 //     (SUPERSEDED, owner decision C3: the migration no longer connects as the ADMIN. `options=-c
 //     role=` is a session DEFAULT and not a boundary -- any statement on that connection can
-//     `RESET ROLE` and become the login -- so a migration connecting as a superuser admin handed
+//     `SET ROLE NONE` and become the login -- so a migration connecting as a superuser admin handed
 //     superuser to every byte of app-owned code that ran inside the window. It now connects as the
 //     MIGRATION ROLE, a role with no privilege of its own, and the admin credential stays with
 //     root. The paragraph below is the original reasoning for connecting as a role other than the
@@ -940,7 +940,7 @@ export function planConnectionFence(facts) {
     // THE MIGRATION ROLE (owner decision C3). Like the admin it is a login the migration window
     // needs and the fence must therefore not close -- but unlike the admin it has no privilege of
     // its own (assessMigrationRoleAttributes() proves that from the server), so exempting it
-    // gives the application's own bytes nothing a RESET ROLE can use. Empty when the caller names none.
+    // gives the application's own bytes nothing a SET ROLE NONE can use. Empty when the caller names none.
     migrationRole = '',
   } = facts
 
@@ -1050,7 +1050,7 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  * THE POINT OF THE WHOLE ROLE (owner decision C3, o3d-1bgr). The migration runs application-owned
  * bytes -- prisma from the app's node_modules, the migration SQL in the checkout, package scripts --
  * over a connection whose login is this role. `options=-c role=<app>` is a session default, so
- * anything on that connection can `RESET ROLE` and become the LOGIN. The login therefore must be a
+ * anything on that connection can `SET ROLE NONE` and become the LOGIN (plain `RESET ROLE` only returns to the `role=` default). The login therefore must be a
  * role that is worth nothing: not a superuser, nothing that creates roles or databases, no
  * replication, no row-security bypass, and a member of nothing the application role is not. The
  * facts come from the server (readMigrationRoleFacts), never from configuration, because a role
@@ -1080,10 +1080,10 @@ export function assessMigrationRoleAttributes(f) {
   if (f.rolreplication) forbidden.push('REPLICATION')
   if (f.rolbypassrls) forbidden.push('BYPASSRLS')
   if (forbidden.length > 0) {
-    return refuse(`holds ${forbidden.join(', ')}. A migration login with any of those is a login every byte of application-owned code in the window can use after \`RESET ROLE\`. Remove it with ALTER ROLE ${quoteIdent(name)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, or name another role.`)
+    return refuse(`holds ${forbidden.join(', ')}. A migration login with any of those is a login every byte of application-owned code in the window can use after \`SET ROLE NONE\`. Remove it with ALTER ROLE ${quoteIdent(name)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, or name another role.`)
   }
   if (f.reachesOtherRoles) {
-    return refuse(`is a member of a role the application role is not a member of, so \`RESET ROLE\` on a migration connection reaches privilege the application itself does not hold. Its only membership may be ${f.appRole}.`)
+    return refuse(`is a member of a role the application role is not a member of, so \`SET ROLE NONE\` on a migration connection reaches privilege the application itself does not hold. Its only membership may be ${f.appRole}.`)
   }
   if (!f.canSetAppRole) {
     return refuse(`cannot SET ROLE to ${f.appRole}, so the migration could not run as it and everything it created would be owned by ${name}. GRANT ${quoteIdent(f.appRole)} TO ${quoteIdent(name)}${f.serverVersionNum >= 160000 ? ' WITH INHERIT TRUE, SET TRUE' : ''}.`)
@@ -2002,7 +2002,7 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
                  ELSE pg_has_role(r.oid, a.oid, 'MEMBER') END AS can_set_app_role,
             pg_has_role(a.oid, r.oid, 'MEMBER') AS app_is_member,
             -- A membership the application role does not itself have. Reaching any such role is
-            -- what a RESET ROLE on a migration connection must not buy.
+            -- what a SET ROLE NONE on a migration connection must not buy.
             EXISTS (SELECT 1 FROM pg_roles x
                      WHERE x.oid <> r.oid
                        AND pg_has_role(r.oid, x.oid, 'MEMBER')

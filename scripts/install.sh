@@ -2554,8 +2554,8 @@ EOSQL
 # THE MIGRATION ROLE (owner decision C3): THE LOGIN THE MIGRATION WINDOW CONNECTS AS.
 #
 # The migration used to connect as the deploy ADMIN and `SET ROLE` to the application role, which is a
-# session default and not a boundary: any statement on that connection could `RESET ROLE`/`SET ROLE
-# NONE` and be the admin. It now connects as THIS role, which is worth nothing -- NOLOGIN until a
+# session default and not a boundary: any statement on that connection could `SET ROLE
+# NONE` and be the admin (plain `RESET ROLE` only returns to the role option's value). It now connects as THIS role, which is worth nothing -- NOLOGIN until a
 # window opens it with a fresh password, no superuser/createrole/createdb/replication/bypassrls, a
 # member of the application role only (so it can `SET ROLE` to it and create objects it owns), and
 # holding CONNECT in its own right so the connection fence, which exempts it, cannot lock it out.
