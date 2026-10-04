@@ -97,6 +97,8 @@ export type RehearsalHooks = {
   beforeStep?: (id: StepId) => void | Promise<void>
   /** Runs once the cluster is up and before any step; throwing aborts the run (the catch-all path). */
   afterClusterStart?: () => void | Promise<void>
+  /** Replaces the cluster starter, so a test can make a start fail after the postmaster has forked. */
+  clusterStarter?: typeof startCluster
   afterProvision?: (client: pg.Client) => Promise<void>
   afterRestore?: (client: pg.Client) => Promise<void>
   tamperStepEnv?: (id: StepId, env: Record<string, string>) => void
@@ -130,6 +132,7 @@ type RunState = {
   envFile: string
   cluster: Cluster | null
   postmasterPid: number | null
+  postmaster: PostmasterIdentity | null
   role: string | null
   password: string
   secrets: string[]
@@ -161,6 +164,51 @@ function readProcStat(pid: number): { state: string; ppid: number } | null {
 export function processIsAlive(pid: number): boolean {
   const stat = readProcStat(pid)
   return stat !== null && stat.state !== 'Z'
+}
+
+/** A postmaster as this run identified it: pid AND start time AND data directory, so a reused pid is not mistaken for it. */
+export type PostmasterIdentity = { pid: number; startTicks: string; dataDir: string }
+
+function readStartTicks(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    const tokens = raw.slice(raw.lastIndexOf(')') + 2).split(' ')
+    return tokens[19] ?? null // field 22, `starttime`
+  } catch {
+    return null
+  }
+}
+
+function cmdlineOf(pid: number): string {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ')
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Identify the postmaster that owns `dataDir` from the directory's OWN postmaster.pid, whether or not
+ * pg_ctl reported success: a start that fails after the fork leaves a running server and no handle.
+ * Null unless the file names this directory and a live process with that pid is running from it.
+ */
+export function capturePostmaster(dataDir: string): PostmasterIdentity | null {
+  let lines: string[]
+  try {
+    lines = readFileSync(path.join(dataDir, 'postmaster.pid'), 'utf8').split('\n')
+  } catch {
+    return null
+  }
+  const pid = Number(lines[0])
+  if (!Number.isInteger(pid) || pid <= 1 || lines[1] !== dataDir || !processIsAlive(pid)) return null
+  const startTicks = readStartTicks(pid)
+  if (startTicks === null || !cmdlineOf(pid).includes(dataDir)) return null
+  return { pid, startTicks, dataDir }
+}
+
+/** The process at that pid is still the one captured: same start time, still running from the same directory. */
+export function postmasterIsStillOurs(identity: PostmasterIdentity): boolean {
+  return processIsAlive(identity.pid) && readStartTicks(identity.pid) === identity.startTicks && cmdlineOf(identity.pid).includes(identity.dataDir)
 }
 
 function listPids(): number[] {
@@ -207,15 +255,22 @@ function tail(text: string, bytes = OUTPUT_TAIL_BYTES): string {
   return text.length > bytes ? text.slice(text.length - bytes) : text
 }
 
-const WHITELISTED_PARENT_ENV = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'NODE_OPTIONS', 'npm_config_cache'] as const
+/**
+ * NOT NODE_OPTIONS, NODE_PATH, LD_*, *_PROXY or any npm_config_* but the cache: a `--require` or
+ * `--import` in the caller's NODE_OPTIONS runs code in every node child before it starts, past every
+ * guard in this file. The one NODE_OPTIONS a child gets is the rehearsal's own (below).
+ */
+const WHITELISTED_PARENT_ENV = ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'npm_config_cache'] as const
+const CHILD_NODE_OPTIONS = '--max-old-space-size=3072'
 
 /** The only part of this process's environment a child inherits. Not DATABASE_URL, not PG*, not a credential. */
-function inheritedEnv(): Record<string, string> {
+export function inheritedEnv(): Record<string, string> {
   const env: Record<string, string> = {}
   for (const name of WHITELISTED_PARENT_ENV) {
     const value = process.env[name]
     if (value !== undefined) env[name] = value
   }
+  env.NODE_OPTIONS = CHILD_NODE_OPTIONS
   return env
 }
 
@@ -337,7 +392,11 @@ export function shredFile(file: string): boolean {
 
 function teardownRun(state: RunState): TeardownResult {
   const errors: string[] = []
-  const pid = state.postmasterPid
+  // A start that failed after the fork left no handle and no pid: read both from the data directory.
+  if (state.postmaster === null) state.postmaster = capturePostmaster(path.join(state.root, 'pg', 'data'))
+  const identity = state.postmaster
+  const pid = identity?.pid ?? state.postmasterPid
+  state.postmasterPid = pid
   let clusterStopped = true
   let orphanPids: number[] = []
 
@@ -349,10 +408,18 @@ function teardownRun(state: RunState): TeardownResult {
       errors.push(`cluster stop threw: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  if (pid !== null && processIsAlive(pid)) {
-    // pg_ctl did not get it. SIGKILL the postmaster THIS run captured, and nothing else.
-    try { process.kill(pid, 'SIGKILL') } catch { /* gone in the meantime */ }
-    for (let i = 0; i < 50 && processIsAlive(pid); i += 1) execFileSync('sleep', ['0.1'])
+  if (identity !== null && postmasterIsStillOurs(identity)) {
+    try {
+      execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
+    } catch (error) {
+      errors.push(`pg_ctl stop by data directory failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  // Last resort: signal ONLY while the process is still the one captured (same start time, same data
+  // directory); a pid the OS has since reused is left alone.
+  if (identity !== null && postmasterIsStillOurs(identity)) {
+    try { process.kill(identity.pid, 'SIGKILL') } catch { /* gone in the meantime */ }
+    for (let i = 0; i < 50 && postmasterIsStillOurs(identity); i += 1) execFileSync('sleep', ['0.1'])
   }
 
   const envFileShredded = shredFile(state.envFile)
@@ -372,7 +439,7 @@ function teardownRun(state: RunState): TeardownResult {
   }
 
   orphanPids = [...new Set([...family.filter((candidate) => processIsAlive(candidate)), ...processesNaming(state.root)])].sort((a, b) => a - b)
-  clusterStopped = orphanPids.length === 0 && (pid === null || !processIsAlive(pid))
+  clusterStopped = orphanPids.length === 0 && (identity === null || !postmasterIsStillOurs(identity))
 
   return { clusterStopped, postmasterPid: pid, envFileShredded, rootRemoved, orphanPids, errors }
 }
@@ -438,6 +505,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     envFile: path.join(root, 'rehearsal.env'),
     cluster: null,
     postmasterPid: null,
+    postmaster: null,
     role: null,
     password,
     secrets: [password, adminPassword, authSecret, cronSecret, settingsKey],
@@ -468,9 +536,11 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   try {
     // ---- Cluster: its own directory, port, superuser role and scram password auth. ----
     port = await freePort()
-    state.cluster = startCluster(root, 'pg', port, '127.0.0.1')
+    state.cluster = (hooks.clusterStarter ?? startCluster)(root, 'pg', port, '127.0.0.1')
     const cluster = state.cluster
-    state.postmasterPid = Number(readFileSync(path.join(cluster.data, 'postmaster.pid'), 'utf8').split('\n')[0])
+    state.postmaster = capturePostmaster(cluster.data)
+    if (state.postmaster === null) throw new Error('the postmaster could not be identified from its data directory')
+    state.postmasterPid = state.postmaster.pid
     log(`[rehearsal] cluster up: port ${port}, postmaster pid ${state.postmasterPid}, directory ${root}`)
     await hooks.afterClusterStart?.()
 

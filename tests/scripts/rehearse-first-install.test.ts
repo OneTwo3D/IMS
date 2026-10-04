@@ -3,6 +3,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
+import { startCluster } from './real-postgres-cluster.ts'
 
 import {
   REHEARSAL_EXIT,
@@ -24,7 +25,7 @@ import {
   rehearsalExitCode,
   type SeededRowFacts,
 } from '@/lib/ops/first-install-rehearsal'
-import { parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
+import { capturePostmaster, inheritedEnv, postmasterIsStillOurs, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
@@ -156,7 +157,11 @@ test('the outbound:status step is optional while the script is absent and requir
   const open = assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: granted\n' })
   assert.equal(open.ok, false, 'a connector reporting itself granted is red')
   assert.match(open.failures.join(' '), /mintsoft: granted/)
-  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nxero: not granted\n' }).ok, true, '"not granted" is held')
+  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: held\nxero: held (not granted)\n' }).ok, true, '"not granted" is held')
+  const missing = assessOutboundStatus({ exitCode: 0, stdout: 'woocommerce: held\nmintsoft: held\n' })
+  assert.equal(missing.ok, false, 'a connector the output does not mention is not evidence it is held')
+  assert.match(missing.failures.join(' '), /no 'held' line for xero/)
+  assert.equal(assessOutboundStatus({ exitCode: 0, stdout: 'everything held\n' }).ok, false, 'a generic held line accounts for no connector')
 })
 
 function step(id: StepId, status: StepResult['status'], required = true): StepResult {
@@ -514,6 +519,95 @@ test('ARM (d): a DATABASE_URL that is not the throwaway cluster, and a connector
   for (const id of ['migrate-deploy', 'seed', 'provision'] as StepId[]) assert.equal(byId(report.steps, id).status, 'passed')
   assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
   assertTornDown(parent, outcome)
+})
+
+test('the fallback kill is bound to the captured identity: a process with another start time or another data directory is not ours', async (t) => {
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-identity-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const dataDir = join(dir, 'data')
+  mkdirSync(dataDir)
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', dataDir], { stdio: 'ignore' })
+  const pid = child.pid as number
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    writeFileSync(join(dataDir, 'postmaster.pid'), `${pid}\n${dataDir}\n`)
+    const identity = capturePostmaster(dataDir)
+    console.log(`# captured identity of pid ${pid}: ${JSON.stringify(identity)}`)
+    assert.ok(identity, 'precondition: a live process running from the directory is captured')
+    assert.equal(postmasterIsStillOurs(identity), true)
+    assert.equal(postmasterIsStillOurs({ ...identity, startTicks: `${identity.startTicks}0` }), false, 'a reused pid has another start time')
+    assert.equal(postmasterIsStillOurs({ ...identity, dataDir: join(dir, 'elsewhere') }), false, 'a process not running from the directory is not ours')
+    writeFileSync(join(dataDir, 'postmaster.pid'), `${pid}\n${join(dir, 'other')}\n`)
+    assert.equal(capturePostmaster(dataDir), null, 'a postmaster.pid that names another directory captures nothing')
+  } finally {
+    child.kill('SIGKILL')
+    await new Promise((resolve) => child.once('exit', resolve))
+  }
+})
+
+test('ISOLATION: a caller NODE_OPTIONS / NODE_PATH / loader / proxy variable never reaches a child (unit)', () => {
+  const planted = { NODE_OPTIONS: '--require /nonexistent/canary.cjs', NODE_PATH: '/nonexistent', HTTPS_PROXY: 'http://127.0.0.1:1', HTTP_PROXY: 'http://127.0.0.1:1', ALL_PROXY: 'x', LD_PRELOAD: '/nonexistent.so', LD_LIBRARY_PATH: '/nonexistent', DYLD_INSERT_LIBRARIES: 'x', npm_config_userconfig: '/nonexistent', npm_config_registry: 'http://127.0.0.1:1', BASH_ENV: '/nonexistent', DATABASE_URL: 'postgresql://x:y@127.0.0.1:1/z' }
+  const previous = Object.fromEntries(Object.keys(planted).map((k) => [k, process.env[k]]))
+  Object.assign(process.env, planted)
+  try {
+    const env = inheritedEnv()
+    console.log(`# inherited keys with ${Object.keys(planted).length} hostile variables planted: ${Object.keys(env).sort().join(',')}`)
+    assert.ok(env.PATH, 'precondition: the whitelist still carries PATH')
+    for (const key of Object.keys(planted)) assert.equal(key in env && key !== 'NODE_OPTIONS', false, key)
+    assert.equal(env.NODE_OPTIONS, '--max-old-space-size=3072', 'the only NODE_OPTIONS a child gets is the rehearsal\'s own')
+  } finally {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test('ISOLATION ARM: a canary --require in the caller NODE_OPTIONS is never executed by any rehearsal child', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const marker = join(parent, 'canary-ran')
+  const canary = join(parent, 'canary.cjs')
+  writeFileSync(canary, `require('node:fs').appendFileSync(${JSON.stringify(marker)}, process.argv.slice(1).join(' ') + '\\n')\n`)
+  const previous = process.env.NODE_OPTIONS
+  process.env.NODE_OPTIONS = `--require ${canary}`
+  try {
+    // Positive control: the canary DOES run in a child that inherits this environment.
+    execFileSync(process.execPath, ['-e', '0'], { env: process.env })
+    assert.equal(existsSync(marker), true, 'precondition: the canary fires in a child that inherits NODE_OPTIONS')
+    rmSync(marker)
+    const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['migrate-deploy', 'seed', 'provision', 'seeded-rows']) })
+    assert.ok(outcome.report)
+    assert.deepEqual(outcome.report.steps.filter((s) => s.status !== 'passed').map((s) => `${s.id}: ${s.reason}`), [], 'precondition: every node child (prisma, tsx, provision) ran')
+    console.log(`# canary marker present after the run: ${existsSync(marker)}`)
+    assert.equal(existsSync(marker), false, 'no rehearsal child executed the caller preload')
+  } finally {
+    if (previous === undefined) delete process.env.NODE_OPTIONS
+    else process.env.NODE_OPTIONS = previous
+  }
+})
+
+test('TEARDOWN: a cluster start that throws AFTER the postmaster forked is still stopped, by the PID read from its own data directory', { timeout: TIMEOUT }, async (t) => {
+  let forkedPid = 0
+  const { parent, outcome, report } = await rehearse(t, {
+    only: new Set<StepId>(['system-identifier']),
+    hooks: {
+      clusterStarter: (root, name, port, listen) => {
+        const cluster = startCluster(root, name, port, listen)
+        forkedPid = Number(readFileSync(join(cluster.data, 'postmaster.pid'), 'utf8').split('\n')[0])
+        throw new Error('injected: pg_ctl reported failure after the postmaster forked')
+      },
+    },
+  })
+  try {
+    console.log(`# postmaster ${forkedPid} existed when the start threw; alive after the run: ${processIsAlive(forkedPid)}`)
+    assert.ok(forkedPid > 0, 'precondition: the postmaster forked before the failure')
+    assert.equal(processIsAlive(forkedPid), false, 'the postmaster the failed start left behind was stopped')
+    assert.equal(report.teardown?.postmasterPid, forkedPid, 'the teardown knew the PID')
+    assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+    assert.deepEqual(runDirsIn(parent), [])
+  } finally {
+    if (forkedPid > 0 && processIsAlive(forkedPid)) process.kill(forkedPid, 'SIGKILL') // the one this test's own hook started
+  }
 })
 
 test('ARM (e): a step that throws is a failed step, later steps still run, and the teardown still happens', { timeout: TIMEOUT }, async (t) => {

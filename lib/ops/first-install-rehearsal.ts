@@ -308,16 +308,28 @@ export function outboundStatusScriptPresent(scripts: Record<string, string> | un
 }
 
 /**
- * ALL HELD means: the command exits 0, says `held` somewhere, and no line pairs a state with
- * `granted`, `open` or `writing`. The output format belongs to the outbound-hold work and is not
- * fixed on this tree; this is deliberately the loosest reading that still fails a connector that
- * reports itself writing, and docs/installation.md says so.
+ * The connectors an outbound hold must account for, one `held` line each.
+ */
+// wms-connector-boundary-ok: o3d-zjsb5.2: the list of connectors the outbound hold covers; names no connector flow
+export const EXPECTED_OUTBOUND_CONNECTORS = ['woocommerce', 'mintsoft', 'xero'] as const
+
+/**
+ * ALL HELD means: the command exits 0, EVERY expected connector has a line that names it and says
+ * `held`, and no line pairs a state with `granted`, `open` or `writing`. A connector the output does
+ * not mention is not evidence of anything, and a generic "held" accounts for none. The exact output
+ * format belongs to the outbound-hold work and is not fixed on this tree, so this reads a line per
+ * connector rather than a structure; tighten it when that script lands.
  */
 export function assessOutboundStatus(run: { exitCode: number | null; stdout: string }): Assessment {
   const failures: string[] = []
   if (run.exitCode !== 0) failures.push(`outbound:status exited ${run.exitCode}`)
-  if (!/\bheld\b/i.test(run.stdout)) failures.push("outbound:status did not report any connector as 'held'")
-  const open = run.stdout.split('\n').filter((line) => /\b(granted|open|writing)\b/i.test(line) && !/\b(not|no|un)[ -]?(granted|open|writing)\b/i.test(line))
+  const lines = run.stdout.split('\n')
+  for (const connector of EXPECTED_OUTBOUND_CONNECTORS) {
+    if (!lines.some((line) => line.toLowerCase().includes(connector) && /\bheld\b/i.test(line))) {
+      failures.push(`outbound:status has no 'held' line for ${connector}`)
+    }
+  }
+  const open = lines.filter((line) => /\b(granted|open|writing)\b/i.test(line) && !/\b(not|no|un)[ -]?(granted|open|writing)\b/i.test(line))
   if (open.length > 0) failures.push(`outbound:status reports a connector that is not held: ${open.slice(0, 3).map((line) => line.trim()).join(' | ')}`)
   return { ok: failures.length === 0, failures }
 }
