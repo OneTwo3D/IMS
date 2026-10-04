@@ -303,12 +303,22 @@ function assertTornDown(parent: string, outcome: Awaited<ReturnType<typeof rehea
   assert.equal(processIsAlive(pid), false, 'the postmaster this run started is not running')
 }
 
-test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach argv, the report is written and the teardown is clean', { timeout: TIMEOUT }, async (t) => {
-  const seen: { mode?: number; passwordInArgv?: number; scanned?: number; control?: number; skipEnvFile?: string; tmpdir?: string } = {}
+/**
+ * EVERY STEP BUT validate-db. `npm run validate:db` ends in `prisma generate`, which rewrites the
+ * generated client under app/generated in the SHARED tree while sibling test files of the same
+ * `test:unit` run are importing it; inside a test that is a flake waiting for a bad moment. The step
+ * stays in the catalogue and in every real run (the report sample in the PR comes from one), and the
+ * property that matters about it here, that it is told not to source a checkout .env, is asserted
+ * below through the env file and the prisma-dev-db.sh test above.
+ */
+const ALL_BUT_VALIDATE_DB: ReadonlySet<StepId> = new Set(STEP_CATALOGUE.map((s) => s.id).filter((id) => id !== 'validate-db'))
+
+test('EVERY STEP BUT validate-db: all pass on a fresh cluster, secrets never reach argv, the report is written and the teardown is clean', { timeout: TIMEOUT }, async (t) => {
+  const seen: { mode?: number; passwordInArgv?: number; scanned?: number; control?: number; skipEnvFile?: string; tmpdir?: string; dotenvPath?: string; dotenvBytes?: number } = {}
   const parent = scratchParent(t)
   const hooks: RehearsalHooks = {
     beforeStep: (id) => {
-      if (id !== 'validate-db') return
+      if (id !== 'preflight-production') return
       const envFiles = readdirSync(parent).filter((n) => n.startsWith('ims-rehearsal-')).map((n) => join(parent, n, 'rehearsal.env')).filter((file) => existsSync(file))
       assert.ok(envFiles.length >= 1, 'precondition: the env file exists mid-run')
       assert.equal(envFiles.length, 1)
@@ -317,6 +327,8 @@ test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach 
       const env = Object.fromEntries(readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => [line.slice(0, line.indexOf('=')), line.slice(line.indexOf('=') + 1)]))
       seen.skipEnvFile = env.IMS_SKIP_ENV_FILE
       seen.tmpdir = env.TMPDIR
+      seen.dotenvPath = env.DOTENV_CONFIG_PATH
+      seen.dotenvBytes = statSync(env.DOTENV_CONFIG_PATH!).size
       const password = new URL(env.DATABASE_URL!).password
       assert.ok(password.length >= 32)
       const secrets = [password, env.AUTH_SECRET!, env.CRON_SECRET!, env.SETTINGS_ENCRYPTION_KEY!, env.DEFAULT_ADMIN_PASSWORD!]
@@ -345,12 +357,13 @@ test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach 
       seen.control = controlHits
     },
   }
-  const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, hooks })
+  const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, hooks, only: ALL_BUT_VALIDATE_DB })
   assert.ok(outcome.report, `the rehearsal produced a report (refusal: ${outcome.refusal})`)
   const report = outcome.report
   console.log(`# env file mode ${seen.mode?.toString(8)}; scanned ${seen.scanned} command lines, secrets found in argv: ${seen.passwordInArgv}; positive control found: ${seen.control}`)
   assert.equal(seen.mode, 0o600)
   assert.equal(seen.skipEnvFile, '1', 'the children are told not to source a checkout .env over the rehearsal DATABASE_URL')
+  assert.ok(seen.dotenvPath?.startsWith(parent) && seen.dotenvBytes === 0, 'dotenv is pointed at an empty file inside the run directory, so a checkout .env cannot add variables')
   assert.ok(seen.tmpdir?.startsWith(parent), 'the children scratch space is inside the run directory, not the caller tmpfs')
   assert.ok((seen.scanned ?? 0) > 10)
   assert.ok((seen.control ?? 0) >= 1, 'the scan can find a secret that is on argv')
@@ -360,7 +373,7 @@ test('FULL REHEARSAL: every step passes on a fresh cluster, secrets never reach 
   assert.deepEqual(failed.map((s) => `${s.id}: ${s.reason}`), [])
   assert.equal(report.verdict, 'GREEN')
   assert.equal(outcome.exitCode, REHEARSAL_EXIT.OK)
-  assert.deepEqual(report.steps.map((s) => s.id), STEP_CATALOGUE.map((s) => s.id), 'every catalogued step is in the report, in order')
+  assert.deepEqual(report.steps.map((s) => s.id), [...ALL_BUT_VALIDATE_DB], 'every selected catalogued step is in the report, in order')
 
   const deploy = byId(report.steps, 'migrate-deploy').detail as { migrationsOnDisk: number; migrationsApplied: number }
   const onDisk = readdirSync(join(REPO, 'prisma/migrations')).filter((n) => existsSync(join(REPO, 'prisma/migrations', n, 'migration.sql'))).length

@@ -523,7 +523,13 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
       // scripts/validate-db.sh and prisma-dev-db.sh source .env.local/.env over the environment
       // unless told not to; a rehearsal must reach its own cluster and nothing the checkout names.
       IMS_SKIP_ENV_FILE: '1',
+      // `dotenv/config` (prisma.config.ts, prisma/seed.ts) would otherwise read the checkout's .env
+      // for every variable the environment does not already set: an SMTP host, a connector key, a
+      // session-lock URL. An empty file in the run directory leaves it nothing to load.
+      DOTENV_CONFIG_PATH: path.join(root, 'empty.env'),
+      DOTENV_CONFIG_QUIET: 'true',
     }
+    writeFileSync(path.join(root, 'empty.env'), '')
     writeFileSync(state.envFile, `${Object.entries(envEntries).map(([k, v]) => `${k}=${v}`).join('\n')}\n`, { mode: 0o600, flag: 'wx' })
     chmodSync(state.envFile, 0o600)
     if ((statSync(state.envFile).mode & 0o777) !== 0o600) throw new Error('the env file is not mode 600')
