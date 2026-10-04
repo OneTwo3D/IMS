@@ -2074,3 +2074,39 @@ test('o3d-6nd55 r6: a freight link cannot be committed while an alignment holds 
   assert.equal(afterRelease, 1, 'and the link must exist afterwards')
   assert.equal(applied, true, 'and the alignment itself must have succeeded')
 })
+
+/**
+ * ARM 14 — THE LANDED-COST ZERO FLOOR AT THE WMS ALIGN-UP (o3d-gj68).
+ *
+ * Align-up is the third writer of a PO-derived cost layer and reaches the ONE allocation through
+ * `computeLandedCostForPendingLines`. A credit cost line larger than a line's goods cost must lay a ZERO
+ * layer and a zero-value movement, queue NO STOCK_RECEIPT, and write ONE durable WARNING after the commit.
+ * The credit is written DIRECTLY on the goods PO (`createPurchaseOrder` filters credits out).
+ */
+test('o3d-gj68: a credit larger than the goods cost lays a ZERO layer at the WMS align-up and warns once', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 2
+  const GOODS_UNIT = 5
+  const seeded = await seedAlignmentTarget('LF', QTY, GOODS_UNIT)
+  await db.freightCostLine.create({
+    data: { poId: seeded.poId, description: 'direct credit', amountForeign: '-13.0000', amountBase: '-13.0000', vatable: false, distributionMethod: 'BY_VALUE', sortOrder: 0 },
+  })
+  // 5 + (-13 / 2) = -1.5 per unit: floored to 0, so 1.5 x 2 = 3.00 could not be absorbed.
+
+  const result = await alignUp(seeded, { delta: QTY, imsQty: 0 })
+  assert.equal(result.applied, true, `PRECONDITION: the alignment must apply (a negative layer would have thrown): ${result.reason}`)
+
+  const layer = await db.costLayer.findFirstOrThrow({ where: { poLineId: seeded.poLineId }, select: { unitCostBase: true } })
+  const movement = await db.stockMovement.findFirstOrThrow({ where: { type: 'WMS_RECEIPT_RECONCILIATION', productId: seeded.productId }, select: { unitCostBase: true, totalValueBase: true } })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const activity = await db.activityLog.findMany({ where: { entityType: 'PURCHASE_ORDER', entityId: seeded.poId, action: 'landed_cost_credit_floored' }, select: { level: true, description: true } })
+  console.log(`[arm14] unfloored unit cost would be ${GOODS_UNIT + -13 / QTY}; layer=${layer.unitCostBase}, movement=${movement.unitCostBase}/${movement.totalValueBase}, STOCK_RECEIPT rows=${logs.length}, floor activity=${activity.length}`)
+  assert.equal(layer.unitCostBase.toString(), '0')
+  assert.equal(Number(movement.totalValueBase), 0)
+  assert.equal(logs.length, 0, 'nothing of value entered stock, so no STOCK_RECEIPT is queued')
+  assert.equal(activity.length, 1, 'exactly one durable WARNING')
+  assert.match(activity[0]!.description, /Mintsoft alignment/)
+  assert.match(activity[0]!.description, /could not absorb 3\.00 of it into stock/)
+})
