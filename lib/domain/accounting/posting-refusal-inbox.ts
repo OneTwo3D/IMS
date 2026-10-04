@@ -776,7 +776,7 @@ export async function recordAccountingPostingRefusal(
       level: 'INFO',
       description:
         `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled (an operator confirmed it) `
-        + `on ${outcome.at.toISOString()} and this posting key is suppressed for ever. Nothing was recorded.`,
+        + `on ${outcome.at.toISOString()}. Nothing was recorded.`,
       metadata: { ...key, reason: record.reason },
     }).catch(() => { /* nothing else to try */ })
     return outcome
@@ -1204,16 +1204,13 @@ async function reportClearDeclinedForHandPostClaim(
     description:
       `A queued ${key.type} for ${key.referenceType} ${key.referenceId} did NOT close its refused-posting row: `
       + `an operator took it to settle by hand at ${claimedAt.toISOString()} and still holds it, which cancelled `
-      + 'the queued row this clear was about. The refusal stays OUTSTANDING and the claim stays theirs — '
-      + 'clearing it would hide a posting nobody could then release or mark handled, while its claim went on '
-      + 'stopping IMS queueing it.'
+      + 'the queued row this clear was about. The refusal is OUTSTANDING and the claim is theirs.'
       // o3d-j625 r34: which of the two durable signals this decline left behind. The signal itself is what
       // stops the mark resolving the row; this line only describes it, and is no longer the mechanism.
       + (counted
         ? ' The postponement is COUNTED against the claim.'
         : ' The postponement could NOT be counted, so the refusal is stamped as carrying an UNACCOUNTED decline '
-          + 'instead — written in this same transaction, under this same lock, so it commits with this decline or '
-          + 'not at all. Marking the claim handled will keep the refusal outstanding either way.'),
+          + 'instead, written in this same transaction under this same lock.'),
     metadata: { ...key, handPostClaimedAt: claimedAt.toISOString(), handPostClaimedBy: claimedBy, postponementCounted: counted },
   }).catch(() => { /* an audit line that cannot be written must not fail the enqueue it describes */ })
 }

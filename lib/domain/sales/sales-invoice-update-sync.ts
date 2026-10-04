@@ -1,4 +1,5 @@
 import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
+import { MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
@@ -161,7 +162,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy:
         'Re-save the order once the accounting connector selection has settled, or correct the invoice by hand '
-        + 'in the books its account codes belong to and mark this row handled — that stops IMS updating it too.',
+        + 'in the books its account codes belong to and mark this row handled. ' + MARK_REMEDY_TAIL,
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -207,7 +208,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       remedy:
         // o3d-j625 r7 (review H-A): r5 said "re-post the invoice from this order", which IMS does not offer.
         'IMS cannot show which accounting connector holds this invoice, so it will not update it. Correct the '
-        + 'invoice by hand in the ledger that holds it, then mark this row handled — that stops IMS updating it too.',
+        + 'invoice by hand in the ledger that holds it, then mark this row handled. ' + MARK_REMEDY_TAIL,
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector },
     })
     return
@@ -295,10 +296,10 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       committed: `the order ${params.orderNumber} is updated in IMS`,
       remedy: handPostDeferred
         ? 'An operator is settling this posting by hand — see "Postings being settled by hand". IMS did not '
-          + 'queue THIS edit, and will not while they hold it. When the claim ends, re-save the order to queue '
-          + 'its current version, or post that version by hand and mark this row handled.'
+          + 'queue THIS edit, and does not queue it while they hold the claim. Re-save the order, or post its current '
+          + 'version by hand and mark this row handled, then check Sync > Exceptions to see what happened.'
         : 'Re-save the order once the cause is resolved (see the accounting activity log), or correct the '
-        + 'invoice by hand in the ledger and mark this row handled — that stops IMS updating it too.',
+        + 'invoice by hand in the ledger and mark this row handled. ' + MARK_REMEDY_TAIL,
       detail: { accountingInvoiceId: params.accountingInvoiceId, documentConnector: params.documentConnector, enqueueReason: enqueued.reason ?? null },
     })
     return

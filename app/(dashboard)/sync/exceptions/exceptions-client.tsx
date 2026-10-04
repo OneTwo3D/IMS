@@ -13,6 +13,10 @@ import {
 import {
   claimWarningFor,
   handPostInputOf,
+  INCOMPLETE_HISTORY_BANNER,
+  MARKED_TOAST,
+  RELEASE_TOAST,
+  TAKE_TOAST,
   markHandledWarningFor,
   releaseWarningFor,
   NOT_LOADED_HAND_POST_INPUT,
@@ -224,7 +228,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = claimingRefusal
                   runAction(
                     () => claimAccountingPostingRefusalForHandPostingAction(target.id),
-                    'Taken for hand posting — IMS will not queue this posting while you hold it.',
+                    TAKE_TOAST,
                   )
                   setClaimingRefusal(null)
                 }}
@@ -252,7 +256,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = releasingRefusal
                   runAction(
                     () => releaseAccountingPostingRefusalHandPostClaimAction(target.id),
-                    'Released — IMS may queue this posting again.',
+                    RELEASE_TOAST,
                   )
                   setReleasingRefusal(null)
                 }}
@@ -288,7 +292,7 @@ export function ExceptionsClient({ data }: Props) {
                   const target = markingRefusal
                   runAction(
                     () => markAccountingPostingRefusalHandledAction(target.id, markingNote),
-                    'Marked as handled.',
+                    MARKED_TOAST,
                   )
                   setMarkingRefusal(null)
                   setMarkingNote('')
@@ -1287,10 +1291,7 @@ export function ExceptionsClient({ data }: Props) {
                         whenever this is set, so no count on this row can carry the fact. */}
                     {row.handPostDeclineUnaccounted ? (
                       <div className="font-medium text-amber-700">
-                        Incomplete history: while this was held by hand, IMS declined at least one posting for it and
-                        could not record how many. Treat the ledger as possibly behind — compare this document with
-                        the ledger, then re-save it to queue the current version. Releasing or marking it handled
-                        will NOT clear this debt.
+                        {INCOMPLETE_HISTORY_BANNER}
                       </div>
                     ) : null}
                     {/* o3d-j625 r16: settling by hand is a two-step ACT. Until the posting is taken there is

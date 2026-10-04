@@ -66,7 +66,7 @@ import {
   type MarkHandledClient,
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
-import { MARK_LOG_OUTCOME_REUSED_KEY, MARK_LOG_OUTCOME_SUPPRESSED, handPostInstruction, handPostOrderFor } from '@/lib/domain/accounting/hand-post-instruction'
+import { claimLogDescription, handPostInstruction, handPostOrderFor, markLogDescription, markNotice, releaseLogDescription, releaseNotice } from '@/lib/domain/accounting/hand-post-instruction'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -2169,17 +2169,12 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
       tag: 'accounting',
       action: 'accounting_posting_refusal_claimed_for_hand_posting',
       level: 'INFO',
-      description:
-        'Took a refused accounting posting to settle it by hand. IMS will refuse to queue this posting while '
-        + 'the claim is held, so it cannot be posted twice while the operator is in the ledger'
-        + (result.cancelledSyncRows.length > 0
-          ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.`
-          : '.')
-        // Codex round 6: carries each earlier posting's STANDING; "replaces" is only ever said of a CONFIRMED document.
-        + describeEarlierPostings(result.earlierPostingDetails)
-        + describeRetiredUnproven(result.retiredUnproven)
-        // Codex round 8: the instruction the operator was given, from the SAME structure as the row text and the dialogs.
-        + ` Instruction shown: ${handPostInstruction({ type: result.type }).step}.`,
+      description: claimLogDescription({
+        cancelledCount: result.cancelledSyncRows.length,
+        earlier: describeEarlierPostings(result.earlierPostingDetails),
+        retired: describeRetiredUnproven(result.retiredUnproven),
+        step: handPostInstruction({ type: result.type }).step,
+      }),
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,
@@ -2228,30 +2223,7 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
       tag: 'accounting',
       action: 'accounting_posting_refusal_hand_post_claim_released',
       level: 'WARNING',
-      description:
-        'Released the hand-posting claim on a refused accounting posting. IMS may queue and post it again '
-        + 'from now on — if it was already posted by hand and not confirmed here, the ledger can get it '
-        + 'twice. The refusal is still outstanding in the exception inbox.'
-        // o3d-j625 r18 (Codex round 17, HIGH 1): and what IMS declined to queue while the claim was held is
-        // named, because nothing requeues those postings on its own — the outstanding row is the record and
-        // re-saving the document is what queues the CURRENT version.
-        /**
-         * o3d-j625 r36 (Codex round 35, HIGH 1) — THE UNACCOUNTED CASE FIRST, BECAUSE THE COUNT IS ZERO IN IT.
-         *
-         * r34 gave the stamp the job of holding a reused key's debt when the count could not be written, and
-         * taught the MARK to say so. This path still read `deferredEdits` alone, which is structurally 0 there —
-         * so releasing a stamped claim logged and announced a ROUTINE release while an uncounted posting was
-         * still owed. Same trap as the mark's, on a surface I had not swept.
-         */
-        + (result.declineUnaccounted
-          ? ' While it was held, IMS declined AT LEAST ONE posting for this key and COULD NOT RECORD HOW MANY, '
-            + 'so this refusal\'s history is incomplete. It stays outstanding. Nothing requeues it by itself — '
-            + 'compare the document with the ledger, then re-save it to queue its current version.'
-          : result.deferredEdits > 0
-            ? ` While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for this key; they `
-              + 'have been added to the refusal\'s count and it stays outstanding. Nothing requeues them by '
-              + 'itself — re-save the document to queue its current version.'
-            : ''),
+      description: releaseLogDescription({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits }),
       metadata: {
         refusalId: id, releasedBy: session.user.id,
         heldBy: result.releasedFrom, heldSince: result.heldSince.toISOString(),
@@ -2264,20 +2236,10 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
     revalidatePath('/sync/exceptions')
     return {
       success: true,
-      // o3d-j625 r36: and the operator is told at the moment of releasing, not left with a routine "Released".
-      ...(result.declineUnaccounted
-        ? {
-            notice: 'Released — but this refusal\'s history is INCOMPLETE: while it was held IMS declined at '
-              + 'least one posting for this key and could not record how many. It stays outstanding. Compare the '
-              + 'document with the ledger, then re-save it to queue the current version.',
-          }
-        : result.deferredEdits > 0
-          ? {
-              notice: `Released. While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for `
-                + 'this key; they are counted on the refusal, which stays outstanding. Nothing requeues them by '
-                + 'itself — re-save the document to queue its current version.',
-            }
-          : {}),
+      // The operator is told at the moment of releasing what IMS declined while the claim was held (a fact), then to check afterwards.
+      ...(releaseNotice({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits })
+        ? { notice: releaseNotice({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits }) as string }
+        : {}),
     }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
@@ -2326,43 +2288,13 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
       tag: 'accounting',
       action: 'accounting_posting_refusal_marked_handled',
       level: 'INFO',
-      description:
-        `Marked a refused ${result.kind} posting as handled: the operator confirmed the current version is in the ledger (posted by hand, or already there); IMS did not read the ledger. `
-        // o3d-j625 r13 (independent review, HIGH) — SAY WHICH OF THE TWO THIS WAS.
-        //
-        // "IMS will not post it" was written for a suppression that covers ONE posting for ever, and it
-        // was the only sentence an operator ever saw. On a REUSED posting key (an invoice or bill update,
-        // a bill payment) it was also false about the future: the same sentence covered every LATER edit
-        // of that document, silently. Those kinds no longer suppress at all, so the copy now states which
-        // of the two happened rather than implying the stronger one.
-        + (result.suppressed ? MARK_LOG_OUTCOME_SUPPRESSED : MARK_LOG_OUTCOME_REUSED_KEY)
-        + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.')
-        /**
-         * o3d-j625 r18 (Codex round 17, HIGH 1) — AND WHETHER THE DEBT IS ACTUALLY DISCHARGED.
-         *
-         * On a reused posting key, a posting IMS declined to queue while the claim was held may be a LATER
-         * version of the same document. The operator posted the version they had; the ledger still does not
-         * hold the current one. The row therefore stays OUTSTANDING and the record says so — it is not a
-         * refusal of their mark (the ledger write they made is real and is recorded here), it is a refusal of
-         * the claim that the obligation is met.
-         */
-        /**
-         * o3d-j625 r34 (Codex round 33, HIGH): and the UNACCOUNTED case gets its own sentence. When the debt is
-         * kept by the stamp rather than by the count, `deferredEdits` is 0 — "IMS was asked to post 0 later
-         * version(s)" is the one thing this must never say, because the truth is "at least one, and IMS could
-         * not count it". The operator meets that at the moment of clicking, which is the requirement: a
-         * residual they would have had to read a log line for earlier is not a mitigation.
-         */
-        + (result.stillOutstanding
-          ? (result.unaccountedDecline
-            ? ' This row STAYS OUTSTANDING: while the claim was held IMS declined at least one posting of this '
-              + 'document and COULD NOT RECORD HOW MANY, so its history here is incomplete. Treat the ledger as '
-              + 'possibly behind: check the document against the ledger, then re-save it to queue the current '
-              + 'version, or post that version by hand and mark it again.'
-            : ` This row STAYS OUTSTANDING: while the claim was held, IMS was asked to post ${result.deferredEdits} `
-              + 'later version(s) of this document and declined, so the ledger does not hold the current one. '
-              + 'Re-save the document to queue it, or post the current version by hand and mark it again.')
-          : ''),
+      description: markLogDescription({
+        kind: result.kind,
+        cancelledCount: result.cancelledSyncRows.length,
+        stillOutstanding: result.stillOutstanding,
+        unaccounted: Boolean(result.unaccountedDecline),
+        deferredEdits: result.deferredEdits,
+      }),
       metadata: {
         refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed,
         cancelledSyncRows: result.cancelledSyncRows,
@@ -2383,17 +2315,7 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
     return {
       success: true,
       ...(result.stillOutstanding
-        ? {
-            notice: result.unaccountedDecline
-              ? 'Your hand posting is recorded, but this row STAYS OUTSTANDING: while you held it IMS declined '
-                + 'at least one posting of this document and could not record how many, so its history here is '
-                + 'INCOMPLETE. Check this document against the ledger, then re-save it to queue the current '
-                + 'version, or post that version by hand and mark it again.'
-              : 'Your hand posting is recorded, but this row STAYS OUTSTANDING: IMS was asked to post '
-                + `${result.deferredEdits} later version(s) of this document while you held it and declined, so `
-                + 'the ledger does not hold the current one. Re-save the document to queue it, or post the '
-                + 'current version by hand and mark it again.',
-          }
+        ? { notice: markNotice({ unaccounted: Boolean(result.unaccountedDecline), deferredEdits: result.deferredEdits }) }
         : {}),
     }
   } catch (error) {

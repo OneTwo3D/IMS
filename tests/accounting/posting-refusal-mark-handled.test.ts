@@ -1098,7 +1098,7 @@ test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unprove
   const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
   assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed standing')
   assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\): if the current version is there, do not post again; if only an earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
-  assert.match(note.description, /IMS cannot rule out that the CURRENT version is already in the ledger \(an earlier version being there does not show it\)/, 'the retired attempt is described against the CURRENT version, not the earlier one (facts only)')
+  assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger \(an earlier version being there does not show it\)/, 'the retired attempt is described against the CURRENT version, not the earlier one (facts only)')
 })
 
 test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the standing: the second log entry carries it for every earlier standing x retired', async () => {
@@ -1128,7 +1128,7 @@ test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the stand
         assert.match(note.description, (earlierRow as { settlementBasis?: string }).settlementBasis ? /INV-TYPED \(an id an operator typed in\) as posted/ : /The ledger holds INV-REAL/, `${where}: carries the earlier row's standing`)
       } else if (retired) {
         assert.doesNotMatch(note.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over a retired attempt`)
-        assert.match(note.description, /IMS cannot rule out that the CURRENT version is already in the ledger/, `${where}: carries the retired-attempt fact`)
+        assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger/, `${where}: carries the retired-attempt fact`)
       } else {
         assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\)/, `${where}: an UPDATE posting always gets the CURRENT-version instruction, whatever was loaded`)
       }
@@ -1153,8 +1153,8 @@ test('[o3d-1e7sl Codex r10] the claim log for a BILL_PAYMENT is the PAYMENT inst
   }
 })
 
-test('[o3d-1e7sl Codex r11] the Mark-as-handled dialog promises exactly what the server does: suppression only where the key names ONE posting for ever', async () => {
-  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+test('[o3d-1e7sl Codex r11/r14] the server suppresses only on a one-posting key, and NO dialog predicts it: the dialog states what marking does now and sends the operator to the list', async () => {
+  const { CHECK_AFTERWARDS, MARK_ACTION_NOW, markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
   const cases: Array<[string, string, boolean]> = [
     ['SALES_INVOICE_UPDATE', 'sales_invoice_update', false],
     ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', false],
@@ -1165,42 +1165,36 @@ test('[o3d-1e7sl Codex r11] the Mark-as-handled dialog promises exactly what the
     refusals.length = 0; syncRows.length = 0; activity.length = 0
     refusals.push(refusal(`r11-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
     assert.equal(ok(await mark(`r11-${type}`)), true, `${type}: the mark goes through`)
-    // what the server DID
     assert.equal(refusals[0]!.suppressedAt instanceof Date, suppresses, `${type}: the server ${suppresses ? 'writes' : 'does NOT write'} the durable suppression`)
-    // what the dialog SAYS must be the same
     const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
-    assert.equal(/will refuse to post it from then on|cannot reach the ledger twice/.test(dialog), suppresses, `${type}: the dialog promises suppression iff the server applies it`)
-    if (!suppresses) assert.match(dialog, /It does not suppress later postings: a later save of the document may queue a new posting or be refused again/, `${type}: and says a later save may post OR be refused again`)
+    assert.ok(dialog.includes(MARK_ACTION_NOW) && dialog.includes(CHECK_AFTERWARDS), `${type}: the dialog states the action now and sends the operator to the list`)
+    assert.doesNotMatch(dialog, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts nothing, in either direction`)
   }
-  // a type the dialog cannot classify never promises it
-  assert.doesNotMatch(markHandledWarningFor({ state: 'not-loaded' }), /will refuse to post it from then on|cannot reach the ledger twice/)
 })
 
 
-test('[o3d-1e7sl Codex r12] the dialog states only what holds in EVERY branch: the deferred-edit (keepOutstanding) branch leaves the refusal OPEN, and the real action does exactly that', async () => {
-  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+test('[o3d-1e7sl Codex r12/r14] the deferred-edit (keepOutstanding) branch leaves the refusal OPEN and the real action says so at that moment; the dialog predicts nothing about it', async () => {
+  const { CHECK_AFTERWARDS, markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
   const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
   for (const [type, kind] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update'], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update'], ['BILL_PAYMENT', 'realised_fx_bill_payment']] as const) {
     refusals.length = 0; syncRows.length = 0; activity.length = 0
     refusals.push(refusal(`r12-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
     assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r12-${type}`)), true, `${type}: claim`)
-    // IMS declined a later posting of the document while the claim was held
     ;(refusals[0] as unknown as Record<string, unknown>).handPostDeferredCount = 2
     const result = await markAccountingPostingRefusalHandledAction(`r12-${type}`, 'posted by hand')
-    // what the SERVER did: the refusal is NOT resolved and the claim is released
-    assert.equal(refusals[0]!.resolvedAt, null, `${type}: the refusal stays OPEN when a later posting was declined during the claim`)
+    assert.equal(refusals[0]!.resolvedAt, null, `${type}: the refusal is OPEN when a later posting was declined during the claim`)
     assert.equal(refusals[0]!.handPostClaimedAt, null, `${type}: and the claim is released`)
     assert.equal(refusals[0]!.suppressedAt, null, `${type}: and nothing is suppressed`)
     const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string } | undefined
-    assert.match(String(note?.description ?? JSON.stringify(result)), /STAYS OUTSTANDING/, `${type}: and the action says so`)
-    // what the DIALOG says must cover that branch, and must not state the closure unconditionally
+    assert.match(String(note?.description), /This row is STILL OUTSTANDING\. While the claim was held IMS declined 2 posting\(s\) for this document\./, `${type}: the log states the state at that moment`)
+    assert.match(String((result as { notice?: string }).notice), /STILL OUTSTANDING/, `${type}: and so does the notice the operator is shown`)
+    assert.ok(String((result as { notice?: string }).notice).includes(CHECK_AFTERWARDS), `${type}: with the pointer to the list`)
     const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
-    assert.match(dialog, /Whether THIS refusal then closes depends on whether a later posting was declined while you held it \(if one was, the refusal stays open, your claim is released/, `${type}: the dialog names the branch`)
-    assert.doesNotMatch(dialog, /This closes THIS refusal/, `${type}: it does not promise the closure`)
+    assert.doesNotMatch(dialog, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts nothing`)
   }
 })
 
-test('[o3d-1e7sl Codex r12] a later save on a reused key can be refused AGAIN (the mark suppresses nothing), and the dialog says so; a one-posting key is suppressed and the dialog promises that', async () => {
+test('[o3d-1e7sl Codex r12/r14] after a real mark, a refused-again posting is listed again on a reused key and not on a one-posting key (server behaviour); no text predicts either', async () => {
   const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
   const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
   const record = { chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' } as const
@@ -1209,17 +1203,13 @@ test('[o3d-1e7sl Codex r12] a later save on a reused key can be refused AGAIN (t
     refusals.push(refusal(`r12b-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
     assert.equal(ok(await mark(`r12b-${type}`)), true, `${type}: marked handled`)
     assert.ok(refusals[0]!.resolvedAt instanceof Date, `${type}: PRECONDITION: the refusal closed`)
-    // the SAME connector condition refuses the document again (a later save / a retry)
     await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }, { kind, ...record })
-    const reopened = refusals[0]!.resolvedAt === null
-    assert.equal(reopened, reused, `${type}: a refused-again posting ${reused ? 'IS listed again (nothing was suppressed)' : 'is NOT listed again (the key is suppressed)'}`)
-    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
-    if (reused) assert.match(dialog, /a later save of the document may queue a new posting or be refused again/, `${type}: the dialog says a later save may be refused again`)
-    else assert.match(dialog, /will refuse to post it from then on/, `${type}: the dialog promises the suppression the server applied`)
+    assert.equal(refusals[0]!.resolvedAt === null, reused, `${type}: a refused-again posting ${reused ? 'IS listed again (nothing was suppressed)' : 'is NOT listed again (the key is suppressed)'}`)
+    assert.doesNotMatch(markHandledWarningFor({ type, state: 'not-loaded' }), /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: the dialog predicts neither`)
   }
 })
 
-test('[o3d-1e7sl Codex r13] ANOTHER operator holding the claim: the refusal and the inbox row never promise the row closes, and the real claim action says it depends', async () => {
+test('[o3d-1e7sl Codex r13/r14] ANOTHER operator holding the claim: the refusal and the inbox row carry the shared present-tense sentence and no closure promise', async () => {
   const { OTHER_OPERATOR_CLAIM_OUTCOME, handPostOrderFor } = await import('@/lib/domain/accounting/hand-post-instruction')
   refusals.length = 0; syncRows.length = 0; activity.length = 0
   refusals.push(refusal('r13-other', 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-r13', scope: '', handPostClaimedAt: new Date('2026-10-01T10:00:00Z'), handPostClaimedBy: 'user-9' }))
@@ -1227,23 +1217,21 @@ test('[o3d-1e7sl Codex r13] ANOTHER operator holding the claim: the refusal and 
   for (const result of [await claimAccountingPostingRefusalForHandPostingAction('r13-other'), await markAccountingPostingRefusalHandledAction('r13-other', 'x')]) {
     assert.equal(ok(result), false, 'the other operator\'s claim refuses both')
     assert.ok(errorOf(result).includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'the refusal carries the shared outcome sentence')
-    assert.doesNotMatch(errorOf(result), /the row\s+closes\.|and when they confirm it the row/i, 'it never promises the closure')
   }
   const row = handPostOrderFor({ type: 'SALES_INVOICE_UPDATE', state: 'not-loaded', queuedRow: null, claim: { at: 'now', byName: 'Sam', mine: false } })
   assert.ok(row.includes(OTHER_OPERATOR_CLAIM_OUTCOME), 'and so does the inbox row')
-  assert.match(row, /Whether the row closes when they confirm depends on whether a later posting was declined/)
 })
 
-test('[o3d-1e7sl Codex r13] the mark activity log states only what holds in every branch (reused key: nothing suppressed, a later edit may be queued or refused again; one-posting key: suppressed)', async () => {
-  const { MARK_LOG_OUTCOME_REUSED_KEY, MARK_LOG_OUTCOME_SUPPRESSED } = await import('@/lib/domain/accounting/hand-post-instruction')
+test('[o3d-1e7sl Codex r13/r14] the mark activity log states the action at that moment and sends the operator to the list; it matches what the server wrote', async () => {
+  const { CHECK_AFTERWARDS, MARK_ACTION_NOW } = await import('@/lib/domain/accounting/hand-post-instruction')
   for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
     refusals.length = 0; syncRows.length = 0; activity.length = 0
     refusals.push(refusal(`r13-log-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
     assert.equal(ok(await mark(`r13-log-${type}`)), true, type)
     const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string }
-    assert.ok(note.description.includes(reused ? MARK_LOG_OUTCOME_REUSED_KEY : MARK_LOG_OUTCOME_SUPPRESSED), `${type}: the log carries the shared outcome`)
-    assert.doesNotMatch(note.description, /will be queued as usual|will not re-post this edit/, `${type}: no guarantee that a later edit queues`)
-    assert.equal(refusals[0]!.suppressedAt instanceof Date, !reused, `${type}: and the log matches what the server wrote`)
+    assert.ok(note.description.includes(MARK_ACTION_NOW) && note.description.includes(CHECK_AFTERWARDS), `${type}: the log carries the shared action sentence and the pointer`)
+    assert.doesNotMatch(note.description, /\b(will|closes|stays?|suppress\w*|from then on|for ever|forever|cannot|until|queues|becomes|comes back|requeues?)\b/i, `${type}: and predicts nothing`)
+    assert.equal(refusals[0]!.suppressedAt instanceof Date, !reused, `${type}: server behaviour is unchanged`)
   }
 })
 

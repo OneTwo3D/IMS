@@ -2,7 +2,7 @@
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
  */
 
-import { handPostStepFor } from '@/lib/domain/accounting/hand-post-instruction'
+import { handPostStepFor, MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -624,8 +624,8 @@ async function refuseUnattributableChart(params: {
       // and a retry of this posting (where one exists) refuses for the same reason until it is.
       remedy:
         'IMS cannot show which accounting connector holds the document this posting names, so it will not post '
-        + 'it. Post it yourself in the ledger that holds that document, then mark this row handled — that '
-        + 'cancels IMS\'s own attempt at it, so it is not posted twice.',
+        + 'it. Post it yourself in the ledger that holds that document, then mark this row handled. '
+        + MARK_REMEDY_TAIL,
       detail: {
         documentConnector: params.documentConnector ?? null,
         connectorNativePayloadKeys: nativeIdKeys,
@@ -679,8 +679,8 @@ async function refuseUnattributableChart(params: {
     // posting is closed by marking the row handled (which stops IMS posting it too).
     remedy:
       `Switch the accounting connector back to ${params.chartConnector} so IMS's own retry of this posting (where `
-      + `it has one) can post it. Otherwise ${handPostStepFor(params.type)} in the ledger it belongs to, then mark this row handled - `
-      + 'that cancels IMS\'s retry, so it is not posted twice.',
+      + `it has one) can post it. Otherwise ${handPostStepFor(params.type)} in the ledger it belongs to, then mark this row handled. `
+      + MARK_REMEDY_TAIL,
   })
   return {
     queued: false,

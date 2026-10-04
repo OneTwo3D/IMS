@@ -780,7 +780,7 @@ test('[o3d-j625 r16 HIGH 1] a claim held by the VIEWER says post it now, then co
   assert.equal(row.handPostClaim.mine, true)
   assert.ok(row.handPostOrder)
   assert.match(row.handPostOrder, /YOU are settling this by hand/)
-  assert.match(row.handPostOrder, /IMS will not queue this posting while you hold it/,
+  assert.match(row.handPostOrder, /While you hold the claim, IMS does not queue this posting/,
     'which is the promise the claim actually makes, and the reason the order is safe')
   assert.match(row.handPostOrder, /"Mark as handled"/, 'and the acknowledgement is the SECOND step')
 })
@@ -1509,21 +1509,16 @@ test('[o3d-j625 r34] both operator-facing projections derive the unaccounted fla
    * THE RULE: every operator-facing branch on `deferredEdits > 0` must have an unaccounted branch ahead of it.
    * Asserted by counting both, so a NEW count-reading string without one fails here.
    */
-  const countBranches = (actions.match(/(?:result|claim)\.deferredEdits > 0/g) ?? []).length
-  assert.ok(countBranches >= 2,
-    `PRECONDITION: the operator-facing count branches must be found; saw ${countBranches}`)
-  // The mark and the release are the two actions with prose; each must branch on the flag FIRST.
-  /**
-   * o3d-j625 r36: counted per SITE, not matched once. The first version of this used a single
-   * `match(/result.declineUnaccounted ?/)`, and the two mutations that silence the release's ACTIVITY LINE and
-   * its NOTICE each came back GREEN — because silencing one left the other for the regex to find. An existential
-   * match over two sibling branches proves neither of them.
-   */
-  const releaseBranches = (actions.match(/result\.declineUnaccounted\s*\n?\s*\?/g) ?? []).length
-  assert.ok(releaseBranches >= 2,
-    `the release must branch on the unaccounted flag in BOTH its activity description and its operator notice; `
-    + `found ${releaseBranches}. Reading the count alone gives a silent, routine release over a posting that is `
-    + 'still owed (round 35 HIGH 1), and silencing either half is enough to do it.')
+  // Codex round 14: the operator-facing sentences are built by ONE function, `declinedWhileHeld(unaccounted, count)`, whose first branch is the
+  // unaccounted one; every action passes the flag it read. A count-only call, or a builder that reads the count first, fails here.
+  const module = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/hand-post-instruction.ts'), 'utf8')
+  const fn = module.slice(module.indexOf('export function declinedWhileHeld'), module.indexOf('export function declinedWhileHeld') + 700)
+  assert.ok(fn.indexOf('if (unaccounted)') > 0 && fn.indexOf('if (unaccounted)') < fn.indexOf('count > 0'),
+    'the shared builder must branch on the unaccounted flag BEFORE it reads the count')
+  assert.ok((actions.match(/unaccounted: Boolean\(result\.declineUnaccounted\)/g) ?? []).length >= 2,
+    'the release must pass the unaccounted flag to BOTH its activity description and its operator notice')
+  assert.ok((actions.match(/unaccounted: Boolean\(result\.unaccountedDecline\)/g) ?? []).length >= 2,
+    'the mark must pass it to BOTH its activity description and its operator notice')
   assert.equal(
     (actions.match(/declineUnaccounted/g) ?? []).length >= 4, true,
     'and it must be returned, logged, noticed and put in the metadata — or one of the surfaces goes quiet again',

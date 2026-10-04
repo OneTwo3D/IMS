@@ -20,10 +20,11 @@
 export const ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL =
   'IMS would have written these postings into books whose chart of accounts does not describe them — the '
   + 'accounting connector changed while the document was being built, or a document id the posting names '
-  + 'cannot be shown to belong to the connector it would post to. Nothing was sent. Each row says which posting '
+  + 'could not be shown to belong to the connector it would post to. Nothing was sent. Each row says which posting '
   + 'is owed, which books it was built for, which connector is active now, what still stands in IMS, and what '
-  + 'to do. A row marked "clears itself" leaves this list when IMS queues the posting. Any other row can be marked '
-  + 'handled once you have posted it by hand: that records who did it and cancels IMS\'s own retry of it. For a posting whose key names one posting for ever IMS then also refuses to post it again; for an invoice or bill update or a bill payment a later save of the document may queue a new posting or be refused again, and whether this refusal closes depends on whether a later posting was declined while you held it. '
+  + 'to do. A row marked "clears itself" is cleared by IMS when the posting is queued. Any other row can be marked '
+  + 'handled once you have posted it by hand. Marking records who did it and cancels IMS\'s own retry of it; check '
+  + 'Sync > Exceptions afterwards to see whether the row closed or a new one appeared. '
   + 'A row marked "Unconfirmed" is not yet '
   + 'one of these: IMS refused it while another job was settling the same posting, and the accounting sync run '
   + 'is still establishing whether it is owed — do not post an unconfirmed row by hand.'
@@ -44,13 +45,12 @@ export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REASON = 'awaiting_reconcili
 export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_REMEDY =
   'Nothing yet — and do NOT post this in the ledger by hand. IMS refused this posting while another job was '
   + 'settling the same one, so it does not yet know whether the posting is owed or was queued by that job. The '
-  + 'accounting sync run settles it automatically, usually within minutes: it then either disappears from this '
-  + 'list or becomes an ordinary refused posting with a remedy. If it is still here after an hour, the '
-  + 'accounting sync cron is not running — check that first.'
+  + 'accounting sync run settles unconfirmed rows; check Sync > Exceptions afterwards. If this row is still here '
+  + 'after an hour, check that the accounting sync cron is running.'
 
 export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_CLEARING_NOTE =
   'Unconfirmed. Waiting for the accounting sync run to settle whether this posting is owed; it is not yet '
-  + 'something to post by hand, and it cannot be marked handled.'
+  + 'something to post by hand, and it is not offered Mark as handled.'
 
 export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_COMMITTED =
   'The work that produced this posting is committed in IMS. Whether the posting itself reached the ledger is '
@@ -60,7 +60,7 @@ export const ACCOUNTING_POSTING_REFUSAL_UNCONFIRMED_COMMITTED =
 export const ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL = {
   auto: 'Clears itself. ',
   retried: 'IMS retries this, but the retry can get stuck. ',
-  manual: 'Nothing in IMS will post this. ',
+  manual: 'IMS does not post this. ',
 } as const
 
 /**
@@ -83,13 +83,12 @@ export const ACCOUNTING_POSTING_REFUSAL_RESOLVED_DETAIL =
  * suppression nobody could reach. This section is the answer, and it says out loud who may end a claim.
  */
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_DETAIL =
-  'Postings an operator has taken to settle BY HAND. While a posting is held here IMS will not queue it — that '
-  + 'is what stops it reaching the ledger twice — and a claim never expires, so it ends only when somebody '
-  + 'confirms the posting or releases it. The ones held LONGEST are listed first, above; below them is the rest '
+  'Postings an operator has taken to settle BY HAND. While a posting is held here IMS does not queue it. A claim '
+  + 'has no expiry: somebody confirms the posting or releases it. The ones held LONGEST are listed first, above; below them is the rest '
   + 'of the list, which you can page through. To reach a specific posting, SEARCH for its document rather than '
   + 'paging: postings are taken and given back while you read, so this list is a view of what is held and not '
   + 'a roll-call. ANYBODY with sync access may release ANYBODY\'s claim, deliberately: otherwise a claim taken '
-  + 'by someone who has left would suppress that posting for ever. Releases are recorded.'
+  + 'by someone who has left would hold that posting indefinitely. Releases are recorded.'
 
 /**
  * o3d-j625 r20 (Codex round 19, HIGH) — WHAT THE LOOKUP SEARCHES, said on the page.
@@ -104,7 +103,7 @@ export const ACCOUNTING_POSTING_HAND_POST_CLAIM_SEARCH_HINT =
 
 /** What "held a long time" means on the section above — a signal to look, never an expiry that acts. */
 export const ACCOUNTING_POSTING_HAND_POST_CLAIM_STALE_NOTE =
-  'Held far longer than a hand posting takes. Nothing will end it on its own: ask the holder, or release it.'
+  'Held far longer than a hand posting takes. A claim does not end on its own: ask the holder, or release it.'
 
 /**
  * o3d-j625 r22 (Codex round 21, HIGH) — the heading of the LONGEST-HELD block.
