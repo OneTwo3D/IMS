@@ -243,6 +243,10 @@ let resetTokenDeleteGate: (() => Promise<void>) | null = null
 let settingsWipeFails = false
 /** o3d-6thk1: fail the statement that clears the previous organisation's mapping. */
 let mappingClearFails = false
+/** o3d-6thk1 (round 2): the IMS tax-type mappings and the cached chart the rebind must clear or keep. */
+let taxRateTypes: Array<string | null> = []
+let taxComponentTypes: Array<string | null> = []
+let chartRows = 0
 
 /**
  * The token row's WRITE LOCK, held by an uncommitted transaction (o3d-9tbz r4).
@@ -295,6 +299,8 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   let settle: (committed: boolean) => void = () => {}
   const settled = new Promise<boolean>((resolve) => { settle = resolve })
   const claimed: string[] = []
+  let stagedTaxClear = false
+  let stagedChartClear = false
   const visibleSetting = (key: string): string | undefined =>
     staged[key] ?? (stagedDeletes.has(key) ? undefined : settings[key])
   const tx = {
@@ -381,6 +387,26 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         return { count }
       },
     },
+    // o3d-6thk1 (round 2): tax-type mappings and the cached chart, staged like every other write.
+    taxRate: {
+      count: async () => (stagedTaxClear ? 0 : taxRateTypes.filter((t) => t != null).length),
+      updateMany: async () => {
+        const n = stagedTaxClear ? 0 : taxRateTypes.filter((t) => t != null).length
+        stagedTaxClear = true
+        return { count: n }
+      },
+    },
+    taxRateComponent: {
+      count: async () => (stagedTaxClear ? 0 : taxComponentTypes.filter((t) => t != null).length),
+      updateMany: async () => ({ count: taxComponentTypes.filter((t) => t != null).length }),
+    },
+    accountingAccount: {
+      deleteMany: async () => {
+        const n = stagedChartClear ? 0 : chartRows
+        stagedChartClear = true
+        return { count: n }
+      },
+    },
     accountingToken: {
       // o3d-6thk1: the previous organisation is read from the token row BEFORE the binding overwrites it.
       findUnique: async () => (stagedToken === undefined ? tokenRow : stagedToken),
@@ -416,6 +442,8 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   }
   try {
     const result = await fn(tx)
+    if (stagedTaxClear) { taxRateTypes = taxRateTypes.map(() => null); taxComponentTypes = taxComponentTypes.map(() => null) }
+    if (stagedChartClear) chartRows = 0
     for (const key of stagedDeletes) delete settings[key]
     for (const [key, value] of Object.entries(staged)) settings[key] = value
     if (stagedTokenDeleteId !== undefined) {
@@ -660,6 +688,9 @@ beforeEach(() => {
   resetTokenDeleteGate = null
   settingsWipeFails = false
   mappingClearFails = false
+  taxRateTypes = []
+  taxComponentTypes = []
+  chartRows = 0
   refreshGrantGate = null
   bindingTokenWriteGate = null
   pendingSettingInserts.clear()
@@ -2858,48 +2889,62 @@ test('[o3d-emus] xeroBaseCurrencyConnectRefusal: unreadable never passes, a matc
   console.log(`# o3d-emus xeroBaseCurrencyConnectRefusal: ${cases} cases`)
 })
 
+
 // ---------------------------------------------------------------------------
-// o3d-6thk1: a tenant rebind must not leave the account mapping on the PREVIOUS organisation.
+// o3d-6thk1: a tenant rebind must not leave organisation-keyed mapping on the PREVIOUS organisation, and
+// must not DESTROY a mapping it cannot show is wrong (Codex round 1: HIGH x2).
 //
-// The mapping is one organisation's chart; the pin and the egress tenant check say nothing about it. So a
-// deliberate rebind (disconnect, then connect elsewhere) used to leave every document raised afterwards
-// posting the previous organisation's account codes under the NEW tenant's stamp.
+// The mapping is one organisation's chart; the pin and the egress tenant check say nothing about it. Three
+// states: KNOWN SAME (keep), KNOWN DIFFERENT (clear accounts, payment map, tax types, cached chart; sync
+// off), UNKNOWN with a mapping (keep, sync off, confirm required).
 // ---------------------------------------------------------------------------
 
 const OTHER = { id: 'c-other', tenantId: '7a1c0e22-other-org', tenantName: 'Other Trading Ltd', tenantType: 'ORGANISATION' }
 
 /** The fifteen account roles, derived from the settings module's own list so a sixteenth is covered. */
 async function accountRoleKeys(): Promise<string[]> {
-  const { XERO_SETTING_KEYS } = await import('@/lib/connectors/xero/settings')
-  return XERO_SETTING_KEYS.filter((key) => key.startsWith('xero_') && key.endsWith('_account'))
+  const { XERO_ACCOUNT_ROLE_KEYS } = await import('@/lib/connectors/xero/account-mapping-rebind')
+  return [...XERO_ACCOUNT_ROLE_KEYS]
 }
 
-/** An instance configured for `conn`: pinned, mapped, sync on, stamped. */
+/** Every setting the rebind rule treats as "a mapping exists": 15 roles, the payment map, two reverse-charge types. */
+async function mappingKeys(): Promise<string[]> {
+  const { XERO_ACCOUNT_MAPPING_KEYS } = await import('@/lib/connectors/xero/account-mapping-rebind')
+  return [...XERO_ACCOUNT_MAPPING_KEYS]
+}
+
+/** An instance configured for `conn`: pinned, mapped (settings AND tax types AND chart), sync on, optionally stamped. */
 async function mappedFor(conn: typeof DEMO, options: { stamp?: boolean } = {}) {
   pinnedTo(conn)
   for (const key of await accountRoleKeys()) settings[key] = `code-of-${conn.tenantName}-${key}`
   settings.accounting_payment_account_map = JSON.stringify({ 'card:GBP': `bank-of-${conn.tenantName}` })
+  settings.accounting_reverse_charge_sales_tax_type = `RC-SALES-${conn.tenantName}`
+  settings.accounting_reverse_charge_purchase_tax_type = `RC-PURCH-${conn.tenantName}`
+  settings.xero_tax_rate_drift_current = '{"drift":["x"]}'
+  settings.xero_tax_rate_drift_last_checked_at = '2026-10-01T00:00:00.000Z'
   settings.xero_sync_enabled = 'true'
   settings.xero_sync_sales_invoice = 'submitted'
+  taxRateTypes = ['OUTPUT2', 'INPUT2', null]
+  taxComponentTypes = ['OUTPUT2']
+  chartRows = 40
   if (options.stamp !== false) settings.xero_account_mapping_tenant_id = conn.tenantId
 }
 
-const mappingRowsPresent = async () =>
-  [...await accountRoleKeys(), 'accounting_payment_account_map'].filter((key) => settings[key] != null)
+const mappingRowsPresent = async () => (await mappingKeys()).filter((key) => settings[key] != null)
+const taxTypesMapped = () => taxRateTypes.filter((t) => t != null).length + taxComponentTypes.filter((t) => t != null).length
 
-test('[o3d-6thk1] a rebind to a DIFFERENT organisation after a disconnect clears the old mapping, switches sync off and says so', async () => {
+test('[o3d-6thk1] KNOWN DIFFERENT organisation: accounts, payment map, reverse-charge types, tax types and the cached chart are cleared, sync is off, and it says so', async () => {
   await mappedFor(DEMO)
-  const roles = await accountRoleKeys()
   const { exchangeCodeForTokens, disconnect } = await loadAuth()
   await disconnect()
   connectionsBody = [OTHER]
 
-  // PRECONDITION, printed: a real disconnect has removed the token row AND the pin (the only other
-  // records of who the mapping was for), and the whole mapping is still there to be inherited.
   const before = await mappingRowsPresent()
-  console.log(`# o3d-6thk1 rebind: account roles=${roles.length}, mapping rows before=${before.length}, token=${tokenRow === null ? 'gone' : 'present'}, pin=${settings.xero_expected_tenant_id ?? 'gone'}, stamp=${settings.xero_account_mapping_tenant_id}`)
-  assert.equal(roles.length, 15, 'PRECONDITION: fifteen account roles')
-  assert.equal(before.length, 16, 'PRECONDITION: the fifteen roles and the payment map are all present')
+  console.log(`# o3d-6thk1 known-different: mapping settings=${before.length}, tax types mapped=${taxTypesMapped()}, chart rows=${chartRows}, token=${tokenRow === null ? 'gone' : 'present'}, pin=${settings.xero_expected_tenant_id ?? 'gone'}, stamp=${settings.xero_account_mapping_tenant_id}`)
+  assert.equal((await accountRoleKeys()).length, 15, 'PRECONDITION: fifteen account roles')
+  assert.equal(before.length, 18, 'PRECONDITION: 15 roles + payment map + 2 reverse-charge types present')
+  assert.equal(taxTypesMapped(), 3)
+  assert.equal(chartRows, 40)
   assert.equal(tokenRow, null)
   assert.equal(settings.xero_expected_tenant_id, undefined)
 
@@ -2907,35 +2952,40 @@ test('[o3d-6thk1] a rebind to a DIFFERENT organisation after a disconnect clears
 
   assert.equal(result.success, true)
   assert.equal((tokenRow as TokenRow | null)?.tenantId, OTHER.tenantId, 'the new organisation is bound')
-  assert.deepEqual(await mappingRowsPresent(), [], 'no account role and no payment map survives from the previous organisation')
-  assert.equal(settings.xero_sync_enabled, undefined, 'sync is off (absent is the default, "false"): nothing posts until re-mapped')
-  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId, 'the stamp names the organisation just bound')
+  assert.deepEqual(await mappingRowsPresent(), [], 'no account role, payment map or reverse-charge type survives from the previous organisation')
+  assert.equal(taxTypesMapped(), 0, 'no IMS tax rate (or component) keeps the previous organisation\'s Xero tax type')
+  assert.equal(chartRows, 0, 'the cached chart of accounts is cleared (o3d-fgrcx); Sync accounts refills it from the new organisation')
+  assert.equal(settings.xero_tax_rate_drift_current, undefined)
+  assert.equal(settings.xero_sync_enabled, undefined, 'sync is off (absent is the default, "false")')
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId)
   assert.equal(settings.xero_sync_sales_invoice, 'submitted', 'unrelated settings are untouched')
   assert.equal(settings.xero_client_id, 'client-id')
-  assert.match(result.accountMappingResetNotice ?? '', /re-mapped/)
+  assert.match(result.accountMappingResetNotice ?? '', /not the organisation the account mapping was set up for/)
+  assert.match(result.accountMappingResetNotice ?? '', /tax-type mapping/)
   assert.match(result.accountMappingResetNotice ?? '', new RegExp(DEMO.tenantId))
-  assert.equal(activity.filter((entry) => entry.action === 'xero_account_mapping_reset').length, 1, 'recorded for whoever is not watching the redirect')
+  assert.equal(activity.filter((entry) => entry.action === 'xero_account_mapping_reset').length, 1)
 })
 
-test('[o3d-6thk1] reconnecting to the SAME organisation (even after a disconnect) keeps the mapping and sync', async () => {
+test('[o3d-6thk1] KNOWN SAME organisation (stamped), even after a disconnect: mapping, tax types, chart and sync are kept', async () => {
   await mappedFor(DEMO)
   const { exchangeCodeForTokens, disconnect } = await loadAuth()
   await disconnect()
   connectionsBody = [DEMO]
   const before = await mappingRowsPresent()
-  assert.equal(before.length, 16, 'PRECONDITION: mapping present, token and pin gone')
+  assert.equal(before.length, 18, 'PRECONDITION: mapping present, token and pin gone, stamp names the same organisation')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, true)
-  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
-  assert.deepEqual(await mappingRowsPresent(), before, 'every mapping row is untouched')
+  assert.deepEqual(await mappingRowsPresent(), before)
+  assert.equal(taxTypesMapped(), 3)
+  assert.equal(chartRows, 40)
   assert.equal(settings.xero_sync_enabled, 'true')
   assert.equal(result.accountMappingResetNotice, undefined)
-  assert.equal(activity.some((entry) => entry.action === 'xero_account_mapping_reset'), false)
+  assert.equal(activity.some((entry) => entry.action.startsWith('xero_account_mapping_')), false)
 })
 
-test('[o3d-6thk1] an in-place re-consent to the pinned organisation keeps the mapping, and a pre-stamp instance is stamped', async () => {
+test('[o3d-6thk1] an in-place re-consent to the pinned organisation keeps everything, and a pre-stamp instance is stamped', async () => {
   await mappedFor(DEMO, { stamp: false })
   connectionsBody = [DEMO]
   const { exchangeCodeForTokens } = await loadAuth()
@@ -2945,59 +2995,92 @@ test('[o3d-6thk1] an in-place re-consent to the pinned organisation keeps the ma
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, true)
-  assert.equal((await mappingRowsPresent()).length, 16)
+  assert.equal((await mappingRowsPresent()).length, 18)
+  assert.equal(taxTypesMapped(), 3)
   assert.equal(settings.xero_sync_enabled, 'true')
-  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId, 'the stamp is written so the NEXT rebind has an answer after a disconnect')
+  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId, 'stamped, so the NEXT Disconnect leaves durable evidence')
 })
 
-test('[o3d-6thk1] a mapping with NO record of whose it is is treated as a different organisation, not assumed to be this one', async () => {
-  // No token row, no pin, no stamp: an instance that was disconnected before the stamp existed. "Same
-  // organisation" cannot be shown, and assuming it is what the defect did.
+test('[o3d-6thk1 round-1 HIGH 1] a PRE-STAMP instance: Disconnect then reconnect to the SAME organisation KEEPS the mapping, turns sync OFF, stamps nothing and asks for confirmation', async () => {
   await mappedFor(DEMO, { stamp: false })
-  tokenRow = null
-  delete settings.xero_expected_tenant_id
-  connectionsBody = [OTHER]
-  const { exchangeCodeForTokens } = await loadAuth()
-  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present with no provenance')
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [DEMO]
+  const before = await mappingRowsPresent()
+  console.log(`# o3d-6thk1 pre-stamp: mapping before=${before.length}, stamp=${settings.xero_account_mapping_tenant_id}, token=${tokenRow === null ? 'gone' : 'present'}, sync=${settings.xero_sync_enabled}`)
+  assert.equal(before.length, 18, 'PRECONDITION: Disconnect preserved the mapping')
+  assert.equal(settings.xero_account_mapping_tenant_id, undefined, 'PRECONDITION: no stamp (an instance from before it existed)')
+  assert.equal(tokenRow, null, 'PRECONDITION: the token row (the only other record) is gone')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, true)
-  assert.deepEqual(await mappingRowsPresent(), [])
-  assert.equal(settings.xero_sync_enabled, undefined)
-  assert.match(result.accountMappingResetNotice ?? '', /no record of/)
+  assert.equal((tokenRow as TokenRow | null)?.tenantId, DEMO.tenantId)
+  assert.deepEqual(await mappingRowsPresent(), before, 'the mapping is KEPT: unknown provenance does not delete')
+  assert.equal(taxTypesMapped(), 3)
+  assert.equal(chartRows, 40)
+  assert.equal(settings.xero_sync_enabled, undefined, 'sync is OFF until the operator confirms')
+  assert.equal(settings.xero_account_mapping_tenant_id, undefined, 'NOTHING is stamped as owned yet')
+  assert.match(result.accountMappingResetNotice ?? '', /could not confirm which organisation this mapping was set up for: sync is OFF until you confirm/)
+  assert.doesNotMatch(result.accountMappingResetNotice ?? '', /not the organisation|different|cleared/i, 'it never claims the mapping belonged to another organisation')
+  assert.equal(activity.filter((entry) => entry.action === 'xero_account_mapping_unconfirmed').length, 1)
+  assert.equal(activity.some((entry) => entry.action === 'xero_account_mapping_reset'), false)
+
+  // THE CONFIRMATION is what ends the hold: readiness says unconfirmed until then, owned after.
+  const lib = await import('@/lib/connectors/xero/account-mapping-rebind')
+  const tx = (await import('@/lib/db')).db as unknown as { $transaction: (fn: (tx: never) => Promise<unknown>) => Promise<unknown> }
+  const owner = async () => (await tx.$transaction(async (t) => lib.readMappingOwnership(t as never, 'xero'))) as Awaited<ReturnType<typeof lib.readMappingOwnership>>
+  assert.equal((await owner()).state, 'unconfirmed', 'readiness blocks: confirm the mapping belongs to the connected organisation')
+  const confirmed = await tx.$transaction(async (t) => lib.confirmMappingOwnership(t as never, { connector: 'xero', expectedTenantId: DEMO.tenantId })) as Awaited<ReturnType<typeof lib.confirmMappingOwnership>>
+  assert.equal(confirmed.ok, true)
+  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId)
+  assert.equal((await owner()).state, 'owned', 'confirmed: the readiness blocker is gone')
 })
 
-test('[o3d-6thk1] a different organisation with NOTHING mapped has nothing to clear: no reset, no notice, sync untouched', async () => {
-  pinnedTo(DEMO)
-  settings.xero_account_mapping_tenant_id = DEMO.tenantId
+test('[o3d-6thk1] UNKNOWN provenance with ONLY tax types mapped is still unconfirmed: kept, sync off', async () => {
+  settings.xero_sync_enabled = 'true'
+  taxRateTypes = ['OUTPUT2']
+  chartRows = 5
+  connectionsBody = [OTHER]
+  const { exchangeCodeForTokens } = await loadAuth()
+  assert.deepEqual(await mappingRowsPresent(), [], 'PRECONDITION: no mapping SETTING exists, only a tax type')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(taxTypesMapped(), 1, 'the tax type is kept')
+  assert.equal(settings.xero_sync_enabled, undefined)
+  assert.equal(settings.xero_account_mapping_tenant_id, undefined)
+  assert.match(result.accountMappingResetNotice ?? '', /could not confirm/)
+})
+
+test('[o3d-6thk1] UNKNOWN provenance with NOTHING mapped is a no-op: the binding stamps its organisation and sync is untouched', async () => {
   settings.xero_sync_enabled = 'true'
   settings.accounting_payment_account_map = '{}'
-  tokenRow = null
-  delete settings.xero_expected_tenant_id
   connectionsBody = [OTHER]
   const { exchangeCodeForTokens } = await loadAuth()
-  assert.deepEqual(await mappingRowsPresent(), ['accounting_payment_account_map'], 'PRECONDITION: only the empty default map exists')
+  assert.deepEqual(await mappingRowsPresent(), ['accounting_payment_account_map'], "PRECONDITION: only the empty '{}' default map exists")
+  assert.equal(taxTypesMapped(), 0)
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, true)
-  assert.equal(result.accountMappingResetNotice, undefined, "an empty '{}' map is not a mapping")
+  assert.equal(result.accountMappingResetNotice, undefined)
   assert.equal(settings.xero_sync_enabled, 'true')
-  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId)
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId, 'a new instance always carries durable evidence through a later Disconnect')
 })
 
 test('[o3d-6thk1] a connect that is REFUSED clears nothing', async () => {
   await mappedFor(DEMO)
   connectionsBody = [OTHER]
   const { exchangeCodeForTokens } = await loadAuth()
-  const before = JSON.stringify(settings)
+  const before = JSON.stringify({ settings, taxRateTypes, chartRows })
   assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId, 'PRECONDITION: pinned to the organisation the mapping is for')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, false, 'the pin refuses the other organisation')
-  assert.equal(JSON.stringify(settings), before, 'no setting was touched')
+  assert.equal(JSON.stringify({ settings, taxRateTypes, chartRows }), before, 'nothing was touched')
   assert.equal(tokenRow?.tenantId, DEMO.tenantId)
 })
 
@@ -3006,31 +3089,31 @@ test('[o3d-6thk1] a binding that FAILS part-way rolls the clear back with it', a
   const { exchangeCodeForTokens, disconnect } = await loadAuth()
   await disconnect()
   connectionsBody = [OTHER]
-  const before = JSON.stringify(settings)
+  const before = JSON.stringify({ settings, taxRateTypes, chartRows })
   bindingTokenWriteGate = async () => { throw new Error('token write failed (injected)') }
-  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present')
+  assert.equal((await mappingRowsPresent()).length, 18, 'PRECONDITION: mapping present')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, false)
   assert.equal(tokenRow, null, 'nothing was bound')
-  assert.equal(JSON.stringify(settings), before, 'and the previous organisation\'s mapping is exactly as it was: clear and bind are one transaction')
+  assert.equal(JSON.stringify({ settings, taxRateTypes, chartRows }), before, 'the previous organisation\'s mapping is exactly as it was')
 })
 
-test('[o3d-6thk1] a failure of the CLEAR itself rolls the binding back: the new organisation is not bound over the old mapping', async () => {
+test('[o3d-6thk1] a failure of the CLEAR itself rolls the binding back, tax types and chart included', async () => {
   await mappedFor(DEMO)
   const { exchangeCodeForTokens, disconnect } = await loadAuth()
   await disconnect()
   connectionsBody = [OTHER]
-  const before = JSON.stringify(settings)
+  const before = JSON.stringify({ settings, taxRateTypes, chartRows })
   mappingClearFails = true
-  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present')
+  assert.equal((await mappingRowsPresent()).length, 18, 'PRECONDITION: mapping present')
 
   const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
 
   assert.equal(result.success, false)
   assert.equal(tokenRow, null, 'the token write is rolled back with the failed clear')
-  assert.equal(JSON.stringify(settings), before, 'no pin, no stamp, and the mapping exactly as it was')
+  assert.equal(JSON.stringify({ settings, taxRateTypes, chartRows }), before, 'no pin, no stamp, mapping and tax types exactly as they were')
 })
 
 test('[o3d-6thk1] the binding takes the mapping lock BEFORE it reads who the mapping belongs to, and clears after the binding rows', () => {

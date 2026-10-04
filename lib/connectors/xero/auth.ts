@@ -404,10 +404,10 @@ async function getExpectedTenantId(): Promise<string | null> {
 async function bindXeroTenant(params: {
   connection: XeroConnectionSummary
   token: StoredTokenWrite
-}): Promise<{ ok: true; accountMappingReset?: Extract<AccountMappingResetOutcome, { reset: true }> } | { ok: false; error: string }> {
+}): Promise<{ ok: true; accountMappingReset?: Exclude<AccountMappingResetOutcome, { kind: 'none' }> } | { ok: false; error: string }> {
   const { connection, token } = params
   const pinValue = serializeSettingValue(XERO_EXPECTED_TENANT_KEY, token.tenantId)
-  let accountMappingReset: AccountMappingResetOutcome = { reset: false }
+  let accountMappingReset: AccountMappingResetOutcome = { kind: 'none' }
 
   try {
     await db.$transaction(async (tx) => {
@@ -480,9 +480,10 @@ async function bindXeroTenant(params: {
       accountMappingReset = await resetAccountMappingForOrganisationChange(tx, {
         previous: previousOrganisation,
         newTenantId: token.tenantId,
+        connector: XERO_CONNECTOR,
       })
     })
-    return accountMappingReset.reset ? { ok: true, accountMappingReset } : { ok: true }
+    return accountMappingReset.kind !== 'none' ? { ok: true, accountMappingReset } : { ok: true }
   } catch (error) {
     if (!(error instanceof XeroBindingRace)) throw error
     const boundTo = await readBoundTenant(error.boundTenantId)
@@ -998,7 +999,7 @@ export async function exchangeCodeForTokens(
         await logActivity({
           entityType: 'SYSTEM',
           tag: 'sync',
-          action: 'xero_account_mapping_reset',
+          action: bound.accountMappingReset.kind === 'cleared' ? 'xero_account_mapping_reset' : 'xero_account_mapping_unconfirmed',
           level: 'WARNING',
           description: accountMappingResetNotice,
           metadata: {
@@ -1006,7 +1007,10 @@ export async function exchangeCodeForTokens(
             previousTenantId: bound.accountMappingReset.previous.tenantId,
             previousBasis: bound.accountMappingReset.previous.basis,
             newTenantId: conn.tenantId,
-            clearedKeys: bound.accountMappingReset.clearedKeys,
+            clearedKeys: bound.accountMappingReset.kind === 'cleared' ? bound.accountMappingReset.clearedKeys : [],
+            keptKeys: bound.accountMappingReset.kind === 'unconfirmed' ? bound.accountMappingReset.keptKeys : [],
+            taxRatesCleared: bound.accountMappingReset.kind === 'cleared' ? bound.accountMappingReset.taxRatesCleared : 0,
+            chartRowsCleared: bound.accountMappingReset.kind === 'cleared' ? bound.accountMappingReset.chartRowsCleared : 0,
             syncWasEnabled: bound.accountMappingReset.syncWasEnabled,
           },
         })

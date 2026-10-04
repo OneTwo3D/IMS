@@ -50,19 +50,30 @@ So:
   organisations in Xero is the quicker one if you only ever want the single organisation.
 - **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
   before. Disconnecting clears the pin.
-- **Connecting to a different organisation clears the account mapping.** The account codes (all fifteen
-  roles under *Account Mapping*) and the Payment Account Mapping describe one organisation's chart of
-  accounts. When a connect binds an organisation other than the one the mapping was set up for, IMS clears
-  them in the same transaction that writes the new binding and switches **Xero sync off**, so nothing posts
-  to the new organisation under the old one's codes. It is not an automatic re-map (matching old codes to a
-  new chart would be a guess) and nothing already stored is rewritten. The callback message and the
-  activity log (`xero_account_mapping_reset`) say so; open Sync settings, choose each account from the new
-  organisation, then switch sync back on (the readiness check lists any role still missing). Reconnecting
-  to the **same** organisation, including after **Disconnect**, keeps the mapping and the sync switch. IMS
-  remembers which organisation the mapping is for in `xero_account_mapping_tenant_id`; where that is
-  unknown (an instance disconnected before it existed) a mapping with no provenance is treated as
-  belonging to a different organisation. The stored chart of accounts used by the account pickers is
-  not refreshed by this: see o3d-fgrcx.
+- **Connecting to a different organisation does not carry the old organisation's mapping with it.** The account
+  codes (all fifteen roles under *Account Mapping*), the Payment Account Mapping, the reverse-charge tax types and
+  each IMS tax rate's Xero tax type describe one organisation's chart. IMS remembers which organisation the mapping
+  belongs to (`xero_account_mapping_tenant_id`, written by every connect and by every mapping save made while
+  ownership is not in doubt; it survives **Disconnect**). Three cases:
+  - **Known different organisation** (the remembered organisation, or the stored token's, is not the one you
+    connected): in the same transaction as the new binding IMS clears the account roles, the payment map, the
+    reverse-charge types, the IMS tax-rate Xero tax types, the cached chart of accounts and the tax-drift snapshot,
+    and switches **Xero sync off**. It is not an automatic re-map (matching old codes to a new chart would be a guess)
+    and nothing already stored is rewritten. Open Sync settings, run **Sync accounts**, choose each account and each
+    tax type, then switch sync back on; the readiness check names whatever is still missing.
+  - **Same organisation**, including after **Disconnect**: everything is kept.
+  - **Unknown** (an instance bound before IMS recorded this, then disconnected): IMS **cannot tell** whether the
+    mapping is this organisation's, so it does **not delete it**. The mapping is kept, **sync is switched off** and
+    Sync settings shows *Confirm the account mapping belongs to <organisation>*. Review the mapping and press the
+    confirm button (an admin step-up action, recorded in the activity log with who and when), or re-map and save;
+    sync cannot be enabled until one of those. The callback message says "could not confirm which organisation this
+    mapping was set up for"; it never claims the mapping belonged to another organisation.
+  A mapping save or payment-map save made from a page rendered against a different organisation than the one now
+  connected is refused (reload and review), and both saves serialise with the connect on the same lock, so a stale tab
+  cannot put the previous organisation's mapping back. `LEAVE`d on purpose: the app credentials, the sync-mode and
+  batch/polling switches, the payment-poll time cursor, the invoice/bill URL templates, per-document contact/item ids
+  (their provenance already ignores another organisation's) and every posted document's ids and sync rows (the tenant
+  stamp on each refuses them at egress).
 - **Two connections at once bind one organisation, not two.** The pin and the stored token are written
   in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
   flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them
