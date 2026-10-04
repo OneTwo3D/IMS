@@ -6,7 +6,7 @@ import {
   isPostableAccountingSyncStatus,
   retiredUnprovenRows,
 } from '@/lib/domain/accounting/postable-sync-statuses'
-import { describeEarlierPostings, describeRetiredUnproven, GENERIC_HAND_POST_STEP, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
+import { describeEarlierPostings, describeRetiredUnproven, handPostStepFor, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -611,7 +611,7 @@ export async function markPostingHandled(
       message:
         'Take this posting for hand posting FIRST — that is what stops IMS queueing it while you are in the '
         + 'ledger. Press "Take for hand posting" (it cancels any queued row that nothing has picked up, and '
-        + `refuses if one may already have been sent), then ${GENERIC_HAND_POST_STEP}, then mark it handled. If you have `
+        + `refuses if one may already have been sent), then ${handPostStepFor(row.type)}, then mark it handled. If you have `
         + 'already posted it, take it now and check the accounting sync log for a row IMS queued meanwhile.',
     }
   }

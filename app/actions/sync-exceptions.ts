@@ -2177,9 +2177,9 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
           : '.')
         // Codex round 6: carries each earlier posting's STANDING; "replaces" is only ever said of a CONFIRMED document.
         + describeEarlierPostings(result.earlierPostingDetails)
-        + describeRetiredUnproven(result.retiredUnproven, { earlierDocumentExists: result.earlierPostingDetails.length > 0 })
+        + describeRetiredUnproven(result.retiredUnproven)
         // Codex round 8: the instruction the operator was given, from the SAME structure as the row text and the dialogs.
-        + ` Instruction shown: ${handPostInstruction({ type: result.type, state: 'loaded', earlierPostingDetails: result.earlierPostingDetails, retiredUnproven: result.retiredUnproven }).step}.`,
+        + ` Instruction shown: ${handPostInstruction({ type: result.type }).step}.`,
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,

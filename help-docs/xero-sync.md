@@ -2365,7 +2365,7 @@ Three things about those rows:
 | --- | --- |
 | `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
 
-**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it), then *Mark as handled*.
+**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled*.
 
 | Refused posting | Why |
 | --- | --- |
@@ -2381,7 +2381,7 @@ Three things about those rows:
 | `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 | `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 
-**Nothing in IMS posts it again** — press *Take for hand posting* first, then check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it), then *Mark as handled* (which also stops IMS ever posting it).
+**Nothing in IMS posts it again** — press *Take for hand posting* first, then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled* (which also stops IMS ever posting it).
 
 | Refused posting | Why |
 | --- | --- |
@@ -2405,13 +2405,12 @@ Three things about those rows:
   What to do in the ledger depends on what IMS knows, and every surface says the same thing (the row, the *Take for hand posting*, *Mark as handled* and *Release* dialogs, and the log entry are all produced by one function):
 
 <!-- hand-post-instruction:begin -->
-| State of the posting | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
+| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
 |---|---|---|
-| Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
-| An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
-| The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
-| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
+| An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| Any other posting (no earlier document can exist) | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
+| The posting type is not known where the text is shown | Identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->
 
   **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own
@@ -2695,13 +2694,12 @@ Each staged row also records the exact journal reference it went into, alongside
 This matters because the batch date is fixed when the run starts, while the marker dates are written as each row is processed. A long or late-evening run that crosses UTC midnight therefore stamps rows with the *next* day while the journal is keyed on the previous one. Reading the batch back from the marker date alone finds nothing in that case — which previously let an order be deleted while its value sat in a posted journal.
 
 Rows staged before this was introduced have no reference recorded, and are still matched on their marker date. Nothing needs to be backfilled; both paths are supported indefinitely.<!-- hand-post-instruction:begin -->
-| State of the posting | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
+| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
 |---|---|---|
-| Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
-| An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
-| The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
-| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
+| An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| Any other posting (no earlier document can exist) | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
+| The posting type is not known where the text is shown | Identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->Books Online was removed in 2026-09.** Xero is the only accounting connector One Two
 > Inventory ships. This page still mentions QuickBooks in places — every one of those mentions is
 > **historical**, and is kept for one reason: most of them explain why a rule on the Xero side is
@@ -5067,7 +5065,7 @@ Three things about those rows:
 | --- | --- |
 | `tax_rate_sync` (TAX_RATE_SYNC / TaxRate) | Saving the tax rate again pushes it to whichever connector is active then; it leaves this list when the push is queued. |
 
-**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it), then *Mark as handled*.
+**IMS retries it, but the retry can get stuck** — press *Take for hand posting* first (that cancels IMS's own queued attempt and stops it queueing another), then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled*.
 
 | Refused posting | Why |
 | --- | --- |
@@ -5083,7 +5081,7 @@ Three things about those rows:
 | `refund_cogs_reversal` (COGS_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 | `refund_unearned_reversal` (UNEARNED_REV_REVERSAL / SalesOrderRefund) | Retry refund accounting queues it again, but always for the connector the refund was staged for — after a connector switch it is refused every time. |
 
-**Nothing in IMS posts it again** — press *Take for hand posting* first, then check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it), then *Mark as handled* (which also stops IMS ever posting it).
+**Nothing in IMS posts it again** — press *Take for hand posting* first, then identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type, then *Mark as handled* (which also stops IMS ever posting it).
 
 | Refused posting | Why |
 | --- | --- |
@@ -5107,13 +5105,12 @@ Three things about those rows:
   What to do in the ledger depends on what IMS knows, and every surface says the same thing (the row, the *Take for hand posting*, *Mark as handled* and *Release* dialogs, and the log entry are all produced by one function):
 
 <!-- hand-post-instruction:begin -->
-| State of the posting | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
+| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |
 |---|---|---|
-| Nothing earlier, nothing in doubt | Post it in the ledger now. | Only once it is posted. |
-| An earlier attempt was retired without proof it never posted | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
-| An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired | Check the ledger for the CURRENT version (the one this refused posting would have made, not the earlier version): if the current version is there, do not post again; if only the earlier version is there, apply the update to it (it updates that earlier document; do not raise a second one); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
-| The same, for a bill payment | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not the earlier payment): if the current payment is there, do not post again; if only the earlier payment is there, register this payment as a new one (the earlier payment does not discharge it); if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
-| IMS could not load what the ledger-side rows say | Check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post again; if only an earlier version is there, update it). | Only once the CURRENT version of the posting is in the ledger. |
+| An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
+| A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| Any other posting (no earlier document can exist) | Check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
+| The posting type is not known where the text is shown | Identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->
 
   **1. Take for hand posting.** Press this *before* you go to the ledger. In one step IMS cancels its own

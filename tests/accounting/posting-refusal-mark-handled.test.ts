@@ -388,7 +388,7 @@ test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, an
         reported += 1
         assert.equal(retired.length, 1, c.name)
         assert.match(retired[0]!, c.reports, c.name)
-        assert.match(String((note as unknown as { description?: string }).description), /look in the ledger for it and post it by hand ONLY if it is not there/, c.name)
+        assert.match(String((note as unknown as { description?: string }).description), /Earlier attempt\(s\) at this posting were retired without proof[\s\S]*Instruction shown: check the ledger for that document first; post it ONLY if it is absent/, c.name)
       } else {
         assert.deepEqual(retired, [], `${c.name}: nothing unproven to report`)
       }
@@ -1097,8 +1097,8 @@ test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unprove
   assert.equal(ok(result), true)
   const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
   assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed standing')
-  assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not the earlier version\): if the current version is there, do not post again; if only the earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
-  assert.match(note.description, /look in the ledger for the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\) and post it by hand ONLY if it is not there/, 'the retired attempt is checked against the CURRENT version, not the earlier one')
+  assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\): if the current version is there, do not post again; if only an earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
+  assert.match(note.description, /IMS cannot rule out that the CURRENT version is already in the ledger \(an earlier version being there does not show it\)/, 'the retired attempt is described against the CURRENT version, not the earlier one (facts only)')
 })
 
 test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the standing: the second log entry carries it for every earlier standing x retired', async () => {
@@ -1128,10 +1128,27 @@ test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the stand
         assert.match(note.description, (earlierRow as { settlementBasis?: string }).settlementBasis ? /INV-TYPED \(an id an operator typed in\) as posted/ : /The ledger holds INV-REAL/, `${where}: carries the earlier row's standing`)
       } else if (retired) {
         assert.doesNotMatch(note.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over a retired attempt`)
-        assert.match(note.description, /Instruction shown: check the ledger for that document first; post it ONLY if it is absent/, `${where}: carries the retired-attempt check`)
+        assert.match(note.description, /IMS cannot rule out that the CURRENT version is already in the ledger/, `${where}: carries the retired-attempt fact`)
       } else {
-        assert.match(note.description, /Instruction shown: post it in the ledger now/, `${where}: with nothing earlier and nothing retired the plain wording is the right one`)
+        assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\)/, `${where}: an UPDATE posting always gets the CURRENT-version instruction, whatever was loaded`)
       }
     }
+  }
+})
+
+test('[o3d-1e7sl Codex r10] the claim log for a BILL_PAYMENT is the PAYMENT instruction in every state: register THIS payment as NEW, never alter the earlier one', async () => {
+  for (const [name, rows] of [
+    ['nothing loaded', []],
+    ['confirmed earlier payment', [{ status: 'SYNCED', externalTransactionId: 'PAY-REAL', attemptRevision: 1 }]],
+    ['retired only', [{ status: 'CANCELLED', attemptRevision: 1 }]],
+  ] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal('r10-bp', 'realised_fx_bill_payment', { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'bill-r10', scope: '' }))
+    rows.forEach((r, i) => syncRows.push(sync(`s-r10-${i}`, refusals[0]!, r as never)))
+    const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+    assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction('r10-bp')), true, name)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
+    assert.match(note.description, /Instruction shown: check the ledger for the CURRENT payment \(the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one\): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment/, `${name}: the payment step`)
+    assert.doesNotMatch(note.description, /apply the update|update it/i, `${name}: never the update wording on a payment`)
   }
 })

@@ -487,12 +487,12 @@ test('[o3d-1e7sl G6/G7] the inbox classifies the rows under a refused posting by
       reported += 1
       assert.equal(row.retiredUnproven.length, 1, c.name)
       assert.match(row.retiredUnproven[0]!, c.reports, c.name)
-      assert.match(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, `${c.name}: the order tells the operator to look first`)
+      assert.match(String(row.handPostOrder), /check the ledger for that document first; post it ONLY if it is absent/i, `${c.name}: the order tells the operator to look first`)
       // And still offers the act that closes it: a retired row must not turn the remedy into a dead end.
       assert.match(String(row.handPostOrder), /Take for hand posting" FIRST/, c.name)
     } else {
       assert.deepEqual(row.retiredUnproven, [], `${c.name}: nothing unproven to report`)
-      assert.doesNotMatch(String(row.handPostOrder), /look in the ledger for it and post it by hand ONLY if it is not there/, c.name)
+      assert.doesNotMatch(String(row.handPostOrder), /Earlier attempt\(s\) at this posting were retired without proof/, c.name)
     }
   }
   console.log(`# G7 cases: ${cases.length}; reported-unproven ${reported}`)
@@ -690,7 +690,7 @@ test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED state (retired unprove
   const order = row.handPostOrder ?? ''
   assert.match(order, /check the ledger for the CURRENT version/)
   assert.match(order, /if the current version is there, do not post again/)
-  assert.match(order, /if only the earlier version is there, apply the update to it/)
+  assert.match(order, /if only an earlier version is there, apply the update to it/)
   assert.doesNotMatch(order, /If it exists, do not post again/, 'the earlier invoice being there does not satisfy the retired attempt\'s check')
 })
 
@@ -710,7 +710,7 @@ test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED BILL_PAYMENT state say
   assert.ok(row, 'PRECONDITION: the bill payment refusal is listed')
   assert.equal(row.earlierPostings.length, 1, 'PRECONDITION: the earlier payment is carried')
   assert.match(row.handPostOrder ?? '', /check the ledger for the CURRENT payment/)
-  assert.match(row.handPostOrder ?? '', /if only the earlier payment is there, register this payment as a new one/)
+  assert.match(row.handPostOrder ?? '', /if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment/)
 })
 
 test('[o3d-j625 r16 HIGH 2 CONTROL] on a key that names ONE posting for ever, a completed row STILL blocks', async (t) => {

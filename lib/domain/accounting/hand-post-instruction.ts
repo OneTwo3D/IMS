@@ -35,16 +35,20 @@ export type HandPostInput = { type?: string } & (
   | { state: 'not-loaded' }
 )
 
-export type HandPostMode = 'plain' | 'retired' | 'earlier' | 'unknown'
-export type HandPostFlow = 'update' | 'payment' | 'other'
+export type HandPostFlow = 'update' | 'payment' | 'conditional' | 'untyped'
 export type HandPostBranch = { when: string; then: string }
 
 export type HandPostInstruction = {
-  mode: HandPostMode
+  /**
+   * THE POSTING TYPE, AND NOTHING ELSE, decides this (Codex round 10). 'update' = an edit of one document (SALES_INVOICE_UPDATE,
+   * PURCHASE_INVOICE_UPDATE); 'payment' = BILL_PAYMENT; 'conditional' = a type whose key is not reused, so no earlier document can
+   * exist; 'untyped' = the type is not known here. What was loaded (earlier documents, retired attempts, nothing) never changes
+   * which action or which Mark-as-handled condition applies: it can only ADD factual sentences.
+   */
   flow: HandPostFlow
   /** The instruction sentence, lower-case, no trailing full stop: the ONE text every surface carries. */
   step: string
-  /** The same instruction as a table: what to do when each ledger state is found. Empty for 'plain'. */
+  /** The same instruction as a table: what to do when each ledger state is found. */
   branches: HandPostBranch[]
   /** What must be true before "Mark as handled" is pressed, as a clause that follows "only once". */
   markHandledCondition: string
@@ -54,80 +58,85 @@ export type HandPostInstruction = {
   alreadyDone: string
 }
 
-const flowOf = (type: string | undefined): HandPostFlow =>
-  type === 'BILL_PAYMENT' ? 'payment' : type === 'SALES_INVOICE_UPDATE' || type === 'PURCHASE_INVOICE_UPDATE' ? 'update' : 'other'
+/**
+ * The reused-key types (drift-guarded against `REUSED_POSTING_KEY_TYPES` in a test; this module stays import-free because the dialogs
+ * are client components). For every one of them the refused posting is the NEXT version of something that may already be in the
+ * ledger, whatever IMS loaded.
+ */
+export const UPDATE_POSTING_TYPES: ReadonlySet<string> = new Set(['SALES_INVOICE_UPDATE', 'PURCHASE_INVOICE_UPDATE'])
+export const PAYMENT_POSTING_TYPES: ReadonlySet<string> = new Set(['BILL_PAYMENT'])
 
-export function handPostInstruction(input: HandPostInput): HandPostInstruction {
-  const flow = flowOf(input.type)
-  // Not loaded (or anything that is not positively 'loaded'): the conservative wording, never the plain one.
-  if (input.state !== 'loaded' || !Array.isArray(input.earlierPostingDetails) || !Array.isArray(input.retiredUnproven)) {
-    return {
-      mode: 'unknown',
-      flow,
-      step: GENERIC_HAND_POST_STEP,
-      branches: [
-        { when: 'the current version is there', then: 'do not post again' },
-        { when: 'only an earlier version is there', then: 'update it' },
-        { when: 'nothing is there', then: 'post it' },
-      ],
-      markHandledCondition: 'the CURRENT version of the posting is in the ledger',
-      markHandledConfirms: 'the CURRENT version of the posting is in the ledger - already there, or you posted or updated it by hand',
-      alreadyDone: 'the CURRENT version of the posting is already in the ledger',
-    }
-  }
-  const earlierExists = input.earlierPostingDetails.length > 0
-  const hasRetired = input.retiredUnproven.length > 0
-  // An earlier document of ANY standing (a confirmed one included) means the refused posting is the NEXT version: finding the earlier
-  // version never satisfies it. (Retired attempts add doubt about the current version; they do not change the rule.)
-  if (earlierExists) {
-    const payment = flow === 'payment'
-    const what = payment ? 'payment' : 'version'
-    const branches: HandPostBranch[] = payment
-      ? [
-        { when: 'the current payment is there', then: 'do not post again' },
-        { when: 'only the earlier payment is there', then: 'register this payment as a new one (the earlier payment does not discharge it)' },
-        { when: 'nothing is there', then: 'post it as a new payment' },
-      ]
-      : [
-        { when: 'the current version is there', then: 'do not post again' },
-        { when: 'only the earlier version is there', then: 'apply the update to it (it updates that earlier document; do not raise a second one)' },
-        { when: 'nothing is there', then: 'post it as a new document' },
-      ]
-    return {
-      mode: 'earlier',
-      flow,
-      step: `check the ledger for the CURRENT ${what} (the one this refused posting would have ${payment ? 'registered, not the earlier payment' : 'made, not the earlier version'}): `
-        + branches.map((b) => `if ${b.when}, ${b.then}`).join('; '),
-      branches,
-      markHandledCondition: `the CURRENT ${what} is in the ledger`,
-      markHandledConfirms: `the CURRENT ${what} is in the ledger - already there, or you posted or updated it by hand`,
-      alreadyDone: `the CURRENT ${what} is already in the ledger`,
-    }
-  }
-  if (hasRetired) {
+export function handPostFlowOf(type: string | undefined): HandPostFlow {
+  if (typeof type !== 'string' || type.trim() === '') return 'untyped'
+  if (UPDATE_POSTING_TYPES.has(type)) return 'update'
+  if (PAYMENT_POSTING_TYPES.has(type)) return 'payment'
+  return 'conditional'
+}
+
+/** What to do, per posting type. A function of the type ONLY. */
+export function handPostInstruction(input: { type?: string }): HandPostInstruction {
+  const flow = handPostFlowOf(input?.type)
+  if (flow === 'update') {
     const branches: HandPostBranch[] = [
-      { when: 'it exists', then: 'do not post again' },
-      { when: 'it is absent', then: 'post it' },
+      { when: 'the current version is there', then: 'do not post again' },
+      { when: 'only an earlier version is there', then: 'apply the update to it (do not raise a second document)' },
+      { when: 'nothing is there', then: 'post it as a new document' },
     ]
     return {
-      mode: 'retired',
+      flow,
+      step: 'check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): '
+        + branches.map((b) => `if ${b.when}, ${b.then}`).join('; '),
+      branches,
+      markHandledCondition: 'the CURRENT version is in the ledger',
+      markHandledConfirms: 'the CURRENT version is in the ledger - already there, or you posted or updated it by hand',
+      alreadyDone: 'the CURRENT version is already in the ledger',
+    }
+  }
+  if (flow === 'payment') {
+    const branches: HandPostBranch[] = [
+      { when: 'the current payment is there', then: 'do not post again' },
+      { when: 'only an earlier payment is there', then: 'register THIS payment as a NEW payment and do NOT alter the earlier payment' },
+      { when: 'nothing is there', then: 'post it as a new payment' },
+    ]
+    return {
+      flow,
+      step: 'check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): '
+        + branches.map((b) => `if ${b.when}, ${b.then}`).join('; '),
+      branches,
+      markHandledCondition: 'the CURRENT payment is in the ledger',
+      markHandledConfirms: 'the CURRENT payment is in the ledger - already there, or you registered it as a new payment by hand',
+      alreadyDone: 'the CURRENT payment is already in the ledger',
+    }
+  }
+  if (flow === 'conditional') {
+    return {
       flow,
       step: 'check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again',
-      branches,
+      branches: [
+        { when: 'it exists', then: 'do not post again' },
+        { when: 'it is absent', then: 'post it' },
+      ],
       markHandledCondition: 'the document is in the ledger (already there, or posted by you)',
       markHandledConfirms: 'the document is in the ledger - it was already there, or you posted it by hand',
       alreadyDone: 'the document is already in the ledger',
     }
   }
   return {
-    mode: 'plain',
     flow,
-    step: 'post it in the ledger now',
-    branches: [],
-    markHandledCondition: 'it is posted',
-    markHandledConfirms: 'you have posted it by hand in the ledger',
-    alreadyDone: 'you have already posted it by hand',
+    step: GENERIC_HAND_POST_STEP,
+    branches: [
+      { when: 'the current version of the posting is there', then: 'do not post again' },
+      { when: 'the posting type has not been identified', then: 'identify it first' },
+    ],
+    markHandledCondition: 'the CURRENT version of the posting is in the ledger',
+    markHandledConfirms: 'the CURRENT version of the posting is in the ledger - already there, or you posted it by hand once you had identified the posting type',
+    alreadyDone: 'the CURRENT version of the posting is already in the ledger',
   }
+}
+
+/** The step for a posting whose type the caller knows (a refusing site's remedy, the not-claimed refusal). Typeless callers get the generic one. */
+export function handPostStepFor(type: string | undefined): string {
+  return handPostInstruction({ type }).step
 }
 
 /**
@@ -142,10 +151,13 @@ export function handPostInputOf(row: { type: string; handPostState?: 'loaded' | 
 /** For a surface that has no row state (the claims list's Release button): the conservative reading. */
 export const NOT_LOADED_HAND_POST_INPUT: HandPostInput = { state: 'not-loaded' }
 
-/** The step used where NO row state is known (a refusing site's remedy, the not-claimed refusal, the help text). */
+/**
+ * The step where even the posting TYPE is not known. It names no per-type branch ("update it" / "register as new"), because the right
+ * one depends on the type: the operator must identify the type first (the exception inbox names it on the row).
+ */
 export const GENERIC_HAND_POST_STEP =
-  'check the ledger for the CURRENT version of the posting first, post it by hand ONLY if it is absent (if it exists, do not post '
-  + 'again; if only an earlier version is there, update it)'
+  'identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the '
+  + 'posting: if it is there, do not post again; otherwise follow the step for that posting type'
 
 const capitalise = (text: string) => text.charAt(0).toUpperCase() + text.slice(1)
 
@@ -171,15 +183,12 @@ export function describeEarlierPostings(earlier: readonly EarlierPosting[]): str
       : '')
 }
 
-export function describeRetiredUnproven(notes: readonly string[], options: { earlierDocumentExists?: boolean } = {}): string {
+export function describeRetiredUnproven(notes: readonly string[]): string {
   if (notes.length === 0) return ''
-  const target = options.earlierDocumentExists
-    ? 'the CURRENT version (the update this refused posting would have made - an earlier version being there is not enough)'
-    : 'it'
+  // FACTUAL ONLY (Codex round 10): what IMS cannot rule out. Which action applies is the single step, by posting type.
   return ' Earlier attempt(s) at this posting were retired without proof that they never reached the ledger: '
     + `${notes.join('; ')}. `
-    + `IMS cannot rule out that the document is already there, so look in the ledger for ${target} and post it by hand ONLY if `
-    + 'it is not there: a second document is not undone by marking this handled.'
+    + 'IMS cannot rule out that the CURRENT version is already in the ledger (an earlier version being there does not show it): a second one is not undone by marking this handled.'
 }
 
 /** The inbox row's "what to do first" text. */
@@ -191,7 +200,10 @@ export function handPostOrderFor(state: HandPostInput & {
   const earlierDetails = state.state === 'loaded' && Array.isArray(state.earlierPostingDetails) ? state.earlierPostingDetails : []
   const retiredNotes = state.state === 'loaded' && Array.isArray(state.retiredUnproven) ? state.retiredUnproven : []
   const earlier = describeEarlierPostings(earlierDetails)
-  const retired = describeRetiredUnproven(retiredNotes, { earlierDocumentExists: earlierDetails.length > 0 })
+  const retired = describeRetiredUnproven(retiredNotes)
+    + (state.state === 'loaded' && Array.isArray(state.earlierPostingDetails) && Array.isArray(state.retiredUnproven)
+      ? ''
+      : ' IMS did not load what the other sync rows for this posting say (earlier versions, retired attempts).')
   if (state.claim?.mine) {
     return 'YOU are settling this by hand. IMS will not queue this posting while you hold it, so take your '
       + `time: ${capitalise(instruction.step)}. ${markHandledSentence(instruction)} If `
@@ -259,18 +271,15 @@ export const HAND_POST_INSTRUCTION_DOC_END = '<!-- hand-post-instruction:end -->
 
 /** The help-docs block: GENERATED from the same structure the row text, the dialogs and the claim log use. */
 export function renderHandPostInstructionDoc(): string {
-  const earlierConfirmed: EarlierPosting[] = [{ ref: 'X', standing: 'CONFIRMED_POSTED' }]
-  const loaded = (type: string, earlierPostingDetails: EarlierPosting[], retiredUnproven: string[]): HandPostInput => ({ type, state: 'loaded', earlierPostingDetails, retiredUnproven })
-  const rows: Array<[string, HandPostInput]> = [
-    ['Nothing earlier, nothing in doubt', loaded('SALES_INVOICE', [], [])],
-    ['An earlier attempt was retired without proof it never posted', loaded('SALES_INVOICE', [], ['a retired attempt'])],
-    ['An earlier version of the document is in the ledger (invoice or bill update), whatever its standing and whether or not an attempt was retired', loaded('SALES_INVOICE_UPDATE', earlierConfirmed, [])],
-    ['The same, for a bill payment', loaded('BILL_PAYMENT', earlierConfirmed, [])],
-    ['IMS could not load what the ledger-side rows say', { type: 'SALES_INVOICE_UPDATE', state: 'not-loaded' }],
+  const rows: Array<[string, { type?: string }]> = [
+    ['An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing', { type: 'SALES_INVOICE_UPDATE' }],
+    ['A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded', { type: 'BILL_PAYMENT' }],
+    ['Any other posting (no earlier document can exist)', { type: 'SALES_INVOICE' }],
+    ['The posting type is not known where the text is shown', {}],
   ]
   return [
     HAND_POST_INSTRUCTION_DOC_BEGIN,
-    '| State of the posting | What the page, the dialogs and the log tell you | When to press *Mark as handled* |',
+    '| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |',
     '|---|---|---|',
     ...rows.map(([name, input]) => {
       const i = handPostInstruction(input)
