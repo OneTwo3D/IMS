@@ -184,7 +184,7 @@ export function describeUnearnedReversalReport(
   if (report.assertedCounted.length === 0 && report.mayHavePostedNotCounted.length === 0) return null
   const parts: string[] = []
   if (report.assertedCounted.length > 0) {
-    parts.push(`sync log(s) ${report.assertedCounted.join(', ')} were settled as posted by an OPERATOR and are COUNTED as unearned revenue already reversed on their queued figure, which nobody read in the ledger`)
+    parts.push(`sync log(s) ${report.assertedCounted.join(', ')} were settled as posted by an OPERATOR and are COUNTED as unearned revenue already reversed on their queued figure, which was not verified against the ledger`)
   }
   if (report.mayHavePostedNotCounted.length > 0) {
     parts.push(`sync log(s) ${report.mayHavePostedNotCounted.join(', ')} are cancelled but may have reached the ledger and are NOT counted, so the true-up may recognise revenue a reversal already took out`)

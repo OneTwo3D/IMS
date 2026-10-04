@@ -608,7 +608,7 @@ export async function proveAllocationDebitPosting<C extends string = string>(
         reason: proof.kind === 'illegible'
           ? `the A2 journal this order was staged into has settled but its lines are no longer readable (evidence compaction), so whether it debited Allocated Inventory (${target.allocatedInventoryAccount}) at all — let alone the £${share.toFixed(2)} recorded against this order — cannot be established`
           : proof.asserted
-            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but nobody read its lines in the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
+            ? `the A2 journal this order was staged into was settled as posted by an OPERATOR typing in a document id (${proof.statuses}), so it is claimed to exist but its lines were not verified against the ledger: the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount}) and nothing is credited against it — confirm the journal in the accounting system`
             : `the A2 journal this order was staged into cannot be read as evidence (${proof.statuses}), so the £${share.toFixed(2)} recorded against this order is not proved to have reached Allocated Inventory (${target.allocatedInventoryAccount})`,
       }
     }
