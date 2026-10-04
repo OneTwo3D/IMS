@@ -133,6 +133,7 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
 
   out.push('## Import files', '')
   out.push(`Rows each importer file set would contain: ${Object.entries(report.plannedOutputRows).map(([k, v]) => `${k} ${v}`).join(', ')}.`, '')
+  out.push(`Warehouse codes the files use (each must already exist in IMS; the tool cannot check): ${report.warehouseCodesUsed.join(', ') || '(none)'}.`, '')
   out.push(report.outputs.length === 0 ? 'No import file was produced by this run.' : 'Load them in the order of the numeric prefix; wait for each file\'s dry-run preview to be clean before the real import.', '')
   if (report.outputs.length > 0) out.push(...table(['File', 'Importer', 'Rows', 'Bytes', 'SHA-256'], report.outputs.map((f) => [f.name, f.target, f.rows, f.bytes, f.sha256])), '')
   return `${out.join('\n')}\n`

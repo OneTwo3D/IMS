@@ -159,6 +159,8 @@ export interface PrepareReport {
   recipes: { cycles: string[][] }
   purchaseOrders: { orders: number; ordersNothingOutstanding: number; linesEmitted: number }
   transfers: { transfers: number; linesEmitted: number }
+  /** Every warehouse code the import files use. The importers refuse a code that does not exist in IMS; the tool cannot check that. */
+  warehouseCodesUsed: string[]
   selfCheckFailures: string[]
 }
 
@@ -292,6 +294,9 @@ class Run {
   stockStated = new Set<string>()
   zeroStated = new Set<string>()
   stockRejected = new Set<string>()
+  skuTrimmed = new Map<string, number>()
+  skuRespelled = new Map<string, number>()
+  warehouses = new Set<string>()
   transferLines: TransferLine[] = []
   transferOutputs: Array<{ key: string; rows: string[][] }> = []
   poOutputs: Array<{ key: string; rows: string[][] }> = []
@@ -347,6 +352,21 @@ function skuProblem(res: Resolved, what: string): { code: string; reason: string
   if (res.kind === 'rejected') return { code: 'PRODUCT_ROW_REJECTED', reason: `${what}'s catalogue row was rejected, so the SKU will not exist in IMS` }
   if (res.kind === 'absent') return { code: 'SKU_NOT_IN_CATALOGUE', reason: `${what} is not in the products dataset or the IMS SKU list` }
   return null
+}
+
+/** Counts SKU cells that were trimmed, and cells matched to the catalogue under a different letter case, per dataset. */
+function trackSku(run: Run, dataset: DatasetName, parsed: { sku: string; trimmed: boolean }, canonical: string): void {
+  if (parsed.trimmed) run.skuTrimmed.set(dataset, (run.skuTrimmed.get(dataset) ?? 0) + 1)
+  if (parsed.sku !== canonical) run.skuRespelled.set(dataset, (run.skuRespelled.get(dataset) ?? 0) + 1)
+}
+
+function reportNormalisation(run: Run): void {
+  const datasets = [...new Set([...run.skuTrimmed.keys(), ...run.skuRespelled.keys()])].sort(cmp) as DatasetName[]
+  for (const dataset of datasets) {
+    const trimmed = run.skuTrimmed.get(dataset) ?? 0
+    const respelled = run.skuRespelled.get(dataset) ?? 0
+    run.find('INFO', 'SKU_NORMALISED', `${dataset}: ${trimmed} SKU cell(s) had outer whitespace trimmed and ${respelled} were matched to the catalogue under a different letter case (the catalogue spelling is what is written)`, dataset)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +599,8 @@ function loadRecipes(run: Run): void {
     if (componentRes.kind === 'excluded') { reject('COMPONENT_EXCLUDED_BY_LIST', `component ${component.sku} is on the exclusion list (${componentRes.reason}) but its parent ${parent.sku} is loaded: the recipe would be incomplete`); continue }
     const componentProblem = skuProblem(componentRes, `component ${component.sku}`)
     if (componentProblem) { reject(componentProblem.code, componentProblem.reason); continue }
+    if (parentRes.kind === 'ok') trackSku(run, 'recipe-lines', parent, parentRes.sku)
+    if (componentRes.kind === 'ok') trackSku(run, 'recipe-lines', component, componentRes.sku)
     candidates.push({ row, parent: parent.sku, parentKey: parent.key, component: component.sku, componentKey: component.key, qty: qty.value, sortOrder })
   }
 
@@ -716,6 +738,7 @@ function loadStock(run: Run): void {
     const problem = skuProblem(res, `SKU ${sku.sku}`)
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
+    trackSku(run, 'stock-lots', sku, res.sku)
     if (res.type === null) { reject('TYPE_UNKNOWN', `SKU ${sku.sku} exists only in IMS and its type is not known; give the type in the ims-skus file`); continue }
     if (!STOCK_BEARING_TYPES.has(res.type)) {
       run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'EXCLUDED_TYPE', `${res.type} products cannot receive opening stock (only SIMPLE, VARIANT and BOM hold stock and cost layers)`)
@@ -756,6 +779,7 @@ function loadStock(run: Run): void {
     for (const lot of list) run.add('stock-lots', lot.row.line, lot.sku, 'EMITTED', 'LOT_COLLAPSED', `collapsed into one weighted-average opening row for ${lot.sku} in ${lot.warehouse}`)
     const noRef = list.filter((l) => l.lotRef === '').map((l) => `${fmt(l.qty)}|${l.unitCostBase.toFixed()}|${l.date}`)
     if (noRef.length !== new Set(noRef).size) identical.push(list[0].sku)
+    run.warehouses.add(list[0].warehouse)
     run.stockGroups.set(gk, {
       sku: list[0].sku,
       key: list[0].key,
@@ -837,6 +861,7 @@ function loadTransfers(run: Run): void {
     const problem = skuProblem(res, `SKU ${sku.sku}`)
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
+    trackSku(run, 'transfers', sku, res.sku)
     if (res.type === null || !STOCK_BEARING_TYPES.has(res.type)) { reject('TYPE_CANNOT_BE_TRANSFERRED', `SKU ${sku.sku} is ${res.type ?? 'of unknown type'}; only SIMPLE, VARIANT and BOM hold stock to transfer`); continue }
     if (v.dispatchDate !== '' && config.asOf) {
       const days = Math.floor(((parseIsoDate(config.asOf) ?? 0) - (parseIsoDate(v.dispatchDate) ?? 0)) / 86_400_000)
@@ -885,6 +910,8 @@ function loadTransfers(run: Run): void {
       continue
     }
     run.add('transfers', l.line, `${l.transferKey}/${l.sku}`, 'EMITTED', 'IN_TRANSIT', 'the outstanding quantity is in the transfers import file')
+    run.warehouses.add(l.from)
+    run.warehouses.add(l.to)
     transferGroups.set(l.transferKey, [...(transferGroups.get(l.transferKey) ?? []), l])
   }
   for (const [gk, need] of needBySource) {
@@ -994,6 +1021,7 @@ function loadPurchaseOrders(run: Run): void {
     const problem = skuProblem(res, `SKU ${sku.sku}`)
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
+    trackSku(run, 'purchase-order-lines', sku, res.sku)
     if (res.type === 'KIT' || res.type === 'VARIABLE') { reject('TYPE_CANNOT_BE_PURCHASED', `SKU ${sku.sku} is ${res.type}; it can never be received into stock`); continue }
 
     let supplierName = v.supplierName.normalize('NFC').trim()
@@ -1026,6 +1054,7 @@ function loadPurchaseOrders(run: Run): void {
       continue
     }
     for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'EMITTED', 'PO_LINE', 'outstanding quantity is in the purchase-orders import file')
+    for (const l of list) if (l.warehouse) run.warehouses.add(l.warehouse)
     const ordered = [...list].sort((a, b) => cmp(a.key, b.key) || cmp(fmt(a.qty), fmt(b.qty)) || cmp(a.unitCost.toFixed(), b.unitCost.toFixed()))
     run.poOutputs.push({
       key: orderKey,
@@ -1049,6 +1078,7 @@ function loadPurchaseOrders(run: Run): void {
 function loadCoverageDatasets(run: Run): void {
   const rowsOf = (name: DatasetName, target: Map<string, string>, withQty: boolean) => {
     let withoutSku = 0
+    const variants = new Map<string, Set<string>>()
     for (const row of run.rows(name)) {
       const v = row.values
       if (v.sku === '') {
@@ -1064,8 +1094,11 @@ function loadCoverageDatasets(run: Run): void {
         run.mintsoftQty.set(sku.key, (run.mintsoftQty.get(sku.key) ?? new D(0)).add(qty.value))
       }
       if (!target.has(sku.key)) target.set(sku.key, sku.sku)
+      variants.set(sku.key, (variants.get(sku.key) ?? new Set<string>()).add(sku.sku))
       run.add(name, row.line, sku.sku, 'EMITTED', 'COVERAGE_ROW', 'used by the coverage check')
     }
+    const clashing = [...variants.values()].filter((set) => set.size > 1).map((set) => [...set].sort(cmp).join(' / '))
+    if (clashing.length > 0) run.find('WARNING', 'SKU_CASE_VARIANTS_IN_SOURCE', `${name} spells ${clashing.length} SKU(s) in more than one letter case; they are treated as one SKU for coverage`, name, clashing)
     if (withoutSku > 0) run.find('WARNING', 'COVERAGE_ROW_WITHOUT_SKU', `${name} has ${withoutSku} row(s) without a SKU; they cannot take part in the coverage check`, name)
   }
   rowsOf('mintsoft-products', run.mintsoftSkus, false)
@@ -1289,8 +1322,10 @@ function verifyUniqueness(files: OutputFile[], run: Run): void {
     return keys
   }
   const report = (label: string, keys: string[]) => {
-    const dup = keys.filter((k, i) => keys.indexOf(k) !== i)
-    if (dup.length > 0) run.selfCheck.push(`${label}: duplicate keys in the output: ${[...new Set(dup)].join(', ')}`)
+    const seen = new Set<string>()
+    const dup = new Set<string>()
+    for (const key of keys) (seen.has(key) ? dup : seen).add(key)
+    if (dup.size > 0) run.selfCheck.push(`${label}: duplicate keys in the output: ${[...dup].sort(cmp).join(', ')}`)
   }
   report('products (sku)', keysOf('products', ['sku']))
   report('opening-stock (sku, warehouse)', keysOf('opening-stock', ['sku', 'warehouseCode']))
@@ -1344,6 +1379,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   loadStock(run)
   loadTransfers(run)
   loadPurchaseOrders(run)
+  reportNormalisation(run)
   loadCoverageDatasets(run)
   const coverage = checkCoverage(run)
   const split = splitZeroAndMissing(run)
@@ -1472,6 +1508,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     recipes: { cycles: run.recipeCycles },
     purchaseOrders: { orders: run.poOutputs.length, ordersNothingOutstanding: run.poOrdersNothingOutstanding, linesEmitted: emittedByTarget['purchase-orders'] },
     transfers: { transfers: run.transferOutputs.length, linesEmitted: emittedByTarget.transfers },
+    warehouseCodesUsed: [...run.warehouses].sort(cmp),
     selfCheckFailures: run.selfCheck,
   }
   return { outputs: finalOutputs, report, blocking: blocking || run.selfCheck.length > 0 }

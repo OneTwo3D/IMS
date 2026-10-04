@@ -170,8 +170,12 @@ export interface IngestedDataset {
   recordsRead: number
 }
 
+/**
+ * Trim, NFC-normalise, and turn CR and CRLF inside a value into LF: the importers' reader does the same to a quoted newline,
+ * so what is written is exactly what they will read.
+ */
 function clean(value: string): string {
-  return value.normalize('NFC').trim()
+  return value.normalize('NFC').replace(/\r\n?/g, '\n').trim()
 }
 
 function hint(wanted: string, headers: string[]): string {

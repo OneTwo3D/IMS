@@ -313,7 +313,7 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
 - **Zero versus missing.** A SKU whose stock rows all say zero is **zero on hand** (excluded: no opening layer is created). A stock-bearing SKU (SIMPLE, VARIANT, BOM) with no stock row at all is **missing from the extract**, listed
   separately. If Mintsoft stock is supplied and the missing SKU holds stock there, that is an error; if Mintsoft stock is not supplied the answer is reported as unknown.
 - **Open purchase orders.** Outstanding quantity per line is ordered minus received, never negative. Fully received lines, closed orders and over-received lines are excluded; an over-received line is also a warning. Lines of one order must agree on
-  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files.
+  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
 - **R14 four-way SKU coverage.** Every SKU in Qoblex, Mintsoft or WooCommerce must exist in IMS after the load (loaded now, or already in IMS) or be on the exclusion list; otherwise it is an error. The report prints a presence matrix (Q, M, W, I).
   A SKU only in IMS, or an exclusion that matches nothing, is a warning.
 - **Chunking.** At most 9,999 data rows and 9,999,999 bytes per file, which is stricter than the importers (they accept 10,000 rows and 10 MiB and **silently drop** every row beyond the row cap). The 10,001st row lands in the second file.
@@ -382,7 +382,7 @@ orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,uni
 ## The report
 
 `validation-report.json` (machine) and `validation-report.md` (people) hold: the inputs with their SHA-256, the checks that ran and the ones that did not, the accounting identity per dataset and per reason code, every finding, every rejected and excluded record
-with its line, the opening-stock collapse (lot total, collapsed total, residual), the zero and missing lists, the R14 presence matrix, the recipe cycles, and the output files with their SHA-256. Findings are ERROR (blocks), WARNING or INFO.
+with its line, the opening-stock collapse (lot total, collapsed total, residual), the zero and missing lists, the R14 presence matrix, the recipe cycles, the warehouse codes the files use (to compare with IMS), SKU-normalisation counts, and the output files with their SHA-256. Findings are ERROR (blocks), WARNING or INFO.
 The report is deterministic: row-level entries are sorted by dataset, outcome, code and key, so the only content that differs between two input orderings is the line numbers (and the input file hashes).
 
 ## Known gaps

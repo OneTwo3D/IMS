@@ -5,7 +5,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ConfigError } from '../../lib/first-load/transform.ts'
-import { dispositionCodes, ds, findingCodes, lot, precondition, product, rowsOf, run } from './helpers.ts'
+import { parseCsv } from '../../lib/csv.ts'
+import { dispositionCodes, ds, findingCodes, loadFixtureDatasets, lot, precondition, product, rowsOf, run } from './helpers.ts'
 
 const rejectedCodes = (result: ReturnType<typeof run>, dataset: string) => dispositionCodes(result, dataset, 'REJECTED')
 
@@ -303,4 +304,23 @@ test('zero-cost opening stock is accepted but warned about', (t) => {
   precondition(t, 'groups', result.report.stock.groups.length)
   assert.equal(result.blocking, false)
   assert.ok(findingCodes(result, 'WARNING').includes('ZERO_COST_OPENING_STOCK'))
+})
+
+test('the report carries SKU-normalisation counts and the warehouse codes the files use (mixed fixture)', (t) => {
+  const result = run(loadFixtureDatasets())
+  const notes = result.report.findings.filter((f) => f.code === 'SKU_NORMALISED')
+  precondition(t, 'normalisation notes', notes.length)
+  const stock = notes.find((f) => f.dataset === 'stock-lots')
+  assert.ok(stock?.message.includes('0 SKU cell(s) had outer whitespace trimmed and 2 were matched to the catalogue under a different letter case'), stock?.message)
+  assert.deepEqual(result.report.warehouseCodesUsed, ['MAIN', 'OVER'])
+  assert.ok(result.report.findings.every((f) => f.severity !== 'INFO' || f.code === 'SKU_NORMALISED'))
+})
+
+test('a CR or CRLF inside a quoted value is written as LF, which is exactly what the importers will read', (t) => {
+  const result = run({ products: ds('products', [product('A', 'SIMPLE', { description: 'line one\r\nline two\rline three' })]) })
+  precondition(t, 'products', 1)
+  assert.equal(result.blocking, false)
+  assert.deepEqual(result.report.selfCheckFailures, [])
+  const parsed = parseCsv(result.outputs[0].content)
+  assert.equal(parsed[0].description, 'line one\nline two\nline three')
 })

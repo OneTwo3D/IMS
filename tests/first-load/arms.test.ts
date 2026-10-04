@@ -94,15 +94,15 @@ function oracle(lots: Array<[string, string]>): string {
     const [i, f = ''] = text.split('.')
     return BigInt(i + f.padEnd(dp, '0'))
   }
-  let total = 0n
-  let qty = 0n
+  let total = BigInt(0)
+  let qty = BigInt(0)
   for (const [q, c] of lots) {
     total += scaled(q, 6) * scaled(c, 10)
     qty += scaled(q, 6)
   }
   const num = total
-  const den = qty * 10_000n
-  const rounded = (2n * num + den) / (2n * den)
+  const den = qty * BigInt(10000)
+  const rounded = (BigInt(2) * num + den) / (BigInt(2) * den)
   const s = rounded.toString().padStart(7, '0')
   return `${s.slice(0, -6)}.${s.slice(-6)}`
 }
