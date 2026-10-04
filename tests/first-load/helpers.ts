@@ -23,6 +23,7 @@ export function config(overrides: Partial<PrepareConfig> = {}): PrepareConfig {
     inTransitConvention: 'counted-in-source',
     purchaseOrderKeyPrefix: 'T-',
     transferKeyPrefix: 'T-',
+    maxPurchaseTaxRate: '0.25',
     ...overrides,
   }
 }

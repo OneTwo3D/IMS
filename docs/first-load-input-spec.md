@@ -61,6 +61,7 @@ A JSON file. Relative paths are relative to the manifest. Unknown keys are refus
 
 - `baseCurrency` is required and never assumed. It must be the organisation's base currency in IMS; the tool cannot read IMS, so the apply step must check it.
 - `asOf` is optional (YYYY-MM-DD). It is only used to date-check transfers. The tool never reads a clock.
+- `maxPurchaseTaxRate` is required when a purchase-order-lines dataset is supplied: the highest purchase tax rate, as a fraction (`"0.25"`), that any IMS tax rate or supplier default could apply. The importer resolves tax rates by name inside IMS, which this tool cannot read, so every order's total is bounded with this rate and a line whose `taxRateValue` is above it is rejected. It is an assertion the apply step must check against IMS.
 - `inTransitConvention` is required when a `transfers` dataset is supplied (see "In-transit stock").
 - `purchaseOrderKeyPrefix` and `transferKeyPrefix` are required when the matching dataset is supplied. They are prefixed to every order or transfer key so a loaded
   reference cannot collide with a reference IMS generates later.
@@ -122,7 +123,7 @@ FIFO lots on hand per SKU and warehouse. A row with `qty` 0 states "zero on hand
 | `qty` | yes | Plain decimal, zero or more, at most 6 decimal places. Negative is refused. |
 | `unitCost` | no | Required for a lot with stock. In `currency`; at most 10 decimal places. |
 | `currency` | yes | 3-letter code. |
-| `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. |
+| `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. Foreign units per ONE base unit (as in the purchase-order importer, which divides by it): base cost = cost / rate. |
 | `receivedDate` | no | Informational. |
 | `lotRef` | no | Lot reference. The same reference twice for one SKU and warehouse is a duplicated row and is refused. |
 
@@ -159,7 +160,7 @@ Reduced to the outstanding quantity per line.
 | `supplierName` | yes | Must be in the suppliers dataset when that is supplied. |
 | `status` | no | OPEN (default if blank), CLOSED or CANCELLED. Anything not OPEN is excluded. |
 | `currency` | yes | 3-letter code. |
-| `fxRateToBase` | no | Required when `currency` is not the base currency. |
+| `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. |
 | `destinationWarehouseCode` | no | Passed through as given (trimmed). |
 | `sku` | yes | Passed through as given (trimmed). |
 | `qtyOrdered` | yes | At most 4 decimal places. |
@@ -313,7 +314,7 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
 - **Zero versus missing.** A SKU whose stock rows all say zero is **zero on hand** (excluded: no opening layer is created). A stock-bearing SKU (SIMPLE, VARIANT, BOM) with no stock row at all is **missing from the extract**, listed
   separately. If the 3PL stock dataset is supplied and the missing SKU holds stock there, that is an error; if it is not supplied the answer is reported as unknown.
 - **Open purchase orders.** Outstanding quantity per line is ordered minus received, never negative. Fully received lines, closed orders and over-received lines are excluded; an over-received line is also a warning. Lines of one order must agree on
-  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. An order whose value (net total plus tax, foreign and in base currency: 14 integer digits) or whose base unit cost (12 integer digits) the purchase order columns cannot hold is rejected whole. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
+  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. An order whose value (net total at the declared `maxPurchaseTaxRate`, foreign and in base currency (foreign divided by the rate): 14 integer digits) or whose base unit cost (12 integer digits) the purchase order columns cannot hold is rejected whole. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
 - **R14 four-way SKU coverage.** Every SKU in Qoblex, the 3PL or WooCommerce must exist in IMS after the load (loaded now, or already in IMS) or be on the exclusion list; otherwise it is an error. The report prints a presence matrix (Q = Qoblex, L = the 3PL, W = WooCommerce, I = already in IMS).
   A SKU only in IMS, or an exclusion that matches nothing, is a warning.
   The 3PL's SKUs are compared case-insensitively like every other SKU; the column map, not the code, says which file is which, so nothing in the tool is Mintsoft-specific.
@@ -393,5 +394,5 @@ The report is deterministic: row-level entries are sorted by dataset, outcome, c
 - Warehouse codes, tax rate names and supplier names for suppliers that already exist in IMS cannot be checked without the database; the importers' own dry-run preview does that.
 - The org base currency is asserted by the manifest, not read from IMS.
 - Units: `stockUnit` is passed through (normalise its spelling with `valueMaps`). **Quantities are taken to be in stock units**; the tool does no purchase-unit to stock-unit conversion, and `PurchaseOrderLine.qty` is defined as stock units.
-- Currency: codes are upper-cased and must be 3 letters; the rate is whatever the source gives. Whether a rate is the right one for the cost date is not checked.
+- Currency: codes are upper-cased and must be 3 letters; the rate is whatever the source gives, read as foreign units per one base unit (confirm the direction from the sample: the importer divides by it). Converting a lot cost by division rounds at 80 significant digits, far below the 6 dp the average is rounded to. Whether a rate is the right one for the cost date is not checked.
 - A PO's original reference is kept (prefixed) as the new order's reference, but reconciliation R8 still proves outstanding quantity, not PO identity.

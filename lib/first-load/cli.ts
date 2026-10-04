@@ -44,10 +44,11 @@ interface Manifest {
   inTransitConvention: InTransitConvention | null
   purchaseOrderKeyPrefix: string | null
   transferKeyPrefix: string | null
+  maxPurchaseTaxRate: string | null
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null }>
 }
 
-const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'inputs'])
+const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'inputs'])
 const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap'])
 
 function parseManifest(text: string): Manifest {
@@ -92,6 +93,7 @@ function parseManifest(text: string): Manifest {
     inTransitConvention: convention as InTransitConvention | null,
     purchaseOrderKeyPrefix: optionalString('purchaseOrderKeyPrefix'),
     transferKeyPrefix: optionalString('transferKeyPrefix'),
+    maxPurchaseTaxRate: optionalString('maxPurchaseTaxRate'),
     inputs,
   }
 }
@@ -224,6 +226,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     inTransitConvention: manifest.inTransitConvention,
     purchaseOrderKeyPrefix: manifest.purchaseOrderKeyPrefix,
     transferKeyPrefix: manifest.transferKeyPrefix,
+    maxPurchaseTaxRate: manifest.maxPurchaseTaxRate,
   }
   let result
   try {

@@ -68,6 +68,11 @@ export interface PrepareConfig {
   inTransitConvention: InTransitConvention | null
   purchaseOrderKeyPrefix: string | null
   transferKeyPrefix: string | null
+  /**
+   * Worst-case purchase tax rate as a fraction ("0.25"), declared by the operator. The importer applies an IMS tax rate it
+   * resolves by NAME (or the supplier's default), which this DB-free tool cannot read, so every order is bounded with this rate.
+   */
+  maxPurchaseTaxRate: string | null
   chunkLimits?: ChunkLimits
 }
 
@@ -122,6 +127,7 @@ export interface PrepareReport {
     inTransitConvention: InTransitConvention | null
     purchaseOrderKeyPrefix: string | null
     transferKeyPrefix: string | null
+    maxPurchaseTaxRate: string | null
     maxRowsPerFile: number
     maxBytesPerFile: number
   }
@@ -768,9 +774,9 @@ function loadStock(run: Run): void {
     if (v.unitCost === '') { reject('MISSING_UNIT_COST', 'a lot with stock on hand has no unit cost'); continue }
     const cost = parseDecimal(v.unitCost, 'unitCost', NUMERIC_LIMITS.lotUnitCost)
     if (!cost.ok) { reject('BAD_UNIT_COST', cost.reason); continue }
-    const converted = cost.value.mul(fx.fx)
+    const converted = cost.value.div(fx.fx)
     if (exceedsIntDigits(converted, NUMERIC_LIMITS.unitCost.maxIntDigits)) {
-      reject('BAD_UNIT_COST', `unit cost ${v.unitCost} ${currency} x rate ${fx.text} = ${fmt(converted)} in the base currency, which has more than ${NUMERIC_LIMITS.unitCost.maxIntDigits} integer digits (the cost column or the importer's number type cannot hold it exactly)`)
+      reject('BAD_UNIT_COST', `unit cost ${v.unitCost} ${currency} / rate ${fx.text} = ${fmt(converted)} in the base currency, which has more than ${NUMERIC_LIMITS.unitCost.maxIntDigits} integer digits (the cost column or the importer's number type cannot hold it exactly)`)
       continue
     }
     lots.push({ row, sku: res.sku, key: sku.key, warehouse: warehouse.code, qty: qty.value, unitCostBase: converted, lotRef: v.lotRef, date: v.receivedDate })
@@ -1021,6 +1027,11 @@ function loadPurchaseOrders(run: Run): void {
       const t = parseDecimal(v.taxRateValue, 'taxRateValue', { maxIntDigits: 3, maxDp: 6 })
       if (!t.ok) { reject('BAD_TAX_RATE', t.reason); continue }
       taxRateValue = fmt(t.value)
+      const asFraction = t.value.gt(1) ? t.value.div(100) : t.value
+      if (config.maxPurchaseTaxRate !== null && asFraction.gt(new D(config.maxPurchaseTaxRate))) {
+        reject('TAX_RATE_ABOVE_DECLARED_MAX', `taxRateValue ${v.taxRateValue} is ${fmt(asFraction)} as a fraction, above the declared maxPurchaseTaxRate ${config.maxPurchaseTaxRate}`)
+        continue
+      }
     }
 
     if (status !== 'OPEN') {
@@ -1079,17 +1090,16 @@ function loadPurchaseOrders(run: Run): void {
       continue
     }
     const fx = new D(list[0].fxText)
-    const taxText = list[0].taxRateValue
-    const taxRate = taxText === '' ? new D(0) : new D(taxText).gt(1) ? new D(taxText).div(100) : new D(taxText)
+    const taxRate = new D(config.maxPurchaseTaxRate ?? '0')
     const subtotalForeign = sum(list.map((l) => l.qty.mul(l.unitCost)))
     const grossForeign = subtotalForeign.mul(new D(1).add(taxRate))
-    const grossBase = grossForeign.mul(fx)
+    const grossBase = grossForeign.div(fx)
     if (
       exceedsIntDigits(grossForeign, NUMERIC_LIMITS.orderValue.maxIntDigits)
       || exceedsIntDigits(grossBase, NUMERIC_LIMITS.orderValue.maxIntDigits)
-      || list.some((l) => exceedsIntDigits(l.unitCost.mul(fx), NUMERIC_LIMITS.unitCostBaseColumn.maxIntDigits))
+      || list.some((l) => exceedsIntDigits(l.unitCost.div(fx), NUMERIC_LIMITS.unitCostBaseColumn.maxIntDigits))
     ) {
-      for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'REJECTED', 'ORDER_VALUE_OUT_OF_RANGE', `the order's value (${fmt(grossForeign)} foreign, ${fmt(grossBase)} base, tax included) or a base unit cost is beyond what the purchase order columns can hold (14 integer digits for totals, 12 for a unit cost)`)
+      for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'REJECTED', 'ORDER_VALUE_OUT_OF_RANGE', `the order's value (${fmt(grossForeign)} foreign, ${fmt(grossBase)} base, at the declared worst-case tax rate ${config.maxPurchaseTaxRate}) or a base unit cost is beyond what the purchase order columns can hold (14 integer digits for totals, 12 for a unit cost)`)
       continue
     }
     for (const l of list) run.add('purchase-order-lines', l.row.line, `${orderKey}/${l.sku}`, 'EMITTED', 'PO_LINE', 'outstanding quantity is in the purchase-orders import file')
@@ -1394,6 +1404,12 @@ export function prepare(input: PrepareInput): PrepareResult {
   }
   needsPrefix('purchase-order-lines', config.purchaseOrderKeyPrefix, 'purchaseOrderKeyPrefix')
   needsPrefix('transfers', config.transferKeyPrefix, 'transferKeyPrefix')
+  if (input.datasets['purchase-order-lines']) {
+    const declared = config.maxPurchaseTaxRate
+    if (declared === null || !/^(0(\.\d{1,6})?|1(\.0{1,6})?)$/.test(declared)) {
+      throw new ConfigError('maxPurchaseTaxRate must be set to the highest purchase tax rate any IMS tax rate or supplier default could apply, as a fraction between 0 and 1 (for example "0.25"): the importer resolves tax rates by name inside IMS, which this tool cannot read, so it bounds every order with this rate')
+    }
+  }
   if (input.datasets.transfers && config.inTransitConvention === null) {
     throw new ConfigError('inTransitConvention must be "counted-in-source" or "excluded-from-source" when transfers are supplied (see docs/first-load-input-spec.md, "In-transit stock")')
   }
@@ -1490,6 +1506,7 @@ export function prepare(input: PrepareInput): PrepareResult {
       inTransitConvention: config.inTransitConvention,
       purchaseOrderKeyPrefix: config.purchaseOrderKeyPrefix,
       transferKeyPrefix: config.transferKeyPrefix,
+      maxPurchaseTaxRate: config.maxPurchaseTaxRate,
       maxRowsPerFile: limits.maxRows,
       maxBytesPerFile: limits.maxBytes,
     },

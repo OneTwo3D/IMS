@@ -5,6 +5,7 @@
   "inTransitConvention": "counted-in-source",
   "purchaseOrderKeyPrefix": "QBX-",
   "transferKeyPrefix": "QBX-",
+  "maxPurchaseTaxRate": "0.25",
   "inputs": [
     { "dataset": "products", "file": "qoblex/products.csv", "columnMap": "maps/qoblex.map.json" },
     { "dataset": "recipe-lines", "file": "qoblex/bom-lines.csv", "columnMap": "maps/qoblex.map.json" },

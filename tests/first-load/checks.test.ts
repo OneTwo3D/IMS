@@ -90,9 +90,9 @@ test('currency: fxRateToBase is required for a non-base currency on lots and on 
   assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '0' }), 'stock-lots'), ['BAD_FX'])
   assert.deepEqual(rejectedCodes(po({ currency: 'USD' }), 'purchase-order-lines'), ['BAD_FX'])
   assert.deepEqual(rejectedCodes(po({ currency: 'gb' }), 'purchase-order-lines'), ['BAD_CURRENCY'])
-  const ok = stock({ currency: 'EUR', fxRateToBase: '0.85' })
+  const ok = stock({ currency: 'EUR', fxRateToBase: '1.25' })
   assert.equal(ok.blocking, false)
-  assert.equal(rowsOf(ok, 'opening-stock')[0].unitCostBase, '1.700000')
+  assert.equal(rowsOf(ok, 'opening-stock')[0].unitCostBase, '1.600000', 'the rate is foreign units per ONE base unit, as in the purchase-order importer: base cost = cost / rate')
 })
 
 test('variants: a VARIANT needs a VARIABLE parent that is itself loaded; parentSku on anything else is refused', (t) => {
@@ -328,7 +328,7 @@ test('a CR or CRLF inside a quoted value is written as LF, which is exactly what
 test('stock ranges: a collapsed quantity, a converted cost and an in-transit addition that the target columns cannot hold are rejected, not emitted', (t) => {
   const products = ds('products', [product('A'), product('B'), product('C')])
   const sumOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '60000000', '1', { lotRef: 'L1' }), lot('A', '60000000', '1', { lotRef: 'L2' })]) })
-  const fxOver = run({ products, 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', fxRateToBase: '5' })]) })
+  const fxOver = run({ products, 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', fxRateToBase: '0.5' })]) })
   const inTransitOver = run({
     products,
     'stock-lots': ds('stock-lots', [lot('C', '99999999', '1')]),
@@ -369,15 +369,36 @@ test('purchase order values: a line total, an order total (tax included) or a ba
     products,
     'purchase-order-lines': ds('purchase-order-lines', [
       order('BIG', { qtyOrdered: '99999999', unitCostForeign: '999999999' }),
-      order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999', taxRateValue: '20' }),
-      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '5000' }),
-      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', currency: 'EUR', fxRateToBase: '0.001' }),
-      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', currency: 'USD', fxRateToBase: '500' }),
+      order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999' }),
+      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '0.0001' }),
+      order('HIGHTAX', { qtyOrdered: '1', unitCostForeign: '1', taxRateValue: '30' }),
+      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', currency: 'EUR', fxRateToBase: '1000' }),
+      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', currency: 'USD', fxRateToBase: '0.001' }),
       order('OK', { qtyOrdered: '1000', unitCostForeign: '1000' }),
     ]),
   })
-  precondition(t, 'orders', 6)
-  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BASE/A:ORDER_VALUE_OUT_OF_RANGE', 'BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FOREIGN/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
+  precondition(t, 'orders', 7)
+  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BASE/A:ORDER_VALUE_OUT_OF_RANGE', 'BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FOREIGN/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'HIGHTAX/A:TAX_RATE_ABOVE_DECLARED_MAX', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
   const emitted = result.report.accountingByCode.find((r) => r.code === 'PO_LINE')
   assert.equal(emitted?.count, 1)
+})
+
+test('FX direction: the purchase-order importer DIVIDES by fxRateToBase, so the same order fits at a high rate and overflows at a low one', (t) => {
+  const products = ds('products', [product('A')])
+  const at = (rate: string) => run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: 'D', sku: 'A', qtyOrdered: '1000000', unitCostForeign: '20000000', currency: 'USD', fxRateToBase: rate })]) })
+  const high = at('1000')
+  const low = at('0.001')
+  precondition(t, 'rates compared', 2)
+  assert.equal(high.blocking, false, 'foreign 2e13 / 1000 = 2e10 base fits (a multiply would give 2e16 and reject)')
+  assert.deepEqual(rejectedCodes(low, 'purchase-order-lines'), ['ORDER_VALUE_OUT_OF_RANGE'])
+  const base = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '1', '3', { currency: 'EUR', fxRateToBase: '2' })]) })
+  assert.equal(rowsOf(base, 'opening-stock')[0].unitCostBase, '1.500000')
+})
+
+test('the declared worst-case purchase tax rate is required with purchase orders and bounds every order', (t) => {
+  const withPo = { products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) }
+  precondition(t, 'cases', 3)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: null }), ConfigError)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: '25%' }), ConfigError)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: '1.5' }), ConfigError)
 })
