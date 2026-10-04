@@ -108,13 +108,14 @@ export async function mintsoftRequest<T>(
     }
   }
 
-  // Set as soon as the first request has been handed to the transport. A hold on a LATER step of this
+  // Set once the first request has been sent and answered. A hold on a LATER step of this
   // same call (the key refresh after a 401) then follows a request that WAS sent: it is not "nothing sent".
   let requestSent = false
   try {
     const apiKey = await getMintsoftAccessToken()
-    requestSent = true
     const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init, config.clientId ?? '')
+    // Only now has a request actually been SENT: a hold that refused the first request itself sent nothing.
+    requestSent = true
     if (firstAttempt.status !== 401) {
       return firstAttempt
     }
