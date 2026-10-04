@@ -692,6 +692,25 @@ test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED state (retired unprove
   assert.doesNotMatch(order, /If it exists, do not post again/, 'the earlier invoice being there does not satisfy the retired attempt\'s check')
 })
 
+test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED BILL_PAYMENT state says "payment", not "update"', async (t) => {
+  const billPaymentRefusal = { ...invoiceUpdateRefusal, id: 'refusal-bp', type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', resolvedAt: null }
+  liveSyncRows.length = 0
+  liveSyncRows.push({ type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', payload: {}, status: 'SYNCED', attemptRevision: 1, externalTransactionId: 'PAY-1' })
+  liveSyncRows.push({ type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', payload: {}, status: 'CANCELLED', attemptRevision: 1, externalTransactionId: null })
+  allRows.push(billPaymentRefusal as never)
+  t.after(() => {
+    allRows.splice(allRows.findIndex((row) => row.id === 'refusal-bp'), 1)
+    liveSyncRows.length = 0
+  })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === 'refusal-bp')
+  assert.ok(row, 'PRECONDITION: the bill payment refusal is listed')
+  assert.equal(row.earlierPostings.length, 1, 'PRECONDITION: the earlier payment is carried')
+  assert.match(row.handPostOrder ?? '', /check the ledger for the CURRENT payment/)
+  assert.match(row.handPostOrder ?? '', /if only the earlier payment is there, register this payment as a new one/)
+})
+
 test('[o3d-j625 r16 HIGH 2 CONTROL] on a key that names ONE posting for ever, a completed row STILL blocks', async (t) => {
   /**
    * WHAT WOULD STILL PASS THE TEST ABOVE WITHOUT THIS ONE: ignoring every completed row, whatever its type.
