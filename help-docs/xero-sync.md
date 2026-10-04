@@ -65,12 +65,19 @@ So:
   - **Unknown** (an instance bound before IMS recorded this, then disconnected): IMS **cannot tell** whether the
     mapping is this organisation's, so it does **not delete it**. The mapping is kept, **sync is switched off** and
     Sync settings shows *Confirm the account mapping belongs to <organisation>*. Review the mapping and press the
-    confirm button (an admin step-up action, recorded in the activity log with who and when), or re-map and save;
-    sync cannot be enabled until one of those. The callback message says "could not confirm which organisation this
+    confirm button (an admin step-up action, recorded in the activity log with who and when). This hold is
+    **persisted** (`xero_account_mapping_unconfirmed`): reconnecting again, to the same organisation or a different
+    one, keeps the mapping, keeps sync off and stamps nothing, because the token row a reconnect creates proves which
+    organisation the token is for, not which one the mapping was made for. Only the confirm button ends the hold
+    (saving the form does not: you may keep codes the new chart happens to share, and saving is not checking each
+    one). The callback message says "could not confirm which organisation this
     mapping was set up for"; it never claims the mapping belonged to another organisation.
   A mapping save or payment-map save made from a page rendered against a different organisation than the one now
   connected is refused (reload and review), and both saves serialise with the connect on the same lock, so a stale tab
-  cannot put the previous organisation's mapping back. `LEAVE`d on purpose: the app credentials, the sync-mode and
+  cannot put the previous organisation's mapping back. Anything that reads data from Xero and stores it afterwards
+  (**Sync accounts**, the tax-type auto-link / generate / single-rate mapping, the tax-rate drift snapshot, the GL
+  balance snapshots) remembers which connection it fetched under and discards the result, with a clear message, if
+  the organisation was changed in between; run it again against the organisation now connected. `LEAVE`d on purpose: the app credentials, the sync-mode and
   batch/polling switches, the payment-poll time cursor, the invoice/bill URL templates, per-document contact/item ids
   (their provenance already ignores another organisation's) and every posted document's ids and sync rows (the tenant
   stamp on each refuses them at egress).

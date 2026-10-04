@@ -967,7 +967,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 {readiness.mappingOwnership.state === 'unconfirmed'
                   ? 'IMS has no record of which Xero organisation the stored account mapping (accounts, payment map and tax types) was set up for, so it cannot enable sync against this one on its own.'
                   : 'The stored account mapping is recorded as belonging to a different Xero organisation than the one connected.'}
-                {' '}Review the Accounts, Payment and Tax tabs. If they are this organisation&apos;s, confirm below (recorded with your name and the time); otherwise re-map them and save.
+                {' '}Review the Accounts, Payment and Tax tabs. Correct anything that belongs to another organisation, then confirm below (recorded with your name and the time). Saving the form alone does not clear this.
               </p>
               <button
                 type="button"

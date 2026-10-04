@@ -203,7 +203,7 @@ export async function saveXeroSettings(
             reasons.push(`missing account mappings (${readiness.missingAccounts.map(a => a.label).join(', ')})`)
           }
           if (readiness.mappingOwnership.state !== 'owned') {
-            reasons.push(`confirm the account mapping belongs to ${readiness.mappingOwnership.boundTenantName ?? 'the connected organisation'} (or re-map it)`)
+            reasons.push(`confirm the account mapping belongs to ${readiness.mappingOwnership.boundTenantName ?? 'the connected organisation'} (re-mapping and saving does not end the hold; confirming does)`)
           }
           if (readiness.missingTaxTypes.length > 0) {
             reasons.push(`missing Xero tax type on IMS VAT rates (${readiness.missingTaxTypes.map(t => t.name).join(', ')})`)

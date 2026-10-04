@@ -3037,6 +3037,81 @@ test('[o3d-6thk1 round-1 HIGH 1] a PRE-STAMP instance: Disconnect then reconnect
   assert.equal((await owner()).state, 'owned', 'confirmed: the readiness blocker is gone')
 })
 
+/** The state a held instance must keep, whatever the next consent does. */
+function assertStillHeld(why: string) {
+  assert.equal(settings.xero_account_mapping_unconfirmed, 'true', `${why}: the hold is persisted`)
+  assert.equal(settings.xero_account_mapping_tenant_id, undefined, `${why}: nothing is stamped as owned`)
+  assert.equal(settings.xero_sync_enabled, undefined, `${why}: sync is OFF`)
+}
+
+async function ownershipState() {
+  const lib = await import('@/lib/connectors/xero/account-mapping-rebind')
+  const dbx = (await import('@/lib/db')).db as unknown as { $transaction: (fn: (tx: never) => Promise<unknown>) => Promise<unknown> }
+  return (await dbx.$transaction(async (t) => lib.readMappingOwnership(t as never, 'xero'))) as Awaited<ReturnType<typeof lib.readMappingOwnership>>
+}
+
+test('[o3d-6thk1 round-2 HIGH 1] the hold SURVIVES a second consent to the SAME organisation (the token row the first reconnect created is not evidence of the mapping owner)', async () => {
+  await mappedFor(DEMO, { stamp: false })
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [DEMO]
+  const first = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+  assert.equal(first.success, true)
+  assertStillHeld('after the first reconnect')
+  assert.equal((tokenRow as TokenRow | null)?.tenantId, DEMO.tenantId, 'PRECONDITION: the first reconnect created a token row naming the organisation')
+  const mappingAfterFirst = await mappingRowsPresent()
+
+  // The Codex scenario: a SECOND consent to the same organisation used to read that token row as the
+  // mapping's owner and STAMP the retained mapping as owned, with nobody having confirmed anything.
+  const second = await exchangeCodeForTokens('code-2', 'https://ims.example/cb')
+  console.log(`# o3d-6thk1 hold twice: second success=${second.success}, hold=${settings.xero_account_mapping_unconfirmed}, stamp=${settings.xero_account_mapping_tenant_id}, sync=${settings.xero_sync_enabled}`)
+  assert.equal(second.success, true)
+  assertStillHeld('after the second consent')
+  assert.deepEqual(await mappingRowsPresent(), mappingAfterFirst, 'the mapping is untouched')
+  assert.equal(taxTypesMapped(), 3)
+  assert.match(second.accountMappingResetNotice ?? '', /could not confirm which organisation this mapping was set up for/)
+  assert.equal((await ownershipState()).state, 'unconfirmed', 'readiness still says: confirm')
+
+  // Only the explicit confirmation ends it.
+  const lib = await import('@/lib/connectors/xero/account-mapping-rebind')
+  const dbx = (await import('@/lib/db')).db as unknown as { $transaction: (fn: (tx: never) => Promise<unknown>) => Promise<unknown> }
+  const confirmed = await dbx.$transaction(async (t) => lib.confirmMappingOwnership(t as never, { connector: 'xero', expectedTenantId: DEMO.tenantId })) as Awaited<ReturnType<typeof lib.confirmMappingOwnership>>
+  assert.equal(confirmed.ok, true)
+  assert.equal(settings.xero_account_mapping_unconfirmed, undefined, 'confirming clears the hold')
+  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId)
+  assert.equal((await ownershipState()).state, 'owned')
+
+  // ...and once owned, a further consent to the same organisation is an ordinary re-consent that keeps it.
+  settings.xero_sync_enabled = 'true'
+  const third = await exchangeCodeForTokens('code-3', 'https://ims.example/cb')
+  assert.equal(third.success, true)
+  assert.equal(third.accountMappingResetNotice, undefined)
+  assert.equal(settings.xero_sync_enabled, 'true')
+})
+
+test('[o3d-6thk1 round-2 HIGH 1] WRONG organisation first, then the right one: the mapping is never adopted by either, and the hold persists across both', async () => {
+  await mappedFor(DEMO, { stamp: false })
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+
+  connectionsBody = [OTHER]
+  const wrong = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+  assert.equal(wrong.success, true)
+  assert.equal((tokenRow as TokenRow | null)?.tenantId, OTHER.tenantId, 'PRECONDITION: the operator picked the WRONG organisation')
+  assertStillHeld('after the wrong organisation')
+  assert.equal((await mappingRowsPresent()).length, 18, 'kept: unknown is not proof it is another organisation')
+  assert.equal(taxTypesMapped(), 3)
+
+  await disconnect()
+  connectionsBody = [DEMO]
+  const right = await exchangeCodeForTokens('code-2', 'https://ims.example/cb')
+  assert.equal(right.success, true)
+  assertStillHeld('after the right organisation')
+  assert.equal((await mappingRowsPresent()).length, 18)
+  assert.match(right.accountMappingResetNotice ?? '', /could not confirm/)
+  assert.doesNotMatch(right.accountMappingResetNotice ?? '', /not the organisation|cleared/i)
+})
+
 test('[o3d-6thk1] UNKNOWN provenance with ONLY tax types mapped is still unconfirmed: kept, sync off', async () => {
   settings.xero_sync_enabled = 'true'
   taxRateTypes = ['OUTPUT2']

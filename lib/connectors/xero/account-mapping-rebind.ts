@@ -23,6 +23,18 @@
  *     (Codex round 1, HIGH). The operator clears it with an explicit, audited confirmation
  *     (`confirmMappingOwnership`), or re-maps; readiness refuses to enable sync until one of those.
  *
+ * THE HOLD IS PERSISTED (`xero_account_mapping_unconfirmed`, Codex round 2, HIGH). The first reconnect of a
+ * pre-stamp instance creates a TOKEN for whichever organisation the operator selected. If a later consent
+ * were allowed to read that token row as "the mapping's owner", a SECOND consent to the same organisation
+ * would stamp the retained mapping as owned with nobody having confirmed it, and a wrong first choice would
+ * become the owner by repetition. The token row proves which organisation the TOKEN is for, never which one
+ * the MAPPING was made for, so it is evidence of the mapping's owner ONLY when it pre-dates any hold (an
+ * instance bound before the stamp existed and never disconnected: the best evidence there is, and the
+ * pre-existing behaviour). While the hold is set, a bind to ANY organisation keeps the mapping, keeps sync
+ * OFF and stamps nothing; only the explicit confirmation (or the mapping being gone) ends it. A re-map and
+ * save does NOT end it: the operator may keep codes the new chart shares, and "I saved the form" is not
+ * "I checked each account", so the confirm button is the one path.
+ *
  * The stamp (`xero_account_mapping_tenant_id`) is the durable evidence: written by every bind that leaves
  * ownership known, and by every mapping SAVE made while the mapping's ownership is not in doubt, so it
  * survives a Disconnect.
@@ -37,6 +49,7 @@
  *     accounting_reverse_charge_purchase_tax_type       CLEAR                   (Xero tax-type code)
  *     xero_tax_rate_drift_current / _last_checked_at    CLEAR                   (derived: IMS rates vs the old org's)
  *     xero_account_mapping_tenant_id                    the stamp itself
+ *     xero_account_mapping_unconfirmed                  the persisted unknown-provenance hold
  *     xero_sync_enabled                                 OFF on known change AND on unknown-with-mapping
  *     xero_expected_tenant_id / xero_pin_release_witness the binding, owned by bindXeroTenant
  *     xero_client_id / xero_client_secret               LEAVE: the app's own credentials, valid for any org
@@ -72,6 +85,9 @@ export const XERO_ACCOUNT_MAPPING_TENANT_KEY = 'xero_account_mapping_tenant_id'
 
 /** The shared payment-account map: one row, but its VALUES are Xero's own bank-account ids. */
 export const PAYMENT_ACCOUNT_MAP_KEY = 'accounting_payment_account_map'
+
+/** Present ('true') while a mapping of unknown provenance is held for confirmation. See the header. */
+export const XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY = 'xero_account_mapping_unconfirmed'
 
 const SYNC_ENABLED_KEY = 'xero_sync_enabled'
 
@@ -121,7 +137,7 @@ export type AccountMappingRebindTx = {
   }
 }
 
-export type PreviousMappingOrganisation = { tenantId: string | null; basis: 'stamp' | 'token' | 'unknown' }
+export type PreviousMappingOrganisation = { tenantId: string | null; basis: 'stamp' | 'token' | 'unknown' | 'hold' }
 
 /**
  * Who the mapping currently belongs to, as far as the instance can tell. MUST be read BEFORE the binding
@@ -131,6 +147,9 @@ export async function readPreviousMappingOrganisation(
   tx: AccountMappingRebindTx,
   connector: string,
 ): Promise<PreviousMappingOrganisation> {
+  // The hold FIRST: while it is set, no tenant (stamp, token row) is evidence of anything about the mapping.
+  const held = (await tx.setting.findUnique({ where: { key: XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY } }))?.value?.trim() === 'true'
+  if (held) return { tenantId: null, basis: 'hold' }
   const stamp = (await tx.setting.findUnique({ where: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY } }))?.value?.trim()
   if (stamp) return { tenantId: stamp, basis: 'stamp' }
   const token = await tx.accountingToken.findUnique({ where: { connector }, select: { tenantId: true } })
@@ -178,6 +197,18 @@ async function writeStamp(tx: AccountMappingRebindTx, tenantId: string): Promise
   } else {
     await tx.setting.create({ data: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY, value: tenantId } })
   }
+  // Owning the mapping ends any hold: the only ways here are the explicit confirmation, a bind with nothing
+  // mapped, and a save that took ownership of an unmapped slate.
+  await tx.setting.deleteMany({ where: { key: { in: [XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY] } } })
+}
+
+async function setHold(tx: AccountMappingRebindTx): Promise<void> {
+  const held = await tx.setting.findUnique({ where: { key: XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY } })
+  if (held) {
+    if (held.value !== 'true') await tx.setting.update({ where: { key: XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY }, data: { value: 'true' } })
+  } else {
+    await tx.setting.create({ data: { key: XERO_ACCOUNT_MAPPING_UNCONFIRMED_KEY, value: 'true' } })
+  }
 }
 
 async function readSyncEnabled(tx: AccountMappingRebindTx): Promise<boolean> {
@@ -195,19 +226,23 @@ export async function resetAccountMappingForOrganisationChange(
   const { previous, newTenantId, connector } = params
   const presence = await readMappingPresence(tx)
 
-  // KNOWN SAME, or nothing mapped: ownership is not in doubt (or there is nothing to own).
+  // THE HOLD, or UNKNOWN, with a mapping present: keep it, hold sync, stamp nothing, PERSIST the hold. While
+  // a hold is active the previous organisation is `hold`, so a second consent (to the same organisation or a
+  // different one) lands here again and cannot promote a token row into ownership.
+  if (presence.any && (previous.basis === 'hold' || previous.tenantId === null)) {
+    const syncWasEnabled = await readSyncEnabled(tx)
+    await setHold(tx)
+    if (syncWasEnabled) await tx.setting.deleteMany({ where: { key: { in: [SYNC_ENABLED_KEY] } } })
+    return { kind: 'unconfirmed', previous, keptKeys: presence.settingKeys, syncWasEnabled }
+  }
+
+  // KNOWN SAME, or nothing mapped (which also retires a hold: there is nothing left to be unsure about).
   if (previous.tenantId === newTenantId || !presence.any) {
     await writeStamp(tx, newTenantId)
     return { kind: 'none' }
   }
 
   const syncWasEnabled = await readSyncEnabled(tx)
-
-  // UNKNOWN with a mapping: keep it, hold sync, stamp nothing.
-  if (previous.tenantId === null) {
-    if (syncWasEnabled) await tx.setting.deleteMany({ where: { key: { in: [SYNC_ENABLED_KEY] } } })
-    return { kind: 'unconfirmed', previous, keptKeys: presence.settingKeys, syncWasEnabled }
-  }
 
   // KNOWN DIFFERENT: clear every organisation-keyed piece, switch sync off, then own the (now empty) slate.
   // An ABSENT settings row is the default for every key here (empty account, sync 'false'), so deleting is
@@ -355,8 +390,9 @@ export function xeroAccountMappingResetMessage(params: {
   if (outcome.kind === 'unconfirmed') {
     return (
       `Connected to ${org}. IMS could not confirm which organisation this mapping was set up for: sync is OFF until you confirm `
-      + `the mapping belongs to ${org} or re-map it. The mapping (accounts, payment map and tax types) was kept exactly as it was; `
-      + 'open Sync settings to confirm it, or re-map the accounts and save, then switch sync back on.'
+      + `the mapping belongs to ${org}. The mapping (accounts, payment map and tax types) was kept exactly as it was; `
+      + 'open Sync settings, correct anything that belongs to another organisation, and press the confirm button '
+      + '(saving the form alone does not end the hold), then switch sync back on.'
     )
   }
   const was = outcome.previous.tenantId ?? 'an organisation IMS has no record of'

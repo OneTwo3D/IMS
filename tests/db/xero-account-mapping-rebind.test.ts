@@ -199,3 +199,49 @@ test('o3d-6thk1 (real tables): a mapping SAVE is refused for a page rendered aga
   assert.deepEqual(observed.unconfirmed, { ok: true, boundTenantId: `tenant-B-${run}`, stampAfterWrite: false })
   assert.deepEqual(observed.first, { ok: true, boundTenantId: `tenant-B-${run}`, stampAfterWrite: true })
 })
+
+test('o3d-6thk1 (real tables): the HOLD is persisted, and a token row created while it is active is NEVER read as the mapping owner', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const observed = await withRollback(async (tx) => {
+    await lockAccountingMappingSelection(tx, 'xero')
+    await seedMapping(tx, `A-${run}`, null, run)
+    const holdRow = async () => (await tx.setting.findUnique({ where: { key: 'xero_account_mapping_unconfirmed' } }))?.value as string | undefined
+
+    // First reconnect: no stamp, no token row -> unknown -> held.
+    const previous1 = await readPreviousMappingOrganisation(tx, 'xero')
+    await bindTo(tx, `tenant-A-${run}`, `Org A ${run}`)
+    const first = await resetAccountMappingForOrganisationChange(tx, { previous: previous1, newTenantId: `tenant-A-${run}`, connector: 'xero' })
+    const afterFirst = { hold: await holdRow(), counts: await counts(tx) }
+
+    // Second consent to the SAME organisation, now with a token row that names it: used to stamp as owned.
+    const previous2 = await readPreviousMappingOrganisation(tx, 'xero')
+    const second = await resetAccountMappingForOrganisationChange(tx, { previous: previous2, newTenantId: `tenant-A-${run}`, connector: 'xero' })
+    const afterSecond = { hold: await holdRow(), counts: await counts(tx) }
+
+    // A consent to a DIFFERENT organisation while held: kept, not cleared (unknown is not proof).
+    const previous3 = await readPreviousMappingOrganisation(tx, 'xero')
+    const third = await resetAccountMappingForOrganisationChange(tx, { previous: previous3, newTenantId: `tenant-B-${run}`, connector: 'xero' })
+    const afterThird = { hold: await holdRow(), counts: await counts(tx) }
+
+    const ownershipHeld = await readMappingOwnership(tx, 'xero')
+    const confirmed = await confirmMappingOwnership(tx, { connector: 'xero', expectedTenantId: `tenant-A-${run}` })
+    const afterConfirm = { hold: await holdRow(), counts: await counts(tx), ownership: await readMappingOwnership(tx, 'xero') }
+    return { previous1, first, afterFirst, previous2, second, afterSecond, previous3, third, afterThird, ownershipHeld, confirmed, afterConfirm }
+  })
+  console.log(`# o3d-6thk1 db hold: previous ${observed.previous1.basis} -> ${observed.previous2.basis} -> ${observed.previous3.basis}; outcomes ${observed.first.kind}/${observed.second.kind}/${observed.third.kind}; hold ${observed.afterFirst.hold}/${observed.afterSecond.hold}/${observed.afterThird.hold}`)
+  assert.equal(observed.previous1.basis, 'unknown')
+  assert.equal(observed.first.kind, 'unconfirmed')
+  assert.equal(observed.afterFirst.hold, 'true', 'the hold is persisted')
+  assert.equal(observed.previous2.basis, 'hold', 'with a token row now present the previous organisation is STILL the hold, not the token\'s tenant')
+  assert.equal(observed.second.kind, 'unconfirmed')
+  assert.equal(observed.afterSecond.counts.stamp, undefined, 'nothing stamped by the second consent')
+  assert.equal(observed.afterSecond.counts.settings, 18)
+  assert.equal(observed.third.kind, 'unconfirmed', 'a different organisation while held keeps the mapping too')
+  assert.deepEqual([observed.afterThird.counts.settings, observed.afterThird.counts.rateTypes, observed.afterThird.counts.chart], [18, 1, 1])
+  assert.equal(observed.afterThird.counts.stamp, undefined)
+  assert.equal(observed.ownershipHeld.state, 'unconfirmed')
+  assert.equal(observed.confirmed.ok, true)
+  assert.equal(observed.afterConfirm.hold, undefined, 'only the confirmation ends the hold')
+  assert.equal(observed.afterConfirm.counts.stamp, `tenant-A-${run}`)
+  assert.equal(observed.afterConfirm.ownership.state, 'owned')
+})
