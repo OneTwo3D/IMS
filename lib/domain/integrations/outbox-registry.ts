@@ -22,6 +22,13 @@ export const WcOrderCompletionOutboxPayloadSchema = z.object({
   orderId: nonEmptyString,
 })
 
+// o3d-6ldlj: the durable "push CANCELLED / ON_HOLD to this storefront order" jobs, enqueued INSIDE the
+// transaction that flips the order. Carries only the order id: every attempt re-reads the IMS order and the
+// WooCommerce order, so the payload can never describe a stale intent.
+export const WcOrderStatusOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+})
+
 export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
@@ -294,6 +301,54 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
           'tracking meta PUT (pushImsTrackingToWc), which replaces the meta absolutely',
           'shoppingSyncLog SYNCED row for the status push',
           'logActivity wc_status_pushed / wc_completion_skipped / wc_completion_retry',
+        ],
+      },
+      replay: 'unsafe-to-replay',
+    },
+    // o3d-6ldlj. TWO NAMED operations, not one parameterised `order.status`: the registry rule above would force
+    // a parameterised entry to be keyed by its sub-operation and average a cancel and a hold (different
+    // customer-visible effects: the cancelled email goes to the ADMIN, the on-hold email to the CUSTOMER, both
+    // UNVERIFIED for this store's plugins) into one verdict. Same shape and same verdict as `order.complete`.
+    //
+    // UNSAFE for the reason `order.complete` is: the effect is a customer- or admin-visible WooCommerce status
+    // PUT, and nothing a local verdict can see proves whether a dead worker's PUT landed. The PUT is guarded (a
+    // fresh IMS re-read, a fresh WooCommerce GET and classifyWcStatusPushEligibility on EVERY attempt, so a
+    // repeat finds the target status and sends nothing) but the shoppingSyncLog row and the activity log sit
+    // outside that guard, hence an effect SEQUENCE, hence no automatic stale-lock reclaim. A row whose worker
+    // died is surfaced, not re-driven: the cron drain moves a PROCESSING row whose lock is past the drain lease
+    // to PERMANENT_FAILED (`parkStaleWcOrderStatusClaims`, compare-and-set on the dead worker's lock) with a
+    // message that says it is NOT known whether WooCommerce changed; Replay on Sync > Exceptions is safe BECAUSE
+    // the retry re-reads IMS and WooCommerce first. PERMANENT_FAILED is inert: the only enqueue is keyed per
+    // flip (order id + flip epoch) and returns the existing row untouched.
+    //
+    // THE SAME INVARIANT AS `order.complete` makes park + Replay safe: every attempt runs under the 2 minute
+    // attempt deadline folded into every WooCommerce request, and re-checks the deadline, its own row AND that
+    // IMS still wants the write immediately before the PUT (attempt-fence.ts); the lease is 10 minutes.
+    'order.cancel': {
+      name: 'orderCancel',
+      schema: WcOrderStatusOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the WooCommerce status PUT to cancelled, behind a fresh IMS re-read, a fresh GET and classifyWcStatusPushEligibility on every attempt',
+        effectsOutsideTheGuard: [
+          'shoppingSyncLog SYNCED row for the status push (read by the webhook echo check)',
+          'logActivity wc_status_pushed / wc_status_push_left_alone / wc_cancel_retry / wc_cancel_dead_lettered',
+        ],
+      },
+      replay: 'unsafe-to-replay',
+    },
+    // o3d-6ldlj. As `order.cancel`, for the on-hold PUT. The classifier leaves a WooCommerce order that is
+    // cancelled / completed / refunded alone and sends nothing automatically onto a partial-shipped or EU
+    // withdrawal status (those park immediately for an operator).
+    'order.hold': {
+      name: 'orderHold',
+      schema: WcOrderStatusOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the WooCommerce status PUT to on-hold, behind a fresh IMS re-read, a fresh GET and classifyWcStatusPushEligibility on every attempt',
+        effectsOutsideTheGuard: [
+          'shoppingSyncLog SYNCED row for the status push (read by the webhook echo check)',
+          'logActivity wc_status_pushed / wc_status_push_left_alone / wc_hold_retry / wc_hold_dead_lettered',
         ],
       },
       replay: 'unsafe-to-replay',
@@ -595,6 +650,7 @@ export type AccountingPostingRefusalProvisionalPayload = z.infer<typeof Accounti
 export type SalesRefundReservationReleaseOutboxPayload = z.infer<typeof SalesRefundReservationReleaseOutboxPayloadSchema>
 export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSchema>
 export type WcOrderCompletionOutboxPayload = z.infer<typeof WcOrderCompletionOutboxPayloadSchema>
+export type WcOrderStatusOutboxPayload = z.infer<typeof WcOrderStatusOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
 

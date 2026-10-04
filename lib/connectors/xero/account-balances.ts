@@ -8,6 +8,7 @@ import {
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from './settings'
 import { xeroGet, xeroGetCached } from './api'
+import { captureXeroConnection, withXeroConnectionFence } from './connection-fence'
 
 const XERO_CONNECTOR = 'xero'
 
@@ -212,6 +213,10 @@ export function buildXeroAccountBalanceSnapshotInputs(
 export async function syncXeroAccountBalanceSnapshots(
   options: SyncXeroAccountBalanceSnapshotsOptions = {},
 ): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
+  // o3d-6thk1 round 3: the snapshot table has no tenant column, so a trial balance fetched for one organisation
+  // and stored after a rebind would sit in the new organisation's ledger history. Remember the connection
+  // BEFORE the fetch; the write below is refused if it moved.
+  const connection = await captureXeroConnection()
   const [settings, baseCurrency, xeroBaseCurrency] = await Promise.all([getXeroSettings(), getBaseCurrencyCode(), getXeroBaseCurrency()])
   if (!xeroBaseCurrency) {
     return { fetched: 0, persisted: 0, skipped: 0, errors: ['Could not determine the connected Xero organisation base currency.'] }
@@ -255,7 +260,9 @@ export async function syncXeroAccountBalanceSnapshots(
     syncRunId: options.syncRunId ?? null,
   })
 
-  const persisted = await persistAccountingAccountBalanceSnapshots(snapshots)
+  const fenced = await withXeroConnectionFence(connection, (tx) => persistAccountingAccountBalanceSnapshots(snapshots, tx as never))
+  if (!fenced.ok) return { fetched: parsedRows.length, persisted: 0, skipped: accounts.length, errors: [fenced.error] }
+  const persisted = fenced.value
   return {
     fetched: parsedRows.length,
     persisted: persisted.persisted,

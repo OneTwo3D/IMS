@@ -38,6 +38,7 @@ import {
   type AccountingBatchHistoryDay,
 } from '@/app/actions/accounting-batch'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
+import { confirmXeroAccountMappingOwnership } from '@/app/actions/xero-sync'
 import {
   ACCOUNT_FIELDS,
   SYNC_TYPE_TOGGLES,
@@ -249,8 +250,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     const payload = buildAccountingSettingsPayload(connectorId, s as unknown as Record<string, string>)
     startTransition(async () => {
       const [xeroResult, mapResult] = await Promise.all([
-        saveAccountingSettings(payload),
-        savePaymentAccountMap(serializePaymentMap(paymentMapRows)),
+        // o3d-6thk1: both saves carry the organisation this page was rendered against, so a tab left open
+        // across a rebind cannot put the previous organisation's mapping back.
+        saveAccountingSettings(payload, readiness.mappingOwnership.boundTenantId),
+        savePaymentAccountMap(serializePaymentMap(paymentMapRows), readiness.mappingOwnership.boundTenantId),
       ])
       if (!xeroResult.success) {
         setMsg(`Error: ${xeroResult.error}`)
@@ -414,6 +417,17 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setAccountsMsgLevel(result.skipped > 0 ? 'warning' : 'info')
     }
     router.refresh()
+  }
+
+  function handleConfirmMappingOwnership() {
+    const tenantId = readiness.mappingOwnership.boundTenantId
+    if (!tenantId) return
+    setMsg(null)
+    startTransition(async () => {
+      const result = await withStepUp(() => confirmXeroAccountMappingOwnership(tenantId))
+      setMsg(result.success ? 'Account mapping confirmed for the connected organisation.' : `Error: ${result.error}`)
+      router.refresh()
+    })
   }
 
   function handleManualSync() {
@@ -944,6 +958,29 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       {tab === 'sync' && (
         <div className="space-y-6">
           {/* Enable Xero Sync */}
+          {readiness.mappingOwnership.state !== 'owned' && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2" data-testid="mapping-ownership-confirm">
+              <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
+                <AlertTriangle className="h-4 w-4" />
+                Confirm the account mapping belongs to {readiness.mappingOwnership.boundTenantName ?? 'the connected organisation'}
+              </div>
+              <p className="text-xs text-amber-800 dark:text-amber-300">
+                {readiness.mappingOwnership.state === 'unconfirmed'
+                  ? 'IMS has no record of which Xero organisation the stored account mapping (accounts, payment map and tax types) was set up for, so it cannot enable sync against this one on its own.'
+                  : 'The stored account mapping is recorded as belonging to a different Xero organisation than the one connected.'}
+                {' '}Review the Accounts, Payment and Tax tabs. Correct anything that belongs to another organisation, then confirm below (recorded with your name and the time). Saving the form alone does not clear this.
+              </p>
+              <button
+                type="button"
+                onClick={handleConfirmMappingOwnership}
+                disabled={isPending || !readiness.mappingOwnership.boundTenantId}
+                className="rounded-md border border-amber-300 px-3 py-1 text-xs font-medium text-amber-900 dark:text-amber-200 disabled:opacity-60"
+              >
+                This mapping belongs to {readiness.mappingOwnership.boundTenantName ?? 'the connected organisation'}
+              </button>
+            </div>
+          )}
+
           {!readiness.ready && s[syncEnabledKey] !== 'true' && (
             <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
               <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">

@@ -376,12 +376,19 @@ export async function updateTaxRate(id: string, input: {
     // mapper UI is populated from a (now cacheable) display list, so a rate archived in Xero after it was
     // shown must not be persisted here and break later invoice/bill sync. Fails CLOSED when Xero is
     // unreachable (can't confirm) rather than trust an unvalidated type.
+    // o3d-6thk1 round 3: remembered BEFORE the live validation, re-checked under the mapping lock in the write.
+    const connection = input.accountingTaxType
+      ? await (await import('@/lib/connectors/xero/connection-fence')).captureXeroConnection()
+      : null
     if (input.accountingTaxType) {
       const { validateAccountingTaxTypeForWrite } = await import('@/lib/accounting/accounting-tax-type-validation')
       const check = await validateAccountingTaxTypeForWrite(input.accountingTaxType)
       if (!check.ok) return { success: false, error: check.error }
     }
     const summary = await db.$transaction(async (tx) => {
+      if (input.accountingTaxType) {
+        await (await import('@/lib/connectors/xero/connection-fence')).assertXeroConnectionUnchanged(tx as never, connection)
+      }
       const components = input.components === undefined ? undefined : normalizeTaxRateComponents(input.components)
       const effectiveRate = components === undefined ? input.rate : (effectiveTaxRateFromComponents(components) ?? input.rate)
       const oldRate = await tx.taxRate.findUnique({
@@ -515,6 +522,10 @@ export async function autoLinkXeroTaxRates(): Promise<{
   await requirePermission('settings.company')
   try {
     const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
+    // o3d-6thk1 round 3: the tax types read below belong to the organisation connected NOW; the write is
+    // refused under the mapping lock if a rebind happened in between (connection-fence.ts).
+    const { captureXeroConnection, assertXeroConnectionUnchanged } = await import('@/lib/connectors/xero/connection-fence')
+    const connection = await captureXeroConnection()
     const result = await getXeroTaxRates()
     if (!result) {
       return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], xeroRatesCount: 0, error: 'Failed to fetch Xero tax rates (not connected?)' }
@@ -545,6 +556,7 @@ export async function autoLinkXeroTaxRates(): Promise<{
       return [{ id: ims.id, taxType: match.taxType }]
     })
     await db.$transaction(async (tx) => {
+      await assertXeroConnectionUnchanged(tx as never, connection)
       for (const entry of plan) {
         await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
       }
@@ -670,6 +682,8 @@ export async function generateMissingXeroTaxRates(
   try {
     const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
     const { putXeroTaxRate } = await import('@/lib/connectors/xero/tax-rates')
+    const { captureXeroConnection, assertXeroConnectionUnchanged } = await import('@/lib/connectors/xero/connection-fence')
+    const connection = await captureXeroConnection() // o3d-6thk1 round 3: see autoLinkXeroTaxRates
     const result = await getXeroTaxRates()
     if (!result) {
       return { success: false, created: 0, failed: [], externalRatesCount: 0, supported: true, error: 'Failed to fetch Xero tax rates (not connected?)' }
@@ -700,7 +714,12 @@ export async function generateMissingXeroTaxRates(
           failed.push({ name: rate.name, error: res.error ?? 'Xero did not return a tax type' })
           continue
         }
-        await db.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: res.taxType } })
+        // The rate now exists in the organisation it was created in; writing its tax type onto the IMS rate is
+        // refused if the instance has been rebound since, so another organisation's type never lands here.
+        await db.$transaction(async (tx) => {
+          await assertXeroConnectionUnchanged(tx as never, connection)
+          await tx.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: res.taxType } })
+        })
         created++
       } catch (e) {
         // Keep going so one rate's failure (e.g. the DB mapping write) doesn't

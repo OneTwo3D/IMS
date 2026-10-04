@@ -50,6 +50,37 @@ So:
   organisations in Xero is the quicker one if you only ever want the single organisation.
 - **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
   before. Disconnecting clears the pin.
+- **Connecting to a different organisation does not carry the old organisation's mapping with it.** The account
+  codes (all fifteen roles under *Account Mapping*), the Payment Account Mapping, the reverse-charge tax types and
+  each IMS tax rate's Xero tax type describe one organisation's chart. IMS remembers which organisation the mapping
+  belongs to (`xero_account_mapping_tenant_id`, written by every connect and by every mapping save made while
+  ownership is not in doubt; it survives **Disconnect**). Three cases:
+  - **Known different organisation** (the remembered organisation, or the stored token's, is not the one you
+    connected): in the same transaction as the new binding IMS clears the account roles, the payment map, the
+    reverse-charge types, the IMS tax-rate Xero tax types, the cached chart of accounts and the tax-drift snapshot,
+    and switches **Xero sync off**. It is not an automatic re-map (matching old codes to a new chart would be a guess)
+    and nothing already stored is rewritten. Open Sync settings, run **Sync accounts**, choose each account and each
+    tax type, then switch sync back on; the readiness check names whatever is still missing.
+  - **Same organisation**, including after **Disconnect**: everything is kept.
+  - **Unknown** (an instance bound before IMS recorded this, then disconnected): IMS **cannot tell** whether the
+    mapping is this organisation's, so it does **not delete it**. The mapping is kept, **sync is switched off** and
+    Sync settings shows *Confirm the account mapping belongs to <organisation>*. Review the mapping and press the
+    confirm button (an admin step-up action, recorded in the activity log with who and when). This hold is
+    **persisted** (`xero_account_mapping_unconfirmed`): reconnecting again, to the same organisation or a different
+    one, keeps the mapping, keeps sync off and stamps nothing, because the token row a reconnect creates proves which
+    organisation the token is for, not which one the mapping was made for. Only the confirm button ends the hold
+    (saving the form does not: you may keep codes the new chart happens to share, and saving is not checking each
+    one). The callback message says "could not confirm which organisation this
+    mapping was set up for"; it never claims the mapping belonged to another organisation.
+  A mapping save or payment-map save made from a page rendered against a different organisation than the one now
+  connected is refused (reload and review), and both saves serialise with the connect on the same lock, so a stale tab
+  cannot put the previous organisation's mapping back. Anything that reads data from Xero and stores it afterwards
+  (**Sync accounts**, the tax-type auto-link / generate / single-rate mapping, the tax-rate drift snapshot, the GL
+  balance snapshots) remembers which connection it fetched under and discards the result, with a clear message, if
+  the organisation was changed in between; run it again against the organisation now connected. `LEAVE`d on purpose: the app credentials, the sync-mode and
+  batch/polling switches, the payment-poll time cursor, the invoice/bill URL templates, per-document contact/item ids
+  (their provenance already ignores another organisation's) and every posted document's ids and sync rows (the tenant
+  stamp on each refuses them at egress).
 - **Two connections at once bind one organisation, not two.** The pin and the stored token are written
   in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
   flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them

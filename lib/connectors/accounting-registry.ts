@@ -93,6 +93,8 @@ export type AccountingConnectionStatus = {
 export type AccountingSyncReadiness = {
   ready: boolean
   notConnected: boolean
+  /** o3d-6thk1: whose the stored account mapping is; anything but 'owned' blocks `ready`. */
+  mappingOwnership: { state: 'owned' | 'unconfirmed' | 'other-organisation'; boundTenantId: string | null; boundTenantName: string | null }
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
   /**
@@ -104,7 +106,7 @@ export type AccountingSyncReadiness = {
 
 export type AccountingConnector = AccountingConnectorDef & {
   getSettingsMasked(): Promise<AccountingConnectorSettingsMasked>
-  saveSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }>
+  saveSettings(data: Record<string, string>, expectedTenantId?: string | null): Promise<{ success: boolean; error?: string }>
   saveConnectionSettings(clientId: string, clientSecret: string): Promise<{ success: boolean; error?: string; message?: string }>
   getConnectionStatus(): Promise<AccountingConnectionStatus>
   getConnectionTestState(): Promise<IntegrationConnectionTestState>
@@ -207,9 +209,9 @@ const ACCOUNTING_CONNECTOR_FACTORIES: {
       const { getXeroSettingsMasked } = await import('@/app/actions/xero-sync')
       return getXeroSettingsMasked() as unknown as Promise<AccountingConnectorSettingsMasked>
     },
-    async saveSettings(data) {
+    async saveSettings(data, expectedTenantId) {
       const { saveXeroSettings } = await import('@/app/actions/xero-sync')
-      return saveXeroSettings(data)
+      return saveXeroSettings(data, expectedTenantId)
     },
     async saveConnectionSettings(clientId, clientSecret) {
       const { saveXeroConnectionSettings } = await import('@/app/actions/xero-sync')

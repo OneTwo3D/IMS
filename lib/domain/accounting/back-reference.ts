@@ -209,7 +209,8 @@ export type AmbiguousPurchaseOrderAttribution = {
    *                        two external ids compete for the same bill link.
    * MULTIPLE_UNLINKED_BILLS — the PO has more than one bill with no external id, so
    *                        the row names the order but not which bill it posted.
-   * NO_LIVE_SYNC_ROW     — NO live row for this PO carries this external id any more. The
+   * NO_LIVE_SYNC_ROW     — NO live row for this PO carries THIS external id any more (o3d-j61p: other
+   *                        rows naming other documents do not stand in for it). The
    *                        attribution evidence disappeared between the candidate read and this
    *                        count (retention deletes accounting_sync_logs by age; a row can also
    *                        be cancelled or have its external id cleared). Zero is NOT a
@@ -486,6 +487,27 @@ export async function resolvePurchaseOrderBackReference(
   // AND THE `=== 0` FENCE BELOW STILL MEANS WHAT IT SAYS. Its purpose is that the decision is made
   // against evidence that still exists; a CANCELLED row naming a document is evidence that still
   // exists, so admitting it narrows the fence's blind spot rather than widening it.
+  //
+  // AND THE ONE ROW IT FINDS MUST BE THE ROW BEING REPAIRED (o3d-j61p). "Exactly one row names a
+  // document" says nothing about WHICH document. If the row under repair is gone (retention, a
+  // cleared id) and ONE sibling names a DIFFERENT bill, the population count below is 1, and the
+  // in-memory `params.externalId` of the vanished row was stamped onto the only unlinked bill while
+  // the surviving row said another bill id had been posted for this PO: the coin flip this fence
+  // exists to refuse, reached from the other side. So the identity is asked as its own count, over
+  // the same population and in the same call (hence under the same per-PO lock when the caller took
+  // it), BEFORE the population is measured: a row naming `params.externalId` must exist. The row's
+  // identity for attribution IS its external id — the sweep and the connectors carry no other handle
+  // on it into this function — so two rows naming the same id read as two competitors below, which
+  // is the safe direction.
+  const ownRowCount = await deps.accountingSyncLog.count({
+    where: {
+      connector: params.connector,
+      type: 'PURCHASE_INVOICE',
+      referenceType: 'PurchaseOrder',
+      referenceId: params.purchaseOrderId,
+      externalTransactionId: params.externalId,
+    },
+  })
   const syncRowCount = await deps.accountingSyncLog.count({
     where: {
       connector: params.connector,
@@ -509,7 +531,9 @@ export async function resolvePurchaseOrderBackReference(
   // Requiring one live row means the decision is always made against evidence that still exists
   // (o3d-9kek r2 finding 2). Retention no longer deletes unresolved evidence either — see
   // UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE — so this is the fence, not the whole fix.
-  if (syncRowCount === 0) {
+  // `ownRowCount === 0` covers `syncRowCount === 0` (a row naming the id is one of the rows counted)
+  // AND the j61p shape: rows exist, none of them is the one being repaired.
+  if (ownRowCount === 0 || syncRowCount === 0) {
     return { outcome: 'ambiguous', reason: 'NO_LIVE_SYNC_ROW', syncRowCount, unlinkedBillCount: unlinkedBills.length }
   }
   if (syncRowCount > 1) {

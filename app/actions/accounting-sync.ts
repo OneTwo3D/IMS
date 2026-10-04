@@ -139,6 +139,8 @@ export type AccountingConnectorId = RegistryAccountingConnectorId
 export type AccountingSyncReadiness = {
   ready: boolean
   notConnected: boolean
+  /** o3d-6thk1: whose the stored account mapping is; anything but 'owned' blocks `ready`. */
+  mappingOwnership: { state: 'owned' | 'unconfirmed' | 'other-organisation'; boundTenantId: string | null; boundTenantName: string | null }
   missingAccounts: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
   /**
@@ -545,7 +547,11 @@ export async function getAccountingSettingsMasked(): Promise<AccountingConnector
     : getAccountingConnector('xero').getSettingsMasked()
 }
 
-export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
+export async function saveAccountingSettings(
+  data: Record<string, string>,
+  /** o3d-6thk1: the organisation the page was rendered against; a save composed for another one is refused. */
+  expectedTenantId?: string | null,
+): Promise<{ success: boolean; error?: string }> {
   // o3d-1fel: the delegate (saveXeroSettings) is guarded, but this body reads the
   // CURRENT account-mapping settings and can return a validation error BEFORE
   // ever reaching that delegate — so unguarded it is both a read of the mapping
@@ -573,7 +579,7 @@ export async function saveAccountingSettings(data: Record<string, string>): Prom
   const errors = validateAccountingAccountMapping(data, current)
   if (errors.length) return { success: false, error: errors.map((e) => e.message).join(' ') }
 
-  return resolved.saveSettings(data)
+  return resolved.saveSettings(data, expectedTenantId)
 }
 
 export async function saveAccountingConnectionSettings(

@@ -75,8 +75,9 @@ import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { enqueueStockSync, pushSalesOrderStatus } from '@/lib/shopping'
+import { enqueueStockSync } from '@/lib/shopping'
 import { pushShipmentCompletionToShopping, scheduleManualShipCompletion } from '@/lib/fulfillment/shipment-completion-push'
+import { attemptShoppingStatusPushAfterCommit, scheduleManualStatusPush, type ShoppingStatusPushRef } from '@/lib/fulfillment/order-status-push'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import {
   resolveLineTaxRateBatch,
@@ -1661,11 +1662,24 @@ export async function applySalesOrderStatusTransition(
 
     const isDraftFinalization = so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT'
 
+    // o3d-zvec.15 / o3d-6ldlj: whether this transition owns the storefront status push (false for a WooCommerce-driven
+    // transition, which would only echo). Decided before the transactions so the SHIPPED / CANCELLED / ON_HOLD
+    // branches can enqueue their durable job inside them. A caller that does not own it NEVER creates a row.
+    const ownsStorefrontStatus = options?.pushStatusToWooCommerce ?? true
+    let storefrontStatusPush: ShoppingStatusPushRef = null
+
     // On CANCEL: release all allocations
     if (targetStatus === 'CANCELLED') {
-      const cancellation = await db.$transaction(async (tx) => (
-        cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
-      ), STOCK_TX_OPTIONS)
+      const cancellation = await db.$transaction(async (tx) => {
+        storefrontStatusPush = null // a retried callback must not inherit an aborted attempt's job
+        const result = await cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
+        // o3d-6ldlj: the durable cancel push commits WITH the cancellation (order row locked by
+        // cancelSalesOrderFulfillmentState; the outbox row is a leaf). No WooCommerce I/O, no pooled query here.
+        storefrontStatusPush = await scheduleManualStatusPush(tx, {
+          orderId: id, target: 'CANCELLED', enabled: ownsStorefrontStatus,
+        })
+        return result
+      }, STOCK_TX_OPTIONS)
       previousStatusForLog = cancellation.previousStatus
       if (cancellation.repairedFalseShipped) {
         // o3d-gz6: the order was SHIPPED with no dispatch evidence (a configurable WC status mapping
@@ -1743,14 +1757,12 @@ export async function applySalesOrderStatusTransition(
       await reconcileAllocationBeforeFulfilment(id)
     }
 
-    // o3d-zvec.15: whether this transition owns the storefront status push (false for a WooCommerce-driven
-    // transition, which would only echo). Decided before the transaction so the SHIPPED branch below can
-    // enqueue the durable completion job inside it.
-    const pushStatusToShopping = (options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0
+    const pushStatusToShopping = ownsStorefrontStatus && so.shoppingLinks.length > 0
     let storefrontCompletionKey: string | null = null
     if (!orderUpdated) {
       const transitionResult = await db.$transaction(async (tx) => {
         storefrontCompletionKey = null // a retried callback must not inherit an aborted attempt's key
+        storefrontStatusPush = null
         return updateSalesOrderStatusUnderLock(tx, {
           orderId: id,
           targetStatus,
@@ -1799,6 +1811,13 @@ export async function applySalesOrderStatusTransition(
                 orderId: id,
                 previousStatus: beforeStatus,
                 targetStatus,
+              })
+            }
+            if (targetStatus === 'ON_HOLD') {
+              // o3d-6ldlj: the durable hold push commits WITH the flip, under the order lock
+              // updateSalesOrderStatusUnderLock took; the push itself happens after the commit.
+              storefrontStatusPush = await scheduleManualStatusPush(lockedTx as never, {
+                orderId: id, target: 'ON_HOLD', enabled: ownsStorefrontStatus,
               })
             }
             if (targetStatus === 'PICKING') {
@@ -1907,22 +1926,12 @@ export async function applySalesOrderStatusTransition(
         orderId: id,
         completionKey: storefrontCompletionKey,
       })
-    } else if (pushStatusToShopping) {
-      pushSalesOrderStatus(id, targetStatus)
-        .then((res) => {
-          if (!res.success) throw new Error(res.error ?? 'unknown error')
-        })
-        .catch(async (syncError) => {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: id,
-            action: 'shopping_status_push_failed',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to shopping connector: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
-            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(syncError) },
-          })
-        })
+    } else {
+      // o3d-6ldlj: CANCELLED / ON_HOLD. The push is a durable job enqueued in the transaction above (null when
+      // this transition does not own the storefront status, the order has no link, or the status has no
+      // storefront equivalent); this is the immediate, un-awaited post-commit attempt. This used to be a
+      // fire-and-forget status push whose failure was only logged and never retried.
+      attemptShoppingStatusPushAfterCommit({ orderId: id, job: storefrontStatusPush })
     }
 
     return { success: true }

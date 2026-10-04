@@ -747,6 +747,23 @@ test('[o3d-9kek r2 f2] ZERO live sync rows is refused, not silently treated as "
   assert.equal(calls.lastUpdateData, undefined)
 })
 
+test('[o3d-j61p] the one live row must be the row being repaired: a sibling naming ANOTHER document is refused, and the id is asked for by value', async () => {
+  const sibling = { id: 'log-other', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'XBILL-2' }
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [sibling],
+  })
+  // PRECONDITION, printed: the population is exactly one row and it is NOT the repaired id.
+  const population = (await Promise.all([deps.accountingSyncLog.count({ where: { referenceId: 'po-1', externalTransactionId: { not: null } } })]))[0]
+  console.log(`# j61p unit: live rows for the PO=${population}, naming XBILL-1=0`)
+  assert.equal(population, 1)
+
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(resolved.outcome, 'ambiguous')
+  assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'NO_LIVE_SYNC_ROW')
+  assert.equal(calls.purchaseInvoiceUpdateMany, 0)
+})
+
 test('[o3d-9kek f1] backReferenceIsMissing stops reporting a PO row whose id is already on a bill', async () => {
   const alreadyApplied = makeDeps({
     bills: [

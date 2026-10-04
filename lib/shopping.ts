@@ -313,7 +313,7 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
         // A failed read, a refused write and a thrown error are FAILURES (o3d-zvec.15): this used to report
         // success unconditionally, so no caller could log or retry them. An ineligible order (cancelled
         // by hand, say) is not a failure — the connector left it alone on purpose — and `outcome` says so.
-        if (outcome.kind === 'read-failed' || outcome.kind === 'write-failed' || outcome.kind === 'error') {
+        if (outcome.kind === 'read-failed' || outcome.kind === 'write-failed' || outcome.kind === 'unconfirmed' || outcome.kind === 'error') {
           return { connector, result: { success: false, error: outcome.error, outcome } }
         }
         return { connector, result: { success: true, outcome } }
@@ -354,6 +354,27 @@ export async function scheduleShoppingOrderCompletion(
 export async function processShoppingOrderCompletions(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
   const { processWcOrderCompletionJobs } = await import('@/lib/connectors/woocommerce/sync/order-completion-jobs')
   return processWcOrderCompletionJobs(options)
+}
+
+/**
+ * Durably schedule the storefront CANCEL or HOLD push for an order, INSIDE the transaction that flips it
+ * (o3d-6ldlj). Connector-neutral: each connector that pushes these owns its own jobs. Returns the job's
+ * reference for the post-commit immediate attempt, or null when no connector has anything to push.
+ */
+export async function scheduleShoppingOrderStatusPush(
+  tx: Parameters<typeof import('@/lib/connectors/woocommerce/sync/order-status-jobs').scheduleWcOrderCancel>[0],
+  input: { orderId: string; target: 'CANCELLED' | 'ON_HOLD'; flippedAt: Date },
+): Promise<import('@/lib/connectors/woocommerce/sync/order-status-jobs').WcOrderStatusJobRef | null> {
+  const { scheduleWcOrderCancel, scheduleWcOrderHold } = await import('@/lib/connectors/woocommerce/sync/order-status-jobs')
+  return input.target === 'CANCELLED'
+    ? scheduleWcOrderCancel(tx, input)
+    : scheduleWcOrderHold(tx, input)
+}
+
+/** Drain/attempt the scheduled storefront cancel/hold pushes (post-commit immediate attempt and the cron). */
+export async function processShoppingOrderStatusPushes(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcOrderStatusJobs } = await import('@/lib/connectors/woocommerce/sync/order-status-jobs')
+  return processWcOrderStatusJobs(options)
 }
 
 /**

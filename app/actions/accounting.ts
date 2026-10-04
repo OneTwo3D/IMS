@@ -4,6 +4,13 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
+import {
+  PAYMENT_ACCOUNT_MAP_KEY,
+  gateMappingSave,
+  stampMappingOwner,
+  type AccountMappingRebindTx,
+} from '@/lib/connectors/xero/account-mapping-rebind'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic accounting actions.
@@ -24,6 +31,8 @@ import { requirePermission } from '@/lib/auth/server'
  */
 export async function savePaymentAccountMap(
   mapJson: string,
+  /** o3d-6thk1: the organisation the page was rendered against; a save composed for another one is refused. */
+  expectedTenantId?: string | null,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('settings.company')
@@ -38,11 +47,23 @@ export async function savePaymentAccountMap(
       return { success: false, error: `Invalid payment account map: ${String(e)}` }
     }
 
-    await db.setting.upsert({
-      where: { key: 'accounting_payment_account_map' },
-      create: { key: 'accounting_payment_account_map', value: mapJson },
-      update: { value: mapJson },
+    // o3d-6thk1: UNDER THE MAPPING LOCK the organisation binding takes. This used to be a bare upsert, so a
+    // save that started around a rebind could commit AFTER the binding cleared the map and put the previous
+    // organisation's bank-account ids back. The gate refuses a page composed for another organisation, and
+    // the stamp records whose map this now is (only when ownership is not in doubt).
+    const refusal = await db.$transaction(async (tx) => {
+      await lockAccountingMappingSelection(tx, 'xero')
+      const gate = await gateMappingSave(tx as unknown as AccountMappingRebindTx, { connector: 'xero', expectedTenantId })
+      if (!gate.ok) return gate.error
+      await tx.setting.upsert({
+        where: { key: PAYMENT_ACCOUNT_MAP_KEY },
+        create: { key: PAYMENT_ACCOUNT_MAP_KEY, value: mapJson },
+        update: { value: mapJson },
+      })
+      if (gate.stampAfterWrite && gate.boundTenantId) await stampMappingOwner(tx as unknown as AccountMappingRebindTx, gate.boundTenantId)
+      return null
     })
+    if (refusal) return { success: false, error: refusal }
 
     await logActivity({
       entityType: 'SYSTEM',

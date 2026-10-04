@@ -939,7 +939,12 @@ test('every registered outbox operation declares a known replay-safety answer an
       // o3d-zvec.15: assessed on o3d-8td2's terms. The effect is a customer-visible status PUT behind a
       // fresh GET + eligibility check on every attempt, with the tracking write, the sync-log row and the
       // activity log outside that guard: an effect sequence, hence unsafe-to-replay (no stale reclaim).
+      'woocommerce/order.cancel',
       'woocommerce/order.complete',
+      // o3d-6ldlj: assessed on o3d-8td2's terms, as order.complete: a status PUT behind a fresh IMS re-read, a
+      // fresh GET and the classifier on every attempt, with the sync-log row and the activity log outside that
+      // guard. An effect sequence, hence unsafe-to-replay (no stale reclaim); a dead worker's claim is parked.
+      'woocommerce/order.hold',
       'woocommerce/stock.push',
       'xero/accounting.post',
     ],
@@ -960,6 +965,10 @@ test('the seven verdicts are the round-3 corrected ones', () => {
     // o3d-zvec.15: the completed push fires WooCommerce's customer email; the tracking write sits outside its
     // guard. An effect sequence, so no safe verdict.
     'woocommerce/order.complete': 'unsafe-to-replay',
+    // o3d-6ldlj: two NAMED operations (a cancel and a hold are different customer-visible effects), each an
+    // effect sequence over a guarded status PUT, so no safe verdict.
+    'woocommerce/order.cancel': 'unsafe-to-replay',
+    'woocommerce/order.hold': 'unsafe-to-replay',
     // Codex round 2 HIGH 2: multiplexes AccountingSyncType; INVOICE_EMAIL enqueues an EmailOutbox
     // row that no fence couples to this worker's completion. ROUND 16: this line used to add "whose
     // own queue is unfenced — o3d-alnk", and o3d-alnk is the branch that stopped it being true. The
@@ -989,6 +998,32 @@ test('o3d-zvec.15 (arm 14): woocommerce/order.complete is an effect sequence, un
   assert.equal(entry.schema.safeParse({ orderId: 'so-1' }).success, true)
   assert.equal(entry.schema.safeParse({ orderId: '  ' }).success, false)
   assert.equal(entry.schema.safeParse({}).success, false)
+})
+
+test('o3d-6ldlj (registry): woocommerce/order.cancel and order.hold are two NAMED effect sequences, unsafe to replay, never stale-reclaimed, each with a described guarded effect and outside-the-guard effects', () => {
+  let evaluated = 0
+  for (const [operation, name, wcStatus] of [['order.cancel', 'orderCancel', 'cancelled'], ['order.hold', 'orderHold', 'on-hold']] as const) {
+    const entry = INTEGRATION_OUTBOX_REGISTRY.woocommerce[operation]
+    assert.ok(entry, `${operation}: precondition: the operation is registered`)
+    assert.equal(entry.effects.keyedBy, 'effect-sequence', operation)
+    assert.equal(entry.replay, 'unsafe-to-replay', operation)
+    assert.equal(integrationOutboxStaleReclaimScope('woocommerce', operation), null, `${operation}: no stale-lock reclaim for a WooCommerce status PUT`)
+    assert.equal(INTEGRATION_OUTBOX_OPERATIONS.woocommerce[name], operation)
+    if (entry.effects.keyedBy === 'effect-sequence') {
+      assert.match(entry.effects.guardedEffect, new RegExp(`PUT to ${wcStatus}.*IMS re-read.*GET.*classifyWcStatusPushEligibility`), `${operation}: the guarded effect is described`)
+      assert.ok(entry.effects.effectsOutsideTheGuard.length >= 2, `${operation}: the outside-the-guard effects are listed`)
+      assert.ok(entry.effects.effectsOutsideTheGuard.some((e) => /shoppingSyncLog/.test(e)), operation)
+      assert.ok(entry.effects.effectsOutsideTheGuard.some((e) => /logActivity/.test(e)), operation)
+    }
+    assert.equal(entry.schema.safeParse({ orderId: 'so-1' }).success, true, operation)
+    assert.equal(entry.schema.safeParse({ orderId: '  ' }).success, false, operation)
+    assert.equal(entry.schema.safeParse({}).success, false, operation)
+    evaluated++
+  }
+  assert.equal(evaluated, 2)
+  // Not one parameterised `order.status`: a single operation would have to be keyed by a sub-operation and would
+  // average a cancel and a hold into one verdict.
+  assert.equal(Object.keys(INTEGRATION_OUTBOX_REGISTRY.woocommerce).some((k) => k === 'order.status'), false)
 })
 
 test('only the unsafe replay answer withholds a stale-lock reclaim', () => {

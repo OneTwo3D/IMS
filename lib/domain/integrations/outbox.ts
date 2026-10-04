@@ -78,6 +78,29 @@ export type ClaimIntegrationOutboxOptions = {
    */
   staleLockMs?: IntegrationOutboxDrainLeaseMs
   maxAttempts?: number
+  /**
+   * o3d-6ldlj: SERIALISE claims that share a key (WooCommerce order status pushes are sequenced PER ORDER).
+   * When given, each candidate is claimed inside ONE transaction that first takes a transaction-scoped advisory
+   * lock on `keyOf(row)`, then asks `mayClaim` (which reads through the SAME transaction), then runs the claim
+   * compare-and-set. Every claimer of that key takes the same lock, so "no sibling is PROCESSING" and "I became
+   * PROCESSING" cannot interleave: a check made BEFORE the claim statement, outside the lock, would let two workers
+   * both pass. A candidate that may not claim is skipped untouched (no attempt consumed, still due, so the next
+   * drain finds it). Needs the default client (a real database), never a caller-supplied one.
+   */
+  /**
+   * o3d-6ldlj: claim ONE job at a time, at the moment its attempt is about to start. `limit` is then only the SCAN
+   * window (how many due candidates are looked at, oldest first) and the call returns as soon as `claimLimit` jobs
+   * were actually claimed. Claiming a whole batch up front stamps every job with the same `lockedAt` while the
+   * worker processes them one after another, so a job at the back can age past the drain lease before its attempt
+   * starts and be parked as "dead" while live.
+   */
+  claimLimit?: number
+  /** Rows to skip (already attempted by this drain). */
+  excludeIds?: string[]
+  claimGate?: {
+    keyOf: (row: IntegrationOutboxRow) => string | null
+    mayClaim: (tx: IntegrationOutboxClient, row: IntegrationOutboxRow, now: Date) => Promise<boolean>
+  }
 }
 
 export type MarkIntegrationOutboxFailureOptions = {
@@ -421,21 +444,50 @@ export async function claimIntegrationOutboxWork(
   const now = options.now ?? new Date()
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
+  const baseWhere = claimableWhere({
+    connector: options.connector,
+    operation: options.operation,
+    idempotencyKeys: options.idempotencyKeys,
+    now,
+    staleLockMs,
+    maxAttempts,
+    staleReclaimScope: integrationOutboxStaleReclaimScope(options.connector, options.operation),
+  })
   const candidates = await client.integrationOutbox.findMany({
-    where: claimableWhere({
-      connector: options.connector,
-      operation: options.operation,
-      idempotencyKeys: options.idempotencyKeys,
-      now,
-      staleLockMs,
-      maxAttempts,
-      staleReclaimScope: integrationOutboxStaleReclaimScope(options.connector, options.operation),
-    }),
+    where: options.excludeIds && options.excludeIds.length > 0
+      ? { AND: [baseWhere, { id: { notIn: [...options.excludeIds] } }] }
+      : baseWhere,
     orderBy: { createdAt: 'asc' },
     take: positiveLimit(options.limit),
   })
 
   const claimed: IntegrationOutboxRow[] = []
+  const gate = options.claimGate
+  if (gate) {
+    if (options.client) throw new Error('claimGate needs the default database client')
+    for (const row of candidates) {
+      const key = gate.keyOf(row)
+      const won = await db.$transaction(async (tx) => {
+        if (key !== null) {
+          await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`
+        }
+        const txClient = tx as unknown as IntegrationOutboxClient
+        if (key !== null && !(await gate.mayClaim(txClient, row, now))) return false
+        const result = await txClient.integrationOutbox.updateMany({
+          where: claimUpdateWhere(row, now, maxAttempts),
+          data: {
+            status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+            lockedAt: now,
+            lockedBy: options.workerId,
+          },
+        })
+        return result.count > 0
+      })
+      if (won) claimed.push(await requireOutboxRow(client, row.id))
+      if (options.claimLimit !== undefined && claimed.length >= options.claimLimit) break
+    }
+    return claimed
+  }
   for (const row of candidates) {
     const result = await client.integrationOutbox.updateMany({
       where: claimUpdateWhere(row, now, maxAttempts),
@@ -447,6 +499,7 @@ export async function claimIntegrationOutboxWork(
     })
     if (result.count === 0) continue
     claimed.push(await requireOutboxRow(client, row.id))
+    if (options.claimLimit !== undefined && claimed.length >= options.claimLimit) break
   }
 
   return claimed
