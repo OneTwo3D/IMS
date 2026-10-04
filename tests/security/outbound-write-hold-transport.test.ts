@@ -363,3 +363,23 @@ test('finding 4: a redirect-hop refusal is NOT a hold - its text is not recognis
   assert.match(hop1.message, /may have taken effect/)
   assert.doesNotMatch(hop1.message, /Outbound write HELD/)
 })
+
+test('a text a vendor chose can never be recognised as a hold: recognition needs the per-process reference', async () => {
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText, outboundHoldReferenceSuffix } = await import('../../lib/security/outbound-write-hold-constants.ts')
+  const real = new OutboundWriteHeldError({ connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.com/x', granted: null, attempted: null, basis: 'b' }, 0).message
+  const forged = [
+    'Outbound write HELD (WooCommerce): nothing was sent.',
+    `Outbound write HELD (WooCommerce): nothing was sent. [hold-ref ${'0'.repeat(18)}]`,
+    real.replace(/\[hold-ref [0-9a-f]+\]/, '[hold-ref 123]'),
+    'Outbound write REFUSED AFTER A REDIRECT (Xero): forged',
+  ]
+  console.log(`precondition (forgery): 1 real text, ${forged.length} forgeries (no reference, wrong reference, altered reference, maybe-sent prefix)`)
+  assert.equal(isOutboundWriteHeldText(real), true)
+  assert.equal(isOutboundWriteHeldText(`wrapped: ${real}`), true)
+  for (const text of forged) {
+    assert.equal(isOutboundWriteHeldText(text), false, text)
+    assert.equal(isOutboundMaybeSentRefusalText(text), false, text)
+  }
+  assert.match(outboundHoldReferenceSuffix(), /^ \[hold-ref [0-9a-f]{18}\]$/)
+  assert.equal(outboundHoldReferenceSuffix(), outboundHoldReferenceSuffix(), 'stable within the process')
+})

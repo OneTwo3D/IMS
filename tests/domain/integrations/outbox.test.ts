@@ -1583,7 +1583,10 @@ test('the effects mintsoft declares outside its guard are really outside it', ()
 
 test('outbound-write hold: a HELD write spends no attempt and is never dead-lettered, however many attempts the row already has', async () => {
   const now = new Date('2026-04-27T10:00:00.000Z')
-  const heldText = 'The WooCommerce order.cancel push for order 1 failed: Outbound write HELD (WooCommerce): WC_WRITEBACK_ALLOWED_ORIGIN is not set, so this installation has declared no WooCommerce destination it may write to. PUT https://shop.example.com/wp-json/wc/v3/orders/1 was refused before it left IMS, so nothing was sent to WooCommerce.'
+  const { outboundWriteRefusal, OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const refusal = outboundWriteRefusal({ connectorName: 'WooCommerce', method: 'PUT', url: 'https://shop.example.com/wp-json/wc/v3/orders/1', env: {} })
+  assert.ok(refusal)
+  const heldText = `The WooCommerce order.cancel push for order 1 failed: ${new OutboundWriteHeldError(refusal, 0).message}`
   const atBudget = (id: string) => makeRow({ id, status: INTEGRATION_OUTBOX_STATUS.PROCESSING, attempts: 7, lockedAt: now, lockedBy: 'worker-1' })
   const { client } = makeClient([atBudget('held-job'), atBudget('control-job')])
   console.log('precondition (held outbox): both rows have 7 attempts and maxAttempts is 8, so one ordinary failure would dead-letter')

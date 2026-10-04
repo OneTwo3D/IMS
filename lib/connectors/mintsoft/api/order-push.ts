@@ -220,7 +220,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
       }
       anyCreateSent = true // any other failure of a create may have reached the WMS
       if (!isOutboundMaybeSentRefusalText(text)) throw error
-      const existing = await findExistingByReference(input, clientId)
+      // A failed RECONCILIATION never replaces the maybe-sent outcome: if this lookup itself throws (a held
+      // login, a transport fault, a malformed body) the ORIGINAL maybe-sent error is what the caller sees.
+      // Otherwise a held lookup would surface as a pre-send hold and clear the create dispatch stamp over a
+      // PUT that may have created the order.
+      const existing = await findExistingByReference(input, clientId).catch(() => 'lookup-failed' as const)
+      if (existing === 'lookup-failed') throw error
       // PROVABLY OURS OR NOT AT ALL. The scoped search matches the order number OR the external reference,
       // so a single hit can be ANOTHER order of ours that shares a number. Only a row carrying THIS order's
       // stable external reference (and the ClientId the search already asserts) may be bound; anything else
@@ -279,7 +284,12 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // the branch that binds our link to a pre-existing order chosen by a collidable
   // number, so the ClientId scope + per-row assertion inside are essential.
   if (created.message && /already exists/i.test(created.message)) {
-    const existing = await findExistingByReference(input, clientId)
+    // This lookup follows a create that WAS sent (the PUT answered "already exists"). A hold on the lookup
+    // is therefore not "nothing sent": re-word it so no queue reads it as a hold that clears the stamp.
+    const existing = await findExistingByReference(input, clientId).catch((error: unknown) => {
+      const text = error instanceof Error ? error.message : String(error)
+      throw isOutboundWriteHeldText(text) ? new Error(outboundTextAfterEarlierSend(text, 'Mintsoft')) : error
+    })
     const externalOrderId = existing ? toStr(existing.ID ?? existing.Id ?? existing.id) : null
     if (existing && externalOrderId) {
       return {

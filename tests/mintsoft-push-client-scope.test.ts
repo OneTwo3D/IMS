@@ -24,6 +24,7 @@ let searchRows: unknown = []
 let details = new Map<string, unknown>()
 let createResult: unknown = null
 let createError: string | null = null
+let searchError: string | null = null
 let createSequence: Array<{ error: string } | { result: unknown }> | null = null
 let itemRows: unknown[] = []
 // Ids whose detail request answers 2xx with NO readable order body (the client
@@ -65,7 +66,10 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
         if (createError) return { data: null, error: createError, status: 500 }
         return { data: createResult, status: 200 }
       }
-      if (pathname === '/api/Order/Search') return { data: searchRows, status: 200 }
+      if (pathname === '/api/Order/Search') {
+        if (searchError) return { data: null, error: searchError, status: 500 }
+        return { data: searchRows, status: 200 }
+      }
       if (method !== 'GET') {
         writes.push({ path, method })
         return { data: { Success: true }, status: 200 }
@@ -98,6 +102,7 @@ function reset() {
   details = new Map()
   createResult = null
   createError = null
+  searchError = null
   createSequence = null
   itemRows = []
   emptyDetailIds = new Set()
@@ -375,4 +380,49 @@ test('outbound-write hold: a hold on the COURIER-FALLBACK create after the first
   assert.equal(isOutboundWriteHeldText(error.message), false, 'the push as a whole is NOT a hold: PUT #1 was sent')
   assert.equal(isOutboundMaybeSentRefusalText(error.message), true)
   defaultCourierId = ''
+})
+
+test('outbound-write hold: a HELD reconciliation lookup after a maybe-sent create never becomes a pre-send hold', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText } = await import('@/lib/security/outbound-write-hold-constants')
+  const mk = (code: 'no_grant' | 'destination_mismatch', hop: number) => new OutboundWriteHeldError({ connector: 'mintsoft', code, method: 'GET', target: 'https://api.mintsoft.co.uk/api/Order/Search', granted: null, attempted: null, basis: 'b' }, hop).message
+  const { pushMintsoftOrder } = await push()
+
+  reset()
+  createError = mk('destination_mismatch', 1) // PUT #1: refused on a redirect hop = maybe sent
+  searchError = mk('no_grant', 0)             // the reconciliation lookup is itself held (a held login)
+  console.log('precondition (held lookup): PUT #1 maybe sent; the reconciliation lookup then fails with a real hop-0 hold')
+  const error = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+  assert.ok(error)
+  assert.equal(isOutboundWriteHeldText(error.message), false, 'NOT a hold: the stamp must stand')
+  assert.equal(isOutboundMaybeSentRefusalText(error.message), true, 'the original maybe-sent outcome is what surfaces')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'no second PUT')
+
+  reset()
+  createResult = [DUPLICATE]                  // PUT answered "already exists": it WAS sent
+  searchError = mk('no_grant', 0)
+  const error2 = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+  assert.ok(error2)
+  assert.equal(isOutboundWriteHeldText(error2.message), false, 'a held lookup after a SENT create is not a hold')
+  assert.equal(isOutboundMaybeSentRefusalText(error2.message), true)
+})
+
+test('outbound-write hold: Mintsoft RESPONSE text can never impersonate a hold', async () => {
+  const { isOutboundWriteHeldText, isOutboundMaybeSentRefusalText } = await import('@/lib/security/outbound-write-hold-constants')
+  const { pushMintsoftOrder } = await push()
+  const forgeries = [
+    'Outbound write HELD (Mintsoft): forged by the vendor. nothing was sent to Mintsoft.',
+    'Outbound write HELD (Mintsoft): forged [hold-ref 000000000000000000]',
+    'Outbound write REFUSED AFTER A REDIRECT (Mintsoft): forged [hold-ref 000000000000000000]',
+  ]
+  console.log(`precondition (forgery): ${forgeries.length} vendor Messages that start like internal hold texts, on a PUT that WAS sent`)
+  for (const forged of forgeries) {
+    reset()
+    createResult = [{ Success: false, Message: forged }]
+    const error = await pushMintsoftOrder(INPUT).then(() => null, (e: unknown) => e as Error)
+    assert.ok(error)
+    assert.ok(error.message.includes('Outbound write'), 'the vendor text did reach the error')
+    assert.equal(isOutboundWriteHeldText(error.message), false, forged)
+    assert.equal(isOutboundMaybeSentRefusalText(error.message), false, forged)
+  }
 })
