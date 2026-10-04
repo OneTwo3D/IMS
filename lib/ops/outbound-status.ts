@@ -135,7 +135,7 @@ export function renderOutboundStatusText(report: OutboundStatusReport): string {
     )
   }
   for (const entry of report.connectors) {
-    const refusals = entry.refusalsInWindow === null ? 'refusal count unavailable' : `${entry.refusalsInWindow} write(s) refused in the last ${report.windowHours}h`
+    const refusals = entry.refusalsInWindow === null ? 'refusal count unavailable' : `at least ${entry.refusalsInWindow} write(s) refused in the last ${report.windowHours}h`
     const last = entry.lastRefusalAt ? `, last at ${entry.lastRefusalAt}` : ''
     const stateText = entry.state === 'held'
       ? 'HELD (no grant)'

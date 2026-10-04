@@ -4562,7 +4562,7 @@ Mintsoft's key-minting login (`POST /api/Auth`) is a write and is held. An insta
 <!-- /outbound-write-hold:held-meaning -->
 
 <!-- outbound-write-hold:status-command -->
-`npm run outbound:status` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours. Pass `--json` for a machine-readable report and `--expect-held` to fail when any connector may write.
+`npm run outbound:status` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours (a lower bound: refusals the rate limit suppressed are added only when the next entry is written). Pass `--json` for a machine-readable report and `--expect-held` to fail when any connector may write.
 
 | Exit code | Name | Meaning |
 |---|---|---|
