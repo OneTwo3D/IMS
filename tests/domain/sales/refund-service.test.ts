@@ -9454,7 +9454,7 @@ test('[Codex r3 HIGH] FULL refund states the open balance with its figures (reco
  * precondition; the three isolate the flag from the journal.
  * ------------------------------------------------------------------------------------------ */
 
-function priorRefundOwingState(options: { priorFlag: boolean; priorRow?: 'synced' }): State {
+function priorRefundOwingState(options: { priorFlag: boolean; priorRow?: 'synced'; rows?: Array<Record<string, unknown>> }): State {
   const state = a2StagedFourUnitState()
   seedPriorAllocationRefund(state)
   const prior = state.refunds.find((refund) => refund.id === 'refund-prior')!
@@ -9469,6 +9469,16 @@ function priorRefundOwingState(options: { priorFlag: boolean; priorRow?: 'synced
       status: 'SYNCED',
       payload: { lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '1210', credit: 10 }] },
     }]
+  }
+  for (const extra of options.rows ?? []) {
+    state.accountingSyncLogs = [...(state.accountingSyncLogs ?? []), {
+      connector: 'xero',
+      type: 'UNEARNED_REV_REVERSAL',
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-prior',
+      payload: { lines: [{ accountCode: '1200', debit: 10 }, { accountCode: '1210', credit: 10 }] },
+      ...extra,
+    } as never]
   }
   // THE CURRENT refund: a full monetary refund whose staging is being re-derived by a retry.
   state.orders[0].refundStatus = 'FULL'
@@ -9542,3 +9552,38 @@ test('[o3d-fj4m] (isolating) a flagged prior refund WITH its journal on record i
   assert.equal(credit, 30, 'the journal exists and is legible: £40 less its own £10')
   assert.doesNotMatch(note, /STILL OWES/, 'the flag does not override a journal that stands')
 })
+
+/* --------------------------------------------------------------------------------------------
+ * o3d-fj4m (Codex round 3 on #733) - MIXED STANDINGS: THE AMOUNT READER AND THE DISCHARGE AGREE.
+ *
+ * A reversal posting can have several attempts. Attempts PROVEN never to have reached the ledger are not part
+ * of what posted (the shared predicate `rowsThatMayHaveReachedLedger`); the amount is proved from the rest,
+ * and every non-CONFIRMED attempt among the rest still makes it unproved (asserted / unknown / live: never
+ * loosened). Each arm asserts the standings of its fixture rows and prints the case.
+ * ------------------------------------------------------------------------------------------ */
+
+const NOT_POSTED = { status: 'CANCELLED', externalTransactionId: null, abandonedBeforeRemoteCall: true, settlementBasis: null }
+const CONFIRMED = { status: 'SYNCED', externalTransactionId: 'JNL-1', abandonedBeforeRemoteCall: null, settlementBasis: null }
+const ASSERTED = { status: 'SYNCED', externalTransactionId: 'TYPED-1', abandonedBeforeRemoteCall: null, settlementBasis: 'OPERATOR_ASSERTION' }
+const UNKNOWN_FAILED = { status: 'FAILED', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null }
+const LIVE = { status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null }
+
+const MIXED_ARMS: Array<{ name: string; rows: Array<Record<string, unknown>>; standings: string[]; credit: number | null }> = [
+  { name: 'PROVEN_NOT_POSTED only', rows: [NOT_POSTED], standings: ['PROVEN_NOT_POSTED'], credit: 40 },
+  { name: 'CONFIRMED_POSTED only', rows: [CONFIRMED], standings: ['CONFIRMED_POSTED'], credit: 30 },
+  { name: 'PROVEN_NOT_POSTED + CONFIRMED_POSTED', rows: [NOT_POSTED, CONFIRMED], standings: ['PROVEN_NOT_POSTED', 'CONFIRMED_POSTED'], credit: 30 },
+  { name: 'CONFIRMED_POSTED + ASSERTED_POSTED', rows: [CONFIRMED, ASSERTED], standings: ['CONFIRMED_POSTED', 'ASSERTED_POSTED'], credit: null },
+  { name: 'CONFIRMED_POSTED + UNKNOWN', rows: [CONFIRMED, UNKNOWN_FAILED], standings: ['CONFIRMED_POSTED', 'UNKNOWN'], credit: null },
+  { name: 'CONFIRMED_POSTED + LIVE_WORK', rows: [CONFIRMED, LIVE], standings: ['CONFIRMED_POSTED', 'LIVE_WORK'], credit: null },
+  { name: 'PROVEN_NOT_POSTED + LIVE_WORK', rows: [NOT_POSTED, LIVE], standings: ['PROVEN_NOT_POSTED', 'LIVE_WORK'], credit: null },
+]
+for (const arm of MIXED_ARMS) {
+  test(`[o3d-fj4m mixed] refund #2 with a prior reversal set of ${arm.name} ${arm.credit === null ? 'is withheld (unproved)' : `credits £${arm.credit}`}`, async () => {
+    const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+    assert.deepEqual(arm.rows.map((row) => ledgerStanding(row as never)), arm.standings, 'PRECONDITION: the fixture rows have the standings the arm names')
+    const state = priorRefundOwingState({ priorFlag: false, rows: arm.rows })
+    const { credit } = await retryRefund2(state)
+    console.log(`o3d-fj4m mixed ${arm.name}: credit=${credit}`)
+    assert.equal(credit, arm.credit)
+  })
+}

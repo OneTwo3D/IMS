@@ -525,7 +525,7 @@ test(
 )
 
 test(
-  '[o3d-fj4m F4] crash gap, CONFIRMED_POSTED beside a PROVEN_NOT_POSTED row (mixed): discharges, relief KEPT, #2 withheld (never 40)',
+  '[o3d-fj4m F4] crash gap, CONFIRMED_POSTED beside a PROVEN_NOT_POSTED row (mixed): discharges, relief KEPT, #2 credits the 30 remainder',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async (t) => {
     const { r, retried, row } = await crashGap(t, 'F4', [
@@ -535,11 +535,9 @@ test(
     assert.equal(retried.success, true)
     assert.equal(row.accountingRetryRequired, false)
     assert.equal(Number(row.allocatedReliefAmount), 10)
-    // The reader proves #1's journal over ALL its rows and refuses a mixed CANCELLED/SYNCED set as unproved:
-    // refund #2 is WITHHELD (nothing credited, the open balance unresolved), the safe direction - never the
-    // whole £40 on top of the £10 that posted.
-    const second = await secondRefund(r, 'F4')
-    assert.ok(second.credit === null || second.credit === 0, `refund #2 credited £${second.credit}; a mixed journal set is unproved, so it is withheld`)
+    // The reader and the discharge agree: the PROVEN_NOT_POSTED attempt is not part of what posted, the amount is
+    // proved from the CONFIRMED one, so #2 credits the remainder (never 40, never withheld).
+    assert.equal((await secondRefund(r, 'F4')).credit, 30)
   },
 )
 
