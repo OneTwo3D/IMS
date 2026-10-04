@@ -40,6 +40,8 @@ import {
   chunkUnits,
   dispositionAnomalies,
   findRecipeCycles,
+  hasInvisibleKeyChars,
+  idToken,
   parseSku,
   skuKey,
   type AccountingRow,
@@ -885,7 +887,10 @@ function loadStock(run: Run): void {
 
   // The same lot twice (same reference) is a duplicated export row, not two lots: refuse it.
   const byRef = new Map<string, Lot[]>()
-  for (const lot of lots) if (lot.lotRef !== '') byRef.set(`${stockGroupKey(lot.key, lot.warehouse)}\u0000${lot.lotRef}`, [...(byRef.get(`${stockGroupKey(lot.key, lot.warehouse)}\u0000${lot.lotRef}`) ?? []), lot])
+  for (const lot of lots) {
+    const token = idToken(lot.lotRef)
+    if (token !== '') byRef.set(`${stockGroupKey(lot.key, lot.warehouse)}\u0000${token}`, [...(byRef.get(`${stockGroupKey(lot.key, lot.warehouse)}\u0000${token}`) ?? []), lot])
+  }
   const refused = new Set<Lot>()
   for (const [, list] of byRef) {
     if (list.length < 2) continue
@@ -894,18 +899,20 @@ function loadStock(run: Run): void {
       run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_REF', `lot reference ${JSON.stringify(lot.lotRef)} appears ${list.length} times for this SKU and warehouse`)
     }
   }
-  // Identical lot rows with no lot reference cannot be told from an exported-twice row, and summing them silently doubles stock.
+  // Rows of one SKU and warehouse with the same quantity and cost are told apart ONLY by distinct, non-blank lot references. A blank
+  // (or whitespace, or zero-width) reference on any of them cannot make it distinct: it could be a referenced lot exported twice, and
+  // summing them silently doubles stock. The date is deliberately not part of the signature: a missing date is no evidence either.
   const bySignature = new Map<string, Lot[]>()
   for (const lot of lots) {
-    if (lot.lotRef !== '') continue
-    const signature = [stockGroupKey(lot.key, lot.warehouse), fmt(lot.qty), lot.unitCostBase.toFixed(), lot.date].join('\u0000')
+    if (refused.has(lot)) continue
+    const signature = [stockGroupKey(lot.key, lot.warehouse), fmt(lot.qty), lot.unitCostBase.toFixed()].join('\u0000')
     bySignature.set(signature, [...(bySignature.get(signature) ?? []), lot])
   }
   for (const list of bySignature.values()) {
-    if (list.length < 2) continue
+    if (list.length < 2 || list.every((lot) => idToken(lot.lotRef) !== '')) continue
     for (const lot of list) {
       refused.add(lot)
-      run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_ROW', `${list.length} identical lot rows (same SKU, warehouse, quantity, cost and date) and no lot reference to tell them apart; they could be one lot exported twice (stock would be doubled) or genuinely separate lots. Add a lot reference column to the export`)
+      run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_ROW', `${list.length} lot rows with the same SKU, warehouse, quantity and cost, and at least one has no lot reference to tell it apart; they could be one lot exported twice (stock would be doubled) or genuinely separate lots. Add a lot reference column to the export`)
     }
   }
   const groups = new Map<string, Lot[]>()
@@ -961,6 +968,7 @@ function loadTransfers(run: Run): void {
     const label = `${v.transferKey}/${sku.ok ? sku.sku : v.sku}`
     const reject = (code: string, reason: string) => run.add('transfers', row.line, label, 'REJECTED', code, reason)
     if (v.transferKey === '') { reject('MISSING_KEY', 'transferKey is empty'); continue }
+    if (hasInvisibleKeyChars(v.transferKey)) { reject('KEY_HAS_INVISIBLE_CHARS', 'transferKey contains a control, space-like or zero-width character, which makes visually equal references differ'); continue }
     if (v.transferKey.startsWith('#')) { reject('KEY_STARTS_WITH_HASH', 'the importers\' CSV reader silently skips a row whose first value starts with "#"'); continue }
     if (!sku.ok) { reject('BAD_SKU', sku.reason); continue }
     const status = v.status.toUpperCase()
@@ -1107,13 +1115,20 @@ function loadPurchaseOrders(run: Run): void {
   for (const row of run.rows('purchase-order-lines')) {
     const parsed = parseSku(row.values.sku)
     if (row.values.orderKey === '' || !parsed.ok) continue
-    const identity = [row.values.orderKey, parsed.key, row.values.lineNo].join('\u0000')
+    const identity = [row.values.orderKey, parsed.key].join('\u0000')
     byIdentity.set(identity, [...(byIdentity.get(identity) ?? []), row])
   }
+  // An order that repeats a SKU is only unambiguous when EVERY such row carries a non-blank line number and no two share one. A blank
+  // (or whitespace, or zero-width) line number on any of them cannot make it distinct from the others.
   for (const list of byIdentity.values()) {
     if (list.length < 2) continue
-    const exact = new Set(list.map((r) => JSON.stringify(r.values))).size === 1
-    for (const row of list) dupInfo.set(row, { exact, count: list.length })
+    const tokens = list.map((r) => idToken(r.values.lineNo))
+    const anyBlank = tokens.some((tok) => tok === '')
+    const tokenCount = new Map<string, number>()
+    for (const tok of tokens) tokenCount.set(tok, (tokenCount.get(tok) ?? 0) + 1)
+    const bad = list.filter((_, i) => anyBlank || (tokenCount.get(tokens[i]) ?? 0) > 1)
+    const exact = new Set(bad.map((r) => JSON.stringify({ ...r.values, lineNo: '' }))).size === 1
+    for (const row of bad) dupInfo.set(row, { exact, count: list.length })
   }
   const candidates: Line[] = []
   const fullyReceivedOrders = new Map<string, { open: number; closed: number }>()
@@ -1125,14 +1140,15 @@ function loadPurchaseOrders(run: Run): void {
     const tally = fullyReceivedOrders.get(v.orderKey) ?? { open: 0, closed: 0 }
     fullyReceivedOrders.set(v.orderKey, tally)
     if (v.orderKey === '') { reject('MISSING_KEY', 'orderKey is empty (an empty key would load every line as its own purchase order)'); continue }
+    if (hasInvisibleKeyChars(v.orderKey)) { reject('KEY_HAS_INVISIBLE_CHARS', 'orderKey contains a control, space-like or zero-width character, which makes visually equal references differ'); continue }
     if (v.orderKey.startsWith('#')) { reject('KEY_STARTS_WITH_HASH', 'the importers\' CSV reader silently skips a row whose first value starts with "#"'); continue }
     if (v.supplierName === '') { reject('MISSING_SUPPLIER', 'supplierName is empty'); continue }
     if (!sku.ok) { reject('BAD_SKU', sku.reason); continue }
     const dup = dupInfo.get(row)
     if (dup) {
       reject(dup.exact ? 'DUPLICATE_PO_LINE' : 'DUPLICATE_PO_LINE_CONFLICT', dup.exact
-        ? `this order line appears ${dup.count} times with identical data; it could be one line exported twice (the outstanding quantity would be doubled) or genuinely repeated. Map a line-number column to lineNo to tell lines apart`
-        : `order ${v.orderKey} has ${dup.count} rows for SKU ${sku.sku}${v.lineNo ? ` and line ${v.lineNo}` : ''} with different data; which is right cannot be decided. Map a line-number column to lineNo if they are separate lines`)
+        ? `this order repeats SKU ${sku.sku} ${dup.count} times with identical data (ignoring the line number) and no distinct, non-blank line number on every one; it could be one line exported twice (the outstanding quantity would be doubled) or genuinely repeated. Map a line-number column to lineNo and fill it on every line`
+        : `order ${v.orderKey} has ${dup.count} rows for SKU ${sku.sku} with different data and no distinct, non-blank line number on every one; which is right cannot be decided. Map a line-number column to lineNo and fill it on every line`)
       continue
     }
     const status = v.status === '' ? 'OPEN' : v.status.toUpperCase()

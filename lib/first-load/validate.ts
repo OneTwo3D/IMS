@@ -33,6 +33,20 @@ export function parseSku(raw: string, label = 'sku'): SkuParse {
   return { ok: true, sku, key: skuKey(sku), trimmed: sku !== raw }
 }
 
+/**
+ * The comparable form of an optional IDENTITY value (lot reference, line number): every space, zero-width and other format
+ * character removed, upper-cased. Empty means "not given". A blank, a space, a zero-width space or a non-breaking space can
+ * therefore never make a row look distinct from another, and `l1` / `L 1` are the same reference.
+ */
+export function idToken(value: string): string {
+  return value.normalize('NFKC').replace(/[\p{Z}\p{C}\s]/gu, '').toUpperCase()
+}
+
+/** True when a KEY (order key, transfer key) contains a control, space-like or zero-width character, which makes visually equal keys differ. */
+export function hasInvisibleKeyChars(value: string): boolean {
+  return /[\p{C}\p{Zl}\p{Zp}]/u.test(value) || /(?! )\p{Zs}/u.test(value)
+}
+
 export function skuKey(sku: string): string {
   return sku.toUpperCase()
 }

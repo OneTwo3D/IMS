@@ -125,7 +125,7 @@ FIFO lots on hand per SKU and warehouse. A row with `qty` 0 states "zero on hand
 | `currency` | yes | 3-letter code. |
 | `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. Foreign units per ONE base unit (as in the purchase-order importer, which divides by it): base cost = cost / rate. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `receivedDate` | no | Informational. |
-| `lotRef` | no | Lot reference. The same reference twice for one SKU and warehouse is a duplicated row and is refused; so are identical rows (same SKU, warehouse, quantity, cost and date) with no reference. |
+| `lotRef` | no | Lot reference. Rows of one SKU and warehouse with the same quantity and cost are told apart ONLY by distinct, non-blank references: the same reference twice (spelling, case, spaces and zero-width characters ignored) is refused, and so are such rows when any of them has no reference. |
 
 ### Dataset: suppliers
 
@@ -163,7 +163,7 @@ Reduced to the outstanding quantity per line.
 | `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `destinationWarehouseCode` | no | Passed through as given (trimmed). |
 | `sku` | yes | Passed through as given (trimmed). |
-| `lineNo` | no | The incumbent's line number. Map it when an order can carry the same SKU on more than one line: two rows with the same order, SKU and line number are rejected as duplicates. |
+| `lineNo` | no | The incumbent's line number. When an order repeats a SKU, EVERY such row must carry a non-blank line number and no two may share one; otherwise all of them are rejected as duplicates. A blank, space or zero-width value never makes a row distinct. |
 | `qtyOrdered` | yes | At most 4 decimal places. |
 | `qtyReceived` | yes | At most 4 decimal places. |
 | `unitCostForeign` | yes | At most 6 decimal places and 9 integer digits. |
@@ -312,7 +312,7 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
 - **SKUs.** A SKU is trimmed and Unicode-normalised; nothing inside it is changed. Other datasets find a product by comparing upper-case (exactly how the opening-stock,
   transfer and purchase-order importers look a SKU up) and the file uses the catalogue's spelling. Two catalogue SKUs that differ only by case reject both. A SKU with a control, non-breaking-space
   or zero-width character, or starting with `#` (the importers' reader skips such a row as a comment), is rejected.
-- **Duplicates.** The same rule everywhere: a duplicate is either provably identical and deduplicated (products, suppliers, exclusions, IMS lists: the extra is *excluded* with `DUPLICATE_ROW`), or rejected with every member, so the answer never depends on row order. A line that would **add** a quantity when repeated is never deduplicated, because that cannot tell an export that repeated a row from a real second line: the same purchase order line twice (same order, SKU and `lineNo`) is rejected as `DUPLICATE_PO_LINE` (identical) or `DUPLICATE_PO_LINE_CONFLICT`; identical stock lot rows with no `lotRef` are rejected as `DUPLICATE_LOT_ROW`; the same lot reference twice, the same recipe component twice, and the same SKU twice in one transfer are rejected. Every duplicate has a disposition, so the accounting table shows it.
+- **Duplicates.** The same rule everywhere: a duplicate is either provably identical and deduplicated (products, suppliers, exclusions, IMS lists: the extra is *excluded* with `DUPLICATE_ROW`), or rejected with every member, so the answer never depends on row order. A line that would **add** a quantity when repeated is never deduplicated, because that cannot tell an export that repeated a row from a real second line: the same purchase order line twice (same order, SKU and `lineNo`) is rejected as `DUPLICATE_PO_LINE` (identical) or `DUPLICATE_PO_LINE_CONFLICT`; stock lot rows with the same SKU, warehouse, quantity and cost where any lacks a distinct, non-blank `lotRef` are rejected as `DUPLICATE_LOT_ROW`; order and transfer keys containing control, zero-width or non-ASCII space characters are refused (`KEY_HAS_INVISIBLE_CHARS`); the same lot reference twice, the same recipe component twice, and the same SKU twice in one transfer are rejected. Every duplicate has a disposition, so the accounting table shows it.
 - **Decimals.** Quantities and costs use exact decimal arithmetic, never floating point. A decimal comma, a thousands separator, an exponent, a sign prefix, more decimal places than the target column holds, or more than
   15 significant digits for a cost (the importers read costs as doubles) is rejected.
 - **Recipes.** Every component and parent must be a loaded product. The recipe graph must be acyclic: the check is `detectBomItemCycleInEdges`, the function the importer's component pass uses, applied repeatedly until every

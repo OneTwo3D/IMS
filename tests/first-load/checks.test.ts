@@ -564,3 +564,59 @@ test('purchase order supplier names resolve against the IMS supplier list when n
   assert.deepEqual(rejectedCodes(po('Nobody', ['Acme']), 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
   assert.equal(rowsOf(po('acme', ['Acme']), 'purchase-orders')[0].supplierName, 'Acme', 'the IMS spelling is written')
 })
+
+const BLANKISH = ['', ' ', '\t', '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u00a0', '\u2003', ' \u200b ', '\u3000']
+
+test('identity sweep: for EVERY optional identity column a blank, whitespace or zero-width value never makes a row distinct', (t) => {
+  const products = ds('products', [product('A')])
+  let cases = 0
+  // purchase-order-lines.lineNo: one row numbered 1, its otherwise identical twin carrying a blank-ish number
+  for (const blank of BLANKISH) {
+    for (const [first, second] of [['1', blank], [blank, '1'], [blank, blank]] as const) {
+      const r = run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A', lineNo: first }), poLine({ sku: 'A', lineNo: second })]) })
+      assert.deepEqual(rejectedCodes(r, 'purchase-order-lines'), ['DUPLICATE_PO_LINE', 'DUPLICATE_PO_LINE'], `lineNo ${JSON.stringify([first, second])}`)
+      cases++
+    }
+  }
+  // stock-lots.lotRef: a referenced lot and its otherwise identical twin carrying a blank-ish reference
+  for (const blank of BLANKISH) {
+    for (const [first, second] of [['L1', blank], [blank, 'L1'], [blank, blank]] as const) {
+      const r = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: first }), lot('A', '5', '2', { lotRef: second, receivedDate: '2026-01-01' })]) })
+      assert.deepEqual(rejectedCodes(r, 'stock-lots'), ['DUPLICATE_LOT_ROW', 'DUPLICATE_LOT_ROW'], `lotRef ${JSON.stringify([first, second])}`)
+      cases++
+    }
+  }
+  // spelling variants of one reference are ONE reference
+  const variant = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: 'l1' }), lot('A', '5', '2', { lotRef: 'L\u200b 1' })]) })
+  assert.deepEqual(rejectedCodes(variant, 'stock-lots'), ['DUPLICATE_LOT_REF', 'DUPLICATE_LOT_REF'])
+  // recipe-lines.sortOrder is an ordering hint, never part of a line's identity
+  const recipe = run({
+    products: ds('products', [product('K', 'KIT'), product('C')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'C', qty: '1', sortOrder: '1' }, { parentSku: 'K', componentSku: 'C', qty: '1', sortOrder: '' }]),
+  })
+  assert.deepEqual(rejectedCodes(recipe, 'recipe-lines'), ['DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE'])
+  precondition(t, 'blank-ish identity cases', cases + 2)
+  assert.equal(cases, BLANKISH.length * 6)
+})
+
+test('identity sweep: genuinely distinct lines still pass (distinct non-blank line numbers, distinct non-blank lot references, different quantities)', (t) => {
+  const products = ds('products', [product('A')])
+  const po = run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A', lineNo: '1' }), poLine({ sku: 'A', lineNo: ' 2 ' })]) })
+  const lots = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: 'L1' }), lot('A', '5', '2', { lotRef: 'L2' }), lot('A', '7', '2')]) })
+  precondition(t, 'cases', 2)
+  assert.equal(po.blocking, false)
+  assert.equal(lots.blocking, false)
+  assert.equal(rowsOf(lots, 'opening-stock')[0].qty, '17')
+})
+
+test('identity sweep: keys with control, zero-width or non-ASCII space characters are refused (visually equal references would differ)', (t) => {
+  const products = ds('products', [product('A')])
+  const keys = ['PO\u200b1', 'PO\u00a01', 'PO\t1', 'PO\u20031']
+  precondition(t, 'bad keys', keys.length)
+  for (const key of keys) {
+    assert.deepEqual(rejectedCodes(run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: key })]) }), 'purchase-order-lines'), ['KEY_HAS_INVISIBLE_CHARS'], JSON.stringify(key))
+    const tr = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '1')]), transfers: ds('transfers', [{ transferKey: key, status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'A', qtyShipped: '1', qtyReceived: '0' }]) })
+    assert.deepEqual(rejectedCodes(tr, 'transfers'), ['KEY_HAS_INVISIBLE_CHARS'])
+  }
+  assert.equal(run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: 'PO 1' })]) }).blocking, false, 'an ordinary space is allowed')
+})
