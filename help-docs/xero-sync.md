@@ -2349,10 +2349,12 @@ allocation is only queued when that recorded connector is the one it would post 
 
 **Documents posted before this version have no recorded connector, and are refused too.** This is
 deliberate and is *not* a narrow window like the chart refusal above: IMS does not guess which ledger holds
-an older invoice, because guessing is the mistake being prevented. To pay or edit such a document through
-IMS, re-post it so the document and its connector are recorded together. For a customer payment, follow
-the remedy in the refusal message itself: it says whether settling by hand is safe, because a deferred
-re-drive may still register the receipt.
+an older invoice, because guessing is the mistake being prevented. **Do not re-post it:** a
+document that is already in a ledger and is posted again can create a second one. Identify the existing
+document in the accounting system and confirm it exists there, then pay or edit it in the accounting system
+itself (IMS will not do it for a document whose connector it cannot prove, and has no step that makes it
+guess). For a customer payment, follow the remedy in the refusal message itself: it says whether settling
+by hand is safe, because a deferred re-drive may still register the receipt.
 
 **The payment account mapping is shared by every accounting connector.** Its keys (`method:currency`)
 are connector-neutral, but each value is one connector's own bank-account ID. A customer payment is
@@ -2454,10 +2456,13 @@ Three things about those rows:
   on this list, marked as being settled by you; another operator who opens the page is told you have it and
   is not offered the action, so two people cannot post the same thing.
 
-  **2. Mark as handled** means: *"I posted this by hand or confirmed it is there; IMS will not post it."* IMS does not read the ledger when you press it: it takes your word, so press it only when the table above says so. It asks for an optional note
-  (for example the ledger journal number) and records who marked it and when. From then on IMS refuses every
-  automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is
-  logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. It is
+  **2. Mark as handled** means: *"I posted this by hand or confirmed it is there."* IMS does not read the ledger when you press it: it takes your word, so press it only when the table above says so. It asks for an optional note
+  (for example the ledger journal number) and records who marked it and when. For a posting whose key names ONE posting for
+  ever, IMS then refuses every automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a
+  follow-up) — each refusal is logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach
+  the ledger twice. For an invoice update, a bill update or a bill payment the key is REUSED by successive
+  versions, so marking cancels IMS's own queued retry and closes THIS refusal but does **not** suppress later
+  postings: a later save of the document queues a new one, which is what the ledger needs. It is
   refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
   wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
   row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
@@ -5049,10 +5054,12 @@ allocation is only queued when that recorded connector is the one it would post 
 
 **Documents posted before this version have no recorded connector, and are refused too.** This is
 deliberate and is *not* a narrow window like the chart refusal above: IMS does not guess which ledger holds
-an older invoice, because guessing is the mistake being prevented. To pay or edit such a document through
-IMS, re-post it so the document and its connector are recorded together. For a customer payment, follow
-the remedy in the refusal message itself: it says whether settling by hand is safe, because a deferred
-re-drive may still register the receipt.
+an older invoice, because guessing is the mistake being prevented. **Do not re-post it:** a
+document that is already in a ledger and is posted again can create a second one. Identify the existing
+document in the accounting system and confirm it exists there, then pay or edit it in the accounting system
+itself (IMS will not do it for a document whose connector it cannot prove, and has no step that makes it
+guess). For a customer payment, follow the remedy in the refusal message itself: it says whether settling
+by hand is safe, because a deferred re-drive may still register the receipt.
 
 **The payment account mapping is shared by every accounting connector.** Its keys (`method:currency`)
 are connector-neutral, but each value is one connector's own bank-account ID. A customer payment is
@@ -5154,10 +5161,13 @@ Three things about those rows:
   on this list, marked as being settled by you; another operator who opens the page is told you have it and
   is not offered the action, so two people cannot post the same thing.
 
-  **2. Mark as handled** means: *"I posted this by hand or confirmed it is there; IMS will not post it."* IMS does not read the ledger when you press it: it takes your word, so press it only when the table above says so. It asks for an optional note
-  (for example the ledger journal number) and records who marked it and when. From then on IMS refuses every
-  automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a follow-up) — each refusal is
-  logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach the ledger twice. It is
+  **2. Mark as handled** means: *"I posted this by hand or confirmed it is there."* IMS does not read the ledger when you press it: it takes your word, so press it only when the table above says so. It asks for an optional note
+  (for example the ledger journal number) and records who marked it and when. For a posting whose key names ONE posting for
+  ever, IMS then refuses every automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a
+  follow-up) — each refusal is logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach
+  the ledger twice. For an invoice update, a bill update or a bill payment the key is REUSED by successive
+  versions, so marking cancels IMS's own queued retry and closes THIS refusal but does **not** suppress later
+  postings: a later save of the document queues a new one, which is what the ledger needs. It is
   refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
   wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
   row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting

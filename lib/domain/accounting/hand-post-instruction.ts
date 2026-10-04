@@ -56,7 +56,21 @@ export type HandPostInstruction = {
   markHandledConfirms: string
   /** What the operator must NOT release over, as a clause that follows "if". */
   alreadyDone: string
+  /**
+   * What pressing Mark as handled DOES, per posting type (Codex round 11): the server cancels IMS's own queued retry and resolves the
+   * row for every type, but it writes the durable suppression (`suppressedAt`) only where the posting key names ONE posting for ever.
+   * On a reused key (update / payment) a later save can queue a new posting, and the dialog must not promise otherwise.
+   */
+  markHandledEffect: string
 }
+
+const EFFECT_REUSED_KEY =
+  'This closes THIS refusal and cancels IMS\'s own queued retry of it. It does NOT stop a later save of the document from queuing a new posting '
+  + 'that can reach the ledger, and if the document was edited again while you were in the ledger IMS keeps the debt and tells you.'
+const EFFECT_ONE_POSTING_KEY =
+  'IMS cancels its own retry of this posting and will refuse to post it from then on, so it cannot reach the ledger twice.'
+const EFFECT_TYPE_UNKNOWN =
+  'This closes this refusal and cancels IMS\'s own queued retry of it. Whether IMS also refuses to post it again afterwards depends on the posting type, so do not rely on that.'
 
 /**
  * The reused-key types (drift-guarded against `REUSED_POSTING_KEY_TYPES` in a test; this module stays import-free because the dialogs
@@ -90,6 +104,7 @@ export function handPostInstruction(input: { type?: string }): HandPostInstructi
       markHandledCondition: 'the CURRENT version is in the ledger',
       markHandledConfirms: 'the CURRENT version is in the ledger - already there, or you posted or updated it by hand',
       alreadyDone: 'the CURRENT version is already in the ledger',
+      markHandledEffect: EFFECT_REUSED_KEY,
     }
   }
   if (flow === 'payment') {
@@ -106,6 +121,7 @@ export function handPostInstruction(input: { type?: string }): HandPostInstructi
       markHandledCondition: 'the CURRENT payment is in the ledger',
       markHandledConfirms: 'the CURRENT payment is in the ledger - already there, or you registered it as a new payment by hand',
       alreadyDone: 'the CURRENT payment is already in the ledger',
+      markHandledEffect: EFFECT_REUSED_KEY,
     }
   }
   if (flow === 'conditional') {
@@ -119,6 +135,7 @@ export function handPostInstruction(input: { type?: string }): HandPostInstructi
       markHandledCondition: 'the document is in the ledger (already there, or posted by you)',
       markHandledConfirms: 'the document is in the ledger - it was already there, or you posted it by hand',
       alreadyDone: 'the document is already in the ledger',
+      markHandledEffect: EFFECT_ONE_POSTING_KEY,
     }
   }
   return {
@@ -131,6 +148,7 @@ export function handPostInstruction(input: { type?: string }): HandPostInstructi
     markHandledCondition: 'the CURRENT version of the posting is in the ledger',
     markHandledConfirms: 'the CURRENT version of the posting is in the ledger - already there, or you posted it by hand once you had identified the posting type',
     alreadyDone: 'the CURRENT version of the posting is already in the ledger',
+    markHandledEffect: EFFECT_TYPE_UNKNOWN,
   }
 }
 
@@ -250,8 +268,7 @@ export function claimWarningFor(input: HandPostInput): string {
 export function markHandledWarningFor(input: HandPostInput): string {
   const instruction = handPostInstruction(input)
   return `Mark this handled ONLY if ${instruction.markHandledConfirms}. IMS does not read the ledger when you press it - it takes `
-    + 'your word. Marking it means: "I posted this by hand or confirmed it is there; IMS will not post it." IMS cancels its own '
-    + 'retry of this posting and will refuse to post it from then on, so it cannot reach the ledger twice. If IMS may already have '
+    + `your word. Marking it means: "I posted this by hand or confirmed it is there." ${instruction.markHandledEffect} If IMS may already have `
     + 'posted it, you will be told, and nothing is changed.'
 }
 

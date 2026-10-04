@@ -322,3 +322,24 @@ test('[o3d-1e7sl Codex r10] the explicit cells: a retired EARLIER update then a 
   assert.doesNotMatch(describeRetiredUnproven(['row s-1']), /post it by hand|look in the ledger/i, 'the retired sentence is factual only')
   assert.doesNotMatch(describeEarlierPostings([{ ref: 'X', standing: 'ASSERTED_POSTED' }]), /post it|REPLACES|update/i, 'the earlier sentence is factual only')
 })
+
+// Codex round 11 (HIGH 2): the help text must never direct an operator to RE-POST a document that may already be in a ledger. A UNIVERSAL
+// absence over every help doc: no sentence tells the reader to re-post it / the document / the invoice without a ledger check.
+test('[o3d-1e7sl Codex r11] no help doc directs re-posting an already posted document without a ledger check (universal absence)', () => {
+  const docs = readdirSync(path.join(ROOT, 'help-docs')).filter((f) => f.endsWith('.md'))
+  assert.ok(docs.length > 5, 'the census reads the help docs')
+  const offenders: string[] = []
+  for (const file of docs) {
+    const text = read(path.join('help-docs', file)).replace(/\s+/g, ' ')
+    for (const sentence of text.split(/(?<=[.!?])\s+/)) {
+      if (!/\b(re-?post|repost) (it|this|that|the (document|invoice|bill|payment|credit note))\b/i.test(sentence)) continue
+      if (/\b(do not|don't|never)\b[^.]{0,40}re-?post|check|verify|confirm|only if|if it (does not )?exist|unless|cannot|is not re-?posted|re-?posting a (document|payment)? ?that|automatically/i.test(sentence)) continue
+      offenders.push(`${file}: ${sentence.slice(0, 160)}`)
+    }
+  }
+  assert.deepEqual(offenders, [], 're-post advice without a ledger check')
+  // the legacy-document paragraph says what to do instead
+  const doc = read('help-docs/xero-sync.md')
+  assert.equal((doc.match(/\*\*Do not re-post it:\*\*/g) ?? []).length, 2, 'both copies of the legacy-document paragraph forbid re-posting')
+  assert.doesNotMatch(doc, /re-post it so the document and its connector are recorded together/)
+})

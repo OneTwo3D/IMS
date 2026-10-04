@@ -1152,3 +1152,26 @@ test('[o3d-1e7sl Codex r10] the claim log for a BILL_PAYMENT is the PAYMENT inst
     assert.doesNotMatch(note.description, /apply the update|update it/i, `${name}: never the update wording on a payment`)
   }
 })
+
+test('[o3d-1e7sl Codex r11] the Mark-as-handled dialog promises exactly what the server does: suppression only where the key names ONE posting for ever', async () => {
+  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const cases: Array<[string, string, boolean]> = [
+    ['SALES_INVOICE_UPDATE', 'sales_invoice_update', false],
+    ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update', false],
+    ['BILL_PAYMENT', 'realised_fx_bill_payment', false],
+    ['STOCK_RECEIPT', 'stock_receipt_journal', true],
+  ]
+  for (const [type, kind, suppresses] of cases) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r11-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r11-${type}`)), true, `${type}: the mark goes through`)
+    // what the server DID
+    assert.equal(refusals[0]!.suppressedAt instanceof Date, suppresses, `${type}: the server ${suppresses ? 'writes' : 'does NOT write'} the durable suppression`)
+    // what the dialog SAYS must be the same
+    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
+    assert.equal(/will refuse to post it from then on|cannot reach the ledger twice/.test(dialog), suppresses, `${type}: the dialog promises suppression iff the server applies it`)
+    if (!suppresses) assert.match(dialog, /does NOT stop a later save of the document from queuing a new posting/, `${type}: and says a later save can post`)
+  }
+  // a type the dialog cannot classify never promises it
+  assert.doesNotMatch(markHandledWarningFor({ state: 'not-loaded' }), /will refuse to post it from then on|cannot reach the ledger twice/)
+})
