@@ -70,7 +70,8 @@ test('every mutating raw fetch under scripts/ is in a file that takes the outbou
 
   const unguarded = mutating.filter((call) => {
     if (/XERO_TOKEN_URL/.test(call.urlText)) return false
-    return !readFileSync(call.file, 'utf8').includes('outboundWriteRefusal(')
+    // The decision must be ACTED ON: the refusal is followed by a throw, not merely computed.
+    return !/outboundWriteRefusal\([\s\S]*?\)\n\s*if \((\w+)\) throw /.test(readFileSync(call.file, 'utf8'))
   })
   assert.deepEqual(
     unguarded.map((call) => `${call.file.slice(process.cwd().length + 1)}:${call.line} ${call.method} ${call.urlText}`),
@@ -92,5 +93,6 @@ test('the cleanup script refuses its Xero write before sending when the grant is
   const source = readFileSync(join(ROOT, 'remove-xero-live-e2e-footprint.ts'), 'utf8')
   const guardAt = source.indexOf('outboundWriteRefusal({')
   const fetchAt = source.indexOf('await fetch(requestUrl')
-  assert.ok(guardAt > 0 && fetchAt > guardAt, 'the decision is taken before the raw fetch that sends the write')
+  const throwAt = source.indexOf('if (heldRefusal) throw new OutboundWriteHeldError(heldRefusal, 0)')
+  assert.ok(guardAt > 0 && throwAt > guardAt && fetchAt > throwAt, 'the decision is taken AND acted on before the raw fetch that sends the write')
 })
