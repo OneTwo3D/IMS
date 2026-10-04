@@ -1,0 +1,4 @@
+orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,lineDiscountForeign,lineDiscountStr,taxRateName,taxRateValue,orderTaxRateName,orderTaxRateValue,pricesIncludeVat,supplierRef,expectedDelivery,orderDiscountForeign,notes
+QBX-PO-5001,Timber Co,GBP,1,MAIN,OAK-BOARD,60,4.25,,,,,,,,,,,
+QBX-PO-5002,Cotton Ltd,EUR,1.25,MAIN,TSHIRT-M,20,2.1,,,,,,,,,,,
+QBX-PO-5002,Cotton Ltd,EUR,1.25,MAIN,TSHIRT-S,30,2.1,,,,,,,,,,,

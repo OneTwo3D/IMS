@@ -1,0 +1,7 @@
+PO No,Supplier,PO State,Cur,FX,Ship To,Item Code,Ord,Rcvd,Cost
+PO-5001,Timber Co,Open,GBP,,Main Warehouse,OAK-BOARD,100,40,4.25
+PO-5001,Timber Co,Open,GBP,,Main Warehouse,widget-9,50,50,1.20
+PO-5002,Cotton Ltd,Open,EUR,1.25,Main Warehouse,TSHIRT-S,30,0,2.10
+PO-5002,Cotton Ltd,Open,EUR,1.25,Main Warehouse,TSHIRT-M,30,10,2.10
+PO-5003,Hardware Inc,Closed,USD,1.3,Main Warehouse,WIDGET-9,10,10,1.00
+PO-5004,Timber Co,Open,GBP,,Main Warehouse,OAK-BOARD,10,12,4.25

@@ -1,0 +1,622 @@
+/**
+ * The remaining checks of the first-load transform: normalisation and collisions, duplicates, decimals, currency, recipes,
+ * open purchase orders, R14 coverage, load order and configuration. Table-driven; every table prints its case count.
+ */
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { ConfigError } from '../../lib/first-load/transform.ts'
+import { parseCsv } from '../../lib/csv.ts'
+import { dispositionCodes, ds, findingCodes, loadFixtureDatasets, lot, precondition, product, rowsOf, run } from './helpers.ts'
+
+const rejectedCodes = (result: ReturnType<typeof run>, dataset: string) => dispositionCodes(result, dataset, 'REJECTED')
+
+test('SKU normalisation: outer whitespace is trimmed and other datasets resolve case-insensitively to the catalogue spelling', (t) => {
+  const result = run({
+    products: ds('products', [product(' Mixed-Case ')]),
+    'stock-lots': ds('stock-lots', [lot('MIXED-CASE', '4', '2'), lot('  mixed-case', '1', '2', { warehouseCode: 'OVER' })]),
+  })
+  precondition(t, 'stock rows resolved', 2)
+  assert.equal(result.blocking, false)
+  assert.deepEqual(rowsOf(result, 'products').map((r) => r.sku), ['Mixed-Case'])
+  assert.deepEqual(rowsOf(result, 'opening-stock').map((r) => [r.sku, r.warehouseCode]), [['Mixed-Case', 'MAIN'], ['Mixed-Case', 'OVER']])
+})
+
+test('SKU collisions, forbidden characters and "#" are rejected, and ALL colliding rows are rejected (no arbitrary winner)', (t) => {
+  const collision = run({ products: ds('products', [product('abc'), product('ABC'), product('other')]) })
+  const bad = run({ products: ds('products', [product('#hash'), product('with\u00a0nbsp'), product('ok')]) })
+  precondition(t, 'collision cases', 2)
+  assert.deepEqual(rejectedCodes(collision, 'products'), ['SKU_CASE_COLLISION', 'SKU_CASE_COLLISION'])
+  assert.deepEqual(rejectedCodes(bad, 'products'), ['BAD_SKU', 'BAD_SKU'])
+  assert.equal(collision.blocking && bad.blocking, true)
+})
+
+test('duplicate keys: identical duplicates collapse, conflicting duplicates are all rejected', (t) => {
+  const identical = run({ products: ds('products', [product('A'), product('A')]), suppliers: ds('suppliers', [{ name: 'Acme' }, { name: 'Acme' }]) })
+  const conflicting = run({ products: ds('products', [product('A'), product('A', 'SIMPLE', { name: 'Different' })]), suppliers: ds('suppliers', [{ name: 'Acme', currency: 'GBP' }, { name: 'Acme', currency: 'EUR' }]) })
+  precondition(t, 'duplicate groups', 4)
+  assert.equal(identical.blocking, false)
+  assert.deepEqual(dispositionCodes(identical, 'products', 'EXCLUDED'), ['DUPLICATE_ROW'])
+  assert.equal(rowsOf(identical, 'products').length, 1)
+  assert.equal(rowsOf(identical, 'suppliers').length, 1, 'an exact duplicate supplier row loads once')
+  assert.deepEqual(rejectedCodes(conflicting, 'products'), ['DUPLICATE_SKU_CONFLICT', 'DUPLICATE_SKU_CONFLICT'])
+  assert.deepEqual(rejectedCodes(conflicting, 'suppliers'), ['DUPLICATE_SUPPLIER_CONFLICT', 'DUPLICATE_SUPPLIER_CONFLICT'])
+})
+
+test('a barcode shared by two products rejects both (the importer would refuse the second)', (t) => {
+  const result = run({ products: ds('products', [product('A', 'SIMPLE', { barcode: '5000000000011' }), product('B', 'SIMPLE', { barcode: '5000000000011' }), product('C')]) })
+  precondition(t, 'barcode groups', 1)
+  assert.deepEqual(rejectedCodes(result, 'products'), ['DUPLICATE_BARCODE', 'DUPLICATE_BARCODE'])
+})
+
+test('decimals: commas, thousands separators, exponents, over-precision and negatives are rejected with a reason, never guessed', (t) => {
+  const cases: Array<[string, string]> = [
+    ['1,5', 'decimal comma'],
+    ['1,000.50', 'thousands separator'],
+    ['1e3', 'not a plain decimal'],
+    ['.5', 'not a plain decimal'],
+    ['+4', 'not a plain decimal'],
+    ['4 pcs', 'not a plain decimal'],
+    ['1.1234567', 'more than 6 decimal places'],
+    ['123456789', 'more than 8 integer digits'],
+    ['-1', 'negative'],
+  ]
+  precondition(t, 'bad numbers', cases.length)
+  for (const [qty, expected] of cases) {
+    const result = run({ products: ds('products', [product('A')]), 'stock-lots': ds('stock-lots', [lot('A', qty, '1')]) })
+    const reason = result.report.dispositions.find((d) => d.dataset === 'stock-lots' && d.outcome === 'REJECTED')?.reason ?? ''
+    assert.ok(reason.includes(expected) || (qty === '-1' && reason.includes('negative')), `${qty}: ${reason}`)
+    assert.equal(result.blocking, true, qty)
+  }
+})
+
+test('decimals: unit costs beyond 15 significant digits (a double would round them) are rejected on purchase orders', (t) => {
+  precondition(t, 'cases', 1)
+  const result = run({
+    products: ds('products', [product('A')]),
+    'purchase-order-lines': ds('purchase-order-lines', [{ orderKey: 'O1', supplierName: 'S', sku: 'A', qtyOrdered: '1', qtyReceived: '0', unitCostForeign: '1234567890.5', currency: 'GBP' }]),
+  })
+  assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['BAD_UNIT_COST'])
+})
+
+test('currency: fxRateToBase is required for a non-base currency on lots and on purchase orders; for the base it must be 1 or blank', (t) => {
+  const stock = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'stock-lots': ds('stock-lots', [lot('A', '1', '2', extra)]) })
+  const po = (extra: Record<string, string>) => run({
+    products: ds('products', [product('A')]),
+    'purchase-order-lines': ds('purchase-order-lines', [{ orderKey: 'O1', supplierName: 'S', sku: 'A', qtyOrdered: '2', qtyReceived: '0', unitCostForeign: '1', currency: 'GBP', ...extra }]),
+  })
+  precondition(t, 'cases', 6)
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR' }), 'stock-lots'), ['BAD_FX'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'GBP', fxRateToBase: '2' }), 'stock-lots'), ['BAD_FX'])
+  assert.deepEqual(rejectedCodes(stock({ currency: 'EUR', fxRateToBase: '0' }), 'stock-lots'), ['BAD_FX'])
+  assert.deepEqual(rejectedCodes(po({ currency: 'USD' }), 'purchase-order-lines'), ['BAD_FX'])
+  assert.deepEqual(rejectedCodes(po({ currency: 'gb' }), 'purchase-order-lines'), ['BAD_CURRENCY'])
+  const ok = stock({ currency: 'EUR', fxRateToBase: '1.25' })
+  assert.equal(ok.blocking, false)
+  assert.equal(rowsOf(ok, 'opening-stock')[0].unitCostBase, '1.600000', 'the rate is foreign units per ONE base unit, as in the purchase-order importer: base cost = cost / rate')
+})
+
+test('variants: a VARIANT needs a VARIABLE parent that is itself loaded; parentSku on anything else is refused', (t) => {
+  const result = run({
+    products: ds('products', [
+      product('V1', 'VARIANT'),
+      product('V2', 'VARIANT', { parentSku: 'SIMPLE-PARENT' }),
+      product('SIMPLE-PARENT'),
+      product('V3', 'VARIANT', { parentSku: 'EXCLUDED-PARENT' }),
+      product('EXCLUDED-PARENT', 'VARIABLE'),
+      product('S', 'SIMPLE', { parentSku: 'EXCLUDED-PARENT' }),
+    ]),
+    'sku-exclusions': ds('sku-exclusions', [{ sku: 'EXCLUDED-PARENT', reason: 'discontinued' }]),
+  })
+  precondition(t, 'variant cases', 4)
+  assert.deepEqual(rejectedCodes(result, 'products').sort(), ['PARENT_ON_NON_VARIANT', 'VARIANT_PARENT_INVALID', 'VARIANT_PARENT_INVALID', 'VARIANT_WITHOUT_PARENT'])
+})
+
+test('recipes: a KIT or BOM with no loadable lines, or no recipe dataset at all, blocks the run', (t) => {
+  const none = run({ products: ds('products', [product('K', 'KIT'), product('P')]) })
+  const empty = run({ products: ds('products', [product('K', 'KIT'), product('P')]), 'recipe-lines': ds('recipe-lines', [{ parentSku: 'OTHER', componentSku: 'P', qty: '1' }]) })
+  precondition(t, 'cases', 2)
+  assert.ok(findingCodes(none, 'ERROR').includes('RECIPES_NOT_SUPPLIED'))
+  assert.ok(findingCodes(empty, 'ERROR').includes('NO_RECIPE_LINES'))
+})
+
+test('recipes: bad lines are rejected (unknown component, duplicate line, 5 decimals, non-recipe parent, delimiter in a SKU)', (t) => {
+  const result = run({
+    products: ds('products', [product('K', 'KIT'), product('P'), product('Q'), product('S;1')]),
+    'recipe-lines': ds('recipe-lines', [
+      { parentSku: 'K', componentSku: 'GHOST', qty: '1' },
+      { parentSku: 'K', componentSku: 'P', qty: '1' },
+      { parentSku: 'K', componentSku: 'P', qty: '2' },
+      { parentSku: 'K', componentSku: 'Q', qty: '1.00001' },
+      { parentSku: 'P', componentSku: 'Q', qty: '1' },
+      { parentSku: 'K', componentSku: 'S;1', qty: '1' },
+    ]),
+  })
+  const codes = rejectedCodes(result, 'recipe-lines').sort()
+  precondition(t, 'rejected recipe lines', codes.length)
+  assert.deepEqual(codes, ['BAD_QTY', 'COMPONENT_SKU_HAS_DELIMITER', 'DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE', 'PARENT_NOT_RECIPE_TYPE', 'SKU_NOT_IN_CATALOGUE'])
+})
+
+test('recipes: the components cell is ordered by sortOrder then SKU, and uses the catalogue spelling', (t) => {
+  const result = run({
+    products: ds('products', [product('Kit', 'KIT'), product('b-part'), product('A-PART'), product('c-part')]),
+    'recipe-lines': ds('recipe-lines', [
+      { parentSku: 'KIT', componentSku: 'B-PART', qty: '1' },
+      { parentSku: 'KIT', componentSku: 'a-part', qty: '2.5' },
+      { parentSku: 'KIT', componentSku: 'C-PART', qty: '3', sortOrder: '1' },
+    ]),
+  })
+  precondition(t, 'recipe lines', 3)
+  assert.equal(result.blocking, false)
+  assert.equal(rowsOf(result, 'products').find((r) => r.sku === 'Kit')?.components, 'c-part:3;A-PART:2.5;b-part:1')
+})
+
+test('load order: parents and components never come after the rows that need them, whatever the input order', (t) => {
+  const result = run({
+    products: ds('products', [
+      product('TABLE', 'BOM'), product('LEG', 'BOM'), product('V-1', 'VARIANT', { parentSku: 'PARENT' }),
+      product('GIFT', 'KIT'), product('PARENT', 'VARIABLE'), product('BOARD'),
+    ]),
+    'recipe-lines': ds('recipe-lines', [
+      { parentSku: 'TABLE', componentSku: 'LEG', qty: '4' }, { parentSku: 'LEG', componentSku: 'BOARD', qty: '1' },
+      { parentSku: 'GIFT', componentSku: 'V-1', qty: '1' }, { parentSku: 'GIFT', componentSku: 'TABLE', qty: '1' },
+    ]),
+  })
+  const order = rowsOf(result, 'products').map((r) => r.sku)
+  precondition(t, 'products ordered', order.length)
+  const at = (sku: string) => order.indexOf(sku)
+  assert.ok(at('PARENT') < at('V-1'), 'a variant follows its parent')
+  assert.ok(at('BOARD') < at('LEG') && at('LEG') < at('TABLE') && at('TABLE') < at('GIFT'), 'nested recipes follow their components')
+  assert.ok(at('V-1') < at('GIFT'))
+  assert.deepEqual(result.report.selfCheckFailures, [])
+})
+
+const poLine = (extra: Record<string, string>) => ({ orderKey: 'O1', supplierName: 'Acme', sku: 'A', qtyOrdered: '10', qtyReceived: '0', unitCostForeign: '2.5', currency: 'GBP', ...extra })
+
+test('purchase orders: only the outstanding quantity is loaded, never negative, and anomalies are reported', (t) => {
+  const result = run({
+    products: ds('products', [product('A'), product('B'), product('C')]),
+    suppliers: ds('suppliers', [{ name: 'Acme' }]),
+    'purchase-order-lines': ds('purchase-order-lines', [
+      poLine({ sku: 'A', qtyOrdered: '10', qtyReceived: '3.5' }),
+      poLine({ sku: 'B', qtyOrdered: '4', qtyReceived: '4' }),
+      poLine({ sku: 'C', qtyOrdered: '4', qtyReceived: '9' }),
+    ]),
+  })
+  precondition(t, 'lines', 3)
+  assert.deepEqual(rowsOf(result, 'purchase-orders').map((r) => [r.orderKey, r.sku, r.qty]), [['T-O1', 'A', '6.5']])
+  assert.deepEqual(dispositionCodes(result, 'purchase-order-lines', 'EXCLUDED').sort(), ['FULLY_RECEIVED', 'OVER_RECEIVED'])
+  assert.ok(findingCodes(result, 'WARNING').includes('PO_OVER_RECEIVED'))
+  assert.equal(result.report.purchaseOrders.orders, 1)
+})
+
+test('purchase orders: inconsistent order-level fields, unknown suppliers, KIT lines and bad dates are rejected', (t) => {
+  const inconsistent = run({
+    products: ds('products', [product('A'), product('B')]),
+    'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A' }), poLine({ sku: 'B', currency: 'EUR', fxRateToBase: '0.9' })]),
+  })
+  const other = run({
+    products: ds('products', [product('A'), product('K', 'KIT'), product('P')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'P', qty: '1' }]),
+    suppliers: ds('suppliers', [{ name: 'Acme' }]),
+    'purchase-order-lines': ds('purchase-order-lines', [
+      poLine({ orderKey: 'O2', supplierName: 'Nobody' }),
+      poLine({ orderKey: 'O3', sku: 'K' }),
+      poLine({ orderKey: 'O4', expectedDelivery: '2026-02-30' }),
+    ]),
+  })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(inconsistent, 'purchase-order-lines'), ['INCONSISTENT_ORDER_FIELDS', 'INCONSISTENT_ORDER_FIELDS'])
+  assert.deepEqual(rejectedCodes(other, 'purchase-order-lines').sort(), ['BAD_DATE', 'SUPPLIER_NOT_IN_FILE', 'TYPE_CANNOT_BE_PURCHASED'])
+})
+
+test('purchase orders: without a suppliers dataset the names are unchecked and the report says so', (t) => {
+  const result = run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) })
+  precondition(t, 'lines', 1)
+  assert.equal(result.blocking, false)
+  assert.ok(findingCodes(result, 'WARNING').includes('SUPPLIER_NAMES_UNCHECKED'))
+})
+
+test('transfers: draft and fully received transfers are excluded; contradictory statuses and same-warehouse rows are rejected', (t) => {
+  const base = { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'A', qtyShipped: '2', qtyReceived: '0' }
+  const result = run({
+    products: ds('products', [product('A')]),
+    'stock-lots': ds('stock-lots', [lot('A', '9', '1')]),
+    transfers: ds('transfers', [
+      { ...base, transferKey: 'DRAFT1', status: 'DRAFT' },
+      { ...base, transferKey: 'DONE', status: 'RECEIVED', qtyReceived: '2' },
+      { ...base, transferKey: 'LIE', status: 'RECEIVED', qtyReceived: '1' },
+      { ...base, transferKey: 'SAME', toWarehouseCode: 'MAIN' },
+      { ...base, transferKey: 'OK' },
+    ]),
+  })
+  precondition(t, 'transfer rows', 5)
+  assert.deepEqual(dispositionCodes(result, 'transfers', 'EXCLUDED').sort(), ['FULLY_RECEIVED', 'NOT_IN_TRANSIT'])
+  assert.deepEqual(rejectedCodes(result, 'transfers').sort(), ['SAME_WAREHOUSE', 'STATUS_CONTRADICTS_QUANTITY'])
+})
+
+test('transfers: lines of one transferKey that disagree are all rejected; a KIT cannot be transferred', (t) => {
+  const base = { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', qtyShipped: '1', qtyReceived: '0' }
+  const result = run({
+    products: ds('products', [product('A'), product('B'), product('K', 'KIT'), product('P')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'P', qty: '1' }]),
+    'stock-lots': ds('stock-lots', [lot('A', '5', '1'), lot('B', '5', '1')]),
+    transfers: ds('transfers', [{ ...base, sku: 'A' }, { ...base, sku: 'B', toWarehouseCode: 'ELSEWHERE' }, { ...base, transferKey: 'T2', sku: 'K' }]),
+  })
+  precondition(t, 'transfer rows', 3)
+  assert.deepEqual(rejectedCodes(result, 'transfers').sort(), ['INCONSISTENT_TRANSFER', 'INCONSISTENT_TRANSFER', 'TYPE_CANNOT_BE_TRANSFERRED'])
+})
+
+test('the exclusion list: needs a reason, flags stock it would drop, and a stale entry is a warning', (t) => {
+  const stockDropped = run({
+    products: ds('products', [product('KEEP'), product('DROP')]),
+    'stock-lots': ds('stock-lots', [lot('DROP', '5', '1'), lot('KEEP', '1', '1')]),
+    'sku-exclusions': ds('sku-exclusions', [{ sku: 'DROP', reason: 'written off' }, { sku: 'NEVER-SEEN', reason: 'old' }]),
+  })
+  const noReason = run({ 'sku-exclusions': ds('sku-exclusions', [{ sku: 'X', reason: '' }]) })
+  precondition(t, 'cases', 2)
+  assert.ok(findingCodes(stockDropped, 'ERROR').includes('EXCLUDED_SKU_HOLDS_STOCK'))
+  assert.ok(findingCodes(stockDropped, 'WARNING').includes('STALE_EXCLUSION'))
+  assert.deepEqual(rejectedCodes(noReason, 'sku-exclusions'), ['MISSING_REASON'])
+  assert.deepEqual(rowsOf(stockDropped, 'opening-stock').length, 0, 'a blocked run has no files')
+})
+
+test('R14: a SKU in the 3PL or WooCommerce that is neither loaded nor excluded blocks; an IMS-existing or excluded SKU does not', (t) => {
+  const result = run({
+    products: ds('products', [product('A')]),
+    'wms-products': ds('wms-products', [{ sku: 'A' }, { sku: 'M-ONLY' }, { sku: 'IN-IMS' }]),
+    'woo-products': ds('woo-products', [{ sku: 'a' }, { sku: 'W-ONLY' }, { sku: 'W-EXCLUDED' }]),
+    'ims-skus': ds('ims-skus', [{ sku: 'IN-IMS', type: 'SIMPLE' }]),
+    'sku-exclusions': ds('sku-exclusions', [{ sku: 'W-EXCLUDED', reason: 'sample' }]),
+  })
+  precondition(t, 'SKUs subject to coverage', 6)
+  const finding = result.report.findings.find((f) => f.code === 'R14_SKU_NOT_LOADED')
+  assert.deepEqual(finding?.keys, ['M-ONLY (L)', 'W-ONLY (W)'])
+  assert.deepEqual(result.report.coverage.excludedAccepted, ['W-EXCLUDED'])
+  const noCatalogue = run({ 'wms-products': ds('wms-products', [{ sku: 'A' }]) })
+  assert.ok(findingCodes(noCatalogue, 'ERROR').includes('R14_NEEDS_CATALOGUE'))
+})
+
+test('rows without a SKU or with a bad value are rejected on products; booleans and lifecycle are strict', (t) => {
+  const result = run({
+    products: ds('products', [
+      product('NOBOOL', 'SIMPLE', { active: 'maybe' }),
+      product('LIFE', 'SIMPLE', { lifecycleStatus: 'RETIRED' }),
+      { sku: '', name: 'No sku', type: 'SIMPLE' },
+      { sku: 'NOTYPE', name: 'x', type: 'WIDGET' },
+      product('OKAY', 'SIMPLE', { active: 'yes', lifecycleStatus: 'active', weight: '0.5' }),
+    ]),
+  })
+  precondition(t, 'product rows', 5)
+  assert.deepEqual(rejectedCodes(result, 'products').sort(), ['BAD_BOOLEAN', 'BAD_LIFECYCLE', 'BAD_SKU', 'BAD_TYPE'])
+})
+
+test('configuration: a missing key prefix, convention or malformed base currency is refused before any row is read', (t) => {
+  const withPo = { products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) }
+  precondition(t, 'cases', 4)
+  assert.throws(() => run(withPo, { purchaseOrderKeyPrefix: null }), ConfigError)
+  assert.throws(() => run(withPo, { purchaseOrderKeyPrefix: 'bad prefix' }), ConfigError)
+  assert.throws(() => run({ transfers: ds('transfers', [{ transferKey: 'T', status: 'DRAFT', fromWarehouseCode: 'A', toWarehouseCode: 'B', sku: 'x', qtyShipped: '1', qtyReceived: '0' }]) }, { inTransitConvention: null }), ConfigError)
+  assert.throws(() => run({}, { baseCurrency: 'pound' }), ConfigError)
+})
+
+test('zero-cost opening stock is accepted but warned about', (t) => {
+  const result = run({ products: ds('products', [product('A')]), 'stock-lots': ds('stock-lots', [lot('A', '3', '0')]) })
+  precondition(t, 'groups', result.report.stock.groups.length)
+  assert.equal(result.blocking, false)
+  assert.ok(findingCodes(result, 'WARNING').includes('ZERO_COST_OPENING_STOCK'))
+})
+
+test('the report carries SKU-normalisation counts and the warehouse codes the files use (mixed fixture)', (t) => {
+  const result = run(loadFixtureDatasets())
+  const notes = result.report.findings.filter((f) => f.code === 'SKU_NORMALISED')
+  precondition(t, 'normalisation notes', notes.length)
+  const stock = notes.find((f) => f.dataset === 'stock-lots')
+  assert.ok(stock?.message.includes('0 SKU cell(s) had outer whitespace trimmed and 2 were matched to the catalogue under a different letter case'), stock?.message)
+  assert.deepEqual(result.report.warehouseCodesUsed, ['MAIN', 'OVER'])
+  assert.ok(result.report.findings.every((f) => f.severity !== 'INFO' || f.code === 'SKU_NORMALISED'))
+})
+
+test('a CR or CRLF inside a quoted value is written as LF, which is exactly what the importers will read', (t) => {
+  const result = run({ products: ds('products', [product('A', 'SIMPLE', { description: 'line one\r\nline two\rline three' })]) })
+  precondition(t, 'products', 1)
+  assert.equal(result.blocking, false)
+  assert.deepEqual(result.report.selfCheckFailures, [])
+  const parsed = parseCsv(result.outputs[0].content)
+  assert.equal(parsed[0].description, 'line one\nline two\nline three')
+})
+
+test('stock ranges: a collapsed quantity, a converted cost and an in-transit addition that the target columns cannot hold are rejected, not emitted', (t) => {
+  const products = ds('products', [product('A'), product('B'), product('C')])
+  const sumOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '60000000', '1', { lotRef: 'L1' }), lot('A', '60000000', '1', { lotRef: 'L2' })]) })
+  const fxOver = run({ products, 'stock-lots': ds('stock-lots', [lot('B', '1', '900000000', { currency: 'EUR', fxRateToBase: '0.5' })]) })
+  const inTransitOver = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('C', '99999999', '1')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C', qtyShipped: '5', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'excluded-from-source' })
+  precondition(t, 'over-range cases', 3)
+  assert.deepEqual(rejectedCodes(sumOver, 'stock-lots'), ['COLLAPSED_OUT_OF_RANGE', 'COLLAPSED_OUT_OF_RANGE'])
+  assert.deepEqual(rejectedCodes(fxOver, 'stock-lots'), ['BAD_UNIT_COST'])
+  assert.deepEqual(rejectedCodes(inTransitOver, 'transfers'), ['OPENING_QTY_OUT_OF_RANGE'])
+  for (const result of [sumOver, fxOver, inTransitOver]) assert.equal(result.blocking, true)
+  const edge = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999.999999', '9999.999999')]) })
+  assert.equal(edge.blocking, false, 'the largest storable VALUE (quantity x cost just under 12 integer digits) still passes')
+})
+
+test('stock value: quantity and cost that each fit but whose product (the movement value) does not are rejected, with and without an in-transit addition', (t) => {
+  const products = ds('products', [product('A'), product('B')])
+  const valueOver = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '99999999', '10000.5')]) })
+  const inTransitValueOver = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('B', '90000000', '10500')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'B', qtyShipped: '9000000', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'excluded-from-source' })
+  const inTransitFits = run({
+    products,
+    'stock-lots': ds('stock-lots', [lot('B', '90000000', '10500')]),
+    transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'B', qtyShipped: '9000000', qtyReceived: '0' }]),
+  }, { inTransitConvention: 'counted-in-source' })
+  precondition(t, 'value cases', 3)
+  assert.deepEqual(rejectedCodes(valueOver, 'stock-lots'), ['COLLAPSED_OUT_OF_RANGE'])
+  assert.deepEqual(rejectedCodes(inTransitValueOver, 'transfers'), ['OPENING_QTY_OUT_OF_RANGE'])
+  assert.equal(inTransitFits.blocking, false, 'the same stock with the in-transit units already inside it fits')
+})
+
+test('purchase order values: a line total, an order total (tax included) or a base unit cost that the columns cannot hold rejects the whole order', (t) => {
+  const products = ds('products', [product('A')])
+  const order = (key: string, extra: Record<string, string>) => poLine({ orderKey: key, sku: 'A', ...extra })
+  const result = run({
+    products,
+    'purchase-order-lines': ds('purchase-order-lines', [
+      order('BIG', { qtyOrdered: '99999999', unitCostForeign: '999999999' }),
+      order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999' }),
+      order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '0.0001' }),
+      order('HIGHTAX', { qtyOrdered: '1', unitCostForeign: '1', taxRateValue: '30' }),
+      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', currency: 'EUR', fxRateToBase: '1000' }),
+      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', currency: 'USD', fxRateToBase: '0.001' }),
+      order('OK', { qtyOrdered: '1000', unitCostForeign: '1000' }),
+    ]),
+  })
+  precondition(t, 'orders', 7)
+  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BASE/A:ORDER_VALUE_OUT_OF_RANGE', 'BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FOREIGN/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'HIGHTAX/A:TAX_RATE_ABOVE_DECLARED_MAX', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
+  const emitted = result.report.accountingByCode.find((r) => r.code === 'PO_LINE')
+  assert.equal(emitted?.count, 1)
+})
+
+test('FX direction: the purchase-order importer DIVIDES by fxRateToBase, so the same order fits at a high rate and overflows at a low one', (t) => {
+  const products = ds('products', [product('A')])
+  const at = (rate: string) => run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: 'D', sku: 'A', qtyOrdered: '1000000', unitCostForeign: '20000000', currency: 'USD', fxRateToBase: rate })]) })
+  const high = at('1000')
+  const low = at('0.001')
+  precondition(t, 'rates compared', 2)
+  assert.equal(high.blocking, false, 'foreign 2e13 / 1000 = 2e10 base fits (a multiply would give 2e16 and reject)')
+  assert.deepEqual(rejectedCodes(low, 'purchase-order-lines'), ['ORDER_VALUE_OUT_OF_RANGE'])
+  const base = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '1', '3', { currency: 'EUR', fxRateToBase: '2' })]) })
+  assert.equal(rowsOf(base, 'opening-stock')[0].unitCostBase, '1.500000')
+})
+
+test('the declared worst-case purchase tax rate is required with purchase orders and bounds every order', (t) => {
+  const withPo = { products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) }
+  precondition(t, 'cases', 3)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: null }), ConfigError)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: '25%' }), ConfigError)
+  assert.throws(() => run(withPo, { maxPurchaseTaxRate: '1.5' }), ConfigError)
+})
+
+test('importer rejection sweep: every emitted number is checked against the scale it is STORED at, and rejected rather than rounded', (t) => {
+  const po = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ currency: 'USD', fxRateToBase: '1.25', ...extra })]) })
+  const prod = (extra: Record<string, string>) => run({ products: ds('products', [product('A', 'SIMPLE', extra)]) })
+  const cases: Array<[string, ReturnType<typeof run>, string]> = [
+    ['fx 9 dp (stored Decimal(18,8))', po({ fxRateToBase: '0.000000011' }), 'BAD_FX'],
+    ['tax fraction 5 dp (stored Decimal(5,4))', po({ taxRateValue: '0.12345' }), 'TAX_RATE_PRECISION'],
+    ['weight 5 dp (Decimal(10,4))', prod({ weight: '1.00001' }), 'BAD_NUMBER'],
+    ['dimension 3 dp (Decimal(10,2))', prod({ widthCm: '1.001' }), 'BAD_NUMBER'],
+    ['price 5 dp (Decimal(12,4))', prod({ salesPriceBase: '1.00001' }), 'BAD_NUMBER'],
+    ['price 9 integer digits (Decimal(12,4))', prod({ salePriceBase: '123456789' }), 'BAD_NUMBER'],
+  ]
+  precondition(t, 'scale cases', cases.length)
+  for (const [name, result, code] of cases) {
+    const codes = result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => d.code)
+    assert.ok(codes.includes(code), `${name}: ${JSON.stringify(codes)}`)
+  }
+  const ok = po({ fxRateToBase: '0.00000001', taxRateValue: '0.1234' })
+  assert.equal(ok.blocking, false, 'the stored scale itself is accepted (8 dp rate, 4 dp tax fraction)')
+  assert.ok(prod({ weight: '1.0001', widthCm: '1.01', salesPriceBase: '1.0001' }).blocking === false)
+})
+
+test('importer rejection sweep: product lifecycle rules of createPurchaseOrder and createTransfer are mirrored for products in the catalogue file', (t) => {
+  const mk = (type: Record<string, string>, line: 'po' | 'transfer') => run({
+    products: ds('products', [product('A', 'SIMPLE', type)]),
+    'stock-lots': ds('stock-lots', [lot('A', '5', '1')]),
+    ...(line === 'po'
+      ? { 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) }
+      : { transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'A', qtyShipped: '1', qtyReceived: '0' }]) }),
+  })
+  precondition(t, 'lifecycle cases', 6)
+  const codes = (r: ReturnType<typeof run>, ds2: string) => rejectedCodes(r, ds2)
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'ARCHIVED' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'])
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'EOL' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'])
+  assert.deepEqual(codes(mk({ active: 'FALSE' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'], 'active FALSE is EOL for the importer')
+  assert.equal(mk({ lifecycleStatus: 'DRAFT' }, 'po').blocking, false)
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'ARCHIVED' }, 'transfer'), 'transfers'), ['PRODUCT_ARCHIVED'])
+  assert.equal(mk({ lifecycleStatus: 'EOL' }, 'transfer').blocking, false, 'an EOL product may be transferred')
+})
+
+test('the report lists the apply-time checks the tool cannot prove (FX availability and the 2% rule among them)', (t) => {
+  const result = run(loadFixtureDatasets())
+  precondition(t, 'apply-time checks listed', result.report.applyTimeChecks.length)
+  const fx = result.report.applyTimeChecks.find((c) => c.id === 'po-fx-rate')
+  assert.ok(fx?.check.includes('within 2%'))
+  assert.ok(findingCodes(result).length > 0)
+})
+
+test('lookup sweep: a supplier name that collides under EITHER importer matching rule rejects every colliding row, and a PO naming it', (t) => {
+  const sup = (...names: string[]) => run({
+    products: ds('products', [product('A')]),
+    suppliers: ds('suppliers', [...names.map((name) => ({ name })), { name: 'Fine Ltd' }]),
+    'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: names[0] }), poLine({ orderKey: 'O2', supplierName: 'Fine Ltd' })]),
+  })
+  const sameData = sup('Acme', 'ACME')
+  const upperOnly = sup('Stra\u00dfe', 'STRASSE') // upper-case rule: ss, lower-case rule: they differ
+  const lowerOnly = sup('Mehmet\u0130', 'Mehmeti\u0307') // lower-case rule: both i + dot above, upper-case rule: they differ
+  precondition(t, 'collision cases', 3)
+  for (const [name, result] of [['same data', sameData], ['upper rule only', upperOnly], ['lower rule only', lowerOnly]] as const) {
+    assert.deepEqual(rejectedCodes(result, 'suppliers'), ['SUPPLIER_NAME_COLLISION', 'SUPPLIER_NAME_COLLISION'], name)
+    assert.deepEqual(rejectedCodes(result, 'purchase-order-lines'), ['SUPPLIER_ROW_REJECTED'], `${name}: the PO naming a colliding supplier is refused, the other order is not`)
+    assert.equal(result.blocking, true)
+  }
+  assert.ok(sameData.report.dispositions.some((d) => d.code === 'SUPPLIER_NAME_COLLISION' && d.reason.includes('"ACME"')), 'the report names the colliding spellings')
+  assert.equal(sup('Solo Ltd').blocking, false)
+})
+
+test('lookup sweep: a tax rate NAME and a numeric value on one line are refused (the tool cannot show they agree); either alone passes', (t) => {
+  const line = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine(extra)]) })
+  precondition(t, 'cases', 3)
+  assert.deepEqual(rejectedCodes(line({ taxRateName: 'Standard', taxRateValue: '20' }), 'purchase-order-lines'), ['TAX_NAME_AND_VALUE'])
+  assert.equal(line({ taxRateName: 'Standard' }).blocking, false)
+  assert.equal(line({ taxRateValue: '20' }).blocking, false)
+})
+
+test('lookup sweep: a catalogue SKU that differs only by case from a SKU already in IMS is refused; the same spelling updates it', (t) => {
+  const withIms = (sku: string) => run({ products: ds('products', [product(sku)]), 'ims-skus': ds('ims-skus', [{ sku: 'ABC', type: 'SIMPLE' }]) })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(withIms('abc'), 'products'), ['SKU_CASE_DIFFERS_FROM_IMS'])
+  assert.equal(withIms('ABC').blocking, false)
+})
+
+test('lookup sweep: categories are cleaned and compared as the importer does (length after cleaning, merged spellings, HTML entities)', (t) => {
+  const result = run({ products: ds('products', [
+    product('A', 'SIMPLE', { category: 'Caf\u00e9  Tables' }),
+    product('B', 'SIMPLE', { category: 'cafe tables' }),
+    product('C', 'SIMPLE', { category: 'Tools &amp; Dies' }),
+    product('D', 'SIMPLE', { category: 'x'.repeat(101) }),
+  ]) })
+  precondition(t, 'category cases', 4)
+  assert.deepEqual(rejectedCodes(result, 'products'), ['CATEGORY_TOO_LONG'])
+  assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_SPELLINGS_MERGED'))
+  assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_HTML_ENTITY'))
+})
+
+test('duplicate sweep: a purchase order line repeated in the source never doubles the outstanding quantity', (t) => {
+  const products = ds('products', [product('A'), product('B')])
+  const lines = (...rows: Array<Record<string, string>>) => run({ products, 'purchase-order-lines': ds('purchase-order-lines', rows) })
+  const exact = lines(poLine({ orderKey: 'X', sku: 'A' }), poLine({ orderKey: 'X', sku: 'A' }), poLine({ orderKey: 'Y', sku: 'B' }))
+  const conflict = lines(poLine({ orderKey: 'X', sku: 'A', qtyOrdered: '5' }), poLine({ orderKey: 'X', sku: 'a', qtyOrdered: '7' }))
+  const distinctByLineNo = lines(poLine({ orderKey: 'X', sku: 'A', lineNo: '1' }), poLine({ orderKey: 'X', sku: 'A', lineNo: '2' }))
+  precondition(t, 'duplicate groups', 3)
+  assert.deepEqual(rejectedCodes(exact, 'purchase-order-lines'), ['DUPLICATE_PO_LINE', 'DUPLICATE_PO_LINE'])
+  assert.equal(exact.report.accountingByCode.find((r) => r.code === 'PO_LINE')?.count, 1, 'the unrelated order is untouched')
+  assert.deepEqual(rejectedCodes(conflict, 'purchase-order-lines'), ['DUPLICATE_PO_LINE_CONFLICT', 'DUPLICATE_PO_LINE_CONFLICT'])
+  assert.equal(distinctByLineNo.blocking, false, 'a line-number column makes repeated SKUs distinct lines')
+  assert.deepEqual(rowsOf(distinctByLineNo, 'purchase-orders').map((r) => r.qty), ['10', '10'])
+})
+
+test('duplicate sweep: identical stock lot rows without a lot reference are rejected, with one they are distinct lots', (t) => {
+  const products = ds('products', [product('A')])
+  const twice = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { receivedDate: '2026-01-01' }), lot('A', '5', '2', { receivedDate: '2026-01-01' })]) })
+  const withRef = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { receivedDate: '2026-01-01', lotRef: 'L1' }), lot('A', '5', '2', { receivedDate: '2026-01-01', lotRef: 'L2' })]) })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(twice, 'stock-lots'), ['DUPLICATE_LOT_ROW', 'DUPLICATE_LOT_ROW'])
+  assert.equal(withRef.blocking, false)
+  assert.equal(rowsOf(withRef, 'opening-stock')[0].qty, '10')
+})
+
+test('duplicate sweep: every dataset either rejects every member of a duplicate or provably dedupes an identical one, and each shows in the accounting', (t) => {
+  const r = run({
+    products: ds('products', [product('P'), product('P'), product('Q'), product('Q', 'SIMPLE', { name: 'other' }), product('K', 'KIT'), product('C1'), product('C2')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'C1', qty: '1' }, { parentSku: 'K', componentSku: 'C1', qty: '1' }, { parentSku: 'K', componentSku: 'C2', qty: '1' }]),
+    suppliers: ds('suppliers', [{ name: 'S' }, { name: 'S' }]),
+    transfers: ds('transfers', [
+      { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C2', qtyShipped: '1', qtyReceived: '0' },
+      { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C2', qtyShipped: '1', qtyReceived: '0' },
+    ]),
+    'stock-lots': ds('stock-lots', [lot('C2', '9', '1')]),
+  })
+  const by = (dataset: string, outcome: string) => r.report.dispositions.filter((d) => d.dataset === dataset && d.outcome === outcome).map((d) => d.code)
+  precondition(t, 'datasets with duplicates', 4)
+  assert.deepEqual(by('products', 'EXCLUDED'), ['DUPLICATE_ROW'])
+  assert.deepEqual(by('products', 'REJECTED'), ['DUPLICATE_SKU_CONFLICT', 'DUPLICATE_SKU_CONFLICT'])
+  assert.deepEqual(by('recipe-lines', 'REJECTED'), ['DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE'])
+  assert.deepEqual(by('suppliers', 'EXCLUDED'), ['DUPLICATE_ROW'])
+  assert.deepEqual(by('transfers', 'REJECTED'), ['DUPLICATE_TRANSFER_LINE', 'DUPLICATE_TRANSFER_LINE'])
+  assert.equal(r.report.accountingBalanced, true)
+})
+
+test('supplier names versus suppliers already in IMS: a collision under either importer rule is rejected; without the list the check is reported as NOT RUN', (t) => {
+  const base = { products: ds('products', [product('A')]) }
+  const withList = (name: string, imsNames: string[]) => run({ ...base, suppliers: ds('suppliers', [{ name }]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))) })
+  precondition(t, 'cases', 6)
+  assert.deepEqual(rejectedCodes(withList('Acme', ['ACME']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'])
+  assert.deepEqual(rejectedCodes(withList('Stra\u00dfe', ['STRASSE']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'], 'upper-case rule only')
+  assert.deepEqual(rejectedCodes(withList('Mehmet\u0130', ['Mehmeti\u0307']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'], 'lower-case rule only')
+  assert.equal(withList('Acme', ['Acme']).blocking, false, 'the same spelling is an update of the existing supplier')
+  assert.deepEqual(rejectedCodes(withList('Zed', ['Acme', 'ACME']), 'ims-suppliers'), ['IMS_SUPPLIER_NAME_COLLISION', 'IMS_SUPPLIER_NAME_COLLISION'])
+  const without = run({ ...base, suppliers: ds('suppliers', [{ name: 'Acme' }]) })
+  const check = without.report.checks.find((c) => c.check.startsWith('new supplier names versus'))
+  assert.equal(check?.status, 'NOT RUN')
+  assert.ok(check?.note.includes('NOT checked'))
+})
+
+test('purchase order supplier names resolve against the IMS supplier list when no suppliers file names them', (t) => {
+  const po = (name: string, imsNames: string[]) => run({ products: ds('products', [product('A')]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: name })]) })
+  precondition(t, 'cases', 3)
+  assert.equal(po('acme', ['Acme']).blocking, false)
+  assert.deepEqual(rejectedCodes(po('Nobody', ['Acme']), 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
+  assert.equal(rowsOf(po('acme', ['Acme']), 'purchase-orders')[0].supplierName, 'Acme', 'the IMS spelling is written')
+})
+
+const BLANKISH = ['', ' ', '\t', '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u00a0', '\u2003', ' \u200b ', '\u3000']
+
+test('identity sweep: for EVERY optional identity column a blank, whitespace or zero-width value never makes a row distinct', (t) => {
+  const products = ds('products', [product('A')])
+  let cases = 0
+  // purchase-order-lines.lineNo: one row numbered 1, its otherwise identical twin carrying a blank-ish number
+  for (const blank of BLANKISH) {
+    for (const [first, second] of [['1', blank], [blank, '1'], [blank, blank]] as const) {
+      const r = run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A', lineNo: first }), poLine({ sku: 'A', lineNo: second })]) })
+      assert.deepEqual(rejectedCodes(r, 'purchase-order-lines'), ['DUPLICATE_PO_LINE', 'DUPLICATE_PO_LINE'], `lineNo ${JSON.stringify([first, second])}`)
+      cases++
+    }
+  }
+  // stock-lots.lotRef: a referenced lot and its otherwise identical twin carrying a blank-ish reference
+  for (const blank of BLANKISH) {
+    for (const [first, second] of [['L1', blank], [blank, 'L1'], [blank, blank]] as const) {
+      const r = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: first }), lot('A', '5', '2', { lotRef: second, receivedDate: '2026-01-01' })]) })
+      assert.deepEqual(rejectedCodes(r, 'stock-lots'), ['DUPLICATE_LOT_ROW', 'DUPLICATE_LOT_ROW'], `lotRef ${JSON.stringify([first, second])}`)
+      cases++
+    }
+  }
+  // spelling variants of one reference are ONE reference
+  const variant = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: 'l1' }), lot('A', '5', '2', { lotRef: 'L\u200b 1' })]) })
+  assert.deepEqual(rejectedCodes(variant, 'stock-lots'), ['DUPLICATE_LOT_REF', 'DUPLICATE_LOT_REF'])
+  // recipe-lines.sortOrder is an ordering hint, never part of a line's identity
+  const recipe = run({
+    products: ds('products', [product('K', 'KIT'), product('C')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'C', qty: '1', sortOrder: '1' }, { parentSku: 'K', componentSku: 'C', qty: '1', sortOrder: '' }]),
+  })
+  assert.deepEqual(rejectedCodes(recipe, 'recipe-lines'), ['DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE'])
+  precondition(t, 'blank-ish identity cases', cases + 2)
+  assert.equal(cases, BLANKISH.length * 6)
+})
+
+test('identity sweep: genuinely distinct lines still pass (distinct non-blank line numbers, distinct non-blank lot references, different quantities)', (t) => {
+  const products = ds('products', [product('A')])
+  const po = run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ sku: 'A', lineNo: '1' }), poLine({ sku: 'A', lineNo: ' 2 ' })]) })
+  const lots = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { lotRef: 'L1' }), lot('A', '5', '2', { lotRef: 'L2' }), lot('A', '7', '2')]) })
+  precondition(t, 'cases', 2)
+  assert.equal(po.blocking, false)
+  assert.equal(lots.blocking, false)
+  assert.equal(rowsOf(lots, 'opening-stock')[0].qty, '17')
+})
+
+test('identity sweep: keys with control, zero-width or non-ASCII space characters are refused (visually equal references would differ)', (t) => {
+  const products = ds('products', [product('A')])
+  const keys = ['PO\u200b1', 'PO\u00a01', 'PO\t1', 'PO\u20031']
+  precondition(t, 'bad keys', keys.length)
+  for (const key of keys) {
+    assert.deepEqual(rejectedCodes(run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: key })]) }), 'purchase-order-lines'), ['KEY_HAS_INVISIBLE_CHARS'], JSON.stringify(key))
+    const tr = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '1')]), transfers: ds('transfers', [{ transferKey: key, status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'A', qtyShipped: '1', qtyReceived: '0' }]) })
+    assert.deepEqual(rejectedCodes(tr, 'transfers'), ['KEY_HAS_INVISIBLE_CHARS'])
+  }
+  assert.equal(run({ products, 'purchase-order-lines': ds('purchase-order-lines', [poLine({ orderKey: 'PO 1' })]) }).blocking, false, 'an ordinary space is allowed')
+})
