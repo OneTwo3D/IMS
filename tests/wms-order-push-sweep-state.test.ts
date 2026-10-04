@@ -314,7 +314,7 @@ test('create: the 5th consecutive failure dead-letters', async () => {
 
 test('outbound-write hold: a HELD create spends no attempt and never dead-letters, even as the 5th failure; an ordinary one still does', async () => {
   const { outboundWriteRefusal, OutboundWriteHeldError } = await import('../lib/security/outbound-write-grant')
-  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', mintsoftClientId: '89', env: {} })
+  const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'PUT', url: 'https://api.mintsoft.co.uk/api/Order', writeScopeId: '89', env: {} })
   assert.ok(refusal, 'precondition: the real refusal path refused the create')
   // mintsoftRequest turns the hold into a returned error and createOrder rethrows it as a plain Error.
   const heldText = new OutboundWriteHeldError(refusal, 0).message
