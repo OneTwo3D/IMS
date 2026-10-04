@@ -53,10 +53,12 @@ test('the mapping key list covers 15 roles, the payment map and the two reverse-
 
 test('operator text: the UNCONFIRMED case never claims another organisation; the CLEARED case says what was cleared', () => {
   const prev = { tenantId: 'A', basis: 'stamp' as const }
-  const unconfirmed = xeroAccountMappingResetMessage({ tenantName: 'Org B', outcome: { kind: 'unconfirmed', previous: { tenantId: null, basis: 'unknown' }, keptKeys: ['xero_sales_account'], syncWasEnabled: true } })
+  const unconfirmed = xeroAccountMappingResetMessage({ tenantName: 'Org B', outcome: { kind: 'unconfirmed', previous: { tenantId: null, basis: 'unknown' }, keptKeys: ['xero_sales_account'], chartRowsCleared: 4, syncWasEnabled: true } })
   assert.match(unconfirmed, /could not confirm which organisation this mapping was set up for: sync is OFF until you confirm/)
   assert.match(unconfirmed, /kept exactly as it was/)
-  assert.doesNotMatch(unconfirmed, /not the organisation|different|cleared|was cleared/i)
+  assert.doesNotMatch(unconfirmed, /not the organisation|different/i)
+  assert.match(unconfirmed, /cached chart of accounts was cleared/, 'it says the chart choices are empty until Sync accounts')
+  assert.match(unconfirmed, /kept exactly as it was/, 'and that the mapping itself was not touched')
   const cleared = xeroAccountMappingResetMessage({ tenantName: 'Org B', outcome: { kind: 'cleared', previous: prev, clearedKeys: ['a', 'b'], taxRatesCleared: 2, taxRateComponentsCleared: 1, chartRowsCleared: 9, syncWasEnabled: true } })
   assert.match(cleared, /not the organisation the account mapping was set up for \(A\)/)
   assert.match(cleared, /2 mapping settings and 3 tax-type mappings/)

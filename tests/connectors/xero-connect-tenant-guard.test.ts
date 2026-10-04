@@ -3018,11 +3018,11 @@ test('[o3d-6thk1 round-1 HIGH 1] a PRE-STAMP instance: Disconnect then reconnect
   assert.equal((tokenRow as TokenRow | null)?.tenantId, DEMO.tenantId)
   assert.deepEqual(await mappingRowsPresent(), before, 'the mapping is KEPT: unknown provenance does not delete')
   assert.equal(taxTypesMapped(), 3)
-  assert.equal(chartRows, 40)
+  assert.equal(chartRows, 0, 'the chart CACHE cannot be attributed to this organisation, so it is cleared even though the mapping is kept (Sync accounts refills it)')
   assert.equal(settings.xero_sync_enabled, undefined, 'sync is OFF until the operator confirms')
   assert.equal(settings.xero_account_mapping_tenant_id, undefined, 'NOTHING is stamped as owned yet')
   assert.match(result.accountMappingResetNotice ?? '', /could not confirm which organisation this mapping was set up for: sync is OFF until you confirm/)
-  assert.doesNotMatch(result.accountMappingResetNotice ?? '', /not the organisation|different|cleared/i, 'it never claims the mapping belonged to another organisation')
+  assert.doesNotMatch(result.accountMappingResetNotice ?? '', /not the organisation|different/i, 'it never claims the mapping belonged to another organisation')
   assert.equal(activity.filter((entry) => entry.action === 'xero_account_mapping_unconfirmed').length, 1)
   assert.equal(activity.some((entry) => entry.action === 'xero_account_mapping_reset'), false)
 
@@ -3109,7 +3109,7 @@ test('[o3d-6thk1 round-2 HIGH 1] WRONG organisation first, then the right one: t
   assertStillHeld('after the right organisation')
   assert.equal((await mappingRowsPresent()).length, 18)
   assert.match(right.accountMappingResetNotice ?? '', /could not confirm/)
-  assert.doesNotMatch(right.accountMappingResetNotice ?? '', /not the organisation|cleared/i)
+  assert.doesNotMatch(right.accountMappingResetNotice ?? '', /not the organisation|different/i)
 })
 
 test('[o3d-6thk1] UNKNOWN provenance with ONLY tax types mapped is still unconfirmed: kept, sync off', async () => {
@@ -3124,6 +3124,7 @@ test('[o3d-6thk1] UNKNOWN provenance with ONLY tax types mapped is still unconfi
 
   assert.equal(result.success, true)
   assert.equal(taxTypesMapped(), 1, 'the tax type is kept')
+  assert.equal(chartRows, 0, 'the unattributable chart cache is cleared')
   assert.equal(settings.xero_sync_enabled, undefined)
   assert.equal(settings.xero_account_mapping_tenant_id, undefined)
   assert.match(result.accountMappingResetNotice ?? '', /could not confirm/)
@@ -3203,4 +3204,62 @@ test('[o3d-6thk1] the binding takes the mapping lock BEFORE it reads who the map
   assert.ok(lock !== -1 && read !== -1 && pin !== -1 && clear !== -1, 'PRECONDITION: all four steps are in bindXeroTenant')
   assert.ok(lock < read && read < pin && pin < clear,
     'lock, then read the previous organisation (the token upsert overwrites it), then the binding rows, then the clear')
+})
+
+// ---------------------------------------------------------------------------
+// Round 3 (Codex HIGH): the chart cache is independent of whether a MAPPING exists. A normal setup syncs the
+// chart before saving any role; Disconnect and a bind to B must not leave B's Sync page offering A's accounts.
+// ---------------------------------------------------------------------------
+
+/** A populated chart cache, a drift snapshot, and NO mapping of any kind. */
+function chartOnly(stampFor: typeof DEMO | null) {
+  chartRows = 25
+  settings.xero_tax_rate_drift_current = '{"drift":["x"]}'
+  settings.xero_tax_rate_drift_last_checked_at = '2026-10-01T00:00:00.000Z'
+  settings.xero_sync_enabled = 'true'
+  if (stampFor) settings.xero_account_mapping_tenant_id = stampFor.tenantId
+}
+
+test('[o3d-6thk1 round-3 HIGH] KNOWN organisation change with a populated chart and NO saved mapping: the new organisation\'s account choices are EMPTY until refresh', async () => {
+  chartOnly(DEMO)
+  const { exchangeCodeForTokens } = await loadAuth()
+  connectionsBody = [OTHER]
+  assert.deepEqual(await mappingRowsPresent(), [], 'PRECONDITION: nothing mapped')
+  assert.equal(chartRows, 25, 'PRECONDITION: the previous organisation\'s chart is cached')
+  assert.equal(settings.xero_account_mapping_tenant_id, DEMO.tenantId, 'PRECONDITION: the stamp names the previous organisation')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  console.log(`# o3d-6thk1 chart-only known change: chart ${25} -> ${chartRows}, drift=${settings.xero_tax_rate_drift_current}, stamp=${settings.xero_account_mapping_tenant_id}`)
+  assert.equal(result.success, true)
+  assert.equal(chartRows, 0, 'the new organisation does not see the previous one\'s accounts')
+  assert.equal(settings.xero_tax_rate_drift_current, undefined)
+  assert.equal(settings.xero_sync_enabled, 'true', 'nothing was mapped, so the toggle is untouched')
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId)
+  assert.equal(result.accountMappingResetNotice, undefined, 'and there is nothing to tell the operator about a mapping')
+})
+
+test('[o3d-6thk1 round-3 HIGH] UNKNOWN provenance, populated chart, NO mapping: the chart is cleared', async () => {
+  chartOnly(null)
+  const { exchangeCodeForTokens } = await loadAuth()
+  connectionsBody = [OTHER]
+  assert.equal(chartRows, 25)
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(chartRows, 0)
+  assert.equal(settings.xero_account_mapping_tenant_id, OTHER.tenantId, 'a new instance carries evidence from now on')
+})
+
+test('[o3d-6thk1 round-3 HIGH] a SAME-organisation reconnect keeps the chart cache', async () => {
+  chartOnly(DEMO)
+  const { exchangeCodeForTokens } = await loadAuth()
+  connectionsBody = [DEMO]
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(chartRows, 25, 'nothing about the organisation changed')
+  assert.equal(settings.xero_tax_rate_drift_current, '{"drift":["x"]}')
 })

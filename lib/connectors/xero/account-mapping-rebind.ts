@@ -11,7 +11,12 @@
  * THREE ANSWERS, because there are three different things the instance can know about whose mapping it is:
  *
  *   • KNOWN SAME (the stamp, or failing it the token row's tenant, names the bound organisation): nothing
- *     is touched.
+ *     is touched, the cached chart included.
+ *
+ *   CACHES (the cached chart, the drift snapshot) are cleared on EVERY path other than known-same, whether or
+ *   not a mapping exists: they can be populated before any role is saved, and keeping them would offer the
+ *   previous organisation's accounts for the new one's re-map. MAPPINGS (operator work) are cleared only on a
+ *   KNOWN change and held when merely unproven.
  *   • KNOWN DIFFERENT (the stamp or the token row names ANOTHER organisation): the mapping is wrong, so it
  *     is CLEARED in the binding transaction and sync is switched OFF. Readiness then names every missing
  *     piece when the operator re-maps and tries to re-enable.
@@ -47,7 +52,7 @@
  *     accounting_payment_account_map                    CLEAR                   (Xero bank-account ids)
  *     accounting_reverse_charge_sales_tax_type          CLEAR                   (Xero tax-type code)
  *     accounting_reverse_charge_purchase_tax_type       CLEAR                   (Xero tax-type code)
- *     xero_tax_rate_drift_current / _last_checked_at    CLEAR                   (derived: IMS rates vs the old org's)
+ *     xero_tax_rate_drift_current / _last_checked_at    CLEAR as a cache (same rule as the chart)
  *     xero_account_mapping_tenant_id                    the stamp itself
  *     xero_account_mapping_unconfirmed                  the persisted unknown-provenance hold
  *     xero_sync_enabled                                 OFF on known change AND on unknown-with-mapping
@@ -62,8 +67,9 @@
  *   tables
  *     tax_rates.accounting_tax_type                     CLEAR (the second HIGH): readiness only checked
  *     tax_rate_components.accounting_tax_type           CLEAR  non-empty, so old types passed it
- *     accounting_accounts (cached chart, connector xero) CLEAR (o3d-fgrcx, folded in: it is a cache and the
- *                                                       Sync accounts action refills it from the new org)
+ *     accounting_accounts (cached chart, connector xero) CLEAR on EVERY change or unprovable organisation, with
+ *                                                       or without a mapping (o3d-fgrcx; round 3): a cache,
+ *                                                       and Sync accounts refills it from the new org
  *     customers/suppliers.accountingContactId,
  *       products.accountingItemId (+ provenance)        LEAVE: "<connector>:<tenantId>" provenance makes
  *                                                       readers ignore another organisation's ids;
@@ -188,7 +194,7 @@ export type AccountMappingResetOutcome =
     chartRowsCleared: number
     syncWasEnabled: boolean
   }
-  | { kind: 'unconfirmed'; previous: PreviousMappingOrganisation; keptKeys: string[]; syncWasEnabled: boolean }
+  | { kind: 'unconfirmed'; previous: PreviousMappingOrganisation; keptKeys: string[]; chartRowsCleared: number; syncWasEnabled: boolean }
 
 async function writeStamp(tx: AccountMappingRebindTx, tenantId: string): Promise<void> {
   const stamped = await tx.setting.findUnique({ where: { key: XERO_ACCOUNT_MAPPING_TENANT_KEY } })
@@ -226,32 +232,47 @@ export async function resetAccountMappingForOrganisationChange(
   const { previous, newTenantId, connector } = params
   const presence = await readMappingPresence(tx)
 
-  // THE HOLD, or UNKNOWN, with a mapping present: keep it, hold sync, stamp nothing, PERSIST the hold. While
-  // a hold is active the previous organisation is `hold`, so a second consent (to the same organisation or a
-  // different one) lands here again and cannot promote a token row into ownership.
-  if (presence.any && (previous.basis === 'hold' || previous.tenantId === null)) {
-    const syncWasEnabled = await readSyncEnabled(tx)
-    await setHold(tx)
-    if (syncWasEnabled) await tx.setting.deleteMany({ where: { key: { in: [SYNC_ENABLED_KEY] } } })
-    return { kind: 'unconfirmed', previous, keptKeys: presence.settingKeys, syncWasEnabled }
+  // KNOWN SAME (the stamp, or a token row that pre-dates any hold, names the organisation being bound):
+  // nothing about the organisation changed, so nothing is cleared, the chart cache included.
+  if (previous.tenantId !== null && previous.tenantId === newTenantId) {
+    await writeStamp(tx, newTenantId)
+    return { kind: 'none' }
   }
 
-  // KNOWN SAME, or nothing mapped (which also retires a hold: there is nothing left to be unsure about).
-  if (previous.tenantId === newTenantId || !presence.any) {
+  // FROM HERE THE ORGANISATION CHANGED OR CANNOT BE SHOWN TO BE THE SAME, and that is decided BEFORE anything
+  // asks whether a mapping exists (Codex round 3, HIGH). CACHES are cleared on every such path, mapping or no
+  // mapping: the cached chart (and the drift snapshot) can be populated with nothing saved yet (an operator
+  // syncs the chart before choosing a role), and then Disconnect and a bind to B would leave B's Sync page
+  // offering A's accounts. A cache is harmless to lose (Sync accounts refills it), and "no way to attribute
+  // it" is exactly the case where keeping it is the unsafe answer. MAPPINGS are different: they are
+  // operator work, so they are cleared only when the change is KNOWN, and held when it is merely unproven.
+  const chartRowsCleared = await clearOrganisationCaches(tx, connector)
+
+  // Nothing mapped: nothing else to clear or hold. Stamp the organisation (which also retires a hold: with
+  // no mapping left there is nothing to be unsure about).
+  if (!presence.any) {
     await writeStamp(tx, newTenantId)
     return { kind: 'none' }
   }
 
   const syncWasEnabled = await readSyncEnabled(tx)
 
-  // KNOWN DIFFERENT: clear every organisation-keyed piece, switch sync off, then own the (now empty) slate.
-  // An ABSENT settings row is the default for every key here (empty account, sync 'false'), so deleting is
-  // the clear.
-  await tx.setting.deleteMany({ where: { key: { in: [...presence.settingKeys, ...DERIVED_ORG_KEYED_KEYS, SYNC_ENABLED_KEY] } } })
-  const [taxRates, taxRateComponents, chart] = await Promise.all([
+  // UNKNOWN or HELD, with a mapping: keep it, hold sync, stamp nothing, PERSIST the hold. While a hold is
+  // active the previous organisation is `hold`, so a second consent (to the same organisation or a
+  // different one) lands here again and cannot promote a token row into ownership.
+  if (previous.tenantId === null) {
+    await setHold(tx)
+    if (syncWasEnabled) await tx.setting.deleteMany({ where: { key: { in: [SYNC_ENABLED_KEY] } } })
+    return { kind: 'unconfirmed', previous, keptKeys: presence.settingKeys, chartRowsCleared, syncWasEnabled }
+  }
+
+  // KNOWN DIFFERENT with a mapping: clear every mapped piece, switch sync off, then own the (now empty)
+  // slate. An ABSENT settings row is the default for every key here (empty account, sync 'false'), so
+  // deleting is the clear.
+  await tx.setting.deleteMany({ where: { key: { in: [...presence.settingKeys, SYNC_ENABLED_KEY] } } })
+  const [taxRates, taxRateComponents] = await Promise.all([
     tx.taxRate.updateMany({ where: { accountingTaxType: { not: null } }, data: { accountingTaxType: null } }),
     tx.taxRateComponent.updateMany({ where: { accountingTaxType: { not: null } }, data: { accountingTaxType: null } }),
-    tx.accountingAccount.deleteMany({ where: { connector } }),
   ])
   await writeStamp(tx, newTenantId)
   return {
@@ -260,9 +281,15 @@ export async function resetAccountMappingForOrganisationChange(
     clearedKeys: presence.settingKeys,
     taxRatesCleared: taxRates.count,
     taxRateComponentsCleared: taxRateComponents.count,
-    chartRowsCleared: chart.count,
+    chartRowsCleared,
     syncWasEnabled,
   }
+}
+
+/** The organisation-keyed CACHES (not mappings): the cached chart of accounts and the derived drift snapshot. */
+async function clearOrganisationCaches(tx: AccountMappingRebindTx, connector: string): Promise<number> {
+  await tx.setting.deleteMany({ where: { key: { in: [...DERIVED_ORG_KEYED_KEYS] } } })
+  return (await tx.accountingAccount.deleteMany({ where: { connector } })).count
 }
 
 // ---------------------------------------------------------------------------
@@ -391,8 +418,9 @@ export function xeroAccountMappingResetMessage(params: {
     return (
       `Connected to ${org}. IMS could not confirm which organisation this mapping was set up for: sync is OFF until you confirm `
       + `the mapping belongs to ${org}. The mapping (accounts, payment map and tax types) was kept exactly as it was; `
-      + 'open Sync settings, correct anything that belongs to another organisation, and press the confirm button '
-      + '(saving the form alone does not end the hold), then switch sync back on.'
+      + 'The cached chart of accounts was cleared (it could not be attributed to this organisation), so the account choices '
+      + 'are empty until you run Sync accounts. Open Sync settings, run Sync accounts, correct anything that belongs to another '
+      + 'organisation, and press the confirm button (saving the form alone does not end the hold), then switch sync back on.'
     )
   }
   const was = outcome.previous.tenantId ?? 'an organisation IMS has no record of'
