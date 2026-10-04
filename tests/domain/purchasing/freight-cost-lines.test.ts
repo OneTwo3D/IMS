@@ -287,5 +287,5 @@ test('UI census: the freight dialog sends the stored ids and sends credit/zero l
   assert.ok(dialog.length > 500)
   assert.ok((dialog.match(/lockedLines/g) ?? []).length >= 4, 'locked (credit/zero) lines are kept, shown and sent back')
   assert.match(dialog, /\.\.\.\(cl\.id \? \{ id: cl\.id \} : \{\}\)/, 'editable lines carry their id')
-  assert.match(dialog, /id: cl\.id,\n\s+description: cl\.description,/, 'locked lines are sent with their id')
+  assert.match(dialog, /\.\.\.lockedLines\.map\(\(cl\) => \(\{\s+id: cl\.id,/, 'locked lines are sent back to the server with their id')
 })
