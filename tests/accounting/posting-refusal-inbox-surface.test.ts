@@ -1511,8 +1511,8 @@ test('[o3d-j625 r34] both operator-facing projections derive the unaccounted fla
    */
   // Codex round 14: the operator-facing sentences are built by ONE function, `declinedWhileHeld(unaccounted, count)`, whose first branch is the
   // unaccounted one; every action passes the flag it read. A count-only call, or a builder that reads the count first, fails here.
-  const module = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/hand-post-instruction.ts'), 'utf8')
-  const fn = module.slice(module.indexOf('export function declinedWhileHeld'), module.indexOf('export function declinedWhileHeld') + 700)
+  const instructionSource = readFileSync(path.join(process.cwd(), 'lib/domain/accounting/hand-post-instruction.ts'), 'utf8')
+  const fn = instructionSource.slice(instructionSource.indexOf('export function declinedWhileHeld'), instructionSource.indexOf('export function declinedWhileHeld') + 700)
   assert.ok(fn.indexOf('if (unaccounted)') > 0 && fn.indexOf('if (unaccounted)') < fn.indexOf('count > 0'),
     'the shared builder must branch on the unaccounted flag BEFORE it reads the count')
   assert.ok((actions.match(/unaccounted: Boolean\(result\.declineUnaccounted\)/g) ?? []).length >= 2,
