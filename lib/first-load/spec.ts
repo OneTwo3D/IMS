@@ -346,14 +346,50 @@ export const NUMERIC_LIMITS = {
   unitCost: { maxIntDigits: 9, maxDp: 6 },
   /** A lot's cost may carry more decimals; only the collapsed average is rounded (to 6 dp). */
   lotUnitCost: { maxIntDigits: 9, maxDp: 10 },
-  fx: { maxIntDigits: 6, maxDp: 10 },
+  /** PurchaseOrder.fxRateToBase is Decimal(18,8): a rate with more than 8 decimals would be stored rounded while the base values were computed from the unrounded one. */
+  fx: { maxIntDigits: 6, maxDp: 8 },
+  /** The tax rate as a fraction is stored in PurchaseOrder.taxRatePercent Decimal(5,4). */
+  taxFraction: { maxDp: 4 },
   /** StockMovement.totalValueBase Decimal(18,6), written by opening stock (quantity x average cost): 12 integer digits. */
   stockValue: { maxIntDigits: 12 },
   /** PurchaseOrder subtotal/total and line totals Decimal(18,4): 14 integer digits, foreign and base. */
   orderValue: { maxIntDigits: 14 },
   /** PurchaseOrderLine.unitCostBase Decimal(18,6): 12 integer digits after the rate is applied. */
   unitCostBaseColumn: { maxIntDigits: 12 },
-  dimension: { maxIntDigits: 9, maxDp: 6 },
+  /** Product.weight Decimal(10,4). */
+  weight: { maxIntDigits: 6, maxDp: 4 },
+  /** Product.widthCm / heightCm / depthCm Decimal(10,2). */
+  dimension: { maxIntDigits: 8, maxDp: 2 },
+  /** Product.salesPriceBase / salePriceBase Decimal(12,4). */
+  price: { maxIntDigits: 8, maxDp: 4 },
 } as const
 
 export const AVERAGE_COST_DP = 6
+
+// ---------------------------------------------------------------------------
+// Importer rejection rules that need IMS itself
+// ---------------------------------------------------------------------------
+
+/**
+ * Every rejection branch of the importers that depends on what is IN IMS, so a DB-free tool cannot prove it. The importers' CSV
+ * dry-run preview skips parts of `createPurchaseOrder` and `createTransfer`, so a clean preview does not prove the PO and
+ * transfer rules below either: the apply step (WP4b) must verify each one before any real import. Printed in every report and
+ * documented in docs/first-load-input-spec.md; a test keeps the two equal.
+ *
+ * The rules the tool CAN prove (required fields, quantity and cost signs and scales, date shapes, lifecycle of products in the
+ * catalogue file, order-group consistency, value ranges against every column written) are validators in transform.ts.
+ */
+export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check: string }> = [
+  { id: 'warehouse-exists', area: 'opening-stock, transfers, purchase-orders', check: 'Every warehouse code in the files exists in IMS (the importers refuse an unknown code; the report lists the codes used).' },
+  { id: 'base-currency', area: 'all', check: 'The manifest baseCurrency equals the organisation base currency in IMS (the importers compare against IMS, not the manifest).' },
+  { id: 'opening-stock-empty', area: 'opening-stock', check: 'The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable).' },
+  { id: 'po-supplier-exists', area: 'purchase-orders', check: 'Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first.' },
+  { id: 'po-fx-rate', area: 'purchase-orders', check: 'For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this.' },
+  { id: 'po-tax-rate', area: 'purchase-orders', check: 'Each taxRateName resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate.' },
+  { id: 'po-reference-free', area: 'purchase-orders', check: 'No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated).' },
+  { id: 'po-product-lifecycle', area: 'purchase-orders', check: 'Products that exist in IMS but not in the products file are ACTIVE or DRAFT (the file\'s own products are checked here).' },
+  { id: 'transfer-reference-free', area: 'transfers', check: 'No existing transfer already has a prefixed transferKey as its reference.' },
+  { id: 'transfer-source-stock', area: 'transfers', check: 'The opening-stock file for the source warehouse has been loaded first, nothing is reserved against it, and its cost layers cover the dispatched quantity.' },
+  { id: 'barcode-free', area: 'products', check: 'No barcode in the products file is already used by a product that exists in IMS.' },
+  { id: 'product-parent-exists', area: 'products', check: 'A VARIANT\'s parent is in an earlier or the same file (proved here) or already in IMS.' },
+]

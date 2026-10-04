@@ -131,6 +131,8 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
   out.push(`- Purchase orders emitted: ${report.purchaseOrders.orders} (${report.purchaseOrders.linesEmitted} line(s)); orders with nothing outstanding: ${report.purchaseOrders.ordersNothingOutstanding}`)
   out.push(`- Transfers emitted: ${report.transfers.transfers} (${report.transfers.linesEmitted} line(s))`, '')
 
+  out.push('## Apply-time checks this tool cannot prove', '', 'These importer rejection rules depend on what is in IMS. A clean dry-run preview does not prove the purchase-order and transfer rules either, so the apply step must verify each before any real import.', '')
+  out.push(...table(['Id', 'Area', 'Check'], report.applyTimeChecks.map((c) => [c.id, c.area, c.check])), '')
   out.push('## Import files', '')
   out.push(`Rows each importer file set would contain: ${Object.entries(report.plannedOutputRows).map(([k, v]) => `${k} ${v}`).join(', ')}.`, '')
   out.push(`Warehouse codes the files use (each must already exist in IMS; the tool cannot check): ${report.warehouseCodesUsed.join(', ') || '(none)'}.`, '')

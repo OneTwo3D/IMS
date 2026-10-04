@@ -19,6 +19,7 @@ import { parseCsvStrict, serializeCsv } from './csv'
 import type { CanonRow, IngestedDataset } from './ingest'
 import { D, fmt, fmtFixed, parseDecimal, roundTo, sum, type Dec } from './money'
 import {
+  APPLY_TIME_CHECKS,
   AVERAGE_COST_DP,
   DATASETS,
   IMPORT_TARGETS,
@@ -167,6 +168,8 @@ export interface PrepareReport {
   transfers: { transfers: number; linesEmitted: number }
   /** Every warehouse code the import files use. The importers refuse a code that does not exist in IMS; the tool cannot check that. */
   warehouseCodesUsed: string[]
+  /** Importer rejection rules this tool cannot prove; the apply step must verify them (see APPLY_TIME_CHECKS). */
+  applyTimeChecks: Array<{ id: string; area: string; check: string }>
   selfCheckFailures: string[]
 }
 
@@ -255,6 +258,8 @@ interface CatEntry {
   type: ProductType
   parentSku: string
   cells: Record<string, string>
+  /** The lifecycle status the importer will give this product. */
+  lifecycle: string
 }
 
 interface StockGroup {
@@ -335,7 +340,7 @@ class Run {
 }
 
 type Resolved =
-  | { kind: 'ok'; sku: string; key: string; type: string | null; source: 'catalogue' | 'ims' }
+  | { kind: 'ok'; sku: string; key: string; type: string | null; source: 'catalogue' | 'ims'; lifecycle: string | null }
   | { kind: 'excluded'; reason: string }
   | { kind: 'rejected' }
   | { kind: 'absent' }
@@ -347,10 +352,10 @@ function resolveProduct(run: Run, key: string): Resolved {
   if (status === 'rejected') return { kind: 'rejected' }
   if (status === 'ok') {
     const entry = run.cat.get(key)!
-    return { kind: 'ok', sku: entry.sku, key, type: entry.type, source: 'catalogue' }
+    return { kind: 'ok', sku: entry.sku, key, type: entry.type, source: 'catalogue', lifecycle: entry.lifecycle }
   }
   const ims = run.ims.get(key)
-  if (ims) return { kind: 'ok', sku: ims.sku, key, type: ims.type, source: 'ims' }
+  if (ims) return { kind: 'ok', sku: ims.sku, key, type: ims.type, source: 'ims', lifecycle: null }
   return { kind: 'absent' }
 }
 
@@ -455,13 +460,13 @@ function validateProductRow(row: CanonRow): { ok: true; entry: CatEntry } | { ok
   const cells: Record<string, string> = {}
   for (const column of ['weight', 'widthCm', 'heightCm', 'depthCm'] as const) {
     if (v[column] === '') continue
-    const parsed = parseDecimal(v[column], column, NUMERIC_LIMITS.dimension)
+    const parsed = parseDecimal(v[column], column, column === 'weight' ? NUMERIC_LIMITS.weight : NUMERIC_LIMITS.dimension)
     if (!parsed.ok) return fail('BAD_NUMBER', parsed.reason)
     cells[column] = fmt(parsed.value)
   }
   for (const column of ['salesPriceBase', 'salePriceBase'] as const) {
     if (v[column] === '') continue
-    const parsed = parseDecimal(v[column], column, NUMERIC_LIMITS.unitCost)
+    const parsed = parseDecimal(v[column], column, NUMERIC_LIMITS.price)
     if (!parsed.ok) return fail('BAD_NUMBER', parsed.reason)
     cells[column] = fmt(parsed.value)
   }
@@ -479,7 +484,9 @@ function validateProductRow(row: CanonRow): { ok: true; entry: CatEntry } | { ok
   for (const column of ['description', 'barcode', 'mpn', 'countryOfOrigin', 'stockUnit', 'imageUrl', 'category'] as const) {
     if (v[column] !== '') cells[column] = v[column]
   }
-  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells } }
+  // The importer's own derivation: a valid lifecycleStatus wins, otherwise active FALSE means EOL, otherwise ACTIVE.
+  const lifecycle = cells.lifecycleStatus ?? (cells.active === 'FALSE' ? 'EOL' : 'ACTIVE')
+  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells, lifecycle } }
 }
 
 function loadCatalogue(run: Run): void {
@@ -890,6 +897,7 @@ function loadTransfers(run: Run): void {
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
     trackSku(run, 'transfers', sku, res.sku)
+    if (res.lifecycle === 'ARCHIVED') { reject('PRODUCT_ARCHIVED', `SKU ${sku.sku} will be created as ARCHIVED; createTransfer refuses archived products`); continue }
     if (res.type === null || !STOCK_BEARING_TYPES.has(res.type)) { reject('TYPE_CANNOT_BE_TRANSFERRED', `SKU ${sku.sku} is ${res.type ?? 'of unknown type'}; only SIMPLE, VARIANT and BOM hold stock to transfer`); continue }
     if (v.dispatchDate !== '' && config.asOf) {
       const days = Math.floor(((parseIsoDate(config.asOf) ?? 0) - (parseIsoDate(v.dispatchDate) ?? 0)) / 86_400_000)
@@ -1028,6 +1036,10 @@ function loadPurchaseOrders(run: Run): void {
       if (!t.ok) { reject('BAD_TAX_RATE', t.reason); continue }
       taxRateValue = fmt(t.value)
       const asFraction = t.value.gt(1) ? t.value.div(100) : t.value
+      if (asFraction.decimalPlaces() > NUMERIC_LIMITS.taxFraction.maxDp) {
+        reject('TAX_RATE_PRECISION', `taxRateValue ${v.taxRateValue} is ${fmt(asFraction)} as a fraction, which has more than ${NUMERIC_LIMITS.taxFraction.maxDp} decimal places; the order stores the rate at 4 (Decimal(5,4)) while computing tax from the unrounded value`)
+        continue
+      }
       if (config.maxPurchaseTaxRate !== null && asFraction.gt(new D(config.maxPurchaseTaxRate))) {
         reject('TAX_RATE_ABOVE_DECLARED_MAX', `taxRateValue ${v.taxRateValue} is ${fmt(asFraction)} as a fraction, above the declared maxPurchaseTaxRate ${config.maxPurchaseTaxRate}`)
         continue
@@ -1058,6 +1070,7 @@ function loadPurchaseOrders(run: Run): void {
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
     trackSku(run, 'purchase-order-lines', sku, res.sku)
+    if (res.lifecycle !== null && res.lifecycle !== 'ACTIVE' && res.lifecycle !== 'DRAFT') { reject('PRODUCT_NOT_PURCHASABLE', `SKU ${sku.sku} will be created as ${res.lifecycle}; createPurchaseOrder only accepts ACTIVE or DRAFT products`); continue }
     if (res.type === 'KIT' || res.type === 'VARIABLE') { reject('TYPE_CANNOT_BE_PURCHASED', `SKU ${sku.sku} is ${res.type}; it can never be received into stock`); continue }
 
     let supplierName = v.supplierName.normalize('NFC').trim()
@@ -1565,6 +1578,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     purchaseOrders: { orders: run.poOutputs.length, ordersNothingOutstanding: run.poOrdersNothingOutstanding, linesEmitted: emittedByTarget['purchase-orders'] },
     transfers: { transfers: run.transferOutputs.length, linesEmitted: emittedByTarget.transfers },
     warehouseCodesUsed: [...run.warehouses].sort(cmp),
+    applyTimeChecks: APPLY_TIME_CHECKS.map((c) => ({ ...c })),
     selfCheckFailures: run.selfCheck,
   }
   return { outputs: finalOutputs, report, blocking: blocking || run.selfCheck.length > 0 }

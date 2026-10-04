@@ -8,7 +8,7 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import {
-  DATASETS, DATASET_NAMES, EXIT_CODE_TABLE, IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS, IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, type ImporterTarget,
+  APPLY_TIME_CHECKS, DATASETS, DATASET_NAMES, EXIT_CODE_TABLE, IMPORTER_MAX_BYTES, IMPORTER_MAX_ROWS, IMPORT_TARGETS, MAX_BYTES_PER_FILE, MAX_ROWS_PER_FILE, type ImporterTarget,
 } from '../../lib/first-load/spec.ts'
 import { precondition } from './helpers.ts'
 
@@ -78,4 +78,10 @@ test('the document has no stale statement of the old "fewer than 10,000 rows" mi
   assert.ok(!/importers? (accept|accepts) (fewer|less) than 10,000/i.test(doc))
   assert.ok(!/nothing was loaded anywhere|will be loaded for you|loads? (it|them) automatically/i.test(doc))
   assert.ok(!/\bTODO\b|\bTBD\b/.test(doc))
+})
+
+test('the apply-time checks in the document are exactly APPLY_TIME_CHECKS (every row, both directions)', (t) => {
+  const rows = tableRows(section('## Apply-time checks this tool cannot prove'))
+  precondition(t, 'document apply-time rows', rows.length)
+  assert.deepEqual(rows, APPLY_TIME_CHECKS.map((c) => [c.id, c.area, c.check]))
 })

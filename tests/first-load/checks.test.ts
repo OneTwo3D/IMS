@@ -402,3 +402,50 @@ test('the declared worst-case purchase tax rate is required with purchase orders
   assert.throws(() => run(withPo, { maxPurchaseTaxRate: '25%' }), ConfigError)
   assert.throws(() => run(withPo, { maxPurchaseTaxRate: '1.5' }), ConfigError)
 })
+
+test('importer rejection sweep: every emitted number is checked against the scale it is STORED at, and rejected rather than rounded', (t) => {
+  const po = (extra: Record<string, string>) => run({ products: ds('products', [product('A')]), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ currency: 'USD', fxRateToBase: '1.25', ...extra })]) })
+  const prod = (extra: Record<string, string>) => run({ products: ds('products', [product('A', 'SIMPLE', extra)]) })
+  const cases: Array<[string, ReturnType<typeof run>, string]> = [
+    ['fx 9 dp (stored Decimal(18,8))', po({ fxRateToBase: '0.000000011' }), 'BAD_FX'],
+    ['tax fraction 5 dp (stored Decimal(5,4))', po({ taxRateValue: '0.12345' }), 'TAX_RATE_PRECISION'],
+    ['weight 5 dp (Decimal(10,4))', prod({ weight: '1.00001' }), 'BAD_NUMBER'],
+    ['dimension 3 dp (Decimal(10,2))', prod({ widthCm: '1.001' }), 'BAD_NUMBER'],
+    ['price 5 dp (Decimal(12,4))', prod({ salesPriceBase: '1.00001' }), 'BAD_NUMBER'],
+    ['price 9 integer digits (Decimal(12,4))', prod({ salePriceBase: '123456789' }), 'BAD_NUMBER'],
+  ]
+  precondition(t, 'scale cases', cases.length)
+  for (const [name, result, code] of cases) {
+    const codes = result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => d.code)
+    assert.ok(codes.includes(code), `${name}: ${JSON.stringify(codes)}`)
+  }
+  const ok = po({ fxRateToBase: '0.00000001', taxRateValue: '0.1234' })
+  assert.equal(ok.blocking, false, 'the stored scale itself is accepted (8 dp rate, 4 dp tax fraction)')
+  assert.ok(prod({ weight: '1.0001', widthCm: '1.01', salesPriceBase: '1.0001' }).blocking === false)
+})
+
+test('importer rejection sweep: product lifecycle rules of createPurchaseOrder and createTransfer are mirrored for products in the catalogue file', (t) => {
+  const mk = (type: Record<string, string>, line: 'po' | 'transfer') => run({
+    products: ds('products', [product('A', 'SIMPLE', type)]),
+    'stock-lots': ds('stock-lots', [lot('A', '5', '1')]),
+    ...(line === 'po'
+      ? { 'purchase-order-lines': ds('purchase-order-lines', [poLine({})]) }
+      : { transfers: ds('transfers', [{ transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'A', qtyShipped: '1', qtyReceived: '0' }]) }),
+  })
+  precondition(t, 'lifecycle cases', 6)
+  const codes = (r: ReturnType<typeof run>, ds2: string) => rejectedCodes(r, ds2)
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'ARCHIVED' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'])
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'EOL' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'])
+  assert.deepEqual(codes(mk({ active: 'FALSE' }, 'po'), 'purchase-order-lines'), ['PRODUCT_NOT_PURCHASABLE'], 'active FALSE is EOL for the importer')
+  assert.equal(mk({ lifecycleStatus: 'DRAFT' }, 'po').blocking, false)
+  assert.deepEqual(codes(mk({ lifecycleStatus: 'ARCHIVED' }, 'transfer'), 'transfers'), ['PRODUCT_ARCHIVED'])
+  assert.equal(mk({ lifecycleStatus: 'EOL' }, 'transfer').blocking, false, 'an EOL product may be transferred')
+})
+
+test('the report lists the apply-time checks the tool cannot prove (FX availability and the 2% rule among them)', (t) => {
+  const result = run(loadFixtureDatasets())
+  precondition(t, 'apply-time checks listed', result.report.applyTimeChecks.length)
+  const fx = result.report.applyTimeChecks.find((c) => c.id === 'po-fx-rate')
+  assert.ok(fx?.check.includes('within 2%'))
+  assert.ok(findingCodes(result).length > 0)
+})

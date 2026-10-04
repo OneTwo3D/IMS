@@ -88,12 +88,12 @@ Qoblex is authoritative. Becomes the products import file.
 | `barcode` | no | Text; leading zeros are kept. A barcode shared by two products rejects both. |
 | `mpn` | no | Passed through as given (trimmed). |
 | `countryOfOrigin` | no | Passed through; the importer normalises it and only warns on an unrecognised value. |
-| `weight` | no | Plain decimal. |
-| `widthCm` | no | Plain decimal. |
-| `heightCm` | no | Plain decimal. |
-| `depthCm` | no | Plain decimal. |
-| `salesPriceBase` | no | Plain decimal, base currency. |
-| `salePriceBase` | no | Plain decimal, base currency. |
+| `weight` | no | Plain decimal, at most 4 decimal places (Decimal(10,4)). |
+| `widthCm` | no | Plain decimal, at most 2 decimal places (Decimal(10,2)). |
+| `heightCm` | no | Plain decimal, at most 2 decimal places (Decimal(10,2)). |
+| `depthCm` | no | Plain decimal, at most 2 decimal places (Decimal(10,2)). |
+| `salesPriceBase` | no | Plain decimal, base currency, at most 4 decimal places (Decimal(12,4)). |
+| `salePriceBase` | no | Plain decimal, base currency, at most 4 decimal places (Decimal(12,4)). |
 | `salesPriceTaxInclusive` | no | TRUE or FALSE. |
 | `stockUnit` | no | Passed through as given (trimmed). |
 | `imageUrl` | no | Passed through as given (trimmed). |
@@ -123,7 +123,7 @@ FIFO lots on hand per SKU and warehouse. A row with `qty` 0 states "zero on hand
 | `qty` | yes | Plain decimal, zero or more, at most 6 decimal places. Negative is refused. |
 | `unitCost` | no | Required for a lot with stock. In `currency`; at most 10 decimal places. |
 | `currency` | yes | 3-letter code. |
-| `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. Foreign units per ONE base unit (as in the purchase-order importer, which divides by it): base cost = cost / rate. |
+| `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. Foreign units per ONE base unit (as in the purchase-order importer, which divides by it): base cost = cost / rate. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `receivedDate` | no | Informational. |
 | `lotRef` | no | Lot reference. The same reference twice for one SKU and warehouse is a duplicated row and is refused. |
 
@@ -160,14 +160,14 @@ Reduced to the outstanding quantity per line.
 | `supplierName` | yes | Must be in the suppliers dataset when that is supplied. |
 | `status` | no | OPEN (default if blank), CLOSED or CANCELLED. Anything not OPEN is excluded. |
 | `currency` | yes | 3-letter code. |
-| `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. |
+| `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `destinationWarehouseCode` | no | Passed through as given (trimmed). |
 | `sku` | yes | Passed through as given (trimmed). |
 | `qtyOrdered` | yes | At most 4 decimal places. |
 | `qtyReceived` | yes | At most 4 decimal places. |
 | `unitCostForeign` | yes | At most 6 decimal places and 9 integer digits. |
 | `taxRateName` | no | Passed through as given (trimmed). |
-| `taxRateValue` | no | Passed through as given (trimmed). |
+| `taxRateValue` | no | Percent or fraction as the importer reads it (above 1 means percent); as a fraction at most 4 decimal places (Decimal(5,4)) and not above `maxPurchaseTaxRate`. |
 | `pricesIncludeVat` | no | TRUE or FALSE. |
 | `supplierRef` | no | Passed through as given (trimmed). |
 | `expectedDelivery` | no | YYYY-MM-DD. |
@@ -386,6 +386,27 @@ orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,uni
 `validation-report.json` (machine) and `validation-report.md` (people) hold: the inputs with their SHA-256, the checks that ran and the ones that did not, the accounting identity per dataset and per reason code, every finding, every rejected and excluded record
 with its line, the opening-stock collapse (lot total, collapsed total, residual), the zero and missing lists, the R14 presence matrix, the recipe cycles, the warehouse codes the files use (to compare with IMS), SKU-normalisation counts, and the output files with their SHA-256. Findings are ERROR (blocks), WARNING or INFO.
 The report is deterministic: row-level entries are sorted by dataset, outcome, code and key, so the only content that differs between two input orderings is the line numbers (and the input file hashes).
+
+## Apply-time checks this tool cannot prove
+
+Every importer rejection rule that depends on what is in IMS. The importers' CSV dry-run preview skips parts of `createPurchaseOrder` and `createTransfer`, so a clean preview does not prove the purchase-order and transfer rules either: the apply step must verify each one before any real import. The same list is printed in every report.
+
+| Id | Area | Check |
+| --- | --- | --- |
+| warehouse-exists | opening-stock, transfers, purchase-orders | Every warehouse code in the files exists in IMS (the importers refuse an unknown code; the report lists the codes used). |
+| base-currency | all | The manifest baseCurrency equals the organisation base currency in IMS (the importers compare against IMS, not the manifest). |
+| opening-stock-empty | opening-stock | The product and warehouse have no stock, cost layer or movement yet (importOpeningStockCsv refuses otherwise; it is not repeatable). |
+| po-supplier-exists | purchase-orders | Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first. |
+| po-fx-rate | purchase-orders | For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this. |
+| po-tax-rate | purchase-orders | Each taxRateName resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. |
+| po-reference-free | purchase-orders | No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated). |
+| po-product-lifecycle | purchase-orders | Products that exist in IMS but not in the products file are ACTIVE or DRAFT (the file's own products are checked here). |
+| transfer-reference-free | transfers | No existing transfer already has a prefixed transferKey as its reference. |
+| transfer-source-stock | transfers | The opening-stock file for the source warehouse has been loaded first, nothing is reserved against it, and its cost layers cover the dispatched quantity. |
+| barcode-free | products | No barcode in the products file is already used by a product that exists in IMS. |
+| product-parent-exists | products | A VARIANT's parent is in an earlier or the same file (proved here) or already in IMS. |
+
+The rules the tool does prove: required fields, quantity and cost signs and scales (every emitted number is checked against the scale of the column it is stored in: weight 4 dp, dimensions 2 dp, prices 4 dp, quantities 4 or 6 dp, costs 6 dp, exchange rate 8 dp, tax rate 4 dp as a fraction, and rejected rather than rounded), date shapes, the lifecycle of products in the catalogue file (a purchase order line needs ACTIVE or DRAFT, a transfer anything but ARCHIVED; `active` FALSE means EOL), order-group consistency and the value ranges of every column written.
 
 ## Known gaps
 
