@@ -224,6 +224,7 @@ export const DATASET_NAMES = [
   'woo-products',
   'sku-exclusions',
   'ims-skus',
+  'ims-suppliers',
 ] as const
 export type DatasetName = (typeof DATASET_NAMES)[number]
 
@@ -274,7 +275,7 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   },
   'purchase-order-lines': {
     columns: [
-      'orderKey', 'supplierName', 'status', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'qtyOrdered', 'qtyReceived',
+      'orderKey', 'supplierName', 'status', 'currency', 'fxRateToBase', 'destinationWarehouseCode', 'sku', 'lineNo', 'qtyOrdered', 'qtyReceived',
       'unitCostForeign', 'taxRateName', 'taxRateValue', 'pricesIncludeVat', 'supplierRef', 'expectedDelivery', 'notes',
     ],
     required: ['orderKey', 'supplierName', 'sku', 'qtyOrdered', 'qtyReceived', 'unitCostForeign', 'currency'],
@@ -310,6 +311,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: ['sku', 'reason'],
     sources: [],
     purpose: 'The explicit, owner-accepted exclusion list: a SKU listed here is deliberately NOT loaded and is exempt from R14. Always canonical.',
+  },
+  'ims-suppliers': {
+    columns: ['name'],
+    required: ['name'],
+    sources: [],
+    purpose: 'Supplier names that already exist in the target IMS. Lets the tool reject a new supplier whose name collides with one of them under the importers\' matching, and check purchase order supplier names. Omit for an empty database. Always canonical.',
   },
   'ims-skus': {
     columns: ['sku', 'type'],
@@ -386,7 +393,7 @@ export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check:
   { id: 'po-supplier-exists', area: 'purchase-orders', check: 'Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first.' },
   { id: 'po-fx-rate', area: 'purchase-orders', check: 'For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this.' },
   { id: 'po-tax-rate', area: 'purchase-orders', check: 'Each line\'s taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree.' },
-  { id: 'lookup-keys-unique-in-ims', area: 'all', check: 'In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers\' case-insensitive matching: they build a Map and the last duplicate wins silently.' },
+  { id: 'lookup-keys-unique-in-ims', area: 'all', check: 'In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers\' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool.' },
   { id: 'po-reference-free', area: 'purchase-orders', check: 'No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated).' },
   { id: 'po-product-lifecycle', area: 'purchase-orders', check: 'Products that exist in IMS but not in the products file are ACTIVE or DRAFT (the file\'s own products are checked here).' },
   { id: 'transfer-reference-free', area: 'transfers', check: 'No existing transfer already has a prefixed transferKey as its reference.' },

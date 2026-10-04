@@ -125,7 +125,7 @@ FIFO lots on hand per SKU and warehouse. A row with `qty` 0 states "zero on hand
 | `currency` | yes | 3-letter code. |
 | `fxRateToBase` | no | Required when `currency` is not the base currency; blank or 1 for the base currency. Foreign units per ONE base unit (as in the purchase-order importer, which divides by it): base cost = cost / rate. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `receivedDate` | no | Informational. |
-| `lotRef` | no | Lot reference. The same reference twice for one SKU and warehouse is a duplicated row and is refused. |
+| `lotRef` | no | Lot reference. The same reference twice for one SKU and warehouse is a duplicated row and is refused; so are identical rows (same SKU, warehouse, quantity, cost and date) with no reference. |
 
 ### Dataset: suppliers
 
@@ -157,12 +157,13 @@ Reduced to the outstanding quantity per line.
 | Column | Required | Meaning |
 | --- | --- | --- |
 | `orderKey` | yes | The incumbent's PO number. Written as `<purchaseOrderKeyPrefix><orderKey>`. |
-| `supplierName` | yes | Must be in the suppliers dataset when that is supplied. |
+| `supplierName` | yes | Must be in the suppliers dataset, or (when supplied) in the ims-suppliers list. |
 | `status` | no | OPEN (default if blank), CLOSED or CANCELLED. Anything not OPEN is excluded. |
 | `currency` | yes | 3-letter code. |
 | `fxRateToBase` | no | Required when `currency` is not the base currency. Foreign units per ONE base unit; the importer divides by it. At most 8 decimal places (the stored scale, Decimal(18,8)): a finer rate is rejected, never rounded. |
 | `destinationWarehouseCode` | no | Passed through as given (trimmed). |
 | `sku` | yes | Passed through as given (trimmed). |
+| `lineNo` | no | The incumbent's line number. Map it when an order can carry the same SKU on more than one line: two rows with the same order, SKU and line number are rejected as duplicates. |
 | `qtyOrdered` | yes | At most 4 decimal places. |
 | `qtyReceived` | yes | At most 4 decimal places. |
 | `unitCostForeign` | yes | At most 6 decimal places and 9 integer digits. |
@@ -226,6 +227,14 @@ The explicit, owner-accepted exclusion list. Always a canonical file.
 | --- | --- | --- |
 | `sku` | yes | A SKU listed here is deliberately not loaded and is exempt from the coverage check. |
 | `reason` | yes | Written reason. An exclusion without one is refused. |
+
+### Dataset: ims-suppliers
+
+Supplier names that already exist in the target IMS. Omit it for an empty database. Always a canonical file.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | An existing supplier's name. A new supplier whose name collides with one of these under the importers' matching (upper-case or lower-case, a different spelling) is rejected; purchase-order supplier names are checked against it when no suppliers dataset names them. **Without this list the collision check against IMS is not performed** (the report says so). |
 
 ### Dataset: ims-skus
 
@@ -303,7 +312,7 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
 - **SKUs.** A SKU is trimmed and Unicode-normalised; nothing inside it is changed. Other datasets find a product by comparing upper-case (exactly how the opening-stock,
   transfer and purchase-order importers look a SKU up) and the file uses the catalogue's spelling. Two catalogue SKUs that differ only by case reject both. A SKU with a control, non-breaking-space
   or zero-width character, or starting with `#` (the importers' reader skips such a row as a comment), is rejected.
-- **Duplicates.** Exact duplicates collapse to one and the extra is excluded. Conflicting duplicates reject **every** member, so the answer never depends on row order.
+- **Duplicates.** The same rule everywhere: a duplicate is either provably identical and deduplicated (products, suppliers, exclusions, IMS lists: the extra is *excluded* with `DUPLICATE_ROW`), or rejected with every member, so the answer never depends on row order. A line that would **add** a quantity when repeated is never deduplicated, because that cannot tell an export that repeated a row from a real second line: the same purchase order line twice (same order, SKU and `lineNo`) is rejected as `DUPLICATE_PO_LINE` (identical) or `DUPLICATE_PO_LINE_CONFLICT`; identical stock lot rows with no `lotRef` are rejected as `DUPLICATE_LOT_ROW`; the same lot reference twice, the same recipe component twice, and the same SKU twice in one transfer are rejected. Every duplicate has a disposition, so the accounting table shows it.
 - **Decimals.** Quantities and costs use exact decimal arithmetic, never floating point. A decimal comma, a thousands separator, an exponent, a sign prefix, more decimal places than the target column holds, or more than
   15 significant digits for a cost (the importers read costs as doubles) is rejected.
 - **Recipes.** Every component and parent must be a loaded product. The recipe graph must be acyclic: the check is `detectBomItemCycleInEdges`, the function the importer's component pass uses, applied repeatedly until every
@@ -314,7 +323,7 @@ Any rejected row or error finding makes the whole run BLOCKED (exit 1) and **no 
 - **Zero versus missing.** A SKU whose stock rows all say zero is **zero on hand** (excluded: no opening layer is created). A stock-bearing SKU (SIMPLE, VARIANT, BOM) with no stock row at all is **missing from the extract**, listed
   separately. If the 3PL stock dataset is supplied and the missing SKU holds stock there, that is an error; if it is not supplied the answer is reported as unknown.
 - **Open purchase orders.** Outstanding quantity per line is ordered minus received, never negative. Fully received lines, closed orders and over-received lines are excluded; an over-received line is also a warning. Lines of one order must agree on
-  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. An order whose value (net total at the declared `maxPurchaseTaxRate`, foreign and in base currency (foreign divided by the rate): 14 integer digits) or whose base unit cost (12 integer digits) the purchase order columns cannot hold is rejected whole. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
+  supplier, currency, rate, warehouse, VAT flag, reference, date, notes and tax rate or the whole order is rejected (the importer refuses such an order). Lines of an order are never split across files. An order whose value (net total at the declared `maxPurchaseTaxRate`, foreign and in base currency (foreign divided by the rate): 14 integer digits) or whose base unit cost (12 integer digits) the purchase order columns cannot hold is rejected whole. When a suppliers dataset is supplied, every supplier a line names must be in it (a line naming a supplier that is only in IMS is rejected unless the ims-suppliers list names it); to reference suppliers that already exist in IMS, leave the suppliers dataset out and the names are passed through unchecked (with a warning).
 - **R14 four-way SKU coverage.** Every SKU in Qoblex, the 3PL or WooCommerce must exist in IMS after the load (loaded now, or already in IMS) or be on the exclusion list; otherwise it is an error. The report prints a presence matrix (Q = Qoblex, L = the 3PL, W = WooCommerce, I = already in IMS).
   A SKU only in IMS, or an exclusion that matches nothing, is a warning.
   The 3PL's SKUs are compared case-insensitively like every other SKU; the column map, not the code, says which file is which, so nothing in the tool is Mintsoft-specific.
@@ -399,7 +408,7 @@ Every importer rejection rule that depends on what is in IMS. The importers' CSV
 | po-supplier-exists | purchase-orders | Each supplier name exists in IMS (matched case-insensitively); the suppliers file creates them only when it is loaded first. |
 | po-fx-rate | purchase-orders | For every non-base currency IMS holds a base-to-currency FX rate on or before the import date, and the supplied fxRateToBase is within 2% of it (createPurchaseOrder, PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE). The CSV dry-run does not run this. |
 | po-tax-rate | purchase-orders | Each line's taxRateName (names are matched case-insensitively, trimmed) or, when only a taxRateValue is given, its value (matched within 0.00005) resolves to an active IMS purchase tax rate, and no rate IMS applies (named, or the supplier default) is above the manifest maxPurchaseTaxRate. A line never carries both: the tool cannot show a name and a value agree. |
-| lookup-keys-unique-in-ims | all | In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers' case-insensitive matching: they build a Map and the last duplicate wins silently. |
+| lookup-keys-unique-in-ims | all | In IMS no two suppliers (name), warehouses (code), products (SKU) or tax rates (name) collide under the importers' case-insensitive matching: they build a Map and the last duplicate wins silently. The tool performs the supplier and SKU parts only against an ims-suppliers / ims-skus list you supply; WITHOUT that list the collision check against IMS is NOT performed and the report says so. Warehouse codes and tax names are never checked by the tool. |
 | po-reference-free | purchase-orders | No existing purchase order already has a prefixed orderKey as its reference (an existing one is skipped, not updated). |
 | po-product-lifecycle | purchase-orders | Products that exist in IMS but not in the products file are ACTIVE or DRAFT (the file's own products are checked here). |
 | transfer-reference-free | transfers | No existing transfer already has a prefixed transferKey as its reference. |

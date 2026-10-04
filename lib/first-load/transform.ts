@@ -299,6 +299,9 @@ class Run {
   exclusions = new Map<string, { sku: string; reason: string }>()
   recipeComponents = new Map<string, Array<{ componentSku: string; componentKey: string; qty: Dec; sortOrder: number | null }>>()
   recipeCycles: string[][] = []
+  imsSuppliers = new Map<string, string>()
+  imsSuppliersLower = new Map<string, string>()
+  imsSupplierCollidedKeys = new Set<string>()
   suppliers = new Map<string, { name: string; cells: Record<string, string> }>()
   supplierStatus = new Map<string, 'ok' | 'rejected'>()
   stockGroups = new Map<string, StockGroup>()
@@ -691,6 +694,46 @@ function checkRecipesPresent(run: Run): void {
 // Suppliers
 // ---------------------------------------------------------------------------
 
+function loadImsSuppliers(run: Run): void {
+  const entries: Array<{ row: CanonRow; name: string }> = []
+  for (const row of run.rows('ims-suppliers')) {
+    const name = row.values.name.normalize('NFC').trim()
+    if (name === '') { run.add('ims-suppliers', row.line, '(blank)', 'REJECTED', 'MISSING_NAME', 'name is empty'); continue }
+    entries.push({ row, name })
+  }
+  const byUpper = new Map<string, Set<string>>()
+  const byLower = new Map<string, Set<string>>()
+  for (const e of entries) {
+    byUpper.set(e.name.toUpperCase(), (byUpper.get(e.name.toUpperCase()) ?? new Set<string>()).add(e.name))
+    byLower.set(e.name.toLowerCase(), (byLower.get(e.name.toLowerCase()) ?? new Set<string>()).add(e.name))
+  }
+  const seen = new Set<string>()
+  for (const e of entries) {
+    if ((byUpper.get(e.name.toUpperCase())?.size ?? 0) > 1 || (byLower.get(e.name.toLowerCase())?.size ?? 0) > 1) {
+      run.add('ims-suppliers', e.row.line, e.name, 'REJECTED', 'IMS_SUPPLIER_NAME_COLLISION', 'two suppliers already in IMS collide under the importers\' name matching: the importers cannot tell them apart and keep the last; fix it in IMS first')
+      run.imsSupplierCollidedKeys.add(e.name.toUpperCase())
+      run.imsSupplierCollidedKeys.add(e.name.toLowerCase())
+    } else if (seen.has(e.name)) run.add('ims-suppliers', e.row.line, e.name, 'EXCLUDED', 'DUPLICATE_IMS_SUPPLIER', 'exact duplicate of another row')
+    else {
+      seen.add(e.name)
+      run.imsSuppliers.set(e.name.toUpperCase(), e.name)
+      run.imsSuppliersLower.set(e.name.toLowerCase(), e.name)
+      run.add('ims-suppliers', e.row.line, e.name, 'EMITTED', 'IMS_SUPPLIER_REGISTERED', 'used by the supplier collision and purchase-order lookup checks')
+    }
+  }
+}
+
+/** The IMS supplier names a candidate name would be confused with (a different spelling under either importer rule, or a colliding pair). */
+function imsSupplierRivals(run: Run, name: string): string[] {
+  const rivals = new Set<string>()
+  const upper = run.imsSuppliers.get(name.toUpperCase())
+  const lower = run.imsSuppliersLower.get(name.toLowerCase())
+  if (upper !== undefined && upper !== name) rivals.add(upper)
+  if (lower !== undefined && lower !== name) rivals.add(lower)
+  if (run.imsSupplierCollidedKeys.has(name.toUpperCase()) || run.imsSupplierCollidedKeys.has(name.toLowerCase())) rivals.add('(two colliding suppliers already in IMS)')
+  return [...rivals].sort(cmp)
+}
+
 function loadSuppliers(run: Run): void {
   type Candidate = { row: CanonRow; name: string; cells: Record<string, string> }
   const groups = new Map<string, Candidate[]>()
@@ -728,6 +771,12 @@ function loadSuppliers(run: Run): void {
     void key
   }
   for (const [key, list] of [...groups.entries()]) {
+    const imsRivals = [...new Set(list.flatMap((c) => imsSupplierRivals(run, c.name)))]
+    if (imsRivals.length > 0) {
+      for (const c of list) run.add('suppliers', c.row.line, c.name, 'REJECTED', 'SUPPLIER_COLLIDES_WITH_IMS', `supplier name ${JSON.stringify(c.name)} collides with ${imsRivals.map((n) => JSON.stringify(n)).join(', ')} already in IMS under the importers' name matching: the supplier importer would update the wrong supplier or the purchase-order importer would resolve to it`)
+      run.supplierStatus.set(key, 'rejected')
+      continue
+    }
     if (list.some((c) => collided.has(c.name))) {
       for (const c of list) {
         const rivals = [...new Set([...list.map((x) => x.name), ...(spellingsByLower.get(c.name.toLowerCase()) ?? [])])].filter((n) => n !== c.name).sort(cmp)
@@ -845,9 +894,22 @@ function loadStock(run: Run): void {
       run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_REF', `lot reference ${JSON.stringify(lot.lotRef)} appears ${list.length} times for this SKU and warehouse`)
     }
   }
+  // Identical lot rows with no lot reference cannot be told from an exported-twice row, and summing them silently doubles stock.
+  const bySignature = new Map<string, Lot[]>()
+  for (const lot of lots) {
+    if (lot.lotRef !== '') continue
+    const signature = [stockGroupKey(lot.key, lot.warehouse), fmt(lot.qty), lot.unitCostBase.toFixed(), lot.date].join('\u0000')
+    bySignature.set(signature, [...(bySignature.get(signature) ?? []), lot])
+  }
+  for (const list of bySignature.values()) {
+    if (list.length < 2) continue
+    for (const lot of list) {
+      refused.add(lot)
+      run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'DUPLICATE_LOT_ROW', `${list.length} identical lot rows (same SKU, warehouse, quantity, cost and date) and no lot reference to tell them apart; they could be one lot exported twice (stock would be doubled) or genuinely separate lots. Add a lot reference column to the export`)
+    }
+  }
   const groups = new Map<string, Lot[]>()
   for (const lot of lots) if (!refused.has(lot)) groups.set(stockGroupKey(lot.key, lot.warehouse), [...(groups.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
-  const identical: string[] = []
   for (const [gk, list] of [...groups.entries()]) {
     const collapsed = collapseLots(list.map((l) => ({ qty: l.qty, unitCostBase: l.unitCostBase })))
     if (exceedsIntDigits(collapsed.qty, NUMERIC_LIMITS.stockQty.maxIntDigits) || exceedsIntDigits(collapsed.average, NUMERIC_LIMITS.unitCost.maxIntDigits) || exceedsIntDigits(collapsed.average.mul(collapsed.qty), NUMERIC_LIMITS.stockValue.maxIntDigits)) {
@@ -857,8 +919,6 @@ function loadStock(run: Run): void {
       continue
     }
     for (const lot of list) run.add('stock-lots', lot.row.line, lot.sku, 'EMITTED', 'LOT_COLLAPSED', `collapsed into one weighted-average opening row for ${lot.sku} in ${lot.warehouse}`)
-    const noRef = list.filter((l) => l.lotRef === '').map((l) => `${fmt(l.qty)}|${l.unitCostBase.toFixed()}|${l.date}`)
-    if (noRef.length !== new Set(noRef).size) identical.push(list[0].sku)
     run.warehouses.add(list[0].warehouse)
     run.stockGroups.set(gk, {
       sku: list[0].sku,
@@ -878,7 +938,6 @@ function loadStock(run: Run): void {
   if (zeroCost.length > 0) {
     run.find('WARNING', 'ZERO_COST_OPENING_STOCK', 'opening stock with a weighted-average cost of zero is accepted by the importer but would sell at zero cost of goods: confirm the cost in Qoblex', 'stock-lots', zeroCost)
   }
-  if (identical.length > 0) run.find('WARNING', 'IDENTICAL_LOT_ROWS', 'identical lot rows (same quantity, cost and date, no lot reference) were SUMMED as separate lots. If they are a duplicated export, the quantity is overstated; add a lot reference column to the export.', 'stock-lots', identical)
   if (excludedHolding.size > 0) {
     run.find('ERROR', 'EXCLUDED_SKU_HOLDS_STOCK', 'SKU(s) on the exclusion list hold stock in the stock extract: that stock would silently not be loaded. Remove the exclusion or confirm the stock is written off.', 'stock-lots', [...excludedHolding.entries()].map(([sku, qty]) => `${sku} (${fmt(qty)})`))
   }
@@ -1041,6 +1100,21 @@ function loadPurchaseOrders(run: Run): void {
     unitCost: Dec
     ordered: Dec
   }
+  // The same purchase order line twice would DOUBLE the outstanding quantity. A line is identified by order, SKU and (when the export
+  // has one) line number; two rows with the same identity are either an exported-twice row or a conflict, and either way all are rejected.
+  const dupInfo = new Map<CanonRow, { exact: boolean; count: number }>()
+  const byIdentity = new Map<string, CanonRow[]>()
+  for (const row of run.rows('purchase-order-lines')) {
+    const parsed = parseSku(row.values.sku)
+    if (row.values.orderKey === '' || !parsed.ok) continue
+    const identity = [row.values.orderKey, parsed.key, row.values.lineNo].join('\u0000')
+    byIdentity.set(identity, [...(byIdentity.get(identity) ?? []), row])
+  }
+  for (const list of byIdentity.values()) {
+    if (list.length < 2) continue
+    const exact = new Set(list.map((r) => JSON.stringify(r.values))).size === 1
+    for (const row of list) dupInfo.set(row, { exact, count: list.length })
+  }
   const candidates: Line[] = []
   const fullyReceivedOrders = new Map<string, { open: number; closed: number }>()
   for (const row of run.rows('purchase-order-lines')) {
@@ -1054,6 +1128,13 @@ function loadPurchaseOrders(run: Run): void {
     if (v.orderKey.startsWith('#')) { reject('KEY_STARTS_WITH_HASH', 'the importers\' CSV reader silently skips a row whose first value starts with "#"'); continue }
     if (v.supplierName === '') { reject('MISSING_SUPPLIER', 'supplierName is empty'); continue }
     if (!sku.ok) { reject('BAD_SKU', sku.reason); continue }
+    const dup = dupInfo.get(row)
+    if (dup) {
+      reject(dup.exact ? 'DUPLICATE_PO_LINE' : 'DUPLICATE_PO_LINE_CONFLICT', dup.exact
+        ? `this order line appears ${dup.count} times with identical data; it could be one line exported twice (the outstanding quantity would be doubled) or genuinely repeated. Map a line-number column to lineNo to tell lines apart`
+        : `order ${v.orderKey} has ${dup.count} rows for SKU ${sku.sku}${v.lineNo ? ` and line ${v.lineNo}` : ''} with different data; which is right cannot be decided. Map a line-number column to lineNo if they are separate lines`)
+      continue
+    }
     const status = v.status === '' ? 'OPEN' : v.status.toUpperCase()
     if (!['OPEN', 'CLOSED', 'CANCELLED'].includes(status)) { reject('BAD_STATUS', `status ${JSON.stringify(v.status)} is not OPEN, CLOSED or CANCELLED (map the source's names in valueMaps.status)`); continue }
     const ordered = parseDecimal(v.qtyOrdered, 'qtyOrdered', NUMERIC_LIMITS.lineQty)
@@ -1123,14 +1204,17 @@ function loadPurchaseOrders(run: Run): void {
     if (res.type === 'KIT' || res.type === 'VARIABLE') { reject('TYPE_CANNOT_BE_PURCHASED', `SKU ${sku.sku} is ${res.type}; it can never be received into stock`); continue }
 
     let supplierName = v.supplierName.normalize('NFC').trim()
-    if (run.has('suppliers')) {
-      const supplierKey = supplierName.toUpperCase()
-      const status2 = run.supplierStatus.get(supplierKey)
-      if (status2 === 'rejected') { reject('SUPPLIER_ROW_REJECTED', `supplier ${JSON.stringify(supplierName)}'s row in the suppliers dataset was rejected`); continue }
-      const supplier = run.suppliers.get(supplierKey)
-      if (!supplier) { reject('SUPPLIER_NOT_IN_FILE', `supplier ${JSON.stringify(supplierName)} is not in the suppliers dataset`); continue }
-      supplierName = supplier.name
-    }
+    const supplierKey = supplierName.toUpperCase()
+    const inFile = run.has('suppliers') ? run.suppliers.get(supplierKey) : undefined
+    if (run.has('suppliers') && run.supplierStatus.get(supplierKey) === 'rejected') { reject('SUPPLIER_ROW_REJECTED', `supplier ${JSON.stringify(supplierName)}'s row in the suppliers dataset was rejected`); continue }
+    if (inFile) supplierName = inFile.name
+    else if (run.has('ims-suppliers')) {
+      // The importer matches by upper-case, so a different case of the one IMS spelling IS the supplier; only a colliding pair in IMS is ambiguous.
+      const known = run.imsSuppliers.get(supplierKey)
+      const ambiguous = run.imsSupplierCollidedKeys.has(supplierKey) || run.imsSupplierCollidedKeys.has(supplierName.toLowerCase())
+      if (known !== undefined && !ambiguous) supplierName = known
+      else { reject(ambiguous ? 'SUPPLIER_AMBIGUOUS_IN_IMS' : 'SUPPLIER_NOT_IN_FILE', ambiguous ? `supplier ${JSON.stringify(supplierName)} matches two suppliers already in IMS that the importers cannot tell apart` : `supplier ${JSON.stringify(supplierName)} is in neither the suppliers dataset nor the IMS supplier list`); continue }
+    } else if (run.has('suppliers')) { reject('SUPPLIER_NOT_IN_FILE', `supplier ${JSON.stringify(supplierName)} is not in the suppliers dataset`); continue }
     tally.open++
     candidates.push({
       row, orderKey: v.orderKey, sku: res.sku, key: sku.key, supplierName, currency, fxText: fx.text, warehouse,
@@ -1138,8 +1222,8 @@ function loadPurchaseOrders(run: Run): void {
       taxRateName: v.taxRateName, taxRateValue, qty: outstanding, unitCost: cost.value, ordered: ordered.value,
     })
   }
-  if (!run.has('suppliers') && candidates.length > 0) {
-    run.find('WARNING', 'SUPPLIER_NAMES_UNCHECKED', 'no suppliers dataset was supplied, so purchase-order supplier names were NOT checked against it. The importer refuses a name that does not exist in IMS.', 'purchase-order-lines', [...new Set(candidates.map((c) => c.supplierName))])
+  if (!run.has('suppliers') && !run.has('ims-suppliers') && candidates.length > 0) {
+    run.find('WARNING', 'SUPPLIER_NAMES_UNCHECKED', 'neither a suppliers dataset nor an IMS supplier list was supplied, so purchase-order supplier names were NOT checked. The importer refuses a name that does not exist in IMS.', 'purchase-order-lines', [...new Set(candidates.map((c) => c.supplierName))])
   }
   run.poOrdersNothingOutstanding = [...fullyReceivedOrders.values()].filter((t) => t.open === 0 && t.closed > 0).length
 
@@ -1492,6 +1576,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   loadCatalogue(run)
   loadRecipes(run)
   if (run.has('products')) checkRecipesPresent(run)
+  loadImsSuppliers(run)
   loadSuppliers(run)
   loadStock(run)
   loadTransfers(run)
@@ -1550,6 +1635,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     { check: 'row accounting identity', status: 'RAN', note: 'every record read has exactly one disposition' },
     split ? { check: 'zero on-hand versus missing from extract', status: 'RAN', note: 'stock-lots and products supplied' } : { check: 'zero on-hand versus missing from extract', status: 'NOT RUN', note: 'needs the products and stock-lots datasets' },
     coverage ? { check: 'R14 four-way SKU coverage', status: 'RAN', note: `sides supplied: ${['products', 'wms', 'woo', 'ims'].filter((s) => (s === 'products' ? run.has('products') : s === 'wms' ? run.has('wms-products') || run.has('wms-stock') : s === 'woo' ? run.has('woo-products') : run.has('ims-skus'))).join(', ')}` } : { check: 'R14 four-way SKU coverage', status: 'NOT RUN', note: 'needs the products dataset' },
+    run.has('ims-suppliers') ? { check: 'new supplier names versus suppliers already in IMS', status: 'RAN', note: 'under both importer matching rules' } : { check: 'new supplier names versus suppliers already in IMS', status: 'NOT RUN', note: 'no ims-suppliers list supplied: a collision with an existing IMS supplier is NOT checked (apply-time check lookup-keys-unique-in-ims)' },
     run.has('recipe-lines') ? { check: 'recipe graph is acyclic', status: 'RAN', note: 'detectBomItemCycleInEdges over every valid recipe line' } : { check: 'recipe graph is acyclic', status: 'NOT RUN', note: 'recipe-lines not supplied' },
     run.has('stock-lots') ? { check: 'multi-lot collapse to one weighted average', status: 'RAN', note: 'exact decimal arithmetic, rounded once to 6 dp' } : { check: 'multi-lot collapse to one weighted average', status: 'NOT RUN', note: 'stock-lots not supplied' },
     run.has('transfers') ? { check: 'in-transit quantity counted once', status: 'RAN', note: `convention ${config.inTransitConvention}` } : { check: 'in-transit quantity counted once', status: 'NOT RUN', note: 'transfers not supplied' },

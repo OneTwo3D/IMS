@@ -496,3 +496,71 @@ test('lookup sweep: categories are cleaned and compared as the importer does (le
   assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_SPELLINGS_MERGED'))
   assert.ok(findingCodes(result, 'WARNING').includes('CATEGORY_HTML_ENTITY'))
 })
+
+test('duplicate sweep: a purchase order line repeated in the source never doubles the outstanding quantity', (t) => {
+  const products = ds('products', [product('A'), product('B')])
+  const lines = (...rows: Array<Record<string, string>>) => run({ products, 'purchase-order-lines': ds('purchase-order-lines', rows) })
+  const exact = lines(poLine({ orderKey: 'X', sku: 'A' }), poLine({ orderKey: 'X', sku: 'A' }), poLine({ orderKey: 'Y', sku: 'B' }))
+  const conflict = lines(poLine({ orderKey: 'X', sku: 'A', qtyOrdered: '5' }), poLine({ orderKey: 'X', sku: 'a', qtyOrdered: '7' }))
+  const distinctByLineNo = lines(poLine({ orderKey: 'X', sku: 'A', lineNo: '1' }), poLine({ orderKey: 'X', sku: 'A', lineNo: '2' }))
+  precondition(t, 'duplicate groups', 3)
+  assert.deepEqual(rejectedCodes(exact, 'purchase-order-lines'), ['DUPLICATE_PO_LINE', 'DUPLICATE_PO_LINE'])
+  assert.equal(exact.report.accountingByCode.find((r) => r.code === 'PO_LINE')?.count, 1, 'the unrelated order is untouched')
+  assert.deepEqual(rejectedCodes(conflict, 'purchase-order-lines'), ['DUPLICATE_PO_LINE_CONFLICT', 'DUPLICATE_PO_LINE_CONFLICT'])
+  assert.equal(distinctByLineNo.blocking, false, 'a line-number column makes repeated SKUs distinct lines')
+  assert.deepEqual(rowsOf(distinctByLineNo, 'purchase-orders').map((r) => r.qty), ['10', '10'])
+})
+
+test('duplicate sweep: identical stock lot rows without a lot reference are rejected, with one they are distinct lots', (t) => {
+  const products = ds('products', [product('A')])
+  const twice = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { receivedDate: '2026-01-01' }), lot('A', '5', '2', { receivedDate: '2026-01-01' })]) })
+  const withRef = run({ products, 'stock-lots': ds('stock-lots', [lot('A', '5', '2', { receivedDate: '2026-01-01', lotRef: 'L1' }), lot('A', '5', '2', { receivedDate: '2026-01-01', lotRef: 'L2' })]) })
+  precondition(t, 'cases', 2)
+  assert.deepEqual(rejectedCodes(twice, 'stock-lots'), ['DUPLICATE_LOT_ROW', 'DUPLICATE_LOT_ROW'])
+  assert.equal(withRef.blocking, false)
+  assert.equal(rowsOf(withRef, 'opening-stock')[0].qty, '10')
+})
+
+test('duplicate sweep: every dataset either rejects every member of a duplicate or provably dedupes an identical one, and each shows in the accounting', (t) => {
+  const r = run({
+    products: ds('products', [product('P'), product('P'), product('Q'), product('Q', 'SIMPLE', { name: 'other' }), product('K', 'KIT'), product('C1'), product('C2')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K', componentSku: 'C1', qty: '1' }, { parentSku: 'K', componentSku: 'C1', qty: '1' }, { parentSku: 'K', componentSku: 'C2', qty: '1' }]),
+    suppliers: ds('suppliers', [{ name: 'S' }, { name: 'S' }]),
+    transfers: ds('transfers', [
+      { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C2', qtyShipped: '1', qtyReceived: '0' },
+      { transferKey: 'T', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'C2', qtyShipped: '1', qtyReceived: '0' },
+    ]),
+    'stock-lots': ds('stock-lots', [lot('C2', '9', '1')]),
+  })
+  const by = (dataset: string, outcome: string) => r.report.dispositions.filter((d) => d.dataset === dataset && d.outcome === outcome).map((d) => d.code)
+  precondition(t, 'datasets with duplicates', 4)
+  assert.deepEqual(by('products', 'EXCLUDED'), ['DUPLICATE_ROW'])
+  assert.deepEqual(by('products', 'REJECTED'), ['DUPLICATE_SKU_CONFLICT', 'DUPLICATE_SKU_CONFLICT'])
+  assert.deepEqual(by('recipe-lines', 'REJECTED'), ['DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE'])
+  assert.deepEqual(by('suppliers', 'EXCLUDED'), ['DUPLICATE_ROW'])
+  assert.deepEqual(by('transfers', 'REJECTED'), ['DUPLICATE_TRANSFER_LINE', 'DUPLICATE_TRANSFER_LINE'])
+  assert.equal(r.report.accountingBalanced, true)
+})
+
+test('supplier names versus suppliers already in IMS: a collision under either importer rule is rejected; without the list the check is reported as NOT RUN', (t) => {
+  const base = { products: ds('products', [product('A')]) }
+  const withList = (name: string, imsNames: string[]) => run({ ...base, suppliers: ds('suppliers', [{ name }]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))) })
+  precondition(t, 'cases', 6)
+  assert.deepEqual(rejectedCodes(withList('Acme', ['ACME']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'])
+  assert.deepEqual(rejectedCodes(withList('Stra\u00dfe', ['STRASSE']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'], 'upper-case rule only')
+  assert.deepEqual(rejectedCodes(withList('Mehmet\u0130', ['Mehmeti\u0307']), 'suppliers'), ['SUPPLIER_COLLIDES_WITH_IMS'], 'lower-case rule only')
+  assert.equal(withList('Acme', ['Acme']).blocking, false, 'the same spelling is an update of the existing supplier')
+  assert.deepEqual(rejectedCodes(withList('Zed', ['Acme', 'ACME']), 'ims-suppliers'), ['IMS_SUPPLIER_NAME_COLLISION', 'IMS_SUPPLIER_NAME_COLLISION'])
+  const without = run({ ...base, suppliers: ds('suppliers', [{ name: 'Acme' }]) })
+  const check = without.report.checks.find((c) => c.check.startsWith('new supplier names versus'))
+  assert.equal(check?.status, 'NOT RUN')
+  assert.ok(check?.note.includes('NOT checked'))
+})
+
+test('purchase order supplier names resolve against the IMS supplier list when no suppliers file names them', (t) => {
+  const po = (name: string, imsNames: string[]) => run({ products: ds('products', [product('A')]), 'ims-suppliers': ds('ims-suppliers', imsNames.map((n) => ({ name: n }))), 'purchase-order-lines': ds('purchase-order-lines', [poLine({ supplierName: name })]) })
+  precondition(t, 'cases', 3)
+  assert.equal(po('acme', ['Acme']).blocking, false)
+  assert.deepEqual(rejectedCodes(po('Nobody', ['Acme']), 'purchase-order-lines'), ['SUPPLIER_NOT_IN_FILE'])
+  assert.equal(rowsOf(po('acme', ['Acme']), 'purchase-orders')[0].supplierName, 'Acme', 'the IMS spelling is written')
+})
