@@ -19,7 +19,7 @@ const CONDITIONAL = /only if|if it exists?\b/i
  * first, or be a prohibition ("do not post again"): a prohibition cannot create an entry.
  */
 const POST_VERB = /(?:^|[:,(]\s*|\b(?:then|and|or|to|must|should|can|may|just|now|please|you|ONLY)\s+)(?:post|hand-post|raise|record|enter|book|remove|delete|adjust|write[- ]off|clear|re-?send|resend|retry)\b/i
-const POST_CONDITIONAL = /only if|if it exists?\b|if (it is |it's |the document is |that is )?(absent|not there|missing)|if (it|the document|that|this) (is not|isn't|does not|doesn't)\b|unless|check[^.;]*\bfirst\b|first check|\bdo not\b|\bdon't\b|\bif the document is already\b/i
+const POST_CONDITIONAL = /only if|if it exists?\b|if (it is |it's |the document is |that is )?(absent|not there|missing)|if (it|the document|that|this) (is not|isn't|does not|doesn't)\b|unless|check[^.;]*\bfirst\b|first check|\bdo not\b|\bdon't\b|\bif the document is already\b|if nothing is there|if only the earlier [a-z]+ is there/i
 /** The cause LABEL (a status name, not an instruction) is not a money word: "verified reversed". */
 const LABELS = /verified reversed/gi
 

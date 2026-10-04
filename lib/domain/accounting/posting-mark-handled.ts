@@ -313,11 +313,16 @@ export function describeEarlierPostings(earlier: readonly EarlierPosting[]): str
       : '')
 }
 
-export function describeRetiredUnproven(notes: readonly string[]): string {
+export function describeRetiredUnproven(notes: readonly string[], options: { earlierDocumentExists?: boolean } = {}): string {
   if (notes.length === 0) return ''
+  // Codex round 7: when an EARLIER version of the document is also in the ledger, "the document is there" is ambiguous: the
+  // retired attempt may have posted THE CURRENT update, and an earlier version being there does NOT satisfy that.
+  const target = options.earlierDocumentExists
+    ? 'the CURRENT version (the update this refused posting would have made - an earlier version being there is not enough)'
+    : 'it'
   return ' Earlier attempt(s) at this posting were retired without proof that they never reached the ledger: '
     + `${notes.join('; ')}. `
-    + 'IMS cannot rule out that the document is already there, so look in the ledger for it and post it by hand ONLY if '
+    + `IMS cannot rule out that the document is already there, so look in the ledger for ${target} and post it by hand ONLY if `
     + 'it is not there: a second document is not undone by marking this handled.'
 }
 

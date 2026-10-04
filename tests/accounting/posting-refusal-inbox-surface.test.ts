@@ -670,6 +670,28 @@ test('[o3d-1e7sl Codex r6] an earlier edit whose document id an OPERATOR typed i
   assert.doesNotMatch(row.handPostOrder ?? '', /ALREADY holds|REPLACES that document|post it in the ledger now|Then post it,/)
 })
 
+test('[o3d-1e7sl Codex r7] the inbox order for a COMBINED state (retired unproven attempt AND confirmed earlier invoice): the earlier invoice never satisfies "do not post again"', async (t) => {
+  liveSyncRows.length = 0
+  liveSyncRows.push({ type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-2', payload: {}, status: 'SYNCED', attemptRevision: 1, externalTransactionId: 'INV-EDIT-1' })
+  liveSyncRows.push({ type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-2', payload: {}, status: 'CANCELLED', attemptRevision: 1, externalTransactionId: null })
+  allRows.push({ ...invoiceUpdateRefusal, resolvedAt: null })
+  t.after(() => {
+    allRows.splice(allRows.findIndex((row) => row.id === invoiceUpdateRefusal.id), 1)
+    liveSyncRows.length = 0
+  })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const row = data.accountingPostingRefusals.find((candidate) => candidate.id === invoiceUpdateRefusal.id)
+  assert.ok(row)
+  assert.equal(row.retiredUnproven.length, 1, 'PRECONDITION: the retired unproven attempt is reported')
+  assert.equal(row.earlierPostings.length, 1, 'PRECONDITION: and so is the confirmed earlier invoice')
+  const order = row.handPostOrder ?? ''
+  assert.match(order, /check the ledger for the CURRENT version/)
+  assert.match(order, /if the current version is there, do not post again/)
+  assert.match(order, /if only the earlier version is there, apply the update to it/)
+  assert.doesNotMatch(order, /If it exists, do not post again/, 'the earlier invoice being there does not satisfy the retired attempt\'s check')
+})
+
 test('[o3d-j625 r16 HIGH 2 CONTROL] on a key that names ONE posting for ever, a completed row STILL blocks', async (t) => {
   /**
    * WHAT WOULD STILL PASS THE TEST ABOVE WITHOUT THIS ONE: ignoring every completed row, whatever its type.

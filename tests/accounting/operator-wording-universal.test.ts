@@ -13,6 +13,7 @@ import { allocationDebitForeignLedgerReports } from '@/lib/domain/accounting/all
 import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
+import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
 import { handPostOrderFor } from '@/lib/domain/accounting/hand-post-order'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
@@ -220,4 +221,63 @@ test('[o3d-1e7sl Codex r6] reductions that render an id carry the standing: foll
   assert.match(read('app/actions/accounting-batch.ts'), /standingLabel: entry\.standingLabel/, 'and the generic mapper passes it through')
   assert.match(read('app/(dashboard)/sync/xero-client.tsx'), /entry\.standingLabel &&/, 'and the panel renders it')
   assert.match(read('app/(dashboard)/sync/exceptions/exceptions-client.tsx'), /row\.standingLabel \?/, 'the backlog table renders it')
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 7: THE COMBINED-STATE MATRIX. A reused posting key can hold a retired unproven attempt, an EARLIER document (version
+// N, any standing) and the refused newer update (N+1, what is owed) at once. Finding the earlier document must never satisfy a
+// "do not post again" branch: that would close the debt without bringing the ledger up to the current version.
+// ---------------------------------------------------------------------------
+test('[o3d-1e7sl Codex r7] combined-state matrix: earlier standing x retired x claim x flow - the earlier document alone never satisfies "do not post again"', () => {
+  const EARLIER: Array<[string, Array<{ ref: string; standing: LedgerStanding }>]> = [
+    ['no earlier', []],
+    ['confirmed earlier', [{ ref: 'INV-9', standing: 'CONFIRMED_POSTED' }]],
+    ['asserted earlier', [{ ref: 'INV-9', standing: 'ASSERTED_POSTED' }]],
+    ['unknown earlier', [{ ref: 'INV-9', standing: 'UNKNOWN' }]],
+  ]
+  const FLOWS: Array<[string, boolean]> = [['SALES_INVOICE_UPDATE', true], ['PURCHASE_INVOICE_UPDATE', true], ['BILL_PAYMENT', true], ['SALES_INVOICE', false], ['STOCK_RECEIPT', false]]
+  // flows where an "update" makes no sense: the key is not reused, so an earlier posting can NEVER exist there (the matrix has no such cell)
+  for (const [type, reused] of FLOWS) assert.equal(accountingSyncRowPostedAnEarlierPosting({ type, status: 'SYNCED' }), reused, `${type}: an earlier posting exists only on a reused key`)
+  let cells = 0
+  let combinedCells = 0
+  for (const [type, reused] of FLOWS) {
+    for (const [earlierName, details] of EARLIER) {
+      if (details.length > 0 && !reused) continue
+      for (const retiredUnproven of [[], ['row s-1 (CANCELLED, no proof)']]) {
+        for (const claim of [null, { at: 'now', byName: null, mine: true }]) {
+          const where = `${type} / ${earlierName} / retired=${retiredUnproven.length} / claim=${claim ? 'mine' : 'none'}`
+          const text = handPostOrderFor({ queuedRow: null, earlierPostingDetails: details, retiredUnproven, type, claim })
+          cells += 1
+          const unverifiedEarlier = details.some((e) => e.standing !== 'CONFIRMED_POSTED')
+          const combined = details.length > 0 && (retiredUnproven.length > 0 || unverifiedEarlier)
+          const clauses = text.split(/(?<=[.;])\s+/)
+          const doNotPostAgain = clauses.filter((c) => /do not post again/i.test(c))
+          if (combined) {
+            combinedCells += 1
+            const what = type === 'BILL_PAYMENT' ? 'payment' : 'version'
+            assert.match(text, new RegExp(`check the ledger for the CURRENT ${what}`), `${where}: asks for the CURRENT ${what}`)
+            // (a) the earlier document alone never satisfies "do not post again"
+            assert.ok(doNotPostAgain.length >= 1 && doNotPostAgain.every((c) => new RegExp(`if the current ${what} is there`, 'i').test(c)), `${where}: "do not post again" only under "if the current ${what} is there"`)
+            assert.doesNotMatch(text, /If it exists, do not post again/i, `${where}: the old document-exists shape is gone`)
+            assert.match(text, new RegExp(`if only the earlier ${what} is there`), `${where}: the earlier-only branch exists`)
+            assert.match(text, /if nothing is there, post it as a new/, `${where}: the nothing-there branch exists`)
+            assert.match(text, /only once the CURRENT version is in the ledger/, `${where}: Mark as handled waits for the current version`)
+            if (retiredUnproven.length > 0) assert.match(text, /the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\)/, `${where}: the retired-attempt sentence names the CURRENT version`)
+            assert.doesNotMatch(text, /post it in the ledger now|Then post it,/i, `${where}: no unconditional post`)
+          } else if (retiredUnproven.length > 0) {
+            assert.ok(doNotPostAgain.every((c) => /If it exists/.test(c)), `${where}: no earlier document, so the document-exists branch is the right one`)
+          } else {
+            assert.equal(doNotPostAgain.length, 0, `${where}: nothing to refuse`)
+          }
+          if (combined || retiredUnproven.length > 0) {
+            // (b) no unconditional action, (c) the history-claim check
+            assert.deepEqual(unconditionalMoneySentences(text), [], `${where}: unconditional action`)
+          }
+          assert.deepEqual(unlicensedHistoryClaims(text, null), [], `${where}: history claim`)
+        }
+      }
+    }
+  }
+  console.log(`# r7 matrix: ${cells} cells, ${combinedCells} combined`)
+  assert.ok(cells >= 40 && combinedCells >= 16, 'the matrix is not vacuous')
 })

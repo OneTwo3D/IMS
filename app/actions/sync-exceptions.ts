@@ -1684,7 +1684,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             remedy: row.remedy,
             handPostOrder: clearing === null || clearing === 'auto'
               ? null
-              : handPostOrderFor({ queuedRow, earlierPostingDetails, retiredUnproven, claim: handPostClaim }),
+              : handPostOrderFor({ queuedRow, earlierPostingDetails, retiredUnproven, type: row.type, claim: handPostClaim }),
           }
         })
       })(),
@@ -2170,7 +2170,7 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
           : '.')
         // Codex round 6: carries each earlier posting's STANDING; "replaces" is only ever said of a CONFIRMED document.
         + describeEarlierPostings(result.earlierPostingDetails)
-        + describeRetiredUnproven(result.retiredUnproven),
+        + describeRetiredUnproven(result.retiredUnproven, { earlierDocumentExists: result.earlierPostingDetails.length > 0 }),
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,

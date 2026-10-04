@@ -1083,3 +1083,16 @@ test('[o3d-1e7sl Codex r6] the claim log carries the STANDING of an earlier post
     assert.deepEqual(note.metadata?.earlierPostingDetails, [{ ref: c.unverified ? 'INV-TYPED' : 'INV-REAL', standing: c.unverified ? 'ASSERTED_POSTED' : 'CONFIRMED_POSTED' }], `${c.name}: the standing is in the log metadata too`)
   }
 })
+
+test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unproven attempt AND a confirmed earlier invoice): the earlier invoice does not satisfy the retired attempt\'s check', async () => {
+  refusals.length = 0; syncRows.length = 0; activity.length = 0
+  refusals.push(refusal('r7-1', 'sales_invoice_update', { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-r7', scope: '' }))
+  syncRows.push(sync('s-r7-earlier', refusals[0]!, { status: 'SYNCED', externalTransactionId: 'INV-REAL', attemptRevision: 1 } as never))
+  syncRows.push(sync('s-r7-retired', refusals[0]!, { status: 'CANCELLED', attemptRevision: 1 } as never))
+  const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
+  const result = await claimAccountingPostingRefusalForHandPostingAction('r7-1')
+  assert.equal(ok(result), true)
+  const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
+  assert.match(note.description, /The ledger ALREADY holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed wording')
+  assert.match(note.description, /look in the ledger for the CURRENT version \(the update this refused posting would have made - an earlier version being there is not enough\) and post it by hand ONLY if it is not there/, 'the retired attempt is checked against the CURRENT version, not the earlier one')
+})
