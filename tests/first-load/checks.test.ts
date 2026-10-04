@@ -458,7 +458,7 @@ test('lookup sweep: a supplier name that collides under EITHER importer matching
   })
   const sameData = sup('Acme', 'ACME')
   const upperOnly = sup('Stra\u00dfe', 'STRASSE') // upper-case rule: ss, lower-case rule: they differ
-  const lowerOnly = sup('Zeta\u212a', 'Zetak') // lower-case rule: k, upper-case rule: they differ
+  const lowerOnly = sup('Mehmet\u0130', 'Mehmeti\u0307') // lower-case rule: both i + dot above, upper-case rule: they differ
   precondition(t, 'collision cases', 3)
   for (const [name, result] of [['same data', sameData], ['upper rule only', upperOnly], ['lower rule only', lowerOnly]] as const) {
     assert.deepEqual(rejectedCodes(result, 'suppliers'), ['SUPPLIER_NAME_COLLISION', 'SUPPLIER_NAME_COLLISION'], name)
