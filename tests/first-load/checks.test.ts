@@ -371,11 +371,13 @@ test('purchase order values: a line total, an order total (tax included) or a ba
       order('BIG', { qtyOrdered: '99999999', unitCostForeign: '999999999' }),
       order('TAX', { qtyOrdered: '1000000', unitCostForeign: '99999999', taxRateValue: '20' }),
       order('FXC', { qtyOrdered: '1', unitCostForeign: '900000000', currency: 'USD', fxRateToBase: '5000' }),
+      order('FOREIGN', { qtyOrdered: '1000000', unitCostForeign: '999999999', currency: 'EUR', fxRateToBase: '0.001' }),
+      order('BASE', { qtyOrdered: '99999999', unitCostForeign: '100000', currency: 'USD', fxRateToBase: '500' }),
       order('OK', { qtyOrdered: '1000', unitCostForeign: '1000' }),
     ]),
   })
-  precondition(t, 'orders', 4)
-  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
+  precondition(t, 'orders', 6)
+  assert.deepEqual(result.report.dispositions.filter((d) => d.outcome === 'REJECTED').map((d) => `${d.key}:${d.code}`).sort(), ['BASE/A:ORDER_VALUE_OUT_OF_RANGE', 'BIG/A:ORDER_VALUE_OUT_OF_RANGE', 'FOREIGN/A:ORDER_VALUE_OUT_OF_RANGE', 'FXC/A:ORDER_VALUE_OUT_OF_RANGE', 'TAX/A:ORDER_VALUE_OUT_OF_RANGE'])
   const emitted = result.report.accountingByCode.find((r) => r.code === 'PO_LINE')
   assert.equal(emitted?.count, 1)
 })
