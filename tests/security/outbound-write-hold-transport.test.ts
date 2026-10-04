@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import test, { after, beforeEach } from 'node:test'
 
 import { connectorFetch } from '../../lib/security/connector-fetch.ts'
-import { isOutboundWriteHeldError, OutboundWriteHeldError } from '../../lib/security/outbound-write-grant.ts'
+import { isOutboundWriteHeldError, OutboundWriteHeldError, outboundWriteRefusal } from '../../lib/security/outbound-write-grant.ts'
 import {
   resetOutboundRefusalRateLimit,
   setOutboundRefusalSink,
@@ -97,7 +97,7 @@ const WRITE_CASES: Case[] = [
   { name: 'Mintsoft GET /api/Order/5/Cancel', connectorName: 'Mintsoft', method: 'GET', path: '/api/Order/5/Cancel', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
   { name: 'Mintsoft GET /api/Order/5/MarkAwaitingConfirmation', connectorName: 'Mintsoft', method: 'GET', path: '/api/Order/5/MarkAwaitingConfirmation', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
   { name: 'Mintsoft POST /api/Order/5/Comments', connectorName: 'Mintsoft', method: 'POST', path: '/api/Order/5/Comments', body: '{}', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
-  { name: 'Mintsoft POST /api/Auth (key-minting login)', connectorName: 'Mintsoft', method: 'POST', path: '/api/Auth', body: '{}', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
+  { name: 'Mintsoft POST /api/Auth (key-minting login)', connectorName: 'Mintsoft', method: 'POST', path: '/api/Auth', body: '{}', mintsoftClientId: '89', grant: (o) => ({ MINTSOFT_WRITE_ALLOWED: `${o}|89` }) },
   { name: 'Xero POST journal', connectorName: 'Xero', method: 'POST', path: '/api.xro/2.0/ManualJournals', body: '{}', headers: { 'Xero-Tenant-Id': TENANT }, grant: () => ({ XERO_WRITE_ALLOWED_TENANT: TENANT }) },
   { name: 'Xero PUT contact', connectorName: 'Xero', method: 'PUT', path: '/api.xro/2.0/Contacts', body: '{}', headers: { 'Xero-Tenant-Id': TENANT }, grant: () => ({ XERO_WRITE_ALLOWED_TENANT: TENANT }) },
 ]
@@ -290,4 +290,72 @@ test('refusals are rate-limited per connector and code, and the suppressed count
   ]
   assert.deepEqual(written, [true, false, false, true, false, true])
   assert.deepEqual(suppressed, [0, 0, 3], 'the entry after the window carries the 3 suppressed refusals')
+})
+
+test('finding 2: key-minting POST /api/Auth is bound to the granted ClientId like every other Mintsoft write', async () => {
+  const listener = await startListener()
+  const grant = { MINTSOFT_WRITE_ALLOWED: `${listener.origin}|89` }
+  const login = (clientId: string | null) => connectorFetch(`${listener.origin}/api/Auth`, { method: 'POST', body: '{"Username":"u","Password":"p"}' }, {
+    connectorName: 'Mintsoft', allowE2eLocalHttp: true, env: env(grant), outboundWriteContext: { writeScopeId: clientId },
+  })
+  console.log('precondition (finding 2): grant names ClientId 89; login attempted with configured ClientId unknown, 101 and 89')
+  await assert.rejects(login(null), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_unproven')
+  await assert.rejects(login('101'), (e: unknown) => isOutboundWriteHeldError(e) && e.code === 'client_mismatch')
+  assert.equal(listener.received.length, 0, 'no credentials left for an unproven or foreign ClientId')
+  assert.equal((await login('89')).status, 200)
+  assert.equal(listener.received.length, 1)
+})
+
+test('finding 3: a granted Xero write that is redirected to another origin is refused BEFORE the body is sent, and says the first request was sent', async () => {
+  const other = await startListener()
+  const xero = await startListener(`${other.origin}/api.xro/2.0/Invoices`)
+  const grant = { XERO_WRITE_ALLOWED_TENANT: TENANT }
+  console.log(`precondition (finding 3): Xero stand-in ${xero.origin} (granted, 307 to ${other.origin}); tenant header and body are intact on the redirect`)
+  const error = await connectorFetch(`${xero.origin}/api.xro/2.0/Invoices`, {
+    method: 'POST', body: '{"Invoices":[]}', headers: { 'Xero-Tenant-Id': TENANT },
+  }, { connectorName: 'Xero', allowE2eLocalHttp: true, env: env(grant) }).then(() => null, (e: unknown) => e)
+  assert.ok(isOutboundWriteHeldError(error))
+  const held = error as OutboundWriteHeldError
+  assert.equal(held.code, 'destination_mismatch')
+  assert.equal(held.hop, 1)
+  assert.equal(xero.received.length, 1, 'the granted request itself was sent')
+  assert.equal(other.received.length, 0, 'the redirect target received NOTHING')
+
+  // and a redirect to a non-loopback host never reaches DNS or a socket either
+  const evil = await startListener('https://evil.example.test/api.xro/2.0/Invoices')
+  const error2 = await connectorFetch(`${evil.origin}/api.xro/2.0/Invoices`, {
+    method: 'POST', body: '{}', headers: { 'Xero-Tenant-Id': TENANT },
+  }, { connectorName: 'Xero', allowE2eLocalHttp: true, env: env(grant) }).then(() => null, (e: unknown) => e)
+  assert.ok(isOutboundWriteHeldError(error2) && error2.hop === 1)
+})
+
+test('finding 1: the Xero token exchange is allowed only to identity.xero.com over https at exactly /connect/token; every variation is a write and refused without a grant', () => {
+  const allowed = outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url: 'https://identity.xero.com/connect/token', env: {} })
+  assert.equal(allowed, null)
+  const variations: Array<[string, string]> = [
+    ['POST', 'http://identity.xero.com/connect/token'], ['POST', 'https://identity.xero.com:8443/connect/token'],
+    ['POST', 'https://identity.xero.com/connect/token/'], ['POST', 'https://identity.xero.com/connect/revocation'],
+    ['POST', 'https://evil.example.test/connect/token'], ['PUT', 'https://identity.xero.com/connect/token'],
+    ['DELETE', 'https://api.xero.com/connections/abc'],
+  ]
+  console.log(`precondition (finding 1): exact token request passes; ${variations.length} variations asserted refused`)
+  for (const [method, url] of variations) {
+    const refusal = outboundWriteRefusal({ connectorName: 'Xero', method, url, env: {} })
+    assert.equal(refusal?.code, 'no_grant', `${method} ${url}`)
+  }
+})
+
+test('finding 4: a redirect-hop refusal is NOT a hold - its text is not recognised by any queue as "nothing sent", and the connector results do not flag it held', async () => {
+  const { isOutboundWriteHeldText } = await import('../../lib/security/outbound-write-hold-constants.ts')
+  const refusal = { connector: 'xero', code: 'destination_mismatch', method: 'POST', target: 'https://other.example.test/x', granted: 'a', attempted: 'b', basis: 'b' } as const
+  const hop0 = new OutboundWriteHeldError(refusal, 0)
+  const hop1 = new OutboundWriteHeldError(refusal, 1)
+  console.log('precondition (finding 4): the same refusal built at hop 0 and at hop 1')
+  assert.equal(isOutboundWriteHeldText(hop0.message), true)
+  assert.equal(isOutboundWriteHeldText(`Failed: ${hop0.message}`), true)
+  assert.equal(isOutboundWriteHeldText(hop1.message), false, 'a possibly-applied write is not recognised as held')
+  assert.equal(isOutboundWriteHeldText(`Contact error: ${hop1.message}`), false)
+  assert.match(hop1.message, /^Outbound write REFUSED AFTER A REDIRECT/)
+  assert.match(hop1.message, /may have taken effect/)
+  assert.doesNotMatch(hop1.message, /Outbound write HELD/)
 })

@@ -45,3 +45,12 @@ test('the processor uses these two functions at all four failure sites and defin
   assert.match(source, /import \{ getRateLimitBackoffMs, isRateLimitError \} from '\.\/deferral'/)
   assert.doesNotMatch(source, /function isRateLimitError|function getRateLimitBackoffMs/)
 })
+
+test('finding 4: a redirect-hop refusal is not deferred without spending a retry (it may have been applied)', () => {
+  const refusal = outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url: 'https://api.xero.com/x', headers: { 'Xero-Tenant-Id': 'x' }, env: {} })
+  assert.ok(refusal)
+  const text = new OutboundWriteHeldError(refusal, 1).message
+  console.log('precondition (xero finding 4): hop-1 text is not a held text')
+  assert.equal(isRateLimitError(text), false)
+  assert.equal(isRateLimitError(`Contact error: ${text}`), false)
+})

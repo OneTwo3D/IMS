@@ -135,7 +135,9 @@ export async function mintsoftRequest<T>(
     return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init, config.clientId ?? '')
   } catch (error) {
     if (isOutboundWriteHeldError(error)) {
-      return { data: null, error: error.message, status: 500, held: true }
+      return error.nothingSent
+        ? { data: null, error: error.message, status: 500, held: true }
+        : { data: null, error: error.message, status: 500 }
     }
     return {
       data: null,

@@ -396,6 +396,8 @@ export async function connectorFetch(
   let body = bodyFromInit(init.body)
   const timeoutMs = getConnectorFetchTimeoutMs(options)
   const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
+  // Only when the e2e loopback allowance applies to the FIRST hop: the origin a redirect must stay on.
+  const firstHopLoopbackOrigin = allowsE2eLocalHttp(url, options) ? url.origin : undefined
 
   try {
     // One wall-clock timeout budget covers connection, response, and all
@@ -414,6 +416,7 @@ export async function connectorFetch(
         headers,
         body,
         writeScopeId: options.outboundWriteContext?.writeScopeId,
+        pinnedOrigin: firstHopLoopbackOrigin,
         env: options.env,
       })
       if (heldRefusal) {

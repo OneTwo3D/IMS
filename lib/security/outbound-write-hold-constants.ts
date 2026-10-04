@@ -39,6 +39,13 @@ export const OUTBOUND_GRANT_FORMAT: Record<OutboundConnector, string> = {
 export const OUTBOUND_HELD_ACTION = 'OUTBOUND_WRITE_HELD'
 export const OUTBOUND_HELD_TAG = 'outbound-write-hold'
 export const OUTBOUND_HELD_TEXT_PREFIX = 'Outbound write HELD'
+/**
+ * A refusal on a REDIRECT HOP. The request that was redirected had already been sent, so this is NOT a
+ * held write: it is a possibly-applied one. It deliberately does not start with OUTBOUND_HELD_TEXT_PREFIX,
+ * so nothing that recognises a hold (and therefore retries without spending an attempt) recognises it; it
+ * takes the ordinary failure path every queue already has for "may have been sent".
+ */
+export const OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX = 'Outbound write REFUSED AFTER A REDIRECT'
 
 /** One refusal per connector and code is logged per this window; the rest are counted, not logged. */
 export const OUTBOUND_REFUSAL_LOG_WINDOW_MS = 60_000
@@ -137,7 +144,7 @@ export function outboundHeldMessage(input: OutboundHeldMessageInput): string {
   if (input.hop === 0) {
     return `${OUTBOUND_HELD_TEXT_PREFIX} (${label}): ${reason} ${input.method} ${input.target} was refused before it left IMS, so nothing was sent to ${label}. This is a hold on this installation, not a rejection by ${label}. ${remedy}`
   }
-  return `${OUTBOUND_HELD_TEXT_PREFIX} (${label}): ${reason} Redirect hop ${input.hop} (${input.method} ${input.target}) was refused before it left IMS, but the request that was redirected HAD ALREADY been sent to ${label}: check ${label} for its effect. This is a hold on this installation, not a rejection by ${label}. ${remedy}`
+  return `${OUTBOUND_REDIRECT_REFUSED_TEXT_PREFIX} (${label}): ${reason} Redirect hop ${input.hop} (${input.method} ${input.target}) was refused before it left IMS, but the request that was redirected HAD ALREADY been sent to ${label} and may have taken effect: check ${label} for its effect before repeating it. It is treated as a failure whose outcome is unknown, not as a hold. ${remedy}`
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -202,9 +209,9 @@ export const OUTBOUND_DOC_BLOCKS: Record<OutboundDocBlockId, string> = {
     'Each variable names exactly one destination. A list, a wildcard, a boolean or a value in any other shape is unreadable and grants nothing. Changing the store URL, the Mintsoft base URL or the Xero organisation in Settings revokes the permission instead of inheriting it, because the comparison is against the destination of the request that is actually being made. Setting a variable changes what the installation may do; it does not start any writer.',
   ].join('\n'),
   'held-meaning': [
-    'A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent, and the text says so.',
+    'A held write is a hold on this installation and not a rejection by the destination. The request is refused before it leaves IMS, so nothing is sent to the destination, and the work that wanted to write is reported as failed with text that begins "Outbound write HELD". A held write is never recorded as sent, accepted or rejected by the destination. Queues that bound their retries (the WooCommerce and Xero outboxes, the Xero sync log, the Mintsoft order push and the WMS dispatch reconcile) do not spend an attempt on a held write and never dead-letter it, however long the hold lasts: the work stays queued and is offered again every 15 minutes. Pushes that have no queue (the WooCommerce product metadata and WMS status pushes, tracking pushes made outside order completion, and exchange-rate pushes) are not retried by the hold; they are reported in the log and run again at their next trigger. The exception to "nothing was sent" is a redirect: when the destination redirects a request that was granted and the next hop is refused, the first request had already been sent and may have taken effect. That refusal begins "Outbound write REFUSED AFTER A REDIRECT", is not a hold, and is treated like any other failure of unknown outcome: it spends an attempt and can be dead-lettered for an operator to check.',
     '',
-    'Mintsoft\'s key-minting login (`POST /api/Auth`) is a write and is held. An installation that authenticates to Mintsoft with a username and password cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero\'s token exchange is allowed, because it only lets IMS read.',
+    'Mintsoft\'s key-minting login (`POST /api/Auth`) is a write and is held. An installation that authenticates to Mintsoft with a username and password cannot renew its token while held, so its reads stop once the stored token expires; use the fixed API key mode on any installation that is held. Xero\'s token exchange (`POST https://identity.xero.com/connect/token`, https only, exactly that path, on every redirect hop) is allowed as a deliberate exception: it rotates IMS\'s own Xero credentials but changes no accounting data, and every Xero read depends on it. Every Xero write must reach `api.xero.com` on every hop; a redirect to any other origin is refused before the body is sent.',
   ].join('\n'),
   'status-command': [
     `\`${OUTBOUND_STATUS_COMMAND}\` answers "is this installation writing to anything?". It reads only the environment and the activity log, makes no network call and writes nothing. It prints, for each connector, whether writes are held or granted (and to which destination), whether the grant variable is unreadable, and how many refused writes were logged in the last 24 hours (a lower bound: refusals the rate limit suppressed are added only when the next entry is written). Pass \`--json\` for a machine-readable report and \`--expect-held\` to fail when any connector may write.`,

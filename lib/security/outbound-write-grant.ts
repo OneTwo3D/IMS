@@ -39,7 +39,7 @@ import {
   type OutboundConnector,
   type OutboundWriteRefusalCode,
 } from './outbound-write-hold-constants'
-import { classifyMintsoftRequest, mintsoftRelativePath } from '@/lib/connectors/mintsoft/api/read-allowlist'
+import { classifyMintsoftRequest } from '@/lib/connectors/mintsoft/api/read-allowlist'
 
 export type OutboundEnv = Record<string, string | undefined>
 
@@ -109,8 +109,13 @@ export function classifyOutboundRequest(params: {
         : { connector, class: 'write', basis: `WooCommerce ${method}` }
     case 'xero': {
       const host = normalizedHost(url)
-      if (host === 'identity.xero.com' && method === 'POST' && url.pathname === '/connect/token') {
-        return { connector, class: 'read', basis: 'Xero identity token exchange (lets IMS read; changes no accounting data)' }
+      if (url.protocol === 'https:' && url.port === '' && host === 'identity.xero.com' && method === 'POST' && url.pathname === '/connect/token') {
+        // A DELIBERATE, NARROW EXCEPTION. The token exchange changes IMS's own credential state at Xero
+        // (it rotates the refresh token) but no accounting data, and every Xero READ depends on it: a hold
+        // that refused it would stop IMS reading Xero within the hour. It is allowed only to Xero's identity
+        // host, over https, at exactly this path, and - like every Xero request - on every redirect hop, so
+        // a redirect to any other host is a refused write.
+        return { connector, class: 'read', basis: 'Xero identity token exchange (rotates IMS\'s own Xero credentials; changes no accounting data; reads depend on it)' }
       }
       if ((host === 'api.xero.com' || host === 'identity.xero.com') && (method === 'GET' || method === 'HEAD')) {
         return { connector, class: 'read', basis: `Xero ${method} ${host}` }
@@ -298,6 +303,11 @@ export type OutboundRequestFacts = {
   headers?: HeadersInit | Headers
   /** The request body as it will be sent, when it is a string (Mintsoft's ClientId is checked in JSON bodies). */
   body?: unknown
+  /**
+   * Only under the non-production e2e loopback allowance: the origin the request was first aimed at, so a
+   * local fake can stand in for Xero while a redirect to any other origin is still refused.
+   */
+  pinnedOrigin?: string
   /** The ClientId Mintsoft is configured with, supplied by the Mintsoft client for every request. */
   writeScopeId?: string | number | null
   env?: OutboundEnv
@@ -401,12 +411,6 @@ export function outboundWriteRefusal(facts: OutboundRequestFacts): OutboundWrite
         && (grant.pathPrefix === '' || url.pathname === grant.pathPrefix || url.pathname.startsWith(`${grant.pathPrefix}/`))
       if (!underBase) return refusal(classification, method, url, 'destination_mismatch', grant.baseUrl, `${url.origin}${url.pathname}`)
 
-      // The one Mintsoft write that has no tenant scope to speak of: the key-minting login. It is
-      // governed by the base URL alone. Everything else must be provably for the granted ClientId.
-      const relativePath = mintsoftRelativePath(url.pathname.slice(grant.pathPrefix.length) || '/')
-      const isAuthLogin = method === 'POST' && relativePath === '/api/Auth'
-      if (isAuthLogin) return null
-
       const configured = facts.writeScopeId === null || facts.writeScopeId === undefined
         ? ''
         : String(facts.writeScopeId).trim()
@@ -420,6 +424,15 @@ export function outboundWriteRefusal(facts: OutboundRequestFacts): OutboundWrite
     case 'xero': {
       const grant = readXeroGrant(env)
       if (!grant.ok) return refusal(classification, method, url, grant.reason === 'absent' ? 'no_grant' : 'unreadable_grant', null, null)
+      // THE DESTINATION OF A XERO WRITE IS XERO, ON EVERY HOP. The tenant header alone would let a
+      // redirect carry an accounting payload (method, body and tenant header intact) to any host, so the
+      // origin must be Xero's API origin - or, only under the non-production e2e loopback allowance, the
+      // origin the request was first aimed at (`pinnedOrigin`, supplied by the transport).
+      const xeroOrigins = new Set<string>(['https://api.xero.com', 'https://identity.xero.com'])
+      if (facts.pinnedOrigin) xeroOrigins.add(facts.pinnedOrigin)
+      if (!xeroOrigins.has(url.origin)) {
+        return refusal(classification, method, url, 'destination_mismatch', 'https://api.xero.com', url.origin)
+      }
       const tenantHeader = facts.headers === undefined ? null : new Headers(facts.headers).get('xero-tenant-id')
       const tenant = tenantHeader === null ? '' : tenantHeader.trim().toLowerCase()
       if (tenant === '') return refusal(classification, method, url, 'tenant_unproven', grant.tenantId, null)

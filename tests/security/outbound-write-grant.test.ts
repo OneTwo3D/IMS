@@ -122,3 +122,20 @@ test('outbound:status grant states come from the environment only and cover ever
   assert.deepEqual(states.map((s) => s.state), ['held', 'unreadable', 'granted'])
   assert.deepEqual(states.map((s) => s.envName), OUTBOUND_CONNECTORS.map((c) => OUTBOUND_GRANT_ENV[c]))
 })
+
+test('finding 2 (decision level): the key-minting login has no exemption; with a grant it needs the granted ClientId', () => {
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.co.uk|89' }
+  const login = (writeScopeId: string | null) => outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId, env })
+  assert.equal(login(null)?.code, 'client_unproven')
+  assert.equal(login('101')?.code, 'client_mismatch')
+  assert.equal(login('89'), null)
+})
+
+test('finding 3 (decision level): a Xero write must target api.xero.com even with the right tenant header', () => {
+  const env = { XERO_WRITE_ALLOWED_TENANT: TENANT }
+  const write = (url: string) => outboundWriteRefusal({ connectorName: 'Xero', method: 'POST', url, headers: { 'xero-tenant-id': TENANT }, env })
+  assert.equal(write('https://api.xero.com/api.xro/2.0/Invoices'), null)
+  for (const url of ['https://evil.example.test/api.xro/2.0/Invoices', 'http://api.xero.com/x', 'https://api.xero.com:8443/x']) {
+    assert.equal(write(url)?.code, 'destination_mismatch', url)
+  }
+})

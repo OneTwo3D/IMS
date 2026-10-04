@@ -282,7 +282,7 @@ export async function wcPost(
     // The outbound-write hold refused this request before it left IMS. Reported in this function's
     // ordinary error shape (callers already handle `error`), with the hold's own text verbatim and
     // `held: true` so a caller that cares can tell a hold from WooCommerce rejecting the write.
-    if (isOutboundWriteHeldError(error)) return { data: null, error: error.message, held: true }
+    if (isOutboundWriteHeldError(error)) return error.nothingSent ? { data: null, error: error.message, held: true } : { data: null, error: error.message }
     throw error
   }
 
@@ -322,7 +322,7 @@ export async function wcPut(
     // The outbound-write hold refused this request before it left IMS. Reported in this function's
     // ordinary error shape (callers already handle `error`), with the hold's own text verbatim and
     // `held: true` so a caller that cares can tell a hold from WooCommerce rejecting the write.
-    if (isOutboundWriteHeldError(error)) return { data: null, error: error.message, held: true }
+    if (isOutboundWriteHeldError(error)) return error.nothingSent ? { data: null, error: error.message, held: true } : { data: null, error: error.message }
     throw error
   }
 

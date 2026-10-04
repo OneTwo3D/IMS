@@ -1602,3 +1602,17 @@ test('outbound-write hold: a HELD write spends no attempt and is never dead-lett
   })
   assert.equal(control.status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED, 'the control: the same row with an ordinary failure DOES dead-letter')
 })
+
+test('outbound-write hold finding 4: a REDIRECT-hop refusal (request already sent) spends an attempt and dead-letters like any maybe-sent failure', async () => {
+  const { OutboundWriteHeldError } = await import('@/lib/security/outbound-write-grant')
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const refusal = { connector: 'woocommerce', code: 'destination_mismatch', method: 'PUT', target: 'https://other.example.test/x', granted: 'https://shop.example.com', attempted: 'https://other.example.test', basis: 'b' } as const
+  const redirectText = new OutboundWriteHeldError(refusal, 1).message
+  console.log('precondition (outbox finding 4): row has 7 of 8 attempts; the failure text is a real hop-1 refusal')
+  const { client } = makeClient([makeRow({ id: 'r', status: INTEGRATION_OUTBOX_STATUS.PROCESSING, attempts: 7, lockedAt: now, lockedBy: 'worker-1' })])
+  const row = await markIntegrationOutboxRetryableFailure({
+    client, id: 'r', workerId: 'worker-1', lockedAt: now, error: redirectText, now, attemptsBeforeFailure: 7, maxAttempts: 8,
+  })
+  assert.equal(row.status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED, 'not retried forever as "nothing sent"')
+  assert.equal(row.attempts, 8)
+})
