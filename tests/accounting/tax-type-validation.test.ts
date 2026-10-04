@@ -71,6 +71,9 @@ mock.module('@/lib/db', {
     db: {
       $transaction: async () => { throw new Error('db.$transaction must not run when validation refuses') },
       taxRate: {},
+      // o3d-6thk1 round 3: updateTaxRate now READS the bound connection before validating (the fence's
+      // capture, connection-fence.ts). A read, not a write: the refusal still must not reach $transaction.
+      accountingToken: { findUnique: async () => null },
     },
   },
 })

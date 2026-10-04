@@ -113,7 +113,12 @@ export async function handleAccountingCallback(request: Request, deps: Accountin
         description: `Connected accounting organisation: ${result.tenantName}`,
         metadata: { connector: 'xero', tenantName: result.tenantName, initiatorUserId: oauthState.initiatorUserId },
       })
-      return await redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' }, oauthState.returnPath)
+      // o3d-6thk1: a binding that cleared the previous organisation's account mapping says so on the page the
+      // operator lands on, in the same message that confirms the connection.
+      const connected = result.tenantName ?? 'Connected'
+      return await redirectWithStatus(origin, connector, {
+        accounting_success: result.accountMappingResetNotice ? `${connected}. ${result.accountMappingResetNotice}` : connected,
+      }, oauthState.returnPath)
     }
     return await redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' }, oauthState.returnPath)
   } catch (e) {
