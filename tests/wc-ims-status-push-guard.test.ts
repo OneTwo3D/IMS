@@ -266,3 +266,40 @@ test('o3d-6ldlj (i): the PUT is refused once the deadline passed, the worker los
   }
   assert.equal(evaluated, 4)
 })
+
+test('o3d-6ldlj (j): a mapping row can NOT make IMS skip the PUT: processing mapped to CANCELLED / ON_HOLD is still PUT, and a custom slug mapped to the target is needs-operator (no PUT, no success)', async () => {
+  let evaluated = 0
+  for (const [status, mapped, wcTarget] of [['CANCELLED', 'CANCELLED', 'cancelled'], ['ON_HOLD', 'ON_HOLD', 'on-hold']] as const) {
+    state.puts.length = 0
+    state.fetches.length = 0
+    state.wcStatus = 'processing'
+    state.mappings = [{ externalStatus: 'processing', imsStatus: mapped }]
+    const outcome = await push(status)
+    assert.equal(state.fetches.length, 1, `${status}: precondition — read`)
+    assert.deepEqual(outcome, { kind: 'pushed' }, `${status}: WooCommerce really changed`)
+    assert.deepEqual(state.puts, [{ path: '/orders/1001', body: { status: wcTarget } }], status)
+    evaluated++
+
+    state.puts.length = 0
+    state.fetches.length = 0
+    state.wcStatus = 'voided-custom'
+    state.mappings = [{ externalStatus: 'voided-custom', imsStatus: mapped }]
+    const custom = await push(status)
+    assert.equal(state.fetches.length, 1)
+    assert.deepEqual(custom, { kind: 'ineligible', wcStatus: 'voided-custom', class: 'needs-operator' }, `${status}: custom slug mapped to the target`)
+    assert.deepEqual(state.puts, [])
+    evaluated++
+  }
+  assert.equal(evaluated, 4)
+})
+
+test('o3d-6ldlj (j2): a REAL-slug already-at-target is still a success with ZERO PUTs, even with a hostile mapping', async () => {
+  state.puts.length = 0
+  state.wcStatus = 'cancelled'
+  state.mappings = [{ externalStatus: 'cancelled', imsStatus: 'PROCESSING' }]
+  assert.deepEqual(await push('CANCELLED'), { kind: 'already-at-target' })
+  state.wcStatus = 'on-hold'
+  state.mappings = [{ externalStatus: 'on-hold', imsStatus: 'PROCESSING' }]
+  assert.deepEqual(await push('ON_HOLD'), { kind: 'already-at-target' })
+  assert.deepEqual(state.puts, [])
+})

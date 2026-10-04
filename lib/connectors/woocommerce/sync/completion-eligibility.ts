@@ -53,6 +53,10 @@ export function classifyWcCompletionEligibility(input: {
   if (reading.handledBy !== null) return 'ineligible-finalised'
   if (CANONICAL_CANCELLED_SLUGS.has(slug)) return 'ineligible-finalised'
   if (CANONICAL_NOT_READY_SLUGS.has(slug)) return 'ineligible-not-ready'
+  // `processing` is WooCommerce's own in-flight status. A mapping row sending it to CANCELLED / ON_HOLD / DELIVERED
+  // is evidence about the IMS order, not about what WooCommerce holds, so it must not make a processing order read as
+  // settled (which would let the completion job SUCCEED having completed nothing) or as not ready (o3d-6ldlj sweep).
+  if (slug === 'processing') return 'eligible'
   if (reading.imsStatus !== null && FINALISED_IMS_STATUSES.has(reading.imsStatus)) return 'ineligible-finalised'
   // Withdrawal statuses deliberately have no mapping row, but an operator may have added one; the
   // withdrawal settings win either way, so check them BEFORE the mapping.
@@ -101,7 +105,8 @@ export async function readWcCompletionEligibility(
  *    status mapped to PROCESSING/ALLOCATED/PICKING/PACKING can be cancelled or held exactly because the importer
  *    treats it as in flight. A status IMS has no reading of is `ineligible-unknown` (retried: add a mapping).
  *
- * WooCommerce's OWN slugs are decided BEFORE the configurable mapping is read (the #719 lesson: the
+ * `already-at-target` is only ever the REAL target slug (a custom status mapped to the target state needs an
+ * operator, never a silent success). WooCommerce's OWN slugs are decided BEFORE the configurable mapping is read (the #719 lesson: the
  * status-mapping action accepts any slug and maps it to any IMS status, so a row sending `cancelled` to
  * PROCESSING would otherwise make an on-hold push eligible over a cancelled order).
  *
@@ -116,8 +121,14 @@ export type WcStatusPushEligibility =
 
 export type WcStatusPushTarget = { wc: 'cancelled'; ims: 'CANCELLED' } | { wc: 'on-hold'; ims: 'ON_HOLD' }
 
-/** WooCommerce's own not-yet-fulfilled slugs, read as these IMS statuses WHATEVER the mapping table says. */
-const CANONICAL_PRE_FULFILMENT_READINGS: Readonly<Record<string, SalesOrderStatus>> = {
+/**
+ * WooCommerce's OWN slugs and what each means for a cancel / hold, decided from the SLUG and never from the
+ * mapping table. `processing` is here too: a row mapping it to CANCELLED or ON_HOLD (the status-mapping action
+ * accepts any slug to any IMS status) must not make an in-flight order look already cancelled / held, because an
+ * IMS state is evidence about the IMS order, not about what WooCommerce holds.
+ */
+const CANONICAL_PUSH_MEANING: Readonly<Record<string, SalesOrderStatus>> = {
+  processing: 'PROCESSING',
   'on-hold': 'ON_HOLD',
   pending: 'PENDING_PAYMENT',
   failed: 'PENDING_PAYMENT',
@@ -133,6 +144,7 @@ export function classifyWcStatusPushEligibility(input: {
   const { reading, withdrawal, target } = input
   const slug = reading.slug
 
+  // 1. WooCommerce's own slugs, by SLUG. `already-at-target` is ONLY ever the real target slug.
   if (slug === target.wc) return 'already-at-target'
   // `completed` and `refunded` (the built-in map reads `refunded` as PROCESSING, so ONLY this check refuses it).
   if (reading.handledBy !== null) return 'ineligible-finalised'
@@ -141,14 +153,17 @@ export function classifyWcStatusPushEligibility(input: {
   if (slug === WC_PARTIAL_SHIPPED_STATUS || slug === withdrawal.submitted || slug === withdrawal.approved) {
     return 'ineligible-needs-operator'
   }
+  const canonical = Object.hasOwn(CANONICAL_PUSH_MEANING, slug) ? CANONICAL_PUSH_MEANING[slug] : null
+  if (canonical !== null) return canTransitionSalesOrder(canonical, target.ims) ? 'eligible' : 'ineligible-unknown'
 
-  // WooCommerce's own pre-fulfilment slugs ignore the mapping table entirely.
-  const imsStatus = Object.hasOwn(CANONICAL_PRE_FULFILMENT_READINGS, slug)
-    ? CANONICAL_PRE_FULFILMENT_READINGS[slug]
-    : reading.imsStatus
+  // 2. A CUSTOM slug: the importer's reading (mapping) decides, through the state machine.
+  const imsStatus = reading.imsStatus
   if (imsStatus === null) return 'ineligible-unknown'
-  // The importer already reads this custom status as the state IMS wants to put the order in.
-  if (imsStatus === target.ims) return 'already-at-target'
+  // The owner mapped a custom status to the very state being pushed. That says nothing certain about what
+  // WooCommerce holds (the store may rely on its own handling of that status), so it is NEVER auto-succeeded and
+  // NEVER overwritten: an operator decides. (An unconditional PUT would replace a status the owner configured;
+  // a silent success would leave WooCommerce unchanged with no retry.)
+  if (imsStatus === target.ims) return 'ineligible-needs-operator'
   if (NEVER_OVERWRITE_IMS_STATUSES.has(imsStatus)) return 'ineligible-finalised'
   return canTransitionSalesOrder(imsStatus, target.ims) ? 'eligible' : 'ineligible-unknown'
 }
