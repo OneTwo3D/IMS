@@ -227,3 +227,24 @@ test('[o3d-6thk1] the ACCOUNT-ROLE save (saveXeroSettings) obeys the same lock a
   assert.equal(await salesNow(), `NEW-ORG-SALES-${run}`)
   assert.equal(await stampNow(deps.db), B, 'owned by the bound organisation')
 })
+
+test('[o3d-6thk1] the FIRST mapping save on a bound organisation (nothing mapped, no stamp) owns it, for the role save and the payment-map save alike', { skip: !RUN }, async () => {
+  const deps = await loadDeps()
+  const run = randomUUID().slice(0, 8)
+  const A = `tenant-A-${run}`
+  const { saveXeroSettings } = await import('../../app/actions/xero-sync.ts')
+
+  await wipe(deps.db)
+  await deps.db.accountingToken.create({ data: { connector: 'xero', accessToken: 'a', expiresAt: new Date(Date.now() + 3600_000), tenantId: A, tenantName: `Org A ${run}` } })
+  assert.equal(await stampNow(deps.db), null, 'PRECONDITION: no stamp')
+  assert.equal(await mapNow(deps.db), null, 'PRECONDITION: nothing mapped')
+  const role = await saveXeroSettings({ xero_sales_account: `ROLE-${run}` }, A)
+  assert.equal(role.success, true)
+  assert.equal(await stampNow(deps.db), A, 'a role save owns an unowned, unmapped instance')
+
+  await deps.db.setting.deleteMany({ where: { key: { in: [STAMP_KEY, 'xero_sales_account'] } } })
+  assert.equal(await stampNow(deps.db), null, 'PRECONDITION (payment map): stamp cleared again')
+  const map = await deps.savePaymentAccountMap(oldMap(run), A)
+  assert.equal(map.success, true)
+  assert.equal(await stampNow(deps.db), A, 'a payment-map save owns it too')
+})
