@@ -1170,8 +1170,51 @@ test('[o3d-1e7sl Codex r11] the Mark-as-handled dialog promises exactly what the
     // what the dialog SAYS must be the same
     const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
     assert.equal(/will refuse to post it from then on|cannot reach the ledger twice/.test(dialog), suppresses, `${type}: the dialog promises suppression iff the server applies it`)
-    if (!suppresses) assert.match(dialog, /does NOT stop a later save of the document from queuing a new posting/, `${type}: and says a later save can post`)
+    if (!suppresses) assert.match(dialog, /It does not suppress later postings: a later save of the document may queue a new posting or be refused again/, `${type}: and says a later save may post OR be refused again`)
   }
   // a type the dialog cannot classify never promises it
   assert.doesNotMatch(markHandledWarningFor({ state: 'not-loaded' }), /will refuse to post it from then on|cannot reach the ledger twice/)
+})
+
+
+test('[o3d-1e7sl Codex r12] the dialog states only what holds in EVERY branch: the deferred-edit (keepOutstanding) branch leaves the refusal OPEN, and the real action does exactly that', async () => {
+  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { claimAccountingPostingRefusalForHandPostingAction, markAccountingPostingRefusalHandledAction } = await import('@/app/actions/sync-exceptions')
+  for (const [type, kind] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update'], ['PURCHASE_INVOICE_UPDATE', 'purchase_invoice_update'], ['BILL_PAYMENT', 'realised_fx_bill_payment']] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r12-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction(`r12-${type}`)), true, `${type}: claim`)
+    // IMS declined a later posting of the document while the claim was held
+    ;(refusals[0] as unknown as Record<string, unknown>).handPostDeferredCount = 2
+    const result = await markAccountingPostingRefusalHandledAction(`r12-${type}`, 'posted by hand')
+    // what the SERVER did: the refusal is NOT resolved and the claim is released
+    assert.equal(refusals[0]!.resolvedAt, null, `${type}: the refusal stays OPEN when a later posting was declined during the claim`)
+    assert.equal(refusals[0]!.handPostClaimedAt, null, `${type}: and the claim is released`)
+    assert.equal(refusals[0]!.suppressedAt, null, `${type}: and nothing is suppressed`)
+    const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_marked_handled') as unknown as { description: string } | undefined
+    assert.match(String(note?.description ?? JSON.stringify(result)), /STAYS OUTSTANDING/, `${type}: and the action says so`)
+    // what the DIALOG says must cover that branch, and must not state the closure unconditionally
+    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
+    assert.match(dialog, /Whether THIS refusal then closes depends on whether a later posting was declined while you held it \(if one was, the refusal stays open, your claim is released/, `${type}: the dialog names the branch`)
+    assert.doesNotMatch(dialog, /This closes THIS refusal/, `${type}: it does not promise the closure`)
+  }
+})
+
+test('[o3d-1e7sl Codex r12] a later save on a reused key can be refused AGAIN (the mark suppresses nothing), and the dialog says so; a one-posting key is suppressed and the dialog promises that', async () => {
+  const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const record = { chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' } as const
+  for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
+    refusals.length = 0; syncRows.length = 0; activity.length = 0
+    refusals.push(refusal(`r12b-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
+    assert.equal(ok(await mark(`r12b-${type}`)), true, `${type}: marked handled`)
+    assert.ok(refusals[0]!.resolvedAt instanceof Date, `${type}: PRECONDITION: the refusal closed`)
+    // the SAME connector condition refuses the document again (a later save / a retry)
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }, { kind, ...record })
+    const reopened = refusals[0]!.resolvedAt === null
+    assert.equal(reopened, reused, `${type}: a refused-again posting ${reused ? 'IS listed again (nothing was suppressed)' : 'is NOT listed again (the key is suppressed)'}`)
+    const dialog = markHandledWarningFor({ type, state: 'not-loaded' })
+    if (reused) assert.match(dialog, /a later save of the document may queue a new posting or be refused again/, `${type}: the dialog says a later save may be refused again`)
+    else assert.match(dialog, /will refuse to post it from then on/, `${type}: the dialog promises the suppression the server applied`)
+  }
 })

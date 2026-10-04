@@ -65,12 +65,13 @@ export type HandPostInstruction = {
 }
 
 const EFFECT_REUSED_KEY =
-  'This closes THIS refusal and cancels IMS\'s own queued retry of it. It does NOT stop a later save of the document from queuing a new posting '
-  + 'that can reach the ledger, and if the document was edited again while you were in the ledger IMS keeps the debt and tells you.'
+  'Marking this records that you dealt with it in the ledger and cancels IMS\'s own queued retry of it. Whether THIS refusal then closes depends on '
+  + 'whether a later posting was declined while you held it (if one was, the refusal stays open, your claim is released, and IMS tells you when you press it). '
+  + 'It does not suppress later postings: a later save of the document may queue a new posting or be refused again. Check Sync > Exceptions afterwards to confirm which.'
 const EFFECT_ONE_POSTING_KEY =
   'IMS cancels its own retry of this posting and will refuse to post it from then on, so it cannot reach the ledger twice.'
 const EFFECT_TYPE_UNKNOWN =
-  'This closes this refusal and cancels IMS\'s own queued retry of it. Whether IMS also refuses to post it again afterwards depends on the posting type, so do not rely on that.'
+  'This records that you dealt with it and cancels IMS\'s own queued retry of it. Whether this refusal closes, and whether IMS refuses to post it again, depends on the posting type and on whether a later posting was declined while you held it. Check Sync > Exceptions afterwards.'
 
 /**
  * The reused-key types (drift-guarded against `REUSED_POSTING_KEY_TYPES` in a test; this module stays import-free because the dialogs

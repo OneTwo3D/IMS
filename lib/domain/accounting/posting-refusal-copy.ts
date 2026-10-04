@@ -23,7 +23,7 @@ export const ACCOUNTING_POSTING_REFUSAL_SECTION_DETAIL =
   + 'cannot be shown to belong to the connector it would post to. Nothing was sent. Each row says which posting '
   + 'is owed, which books it was built for, which connector is active now, what still stands in IMS, and what '
   + 'to do. A row marked "clears itself" leaves this list when IMS queues the posting. Any other row can be marked '
-  + 'handled once you have posted it by hand: that records who did it and cancels IMS\'s own retry of it. For a posting whose key names one posting for ever IMS then also refuses to post it again; for an invoice or bill update or a bill payment a later save of the document can still queue a new one. '
+  + 'handled once you have posted it by hand: that records who did it and cancels IMS\'s own retry of it. For a posting whose key names one posting for ever IMS then also refuses to post it again; for an invoice or bill update or a bill payment a later save of the document may queue a new posting or be refused again, and whether this refusal closes depends on whether a later posting was declined while you held it. '
   + 'A row marked "Unconfirmed" is not yet '
   + 'one of these: IMS refused it while another job was settling the same posting, and the accounting sync run '
   + 'is still establishing whether it is owed — do not post an unconfirmed row by hand.'

@@ -2461,8 +2461,11 @@ Three things about those rows:
   ever, IMS then refuses every automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a
   follow-up) — each refusal is logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach
   the ledger twice. For an invoice update, a bill update or a bill payment the key is REUSED by successive
-  versions, so marking cancels IMS's own queued retry and closes THIS refusal but does **not** suppress later
-  postings: a later save of the document queues a new one, which is what the ledger needs. It is
+  versions, so marking records your confirmation and cancels IMS's own queued retry, but whether THIS refusal
+  closes depends on whether a later posting was declined while you held it (if one was, the refusal stays open,
+  your claim is released, and IMS tells you when you press it). Marking does **not** suppress later postings: a
+  later save of the document may queue a new posting or be refused again (for example while its invoice belongs
+  to a connector that is no longer active). Check the Sync > Exceptions list afterwards to confirm which. It is
   refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
   wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
   row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
@@ -5166,8 +5169,11 @@ Three things about those rows:
   ever, IMS then refuses every automatic attempt to post it (a retry, a sweep, the landed-cost outbox, a
   follow-up) — each refusal is logged as `accounting_posting_suppressed_handled_by_hand` — so it cannot reach
   the ledger twice. For an invoice update, a bill update or a bill payment the key is REUSED by successive
-  versions, so marking cancels IMS's own queued retry and closes THIS refusal but does **not** suppress later
-  postings: a later save of the document queues a new one, which is what the ledger needs. It is
+  versions, so marking records your confirmation and cancels IMS's own queued retry, but whether THIS refusal
+  closes depends on whether a later posting was declined while you held it (if one was, the refusal stays open,
+  your claim is released, and IMS tells you when you press it). Marking does **not** suppress later postings: a
+  later save of the document may queue a new posting or be refused again (for example while its invoice belongs
+  to a connector that is no longer active). Check the Sync > Exceptions list afterwards to confirm which. It is
   refused if you do not hold the posting: taking it is what establishes that IMS was standing back while you
   wrote to the ledger, and without that the two could have happened at once. IMS also refuses the mark on a
   row that clears itself, whatever the page showed. A row that clears itself leaves the list when the posting
