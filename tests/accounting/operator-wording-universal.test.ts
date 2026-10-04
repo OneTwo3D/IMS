@@ -343,3 +343,11 @@ test('[o3d-1e7sl Codex r11] no help doc directs re-posting an already posted doc
   assert.equal((doc.match(/\*\*Do not re-post it:\*\*/g) ?? []).length, 2, 'both copies of the legacy-document paragraph forbid re-posting')
   assert.doesNotMatch(doc, /re-post it so the document and its connector are recorded together/)
 })
+
+// Codex round 12: the help text may state only what holds in every branch of the mark action.
+test('[o3d-1e7sl Codex r12] the help text (both copies) states the Mark-as-handled outcome conditionally, never as a guaranteed closure or a guaranteed later posting', () => {
+  const doc = read('help-docs/xero-sync.md').replace(/\s+/g, ' ')
+  assert.equal((doc.match(/whether THIS refusal closes depends on whether a later posting was declined while you held it \(if one was, the refusal stays open, your claim is released, and IMS tells you when you press it\)/g) ?? []).length, 2, 'both copies carry the conditional closure')
+  assert.equal((doc.match(/a later save of the document may queue a new posting or be refused again/g) ?? []).length, 2, 'both copies say a later save may be refused again')
+  assert.doesNotMatch(doc, /a later save of the document queues a new one|closes THIS refusal but does \*\*not\*\*/, 'no guaranteed closure or guaranteed later posting')
+})
