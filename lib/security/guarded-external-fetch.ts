@@ -21,9 +21,9 @@ const MAX_REDIRECTS = 5
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
 export type GuardedExternalFetchOptions = {
-  /** 'WooCommerce' | 'Mintsoft' | 'Xero'. */
+  /** The connector this request is for, named as connectorFetch names it. */
   connectorName: string
-  /** Mintsoft only: the ClientId the process is configured with. */
+  /** The write-scope id (client/account id) the process is configured with, where the connector scopes writes by one. */
   writeScopeId?: string | number | null
   env?: OutboundEnv
 }
