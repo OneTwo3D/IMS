@@ -281,13 +281,16 @@ test('o3d-4gw0 UNPINNED: a line that was never allocated still follows the CURRE
 
 test('o3d-4gw0 REFUND-PRODUCT-MISMATCH: a refund line naming another product than its line falls back to its own product', { skip: SKIP }, async () => {
   // Same rule shipment-service applies: the line's pin is not about a different product, so the
-  // refund expands the product it names. Refund 2 units of component A on the kit line: A nets 2.
+  // refund expands the product it names. Refund 2 units of component A on the kit line (pinned
+  // 1xA+1xB, 2 kits), nothing shipped: A nets to 0 and B is untouched, so ONLY B is short (2). If the
+  // refund were expanded through the kit pin it would net B as well and hide that shortfall.
   await withFixture({ a: 1, b: 1 }, 2, async (deps, f) => {
     await pinLine(deps, f)
     await refundKits(deps, f, 2, f.aId) // product A (a leaf) on a line whose product is the kit
-    await shipLeaves(deps, f, 0, 2)
     const rows = await deps.findExternalFulfillmentShortfall(f.orderId)
     console.log(`o3d-4gw0 MISMATCH result: ${JSON.stringify(summarize(rows, f))} (refund line product=A, line product=kit)`)
-    assert.deepEqual(rows, [], 'A demand 2 less refund-of-A 2 = 0; B demand 2 covered')
+    assert.equal(rows.length, 1, 'exactly one shortfall row')
+    assert.equal(rows[0].productId, f.bId)
+    assert.equal(rows[0].outstandingQty, '2')
   })
 })
