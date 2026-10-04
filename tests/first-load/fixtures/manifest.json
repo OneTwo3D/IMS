@@ -1,0 +1,21 @@
+{
+  "formatVersion": 1,
+  "baseCurrency": "GBP",
+  "asOf": "2026-10-01",
+  "inTransitConvention": "counted-in-source",
+  "purchaseOrderKeyPrefix": "QBX-",
+  "transferKeyPrefix": "QBX-",
+  "inputs": [
+    { "dataset": "products", "file": "qoblex/products.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "recipe-lines", "file": "qoblex/bom-lines.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "stock-lots", "file": "qoblex/stock-lots.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "suppliers", "file": "qoblex/suppliers.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "purchase-order-lines", "file": "qoblex/purchase-orders.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "transfers", "file": "qoblex/transfers.csv", "columnMap": "maps/qoblex.map.json" },
+    { "dataset": "mintsoft-products", "file": "mintsoft/products.csv", "columnMap": "maps/mintsoft.map.json" },
+    { "dataset": "mintsoft-stock", "file": "mintsoft/stock.csv", "columnMap": "maps/mintsoft.map.json" },
+    { "dataset": "woo-products", "file": "woocommerce/products.csv", "columnMap": "maps/woocommerce.map.json" },
+    { "dataset": "sku-exclusions", "file": "canonical/sku-exclusions.csv" },
+    { "dataset": "ims-skus", "file": "canonical/ims-skus.csv" }
+  ]
+}

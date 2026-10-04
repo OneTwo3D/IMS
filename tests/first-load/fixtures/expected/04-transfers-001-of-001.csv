@@ -1,0 +1,4 @@
+transferKey,fromWarehouseCode,toWarehouseCode,status,sku,qty,notes
+QBX-TR-100,MAIN,OVER,IN_TRANSIT,OAK-BOARD,6,
+QBX-TR-100,MAIN,OVER,IN_TRANSIT,TSHIRT-M,2,
+QBX-TR-101,MAIN,OVER,IN_TRANSIT,LEG-01,3,
