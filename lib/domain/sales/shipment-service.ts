@@ -20,7 +20,7 @@ import {
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
-import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
+import { lineFulfillmentRequirementQuantities, refundLineResolvableLine } from '@/lib/products/fulfillment-requirement-snapshot'
 import {
   dispatchForeclosesRepackRecovery,
   shipmentIsUnreopenableCommitment,
@@ -297,10 +297,10 @@ async function loadOrderLeafQuantities(
   for (const refundLine of refundLines) {
     // An unmatched external refund (no order line / no product) can't be attributed to a leaf — skip it.
     if (!refundLine.salesOrderLineId || !refundLine.productId) continue
-    const refundedLine = orderLineById.get(refundLine.salesOrderLineId)
-    const refundedResolvable = refundedLine?.productId === refundLine.productId
-      ? refundedLine
-      : { id: refundLine.salesOrderLineId, productId: refundLine.productId }
+    const refundedResolvable = refundLineResolvableLine(
+      { salesOrderLineId: refundLine.salesOrderLineId, productId: refundLine.productId },
+      orderLineById,
+    )
     for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(refundedResolvable, toDecimal(refundLine.qty), graph)) {
       const key = `${refundLine.salesOrderLineId}|${componentId}`
       refundedByLeaf.set(key, (refundedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
