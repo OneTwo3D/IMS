@@ -324,7 +324,15 @@ test('outbound-write hold: a create refused on a REDIRECT HOP (already sent) is 
   console.log('precondition (redirect create): the first PUT answered with a hop-1 refusal; the order exists at the WMS under our ClientId')
   const found = await pushMintsoftOrder(INPUT)
   assert.equal(found.externalOrderId, '900', 'the order that may have been created is found by lookup and bound')
+  assert.equal(found.needsVerification, true, 'bound as minted-but-UNVERIFIED: the scoped verification read still runs')
   assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'exactly ONE PUT: no blind replay')
+
+  // A same-client order that shares our ORDER NUMBER but carries a different external reference is NOT ours.
+  reset()
+  createError = new OutboundWriteHeldError(refusal, 1).message
+  searchRows = [{ ID: 777, OrderNumber: 'WC-1001', ExternalOrderReference: 'SOMEONE-ELSES-REF', ClientId: CLIENT }]
+  await assert.rejects(() => pushMintsoftOrder(INPUT), /REFUSED AFTER A REDIRECT/, 'identity not proven: left ambiguous, never bound')
+  assert.equal(calls.filter((path) => path === '/api/Order').length, 1, 'and still no second PUT')
 
   reset()
   createError = new OutboundWriteHeldError(refusal, 1).message

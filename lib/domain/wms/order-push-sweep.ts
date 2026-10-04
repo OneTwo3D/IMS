@@ -1771,8 +1771,13 @@ export async function runWmsOrderPushSweepCore(
         if (dead) result.deadLettered += 1
         else result.failed += 1
         const state: PushState = dead ? 'DEAD_LETTER' : 'PENDING_CREATE'
+        // `lastAttemptAt` IS the create dispatch stamp (decideCreateClaim): a stamped PENDING_CREATE link is
+        // skipped until its lease expires and then parked AMBIGUOUS_CREATE ("a create may have left"). A
+        // PROVEN pre-send hold sent nothing, so it must leave NO stamp - otherwise the order stops being
+        // offered for create even after the destination is granted. Every other failure keeps the stamp.
+        const attemptStamp = heldByOutboundHold ? null : ts
         await port
-          .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: ts }, { state, attempts, lastError: message, lastAttemptAt: ts })
+          .upsertByOrder(order.id, { connector: connectorId, state, attempts, lastError: message, lastAttemptAt: attemptStamp }, { state, attempts, lastError: message, lastAttemptAt: attemptStamp })
           .catch(() => {})
         await audit({
           action: 'order_create', outcome: push ? 'SUCCEEDED' : 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: push?.externalOrderId ?? null,

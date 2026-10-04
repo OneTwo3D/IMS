@@ -327,12 +327,22 @@ test('outbound-write hold: a HELD create spends no attempt and never dead-letter
   assert.equal(heldResult.failed, 1)
   assert.equal(heldPort.upserts[0].update.state, 'PENDING_CREATE')
   assert.equal(heldPort.upserts[0].update.attempts, 4, 'no attempt was spent')
+  // THE DISPATCH STAMP: lastAttemptAt is what makes a later sweep park the link AMBIGUOUS_CREATE. A proven
+  // pre-send hold sent nothing, so it must leave none, and the link must be claimable again after the lease.
+  const { decideCreateClaim } = await import('../lib/domain/wms/order-push-sweep')
+  const later = new Date(NOW().getTime() + 60 * 60 * 1000) // an hour: well past the 5-minute create lease
+  assert.equal(heldPort.upserts[0].update.lastAttemptAt, null, 'a held create leaves no dispatch stamp')
+  assert.equal(decideCreateClaim({ state: String(heldPort.upserts[0].update.state), lastAttemptAt: heldPort.upserts[0].update.lastAttemptAt as Date | null }, later), 'CLAIM', 'a later sweep, after the lease and after a grant, offers it for create again')
   assert.match(String(heldPort.upserts[0].update.lastError), /Outbound write HELD/)
 
   const ordinary = connector({ pushOrder: async () => { throw new Error('still down') } })
   const controlPort = makePort({ createCandidates: [candidate({ pushAttempts: 4 })] })
   const controlResult = await runWmsOrderPushSweepCore(ordinary, 'mintsoft', controlPort.port, { now: NOW })
   assert.equal(controlResult.deadLettered, 1, 'the control: the same order with an ordinary failure dead-letters')
+  const stamped = makePort({ createCandidates: [candidate({ pushAttempts: 1 })] })
+  await runWmsOrderPushSweepCore(ordinary, 'mintsoft', stamped.port, { now: NOW })
+  assert.ok(stamped.upserts[0].update.lastAttemptAt instanceof Date, 'control: an ordinary failure keeps the stamp')
+  assert.equal(decideCreateClaim({ state: 'PENDING_CREATE', lastAttemptAt: stamped.upserts[0].update.lastAttemptAt as Date }, later), 'PARK_AMBIGUOUS', 'control: and a later sweep parks it ambiguous, which is the path the hold must not take')
 })
 
 test('o3d-92fu create: a line with no SKU parks VALIDATION_FAILED — no claim, no remote call, no dead letter', async () => {

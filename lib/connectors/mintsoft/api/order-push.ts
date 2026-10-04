@@ -199,17 +199,28 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
     : { kind: 'name' }
   // A create refused on a REDIRECT HOP (the outbound-write hold) has ALREADY been sent: the first
   // request may have created the order. It must not be answered by a blind second PUT. It goes down the
-  // maybe-sent path instead: look the order up by its reference (a scoped READ), and if it exists, take
-  // the "already exists" reconcile branch below, which re-reads it under our ClientId and binds it.
-  // If it cannot be found the error is re-thrown unchanged (an attempt is spent, as for a timeout).
+  // maybe-sent path instead: look the order up (a scoped READ) and bind it ONLY if it is provably this
+  // order (below). If it cannot be proven the error is re-thrown unchanged (an attempt is spent, as for a
+  // timeout, and the link parks AMBIGUOUS_CREATE for an operator).
   const createOrReconcile = async (payload: Record<string, unknown>) => {
     try {
       return await createOrder(payload)
     } catch (error) {
       if (!isOutboundRedirectRefusedText(error instanceof Error ? error.message : String(error))) throw error
       const existing = await findExistingByReference(input, clientId)
-      if (!existing) throw error
-      return { ok: false, data: null, message: 'Order already exists (found by lookup after a refused redirect)' }
+      // PROVABLY OURS OR NOT AT ALL. The scoped search matches the order number OR the external reference,
+      // so a single hit can be ANOTHER order of ours that shares a number. Only a row carrying THIS order's
+      // stable external reference (and the ClientId the search already asserts) may be bound; anything else
+      // leaves the create unresolved (the maybe-sent error is re-thrown, an attempt is spent, the link
+      // parks AMBIGUOUS_CREATE for an operator).
+      const existingId = existing
+        && input.externalReference != null && input.externalReference !== ''
+        && toStr(existing.ExternalOrderReference) === input.externalReference
+        ? toStr(existing.ID ?? existing.Id ?? existing.id)
+        : null
+      if (!existing || !existingId) throw error
+      // Bound as a MINTED-BUT-UNVERIFIED id (PENDING_VERIFY): the scoped verification read still runs.
+      return { ok: true, data: { Success: true, OrderId: existingId, OrderNumber: toStr(existing.OrderNumber) } as RawOrder, message: null }
     }
   }
   let created = await createOrReconcile(buildPushPayload(input, initialCourier))
