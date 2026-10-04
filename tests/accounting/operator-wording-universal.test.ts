@@ -217,10 +217,13 @@ test('[o3d-1e7sl Codex r8] census: no surface renders hand-post / mark-handled a
     ['app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'releaseWarningFor'],
     ['app/actions/sync-exceptions.ts', 'handPostOrderFor'],
     ['app/actions/sync-exceptions.ts', 'handPostInstruction'],
-    ['lib/accounting.ts', 'handPostStepFor(params.type)'],
     ['lib/domain/accounting/posting-mark-handled.ts', 'handPostStepFor(row.type)'],
     ['lib/domain/accounting/posting-refusal-kinds-doc.ts', 'GENERIC_HAND_POST_STEP'],
   ] as const) assert.ok(read(file).includes(symbol), `${file} renders through ${symbol}`)
+  // BOTH refusing-site remedies in lib/accounting.ts know the posting type and render the TYPED step (never the typeless one)
+  const accountingSource = read('lib/accounting.ts')
+  assert.equal((accountingSource.match(/handPostStepFor\(params\.type\)/g) ?? []).length, 2, 'both refusal remedies use the typed step')
+  assert.doesNotMatch(accountingSource, /handPostStepFor\(undefined\)|GENERIC_HAND_POST_STEP/, 'no refusal remedy falls back to the typeless step')
   // the help text is GENERATED from the same function
   const doc = read('help-docs/xero-sync.md')
   const blocks = doc.split('<!-- hand-post-instruction:begin -->').slice(1).map((b) => `<!-- hand-post-instruction:begin -->${b.slice(0, b.indexOf('<!-- hand-post-instruction:end -->'))}<!-- hand-post-instruction:end -->`)
