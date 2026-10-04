@@ -299,7 +299,6 @@ class Run {
   mintsoftQty = new Map<string, Dec>()
   mintsoftSkus = new Map<string, string>()
   wooSkus = new Map<string, string>()
-  ingestRejects = 0
 
   constructor(readonly input: PrepareInput) {}
 
@@ -368,7 +367,7 @@ function loadExclusions(run: Run): void {
     }
     groups.set(sku.key, [...(groups.get(sku.key) ?? []), { row, sku: sku.sku, reason: row.values.reason }])
   }
-  for (const [key, list] of [...groups.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [key, list] of [...groups.entries()]) {
     if (new Set(list.map((entry) => entry.reason)).size > 1 || new Set(list.map((entry) => entry.sku)).size > 1) {
       for (const entry of list) run.add('sku-exclusions', entry.row.line, entry.sku, 'REJECTED', 'CONFLICTING_EXCLUSION', 'the same SKU is listed with different reasons or different letter case')
       continue
@@ -394,7 +393,7 @@ function loadImsSkus(run: Run): void {
     }
     groups.set(sku.key, [...(groups.get(sku.key) ?? []), { row, sku: sku.sku, type }])
   }
-  for (const [key, list] of [...groups.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [key, list] of [...groups.entries()]) {
     if (new Set(list.map((e) => `${e.sku}|${e.type}`)).size > 1) {
       for (const entry of list) run.add('ims-skus', entry.row.line, entry.sku, 'REJECTED', 'CONFLICTING_IMS_SKU', 'the same SKU appears with different type or letter case')
       continue
@@ -473,7 +472,7 @@ function loadCatalogue(run: Run): void {
   }
 
   const survivors: Candidate[] = []
-  for (const [key, list] of [...groups.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [key, list] of [...groups.entries()]) {
     const signatures = new Set(list.map((c) => JSON.stringify([c.entry.sku, c.entry.name, c.entry.type, c.entry.parentSku, c.entry.cells])))
     const distinctSkus = new Set(list.map((c) => c.entry.sku))
     if (distinctSkus.size > 1) {
@@ -505,7 +504,7 @@ function loadCatalogue(run: Run): void {
     if (barcode) byBarcode.set(barcode, [...(byBarcode.get(barcode) ?? []), c])
   }
   const barcodeLoser = new Set<string>()
-  for (const [barcode, list] of [...byBarcode.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [barcode, list] of [...byBarcode.entries()]) {
     if (list.length < 2) continue
     for (const c of list) {
       barcodeLoser.add(c.entry.key)
@@ -586,7 +585,7 @@ function loadRecipes(run: Run): void {
   const byPair = new Map<string, Line[]>()
   for (const line of candidates) byPair.set(`${line.parentKey}\u0000${line.componentKey}`, [...(byPair.get(`${line.parentKey}\u0000${line.componentKey}`) ?? []), line])
   const valid: Line[] = []
-  for (const [, list] of [...byPair.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [, list] of [...byPair.entries()]) {
     if (list.length > 1) {
       for (const line of list) run.add('recipe-lines', line.row.line, line.parent, 'REJECTED', 'DUPLICATE_RECIPE_LINE', `component ${line.component} is listed ${list.length} times for ${line.parent}; whether to add the quantities cannot be decided`)
     } else valid.push(list[0])
@@ -657,7 +656,7 @@ function loadSuppliers(run: Run): void {
     const key = name.toUpperCase()
     groups.set(key, [...(groups.get(key) ?? []), { row, name, cells }])
   }
-  for (const [key, list] of [...groups.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [key, list] of [...groups.entries()]) {
     const signatures = new Set(list.map((c) => JSON.stringify(c.cells)))
     if (signatures.size > 1) {
       for (const c of list) run.add('suppliers', c.row.line, c.name, 'REJECTED', 'DUPLICATE_SUPPLIER_CONFLICT', `the supplier name appears ${list.length} times (ignoring letter case) with different data`)
@@ -752,7 +751,7 @@ function loadStock(run: Run): void {
   const groups = new Map<string, Lot[]>()
   for (const lot of lots) if (!refused.has(lot)) groups.set(stockGroupKey(lot.key, lot.warehouse), [...(groups.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
   const identical: string[] = []
-  for (const [gk, list] of [...groups.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [gk, list] of [...groups.entries()]) {
     const collapsed = collapseLots(list.map((l) => ({ qty: l.qty, unitCostBase: l.unitCostBase })))
     for (const lot of list) run.add('stock-lots', lot.row.line, lot.sku, 'EMITTED', 'LOT_COLLAPSED', `collapsed into one weighted-average opening row for ${lot.sku} in ${lot.warehouse}`)
     const noRef = list.filter((l) => l.lotRef === '').map((l) => `${fmt(l.qty)}|${l.unitCostBase.toFixed()}|${l.date}`)
@@ -853,7 +852,7 @@ function loadTransfers(run: Run): void {
   const byTransfer = new Map<string, Line[]>()
   for (const c of candidates) byTransfer.set(c.transferKey, [...(byTransfer.get(c.transferKey) ?? []), c])
   const live: Line[] = []
-  for (const [key, list] of [...byTransfer.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [key, list] of [...byTransfer.entries()]) {
     const shape = new Set(list.map((l) => JSON.stringify([l.from, l.to, l.notes])))
     const skus = list.map((l) => l.key)
     if (shape.size > 1) {
@@ -867,7 +866,7 @@ function loadTransfers(run: Run): void {
   const needBySource = new Map<string, Dec>()
   for (const l of live) needBySource.set(stockGroupKey(l.key, l.from), (needBySource.get(stockGroupKey(l.key, l.from)) ?? new D(0)).add(l.outstanding))
   const failedSources = new Set<string>()
-  for (const [gk, need] of [...needBySource.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+  for (const [gk, need] of [...needBySource.entries()]) {
     const group = run.stockGroups.get(gk)
     if (convention === 'counted-in-source') {
       if (!group || group.lotQty.lt(need)) failedSources.add(gk)
