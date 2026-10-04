@@ -599,7 +599,6 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
       return result.status === 'passed' || !def.prerequisite
     }
 
-    const def = (id: StepId) => STEP_CATALOGUE.find((candidate) => candidate.id === id)!
     const stepBodies: Record<StepId, () => Promise<StepOutcome>> = {
       'migrate-deploy': async () => {
         const run = await childIn('migrate-deploy', bin('prisma'), ['migrate', 'deploy'])

@@ -63,8 +63,8 @@ export type StepDefinition = {
 
 /** In execution order. The numbers are the report items of the rehearsal brief (and o3d-zjsb5.2/.3). */
 export const STEP_CATALOGUE: readonly StepDefinition[] = [
-  { id: 'migrate-deploy', item: 1, title: 'prisma migrate deploy applies every migration', prerequisite: true },
-  { id: 'migrate-status', item: 1, title: 'prisma migrate status reports the schema up to date', prerequisite: false },
+  { id: 'migrate-deploy', item: 1, title: 'Every migration applied by migrate deploy', prerequisite: true },
+  { id: 'migrate-status', item: 1, title: 'Migration status reports the schema up to date', prerequisite: false },
   { id: 'seed', item: 0, title: 'npm run db:seed', prerequisite: true },
   { id: 'provision', item: 0, title: 'scripts/provision-instance.mjs (SMTP unset, no connector credentials)', prerequisite: true },
   { id: 'seeded-rows', item: 2, title: 'Seeded Organisation (GBP), warehouse, currency and tax rows', prerequisite: false },
@@ -74,7 +74,7 @@ export const STEP_CATALOGUE: readonly StepDefinition[] = [
   { id: 'validate-db', item: 6, title: 'npm run validate:db', prerequisite: false },
   { id: 'invariant-preflight', item: 7, title: 'npm run invariant-check:preflight exits 0', prerequisite: false },
   { id: 'outbound-status', item: 8, title: 'npm run outbound:status reports every connector held', prerequisite: false },
-  { id: 'restore-parity', item: 9, title: 'pg_dump restore point restored into a second database: row-count and md5 parity per table', prerequisite: false },
+  { id: 'restore-parity', item: 9, title: 'Restore point dumped and restored into a second database: row-count and md5 parity per table', prerequisite: false },
 ]
 
 export type StepStatus = 'passed' | 'failed' | 'skipped'
@@ -376,6 +376,7 @@ export const FORBIDDEN_ENV_PATTERNS: readonly RegExp[] = [
   /^SMTP_/,
   /^WC_/,
   /^WOO/,
+  // wms-connector-boundary-ok: o3d-zjsb5.2: an env-name prefix this guard REFUSES; it names no connector flow
   /^MINTSOFT/,
   /^XERO/,
   /^QB_/,

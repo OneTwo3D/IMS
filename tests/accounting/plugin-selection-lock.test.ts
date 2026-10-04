@@ -1050,6 +1050,18 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             No application code path calls it (its imports are dynamic and its
  *                             only callers are under tests/), it writes only what
  *                             `processPendingEmailOutbox` writes, and it holds no plugin key.
+ *   'throwaway-cluster-rehearsal'
+ *                           — scripts/rehearse-first-install.ts. It does NOT connect to this
+ *                             application's database: it runs `initdb` into a fresh directory, starts a
+ *                             cluster of its own on a private loopback port with its own superuser
+ *                             role and a random password, runs migrate/seed/provision against THAT,
+ *                             dumps and restores it into a second database of the same cluster, and
+ *                             removes the lot in a `finally`. What keeps it off every other database
+ *                             is `assertThrowawayDatabaseUrl` (host, port, role and database must be
+ *                             the rehearsal's own), applied before every child process is spawned and
+ *                             every connection opened, over a WHITELISTED child environment that never
+ *                             carries an inherited DATABASE_URL, PG* variable or connector credential.
+ *                             It writes no plugin key (the lexical inventory above scans `scripts`).
  *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
  *                             It takes no lock and cannot practically be made to (it runs before the
  *                             app is up); what keeps it safe is that it must not write a plugin key,
@@ -1078,6 +1090,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'scratch-database-stamp'
   | 'lane-email-outbox-client'
   | 'seed'
+  | 'throwaway-cluster-rehearsal'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
   'app/api/backup/create/route.ts': 'dump-only',
@@ -1292,6 +1305,7 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/stamp-scratch-database.ts': 'scratch-database-stamp',
   'lib/email-outbox.ts': 'lane-email-outbox-client',
   'prisma/seed.ts': 'seed',
+  'scripts/rehearse-first-install.ts': 'throwaway-cluster-rehearsal',
 }
 
 function replayPaths(): string[] {
