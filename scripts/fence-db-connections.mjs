@@ -1066,12 +1066,18 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
  *   membership of the application role would be revoked with the application's)
  * @returns {{ usable: boolean, reason: string }}
  */
+/** The comment the tool puts on a migration role it creates. A role without it was not made by this tool and is never adopted. */
+export const MIGRATION_ROLE_MARKER = 'ims migration login: created by the IMS installer, holds nothing of its own'
+
 export function assessMigrationRoleAttributes(f) {
   const name = f.migrationRole
   const refuse = (why) => ({ usable: false, reason: `the migration role ${name} ${why}` })
   if (!name) return { usable: false, reason: 'no migration role was named (--migration-role), so the migration has no login that is not the deploy admin.' }
   if (!f.exists) {
     return refuse(`does not exist. Create it (the installer does, and \`node scripts/fence-db-connections.mjs --ensure-migration-role\` does as the admin): CREATE ROLE ${quoteIdent(name)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT ${quoteIdent(f.appRole)} TO ${quoteIdent(name)}${f.serverVersionNum >= 160000 ? ' WITH INHERIT TRUE, SET TRUE' : ''}; GRANT CONNECT ON DATABASE <database> TO ${quoteIdent(name)};`)
+  }
+  if (!f.marked) {
+    return refuse(`exists but was not created by this tool (it does not carry the comment "${MIGRATION_ROLE_MARKER}"). A role somebody else made under this name may be a login with a known password or privileges of its own, and it is NOT adopted, altered or granted anything. Name another role (IMS_MIGRATION_ROLE in the root credential file) or, if you made this one for this purpose and it holds nothing, mark it: COMMENT ON ROLE ${quoteIdent(name)} IS '${MIGRATION_ROLE_MARKER}';`)
   }
   const forbidden = []
   if (f.rolsuper) forbidden.push('SUPERUSER')
@@ -1081,6 +1087,12 @@ export function assessMigrationRoleAttributes(f) {
   if (f.rolbypassrls) forbidden.push('BYPASSRLS')
   if (forbidden.length > 0) {
     return refuse(`holds ${forbidden.join(', ')}. A migration login with any of those is a login every byte of application-owned code in the window can use after \`SET ROLE NONE\`. Remove it with ALTER ROLE ${quoteIdent(name)} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS, or name another role.`)
+  }
+  if (f.directDependencies > 0) {
+    return refuse(`holds or owns ${f.directDependencies} object(s) or privilege(s) of its own somewhere in this cluster (an owned object, a direct grant on a table, schema, database or other object, or a default privilege), which \`SET ROLE NONE\` on a migration connection would exercise. Its only grant is CONNECT on this database.`)
+  }
+  if (f.roleSettings > 0) {
+    return refuse(`has ${f.roleSettings} per-role setting(s) (ALTER ROLE ... SET), which would apply to every migration session. Remove them.`)
   }
   if (f.reachesOtherRoles) {
     return refuse(`is a member of a role the application role is not a member of, so \`SET ROLE NONE\` on a migration connection reaches privilege the application itself does not hold. Its only membership may be ${f.appRole}.`)
@@ -1144,10 +1156,37 @@ export function buildMigrationLoginUrl(adminConnectionString, migrationRole, pas
   } catch {
     throw new Error('The admin connection string cannot be parsed as a URL, so the migration login cannot be substituted into it.')
   }
+  // THE ADMIN URL'S QUERY STRING IS NOT THE MIGRATION URL'S (Codex CRITICAL). node-postgres and libpq give
+  // query parameters precedence over the userinfo, and a query can carry a password, a client certificate,
+  // a key password, a passfile, a service, startup `options`, another host or database. So the query is
+  // WHITELISTED: only transport-trust parameters survive. A parameter that names an IDENTITY or a SECRET is
+  // REFUSED outright (stripping `host=` would silently re-aim the URL; stripping `password=` would leave the
+  // operator believing the admin URL was fine); anything else not on the list is dropped.
+  const refused = []
+  for (const key of new Set([...url.searchParams.keys()])) {
+    if (MIGRATION_URL_REFUSED_PARAMETERS.has(key.toLowerCase())) refused.push(key)
+  }
+  if (refused.length > 0) {
+    throw new Error(
+      `The admin connection string carries the query parameter(s) ${refused.join(', ')}, which name a credential or an identity. ` +
+        'They take precedence over the userinfo, so a migration URL built from this one could authenticate as the admin or carry the admin secret to the application account. ' +
+        'Put the admin login in the userinfo of DEPLOY_ADMIN_DATABASE_URL and nothing identity-bearing in its query. Refusing to compose a migration URL.',
+    )
+  }
+  for (const key of new Set([...url.searchParams.keys()])) {
+    if (!MIGRATION_URL_SAFE_PARAMETERS.has(key.toLowerCase())) url.searchParams.delete(key)
+  }
   url.username = String(migrationRole)
   url.password = String(password)
   return buildMigrationConnectionString(url.toString(), appRole, migrationNonce)
 }
+
+/** The only query parameters of the admin URL that reach the migration URL: transport trust, nothing else. */
+export const MIGRATION_URL_SAFE_PARAMETERS = new Set(['sslmode', 'sslrootcert', 'sslcrl', 'sslsni', 'uselibpqcompat', 'connect_timeout'])
+/** Query parameters that name a credential or an identity: an admin URL carrying one is refused, not trimmed. */
+export const MIGRATION_URL_REFUSED_PARAMETERS = new Set([
+  'user', 'password', 'sslpassword', 'passfile', 'service', 'servicefile', 'host', 'hostaddr', 'port', 'dbname', 'database',
+])
 
 /**
  * Pure: the admin connection string with `options=-c role=<appRole>` merged in.
@@ -1993,7 +2032,16 @@ async function otherClientBackends(client) {
  */
 async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
   const { rows } = await client.query(
-    `SELECT r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
+    `SELECT r.rolsuper,
+            (shobj_description(r.oid, 'pg_authid') = $3) AS marked,
+            -- EVERYTHING THE ROLE OWNS OR IS GRANTED ANYWHERE IN THE CLUSTER, from the shared dependency
+            -- catalogue (owner 'o' and ACL 'a' entries, which also record default privileges), except the
+            -- one thing it is meant to hold: CONNECT on THIS database.
+            (SELECT count(*)::int FROM pg_shdepend d
+              WHERE d.refclassid = 'pg_authid'::regclass AND d.refobjid = r.oid AND d.deptype IN ('o', 'a')
+                AND NOT (d.deptype = 'a' AND d.classid = 'pg_database'::regclass
+                         AND d.objid = (SELECT oid FROM pg_database WHERE datname = current_database()))) AS direct_dependencies,
+            (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS role_settings, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
             current_setting('server_version_num')::int AS server_version_num,
             -- 'SET' is a PostgreSQL 16 mode of pg_has_role(); before it, MEMBER is what answers
             -- "may SET ROLE". The CASE keeps the unknown mode from ever being evaluated on 15.
@@ -2011,7 +2059,7 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
             EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.roleid = r.oid AND m.member = adm.oid AND m.admin_option) AS admin_has_admin_option
        FROM pg_roles r, pg_roles a, pg_roles adm
       WHERE r.rolname = $1 AND a.rolname = $2 AND adm.rolname = current_user`,
-    [migrationRole, appRole],
+    [migrationRole, appRole, MIGRATION_ROLE_MARKER],
   )
   const row = rows[0]
   const serverVersionNum = Number((await client.query(`SELECT current_setting('server_version_num')::int AS v`)).rows[0]?.v ?? 0)
@@ -2020,6 +2068,9 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
   return {
     ...base,
     exists: true,
+    marked: row.marked === true,
+    directDependencies: Number(row.direct_dependencies ?? 0),
+    roleSettings: Number(row.role_settings ?? 0),
     rolsuper: row.rolsuper === true,
     rolcreaterole: row.rolcreaterole === true,
     rolcreatedb: row.rolcreatedb === true,
@@ -3795,7 +3846,36 @@ export async function doPrintMigrationUrl(client, options, adminUrl) {
   }
   const password = randomBytes(32).toString('hex')
   await client.query(buildMigrationLoginStatement(options.migrationRole, scramSha256Verifier(password)))
-  MACHINE_CHANNEL.write(`${buildMigrationLoginUrl(adminUrl, options.migrationRole, password, appRole, options.migrationNonce)}\n`)
+  let migrationUrl
+  try {
+    migrationUrl = buildMigrationLoginUrl(adminUrl, options.migrationRole, password, appRole, options.migrationNonce)
+  } catch (error) {
+    await retireMigrationLogin(client, options.migrationRole)
+    console.error(`NO MIGRATION URL: ${error instanceof Error ? error.message : String(error)}`)
+    return EXIT_ERROR
+  }
+  // PROVEN, NOT ASSUMED: the URL is opened once here and must authenticate as the migration role and run as
+  // the application role. Whatever a driver does with a query parameter, a URL that logs in as anything else
+  // is never printed, and the login just opened is closed again.
+  // (Without the binding stamp: this connection is closed before the window starts and must not be a sighting
+  // of it.)
+  const probe = new pg.Client({ connectionString: buildMigrationLoginUrl(adminUrl, options.migrationRole, password, appRole, '') })
+  let landed = { s: '', c: '' }
+  try {
+    await probe.connect()
+    const { rows: who } = await probe.query('SELECT session_user AS s, current_user AS c')
+    landed = who[0] ?? landed
+  } catch (error) {
+    landed = { s: `<could not connect: ${error instanceof Error ? error.message : String(error)}>`, c: '' }
+  } finally {
+    await probe.end().catch(() => {})
+  }
+  if (landed.s !== options.migrationRole || landed.c !== appRole) {
+    await retireMigrationLogin(client, options.migrationRole)
+    console.error(`NO MIGRATION URL: the URL authenticated as "${landed.s}" and ran as "${landed.c}", not as ${options.migrationRole} running as ${appRole}. Nothing was printed and the login was closed.`)
+    return EXIT_ERROR
+  }
+  MACHINE_CHANNEL.write(`${migrationUrl}\n`)
   console.error(`The migration connects as ${options.migrationRole} (a fresh password for this window; no privilege of its own) and RUNS AS ${appRole}. The deploy admin login is not in that URL.`)
   return EXIT_OK
 }
@@ -3829,13 +3909,34 @@ export async function doEnsureMigrationRole(client, options) {
     return EXIT_ERROR
   }
   const modern = Number((await client.query(`SELECT current_setting('server_version_num')::int AS v`)).rows[0]?.v ?? 0) >= 160000
-  const { rows } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [migrationRole])
-  if (rows.length === 0) {
-    await client.query(`CREATE ROLE ${quoteIdent(migrationRole)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`)
-    console.error(`Created the role ${migrationRole}.`)
+  // NEVER ADOPT A ROLE THIS TOOL DID NOT MAKE (Codex CRITICAL). A pre-existing role under this name may be a
+  // login with a known password; granting it the application's membership and CONNECT would hand it the
+  // application's privileges at once, and a refusal after the grants would not undo them. So an existing
+  // role is judged FIRST, from the server, and nothing is granted unless it carries the marker comment and
+  // passes the same assessment the preflight applies; creation, marker and grants are one transaction.
+  const existing = await client.query('SELECT oid FROM pg_roles WHERE rolname = $1', [migrationRole])
+  if (existing.rows.length > 0) {
+    const before = assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, facts))
+    if (!before.usable && !/no CONNECT of its own|does not exist|cannot SET ROLE/.test(before.reason)) {
+      console.error(`NOT ENSURED: ${before.reason}`)
+      console.error('Nothing was granted to it and nothing about it was altered.')
+      return EXIT_ERROR
+    }
   }
-  await client.query(`GRANT ${quoteIdent(appRole)} TO ${quoteIdent(migrationRole)}${modern ? ' WITH INHERIT TRUE, SET TRUE' : ''}`)
-  await client.query(`GRANT CONNECT ON DATABASE ${quoteIdent(facts.database)} TO ${quoteIdent(migrationRole)}`)
+  await client.query('BEGIN')
+  try {
+    if (existing.rows.length === 0) {
+      await client.query(`CREATE ROLE ${quoteIdent(migrationRole)} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`)
+      await client.query(`COMMENT ON ROLE ${quoteIdent(migrationRole)} IS '${MIGRATION_ROLE_MARKER}'`)
+      console.error(`Created the role ${migrationRole}.`)
+    }
+    await client.query(`GRANT ${quoteIdent(appRole)} TO ${quoteIdent(migrationRole)}${modern ? ' WITH INHERIT TRUE, SET TRUE' : ''}`)
+    await client.query(`GRANT CONNECT ON DATABASE ${quoteIdent(facts.database)} TO ${quoteIdent(migrationRole)}`)
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  }
   const after = await readFacts(client, appRole)
   const verdict = assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, after))
   if (!verdict.usable) {
@@ -3854,15 +3955,47 @@ export async function doEnsureMigrationRole(client, options) {
  * advisory line.
  */
 export async function retireMigrationLogin(client, migrationRole) {
-  if (!migrationRole) return
-  try {
-    const { rows } = await client.query('SELECT 1 FROM pg_roles WHERE rolname = $1', [migrationRole])
-    if (rows.length === 0) return
-    await client.query(buildMigrationLogoutStatement(migrationRole))
-    console.error(`The migration login ${migrationRole} is closed (NOLOGIN, no password).`)
-  } catch (error) {
-    console.error(`ADVISORY: could not close the migration login ${migrationRole} (${error instanceof Error ? error.message : String(error)}). The fence is released; the next window sets a different password on it. To close it by hand: ${buildMigrationLogoutStatement(migrationRole)};`)
+  // RETURNS true only when the SERVER confirms the login is closed: `rolcanlogin` false and, where the
+  // admin may read it, a NULL password. A failed ALTER is retried once, and a login that stays open is a
+  // FAILED RELEASE (Codex HIGH): the application account holds the window's password and an open login
+  // keeps CONNECT through every later fence. Nothing here is advisory any more.
+  if (!migrationRole) return true
+  let lastError = ''
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const { rows } = await client.query('SELECT rolcanlogin FROM pg_roles WHERE rolname = $1', [migrationRole])
+      if (rows.length === 0) return true
+      await client.query(buildMigrationLogoutStatement(migrationRole))
+      const after = (await client.query('SELECT rolcanlogin FROM pg_roles WHERE rolname = $1', [migrationRole])).rows[0]
+      let passwordGone = true
+      try {
+        const pw = (await client.query('SELECT rolpassword IS NULL AS gone FROM pg_authid WHERE rolname = $1', [migrationRole])).rows[0]
+        passwordGone = pw?.gone === true
+      } catch {
+        // pg_authid is superuser-only; with NOLOGIN confirmed the password cannot be used to log in.
+      }
+      if (after && after.rolcanlogin === false && passwordGone) {
+        console.error(`The migration login ${migrationRole} is closed (confirmed by the server: NOLOGIN, no password).`)
+        return true
+      }
+      lastError = `the server still reports ${after?.rolcanlogin === true ? 'LOGIN enabled' : 'a stored password'} after the ALTER`
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error)
+    }
   }
+  console.error(`THE MIGRATION LOGIN ${migrationRole} IS STILL OPEN (${lastError}). The CONNECT grants are restored, but the application account holds the password of this window and the login keeps CONNECT through every later fence.`)
+  console.error(`Re-run the release (it is idempotent and retries this), or close it by hand as a superuser or its administrator: ${buildMigrationLogoutStatement(migrationRole)};`)
+  return false
+}
+
+/**
+ * The end of a release: when the grants are back (or already were), the window's login must be CONFIRMED
+ * closed, and a login that cannot be confirmed closed turns the release into a failure. Returns the exit
+ * status the helper ends with.
+ */
+export async function finishRelease(client, options, releaseCode) {
+  if (releaseCode !== EXIT_OK && releaseCode !== EXIT_ALREADY_RELEASED) return releaseCode
+  return (await retireMigrationLogin(client, options.migrationRole)) ? releaseCode : EXIT_ERROR
 }
 
 async function main() {
@@ -4039,11 +4172,7 @@ async function main() {
     else if (options.mode === 'audit-authority') process.exitCode = await doAuditAuthority(client, options)
     else if (options.mode === 'ensure-migration-role') process.exitCode = await doEnsureMigrationRole(client, options)
     else {
-      process.exitCode = await doRelease(client, options)
-      // Released, or already released: the window is over, so its login is closed.
-      if (process.exitCode === EXIT_OK || process.exitCode === EXIT_ALREADY_RELEASED) {
-        await retireMigrationLogin(client, options.migrationRole)
-      }
+      process.exitCode = await finishRelease(client, options, await doRelease(client, options))
     }
   } finally {
     await client.end()

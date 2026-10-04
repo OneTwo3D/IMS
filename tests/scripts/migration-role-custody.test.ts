@@ -8,7 +8,11 @@ import { test } from 'node:test'
 import pg from 'pg'
 
 import {
+  MIGRATION_ROLE_MARKER,
+  MIGRATION_URL_SAFE_PARAMETERS,
   assessMigrationRoleAttributes,
+  finishRelease,
+  retireMigrationLogin,
   buildMigrationLoginUrl,
   planConnectionFence,
   scramSha256Verifier,
@@ -281,6 +285,7 @@ test('[o3d-1bgr] the preflight refuses a migration role that is not worth nothin
     ]
     for (const { role, setup, expect } of fixtures) {
       rig.cluster.psql(['-c', `CREATE ROLE ${role} NOLOGIN ${setup.join(' ')}`])
+      rig.cluster.psql(['-c', `COMMENT ON ROLE ${role} IS '${MIGRATION_ROLE_MARKER}'`])
       rig.cluster.psql(['-c', `GRANT imsapp TO ${role}`])
       rig.cluster.psql(['-c', `GRANT CONNECT ON DATABASE imsdb TO ${role}`])
       const run = helper(rig, ['--preflight'], { migrationRole: role })
@@ -292,6 +297,7 @@ test('[o3d-1bgr] the preflight refuses a migration role that is not worth nothin
     // A membership the application role does not have.
     rig.cluster.psql(['-c', 'CREATE ROLE other_privilege NOLOGIN'])
     rig.cluster.psql(['-c', 'CREATE ROLE mig_extra NOLOGIN'])
+    rig.cluster.psql(['-c', `COMMENT ON ROLE mig_extra IS '${MIGRATION_ROLE_MARKER}'`])
     rig.cluster.psql(['-c', 'GRANT imsapp, other_privilege TO mig_extra'])
     rig.cluster.psql(['-c', 'GRANT CONNECT ON DATABASE imsdb TO mig_extra'])
     const extra = helper(rig, ['--preflight'], { migrationRole: 'mig_extra' })
@@ -300,6 +306,7 @@ test('[o3d-1bgr] the preflight refuses a migration role that is not worth nothin
 
     // No direct CONNECT: the fence would lock it out together with the application role.
     rig.cluster.psql(['-c', 'CREATE ROLE mig_noconnect NOLOGIN'])
+    rig.cluster.psql(['-c', `COMMENT ON ROLE mig_noconnect IS '${MIGRATION_ROLE_MARKER}'`])
     rig.cluster.psql(['-c', 'GRANT imsapp TO mig_noconnect'])
     const noConnect = helper(rig, ['--preflight'], { migrationRole: 'mig_noconnect' })
     assert.equal(noConnect.status, 3, `a migration role with no CONNECT of its own is refused:\n${noConnect.stderr}`)
@@ -355,20 +362,162 @@ test('[o3d-1bgr] the minted password is in no server log: the verifier is sent, 
   })
 })
 
-test('[o3d-1bgr] --ensure-migration-role never demotes or adopts a role someone else made under that name', async () => {
+test('[o3d-1bgr] --ensure-migration-role never adopts, grants or alters a role someone else made under that name (Codex CRITICAL)', async () => {
   await withRig(async (rig) => {
-    rig.cluster.psql(['-c', 'CREATE ROLE imsapp_migrator NOLOGIN SUPERUSER'])
+    // A pre-existing LOGIN role with a known password and no marker: the dangerous case. Granting it the
+    // application role would hand it the application's database-owner privileges at once.
+    rig.cluster.psql(['-c', "CREATE ROLE imsapp_migrator LOGIN PASSWORD 'known-password'"])
+    const state = () => rig.cluster.psql(['-c', "SELECT (SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'imsapp_migrator'), (SELECT rolcanlogin FROM pg_roles WHERE rolname = 'imsapp_migrator'), coalesce((SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'imsapp_migrator'), '<none>'), has_database_privilege('imsapp_migrator', 'imsdb', 'CREATE')"])
+    const before = state()
+    console.log(`precondition: pre-existing unmarked login: memberships|login|comment|CREATE = ${before}`)
+    assert.equal(before, '0|t|<none>|f')
     const run = helper(rig, ['--ensure-migration-role'])
-    console.log(`pre-existing superuser role: exit ${run.status}`)
+    console.log(`ensure over it: exit ${run.status}; ${run.stderr.split('\n').find((l) => /NOT ENSURED/.test(l))?.slice(0, 120)}`)
     assert.notEqual(run.status, 0)
-    assert.match(run.stderr, /SUPERUSER/)
-    assert.equal(rig.cluster.psql(['-c', "SELECT rolsuper FROM pg_roles WHERE rolname = 'imsapp_migrator'"]), 't', 'the existing role is left exactly as it was found')
+    assert.match(run.stderr, /was not created by this tool/)
+    assert.equal(state(), before, 'nothing was granted to it, commented on or altered')
+    // The same role is refused by the preflight and by --print-migration-url.
+    assert.equal(helper(rig, ['--preflight']).status, 3)
+    assert.notEqual(helper(rig, ['--print-migration-url', `--migration-nonce=${NONCE}`]).status, 0)
+
+    // MUTATION no-marker-check: with the marker test removed the SAME call grants it the membership.
+    const script = mutatedHelper(rig, '  if (!f.marked) {', '  if (false) {', 'no-marker-check')
+    const bad = helper(rig, ['--ensure-migration-role'], { script })
+    console.log(`mutated ensure over it: exit ${bad.status}; state now ${state()}`)
+    assert.ok(Number(state().split('|')[0]) >= 1, 'the mutated ensure grants the application role to the foreign login: the real arm above would be red')
   })
+})
+
+test('[o3d-1bgr] the preflight audits what a marked role holds DIRECTLY, one fixture each (Codex HIGH)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const ok = helper(rig, ['--preflight'])
+    console.log(`control: preflight over the role ensure made exits ${ok.status}`)
+    assert.equal(ok.status, 0, ok.stderr)
+    const fixtures: Array<{ label: string; sql: string; undo: string; expect: RegExp }> = [
+      { label: 'an owned object', sql: 'CREATE TABLE owned_by_mig (id int); ALTER TABLE owned_by_mig OWNER TO imsapp_migrator', undo: 'DROP TABLE owned_by_mig', expect: /object\(s\) or privilege\(s\) of its own/ },
+      { label: 'a direct grant on a table', sql: 'CREATE TABLE granted (id int); GRANT SELECT ON granted TO imsapp_migrator', undo: 'DROP TABLE granted', expect: /object\(s\) or privilege\(s\) of its own/ },
+      { label: 'CREATE on a schema', sql: 'CREATE SCHEMA extra_schema; GRANT CREATE ON SCHEMA extra_schema TO imsapp_migrator', undo: 'DROP SCHEMA extra_schema', expect: /object\(s\) or privilege\(s\) of its own/ },
+      { label: 'a default privilege', sql: 'ALTER DEFAULT PRIVILEGES FOR ROLE imsapp_migrator GRANT SELECT ON TABLES TO imsapp', undo: 'ALTER DEFAULT PRIVILEGES FOR ROLE imsapp_migrator REVOKE SELECT ON TABLES FROM imsapp', expect: /object\(s\) or privilege\(s\) of its own/ },
+      { label: 'a privilege on ANOTHER database', sql: 'CREATE DATABASE otherdb; GRANT CONNECT ON DATABASE otherdb TO imsapp_migrator', undo: 'DROP DATABASE otherdb', expect: /object\(s\) or privilege\(s\) of its own/ },
+      { label: 'a per-role setting', sql: "ALTER ROLE imsapp_migrator SET search_path = pg_catalog", undo: 'ALTER ROLE imsapp_migrator RESET search_path', expect: /per-role setting/ },
+      { label: 'pg_read_server_files membership', sql: 'GRANT pg_read_server_files TO imsapp_migrator', undo: 'REVOKE pg_read_server_files FROM imsapp_migrator', expect: /member of a role the application role is not/ },
+    ]
+    for (const { label, sql, undo, expect } of fixtures) {
+      const dbFor = (statement: string) => (/DATABASE/.test(statement) ? 'postgres' : 'imsdb')
+      for (const statement of sql.split('; ')) rig.cluster.psql(['-c', statement], { database: dbFor(statement) })
+      const run = helper(rig, ['--preflight'])
+      console.log(`${label}: preflight exit ${run.status}`)
+      assert.equal(run.status, 3, `${label} must be refused:\n${run.stderr}`)
+      assert.match(run.stderr, expect, label)
+      rig.cluster.psql(['-c', undo], { database: dbFor(undo) })
+      assert.equal(helper(rig, ['--preflight']).status, 0, `control after undoing ${label}: the role passes again`)
+    }
+    // MUTATION no-direct-audit: the owned-object fixture passes the preflight without the dependency check.
+    const script = mutatedHelper(rig, '  if (f.directDependencies > 0) {', '  if (false) {', 'no-direct-audit')
+    rig.cluster.psql(['-c', 'CREATE TABLE owned_by_mig (id int); ALTER TABLE owned_by_mig OWNER TO imsapp_migrator'], { database: 'imsdb' })
+    const accepted = helper(rig, ['--preflight'], { script })
+    console.log(`mutated preflight over a role that owns a table: exit ${accepted.status}`)
+    assert.equal(accepted.status, 0, 'the mutated preflight accepts it: the real arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] a URL built from an admin URL with credential or identity query parameters is refused, and a hostile query is stripped (Codex CRITICAL)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const secretUrl = `postgresql://deployadmin@127.0.0.1:${rig.port}/imsdb?password=${encodeURIComponent(rig.adminPassword)}`
+    for (const hostile of [`?password=${encodeURIComponent(rig.adminPassword)}`, '?sslpassword=hunter2', '?user=deployadmin', '?passfile=/root/.pgpass', '?host=evil.example', '?dbname=postgres']) {
+      const url = `postgresql://deployadmin:${rig.adminPassword}@127.0.0.1:${rig.port}/imsdb${hostile}`
+      const run = spawnSync('node', [SCRIPT, '--print-migration-url', `--migration-nonce=${NONCE}`, ...rig.identity, '--migration-role=imsapp_migrator'], {
+        encoding: 'utf8', env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: url } as unknown as NodeJS.ProcessEnv, cwd: rig.root,
+      })
+      console.log(`admin URL with ${hostile.split('=')[0]}: exit ${run.status}, stdout bytes ${run.stdout.length}`)
+      assert.notEqual(run.status, 0, hostile)
+      assert.equal(run.stdout, '', 'nothing is printed')
+      assert.ok(!`${run.stdout}${run.stderr}`.includes(rig.adminPassword), 'and the admin secret is not echoed')
+    }
+    void secretUrl
+    // A hostile but non-identity query is STRIPPED: the emitted URL's options is exactly the role option.
+    const stripped = spawnSync('node', [SCRIPT, '--print-migration-url', `--migration-nonce=${NONCE}`, ...rig.identity, '--migration-role=imsapp_migrator'], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: `${rig.adminUrl}?options=${encodeURIComponent('-c statement_timeout=0 -c search_path=evil')}&application_name=evil&sslmode=disable` } as unknown as NodeJS.ProcessEnv,
+      cwd: rig.root,
+    })
+    assert.equal(stripped.status, 0, stripped.stderr)
+    const emitted = new URL(stripped.stdout.trim())
+    const keys = [...emitted.searchParams.keys()].sort()
+    console.log(`emitted query keys: ${keys.join(',')}; options=${emitted.searchParams.get('options')}`)
+    assert.deepEqual(keys, ['application_name', 'options', 'sslmode'], 'only the whitelisted transport parameter plus the two this tool sets')
+    assert.equal(emitted.searchParams.get('options'), '-c role=imsapp')
+    assert.match(emitted.searchParams.get('application_name') ?? '', /^ims-migration-/)
+    assert.ok(!stripped.stdout.includes('evil') && !stripped.stdout.includes(rig.adminPassword))
+    await session(emitted.toString(), async (client) => {
+      assert.deepEqual((await client.query('SELECT session_user AS s, current_user AS c')).rows[0], { s: 'imsapp_migrator', c: 'imsapp' })
+    })
+  })
+})
+
+test('buildMigrationLoginUrl: every query parameter that is not whitelisted is gone, and the whitelist holds only transport trust (pure)', () => {
+  const names = ['sslmode', 'sslrootcert', 'sslcert', 'sslkey', 'options', 'application_name', 'fallback_application_name', 'keepalives', 'target_session_attrs', 'schema', 'connection_limit', 'pgbouncer', 'channel_binding', 'gssencmode', 'krbsrvname', 'requirepeer', 'ssl', 'replication']
+  for (const name of names) {
+    const url = new URL(buildMigrationLoginUrl(`postgresql://adm:pw@h:5432/d?${name}=X`, 'mig', 'pw2', 'app', NONCE))
+    const kept = [...url.searchParams.keys()].filter((key) => key !== 'options' && key !== 'application_name')
+    assert.equal(kept.length > 0, MIGRATION_URL_SAFE_PARAMETERS.has(name), `${name}: kept only if whitelisted`)
+    assert.ok(!url.toString().includes('=X') || MIGRATION_URL_SAFE_PARAMETERS.has(name), `${name}: its value is not carried`)
+  }
+  assert.deepEqual([...MIGRATION_URL_SAFE_PARAMETERS].sort(), ['connect_timeout', 'sslcrl', 'sslmode', 'sslrootcert', 'sslsni', 'uselibpqcompat'])
+  for (const refused of ['password', 'PASSWORD', 'user', 'sslpassword', 'passfile', 'service', 'host', 'hostaddr', 'port', 'dbname']) {
+    assert.throws(() => buildMigrationLoginUrl(`postgresql://adm:pw@h:5432/d?${refused}=X`, 'mig', 'pw2', 'app'), /credential or an identity/, refused)
+  }
+})
+
+test('[o3d-1bgr] a release whose migration login cannot be CONFIRMED closed fails loud (Codex HIGH)', async () => {
+  const log = (t: { lines: string[] }) => (...a: unknown[]) => { t.lines.push(a.join(' ')) }
+  const fake = (behaviour: 'closes' | 'alter-throws' | 'stays-open') => {
+    const state = { canLogin: true, statements: [] as string[] }
+    return {
+      state,
+      client: {
+        query: async (sql: string) => {
+          state.statements.push(sql)
+          if (/FROM pg_roles/.test(sql)) return { rows: [{ rolcanlogin: state.canLogin }] }
+          if (/pg_authid/.test(sql)) return { rows: [{ gone: !state.canLogin }] }
+          if (/^ALTER ROLE/.test(sql)) {
+            if (behaviour === 'alter-throws') throw new Error('permission denied to alter role')
+            if (behaviour === 'closes') state.canLogin = false
+            return { rows: [] }
+          }
+          throw new Error(`unexpected ${sql}`)
+        },
+      },
+    }
+  }
+  const captured = { lines: [] as string[] }
+  const original = console.error
+  console.error = log(captured)
+  try {
+    const closes = fake('closes')
+    assert.equal(await finishRelease(closes.client as never, { migrationRole: 'm' }, 0), 0, 'closed and confirmed: the release keeps its status')
+    assert.equal(await finishRelease(fake('closes').client as never, { migrationRole: 'm' }, 6), 6, 'including the already-released status')
+    for (const behaviour of ['alter-throws', 'stays-open'] as const) {
+      const run = fake(behaviour)
+      const code = await finishRelease(run.client as never, { migrationRole: 'm' }, 0)
+      console.log(`${behaviour}: release ends with ${code}; ALTER attempts ${run.state.statements.filter((q) => /^ALTER/.test(q)).length}`)
+      assert.equal(code, 1, `${behaviour}: a login that is not confirmed closed fails the release`)
+      assert.equal(run.state.statements.filter((q) => /^ALTER/.test(q)).length, 2, 'after one retry')
+      assert.ok(captured.lines.some((l) => /STILL OPEN/.test(l)) && captured.lines.some((l) => /ALTER ROLE "m" NOLOGIN PASSWORD NULL/.test(l)), 'with the statement that closes it by hand')
+    }
+    assert.equal(await finishRelease(fake('stays-open').client as never, { migrationRole: 'm' }, 3), 3, 'a release that itself failed keeps its own status')
+    assert.equal(await retireMigrationLogin(fake('closes').client as never, ''), true)
+  } finally {
+    console.error = original
+  }
 })
 
 test('assessMigrationRoleAttributes: administrability, one fixture each (pure)', () => {
   const proper = {
     migrationRole: 'm', appRole: 'a', database: 'd', adminRole: 'adm', serverVersionNum: 160000, exists: true,
+    marked: true, directDependencies: 0, roleSettings: 0,
     rolsuper: false, rolcreaterole: false, rolcreatedb: false, rolreplication: false, rolbypassrls: false,
     canSetAppRole: true, appIsMember: false, reachesOtherRoles: false, directConnect: true,
     adminIsSuperuser: false, adminCreaterole: true, adminHasAdminOption: true,
@@ -514,7 +663,9 @@ test('[o3d-1bgr] MUTATION skip-NOLOGIN: without the closing statement the minted
     publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
     assert.equal(helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`]).status, 0)
     const release = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script })
-    assert.ok(release.status === 0 || release.status === 6, release.stderr)
+    // Since Codex round 1 the release CONFIRMS the close: without the ALTER it ends non-zero and says so.
+    assert.equal(release.status, 1, release.stderr)
+    assert.match(release.stderr, /STILL OPEN/)
     await session(url, async (client) => { await client.query('SELECT 1') })
     console.log('mutated release: the minted login still connects')
   })

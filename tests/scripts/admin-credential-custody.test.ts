@@ -546,3 +546,21 @@ test('[o3d-1bgr] db_migration_role_for derives <app user>_migrator, prefers the 
   assert.match(role('DB_MIGRATION_ROLE=', '--app-user=x;rm'), /rc=1/, 'and so is anything shell-shaped')
   assert.equal(role('DB_MIGRATION_ROLE='), 'rc=0', 'with no name at all nothing is printed and the helper itself refuses what needs one')
 })
+
+test('[o3d-1bgr] the invocation WINS over the root file, and the file answers when the invocation is silent (Codex HIGH: install.sh discarded the invocation)', () => {
+  const dir = workdir()
+  try {
+    const { trust, file } = credentialTree(dir, `DEPLOY_ADMIN_DATABASE_URL="${URL_VALUE}"\nIMS_MIGRATION_ROLE=from_file\n`)
+    const run = (env: Record<string, string>) => bash(
+      'source "$1"; db_admin_credential_load "" "$2" "$3" "$4"; echo "admin=[${DEPLOY_ADMIN_DATABASE_URL}]"',
+      [SHIPPED_LIBRARY, file, String(UID), trust], env)
+    const typed = 'postgresql://typed:canary-invocation@127.0.0.1:5432/imsdb'
+    const both = run({ DEPLOY_ADMIN_DATABASE_URL: typed })
+    console.log(`invocation + file: ${both.stdout.trim()}`)
+    assert.match(both.stdout, /admin=\[postgresql:\/\/typed:canary-invocation@/, 'the invocation value is the one in use')
+    const silent = run({})
+    assert.match(silent.stdout, /s3cret-canary/, 'with the invocation silent the root file answers')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

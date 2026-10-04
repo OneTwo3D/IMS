@@ -27,6 +27,12 @@ This repository uses an `x.y.z` release scheme.
   The server is asked, not the configuration: a migration role that is a superuser, holds CREATEROLE/CREATEDB/
   REPLICATION/BYPASSRLS, reaches a role the application cannot, cannot `SET ROLE` to the application role, has no
   `CONNECT` of its own or cannot be altered by the admin is refused by `--preflight` before anything is stopped.
+- **A migration role this tool did not create is never adopted** (marker comment; refused before any grant, in one
+  transaction), a marked role that owns or is granted anything of its own anywhere in the cluster, carries per-role
+  settings or reaches a role the application cannot is refused by `--preflight`, the minted URL keeps only
+  transport-trust query parameters from the admin URL (an admin URL carrying `password=`, `user=`, `host=` and the
+  like is refused) and is opened once to prove it authenticates as the migration role, and a release whose login the
+  server cannot confirm closed now FAILS (retryable) instead of reporting success.
 - **The operator recovery wrappers** read the root file, run the helper as root, and (o3d-bpbv) take the cutover
   lock first, resolve the documented pointer once, hash that directory and execute the helper by the resolved
   path, so a publication landing between the hash and the exec can no longer substitute a different release.

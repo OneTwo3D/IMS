@@ -52,6 +52,7 @@ const SHIPPED = [
   'provision_database_role_and_privileges',
   'first_install_exemption_available',
   'require_fenceable_database',
+  'ensure_migration_role_exists',
 ]
   .map((name) => shippedFunction(INSTALL_SOURCE, name))
   .join('\n')
@@ -84,6 +85,7 @@ run_as_user() { shift; "$@"; }
 # The operator text about the admin credential is the fence library's one function (owner decision C3),
 # so the refusal this rig exercises reaches it the way the installer does.
 source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}
+MIGRATION_ROLE_MARKER=${JSON.stringify(/^MIGRATION_ROLE_MARKER='([^']+)'$/m.exec(INSTALL_SOURCE)?.[1] ?? '')}
 INSTALL_POSTGRES=y
 APP_DIR="/nonexistent/app"
 DEPLOY_ADMIN_DATABASE_URL=""
@@ -627,4 +629,36 @@ test('r37: the shipped order is the tested order — nothing mutating sits befor
     callSites[0].index > gates[0].index && callSites[1].index > gates[1].index,
     'each path performs its gate first and its role work second',
   )
+})
+
+test('[o3d-1bgr] install.sh never grants the application role to a pre-existing login it did not create, and creates and re-verifies its own (Codex CRITICAL)', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ims-migrole-install-'))
+  let cluster: Cluster | undefined
+  try {
+    cluster = startCluster(root, 'mr', await freePort(), '127.0.0.1')
+    cluster.psql(['-c', 'CREATE ROLE imsuser LOGIN'])
+    cluster.psql(['-c', 'CREATE DATABASE one_two_inventory OWNER imsuser'])
+    const vars = { DB_HOST: '127.0.0.1', DB_PORT: String(cluster.port), DB_NAME: 'one_two_inventory', DB_USER: 'imsuser', DB_PASSWORD: 'x', IMS_PG_SOCKET_DIR: cluster.socket }
+    const state = () => cluster!.psql(['-c', "SELECT (SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'imsuser_migrator'), (SELECT rolcanlogin FROM pg_roles WHERE rolname = 'imsuser_migrator'), coalesce((SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = 'imsuser_migrator'), '<none>')"])
+
+    // 1. A FOREIGN LOGIN with a known password under the migration name.
+    cluster.psql(['-c', "CREATE ROLE imsuser_migrator LOGIN PASSWORD 'known'"])
+    console.log(`precondition: foreign login memberships|login|comment = ${state()}`)
+    const refused = runShipped(vars, {}, 'ensure_migration_role_exists; echo REACHED_END')
+    console.log(`install over a foreign login: exit ${refused.status}`)
+    assert.equal(refused.status, 9, refused.output)
+    assert.doesNotMatch(refused.output, /REACHED_END/)
+    assert.match(refused.output, /NOT created by this installer|was NOT created by this installer|already exists and was NOT created/)
+    assert.equal(state(), '0|t|<none>', 'nothing granted, commented on or altered')
+
+    // 2. Its own: created marked, granted, idempotent on a re-run.
+    cluster.psql(['-c', 'DROP ROLE imsuser_migrator'])
+    const created = runShipped(vars, {}, 'ensure_migration_role_exists')
+    assert.equal(created.status, 0, created.output)
+    assert.match(state(), /^1\|f\|ims migration login/, 'one membership (the application role), NOLOGIN, marked')
+    assert.equal(runShipped(vars, {}, 'ensure_migration_role_exists').status, 0, 'a re-run over its own role succeeds')
+  } finally {
+    cluster?.stop()
+    rmSync(root, { recursive: true, force: true })
+  }
 })

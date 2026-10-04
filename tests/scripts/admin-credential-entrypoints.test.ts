@@ -253,3 +253,37 @@ for (const entrypoint of ENTRYPOINTS) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// CLASSES THAT MUST NOT RECUR (Codex round 1)
+// ---------------------------------------------------------------------------
+
+test('[o3d-1bgr] no entrypoint assigns DEPLOY_ADMIN_DATABASE_URL at top level: that discards the invocation before the loader reads it', () => {
+  for (const file of ENTRYPOINTS) {
+    const hits = readFileSync(join(ROOT, file), 'utf8').split('\n')
+      .map((text, index) => ({ text, line: index + 1 }))
+      .filter(({ text }) => /^DEPLOY_ADMIN_DATABASE_URL=/.test(text))
+    console.log(`${file}: top-level assignments of the admin variable: ${hits.length}`)
+    assert.deepEqual(hits, [], `${file}: the loader owns the variable; an assignment before it throws away what root typed`)
+  }
+})
+
+test('[o3d-1bgr] a role under the migration name is never granted anything before the marker is checked: every GRANT follows the refusal, in every script that creates the role', () => {
+  const mjs = readFileSync(join(ROOT, 'scripts/fence-db-connections.mjs'), 'utf8')
+  const marker = /MIGRATION_ROLE_MARKER = '([^']+)'/.exec(mjs)?.[1] ?? ''
+  assert.ok(marker.length > 20, 'precondition: the marker literal was found')
+  for (const [file, grant, refusal] of [
+    ['scripts/install.sh', 'EXECUTE \'GRANT "${DB_USER}" TO "${role}"', "RAISE EXCEPTION 'role % exists and was not created by this installer'"],
+    ['scripts/provision-ims-tenant.sh', 'EXECUTE \'GRANT "${DB_USER}" TO "${DB_USER}_migrator"', "RAISE EXCEPTION 'role %_migrator exists and was not created by this tool'"],
+  ] as const) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    const at = text.indexOf(grant)
+    const raise = text.indexOf(refusal)
+    console.log(`${file}: refusal at ${raise}, first GRANT at ${at}`)
+    assert.ok(raise > 0 && at > raise, `${file}: the refusal for an unmarked existing role precedes every grant (one transaction)`)
+    assert.ok(text.includes(marker) || text.includes('MIGRATION_ROLE_MARKER'), `${file}: carries the marker`)
+  }
+  assert.ok(readFileSync(join(ROOT, 'scripts/provision-ims-tenant.sh'), 'utf8').includes(marker), 'the external provisioner spells the same marker literal as the helper')
+  assert.ok(readFileSync(join(ROOT, 'scripts/install.sh'), 'utf8').includes(`MIGRATION_ROLE_MARKER='${marker}'`), 'and so does install.sh')
+  assert.ok(mjs.includes('await finishRelease(client, options, await doRelease(client, options))'), 'release goes through finishRelease(): a login not confirmed closed fails it')
+})

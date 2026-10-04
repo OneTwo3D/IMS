@@ -2568,6 +2568,10 @@ EOSQL
 # must not have is REFUSED here by name rather than quietly demoted. It is safe under an adopted
 # fence: the role is exempt from it, and granting CONNECT to it is not what the fence holds out.
 # On an external database this script does not administer anything, so it says what to run instead.
+# The comment a migration role this installer creates carries; a role without it is never adopted. The same literal
+# is MIGRATION_ROLE_MARKER in fence-db-connections.mjs (a test asserts they are equal).
+MIGRATION_ROLE_MARKER='ims migration login: created by the IMS installer, holds nothing of its own'
+
 ensure_migration_role_exists() {
   local role="${DB_MIGRATION_ROLE:-${DB_USER}_migrator}" bad=""
   [[ "${role}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || die "The migration role name '${role}' is not a plain identifier of at most 63 characters (it is '<application role>_migrator' unless the credential file names another). Nothing has been stopped and nothing has been migrated."
@@ -2582,26 +2586,37 @@ ensure_migration_role_exists() {
     warn "or, once the admin credential is in ${DB_ADMIN_CREDENTIAL_FILE}, run fence-db-connections.mjs --ensure-migration-role (docs/installation.md)."
     return 0
   fi
-  pg_local_psql -q >/dev/null <<EOSQL || die "Creating the migration role '${role}' failed. Nothing has been stopped and nothing has been migrated."
+  # AN EXISTING ROLE IS JUDGED BEFORE ANYTHING IS GRANTED, AND IS NEVER ADOPTED UNLESS THIS TOOL MADE IT
+  # (Codex CRITICAL). A role found under this name that does not carry the marker comment may be a login
+  # with a known password; granting it the application role and CONNECT would hand it the application's
+  # database-owner privileges at once, and a refusal after the grants cannot undo them. The check, the
+  # creation, the marker and the grants are ONE statement (a DO block is one transaction): a refusal
+  # raises before any GRANT and rolls the whole thing back.
+  pg_local_psql -q >/dev/null <<EOSQL || die "The migration role '${role}' could not be created or verified: either it already exists and was NOT created by this installer (it lacks the comment '${MIGRATION_ROLE_MARKER}' — it is not adopted, altered or granted anything; name another role with IMS_MIGRATION_ROLE in ${DB_ADMIN_CREDENTIAL_FILE}, or mark it yourself once you know it holds nothing), or the statement failed. Nothing has been stopped and nothing has been migrated."
     DO \$mig\$
     BEGIN
-      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+      IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
+        IF shobj_description((SELECT oid FROM pg_roles WHERE rolname = '${role}'), 'pg_authid') IS DISTINCT FROM '${MIGRATION_ROLE_MARKER}' THEN
+          RAISE EXCEPTION 'role % exists and was not created by this installer', '${role}';
+        END IF;
+      ELSE
         CREATE ROLE "${role}" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+        COMMENT ON ROLE "${role}" IS '${MIGRATION_ROLE_MARKER}';
       END IF;
       IF current_setting('server_version_num')::int >= 160000 THEN
         EXECUTE 'GRANT "${DB_USER}" TO "${role}" WITH INHERIT TRUE, SET TRUE';
       ELSE
         EXECUTE 'GRANT "${DB_USER}" TO "${role}"';
       END IF;
+      EXECUTE 'GRANT CONNECT ON DATABASE "${DB_NAME}" TO "${role}"';
     END
     \$mig\$;
-    GRANT CONNECT ON DATABASE "${DB_NAME}" TO "${role}";
 EOSQL
   bad="$(pg_local_psql -At <<EOSQL 2>/dev/null || true
     SELECT rolname FROM pg_roles WHERE rolname = '${role}' AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls);
 EOSQL
   )"
-  [[ -z "${bad}" ]] || die "The role '${role}' already existed and holds a privilege the migration login must not have (superuser, createrole, createdb, replication or bypassrls). It is not altered here. Remove the privilege (ALTER ROLE \"${role}\" NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS) or set another name in ${DB_ADMIN_CREDENTIAL_FILE} (IMS_MIGRATION_ROLE=...). Nothing has been stopped and nothing has been migrated."
+  [[ -z "${bad}" ]] || die "The role '${role}' (created by this installer) holds a privilege the migration login must not have (superuser, createrole, createdb, replication or bypassrls). It is not altered here. Remove the privilege (ALTER ROLE \"${role}\" NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS) or set another name in ${DB_ADMIN_CREDENTIAL_FILE} (IMS_MIGRATION_ROLE=...). Nothing has been stopped and nothing has been migrated."
   success "Migration role '${role}' ready (no login until a cutover window opens one)."
 }
 
@@ -7549,7 +7564,6 @@ require_real_service_root "${LOG_DIR}"  "the log directory"
 # REFUSES a copy of it left in the application's .env (naming the file to move it to, never using
 # the value) and un-exports the variable, so a value typed on `sudo env DEPLOY_ADMIN_DATABASE_URL=...`
 # is not inherited by every command this run starts as ${APP_USER}.
-DEPLOY_ADMIN_DATABASE_URL=""
 db_admin_credential_load "${APP_DIR}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
 
 if [[ -f /etc/os-release ]]; then

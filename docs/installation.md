@@ -3967,7 +3967,16 @@ database needs once, as a superuser of that server):
 CREATE ROLE "imsuser_migrator" NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 GRANT "imsuser" TO "imsuser_migrator" WITH INHERIT TRUE, SET TRUE;   -- PostgreSQL 16+; before it: GRANT "imsuser" TO "imsuser_migrator";
 GRANT CONNECT ON DATABASE "onetwoinventory" TO "imsuser_migrator";
+COMMENT ON ROLE "imsuser_migrator" IS 'ims migration login: created by the IMS installer, holds nothing of its own';
 ```
+
+**A role that already exists is never adopted.** The comment above is the marker: `install.sh`,
+`provision-ims-tenant.sh` and `--ensure-migration-role` refuse (before granting or altering anything,
+in one transaction) a role under that name that does not carry it, because such a role may be a login
+with a known password and the grants would hand it the application's privileges. `--preflight`
+additionally refuses a marked role that owns or is granted anything of its own anywhere in the
+cluster (owned objects, direct grants, default privileges), that carries `ALTER ROLE ... SET`
+settings, or that reaches a role the application cannot (for example `pg_read_server_files`).
 
 or, as root with the admin credential in the file or on the invocation,
 `node /etc/ims-cutover-recovery/app/scripts/fence-db-connections.mjs --ensure-migration-role --app-host=… --app-port=… --app-user=… --app-database=… --migration-role=…`,
@@ -3981,11 +3990,16 @@ nothing the application role is not, can `SET ROLE` to the application role, has
 own, and can be altered by the admin; then sets `ALTER ROLE … LOGIN PASSWORD '<verifier>'` with 256
 random bits sent as a client-computed **SCRAM-SHA-256 verifier**, so the plaintext is in no server
 log (a `log_statement = 'all'` log carries the verifier, which is not the password), and prints a URL
-for the migration role with the same host, port, database and query as the admin URL plus
+for the migration role with the same host, port and database as the admin URL, only its transport-trust
+query parameters (`sslmode`, `sslrootcert`, `sslcrl`, `sslsni`, `uselibpqcompat`, `connect_timeout`), plus
 `options=-c role=<app>` and the window's binding stamp. The admin login and password are never in
-that URL. `--release` ends with `ALTER ROLE … NOLOGIN PASSWORD NULL`, advisory (a failure to close
-it is a line, never a change to the release's exit status). A window that is **interrupted** leaves a
-password nobody holds; the next window mints another.
+that URL. `--release` ends with `ALTER ROLE … NOLOGIN PASSWORD NULL` and then **asks the server** (`rolcanlogin`
+false and, where the admin may read it, a null password). A login that cannot be confirmed closed
+(retried once) makes the **release fail**: non-zero exit, the `CONNECT` grants already restored, and a
+message with the one statement that closes it by hand. Re-running the release is idempotent and retries
+it. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
+as the application role, or it is not printed and the login is closed again. A window that is
+**interrupted** leaves a password nobody holds; the next window mints another.
 
 **What is not done here.** A password-less admin through local peer authentication for a
 `postgres` OS user (no stored admin password at all) is a separate change. `pg_dump`, which takes a
