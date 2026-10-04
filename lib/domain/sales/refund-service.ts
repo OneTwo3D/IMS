@@ -62,7 +62,7 @@ import {
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
-import { LEDGER_STANDING_SELECT, ledgerStanding, rowsThatMayHaveReachedLedger, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
