@@ -4398,9 +4398,13 @@ _db_fence_scrub_environment() {
       *) unset -v "${name}" 2>/dev/null || true ;;
     esac
   done
+  # Captured with its status taken (a process substitution reports its producer's failure to nobody),
+  # then read from a here-string.
+  local exported_functions=""
+  exported_functions="$(declare -Fx)" || exported_functions=""
   while read -r _ _ name; do
     [[ -n "${name}" ]] && unset -f "${name}" 2>/dev/null || true
-  done < <(declare -Fx)
+  done <<<"${exported_functions}"
 }
 
 db_fence_exec_root() {

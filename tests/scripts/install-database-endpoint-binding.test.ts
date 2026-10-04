@@ -81,6 +81,9 @@ die()     { error "$*"; exit 9; }
 # whoever is running the tests, so the privilege transition is the identity function. Everything
 # else about the invocation — the sanitising, the binding, the flags — is the shipped code.
 run_as_user() { shift; "$@"; }
+# The operator text about the admin credential is the fence library's one function (owner decision C3),
+# so the refusal this rig exercises reaches it the way the installer does.
+source ${JSON.stringify(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'))}
 INSTALL_POSTGRES=y
 APP_DIR="/nonexistent/app"
 DEPLOY_ADMIN_DATABASE_URL=""
@@ -464,7 +467,8 @@ test('r37: a duplicate database plus a failed fence preflight leaves credentials
     assert.equal(run.status, 9, `a cutover with no admin URL must refuse:\n${run.output}`)
     assert.match(run.output, /FENCED_PATH/, 'precondition: a pre-existing database takes the fenced path')
     assert.doesNotMatch(run.output, /PROVISIONED/, 'and the refusal must land before the role work')
-    assert.match(run.output, /DEPLOY_ADMIN_DATABASE_URL is not set/, 'for the reason the finding names')
+    assert.match(run.output, /has no privileged connection that would survive revoking CONNECT/, 'for the reason the finding names')
+    assert.match(run.output, /\/etc\/ims-db-admin\/deploy-admin\.env/, 'and it names the root credential file the operator supplies it in')
     assert.match(run.output, /Nothing has been stopped and nothing has been migrated/, 'and it says the box is untouched')
 
     // ...AND IT IS TRUE. The credential the live writers hold still works.
