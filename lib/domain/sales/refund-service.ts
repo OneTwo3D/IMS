@@ -62,7 +62,7 @@ import {
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
-import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, ledgerStanding, rowsThatMayHaveReachedLedger, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 
@@ -2071,7 +2071,7 @@ async function stageRefundAccountingReversals(
           assumedReliefNotes.push(`prior refund ${priorRefund.id}'s £${recordedRelief.toFixed(2)} of Allocated Inventory relief was counted from its own record because its reversal journal is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`)
           continue
         }
-        const proof = proveJournalPosting(ownReversalRows, settings.allocatedInventoryAccount, 'credit')
+        const proof = proveJournalPosting(ownReversalRows, settings.allocatedInventoryAccount, 'credit', { excludeProvenNotPosted: true })
         if (proof.kind === 'illegible') {
           // A settled row whose payload was compacted away. Same position as no row at all, and
           // recorded as an assumption for the same reason (o3d-o97 r6).
@@ -2109,7 +2109,7 @@ async function stageRefundAccountingReversals(
         // o3d-o97 r5: and the same now goes for CANCELLED, which r4 still read as a proved zero.
         // With no recorded column behind this branch there is nothing to fall back on either, so an
         // ILLEGIBLE payload on a settled row refuses here rather than resolving to a figure.
-        const proof = proveJournalPosting(ownRows, settings.allocatedInventoryAccount, 'credit')
+        const proof = proveJournalPosting(ownRows, settings.allocatedInventoryAccount, 'credit', { excludeProvenNotPosted: true })
         if (proof.kind === 'proved') {
           priorRefundAllocationRelief += proof.amount
         } else if (proof.kind === 'illegible') {
@@ -2183,10 +2183,11 @@ async function stageRefundAccountingReversals(
         : 0
       // o3d-3la07 (M8): "settled" for an AMOUNT is a CONFIRMED, SYNCED row. An operator-asserted
       // reversal is unsettled here - it lands in the existing UNRESOLVED branch below.
-      const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
+      // o3d-fj4m (round 3): attempts PROVEN never to have reached the ledger are not part of what posted.
+      const unsettled = rowsThatMayHaveReachedLedger(reversalRows).filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
-      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
+      const legible = rowsThatMayHaveReachedLedger(reversalRows).filter((row) => payloadLinesLegible(row.payload))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either

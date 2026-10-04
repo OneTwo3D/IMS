@@ -2,7 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import type { RefundAccountingSettlement } from '@/lib/domain/sales/refund-accounting-obligations'
 import type { db } from '@/lib/db'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
-import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding, rowsThatMayHaveReachedLedger } from '@/lib/domain/accounting/ledger-standing'
 import { PRIOR_ATTEMPT_SELECT } from '@/lib/domain/accounting/prior-posting-evidence'
 
 /**
@@ -73,11 +73,10 @@ export async function dischargeRefundAccountingObligation(
         await lockFollowUpScope(tx, { connector, type: 'UNEARNED_REV_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: refundId })
       }
       const rows = await tx.accountingSyncLog.findMany({ where, select: PRIOR_ATTEMPT_SELECT })
-      const standings = rows.map((row) => ledgerStanding(row))
-      // CONFIRMED_POSTED is a settled fact: the journal posted, so the obligation IS met even though posting is
-      // off now (Codex round 2 on #733). It discharges - the flag and the staged record come down, so the refund
-      // stops blocking the order (scjz.22) - and the relief is PRESERVED, never zeroed. PROVEN_NOT_POSTED rows
-      // alongside it are irrelevant. Everything else may have posted or may still post and stays unresolved.
+      // The SAME predicate the amount reader uses (rowsThatMayHaveReachedLedger): attempts proven never to have
+      // reached the ledger are not part of what posted, so the two cannot disagree about a mixed set.
+      const counted = rowsThatMayHaveReachedLedger(rows)
+      const standings = counted.map((row) => ledgerStanding(row))
       const unsettled = standings.filter((standing) => standing !== 'PROVEN_NOT_POSTED' && standing !== 'CONFIRMED_POSTED')
       if (unsettled.length > 0) {
         const live = unsettled.includes('LIVE_WORK')
@@ -90,7 +89,7 @@ export async function dischargeRefundAccountingObligation(
             + 'Until then this refund blocks further refunds on the order.',
         }
       }
-      zero = !standings.includes('CONFIRMED_POSTED')
+      zero = counted.length === 0
     }
     await tx.salesOrderRefund.update({
       where: { id: refundId },
