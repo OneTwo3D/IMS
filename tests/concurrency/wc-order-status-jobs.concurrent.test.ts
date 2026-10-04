@@ -1145,6 +1145,38 @@ test('o3d-6ldlj (arm 26b): two jobs of one order CLAIMED AT THE SAME INSTANT are
   console.log(`claim races run: ${ROUNDS}`)
 })
 
+test('o3d-6ldlj (arm 26c): the claim takes the PER-ORDER ADVISORY LOCK before it checks and claims — parked behind a holder of that lock, it claims nothing until released, and only that order is held up', { skip }, async (t) => {
+  const deps = await loadDeps()
+  t.after(() => teardown(deps))
+  const [, hold] = kindsOf(deps)
+  resetWc()
+  const orderId = await newOrder(deps, 'advisory', 'ON_HOLD')
+  const otherOrder = await newOrder(deps, 'advisory-other', 'ON_HOLD')
+  const ref = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId, flippedAt: new Date(1_760_003_000_000) }))
+  const otherRef = await deps.db.$transaction((tx) => hold.schedule(tx, { orderId: otherOrder, flippedAt: new Date(1_760_003_000_001) }))
+  assert.ok(ref && otherRef)
+  const holderReady = Promise.withResolvers<number>()
+  const holderGo = Promise.withResolvers<void>()
+  const holder = deps.db.$transaction(async (tx) => {
+    const [{ pid }] = await tx.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`woocommerce-order-status:${orderId}`}, 0))`
+    holderReady.resolve(pid)
+    await holderGo.promise
+  }, { timeout: 30_000 })
+  const holderPid = await holderReady.promise
+
+  const blocked = hold.process({ idempotencyKeys: [ref.key] })
+  await waitUntilParkedBehind(deps.db, { holderPid, waitingOn: /pg_advisory_xact_lock/i, describe: 'the claim behind the per-order advisory lock' })
+  assert.equal((await rowOf(deps, ref.key)).status, 'PENDING', 'precondition: parked on the lock, nothing claimed yet')
+  const other = await hold.process({ idempotencyKeys: [otherRef.key] })
+  assert.equal(other.claimed, 1, 'a DIFFERENT order is not held up')
+  holderGo.resolve()
+  await holder
+  const run = await blocked
+  assert.equal(run.claimed, 1, 'released: the claim proceeds')
+  assert.equal((await rowOf(deps, ref.key)).status, 'SUCCEEDED')
+})
+
 test('o3d-6ldlj (arm 27): an UNCONFIRMED write (200 with another status) is not done: retried, then dead-lettered with the cause', { skip }, async (t) => {
   const deps = await loadDeps()
   t.after(() => teardown(deps))
