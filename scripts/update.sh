@@ -502,13 +502,11 @@ DATABASE_URL="$(env_file_value DATABASE_URL "${APP_DIR}/.env")"
 # (it is not in sudo's env_keep), so the file answers, exactly as before. It changes only the case
 # where BOTH are set, and there the two are compared and the disagreement is announced rather than
 # resolved in silence.
-# THE ADMIN CREDENTIAL IS ROOT'S AND IS NEVER READ FROM ${APP_DIR}/.env (owner decision C3).
-# db_admin_credential_load() takes the invocation first and ${DB_ADMIN_CREDENTIAL_FILE} second,
-# REFUSES a copy of it left in the application's .env -- here, before anything is stopped, naming the
-# file to move it to and never using the value -- and un-exports the variable, so a value typed on
-# `sudo env DEPLOY_ADMIN_DATABASE_URL=... bash update.sh` is not inherited by every command this run
-# starts as ${APP_USER}. (It used to be reassigned and so stayed exported.)
-db_admin_credential_load "${APP_DIR}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
+# THE ADMIN CREDENTIAL IS ROOT'S AND IS NEVER READ FROM ${APP_DIR}/.env (owner decision C3). It is
+# loaded below, as soon as the fence library that loads it has been sourced; this line only makes sure
+# that a value typed on `sudo env DEPLOY_ADMIN_DATABASE_URL=... bash update.sh` is NOT exported to
+# anything this run starts in the meantime.
+export -n DEPLOY_ADMIN_DATABASE_URL 2>/dev/null || true
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +947,14 @@ if ! $DRY_RUN && ! $PRINT_FENCE_DIGEST; then
 else
   IMS_DRIVER_PUBLISH_NOTE="this run is a write-nothing mode (--dry-run and --print-fence-digest) and published no root-owned snapshot, so it may execute no helper as root"
 fi
+
+# THE ADMIN CREDENTIAL (owner decision C3), loaded now that the library which owns that rule exists.
+# db_admin_credential_load() takes the invocation first and ${DB_ADMIN_CREDENTIAL_FILE} second,
+# REFUSES a copy of it left in the application's .env -- here, before anything is stopped, naming the
+# file to move it to and never using the value -- and un-exports the variable, so a value typed on
+# `sudo env DEPLOY_ADMIN_DATABASE_URL=... bash update.sh` is not inherited by every command this run
+# starts as ${APP_USER}. (It used to be reassigned and so stayed exported.)
+db_admin_credential_load "${APP_DIR}/.env" || die "The deploy admin credential could not be established (the reason is printed above). Nothing has been stopped and nothing has been changed."
 
 # AND THE DEPLOYMENT METADATA IS RESOLVED HERE, not three hundred lines above (o3d-z5be). The read
 # used to sit beside the .env reads at the top of this file, and it has to move down to here for one
@@ -1862,7 +1868,7 @@ readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 # destination that matches no root is REFUSED — a new publication site outside these six fails
 # loudly at install time instead of silently resolving its own path.
 publish_trust_root_candidates() {
-  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}" "${DB_ADMIN_CREDENTIAL_DIR:-}"
 }
 
 # WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK — PROVEN BY WALKING TO IT (o3d-rn10 r4).
@@ -3595,7 +3601,7 @@ fence_db_connections() {
       # this is that order on the path the ordinary cutover takes.
       DB_FENCE_UP=true
       DB_FENCE_RAISED=true
-      # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5).
+      # THE MIGRATION CONNECTS AS THE MIGRATION ROLE (it was the admin until owner decision C3) AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5).
       # The bare admin URL is what made every object a migration created owned by the deploy
       # superuser with no grant to the application: the drift check, the verification hook and
       # pg_dump all share this same admin connection and read it perfectly, so the deploy

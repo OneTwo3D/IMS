@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -77,14 +77,14 @@ async function withRig(body: (rig: Rig) => Promise<void>, setup: (rig: Rig) => v
 }
 
 /** The shipped helper, run as a real process. The admin URL goes in the ENVIRONMENT, never argv. */
-function helper(rig: Rig, args: string[], extra: { migrationRole?: string | null } = {}) {
+function helper(rig: Rig, args: string[], extra: { migrationRole?: string | null; script?: string } = {}) {
   const migrationRole = extra.migrationRole === undefined ? 'imsapp_migrator' : extra.migrationRole
   const run = spawnSync(
     'node',
-    [SCRIPT, ...args, ...rig.identity, ...(migrationRole ? [`--migration-role=${migrationRole}`] : [])],
+    [extra.script ?? SCRIPT, ...args, ...rig.identity, ...(migrationRole ? [`--migration-role=${migrationRole}`] : [])],
     {
       encoding: 'utf8',
-      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: rig.adminUrl },
+      env: { PATH: process.env.PATH ?? '', DEPLOY_ADMIN_DATABASE_URL: rig.adminUrl } as unknown as NodeJS.ProcessEnv,
       cwd: rig.root,
     },
   )
@@ -180,7 +180,7 @@ test('[o3d-1bgr] a migration over the minted URL creates tables owned by the app
     for (const script of ['scripts/check-app-db-object-access.mjs', 'scripts/check-db-writers.mjs']) {
       const run = spawnSync('node', [join(process.cwd(), script), '--app-role=imsapp'], {
         encoding: 'utf8',
-        env: { PATH: process.env.PATH ?? '', DATABASE_URL: url, DEPLOY_ADMIN_DATABASE_URL: canary },
+        env: { PATH: process.env.PATH ?? '', DATABASE_URL: url, DEPLOY_ADMIN_DATABASE_URL: canary } as unknown as NodeJS.ProcessEnv,
         cwd: rig.root,
       })
       console.log(`${script} over the migration URL with an admin canary in the environment: exit ${run.status}`)
@@ -404,4 +404,109 @@ test('scramSha256Verifier has the shape PostgreSQL stores', () => {
   const verifier = scramSha256Verifier('secret', Buffer.from('0123456789abcdef'))
   assert.match(verifier, /^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/)
   assert.equal(existsSync(SCRIPT), true)
+})
+
+// ---------------------------------------------------------------------------
+// ONE NAMED MUTATION PER ARM, run against a real cluster. Each applies one edit to a COPY of the
+// shipped helper (with a node_modules link so its imports resolve) and shows the property the
+// arm above asserts is then false -- i.e. that arm would be red. The shipped file is never edited.
+// ---------------------------------------------------------------------------
+
+function mutatedHelper(rig: Rig, find: string, replacement: string, label: string): string {
+  const original = readFileSync(SCRIPT, 'utf8')
+  const mutated = original.replace(find, replacement)
+  assert.notEqual(mutated, original, `mutation "${label}" must change the helper (precondition)`)
+  const dir = join(rig.root, `mutant-${label}`)
+  mkdirSync(join(dir, 'scripts'), { recursive: true })
+  symlinkSync(join(process.cwd(), 'node_modules'), join(dir, 'node_modules'))
+  const copy = join(dir, 'scripts', 'fence-db-connections.mjs')
+  writeFileSync(copy, mutated)
+  return copy
+}
+
+test('[o3d-1bgr] MUTATION compose-from-admin: a URL built from the admin userinfo logs in as the superuser (core arm would be red)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const script = mutatedHelper(
+      rig,
+      'buildMigrationLoginUrl(adminUrl, options.migrationRole, password, appRole, options.migrationNonce)',
+      'buildMigrationConnectionString(adminUrl, appRole, options.migrationNonce)',
+      'admin-userinfo',
+    )
+    const run = helper(rig, ['--print-migration-url', `--migration-nonce=${NONCE}`], { script })
+    assert.equal(run.status, 0, run.stderr)
+    const url = run.stdout.trim()
+    console.log(`mutated URL logs in as ${decodeURIComponent(new URL(url).username)}`)
+    await session(url, async (client) => {
+      await client.query('SET ROLE NONE')
+      const row = (await client.query('SELECT rolsuper FROM pg_roles WHERE rolname = session_user')).rows[0]
+      assert.equal(row.rolsuper, true, 'the mutated URL is the admin: SET ROLE NONE reaches a superuser, so the core arm would be red')
+    })
+  })
+})
+
+test('[o3d-1bgr] MUTATION drop-exemption: revoking CONNECT from the migration role too locks the window out (fence arm would be red)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const script = mutatedHelper(rig, "    if (migrationRole && grantee === migrationRole) continue\n", '', 'no-exemption')
+    const stateFile = join(rig.root, 'state.json')
+    const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script })
+    assert.equal(plan.status, 0, plan.stderr)
+    const planned = JSON.parse(plan.stdout.trim())
+    console.log(`mutated plan revokes from: ${planned.revoked.join(', ')}`)
+    assert.ok(planned.revoked.includes('imsapp_migrator'), 'the mutated plan revokes from the migration role: the fence arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] MUTATION no-superuser-check: a superuser migration role passes the preflight (preflight arm would be red)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    rig.cluster.psql(['-c', 'ALTER ROLE imsapp_migrator SUPERUSER'])
+    const script = mutatedHelper(rig, "  if (f.rolsuper) forbidden.push('SUPERUSER')\n", '', 'no-superuser-check')
+    const run = helper(rig, ['--preflight'], { script })
+    console.log(`mutated preflight over a SUPERUSER migration role: exit ${run.status}`)
+    assert.equal(run.status, 0, 'the mutated preflight accepts a superuser migration login: the real arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] MUTATION skip-NOLOGIN: without the closing statement the minted password still logs in after the release (release arm would be red)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    const script = mutatedHelper(rig, '    await client.query(buildMigrationLogoutStatement(migrationRole))\n', '', 'no-logout')
+    const url = printUrl(rig)
+    const stateFile = join(rig.root, 'state.json')
+    const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`])
+    publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
+    assert.equal(helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`]).status, 0)
+    const release = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script })
+    assert.ok(release.status === 0 || release.status === 6, release.stderr)
+    await session(url, async (client) => { await client.query('SELECT 1') })
+    console.log('mutated release: the minted login still connects')
+  })
+})
+
+test('[o3d-1bgr] MUTATION plaintext-password: sending the password itself puts it in the server log (log arm would be red)', async () => {
+  await withRig(async (rig) => {
+    rig.cluster.psql(['-c', "ALTER SYSTEM SET log_statement = 'all'"])
+    rig.cluster.psql(['-c', 'SELECT pg_reload_conf()'])
+    ensure(rig)
+    const script = mutatedHelper(
+      rig,
+      'await client.query(buildMigrationLoginStatement(options.migrationRole, scramSha256Verifier(password)))',
+      'await client.query(buildMigrationLoginStatement(options.migrationRole, password))',
+      'plaintext-password',
+    )
+    const run = helper(rig, ['--print-migration-url', `--migration-nonce=${NONCE}`], { script })
+    assert.equal(run.status, 0, run.stderr)
+    const password = decodeURIComponent(new URL(run.stdout.trim()).password)
+    const log = join(rig.root, 'mig', 'pg.log')
+    let text = ''
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      text = readFileSync(log, 'utf8')
+      if (text.includes(password)) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    assert.ok(text.includes(password), 'the mutated helper leaks the plaintext into the server log: the real arm above would be red')
+  })
 })

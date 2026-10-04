@@ -4159,6 +4159,10 @@ db_fence_raise() {
 # ---------------------------------------------------------------------------
 readonly DB_ADMIN_CREDENTIAL_DIR="/etc/ims-db-admin"
 readonly DB_ADMIN_CREDENTIAL_FILE="${DB_ADMIN_CREDENTIAL_DIR}/deploy-admin.env"
+# THE DIRECTORY THE OWNERSHIP WALK UP FROM THE CREDENTIAL FILE STOPS AT, and a literal for the reason
+# every other root here is: `/` on a host (every component up to it must be root's and unwritable by
+# anyone else), a scratch directory in the harnesses that rewrite this one line.
+readonly DB_ADMIN_CREDENTIAL_TRUST_ROOT="/"
 
 # THE ONE SENTENCE ABOUT WHERE THE CREDENTIAL LIVES. Every refusal, banner and wrapper message about
 # it is this function's output, and the recovery wrappers bake it in (declare -f), so there is one
@@ -4172,10 +4176,10 @@ db_admin_credential_instruction() {
   local situation="${1:-where}" detail="${2:-}" file="${DB_ADMIN_CREDENTIAL_FILE}" dir="${DB_ADMIN_CREDENTIAL_DIR}"
   case "${situation}" in
     absent)
-      printf '%s' "DEPLOY_ADMIN_DATABASE_URL was not supplied on this invocation and there is no ${file}. It is the root-only credential of a superuser or database-owner login that is a DIFFERENT role from the application's, and it lives in that file (root:root, mode 0600, in ${dir}, mode 0700) -- never in the application's .env, which the application account can write. Supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command>. To keep it, create ${dir} as root (install -d -m 0700 -o root -g root ${dir}) and put DEPLOY_ADMIN_DATABASE_URL=postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE in ${file} with an editor as root under umask 077, so the password is never on a command line. See docs/installation.md."
+      printf '%s' "DEPLOY_ADMIN_DATABASE_URL was not supplied on this invocation and there is no ${file}. It is the root-only credential of a superuser or database-owner login that is a DIFFERENT role from the application's, and it lives in that file (root:root, mode 0600, in ${dir}, mode 0700) -- never in the application's environment file, which the application account can write. Supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command> (that puts it on a command line for the length of the run; the file does not). To keep it, create ${dir} as root (owned by root, mode 0700) and put DEPLOY_ADMIN_DATABASE_URL=postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE in ${file} with an editor as root under umask 077, so the password is never on a command line. See docs/installation.md."
       ;;
     refused)
-      printf '%s' "${file} exists but was NOT read: ${detail}. It must be a regular file (not a link) owned by root, readable by nobody else (mode 0600), inside directories only root can write. Fix that as root (chown root:root ${file}; chmod 0600 ${file}; chmod 0700 ${dir}); nothing is read from it until it is right."
+      printf '%s' "${file} exists but was NOT read: ${detail}. It must be a regular file (not a link) owned by root, readable by nobody else (mode 0600), inside directories only root can write. Fix that as root (the file must belong to root:root with mode 0600, and ${dir} to root:root with mode 0700); nothing is read from it until it is right."
       ;;
     env-copy)
       printf '%s' "${detail} still defines DEPLOY_ADMIN_DATABASE_URL. That file belongs to the application account, which must never hold the admin credential, and this run will not use or move it (it would be adopting an application-owned value as a root credential). Remove the line from ${detail} and put it in ${file} instead (root:root, mode 0600, in ${dir}, mode 0700, written as root under umask 077), or supply it for this run with: sudo env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' <this command>. Nothing has been stopped and nothing has been changed."
@@ -4184,7 +4188,7 @@ db_admin_credential_instruction() {
       printf '%s' "the admin credential is root-only (${file}, or sudo env DEPLOY_ADMIN_DATABASE_URL=... on the invocation) and this account is not root, so this run cannot use or even inspect it. Re-run as root."
       ;;
     *)
-      printf '%s' "DEPLOY_ADMIN_DATABASE_URL is read from the root-owned credential file ${file} (root:root, mode 0600, in ${dir}, mode 0700), or from the invocation (sudo env DEPLOY_ADMIN_DATABASE_URL=... <command>), which takes precedence. It is never read from the application's .env."
+      printf '%s' "DEPLOY_ADMIN_DATABASE_URL is read from the root-owned credential file ${file} (root:root, mode 0600, in ${dir}, mode 0700), or from the invocation (sudo env DEPLOY_ADMIN_DATABASE_URL=... <command>), which takes precedence. It is never read from the application's environment file."
       ;;
   esac
 }
@@ -4221,7 +4225,7 @@ db_admin_env_text_value() {
 # writable by neither group nor other: a root-owned file inside a directory somebody else may write
 # can simply be replaced.
 db_admin_credential_check() {
-  local file="$1" want_uid="${2:-0}" stop_dir="${3:-/}" meta kind owner mode dir
+  local file="$1" want_uid="${2:-0}" stop_dir="${3:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}" meta kind owner mode dir
   if [[ ! -e "${file}" && ! -L "${file}" ]]; then
     return 2
   fi
@@ -4268,7 +4272,7 @@ db_admin_credential_check() {
 # again off the DESCRIPTOR it is read from (same inode, a regular file, the right owner, no group or
 # other access), so a name swapped between the check and the read cannot supply the value.
 db_admin_credential_read() {
-  local key="$1" file="${2:-${DB_ADMIN_CREDENTIAL_FILE}}" want_uid="${3:-0}" stop_dir="${4:-/}"
+  local key="$1" file="${2:-${DB_ADMIN_CREDENTIAL_FILE}}" want_uid="${3:-0}" stop_dir="${4:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}"
   local why rc=0 before after fd content
   why="$(db_admin_credential_check "${file}" "${want_uid}" "${stop_dir}")" || rc=$?
   if [[ "${rc}" -eq 2 ]]; then
@@ -4279,7 +4283,9 @@ db_admin_credential_read() {
     return 1
   fi
   before="$(LC_ALL=C stat -c '%i' -- "${file}" 2>/dev/null)" || before=""
-  if ! exec {fd}<"${file}"; then
+  # A failed `exec` redirection can end a non-interactive shell (and a refusal that kills the caller is
+  # not the refusal this function owes it), so readability is asked first.
+  if [[ ! -r "${file}" ]] || ! exec {fd}<"${file}"; then
     echo "REFUSING to read ${file}: it could not be opened. $(db_admin_credential_instruction refused "it could not be opened")" >&2
     return 1
   fi
@@ -4319,7 +4325,9 @@ db_admin_credential_refuse_env_copy() {
 # is NOT a failure here: each entrypoint refuses, in the place and words that suit it, when it needs one.
 DB_MIGRATION_ROLE=""
 db_admin_credential_load() {
-  local app_env_file="${1:-}" invocation="" role="" rc=0
+  # ${2}-${4} are the file, the uid it must belong to and the directory the ancestry walk stops at:
+  # the installed defaults, and parameters only so a test can run the real code unprivileged.
+  local app_env_file="${1:-}" file="${2:-${DB_ADMIN_CREDENTIAL_FILE}}" want_uid="${3:-0}" stop_dir="${4:-${DB_ADMIN_CREDENTIAL_TRUST_ROOT}}" invocation="" role="" rc=0
   export -n DEPLOY_ADMIN_DATABASE_URL IMS_MIGRATION_ROLE 2>/dev/null || true
   invocation="${DEPLOY_ADMIN_DATABASE_URL:-}"
   role="${IMS_MIGRATION_ROLE:-}"
@@ -4328,9 +4336,9 @@ db_admin_credential_load() {
     db_admin_credential_refuse_env_copy "${app_env_file}" || return 1
   fi
   local file_url="" file_role=""
-  file_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL)" || rc=$?
+  file_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL "${file}" "${want_uid}" "${stop_dir}")" || rc=$?
   if [[ "${rc}" -eq 0 ]]; then
-    file_role="$(db_admin_credential_read IMS_MIGRATION_ROLE)" || file_role=""
+    file_role="$(db_admin_credential_read IMS_MIGRATION_ROLE "${file}" "${want_uid}" "${stop_dir}")" || file_role=""
   elif [[ "${rc}" -eq 1 && -z "${invocation}" ]]; then
     return 1
   fi
@@ -4342,7 +4350,9 @@ db_admin_credential_load() {
 
 # THE MIGRATION ROLE'S NAME, from the first of: the role recorded with the credential, the one named
 # in an --app-user argument plus `_migrator`. A name that is not a plain identifier is refused, so
-# nothing that reaches an argument can be anything but a role name.
+# nothing that reaches an argument can be anything but a role name. With neither there is no name and
+# nothing is printed (status 0): the helper itself refuses every mode that needs the application's
+# identity without one, and the modes that need a migration role refuse without --migration-role.
 db_migration_role_for() {
   local role="${DB_MIGRATION_ROLE:-}" arg
   if [[ -z "${role}" ]]; then
@@ -4352,6 +4362,7 @@ db_migration_role_for() {
       esac
     done
   fi
+  [[ -n "${role}" ]] || return 0
   [[ "${role}" =~ ^[A-Za-z_][A-Za-z0-9_]{0,62}$ ]] || return 1
   printf '%s' "${role}"
 }
@@ -4394,7 +4405,7 @@ db_fence_exec_root() {
     _db_fence_scrub_environment
     export DEPLOY_ADMIN_DATABASE_URL="${admin}"
     cd / || exit 1
-    exec node "${fence_script}" "$@" "--migration-role=${role}"
+    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}
   )
 }
 
@@ -4409,7 +4420,7 @@ db_fence_exec_root_with_database_url() {
     _db_fence_scrub_environment
     export DATABASE_URL="${url}"
     cd / || exit 1
-    exec node "${fence_script}" "$@" "--migration-role=${role}"
+    exec node "${fence_script}" "$@" ${role:+"--migration-role=${role}"}
   )
 }
 
@@ -4625,6 +4636,7 @@ db_fence_publish_operator_wrappers() {
       printf 'credential_uid=%q\n' "$(id -u)"
       printf 'migration_role=%q\n' "${baked_migration_role}"
       printf 'app_account=%q\n' "${app_user}"
+      printf 'DB_ADMIN_CREDENTIAL_TRUST_ROOT=%q\n' "${DB_ADMIN_CREDENTIAL_TRUST_ROOT}"
       printf 'DB_ADMIN_CREDENTIAL_FILE=%q\n' "${credential_file}"
       printf 'DB_ADMIN_CREDENTIAL_DIR=%q\n' "${credential_file%/*}"
       # ONE TEXT, AND ONE READER, FROM THE LIBRARY'S SINGLE COPY: the functions are written out of
@@ -4685,8 +4697,9 @@ if [[ -z "${authority_dir}" || ! -d "${authority_dir}" || ! -O "${authority_dir}
   exit 1
 fi
 # THE CREDENTIAL: THE INVOCATION, THEN THE ROOT FILE, AND NOTHING THE APPLICATION CAN WRITE
-# (owner decision C3). The application's .env is not consulted and neither is anything else: a value
-# that account could have planted is not a credential this wrapper will run a privileged helper with.
+# (owner decision C3). The application's own environment file is not consulted and neither is anything
+# else: a value that account could have planted is not a credential this wrapper will run a privileged
+# helper with.
 # `sudo env DEPLOY_ADMIN_DATABASE_URL=... <wrapper>` wins over the file. It is then UN-EXPORTED, and
 # the helper below is started with a scrubbed environment, so nothing the application account runs
 # can inherit it from here.
@@ -4694,7 +4707,7 @@ admin_url="${DEPLOY_ADMIN_DATABASE_URL:-}"
 export -n DEPLOY_ADMIN_DATABASE_URL 2>/dev/null || true
 if [[ -z "${admin_url}" ]]; then
   credential_rc=0
-  admin_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL "${credential_file}" "${credential_uid}")" || credential_rc=$?
+  admin_url="$(db_admin_credential_read DEPLOY_ADMIN_DATABASE_URL "${credential_file}" "${credential_uid}" "${DB_ADMIN_CREDENTIAL_TRUST_ROOT}")" || credential_rc=$?
   if [[ "${credential_rc}" -eq 1 ]]; then
     exit 1
   fi
@@ -4703,13 +4716,18 @@ unset DEPLOY_ADMIN_DATABASE_URL
 if [[ -z "${admin_url}" ]]; then
   echo "There is no privileged connection to ${mode} with. $(db_admin_credential_instruction absent)" >&2
   echo "" >&2
+  # THIS WRAPPER'S OWN ABSOLUTE PATH, in the invocation that supplies the credential, so that pasting
+  # the line works: `env`, and the whole line prefixed, because `sudo VAR=x /path` is not a thing sudo
+  # accepts and a bare `VAR=x /path` is EACCES for the non-root shell this is most likely read in.
+  echo "  ${sudo_prefix}env DEPLOY_ADMIN_DATABASE_URL='postgresql://ADMIN:PASSWORD@HOST:PORT/DATABASE' ${self}" >&2
+  echo "" >&2
   echo "It must be a superuser or database-owner connection as a DIFFERENT role from the one the" >&2
   echo "fence revoked CONNECT from; see docs/installation.md." >&2
   exit 1
 fi
 # THE HELPER RUNS AS ROOT, NEVER AS THE APPLICATION ACCOUNT, WITH A SCRUBBED ENVIRONMENT AND THE
 # CREDENTIAL ONLY IN ITS ENVIRONMENT BY NAME. `run_helper <script> <arguments...>` is the whole of how
-# this wrapper executes it; there is no runuser branch to take.
+# this wrapper executes it; there is no privilege drop to take.
 run_helper() {
   local script="$1"
   shift
@@ -4717,7 +4735,7 @@ run_helper() {
     _db_fence_scrub_environment
     export DEPLOY_ADMIN_DATABASE_URL="${admin_url}"
     cd / || exit 1
-    exec node "${script}" "$@" "--migration-role=${migration_role}"
+    exec node "${script}" "$@" ${migration_role:+"--migration-role=${migration_role}"}
   )
 }
 # THE TREE THAT RUNS IS THE TREE THAT WAS HASHED (o3d-bpbv). The documented name is a pointer, and the

@@ -2614,9 +2614,15 @@ write_admin_credential_file() {
   local url="${DEPLOY_ADMIN_DATABASE_URL:-}" role="${DB_MIGRATION_ROLE:-${DB_USER}_migrator}"
   [[ -n "${url}" ]] || return 0
   [[ "${url}${role}" != *\"* && "${url}${role}" != *$'\n'* ]] || { echo "The admin URL or the migration role name contains a double quote or a line break and cannot be recorded in ${DB_ADMIN_CREDENTIAL_FILE}." >&2; return 1; }
+  # Created by this root process under umask 077, so root-owned and 0700; an EXISTING directory is
+  # judged, never re-moded, and a wrong one is refused rather than repaired.
   if [[ ! -d "${DB_ADMIN_CREDENTIAL_DIR}" ]]; then
-    install -d -m 0700 -o root -g root "${DB_ADMIN_CREDENTIAL_DIR}" || return 1
+    ( umask 077; mkdir -p "${DB_ADMIN_CREDENTIAL_DIR}" ) || return 1
   fi
+  [[ "$(LC_ALL=C stat -c '%u:%a' -- "${DB_ADMIN_CREDENTIAL_DIR}" 2>/dev/null)" == "$(id -u):700" ]] || {
+    echo "${DB_ADMIN_CREDENTIAL_DIR} must be owned by root with mode 0700 and is not, so the admin credential was not recorded there. Fix its owner and mode as root and re-run." >&2
+    return 1
+  }
   {
     printf '# Root-only. Read as data by the cutover scripts; never sourced. See docs/installation.md.\n'
     printf 'DEPLOY_ADMIN_DATABASE_URL="%s"\n' "${url}"
@@ -2775,7 +2781,7 @@ FIRST_INSTALL_PIN_CONTRACT="On a first install, IMS_FENCE_ARTEFACT_SHA256 is the
 resolve_fence_script() {
   local script
   if ${FIRST_INSTALL_NO_CREDENTIALED_FENCE}; then
-    echo "This run is a FIRST INSTALL — no service, no crontab and no other launcher was found, and the database was created by this run — so it performs NO credentialed fence execution: there is no writer to drain and nothing to hold closed. Something on this path asked for the fence helper anyway, and it will not be handed the admin credential: the tree it would run is assembled out of an application-owned checkout, and a first install is exactly the run with no standing artefact to authenticate it against. Nothing has been migrated." >&2
+    echo "This run is a FIRST INSTALL — no service, no crontab and no other launcher was found, and the database was created by this run — so it performs NO credentialed fence execution: there is no writer to drain and nothing to hold closed. Something on this path asked for the fence helper anyway, and it will not be handed DEPLOY_ADMIN_DATABASE_URL: the tree it would run is assembled out of an application-owned checkout, and a first install is exactly the run with no standing artefact to authenticate it against. Nothing has been migrated." >&2
     return 1
   fi
   script="$(db_fence_script_in_use)" || return 1
@@ -6706,7 +6712,7 @@ fence_db_connections() {
       # this is that order on the path the ordinary cutover takes.
       DB_FENCE_UP=true
       DB_FENCE_RAISED=true
-      # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5,
+      # THE MIGRATION CONNECTS AS THE MIGRATION ROLE (it was the admin until owner decision C3) AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5,
       # Codex r4 CRITICAL). This installer makes the APPLICATION role the database owner, and
       # the fence refuses when admin == app — so the only fenceable configuration here is a
       # separate SUPERUSER admin, and with the bare admin URL every table, index and sequence

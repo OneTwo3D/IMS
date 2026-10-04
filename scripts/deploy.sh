@@ -933,7 +933,7 @@ valid_tcp_port "${PORT}" || die "IMS_PORT must be a decimal TCP port in 1-65535,
 # connection fence is up, because the fence shuts the application role out and the
 # migration must not be shut out with it.
 #
-# It CONNECTS as the admin and RUNS AS the application role — see fence_db_connections(),
+# It CONNECTS as the migration role (it was the admin until owner decision C3) and RUNS AS the application role — see fence_db_connections(),
 # which composes the URL through fence-db-connections.mjs --print-migration-url. Connecting
 # as the admin is what keeps the fence effective; running as the application role is what
 # stops every object the migration creates being owned by a superuser the application has no
@@ -1325,7 +1325,7 @@ readonly PUBLISH_STAGE_DIRNAME=".ims-publish"
 # destination that matches no root is REFUSED — a new publication site outside these six fails
 # loudly at install time instead of silently resolving its own path.
 publish_trust_root_candidates() {
-  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}"
+  printf '%s\n' "${APP_DIR:-}" "${DATA_DIR:-}" "${CUTOVER_STATE_DIR:-}" "${CUTOVER_ROOT_DIR:-}" "${DB_ENV_SNAPSHOT_DIR:-}" "${DB_CA_PUBLISH_DIR:-}" "${DB_FENCE_RECOVERY_DIR:-}" "${DB_ADMIN_CREDENTIAL_DIR:-}"
 }
 
 # WHETHER "$1" MAY BE A STARTING POINT FOR THE WALK — PROVEN BY WALKING TO IT (o3d-rn10 r4).
@@ -2805,7 +2805,7 @@ fence_db_connections() {
       # this is that order on the path the ordinary cutover takes.
       DB_FENCE_UP=true
       DB_FENCE_RAISED=true
-      # THE MIGRATION CONNECTS AS THE ADMIN AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5).
+      # THE MIGRATION CONNECTS AS THE MIGRATION ROLE (it was the admin until owner decision C3) AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5).
       # Using the bare admin URL here is what made every object a migration created owned by
       # the deploy superuser, with no grant to the application: the deploy passed — the drift
       # check, the verification hook and pg_dump all share this same admin connection and can

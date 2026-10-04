@@ -281,8 +281,8 @@ test('r38: the rotation happens inside the stopped, fenced window and moves exac
         DB_USER: 'imsuser',
         DB_PASSWORD: 'rotated-secret',
         IMS_PG_SOCKET_DIR: cluster.socket,
-        // Carried through the heredoc so the comparison below can prove the privileged connection
-        // — the one the fence itself is held with — survives the second write untouched.
+        // Offered to the run so the assertion below can prove the heredoc does NOT carry it into the
+        // application-owned file (owner decision C3).
         DEPLOY_ADMIN_DATABASE_URL: adminUrl,
       },
       `${REINSTALL_BODY}
@@ -337,10 +337,14 @@ test('r38: the rotation happens inside the stopped, fenced window and moves exac
       changed[0][1].slice('DATABASE_URL='.length),
       'the run and the file must name the same URL',
     )
-    assert.match(
-      readFileSync(join(root, '.env'), 'utf8'),
-      new RegExp(`^DEPLOY_ADMIN_DATABASE_URL=${adminUrl.replace(/[.]/g, '\\.')}$`, 'm'),
-      'the deploy admin connection — the one the fence itself is held with — must be untouched',
+    // THE ADMIN CONNECTION IS NOT IN THIS FILE (owner decision C3). It used to be carried through
+    // the rewrite and asserted untouched; it is root's now, recorded in a root-owned file, and the
+    // application account that owns this one must never hold it. The run had it in its environment
+    // (see the DEPLOY_ADMIN_DATABASE_URL above), so its absence here proves the heredoc does not
+    // carry it, not that nobody offered it.
+    assert.ok(
+      !readFileSync(join(root, '.env'), 'utf8').includes('DEPLOY_ADMIN_DATABASE_URL'),
+      'the application .env must not name the deploy admin connection at all (universal absence)',
     )
     assert.equal(statSync(join(root, '.env')).mode & 0o777, 0o600, 'and the rewritten file must still be mode 600')
   } finally {
