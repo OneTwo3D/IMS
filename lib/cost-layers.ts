@@ -258,7 +258,9 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   // DROPPED: a shipment revalued from 4.00 to -6.00 posted only the 4.00 reversal, and 6.00 posted
   // nowhere. A negative basis cannot be represented here (o3d-gd2f), and
   // `refreshShipmentCogsForCostLayerChange` refuses the revaluation before it gets this far; this
-  // throw is the backstop that keeps the leg-drop from ever being silent again.
+  // throw is the backstop that keeps the leg-drop from ever being silent again. Landed cost can no longer
+  // reach it (the allocation floors every unit cost at zero, so a shipment is revalued down to 0.00 at
+  // worst, which this builder handles by emitting the reversal leg only); it stays for any other source.
   if (oldCogs.lt(0) || newCogs.lt(0)) {
     throw new Error(
       `buildShipmentCogsRevaluationSyncPayload: shipment ${input.shipmentId} would be revalued from `
@@ -1558,6 +1560,14 @@ const JOURNALED_REVALUATION_ABORT_SENTINEL = 'journaled_shipment_revaluation_ref
  *  - A PRODUCTION-ORDER RECOMPUTE: manufacturing rejects negative cost lines outright, so the credit
  *    is never on the production order. It is on the purchase order that supplied a component, and the
  *    recompute merely carried the component layer's cost through to the finished goods.
+ *
+ * AFTER THE ZERO FLOOR (lib/domain/purchasing/landed-cost-allocation.ts) THIS IS A BACKSTOP. Landed cost
+ * can no longer drive a layer, a snapshot or a shipment below zero: a credit larger than the goods cost
+ * values the units at zero and reports the unabsorbed part as a warning instead. So the credit-line
+ * wording below is reachable only from a caller that reaches this refusal with a negative cost from
+ * ANOTHER source while still carrying a revaluation context. The text is deliberately left as it was: it
+ * is tested operator wording for a refusal this change does not touch, and rewording it would be a
+ * judgement about sources that are not landed cost.
  */
 function buildRefusalRemedy(
   context: ShipmentRevaluationContext | null,

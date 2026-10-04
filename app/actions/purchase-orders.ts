@@ -72,11 +72,23 @@ import {
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
-  computeGrossUnitCostBaseByLine,
+  computeLandedCostForPendingLines,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
+  freightPoContributesLandedCost,
+  logLandedCostCreditFloorActivities,
   queueLandedCostAdjustmentJournals,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
+import { unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import {
+  buildFreightCostLineRows,
+  CreateFreightPoInputSchema,
+  FreightCostLinesSchema,
+  type CreateFreightPoInput,
+  type FreightCostLineInput,
+} from '@/lib/domain/purchasing/freight-cost-lines'
+import { describeFlooredLandedCredit, type FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
+import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { CancelPurchaseOrderResult } from '@/lib/domain/purchasing/cancellation-service'
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
@@ -249,6 +261,12 @@ export type PoDetail = PoRow & {
     }
   }[]
   totalLandedCostBase: number
+  /**
+   * Lines whose gross unit cost the zero floor held at 0.00 because a negative landed cost was larger than
+   * the goods cost (computed for the ORDERED qty; read-only, nothing is written). `message` is the one
+   * shared sentence from describeFlooredLandedCredit.
+   */
+  landedCostFloors: { lineId: string; sku: string; unflooredGrossUnitCostBase: number; unabsorbedBase: number; message: string }[]
   linkedPrimaryPos: { id: string; reference: string; supplierName: string; totalBase: number }[]
 }
 
@@ -804,7 +822,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     }
   }
 
-  const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+  // THE ONE ALLOCATION, the same one receipt and recalculation use. `freightLinks` is read unfiltered
+  // because it also LISTS cancelled freight for the operator, so the COST inputs are filtered here: a
+  // cancelled freight PO's lines count toward neither receipt nor recalculation.
+  const landedAllocation = computeLandedCostForPendingLines({
     lines: po.lines.map((line) => ({
       id: line.id,
       qty: line.qty,
@@ -814,21 +835,44 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       weight: line.product?.weight ?? null,
     })),
     directCostLines: po.freightCostLines.map((costLine) => ({
+      id: costLine.id,
       amountBase: costLine.amountBase,
       distributionMethod: costLine.distributionMethod,
     })),
-    linkedCostLines: freightLinks.flatMap((link) => (
-      link.freightPo.costLines.map((costLine) => ({
-        amountBase: costLine.amountBase,
-        distributionMethod: costLine.distributionMethod,
-      }))
-    )),
+    linkedCostLines: freightLinks
+      .filter((link) => freightPoContributesLandedCost(link.freightPo.status))
+      .flatMap((link) => (
+        link.freightPo.costLines.map((costLine) => ({
+          id: costLine.id,
+          amountBase: costLine.amountBase,
+          distributionMethod: costLine.distributionMethod,
+        }))
+      )),
+  })
+  const grossUnitCostBaseByLine = landedAllocation.grossUnitCostBaseByLine
+  const landedCostFloors = landedAllocation.floors.map((floor) => {
+    const poLine = po.lines.find((line) => line.id === floor.lineId)
+    const unabsorbedBase = unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, floor.qty)
+    return {
+      lineId: floor.lineId,
+      sku: poLine?.product?.sku ?? floor.lineId,
+      unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toNumber(),
+      unabsorbedBase: unabsorbedBase.toNumber(),
+      message: describeFlooredLandedCredit({
+        context: `PO ${po.reference}`,
+        entries: [{
+          label: poLine?.product?.sku ?? floor.lineId,
+          unabsorbedBase,
+          unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+        }],
+      }),
+    }
   })
 
   const mappedLines = po.lines.map(mapLine).map((line) => {
     return {
       ...line,
-      grossUnitCostBase: grossUnitCostBaseByLine.get(line.id) ?? line.unitCostBase,
+      grossUnitCostBase: grossUnitCostBaseByLine.get(line.id)?.toNumber() ?? line.unitCostBase,
       qtyBilled: qtyBilledByLine.get(line.id) ?? 0,
     }
   })
@@ -978,6 +1022,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       },
     })),
     totalLandedCostBase,
+    landedCostFloors,
     linkedPrimaryPos: await (async () => {
       // For FREIGHT POs: show which primary POs this is linked to
       const primaryLinks = await db.landedCostLink.findMany({
@@ -1766,7 +1811,7 @@ export async function receivePurchaseOrder(
   receiptLines: ReceiptLineInput[],
   notes?: string,
   options?: { confirmWarehouseDivergence?: boolean; idempotencyToken?: string },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warnings?: string[] }> {
   try {
     await requirePermission('purchasing.receive')
     const po = await db.purchaseOrder.findUnique({
@@ -1786,11 +1831,11 @@ export async function receivePurchaseOrder(
             unitCostBase: true,
             landedUnitCostBase: true,
             totalBase: true,
-            product: { select: { weight: true } },
+            product: { select: { weight: true, sku: true } },
           },
         },
         freightCostLines: {
-          select: { amountBase: true, distributionMethod: true },
+          select: { id: true, amountBase: true, distributionMethod: true },
         },
         landedCostLinks: {
           // o3d-8m8pe: this pre-transaction read is not consumed for cost (the in-transaction `currentPo`
@@ -1801,7 +1846,7 @@ export async function receivePurchaseOrder(
             freightPO: {
               select: {
                 freightCostLines: {
-                  select: { amountBase: true, distributionMethod: true },
+                  select: { id: true, amountBase: true, distributionMethod: true },
                 },
               },
             },
@@ -1917,11 +1962,11 @@ export async function receivePurchaseOrder(
               unitCostBase: true,
               landedUnitCostBase: true,
               totalBase: true,
-              product: { select: { weight: true } },
+              product: { select: { weight: true, sku: true } },
             },
           },
           freightCostLines: {
-            select: { amountBase: true, distributionMethod: true },
+            select: { id: true, amountBase: true, distributionMethod: true },
           },
           landedCostLinks: {
             // o3d-8m8pe: a CANCELLED freight PO must not contribute to the cost of these units.
@@ -1942,7 +1987,7 @@ export async function receivePurchaseOrder(
               freightPO: {
                 select: {
                   freightCostLines: {
-                    select: { amountBase: true, distributionMethod: true },
+                    select: { id: true, amountBase: true, distributionMethod: true },
                   },
                 },
               },
@@ -1957,7 +2002,10 @@ export async function receivePurchaseOrder(
         throw new Error(canFullyReceive.error)
       }
 
-      const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+      // THE ONE ALLOCATION (landed-cost-allocation.ts): the same cost recalculation will compute for these
+      // units, so a receipt followed by a recalculation with unchanged cost lines posts nothing. A negative
+      // landed cost is applied, and the zero floor's footprint comes back in `floors`.
+      const landedAllocation = computeLandedCostForPendingLines({
         lines: currentPo.lines.map((line) => ({
           id: line.id,
           qty: line.qty,
@@ -1967,16 +2015,23 @@ export async function receivePurchaseOrder(
           weight: line.product?.weight ?? null,
         })),
         directCostLines: currentPo.freightCostLines.map((costLine) => ({
+          id: costLine.id,
           amountBase: costLine.amountBase,
           distributionMethod: costLine.distributionMethod,
         })),
         linkedCostLines: currentPo.landedCostLinks.flatMap((link) => (
           link.freightPO.freightCostLines.map((costLine) => ({
+            id: costLine.id,
             amountBase: costLine.amountBase,
             distributionMethod: costLine.distributionMethod,
           }))
         )),
       })
+      const grossUnitCostBaseByLine = landedAllocation.grossUnitCostBaseByLine
+      const floorByPoLine = new Map(landedAllocation.floors.map((floor) => [floor.lineId, floor]))
+      // What the floor could not absorb, per PO line, over the quantity THIS receipt lays. Reported after the
+      // commit (an activity write uses its own connection) and returned to the operator.
+      const creditFloorByPoLine = new Map<string, FlooredLandedCreditEntry>()
 
       // Re-validate outstanding qty under lock — the pre-tx check used a
       // stale snapshot that concurrent receipts could have advanced past. mgyk:
@@ -2039,6 +2094,16 @@ export async function receivePurchaseOrder(
         if (qtyReceived.lte(0)) continue
         const qtyReceivedStr = qtyReceived.toFixed(6)
         totalReceiptValue = addMoney(totalReceiptValue, multiplyMoney(qtyReceived, unitCostBase))
+        const floor = floorByPoLine.get(poLine.id)
+        if (floor) {
+          const previous = creditFloorByPoLine.get(poLine.id)
+          const unabsorbedBase = unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, qtyReceived)
+          creditFloorByPoLine.set(poLine.id, {
+            label: poLine.product?.sku ?? poLine.id,
+            unabsorbedBase: previous ? previous.unabsorbedBase.add(unabsorbedBase) : unabsorbedBase,
+            unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+          })
+        }
 
         await tx.stockMovement.create({
           data: {
@@ -2215,7 +2280,13 @@ export async function receivePurchaseOrder(
         }
       }
 
-      return { allReceived, newStatus, freightPoIds, totalReceiptValue: totalReceiptValue.toNumber() }
+      return {
+        allReceived,
+        newStatus,
+        freightPoIds,
+        totalReceiptValue: totalReceiptValue.toNumber(),
+        creditFloorEntries: [...creditFloorByPoLine.values()],
+      }
     }, STOCK_TX_OPTIONS)
 
     // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
@@ -2324,7 +2395,17 @@ export async function receivePurchaseOrder(
       console.error(syncError)
     }
 
-    return { success: true }
+    // A negative landed cost larger than the goods cost was held at zero (see allocateLandedCost). The
+    // operator is told in the result and the durable WARNING is written now, AFTER the commit.
+    const warnings: string[] = []
+    if (receiptResult.creditFloorEntries.length > 0) {
+      warnings.push(await logFlooredLandedCredit({
+        purchaseOrderId: id,
+        context: `PO ${po.reference} receipt`,
+        entries: receiptResult.creditFloorEntries,
+      }))
+    }
+    return warnings.length > 0 ? { success: true, warnings } : { success: true }
   } catch (e) {
     await logActivity({
       entityType: 'PURCHASE_ORDER',
@@ -4202,23 +4283,9 @@ export async function markBillPaid(
 // Freight / Landed Cost POs
 // ---------------------------------------------------------------------------
 
-export type FreightCostLineInput = {
-  description: string
-  amountForeign: number
-  vatable: boolean
-  distributionMethod: string
-}
-
-export type CreateFreightPoInput = {
-  supplierId: string
-  currency: string
-  fxRateToBase: number
-  primaryPoIds: string[]
-  supplierRef?: string
-  notes?: string
-  taxRateValue?: number
-  costLines: FreightCostLineInput[]
-}
+// The input shapes are DERIVED from the boundary schema (lib/domain/purchasing/freight-cost-lines.ts), so
+// the type the UIs compile against and the validation the actions run cannot drift apart.
+export type { FreightCostLineInput, CreateFreightPoInput }
 
 // audit-g5u2.3: record a supplier credit note (DRAFT) against a billed (freight)
 // PO — e.g. crediting a duplicate freight bill. POSTED later via
@@ -4591,35 +4658,22 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
   }
 }
 
-export async function createFreightPo(input: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
+export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
-    if (!input.costLines.length) return { success: false, error: 'Add at least one cost line' }
-    if (!input.primaryPoIds.length) return { success: false, error: 'Link to at least one primary PO' }
+    // The boundary: shape, finiteness, the four distribution methods, an exchange rate above zero, and the
+    // net-subtotal rule. See lib/domain/purchasing/freight-cost-lines.ts for what is accepted and why.
+    const parsedInput = CreateFreightPoInputSchema.safeParse(rawInput)
+    if (!parsedInput.success) {
+      return { success: false, error: parsedInput.error.issues[0]?.message ?? 'Invalid freight order' }
+    }
+    const input = parsedInput.data
 
-    const fxRate = input.fxRateToBase || 1
-    const vatRate = input.taxRateValue ?? 0
-
-    let subtotalForeign = 0
-    let taxForeign = 0
-    const costLineData = input.costLines.map((cl, i) => {
-      const amountBase = Math.round((cl.amountForeign / fxRate) * 10000) / 10000
-      subtotalForeign += cl.amountForeign
-      if (cl.vatable && vatRate > 0) taxForeign += Math.round(cl.amountForeign * vatRate * 10000) / 10000
-      return {
-        description: cl.description,
-        amountForeign: cl.amountForeign,
-        amountBase,
-        vatable: cl.vatable,
-        distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
-        sortOrder: i,
-      }
-    })
-
-    const subtotalBase = Math.round((subtotalForeign / fxRate) * 10000) / 10000
-    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
-    const totalForeign = subtotalForeign + taxForeign
-    const totalBase = subtotalBase + taxBase
+    const fxRate = input.fxRateToBase
+    // The ONE row builder, shared with updateFreightPoCosts: the same input persists the same rows.
+    const built = buildFreightCostLineRows(input.costLines, fxRate, input.taxRateValue ?? 0)
+    const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
+    const costLineData = built.rows
 
     const freightReference = await makeReference()
     // Create the freight PO + landed-cost links AND run the initial recalc in ONE
@@ -4676,6 +4730,9 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       revalidatePath(`/purchase-orders/${pid}`)
     }
     revalidatePath('/purchase-orders')
+    // The zero floor held a layer at 0.00 (a negative landed cost larger than the goods cost): the durable
+    // WARNING is written now, AFTER the commit.
+    await logLandedCostCreditFloorActivities(landedResult)
     const mapped = mapPoRow(po)
     try {
       await queueLandedCostAdjustmentJournals(landedResult)
@@ -4798,11 +4855,23 @@ export async function getGoodsPosForLinking(): Promise<{ id: string; reference: 
 /** Update a freight PO's cost lines and recalculate landed costs on linked primary POs */
 export async function updateFreightPoCosts(
   freightPoId: string,
-  costLines: FreightCostLineInput[],
-  taxRateValue?: number,
+  rawCostLines: FreightCostLineInput[],
+  rawTaxRateValue?: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
+    // The same boundary createFreightPo applies (shape, finiteness, the four methods, the net-subtotal
+    // rule). An empty list stays valid here: it clears the order's cost lines, as it always has.
+    const parsedLines = FreightCostLinesSchema.safeParse(rawCostLines)
+    if (!parsedLines.success) {
+      return { success: false, error: parsedLines.error.issues[0]?.message ?? 'Invalid cost lines' }
+    }
+    const taxRateParse = z.number().refine(Number.isFinite, 'Tax rate must be a finite number').min(0, 'Tax rate cannot be negative').optional().safeParse(rawTaxRateValue)
+    if (!taxRateParse.success) {
+      return { success: false, error: taxRateParse.error.issues[0]?.message ?? 'Invalid tax rate' }
+    }
+    const costLines = parsedLines.data
+    const taxRateValue = taxRateParse.data
     const { reference, landedResult } = await db.$transaction(async (tx) => {
       // ─── o3d-6nd55 r3 (Codex round-3 HIGH): THE PARENT ORDERS BEFORE THEIR COST ROWS ───
       //
@@ -4836,38 +4905,14 @@ export async function updateFreightPoCosts(
       if (!po) throw new Error('PO not found')
       if (po.type !== 'FREIGHT') throw new Error('Not a freight PO')
 
-      const fxRate = new Prisma.Decimal(po.fxRateToBase)
-      const vatRate = new Prisma.Decimal(taxRateValue ?? 0)
+      // The ONE row builder, shared with createFreightPo: the same input persists the same rows.
+      const built = buildFreightCostLineRows(costLines, new Prisma.Decimal(po.fxRateToBase), taxRateValue ?? 0)
+      const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
 
       await tx.freightCostLine.deleteMany({ where: { poId: freightPoId } })
-
-      let subtotalForeign = new Prisma.Decimal(0)
-      let taxForeign = new Prisma.Decimal(0)
-      const lineData = costLines.map((cl, i) => {
-        const amountForeign = new Prisma.Decimal(cl.amountForeign)
-        const amountBase = amountForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
-        subtotalForeign = subtotalForeign.add(amountForeign)
-        if (cl.vatable && vatRate.gt(0)) {
-          taxForeign = taxForeign.add(amountForeign.mul(vatRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP))
-        }
-        return {
-          poId: freightPoId,
-          description: cl.description,
-          amountForeign,
-          amountBase,
-          vatable: cl.vatable,
-          distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
-          sortOrder: i,
-        }
-      })
-      if (lineData.length > 0) {
-        await tx.freightCostLine.createMany({ data: lineData })
+      if (built.rows.length > 0) {
+        await tx.freightCostLine.createMany({ data: built.rows.map((row) => ({ ...row, poId: freightPoId })) })
       }
-
-      const subtotalBase = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
-      const taxBase = taxForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
-      const totalForeign = subtotalForeign.add(taxForeign)
-      const totalBase = subtotalBase.add(taxBase)
 
       await tx.purchaseOrder.update({
         where: { id: freightPoId },
@@ -4896,6 +4941,8 @@ export async function updateFreightPoCosts(
     for (const primaryPoId of landedResult.revalidatePoIds) {
       revalidatePath(`/purchase-orders/${primaryPoId}`)
     }
+    // The zero floor held a layer at 0.00: the durable WARNING is written now, AFTER the commit.
+    await logLandedCostCreditFloorActivities(landedResult)
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: freightPoId,

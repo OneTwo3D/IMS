@@ -193,20 +193,27 @@ If a freight PO is added or updated after goods have already been received, the 
 - Existing FIFO cost layers from the affected receipts are revalued with the new unit costs.
 - If any of those layers have already been consumed by sales shipments, a COGS revaluation journal is queued for Xero — it reverses the old COGS amount and posts the new one.
 - All cost-layer snapshot changes are recorded in the activity log so finance can trace what changed and why.
-- **A credit that would push an already-journaled shipment's cost below zero is refused.** This happens when a
-  credit cost line (a negative amount) is larger than the value of the goods it is spread over, and some of those goods
-  have already shipped and been journaled. IMS cannot post a negative COGS, so it changes nothing: no cost layer,
-  shipment or journal is touched. It writes an **ERROR** entry to the activity log
-  (`landed_cost_revaluation_refused_journaled_shipment`) naming the shipment, its old and new COGS, and the credit line
-  to correct.
-  - When you save a **freight PO**, the save itself fails with that reason, and your edit is not kept.
-  - When you edit **additional costs on a goods PO**, the cost lines are saved but the recalculation is refused, as with
-    any failed recalculation there. Correct or remove the credit line and save again.
-  - When you **cancel a freight PO**, the cancellation fails and the PO stays active. Cancelling it takes its own
-    uplift off the cost layer while a credit on another PO stays behind, which is what pushes the cost below zero — so
-    the line to correct is on that *other* purchase order, and the message names it. Correct it, then cancel again.
-  - When you **recompute a production order**, the recompute fails. A production order cannot carry a negative cost
-    line, so the negative cost comes from a component's purchase order: correct the credit there, then recompute.
+- **A credit or zero cost line is applied the same way at receipt and at recalculation.** A cost line with a
+  negative amount (a discount or credit from the supplier) reduces the cost spread over the goods it is allocated to,
+  and a zero line adds nothing. The unit cost laid at receipt, the one shown on the purchase order and the one a later
+  recalculation writes are computed by the same code from the same cost lines, so receiving goods and then saving the
+  same freight costs again changes nothing and queues no journal.
+- **A unit is never valued below zero.** If a credit is larger than the goods cost it is spread over, IMS values those
+  units at **0.00** and does **not** push the cost negative. The part of the credit that could not be absorbed into
+  stock is reported, not redistributed onto other lines and not posted by IMS: the purchase order detail shows a
+  warning beside the line, the receipt result lists it, the recalculation's audit run records it (the
+  `landed_cost_credit_floored` warning, with the unfloored unit cost and the amount per layer), and a **WARNING** entry
+  (`landed_cost_credit_floored`) is written to the activity log. IMS queues no journal for that amount, so it is for
+  you to establish what it corresponds to in the ledger. Because cost can no longer go below zero from landed cost,
+  an already-journaled shipment is never revalued below zero by a freight change.
+- **Freight orders accept an individual credit line, but not a net credit.** A freight order whose cost lines total
+  less than zero is refused with a message that a net credit from the supplier belongs on a supplier credit note. A
+  zero line, a zero total, and a negative line inside a non-negative total are accepted. The cost-line forms themselves
+  still accept positive amounts only.
+- **A safeguard remains underneath.** Revaluing an already-journaled shipment below zero is still refused (nothing is
+  changed and an **ERROR** entry, `landed_cost_revaluation_refused_journaled_shipment`, is written to the activity
+  log) because IMS cannot post a negative COGS. Landed cost can no longer cause it; it stays in case another source
+  ever does.
 
 - **If stock moves while the recalculation is starting, it asks you to retry.** Creating a freight PO, saving a freight
   PO's costs and cancelling a freight PO each lock every transfer, purchase order and cost layer the revaluation will

@@ -1,0 +1,129 @@
+import { z } from 'zod'
+import { Prisma } from '@/app/generated/prisma/client'
+import { LANDED_COST_DISTRIBUTION_METHODS, type LandedCostDistributionMethod } from './landed-cost-allocation'
+
+/**
+ * THE BOUNDARY FOR A FREIGHT ORDER'S COST LINES, shared by `createFreightPo` and `updateFreightPoCosts`.
+ *
+ * Both actions used to persist whatever they were handed: no sign rule, no finiteness check, no check that
+ * the distribution method was one of the four, an exchange rate defaulted with `|| 1`. Two things made
+ * that worse than it sounds. The three freight-cost UIs filter non-positive amounts client-side, so that
+ * filter was the only thing between a crafted call and the cost basis; and the two actions built their rows
+ * differently (one in floats, one in Decimal), so the same input could persist different `amountBase` and
+ * `taxBase` depending on which action saved it.
+ *
+ * WHAT IS ACCEPTED. A signed amount is accepted DELIBERATELY: the owner's decision is that a credit or zero
+ * cost line is applied to inventory basis (with a per-layer floor at zero, see landed-cost-allocation.ts),
+ * so the rule lives in the arithmetic and not in a UI filter. An individual negative line is fine and so is
+ * a zero line and a zero net. A NET-negative freight order is refused: an order whose lines total less than
+ * zero is a supplier credit, and that belongs on a supplier credit note, not on a cost order.
+ *
+ * The UIs stay positive-only; opening them to credit lines is a separate workflow decision.
+ */
+
+export const FREIGHT_NET_CREDIT_MESSAGE =
+  'The cost lines of a freight order cannot total less than zero. A net credit from the supplier belongs on a supplier credit note.'
+
+// Deliberately `boolean`, not a type predicate: the schema's type stays `string` so the UI components, which
+// hold the method as a plain string, compile against it; the row builder narrows after parsing.
+function isDistributionMethod(value: string): boolean {
+  return (LANDED_COST_DISTRIBUTION_METHODS as readonly string[]).includes(value)
+}
+
+const finiteNumber = (label: string) => z
+  .number({ error: `${label} must be a number` })
+  .refine(Number.isFinite, `${label} must be a finite number`)
+
+export const FreightCostLineInputSchema = z.object({
+  description: z.string({ error: 'Each cost line needs a description' }),
+  amountForeign: finiteNumber('Cost line amount'),
+  vatable: z.boolean({ error: 'Cost line vatable must be true or false' }),
+  distributionMethod: z
+    .string({ error: 'Each cost line needs a distribution method' })
+    .refine((value) => isDistributionMethod(value), `Distribution method must be one of ${LANDED_COST_DISTRIBUTION_METHODS.join(', ')}`),
+})
+
+export type FreightCostLineInput = z.infer<typeof FreightCostLineInputSchema>
+
+/** The line list both actions parse, including the net-subtotal rule (D2). An empty list is valid here. */
+export const FreightCostLinesSchema = z.array(FreightCostLineInputSchema).superRefine((lines, context) => {
+  const net = lines.reduce((sum, line) => sum.add(new Prisma.Decimal(line.amountForeign)), new Prisma.Decimal(0))
+  if (net.lt(0)) context.addIssue({ code: 'custom', message: FREIGHT_NET_CREDIT_MESSAGE })
+})
+
+export const CreateFreightPoInputSchema = z.object({
+  supplierId: z.string().min(1, 'Select a supplier'),
+  currency: z.string().min(1, 'Currency is required'),
+  fxRateToBase: finiteNumber('Exchange rate').gt(0, 'Exchange rate must be greater than zero'),
+  // costLines before primaryPoIds: the first issue is what the caller reports, and "add a cost line" has
+  // always been reported before "link a primary PO".
+  costLines: FreightCostLinesSchema.min(1, 'Add at least one cost line'),
+  primaryPoIds: z.array(z.string().min(1)).min(1, 'Link to at least one primary PO'),
+  supplierRef: z.string().optional(),
+  notes: z.string().optional(),
+  taxRateValue: finiteNumber('Tax rate').min(0, 'Tax rate cannot be negative').optional(),
+})
+
+export type CreateFreightPoInput = z.infer<typeof CreateFreightPoInputSchema>
+
+export type FreightCostLineRow = {
+  description: string
+  amountForeign: Prisma.Decimal
+  amountBase: Prisma.Decimal
+  vatable: boolean
+  distributionMethod: LandedCostDistributionMethod
+  sortOrder: number
+}
+
+export type FreightCostLineRows = {
+  rows: FreightCostLineRow[]
+  subtotalForeign: Prisma.Decimal
+  taxForeign: Prisma.Decimal
+  subtotalBase: Prisma.Decimal
+  taxBase: Prisma.Decimal
+  totalForeign: Prisma.Decimal
+  totalBase: Prisma.Decimal
+}
+
+/**
+ * THE ONE ROW BUILDER. Decimal throughout, 4dp HALF_UP at exactly the points the order's own totals are
+ * stored, so the same input persists byte-identical rows and totals whichever action saves it. `lines` must
+ * already have been parsed with `FreightCostLinesSchema`.
+ */
+export function buildFreightCostLineRows(
+  lines: FreightCostLineInput[],
+  fxRateToBase: Prisma.Decimal | number | string,
+  taxRateValue: Prisma.Decimal | number | string = 0,
+): FreightCostLineRows {
+  const fxRate = new Prisma.Decimal(fxRateToBase)
+  const vatRate = new Prisma.Decimal(taxRateValue)
+  let subtotalForeign = new Prisma.Decimal(0)
+  let taxForeign = new Prisma.Decimal(0)
+  const rows = lines.map((line, index): FreightCostLineRow => {
+    const amountForeign = new Prisma.Decimal(line.amountForeign)
+    const amountBase = amountForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+    subtotalForeign = subtotalForeign.add(amountForeign)
+    if (line.vatable && vatRate.gt(0)) {
+      taxForeign = taxForeign.add(amountForeign.mul(vatRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP))
+    }
+    return {
+      description: line.description,
+      amountForeign,
+      amountBase,
+      vatable: line.vatable,
+      distributionMethod: line.distributionMethod as LandedCostDistributionMethod,
+      sortOrder: index,
+    }
+  })
+  const subtotalBase = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+  const taxBase = taxForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+  return {
+    rows,
+    subtotalForeign,
+    taxForeign,
+    subtotalBase,
+    taxBase,
+    totalForeign: subtotalForeign.add(taxForeign),
+    totalBase: subtotalBase.add(taxBase),
+  }
+}

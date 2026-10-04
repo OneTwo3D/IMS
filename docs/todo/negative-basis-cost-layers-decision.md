@@ -2,8 +2,16 @@
 
 **Issue:** `o3d-gd2f` (P2, blocks P1 `o3d-eiuo`) · **Epic:** `epic:landed-cost` (`onetwo3d-ims-6oyu.19`)
 **Verified against:** this branch's head. Every location below was re-read at that commit.
-**Status:** DECISION NOT TAKEN. The narrow sign defect is fixed (see §5). Full negative-basis
-support is **not** authorised and is **not** implemented.
+**Status:** FREIGHT CREDITS NO LONGER REACH A NEGATIVE BASIS (decision taken, 2026-10-01; implemented
+by the landed-cost sign change). A credit or zero freight cost line is now **applied** to inventory
+basis, the receipt-side helper and both revaluation paths computing it from ONE allocation
+(`lib/domain/purchasing/landed-cost-allocation.ts`), with a **per-layer floor at zero** and a visible
+warning: a unit is never valued below zero, and the part of a credit the floor could not absorb is
+reported (revaluation-run `warningsJson`, activity-log WARNING, the receipt result and the PO detail),
+not redistributed and not posted. Full negative-basis support is still **not** authorised and **not**
+implemented; what this document describes in §1 is the behaviour **before** that change, kept as the
+record of why the floor was chosen. What is left of `o3d-gd2f` is negative cost from sources other than
+freight credits (see §4.0), which the refusals described below still guard.
 
 > **Round-2 correction notice.** An earlier revision of this document asserted that a negative
 > basis arises "through ordinary, supported operator action", and attributed the write to a
@@ -15,6 +23,9 @@ support is **not** authorised and is **not** implemented.
 ---
 
 ## 1. What a negative basis is, and how it is reached
+
+> **Historical (superseded by the floor, see the status above).** The table below describes the
+> behaviour before the landed-cost sign change; line numbers are of that older code.
 
 A FIFO cost layer's `unitCostBase` becomes negative when a **credit** (negative-amount) freight
 cost line is distributed onto a PO line whose own unit cost is smaller than the credit per unit.
@@ -66,6 +77,12 @@ liability-side document in this system, and by design it does not reach inventor
 
 ### 1.2 THE REACHABILITY VERDICT
 
+> **Superseded.** `createFreightPo` and `updateFreightPoCosts` now validate their input at the
+> action boundary (`lib/domain/purchasing/freight-cost-lines.ts`): a signed amount is accepted
+> deliberately, a freight order whose lines total less than zero is refused (a net credit belongs on
+> a supplier credit note), and the arithmetic floors each unit at zero, so a negative basis is no
+> longer reachable from freight at all. The verdict below is the pre-change reading.
+
 **A negative cost basis is NOT reachable through any supported operator workflow at this head.**
 It requires a crafted invocation of one of two server actions — `createFreightPo` or
 `updateFreightPoCosts` — which accept a negative `amountForeign` that no UI can submit. Both are
@@ -99,6 +116,10 @@ operators corrupting basis today" (they cannot) but "do we want credit freight t
    Filed as **`o3d-ic2g`**.
 
 ### 1.4 A divergence worth noting on its own
+
+> **Resolved.** The receipt, the WMS book-in, the WMS align-up and the PO preview now call the same
+> allocation as both recalculation paths, which applies credits; the divergence below no longer
+> exists. Kept as the record of the defect.
 
 The read-only preview helper `computeGrossUnitCostBaseByLine` **does** filter credit lines out
 (`lib/domain/purchasing/landed-cost-service.ts:711`, `if (amountBase.lte(0)) continue`). That
