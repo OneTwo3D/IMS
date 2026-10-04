@@ -2244,6 +2244,17 @@ the refund for a credit note and its reversals, re-run the revaluation for an FX
 whose credit note was refused keeps its **accounting retry required** flag and its warning, so it
 stays on the list of refunds owing accounting rather than looking settled.
 
+**Only a clean hand-off or Retry accounting takes that flag down.** A storefront delivering the same
+refund a second time (a redelivered WooCommerce refund) is recognised as a replay of the refund IMS
+already has: it creates nothing, queues nothing new, and **leaves the flag and the recorded postings
+alone**. Until the refund's accounting has been retried, a further refund on the same order is refused
+("A previous refund on this order has unresolved accounting and must be retried before another refund
+can be created"), so the order's next refund can never be worked out against a reversal that was not
+queued. The Allocated Inventory relief a refund records when it is created is counted by the order's
+next refund only against a reversal journal that exists; if the connector's posting of that reversal was
+switched off when the hand-off ran (so it will never exist), the recorded relief is written down to £0
+in the same step that clears the flag, and the next refund credits the open balance in full.
+
 This is a refusal, not a retry: IMS does not re-resolve the connector and try again on its own,
 because "which books does this belong in" is not a question it can answer for you in the middle of a
 switch.

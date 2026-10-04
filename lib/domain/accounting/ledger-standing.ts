@@ -192,6 +192,21 @@ export function mayHaveReachedLedger(row: LedgerStandingRow, options: LedgerStan
 }
 
 /**
+ * THE ROWS THAT COUNT TOWARD "WHAT POSTED" FOR ONE POSTING (o3d-fj4m, Codex round 3 on #733).
+ *
+ * A posting can have several attempts (a cancelled one, then a re-queued one). The attempts PROVEN never to
+ * have reached the ledger are not part of what posted and are EXCLUDED; every other attempt counts, and is
+ * then judged by its own standing. This is the ONE definition: the refund discharge classifies a refund's
+ * reversal attempts with it, and the refund amount reader (`proveJournalPosting` with
+ * `excludeProvenNotPosted`) proves the posted amount from what it leaves, so the two cannot disagree about a
+ * mixed set. It does NOT loosen anything for asserted / unknown / live rows: they still count, and an
+ * amount is still proved only by CONFIRMED_POSTED rows.
+ */
+export function rowsThatMayHaveReachedLedger<T extends LedgerStandingRow>(rows: readonly T[]): T[] {
+  return rows.filter((row) => mayHaveReachedLedger(row))
+}
+
+/**
  * Is this a LEDGER FACT - the connector answered - rather than a claim, a guess or unfinished work?
  * The reading AMOUNT questions need (relief proved, a posted line's contents): an operator-typed id
  * is a claim the document exists, not a figure anybody read.

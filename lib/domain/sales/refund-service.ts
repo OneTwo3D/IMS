@@ -463,8 +463,14 @@ async function runInTransaction<T>(
   client: RefundServiceClient,
   callback: (tx: Prisma.TransactionClient) => Promise<T>,
 ): Promise<T> {
+  // o3d-fpzhm: A COPY, NEVER THE SHARED OBJECT. A Prisma transaction client exposes `$transaction` at
+  // runtime, so this takes the NESTED path when `client` is already a transaction (the staging transaction
+  // calls it that way), and Prisma's `_transactionWithCallback` stamps `options.newTxId` ONTO THE OBJECT IT IS
+  // GIVEN. Handed the module-level constant, every later top-level call in the process started with the id of
+  // a transaction that had long since committed and failed with P2028 ("A start cannot be executed on a
+  // committed transaction") - refund #2, a storefront replay and an accounting retry alike.
   return canRunTransaction(client)
-    ? client.$transaction(callback, REFUND_TX_OPTIONS)
+    ? client.$transaction(callback, { ...REFUND_TX_OPTIONS })
     : callback(client)
 }
 
@@ -1419,6 +1425,10 @@ async function stageRefundAccountingReversals(
             // recorded on the refund row. Its sync log — the only previous source — is deleted by
             // `retention_sync_logs_months` once it terminalises.
             allocatedReliefAmount: true,
+            // o3d-fj4m: whether this earlier refund STILL OWES its accounting. The amount above is written
+            // at staging, BEFORE any enqueue; while the flag stands, the journal it describes may never
+            // have been queued, and an absent journal must not be read as "retention deleted it".
+            accountingRetryRequired: true,
             lines: {
               select: {
                 id: true,
@@ -2045,13 +2055,23 @@ async function stageRefundAccountingReversals(
         // the record rather than on a journal (o3d-o97 r6): "only SYNCED and CANCELLED are deleted"
         // includes CANCELLED, so this absence is exactly as consistent with a relief that never
         // reached the ledger, and counting it silently retires the refusal that stood yesterday.
+        if (ownReversalRows.length === 0 && priorRefund.accountingRetryRequired) {
+          // o3d-fj4m: NOT retention. A refund that still owes its accounting has had nothing queued (or its
+          // queue never answered), so the absence of its journal is the ordinary state of an unfinished hand-off
+          // - counting the recorded amount would credit Allocated Inventory against relief that was never
+          // raised. Refused rather than counted: whether the retry will ever post it is not established.
+          // (A new refund is normally blocked while this flag stands - scjz.22 - so this is the net under it
+          // for a flag set after the later refund was created, or a path that bypasses that check.)
+          priorRefundReliefUnresolved = `prior refund ${priorRefund.id} recorded £${recordedRelief.toFixed(2)} of Allocated Inventory relief and STILL OWES its accounting, and its reversal journal has not been queued - nothing was credited to ${settings.allocatedInventoryAccount} for it, so how much of the A2 debit is still open cannot be established until that refund's accounting is retried`
+          continue
+        }
         if (ownReversalRows.length === 0) {
           priorRefundAllocationRelief += recordedRelief
           assumedReliefTotal += recordedRelief
           assumedReliefNotes.push(`prior refund ${priorRefund.id}'s £${recordedRelief.toFixed(2)} of Allocated Inventory relief was counted from its own record because its reversal journal is no longer on record (retention) — retention deletes cancelled journals as well as settled ones, so whether those pounds ever reached the account is not established`)
           continue
         }
-        const proof = proveJournalPosting(ownReversalRows, settings.allocatedInventoryAccount, 'credit')
+        const proof = proveJournalPosting(ownReversalRows, settings.allocatedInventoryAccount, 'credit', { excludeProvenNotPosted: true })
         if (proof.kind === 'illegible') {
           // A settled row whose payload was compacted away. Same position as no row at all, and
           // recorded as an assumption for the same reason (o3d-o97 r6).
@@ -2089,7 +2109,7 @@ async function stageRefundAccountingReversals(
         // o3d-o97 r5: and the same now goes for CANCELLED, which r4 still read as a proved zero.
         // With no recorded column behind this branch there is nothing to fall back on either, so an
         // ILLEGIBLE payload on a settled row refuses here rather than resolving to a figure.
-        const proof = proveJournalPosting(ownRows, settings.allocatedInventoryAccount, 'credit')
+        const proof = proveJournalPosting(ownRows, settings.allocatedInventoryAccount, 'credit', { excludeProvenNotPosted: true })
         if (proof.kind === 'proved') {
           priorRefundAllocationRelief += proof.amount
         } else if (proof.kind === 'illegible') {
@@ -2163,6 +2183,11 @@ async function stageRefundAccountingReversals(
         : 0
       // o3d-3la07 (M8): "settled" for an AMOUNT is a CONFIRMED, SYNCED row. An operator-asserted
       // reversal is unsettled here - it lands in the existing UNRESOLVED branch below.
+      // o3d-fj4m (round 3) AUDIT: deliberately NOT narrowed by `rowsThatMayHaveReachedLedger`. These are DIFFERENT
+      // order-level reversals, not attempts at one posting, and the order's recorded reversal total
+      // (`allocationReversalAmount`) already counts a PROVEN_NOT_POSTED one, so dropping its row would leave its
+      // pounds counted as assumed relief for a journal that never posted. 1b pins this refusal
+      // (`[o3d-3la07 M8] ALLOCATION_REVERSAL PROVEN_NOT_POSTED: the refund is UNRESOLVED`).
       const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).

@@ -71,6 +71,7 @@ import { roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInpu
 import {
   LEDGER_STANDING_SELECT,
   ledgerStanding,
+  rowsThatMayHaveReachedLedger,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
 
@@ -253,8 +254,18 @@ export function proveJournalPosting(
   rows: JournalProofRow[],
   accountCode: string,
   side: 'credit' | 'debit',
+  options: { excludeProvenNotPosted?: boolean } = {},
 ): JournalLedgerProof {
   if (rows.length === 0) return { kind: 'unproved', statuses: 'absent' }
+  // o3d-fj4m (round 3): for a posting with several ATTEMPTS, the ones PROVEN never to have reached the ledger
+  // are not part of what posted (the shared predicate the refund discharge uses). If nothing else is left,
+  // nothing posted: a proved zero. Opt-in: single-journal callers (Group B's per-shipment journal, the A2
+  // debit) keep refusing a cancelled row, as they always have.
+  if (options.excludeProvenNotPosted) {
+    const counted = rowsThatMayHaveReachedLedger(rows)
+    if (counted.length === 0) return { kind: 'proved', amount: 0 }
+    rows = counted
+  }
   // o3d-3la07 (M8/M9): an AMOUNT is proved by a CONFIRMED row only (see journalRowProvesAmount).
   if (rows.some((row) => !journalRowProvesAmount(row))) {
     return {
