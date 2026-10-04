@@ -241,6 +241,8 @@ const pendingSettingInserts = new Map<string, Promise<boolean>>()
 let resetTokenDeleteGate: (() => Promise<void>) | null = null
 /** Makes the full reset's settings wipe fail, so a reset that dies part-way is a testable state. */
 let settingsWipeFails = false
+/** o3d-6thk1: fail the statement that clears the previous organisation's mapping. */
+let mappingClearFails = false
 
 /**
  * The token row's WRITE LOCK, held by an uncommitted transaction (o3d-9tbz r4).
@@ -358,6 +360,7 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         }
         if (!wholesale) {
           const keys = typeof predicate === 'string' ? [predicate] : (predicate?.in ?? [])
+          if (mappingClearFails && keys.includes('xero_sync_enabled')) throw new Error('mapping clear failed (injected)')
           let count = 0
           for (const key of keys) {
             if (visibleSetting(key) == null) continue
@@ -656,6 +659,7 @@ beforeEach(() => {
   organisationFetchGate = null
   resetTokenDeleteGate = null
   settingsWipeFails = false
+  mappingClearFails = false
   refreshGrantGate = null
   bindingTokenWriteGate = null
   pendingSettingInserts.clear()
@@ -3011,4 +3015,34 @@ test('[o3d-6thk1] a binding that FAILS part-way rolls the clear back with it', a
   assert.equal(result.success, false)
   assert.equal(tokenRow, null, 'nothing was bound')
   assert.equal(JSON.stringify(settings), before, 'and the previous organisation\'s mapping is exactly as it was: clear and bind are one transaction')
+})
+
+test('[o3d-6thk1] a failure of the CLEAR itself rolls the binding back: the new organisation is not bound over the old mapping', async () => {
+  await mappedFor(DEMO)
+  const { exchangeCodeForTokens, disconnect } = await loadAuth()
+  await disconnect()
+  connectionsBody = [OTHER]
+  const before = JSON.stringify(settings)
+  mappingClearFails = true
+  assert.equal((await mappingRowsPresent()).length, 16, 'PRECONDITION: mapping present')
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/cb')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null, 'the token write is rolled back with the failed clear')
+  assert.equal(JSON.stringify(settings), before, 'no pin, no stamp, and the mapping exactly as it was')
+})
+
+test('[o3d-6thk1] the binding takes the mapping lock BEFORE it reads who the mapping belongs to, and clears after the binding rows', () => {
+  // The lock is inert in this file's double, so its presence and position are asserted on the source (the
+  // lock itself has its own tests). Comments are stripped so a mention in prose cannot satisfy it.
+  const body = functionBody(xeroAuthSource(), 'async function bindXeroTenant')
+  const lock = body.indexOf('lockAccountingMappingSelection(tx')
+  const read = body.indexOf('readPreviousMappingOrganisation(tx')
+  const pin = body.indexOf('runOrderedAccountingBindingWrites(')
+  const clear = body.indexOf('resetAccountMappingForOrganisationChange(tx')
+  console.log(`# o3d-6thk1 order: lock@${lock} read@${read} bindingRows@${pin} clear@${clear}`)
+  assert.ok(lock !== -1 && read !== -1 && pin !== -1 && clear !== -1, 'PRECONDITION: all four steps are in bindXeroTenant')
+  assert.ok(lock < read && read < pin && pin < clear,
+    'lock, then read the previous organisation (the token upsert overwrites it), then the binding rows, then the clear')
 })
