@@ -125,6 +125,8 @@ export type RehearsalReport = {
   steps: StepResult[]
   teardown: TeardownResult | null
   notes: string[]
+  /** The signal that interrupted the run, if one did: an interrupted run is RED whatever its steps say. */
+  interrupted: string | null
 }
 
 /** A required step that did not pass makes the report RED; an optional step never does. */
@@ -132,9 +134,9 @@ export function isRed(steps: readonly StepResult[]): boolean {
   return steps.some((step) => step.required && step.status !== 'passed')
 }
 
-export function rehearsalExitCode(steps: readonly StepResult[], teardown: TeardownResult | null): RehearsalExitCode {
+export function rehearsalExitCode(steps: readonly StepResult[], teardown: TeardownResult | null, interrupted: string | null = null): RehearsalExitCode {
   if (teardown === null || teardownIncomplete(teardown)) return REHEARSAL_EXIT.TEARDOWN_INCOMPLETE
-  return isRed(steps) ? REHEARSAL_EXIT.RED : REHEARSAL_EXIT.OK
+  return isRed(steps) || interrupted !== null ? REHEARSAL_EXIT.RED : REHEARSAL_EXIT.OK
 }
 
 export function teardownIncomplete(teardown: TeardownResult): boolean {
@@ -326,18 +328,31 @@ export function assessOutboundStatus(run: { exitCode: number | null; stdout: str
   const failures: string[] = []
   if (run.exitCode !== 0) failures.push(`outbound:status exited ${run.exitCode}`)
 
-  const text = run.stdout
-  const start = text.search(/^\{\s*$/m)
+  // EXACTLY ONE top-level JSON object, with nothing but the npm banner (`> ...` lines and blanks)
+  // before it and nothing but the `Exit code N.` line and blanks after it. Two reports, a stale block,
+  // or any other text leave no unambiguous answer to "which one is the status", so they fail.
+  const lines = run.stdout.split('\n')
+  const starts = lines.flatMap((line, index) => (line === '{' ? [index] : []))
   let parsed: unknown = null
-  if (start !== -1) {
-    const end = text.indexOf('\n}', start)
-    if (end !== -1) {
-      try {
-        parsed = JSON.parse(text.slice(start, end + 2))
-      } catch {
-        parsed = null
-      }
-    }
+  if (starts.length !== 1) {
+    failures.push(`outbound:status output must contain exactly one JSON report, found ${starts.length}`)
+    return { ok: false, failures }
+  }
+  const startLine = starts[0]!
+  const endLine = lines.findIndex((line, index) => index > startLine && line === '}')
+  if (endLine === -1) {
+    failures.push('outbound:status output is not a JSON report with a connectors list')
+    return { ok: false, failures }
+  }
+  const stray = [
+    ...lines.slice(0, startLine).filter((line) => line.trim() !== '' && !line.startsWith('>')),
+    ...lines.slice(endLine + 1).filter((line) => line.trim() !== '' && !/^Exit code \d+\.?$/.test(line.trim())),
+  ]
+  if (stray.length > 0) failures.push(`outbound:status printed unexpected text around the report: ${stray.slice(0, 2).join(' | ')}`)
+  try {
+    parsed = JSON.parse(lines.slice(startLine, endLine + 1).join('\n'))
+  } catch {
+    parsed = null
   }
   const connectors = (parsed as { connectors?: unknown } | null)?.connectors
   if (parsed === null || typeof parsed !== 'object' || !Array.isArray(connectors)) {
@@ -454,8 +469,8 @@ export function redactSecrets(text: string, secrets: readonly string[]): string 
 }
 
 export function buildReport(input: Omit<RehearsalReport, 'schemaVersion' | 'tool' | 'verdict' | 'exitCode' | 'durationMs'>): RehearsalReport {
-  const exitCode = rehearsalExitCode(input.steps, input.teardown)
-  const red = isRed(input.steps) || exitCode !== REHEARSAL_EXIT.OK
+  const exitCode = rehearsalExitCode(input.steps, input.teardown, input.interrupted)
+  const red = isRed(input.steps) || input.interrupted !== null || exitCode !== REHEARSAL_EXIT.OK
   return {
     schemaVersion: 1,
     tool: 'rehearse-first-install',

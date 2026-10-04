@@ -43,6 +43,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -97,6 +98,10 @@ export type RehearsalHooks = {
   beforeStep?: (id: StepId) => void | Promise<void>
   /** Runs once the cluster is up and before any step; throwing aborts the run (the catch-all path). */
   afterClusterStart?: () => void | Promise<void>
+  /** Runs inside teardown after the first identity check and before the stop, so a test can replace the postmaster in that gap. */
+  betweenIdentityAndStop?: () => void
+  /** Replaces the report file writer, so a test can fail one of the two report files. */
+  writeReportFile?: (file: string, data: string) => void
   /** Replaces the cluster starter, so a test can make a start fail after the postmaster has forked. */
   clusterStarter?: typeof startCluster
   afterProvision?: (client: pg.Client) => Promise<void>
@@ -133,6 +138,7 @@ type RunState = {
   cluster: Cluster | null
   postmasterPid: number | null
   postmaster: PostmasterIdentity | null
+  betweenIdentityAndStop?: () => void
   role: string | null
   password: string
   secrets: string[]
@@ -167,7 +173,7 @@ export function processIsAlive(pid: number): boolean {
 }
 
 /** A postmaster as this run identified it: pid AND start time AND data directory, so a reused pid is not mistaken for it. */
-export type PostmasterIdentity = { pid: number; startTicks: string; dataDir: string }
+export type PostmasterIdentity = { pid: number; startTicks: string; dataDir: string; pidFileStart: string }
 
 export function readStartTicks(pid: number): string | null {
   try {
@@ -225,7 +231,17 @@ export function capturePostmaster(dataDir: string): PostmasterIdentity | null {
   if (!Number.isFinite(recorded) || actual === null || Math.abs(recorded - actual) > 3) return null
   const startTicks = readStartTicks(pid)
   if (startTicks === null) return null
-  return { pid, startTicks, dataDir }
+  return { pid, startTicks, dataDir, pidFileStart: lines[2]! }
+}
+
+/** The data directory's postmaster.pid still names this pid, this directory and this start record: what `pg_ctl -D` is about to act on. */
+export function pidFileStillNames(identity: PostmasterIdentity): boolean {
+  try {
+    const lines = readFileSync(path.join(identity.dataDir, 'postmaster.pid'), 'utf8').split('\n')
+    return Number(lines[0]) === identity.pid && lines[1] === identity.dataDir && lines[2] === identity.pidFileStart
+  } catch {
+    return false
+  }
 }
 
 /** The process at that pid is still the one captured: same start time, still running from the same directory. */
@@ -430,13 +446,26 @@ function teardownRun(state: RunState): TeardownResult {
   // a directory a replacement now owns would stop the replacement; there is no unconditional stop here
   // and no numeric-pid SIGKILL (a pid can be reused between any check and the signal): a postmaster
   // that cannot be stopped this way is reported as an orphan and the exit code says so.
+  //
+  // WHAT THIS DOES NOT CLOSE, stated plainly: the identity check and `pg_ctl` are two separate acts, and
+  // Linux offers no handle (pidfd) that Node can pass to pg_ctl, so a replacement that takes the data
+  // directory between the LAST check below and pg_ctl's own read of postmaster.pid would be stopped.
+  // The window is narrowed to the gap between two reads of the same small file: identity is confirmed,
+  // then the pid file is confirmed to still name that pid, directory and start record, immediately
+  // before pg_ctl runs. The residual is an accepted limit of a throwaway cluster on a private port in a
+  // directory only this run knows the name of; anything detected as replaced is reported, never stopped.
   if (identity !== null && postmasterIsStillOurs(identity)) {
-    try {
-      execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
-    } catch (error) {
-      errors.push(`pg_ctl stop failed: ${error instanceof Error ? error.message : String(error)}`)
+    state.betweenIdentityAndStop?.()
+    if (pidFileStillNames(identity) && postmasterIsStillOurs(identity)) {
+      try {
+        execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
+      } catch (error) {
+        errors.push(`pg_ctl stop failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (postmasterIsStillOurs(identity)) errors.push(`postmaster ${identity.pid} is still running after pg_ctl stop; it is left alone and reported as an orphan`)
+    } else {
+      errors.push('the data directory was taken over between the identity check and the stop; nothing was stopped')
     }
-    if (postmasterIsStillOurs(identity)) errors.push(`postmaster ${identity.pid} is still running after pg_ctl stop; it is left alone and reported as an orphan`)
   } else if (state.cluster) {
     errors.push('the postmaster this run started no longer matches its captured identity; it was not stopped, because whatever owns the data directory now is not ours to stop')
   }
@@ -569,6 +598,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   try {
     // ---- Cluster: its own directory, port, superuser role and scram password auth. ----
     port = await freePort()
+    state.betweenIdentityAndStop = hooks.betweenIdentityAndStop
     state.cluster = (hooks.clusterStarter ?? startCluster)(root, 'pg', port, '127.0.0.1')
     const cluster = state.cluster
     state.postmaster = capturePostmaster(cluster.data)
@@ -971,22 +1001,43 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     steps: results,
     teardown: state.teardown,
     notes,
+    interrupted: interrupted as string | null,
   })
 
   const outDir = path.join(reportDir, runId)
   const json = path.join(outDir, 'readiness-report.json')
   const markdown = path.join(outDir, 'readiness-report.md')
+  const write = hooks.writeReportFile ?? ((file: string, data: string) => writeFileSync(file, data))
+  // Both files are written under temporary names and only then renamed into place, the JSON (the file
+  // the go/no-go gate reads) LAST, so a failure part-way never leaves a GREEN JSON beside a missing
+  // Markdown. On any failure everything is removed and an amended RED copy is attempted; whatever then
+  // exists on disk says RED.
+  const publish = (toPublish: RehearsalReport): void => {
+    const tmpJson = `${json}.tmp`
+    const tmpMarkdown = `${markdown}.tmp`
+    try {
+      mkdirSync(outDir, { recursive: true })
+      write(tmpMarkdown, renderMarkdown(toPublish))
+      write(tmpJson, `${JSON.stringify(toPublish, null, 2)}\n`)
+      renameSync(tmpMarkdown, markdown)
+      renameSync(tmpJson, json)
+    } catch (error) {
+      for (const file of [tmpJson, tmpMarkdown, json, markdown]) rmSync(file, { force: true })
+      throw error
+    }
+  }
   try {
-    mkdirSync(outDir, { recursive: true })
-    writeFileSync(json, `${JSON.stringify(report, null, 2)}\n`)
-    writeFileSync(markdown, renderMarkdown(report))
+    publish(report)
   } catch (error) {
-    // The run happened; its verdict must not be lost with the files, and what is printed must not
-    // say GREEN about a run that produced nothing attachable: amend the report itself.
     const reportWriteError = error instanceof Error ? error.message : String(error)
     const exitCode = report.exitCode === REHEARSAL_EXIT.OK ? REHEARSAL_EXIT.RED : report.exitCode
     const amended: RehearsalReport = { ...report, verdict: 'RED', exitCode, notes: [...report.notes, `The report could not be written (${reportWriteError}); this copy is the only record.`] }
-    return { exitCode, report: amended, runRoot: root, reportWriteError }
+    try {
+      publish(amended)
+      return { exitCode, report: amended, reportPaths: { json, markdown }, runRoot: root, reportWriteError }
+    } catch {
+      return { exitCode, report: amended, runRoot: root, reportWriteError }
+    }
   }
   return { exitCode: report.exitCode, report, reportPaths: { json, markdown }, runRoot: root }
 }

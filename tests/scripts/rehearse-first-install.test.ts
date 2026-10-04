@@ -166,9 +166,13 @@ test('the outbound:status step is optional while the script is absent and requir
     ['a missing connector', report({ woocommerce: 'held', mintsoft: 'held' }), /no entry for xero/],
     ['a duplicated connector', report(allHeld).replace('"connector": "xero"', '"connector": "mintsoft"'), /mintsoft.*more than once/],
     ['an unknown connector', report({ ...allHeld, acme: 'held' }), /unknown connector acme/],
-    ['mixed states on one connector line of a text report', 'woocommerce: held, not granted, open\nmintsoft: held\nxero: held\n', /not a JSON report/],
+    ['mixed states on one connector line of a text report', 'woocommerce: held, not granted, open\nmintsoft: held\nxero: held\n', /exactly one JSON report, found 0/],
     ['anyGranted true although every state says held', report(allHeld, { anyGranted: true }), /anyGranted/],
     ['a non-zero exit', report(allHeld).replace('Exit code 0', 'Exit code 3'), /exited 3/],
+    ['a stale all-held block followed by the real report showing a grant', `${report(allHeld)}\n${report({ ...allHeld, xero: 'granted' }, { anyGranted: true })}`, /exactly one JSON report/],
+    ['the real report showing a grant followed by a stale all-held block', `${report({ ...allHeld, xero: 'granted' }, { anyGranted: true })}\n${report(allHeld)}`, /exactly one JSON report/],
+    ['diagnostic text before the report', `warning: using a cached status\n${report(allHeld)}`, /unexpected text/],
+    ['diagnostic text after the report', `${report(allHeld)}\neverything is fine, trust me\n`, /unexpected text/],
   ]
   for (const [name, stdout, pattern] of bad) {
     const result = assessOutboundStatus({ exitCode: name === 'a non-zero exit' ? 3 : 0, stdout })
@@ -663,6 +667,84 @@ test('TEARDOWN: a replacement postmaster that took over the data directory is NO
   } finally {
     if (replacementPid > 0 && processIsAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL') // started by this test's own hook
   }
+})
+
+test('TEARDOWN: a postmaster replaced AFTER the first identity check and BEFORE the stop is caught by the pid-file re-check (the residual window is the few microseconds after it)', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const bin = pgBinDir()
+  let originalPid = 0
+  let replacementPid = 0
+  let dataDir = ''
+  const hooks: RehearsalHooks = {
+    betweenIdentityAndStop: () => {
+      const run = readdirSync(parent).find((name) => name.startsWith('ims-rehearsal-') && name !== 'reports')!
+      dataDir = join(parent, run, 'pg', 'data')
+      const lines = readFileSync(join(dataDir, 'postmaster.pid'), 'utf8').split('\n')
+      originalPid = Number(lines[0])
+      execFileSync(join(bin, 'pg_ctl'), ['-D', dataDir, '-m', 'fast', '-w', 'stop'], { stdio: 'pipe' })
+      execFileSync(join(bin, 'pg_ctl'), ['-D', dataDir, '-l', join(parent, run, 'pg2.log'), '-o', `-p ${lines[3]} -k ${join(parent, run, 'pg', 'sock')} -c listen_addresses=127.0.0.1`, '-w', 'start'], { stdio: 'pipe' })
+      replacementPid = Number(readFileSync(join(dataDir, 'postmaster.pid'), 'utf8').split('\n')[0])
+    },
+  }
+  const outcome = await runRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, hooks, only: new Set<StepId>(['system-identifier']) })
+  try {
+    console.log(`# postmaster ${originalPid} replaced by ${replacementPid} between the identity check and the stop; replacement alive after the run: ${processIsAlive(replacementPid)}`)
+    assert.ok(originalPid > 0 && replacementPid > 0 && originalPid !== replacementPid, 'precondition: the replacement happened in the gap')
+    assert.equal(processIsAlive(replacementPid), true, 'the replacement was not stopped')
+    assert.equal(outcome.exitCode, REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
+  } finally {
+    if (replacementPid > 0 && processIsAlive(replacementPid)) process.kill(replacementPid, 'SIGKILL') // started by this test's own hook
+  }
+})
+
+test('REPORT PUBLICATION: if the Markdown cannot be written, no artefact on disk says GREEN and every one that exists says RED', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  let mdAttempts = 0
+  const outcome = await runRehearsal({
+    parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['system-identifier']),
+    hooks: {
+      writeReportFile: (file, data) => {
+        if (file.includes('readiness-report.md')) {
+          mdAttempts += 1
+          if (mdAttempts === 1) throw new Error('injected: disk full while writing the Markdown report')
+        }
+        writeFileSync(file, data)
+      },
+    },
+  })
+  assert.ok(outcome.report)
+  const dirs = existsSync(join(parent, 'reports')) ? readdirSync(join(parent, 'reports')) : []
+  const files = dirs.flatMap((d) => readdirSync(join(parent, 'reports', d)).map((f) => join(parent, 'reports', d, f)))
+  const verdicts = files.map((f) => `${f.split('/').pop()}: ${f.endsWith('.json') ? (JSON.parse(readFileSync(f, 'utf8')) as { verdict: string }).verdict : (/^# Fresh-install rehearsal: (\w+)/.exec(readFileSync(f, 'utf8'))?.[1] ?? '?')}`)
+  console.log(`# every step passed: ${outcome.report.steps.every((x) => x.status === 'passed')}; artefacts on disk after the Markdown failure: ${JSON.stringify(verdicts)}; exit ${outcome.exitCode}`)
+  assert.ok(outcome.report.steps.every((x) => x.status === 'passed'), 'precondition: the run itself was clean')
+  assert.ok(mdAttempts >= 1, 'precondition: the Markdown write failed once')
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.equal(outcome.report.verdict, 'RED')
+  assert.equal(verdicts.some((v) => /GREEN/.test(v)), false, 'no artefact on disk says GREEN')
+  assert.equal(files.some((f) => f.endsWith('.tmp')), false, 'no temporary file is left behind')
+  if (verdicts.length > 0) assert.ok(verdicts.every((v) => /RED/.test(v)), 'every artefact that exists says RED')
+})
+
+test('INTERRUPTION during the last, asynchronous step (no child to kill) still makes the report RED', { timeout: TIMEOUT }, async (t) => {
+  const before = new Set(process.listeners('SIGTERM'))
+  const outcome = await rehearse(t, {
+    only: LIGHT,
+    hooks: {
+      afterRestore: async () => {
+        const mine = process.listeners('SIGTERM').filter((l) => !before.has(l))
+        assert.equal(mine.length, 1, 'precondition: the rehearsal installed exactly one SIGTERM handler')
+        ;(mine[0] as (signal: string) => void)('SIGTERM')
+      },
+    },
+  })
+  const { report } = outcome
+  console.log(`# every step passed: ${report.steps.every((x) => x.status === 'passed')}; notes: ${JSON.stringify(report.notes)}; verdict ${report.verdict}; exit ${outcome.outcome.exitCode}`)
+  assert.ok(report.steps.every((x) => x.status === 'passed'), 'precondition: the final step completed although the signal arrived during it')
+  assert.ok(report.notes.some((note) => /interrupted by SIGTERM/.test(note)))
+  assert.equal(report.verdict, 'RED')
+  assert.equal(outcome.outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.equal(report.exitCode, REHEARSAL_EXIT.RED)
 })
 
 test('ISOLATION ARM: a hostile user npm configuration in the caller HOME is never read by a rehearsal child', { timeout: TIMEOUT }, async (t) => {
