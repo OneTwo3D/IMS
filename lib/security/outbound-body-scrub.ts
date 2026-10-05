@@ -7,7 +7,7 @@
  * reaching a destination and being echoed back.
  *
  * What the real callers send (read from the call sites):
- *   - a JSON string (every Mintsoft, WooCommerce and Xero request body);
+ *   - a JSON string (every connector request body);
  *   - URLSearchParams (the two Xero token requests: secrets and codes, no free text);
  *   - a Uint8Array (the Xero attachment upload: a BINARY file, deliberately never rewritten).
  * connectorFetch already REFUSES every other body type (streams, FormData, Blob...) with "body type is not
