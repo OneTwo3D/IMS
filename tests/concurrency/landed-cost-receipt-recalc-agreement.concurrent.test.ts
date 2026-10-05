@@ -386,8 +386,11 @@ test('re-save of IDENTICAL freight lines (order-sensitive fixture, two freight o
   const idsBefore = (await db.freightCostLine.findMany({ where: { poId: { in: [a.poId, b.poId] } }, select: { id: true } })).map((r) => r.id).sort().join()
   const asInput = (amounts: string[]) => amounts.map((amount, index) => ({ description: `freight ${index}`, amountForeign: Number(amount), vatable: false, distributionMethod: 'BY_QUANTITY' }))
   for (let i = 0; i < 6; i += 1) {
-    const one = await updateFreightPoCosts(a.poId, asInput(['89401.8989', '-27040.1416']))
-    const two = await updateFreightPoCosts(b.poId, asInput(['18605.9624']))
+    // Alternate which freight order is re-saved FIRST, so the recreated ids interleave in both orders.
+    const saveA = () => updateFreightPoCosts(a.poId, asInput(['89401.8989', '-27040.1416']))
+    const saveB = () => updateFreightPoCosts(b.poId, asInput(['18605.9624']))
+    const one = i % 2 === 0 ? await saveA() : await saveB()
+    const two = i % 2 === 0 ? await saveB() : await saveA()
     assert.equal(one.success && two.success, true, `PRECONDITION: the re-save must succeed: ${one.error ?? two.error}`)
   }
   const after = await layers()
