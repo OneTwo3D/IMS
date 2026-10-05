@@ -17,7 +17,7 @@ The accounting rule for which units leave stock first. The unit you sell today i
 The accounting value of stock that has been dispatched to a customer. The system books COGS at shipment time by consuming FIFO cost layers oldest-first. COGS is what your profit-and-loss reports use for the "cost" side of margin.
 
 **Landed cost**
-The all-in cost of getting a unit of stock into your warehouse, including the supplier price plus freight, customs, duties, and other inbound charges. The system distributes landed-cost POs across the underlying goods POs so the cost layers reflect the true unit cost, not just the supplier invoice.
+The all-in cost of getting a unit of stock into your warehouse, including the supplier price plus freight, customs, duties, and other inbound charges. The system distributes landed-cost POs across the underlying goods POs so the cost layers reflect the true unit cost, not just the supplier invoice. A credit (negative) cost line reduces the cost, but a unit is never valued below zero.
 
 **Stock unit**
 The unit of measure a product is counted in (pcs, kg, m, etc.). Distinct from `Purchase unit` — e.g. you might count a fabric in metres internally but buy it from the supplier as 100-metre rolls.
@@ -73,7 +73,7 @@ A pre-purchase document sent to a supplier asking them to quote prices on a list
 The point in the workflow where the supplier's goods physically arrive in your warehouse. Receiving creates FIFO cost layers and increments stock-on-hand. The PO moves to PARTIALLY_RECEIVED or RECEIVED depending on whether everything came in one shipment.
 
 **Landed-cost PO (freight PO)**
-A separate purchase order that captures shipping, customs, duties, and other inbound charges associated with one or more primary goods POs. The landed cost gets distributed across the primary POs' lines so the cost layers reflect the true all-in unit cost.
+A separate purchase order that captures shipping, customs, duties, and other inbound charges associated with one or more primary goods POs. The landed cost gets distributed across the primary POs' lines so the cost layers reflect the true all-in unit cost. Credit lines reduce that cost, floored at zero per unit.
 
 **Reorder evidence**
 Forecast metadata attached to a PO line generated from a supplier-scoped reorder draft. Records why the system suggested this quantity at this time (current stock, daily sales rate, lead-time days, etc.). Operators and auditors can replay the suggestion later.

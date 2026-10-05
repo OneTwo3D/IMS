@@ -2563,10 +2563,13 @@ The daily batch intentionally processes A1 revenue deferral, A2 inventory alloca
 Retry behavior is marker-driven. If the process stops after A1, the next run skips A1-marked orders and continues with A2. If it stops after A2, the next run continues with Group B. If Group B partially fails, unmarked shipments remain eligible for the next run. Do not manually clear these dates unless finance has also reversed any exported journals.
 
 **The daily batch refuses a negative cost, by name, instead of posting it short.** A cost layer's
-unit cost can go below zero when a landed-cost recalculation spreads a credit freight cost line
-larger than the goods it is spread over, and the recalculation rewrites the cost recorded on
-allocations and shipments that already used that layer. The daily batch now checks for it in three
-places:
+unit cost used to be able to go below zero when a landed-cost recalculation spread a credit freight
+cost line larger than the goods it was spread over, rewriting the cost recorded on allocations and
+shipments that already used that layer. Landed cost can no longer do that to a purchase order's own
+layers: a unit is valued at zero instead of below it (see *Recalculation after receipt* in the purchasing guide;
+manufactured goods built from such a layer are not floored). The daily batch keeps
+its three checks as defence in depth against any other source of a negative cost, because posting one
+short is the defect they exist to prevent:
 
 - **Group A2** — an order whose allocated or dispatched units would be reclassified at a negative
   cost is not reclassified. The other orders in the batch are reclassified as normal, and the
@@ -2582,9 +2585,9 @@ places:
   unit in it.
 
 For Group A2 and Group B nothing about the refused order is stamped, so it stays queued: correct the
-cost basis (usually by removing or correcting the credit freight cost line on the purchase order,
-which re-runs the landed-cost recalculation) and the next batch reclassifies the order, then posts
-its COGS — the Allocated Inventory debit and credit come out equal. For a refused **rebuild** the
+cost basis that went negative (the activity log entry names the cost layer) and the next batch
+reclassifies the order, then posts its COGS — the Allocated Inventory debit and credit come out
+equal. For a refused **rebuild** the
 shipments are already stamped from the original run; correcting the cost basis revalues their COGS
 back above zero, and the next batch's rebuild sweep then recreates the missing journal. Nothing
 needs clearing by hand in either case. Before this, Group A2 debited Allocated Inventory short,
@@ -2595,12 +2598,13 @@ order (or, for a rebuild, against the batch reference), naming the shipment and 
 it is listed first in the daily batch run's errors, which marks that cron run failed. A failed cron
 run shows on System Health as a warning, not an alert, so the activity log is the place to look.
 
-**A shipment that was *already* journaled is protected earlier, at the recalculation itself.**
+**A shipment that was *already* journaled is protected earlier, at the revaluation itself.**
 Revaluing it below zero used to post the reversal of its old COGS and drop the negative repost, so
-the difference posted nowhere. Now the landed-cost recalculation refuses and changes nothing (see
-*Recalculation after receipt* in the purchasing guide). A refused recalculation leaves that
-shipment's recorded cost as it was, so none of the three batch checks above ever sees a negative
-cost from it (o3d-c08y).
+the difference posted nowhere. The revaluation refuses and changes nothing if it is ever asked to
+(see *Recalculation after receipt* in the purchasing guide). A landed-cost recalculation cannot ask
+any more for a purchase order's own layers, because it floors each unit cost at zero, so a freight credit that exceeds the goods
+cost revalues the shipment down to 0.00 (the reversal leg only) and reports the part of the credit it
+could not absorb as a warning. The refusal stays as the backstop (o3d-c08y).
 
 **The checks above read each shipment's cost *after* locking it, so a recalculation running at the
 same time cannot slip a stale value past them.** A landed-cost recalculation may change a shipment's

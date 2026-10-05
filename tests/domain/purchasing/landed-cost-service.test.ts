@@ -52,8 +52,12 @@ const baseLines = [
   },
 ]
 
+function grossNumbers(gross: Map<string, Prisma.Decimal>): Record<string, number> {
+  return Object.fromEntries([...gross].map(([id, value]) => [id, value.toNumber()]))
+}
+
 function grossFor(amountBase: number, distributionMethod: string): Record<string, number> {
-  return Object.fromEntries(computeGrossUnitCostBaseByLine({
+  return grossNumbers(computeGrossUnitCostBaseByLine({
     lines: baseLines,
     directCostLines: [{ amountBase, distributionMethod }],
   }))
@@ -104,7 +108,7 @@ test('flags BY_WEIGHT lines that receive zero freight because their weight is ze
   // line-a weight 0 (positive qty), line-b weight 1: BY_WEIGHT puts all freight on
   // line-b and none on line-a, which must raise a per-line diagnostic.
   const zeroWeightLines: string[][] = []
-  const gross = Object.fromEntries(computeGrossUnitCostBaseByLine({
+  const gross = grossNumbers(computeGrossUnitCostBaseByLine({
     lines: [{ id: 'line-a', qty: 2, unitCostBase: 10, totalBase: 20, weight: 0 }, baseLines[1]],
     directCostLines: [{ amountBase: 30, distributionMethod: 'BY_WEIGHT' }],
     onWeightZeroLines: (lineIds) => zeroWeightLines.push(lineIds),
@@ -142,7 +146,7 @@ test('allocates landed cost equally by eligible line', () => {
 })
 
 test('combines direct and linked landed-cost sources', () => {
-  const gross = Object.fromEntries(computeGrossUnitCostBaseByLine({
+  const gross = grossNumbers(computeGrossUnitCostBaseByLine({
     lines: baseLines,
     directCostLines: [{ amountBase: 30, distributionMethod: 'BY_QUANTITY' }],
     linkedCostLines: [{ amountBase: 40, distributionMethod: 'BY_VALUE' }],
@@ -2183,3 +2187,297 @@ test('the in-transit residue is computed by ONE function reached from EVERY reva
   const reads = source.match(/deps\.getInTransitTransferLinesForCostLayer\(/g) ?? []
   assert.equal(reads.length, 1, 'the in-transit reader is invoked only inside the shared helper')
 })
+
+// ─── A credit or zero cost line, applied by receipt and revaluation alike, floored at zero ──────────────
+//
+// Every arm below prints its precondition. T3/T9 drive the REAL recalculation functions through a fake
+// transaction; T4 proves the receipt-side helper and BOTH revaluation paths write the same cost.
+
+type RecalcFixture = {
+  name: string
+  lines: Array<{ id: string; qty: number; unitCostBase: number; totalBase: number; weight: number | null }>
+  direct: Array<{ id: string; amountBase: number; distributionMethod: string }>
+  linked: Array<{ id: string; amountBase: number; distributionMethod: string }>
+  expectCreditLine: boolean
+  expectFloor: boolean
+}
+
+function fixtureLine(id: string, qty: number, unit: number, weight: number | null = 1) {
+  return { id, qty, unitCostBase: unit, totalBase: qty * unit, weight }
+}
+
+const AGREEMENT_FIXTURES: RecalcFixture[] = [
+  {
+    name: 'a credit',
+    lines: [fixtureLine('a', 1, 10), fixtureLine('b', 1, 10)],
+    direct: [{ id: 'c1', amountBase: -4, distributionMethod: 'BY_VALUE' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: false,
+  },
+  {
+    name: 'a zero line beside a positive one',
+    lines: [fixtureLine('a', 2, 10), fixtureLine('b', 1, 20)],
+    direct: [{ id: 'c1', amountBase: 0, distributionMethod: 'BY_QUANTITY' }],
+    linked: [{ id: 'l1', amountBase: 30, distributionMethod: 'BY_VALUE' }],
+    expectCreditLine: false,
+    expectFloor: false,
+  },
+  {
+    name: 'a credit with the BY_WEIGHT equal-split fallback',
+    lines: [fixtureLine('a', 2, 10, 0), fixtureLine('b', 1, 20, 0)],
+    direct: [{ id: 'c1', amountBase: -6, distributionMethod: 'BY_WEIGHT' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: false,
+  },
+  {
+    name: 'direct and linked sources, mixed sign',
+    lines: [fixtureLine('a', 2, 10), fixtureLine('b', 1, 20)],
+    direct: [{ id: 'c1', amountBase: 30, distributionMethod: 'BY_QUANTITY' }],
+    linked: [{ id: 'l1', amountBase: -10, distributionMethod: 'BY_VALUE' }, { id: 'l2', amountBase: 40, distributionMethod: 'BY_VALUE' }],
+    expectCreditLine: true,
+    expectFloor: false,
+  },
+  {
+    name: 'a credit larger than a line\'s goods cost (the floor)',
+    lines: [fixtureLine('a', 1, 1), fixtureLine('b', 1, 100)],
+    direct: [{ id: 'c1', amountBase: -3, distributionMethod: 'BY_QUANTITY' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: true,
+  },
+  {
+    name: 'mixed sign across both sources with a floor',
+    lines: [fixtureLine('a', 3, 1), fixtureLine('b', 1, 50)],
+    direct: [{ id: 'c1', amountBase: 8, distributionMethod: 'BY_VALUE' }],
+    linked: [{ id: 'l1', amountBase: -20, distributionMethod: 'BY_QUANTITY' }],
+    expectCreditLine: true,
+    expectFloor: true,
+  },
+]
+
+function recalcPoFor(fixture: RecalcFixture, mode: 'direct' | 'linked') {
+  const lineRows = fixture.lines.map((l) => ({
+    id: l.id,
+    qty: l.qty,
+    unitCostBase: l.unitCostBase,
+    totalBase: l.totalBase,
+    landedUnitCostBase: l.unitCostBase,
+    product: { weight: l.weight },
+    costLayers: [{ id: `layer-${l.id}`, unitCostBase: l.unitCostBase, receivedQty: l.qty, remainingQty: l.qty }],
+  }))
+  return {
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    subtotalBase: '1',
+    directFreightBase: '0',
+    lines: lineRows,
+    freightCostLines: fixture.direct,
+    landedCostLinks: mode === 'direct'
+      ? (fixture.linked.length > 0 ? [{ freightPO: { id: 'f-1', reference: 'F-1', freightCostLines: fixture.linked } }] : [])
+      : [],
+  }
+}
+
+async function runRecalc(fixture: RecalcFixture, mode: 'direct' | 'linked', depsOverride: Partial<LandedCostServiceDeps> = {}, priorRunAfterJson: unknown = null) {
+  const po = recalcPoFor(fixture, mode)
+  const costLayerUpdates: Array<{ where: { id: string }; data: { unitCostBase: Prisma.Decimal } }> = []
+  const lineUpdates: Array<{ where: { id: string }; data: { landedUnitCostBase: Prisma.Decimal } }> = []
+  const runs: Array<{ data: { warningsJson: Array<{ code: string; message: string }>; afterJson: { lines: Array<{ lineId: string; costLayers: Array<Record<string, string | number>> }> } } }> = []
+  const tx = {
+    landedCostLink: {
+      findMany: async ({ where }: { where: { freightPoId?: string; primaryPoId?: string } }) => {
+        if (where.freightPoId) return [{ primaryPoId: 'po-1' }]
+        return fixture.linked.length > 0 ? [{ freightPO: { id: 'f-1', reference: 'F-1', freightCostLines: fixture.linked } }] : []
+      },
+      updateMany: async () => ({ count: 1 }),
+    },
+    purchaseOrder: { findUnique: async () => po },
+    purchaseOrderLine: { update: async (args: never) => { lineUpdates.push(args); return args } },
+    costLayer: { update: async (args: never) => { costLayerUpdates.push(args); return args } },
+    landedCostRevaluationRun: {
+      findFirst: async () => (priorRunAfterJson ? { afterJson: priorRunAfterJson } : null),
+      create: async (args: never) => { runs.push(args); return { id: `audit-${runs.length}` } },
+    },
+  }
+  const result = mode === 'direct'
+    ? await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(depsOverride), TEST_AUDIT_OPTIONS)
+    : await recalculateLandedCosts(tx as never, 'f-1', noopDeps(depsOverride), TEST_AUDIT_OPTIONS)
+  return { result, costLayerUpdates, lineUpdates, runs }
+}
+
+test('T4: the receipt-side helper and BOTH revaluation paths write the SAME unit cost for every fixture (Decimal equality)', async () => {
+  let creditFixtures = 0
+  let floorFixtures = 0
+  let compared = 0
+  for (const fixture of AGREEMENT_FIXTURES) {
+    const helper = computeGrossUnitCostBaseByLine({
+      lines: fixture.lines.map((l) => ({ ...l })),
+      directCostLines: fixture.direct,
+      linkedCostLines: fixture.linked,
+    })
+    if (fixture.expectCreditLine) creditFixtures += 1
+    if (fixture.expectFloor) floorFixtures += 1
+    for (const mode of ['direct', 'linked'] as const) {
+      const { costLayerUpdates, lineUpdates } = await runRecalc(fixture, mode)
+      assert.equal(costLayerUpdates.length, fixture.lines.length, `${fixture.name}/${mode}: every layer was revalued`)
+      for (const l of fixture.lines) {
+        const expected = new Prisma.Decimal(helper.get(l.id) as never)
+        const layer = costLayerUpdates.find((u) => u.where.id === `layer-${l.id}`)!.data.unitCostBase
+        const poLine = lineUpdates.find((u) => u.where.id === l.id)!.data.landedUnitCostBase
+        assert.equal(new Prisma.Decimal(layer).eq(expected), true, `${fixture.name}/${mode}/${l.id}: layer ${layer} vs helper ${expected}`)
+        assert.equal(new Prisma.Decimal(poLine).eq(expected), true, `${fixture.name}/${mode}/${l.id}: PO line ${poLine} vs helper ${expected}`)
+        compared += 1
+      }
+    }
+  }
+  console.log(`T4 PRECONDITION: fixtures: ${AGREEMENT_FIXTURES.length} (credit: ${creditFixtures}, floored: ${floorFixtures}), recalc paths: 2, layer+PO-line values compared: ${compared * 2}`)
+  assert.equal(creditFixtures >= 4 && floorFixtures >= 2, true)
+})
+
+test('T3: both recalculation paths write ZERO for a floored layer, warn, and carry the residue in the audit row', async () => {
+  const fixture: RecalcFixture = {
+    name: 'floor',
+    lines: [fixtureLine('a', 1, 1)],
+    direct: [{ id: 'c1', amountBase: -3, distributionMethod: 'BY_VALUE' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: true,
+  }
+  for (const mode of ['direct', 'linked'] as const) {
+    const { result, costLayerUpdates, lineUpdates, runs } = await runRecalc(fixture, mode)
+    const layer = costLayerUpdates[0].data.unitCostBase
+    assert.equal(layer.toString(), '0', `${mode}: layer written at zero, not -2`)
+    assert.equal(Object.is(layer.toNumber(), 0), true)
+    assert.equal(lineUpdates[0].data.landedUnitCostBase.toString(), '0')
+    const warningCodes = runs[0].data.warningsJson.map((w) => w.code)
+    const afterLayer = runs[0].data.afterJson.lines[0].costLayers[0]
+    console.log(`T3 PRECONDITION (${mode}): layer=${layer}, warningsJson=${JSON.stringify(warningCodes)}, unabsorbedBase=${afterLayer.unabsorbedBase}, unflooredGrossUnitCostBase=${afterLayer.unflooredGrossUnitCostBase}`)
+    assert.deepEqual(warningCodes, ['landed_cost_credit_floored'])
+    assert.deepEqual(result.warnings.map((w) => w.code), ['landed_cost_credit_floored'])
+    assert.equal(afterLayer.unabsorbedBase, '2')
+    assert.equal(afterLayer.unflooredGrossUnitCostBase, '-2')
+    assert.match(runs[0].data.warningsJson[0].message, /could not absorb 2\.00 of it into stock/)
+    assert.equal(result.creditFloorActivities?.length, 1, `${mode}: the layer's cost changed 1 -> 0, so one activity entry is due`)
+  }
+})
+
+test('T9: a second recalculation of a floored layer posts NOTHING, repeats the warning in the audit row only, and logs no second activity', async () => {
+  const fixture: RecalcFixture = {
+    name: 'floor',
+    lines: [fixtureLine('a', 1, 1)],
+    direct: [{ id: 'c1', amountBase: -3, distributionMethod: 'BY_VALUE' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: true,
+  }
+  for (const mode of ['direct', 'linked'] as const) {
+    const first = await runRecalc(fixture, mode)
+    assert.equal(first.result.inventoryTransitAdjustments.length, 1, `${mode}: the first run reclasses 1 -> 0`)
+    assert.equal(first.result.inventoryTransitAdjustments[0].totalDelta, -1)
+
+    // The second run starts from the state the first one left: layer already at 0.
+    const settled: RecalcFixture = { ...fixture }
+    const po = recalcPoFor(settled, mode)
+    po.lines[0].costLayers[0].unitCostBase = 0
+    po.lines[0].landedUnitCostBase = 0
+    const runs: Array<{ data: { warningsJson: Array<{ code: string }> } }> = []
+    const tx = {
+      landedCostLink: {
+        findMany: async ({ where }: { where: { freightPoId?: string } }) => (where.freightPoId ? [{ primaryPoId: 'po-1' }] : []),
+        updateMany: async () => ({ count: 1 }),
+      },
+      purchaseOrder: { findUnique: async () => po },
+      purchaseOrderLine: { update: async () => ({}) },
+      costLayer: { update: async () => ({}) },
+      landedCostRevaluationRun: {
+        findFirst: async () => ({ afterJson: (first.runs[0] as { data: { afterJson: unknown } }).data.afterJson }),
+        create: async (args: never) => { runs.push(args); return { id: 'audit-2' } },
+      },
+    }
+    const second = mode === 'direct'
+      ? await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
+      : await recalculateLandedCosts(tx as never, 'f-1', noopDeps(), TEST_AUDIT_OPTIONS)
+    console.log(`T9 PRECONDITION (${mode}): run 1 adjustments=${first.result.inventoryTransitAdjustments.length}, run 2 adjustments=${second.inventoryTransitAdjustments.length}+${second.cogsAdjustments.length}, run 2 warningsJson=${JSON.stringify(runs[0].data.warningsJson.map((w) => w.code))}, run 2 activities=${second.creditFloorActivities?.length}`)
+    assert.equal(second.inventoryTransitAdjustments.length, 0)
+    assert.equal(second.cogsAdjustments.length, 0)
+    assert.deepEqual(runs[0].data.warningsJson.map((w) => w.code), ['landed_cost_credit_floored'], 'the audit row repeats the STATE')
+    assert.equal(second.creditFloorActivities?.length, 0, 'no activity entry without a change (event, not state)')
+  }
+})
+
+test('T8: propagation to manufactured outputs is NOT floored (unchanged from before the landed-cost floor)', async () => {
+  // The floor applies to a purchase order's OWN layers only. Propagation applies the source's delta to the output's
+  // STORED cost, so flooring there would make a credit followed by its reversal over- or undervalue the output
+  // (stored cost 0.5, delta -1 floors to 0, delta +1 then gives 1.0 instead of 0.5). That needs the unfloored basis
+  // persisted and is a separate issue; until then the output is written exactly as it always was and the
+  // below-zero refusal remains the backstop.
+  const layers: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
+    'out-1': { unitCostBase: '0.5', receivedQty: '1', remainingQty: '1' },
+  }
+  const updates: Record<string, string> = {}
+  const tx = {
+    costLayer: {
+      findUnique: async ({ where }: { where: { id: string } }) => layers[where.id] ?? null,
+      update: async ({ where, data }: { where: { id: string }; data: { unitCostBase: unknown } }) => { updates[where.id] = String(data.unitCostBase) },
+    },
+    costLayerSourceLine: { update: async () => ({}) },
+  }
+  const deps = noopDeps({
+    getDependentOutputSourceLines: async (_tx, id) => (id === 'src-1' ? [{ sourceLineId: 'sl1', outputCostLayerId: 'out-1', qty: toDecimal(1) }] : []),
+  })
+  await propagateLandedCostToOutputs(
+    tx as never, deps, 'src-1', new Prisma.Decimal(-1), () => {}, new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
+  )
+  console.log(`T8 PRECONDITION: output 0.5 with a -1 delta is written at ${updates['out-1']} (unfloored, as before)`)
+  assert.equal(updates['out-1'], '-0.5')
+})
+
+test('T9b: a floored layer already at zero whose RESIDUE grows (credit -3 -> -5) DOES get a new activity entry', async () => {
+  const base: RecalcFixture = {
+    name: 'floor',
+    lines: [fixtureLine('a', 1, 1)],
+    direct: [{ id: 'c1', amountBase: -3, distributionMethod: 'BY_VALUE' }],
+    linked: [],
+    expectCreditLine: true,
+    expectFloor: true,
+  }
+  for (const mode of ['direct', 'linked'] as const) {
+    const first = await runRecalc(base, mode)
+    const priorAfter = (first.runs[0] as { data: { afterJson: unknown } }).data.afterJson
+    // The same credit again: residue 2 == previous 2, layer already settled at 0 -> no entry.
+    const settledPo = { ...base, lines: [fixtureLine('a', 1, 1)] }
+    const grown: RecalcFixture = { ...settledPo, direct: [{ id: 'c1', amountBase: -5, distributionMethod: 'BY_VALUE' }] }
+    const poFor = (fixture: RecalcFixture) => {
+      const po = recalcPoFor(fixture, mode)
+      po.lines[0].costLayers[0].unitCostBase = 0
+      po.lines[0].landedUnitCostBase = 0
+      return po
+    }
+    const run = async (fixture: RecalcFixture) => {
+      const po = poFor(fixture)
+      const tx = {
+        landedCostLink: {
+          findMany: async ({ where }: { where: { freightPoId?: string } }) => (where.freightPoId ? [{ primaryPoId: 'po-1' }] : []),
+          updateMany: async () => ({ count: 1 }),
+        },
+        purchaseOrder: { findUnique: async () => po },
+        purchaseOrderLine: { update: async () => ({}) },
+        costLayer: { update: async () => ({}) },
+        landedCostRevaluationRun: { findFirst: async () => ({ afterJson: priorAfter }), create: async () => ({ id: 'audit-x' }) },
+      }
+      return mode === 'direct'
+        ? recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
+        : recalculateLandedCosts(tx as never, 'f-1', noopDeps(), TEST_AUDIT_OPTIONS)
+    }
+    const same = await run(settledPo)
+    const bigger = await run(grown)
+    console.log(`T9b PRECONDITION (${mode}): layer stays 0 in both; same residue activities=${same.creditFloorActivities?.length}, grown residue (2 -> 4) activities=${bigger.creditFloorActivities?.length}`)
+    assert.equal(same.creditFloorActivities?.length, 0)
+    assert.equal(bigger.creditFloorActivities?.length, 1, 'a changed residue is an event')
+    assert.match(bigger.creditFloorActivities![0].entries[0].unabsorbedBase.toString(), /^4$/)
+  }
+})
+

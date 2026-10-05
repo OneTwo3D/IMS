@@ -27,15 +27,23 @@ import { loadTransferLineLandedQty, requireLandedQty } from '@/lib/domain/invent
 import { LANDED_COST_PROPAGATION_MAX_DEPTH } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
+import {
+  allocateLandedCost,
+  unabsorbedBaseForQty,
+  type LandedAllocation,
+  type LandedAllocationCostLine,
+  type LandedAllocationEvent,
+  type LandedAllocationSourceRank,
+} from './landed-cost-allocation'
+import { logFlooredLandedCredit } from './landed-cost-floor-activity'
+import { describeFlooredLandedCredit, type FlooredLandedCreditEntry } from './landed-cost-floor-text'
 
-export const LANDED_COST_DISTRIBUTION_METHODS = [
-  'BY_VALUE',
-  'BY_QUANTITY',
-  'BY_WEIGHT',
-  'EQUAL_SPLIT',
-] as const
-
-export type LandedCostDistributionMethod = typeof LANDED_COST_DISTRIBUTION_METHODS[number]
+export {
+  LANDED_COST_DISTRIBUTION_METHODS,
+  computeDistributionBase,
+  normalizeLandedCostMethod,
+  type LandedCostDistributionMethod,
+} from './landed-cost-allocation'
 
 export type PendingGrossCostLine = {
   id: string
@@ -47,6 +55,8 @@ export type PendingGrossCostLine = {
 }
 
 export type PendingGrossCostLineSource = {
+  /** Selected by every reader so the allocation has a deterministic order; see allocateLandedCost. */
+  id?: string | null
   amountBase: Prisma.Decimal | number | string
   distributionMethod: string | null | undefined
 }
@@ -71,10 +81,20 @@ export type LandedCostRecalcResult = {
     eventKey: string
     totalDelta: number
   }>
+  /**
+   * Floored-negative-landed-cost activity entries still to be written, by the caller, AFTER its transaction
+   * commits (see logLandedCostCreditFloorActivities). Optional so a result rebuilt from an outbox payload,
+   * which carries only the journals, stays valid.
+   */
+  creditFloorActivities?: Array<{
+    purchaseOrderId: string
+    context: string
+    entries: FlooredLandedCreditEntry[]
+  }>
 }
 
 export type LandedCostRevaluationWarning = {
-  code: 'weight_fallback' | 'weight_zero_line'
+  code: 'weight_fallback' | 'weight_zero_line' | 'landed_cost_credit_floored'
   context: string
   message: string
 }
@@ -99,12 +119,6 @@ export type LandedCostRevaluationOptions = {
    * queueLandedCostAdjustmentJournals call). Only the journaling callers pass it.
    */
   scheduleAdjustmentJournals?: boolean
-}
-
-type DistributionLine = {
-  qty: Prisma.Decimal
-  totalBase: Prisma.Decimal
-  product: { weight: Prisma.Decimal | null }
 }
 
 type DecimalInput = Prisma.Decimal | number | string
@@ -157,6 +171,38 @@ type PropagatedOutputLayerAudit = {
   inventoryDelta: string
   /** o3d-nrl4 PR B: the portion of `inventoryDelta` that belongs to units of this output still in transit. */
   inTransitResidue: InTransitResidueEntry[]
+}
+
+/** One cost layer's row in a revaluation run's `afterJson`. The two floor keys exist only on a layer whose
+ *  line hit the zero floor (a new JSON key, no schema change; same precedent as `inTransitResidue`). */
+type AfterLayerAudit = {
+  costLayerId: string
+  oldUnitCostBase: string
+  newUnitCostBase: string
+  receivedQty: string
+  remainingQty: string
+  consumedQty: string
+  returnedQty: string
+  supplierReturnedQty: string
+  manufacturingConsumedQty: string
+  cogsDelta: string
+  inventoryDelta: string
+  affectedRefundSnapshots: number
+  affectedShipments: number
+  affectedSalesOrderLines: number
+  /** The 6dp unit cost before the floor (strictly negative). Present only when the line was floored. */
+  unflooredGrossUnitCostBase?: string
+  /** `max(0, -unflooredGrossUnitCostBase) x receivedQty`, exact. Present only when the line was floored. */
+  unabsorbedBase?: string
+}
+
+type AfterLineAudit = {
+  lineId: string
+  qty: string
+  unitCostBase: string
+  landedAmountBase: string
+  grossUnitCostBase: string
+  costLayers: AfterLayerAudit[]
 }
 
 type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
@@ -218,35 +264,7 @@ function emptyRecalcResult(): LandedCostRecalcResult {
     warnings: [],
     inventoryTransitAdjustments: [],
     cogsAdjustments: [],
-  }
-}
-
-export function normalizeLandedCostMethod(
-  method: string | null | undefined,
-): LandedCostDistributionMethod {
-  return LANDED_COST_DISTRIBUTION_METHODS.includes(method as LandedCostDistributionMethod)
-    ? method as LandedCostDistributionMethod
-    : 'BY_VALUE'
-}
-
-export function computeDistributionBase(
-  line: DistributionLine,
-  method: LandedCostDistributionMethod,
-): Prisma.Decimal {
-  switch (method) {
-    case 'BY_WEIGHT':
-      return decimal(line.product.weight).mul(line.qty)
-    case 'BY_QUANTITY':
-      // Per-unit distribution: a 1000-unit line absorbs 1000× a 1-unit line.
-      return decimal(line.qty)
-    case 'EQUAL_SPLIT':
-      // nmim: EQUAL_SPLIT weights each LINE equally (base 1/line) REGARDLESS of
-      // quantity — this is intentional, the distinct "split freight evenly across
-      // line items" option. Callers wanting per-unit distribution use BY_QUANTITY.
-      return new Prisma.Decimal(1)
-    case 'BY_VALUE':
-    default:
-      return decimal(line.totalBase)
+    creditFloorActivities: [],
   }
 }
 
@@ -593,7 +611,8 @@ export async function propagateLandedCostToOutputs(
 /**
  * o3d-c08y: the NEGATIVE (credit) cost lines behind a revaluation, named in a refusal so the operator
  * is told exactly which line to correct. Positive lines are left out: they cannot drive a basis
- * below zero.
+ * below zero. The allocation now floors every unit cost at zero, so a landed-cost revaluation can no
+ * longer reach that refusal; the context is still carried for the backstop (see buildRefusalRemedy).
  */
 function creditCostLinesOf(
   entries: Array<{ line: { id?: string | null; amountBase: Prisma.Decimal | number | string | null }; poId: string; poReference: string | null }>,
@@ -676,17 +695,85 @@ function captureWeightZeroLines(
 }
 
 /**
- * Positive-quantity lines that contributed zero weight to a BY_WEIGHT split
- * (weight 0/null) and therefore received no freight while other lines absorbed
- * it. Only meaningful on the non-fallback path (basisTotal > 0); the all-zero
- * case is already reported by the weight-fallback warning (scjz.17).
+ * Turn the allocation's events into the recalculation's warnings, in the order the cost lines were
+ * processed. `contextPrefix` is e.g. `recalculateLandedCosts:PO-1`; linked-freight cost lines add `:linked`.
  */
-function zeroWeightEligibleLineIds(
-  method: LandedCostDistributionMethod,
-  bases: Array<{ lineId: string; base: Prisma.Decimal }>,
-): string[] {
-  if (method !== 'BY_WEIGHT') return []
-  return bases.filter((entry) => entry.base.lte(0)).map((entry) => entry.lineId)
+function captureAllocationEvents(
+  events: LandedAllocationEvent[],
+  result: LandedCostRecalcResult,
+  runWarnings: LandedCostRevaluationWarning[],
+  deps: LandedCostServiceDeps,
+  contextPrefix: string,
+): void {
+  for (const event of events) {
+    const context = event.sourceRank === 1 ? `${contextPrefix}:linked` : contextPrefix
+    if (event.kind === 'weight_fallback') captureWeightFallback(result, runWarnings, deps, context)
+    else captureWeightZeroLines(result, runWarnings, deps, context, event.lineIds)
+  }
+}
+
+/**
+ * The floor's footprint on one revaluation: the per-layer audit keys, and the single warning the run
+ * carries. `activityDue` is true only when a floored layer's unit cost actually CHANGED in this run, so a
+ * no-op recalculation repeats the warning in `warningsJson` (state) without writing another activity entry
+ * (event). A change of the unabsorbed AMOUNT while the layer stays at zero is an event too: the callers
+ * compare it with the previous run's record (`previousFloorResidue`) and set `activityDue`.
+ */
+type FloorFootprint = {
+  entries: FlooredLandedCreditEntry[]
+  activityDue: boolean
+}
+
+/**
+ * What the PREVIOUS revaluation of this order recorded as unabsorbed (the sum of `unabsorbedBase` over its
+ * layers in `afterJson`), or zero when it floored nothing or there was no run. The floor's residue can change
+ * while every floored layer stays at 0.00 (a credit that grows), so "did the unit cost change" cannot tell a
+ * repeat from a new amount; the previous run's own record can. Read only when this run floored something.
+ */
+async function previousFloorResidue(tx: Prisma.TransactionClient, primaryPoId: string): Promise<Prisma.Decimal> {
+  const run = await tx.landedCostRevaluationRun.findFirst({
+    where: { primaryPoId },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    select: { afterJson: true },
+  })
+  const lines = (run?.afterJson as { lines?: Array<{ costLayers?: Array<{ unabsorbedBase?: string }> }> } | null | undefined)?.lines ?? []
+  let total = new Prisma.Decimal(0)
+  for (const line of lines) {
+    for (const layer of line.costLayers ?? []) {
+      if (layer.unabsorbedBase) total = total.add(new Prisma.Decimal(layer.unabsorbedBase))
+    }
+  }
+  return total
+}
+
+function recordFlooredLandedCredit(
+  result: LandedCostRecalcResult,
+  runWarnings: LandedCostRevaluationWarning[],
+  purchaseOrderId: string,
+  context: string,
+  footprint: FloorFootprint,
+): void {
+  if (footprint.entries.length === 0) return
+  const message = describeFlooredLandedCredit({ context, entries: footprint.entries })
+  const warning: LandedCostRevaluationWarning = { code: 'landed_cost_credit_floored', context, message }
+  result.warnings.push(warning)
+  runWarnings.push(warning)
+  if (footprint.activityDue) {
+    ;(result.creditFloorActivities ??= []).push({ purchaseOrderId, context, entries: footprint.entries })
+  }
+}
+
+/**
+ * Write the durable activity WARNINGs a recalculation collected. Call it AFTER the transaction that ran the
+ * recalculation has committed: an activity write uses its own connection, so writing inside would leave the
+ * entry standing if the transaction later rolled back.
+ */
+export async function logLandedCostCreditFloorActivities(
+  result: Pick<LandedCostRecalcResult, 'creditFloorActivities'> | null | undefined,
+): Promise<void> {
+  for (const activity of result?.creditFloorActivities ?? []) {
+    await logFlooredLandedCredit(activity)
+  }
 }
 
 function decimalText(value: Prisma.Decimal | number | string | null | undefined): string {
@@ -838,72 +925,72 @@ export const CONTRIBUTING_LANDED_COST_LINK_WHERE = {
   freightPO: { status: { not: 'CANCELLED' } },
 } as const
 
+/**
+ * The receipt-side entry point to the ONE allocation (lib/domain/purchasing/landed-cost-allocation.ts): a
+ * thin adapter from the shapes the callers already hold (PO lines, the PO's own cost lines, its linked
+ * freight POs' cost lines) to `allocateLandedCost`. It adds nothing to the arithmetic, so the preview, the
+ * manual receipt, the WMS book-in and the WMS align-up cannot disagree with `recalculateLandedCosts` or
+ * `recalculateDirectLandedCosts`, which call the same function.
+ *
+ * Returns the whole allocation, not just the cost: a caller that lays a layer must also learn whether the
+ * zero floor absorbed part of a negative landed cost (`floors`), because that is the one number the
+ * operator has to be told. Pure apart from the weight-fallback warning it has always raised.
+ */
+export function computeLandedCostForPendingLines(params: {
+  lines: PendingGrossCostLine[]
+  directCostLines?: PendingGrossCostLineSource[]
+  linkedCostLines?: PendingGrossCostLineSource[]
+  onWeightZeroLines?: (lineIds: string[]) => void
+}): LandedAllocation {
+  const toCostLines = (sources: PendingGrossCostLineSource[] | undefined, sourceRank: LandedAllocationSourceRank): LandedAllocationCostLine[] => (
+    (sources ?? []).map((source) => ({
+      id: source.id ?? null,
+      amountBase: source.amountBase,
+      distributionMethod: source.distributionMethod,
+      sourceRank,
+    }))
+  )
+  const allocation = allocateLandedCost(
+    params.lines.map((line) => ({
+      id: line.id,
+      qty: line.qty,
+      unitCostBase: line.unitCostBase,
+      totalBase: line.totalBase,
+      weight: line.weight ?? null,
+    })),
+    [...toCostLines(params.directCostLines, 0), ...toCostLines(params.linkedCostLines, 1)],
+  )
+  for (const event of allocation.events) {
+    if (event.kind === 'weight_fallback') {
+      warnWeightFallback('computeGrossUnitCostBaseByLine')
+    } else if (params.onWeightZeroLines) {
+      // Opt-in only: this helper also runs on read-only cost previews
+      // (getPurchaseOrder, receipt validation), so it must not persist a warning
+      // by default. The recalc paths surface the diagnostic via result.warnings.
+      params.onWeightZeroLines(event.lineIds)
+    }
+  }
+  return allocation
+}
+
 export function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
   linkedCostLines?: PendingGrossCostLineSource[]
   onWeightZeroLines?: (lineIds: string[]) => void
-}): Map<string, number> {
-  const eligibleLines = params.lines.filter((line) => decimal(line.qty).gt(0))
-  const landedByLine = new Map<string, Prisma.Decimal>()
-  for (const line of eligibleLines) {
-    landedByLine.set(line.id, new Prisma.Decimal(0))
-  }
+}): Map<string, Prisma.Decimal> {
+  return computeLandedCostForPendingLines(params).grossUnitCostBaseByLine
+}
 
-  const allCostLines = [
-    ...(params.directCostLines ?? []),
-    ...(params.linkedCostLines ?? []),
-  ]
-
-  for (const costLine of allCostLines) {
-    const amountBase = decimal(costLine.amountBase)
-    if (amountBase.lte(0)) continue
-    const method = normalizeLandedCostMethod(costLine.distributionMethod)
-    const bases = eligibleLines.map((line) => ({
-      lineId: line.id,
-      base: computeDistributionBase(
-        {
-          qty: decimal(line.qty),
-          totalBase: decimal(line.totalBase),
-          product: { weight: decimal(line.weight) },
-        },
-        method,
-      ),
-    }))
-    let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
-    if (basisTotal.lte(0)) {
-      if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
-      basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
-      for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else if (params.onWeightZeroLines) {
-      // Opt-in only: this helper also runs on read-only cost previews
-      // (getPurchaseOrder, receipt validation), so it must not persist a warning
-      // by default. The recalc paths surface the diagnostic via result.warnings.
-      const zeroWeightLineIds = zeroWeightEligibleLineIds(method, bases)
-      if (zeroWeightLineIds.length > 0) params.onWeightZeroLines(zeroWeightLineIds)
-    }
-    for (const entry of bases) {
-      const share = amountBase.mul(entry.base).div(basisTotal)
-      landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
-    }
-  }
-
-  const grossByLine = new Map<string, number>()
-  for (const line of params.lines) {
-    if (decimal(line.qty).lte(0)) {
-      grossByLine.set(line.id, decimal(line.unitCostBase).toNumber())
-      continue
-    }
-    grossByLine.set(
-      line.id,
-      decimal(line.unitCostBase)
-        .add(decimal(landedByLine.get(line.id)).div(decimal(line.qty)))
-        .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
-        .toNumber(),
-    )
-  }
-
-  return grossByLine
+/**
+ * Whether a freight PO's cost lines still count toward landed cost. The in-memory twin of
+ * `CONTRIBUTING_LANDED_COST_LINK_WHERE` (derived from it, never restated): the PO detail preview reads its
+ * freight links through `getLinkedFreightPos`, which is deliberately unfiltered because it also LISTS
+ * cancelled freight for the operator, so the cost inputs must be filtered here to agree with receipt and
+ * recalculation.
+ */
+export function freightPoContributesLandedCost(freightPoStatus: string): boolean {
+  return freightPoStatus !== CONTRIBUTING_LANDED_COST_LINK_WHERE.freightPO.status.not
 }
 
 /**
@@ -1219,86 +1306,26 @@ export async function recalculateLandedCosts(
         }))),
       ]),
     }
-    const landedByLine = new Map<string, Prisma.Decimal>()
-    for (const line of primaryPo.lines) {
-      landedByLine.set(line.id, new Prisma.Decimal(0))
-    }
-
-    const eligibleLines = primaryPo.lines.filter((line) => decimal(line.qty).gt(0))
+    // THE ONE ALLOCATION (landed-cost-allocation.ts): the same function the preview, the receipt, the WMS
+    // book-in and the align-up call, so a layer laid at receipt and the same layer revalued here cannot
+    // differ for the same cost lines. Source rank 0 = this PO's own lines, 1 = the linked freight POs'.
     const runWarnings: LandedCostRevaluationWarning[] = []
-    for (const freightCostLine of primaryPo.freightCostLines) {
-      const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
-      const bases = eligibleLines.map((line) => ({
-        lineId: line.id,
-        base: computeDistributionBase(line, method),
-      }))
-      let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
-
-      if (basisTotal.lte(0)) {
-        if (method === 'BY_WEIGHT') captureWeightFallback(
-          result,
-          runWarnings,
-          serviceDeps,
-          `recalculateLandedCosts:${primaryPo.reference}`,
-        )
-        const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
-        basisTotal = equalBase
-        for (const entry of bases) entry.base = new Prisma.Decimal(1)
-      } else if (decimal(freightCostLine.amountBase).gt(0)) {
-        // Only warn when positive freight was actually distributed away from the
-        // zero-weight line; a zero/credit cost line assigns nothing (scjz.17).
-        captureWeightZeroLines(
-          result,
-          runWarnings,
-          serviceDeps,
-          `recalculateLandedCosts:${primaryPo.reference}`,
-          zeroWeightEligibleLineIds(method, bases),
-        )
-      }
-
-      const amountBase = decimal(freightCostLine.amountBase)
-      for (const entry of bases) {
-        const share = amountBase.mul(entry.base).div(basisTotal)
-        landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
-      }
-    }
-
-    for (const linkRow of allLinks) {
-      for (const freightCostLine of linkRow.freightPO.freightCostLines) {
-        const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
-        const bases = eligibleLines.map((line) => ({
-          lineId: line.id,
-          base: computeDistributionBase(line, method),
-        }))
-        let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
-
-        if (basisTotal.lte(0)) {
-          if (method === 'BY_WEIGHT') captureWeightFallback(
-            result,
-            runWarnings,
-            serviceDeps,
-            `recalculateLandedCosts:${primaryPo.reference}:linked`,
-          )
-          const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
-          basisTotal = equalBase
-          for (const entry of bases) entry.base = new Prisma.Decimal(1)
-        } else if (decimal(freightCostLine.amountBase).gt(0)) {
-          captureWeightZeroLines(
-            result,
-            runWarnings,
-            serviceDeps,
-            `recalculateLandedCosts:${primaryPo.reference}:linked`,
-            zeroWeightEligibleLineIds(method, bases),
-          )
-        }
-
-        const amountBase = decimal(freightCostLine.amountBase)
-        for (const entry of bases) {
-          const share = amountBase.mul(entry.base).div(basisTotal)
-          landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
-        }
-      }
-    }
+    const allocation = allocateLandedCost(
+      primaryPo.lines.map((line) => ({
+        id: line.id,
+        qty: line.qty,
+        unitCostBase: line.unitCostBase,
+        totalBase: line.totalBase,
+        weight: line.product?.weight ?? null,
+      })),
+      [
+        ...primaryPo.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 0 as const })),
+        ...allLinks.flatMap((linkRow) => linkRow.freightPO.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 1 as const }))),
+      ],
+    )
+    captureAllocationEvents(allocation.events, result, runWarnings, serviceDeps, `recalculateLandedCosts:${primaryPo.reference}`)
+    const floorByLine = new Map(allocation.floors.map((floor) => [floor.lineId, floor]))
+    const floorFootprint: FloorFootprint = { entries: [], activityDue: false }
 
     let totalCogsDelta = new Prisma.Decimal(0)
     let totalInventoryDelta = new Prisma.Decimal(0)
@@ -1309,54 +1336,18 @@ export async function recalculateLandedCosts(
     // o3d-nrl4 PR B: every in-transit residue line this run capitalised (root layers and propagated outputs),
     // itemised so the journal total is substantiated in the audit run. A new JSON key, no schema change.
     const inTransitResidue: InTransitResidueEntry[] = []
-    const afterLines: Array<{
-      lineId: string
-      qty: string
-      unitCostBase: string
-      landedAmountBase: string
-      grossUnitCostBase: string
-      costLayers: Array<{
-        costLayerId: string
-        oldUnitCostBase: string
-        newUnitCostBase: string
-        receivedQty: string
-        remainingQty: string
-        consumedQty: string
-        returnedQty: string
-        supplierReturnedQty: string
-        manufacturingConsumedQty: string
-        cogsDelta: string
-        inventoryDelta: string
-        affectedRefundSnapshots: number
-        affectedShipments: number
-        affectedSalesOrderLines: number
-      }>
-    }> = []
+    const afterLines: AfterLineAudit[] = []
 
     for (const line of primaryPo.lines) {
       const lineQty = decimal(line.qty)
       if (lineQty.lte(0)) continue
 
       const baseUnitCostBase = decimal(line.unitCostBase)
-      const landedForLine = decimal(landedByLine.get(line.id))
-      const landedPerUnit = landedForLine.div(lineQty)
-      const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
-      const afterLayers: Array<{
-        costLayerId: string
-        oldUnitCostBase: string
-        newUnitCostBase: string
-        receivedQty: string
-        remainingQty: string
-        consumedQty: string
-        returnedQty: string
-        supplierReturnedQty: string
-        manufacturingConsumedQty: string
-        cogsDelta: string
-        inventoryDelta: string
-        affectedRefundSnapshots: number
-        affectedShipments: number
-        affectedSalesOrderLines: number
-      }> = []
+      const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
+      const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
+      const floor = floorByLine.get(line.id)
+      let lineUnabsorbedBase = new Prisma.Decimal(0)
+      const afterLayers: AfterLayerAudit[] = []
 
       await tx.purchaseOrderLine.update({
         where: { id: line.id },
@@ -1437,6 +1428,12 @@ export async function recalculateLandedCosts(
           totalCogsDelta = totalCogsDelta.sub(shipmentRefresh.cogsRevaluationDelta)
           affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
         }
+        // The zero floor's footprint on this layer (units the floor could not absorb), exact Decimal.
+        const layerUnabsorbedBase = floor ? unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, receivedQty) : null
+        if (floor && layerUnabsorbedBase) {
+          lineUnabsorbedBase = lineUnabsorbedBase.add(layerUnabsorbedBase)
+          if (!oldUnitCost.eq(newUnitCost)) floorFootprint.activityDue = true
+        }
         afterLayers.push({
           costLayerId: cl.id,
           oldUnitCostBase: oldUnitCost.toString(),
@@ -1452,6 +1449,19 @@ export async function recalculateLandedCosts(
           affectedRefundSnapshots,
           affectedShipments,
           affectedSalesOrderLines,
+          ...(floor && layerUnabsorbedBase
+            ? {
+              unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toString(),
+              unabsorbedBase: layerUnabsorbedBase.toString(),
+            }
+            : {}),
+        })
+      }
+      if (floor && lineUnabsorbedBase.gt(0)) {
+        floorFootprint.entries.push({
+          label: `PO line ${line.id}`,
+          unabsorbedBase: lineUnabsorbedBase,
+          unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
         })
       }
       afterLines.push({
@@ -1464,6 +1474,14 @@ export async function recalculateLandedCosts(
       })
     }
 
+    if (floorFootprint.entries.length > 0 && !floorFootprint.activityDue) {
+      // The layer cost did not change; a changed RESIDUE still deserves a new entry.
+      const residueNow = floorFootprint.entries.reduce((sum, entry) => sum.add(entry.unabsorbedBase), new Prisma.Decimal(0))
+      if (!(await previousFloorResidue(tx, primaryPoId)).eq(residueNow)) floorFootprint.activityDue = true
+    }
+    recordFlooredLandedCredit(
+      result, runWarnings, primaryPoId, `recalculateLandedCosts:${primaryPo.reference}`, floorFootprint,
+    )
     result.revalidatePoIds.push(primaryPoId)
     const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers, recalcRunId)
 
@@ -1625,48 +1643,25 @@ export async function recalculateDirectLandedCosts(
   }
   const beforeJson = revaluationBeforeJson(po)
 
-  const landedByLine = new Map<string, Prisma.Decimal>()
-  for (const line of po.lines) {
-    landedByLine.set(line.id, new Prisma.Decimal(0))
-  }
-
-  const eligibleLines = po.lines.filter((line) => decimal(line.qty).gt(0))
-  const freightCostLines = [
-    ...po.freightCostLines.map((freightCostLine) => ({
-      freightCostLine,
-      warningContext: `recalculateDirectLandedCosts:${po.reference}`,
-    })),
-    ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines.map((freightCostLine) => ({
-      freightCostLine,
-      warningContext: `recalculateDirectLandedCosts:${po.reference}:linked`,
-    }))),
-  ]
+  // THE ONE ALLOCATION (landed-cost-allocation.ts), shared with recalculateLandedCosts and every
+  // receipt-side writer. Source rank 0 = this PO's own cost lines, 1 = its linked freight POs'.
   const runWarnings: LandedCostRevaluationWarning[] = []
-  for (const { freightCostLine, warningContext } of freightCostLines) {
-    const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
-    const bases = eligibleLines.map((line) => ({
-      lineId: line.id,
-      base: computeDistributionBase(line, method),
-    }))
-    let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
-    if (basisTotal.lte(0)) {
-      if (method === 'BY_WEIGHT') captureWeightFallback(
-        result,
-        runWarnings,
-        serviceDeps,
-        warningContext,
-      )
-      basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
-      for (const entry of bases) entry.base = new Prisma.Decimal(1)
-    } else if (decimal(freightCostLine.amountBase).gt(0)) {
-      captureWeightZeroLines(result, runWarnings, serviceDeps, warningContext, zeroWeightEligibleLineIds(method, bases))
-    }
-    const amountBase = decimal(freightCostLine.amountBase)
-    for (const entry of bases) {
-      const share = amountBase.mul(entry.base).div(basisTotal)
-      landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
-    }
-  }
+  const allocation = allocateLandedCost(
+    po.lines.map((line) => ({
+      id: line.id,
+      qty: line.qty,
+      unitCostBase: line.unitCostBase,
+      totalBase: line.totalBase,
+      weight: line.product?.weight ?? null,
+    })),
+    [
+      ...po.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 0 as const })),
+      ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines.map((costLine) => ({ ...costLine, sourceRank: 1 as const }))),
+    ],
+  )
+  captureAllocationEvents(allocation.events, result, runWarnings, serviceDeps, `recalculateDirectLandedCosts:${po.reference}`)
+  const floorByLine = new Map(allocation.floors.map((floor) => [floor.lineId, floor]))
+  const floorFootprint: FloorFootprint = { entries: [], activityDue: false }
 
   let totalCogsDelta = new Prisma.Decimal(0)
   let totalInventoryDelta = new Prisma.Decimal(0)
@@ -1677,54 +1672,18 @@ export async function recalculateDirectLandedCosts(
   // o3d-nrl4 PR B: every in-transit residue line this run capitalised (root layers and propagated outputs),
   // itemised so the journal total is substantiated in the audit run. A new JSON key, no schema change.
   const inTransitResidue: InTransitResidueEntry[] = []
-  const afterLines: Array<{
-    lineId: string
-    qty: string
-    unitCostBase: string
-    landedAmountBase: string
-    grossUnitCostBase: string
-    costLayers: Array<{
-      costLayerId: string
-      oldUnitCostBase: string
-      newUnitCostBase: string
-      receivedQty: string
-      remainingQty: string
-      consumedQty: string
-      returnedQty: string
-      supplierReturnedQty: string
-      manufacturingConsumedQty: string
-      cogsDelta: string
-      inventoryDelta: string
-      affectedRefundSnapshots: number
-      affectedShipments: number
-      affectedSalesOrderLines: number
-    }>
-  }> = []
+  const afterLines: AfterLineAudit[] = []
 
   for (const line of po.lines) {
     const lineQty = decimal(line.qty)
     if (lineQty.lte(0)) continue
 
     const baseUnitCostBase = decimal(line.unitCostBase)
-    const landedForLine = decimal(landedByLine.get(line.id))
-    const landedPerUnit = landedForLine.div(lineQty)
-    const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
-    const afterLayers: Array<{
-      costLayerId: string
-      oldUnitCostBase: string
-      newUnitCostBase: string
-      receivedQty: string
-      remainingQty: string
-      consumedQty: string
-      returnedQty: string
-      supplierReturnedQty: string
-      manufacturingConsumedQty: string
-      cogsDelta: string
-      inventoryDelta: string
-      affectedRefundSnapshots: number
-      affectedShipments: number
-      affectedSalesOrderLines: number
-    }> = []
+    const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
+    const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
+    const floor = floorByLine.get(line.id)
+    let lineUnabsorbedBase = new Prisma.Decimal(0)
+    const afterLayers: AfterLayerAudit[] = []
 
     await tx.purchaseOrderLine.update({
       where: { id: line.id },
@@ -1804,6 +1763,12 @@ export async function recalculateDirectLandedCosts(
         totalCogsDelta = totalCogsDelta.sub(shipmentRefresh.cogsRevaluationDelta)
         affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
       }
+      // The zero floor's footprint on this layer (units the floor could not absorb), exact Decimal.
+      const layerUnabsorbedBase = floor ? unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, receivedQty) : null
+      if (floor && layerUnabsorbedBase) {
+        lineUnabsorbedBase = lineUnabsorbedBase.add(layerUnabsorbedBase)
+        if (!oldUnitCost.eq(newUnitCost)) floorFootprint.activityDue = true
+      }
       afterLayers.push({
         costLayerId: cl.id,
         oldUnitCostBase: oldUnitCost.toString(),
@@ -1819,6 +1784,19 @@ export async function recalculateDirectLandedCosts(
         affectedRefundSnapshots,
         affectedShipments,
         affectedSalesOrderLines,
+        ...(floor && layerUnabsorbedBase
+          ? {
+            unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toString(),
+            unabsorbedBase: layerUnabsorbedBase.toString(),
+          }
+          : {}),
+      })
+    }
+    if (floor && lineUnabsorbedBase.gt(0)) {
+      floorFootprint.entries.push({
+        label: `PO line ${line.id}`,
+        unabsorbedBase: lineUnabsorbedBase,
+        unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
       })
     }
     afterLines.push({
@@ -1831,6 +1809,11 @@ export async function recalculateDirectLandedCosts(
     })
   }
 
+  if (floorFootprint.entries.length > 0 && !floorFootprint.activityDue) {
+    const residueNow = floorFootprint.entries.reduce((sum, entry) => sum.add(entry.unabsorbedBase), new Prisma.Decimal(0))
+    if (!(await previousFloorResidue(tx, poId)).eq(residueNow)) floorFootprint.activityDue = true
+  }
+  recordFlooredLandedCredit(result, runWarnings, poId, `recalculateDirectLandedCosts:${po.reference}`, floorFootprint)
   result.revalidatePoIds.push(poId)
   const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers, recalcRunId)
   if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
