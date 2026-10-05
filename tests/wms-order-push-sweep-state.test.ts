@@ -1418,13 +1418,13 @@ test('outbound-write hold (interleaving): a LATE held worker does not erase a NE
   assert.equal(slot.port.upserts.length, 0)
 })
 
-test('outbound-write hold (interleaving): a hold that FOLLOWS a sent request leaves the stamp (maybe-sent), only a push that sent nothing clears it', async () => {
+test('outbound-write hold (interleaving): a hold that FOLLOWS a create that was processed (courier-fallback PUT) leaves the stamp (maybe-sent)', async () => {
   const { outboundWriteRefusal, OutboundWriteHeldError, } = await import('../lib/security/outbound-write-grant')
   const { outboundTextAfterEarlierSend } = await import('../lib/security/outbound-write-hold-constants')
   const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId: '89', env: {} })
   assert.ok(refusal)
   const afterSend = outboundTextAfterEarlierSend(new OutboundWriteHeldError(refusal, 0).message, 'Mintsoft')
-  console.log('precondition (maybe-sent hold): the connector reports a hold that came AFTER its first PUT was sent (401, then a held key refresh)')
+  console.log('precondition (maybe-sent hold): the connector reports a hold that came AFTER its first PUT was processed and answered (the courier-fallback second PUT is held)')
   const port = makePort({ createCandidates: [candidate({ pushAttempts: 1 })] })
   const r = await runWmsOrderPushSweepCore(connector({ pushOrder: async () => { throw new Error(afterSend) } }), 'mintsoft', port.port, { now: NOW })
   assert.equal(port.ownedWrites.length, 0, 'the stamp is not cleared')

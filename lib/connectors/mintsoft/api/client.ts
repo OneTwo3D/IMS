@@ -10,7 +10,6 @@ import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
-import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
 import {
   extractMintsoftArrayPayload,
@@ -108,14 +107,15 @@ export async function mintsoftRequest<T>(
     }
   }
 
-  // Set once the first request has been sent and answered. A hold on a LATER step of this
-  // same call (the key refresh after a 401) then follows a request that WAS sent: it is not "nothing sent".
-  let requestSent = false
   try {
     const apiKey = await getMintsoftAccessToken()
     const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init, config.clientId ?? '')
-    // Only now has a request actually been SENT: a hold that refused the first request itself sent nothing.
-    requestSent = true
+    // ONLY AN HTTP 401 REACHES THE REFRESH STEP, AND ONLY A 401 IS PROOF THE REQUEST WAS NOT PROCESSED: Mintsoft
+    // rejects an unauthenticated request before the handler runs, so a create that drew a 401 created nothing.
+    // Any other outcome (403, 404, 409, 422, 5xx, a timeout or a transport error) proves nothing about whether
+    // the handler ran and is returned as an ordinary failure below, never as a hold. So a hold on the key
+    // refresh that follows a 401 refuses a login, not a create: it is a PURE hold (nothing was applied), and the
+    // order-push sweep clears its own claim stamp and spends no attempt for it.
     if (firstAttempt.status !== 401) {
       return firstAttempt
     }
@@ -140,11 +140,6 @@ export async function mintsoftRequest<T>(
     const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
     return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init, config.clientId ?? '')
   } catch (error) {
-    if (isOutboundWriteHeldError(error) && requestSent && error.nothingSent) {
-      // The first request of this call was sent; this hold refused a later step. Re-worded so no queue
-      // reads it as a hold (and clears a create dispatch stamp over a request that may have landed).
-      return { data: null, error: outboundTextAfterEarlierSend(error.message, 'Mintsoft'), status: 500 }
-    }
     if (isOutboundWriteHeldError(error)) {
       return error.nothingSent
         ? { data: null, error: error.message, status: 500, held: true }

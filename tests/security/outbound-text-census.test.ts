@@ -12,17 +12,24 @@ import ts from 'typescript'
  * caught error. This test enforces it over EVERY .ts/.tsx file under lib/ and app/ - not a fixed file list - so a
  * new writer in a new file is inspected too.
  *
- * Two detectors, both AST-based, resolving a text argument through one level of `const`:
+ * Detectors, all AST-based, resolving a text argument through one level of `const`:
  *  A. a CALL to a vendor free-text writer, found by name: postConflictComment, addOrderComment,
  *     addMintsoftOrderComment (the WMS comment writers; the contract is WmsConnector.addOrderComment), and wcPost
  *     to an order `notes` path (a WooCommerce order note);
- *  B. an object-literal property whose key is a destination free-text field - Narration, Reference, Comments,
+ *     Aliases of a writer are followed one level (`const f = addOrderComment`, `const { addOrderComment: f } = c`);
+ *  B. an object-literal property (including a shorthand `{ note }` and a literal-computed key `['note']`), or an
+ *     assignment `payload.note = value` / `payload['note'] = value`, whose key is a destination free-text field - Narration, Reference, Comments,
  *     Comment, Notes, Note, note, comment, narration, reference, Description (as sent to Xero/Mintsoft/WooCommerce
  *     payload builders) - in a file under lib/connectors/.
  *
  * A finding is a text built from a caught error / error message / failure-named identifier (error, err, e,
  * message, reason, detail, lastError, cause...). A finding is acceptable only if it is in ALLOWED, which is
  * SHRINK-ONLY: an entry that no longer matches any finding fails the test, and each carries a justification.
+ *
+ * WHAT IT DOES NOT COVER, stated plainly: it is a syntactic census, not a data-flow analysis. It does not follow
+ * text through helper functions or closures, through object spreads, or through computed keys that are not
+ * literals. Those shapes need symbol-level analysis (filed as a follow-up); the claim made in the docs is limited
+ * to what this test covers.
  *
  * Mutation (recorded in the PR): add a new file under lib/ that writes `${String(error)}` into a comment => red.
  */
@@ -65,6 +72,23 @@ export function scanFile(file: string, text: string): { callSites: number; prope
   }
   collect(source)
 
+  // Writer aliases, one level: `const f = addOrderComment` and `const { addOrderComment: f } = connector`.
+  const writerNames = new Set(WRITER_FUNCTIONS)
+  const aliasScan = (n: ts.Node) => {
+    if (ts.isVariableDeclaration(n) && n.initializer) {
+      if (ts.isIdentifier(n.name) && ts.isIdentifier(n.initializer) && WRITER_FUNCTIONS.has(n.initializer.text)) writerNames.add(n.name.text)
+      if (ts.isIdentifier(n.name) && ts.isPropertyAccessExpression(n.initializer) && WRITER_FUNCTIONS.has(n.initializer.name.text)) writerNames.add(n.name.text)
+      if (ts.isObjectBindingPattern(n.name)) {
+        for (const element of n.name.elements) {
+          const source = (element.propertyName ?? element.name) as ts.Node
+          if (ts.isIdentifier(source) && WRITER_FUNCTIONS.has(source.text) && ts.isIdentifier(element.name)) writerNames.add(element.name.text)
+        }
+      }
+    }
+    ts.forEachChild(n, aliasScan)
+  }
+  aliasScan(source)
+
   const findings: Finding[] = []
   let callSites = 0
   let properties = 0
@@ -89,16 +113,27 @@ export function scanFile(file: string, text: string): { callSites: number; prope
       const callee = n.expression
       const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : ''
       const isNote = name === 'wcPost' && /notes/.test(n.arguments[0]?.getText(source) ?? '')
-      if (WRITER_FUNCTIONS.has(name) || isNote) {
+      if (writerNames.has(name) || isNote) {
         callSites += 1
         for (const arg of [...n.arguments].slice(1)) check(arg, n, name, 0)
       }
     }
-    if (ts.isPropertyAssignment(n) && file.startsWith('lib/connectors/')) {
-      const key = ts.isIdentifier(n.name) || ts.isStringLiteralLike(n.name) ? n.name.text : ''
-      if (FREE_TEXT_KEYS.has(key)) {
-        properties += 1
-        check(n.initializer, n, key, 0)
+    if (file.startsWith('lib/connectors/')) {
+      const literalKey = (name: ts.PropertyName | ts.Expression): string => {
+        if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) return name.text
+        if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) return name.expression.text
+        return ''
+      }
+      if (ts.isPropertyAssignment(n)) {
+        const key = literalKey(n.name)
+        if (FREE_TEXT_KEYS.has(key)) { properties += 1; check(n.initializer, n, key, 0) }
+      } else if (ts.isShorthandPropertyAssignment(n)) {
+        if (FREE_TEXT_KEYS.has(n.name.text)) { properties += 1; check(n.name, n, n.name.text, 0) }
+      } else if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const target = n.left
+        const key = ts.isPropertyAccessExpression(target) ? target.name.text
+          : ts.isElementAccessExpression(target) && ts.isStringLiteralLike(target.argumentExpression) ? target.argumentExpression.text : ''
+        if (FREE_TEXT_KEYS.has(key)) { properties += 1; check(n.right, n, key, 0) }
       }
     }
     ts.forEachChild(n, visit)
@@ -138,13 +173,20 @@ test('the census can fail: it flags a new file, an alias const, a member message
     viaConst: "async function f(postConflictComment: any, lastError: string) { const c = `see ${lastError}`; await postConflictComment('1', c) }",
     wcNote: "async function f(wcPost: any, err: unknown) { await wcPost('orders/1/notes', { note: String(err) }) }",
     payloadProperty: "function f(reason: string) { return { Narration: `posted: ${reason}`, Reference: 'x' } }",
+    aliasConst: "async function f(addOrderComment: any, error: unknown) { const send = addOrderComment; await send('1', String(error)) }",
+    aliasDestructure: "async function f(c: any, error: unknown) { const { addOrderComment: post } = c; await post('1', `x ${error}`) }",
+    assignment: "function f(error: unknown) { const payload: Record<string, string> = {}; payload.Comment = String(error); return payload }",
+    elementAssignment: "function f(err: unknown) { const payload: Record<string, string> = {}; payload['note'] = `${err}`; return payload }",
+    shorthand: "function f(reason: string) { const note = `why ${reason}`; return { note } }",
+    computedLiteralKey: "function f(reason: string) { return { ['Narration']: `posted ${reason}` } }",
   }
-  console.log(`precondition (census probe): ${Object.keys(cases).length} evasion shapes, 2 clean controls`)
+  console.log(`precondition (census probe): ${Object.keys(cases).length} evasion shapes, 3 clean controls`)
   for (const [name, code] of Object.entries(cases)) {
     assert.ok(probe(code).findings.length > 0, `the census missed the ${name} shape`)
   }
   assert.equal(probe("async function f(postConflictComment: any, order: any) { await postConflictComment('1', `IMS: method '${order.shippingService}' did not map`, order.id) }").findings.length, 0)
   assert.equal(probe("function f(order: any) { return { Narration: `Order ${order.number}`, Reference: order.number } }").findings.length, 0)
+  assert.equal(probe("function f(order: any) { const note = `Order ${order.number}`; const p: Record<string, string> = {}; p.Comment = note; return { note } }").findings.length, 0)
 })
 
 test('a NEW file with a failing writer is found by the whole-tree scan (it does not depend on a file list)', () => {
