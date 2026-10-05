@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import test, { mock } from 'node:test'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
 
@@ -109,7 +110,8 @@ test('[o3d-j625 r10] a contended in-transaction refusal is PERSISTED as a provis
   const payload = AccountingPostingRefusalProvisionalPayloadSchema.parse(claim.payloadJson)
   assert.deepEqual(payload.key, KEY, 'keyed on the posting, so the replay clears and is cleared by the same thing')
   assert.equal(payload.record.reason, RECORD.reason)
-  assert.equal(payload.record.remedy, RECORD.remedy)
+  // Codex round 16: the sink guard runs at the entry of recordAccountingPostingRefusal, so the persisted provisional remedy carries the claim-and-ledger-check preamble too
+  assert.equal(payload.record.remedy, withHandPostSafety(RECORD.remedy))
   assert.equal(payload.record.kind, 'manufacturing_journal')
   assert.equal(payload.mergeOnly, true, 'the merge shape survives, or the replay would overwrite the enqueue\'s own reason')
   assert.equal(payload.decidedAt, decidedAt.toISOString(),
