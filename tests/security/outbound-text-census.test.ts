@@ -1,38 +1,49 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 import ts from 'typescript'
 
 /**
- * CENSUS: NO ERROR OR HOLD TEXT IS WRITTEN INTO A VENDOR-BOUND FREE-TEXT FIELD.
+ * CENSUS, FAILING CLOSED: NO ERROR OR HOLD TEXT IS WRITTEN INTO A DESTINATION-BOUND FREE-TEXT FIELD.
  *
- * The free-text writers are the order comments sent to the WMS (postConflictComment / addOrderComment) and the
- * WooCommerce order notes (wcPost to .../notes). This test finds every call to them, resolves the text argument
- * (one level: a `const` in the same file), and fails if it is built from a caught error, an error/message
- * property, or an identifier that conventionally holds failure text. It prints how many call sites it examined.
+ * Transports never modify a request body, so the guarantee that a destination is never sent a hold text (which
+ * would let it echo a verbatim, validly-referenced text back) is that no code builds destination free text from a
+ * caught error. This test enforces it over EVERY .ts/.tsx file under lib/ and app/ - not a fixed file list - so a
+ * new writer in a new file is inspected too.
  *
- * Mutation (recorded in the PR): make a comment interpolate `${error}` or `${String(e)}` => red.
+ * Two detectors, both AST-based, resolving a text argument through one level of `const`:
+ *  A. a CALL to a vendor free-text writer, found by name: postConflictComment, addOrderComment,
+ *     addMintsoftOrderComment (the WMS comment writers; the contract is WmsConnector.addOrderComment), and wcPost
+ *     to an order `notes` path (a WooCommerce order note);
+ *  B. an object-literal property whose key is a destination free-text field - Narration, Reference, Comments,
+ *     Comment, Notes, Note, note, comment, narration, reference, Description (as sent to Xero/Mintsoft/WooCommerce
+ *     payload builders) - in a file under lib/connectors/.
+ *
+ * A finding is a text built from a caught error / error message / failure-named identifier (error, err, e,
+ * message, reason, detail, lastError, cause...). A finding is acceptable only if it is in ALLOWED, which is
+ * SHRINK-ONLY: an entry that no longer matches any finding fails the test, and each carries a justification.
+ *
+ * Mutation (recorded in the PR): add a new file under lib/ that writes `${String(error)}` into a comment => red.
  */
 
-const FILES = [
-  'lib/domain/wms/order-push-sweep.ts',
-  'app/actions/sales.ts',
-  'lib/connectors/woocommerce/sync/invoice-note.ts',
-]
-const WRITERS = new Set(['postConflictComment', 'addOrderComment', 'addMintsoftOrderComment'])
+const ROOTS = ['lib', 'app']
+const WRITER_FUNCTIONS = new Set(['postConflictComment', 'addOrderComment', 'addMintsoftOrderComment'])
+const FREE_TEXT_KEYS = new Set(['Narration', 'narration', 'Reference', 'reference', 'Comments', 'Comment', 'comment', 'Notes', 'Note', 'note', 'Description'])
 const FAILURE_NAME = /^(e|err|error|exception|message|lastError|reason|detail|details|cause|outcome|failure|errorMessage)$/i
 
-type Finding = { where: string; why: string }
+/** shrink-only: `file | key-or-writer | identifier` -> why this is not a destination payload built from failure text. */
+const ALLOWED: Record<string, string> = {}
 
-function textArgs(call: ts.CallExpression, source: ts.SourceFile): ts.Expression[] | null {
-  const callee = call.expression
-  const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : ''
-  if (WRITERS.has(name)) return [...call.arguments].slice(1) // (externalOrderId, comment, orderId?) - the comment and what follows
-  if (name === 'wcPost') {
-    const path = call.arguments[0]?.getText(source) ?? ''
-    if (/notes/.test(path)) return [...call.arguments].slice(1)
-  }
-  return null
+type Finding = { id: string; where: string; why: string }
+
+function walk(dir: string): string[] {
+  return readdirSync(dir).flatMap((entry) => {
+    if (entry === 'node_modules' || entry === 'generated' || entry === '.next') return []
+    const full = join(dir, entry)
+    if (statSync(full).isDirectory()) return walk(full)
+    return /\.(ts|tsx)$/.test(entry) && !/\.d\.ts$/.test(entry) ? [full] : []
+  })
 }
 
 function identifiersIn(node: ts.Node): ts.Identifier[] {
@@ -45,67 +56,108 @@ function identifiersIn(node: ts.Node): ts.Identifier[] {
   return found
 }
 
-function scan(file: string): { examined: number; findings: Finding[] } {
-  const source = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true)
+export function scanFile(file: string, text: string): { callSites: number; properties: number; findings: Finding[] } {
+  const source = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
   const declarations = new Map<string, ts.Expression>()
   const collect = (n: ts.Node) => {
     if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) declarations.set(n.name.text, n.initializer)
     ts.forEachChild(n, collect)
   }
   collect(source)
+
   const findings: Finding[] = []
-  let examined = 0
+  let callSites = 0
+  let properties = 0
   const where = (n: ts.Node) => `${file}:${source.getLineAndCharacterOfPosition(n.getStart(source)).line + 1}`
-  const check = (expression: ts.Expression, origin: ts.Node, depth: number) => {
+
+  const check = (expression: ts.Expression, origin: ts.Node, label: string, depth: number) => {
     for (const id of identifiersIn(expression)) {
-      const isMemberName = ts.isPropertyAccessExpression(id.parent) && id.parent.name === id
-      if (FAILURE_NAME.test(id.text) && !(isMemberName && !/^(message|error)$/i.test(id.text))) {
-        findings.push({ where: where(origin), why: `free text built from "${id.text}"` })
-      }
+      const parent = id.parent
+      const isMemberName = ts.isPropertyAccessExpression(parent) && parent.name === id
+      const isPropertyKey = ts.isPropertyAssignment(parent) && parent.name === id
+      if (isPropertyKey) continue
+      // `x.message` / `x.error` are failure text wherever they appear; other member names are just fields.
+      const failure = FAILURE_NAME.test(id.text) && (!isMemberName || /^(message|error|lastError|errorMessage)$/i.test(id.text))
+      if (failure) findings.push({ id: `${file} | ${label} | ${id.text}`, where: where(origin), why: `free text built from "${id.text}"` })
       const resolved = declarations.get(id.text)
-      if (resolved && depth < 2 && !isMemberName) check(resolved, origin, depth + 1)
+      if (resolved && depth < 2 && !isMemberName) check(resolved, origin, label, depth + 1)
     }
   }
+
   const visit = (n: ts.Node) => {
     if (ts.isCallExpression(n)) {
-      const args = textArgs(n, source)
-      if (args) {
-        examined += 1
-        for (const arg of args) check(arg, n, 0)
+      const callee = n.expression
+      const name = ts.isIdentifier(callee) ? callee.text : ts.isPropertyAccessExpression(callee) ? callee.name.text : ''
+      const isNote = name === 'wcPost' && /notes/.test(n.arguments[0]?.getText(source) ?? '')
+      if (WRITER_FUNCTIONS.has(name) || isNote) {
+        callSites += 1
+        for (const arg of [...n.arguments].slice(1)) check(arg, n, name, 0)
+      }
+    }
+    if (ts.isPropertyAssignment(n) && file.startsWith('lib/connectors/')) {
+      const key = ts.isIdentifier(n.name) || ts.isStringLiteralLike(n.name) ? n.name.text : ''
+      if (FREE_TEXT_KEYS.has(key)) {
+        properties += 1
+        check(n.initializer, n, key, 0)
       }
     }
     ts.forEachChild(n, visit)
   }
   visit(source)
-  return { examined, findings }
+  return { callSites, properties, findings }
 }
 
-test('no vendor-bound free-text writer is given text derived from a caught error or failure message', () => {
-  const results = FILES.map(scan)
-  const examined = results.reduce((sum, r) => sum + r.examined, 0)
-  console.log(`precondition (text census): ${FILES.length} files, ${examined} free-text writer call sites examined`)
-  assert.ok(examined >= 7, `the census must find the writer call sites that exist (found ${examined})`)
-  assert.deepEqual(results.flatMap((r) => r.findings).map((f) => `${f.where} ${f.why}`), [])
+test('no destination free-text writer anywhere under lib/ or app/ is given text derived from a caught error or failure message', () => {
+  const files = ROOTS.flatMap((root) => walk(join(process.cwd(), root))).map((full) => full.slice(process.cwd().length + 1))
+  let callSites = 0
+  let properties = 0
+  const findings: Finding[] = []
+  for (const file of files) {
+    const result = scanFile(file, readFileSync(join(process.cwd(), file), 'utf8'))
+    callSites += result.callSites
+    properties += result.properties
+    findings.push(...result.findings)
+  }
+  console.log(`precondition (text census): ${files.length} files under lib/ and app/, ${callSites} writer call sites and ${properties} free-text payload properties examined`)
+  assert.ok(files.length > 800, 'the census must be scanning the whole code base, not a list')
+  assert.ok(callSites >= 7, `the known writer call sites must be found (found ${callSites})`)
+  assert.ok(properties >= 5, `the payload free-text properties must be found (found ${properties})`)
+
+  const unexplained = findings.filter((f) => !(f.id in ALLOWED))
+  assert.deepEqual(unexplained.map((f) => `${f.where} ${f.why} [${f.id}]`), [])
+  const stale = Object.keys(ALLOWED).filter((id) => !findings.some((f) => f.id === id))
+  assert.deepEqual(stale, [], 'ALLOWED is shrink-only: an entry that no longer matches a finding must be deleted')
+  for (const [id, why] of Object.entries(ALLOWED)) assert.ok(why.length >= 30, `${id} needs a real justification`)
 })
 
-test('the census can fail: a comment built from an error, a message property or a resolved const is flagged', () => {
-  const dir = 'tmp-text-census-probe'
+test('the census can fail: it flags a new file, an alias const, a member message, and a payload property built from an error; a fixed text is clean', () => {
+  const probe = (code: string, file = 'lib/connectors/probe.ts') => scanFile(file, code)
+  const cases: Record<string, string> = {
+    newFileDirect: "async function f(postConflictComment: any, error: unknown) { await postConflictComment('1', `failed: ${String(error)}`) }",
+    member: "async function f(c: any, e: Error) { await c.addOrderComment('1', 'x ' + e.message) }",
+    viaConst: "async function f(postConflictComment: any, lastError: string) { const c = `see ${lastError}`; await postConflictComment('1', c) }",
+    wcNote: "async function f(wcPost: any, err: unknown) { await wcPost('orders/1/notes', { note: String(err) }) }",
+    payloadProperty: "function f(reason: string) { return { Narration: `posted: ${reason}`, Reference: 'x' } }",
+  }
+  console.log(`precondition (census probe): ${Object.keys(cases).length} evasion shapes, 2 clean controls`)
+  for (const [name, code] of Object.entries(cases)) {
+    assert.ok(probe(code).findings.length > 0, `the census missed the ${name} shape`)
+  }
+  assert.equal(probe("async function f(postConflictComment: any, order: any) { await postConflictComment('1', `IMS: method '${order.shippingService}' did not map`, order.id) }").findings.length, 0)
+  assert.equal(probe("function f(order: any) { return { Narration: `Order ${order.number}`, Reference: order.number } }").findings.length, 0)
+})
+
+test('a NEW file with a failing writer is found by the whole-tree scan (it does not depend on a file list)', () => {
+  const dir = join(process.cwd(), 'lib', 'zz-text-census-probe')
   mkdirSync(dir, { recursive: true })
   try {
-    const cases: Record<string, string> = {
-      direct: "async function f(postConflictComment: any, error: unknown) { await postConflictComment('1', `failed: ${error}`) }",
-      member: "async function f(connector: any, e: Error) { await connector.addOrderComment('1', 'x ' + e.message) }",
-      viaConst: "async function f(postConflictComment: any, lastError: string) { const c = `see ${lastError}`; await postConflictComment('1', c) }",
-    }
-    for (const [name, code] of Object.entries(cases)) {
-      const file = `${dir}/${name}.ts`
-      writeFileSync(file, code)
-      assert.ok(scan(file).findings.length > 0, `the census missed the ${name} shape`)
-    }
-    const clean = `${dir}/clean.ts`
-    writeFileSync(clean, "async function f(postConflictComment: any, order: any) { await postConflictComment('1', `IMS: shipping method '${order.shippingService}' did not map`, order.id) }")
-    assert.equal(scan(clean).findings.length, 0, 'the control: a fixed comment is clean')
-    console.log('precondition (census probe): 3 evasion shapes flagged, 1 clean control passes')
+    const file = join(dir, 'writer.ts')
+    writeFileSync(file, "export async function w(postConflictComment: (a: string, b: string) => Promise<void>, error: unknown) { await postConflictComment('1', `boom ${String(error)}`) }\n")
+    const files = ROOTS.flatMap((root) => walk(join(process.cwd(), root))).map((full) => full.slice(process.cwd().length + 1))
+    assert.ok(files.includes('lib/zz-text-census-probe/writer.ts'), 'the scan lists the new file')
+    const findings = files.flatMap((f) => scanFile(f, readFileSync(join(process.cwd(), f), 'utf8')).findings)
+    assert.ok(findings.some((f) => f.where.startsWith('lib/zz-text-census-probe/writer.ts')), 'and flags it')
+    console.log('precondition (new file): a fresh lib/zz-text-census-probe/writer.ts was written, scanned and flagged')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

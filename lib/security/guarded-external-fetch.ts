@@ -16,7 +16,6 @@
  */
 
 import { OutboundWriteHeldError, outboundWriteRefusal, type OutboundEnv } from './outbound-write-grant'
-import { applyScrubbedContentLength, scrubOutboundBody } from './outbound-body-scrub'
 
 const MAX_REDIRECTS = 5
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
@@ -37,11 +36,8 @@ export async function guardedExternalFetch(
   let url = input instanceof URL ? input : new URL(input)
   let method = (init.method ?? 'GET').toUpperCase()
   let headers = new Headers(init.headers)
-  // No hold text reaches a destination (see connectorFetch and outbound-body-scrub.ts): text bodies lose any
-  // reference tokens; binary bodies are untouched; Content-Length is reset when a body changed.
-  const scrubbed = scrubOutboundBody(init.body, headers.get('content-type'))
-  let body = scrubbed.body as BodyInit | null | undefined
-  if (scrubbed.changed) applyScrubbedContentLength(headers, scrubbed.body)
+  // Like connectorFetch, this never modifies a request body.
+  let body = init.body
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const refusal = outboundWriteRefusal({

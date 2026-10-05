@@ -13,7 +13,6 @@ import {
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { OutboundWriteHeldError, outboundWriteRefusal } from './outbound-write-grant'
 import { recordOutboundWriteRefusal } from './outbound-write-refusal-log'
-import { applyScrubbedContentLength, scrubOutboundBody } from './outbound-body-scrub'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -394,13 +393,8 @@ export async function connectorFetch(
   let url = input instanceof URL ? input : new URL(input)
   let method = init.method ?? 'GET'
   let headers = headersFromInit(init.headers)
-  // NO HOLD TEXT REACHES A DESTINATION (defence in depth; see lib/security/outbound-body-scrub.ts). TEXT bodies
-  // have hold reference tokens removed; binary bodies (the Xero attachment upload) are never rewritten; a
-  // body type bodyFromInit cannot handle is refused. When a text body changes, Content-Length is reset to the
-  // byte length actually sent.
-  const scrubbed = scrubOutboundBody(init.body, headers.get('content-type'))
-  let body = bodyFromInit(scrubbed.body as BodyInit | null | undefined)
-  if (scrubbed.changed) applyScrubbedContentLength(headers, scrubbed.body)
+  // The transport NEVER modifies a request body: what the caller built (and may have signed) is what is sent.
+  let body = bodyFromInit(init.body)
   const timeoutMs = getConnectorFetchTimeoutMs(options)
   const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
   // Only when the e2e loopback allowance applies to the FIRST hop: the origin a redirect must stay on.
