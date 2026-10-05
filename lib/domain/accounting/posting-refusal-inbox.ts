@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -562,9 +563,12 @@ async function postingSupersedesThisRefusal(
 export async function recordAccountingPostingRefusal(
   client: PostingRefusalClient,
   key: PostingRefusalKey,
-  record: AccountingPostingRefusalRecord,
+  rawRecord: AccountingPostingRefusalRecord,
   options?: RecordRefusalOptions,
 ): Promise<RefusalRecordOutcome> {
+  // Codex round 16: THE SINK GUARD. Every refusing site's remedy passes through here, so a hand-post / re-post / re-save instruction never reaches the
+  // exception inbox without the claim-and-ledger-check preamble in front of it.
+  const record: AccountingPostingRefusalRecord = { ...rawRecord, remedy: withHandPostSafety(rawRecord.remedy) }
   const now = new Date()
   const decidedAt = options?.decidedAt ?? now
   // A holder rather than a plain `let`: the assignment happens inside a callback, and TypeScript would

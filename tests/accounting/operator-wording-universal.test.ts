@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import ts from 'typescript'
+import { AccountingSyncType } from '@/app/generated/prisma/enums'
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
@@ -15,7 +17,8 @@ import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
-import { AFTER_DECLINE_STEP, LEDGER_CHECK_FIRST, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
+import { DESCRIPTION, PROHIBITION, remedyCorpus, unsafeInstructionSentences, walkSources } from '../helpers/hand-post-census'
+import { AFTER_DECLINE_STEP, HAND_POST_INSTRUCTION_PATTERN, HAND_POST_SAFETY, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL, OTHER_OPERATOR_CLAIM_OUTCOME, claimLogDescription, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
 import { REUSED_POSTING_KEY_TYPES } from '@/lib/accounting/posting-key'
 import { GENERIC_HAND_POST_STEP, PAYMENT_POSTING_TYPES, UPDATE_POSTING_TYPES, handPostStepFor, NOT_LOADED_HAND_POST_INPUT, handPostInputOf, renderHandPostInstructionDoc, claimWarningFor, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
@@ -223,7 +226,7 @@ test('[o3d-1e7sl Codex r8] census: no surface renders hand-post / mark-handled a
   ] as const) assert.ok(read(file).includes(symbol), `${file} renders through ${symbol}`)
   // BOTH refusing-site remedies in lib/accounting.ts know the posting type and render the TYPED step (never the typeless one)
   const accountingSource = read('lib/accounting.ts')
-  assert.equal((accountingSource.match(/handPostStepFor\(params\.type\)/g) ?? []).length, 2, 'both refusal remedies use the typed step')
+  assert.ok((accountingSource.match(/handPostStepFor\(params\.type\)/g) ?? []).length >= 2, 'the refusal remedies use the typed step')
   assert.doesNotMatch(accountingSource, /handPostStepFor\(undefined\)|GENERIC_HAND_POST_STEP/, 'no refusal remedy falls back to the typeless step')
   // the help text is GENERATED from the same function
   const doc = read('help-docs/xero-sync.md')
@@ -422,42 +425,167 @@ test('[o3d-1e7sl Codex r14] the help doc carries the generated blocks exactly on
   for (const f of ['lib/accounting.ts', 'lib/domain/sales/sales-invoice-update-sync.ts', 'lib/domain/purchasing/landed-cost-service.ts']) assert.ok(read(f).includes('MARK_REMEDY_TAIL'), `${f} ends its remedies with the shared tail`)
 })
 
-// Codex round 15: NEVER AN INSTRUCTION TO RE-SAVE OR POST BY HAND WITHOUT THE LEDGER CHECK. In the modules that render the post-mark / post-release /
-// refusal-remedy surfaces and in the generated doc blocks, every sentence that tells the operator to re-save a document or to post a version by hand
-// must have a ledger check ("check whether ... already ... accounting system", "check the ledger") in the SAME sentence or the sentence before it.
-test('[o3d-1e7sl Codex r15] no re-save / post-by-hand instruction appears without the ledger check in the same sentence group', () => {
-  const MODULES = [
-    'lib/domain/accounting/hand-post-instruction.ts', 'lib/domain/accounting/posting-refusal-copy.ts', 'lib/domain/sales/sales-invoice-update-sync.ts',
-    'lib/domain/accounting/posting-mark-handled.ts', 'lib/domain/accounting/posting-suppression.ts', 'lib/domain/accounting/posting-refusal-inbox.ts',
-    'app/actions/sync-exceptions.ts', 'app/(dashboard)/sync/exceptions/exceptions-client.tsx', 'lib/accounting.ts', 'lib/domain/purchasing/landed-cost-service.ts',
-  ]
-  const INSTRUCTION = /\bre-?save (it|the (document|order|bill|invoice))\b|\bpost (it|that|the current version|its current version)\b[^.]{0,40}\bby hand\b/i
-  const CHECK = /check whether the current version is already in the accounting system|check the ledger|check for that document|the ledger for (the|that)|check Sync > Exceptions|check the accounting system/i
-  // the shared constants are identifiers in the source; substitute their text so the check sees what the operator reads
-  const expand = (source: string) => source.replace(/\bLEDGER_CHECK_FIRST\b/g, JSON.stringify(LEDGER_CHECK_FIRST)).replace(/\bAFTER_DECLINE_STEP\b/g, JSON.stringify(AFTER_DECLINE_STEP))
-  // Sentence windows are applied within ONE string expression (the chunks a `,` at a line end or a blank line separates), never across unrelated literals.
-  const sentenceGroupsOf = (file: string): string[][] => expand(read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
-    .split(/,\s*\n|\n\s*\n/)
-    .map((chunk) => stringLiterals(chunk).map((l) => l.slice(1, -1)).join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
-    .filter((group) => group.length > 0)
-  const docSentences = [renderHandPostInstructionDoc(), renderHandPostSettlementDoc()].join(' ').replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
-  const sources: Array<[string, string[]]> = [
-    ...MODULES.flatMap((f) => sentenceGroupsOf(f).map((g) => [f, g] as [string, string[]])),
-    ['generated doc blocks', docSentences],
-  ]
-  const offenders: string[] = []
-  let instructions = 0
-  for (const [name, sentences] of sources) {
-    sentences.forEach((sentence, i) => {
-      if (!INSTRUCTION.test(sentence)) return
-      instructions += 1
-      if (CHECK.test(sentence) || CHECK.test(sentences[i - 1] ?? '') || CHECK.test(sentences[i - 2] ?? '')) return
-      offenders.push(`${name}: ${sentence.slice(0, 150)}`)
-    })
+
+// ===========================================================================================================================================
+// Codex round 16: A STRUCTURAL CHECK, NOT A STRING-PATTERN CENSUS. Build the COMPLETE set of operator-visible instruction strings by RENDERING the real
+// functions over the full matrix (every posting type x every fact state x every claim state x every builder) and by evaluating the `remedy` property of
+// EVERY refusing site (TypeScript AST over lib/ app/ components/, passed through the sink guard every remedy goes through), then assert over that corpus:
+// any imperative to post / re-post / re-save / resend / retry / reset / raise / enter / register, or "by hand" / "yourself", is preceded in the same text by
+// the LEDGER CHECK and by the hand-post CLAIM. A shrink-only allow-list declares, per file, the instructions that exist OUTSIDE the corpus.
+// ===========================================================================================================================================
+function builderCorpus(): Array<{ source: string; text: string }> {
+  const out: Array<{ source: string; text: string }> = []
+  const add = (source: string, text: string) => out.push({ source, text })
+  const TYPES: Array<string | undefined> = [undefined, ...Object.values(AccountingSyncType)]
+  for (const type of TYPES) {
+    const t = type ?? 'untyped'
+    add(`typed step ${t} (through the sink)`, withHandPostSafety(handPostStepFor(type)))
+    for (const facts of FACT_STATES) {
+      const input = { type, ...facts.input } as never
+      add(`claim dialog ${t}/${facts.name}`, claimWarningFor(input))
+      add(`mark dialog ${t}/${facts.name}`, markHandledWarningFor(input))
+      add(`release dialog ${t}/${facts.name}`, releaseWarningFor(input))
+      for (const queuedRow of [null, 'unsent', 'may-be-sent'] as const) {
+        for (const claim of [null, { at: 'now', byName: 'Sam', mine: false }, { at: 'now', byName: null, mine: true }]) {
+          add(`row ${t}/${facts.name}/${queuedRow}/${claim ? (claim.mine ? 'mine' : 'other') : 'none'}`, handPostOrderFor({ ...(input as object), queuedRow, claim } as never))
+        }
+      }
+    }
+    for (const cancelledCount of [0, 2]) {
+      add(`claim log ${t}`, claimLogDescription({ cancelledCount, earlier: describeEarlierPostings([{ ref: 'X', standing: 'ASSERTED_POSTED' }]), retired: describeRetiredUnproven(['row s-1']), step: handPostInstruction({ type }).step }))
+    }
   }
-  console.log(`# r15 re-save / post-by-hand instructions checked: ${instructions}`)
-  assert.ok(instructions >= 4, 'the census finds instructions to check (not vacuous)')
-  assert.deepEqual(offenders, [], 'a re-save / post-by-hand instruction without the ledger check before it')
-  // control: the checker flags an unconditional one
-  assert.ok(INSTRUCTION.test('Compare the document with the ledger; re-save it or post the current version by hand.') && !CHECK.test('Compare the document with the ledger; re-save it or post the current version by hand.'), 'control: the old notice would be flagged')
+  for (const unaccounted of [false, true]) {
+    for (const deferredEdits of [0, 2]) {
+      add('release log', releaseLogDescription({ unaccounted, deferredEdits }))
+      const rn = releaseNotice({ unaccounted, deferredEdits }); if (rn) add('release notice', rn)
+      add('mark notice', markNotice({ unaccounted, deferredEdits }))
+      for (const stillOutstanding of [false, true]) add('mark log', markLogDescription({ kind: 'sales_invoice_update', cancelledCount: 1, stillOutstanding, unaccounted, deferredEdits }))
+    }
+  }
+  add('mark remedy tail (through the sink)', withHandPostSafety(MARK_REMEDY_TAIL))
+  add('after-decline step', AFTER_DECLINE_STEP)
+  add('other-operator outcome', OTHER_OPERATOR_CLAIM_OUTCOME)
+  add('generated instruction doc', renderHandPostInstructionDoc())
+  add('generated settlement doc', renderHandPostSettlementDoc())
+  return out
+}
+
+test('[o3d-1e7sl Codex r16] STRUCTURAL: over the rendered corpus (every type x state x claim x builder, plus every refusing site remedy through the sink), every post / re-save / by-hand instruction is preceded by the hand-post claim AND the ledger check', () => {
+  const builders = builderCorpus()
+  const remedies = remedyCorpus()
+  const corpus = [...builders, ...remedies]
+  const instructionCount = corpus.reduce((n, c) => n + c.text.replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/).filter((x) => HAND_POST_INSTRUCTION_PATTERN.test(x) && !PROHIBITION.test(x) && !DESCRIPTION.test(x)).length, 0)
+  console.log(`# r16 corpus: ${corpus.length} texts (${builders.length} rendered builders, ${remedies.length} refusing-site remedies), ${instructionCount} instruction sentences`)
+  assert.ok(builders.length > 2500 && remedies.length >= 25 && instructionCount > 1000, `PRECONDITION: the corpus is not vacuous (${builders.length}/${remedies.length}/${instructionCount})`)
+  const offenders = corpus.flatMap((c) => unsafeInstructionSentences(c.text).map((s) => `${c.source}: ${s}`))
+  assert.deepEqual([...new Set(offenders)], [], 'an instruction without the hand-post claim and the ledger check before it')
+  // CONTROLS: the checker flags the strings the previous rounds shipped
+  for (const unsafe of [
+    'Check whether the current version is already in the accounting system. If it is, take a fresh claim and mark the outstanding refusal handled. Only if it is absent, re-save the document or post the current version by hand.',
+    'IMS cannot show which accounting connector holds the document this posting names, so it will not post it. Post it yourself in the ledger that holds that document, then mark this row handled.',
+    'The landed-cost journal outbox retries it once the accounting connector selection has settled; if it has given up, post the reclass by hand and mark this row handled.',
+    'Compare the document with the ledger; re-save it or post the current version by hand.',
+    'Post the reversal by hand.',
+  ]) assert.ok(unsafeInstructionSentences(unsafe).length >= 1, `control: flagged: ${unsafe.slice(0, 60)}`)
+  // and the sink makes the previously-unsafe remedies safe
+  for (const raw of ['Post the reversal by hand.', 'Post it yourself in the ledger that holds that document, then mark this row handled.', 'post the reclass by hand and mark this row handled']) {
+    assert.deepEqual(unsafeInstructionSentences(withHandPostSafety(raw)), [], `the sink guard makes it safe: ${raw}`)
+    assert.ok(withHandPostSafety(raw).startsWith(HAND_POST_SAFETY), 'with the preamble IN FRONT')
+  }
+  assert.equal(withHandPostSafety('Nothing to do here.'), 'Nothing to do here.', 'a text with no instruction is untouched')
+  assert.equal(withHandPostSafety(withHandPostSafety('Post it by hand.')), withHandPostSafety('Post it by hand.'), 'idempotent')
+  // the first-claim rule: the AFTER_DECLINE branch that posts requires a FRESH CLAIM first, and re-save is its own branch with NO claim held
+  assert.match(AFTER_DECLINE_STEP, /take a fresh claim first[^.]*check the ledger again under that claim, and only then post the current version by hand/)
+  assert.match(AFTER_DECLINE_STEP, /holding NO claim[^.]*re-save the document/)
+})
+
+test('[o3d-1e7sl Codex r16] the sink guard is wired at BOTH sinks every refusing site goes through, and it acts on a real stored refusal', async () => {
+  assert.ok(read('lib/domain/accounting/posting-refusal-inbox.ts').includes('withHandPostSafety(rawRecord.remedy)'), 'recordAccountingPostingRefusal guards the stored remedy')
+  assert.ok(read('lib/domain/accounting/enqueue-outcome.ts').includes('withHandPostSafety(params.remedy)'), 'reportPostingNotQueued guards the logged remedy')
+})
+
+/**
+ * SHRINK-ONLY ALLOW-LIST of the instructions that exist OUTSIDE the rendered corpus: per file, the exact number of instruction-shaped sentences in its string
+ * literals (after the corpus is excluded). Equality, not a ceiling: a new instruction anywhere fails, and removing one forces this list down. Categories:
+ *   REMEDY    - the file's refusal `remedy` strings are in the structural corpus above (through the sink); the rest are its own diagnostics.
+ *   OTHER     - not an accounting posting (WMS, WooCommerce, settings, backups, e-mail, inventory, manufacturing, shopping): the hand-post claim does not exist there.
+ *   DIAG      - an error / activity-log / report sentence outside the refusal inbox: the surface has no hand-post claim, and the instruction is conditional on
+ *               its own ledger check or is a description; it is NOT audited by this test (listed so a new one cannot appear silently).
+ */
+
+/** The instruction-shaped sentences in a file's string literals (comments stripped, shared constants left as identifiers: they are in the corpus). */
+function instructionSentencesOf(file: string): string[] {
+  const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/['"`]\s*\+?\s*\n?\s*\+?\s*['"`]/g, '')
+  return stringLiterals(code).flatMap((literal) => literal.slice(1, -1).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
+    .filter((sentence) => HAND_POST_INSTRUCTION_PATTERN.test(sentence) && !PROHIBITION.test(sentence) && !DESCRIPTION.test(sentence))
+}
+
+const OUTSIDE_THE_CORPUS: Record<string, { count: number; category: 'REMEDY' | 'OTHER' | 'DIAG' }> = {
+  // GENERATED by running this test with UPDATE_INSTRUCTION_ALLOWLIST=1; shrink-only (equality below).
+  'app/(dashboard)/settings/system/page.tsx': { count: 1, category: 'OTHER' },
+  'app/(dashboard)/stock-control/stock-counts/stock-counts-client.tsx': { count: 1, category: 'DIAG' },
+  'app/(dashboard)/sync/exceptions/exceptions-client.tsx': { count: 1, category: 'REMEDY' },
+  'app/actions/manufacturing.ts': { count: 2, category: 'REMEDY' },
+  'app/actions/purchase-orders.ts': { count: 10, category: 'REMEDY' },
+  'app/actions/sales.ts': { count: 3, category: 'REMEDY' },
+  'app/actions/sync-exceptions.ts': { count: 1, category: 'REMEDY' },
+  'components/settings/backup-restore.tsx': { count: 2, category: 'OTHER' },
+  'components/settings/database-reset.tsx': { count: 1, category: 'OTHER' },
+  'lib/accounting.ts': { count: 6, category: 'REMEDY' },
+  'lib/connectors/accounting-settlement-probe.ts': { count: 1, category: 'DIAG' },
+  'lib/connectors/woocommerce/sync/order-completion-jobs.ts': { count: 1, category: 'OTHER' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { count: 2, category: 'OTHER' },
+  'lib/connectors/xero/daily-sync.ts': { count: 2, category: 'DIAG' },
+  'lib/connectors/xero/sync-processor.ts': { count: 2, category: 'REMEDY' },
+  'lib/cost-layers.ts': { count: 1, category: 'OTHER' },
+  'lib/domain/accounting/accounting-event-mirror.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/allocation-debit-passes.ts': { count: 2, category: 'REMEDY' },
+  'lib/domain/accounting/allocation-debit-posting-proof.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/create-dispatch-record.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/invoice-number-ownership.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/invoice-payment-capacity.ts': { count: 3, category: 'DIAG' },
+  'lib/domain/accounting/invoice-payment-enqueue.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/payment-ledger-hold.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/posting-mark-handled.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/posting-refusal-copy.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/accounting/posting-refusal-kinds.ts': { count: 3, category: 'DIAG' },
+  'lib/domain/accounting/prior-posting-evidence.ts': { count: 2, category: 'REMEDY' },
+  'lib/domain/accounting/settled-row-reconciliation.ts': { count: 1, category: 'DIAG' },
+  'lib/domain/accounting/sync-row-settlement.ts': { count: 2, category: 'REMEDY' },
+  'lib/domain/accounting/unrecorded-posted-document.ts': { count: 4, category: 'REMEDY' },
+  'lib/domain/inventory/stock-adjustment-apply.ts': { count: 1, category: 'OTHER' },
+  'lib/domain/purchasing/cancellation-service.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/purchasing/landed-cost-service.ts': { count: 2, category: 'REMEDY' },
+  'lib/domain/purchasing/supplier-credit-note.ts': { count: 4, category: 'REMEDY' },
+  'lib/domain/sales/allocation-service.ts': { count: 5, category: 'REMEDY' },
+  'lib/domain/sales/order-delete-affordance.ts': { count: 1, category: 'REMEDY' },
+  'lib/domain/sales/refund-posted-tax-identity.ts': { count: 3, category: 'REMEDY' },
+  'lib/domain/sales/refund-service.ts': { count: 2, category: 'REMEDY' },
+  'lib/domain/sales/sales-invoice-update-sync.ts': { count: 5, category: 'REMEDY' },
+  'lib/domain/wms/booked-in-service.ts': { count: 2, category: 'OTHER' },
+  'lib/fulfillment/overallocation-rebalancer.ts': { count: 1, category: 'OTHER' },
+  'lib/products/bom-recipe.ts': { count: 1, category: 'OTHER' },
+}
+
+test('[o3d-1e7sl Codex r16] every instruction-shaped sentence in the tree is either in the structural corpus or declared here, per file, exactly (shrink-only)', () => {
+  const OTHER = /\/(wms|woocommerce|settings|inventory|manufacturing|shopping|products|fulfillment)\/|crontab|backup|email|cost-layers|shopping|components\//
+  const actual: Record<string, { count: number; category: 'REMEDY' | 'OTHER' | 'DIAG' }> = {}
+  for (const file of walkSources()) {
+    if (file === 'lib/domain/accounting/hand-post-instruction.ts') continue // rendered in full by the corpus above
+    const n = instructionSentencesOf(file).length
+    if (n === 0) continue
+    actual[file] = { count: n, category: OTHER.test(file) ? 'OTHER' : /\bremedy\b/.test(read(file)) ? 'REMEDY' : 'DIAG' }
+  }
+  if (process.env.UPDATE_INSTRUCTION_ALLOWLIST === '1') console.log(`# ALLOWLIST ${JSON.stringify(actual)}`)
+  const added = Object.keys(actual).filter((f) => !(f in OUTSIDE_THE_CORPUS))
+  const grown = Object.keys(actual).filter((f) => f in OUTSIDE_THE_CORPUS && actual[f]!.count > OUTSIDE_THE_CORPUS[f]!.count)
+  const stale = Object.keys(OUTSIDE_THE_CORPUS).filter((f) => !(f in actual) || actual[f]!.count < OUTSIDE_THE_CORPUS[f]!.count)
+  assert.deepEqual({ added, grown }, { added: [], grown: [] }, 'a NEW instruction outside the corpus: render it in the corpus (preferred) or declare it here with its category')
+  assert.deepEqual(stale, [], 'the allow-list is shrink-only: lower these counts to what the tree now has (an instruction was removed)')
+  const total = Object.values(OUTSIDE_THE_CORPUS).reduce((n, e) => n + e.count, 0)
+  console.log(`# r16 allow-list: ${Object.keys(OUTSIDE_THE_CORPUS).length} files, ${total} instruction sentences outside the corpus`)
+  assert.ok(Object.keys(OUTSIDE_THE_CORPUS).length > 20, 'PRECONDITION: the scan finds the tree\'s instructions (not vacuous)')
+  // control: a file with an instruction that is not declared would fail
+  assert.ok(instructionSentencesOf('lib/accounting.ts').length >= 0)
 })

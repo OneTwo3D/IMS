@@ -388,7 +388,7 @@ test('[o3d-1e7sl G5] the claim decides per STANDING of the row under the key, an
         reported += 1
         assert.equal(retired.length, 1, c.name)
         assert.match(retired[0]!, c.reports, c.name)
-        assert.match(String((note as unknown as { description?: string }).description), /Earlier attempt\(s\) at this posting were retired without proof[\s\S]*Instruction shown: check the ledger for that document first; post it ONLY if it is absent/, c.name)
+        assert.match(String((note as unknown as { description?: string }).description), /Earlier attempt\(s\) at this posting were retired without proof[\s\S]*Instruction shown, to follow under the claim just taken: check the ledger for that document first; post it ONLY if it is absent/, c.name)
       } else {
         assert.deepEqual(retired, [], `${c.name}: nothing unproven to report`)
       }
@@ -1076,11 +1076,11 @@ test('[o3d-1e7sl Codex r6] the claim log carries the STANDING of an earlier post
     if (c.unverified) {
       assert.match(note.description, /INV-TYPED \(an id an operator typed in\) as posted/, c.name)
       assert.match(note.description, /has NOT verified it\./, c.name)
-      assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, c.name)
+      assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, c.name)
       assert.doesNotMatch(note.description, /already holds|REPLACES|post it in the ledger now/i, c.name)
     } else {
       assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, c.name)
-      assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, c.name)
+      assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, c.name)
       assert.doesNotMatch(note.description, /post it in the ledger now/i, `${c.name}: Codex r9 - an earlier document exists, so the plain wording is unreachable`)
     }
     assert.deepEqual(note.metadata?.earlierPostingDetails, [{ ref: c.unverified ? 'INV-TYPED' : 'INV-REAL', standing: c.unverified ? 'ASSERTED_POSTED' : 'CONFIRMED_POSTED' }], `${c.name}: the standing is in the log metadata too`)
@@ -1097,7 +1097,7 @@ test('[o3d-1e7sl Codex r7] the claim log for a COMBINED state (a retired unprove
   assert.equal(ok(result), true)
   const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
   assert.match(note.description, /The ledger holds INV-REAL for this obligation \(confirmed by the connector\)/, 'the earlier document keeps its confirmed standing')
-  assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\): if the current version is there, do not post again; if only an earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
+  assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\): if the current version is there, do not post again; if only an earlier version is there, apply the update to it/, 'the log carries the SAME instruction the row and the dialogs show')
   assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger \(an earlier version being there does not show it\)/, 'the retired attempt is described against the CURRENT version, not the earlier one (facts only)')
 })
 
@@ -1124,13 +1124,13 @@ test('[o3d-1e7sl Codex r9] a REPEATED Take by the claim holder reloads the stand
       assert.ok(note, `${where}: the repeated take writes a fresh operator-facing log entry (so the entry must carry the standing)`)
       if (earlierRow) {
         assert.doesNotMatch(note!.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over an earlier document`)
-        assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version/, `${where}: carries the current-version instruction`)
+        assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version/, `${where}: carries the current-version instruction`)
         assert.match(note.description, (earlierRow as { settlementBasis?: string }).settlementBasis ? /INV-TYPED \(an id an operator typed in\) as posted/ : /The ledger holds INV-REAL/, `${where}: carries the earlier row's standing`)
       } else if (retired) {
         assert.doesNotMatch(note.description, /post it in the ledger now/i, `${where}: the re-claim log never says the plain wording over a retired attempt`)
         assert.match(note.description, /IMS has no proof that the CURRENT version is not already in the ledger/, `${where}: carries the retired-attempt fact`)
       } else {
-        assert.match(note.description, /Instruction shown: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\)/, `${where}: an UPDATE posting always gets the CURRENT-version instruction, whatever was loaded`)
+        assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT version \(the one this refused posting would have made, not an earlier version\)/, `${where}: an UPDATE posting always gets the CURRENT-version instruction, whatever was loaded`)
       }
     }
   }
@@ -1148,7 +1148,7 @@ test('[o3d-1e7sl Codex r10] the claim log for a BILL_PAYMENT is the PAYMENT inst
     const { claimAccountingPostingRefusalForHandPostingAction } = await import('@/app/actions/sync-exceptions')
     assert.equal(ok(await claimAccountingPostingRefusalForHandPostingAction('r10-bp')), true, name)
     const note = activity.find((entry) => entry.action === 'accounting_posting_refusal_claimed_for_hand_posting') as unknown as { description: string }
-    assert.match(note.description, /Instruction shown: check the ledger for the CURRENT payment \(the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one\): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment/, `${name}: the payment step`)
+    assert.match(note.description, /Instruction shown, to follow under the claim just taken: check the ledger for the CURRENT payment \(the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one\): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment/, `${name}: the payment step`)
     assert.doesNotMatch(note.description, /apply the update|update it/i, `${name}: never the update wording on a payment`)
   }
 })
@@ -1261,10 +1261,39 @@ test('[o3d-1e7sl Codex r15] a deferred edit the operator ALREADY posted by hand 
         assert.ok(text.includes(AFTER_DECLINE_STEP), `${mode}/${type}: the ${name} carries the conditional ledger check`)
         assert.ok(text.includes(CHECK_AFTERWARDS), `${mode}/${type}: and the pointer to the list`)
         // the ledger check PRECEDES any re-save / post-by-hand instruction in the same text
-        assert.ok(text.indexOf('Check whether the current version is already in the accounting system') < text.search(/re-save the document or post the current version by hand/), `${mode}/${type}: ${name}: the check comes first`)
-        assert.match(text, /Only if it is absent, re-save the document or post the current version by hand\./, `${mode}/${type}: ${name}: the re-save / post is conditional on absence`)
+        assert.ok(text.indexOf('Check whether the current version is already in the accounting system') < text.search(/post the current version by hand/), `${mode}/${type}: ${name}: the check comes first`)
+        assert.match(text, /If it is absent, EITHER take a fresh claim first[^.]*check the ledger again under that claim, and only then post the current version by hand, OR - holding NO claim[^.]*re-save the document\./, `${mode}/${type}: ${name}: the post needs a FRESH CLAIM and a re-check, and the re-save is its own branch with no claim held`)
         assert.doesNotMatch(text, /(^|\. )Re-save it|Compare the document with the ledger; re-save/i, `${mode}/${type}: ${name}: no unconditional re-save`)
       }
     }
+  }
+})
+
+test('[o3d-1e7sl Codex r16] THE SINK GUARD ACTS: every refusing site\'s RAW remedy, fed through the real recordAccountingPostingRefusal, is stored with the claim-and-ledger-check preamble in front of any post / re-save / by-hand instruction', async () => {
+  const { remedyCorpus, unsafeInstructionSentences } = await import('../helpers/hand-post-census')
+  const { HAND_POST_SAFETY, HAND_POST_INSTRUCTION_PATTERN } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
+  const raw = remedyCorpus({ sink: false })
+  assert.ok(raw.length >= 25, `PRECONDITION: the raw remedies of the refusing sites are extracted (${raw.length})`)
+  let stored = 0
+  let guarded = 0
+  for (const [i, r] of raw.entries()) {
+    refusals.length = 0
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'SALES_INVOICE_UPDATE', referenceType: 'Doc', referenceId: `d-${i}`, scope: '' },
+      { kind: 'sales_invoice_update', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: r.text })
+    const row = refusals[0] as unknown as { remedy?: string } | undefined
+    if (!row) continue
+    stored += 1
+    assert.deepEqual(unsafeInstructionSentences(String(row.remedy)), [], `${r.source}: the STORED remedy is safe: ${r.text.slice(0, 80)}`)
+    if (HAND_POST_INSTRUCTION_PATTERN.test(r.text) && !/\b(do not|don't|never)\b/i.test(r.text)) { guarded += 1; assert.ok(String(row.remedy).startsWith(HAND_POST_SAFETY) || String(row.remedy).includes(HAND_POST_SAFETY), `${r.source}: the preamble is in the stored remedy`) }
+  }
+  console.log(`# r16 sink: ${raw.length} raw remedies, ${stored} stored, ${guarded} carried an instruction and got the preamble`)
+  assert.ok(stored >= 25 && guarded >= 5, 'the sink really stored and guarded them')
+  // and the named unsafe strings the reviews found
+  for (const unsafe of ['Post it yourself in the ledger that holds that document, then mark this row handled.', 'Post the reversal by hand.', 'post the reclass by hand and mark this row handled']) {
+    refusals.length = 0
+    await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'STOCK_RECEIPT', referenceType: 'Doc', referenceId: 'd-unsafe', scope: '' },
+      { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: unsafe })
+    assert.ok(String((refusals[0] as unknown as { remedy: string }).remedy).startsWith(HAND_POST_SAFETY), `stored with the preamble first: ${unsafe}`)
   }
 })

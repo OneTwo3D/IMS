@@ -76,7 +76,8 @@ export const MARK_REMEDY_TAIL = `Marking the row handled cancels IMS's own queue
  */
 export const AFTER_DECLINE_STEP =
   'Check whether the current version is already in the accounting system. If it is, take a fresh claim and mark the outstanding refusal handled. '
-  + 'Only if it is absent, re-save the document or post the current version by hand.'
+  + 'If it is absent, EITHER take a fresh claim first (the claim is what stops IMS queueing it while you post), check the ledger again under that claim, '
+  + 'and only then post the current version by hand, OR - holding NO claim, because a save is declined while a claim is held - re-save the document.'
 export const LEDGER_CHECK_FIRST = 'Check whether the current version is already in the accounting system. Only if it is absent: '
 export const RELEASE_ACTION_NOW = 'Releasing gives up your claim on this posting.'
 export const TAKE_TOAST = `Taken for hand posting. ${CLAIM_ACTION_NOW}`
@@ -302,7 +303,7 @@ export function releaseWarningFor(input: HandPostInput): string {
 export function claimLogDescription(args: { cancelledCount: number; earlier: string; retired: string; step: string }): string {
   return `Took a refused accounting posting to settle it by hand. ${CLAIM_ACTION_NOW}`
     + (args.cancelledCount > 0 ? ` ${args.cancelledCount} unsent queued row(s) for it were cancelled.` : '')
-    + args.earlier + args.retired + ` Instruction shown: ${args.step}.`
+    + args.earlier + args.retired + ` Instruction shown, to follow under the claim just taken: ${args.step}.`
 }
 
 export function releaseLogDescription(args: { unaccounted: boolean; deferredEdits: number }): string {
@@ -345,11 +346,13 @@ export function renderHandPostInstructionDoc(): string {
   ]
   return [
     HAND_POST_INSTRUCTION_DOC_BEGIN,
+    'Take the posting for hand posting first and hold that claim while you work: every row below applies only under that claim.',
+    '',
     '| Posting type | What the page, the dialogs and the log tell you | When to press *Mark as handled* |',
     '|---|---|---|',
     ...rows.map(([name, input]) => {
       const i = handPostInstruction(input)
-      return `| ${name} | ${capitalise(i.step)}. | Only once ${i.markHandledCondition}. |`
+      return `| ${name} | Hold the hand-post claim, then: ${i.step}. | Only once ${i.markHandledCondition}. |`
     }),
     HAND_POST_INSTRUCTION_DOC_END,
   ].join('\n')
@@ -412,4 +415,25 @@ export function renderHandPostSettlementDoc(): string {
       + 'A claim the run keeps failing to settle is moved to the **integration outbox failures** section.',
     HAND_POST_SETTLEMENT_DOC_END,
   ].join('\n')
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// Codex round 16: EVERY remedy a refusing site writes passes through ONE sink guard, so a hand-post / re-post / re-save instruction can never reach an
+// operator without the claim-and-ledger-check preamble in front of it. (Auditing ~100 hand-written remedy strings one by one is what kept failing open;
+// a string that already carries the preamble is left alone, and a string with no such instruction is not touched.)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+
+/** An imperative to post, re-post, re-save, re-send, retry, reset, raise, enter or register something, or to do anything "by hand" / "yourself". */
+export const HAND_POST_INSTRUCTION_PATTERN =
+  /\b(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register)\b[^.]{0,80}\b(by hand|yourself|manually|again|in the ledger|in the accounting system|from (its|the) source document|in (Xero|QuickBooks))\b|\bpost (it|this|that|the current (version|payment)|its current version)\b|\byourself\b|\bre-?save\b|\bre-?post\b|\bresend\b|\bre-?raise\b/i
+
+export const HAND_POST_SAFETY =
+  'BEFORE any hand posting, re-post or re-save: take the posting for hand posting on this row and hold that claim (so IMS does not queue it while you work), '
+  + 'and check whether the current version is already in the accounting system; act only if it is absent.'
+
+/** The text with the safety preamble in front of it when it carries an instruction (idempotent; text with no instruction is returned unchanged). */
+export function withHandPostSafety(text: string): string {
+  if (!HAND_POST_INSTRUCTION_PATTERN.test(text) || text.includes(HAND_POST_SAFETY)) return text
+  return `${HAND_POST_SAFETY} ${text}`
 }
