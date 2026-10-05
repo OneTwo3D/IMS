@@ -2614,8 +2614,9 @@ Retry behavior is marker-driven. If the process stops after A1, the next run ski
 **The daily batch refuses a negative cost, by name, instead of posting it short.** A cost layer's
 unit cost used to be able to go below zero when a landed-cost recalculation spread a credit freight
 cost line larger than the goods it was spread over, rewriting the cost recorded on allocations and
-shipments that already used that layer. Landed cost can no longer do that: a unit is valued at zero
-instead of below it (see *Recalculation after receipt* in the purchasing guide). The daily batch keeps
+shipments that already used that layer. Landed cost can no longer do that to a purchase order's own
+layers: a unit is valued at zero instead of below it (see *Recalculation after receipt* in the purchasing guide;
+manufactured goods built from such a layer are not floored). The daily batch keeps
 its three checks as defence in depth against any other source of a negative cost, because posting one
 short is the defect they exist to prevent:
 
@@ -2650,7 +2651,7 @@ run shows on System Health as a warning, not an alert, so the activity log is th
 Revaluing it below zero used to post the reversal of its old COGS and drop the negative repost, so
 the difference posted nowhere. The revaluation refuses and changes nothing if it is ever asked to
 (see *Recalculation after receipt* in the purchasing guide). A landed-cost recalculation cannot ask
-any more, because it floors each unit cost at zero, so a freight credit that exceeds the goods
+any more for a purchase order's own layers, because it floors each unit cost at zero, so a freight credit that exceeds the goods
 cost revalues the shipment down to 0.00 (the reversal leg only) and reports the part of the credit it
 could not absorb as a warning. The refusal stays as the backstop (o3d-c08y).
 

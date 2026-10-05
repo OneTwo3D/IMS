@@ -28,7 +28,6 @@ import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconcilia
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 import {
   allocateLandedCost,
-  floorUnitCostAtZero,
   unabsorbedBaseForQty,
   type LandedAllocation,
   type LandedAllocationCostLine,
@@ -171,9 +170,6 @@ type PropagatedOutputLayerAudit = {
   inventoryDelta: string
   /** o3d-nrl4 PR B: the portion of `inventoryDelta` that belongs to units of this output still in transit. */
   inTransitResidue: InTransitResidueEntry[]
-  /** Present only when the output's own cost would have rounded below zero and was floored there. */
-  unabsorbedBase?: string
-  unflooredUnitCostBase?: string
 }
 
 /** One cost layer's row in a revaluation run's `afterJson`. The two floor keys exist only on a layer whose
@@ -499,7 +495,7 @@ export async function propagateLandedCostToOutputs(
   accumulate: (
     cogsDelta: Prisma.Decimal,
     inventoryDelta: Prisma.Decimal,
-    audit: { sourceCostLayerId: string; outputCostLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; consumedQty: string; inTransitResidue: InTransitResidueEntry[]; unabsorbedBase?: string; unflooredUnitCostBase?: string },
+    audit: { sourceCostLayerId: string; outputCostLayerId: string; oldUnitCostBase: string; newUnitCostBase: string; consumedQty: string; inTransitResidue: InTransitResidueEntry[] },
   ) => void,
   ancestors: Set<string>,
   depth: number,
@@ -550,15 +546,7 @@ export async function propagateLandedCostToOutputs(
     const outputUnitDelta = costDeltaPerUnit.mul(consumedQty).div(outputReceivedQty)
     if (outputUnitDelta.abs().lte(LANDED_COST_DELTA_EPSILON)) continue
     const oldOutputUnitCost = decimal(output.unitCostBase)
-    // THE SAME FLOOR as the root layer. The source delta is already floored upstream, but the output's own
-    // cost is `old + delta` rounded here, and when the output's cost came entirely from this source a
-    // HALF_UP tie can land one micro-unit below zero (-0.000001), which the movement builders refuse. Floored
-    // after rounding, like the root; the residue is reported on the audit row, never redistributed.
-    const roundedOutputUnitCost = oldOutputUnitCost.add(outputUnitDelta).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
-    const newOutputUnitCost = floorUnitCostAtZero(roundedOutputUnitCost)
-    const outputUnabsorbedBase = roundedOutputUnitCost.lt(0)
-      ? unabsorbedBaseForQty(roundedOutputUnitCost, outputReceivedQty)
-      : null
+    const newOutputUnitCost = oldOutputUnitCost.add(outputUnitDelta).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
 
     await tx.costLayer.update({ where: { id: outputCostLayerId }, data: { unitCostBase: newOutputUnitCost } })
     await deps.recordCostLayerRevaluation(tx, {
@@ -612,13 +600,10 @@ export async function propagateLandedCostToOutputs(
       newUnitCostBase: newOutputUnitCost.toString(),
       consumedQty: consumedQty.toString(),
       inTransitResidue: outputResidue.entries,
-      ...(outputUnabsorbedBase
-        ? { unabsorbedBase: outputUnabsorbedBase.toString(), unflooredUnitCostBase: roundedOutputUnitCost.toString() }
-        : {}),
     })
 
     // Cascade into outputs that consumed THIS output (nested BOM levels).
-    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnabsorbedBase ? newOutputUnitCost.sub(oldOutputUnitCost) : outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext)
+    await propagateLandedCostToOutputs(tx, deps, outputCostLayerId, outputUnitDelta, accumulate, nextAncestors, depth + 1, recalcRunId, revaluedAt, revaluationContext)
   }
 }
 
@@ -758,24 +743,6 @@ async function previousFloorResidue(tx: Prisma.TransactionClient, primaryPoId: s
     }
   }
   return total
-}
-
-/**
- * A manufactured output whose own cost would have rounded below zero was floored too (propagateLandedCostToOutputs).
- * It joins the SAME warning as the root layers, through the same builder: the entry names the output layer and the
- * amount it could not absorb, and the floor is an event, so the activity entry is due.
- */
-function noteFlooredOutput(
-  footprint: FloorFootprint,
-  audit: { outputCostLayerId: string; unabsorbedBase?: string; unflooredUnitCostBase?: string },
-): void {
-  if (!audit.unabsorbedBase || !audit.unflooredUnitCostBase) return
-  footprint.entries.push({
-    label: `manufactured output layer ${audit.outputCostLayerId}`,
-    unabsorbedBase: new Prisma.Decimal(audit.unabsorbedBase),
-    unflooredGrossUnitCostBase: new Prisma.Decimal(audit.unflooredUnitCostBase),
-  })
-  footprint.activityDue = true
 }
 
 function recordFlooredLandedCredit(
@@ -1443,7 +1410,6 @@ export async function recalculateLandedCosts(
             totalInventoryDelta = totalInventoryDelta.add(invD)
             inTransitResidue.push(...audit.inTransitResidue)
             propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
-            noteFlooredOutput(floorFootprint, audit)
           },
           new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
         )
@@ -1780,7 +1746,6 @@ export async function recalculateDirectLandedCosts(
           totalInventoryDelta = totalInventoryDelta.add(invD)
           inTransitResidue.push(...audit.inTransitResidue)
           propagatedOutputLayers.push({ ...audit, cogsDelta: cogsD.toString(), inventoryDelta: invD.toString() })
-          noteFlooredOutput(floorFootprint, audit)
         },
         new Set(), 1, recalcRunId, revaluedAt, revaluationContext,
       )

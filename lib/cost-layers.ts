@@ -259,8 +259,9 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   // nowhere. A negative basis cannot be represented here (o3d-gd2f), and
   // `refreshShipmentCogsForCostLayerChange` refuses the revaluation before it gets this far; this
   // throw is the backstop that keeps the leg-drop from ever being silent again. Landed cost can no longer
-  // reach it (the allocation floors every unit cost at zero, so a shipment is revalued down to 0.00 at
-  // worst, which this builder handles by emitting the reversal leg only); it stays for any other source.
+  // reach it on a purchase order's OWN layers (the allocation floors their unit cost at zero, so a shipment of
+  // them is revalued down to 0.00 at worst, which this builder handles by emitting the reversal leg only); it
+  // stays for manufactured outputs (landed-cost propagation does not floor them) and any other source.
   if (oldCogs.lt(0) || newCogs.lt(0)) {
     throw new Error(
       `buildShipmentCogsRevaluationSyncPayload: shipment ${input.shipmentId} would be revalued from `
@@ -1562,10 +1563,11 @@ const JOURNALED_REVALUATION_ABORT_SENTINEL = 'journaled_shipment_revaluation_ref
  *    recompute merely carried the component layer's cost through to the finished goods.
  *
  * AFTER THE ZERO FLOOR (lib/domain/purchasing/landed-cost-allocation.ts) THIS IS A BACKSTOP. Landed cost
- * can no longer drive a layer, a snapshot or a shipment below zero: a credit larger than the goods cost
- * values the units at zero and reports the unabsorbed part as a warning instead. So the credit-line
- * wording below is reachable only from a caller that reaches this refusal with a negative cost from
- * ANOTHER source while still carrying a revaluation context. The text is deliberately left as it was: it
+ * can no longer drive a purchase order's OWN layers, their snapshots or a shipment of them below zero: a
+ * credit larger than the goods cost values the units at zero and reports the unabsorbed part as a warning
+ * instead. Manufactured outputs fed by such a layer are NOT floored (propagation applies deltas to the stored
+ * cost). So the credit-line wording below is reachable only from a caller that reaches this refusal with a
+ * negative cost from ANOTHER source (or such an output) while still carrying a revaluation context. The text is deliberately left as it was: it
  * is tested operator wording for a refusal this change does not touch, and rewording it would be a
  * judgement about sources that are not landed cost.
  */

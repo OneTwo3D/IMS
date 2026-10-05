@@ -20,7 +20,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  * WHAT CHANGED (the landed-cost sign change, o3d-gj68 / o3d-ab13). A credit freight line is now APPLIED
  * and a unit is FLOORED at zero, so a landed-cost recalculation can no longer drive a layer to -6.00:
  * the same fixture now revalues the shipment to 0.00 and warns about the 6.00 it could not absorb. The
- * refusal this file was written for is therefore UNREACHABLE FROM LANDED COST and is kept as a backstop
+ * refusal this file was written for is therefore UNREACHABLE FROM LANDED COST for a purchase order's own layers and is kept as a backstop
  * for any other source of a negative cost. So the refusal arms below REACH it by INJECTING the negative
  * directly — the layer's cost and the shipment snapshots are written negative inside a real transaction
  * and `refreshShipmentCogsForCostLayerChange` is driven exactly as the recalculation drives it — and each

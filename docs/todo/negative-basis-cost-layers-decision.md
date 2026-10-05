@@ -2,7 +2,7 @@
 
 **Issue:** `o3d-gd2f` (P2, blocks P1 `o3d-eiuo`) · **Epic:** `epic:landed-cost` (`onetwo3d-ims-6oyu.19`)
 **Verified against:** this branch's head. Every location below was re-read at that commit.
-**Status:** FREIGHT CREDITS NO LONGER REACH A NEGATIVE BASIS (decision taken, 2026-10-01; implemented
+**Status:** FREIGHT CREDITS NO LONGER REACH A NEGATIVE BASIS ON A PURCHASE ORDER'S OWN LAYERS (decision taken, 2026-10-01; implemented
 by the landed-cost sign change). A credit or zero freight cost line is now **applied** to inventory
 basis, the receipt-side helper and both revaluation paths computing it from ONE allocation
 (`lib/domain/purchasing/landed-cost-allocation.ts`), with a **per-layer floor at zero** and a visible
@@ -11,7 +11,9 @@ reported (revaluation-run `warningsJson`, activity-log WARNING, the receipt resu
 not redistributed and not posted. Full negative-basis support is still **not** authorised and **not**
 implemented; what this document describes in §1 is the behaviour **before** that change, kept as the
 record of why the floor was chosen. What is left of `o3d-gd2f` is negative cost from sources other than
-freight credits (see §4.0), which the refusals described below still guard.
+freight credits (see §4.0), which the refusals described below still guard, and manufactured outputs built from a
+floored layer: landed-cost propagation applies deltas to the stored output cost and does NOT floor it (a credit then
+its reversal can over- or undervalue the output; filed as its own issue).
 
 > **Round-2 correction notice.** An earlier revision of this document asserted that a negative
 > basis arises "through ordinary, supported operator action", and attributed the write to a

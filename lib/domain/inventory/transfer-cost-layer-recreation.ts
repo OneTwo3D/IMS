@@ -67,7 +67,7 @@
  *    `updateSnapshotsForCostLayerChange` then patched
  *    `stock_transfer_lines.costLayerSnapshot` IN PLACE: a credit landing while units
  *    were in transit rewrote a positive dispatch snapshot negative and the receipt
- *    read it. Landed cost can no longer produce it: the one allocation
+ *    read it. Landed cost can no longer produce it on a PURCHASE ORDER's own layers: the one allocation
  *    (lib/domain/purchasing/landed-cost-allocation.ts) holds a layer's cost at zero
  *    instead of letting it go negative, so no layer or snapshot reaches this helper
  *    below zero FROM LANDED COST. The refusal stays as the backstop for any other

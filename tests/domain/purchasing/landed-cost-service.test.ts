@@ -2408,11 +2408,14 @@ test('T9: a second recalculation of a floored layer posts NOTHING, repeats the w
   }
 })
 
-test('T8: propagation floors an output layer whose cost would round to -0.000001 on a HALF_UP tie', async () => {
-  // Source delta -0.000003/unit, 1 unit consumed into an output of 2 received: output delta -0.0000015.
-  // Output old cost 0.000001 -> -0.0000005 -> HALF_UP -> -0.000001 (away from zero).
+test('T8: propagation to manufactured outputs is NOT floored (unchanged from before the landed-cost floor)', async () => {
+  // The floor applies to a purchase order's OWN layers only. Propagation applies the source's delta to the output's
+  // STORED cost, so flooring there would make a credit followed by its reversal over- or undervalue the output
+  // (stored cost 0.5, delta -1 floors to 0, delta +1 then gives 1.0 instead of 0.5). That needs the unfloored basis
+  // persisted and is a separate issue; until then the output is written exactly as it always was and the
+  // below-zero refusal remains the backstop.
   const layers: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
-    'out-1': { unitCostBase: '0.000001', receivedQty: '2', remainingQty: '2' },
+    'out-1': { unitCostBase: '0.5', receivedQty: '1', remainingQty: '1' },
   }
   const updates: Record<string, string> = {}
   const tx = {
@@ -2422,19 +2425,14 @@ test('T8: propagation floors an output layer whose cost would round to -0.000001
     },
     costLayerSourceLine: { update: async () => ({}) },
   }
-  const audits: Array<{ unabsorbedBase?: string; newUnitCostBase: string }> = []
   const deps = noopDeps({
     getDependentOutputSourceLines: async (_tx, id) => (id === 'src-1' ? [{ sourceLineId: 'sl1', outputCostLayerId: 'out-1', qty: toDecimal(1) }] : []),
   })
   await propagateLandedCostToOutputs(
-    tx as never, deps, 'src-1', new Prisma.Decimal('-0.000003'),
-    (_c, _i, audit) => { audits.push(audit) },
-    new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
+    tx as never, deps, 'src-1', new Prisma.Decimal(-1), () => {}, new Set(), 1, 'test-recalc-run', new Date('2026-06-20T00:00:00.000Z'),
   )
-  console.log(`T8 PRECONDITION: output layer written at ${updates['out-1']}, audit unabsorbedBase=${audits[0]?.unabsorbedBase}`)
-  assert.equal(audits.length, 1, 'the propagation reached the output layer')
-  assert.equal(updates['out-1'], '0', 'floored, never -0.000001')
-  assert.equal(audits[0].unabsorbedBase, '0.000002', 'the residue is reported: 0.000001 x 2 units')
+  console.log(`T8 PRECONDITION: output 0.5 with a -1 delta is written at ${updates['out-1']} (unfloored, as before)`)
+  assert.equal(updates['out-1'], '-0.5')
 })
 
 test('T9b: a floored layer already at zero whose RESIDUE grows (credit -3 -> -5) DOES get a new activity entry', async () => {
@@ -2483,45 +2481,3 @@ test('T9b: a floored layer already at zero whose RESIDUE grows (credit -3 -> -5)
   }
 })
 
-test('T8b: a manufactured OUTPUT floored by the propagation joins the same warning and the activity entry', async () => {
-  // Root layer 1.000003 -> 1.000000 (no freight): per-unit delta -0.000003. One unit of it fed an output layer of
-  // 2 received at 0.000001: output delta -0.0000015, 0.000001 - 0.0000015 rounds (HALF_UP) to -0.000001 -> floored.
-  const outputs: Record<string, { unitCostBase: string; receivedQty: string; remainingQty: string }> = {
-    'out-1': { unitCostBase: '0.000001', receivedQty: '2', remainingQty: '2' },
-  }
-  const written: Record<string, string> = {}
-  const po = {
-    id: 'po-1', reference: 'PO-1', status: 'RECEIVED',
-    lines: [{
-      id: 'line-a', qty: 1, unitCostBase: '1.000000', landedUnitCostBase: '1.000003', totalBase: '1.000000',
-      product: { weight: 1 },
-      costLayers: [{ id: 'layer-a', unitCostBase: '1.000003', receivedQty: 1, remainingQty: 1 }],
-    }],
-    freightCostLines: [],
-    landedCostLinks: [],
-  }
-  const runs: Array<{ data: { warningsJson: Array<{ code: string; message: string }>; afterJson: { propagatedOutputLayers: Array<{ unabsorbedBase?: string }> } } }> = []
-  const tx = {
-    purchaseOrder: { findUnique: async () => po },
-    purchaseOrderLine: { update: async () => ({}) },
-    costLayer: {
-      update: async ({ where, data }: { where: { id: string }; data: { unitCostBase: unknown } }) => { written[where.id] = String(data.unitCostBase) },
-      findUnique: async ({ where }: { where: { id: string } }) => outputs[where.id] ?? null,
-    },
-    costLayerSourceLine: { update: async () => ({}) },
-    landedCostRevaluationRun: {
-      findFirst: async () => null,
-      create: async (args: never) => { runs.push(args); return { id: 'audit-1' } },
-    },
-  }
-  const deps = noopDeps({
-    getDependentOutputSourceLines: async (_tx, id) => (id === 'layer-a' ? [{ sourceLineId: 'sl1', outputCostLayerId: 'out-1', qty: toDecimal(1) }] : []),
-  })
-  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', deps, TEST_AUDIT_OPTIONS)
-  console.log(`T8b PRECONDITION: output layer written at ${written['out-1']}, warnings ${JSON.stringify(result.warnings.map((w) => w.code))}, activities ${result.creditFloorActivities?.length}`)
-  assert.equal(written['out-1'], '0', 'the output layer is floored')
-  assert.deepEqual(result.warnings.map((w) => w.code), ['landed_cost_credit_floored'])
-  assert.match(result.warnings[0].message, /manufactured output layer out-1: 0\.00/)
-  assert.equal(result.creditFloorActivities?.length, 1)
-  assert.equal(runs[0].data.afterJson.propagatedOutputLayers[0].unabsorbedBase, '0.000002')
-})
