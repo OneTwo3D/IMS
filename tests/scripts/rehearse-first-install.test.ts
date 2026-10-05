@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, renameSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
 import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
@@ -26,7 +26,7 @@ import {
   rehearsalExitCode,
   type SeededRowFacts,
 } from '@/lib/ops/first-install-rehearsal'
-import { capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
+import { ancestorProblem, capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
@@ -258,10 +258,30 @@ test('shredFile removes a mode-600 file that holds a secret, and reports a file 
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const file = join(dir, 'rehearsal.env')
   writeFileSync(file, 'DATABASE_URL=postgresql://role:secret@127.0.0.1:1/x\n', { mode: 0o600 })
+  const info = statSync(file)
   assert.equal(existsSync(file), true, 'precondition: the file exists before the shred')
-  assert.equal(shredFile(file), true)
+  assert.deepEqual(shredFile(file, { dev: info.dev, ino: info.ino }), { ok: true })
   assert.equal(existsSync(file), false)
-  assert.equal(shredFile(file), true, 'a second shred of a missing file is a success, not an error')
+  assert.deepEqual(shredFile(file, { dev: info.dev, ino: info.ino }), { ok: true }, 'a second shred of a missing file is a success, not an error')
+})
+
+test('shredFile refuses a symlink, a different regular file and a FIFO at the name, writes nothing, and never hangs', (t) => {
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-shred2-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const mine = join(dir, 'mine')
+  writeFileSync(mine, 'created by the run')
+  const id = { dev: statSync(mine).dev, ino: statSync(mine).ino }
+  const victim = join(dir, 'victim')
+  writeFileSync(victim, 'precious')
+  symlinkSync(victim, join(dir, 'link'))
+  assert.equal(shredFile(join(dir, 'link'), id).ok, false)
+  assert.equal(shredFile(victim, id).ok, false, 'a regular file with another inode is not ours')
+  execFileSync('mkfifo', [join(dir, 'fifo')])
+  assert.equal(shredFile(join(dir, 'fifo'), id).ok, false, 'a FIFO is refused without blocking')
+  assert.equal(shredFile(mine, null).ok, false, 'no recorded identity means nothing may be overwritten')
+  console.log(`# victim after four refusals: ${JSON.stringify(readFileSync(victim, 'utf8'))}; mine: ${JSON.stringify(readFileSync(mine, 'utf8'))}`)
+  assert.equal(readFileSync(victim, 'utf8'), 'precious')
+  assert.equal(readFileSync(mine, 'utf8'), 'created by the run')
 })
 
 test('a RAM-backed --root is refused before anything is created', () => {
@@ -843,6 +863,103 @@ test('RECORDED BUT NOT COUNTED: the docs name exactly the detail fields that are
     assert.ok(sentence.includes(key), `${key} is documented as informational`)
     assert.ok(new RegExp(`\\b${key}\\b`).test(script), `${key} is a real detail field`)
   }
+})
+
+test('ancestorProblem: the pure predicate (root-owned sticky accepted; every other writable shape refused)', () => {
+  const dir = (uid: number, mode: number, extra: Partial<{ isSymlink: boolean; isDirectory: boolean }> = {}) => ancestorProblem({ isDirectory: true, isSymlink: false, uid, mode, ...extra }, 1000)
+  assert.equal(dir(0, 0o41777), null, 'a root-owned sticky 1777 directory (/tmp, /var/tmp) is accepted')
+  assert.equal(dir(0, 0o40755), null)
+  assert.equal(dir(1000, 0o40700), null, 'owned by the running account, not writable by others')
+  assert.equal(dir(1000, 0o40775) !== null, true, 'group-writable, not sticky')
+  assert.equal(dir(1000, 0o40757) !== null, true, 'other-writable, not sticky')
+  assert.equal(dir(1000, 0o41777) !== null, true, 'sticky but NOT root-owned')
+  assert.equal(dir(0, 0o40777) !== null, true, 'root-owned, world-writable, not sticky')
+  assert.equal(dir(1234, 0o40755) !== null, true, 'owned by another account')
+  assert.equal(dir(0, 0o40755, { isSymlink: true }) !== null, true, 'a symlink')
+  assert.equal(dir(0, 0o100644, { isDirectory: false }) !== null, true, 'not a directory')
+})
+
+test('ANCESTORS: a group-writable, non-sticky ancestor of --root is refused with exit 2 before anything is created', { timeout: TIMEOUT }, async (t) => {
+  const outer = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-anc-'))
+  t.after(() => rmSync(outer, { recursive: true, force: true }))
+  chmodSync(outer, 0o775)
+  const root = join(outer, 'work')
+  mkdirSync(root, { mode: 0o700 })
+  const reports = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-rep-'))
+  t.after(() => rmSync(reports, { recursive: true, force: true }))
+  const outcome = await runRehearsal({ parentDir: root, reportDir: reports, log: () => undefined, only: new Set<StepId>() })
+  console.log(`# --root under a 0775 ancestor: exit ${outcome.exitCode}; refusal: ${outcome.refusal}; run dirs created: ${JSON.stringify(readdirSync(root))}`)
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.REFUSED)
+  assert.match(outcome.refusal ?? '', /--root .*writable by group or others/)
+  assert.deepEqual(readdirSync(root), [])
+})
+
+test('ANCESTORS: a group-writable, non-sticky ancestor of --report-dir is refused with exit 2 before anything is created', { timeout: TIMEOUT }, async (t) => {
+  const outer = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-anc-'))
+  t.after(() => rmSync(outer, { recursive: true, force: true }))
+  chmodSync(outer, 0o775)
+  const root = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-work-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const outcome = await runRehearsal({ parentDir: root, reportDir: join(outer, 'reports'), log: () => undefined, only: new Set<StepId>() })
+  console.log(`# --report-dir under a 0775 ancestor: exit ${outcome.exitCode}; refusal: ${outcome.refusal}; run dirs created: ${JSON.stringify(readdirSync(root))}`)
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.REFUSED)
+  assert.match(outcome.refusal ?? '', /--report-dir .*writable by group or others/)
+  assert.deepEqual(readdirSync(root), [])
+})
+
+for (const mode of ['symlink', 'different file'] as const) {
+  test(`SHRED never follows a path blindly: the env file replaced by a ${mode} before the teardown is not overwritten, and the teardown says so (exit 3)`, { timeout: TIMEOUT }, async (t) => {
+    const parent = scratchParent(t)
+    const victim = join(parent, 'victim.txt')
+    writeFileSync(victim, 'precious')
+    let envFile = ''
+    const outcome = await runRehearsal({
+      parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['system-identifier']),
+      hooks: {
+        betweenIdentityAndStop: () => {
+          const run = readdirSync(parent).find((name) => name.startsWith('ims-rehearsal-') && name !== 'reports')!
+          envFile = join(parent, run, 'rehearsal.env')
+          rmSync(envFile)
+          if (mode === 'symlink') symlinkSync(victim, envFile)
+          else writeFileSync(envFile, 'decoy contents')
+        },
+      },
+    })
+    assert.ok(outcome.report)
+    const decoy = mode === 'symlink' ? readFileSync(victim, 'utf8') : (existsSync(envFile) ? readFileSync(envFile, 'utf8') : '(removed with the run directory)')
+    console.log(`# env file replaced by a ${mode}; victim now ${JSON.stringify(readFileSync(victim, 'utf8'))}; decoy now ${JSON.stringify(decoy)}; envFileShredded=${outcome.report.teardown?.envFileShredded}; exit ${outcome.exitCode}; errors ${JSON.stringify(outcome.report.teardown?.errors)}`)
+    assert.ok(envFile.length > 0, 'precondition: the replacement happened')
+    assert.equal(readFileSync(victim, 'utf8'), 'precious', 'the symlink target was not overwritten')
+    if (mode === 'different file') assert.notEqual(decoy, '', 'the decoy was not truncated or overwritten with random bytes')
+    assert.equal(outcome.report.teardown?.envFileShredded, false)
+    assert.match((outcome.report.teardown?.errors ?? []).join(' '), /env file/)
+    assert.equal(outcome.exitCode, REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
+  })
+}
+
+test('REPORT DIRECTORY identity: swapping the validated --report-dir for another directory is detected, nothing is published into it, and the run is RED', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const reportDir = join(parent, 'reports')
+  let swappedInto = ''
+  const outcome = await runRehearsal({
+    parentDir: parent, reportDir, log: () => undefined, only: new Set<StepId>(['system-identifier']),
+    hooks: {
+      beforePublish: () => {
+        renameSync(reportDir, join(parent, 'reports-moved'))
+        mkdirSync(reportDir, { mode: 0o700 })
+        swappedInto = reportDir
+      },
+    },
+  })
+  assert.ok(outcome.report)
+  const inSwapped = readdirSync(swappedInto).flatMap((d) => readdirSync(join(swappedInto, d)))
+  console.log(`# every step passed: ${outcome.report.steps.every((x) => x.status === 'passed')}; files published into the swapped directory: ${JSON.stringify(inSwapped)}; paths returned: ${JSON.stringify(outcome.reportPaths ?? null)}; exit ${outcome.exitCode}; error: ${outcome.reportWriteError}`)
+  assert.ok(outcome.report.steps.every((x) => x.status === 'passed'), 'precondition: the run itself was clean')
+  assert.ok(swappedInto.length > 0, 'precondition: the directory was swapped')
+  assert.deepEqual(inSwapped, [], 'nothing was published into the swapped directory')
+  assert.equal(outcome.reportPaths, undefined)
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.equal(outcome.report.verdict, 'RED')
 })
 
 test('INTERRUPTION during the last, asynchronous step (no child to kill) still makes the report RED', { timeout: TIMEOUT }, async (t) => {

@@ -37,6 +37,7 @@ import {
   accessSync,
   chmodSync,
   closeSync,
+  fstatSync,
   fsyncSync,
   openSync,
   writeSync,
@@ -144,6 +145,8 @@ type StepOutcome = { status: 'passed' | 'failed'; reason?: string; detail?: Reco
 type RunState = {
   root: string
   envFile: string
+  /** device and inode of the env file, recorded when this run created it */
+  envFileId: FileIdentity | null
   cluster: Cluster | null
   postmasterPid: number | null
   postmaster: PostmasterIdentity | null
@@ -425,18 +428,88 @@ function countMigrationDirectories(repoRoot: string): number {
 // Teardown. Synchronous on purpose: it must be able to finish inside a signal handler.
 // ---------------------------------------------------------------------------------------------
 
-export function shredFile(file: string): boolean {
-  if (!existsSync(file)) return true
-  try {
-    execFileSync('shred', ['-u', '-n', '1', file], { stdio: 'pipe' })
-  } catch {
-    // shred missing or refused: overwrite then unlink. Best effort on a copy-on-write file system.
+/** Facts about one path component, as `lstat` reports them. */
+export type ComponentInfo = { isDirectory: boolean; isSymlink: boolean; uid: number; mode: number }
+
+/**
+ * Why a directory is NOT trustworthy as an ancestor of the rehearsal's work or report directories, or
+ * null when it is: it must be a real directory (never a symlink), owned by root or the running account,
+ * and not writable by group or others, unless it carries the sticky bit AND is owned by root (the
+ * /tmp and /var/tmp shape, where others can create names but cannot rename or remove ours).
+ */
+export function ancestorProblem(info: ComponentInfo, myUid: number): string | null {
+  if (info.isSymlink) return 'is a symlink'
+  if (!info.isDirectory) return 'is not a directory'
+  if (info.uid !== 0 && info.uid !== myUid) return `is owned by uid ${info.uid}, neither root nor the running account`
+  if ((info.mode & 0o022) !== 0 && !((info.mode & 0o1000) !== 0 && info.uid === 0)) return 'is writable by group or others and is not a root-owned sticky directory'
+  return null
+}
+
+/**
+ * Check `target` and every ancestor up to `/`. A same-host attacker who can ALREADY rename or replace one
+ * of these is out of scope: this refuses configurations in which OTHER accounts could, and it cannot
+ * defend against an account that already owns (or is root over) a validated ancestor. Node offers no
+ * directory-descriptor-anchored `openat`, so what follows the check is a path walk, not a held handle.
+ */
+export function checkAncestors(target: string, label: string): string | null {
+  const myUid = typeof process.getuid === 'function' ? process.getuid() : 0
+  let current = path.resolve(target)
+  for (;;) {
+    let info: ComponentInfo
     try {
-      writeFileSync(file, randomBytes(Math.max(statSync(file).size, 1)))
-    } catch { /* fall through to unlink */ }
-    try { unlinkSync(file) } catch { /* checked below */ }
+      const stat = lstatSync(current)
+      info = { isDirectory: stat.isDirectory(), isSymlink: stat.isSymbolicLink(), uid: stat.uid, mode: stat.mode }
+    } catch (error) {
+      return `${label} ${target}: cannot inspect ${current}: ${error instanceof Error ? error.message : String(error)}`
+    }
+    const problem = ancestorProblem(info, myUid)
+    if (problem !== null) return `${label} ${target}: ${current} ${problem}. Use a directory whose every ancestor only root or this account can modify.`
+    const parent = path.dirname(current)
+    if (parent === current) return null
+    current = parent
   }
-  return !existsSync(file)
+}
+
+class DirectoryReplacedError extends Error {}
+
+export type FileIdentity = { dev: number; ino: number }
+
+/**
+ * Overwrite and remove a file THIS run created, and nothing else. The file is opened with O_NOFOLLOW
+ * (a symlink at the name is refused, ELOOP) and O_NONBLOCK (a FIFO planted there cannot hang the open),
+ * the DESCRIPTOR is fstat-ed, and it must be a regular file with the dev and inode recorded when the run
+ * created it; only then are random bytes written through that descriptor. If the identity does not
+ * match, nothing is written and the reason is returned (the teardown then exits 3). There is no
+ * fallback that writes by path. The final unlink re-checks the name's identity first; the gap between
+ * that check and the unlink is the same accepted residual as the rest of the path-based teardown.
+ */
+export function shredFile(file: string, expected: FileIdentity | null): { ok: boolean; reason?: string } {
+  let fd: number
+  try {
+    fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT') return { ok: true }
+    return { ok: false, reason: `${file} was not opened (${code ?? 'error'}): it is not the file this run created, so it was left alone` }
+  }
+  try {
+    const info = fstatSync(fd)
+    if (expected === null || !info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino) {
+      return { ok: false, reason: `${file} is not the file this run created (device/inode differ or it is not a regular file), so it was neither overwritten nor removed` }
+    }
+    writeSync(fd, randomBytes(Math.max(info.size, 1)))
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  try {
+    const now = lstatSync(file)
+    if (now.isSymbolicLink() || now.dev !== expected.dev || now.ino !== expected.ino) return { ok: false, reason: `${file} changed after it was overwritten, so it was not removed` }
+    unlinkSync(file)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, reason: `${file} could not be removed: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  return { ok: !existsSync(file) }
 }
 
 /**
@@ -519,8 +592,9 @@ function teardownRun(state: RunState): TeardownResult {
     errors.push('the postmaster this run started no longer matches its captured identity; it was not stopped, because whatever owns the data directory now is not ours to stop')
   }
 
-  const envFileShredded = shredFile(state.envFile)
-  if (!envFileShredded) errors.push(`env file still present: ${state.envFile}`)
+  const shred = shredFile(state.envFile, state.envFileId)
+  const envFileShredded = shred.ok
+  if (!envFileShredded) errors.push(`env file: ${shred.reason ?? `still present: ${state.envFile}`}`)
 
   let rootRemoved = false
   const base = path.basename(state.root)
@@ -569,6 +643,8 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     return refuse(error instanceof Error ? error.message : String(error))
   }
   if (!existsSync(parentDir) || !statSync(parentDir).isDirectory()) return refuse(`--root ${parentDir} is not a directory`)
+  const rootAncestors = checkAncestors(parentDir, '--root')
+  if (rootAncestors !== null) return refuse(rootAncestors)
   let parentType: string
   try {
     parentType = filesystemType(parentDir)
@@ -578,6 +654,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   if (RAM_BACKED.has(parentType)) {
     return refuse(`${parentDir} is on ${parentType}: a cluster there is held in RAM. Use a disk-backed directory such as /var/tmp.`)
   }
+  let reportDirId: FileIdentity | null = null
   // The report directory is checked BEFORE the cluster exists: a run that cannot write its report
   // has produced nothing, and finding that out after the teardown would waste the whole rehearsal.
   try {
@@ -589,9 +666,12 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     if (!info.isDirectory()) throw new Error('it is not a real directory (a symlink is refused)')
     if (typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('it is not owned by the account running the rehearsal')
     if ((info.mode & 0o022) !== 0) throw new Error('it is writable by group or others')
+    reportDirId = { dev: info.dev, ino: info.ino }
   } catch (error) {
     return refuse(`--report-dir ${reportDir} cannot be created or written: ${error instanceof Error ? error.message : String(error)}`)
   }
+  const reportAncestors = checkAncestors(reportDir, '--report-dir')
+  if (reportAncestors !== null) return refuse(reportAncestors)
   for (const needed of ['prisma/schema.prisma', 'node_modules/.bin/prisma', 'node_modules/.bin/tsx', 'scripts/provision-instance.mjs']) {
     if (!existsSync(path.join(repoRoot, needed))) return refuse(`${needed} not found under ${repoRoot}: run from an IMS checkout with its dependencies installed and prisma generated`)
   }
@@ -609,6 +689,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   const state: RunState = {
     root,
     envFile: path.join(root, 'rehearsal.env'),
+    envFileId: null,
     cluster: null,
     postmasterPid: null,
     postmaster: null,
@@ -719,10 +800,21 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
       DOTENV_CONFIG_PATH: path.join(root, 'empty.env'),
       DOTENV_CONFIG_QUIET: 'true',
     }
-    writeFileSync(path.join(root, 'empty.env'), '')
-    writeFileSync(state.envFile, `${Object.entries(envEntries).map(([k, v]) => `${k}=${v}`).join('\n')}\n`, { mode: 0o600, flag: 'wx' })
-    chmodSync(state.envFile, 0o600)
-    if ((statSync(state.envFile).mode & 0o777) !== 0o600) throw new Error('the env file is not mode 600')
+    writeFileSync(path.join(root, 'empty.env'), '', { flag: 'wx' })
+    {
+      // Created exclusively, never through a symlink, mode 600; its device and inode are recorded so the
+      // teardown can prove it is overwriting THIS file and not whatever now sits at the name.
+      const fd = openSync(state.envFile, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600)
+      try {
+        writeSync(fd, `${Object.entries(envEntries).map(([k, v]) => `${k}=${v}`).join('\n')}\n`)
+        fsyncSync(fd)
+        const info = fstatSync(fd)
+        if ((info.mode & 0o777) !== 0o600) throw new Error('the env file is not mode 600')
+        state.envFileId = { dev: info.dev, ino: info.ino }
+      } finally {
+        closeSync(fd)
+      }
+    }
     const fileEnv = parseEnvFile(state.envFile)
     if (process.env.DATABASE_URL) {
       notes.push('An inherited DATABASE_URL was present and was IGNORED: every step used the throwaway cluster\'s own URL.')
@@ -1040,7 +1132,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
     try {
       state.teardown = teardownRun(state)
     } catch (error) {
-      state.teardown = { clusterStopped: false, postmasterPid: state.postmasterPid, envFileShredded: !existsSync(state.envFile), rootRemoved: !existsSync(root), orphanPids: [], errors: [`teardown threw: ${error instanceof Error ? error.message : String(error)}`] }
+      state.teardown = { clusterStopped: false, postmasterPid: state.postmasterPid, envFileShredded: false, rootRemoved: !existsSync(root), orphanPids: [], errors: [`teardown threw: ${error instanceof Error ? error.message : String(error)}`] }
     }
     process.removeListener('SIGINT', onSignal)
     process.removeListener('SIGTERM', onSignal)
@@ -1074,32 +1166,54 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   // files; neither is a report, and only a JSON whose companion verifies is. On a CAUGHT failure
   // everything this run created is removed and an amended RED copy is attempted, so whatever exists says RED.
   let outDirCreated = false
+  let outDirId: FileIdentity | null = null
   const created: string[] = []
+  // The directories are re-identified by device and inode before the first write, before each rename and
+  // before the paths are returned: a report directory (or an ancestor of it) swapped for another after
+  // validation is detected, nothing more is written, and nothing is cleaned up by path inside it.
+  // RESIDUAL, stated plainly: this is a path walk, not a held directory handle (Node has no openat), so
+  // a swap in the instants between a check and the next call is not excluded; an attacker who can swap
+  // a validated ancestor is one the ancestor check above already refuses to run beside.
+  const assertDirectories = (): void => {
+    for (const [dir, id] of [[reportDir, reportDirId], [outDir, outDirId]] as const) {
+      if (id === null) continue
+      const now = lstatSync(dir)
+      if (now.isSymbolicLink() || now.dev !== id.dev || now.ino !== id.ino) throw new DirectoryReplacedError(`${dir} is no longer the directory that was validated (device/inode changed)`)
+    }
+  }
   const publish = (toPublish: RehearsalReport): void => {
     const suffix = randomHex(6)
     const tmpJson = path.join(outDir, `.readiness-report.json.${suffix}.tmp`)
     const tmpMarkdown = path.join(outDir, `.readiness-report.md.${suffix}.tmp`)
     try {
+      assertDirectories()
       const markdownText = renderMarkdown(toPublish)
       const record = { ...toPublish, companionMarkdownSha256: createHash('sha256').update(markdownText).digest('hex') }
       created.push(tmpMarkdown)
       write(tmpMarkdown, markdownText)
       created.push(tmpJson)
       write(tmpJson, `${JSON.stringify(record, null, 2)}\n`)
+      assertDirectories()
       created.push(markdown)
       renameSync(tmpMarkdown, markdown)
+      assertDirectories()
       created.push(json)
       renameSync(tmpJson, json)
       fsyncDirectory(outDir)
+      assertDirectories()
     } catch (error) {
-      for (const file of created.splice(0)) rmSync(file, { force: true })
+      // After a replaced directory, never touch it by path: whatever is there is not ours to clean.
+      if (!(error instanceof DirectoryReplacedError)) for (const file of created.splice(0)) rmSync(file, { force: true })
       throw error
     }
   }
   hooks.beforePublish?.(outDir)
   try {
+    assertDirectories()
     mkdirSync(outDir, { mode: 0o700 }) // not recursive: EEXIST (a planted directory) is a refusal
     outDirCreated = true
+    const outInfo = lstatSync(outDir)
+    outDirId = { dev: outInfo.dev, ino: outInfo.ino }
     publish(report)
   } catch (error) {
     const reportWriteError = error instanceof Error ? error.message : String(error)
