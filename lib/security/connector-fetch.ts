@@ -13,7 +13,7 @@ import {
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { OutboundWriteHeldError, outboundWriteRefusal } from './outbound-write-grant'
 import { recordOutboundWriteRefusal } from './outbound-write-refusal-log'
-import { stripOutboundHoldReferences } from './outbound-write-hold-constants'
+import { applyScrubbedContentLength, scrubOutboundBody } from './outbound-body-scrub'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -134,12 +134,6 @@ function bodyFromInit(body: BodyInit | null | undefined): Buffer | string | unde
     return Buffer.from(body.buffer, body.byteOffset, body.byteLength)
   }
   throw new Error('Connector request body type is not supported by the validated HTTP client.')
-}
-
-function scrubHoldReferencesFromBody(body: Buffer | string | undefined): Buffer | string | undefined {
-  if (body === undefined) return body
-  if (typeof body === 'string') return body.includes('[hold-ref ') ? stripOutboundHoldReferences(body) : body
-  return body.includes('[hold-ref ') ? Buffer.from(stripOutboundHoldReferences(body.toString('utf8')), 'utf8') : body
 }
 
 function normalizeRequestHost(host: string): string {
@@ -400,11 +394,13 @@ export async function connectorFetch(
   let url = input instanceof URL ? input : new URL(input)
   let method = init.method ?? 'GET'
   let headers = headersFromInit(init.headers)
-  // NO HOLD TEXT REACHES A DESTINATION. A hold or maybe-sent refusal text carries a keyed reference; if one
-  // were ever written into an outgoing body (a comment, a note, a narration) and echoed back it could be
-  // replayed as a verbatim valid text. So every reference token is removed from the outgoing body here, at the
-  // one transport every connector request passes through.
-  let body = scrubHoldReferencesFromBody(bodyFromInit(init.body))
+  // NO HOLD TEXT REACHES A DESTINATION (defence in depth; see lib/security/outbound-body-scrub.ts). TEXT bodies
+  // have hold reference tokens removed; binary bodies (the Xero attachment upload) are never rewritten; a
+  // body type bodyFromInit cannot handle is refused. When a text body changes, Content-Length is reset to the
+  // byte length actually sent.
+  const scrubbed = scrubOutboundBody(init.body, headers.get('content-type'))
+  let body = bodyFromInit(scrubbed.body as BodyInit | null | undefined)
+  if (scrubbed.changed) applyScrubbedContentLength(headers, scrubbed.body)
   const timeoutMs = getConnectorFetchTimeoutMs(options)
   const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
   // Only when the e2e loopback allowance applies to the FIRST hop: the origin a redirect must stay on.
