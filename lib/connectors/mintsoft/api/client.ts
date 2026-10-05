@@ -8,7 +8,7 @@ import {
 } from './asn-creation-rule'
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
-import { connectorFetch, connectorFetchRedirectsFollowed } from '@/lib/security/connector-fetch'
+import * as connectorTransport from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
 import { clampCustomsDescription } from '@/lib/trade/customs-description'
@@ -66,7 +66,7 @@ async function sendMintsoftRequest<T>(
   init: RequestInit | undefined,
   clientId: string,
 ): Promise<MintsoftRequestResult<T>> {
-  const response = await connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
+  const response = await connectorTransport.connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
     ...init,
     headers: {
       ...buildMintsoftRequestHeaders(baseUrl, init),
@@ -79,7 +79,11 @@ async function sendMintsoftRequest<T>(
     outboundWriteContext: { writeScopeId: clientId },
   })
 
-  const redirectsFollowed = connectorFetchRedirectsFollowed(response)
+  // Hop provenance, or null when the transport does not provide it (a stand-in transport, a response that did not
+  // come from connectorFetch): unknown is treated as NOT proof (see mintsoftRequest).
+  const redirectsFollowed = typeof connectorTransport.connectorFetchRedirectsFollowed === 'function'
+    ? connectorTransport.connectorFetchRedirectsFollowed(response)
+    : null
 
   if (!response.ok) {
     return {
