@@ -19,8 +19,9 @@ import { assertScratchDatabaseBeforeAnyWrite } from './scratch-database-guard'
  * 4.00 DISPATCH subledger row, with `result.errors` empty. After the fix the same interleaving refuses
  * the order by name and stamps nothing.
  *
- * WHAT IS ASSERTED HERE, with the real `recalculateLandedCosts` on one connection and the real
- * `lockCostLayersForGroupBWindow` on another:
+ * WHAT IS ASSERTED HERE, with a revaluation that writes the negative directly (the real
+ * `recalculateLandedCosts` now floors a credit at zero, so it can no longer produce one; see
+ * `injectNegativeRevaluation`) on one connection and the real `lockCostLayersForGroupBWindow` on another:
  *  1. the lock BLOCKS while the revaluation holds the layer (proved from `pg_stat_activity`, not from a
  *     sleep), and the read that follows it returns the COMMITTED NEGATIVE snapshot — never the positive
  *     one the probe saw;
@@ -81,7 +82,7 @@ async function deleteSeededOrders() {
 
 /**
  * One unit bought at 4.00, shipped and NOT journaled — the case `refreshShipmentCogsForCostLayerChange`
- * deliberately hands to the daily batch — with a linked freight PO carrying a -10.00 credit line.
+ * deliberately hands to the daily batch — with a linked freight PO carrying a -10.00 credit line (the negative itself is now INJECTED, see `injectNegativeRevaluation`: landed cost floors at zero).
  */
 async function seed(label: string) {
   const { db } = await import('@/lib/db')
@@ -245,10 +246,39 @@ async function waitForLockWait(
   )
 }
 
-const recalcLinked = async (tx: unknown, freightPoId: string) => {
-  const { recalculateLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
-  return recalculateLandedCosts(tx as never, freightPoId, undefined, {
-    triggeredById: null, reason: 'freight_purchase_order_costs_updated', scheduleAdjustmentJournals: true,
+/**
+ * THE REVALUATION THIS FILE RACES THE BATCH AGAINST, WITH THE NEGATIVE INJECTED DIRECTLY.
+ *
+ * It used to be the real `recalculateLandedCosts` over the -10.00 credit freight line, which drove the layer
+ * to -6.00. The landed-cost sign change floors a unit at zero, so that recalculation now writes 0.00 and
+ * never produces the negative this file's properties are about. The properties under test are about the
+ * BATCH reading under the cost-layer lock, and they do not depend on where a negative came from, so the
+ * negative is written the way the revaluation writes it — the layer's cost, the shipment snapshots (via
+ * `updateSnapshotsForCostLayerChange`), then `refreshShipmentCogsForCostLayerChange` for the shipment's
+ * `cogsBatchAmount` — with the same context a recalculation supplies. It is still ONE transaction holding
+ * the layer row, which is what the lock ordering is measured against.
+ */
+const NEGATIVE_UNIT_COST = -6
+const injectNegativeRevaluation = async (tx: unknown, fixture: Awaited<ReturnType<typeof seed>>) => {
+  const { refreshShipmentCogsForCostLayerChange, updateSnapshotsForCostLayerChange } = await import('@/lib/cost-layers')
+  const client = tx as Parameters<typeof updateSnapshotsForCostLayerChange>[0] & { costLayer: { update: (args: unknown) => Promise<unknown> } }
+  await client.costLayer.update({ where: { id: fixture.layer.id }, data: { unitCostBase: NEGATIVE_UNIT_COST } })
+  await updateSnapshotsForCostLayerChange(client, fixture.layer.id, NEGATIVE_UNIT_COST)
+  await refreshShipmentCogsForCostLayerChange(client, fixture.layer.id, {
+    recalcRunId: 'injected-run',
+    revaluationContext: {
+      source: 'landed_cost_recalc',
+      operation: 'save',
+      primaryPoId: fixture.goods.id,
+      primaryPoReference: fixture.goods.reference,
+      freightPoId: fixture.freight.id,
+      creditCostLines: [{
+        freightCostLineId: fixture.creditLineId,
+        purchaseOrderId: fixture.freight.id,
+        purchaseOrderReference: fixture.freight.reference,
+        amountBase: '-10.00',
+      }],
+    },
   })
 }
 
@@ -272,7 +302,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
     const revaluationBackend = deferred<number>()
     const revaluation = db.$transaction(async (tx) => {
       revaluationBackend.resolve(await backendPid(tx))
-      await recalcLinked(tx, fixture.freight.id)
+      await injectNegativeRevaluation(tx, fixture)
       revaluationWrote.resolve()
       await releaseRevaluation.promise
     }, TX).catch((error) => { revaluationError = error })
@@ -328,6 +358,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
       `PRECONDITION: what THIS transaction blocked on was the cost-layer lock, so the ordering under test `
       + `was exercised: ${lockWaitStatement}`,
     )
+    console.log(`group-B PRECONDITION: injected negative committed (${NEGATIVE_UNIT_COST}); probe saw ${probeUnitCost}, read under the lock saw ${readUnitCost}`)
     assert.equal(probeUnitCost, '4.000000', 'PRECONDITION: the probe really did see the stale positive basis')
     assert.equal(readUnitCost, '-6.000000', 'the read under the lock returns the COMMITTED negative basis (o3d-c08y r2)')
     assert.equal(reloadedCogs, -6, 'and the cogsBatchAmount it would post with is the committed one')
@@ -368,7 +399,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
       // Same discipline the other way round: here it is the REVALUATION that blocks, so its own
       // transaction reports the pid.
       revaluationBackend.resolve(await backendPid(tx))
-      return recalcLinked(tx, fixture.freight.id)
+      return injectNegativeRevaluation(tx, fixture)
     }, TX).catch((error) => { refusal = error })
 
     const lockWaitStatement = await waitForLockWait({
@@ -385,6 +416,7 @@ test('o3d-c08y r2: the Group B cost-layer lock serializes the batch against a la
       lockWaitStatement, /cost_layers|shipments/,
       `PRECONDITION: the revaluation's own backend waited, and on one of the rows the batch holds: ${lockWaitStatement}`,
     )
+    console.log(`group-B PRECONDITION: refusal reached: ${refusal instanceof JournaledShipmentRevaluationRefusedError ? 1 : 0}`)
     assert.ok(
       refusal instanceof JournaledShipmentRevaluationRefusedError,
       `the revaluation is refused once the shipment is journaled: ${String(refusal)}`,

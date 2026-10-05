@@ -4,6 +4,7 @@ import test, { mock } from 'node:test'
 import { config } from 'dotenv'
 
 import { assertScratchDatabaseBeforeAnyWrite } from './scratch-database-guard'
+import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys.ts'
 
 /**
  * o3d-c08y — A REVALUATION THAT WOULD TAKE AN ALREADY-JOURNALED SHIPMENT BELOW ZERO IS REFUSED, AND
@@ -16,12 +17,22 @@ import { assertScratchDatabaseBeforeAnyWrite } from './scratch-database-guard'
  * COGS journal was empty because the whole -10.00 had been claimed as shipment-owned, and the COGS
  * subledger recorded -10.00. 6.00 posted nowhere and nothing said so.
  *
- * WHAT IS ASSERTED, for the linked-freight recalc, the direct-cost recalc and the freight-PO edit
- * action, after the refusal: the layer's cost, the shipment snapshot, `cogsBatchAmount`, the PO
- * line's landed cost and (for the action) the freight line itself are unchanged; no accounting sync
- * row, COGS subledger row or revaluation-run row was written; one ERROR activity entry exists and
- * names the credit line. A POSITIVE CONTROL runs the same fixture with a credit that leaves the
- * basis positive, so a fixture that never reaches the revaluation cannot pass for a refusal.
+ * WHAT CHANGED (the landed-cost sign change, o3d-gj68 / o3d-ab13). A credit freight line is now APPLIED
+ * and a unit is FLOORED at zero, so a landed-cost recalculation can no longer drive a layer to -6.00:
+ * the same fixture now revalues the shipment to 0.00 and warns about the 6.00 it could not absorb. The
+ * refusal this file was written for is therefore UNREACHABLE FROM LANDED COST for a purchase order's own layers and is kept as a backstop
+ * for any other source of a negative cost. So the refusal arms below REACH it by INJECTING the negative
+ * directly — the layer's cost and the shipment snapshots are written negative inside a real transaction
+ * and `refreshShipmentCogsForCostLayerChange` is driven exactly as the recalculation drives it — and each
+ * prints "refusal reached" so an arm that never gets there cannot pass for a refusal. A NEW arm proves the
+ * credit fixture floors instead of refusing, with a 2-line COGS_REVERSAL of 4.00.
+ *
+ * WHAT IS ASSERTED for a refusal, for the linked-freight shape, the direct-cost shape and the freight-PO
+ * edit action, after it: the layer's cost, the shipment snapshot, `cogsBatchAmount`, the PO line's landed
+ * cost and (for the action) the freight line itself are unchanged; no accounting sync row, COGS subledger
+ * row or revaluation-run row was written; one ERROR activity entry exists and names the credit line. A
+ * POSITIVE CONTROL runs the real recalculation with a credit that leaves the basis positive, so a fixture
+ * that never reaches the revaluation cannot pass for a refusal.
  *
  * No network: fetch and the connector transport throw, and nothing here reaches Xero, QuickBooks,
  * Mintsoft or WooCommerce. No email is sent.
@@ -206,6 +217,47 @@ const recalcLinked = async (fixture: Fixture) => {
   }), TX)
 }
 
+/**
+ * REACH THE REFUSAL BY INJECTING THE NEGATIVE (landed cost can no longer produce it). Inside one real
+ * transaction: the layer's cost is written to `negativeUnitCost`, the shipment snapshots are patched to
+ * it exactly as the recalculation patches them, and `refreshShipmentCogsForCostLayerChange` is driven with
+ * the context the recalculation would have supplied. The caller decides what to do with the refusal.
+ */
+async function driveNegativeRevaluation(
+  fixture: Fixture,
+  source: 'landed_cost_recalc' | 'direct_landed_cost_recalc',
+  negativeUnitCost: number,
+  swallow = false,
+): Promise<{ refusal: unknown }> {
+  const { db } = await import('@/lib/db')
+  const { refreshShipmentCogsForCostLayerChange, updateSnapshotsForCostLayerChange } = await import('@/lib/cost-layers')
+  const holder: { refusal: unknown } = { refusal: null }
+  await db.$transaction(async (tx) => {
+    await tx.costLayer.update({ where: { id: fixture.layer.id }, data: { unitCostBase: negativeUnitCost } })
+    await updateSnapshotsForCostLayerChange(tx, fixture.layer.id, negativeUnitCost)
+    const revaluationContext = {
+      source,
+      operation: 'save' as const,
+      primaryPoId: fixture.goods.id,
+      primaryPoReference: fixture.goods.reference,
+      ...(fixture.freight ? { freightPoId: fixture.freight.id } : {}),
+      creditCostLines: [{
+        freightCostLineId: fixture.creditLineId,
+        purchaseOrderId: fixture.freight?.id ?? fixture.goods.id,
+        purchaseOrderReference: fixture.freight?.reference ?? fixture.goods.reference,
+        amountBase: '-10.00',
+      }],
+    }
+    try {
+      await refreshShipmentCogsForCostLayerChange(tx, fixture.layer.id, { recalcRunId: 'injected-run', revaluationContext })
+    } catch (error) {
+      holder.refusal = error
+      if (!swallow) throw error
+    }
+  }, TX).catch((error) => { if (!swallow) throw error })
+  return holder
+}
+
 test('o3d-c08y: a revaluation that would take a journaled shipment below zero is refused, and leaves nothing behind', { skip }, async (t) => {
   loadEnv()
   await assertScratchDatabaseBeforeAnyWrite()
@@ -222,9 +274,11 @@ test('o3d-c08y: a revaluation that would take a journaled shipment below zero is
     assert.equal(after.errors.length, 0)
   })
 
-  await t.test('SCEN=J, the linked freight recalc: refused, nothing written, one ERROR naming the credit line', async () => {
+  await t.test('SCEN=J, a negative reaching a journaled shipment: refused, nothing written, one ERROR naming the credit line', async () => {
     const fixture = await seed('linked', 'freight', -10)
-    await assert.rejects(() => recalcLinked(fixture), JournaledShipmentRevaluationRefusedError)
+    const reached = await driveNegativeRevaluation(fixture, 'landed_cost_recalc', -6, true)
+    console.log(`SCEN=J PRECONDITION: refusal reached: ${reached.refusal instanceof JournaledShipmentRevaluationRefusedError ? 1 : 0}`)
+    assert.ok(reached.refusal instanceof JournaledShipmentRevaluationRefusedError, 'PRECONDITION: the refusal was not reached')
     const after = await state(fixture)
     assertUntouched(after, 'linked recalc')
     assertReported(after, fixture, 'linked recalc')
@@ -232,48 +286,88 @@ test('o3d-c08y: a revaluation that would take a journaled shipment below zero is
 
   await t.test('a caller that CATCHES the refusal cannot commit the revaluation it had already written', async () => {
     const fixture = await seed('swallow', 'freight', -10)
-    const { db } = await import('@/lib/db')
-    const { recalculateLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
-    let caught: unknown = null
-    await db.$transaction(async (tx) => {
-      try {
-        await recalculateLandedCosts(tx, fixture.freight!.id, undefined, {
-          triggeredById: null, reason: 'freight_purchase_order_costs_updated', scheduleAdjustmentJournals: true,
-        })
-      } catch (error) {
-        caught = error // swallowed: this caller goes on to commit
-      }
-    }, TX).catch(() => undefined)
-    assert.ok(caught instanceof JournaledShipmentRevaluationRefusedError, 'PRECONDITION: the refusal was not reached')
+    // The helper swallows the refusal INSIDE the transaction and lets the caller go on to commit.
+    const reached = await driveNegativeRevaluation(fixture, 'landed_cost_recalc', -6, true)
+    console.log(`swallow PRECONDITION: refusal reached: ${reached.refusal instanceof JournaledShipmentRevaluationRefusedError ? 1 : 0}`)
+    assert.ok(reached.refusal instanceof JournaledShipmentRevaluationRefusedError, 'PRECONDITION: the refusal was not reached')
     assertUntouched(await state(fixture), 'swallowed refusal')
   })
 
-  await t.test('the direct-cost recalc (a credit on the goods PO itself) is refused the same way', async () => {
+  await t.test('the direct-cost revaluation (a credit on the goods PO itself) is refused the same way', async () => {
     const fixture = await seed('direct', 'direct', -10)
-    const { db } = await import('@/lib/db')
-    const { recalculateDirectLandedCosts } = await import('@/lib/domain/purchasing/landed-cost-service')
-    await assert.rejects(
-      () => db.$transaction((tx) => recalculateDirectLandedCosts(tx, fixture.goods.id, undefined, {
-        triggeredById: null, reason: 'purchase_order_additional_costs_updated', scheduleAdjustmentJournals: true,
-      }), TX),
-      JournaledShipmentRevaluationRefusedError,
-    )
+    const reached = await driveNegativeRevaluation(fixture, 'direct_landed_cost_recalc', -6, true)
+    console.log(`direct PRECONDITION: refusal reached: ${reached.refusal instanceof JournaledShipmentRevaluationRefusedError ? 1 : 0}`)
+    assert.ok(reached.refusal instanceof JournaledShipmentRevaluationRefusedError, 'PRECONDITION: the refusal was not reached')
     const after = await state(fixture)
     assertUntouched(after, 'direct recalc')
     assertReported(after, fixture, 'direct recalc')
   })
 
-  await t.test('the freight-PO edit action: refused with the reason, and the credit line edit is rolled back with it', async () => {
+  await t.test('the freight-PO edit action: a NET credit is refused at the boundary with the supplier-credit-note reason, and nothing is saved', async () => {
     const fixture = await seed('action', 'freight', 0)
     const { updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
     const outcome = await updateFreightPoCosts(fixture.freight!.id, [
       { description: 'Freight credit', amountForeign: -10, vatable: false, distributionMethod: 'BY_VALUE' },
-    ] as never)
+    ])
+    console.log(`action PRECONDITION: outcome=${JSON.stringify(outcome)}`)
     assert.equal(outcome.success, false)
-    assert.match(String(outcome.error), /REFUSED/)
+    assert.match(String(outcome.error), /supplier credit note/)
     const { db } = await import('@/lib/db')
     const lines = await db.freightCostLine.findMany({ where: { poId: fixture.freight!.id }, select: { id: true, amountBase: true } })
     assert.deepEqual(lines.map((line) => [line.id, Number(line.amountBase)]), [[fixture.creditLineId, 0]], 'the refused credit line was saved')
     assertUntouched(await state(fixture), 'freight-PO edit')
+  })
+
+  await t.test('THE SAME CREDIT FIXTURE NOW FLOORS: layer 0.00, one 2-line COGS_REVERSAL of 4.00, the 6.00 it could not absorb is warned, no refusal', async () => {
+    const { db } = await import('@/lib/db')
+    const keys: Array<[string, string]> = [
+      [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'],
+      ['xero_sync_enabled', 'true'],
+      ['xero_sync_cogs_reversal', 'submitted'],
+      ['xero_inventory_account', '630'],
+      ['xero_cogs_account', '500'],
+    ]
+    const previous = new Map<string, string | null>()
+    for (const [key, value] of keys) {
+      previous.set(key, (await db.setting.findUnique({ where: { key }, select: { value: true } }))?.value ?? null)
+      await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    }
+    try {
+      const fixture = await seed('floor', 'freight', -10)
+      const { recalculateLandedCosts, logLandedCostCreditFloorActivities } = await import('@/lib/domain/purchasing/landed-cost-service')
+      const result = await db.$transaction((tx) => recalculateLandedCosts(tx, fixture.freight!.id, undefined, {
+        triggeredById: null, reason: 'freight_purchase_order_costs_updated', scheduleAdjustmentJournals: true,
+      }), TX)
+      const after = await state(fixture)
+      const reversals = await db.accountingSyncLog.findMany({ where: { type: 'COGS_REVERSAL', referenceId: fixture.shipment.id }, select: { payload: true } })
+      const reversalLines = (reversals[0]?.payload as { lines?: Array<{ debit?: number; credit?: number }> } | null)?.lines ?? []
+      const run = await db.landedCostRevaluationRun.findFirstOrThrow({ where: { primaryPoId: fixture.goods.id }, select: { warningsJson: true, afterJson: true } })
+      const warnings = run.warningsJson as Array<{ code: string; message: string }>
+      const layerAudit = (run.afterJson as { lines: Array<{ costLayers: Array<{ unabsorbedBase?: string; unflooredGrossUnitCostBase?: string }> }> }).lines[0].costLayers[0]
+      console.log(`FLOOR PRECONDITION: layer=${after.layerUnitCost}, snapshot=${after.snapshotUnitCost}, cogsBatchAmount=${after.cogsBatchAmount}, COGS_REVERSAL rows=${reversals.length} with ${reversalLines.length} lines, refusal entries=${after.errors.length}, warning codes=${JSON.stringify(warnings.map((w) => w.code))}, unabsorbedBase=${layerAudit.unabsorbedBase}`)
+      assert.equal(after.layerUnitCost, 0, 'the layer is floored at zero, not -6')
+      assert.equal(after.poLineLanded, 0)
+      assert.equal(Number(after.snapshotUnitCost), 0)
+      assert.equal(after.cogsBatchAmount, 0, 'the shipment is revalued down to 0.00')
+      assert.equal(after.errors.length, 0, 'no refusal entry: the credit is absorbed down to zero, not refused')
+      assert.equal(reversals.length, 1, 'exactly one COGS_REVERSAL')
+      assert.equal(reversalLines.length, 2, 'the reversal leg only: the new side is zero, so no repost legs')
+      assert.deepEqual(reversalLines.map((line) => line.debit ?? line.credit), [4, 4], 'of 4.00')
+      assert.deepEqual(warnings.map((w) => w.code), ['landed_cost_credit_floored'])
+      assert.match(warnings[0].message, /could not absorb 6\.00 of it into stock/)
+      assert.equal(layerAudit.unabsorbedBase, '6')
+      assert.equal(layerAudit.unflooredGrossUnitCostBase, '-6')
+
+      // The durable WARNING is written by the caller AFTER the commit: drive that half too.
+      await logLandedCostCreditFloorActivities(result)
+      const activity = await db.activityLog.findMany({ where: { entityType: 'PURCHASE_ORDER', entityId: fixture.goods.id, action: 'landed_cost_credit_floored' }, select: { level: true } })
+      assert.deepEqual(activity.map((row) => row.level), ['WARNING'])
+    } finally {
+      for (const [key] of keys) {
+        const before = previous.get(key) ?? null
+        if (before === null) await db.setting.deleteMany({ where: { key } })
+        else await db.setting.update({ where: { key }, data: { value: before } })
+      }
+    }
   })
 })

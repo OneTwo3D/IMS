@@ -143,6 +143,9 @@ function ReceiveDialog({
   const [error, setError] = useState('')
   // audit-H7: require explicit confirmation when receiving into a non-destination warehouse.
   const [confirmDivergence, setConfirmDivergence] = useState(false)
+  // The receipt committed, but the zero floor held some units at 0.00 (a negative landed cost larger than the
+  // goods cost). The dialog stays open so the operator reads it; it carries IMS's one shared sentence.
+  const [receivedWarnings, setReceivedWarnings] = useState<string[]>([])
   // opys: stable idempotency token for this receive submission. Created lazily on
   // first submit and reused across double-clicks / retries so the server dedups a
   // double-booked receipt; reset only after a confirmed success.
@@ -217,7 +220,8 @@ function ReceiveDialog({
       if (result.success) {
         idempotencyTokenRef.current = null
         router.refresh()
-        onClose()
+        if (result.warnings && result.warnings.length > 0) setReceivedWarnings(result.warnings)
+        else onClose()
       } else {
         setError(result.error ?? 'Failed to receive goods')
       }
@@ -330,6 +334,12 @@ function ReceiveDialog({
             </label>
           )}
 
+          {receivedWarnings.length > 0 && (
+            <div role="status" className="space-y-1 rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+              <p className="font-medium">The goods were received. Some units were valued at 0.00:</p>
+              {receivedWarnings.map((warning) => <p key={warning}>{warning}</p>)}
+            </div>
+          )}
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
 
@@ -346,11 +356,17 @@ function ReceiveDialog({
             <span className="mr-1 text-xs text-muted-foreground">
               {totalToReceive > 0 ? `${totalToReceive} unit${totalToReceive === 1 ? '' : 's'} across ${receiptLines.filter((l) => l.qtyToReceive > 0).length} line(s)` : 'Nothing to receive yet'}
             </span>
-            <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-            <Button onClick={handleConfirm} disabled={isPending || totalToReceive <= 0}>
-              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-              Confirm Receipt
-            </Button>
+            {receivedWarnings.length > 0 ? (
+              <Button onClick={onClose}>Close</Button>
+            ) : (
+              <>
+                <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+                <Button onClick={handleConfirm} disabled={isPending || totalToReceive <= 0}>
+                  {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+                  Confirm Receipt
+                </Button>
+              </>
+            )}
           </div>
         </DialogFooter>
       </DialogContent>
@@ -1663,9 +1679,13 @@ function EditFreightCostsDialog({
   // Initialize from existing linked freight data (we get cost lines from linkedFreightPos)
   // For a FREIGHT type PO we need to fetch its own cost lines — but we don't have them directly
   // We'll use the PO's direct freight info and allow editing
+  // This dialog is positive-only (credits are entered as supplier credit notes). A stored line that is zero or a
+  // credit is therefore NOT editable here: it is listed read-only and sent back to the server unchanged (saving
+  // replaces the order's lines, so leaving it out would silently delete it).
+  const lockedLines = po.freightCostLines.filter((cl) => cl.amountForeign <= 0)
   const [costLines, setCostLines] = useState<FreightCostEditLine[]>(() => {
     if (po.freightCostLines.length > 0) {
-      return po.freightCostLines.map((cl) => ({
+      return po.freightCostLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
         key: Math.random().toString(36).slice(2),
         description: cl.description,
         amountForeign: cl.amountForeign,
@@ -1679,7 +1699,7 @@ function EditFreightCostsDialog({
     return []
   })
 
-  const subtotal = costLines.reduce((s, cl) => s + cl.amountForeign, 0)
+  const subtotal = costLines.reduce((s, cl) => s + cl.amountForeign, 0) + lockedLines.reduce((s, cl) => s + cl.amountForeign, 0)
 
   function handleSave() {
     setError('')
@@ -1687,12 +1707,20 @@ function EditFreightCostsDialog({
     startTransition(async () => {
       const result = await updateFreightPoCosts(
         po.id,
-        costLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
-          description: cl.description,
-          amountForeign: cl.amountForeign,
-          vatable: cl.vatable,
-          distributionMethod: cl.distributionMethod,
-        })),
+        [
+          ...costLines.filter((cl) => cl.amountForeign > 0).map((cl) => ({
+            description: cl.description,
+            amountForeign: cl.amountForeign,
+            vatable: cl.vatable,
+            distributionMethod: cl.distributionMethod,
+          })),
+          ...lockedLines.map((cl) => ({
+            description: cl.description,
+            amountForeign: cl.amountForeign,
+            vatable: cl.vatable,
+            distributionMethod: cl.distributionMethod,
+          })),
+        ],
       )
       if (result.success) {
         router.refresh()
@@ -1765,6 +1793,15 @@ function EditFreightCostsDialog({
           >
             <Plus className="h-3 w-3 mr-1" />Add Cost Line
           </Button>
+
+          {lockedLines.length > 0 && (
+            <div className="rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-900 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200">
+              <p className="font-medium">Credit and zero lines cannot be edited here and are kept as they are:</p>
+              {lockedLines.map((cl) => (
+                <p key={cl.id} className="font-mono">{cl.description || '(no description)'}: {fMoney(cl.amountForeign)}</p>
+              ))}
+            </div>
+          )}
 
           <div className="flex justify-end text-sm font-medium">
             <span>Total: {fMoney(subtotal)}</span>
@@ -2387,7 +2424,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 {po.currency !== baseCurrency.code && (
                   <TableHead className="px-4 text-xs text-right w-28">Unit Cost (£)</TableHead>
                 )}
-                {po.totalLandedCostBase > 0 && (
+                {(po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) && (
                   <TableHead className="px-4 text-xs text-right w-28">Gross Cost (£)</TableHead>
                 )}
                 <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
@@ -2424,9 +2461,17 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                       {baseMoney(line.unitCostBase)}
                     </TableCell>
                   )}
-                  {po.totalLandedCostBase > 0 && (
+                  {(po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) && (
                     <TableCell className="px-4 text-right tabular-nums font-mono text-xs font-medium">
                       {baseMoney(line.grossUnitCostBase)}
+                      {po.landedCostFloors.some((floor) => floor.lineId === line.id) && (
+                        <span
+                          title={po.landedCostFloors.find((floor) => floor.lineId === line.id)?.message}
+                          className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+                        >
+                          floored at 0
+                        </span>
+                      )}
                     </TableCell>
                   )}
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">
@@ -2449,7 +2494,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 // Columns before "Total ({sym})": 4 always present (thumbnail, Product,
                 // Qty, Unit Cost {sym}) plus each conditional column. labelSpan must
                 // equal that count so the amount cell lands under the Total header.
-                const labelSpan = 4 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + (po.totalLandedCostBase > 0 ? 1 : 0)
+                const labelSpan = 4 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + ((po.totalLandedCostBase !== 0 || po.landedCostFloors.length > 0) ? 1 : 0)
                 // Total discount = sum of line discounts + order-level
                 // discount. The stored `subtotalForeign` is already
                 // post-discount; we surface the breakdown for clarity.

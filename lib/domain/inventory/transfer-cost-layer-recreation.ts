@@ -61,15 +61,18 @@
  * o3d-gd2f). This is the third decision on the same input, and the first that the
  * rest of the system can actually represent.
  *
- *  - The input IS reachable, so refusing is not a claim that it cannot happen.
- *    `recalculateLandedCosts` distributes freight cost lines with no positivity
- *    filter — its own comment names "a zero/credit cost line" — so
- *    `grossUnitCostBase = unitCostBase + landedPerUnit` can go negative with nothing
- *    flooring it, and it is written straight onto the layer.
- *    `updateSnapshotsForCostLayerChange` then patches
- *    `stock_transfer_lines.costLayerSnapshot` IN PLACE, so a credit note landing
- *    while units are in transit rewrites a positive dispatch snapshot negative and
- *    the receipt reads it.
+ *  - HOW THE INPUT USED TO ARISE, AND WHAT CHANGED. `recalculateLandedCosts`
+ *    distributed every freight cost line, credits included, and nothing floored the
+ *    resulting gross unit cost, so it was written straight onto the layer, and
+ *    `updateSnapshotsForCostLayerChange` then patched
+ *    `stock_transfer_lines.costLayerSnapshot` IN PLACE: a credit landing while units
+ *    were in transit rewrote a positive dispatch snapshot negative and the receipt
+ *    read it. Landed cost can no longer produce it on a PURCHASE ORDER's own layers: the one allocation
+ *    (lib/domain/purchasing/landed-cost-allocation.ts) holds a layer's cost at zero
+ *    instead of letting it go negative, so no layer or snapshot reaches this helper
+ *    below zero FROM LANDED COST. The refusal stays as the backstop for any other
+ *    source (a manufacturing recompute, a transfer path, a hand-edited snapshot) —
+ *    refusing is still not a claim that the input cannot happen.
  *  - But NOTHING DOWNSTREAM CAN CARRY THE SIGN. Round 4 created the layer at the
  *    negative cost to conserve basis as well as quantity. That conserves the layer
  *    and corrupts the ledger, more quietly than the skip did:
