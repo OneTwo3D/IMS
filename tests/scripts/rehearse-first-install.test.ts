@@ -930,7 +930,7 @@ for (const mode of ['symlink', 'different file'] as const) {
     console.log(`# env file replaced by a ${mode}; victim now ${JSON.stringify(readFileSync(victim, 'utf8'))}; decoy now ${JSON.stringify(decoy)}; envFileShredded=${outcome.report.teardown?.envFileShredded}; exit ${outcome.exitCode}; errors ${JSON.stringify(outcome.report.teardown?.errors)}`)
     assert.ok(envFile.length > 0, 'precondition: the replacement happened')
     assert.equal(readFileSync(victim, 'utf8'), 'precious', 'the symlink target was not overwritten')
-    if (mode === 'different file') assert.notEqual(decoy, '', 'the decoy was not truncated or overwritten with random bytes')
+    if (mode === 'different file') assert.equal(decoy, 'decoy contents', 'the decoy was not truncated or overwritten with random bytes')
     assert.equal(outcome.report.teardown?.envFileShredded, false)
     assert.match((outcome.report.teardown?.errors ?? []).join(' '), /env file/)
     assert.equal(outcome.exitCode, REHEARSAL_EXIT.TEARDOWN_INCOMPLETE)
