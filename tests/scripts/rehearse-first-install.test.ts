@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, chmodSync, copyFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { type TestContext, test } from 'node:test'
 import { pgBinDir, startCluster } from './real-postgres-cluster.ts'
@@ -16,6 +16,7 @@ import {
   assertNoConnectorEnv,
   assertThrowawayDatabaseUrl,
   assessOutboundStatus,
+  assessBaseCurrencyLock,
   assessParity,
   assessSeededRows,
   compareParity,
@@ -25,7 +26,7 @@ import {
   rehearsalExitCode,
   type SeededRowFacts,
 } from '@/lib/ops/first-install-rehearsal'
-import { capturePostmaster, inheritedEnv, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
+import { capturePostmaster, inheritedEnv, verifyPublishedReport, writeExclusive, postmasterIsStillOurs, processStartEpochSeconds, parseArgs, processIsAlive, processesNaming, runRehearsal, shredFile, type RehearsalHooks } from '@/scripts/rehearse-first-install'
 
 const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
@@ -746,6 +747,102 @@ test('REPORT PUBLICATION (isolating arm): when the Markdown can NEVER be written
   assert.equal(outcome.reportPaths, undefined)
   assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
   assert.equal(outcome.report.verdict, 'RED')
+})
+
+test('RECORDED PRECONDITIONS COUNT: every fact the base-currency check records can turn it RED on its own (table-driven)', () => {
+  const clean = { isBaseCurrencyLocked: false, tableCounts: { products: 0, suppliers: 0, customers: 0, purchase_orders: 0, sales_orders: 0, stock_movements: 0 }, lockSettingRows: 0 }
+  assert.deepEqual(assessBaseCurrencyLock(clean), { ok: true, failures: [] })
+  const cases: Array<[string, typeof clean, RegExp]> = [
+    ['the application says locked', { ...clean, isBaseCurrencyLocked: true }, /isBaseCurrencyLocked\(\) returned true/],
+    ['a lock setting row exists although its value is false', { ...clean, lockSettingRows: 1 }, /base_currency_locked setting row/],
+    ...Object.keys(clean.tableCounts).map((table): [string, typeof clean, RegExp] => [`${table} is not empty although the lock check says false`, { ...clean, tableCounts: { ...clean.tableCounts, [table]: 3 } }, new RegExp(`${table} holds 3 row`)]),
+  ]
+  for (const [name, facts, pattern] of cases) {
+    const result = assessBaseCurrencyLock(facts)
+    assert.equal(result.ok, false, name)
+    assert.match(result.failures.join(' | '), pattern, name)
+  }
+  console.log(`# ${cases.length} single-fact failures each turned the check red`)
+})
+
+test('ARM: a lock setting row whose value is FALSE still fails the precondition, although the application says unlocked', { timeout: TIMEOUT }, async (t) => {
+  const { parent, outcome, report } = await rehearse(t, {
+    only: LIGHT,
+    hooks: { afterProvision: async (client) => { await client.query(`insert into settings (key, value, "updatedAt") values ('base_currency_locked', 'false', now())`) } },
+  })
+  const probe = byId(report.steps, 'base-currency-unlocked')
+  console.log(`# probe says locked=${(probe.detail as { isBaseCurrencyLocked: boolean }).isBaseCurrencyLocked}; step ${probe.status}: ${probe.reason}`)
+  assert.equal((probe.detail as { isBaseCurrencyLocked: boolean }).isBaseCurrencyLocked, false, 'precondition: the application itself says unlocked')
+  assert.equal(probe.status, 'failed')
+  assert.equal(report.verdict, 'RED')
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assertTornDown(parent, outcome)
+})
+
+test('REPORT FILES never follow a planted symlink: the run directory is created exclusively and temporary files are opened O_EXCL|O_NOFOLLOW', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const victim = join(parent, 'victim.txt')
+  writeFileSync(victim, 'precious')
+  const planted: string[] = []
+  const outcome = await runRehearsal({
+    parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, only: new Set<StepId>(['system-identifier']),
+    hooks: {
+      beforePublish: (outDir) => {
+        // What an attacker who can see the run id and write to the report directory could do.
+        mkdirSync(outDir, { recursive: true })
+        for (const name of ['readiness-report.json.tmp', 'readiness-report.md.tmp', 'readiness-report.json', 'readiness-report.md']) {
+          symlinkSync(victim, join(outDir, name))
+          planted.push(name)
+        }
+      },
+    },
+  })
+  assert.ok(outcome.report)
+  console.log(`# planted ${planted.length} symlinks at predictable names; victim now: ${JSON.stringify(readFileSync(victim, 'utf8'))}; write error: ${outcome.reportWriteError}`)
+  assert.equal(planted.length, 4, 'precondition: the symlinks were planted')
+  assert.equal(readFileSync(victim, 'utf8'), 'precious', 'the file the symlinks pointed at was not written through')
+  assert.equal(outcome.exitCode, REHEARSAL_EXIT.RED)
+  assert.ok(outcome.reportWriteError)
+})
+
+test('writeExclusive refuses an existing file and a symlink, and creates mode 600', (t) => {
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-rehearsal-test-excl-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const victim = join(dir, 'victim')
+  writeFileSync(victim, 'precious')
+  symlinkSync(victim, join(dir, 'link'))
+  assert.throws(() => writeExclusive(join(dir, 'link'), 'x'), /EEXIST|ELOOP/)
+  assert.throws(() => writeExclusive(victim, 'x'), /EEXIST/)
+  assert.equal(readFileSync(victim, 'utf8'), 'precious')
+  writeExclusive(join(dir, 'new'), 'data')
+  assert.equal(statSync(join(dir, 'new')).mode & 0o777, 0o600)
+  assert.equal(readFileSync(join(dir, 'new'), 'utf8'), 'data')
+})
+
+test('REPORT PAIR: the JSON is the commit record and names its companion Markdown by sha256, so a missing or altered .md is detectable', { timeout: TIMEOUT }, async (t) => {
+  const { outcome } = await rehearse(t, { only: new Set<StepId>(['system-identifier']) })
+  const paths = outcome.reportPaths!
+  const sound = verifyPublishedReport(paths.json)
+  console.log(`# companion check on an untouched pair: ${JSON.stringify(sound)}`)
+  assert.deepEqual(sound, { ok: true })
+  assert.match((JSON.parse(readFileSync(paths.json, 'utf8')) as { companionMarkdownSha256: string }).companionMarkdownSha256, /^[0-9a-f]{64}$/)
+  writeFileSync(paths.markdown, `${readFileSync(paths.markdown, 'utf8')}\ntampered\n`)
+  assert.equal(verifyPublishedReport(paths.json).ok, false, 'an altered Markdown is detected')
+  rmSync(paths.markdown)
+  assert.equal(verifyPublishedReport(paths.json).ok, false, 'a missing Markdown is detected')
+})
+
+test('RECORDED BUT NOT COUNTED: the docs name exactly the detail fields that are informational, and each exists in the script', () => {
+  const docs = readFileSync(join(REPO, 'docs/installation.md'), 'utf8')
+  const script = readFileSync(join(REPO, 'scripts/rehearse-first-install.ts'), 'utf8')
+  const informational = ['warnings', 'concurrencyTierSkippedInsideValidateDb', 'summary', 'tablesChangedSinceProvisioning']
+  const sentence = /with four deliberate exceptions recorded for information only[^\n]*/.exec(docs)?.[0] ?? ''
+  console.log(`# informational fields documented: ${informational.filter((k) => sentence.includes(k)).length} of ${informational.length}; in script: ${informational.filter((k) => new RegExp(`\\b${k}\\b`).test(script)).length}`)
+  assert.ok(sentence.length > 0, 'precondition: the exceptions sentence exists')
+  for (const key of informational) {
+    assert.ok(sentence.includes(key), `${key} is documented as informational`)
+    assert.ok(new RegExp(`\\b${key}\\b`).test(script), `${key} is a real detail field`)
+  }
 })
 
 test('INTERRUPTION during the last, asynchronous step (no child to kill) still makes the report RED', { timeout: TIMEOUT }, async (t) => {

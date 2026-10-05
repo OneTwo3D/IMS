@@ -228,6 +228,31 @@ export function assessSeededRows(facts: SeededRowFacts): Assessment {
   return { ok: failures.length === 0, failures }
 }
 
+export const BASE_CURRENCY_LOCK_TABLES = ['products', 'suppliers', 'customers', 'purchase_orders', 'sales_orders', 'stock_movements'] as const
+
+export type BaseCurrencyLockFacts = {
+  isBaseCurrencyLocked: boolean
+  tableCounts: Record<string, number>
+  lockSettingRows: number
+}
+
+/**
+ * Item 3. The application's answer is only evidence under the preconditions the report records, so
+ * EVERY recorded fact is part of the verdict: the application says unlocked, each of the six tables the
+ * lock reads is empty, and no `base_currency_locked` setting row exists (a row valued false still
+ * means somebody wrote one before the rehearsal looked).
+ */
+export function assessBaseCurrencyLock(facts: BaseCurrencyLockFacts): Assessment {
+  const failures: string[] = []
+  if (facts.isBaseCurrencyLocked !== false) failures.push('isBaseCurrencyLocked() returned true on a fresh install: something wrote master data or the lock setting before the rehearsal read it')
+  for (const table of BASE_CURRENCY_LOCK_TABLES) {
+    const count = facts.tableCounts[table]
+    if (count !== 0) failures.push(`${table} holds ${count === undefined ? 'an unknown number of' : count} row(s) on a fresh install`)
+  }
+  if (facts.lockSettingRows !== 0) failures.push(`a base_currency_locked setting row exists (${facts.lockSettingRows}) on a fresh install`)
+  return { ok: failures.length === 0, failures }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Item 9: restore parity.
 // ---------------------------------------------------------------------------------------------

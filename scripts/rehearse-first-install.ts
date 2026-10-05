@@ -36,6 +36,11 @@ import { createHash, randomBytes } from 'node:crypto'
 import {
   accessSync,
   chmodSync,
+  closeSync,
+  fsyncSync,
+  openSync,
+  writeSync,
+  lstatSync,
   constants as fsConstants,
   existsSync,
   mkdirSync,
@@ -73,7 +78,9 @@ import {
   type TeardownResult,
   assertNoConnectorEnv,
   assertThrowawayDatabaseUrl,
+  assessBaseCurrencyLock,
   assessOutboundStatus,
+  BASE_CURRENCY_LOCK_TABLES,
   assessParity,
   assessSeededRows,
   buildReport,
@@ -100,6 +107,8 @@ export type RehearsalHooks = {
   afterClusterStart?: () => void | Promise<void>
   /** Runs inside teardown after the first identity check and before the stop, so a test can replace the postmaster in that gap. */
   betweenIdentityAndStop?: () => void
+  /** Runs just before the report is published, with the run's report directory path (a test plants things there). */
+  beforePublish?: (outDir: string) => void
   /** Replaces the report file writer, so a test can fail one of the two report files. */
   writeReportFile?: (file: string, data: string) => void
   /** Replaces the cluster starter, so a test can make a start fail after the postmaster has forked. */
@@ -430,6 +439,46 @@ export function shredFile(file: string): boolean {
   return !existsSync(file)
 }
 
+/**
+ * Create a file that must not exist yet, never through a symlink, readable by this account only:
+ * O_EXCL (fail if anything, including a symlink, is already at the name) with O_NOFOLLOW, then fsync so
+ * the bytes are on disk before anything is renamed over a published name.
+ */
+export function writeExclusive(file: string, data: string): void {
+  const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600)
+  try {
+    writeSync(fd, data)
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function fsyncDirectory(dir: string): void {
+  const fd = openSync(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY)
+  try {
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * The JSON is the commit record of a published report and names its companion Markdown by sha256.
+ * `{ ok: true }` only when the JSON parses, and the Markdown beside it exists with exactly that digest.
+ */
+export function verifyPublishedReport(jsonFile: string): { ok: true } | { ok: false; reason: string } {
+  try {
+    const parsed = JSON.parse(readFileSync(jsonFile, 'utf8')) as { companionMarkdownSha256?: unknown }
+    if (typeof parsed.companionMarkdownSha256 !== 'string') return { ok: false, reason: 'the JSON carries no companionMarkdownSha256' }
+    const markdown = readFileSync(jsonFile.replace(/\.json$/, '.md'))
+    const actual = createHash('sha256').update(markdown).digest('hex')
+    return actual === parsed.companionMarkdownSha256 ? { ok: true } : { ok: false, reason: 'the Markdown does not match the digest the JSON records' }
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 function teardownRun(state: RunState): TeardownResult {
   const errors: string[] = []
   // A start that failed after the fork left no handle and no pid: read both from the data directory.
@@ -532,8 +581,14 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   // The report directory is checked BEFORE the cluster exists: a run that cannot write its report
   // has produced nothing, and finding that out after the teardown would waste the whole rehearsal.
   try {
-    mkdirSync(reportDir, { recursive: true })
+    mkdirSync(reportDir, { recursive: true, mode: 0o700 })
     accessSync(reportDir, fsConstants.W_OK)
+    // The directory reports are published INTO must be a real directory (not a symlink), owned by this
+    // account, and not writable by anyone else: otherwise another account could plant names in it.
+    const info = lstatSync(reportDir)
+    if (!info.isDirectory()) throw new Error('it is not a real directory (a symlink is refused)')
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) throw new Error('it is not owned by the account running the rehearsal')
+    if ((info.mode & 0o022) !== 0) throw new Error('it is writable by group or others')
   } catch (error) {
     return refuse(`--report-dir ${reportDir} cannot be created or written: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -802,25 +857,26 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
         }
       },
       'base-currency-unlocked': async () => {
-        // The precondition the answer is only meaningful under: the six tables the lock reads are empty.
-        const counts = await pgClient(async (client) => {
-          const out: Record<string, number> = {}
-          for (const table of ['products', 'suppliers', 'customers', 'purchase_orders', 'sales_orders', 'stock_movements']) {
-            out[table] = Number((await client.query(`select count(*)::int as n from public.${ident(table)}`)).rows[0].n)
+        // The preconditions the answer is only meaningful under, recorded AND counted: the six tables the
+        // lock reads are empty and no lock setting row exists (assessBaseCurrencyLock).
+        const facts = await pgClient(async (client) => {
+          const tableCounts: Record<string, number> = {}
+          for (const table of BASE_CURRENCY_LOCK_TABLES) {
+            tableCounts[table] = Number((await client.query(`select count(*)::int as n from public.${ident(table)}`)).rows[0].n)
           }
           const flag = await client.query(`select value from settings where key = 'base_currency_locked'`)
-          out.base_currency_locked_setting_rows = flag.rowCount ?? 0
-          return out
+          return { tableCounts, lockSettingRows: flag.rowCount ?? 0 }
         })
         const run = await childIn('base-currency-unlocked', bin('tsx'), ['scripts/lib/first-install-probe.ts'])
         const line = run.stdout.split('\n').find((candidate) => candidate.startsWith('REHEARSAL_PROBE '))
-        if (run.exitCode !== 0 || !line) return { status: 'failed', reason: `the probe did not report (exit ${run.exitCode}). ${outputTail(run)}`, detail: { tablesRead: counts } }
+        const tablesRead = { ...facts.tableCounts, base_currency_locked_setting_rows: facts.lockSettingRows }
+        if (run.exitCode !== 0 || !line) return { status: 'failed', reason: `the probe did not report (exit ${run.exitCode}). ${outputTail(run)}`, detail: { tablesRead } }
         const probe = JSON.parse(line.slice('REHEARSAL_PROBE '.length)) as { locked: boolean; baseCurrencyCode: string }
-        const ok = probe.locked === false
+        const assessment = assessBaseCurrencyLock({ isBaseCurrencyLocked: probe.locked, tableCounts: facts.tableCounts, lockSettingRows: facts.lockSettingRows })
         return {
-          status: ok ? 'passed' : 'failed',
-          reason: ok ? undefined : 'isBaseCurrencyLocked() returned true on a fresh install: something wrote master data or the lock setting before the rehearsal read it',
-          detail: { isBaseCurrencyLocked: probe.locked, baseCurrencyCode: probe.baseCurrencyCode, tablesRead: counts },
+          status: assessment.ok ? 'passed' : 'failed',
+          reason: assessment.ok ? undefined : assessment.failures.join('; '),
+          detail: { isBaseCurrencyLocked: probe.locked, baseCurrencyCode: probe.baseCurrencyCode, tablesRead },
         }
       },
       'system-identifier': async () => {
@@ -1007,31 +1063,49 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
   const outDir = path.join(reportDir, runId)
   const json = path.join(outDir, 'readiness-report.json')
   const markdown = path.join(outDir, 'readiness-report.md')
-  const write = hooks.writeReportFile ?? ((file: string, data: string) => writeFileSync(file, data))
-  // Both files are written under temporary names and only then renamed into place, the JSON (the file
-  // the go/no-go gate reads) LAST, so a failure part-way never leaves a GREEN JSON beside a missing
-  // Markdown. On any failure everything is removed and an amended RED copy is attempted; whatever then
-  // exists on disk says RED.
+  const write = hooks.writeReportFile ?? writeExclusive
+  // PUBLICATION. The run's report directory is created EXCLUSIVELY (mode 700; anything already at that
+  // name, including a planted directory or symlink, refuses the whole publication), and inside it every
+  // file is created with O_EXCL|O_NOFOLLOW under a random temporary name, fsynced, and renamed within
+  // the directory: Markdown first, the JSON LAST. The JSON is the COMMIT RECORD: it carries
+  // `companionMarkdownSha256`, so a JSON whose Markdown is missing or different is detectably not the
+  // pair that was published (`verifyPublishedReport`). Rename is atomic per file, not across the pair:
+  // after a crash or power loss the directory can hold a Markdown without a JSON, or leftover `*.tmp`
+  // files; neither is a report, and only a JSON whose companion verifies is. On a CAUGHT failure
+  // everything this run created is removed and an amended RED copy is attempted, so whatever exists says RED.
+  let outDirCreated = false
+  const created: string[] = []
   const publish = (toPublish: RehearsalReport): void => {
-    const tmpJson = `${json}.tmp`
-    const tmpMarkdown = `${markdown}.tmp`
+    const suffix = randomHex(6)
+    const tmpJson = path.join(outDir, `.readiness-report.json.${suffix}.tmp`)
+    const tmpMarkdown = path.join(outDir, `.readiness-report.md.${suffix}.tmp`)
     try {
-      mkdirSync(outDir, { recursive: true })
-      write(tmpMarkdown, renderMarkdown(toPublish))
-      write(tmpJson, `${JSON.stringify(toPublish, null, 2)}\n`)
+      const markdownText = renderMarkdown(toPublish)
+      const record = { ...toPublish, companionMarkdownSha256: createHash('sha256').update(markdownText).digest('hex') }
+      created.push(tmpMarkdown)
+      write(tmpMarkdown, markdownText)
+      created.push(tmpJson)
+      write(tmpJson, `${JSON.stringify(record, null, 2)}\n`)
+      created.push(markdown)
       renameSync(tmpMarkdown, markdown)
+      created.push(json)
       renameSync(tmpJson, json)
+      fsyncDirectory(outDir)
     } catch (error) {
-      for (const file of [tmpJson, tmpMarkdown, json, markdown]) rmSync(file, { force: true })
+      for (const file of created.splice(0)) rmSync(file, { force: true })
       throw error
     }
   }
+  hooks.beforePublish?.(outDir)
   try {
+    mkdirSync(outDir, { mode: 0o700 }) // not recursive: EEXIST (a planted directory) is a refusal
+    outDirCreated = true
     publish(report)
   } catch (error) {
     const reportWriteError = error instanceof Error ? error.message : String(error)
     const exitCode = report.exitCode === REHEARSAL_EXIT.OK ? REHEARSAL_EXIT.RED : report.exitCode
     const amended: RehearsalReport = { ...report, verdict: 'RED', exitCode, notes: [...report.notes, `The report could not be written (${reportWriteError}); this copy is the only record.`] }
+    if (!outDirCreated) return { exitCode, report: amended, runRoot: root, reportWriteError }
     try {
       publish(amended)
       return { exitCode, report: amended, reportPaths: { json, markdown }, runRoot: root, reportWriteError }
