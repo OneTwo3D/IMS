@@ -31,6 +31,18 @@ export type ConnectorFetchOptions = Pick<
 }
 
 const MAX_REDIRECTS = 5
+
+/**
+ * How many redirect hops were FOLLOWED to produce a response returned by connectorFetch. A caller that wants to
+ * reason about what an early response proves (a 401 on the ORIGINAL request vs a 401 from a later hop) reads it
+ * with {@link connectorFetchRedirectsFollowed}. Kept off the Response object itself so the type is unchanged.
+ */
+const redirectsFollowedByResponse = new WeakMap<Response, number>()
+
+/** Redirect hops followed for `response`, or null when it did not come from connectorFetch (unknown). */
+export function connectorFetchRedirectsFollowed(response: Response): number | null {
+  return redirectsFollowedByResponse.get(response) ?? null
+}
 export const DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS = 30_000
 export const DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
@@ -427,7 +439,10 @@ export async function connectorFetch(
       }
       const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
       const nextUrl = redirectLocation(response, url)
-      if (!nextUrl) return response
+      if (!nextUrl) {
+        redirectsFollowedByResponse.set(response, redirectCount)
+        return response
+      }
       if (redirectCount === MAX_REDIRECTS) {
         throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
       }

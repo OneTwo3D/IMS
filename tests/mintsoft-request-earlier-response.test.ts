@@ -4,6 +4,7 @@ import test, { mock } from 'node:test'
 
 import { OutboundWriteHeldError, outboundWriteRefusal } from '../lib/security/outbound-write-grant'
 import { isOutboundMaybeSentRefusalText, isOutboundWriteHeldText } from '../lib/security/outbound-write-hold-constants'
+import * as realTransport from '../lib/security/connector-fetch'
 import { setOutboundRefusalSink } from '../lib/security/outbound-write-refusal-log'
 
 /**
@@ -17,6 +18,19 @@ import { setOutboundRefusalSink } from '../lib/security/outbound-write-refusal-l
  */
 
 setOutboundRefusalSink(async () => undefined)
+
+// The real transport, optionally handing back a COPY of each response so its hop provenance is unavailable.
+let hideProvenance = false
+mock.module('@/lib/security/connector-fetch', {
+  namedExports: {
+    connectorFetchRedirectsFollowed: realTransport.connectorFetchRedirectsFollowed,
+    connectorFetch: async (...args: Parameters<typeof realTransport.connectorFetch>) => {
+      const response = await realTransport.connectorFetch(...args)
+      if (!hideProvenance) return response
+      return new Response(await response.arrayBuffer(), { status: response.status, headers: response.headers })
+    },
+  },
+})
 
 let baseUrl = ''
 let tokenCalls = 0
@@ -129,6 +143,50 @@ test('through pushMintsoftOrder: a create that drew a 401 and then a held key re
     assert.equal(isOutboundWriteHeldText(error.message), true, 'a PURE hold: the sweep recognises it and clears the stamp by compare-and-set')
     assert.equal(isOutboundMaybeSentRefusalText(error.message), false)
   } finally {
+    delete process.env.MINTSOFT_WRITE_ALLOWED
+    delete process.env.E2E_TEST_MODE
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+test('table (settled rule): a 401 is proof of non-processing ONLY with zero followed redirects; after a redirect hop, or with the hop count unavailable, a held refresh is maybe-sent', async () => {
+  const received: string[] = []
+  const server = createServer((req, res) => {
+    received.push(`${req.method} ${req.url}`)
+    if (req.url === '/api/Order' && redirectFirst) { res.writeHead(307, { location: '/api/OrderMoved' }); res.end(); return }
+    res.writeHead(401); res.end()
+  })
+  let redirectFirst = false
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  process.env.E2E_TEST_MODE = '1'
+  process.env.MINTSOFT_WRITE_ALLOWED = `${baseUrl}|89`
+  try {
+    const { mintsoftRequest } = await import('../lib/connectors/mintsoft/api/client')
+    const cases: Array<[string, { redirect: boolean; hide: boolean }, 'hold' | 'maybe-sent']> = [
+      ['401 on the original request, zero hops', { redirect: false, hide: false }, 'hold'],
+      ['401 after one followed redirect hop', { redirect: true, hide: false }, 'maybe-sent'],
+      ['401 with the hop count unavailable', { redirect: false, hide: true }, 'maybe-sent'],
+    ]
+    console.log(`precondition (hop provenance): ${cases.length} cases; every refresh step is held`)
+    for (const [name, mode, expected] of cases) {
+      redirectFirst = mode.redirect
+      hideProvenance = mode.hide
+      received.length = 0
+      const result = await mintsoftRequest('/api/Order', { method: 'PUT', body: '{"ClientId":89}' })
+      hideProvenance = false
+      assert.deepEqual(received, mode.redirect ? ['PUT /api/Order', 'PUT /api/OrderMoved'] : ['PUT /api/Order'], `${name}: no replay after the refusal`)
+      if (expected === 'hold') {
+        assert.equal(result.held, true, name)
+        assert.equal(isOutboundWriteHeldText(result.error), true, name)
+      } else {
+        assert.equal(result.held, undefined, name)
+        assert.equal(isOutboundWriteHeldText(result.error), false, `${name}: must NOT be a hold`)
+        assert.equal(isOutboundMaybeSentRefusalText(result.error), true, `${name}: maybe-sent`)
+      }
+    }
+  } finally {
+    hideProvenance = false
     delete process.env.MINTSOFT_WRITE_ALLOWED
     delete process.env.E2E_TEST_MODE
     await new Promise<void>((resolve) => server.close(() => resolve()))
