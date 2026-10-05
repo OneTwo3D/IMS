@@ -11,7 +11,6 @@ import {
   MIGRATION_ROLE_MARKER,
   MIGRATION_URL_SAFE_PARAMETERS,
   assessMigrationRoleAttributes,
-  finishRelease,
   retireMigrationLogin,
   buildMigrationLoginUrl,
   planConnectionFence,
@@ -401,6 +400,10 @@ test('[o3d-1bgr] the preflight audits what a marked role holds DIRECTLY, one fix
       { label: 'a default privilege', sql: 'ALTER DEFAULT PRIVILEGES FOR ROLE imsapp_migrator GRANT SELECT ON TABLES TO imsapp', undo: 'ALTER DEFAULT PRIVILEGES FOR ROLE imsapp_migrator REVOKE SELECT ON TABLES FROM imsapp', expect: /object\(s\) or privilege\(s\) of its own/ },
       { label: 'a privilege on ANOTHER database', sql: 'CREATE DATABASE otherdb; GRANT CONNECT ON DATABASE otherdb TO imsapp_migrator', undo: 'DROP DATABASE otherdb', expect: /object\(s\) or privilege\(s\) of its own/ },
       { label: 'a per-role setting', sql: "ALTER ROLE imsapp_migrator SET search_path = pg_catalog", undo: 'ALTER ROLE imsapp_migrator RESET search_path', expect: /per-role setting/ },
+      { label: 'CREATE on the application database', sql: 'GRANT CREATE ON DATABASE imsdb TO imsapp_migrator', undo: 'REVOKE CREATE ON DATABASE imsdb FROM imsapp_migrator', expect: /beyond CONNECT/ },
+      { label: 'TEMPORARY on the application database', sql: 'GRANT TEMPORARY ON DATABASE imsdb TO imsapp_migrator', undo: 'REVOKE TEMPORARY ON DATABASE imsdb FROM imsapp_migrator', expect: /beyond CONNECT/ },
+      { label: 'CONNECT with grant option', sql: 'GRANT CONNECT ON DATABASE imsdb TO imsapp_migrator WITH GRANT OPTION', undo: 'REVOKE GRANT OPTION FOR CONNECT ON DATABASE imsdb FROM imsapp_migrator', expect: /beyond CONNECT/ },
+      { label: 'a usable membership in a role the application holds with SET FALSE and INHERIT FALSE', sql: 'CREATE ROLE other_priv NOLOGIN; GRANT other_priv TO imsapp WITH INHERIT FALSE, SET FALSE; GRANT other_priv TO imsapp_migrator WITH INHERIT TRUE, SET TRUE', undo: 'REVOKE other_priv FROM imsapp_migrator; REVOKE other_priv FROM imsapp; DROP ROLE other_priv', expect: /direct member of 1 role/ },
       { label: 'pg_read_server_files membership', sql: 'GRANT pg_read_server_files TO imsapp_migrator', undo: 'REVOKE pg_read_server_files FROM imsapp_migrator', expect: /member of a role the application role is not/ },
     ]
     for (const { label, sql, undo, expect } of fixtures) {
@@ -419,6 +422,29 @@ test('[o3d-1bgr] the preflight audits what a marked role holds DIRECTLY, one fix
     const accepted = helper(rig, ['--preflight'], { script })
     console.log(`mutated preflight over a role that owns a table: exit ${accepted.status}`)
     assert.equal(accepted.status, 0, 'the mutated preflight accepts it: the real arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] MUTATIONS database-privilege audit and membership comparison: each fixture passes the preflight once its check is removed (Codex round 2)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    rig.cluster.psql(['-c', 'GRANT CREATE ON DATABASE imsdb TO imsapp_migrator'])
+    const noDbAudit = mutatedHelper(rig, '  if (f.databaseExtraPrivileges > 0) {', '  if (false) {', 'no-db-privilege-audit')
+    const real = helper(rig, ['--preflight'])
+    const mutated = helper(rig, ['--preflight'], { script: noDbAudit })
+    console.log(`CREATE on the database: real preflight exit ${real.status}, mutated ${mutated.status}`)
+    assert.equal(real.status, 3)
+    assert.equal(mutated.status, 0, 'without the audit a role holding CREATE on the application database passes')
+    rig.cluster.psql(['-c', 'REVOKE CREATE ON DATABASE imsdb FROM imsapp_migrator'])
+    rig.cluster.psql(['-c', 'CREATE ROLE other_priv NOLOGIN'])
+    rig.cluster.psql(['-c', 'GRANT other_priv TO imsapp WITH INHERIT FALSE, SET FALSE'])
+    rig.cluster.psql(['-c', 'GRANT other_priv TO imsapp_migrator WITH INHERIT TRUE, SET TRUE'])
+    const noMembership = mutatedHelper(rig, '  if (f.otherMemberships > 0) {', '  if (false) {', 'no-membership-comparison')
+    const realM = helper(rig, ['--preflight'])
+    const mutatedM = helper(rig, ['--preflight'], { script: noMembership })
+    console.log(`SET FALSE vs SET TRUE membership: real preflight exit ${realM.status}, mutated ${mutatedM.status}`)
+    assert.equal(realM.status, 3)
+    assert.equal(mutatedM.status, 0, 'the old MEMBER comparison admits it: pg_has_role MEMBER ignores the INHERIT/SET options')
   })
 })
 
@@ -471,7 +497,7 @@ test('buildMigrationLoginUrl: every query parameter that is not whitelisted is g
   }
 })
 
-test('[o3d-1bgr] a release whose migration login cannot be CONFIRMED closed fails loud (Codex HIGH)', async () => {
+test('[o3d-1bgr] retireMigrationLogin reports true only when the server confirms the login closed (Codex HIGH)', async () => {
   const log = (t: { lines: string[] }) => (...a: unknown[]) => { t.lines.push(a.join(' ')) }
   const fake = (behaviour: 'closes' | 'alter-throws' | 'stays-open') => {
     const state = { canLogin: true, statements: [] as string[] }
@@ -496,18 +522,15 @@ test('[o3d-1bgr] a release whose migration login cannot be CONFIRMED closed fail
   const original = console.error
   console.error = log(captured)
   try {
-    const closes = fake('closes')
-    assert.equal(await finishRelease(closes.client as never, { migrationRole: 'm' }, 0), 0, 'closed and confirmed: the release keeps its status')
-    assert.equal(await finishRelease(fake('closes').client as never, { migrationRole: 'm' }, 6), 6, 'including the already-released status')
+    assert.equal(await retireMigrationLogin(fake('closes').client as never, 'm'), true, 'closed and confirmed')
     for (const behaviour of ['alter-throws', 'stays-open'] as const) {
       const run = fake(behaviour)
-      const code = await finishRelease(run.client as never, { migrationRole: 'm' }, 0)
-      console.log(`${behaviour}: release ends with ${code}; ALTER attempts ${run.state.statements.filter((q) => /^ALTER/.test(q)).length}`)
-      assert.equal(code, 1, `${behaviour}: a login that is not confirmed closed fails the release`)
+      const ok = await retireMigrationLogin(run.client as never, 'm')
+      console.log(`${behaviour}: confirmed closed = ${ok}; ALTER attempts ${run.state.statements.filter((q) => /^ALTER/.test(q)).length}`)
+      assert.equal(ok, false, `${behaviour}: a login that is not confirmed closed is reported as such`)
       assert.equal(run.state.statements.filter((q) => /^ALTER/.test(q)).length, 2, 'after one retry')
       assert.ok(captured.lines.some((l) => /STILL OPEN/.test(l)) && captured.lines.some((l) => /ALTER ROLE "m" NOLOGIN PASSWORD NULL/.test(l)), 'with the statement that closes it by hand')
     }
-    assert.equal(await finishRelease(fake('stays-open').client as never, { migrationRole: 'm' }, 3), 3, 'a release that itself failed keeps its own status')
     assert.equal(await retireMigrationLogin(fake('closes').client as never, ''), true)
   } finally {
     console.error = original
@@ -653,21 +676,47 @@ test('[o3d-1bgr] MUTATION no-superuser-check: TWO checks refuse a superuser migr
   })
 })
 
-test('[o3d-1bgr] MUTATION skip-NOLOGIN: without the closing statement the minted password still logs in after the release (release arm would be red)', async () => {
+test('[o3d-1bgr] release closes the migration login FIRST: when it cannot, CONNECT is NOT restored and the fence stands (Codex round 2)', async () => {
   await withRig(async (rig) => {
     ensure(rig)
-    const script = mutatedHelper(rig, '    await client.query(buildMigrationLogoutStatement(migrationRole))\n', '', 'no-logout')
     const url = printUrl(rig)
     const stateFile = join(rig.root, 'state.json')
     const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`])
     publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
     assert.equal(helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`]).status, 0)
-    const release = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script })
-    // Since Codex round 1 the release CONFIRMS the close: without the ALTER it ends non-zero and says so.
+    const acl = () => rig.cluster.psql(['-c', "SELECT coalesce(datacl::text, '<default>') FROM pg_database WHERE datname = 'imsdb'"])
+    const appUrl = `postgresql://imsapp:${rig.appPassword}@127.0.0.1:${rig.port}/imsdb`
+    const fenced = acl()
+    console.log(`precondition: ACL while fenced = ${fenced}`)
+    await assert.rejects(session(appUrl, async (client) => { await client.query('SELECT 1') }), (error: { code?: string }) => error.code === '42501', 'precondition: the application is shut out')
+
+    // THE FAILURE BRANCH, real cluster: the ALTER is mutated away, so the server keeps saying LOGIN.
+    const stuck = mutatedHelper(rig, '      await client.query(buildMigrationLogoutStatement(migrationRole))\n', '', 'no-logout')
+    const release = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script: stuck })
+    console.log(`release with the login unclosable: exit ${release.status}; ACL now = ${acl()}`)
     assert.equal(release.status, 1, release.stderr)
     assert.match(release.stderr, /STILL OPEN/)
+    assert.match(release.stderr, /CONNECT has NOT been restored/)
+    assert.equal(acl(), fenced, 'the ACL is exactly what it was: nothing was restored')
+    await assert.rejects(session(appUrl, async (client) => { await client.query('SELECT 1') }), (error: { code?: string }) => error.code === '42501', 'the application is STILL shut out')
+    assert.ok(existsSync(stateFile), 'and the record is untouched')
+
+    // MUTATION release-order: with the early close disabled the release restores CONNECT while the login is
+    // still open -- the defect. (The close is also broken in this copy, so the open login is what remains.)
+    const original = readFileSync(SCRIPT, 'utf8')
+    const early = "  if (options.migrationRole && !(await retireMigrationLogin(client, options.migrationRole))) {\n    console.error('NOT RELEASED"
+    const mutated = original.replace(early, "  if (false) {\n    console.error('NOT RELEASED").replace('      await client.query(buildMigrationLogoutStatement(migrationRole))\n', '')
+    assert.notEqual(mutated, original, 'precondition: the mutation applies')
+    const dir = join(rig.root, 'mutant-close-after-grants')
+    mkdirSync(join(dir, 'scripts'), { recursive: true })
+    symlinkSync(join(process.cwd(), 'node_modules'), join(dir, 'node_modules'))
+    const copy = join(dir, 'scripts', 'fence-db-connections.mjs')
+    writeFileSync(copy, mutated)
+    const composite = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`], { script: copy })
+    console.log(`mutated (early close off): exit ${composite.status}; ACL = ${acl()}`)
+    await session(appUrl, async (client) => { await client.query('SELECT 1') })
     await session(url, async (client) => { await client.query('SELECT 1') })
-    console.log('mutated release: the minted login still connects')
+    assert.notEqual(acl(), fenced, 'the mutated release restored CONNECT with the migration login still open: the real arm above would be red')
   })
 })
 

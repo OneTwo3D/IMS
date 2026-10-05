@@ -285,5 +285,13 @@ test('[o3d-1bgr] a role under the migration name is never granted anything befor
   }
   assert.ok(readFileSync(join(ROOT, 'scripts/provision-ims-tenant.sh'), 'utf8').includes(marker), 'the external provisioner spells the same marker literal as the helper')
   assert.ok(readFileSync(join(ROOT, 'scripts/install.sh'), 'utf8').includes(`MIGRATION_ROLE_MARKER='${marker}'`), 'and so does install.sh')
-  assert.ok(mjs.includes('await finishRelease(client, options, await doRelease(client, options))'), 'release goes through finishRelease(): a login not confirmed closed fails it')
+  // RELEASE ORDERING (Codex round 2): inside doRelease the migration login is closed and confirmed BEFORE the first
+  // statement that restores CONNECT, and a login that cannot be closed returns before any of them.
+  const release = mjs.slice(mjs.indexOf('export async function doRelease('), mjs.indexOf('export async function doAuditAuthority('))
+  const close = release.indexOf('retireMigrationLogin(client, options.migrationRole)')
+  const grants = release.indexOf('buildGrantStatements(')
+  console.log(`doRelease: login close at ${close}, first grant statements built at ${grants}`)
+  assert.ok(close > 0 && grants > close, 'the close precedes every grant')
+  assert.match(release.slice(close, close + 400), /return EXIT_ERROR/, 'and a failure to close returns before them')
+  assert.ok(!/retireMigrationLogin\(/.test(mjs.slice(mjs.indexOf('async function main()'))), 'main() does not close it again after the grants')
 })

@@ -1091,11 +1091,17 @@ export function assessMigrationRoleAttributes(f) {
   if (f.directDependencies > 0) {
     return refuse(`holds or owns ${f.directDependencies} object(s) or privilege(s) of its own somewhere in this cluster (an owned object, a direct grant on a table, schema, database or other object, or a default privilege), which \`SET ROLE NONE\` on a migration connection would exercise. Its only grant is CONNECT on this database.`)
   }
+  if (f.databaseExtraPrivileges > 0) {
+    return refuse(`holds a privilege on ${f.database} beyond CONNECT (CREATE or TEMPORARY), or CONNECT with grant option. On this database it may hold CONNECT and nothing else; whatever else it needs it has through the application role.`)
+  }
   if (f.roleSettings > 0) {
     return refuse(`has ${f.roleSettings} per-role setting(s) (ALTER ROLE ... SET), which would apply to every migration session. Remove them.`)
   }
   if (f.reachesOtherRoles) {
     return refuse(`is a member of a role the application role is not a member of, so \`SET ROLE NONE\` on a migration connection reaches privilege the application itself does not hold. Its only membership may be ${f.appRole}.`)
+  }
+  if (f.otherMemberships > 0) {
+    return refuse(`is a direct member of ${f.otherMemberships} role(s) besides ${f.appRole}. Its only membership may be the application role: a membership in another role is judged usable by the migration role whatever options the application's own membership has (PostgreSQL 16+ INHERIT/SET), and \`SET ROLE NONE\` on a migration connection would exercise it.`)
   }
   if (!f.canSetAppRole) {
     return refuse(`cannot SET ROLE to ${f.appRole}, so the migration could not run as it and everything it created would be owned by ${name}. GRANT ${quoteIdent(f.appRole)} TO ${quoteIdent(name)}${f.serverVersionNum >= 160000 ? ' WITH INHERIT TRUE, SET TRUE' : ''}.`)
@@ -2041,7 +2047,17 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
               WHERE d.refclassid = 'pg_authid'::regclass AND d.refobjid = r.oid AND d.deptype IN ('o', 'a')
                 AND NOT (d.deptype = 'a' AND d.classid = 'pg_database'::regclass
                          AND d.objid = (SELECT oid FROM pg_database WHERE datname = current_database()))) AS direct_dependencies,
-            (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS role_settings, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
+            (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS role_settings,
+            -- ON THIS DATABASE the role may hold CONNECT and nothing else, and not with grant option. The
+            -- shared-dependency count above deliberately skips this database's ACL entry (one dependency
+            -- per grantee, not per privilege), so the entry is read here, privilege by privilege.
+            (SELECT count(*)::int FROM pg_database dd, aclexplode(coalesce(dd.datacl, acldefault('d', dd.datdba))) x
+              WHERE dd.datname = current_database() AND x.grantee = r.oid
+                AND (x.privilege_type <> 'CONNECT' OR x.is_grantable)) AS database_extra_privileges,
+            -- EVERY MEMBERSHIP BUT THE APPLICATION ROLE'S, whatever its INHERIT/SET options. pg_has_role(...,
+            -- 'MEMBER') ignores those options (PostgreSQL 16+), so a role the application holds with SET FALSE
+            -- and INHERIT FALSE looks "reachable by both" while the migration role's usable membership is not.
+            (SELECT count(*)::int FROM pg_auth_members mm WHERE mm.member = r.oid AND mm.roleid <> a.oid) AS other_memberships, r.rolcreaterole, r.rolcreatedb, r.rolreplication, r.rolbypassrls,
             current_setting('server_version_num')::int AS server_version_num,
             -- 'SET' is a PostgreSQL 16 mode of pg_has_role(); before it, MEMBER is what answers
             -- "may SET ROLE". The CASE keeps the unknown mode from ever being evaluated on 15.
@@ -2070,6 +2086,8 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
     exists: true,
     marked: row.marked === true,
     directDependencies: Number(row.direct_dependencies ?? 0),
+    databaseExtraPrivileges: Number(row.database_extra_privileges ?? 0),
+    otherMemberships: Number(row.other_memberships ?? 0),
     roleSettings: Number(row.role_settings ?? 0),
     rolsuper: row.rolsuper === true,
     rolcreaterole: row.rolcreaterole === true,
@@ -3287,6 +3305,17 @@ export async function doRelease(client, options) {
   }
   if (!requireBoundDatabaseIdentity(released, 'NOT RELEASED', options)) return EXIT_ERROR
 
+  // THE MIGRATION LOGIN IS CLOSED, AND CONFIRMED CLOSED, BEFORE ANY CONNECT IS GIVEN BACK (Codex round 2,
+  // HIGH). The grants below let the application in; a login still open at that moment (the window's
+  // password is in the application account's hands) would be open to a database whose schema may be half
+  // moved. So if the server cannot be made to say NOLOGIN, NOTHING is restored: the fence stands, the ACL
+  // is untouched, and the message says so and how to recover.
+  if (options.migrationRole && !(await retireMigrationLogin(client, options.migrationRole))) {
+    console.error('NOT RELEASED: CONNECT has NOT been restored to anyone. The fence STILL STANDS and the record is untouched.')
+    console.error('Close the migration login (the statement above), then run the release again; it is idempotent.')
+    return EXIT_ERROR
+  }
+
   // THROUGH THE PROVENANCE GATE, AND THIS IS THE CALL SITE THE GATE EXISTS FOR (o3d-secops r23,
   // Codex CRITICAL). Every statement below is a `GRANT CONNECT` built out of this record. A record
   // whose directory or whose own inode belongs to anything but the publishing account is a list
@@ -3983,19 +4012,9 @@ export async function retireMigrationLogin(client, migrationRole) {
       lastError = error instanceof Error ? error.message : String(error)
     }
   }
-  console.error(`THE MIGRATION LOGIN ${migrationRole} IS STILL OPEN (${lastError}). The CONNECT grants are restored, but the application account holds the password of this window and the login keeps CONNECT through every later fence.`)
+  console.error(`THE MIGRATION LOGIN ${migrationRole} IS STILL OPEN (${lastError}). NO CONNECT GRANT HAS BEEN RESTORED (the login is closed first, so this release stops here): the fence still stands, and the application account holds the password of this window.`)
   console.error(`Re-run the release (it is idempotent and retries this), or close it by hand as a superuser or its administrator: ${buildMigrationLogoutStatement(migrationRole)};`)
   return false
-}
-
-/**
- * The end of a release: when the grants are back (or already were), the window's login must be CONFIRMED
- * closed, and a login that cannot be confirmed closed turns the release into a failure. Returns the exit
- * status the helper ends with.
- */
-export async function finishRelease(client, options, releaseCode) {
-  if (releaseCode !== EXIT_OK && releaseCode !== EXIT_ALREADY_RELEASED) return releaseCode
-  return (await retireMigrationLogin(client, options.migrationRole)) ? releaseCode : EXIT_ERROR
 }
 
 async function main() {
@@ -4172,7 +4191,7 @@ async function main() {
     else if (options.mode === 'audit-authority') process.exitCode = await doAuditAuthority(client, options)
     else if (options.mode === 'ensure-migration-role') process.exitCode = await doEnsureMigrationRole(client, options)
     else {
-      process.exitCode = await finishRelease(client, options, await doRelease(client, options))
+      process.exitCode = await doRelease(client, options)
     }
   } finally {
     await client.end()

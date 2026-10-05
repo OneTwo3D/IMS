@@ -3995,9 +3995,10 @@ query parameters (`sslmode`, `sslrootcert`, `sslcrl`, `sslsni`, `uselibpqcompat`
 `options=-c role=<app>` and the window's binding stamp. The admin login and password are never in
 that URL. `--release` ends with `ALTER ROLE … NOLOGIN PASSWORD NULL` and then **asks the server** (`rolcanlogin`
 false and, where the admin may read it, a null password). A login that cannot be confirmed closed
-(retried once) makes the **release fail**: non-zero exit, the `CONNECT` grants already restored, and a
-message with the one statement that closes it by hand. Re-running the release is idempotent and retries
-it. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
+(retried once) makes the **release fail** *before any `CONNECT` is restored*: the login is closed and
+confirmed first, so on failure the application role still has no `CONNECT`, the fence stands and the record
+is untouched. The message gives the one statement that closes the login by hand; re-running the release is
+idempotent and retries it. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
 as the application role, or it is not printed and the login is closed again. A window that is
 **interrupted** leaves a password nobody holds; the next window mints another.
 

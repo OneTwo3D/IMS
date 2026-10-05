@@ -32,7 +32,10 @@ This repository uses an `x.y.z` release scheme.
   settings or reaches a role the application cannot is refused by `--preflight`, the minted URL keeps only
   transport-trust query parameters from the admin URL (an admin URL carrying `password=`, `user=`, `host=` and the
   like is refused) and is opened once to prove it authenticates as the migration role, and a release whose login the
-  server cannot confirm closed now FAILS (retryable) instead of reporting success.
+  server cannot confirm closed now FAILS (retryable) instead of reporting success, **before any CONNECT is
+  restored** (the login is closed first; a failure leaves the fence standing). The audit also refuses a marked role
+  holding anything beyond CONNECT on the application database, and any direct membership besides the application
+  role (PostgreSQL 16+ INHERIT/SET options are not trusted to compare).
 - **The operator recovery wrappers** read the root file, run the helper as root, and (o3d-bpbv) take the cutover
   lock first, resolve the documented pointer once, hash that directory and execute the helper by the resolved
   path, so a publication landing between the hash and the exec can no longer substitute a different release.
