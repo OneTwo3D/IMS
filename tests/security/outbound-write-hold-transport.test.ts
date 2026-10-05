@@ -27,7 +27,7 @@ import {
  *      Mutation: accept a comma list (take the first entry).
  */
 
-type Received = { method: string; url: string; body: string }
+type Received = { method: string; url: string; body: string; raw: Buffer }
 
 type Listener = { origin: string; server: Server; received: Received[]; redirectTo: string | null }
 
@@ -40,7 +40,7 @@ async function startListener(redirectTo: string | null = null): Promise<Listener
     const chunks: Buffer[] = []
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
     req.on('end', () => {
-      received.push({ method: req.method ?? '', url: req.url ?? '', body: Buffer.concat(chunks).toString('utf8') })
+      received.push({ method: req.method ?? '', url: req.url ?? '', body: Buffer.concat(chunks).toString('utf8'), raw: Buffer.concat(chunks) })
       if (listener.redirectTo) {
         res.writeHead(307, { location: listener.redirectTo })
         res.end()
@@ -383,4 +383,47 @@ test('a text a vendor chose can never be recognised as a hold: recognition needs
   assert.match(outboundHoldReferenceSuffix('held', 'x'), /^ \[hold-ref [0-9a-f]{18}\]$/)
   assert.notEqual(outboundHoldReferenceSuffix('held', 'x'), outboundHoldReferenceSuffix('maybe-sent', 'x'), 'per kind')
   assert.notEqual(outboundHoldReferenceSuffix('held', 'x'), outboundHoldReferenceSuffix('held', 'y'), 'per text')
+})
+
+test('the transports NEVER modify a request body: string, form, textual and binary bodies arrive byte for byte, with the caller\'s Content-Length', async () => {
+  const { guardedExternalFetch } = await import('../../lib/security/guarded-external-fetch.ts')
+  const real = new OutboundWriteHeldError({ connector: 'woocommerce', code: 'no_grant', method: 'PUT', target: 'https://shop.example.com/x', granted: null, attempted: null, basis: 'b' }, 0).message
+  assert.match(real, /\[hold-ref /, 'precondition: the bodies below really contain a hold text with its token')
+  const listener = await startListener()
+  const env1 = env({ WC_WRITEBACK_ALLOWED_ORIGIN: listener.origin })
+  const json = JSON.stringify({ note: real })
+  const jsonBuffer = Buffer.from(json, 'utf8')
+  const latin1 = Buffer.from(`café ${real}`, 'latin1')
+  const binary = Buffer.concat([Buffer.from([0x25, 0x50, 0x44, 0x46, 0xff, 0x00]), Buffer.from(real), Buffer.from([0x80, 0xc3, 0x28])])
+  const bodies: Array<[string, BodyInit, Buffer, Record<string, string>]> = [
+    ['json string', json, Buffer.from(json), { 'content-type': 'application/json' }],
+    ['form', new URLSearchParams({ note: real }), Buffer.from(new URLSearchParams({ note: real }).toString()), {}],
+    ['textual buffer', new Uint8Array(jsonBuffer), jsonBuffer, { 'content-type': 'application/json', 'content-length': String(jsonBuffer.length) }],
+    ['latin-1 text buffer', new Uint8Array(latin1), latin1, { 'content-type': 'text/plain; charset=iso-8859-1', 'content-length': String(latin1.length) }],
+    ['binary', new Uint8Array(binary), binary, { 'content-type': 'application/pdf', 'content-length': String(binary.length) }],
+  ]
+  console.log(`precondition (bodies untouched): ${bodies.length} body shapes, each carrying a real hold text, through both transports`)
+  for (const [name, body, expected, headers] of bodies) {
+    for (const via of ['connectorFetch', 'guardedExternalFetch'] as const) {
+      const before = listener.received.length
+      if (via === 'connectorFetch') {
+        await connectorFetch(`${listener.origin}/p`, { method: 'POST', body, headers }, { connectorName: 'WooCommerce', allowE2eLocalHttp: true, env: env1 })
+      } else {
+        await guardedExternalFetch(`${listener.origin}/p`, { method: 'POST', body, headers }, { connectorName: 'WooCommerce', env: env1 })
+      }
+      assert.equal(listener.received.length, before + 1)
+      assert.equal(listener.received[before]!.raw.equals(expected), true, `${name} via ${via}: byte for byte`)
+    }
+  }
+})
+
+test('body types the connectors cannot inspect are refused by connectorFetch before anything is sent', async () => {
+  const listener = await startListener()
+  const options = { connectorName: 'WooCommerce', allowE2eLocalHttp: true, env: env({ WC_WRITEBACK_ALLOWED_ORIGIN: listener.origin }) }
+  const unsupported: Array<[string, BodyInit]> = [['FormData', new FormData()], ['Blob', new Blob(['x'])], ['ReadableStream', new ReadableStream()]]
+  console.log(`precondition (unsupported bodies): ${unsupported.length} types on a granted WRITE`)
+  for (const [name, body] of unsupported) {
+    await assert.rejects(connectorFetch(`${listener.origin}/x`, { method: 'POST', body }, options), /not supported/, name)
+  }
+  assert.equal(listener.received.length, 0)
 })
