@@ -1,0 +1,13 @@
+Item Code;Location;Qty on hand;Unit cost;Cost currency;Rate to GBP;Received;Lot no
+OAK-BOARD;Main Warehouse;10;4.00;GBP;;2026-01-10;L-001
+OAK-BOARD;Main Warehouse;20;5.00;GBP;;2026-03-05;L-002
+OAK-BOARD;Main Warehouse;30;6.00;GBP;;2026-06-20;L-003
+OAK-BOARD;Overflow;5;4.50;GBP;;2026-02-01;L-004
+LEG-01;Main Warehouse;8;12.00;GBP;;2026-05-01;L-005
+TABLE-01;Main Warehouse;2;60.00;GBP;;2026-05-02;L-006
+TSHIRT-S;Main Warehouse;7;3.00;EUR;1.25;2026-04-04;L-007
+TSHIRT-M;Main Warehouse;4;3.00;GBP;;2026-04-04;L-008
+WIDGET-9;Main Warehouse;12;1.25;GBP;;2026-01-15;L-009
+Widget-9;Main Warehouse;5;1.50;GBP;;2026-02-15;L-010
+ZERO-ITEM;Main Warehouse;0;1.00;GBP;;2026-01-01;L-011
+GIFT-SET;Main Warehouse;0;0;GBP;;2026-01-01;L-012

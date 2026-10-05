@@ -42,6 +42,18 @@ This repository uses an `x.y.z` release scheme.
 - **Operator action on upgrade:** move `DEPLOY_ADMIN_DATABASE_URL` out of `.env` into the root file, and make sure
   the migration role exists. A fresh installation needs neither step. No migration.
 
+### First-load preparation tool: validates and prepares the incumbent exports for the existing importers (o3d-zjsb5)
+
+- **New command `npm run first-load:prepare`, file in and file out (no database, no network).** It reads Qoblex, 3PL and
+  WooCommerce export files through a column map (or already-canonical CSVs) and writes importer-ready files with the
+  importers' exact template headers, plus a JSON and Markdown validation report that accounts for every input row as
+  emitted, excluded or rejected. It checks SKU coverage across the systems, that the recipe graph has no cycle, collapses FIFO
+  lots to one exact weighted-average cost per SKU and warehouse, reports zero on-hand separately from missing, reduces open
+  purchase orders to the outstanding quantity, counts in-transit stock once, and splits files below the importers' row and
+  size caps. Any rejected row blocks the run and no import file is written. The real column maps wait for the owner's sample
+  exports; the maps in the tests use invented headers. Reference: `docs/first-load-input-spec.md`. No migration, nothing
+  runs at start-up.
+
 ### Late landed cost on stock in transit between warehouses now reaches Inventory (o3d-nrl4)
 
 - **A freight order added, edited or cancelled after the goods were bought now posts the share that belongs

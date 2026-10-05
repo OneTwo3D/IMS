@@ -1,0 +1,95 @@
+{
+  "formatVersion": 1,
+  "source": "qoblex",
+  "datasets": {
+    "products": {
+      "expectedHeaders": ["Item Code", "Item Description", "Item Class", "Master Item Code", "Category Path", "Barcode (EAN)", "Weight kg", "Retail Price", "Active Flag"],
+      "columns": {
+        "sku": "Item Code",
+        "name": "Item Description",
+        "type": "Item Class",
+        "parentSku": "Master Item Code",
+        "category": "Category Path",
+        "barcode": "Barcode (EAN)",
+        "weight": "Weight kg",
+        "salesPriceBase": "Retail Price",
+        "active": "Active Flag"
+      },
+      "valueMaps": {
+        "type": {
+          "Stocked item": "SIMPLE",
+          "Parent product": "VARIABLE",
+          "Variant": "VARIANT",
+          "Bundle": "KIT",
+          "Assembly": "BOM",
+          "Service": "NON_INVENTORY"
+        },
+        "active": { "Y": "TRUE", "N": "FALSE" }
+      }
+    },
+    "recipe-lines": {
+      "columns": { "parentSku": "Assembly Code", "componentSku": "Part Code", "qty": "Quantity per", "sortOrder": "Line No" }
+    },
+    "stock-lots": {
+      "delimiter": ";",
+      "columns": {
+        "sku": "Item Code",
+        "warehouseCode": "Location",
+        "qty": "Qty on hand",
+        "unitCost": "Unit cost",
+        "currency": "Cost currency",
+        "fxRateToBase": "Rate to GBP",
+        "receivedDate": "Received",
+        "lotRef": "Lot no"
+      },
+      "valueMaps": { "warehouseCode": { "Main Warehouse": "MAIN", "Overflow": "OVER" } }
+    },
+    "suppliers": {
+      "columns": {
+        "name": "Supplier Name",
+        "contactName": "Contact",
+        "email": "E-mail",
+        "paymentTermsDays": "Terms (days)",
+        "currency": "Cur",
+        "vatNumber": "VAT No",
+        "city": "Town",
+        "country": "Country"
+      }
+    },
+    "purchase-order-lines": {
+      "columns": {
+        "orderKey": "PO No",
+        "supplierName": "Supplier",
+        "status": "PO State",
+        "currency": "Cur",
+        "fxRateToBase": "FX",
+        "destinationWarehouseCode": "Ship To",
+        "sku": "Item Code",
+        "qtyOrdered": "Ord",
+        "qtyReceived": "Rcvd",
+        "unitCostForeign": "Cost"
+      },
+      "valueMaps": {
+        "status": { "Open": "OPEN", "Closed": "CLOSED" },
+        "destinationWarehouseCode": { "Main Warehouse": "MAIN", "Overflow": "OVER" }
+      }
+    },
+    "transfers": {
+      "columns": {
+        "transferKey": "Transfer No",
+        "status": "Transfer Status",
+        "fromWarehouseCode": "From Location",
+        "toWarehouseCode": "To Location",
+        "sku": "Item Code",
+        "qtyShipped": "Shipped",
+        "qtyReceived": "Received",
+        "dispatchDate": "Shipped On"
+      },
+      "valueMaps": {
+        "status": { "In transit": "IN_TRANSIT", "Part received": "PARTIALLY_RECEIVED", "Completed": "COMPLETED", "Draft": "DRAFT" },
+        "fromWarehouseCode": { "Main Warehouse": "MAIN", "Overflow": "OVER" },
+        "toWarehouseCode": { "Main Warehouse": "MAIN", "Overflow": "OVER" }
+      }
+    }
+  }
+}

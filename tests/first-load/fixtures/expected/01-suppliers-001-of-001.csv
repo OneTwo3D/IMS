@@ -1,0 +1,4 @@
+supplierId,name,contactName,email,phone,currency,vatNumber,accountNumber,paymentTermsDays,addressLine1,addressLine2,city,county,postcode,country,notes
+,Cotton Ltd,Sam Weaver,sales@cotton.example,,EUR,,,45,,,Porto,,,Portugal,
+,Hardware Inc,,,,USD,,,0,,,Austin,,,United States,
+,Timber Co,Alex Wood,orders@timber.example,,GBP,GB123456789,,30,,,Leeds,,,United Kingdom,

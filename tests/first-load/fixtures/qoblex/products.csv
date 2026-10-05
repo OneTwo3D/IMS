@@ -1,0 +1,12 @@
+Item Code,Item Description,Item Class,Master Item Code,Category Path,Barcode (EAN),Weight kg,Retail Price,Active Flag
+OAK-BOARD,"Oak board, 18mm",Stocked item,,Raw materials,5000000000011,2.5,4.50,Y
+LEG-01,Table leg,Assembly,,Furniture,,1.2,12.00,Y
+TABLE-01,Oak table,Assembly,,Furniture,5000000000028,9.5,95.00,Y
+TSHIRT,T-shirt,Parent product,,Apparel,,0.2,19.99,Y
+TSHIRT-S,T-shirt small,Variant,TSHIRT,Apparel,,0.2,19.99,Y
+TSHIRT-M,T-shirt medium,Variant,TSHIRT,Apparel,,0.2,19.99,Y
+GIFT-SET,Gift set,Bundle,,Bundles,,0.5,29.99,Y
+DELIVERY,Delivery charge,Service,,Services,,,4.95,Y
+widget-9, Widget 9 ,Stocked item,,Components,,0.1,2.75,Y
+NEVER-STOCKED,Never stocked sample,Stocked item,,Components,,0.1,1.00,N
+ZERO-ITEM,Zero stock sample,Stocked item,,Components,,0.1,1.00,Y

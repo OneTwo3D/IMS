@@ -1,0 +1,4 @@
+Supplier Name,Contact,E-mail,Terms (days),Cur,VAT No,Town,Country
+Timber Co,Alex Wood,orders@timber.example,30,GBP,GB123456789,Leeds,United Kingdom
+Cotton Ltd,Sam Weaver,sales@cotton.example,45,EUR,,Porto,Portugal
+Hardware Inc,,,0,USD,,Austin,United States

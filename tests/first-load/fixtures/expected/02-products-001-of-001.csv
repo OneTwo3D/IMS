@@ -1,0 +1,12 @@
+productId,parentProductId,sku,name,description,type,parentSku,barcode,mpn,countryOfOrigin,preferredSupplierId,preferredSupplierName,preferredSupplierLocked,weight,widthCm,heightCm,depthCm,salesPriceBase,salePriceBase,salesPriceTaxInclusive,stockUnit,oversellAllowed,imageUrl,active,lifecycleStatus,components,category
+,,DELIVERY,Delivery charge,,NON_INVENTORY,,,,,,,,,,,,4.95,,,,,,TRUE,,,Services
+,,NEVER-STOCKED,Never stocked sample,,SIMPLE,,,,,,,,0.1,,,,1,,,,,,FALSE,,,Components
+,,OAK-BOARD,"Oak board, 18mm",,SIMPLE,,5000000000011,,,,,,2.5,,,,4.5,,,,,,TRUE,,,Raw materials
+,,TSHIRT,T-shirt,,VARIABLE,,,,,,,,0.2,,,,19.99,,,,,,TRUE,,,Apparel
+,,widget-9,Widget 9,,SIMPLE,,,,,,,,0.1,,,,2.75,,,,,,TRUE,,,Components
+,,ZERO-ITEM,Zero stock sample,,SIMPLE,,,,,,,,0.1,,,,1,,,,,,TRUE,,,Components
+,,TSHIRT-M,T-shirt medium,,VARIANT,TSHIRT,,,,,,,0.2,,,,19.99,,,,,,TRUE,,,Apparel
+,,TSHIRT-S,T-shirt small,,VARIANT,TSHIRT,,,,,,,0.2,,,,19.99,,,,,,TRUE,,,Apparel
+,,GIFT-SET,Gift set,,KIT,,,,,,,,0.5,,,,29.99,,,,,,TRUE,,TSHIRT-S:1;widget-9:2,Bundles
+,,LEG-01,Table leg,,BOM,,,,,,,,1.2,,,,12,,,,,,TRUE,,OAK-BOARD:0.5,Furniture
+,,TABLE-01,Oak table,,BOM,,5000000000028,,,,,,9.5,,,,95,,,,,,TRUE,,LEG-01:4;OAK-BOARD:2,Furniture
