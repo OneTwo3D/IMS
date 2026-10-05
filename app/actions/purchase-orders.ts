@@ -1,5 +1,6 @@
 'use server'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
@@ -2828,7 +2829,7 @@ export async function returnPurchaseOrder(
           tag: 'purchase',
           level: creditNote ? 'INFO' : 'WARNING',
           description: creditNote
-            ? `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — a DRAFT supplier credit note of ${po.currency} ${creditNote.amountForeign.toFixed(2)} was created for review. Post it to credit the supplier bill.`
+            ? withLedgerCheck(`Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — a DRAFT supplier credit note of ${po.currency} ${creditNote.amountForeign.toFixed(2)} was created for review. Post it to credit the supplier bill.`)
             : `Return on PO ${po.reference} leaves ${overBilling.totalOverBilledQty} unit(s) billed but not kept — ${overBilling.totalOverBilledValueBase} over-billed (base currency) across ${overBilling.bills.length} bill(s). Raise a supplier credit.`,
           metadata: {
             reference: po.reference,
@@ -2855,7 +2856,7 @@ export async function returnPurchaseOrder(
           action: 'return_credit_suppressed',
           tag: 'purchase',
           level: 'WARNING',
-          description: `Return on PO ${po.reference}: ${po.currency} ${suppressedReturnCredit.toFixed(2)} of return credit (cumulative) could not be auto-created because existing credit notes (e.g. a manual allowance) already use the bill's creditable amount. Review and raise the outstanding supplier credit manually.`,
+          description: withLedgerCheck(`Return on PO ${po.reference}: ${po.currency} ${suppressedReturnCredit.toFixed(2)} of return credit (cumulative) could not be auto-created because existing credit notes (e.g. a manual allowance) already use the bill's creditable amount. Review and raise the outstanding supplier credit manually.`),
           metadata: { reference: po.reference, suppressedReturnCreditForeign: suppressedReturnCredit, currency: po.currency },
         })
       }
@@ -3713,12 +3714,12 @@ export async function updateInvoice(
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
+          withLedgerCheck(`The bill edit was SAVED IN IMS but NOT queued to the accounting connector: the accounting `
           + `queue ${billUpdateSync.outcome === 'refused-chart-retired' ? 'REFUSED (the accounting connector this edit was built for is no longer the active one)' : 'declined'} a PURCHASE_INVOICE_UPDATE for bill `
           + `${normalizedHeader.invoiceNumber ?? invoice.invoiceNumber ?? invoice.id}. The ledger still `
           + `holds the PREVIOUS version of this bill and nothing will retry on its own — either re-save `
           + `the bill once the accounting connector selection has settled, or correct the bill by hand in `
-          + `the ledger.`,
+          + `the ledger.`),
         metadata: {
           reference: invoice.po.reference,
           invoiceId: invoice.id,
@@ -4035,9 +4036,9 @@ export async function markBillPaid(
               `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
               `is switched off), so the paid status was rolled back rather than left standing with ` +
               `nothing queued.`
-          : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
+          : withLedgerCheck(`Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
             `queued for the accounting connector, so the paid status was rolled back rather than left ` +
-            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
+            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`),
         metadata: {
           invoiceId: invoice.id,
           reference: invoice.po.reference,
@@ -4411,9 +4412,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       return {
         success: false,
         error:
-          'The credit note was NOT posted: the accounting connector changed while it was being prepared, so its '
+          withLedgerCheck('The credit note was NOT posted: the accounting connector changed while it was being prepared, so its '
           + 'account codes no longer describe the ledger it would be sent to. It is still a draft — post it again '
-          + 'once the accounting connector selection has settled.',
+          + 'once the accounting connector selection has settled.'),
       }
     }
     const shouldQueueXero =

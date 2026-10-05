@@ -437,3 +437,16 @@ export function withHandPostSafety(text: string): string {
   if (!HAND_POST_INSTRUCTION_PATTERN.test(text) || text.includes(HAND_POST_SAFETY)) return text
   return `${HAND_POST_SAFETY} ${text}`
 }
+
+
+/**
+ * Codex round 17: for the operator-visible instruction texts that are NOT on the refusal inbox (an error message on a purchase order, a chargeback warning, a
+ * reconciliation message): there is no hand-post claim there, so the preamble is the LEDGER CHECK alone. Idempotent; text with no instruction is untouched; a text
+ * that already carries the full hand-post preamble is left alone.
+ */
+export const LEDGER_CHECK_PREAMBLE = 'BEFORE acting on this: check whether the current version is already in the accounting system, and act only if it is absent.'
+
+export function withLedgerCheck(text: string): string {
+  if (!HAND_POST_INSTRUCTION_PATTERN.test(text) || text.includes(LEDGER_CHECK_PREAMBLE) || text.includes(HAND_POST_SAFETY)) return text
+  return `${LEDGER_CHECK_PREAMBLE} ${text}`
+}

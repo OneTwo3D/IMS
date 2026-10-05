@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import {
@@ -281,13 +282,13 @@ export function describeBlockedPriorAttempt(params: {
   referenceId: string
   syncLogId: string
 }): string {
-  return `NOTHING WAS QUEUED. A previous ${params.type} attempt for ${params.referenceType} ${params.referenceId} `
+  return withLedgerCheck(`NOTHING WAS QUEUED. A previous ${params.type} attempt for ${params.referenceType} ${params.referenceId} `
     + `(sync row ${params.syncLogId}) was settled by an operator as "not posted". That is a person's word about an `
     + 'accounting system IMS did not check - a lost response, a late webhook or a hand-posted document would leave the '
     + 'same row - so IMS will not post this again on the strength of it, and posting again could create a SECOND '
     + 'document. REMEDY: open the accounting system. If the document is there, nothing more is owed. If it is not, '
     + 'post it there by hand and mark this posting handled in the refusal inbox. This posting is still outstanding '
-    + 'until you do.'
+    + 'until you do.')
 }
 
 /**

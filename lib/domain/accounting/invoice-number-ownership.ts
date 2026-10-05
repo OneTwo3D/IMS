@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 /**
  * WHO OWNS THE NUMBER WE ARE ABOUT TO POST UNDER (o3d-k26m.5).
  *
@@ -308,11 +309,11 @@ export function decideInvoiceNumberPost(params: {
       code: 'NUMBER_NOT_ASKABLE',
       retryable: false,
       reason:
-        `Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger cannot be asked who `
+        withLedgerCheck(`Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger cannot be asked who `
         + `holds that number — ${params.lookup.error}. NOTHING WAS SENT. The create is update-or-create on the `
         + 'number, so posting without a trustworthy answer risks silently replacing a document that already '
         + 'carries it. Renumber the invoice in WooCommerce (the number is taken verbatim from '
-        + '_wcpdf_invoice_number) and re-queue this order, or post it by hand and link the document to the order.',
+        + '_wcpdf_invoice_number) and re-queue this order, or post it by hand and link the document to the order.'),
     }
   }
 

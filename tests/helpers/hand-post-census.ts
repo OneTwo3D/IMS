@@ -89,3 +89,73 @@ export function remedyCorpus(options: { sink?: boolean } = {}): Array<{ source: 
   return out
 }
 
+
+/** The instruction-shaped sentences in a file's string literals (comments stripped, shared constants left as identifiers: they are in the corpus). */
+export function instructionSentencesOf(file: string): string[] {
+  const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/['"`]\s*\+?\s*\n?\s*\+?\s*['"`]/g, '')
+  return stringLiterals(code).flatMap((literal) => literal.slice(1, -1).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
+    .filter((sentence) => HAND_POST_INSTRUCTION_PATTERN.test(sentence) && !PROHIBITION.test(sentence) && !DESCRIPTION.test(sentence))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// Codex round 17: THE AST CENSUS OF INSTRUCTION SITES. Every maximal string concatenation / template in lib/ app/ components/ is evaluated to its static
+// text; each instruction-shaped sentence in it is attributed to its SITE and classified by where the text goes:
+//   'guard-call'  - inside withHandPostSafety(...)
+//   'sink-remedy' - the `remedy` of an object handed to a refusal sink (reportPostingNotQueued / recordAccountingPostingRefusal / recordRefusalIfAsked /
+//                   the local `answer` of lib/accounting.ts), all of which apply withHandPostSafety
+//   null          - UNGUARDED: must be declared (shrink-only) with a verdict and a one-line justification, or it fails.
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+export type InstructionSite = { file: string; sentence: string; guard: 'guard-call' | 'sink-remedy' | null }
+
+const SINK_CALLEES = new Set(['reportPostingNotQueued', 'recordAccountingPostingRefusal', 'recordRefusalIfAsked', 'answer'])
+
+function flatText(node: ts.Node): string {
+  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text
+  if (ts.isParenthesizedExpression(node)) return flatText(node.expression)
+  if (ts.isTemplateExpression(node)) return node.head.text + node.templateSpans.map((span) => '{}' + span.literal.text).join('')
+  if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken) return flatText(node.left) + flatText(node.right)
+  if (ts.isConditionalExpression(node)) return `${flatText(node.whenTrue)} ${flatText(node.whenFalse)}`
+  if (ts.isIdentifier(node)) {
+    if (node.text === 'MARK_REMEDY_TAIL') return MARK_REMEDY_TAIL
+    if (node.text === 'LEDGER_CHECK_FIRST') return LEDGER_CHECK_FIRST
+    if (node.text === 'AFTER_DECLINE_STEP') return AFTER_DECLINE_STEP
+  }
+  return ''
+}
+
+function guardOf(node: ts.Node): InstructionSite['guard'] {
+  for (let n: ts.Node | undefined = node.parent; n; n = n.parent) {
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && (n.expression.text === 'withHandPostSafety' || n.expression.text === 'withLedgerCheck')) return 'guard-call'
+    if (ts.isPropertyAssignment(n) && ts.isIdentifier(n.name) && n.name.text === 'remedy') {
+      for (let m: ts.Node | undefined = n.parent; m; m = m.parent) {
+        if (ts.isCallExpression(m) && ts.isIdentifier(m.expression) && SINK_CALLEES.has(m.expression.text)) return 'sink-remedy'
+      }
+    }
+  }
+  return null
+}
+
+export function instructionSites(): InstructionSite[] {
+  const out: InstructionSite[] = []
+  for (const file of walkSources()) {
+    if (file === 'lib/domain/accounting/hand-post-instruction.ts') continue // rendered in full by the corpus
+    const source = read(file)
+    if (!HAND_POST_INSTRUCTION_PATTERN.test(source.replace(/\s+/g, ' ')) && !/re-?save|yourself/i.test(source)) continue
+    const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, file.endsWith('x') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
+    const visit = (node: ts.Node) => {
+      const isText = ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) || ts.isTemplateExpression(node) || (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.PlusToken)
+      const parentIsConcat = node.parent && ts.isBinaryExpression(node.parent) && node.parent.operatorToken.kind === ts.SyntaxKind.PlusToken
+      const parentIsParenConcat = node.parent && ts.isParenthesizedExpression(node.parent) && node.parent.parent && ts.isBinaryExpression(node.parent.parent) && node.parent.parent.operatorToken.kind === ts.SyntaxKind.PlusToken
+      if (isText && !parentIsConcat && !parentIsParenConcat) {
+        const guard = guardOf(node)
+        for (const sentence of flatText(node).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)) {
+          if (HAND_POST_INSTRUCTION_PATTERN.test(sentence) && !PROHIBITION.test(sentence) && !DESCRIPTION.test(sentence)) out.push({ file, sentence: sentence.trim(), guard })
+        }
+        if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sf)
+  }
+  return out
+}

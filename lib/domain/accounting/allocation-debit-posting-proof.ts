@@ -62,6 +62,7 @@
  * caller can reach for the other's answer by accident.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import {
   parseAllocationDebitPasses,
@@ -159,10 +160,10 @@ export function assertedJournalRemedy(params: {
   if (params.full) {
     // A FULL refund closes both batch windows for ever: the whole open balance is what is stranded.
     return ob
-      ? 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
-        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail
-      : 'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
-        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail
+      ? withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand in Xero ' +
+        `(DR Inventory / CR Allocated Inventory £${ob.open.toFixed(2)}: the ${balanceText}; do not credit more than the open balance).${DEDUCT} ` + tail)
+      : withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for this order by hand ' +
+        'in Xero (DR Inventory / CR Allocated Inventory for the amount still open: the recorded A2 debit less relief already credited; the open balance could not be established here, so none is given).' + DEDUCT + ' ' + tail)
   }
   // A PARTIAL refund: the rest of the order's A2 debit belongs to units the customer still holds.
   if (ob && params.withheldAmount !== null && params.withheldAmount > 0.005) {

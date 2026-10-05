@@ -30,6 +30,7 @@
  * database or a Xero tenant.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { ledgerStanding } from './ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from './sync-row-settlement'
 
@@ -383,9 +384,9 @@ export function describeAttemptUndecidedRefusal(
 export const REGISTRATION_IN_FLIGHT_REFUSAL: PaymentDeleteRefusal = {
   code: 'registration_in_flight',
   message:
-    'A worker claimed this receipt\'s queued payment registration while the deletion was being made, so '
+    withLedgerCheck('A worker claimed this receipt\'s queued payment registration while the deletion was being made, so '
     + 'nothing was deleted. It may now be posting to the accounting system. Reload the order and look '
-    + 'again once the sync has finished — if it did post, reverse it in the accounting system first.',
+    + 'again once the sync has finished — if it did post, reverse it in the accounting system first.'),
 }
 
 // ---------------------------------------------------------------------------
@@ -791,8 +792,8 @@ export function sameLedgerIdentifier(a: string | null | undefined, b: string | n
 export const HOLD_MOVED_REFUSAL: LedgerReversalRefusal = {
   code: 'hold_moved',
   message:
-    'This receipt\'s payment registrations changed while the reversal was being recorded — one was '
-    + 'claimed, retried or resolved — so nothing was changed. Reload the order and look again.',
+    withLedgerCheck('This receipt\'s payment registrations changed while the reversal was being recorded — one was '
+    + 'claimed, retried or resolved — so nothing was changed. Reload the order and look again.'),
 }
 
 /**

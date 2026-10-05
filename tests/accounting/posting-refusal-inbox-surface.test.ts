@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
@@ -647,7 +648,7 @@ test('[o3d-j625 r16 HIGH 2] an EARLIER edit\'s completed row leaves the newly re
   assert.match(row.handPostOrder, /The ledger holds INV-EDIT-1 for this obligation \(confirmed by the connector\)/, 'with what the ledger holds stated')
   assert.match(row.handPostOrder, /check the ledger for the CURRENT version/, 'and the instruction is the CURRENT-version check, so the operator updates that document instead of raising a second one or stopping at the earlier one')
   assert.doesNotMatch(row.handPostOrder, /post it in the ledger now/i, 'Codex r9: an earlier document exists, so the plain wording is unreachable')
-  assert.equal(row.remedy, invoiceUpdateRefusal.remedy, 'and the site\'s own remedy is verbatim')
+  assert.equal(row.remedy, withHandPostSafety(invoiceUpdateRefusal.remedy), 'and the site\'s own remedy is shown (behind the read guard\'s preamble when it carries an instruction)')
 })
 
 test('[o3d-1e7sl Codex r6] an earlier edit whose document id an OPERATOR typed in keeps its standing in the inbox order: not "REPLACES", not "post it now"', async (t) => {
@@ -1543,4 +1544,28 @@ test('[o3d-j625 r34] both operator-facing projections derive the unaccounted fla
     !beforeFlag.slice(beforeFlag.lastIndexOf('row.clearingNote')).includes('<Button'),
     'and no control for this row may precede it',
   )
+})
+
+test('[o3d-1e7sl Codex r17] a refusal row persisted with the OLD unguarded remedy renders GUARDED through the real loader (the guard acts on read, idempotently)', async (t) => {
+  const { HAND_POST_SAFETY, withHandPostSafety } = await import('@/lib/domain/accounting/hand-post-instruction')
+  const { unsafeInstructionSentences } = await import('./../helpers/hand-post-census')
+  const OLD = 'Post it by hand in the ledger it belongs to and mark this row handled — that cancels IMS\'s retry, so it is not posted twice.'
+  const already = withHandPostSafety('Correct the bill by hand in the ledger and mark this row handled.')
+  liveSyncRows.length = 0
+  allRows.push({ ...invoiceUpdateRefusal, id: 'refusal-old', referenceId: 'so-old', resolvedAt: null, remedy: OLD } as never)
+  allRows.push({ ...invoiceUpdateRefusal, id: 'refusal-guarded', referenceId: 'so-guarded', resolvedAt: null, remedy: already } as never)
+  allRows.push({ ...invoiceUpdateRefusal, id: 'refusal-plain', referenceId: 'so-plain', resolvedAt: null, remedy: 'Re-map the payment method against the connector now in use.' } as never)
+  t.after(() => {
+    for (const id of ['refusal-old', 'refusal-guarded', 'refusal-plain']) allRows.splice(allRows.findIndex((row) => row.id === id), 1)
+    liveSyncRows.length = 0
+  })
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const old = data.accountingPostingRefusals.find((r) => r.id === 'refusal-old')
+  assert.ok(old, 'PRECONDITION: the old row is listed')
+  assert.ok(old.remedy.startsWith(HAND_POST_SAFETY), 'the OLD unguarded remedy is shown with the preamble in front')
+  assert.ok(old.remedy.endsWith(OLD), 'and the site\'s own text is kept after it')
+  assert.deepEqual(unsafeInstructionSentences(old.remedy), [], 'so no unguarded instruction reaches the page')
+  assert.equal(data.accountingPostingRefusals.find((r) => r.id === 'refusal-guarded')!.remedy, already, 'a row that already carries the preamble is not guarded twice')
+  assert.equal(data.accountingPostingRefusals.find((r) => r.id === 'refusal-plain')!.remedy, 'Re-map the payment method against the connector now in use.', 'a remedy with no instruction is untouched')
 })

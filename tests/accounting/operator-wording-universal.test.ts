@@ -17,8 +17,9 @@ import * as refusalCopy from '@/lib/domain/accounting/posting-refusal-copy'
 import { describeFollowUpObligationBacklogRow } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { accountingSyncRowPostedAnEarlierPosting } from '@/lib/domain/accounting/posting-mark-handled'
 import { describeEarlierPostings } from '@/lib/domain/accounting/posting-mark-handled'
-import { DESCRIPTION, PROHIBITION, remedyCorpus, unsafeInstructionSentences, walkSources } from '../helpers/hand-post-census'
-import { AFTER_DECLINE_STEP, HAND_POST_INSTRUCTION_PATTERN, HAND_POST_SAFETY, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL, OTHER_OPERATOR_CLAIM_OUTCOME, claimLogDescription, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
+import { dailyBatchAssertedRefusal, dailyBatchUnprovedRefusal } from '@/lib/connectors/xero/daily-sync'
+import { DESCRIPTION, PROHIBITION, instructionSites, remedyCorpus, unsafeInstructionSentences, walkSources } from '../helpers/hand-post-census'
+import { AFTER_DECLINE_STEP, HAND_POST_INSTRUCTION_PATTERN, HAND_POST_SAFETY, LEDGER_CHECK_FIRST, MARK_REMEDY_TAIL, OTHER_OPERATOR_CLAIM_OUTCOME, claimLogDescription, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety, withLedgerCheck, LEDGER_CHECK_PREAMBLE, HAND_POST_INSTRUCTION_DOC_BEGIN, HAND_POST_INSTRUCTION_DOC_END, HAND_POST_SETTLEMENT_DOC_BEGIN, HAND_POST_SETTLEMENT_DOC_END, renderHandPostSettlementDoc } from '@/lib/domain/accounting/hand-post-instruction'
 import { REUSED_POSTING_KEY_TYPES } from '@/lib/accounting/posting-key'
 import { GENERIC_HAND_POST_STEP, PAYMENT_POSTING_TYPES, UPDATE_POSTING_TYPES, handPostStepFor, NOT_LOADED_HAND_POST_INPUT, handPostInputOf, renderHandPostInstructionDoc, claimWarningFor, handPostInstruction, handPostOrderFor, markHandledWarningFor, releaseWarningFor } from '@/lib/domain/accounting/hand-post-instruction'
 import { ROUND_2_SHAPE, ROUND_4_SHAPE, unconditionalMoneySentences, unlicensedHistoryClaims } from '../helpers/unconditional-instruction'
@@ -506,86 +507,95 @@ test('[o3d-1e7sl Codex r16] the sink guard is wired at BOTH sinks every refusing
 })
 
 /**
- * SHRINK-ONLY ALLOW-LIST of the instructions that exist OUTSIDE the rendered corpus: per file, the exact number of instruction-shaped sentences in its string
- * literals (after the corpus is excluded). Equality, not a ceiling: a new instruction anywhere fails, and removing one forces this list down. Categories:
- *   REMEDY    - the file's refusal `remedy` strings are in the structural corpus above (through the sink); the rest are its own diagnostics.
- *   OTHER     - not an accounting posting (WMS, WooCommerce, settings, backups, e-mail, inventory, manufacturing, shopping): the hand-post claim does not exist there.
- *   DIAG      - an error / activity-log / report sentence outside the refusal inbox: the surface has no hand-post claim, and the instruction is conditional on
- *               its own ledger check or is a description; it is NOT audited by this test (listed so a new one cannot appear silently).
+ * Codex round 17: THE PER-SENTENCE AUDIT, STRUCTURAL AND SHRINK-ONLY. `instructionSites()` walks the AST of every string expression in lib/ app/ components/
+ * and attributes each instruction-shaped sentence to where it goes: inside `withHandPostSafety(...)` / `withLedgerCheck(...)` ('guard-call'), or the `remedy`
+ * of an object handed to a refusal sink that applies `withHandPostSafety` ('sink-remedy'). Both are SAFE by construction: a ledger-affecting post / re-post /
+ * re-save / resend / retry / reset instruction can only reach an operator through one of them. Every OTHER site must be declared below, one entry per
+ * sentence, with a verdict and a one-line justification, and the list is shrink-only by equality (a new unguarded instruction fails; a removed one forces the
+ * entry out). Verdicts:
+ *   DESCRIPTION    - not an instruction to the operator (it states what IMS does / did not do, or is a journal memo), so nothing can be followed.
+ *   CHECKS_FIRST   - an instruction that is itself the ledger check, or sits behind the ledger check in the same builder (typed step).
+ *   NON_ACCOUNTING - not an accounting posting at all (WMS, WooCommerce settings, scheduler, backup, inventory, BOM).
  */
+type SiteVerdict = 'DESCRIPTION' | 'CHECKS_FIRST' | 'NON_ACCOUNTING'
+const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdict; why: string; count?: number }> = [
+  { file: 'app/(dashboard)/settings/system/page.tsx', prefix: 'Restart the service after rotating the secret', verdict: 'NON_ACCOUNTING', why: 'scheduler secret rotation, no ledger involved' },
+  { file: 'app/(dashboard)/stock-control/stock-counts/stock-counts-client.tsx', prefix: 'Post this stock count?', verdict: 'NON_ACCOUNTING', why: 'inventory stock-count confirmation dialog' },
+  { file: 'app/actions/sync-exceptions.ts', prefix: 'Ran the post-maintenance warehouse re-check by hand', verdict: 'NON_ACCOUNTING', why: 'WMS ASN re-check log' },
+  { file: 'lib/accounting.ts', prefix: 'It was answered as "this connector does not post this type"', verdict: 'DESCRIPTION', why: 'states what the queue answered; nothing to follow' },
+  { file: 'lib/connectors/accounting-settlement-probe.ts', prefix: 'This entry will retry once that attempt is readable', verdict: 'DESCRIPTION', why: 'states IMS own retry behaviour' },
+  { file: 'lib/connectors/woocommerce/sync/order-completion-jobs.ts', prefix: 'Replay it: the retry re-reads the order first', verdict: 'NON_ACCOUNTING', why: 'WooCommerce order-completion write-back, no ledger posting' },
+  { file: 'lib/connectors/woocommerce/sync/product-sync.ts', prefix: 'Resolve the duplicate SKU / barcode', verdict: 'NON_ACCOUNTING', why: 'WooCommerce product-structure conflict' },
+  { file: 'lib/connectors/xero/daily-sync.ts', prefix: 'Daily batch DAILY_BATCH_GROUP_B not recreated', verdict: 'DESCRIPTION', why: 'states why the rebuild was refused' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'There is nothing that would stop a re-post.', verdict: 'DESCRIPTION', why: 'states a hazard; the instruction beside it is CHECK XERO first' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'CHECK XERO before re-queueing', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check, before any re-queue' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'NOTHING WAS SENT; the worker that holds the row now will post it.', verdict: 'DESCRIPTION', why: 'states what IMS did' },
+  { file: 'lib/cost-layers.ts', prefix: 'Reverse and repost shipment COGS after cost-layer revaluation', verdict: 'DESCRIPTION', why: 'journal memo text, not an instruction' },
+  { file: 'lib/cost-layers.ts', prefix: 'IMS cannot post a negative shipment COGS', verdict: 'DESCRIPTION', why: 'states a limitation' },
+  { file: 'lib/domain/accounting/invoice-number-ownership.ts', prefix: 'Refusing to post {} as invoice number {}', verdict: 'DESCRIPTION', why: 'states why IMS refused; the remedy sentence is guarded' },
+  { file: 'lib/domain/accounting/posting-mark-handled.ts', prefix: 'Check the ledger and settle that row in the accounting sync log first', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check' },
+  { file: 'lib/domain/accounting/posting-refusal-copy.ts', prefix: 'IMS does not post this.', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
+  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'Retry refund accounting queues it again', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind', count: 3 },
+  { file: 'lib/domain/accounting/posting-suppression.ts', prefix: 'IMS did NOT post {} for {} {}', verdict: 'DESCRIPTION', why: 'states what IMS did' },
+  { file: 'lib/domain/accounting/sync-row-settlement.ts', prefix: 'Without it the row records a post that nothing can be reconciled against.', verdict: 'DESCRIPTION', why: 'states a consequence' },
+  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'REMEDY: {lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'the sentence opens with the lookup of the document in the ledger; nothing is posted, the options are keep, void or reverse', count: 2 },
+  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{Lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'opens with the lookup in the ledger' },
+  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'THIS OPERATION RETURNS NO IDENTIFIER', verdict: 'DESCRIPTION', why: 'states why the document cannot be recorded' },
+  { file: 'lib/domain/sales/allocation-service.ts', prefix: 'The declared set holds quantity nothing has accounted', verdict: 'DESCRIPTION', why: 'states why the hand-back was refused' },
+  { file: 'lib/domain/sales/allocation-service.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
+  { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} carries no VAT rate of its own', verdict: 'DESCRIPTION', why: 'states why no identity exists (credit note "posts under")' },
+  { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} has no accounting tax code', verdict: 'DESCRIPTION', why: 'states why no identity exists' },
+  { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: 'Shipping posts under the order', verdict: 'DESCRIPTION', why: 'states why no identity exists' },
+  { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'Only if it is absent: re-save the order', verdict: 'CHECKS_FIRST', why: 'every such sentence follows the typed ledger-check sentence in the same builder and is conditional on its outcome', count: 5 },
+  { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'If it is absent, EITHER take a fresh claim first', verdict: 'CHECKS_FIRST', why: 'conditional on the ledger check and takes a fresh claim before posting' },
+  { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'Sales invoice update for {} against accounting invoice {} was NOT queued', verdict: 'DESCRIPTION', why: 'states what IMS did and why' },
+  { file: 'lib/fulfillment/overallocation-rebalancer.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
+  { file: 'lib/products/bom-recipe.ts', prefix: 'An older BOM recipe for a different product', verdict: 'NON_ACCOUNTING', why: 'manufacturing BOM recipe' },
+  { file: 'components/settings/backup-restore.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button', count: 2 },
+  { file: 'components/settings/database-reset.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button' },
+]
 
-/** The instruction-shaped sentences in a file's string literals (comments stripped, shared constants left as identifiers: they are in the corpus). */
-function instructionSentencesOf(file: string): string[] {
-  const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/['"`]\s*\+?\s*\n?\s*\+?\s*['"`]/g, '')
-  return stringLiterals(code).flatMap((literal) => literal.slice(1, -1).replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/))
-    .filter((sentence) => HAND_POST_INSTRUCTION_PATTERN.test(sentence) && !PROHIBITION.test(sentence) && !DESCRIPTION.test(sentence))
-}
-
-const OUTSIDE_THE_CORPUS: Record<string, { count: number; category: 'REMEDY' | 'OTHER' | 'DIAG' }> = {
-  // GENERATED by running this test with UPDATE_INSTRUCTION_ALLOWLIST=1; shrink-only (equality below).
-  'app/(dashboard)/settings/system/page.tsx': { count: 1, category: 'OTHER' },
-  'app/(dashboard)/stock-control/stock-counts/stock-counts-client.tsx': { count: 1, category: 'DIAG' },
-  'app/(dashboard)/sync/exceptions/exceptions-client.tsx': { count: 1, category: 'REMEDY' },
-  'app/actions/manufacturing.ts': { count: 2, category: 'REMEDY' },
-  'app/actions/purchase-orders.ts': { count: 10, category: 'REMEDY' },
-  'app/actions/sales.ts': { count: 3, category: 'REMEDY' },
-  'app/actions/sync-exceptions.ts': { count: 1, category: 'REMEDY' },
-  'components/settings/backup-restore.tsx': { count: 2, category: 'OTHER' },
-  'components/settings/database-reset.tsx': { count: 1, category: 'OTHER' },
-  'lib/accounting.ts': { count: 6, category: 'REMEDY' },
-  'lib/connectors/accounting-settlement-probe.ts': { count: 1, category: 'DIAG' },
-  'lib/connectors/woocommerce/sync/order-completion-jobs.ts': { count: 1, category: 'OTHER' },
-  'lib/connectors/woocommerce/sync/order-import.ts': { count: 2, category: 'OTHER' },
-  'lib/connectors/xero/daily-sync.ts': { count: 2, category: 'DIAG' },
-  'lib/connectors/xero/sync-processor.ts': { count: 2, category: 'REMEDY' },
-  'lib/cost-layers.ts': { count: 1, category: 'OTHER' },
-  'lib/domain/accounting/accounting-event-mirror.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/allocation-debit-passes.ts': { count: 2, category: 'REMEDY' },
-  'lib/domain/accounting/allocation-debit-posting-proof.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/create-dispatch-record.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/invoice-number-ownership.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/invoice-payment-capacity.ts': { count: 3, category: 'DIAG' },
-  'lib/domain/accounting/invoice-payment-enqueue.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/payment-ledger-hold.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/posting-mark-handled.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/posting-refusal-copy.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/accounting/posting-refusal-kinds.ts': { count: 3, category: 'DIAG' },
-  'lib/domain/accounting/prior-posting-evidence.ts': { count: 2, category: 'REMEDY' },
-  'lib/domain/accounting/settled-row-reconciliation.ts': { count: 1, category: 'DIAG' },
-  'lib/domain/accounting/sync-row-settlement.ts': { count: 2, category: 'REMEDY' },
-  'lib/domain/accounting/unrecorded-posted-document.ts': { count: 4, category: 'REMEDY' },
-  'lib/domain/inventory/stock-adjustment-apply.ts': { count: 1, category: 'OTHER' },
-  'lib/domain/purchasing/cancellation-service.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/purchasing/landed-cost-service.ts': { count: 2, category: 'REMEDY' },
-  'lib/domain/purchasing/supplier-credit-note.ts': { count: 4, category: 'REMEDY' },
-  'lib/domain/sales/allocation-service.ts': { count: 5, category: 'REMEDY' },
-  'lib/domain/sales/order-delete-affordance.ts': { count: 1, category: 'REMEDY' },
-  'lib/domain/sales/refund-posted-tax-identity.ts': { count: 3, category: 'REMEDY' },
-  'lib/domain/sales/refund-service.ts': { count: 2, category: 'REMEDY' },
-  'lib/domain/sales/sales-invoice-update-sync.ts': { count: 5, category: 'REMEDY' },
-  'lib/domain/wms/booked-in-service.ts': { count: 2, category: 'OTHER' },
-  'lib/fulfillment/overallocation-rebalancer.ts': { count: 1, category: 'OTHER' },
-  'lib/products/bom-recipe.ts': { count: 1, category: 'OTHER' },
-}
-
-test('[o3d-1e7sl Codex r16] every instruction-shaped sentence in the tree is either in the structural corpus or declared here, per file, exactly (shrink-only)', () => {
-  const OTHER = /\/(wms|woocommerce|settings|inventory|manufacturing|shopping|products|fulfillment)\/|crontab|backup|email|cost-layers|shopping|components\//
-  const actual: Record<string, { count: number; category: 'REMEDY' | 'OTHER' | 'DIAG' }> = {}
-  for (const file of walkSources()) {
-    if (file === 'lib/domain/accounting/hand-post-instruction.ts') continue // rendered in full by the corpus above
-    const n = instructionSentencesOf(file).length
-    if (n === 0) continue
-    actual[file] = { count: n, category: OTHER.test(file) ? 'OTHER' : /\bremedy\b/.test(read(file)) ? 'REMEDY' : 'DIAG' }
+test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by construction or declared per sentence (verdict + justification), exactly (shrink-only)', () => {
+  const sites = instructionSites()
+  assert.ok(sites.filter((s) => s.guard === 'guard-call').length >= 30, 'PRECONDITION: the AST walk finds the guarded sites (not vacuous)')
+  assert.ok(sites.filter((s) => s.guard === 'sink-remedy').length >= 15, 'PRECONDITION: the AST walk finds the sink-remedy sites (not vacuous)')
+  const unguarded = sites.filter((s) => s.guard === null)
+  const used = new Map<number, number>()
+  const undeclared: string[] = []
+  for (const site of unguarded) {
+    const idx = UNGUARDED_SITES.findIndex((e, i) => e.file === site.file && site.sentence.startsWith(e.prefix) && (used.get(i) ?? 0) < (e.count ?? 1))
+    if (idx < 0) undeclared.push(`${site.file}: ${site.sentence.slice(0, 140)}`)
+    else used.set(idx, (used.get(idx) ?? 0) + 1)
   }
-  if (process.env.UPDATE_INSTRUCTION_ALLOWLIST === '1') console.log(`# ALLOWLIST ${JSON.stringify(actual)}`)
-  const added = Object.keys(actual).filter((f) => !(f in OUTSIDE_THE_CORPUS))
-  const grown = Object.keys(actual).filter((f) => f in OUTSIDE_THE_CORPUS && actual[f]!.count > OUTSIDE_THE_CORPUS[f]!.count)
-  const stale = Object.keys(OUTSIDE_THE_CORPUS).filter((f) => !(f in actual) || actual[f]!.count < OUTSIDE_THE_CORPUS[f]!.count)
-  assert.deepEqual({ added, grown }, { added: [], grown: [] }, 'a NEW instruction outside the corpus: render it in the corpus (preferred) or declare it here with its category')
-  assert.deepEqual(stale, [], 'the allow-list is shrink-only: lower these counts to what the tree now has (an instruction was removed)')
-  const total = Object.values(OUTSIDE_THE_CORPUS).reduce((n, e) => n + e.count, 0)
-  console.log(`# r16 allow-list: ${Object.keys(OUTSIDE_THE_CORPUS).length} files, ${total} instruction sentences outside the corpus`)
-  assert.ok(Object.keys(OUTSIDE_THE_CORPUS).length > 20, 'PRECONDITION: the scan finds the tree\'s instructions (not vacuous)')
-  // control: a file with an instruction that is not declared would fail
-  assert.ok(instructionSentencesOf('lib/accounting.ts').length >= 0)
+  assert.deepEqual(undeclared, [], 'an UNGUARDED instruction: wrap it in withLedgerCheck / withHandPostSafety (preferred), route it through the sink remedy, or declare it with a verdict')
+  const stale = UNGUARDED_SITES.filter((e, i) => (used.get(i) ?? 0) !== (e.count ?? 1)).map((e) => `${e.file}: ${e.prefix}`)
+  assert.deepEqual(stale, [], 'shrink-only: remove / lower these entries (the instruction was removed or guarded)')
+  for (const e of UNGUARDED_SITES) assert.ok(e.why.length > 10, `${e.file}: ${e.prefix} needs a justification`)
+  if (process.env.PRINT_INSTRUCTION_AUDIT === '1') {
+    for (const s of sites) {
+      const e = s.guard === null ? UNGUARDED_SITES.find((x) => x.file === s.file && s.sentence.startsWith(x.prefix)) : null
+      console.log(`AUDIT\t${s.file}\t${s.sentence.slice(0, 110)}\t${s.guard ?? e?.verdict}\t${e?.why ?? ''}`)
+    }
+  }
+})
+
+test('[o3d-1e7sl Codex r17] the unguarded-site check can fail (a new unguarded instruction is flagged)', () => {
+  const probe = { file: 'lib/x.ts', sentence: 'Post it again by hand.', guard: null as null }
+  const declared = UNGUARDED_SITES.some((e) => e.file === probe.file && probe.sentence.startsWith(e.prefix))
+  assert.equal(declared, false, 'control: an undeclared unguarded instruction does not match any entry')
+  assert.equal(withLedgerCheck('Post it again by hand.').startsWith(LEDGER_CHECK_PREAMBLE), true)
+  assert.equal(withLedgerCheck('Nothing to do here.'), 'Nothing to do here.')
+  assert.equal(withLedgerCheck(withLedgerCheck('Post it again by hand.')), withLedgerCheck('Post it again by hand.'), 'idempotent')
+})
+
+test('[o3d-1e7sl Codex r17] the daily-batch diagnostics, rendered through the REAL builders, never advise a re-post before the ledger check', () => {
+  for (const [name, text] of [['unproved row', dailyBatchUnprovedRefusal('DAILY_BATCH_GROUP_B', 'R-1 (id-1, CANCELLED)')], ['asserted row', dailyBatchAssertedRefusal('DAILY_BATCH_GROUP_B', 'R-1 (id-1, SYNCED, external id J-1)')]] as const) {
+    const sentences = text.replace(/\s+/g, ' ').split(/(?<=[.!?])\s+/)
+    const instructionIdx = sentences.findIndex((x) => /re-?post|post it|re-?save|raise it/i.test(x) && !/could post|rebuild posts|would post/i.test(x))
+    assert.ok(instructionIdx >= 0, `${name}: PRECONDITION: the diagnostic carries a post instruction`)
+    const before = sentences.slice(0, instructionIdx + 1).join(' ')
+    assert.match(before, /check[^.]*(accounting system|ledger)|(Open|open) that document in the accounting system/, `${name}: the ledger check comes before the instruction`)
+    assert.match(before, /only if|If it does not exist|does not exist/i, `${name}: the instruction is conditional on the check`)
+  }
+  assert.doesNotMatch(dailyBatchUnprovedRefusal('X', 'r'), /Re-post it deliberately, or leave it/, 'the old unconditional advice is gone')
 })

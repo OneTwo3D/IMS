@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
@@ -3447,12 +3448,12 @@ export function unserviceableRefundAccountingRetryPins(
 
 /** The refusal an unserviceable pin produces, named so an operator knows which ledger and why. */
 export function unserviceableRefundAccountingRetryError(pins: readonly string[]): string {
-  return 'This refund\'s staged accounting reversals are pinned to '
+  return withLedgerCheck('This refund\'s staged accounting reversals are pinned to '
     + `${pins.join(', ')}, which this build no longer ships. They are NOT re-queued: an unpinned `
     + 'retry would post them to the active ledger instead, crediting one set of books for a '
     + 'reversal that was proved against another. The refund keeps its retry flag and its staged '
     + 'reversals, so nothing is lost — reconnect that ledger, or raise the reversals against it by '
-    + 'hand and clear the flag.'
+    + 'hand and clear the flag.')
 }
 
 /**
@@ -3941,7 +3942,7 @@ export async function createSalesOrderRefund(
       const conflictResult: { conflict: RefundCreationConflict; conflictError: string } = input.chargeback
         ? {
             conflict: 'prior-refund',
-            conflictError: `Order already carries refund ${conflictRef} — auto-chargeback skipped because the remaining balance is ambiguous; raise the credit note manually.`,
+            conflictError: withLedgerCheck(`Order already carries refund ${conflictRef} — auto-chargeback skipped because the remaining balance is ambiguous; raise the credit note manually.`),
           }
         : {
             conflict: 'prior-chargeback',
@@ -5278,10 +5279,10 @@ export async function retrySalesOrderRefundAccounting(
         if (recordVerdict === 'staged-never-recorded') {
           return {
             success: false,
-            error: 'This refund\'s accounting reversals were staged but the record of them was never '
+            error: withLedgerCheck('This refund\'s accounting reversals were staged but the record of them was never '
               + 'written, and the same staging cleared the order\'s revenue deferral — so no retry can '
               + 'derive them again. Raise the COGS/unearned/allocated-inventory reversals manually against '
-              + 'the refund\'s own cost snapshots and reconcile the order, then clear this flag by hand.',
+              + 'the refund\'s own cost snapshots and reconcile the order, then clear this flag by hand.'),
           }
         }
         // -----------------------------------------------------------------------------------------

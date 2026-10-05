@@ -110,6 +110,7 @@
  * re-post of the SAME entry return the original Xero payment rather than create a second.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { LEDGER_STANDING_SELECT, ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
@@ -652,18 +653,18 @@ export async function guardInvoicePaymentCapacity(
       + `${params.accountingInvoiceId}: `
     switch (verdict.refusal) {
       case 'LEDGER_AMOUNT_UNKNOWN':
-        return head
+        return withLedgerCheck(head
           + `a payment already posted for this invoice does not record its amount, so IMS cannot tell `
           + `how much of the invoice is still outstanding. Nothing was sent — reconcile the invoice in `
-          + `the ledger and register the payment there by hand.`
+          + `the ledger and register the payment there by hand.`)
       case 'ASSERTED_REGISTRATION':
-        return head
+        return withLedgerCheck(head
           + `a payment already registered against this invoice (sync ${verdict.ambiguousIds.join(', ')}) was `
           + `recorded on an OPERATOR'S ASSERTION, not confirmed by the accounting connector: IMS did not verify `
           + `that settlement against the ledger: it read no document and compared no amount, so the figure it holds for it `
           + `is what it MEANT to send. How much of this invoice is already settled therefore cannot be `
           + `measured, and IMS will not guess with money. Nothing was sent. Open that payment in the ledger, `
-          + `confirm what it actually settled, and register any balance genuinely owed there by hand.`
+          + `confirm what it actually settled, and register any balance genuinely owed there by hand.`)
       case 'SETTLED_ON_RETIRED_DOCUMENT':
         return head
           + `this receipt is ALREADY REGISTERED in the accounting connector against a different document `
@@ -684,11 +685,11 @@ export async function guardInvoicePaymentCapacity(
           + `there, resolve that sync entry and record the receipt again; if it IS there, the invoice `
           + `is already settled by it and no further payment should be registered.`
       case 'WOULD_OVERPAY':
-        return head
+        return withLedgerCheck(head
           + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed()} with `
           + `${(verdict.alreadyPosted ?? toDecimal(0)).toFixed()} already registered against it, so this payment `
           + `would over-settle it. Nothing was sent — reconcile the invoice in the ledger and register `
-          + `the balance there by hand if it is genuinely owed.`
+          + `the balance there by hand if it is genuinely owed.`)
     }
   })()
 

@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
 //
@@ -301,16 +302,16 @@ export class SupplierCreditNoteEnqueueDeclined extends Error {
   /** What the operator sees. Nothing here is recoverable by retrying the same action unchanged. */
   get operatorMessage(): string {
     return this.reason === 'refused'
-      ? 'The credit note was NOT posted. IMS could not establish that the accounting connector now '
+      ? withLedgerCheck('The credit note was NOT posted. IMS could not establish that the accounting connector now '
         + 'selected is the one holding the bill this credit is allocated against — an accounting invoice '
         + 'id is kept when the connector selection changes and carries no provenance of its own, so '
         + 'allocating against the wrong one would credit an unrelated document. The credit note is still '
         + 'a draft. Switch back to the connector holding the bill, or re-post the bill to the connector '
-        + 'now in use, then post the credit note again.'
-      : 'The credit note was NOT posted: the accounting connector would not accept a supplier credit '
+        + 'now in use, then post the credit note again.')
+      : withLedgerCheck('The credit note was NOT posted: the accounting connector would not accept a supplier credit '
         + 'note (accounting sync, or purchase-credit-note posting specifically, is switched off). The '
         + 'credit note is still a draft — turn that posting back on and post it again, or enter the '
-        + 'credit in the ledger by hand.'
+        + 'credit in the ledger by hand.')
   }
 }
 
@@ -397,7 +398,7 @@ export function decidePurchaseCreditNotePost(input: {
         + `${lookup.error}. Posting without that answer risks a SECOND ACCPAYCREDIT for one credit — Xero's `
         + `idempotency key lasts six minutes and ACCPAYCREDIT numbers need not be unique, so a replay creates `
         + `rather than collides. ${lookup.unaskable
-          ? 'This will not clear on its own: post the credit note in Xero by hand and link its id to the IMS credit note.'
+          ? withLedgerCheck('This will not clear on its own: post the credit note in Xero by hand and link its id to the IMS credit note.')
           : 'It retries.'}`,
     }
   }
@@ -442,10 +443,10 @@ export function decidePurchaseCreditNotePost(input: {
     action: 'refuse',
     retryable: false,
     reason:
-      `NOTHING WAS SENT. A create for credit note ${number} has already been dispatched to Xero and its outcome `
+      withLedgerCheck(`NOTHING WAS SENT. A create for credit note ${number} has already been dispatched to Xero and its outcome `
       + `is unknown — the ledger does not show the document now, but an empty answer is not proof that the earlier `
       + `attempt failed, and creating again is how one credit note becomes two ACCPAYCREDITs. Check Xero for `
       + `${number}: if it is there, link its id to the IMS credit note; if it is genuinely absent, post it from a `
-      + `fresh sync row.`,
+      + `fresh sync row.`),
   }
 }

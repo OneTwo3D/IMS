@@ -13,6 +13,7 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { createHash } from 'node:crypto'
 
@@ -711,6 +712,30 @@ export function takeDailyBatchWindow<T>(
  */
 type DailyBatchRecreateVerdict = { blocked: boolean; refusal: string | null }
 
+/** Codex round 17: the refusal for a daily batch whose cancelled/failed row was settled BY HAND as posted. Pure, so the operator wording is rendered by the tests. */
+export function dailyBatchAssertedRefusal(type: string, describeAsserted: string): string {
+  return withLedgerCheck(`Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
+        '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
+        'system; IMS did not verify the document, which organisation holds it or its lines.' +
+        ' The batch is deliberately NOT recreated, because if the journal really is ' +
+        'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
+        'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
+        'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +
+        'the row\'s own lines and correct the id.')
+}
+
+/** Codex round 17: the refusal for a daily batch with cancelled/failed rows that do not prove the journal never reached the ledger. Pure, so the tests render it. */
+export function dailyBatchUnprovedRefusal(type: string, describe: string): string {
+  return withLedgerCheck(
+    `Daily batch ${type} not recreated: ${describe} — ` +
+      'a cancelled or failed row does not establish that its journal never reached the ledger ' +
+      '(the processor posts before it persists SYNCED), so re-raising it could post the same ' +
+      'journal twice. Check the accounting system for a journal covering this batch first: if one is there, settle the row with its id; ' +
+      'only if none is there, re-post it deliberately. Or leave it: the orders/shipments keep their stamps ' +
+      'and the standing accounting invariants keep reporting them.',
+  )
+}
+
 async function dailyBatchRecreateVerdict(
   type: DailyBatchLogType,
   refs: string | DailyBatchLiveRefs,
@@ -767,14 +792,7 @@ async function dailyBatchRecreateVerdict(
     return {
       blocked: true,
       refusal:
-        `Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
-        '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
-        'system; IMS did not verify the document, which organisation holds it or its lines.' +
-        ' The batch is deliberately NOT recreated, because if the journal really is ' +
-        'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
-        'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
-        'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +
-        'the row\'s own lines and correct the id.',
+        dailyBatchAssertedRefusal(type, describeAsserted),
     }
   }
   // Read from the SHARED rule, not restated (o3d-nepa). Retention's delete predicate asks the same
@@ -795,11 +813,7 @@ async function dailyBatchRecreateVerdict(
   return {
     blocked: true,
     refusal:
-      `Daily batch ${type} not recreated: ${describe} — ` +
-      'a cancelled or failed row does not establish that its journal never reached the ledger ' +
-      '(the processor posts before it persists SYNCED), so re-raising it could post the same ' +
-      'journal twice. Re-post it deliberately, or leave it: the orders/shipments keep their stamps ' +
-      'and the standing accounting invariants keep reporting them.',
+      dailyBatchUnprovedRefusal(type, describe),
   }
 }
 

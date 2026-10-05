@@ -8,6 +8,7 @@
  * endpoint worth exposing — so the shared logic lives here and app/actions/sales.ts imports it.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
@@ -687,8 +688,8 @@ export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string
       + 'undoable. Read the document, record what is actually there, and ESCALATE.'
   }
   if (redrive.redrive === 'none') {
-    return 'Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
-      + 'genuinely owed.'
+    return withLedgerCheck('Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
+      + 'genuinely owed.')
   }
   if (redrive.redrive === 'invoice-post') {
     return 'HAND SETTLEMENT IS REFUSED HERE: this receipt has no sync row of its own, which is exactly what the '

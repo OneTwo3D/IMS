@@ -40,6 +40,7 @@
  * that wrote them. What they are no longer allowed to do is stand in for the history.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { parseDailyBatchReference } from '@/lib/domain/accounting/daily-batch-reference'
 import { ledgerStanding, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
@@ -743,10 +744,10 @@ export function allocationDebitForeignLedgerReports(input: {
     // Codex round 4: "NOT on record" is a statement about IMS's own rows, not the foreign ledger, so BOTH remedies
     // check first and post only for a genuinely absent journal.
     const remedy = ambiguous
-      ? `CHECK ${connector} FIRST for a journal covering this batch, and post DR Allocated Inventory `
-        + `by hand there ONLY if it is genuinely absent`
-      : `CHECK ${connector} FIRST for a journal covering this batch, and post it there by hand from the orders' own `
-        + 'pass history ONLY if it is genuinely absent'
+      ? withLedgerCheck(`CHECK ${connector} FIRST for a journal covering this batch, and post DR Allocated Inventory `
+        + `by hand there ONLY if it is genuinely absent`)
+      : withLedgerCheck(`CHECK ${connector} FIRST for a journal covering this batch, and post it there by hand from the orders' own `
+        + 'pass history ONLY if it is genuinely absent')
     return (
       `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated in full: ${input.referenceId} — £${total.toFixed(2)} of it `
       + `was debited to Allocated Inventory on ${connector}, ${standing}. `
@@ -760,10 +761,10 @@ export function allocationDebitForeignLedgerReports(input: {
 
 export function allocationDebitRecreateRefusal(referenceId: string, reasons: readonly string[]): string {
   return (
-    `Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated: ${referenceId} — ${reasons.join('; ')}. `
+    withLedgerCheck(`Daily batch DAILY_BATCH_INVENTORY_ALLOC not recreated: ${referenceId} — ${reasons.join('; ')}. `
     + '`allocationBatchAmount` is the CUMULATIVE total of every Group A2 pass an order has been '
     + 'through, not this batch\'s share of it, so rebuilding the batch from it would re-post pounds '
     + 'an EARLIER batch already carried. If this batch really is missing from the ledger, post it '
-    + 'there by hand from the orders it named and leave the stamps alone.'
+    + 'there by hand from the orders it named and leave the stamps alone.')
   )
 }

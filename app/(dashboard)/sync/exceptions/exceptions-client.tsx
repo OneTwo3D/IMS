@@ -1,5 +1,6 @@
 'use client'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Fragment, useState, useTransition } from 'react'
 import {
   ACCOUNTING_POSTING_REFUSAL_CLEARING_LABEL,
@@ -582,7 +583,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
-            detail="Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers."
+            detail={withLedgerCheck("Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers.")}
             shown={data.refundSyncParks.length}
             total={data.summary.refundSyncParks}
           />

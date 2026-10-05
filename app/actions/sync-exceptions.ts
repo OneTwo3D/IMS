@@ -66,7 +66,7 @@ import {
   type MarkHandledClient,
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
-import { claimLogDescription, handPostInstruction, handPostOrderFor, markLogDescription, markNotice, releaseLogDescription, releaseNotice } from '@/lib/domain/accounting/hand-post-instruction'
+import { claimLogDescription, handPostInstruction, handPostOrderFor, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -1686,7 +1686,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             handPostDeclineUnaccounted: row.handPostDeclineUncountedAt !== null,
             // o3d-j625 r16: the site's own remedy, VERBATIM, in every case — round 12's property with the
             // exception r14 introduced removed again. What to do FIRST is its own field.
-            remedy: row.remedy,
+            // Codex round 17: GUARDED ON READ too. A row persisted before the sink guard existed still holds its raw remedy; the guard is idempotent,
+            // so a row that already carries the preamble is returned as it is.
+            remedy: withHandPostSafety(row.remedy),
             handPostOrder: clearing === null || clearing === 'auto'
               ? null
               : handPostOrderFor({ queuedRow, state: 'loaded', earlierPostingDetails, retiredUnproven, type: row.type, claim: handPostClaim }),

@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { isUniqueConstraintViolation, uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
@@ -374,7 +375,7 @@ const PENDING_REFUSAL_MESSAGE =
   + 'processed, retried, or retired by the ordinary sweeps.'
 
 function describeDailyBatchRefusal(type: string): string {
-  return `${type} is a DAILY BATCH row and cannot be settled as NOT POSTED. A batch row is keyed by `
+  return withLedgerCheck(`${type} is a DAILY BATCH row and cannot be settled as NOT POSTED. A batch row is keyed by `
     + 'the batch, not by one order, and CANCELLED reads as "never posted" BOTH to the batch recreators '
     + 'and to the order delete guard. Settling it that way would let an order be hard-deleted while a '
     + 'recreate is already building a journal that still contains that order\'s value. What you CAN do '
@@ -384,7 +385,7 @@ function describeDailyBatchRefusal(type: string): string {
     + 'reporting the batch until the journal is confirmed. If the journal is genuinely not in the '
     + 'accounting system, post it there from this '
     + 'row\'s own lines and record that id here — a batch is a finance-level correction, and there is '
-    + 'no per-row cancel for one.'
+    + 'no per-row cancel for one.')
 }
 
 /**
