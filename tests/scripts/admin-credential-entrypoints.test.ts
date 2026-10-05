@@ -295,3 +295,61 @@ test('[o3d-1bgr] a role under the migration name is never granted anything befor
   assert.match(release.slice(close, close + 400), /return EXIT_ERROR/, 'and a failure to close returns before them')
   assert.ok(!/retireMigrationLogin\(/.test(mjs.slice(mjs.indexOf('async function main()'))), 'main() does not close it again after the grants')
 })
+
+/**
+ * A FAILED RELEASE IS JUDGED BY THE DATABASE, NOT BY THE EXIT STATUS (Codex round 3, HIGH). In each entrypoint the
+ * arm that handles a non-zero release reads FENCE_STATE through the whole-line reader, and every value but `held`
+ * clears DB_FENCE_UP (so the exit trap re-fences and the banner stops claiming a fence) before the old "could not
+ * be released, no CONNECT" message can be printed.
+ */
+function failedReleaseArm(text: string, errorPhrase: string): { reads: boolean; clears: boolean; ordered: boolean; arm: string } {
+  const message = text.indexOf(errorPhrase)
+  const reader = text.lastIndexOf('db_fence_state_after_release', message)
+  const arm = reader === -1 ? '' : text.slice(reader, message)
+  return {
+    reads: reader !== -1 && /\$\{?released\}?/.test(arm),
+    clears: /!= "held" \]\]; then\s+DB_FENCE_UP=false[\s\S]*return 1/.test(arm),
+    ordered: reader !== -1 && reader < message,
+    arm,
+  }
+}
+
+const RELEASE_ENTRYPOINTS: Array<[string, string]> = [
+  ['scripts/deploy.sh', 'THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role'],
+  ['scripts/update.sh', 'THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role still has'],
+  ['scripts/install.sh', 'THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role still has'],
+]
+
+test('[o3d-1bgr] every entrypoint clears DB_FENCE_UP on a failed release unless the database reports FENCE_STATE=held', () => {
+  for (const [file, phrase] of RELEASE_ENTRYPOINTS) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    const seen = failedReleaseArm(text, phrase)
+    console.log(`${file}: reads FENCE_STATE ${seen.reads}, clears DB_FENCE_UP ${seen.clears}, before the old message ${seen.ordered}`)
+    assert.ok(seen.reads && seen.clears && seen.ordered, `${file}: the failed-release arm reads the database's state and clears the flag`)
+    // the guard can fail: the same check on the text with the clearing line removed
+    const broken = text.replace(/(!= "held" \]\]; then\s+)DB_FENCE_UP=false/, '$1:')
+    assert.notEqual(broken, text, `${file}: precondition: the mutation applies`)
+    assert.equal(failedReleaseArm(broken, phrase).clears, false, `${file}: MUTATION no-clear: the check turns red`)
+  }
+})
+
+test('[o3d-1bgr] the recovery wrapper reads FENCE_STATE and never says "still closed" on a failed release without it', () => {
+  const lib = readFileSync(join(ROOT, 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const from = lib.indexOf('release_the_fence() {')
+  const body = lib.slice(from, lib.indexOf('\n}\n', from))
+  assert.match(body, /machine_field "\$\{released\}" FENCE_STATE/, 'it reads the whole-line key')
+  assert.match(body, /FENCE_STATE=\$\{fence_state\}/, 'and names the answer to the operator')
+  assert.match(body, /CONNECT may already be restored/, 'with the warning for restored/unknown')
+  assert.ok(body.indexOf('FENCE_STATE') > 0 && body.indexOf('FENCE_STATE') < body.indexOf('digest="$(sha256sum'), 'on the failure arm, before any record handling')
+})
+
+test('[o3d-1bgr] no entrypoint decides the fence state from DB_FENCE_UP alone after a release helper call (sweep)', () => {
+  // Every `--release` invocation in an entrypoint is followed, in the same function, by the database-state reading.
+  for (const file of ['scripts/deploy.sh', 'scripts/update.sh', 'scripts/install.sh']) {
+    const text = readFileSync(join(ROOT, file), 'utf8')
+    const calls = [...text.matchAll(/db_fence_helper "\$\{?fence_script\}?" --release /g)]
+    console.log(`${file}: ${calls.length} --release helper call(s)`)
+    assert.equal(calls.length, 1, `${file}: exactly one place runs the release helper`)
+    assert.ok(text.indexOf('db_fence_state_after_release', calls[0].index) > calls[0].index, `${file}: and it reads FENCE_STATE after`)
+  }
+})

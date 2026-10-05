@@ -3978,6 +3978,15 @@ release_db_connections() {
     return 0
   fi
 
+  # The database's answer, not the exit status (Codex round 3, HIGH): see the same lines in deploy.sh.
+  local fence_state=""
+  fence_state="$(db_fence_state_after_release "${released}")"
+  if [[ "${fence_state}" != "held" ]]; then
+    DB_FENCE_UP=false
+    error "THE RELEASE FAILED (exit ${rc}) BUT THE FENCE IS NOT STANDING: the database reports FENCE_STATE=${fence_state}."
+    error "CONNECT may be back for ${APP_USER}'s role, so this run treats the database as OPEN and will re-fence it on the way out."
+    return 1
+  fi
   error "THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role still has"
   error "no CONNECT on this database, so the application cannot start until this is undone:"
   error "  ${DB_FENCE_RELEASE_CMD}"

@@ -3181,6 +3181,18 @@ release_db_connections() {
     return 0
   fi
 
+  # WHAT THE DATABASE SAYS, NOT WHAT THE EXIT STATUS IMPLIES (Codex round 3, HIGH). The GRANT transaction can
+  # commit and the release still exit non-zero (the verification read failed, the COMMIT acknowledgement was
+  # lost), so a non-zero status is not "the fence is still up". Only `held` leaves DB_FENCE_UP true; anything
+  # else clears it, so the exit trap re-fences and the banner stops claiming a fence that is not standing.
+  local fence_state=""
+  fence_state="$(db_fence_state_after_release "$released")"
+  if [[ "$fence_state" != "held" ]]; then
+    DB_FENCE_UP=false
+    echo -e "${RED}[ERROR]${RESET} THE RELEASE FAILED (exit ${rc}) BUT THE FENCE IS NOT STANDING: the database reports FENCE_STATE=${fence_state}." >&2
+    echo -e "${RED}[ERROR]${RESET} CONNECT may be back for ${APP_USER}'s role, so this run treats the database as OPEN and will re-fence it on the way out." >&2
+    return 1
+  fi
   echo -e "${RED}[ERROR]${RESET} THE CONNECTION FENCE COULD NOT BE RELEASED (exit ${rc}). The application role" >&2
   echo -e "${RED}[ERROR]${RESET} still has no CONNECT on this database and cannot start until this is undone:" >&2
   echo -e "${RED}[ERROR]${RESET}   ${DB_FENCE_RELEASE_CMD}" >&2

@@ -3567,6 +3567,17 @@ db_fence_machine_field() {
   printf '%s\n' "${value}"
 }
 
+# WHAT A RELEASE THAT DID NOT SUCCEED LEFT STANDING, READ FROM THE DATABASE'S OWN ANSWER (Codex round 3,
+# HIGH). The helper reads the ACL again on a fresh connection after any failed release and prints one whole
+# line, FENCE_STATE=held|restored|unknown. This returns that word, and `unknown` for anything else: no line,
+# two lines, a value that is not one of the three. Callers treat only `held` as a fence that is standing;
+# an exit status or a flag is never the evidence, because the GRANT may have committed before the failure.
+db_fence_state_after_release() {
+  local state=""
+  state="$(db_fence_machine_field "$1" FENCE_STATE '^(held|restored|unknown)$')" || state="unknown"
+  printf '%s\n' "${state}"
+}
+
 db_fence_machine_verdict() {
   local stream="$1" prefix="$2" nonce="$3" affirmative="$4"
   [[ "${nonce}" =~ ^[0-9a-f]{32,64}$ ]] || return 1
@@ -5027,6 +5038,14 @@ release_the_fence() {
   # every grantee already holds CONNECT, which is what a crash between the grants and this step
   # leaves. Both mean the same thing about the database: there is nothing left to grant here.
   if [[ "${rc}" -ne 0 && "${rc}" -ne 6 ]]; then
+    # THE DATABASE'S ANSWER, NOT THE STATUS (Codex round 3, HIGH): a failed release can have committed its grants.
+    local fence_state=""
+    fence_state="$(machine_field "${released}" FENCE_STATE '^(held|restored|unknown)$')" || fence_state="unknown"
+    if [[ "${fence_state}" == "held" ]]; then
+      echo "The release failed and the database reports the fence STILL STANDING (FENCE_STATE=held); nothing was restored. The record is untouched; run this again." >&2
+    else
+      echo "THE RELEASE FAILED BUT THE FENCE IS NOT NECESSARILY STANDING (FENCE_STATE=${fence_state}): CONNECT may already be restored to the application. The record is untouched and a re-run is safe. Do NOT start or stop anything on the belief that the database is still closed." >&2
+    fi
     return 1
   fi
   if [[ ! -e "${state_file}" && ! -L "${state_file}" ]]; then

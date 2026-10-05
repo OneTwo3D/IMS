@@ -36,6 +36,10 @@ This repository uses an `x.y.z` release scheme.
   restored** (the login is closed first; a failure leaves the fence standing). The audit also refuses a marked role
   holding anything beyond CONNECT on the application database, and any direct membership besides the application
   role (PostgreSQL 16+ INHERIT/SET options are not trusted to compare).
+  A release that fails after its grants may have committed now reports `FENCE_STATE=held|restored|unknown` read from
+  the ACL on a fresh connection, and the three entrypoints and the wrapper clear their "fence is up" state on
+  anything but `held`; `--preflight` and `--fence` (again at the end of the drain) refuse a migration login that is
+  already open (LOGIN or a stored password).
 - **The operator recovery wrappers** read the root file, run the helper as root, and (o3d-bpbv) take the cutover
   lock first, resolve the documented pointer once, hash that directory and execute the helper by the resolved
   path, so a publication landing between the hash and the exec can no longer substitute a different release.

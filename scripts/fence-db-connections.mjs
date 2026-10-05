@@ -1069,7 +1069,7 @@ export function assessMigrationRole({ adminRole, appRole, adminIsSuperuser, admi
 /** The comment the tool puts on a migration role it creates. A role without it was not made by this tool and is never adopted. */
 export const MIGRATION_ROLE_MARKER = 'ims migration login: created by the IMS installer, holds nothing of its own'
 
-export function assessMigrationRoleAttributes(f) {
+export function assessMigrationRoleAttributes(f, { requireClosed = false } = {}) {
   const name = f.migrationRole
   const refuse = (why) => ({ usable: false, reason: `the migration role ${name} ${why}` })
   if (!name) return { usable: false, reason: 'no migration role was named (--migration-role), so the migration has no login that is not the deploy admin.' }
@@ -1090,6 +1090,11 @@ export function assessMigrationRoleAttributes(f) {
   }
   if (f.directDependencies > 0) {
     return refuse(`holds or owns ${f.directDependencies} object(s) or privilege(s) of its own somewhere in this cluster (an owned object, a direct grant on a table, schema, database or other object, or a default privilege), which \`SET ROLE NONE\` on a migration connection would exercise. Its only grant is CONNECT on this database.`)
+  }
+  // OUTSIDE A WINDOW THE LOGIN IS CLOSED (Codex round 3, HIGH). --preflight and --fence ask for it; the
+  // window's own steps (--print-migration-url, --ensure-migration-role) do not, because they are what open it.
+  if (requireClosed && (f.canLogin || f.hasStoredPassword === true)) {
+    return refuse(`is ALREADY OPEN (${f.canLogin ? 'LOGIN is enabled' : 'it still holds a stored password'}), which is what a release that could not close it leaves behind. Whoever holds that password can connect after the drain, through the CONNECT this role keeps. Close it first, as a superuser or its administrator: ALTER ROLE ${quoteIdent(name)} NOLOGIN PASSWORD NULL; (or run the release wrapper, which does), then start the cutover again.`)
   }
   if (f.databaseExtraPrivileges > 0) {
     return refuse(`holds a privilege on ${f.database} beyond CONNECT (CREATE or TEMPORARY), or CONNECT with grant option. On this database it may hold CONNECT and nothing else; whatever else it needs it has through the application role.`)
@@ -2048,6 +2053,13 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
                 AND NOT (d.deptype = 'a' AND d.classid = 'pg_database'::regclass
                          AND d.objid = (SELECT oid FROM pg_database WHERE datname = current_database()))) AS direct_dependencies,
             (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS role_settings,
+            -- IS THE LOGIN OPEN. Outside a window the role is NOLOGIN with no password (D1); a role left
+            -- LOGIN, or still holding the password of an earlier window, is a login somebody may hold. The
+            -- password column is readable only where the admin may read pg_authid: unreadable is null, and
+            -- null is "not known" (rolcanlogin is the check that does not depend on it).
+            r.rolcanlogin,
+            CASE WHEN has_table_privilege(current_user, 'pg_catalog.pg_authid', 'SELECT')
+                 THEN (SELECT x.rolpassword IS NOT NULL FROM pg_authid x WHERE x.oid = r.oid) END AS has_stored_password,
             -- ON THIS DATABASE the role may hold CONNECT and nothing else, and not with grant option. The
             -- shared-dependency count above deliberately skips this database's ACL entry (one dependency
             -- per grantee, not per privilege), so the entry is read here, privilege by privilege.
@@ -2089,6 +2101,8 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
     databaseExtraPrivileges: Number(row.database_extra_privileges ?? 0),
     otherMemberships: Number(row.other_memberships ?? 0),
     roleSettings: Number(row.role_settings ?? 0),
+    canLogin: row.rolcanlogin === true,
+    hasStoredPassword: row.has_stored_password === true ? true : row.has_stored_password === false ? false : null,
     rolsuper: row.rolsuper === true,
     rolcreaterole: row.rolcreaterole === true,
     rolcreatedb: row.rolcreatedb === true,
@@ -2128,7 +2142,7 @@ async function assessFence(client, appRole, migrationRole = '') {
   // THE MIGRATION LOGIN, asked of the server (owner decision C3). null when the caller named none:
   // the entrypoints always do, through db_fence_exec_root().
   const migration = migrationRole
-    ? assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, facts))
+    ? assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, migrationRole, facts), { requireClosed: true })
     : null
   return { facts, plan, role, migration }
 }
@@ -3089,6 +3103,18 @@ async function completeFence(client, options, { facts, plan, grants, appRole, re
     remaining = await otherClientBackends(client)
   }
 
+  // AND THE LOGIN IS ASKED ABOUT AGAIN, HERE, AT THE END OF THE DRAIN (Codex round 3, HIGH). The preflight
+  // and the read at the top of --fence were taken before the revoke; a role opened since (or left open and
+  // missed) keeps its own CONNECT through everything above, so the room is not closed to it.
+  if (options.migrationRole) {
+    const late = assessMigrationRoleAttributes(await readMigrationRoleFacts(client, appRole, options.migrationRole, await readFacts(client, appRole)), { requireClosed: true })
+    if (!late.usable && /ALREADY OPEN/.test(late.reason)) {
+      console.error(`Fence applied, but NOT HELD: ${late.reason}`)
+      console.error('The fence is left standing; release it with --release (which closes the login) before starting the application.')
+      return EXIT_FENCE_STANDING
+    }
+  }
+
   if (remaining.length > 0) {
     console.error(`Fence applied, but ${remaining.length} client backend(s) are still attached:`)
     for (const row of remaining) {
@@ -3328,6 +3354,8 @@ export async function doRelease(client, options) {
     return releaseWithoutRecord(client, options, read, connectedDatabase, connectedPostmaster)
   }
   const state = read.state
+  // What a failed release has to report on is the record's own list, so it is kept where main() can read it.
+  options.releaseRecord = { database: state.database, revoked: Array.isArray(state.revoked) ? [...state.revoked] : [] }
 
   // The record names the database it fenced. If this connection is attached somewhere else, the
   // GRANTs below would name that database from a connection that has no business with it.
@@ -3541,17 +3569,29 @@ export async function doRelease(client, options) {
   // interruption after COMMIT reads `absent` on a stamped record and is answered by the retry arm
   // above. There is no interruption that leaves a mixed one.
   await client.query('BEGIN')
+  // FROM THE MOMENT COMMIT IS SENT, WHETHER IT TOOK IS NOT KNOWN TO THIS PROCESS (Codex round 3, HIGH): the
+  // server may have committed and the acknowledgement been lost. Nothing below may claim the fence still
+  // stands on that evidence; main() reads the ACL on a fresh connection and reports FENCE_STATE.
+  let commitSent = false
   try {
     for (const statement of grants) {
       await client.query(statement)
       console.error(`  ${statement}`)
     }
+    commitSent = true
     await client.query('COMMIT')
   } catch (error) {
     // The rollback is best-effort and its failure is not the news: what matters is that this run
     // does not report a release it did not complete. A transaction that never committed leaves
     // the fence exactly as it found it, which is the state a re-run is able to release from.
     await client.query('ROLLBACK').catch(() => {})
+    if (commitSent) {
+      console.error(`Release OUTCOME UNKNOWN: the COMMIT was sent and its result was not received (${error instanceof Error ? error.message : String(error)}).`)
+      console.error('CONNECT MAY ALREADY BE RESTORED. The ACL is read again on a new connection below (FENCE_STATE); until it says "held" nothing may treat the fence as standing.')
+      console.error('A re-run is safe either way. Or run these by hand as a superuser on that server:')
+      for (const statement of grants) console.error(`  ${statement}`)
+      return EXIT_ERROR
+    }
     console.error(`Release FAILED and was rolled back: ${error instanceof Error ? error.message : String(error)}`)
     console.error(`The fence described by ${options.stateFile} is still standing and its record is untouched, so a`)
     console.error('re-run releases from it. Or run these by hand as a superuser on that server:')
@@ -3566,7 +3606,7 @@ export async function doRelease(client, options) {
   )
   const check = verifyRelease(rows[0]?.datacl_privileges, state.revoked)
   if (!check.released) {
-    console.error(`Release did NOT take: ${check.missing.join(', ')} still lack CONNECT on ${state.database}.`)
+    console.error(`Release did NOT take (on the read just made): ${check.missing.join(', ')} lack CONNECT on ${state.database}; the grants were committed, so the ACL is read again on a new connection below (FENCE_STATE).`)
     console.error('Run this by hand as a superuser before starting the application:')
     for (const statement of grants) console.error(`  ${statement}`)
     return EXIT_ERROR
@@ -4017,6 +4057,51 @@ export async function retireMigrationLogin(client, migrationRole) {
   return false
 }
 
+/**
+ * AFTER ANY RELEASE THAT DID NOT SUCCEED, ASK THE DATABASE, ON A CONNECTION THAT IS NOT THE ONE THAT FAILED
+ * (Codex round 3, HIGH), and say it on the machine channel as one whole line:
+ *
+ *   FENCE_STATE=held       the application role cannot connect and none of the roles the record names holds CONNECT
+ *   FENCE_STATE=restored   the application role CAN connect: the fence is not standing, whatever the exit status says
+ *   FENCE_STATE=unknown    anything else (a mixed ACL, a role that cannot be asked about, no answer at all)
+ *
+ * The callers never infer the fence from an exit status or a flag: `restored` and `unknown` both mean "not
+ * up" to them, and only `held` leaves it standing.
+ */
+export function classifyFenceState({ appConnects, recordedHolding, answered }) {
+  if (!answered) return 'unknown'
+  if (appConnects) return 'restored'
+  return recordedHolding > 0 ? 'unknown' : 'held'
+}
+
+async function reportFenceState(connectionString, options) {
+  let state = 'unknown'
+  const fresh = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-state' })
+  try {
+    await fresh.connect()
+    const database = options.releaseRecord?.database || options.appDatabase
+    const appRole = options.appRole || options.appUser
+    const { rows } = await fresh.query(
+      `SELECT has_database_privilege($1, d.oid, 'CONNECT') AS app_connects, ${DATACL_PRIVILEGES_SQL} AS privileges
+         FROM pg_database d WHERE d.datname = $2`,
+      [appRole, database],
+    )
+    const recorded = options.releaseRecord?.revoked ?? []
+    state = classifyFenceState({
+      answered: rows.length === 1,
+      appConnects: rows[0]?.app_connects === true,
+      recordedHolding: recorded.filter((grantee) => granteeHasConnect(rows[0]?.privileges, grantee)).length,
+    })
+  } catch (error) {
+    console.error(`The ACL could not be read again after the failed release: ${error instanceof Error ? error.message : String(error)}`)
+  } finally {
+    await fresh.end().catch(() => {})
+  }
+  if (state === 'held') console.error('After the failed release the ACL still shows the fence standing (FENCE_STATE=held).')
+  else console.error(`After the failed release the fence MUST NOT BE TREATED AS STANDING (FENCE_STATE=${state}): ${state === 'restored' ? 'the application role can connect' : 'the ACL could not be shown to be fenced'}.`)
+  MACHINE_CHANNEL.write(`FENCE_STATE=${state}\n`)
+}
+
 async function main() {
   // THE MACHINE CHANNEL IS SEALED BEFORE A SINGLE LINE IS PRINTED (o3d-secops r32, Codex HIGH 1).
   // From here `console.log` writes to stderr, so stdout carries the machine lines this file writes
@@ -4191,7 +4276,14 @@ async function main() {
     else if (options.mode === 'audit-authority') process.exitCode = await doAuditAuthority(client, options)
     else if (options.mode === 'ensure-migration-role') process.exitCode = await doEnsureMigrationRole(client, options)
     else {
-      process.exitCode = await doRelease(client, options)
+      let releaseCode = EXIT_ERROR
+      try {
+        releaseCode = await doRelease(client, options)
+      } catch (error) {
+        console.error(`Release FAILED part-way: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (releaseCode !== EXIT_OK) await reportFenceState(connectionString, options)
+      process.exitCode = releaseCode
     }
   } finally {
     await client.end()

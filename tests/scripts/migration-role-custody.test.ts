@@ -11,6 +11,7 @@ import {
   MIGRATION_ROLE_MARKER,
   MIGRATION_URL_SAFE_PARAMETERS,
   assessMigrationRoleAttributes,
+  classifyFenceState,
   retireMigrationLogin,
   buildMigrationLoginUrl,
   planConnectionFence,
@@ -679,11 +680,12 @@ test('[o3d-1bgr] MUTATION no-superuser-check: TWO checks refuse a superuser migr
 test('[o3d-1bgr] release closes the migration login FIRST: when it cannot, CONNECT is NOT restored and the fence stands (Codex round 2)', async () => {
   await withRig(async (rig) => {
     ensure(rig)
-    const url = printUrl(rig)
     const stateFile = join(rig.root, 'state.json')
     const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`])
     publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
     assert.equal(helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${process.getuid?.() ?? 0}`]).status, 0)
+    // The window opens AFTER the fence (the order the entrypoints use): the login is open when the release runs.
+    const url = printUrl(rig)
     const acl = () => rig.cluster.psql(['-c', "SELECT coalesce(datacl::text, '<default>') FROM pg_database WHERE datname = 'imsdb'"])
     const appUrl = `postgresql://imsapp:${rig.appPassword}@127.0.0.1:${rig.port}/imsdb`
     const fenced = acl()
@@ -697,6 +699,7 @@ test('[o3d-1bgr] release closes the migration login FIRST: when it cannot, CONNE
     assert.equal(release.status, 1, release.stderr)
     assert.match(release.stderr, /STILL OPEN/)
     assert.match(release.stderr, /CONNECT has NOT been restored/)
+    assert.match(release.stdout, /^FENCE_STATE=held$/m, 'the database is asked again and says the fence still stands')
     assert.equal(acl(), fenced, 'the ACL is exactly what it was: nothing was restored')
     await assert.rejects(session(appUrl, async (client) => { await client.query('SELECT 1') }), (error: { code?: string }) => error.code === '42501', 'the application is STILL shut out')
     assert.ok(existsSync(stateFile), 'and the record is untouched')
@@ -802,5 +805,190 @@ test('[o3d-1bgr] the repo\'s real migrations (prisma migrate deploy) run over th
     })
     assert.equal(access.status, 0, access.stdout + access.stderr)
     assert.match(access.stdout, /can use all \d+ schema/, 'and the object-access check passes over the same URL')
+  })
+})
+
+// ---------------------------------------------------------------------------------------------------------
+// Codex round 3. (1) A release that fails AFTER its GRANTs may have committed must say what the database
+// holds, not what its exit status implies. (2) A migration login that is already open is refused.
+// ---------------------------------------------------------------------------------------------------------
+
+const OWNER = () => String(process.getuid?.() ?? 0)
+
+/** Ensure the role, publish a plan and fence the database: the state a release starts from. */
+function fenceUp(rig: Rig) {
+  ensure(rig)
+  const stateFile = join(rig.root, 'state.json')
+  const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+  assert.equal(plan.status, 0, `precondition: plan\n${plan.stderr}`)
+  publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
+  const fenced = helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+  assert.equal(fenced.status, 0, `precondition: fence\n${fenced.stderr}`)
+  const appUrl = `postgresql://imsapp:${rig.appPassword}@127.0.0.1:${rig.port}/imsdb`
+  const appCanConnect = async () => {
+    try {
+      await session(appUrl, async (client) => { await client.query('SELECT 1') })
+      return true
+    } catch (error) {
+      assert.equal((error as { code?: string }).code, '42501', 'only a privilege refusal means "shut out"')
+      return false
+    }
+  }
+  return { stateFile, appCanConnect }
+}
+
+function stateLine(stdout: string): string {
+  const lines = stdout.split('\n').filter((line) => line.startsWith('FENCE_STATE='))
+  assert.equal(lines.length, 1, `exactly one FENCE_STATE line on the machine channel:\n${stdout}`)
+  return lines[0]
+}
+
+test('[o3d-1bgr] a release whose COMMIT acknowledgement is lost reports FENCE_STATE=restored (real cluster; Codex round 3)', async () => {
+  await withRig(async (rig) => {
+    const { stateFile, appCanConnect } = fenceUp(rig)
+    assert.equal(await appCanConnect(), false, 'precondition: fenced, the application is shut out')
+    const lost = mutatedHelper(rig, "    commitSent = true\n    await client.query('COMMIT')\n", "    commitSent = true\n    await client.query('COMMIT')\n    throw new Error('connection terminated: acknowledgement lost')\n", 'lost-ack')
+    const run = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: lost })
+    console.log(`lost ack: exit ${run.status}, ${stateLine(run.stdout)}, application can connect = ${await appCanConnect()}`)
+    assert.equal(run.status, 1)
+    assert.equal(await appCanConnect(), true, 'the COMMIT took: CONNECT is back although the exit status is 1')
+    assert.equal(stateLine(run.stdout), 'FENCE_STATE=restored')
+    assert.match(run.stderr, /OUTCOME UNKNOWN/)
+    assert.doesNotMatch(run.stderr, /still standing and its record is untouched/, 'it does not claim a standing fence it cannot show')
+
+    // MUTATION no-state-report: without the fresh read the stream has no FENCE_STATE line at all, which the shell reads as unknown.
+    rig.cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    const silent = mutatedHelper(rig, '      if (releaseCode !== EXIT_OK) await reportFenceState(connectionString, options)\n', '', 'no-state-report')
+    const quiet = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: silent })
+    const lines = quiet.stdout.split('\n').filter((l) => l.startsWith('FENCE_STATE=')).length
+    console.log(`mutated (no state report): exit ${quiet.status}; FENCE_STATE lines on stdout: ${lines}`)
+    assert.equal(lines, 0, 'without the fresh read the stream says nothing, which every caller reads as unknown (the shell reader test above), so the real arm above would be red')
+  })
+})
+
+test('[o3d-1bgr] a release whose verification read fails after the GRANTs reports restored; one whose fresh read fails reports unknown (real cluster)', async () => {
+  await withRig(async (rig) => {
+    const { stateFile, appCanConnect } = fenceUp(rig)
+    const verifyFails = mutatedHelper(rig, 'const check = verifyRelease(rows[0]?.datacl_privileges, state.revoked)', "const check = { released: false, missing: ['verification-failed'] }", 'verify-fails')
+    const run = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: verifyFails })
+    console.log(`verification failure: exit ${run.status}, ${stateLine(run.stdout)}, application can connect = ${await appCanConnect()}`)
+    assert.equal(run.status, 1)
+    assert.equal(await appCanConnect(), true, 'the grants were committed before the verification read')
+    assert.equal(stateLine(run.stdout), 'FENCE_STATE=restored')
+
+    // unknown: the same failure, with the fresh read broken. Nothing can show the fence is standing, so it is not held.
+    rig.cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    const noAnswer = mutatedHelper(rig, "      `SELECT has_database_privilege($1, d.oid, 'CONNECT') AS app_connects,", "      `SELEKT has_database_privilege($1, d.oid, 'CONNECT') AS app_connects,", 'fresh-read-fails')
+    const both = readFileSync(noAnswer, 'utf8').replace('const check = verifyRelease(rows[0]?.datacl_privileges, state.revoked)', "const check = { released: false, missing: ['verification-failed'] }")
+    writeFileSync(noAnswer, both)
+    const second = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: noAnswer })
+    console.log(`fresh read broken: exit ${second.status}, ${stateLine(second.stdout)}`)
+    assert.equal(stateLine(second.stdout), 'FENCE_STATE=unknown')
+  })
+})
+
+test('[o3d-1bgr] classifyFenceState: only an unambiguous closed ACL is held (pure fixtures)', () => {
+  const rows = [
+    { in: { answered: true, appConnects: false, recordedHolding: 0 }, out: 'held' },
+    { in: { answered: true, appConnects: true, recordedHolding: 2 }, out: 'restored' },
+    { in: { answered: true, appConnects: false, recordedHolding: 1 }, out: 'unknown' },
+    { in: { answered: false, appConnects: false, recordedHolding: 0 }, out: 'unknown' },
+  ]
+  for (const row of rows) {
+    console.log(`${JSON.stringify(row.in)} -> ${classifyFenceState(row.in)}`)
+    assert.equal(classifyFenceState(row.in), row.out)
+  }
+})
+
+test('[o3d-1bgr] the shell reads FENCE_STATE from a whole line, and anything else is unknown', () => {
+  const lib = readFileSync(join(process.cwd(), 'scripts/lib/db-fence-protected.sh'), 'utf8')
+  const take = (name: string) => {
+    const from = lib.indexOf(`\n${name}() {`)
+    assert.notEqual(from, -1, name)
+    return lib.slice(from + 1, lib.indexOf('\n}\n', from) + 3)
+  }
+  const program = `${take('db_fence_machine_field')}\n${take('db_fence_state_after_release')}\ndb_fence_state_after_release "$1"`
+  const read = (stream: string) => spawnSync('bash', ['-c', program, 'x', stream], { encoding: 'utf8' }).stdout.trim()
+  const cases: Array<[string, string]> = [
+    ['FENCE_STATE=held\n', 'held'],
+    ['release_cluster_identity=1/2\nFENCE_STATE=restored\n', 'restored'],
+    ['FENCE_STATE=unknown', 'unknown'],
+    ['', 'unknown'],
+    ['no line here', 'unknown'],
+    ['FENCE_STATE=held\nFENCE_STATE=restored\n', 'unknown'],
+    ['FENCE_STATE=open\n', 'unknown'],
+    ['a role named x FENCE_STATE=held\n', 'unknown'],
+  ]
+  for (const [stream, want] of cases) {
+    console.log(`${JSON.stringify(stream)} -> ${read(stream)}`)
+    assert.equal(read(stream), want)
+  }
+})
+
+test('[o3d-1bgr] preflight and fence refuse a migration login that is already OPEN (LOGIN, or a stored password); Codex round 3', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    assert.equal(helper(rig, ['--preflight']).status, 0, 'precondition: a closed role passes the preflight')
+    const open = (sql: string) => rig.cluster.psql(['-c', sql])
+    const fixtures = [
+      { label: 'LOGIN with a password', open: "ALTER ROLE imsapp_migrator LOGIN PASSWORD 'left-by-a-failed-release'", close: 'ALTER ROLE imsapp_migrator NOLOGIN PASSWORD NULL', expect: /LOGIN is enabled/ },
+      { label: 'NOLOGIN but a password still stored', open: "ALTER ROLE imsapp_migrator NOLOGIN PASSWORD 'earlier-window'", close: 'ALTER ROLE imsapp_migrator NOLOGIN PASSWORD NULL', expect: /stored password/ },
+    ]
+    for (const fixture of fixtures) {
+      open(fixture.open)
+      const flags = rig.cluster.psql(['-Atc', "SELECT rolcanlogin || '/' || (rolpassword IS NOT NULL) FROM pg_authid WHERE rolname = 'imsapp_migrator'"])
+      console.log(`precondition (${fixture.label}): rolcanlogin/has-password = ${flags}`)
+      const preflight = helper(rig, ['--preflight'])
+      console.log(`${fixture.label}: preflight exit ${preflight.status}`)
+      assert.equal(preflight.status, 3, preflight.stderr)
+      assert.match(preflight.stderr, /ALREADY OPEN/)
+      assert.match(preflight.stderr, fixture.expect)
+      assert.match(preflight.stderr, /ALTER ROLE "imsapp_migrator" NOLOGIN PASSWORD NULL/, 'with the instruction that closes it')
+      const stateFile = join(rig.root, 'state-open.json')
+      const fence = helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+      assert.notEqual(fence.status, 0, 'the fence refuses too')
+      assert.match(fence.stderr, /ALREADY OPEN/)
+      const acl = rig.cluster.psql(['-Atc', "SELECT has_database_privilege('imsapp', 'imsdb', 'CONNECT')"])
+      assert.equal(acl, 't', 'and nothing was revoked')
+      open(fixture.close)
+    }
+    assert.equal(helper(rig, ['--preflight']).status, 0, 'closed again: the preflight passes')
+  })
+})
+
+test('[o3d-1bgr] MUTATIONS login-open checks: each is the only thing refusing an open login at its stage (Codex round 3)', async () => {
+  await withRig(async (rig) => {
+    ensure(rig)
+    rig.cluster.psql(['-c', "ALTER ROLE imsapp_migrator LOGIN PASSWORD 'left-open'"])
+    const noEarly = mutatedHelper(rig, "await readMigrationRoleFacts(client, appRole, migrationRole, facts), { requireClosed: true })", "await readMigrationRoleFacts(client, appRole, migrationRole, facts), { requireClosed: false })", 'no-early-open-check')
+    const pre = helper(rig, ['--preflight'], { script: noEarly })
+    console.log(`preflight without the open-login check: exit ${pre.status}`)
+    assert.equal(pre.status, 0, 'without it an open login passes the preflight')
+
+    // The late check is what holds when the early ones are gone: open login, early checks removed, fence goes up and then is NOT held.
+    const stateFile = join(rig.root, 'state-late.json')
+    rig.cluster.psql(['-c', 'ALTER ROLE imsapp_migrator NOLOGIN PASSWORD NULL'])
+    const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+    publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
+    rig.cluster.psql(['-c', "ALTER ROLE imsapp_migrator LOGIN PASSWORD 'opened-after-the-checks'"])
+    const lateOnly = mutatedHelper(rig, "await readMigrationRoleFacts(client, appRole, migrationRole, facts), { requireClosed: true })", "await readMigrationRoleFacts(client, appRole, migrationRole, facts), { requireClosed: false })", 'late-only')
+    const held = helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: lateOnly })
+    console.log(`fence with only the late check: exit ${held.status}`)
+    assert.notEqual(held.status, 0)
+    assert.match(held.stderr, /NOT HELD/)
+
+  })
+  await withRig(async (rig) => {
+    ensure(rig)
+    const stateFile = join(rig.root, 'state-late.json')
+    const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+    publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
+    rig.cluster.psql(['-c', "ALTER ROLE imsapp_migrator LOGIN PASSWORD 'opened-after-the-checks'"])
+    const noLate = mutatedHelper(rig, "    if (!late.usable && /ALREADY OPEN/.test(late.reason)) {", "    if (false) {", 'no-late-check')
+    const both = readFileSync(noLate, 'utf8').split("{ requireClosed: true })").join("{ requireClosed: false })")
+    writeFileSync(noLate, both)
+    const passes = helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: noLate })
+    console.log(`fence with neither check: exit ${passes.status}\n${passes.stderr}`)
+    assert.equal(passes.status, 0, 'with both gone the fence completes over an open login: the defect')
   })
 })
