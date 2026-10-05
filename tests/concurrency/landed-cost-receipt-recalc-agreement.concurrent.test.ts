@@ -366,3 +366,37 @@ test('preview badge: units landed by a WMS alignment count as RECEIVED for the t
   assert.match(after, /\(1 received\)/)
   assert.match(after, /\(1 not yet received\)/)
 })
+
+// ─── The original defect, end to end: an identical re-save of order-sensitive lines changes nothing ──────
+
+test('re-save of IDENTICAL freight lines (order-sensitive fixture, two freight orders, real action, real layers) leaves every layer unchanged and posts nothing', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const { receivePurchaseOrder, updateFreightPoCosts } = await import('@/app/actions/purchase-orders')
+  // The fixture on which summing the cost lines' shares in a different order moves a 6dp unit cost.
+  const goods = await seedGoodsPo('rs3', 25, 3.01, [{ qty: 6, unit: 19.58 }, { qty: 8, unit: 6.46 }, { qty: 17, unit: 10.74 }])
+  const a = await seedFreightWithLines(goods.poId, goods.supplierId, ['89401.8989', '-27040.1416'], 'PO_SENT', { method: 'BY_QUANTITY' })
+  const b = await seedFreightWithLines(goods.poId, goods.supplierId, ['18605.9624'], 'PO_SENT', { method: 'BY_QUANTITY' })
+  const poLines = await db.purchaseOrderLine.findMany({ where: { poId: goods.poId }, orderBy: { sortOrder: 'asc' }, select: { id: true, qty: true } })
+  const received = await receivePurchaseOrder(goods.poId, poLines.map((l) => ({ poLineId: l.id, qtyReceived: Number(l.qty), warehouseId: goods.warehouseId })))
+  assert.equal(received.success, true, `PRECONDITION: the receipt must succeed: ${received.error}`)
+  const layers = async () => (await db.costLayer.findMany({ where: { poLineId: { in: poLines.map((l) => l.id) } }, orderBy: { poLineId: 'asc' }, select: { poLineId: true, unitCostBase: true } })).map((l) => `${l.poLineId}:${l.unitCostBase}`).join(' ')
+  const before = await layers()
+  const idsBefore = (await db.freightCostLine.findMany({ where: { poId: { in: [a.poId, b.poId] } }, select: { id: true } })).map((r) => r.id).sort().join()
+  const asInput = (amounts: string[]) => amounts.map((amount, index) => ({ description: `freight ${index}`, amountForeign: Number(amount), vatable: false, distributionMethod: 'BY_QUANTITY' }))
+  for (let i = 0; i < 6; i += 1) {
+    const one = await updateFreightPoCosts(a.poId, asInput(['89401.8989', '-27040.1416']))
+    const two = await updateFreightPoCosts(b.poId, asInput(['18605.9624']))
+    assert.equal(one.success && two.success, true, `PRECONDITION: the re-save must succeed: ${one.error ?? two.error}`)
+  }
+  const after = await layers()
+  const idsAfter = (await db.freightCostLine.findMany({ where: { poId: { in: [a.poId, b.poId] } }, select: { id: true } })).map((r) => r.id).sort().join()
+  const reclass = await journalRows(goods.poId, 'STOCK_IN_TRANSIT')
+  const cogs = await journalRows(goods.poId, 'COGS_JOURNAL')
+  console.log(`re-save PRECONDITION: 12 identical saves; cost-line ids renumbered: ${idsBefore !== idsAfter}; layers unchanged: ${before === after}; STOCK_IN_TRANSIT rows ${reclass}, COGS_JOURNAL rows ${cogs}`)
+  assert.equal(idsBefore === idsAfter, false, 'PRECONDITION: the saves really did renumber the cost-line ids')
+  assert.equal(after, before, 'every layer cost is byte-identical')
+  assert.equal(reclass, 0)
+  assert.equal(cogs, 0)
+})

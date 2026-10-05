@@ -19,7 +19,7 @@ import { Prisma } from '@/app/generated/prisma/client'
  * THE RULES (each is a test row):
  *  1. Every cost line is distributed whatever its sign. A zero line distributes zero by arithmetic, not by
  *     being skipped.
- *  2. Deterministic order: cost lines by (sourceRank, id), lines by id. Decimal division is rounded to the
+ *  2. Deterministic order: cost lines by CONTENT (sourceRank, amount, method), lines by id. Decimal division is rounded to the
  *     configured precision, so the order the shares are summed in can move the last digit; a database read
  *     with no ORDER BY must not be able to do that.
  *  3. A line is eligible when its qty is greater than zero. The basis is `computeDistributionBase`. An
@@ -97,7 +97,7 @@ export type LandedAllocationLine = {
 export type LandedAllocationSourceRank = 0 | 1
 
 export type LandedAllocationCostLine = {
-  /** Only used to give the allocation a deterministic order; a line with no id sorts as ''. */
+  /** Identifies the line in warnings only; it takes no part in the arithmetic or its order. */
   id?: string | null
   amountBase: DecimalInput
   distributionMethod: string | null | undefined
@@ -152,8 +152,17 @@ export function allocateLandedCost(
   costLines: LandedAllocationCostLine[],
 ): LandedAllocation {
   const orderedLines = [...lines].sort((a, b) => compareIds(a.id, b.id))
+  // ORDER BY CONTENT, never by id or insertion order. Ids are renumbered whenever a freight order's lines are
+  // saved (they are deleted and recreated), and a read has no ORDER BY, so an order that involved either would
+  // let a save that changed nothing move a cost line past another and change a 6dp unit cost (Decimal rounds
+  // each share to 20 significant digits, so the summation order is observable). Two cost lines with the same
+  // (sourceRank, amount, method) produce the same share, so they are interchangeable and their relative order
+  // cannot matter; ties keep the input order only so warnings stay in a stable order. Everything else about a
+  // cost line (id, description, which freight order it sits on) takes no part in the arithmetic.
   const orderedCostLines = [...costLines].sort((a, b) => (
-    a.sourceRank - b.sourceRank || compareIds(a.id ?? '', b.id ?? '')
+    a.sourceRank - b.sourceRank
+    || decimal(a.amountBase).cmp(decimal(b.amountBase))
+    || compareIds(normalizeLandedCostMethod(a.distributionMethod), normalizeLandedCostMethod(b.distributionMethod))
   ))
   const eligibleLines = orderedLines.filter((line) => decimal(line.qty).gt(0))
 

@@ -165,48 +165,94 @@ test('T10b: the floor is applied AFTER rounding — a -0.0000005 tie rounds away
 
 // ─── Determinism: the order the shares are summed in must not depend on the read ────────────────────────
 
-test('T6: the allocation is independent of the order its inputs arrive in (cost lines and lines are sorted)', () => {
-  // A fixture found by search on which the ORDER the shares are summed in changes the 6dp answer: Decimal
-  // division and addition round to 20 significant digits, so (a+b)+c and (c+b)+a can land on opposite sides of
-  // a 6dp HALF_UP boundary. Without the (sourceRank, id) sort a database read with no ORDER BY could therefore
-  // move a stored unit cost by one micro-unit between two otherwise identical runs.
-  const lines = [
-    { id: 'L0', qty: 25, unitCostBase: 3.01, totalBase: 75.25, weight: null },
-    { id: 'L1', qty: 6, unitCostBase: 19.58, totalBase: 117.48, weight: null },
-    { id: 'L2', qty: 8, unitCostBase: 6.46, totalBase: 51.68, weight: null },
-    { id: 'L3', qty: 17, unitCostBase: 10.74, totalBase: 182.58, weight: null },
-  ]
-  const costLines = [
-    cost('89401.8989', 'BY_QUANTITY', 0, 'c1'),
-    cost('-27040.1416', 'BY_QUANTITY', 0, 'c2'),
-    cost('18605.9624', 'BY_QUANTITY', 0, 'c3'),
+function permutationsOf<T>(items: T[]): T[][] {
+  if (items.length <= 1) return [items]
+  return items.flatMap((item, index) => permutationsOf([...items.slice(0, index), ...items.slice(index + 1)]).map((rest) => [item, ...rest]))
+}
+
+test('T6: the allocation is INVARIANT to cost-line order and to id renumbering (property test over order-sensitive fixtures)', () => {
+  // Fixtures found by search on which the ORDER the shares are summed in changes the 6dp answer: Decimal division
+  // and addition round to 20 significant digits, so (a+b)+c and (c+b)+a can land on opposite sides of a 6dp
+  // HALF_UP boundary. Ids are renumbered whenever a freight order's lines are re-saved and a read has no ORDER BY,
+  // so an allocation that depended on either would let a save that changed nothing move a stored unit cost.
+  const fixtures: Array<{ name: string; lines: LandedAllocationLine[]; costs: Array<[string, string, 0 | 1]> }> = [
+    {
+      name: 'F1 BY_QUANTITY x3',
+      lines: [
+        { id: 'L0', qty: 25, unitCostBase: 3.01, totalBase: 75.25, weight: null },
+        { id: 'L1', qty: 6, unitCostBase: 19.58, totalBase: 117.48, weight: null },
+        { id: 'L2', qty: 8, unitCostBase: 6.46, totalBase: 51.68, weight: null },
+        { id: 'L3', qty: 17, unitCostBase: 10.74, totalBase: 182.58, weight: null },
+      ],
+      costs: [['89401.8989', 'BY_QUANTITY', 0], ['-27040.1416', 'BY_QUANTITY', 0], ['18605.9624', 'BY_QUANTITY', 0]],
+    },
+    {
+      name: 'F1b the same lines split across the direct and linked sources',
+      lines: [
+        { id: 'L0', qty: 25, unitCostBase: 3.01, totalBase: 75.25, weight: null },
+        { id: 'L1', qty: 6, unitCostBase: 19.58, totalBase: 117.48, weight: null },
+        { id: 'L2', qty: 8, unitCostBase: 6.46, totalBase: 51.68, weight: null },
+        { id: 'L3', qty: 17, unitCostBase: 10.74, totalBase: 182.58, weight: null },
+      ],
+      costs: [['89401.8989', 'BY_QUANTITY', 0], ['-27040.1416', 'BY_QUANTITY', 1], ['18605.9624', 'BY_QUANTITY', 1]],
+    },
+    {
+      name: 'F2 EQUAL_SPLIT + BY_QUANTITY',
+      lines: [
+        { id: 'L0', qty: 30, unitCostBase: 10.98, totalBase: 329.4, weight: null },
+        { id: 'L1', qty: 12, unitCostBase: 8.79, totalBase: 105.48, weight: null },
+        { id: 'L2', qty: 12, unitCostBase: 2.06, totalBase: 24.72, weight: null },
+        { id: 'L3', qty: 31, unitCostBase: 0.83, totalBase: 25.73, weight: null },
+      ],
+      costs: [['79079.8278', 'EQUAL_SPLIT', 0], ['-66285.3417', 'BY_QUANTITY', 0], ['-30302.1575', 'BY_QUANTITY', 0]],
+    },
+    {
+      name: 'F3 EQUAL_SPLIT x3',
+      lines: [
+        { id: 'L0', qty: 39, unitCostBase: 19.78, totalBase: 771.42, weight: null },
+        { id: 'L1', qty: 8, unitCostBase: 5, totalBase: 40, weight: null },
+        { id: 'L2', qty: 21, unitCostBase: 10.08, totalBase: 211.68, weight: null },
+      ],
+      costs: [['87040.6095', 'EQUAL_SPLIT', 0], ['-74338.2949', 'EQUAL_SPLIT', 0], ['-26049.4607', 'EQUAL_SPLIT', 0]],
+    },
   ]
   const render = (a: ReturnType<typeof allocateLandedCost>) => JSON.stringify([
-    [...a.grossUnitCostBaseByLine].map(([id, v]) => [id, v.toString()]),
-    [...a.landedAmountByLine].map(([id, v]) => [id, v.toString()]),
+    [...a.grossUnitCostBaseByLine].sort(([x], [y]) => (x < y ? -1 : 1)).map(([id, v]) => [id, v.toString()]),
+    [...a.landedAmountByLine].sort(([x], [y]) => (x < y ? -1 : 1)).map(([id, v]) => [id, v.toString()]),
+    a.floors.map((f) => [f.lineId, f.unflooredGrossUnitCostBase.toString()]),
   ])
-  const baseline = allocateLandedCost(lines, costLines)
-
-  // PRECONDITION: the fixture really IS order-sensitive. Summing the same shares in c3,c2,c1 order BY HAND
-  // gives a different 6dp cost for L3, so an unsorted core would differ between the two input orders.
-  const byHand = (order: LandedAllocationCostLine[]) => {
-    const total = lines.reduce((sum, l) => sum.add(l.qty), new Prisma.Decimal(0))
+  // The oracle: sum the shares by hand in a stated order and report every line's 6dp cost.
+  const byHand = (fixture: (typeof fixtures)[number], order: Array<[string, string, 0 | 1]>) => fixture.lines.map((line) => {
     let landed = new Prisma.Decimal(0)
-    for (const c of order) landed = landed.add(new Prisma.Decimal(c.amountBase).mul(17).div(total))
-    return new Prisma.Decimal(10.74).add(landed.div(17)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toString()
+    for (const [amount, method] of order) {
+      const base = (l: LandedAllocationLine) => (method === 'BY_QUANTITY' ? new Prisma.Decimal(l.qty) : new Prisma.Decimal(1))
+      const total = fixture.lines.reduce((sum, l) => sum.add(base(l)), new Prisma.Decimal(0))
+      landed = landed.add(new Prisma.Decimal(amount).mul(base(line)).div(total))
+    }
+    return new Prisma.Decimal(line.unitCostBase).add(landed.div(line.qty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toString()
+  }).join()
+  let sensitive = 0
+  let compared = 0
+  for (const fixture of fixtures) {
+    const make = (order: number[], ids: string[]) => allocateLandedCost(
+      [...fixture.lines].reverse(),
+      order.map((i, position) => ({ id: ids[position], amountBase: fixture.costs[i][0], distributionMethod: fixture.costs[i][1], sourceRank: fixture.costs[i][2] })),
+    )
+    const baseline = make([0, 1, 2], ['a', 'b', 'c'])
+    // PRECONDITION: summing the same shares in the opposite order BY HAND gives a different answer for this fixture
+    // (so an order-dependent allocation would be observable here).
+    const forward = byHand(fixture, fixture.costs)
+    const backward = byHand(fixture, [...fixture.costs].reverse())
+    if (forward !== backward) sensitive += 1
+    for (const order of permutationsOf([0, 1, 2])) {
+      for (const ids of permutationsOf(['a', 'b', 'c'])) {
+        assert.equal(render(make(order, ids)), render(baseline), `${fixture.name}: cost order ${order.join('')} / ids ${ids.join('')} changed the allocation`)
+        compared += 1
+      }
+    }
   }
-  const forward = byHand(costLines)
-  const backward = byHand([...costLines].reverse())
-  console.log(`T6 PRECONDITION: L3 cost summed c1,c2,c3 = ${forward}; summed c3,c2,c1 = ${backward}; the core says ${baseline.grossUnitCostBaseByLine.get('L3')}`)
-  assert.notEqual(forward, backward, 'the fixture must be order-sensitive or this arm proves nothing')
-  assert.equal(baseline.grossUnitCostBaseByLine.get('L3')?.toString(), forward, 'the core sums in (sourceRank, id) order')
-
-  const permutations: number[][] = [[2, 1, 0], [1, 0, 2], [2, 0, 1], [0, 2, 1]]
-  for (const order of permutations) {
-    const shuffled = allocateLandedCost([...lines].reverse(), order.map((i) => costLines[i]))
-    assert.equal(render(shuffled), render(baseline), `permutation ${order.join(',')} changed the allocation`)
-  }
-  console.log(`T6 PRECONDITION: permutations compared: ${permutations.length}`)
+  console.log(`T6 PRECONDITION: fixtures: ${fixtures.length}, order-sensitive by hand: ${sensitive}, permutation x renumbering combinations compared: ${compared}`)
+  assert.equal(sensitive >= 3, true, 'at least three fixtures must be genuinely order-sensitive or this proves nothing')
 })
 
 // ─── Warnings ────────────────────────────────────────────────────────────────────────────────────────────
