@@ -80,10 +80,18 @@ type VerifyTokenOptions = Pick<TokenOptions, 'now'> & {
   env?: Record<string, string | undefined>
 }
 
+// BUILD-TIME FILE TRACING (next build, Turbopack). Every path below is derived from process.cwd() or
+// from the INVOICE_PDF_STORAGE_DIR environment variable, i.e. it is unknown at build time, and
+// Turbopack answers an unknown path under the project root by listing the WHOLE project directory.
+// That listing fails (and, in Turbopack, panics the build) on any directory the build user cannot
+// read -- the installer's root-owned 0700 `.ims-publish` staging directory in the application
+// directory is one. The marker on the first argument of each call tells Turbopack not to trace
+// it; nothing here is meant to be bundled, the files are read at runtime.
+// tests/scripts/first-install-blockers.test.ts fails if a call below loses its marker.
 function configuredInvoicePdfStorageDir(env: Record<string, string | undefined> = process.env): string {
   const configured = env.INVOICE_PDF_STORAGE_DIR?.trim()
-  const fallback = path.join(process.cwd(), 'data', 'invoices')
-  return path.resolve(configured && configured.length > 0 ? configured : fallback)
+  const fallback = path.join(/* turbopackIgnore: true */ process.cwd(), 'data', 'invoices')
+  return path.resolve(/* turbopackIgnore: true */ configured && configured.length > 0 ? configured : fallback)
 }
 
 function invoicePdfFilename(orderId: string): string | null {
@@ -107,8 +115,8 @@ function isSameOrWithinDirectory(root: string, filePath: string): boolean {
 async function resolveRealInvoicePdfPath(filePath: string): Promise<string | null> {
   try {
     const [realRoot, realFilePath] = await Promise.all([
-      realpath(configuredInvoicePdfStorageDir()),
-      realpath(filePath),
+      realpath(/* turbopackIgnore: true */ configuredInvoicePdfStorageDir()),
+      realpath(/* turbopackIgnore: true */ filePath),
     ])
     return isWithinDirectory(realRoot, realFilePath) ? realFilePath : null
   } catch {
@@ -119,21 +127,21 @@ async function resolveRealInvoicePdfPath(filePath: string): Promise<string | nul
 async function ensureInvoicePdfStorageDir(filePath: string): Promise<void> {
   const root = configuredInvoicePdfStorageDir()
   if (process.env.NODE_ENV === 'production') {
-    await access(root, constants.W_OK)
+    await access(/* turbopackIgnore: true */ root, constants.W_OK)
   } else {
-    await mkdir(root, { recursive: true })
+    await mkdir(/* turbopackIgnore: true */ root, { recursive: true })
   }
 
   const [realRoot, realParent] = await Promise.all([
-    realpath(root),
-    realpath(path.dirname(filePath)),
+    realpath(/* turbopackIgnore: true */ root),
+    realpath(path.dirname(/* turbopackIgnore: true */ filePath)),
   ])
   if (!isSameOrWithinDirectory(realRoot, realParent)) {
     throw new Error('Invoice PDF storage path resolved outside configured directory')
   }
 
   try {
-    const existing = await lstat(filePath)
+    const existing = await lstat(/* turbopackIgnore: true */ filePath)
     if (existing.isSymbolicLink()) {
       throw new Error('Invoice PDF target path must not be a symlink')
     }
@@ -147,7 +155,7 @@ function resolveInvoicePdfPath(orderId: string): string | null {
   if (!filename) return null
 
   const root = configuredInvoicePdfStorageDir()
-  const filePath = path.resolve(root, filename)
+  const filePath = path.resolve(/* turbopackIgnore: true */ root, filename)
   if (!isWithinDirectory(root, filePath)) return null
   return filePath
 }
@@ -258,7 +266,7 @@ export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
   const realFilePath = await resolveRealInvoicePdfPath(filePath)
   if (!realFilePath) return null
   try {
-    return await readFile(realFilePath)
+    return await readFile(/* turbopackIgnore: true */ realFilePath)
   } catch {
     return null
   }
@@ -268,11 +276,11 @@ export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
 export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promise<string> {
   const filePath = getInvoicePdfPath(orderId)
   await ensureInvoicePdfStorageDir(filePath)
-  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`)
+  const tempPath = path.join(path.dirname(/* turbopackIgnore: true */ filePath), `.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`)
   // Connector PDFs are idempotently re-fetchable, so atomic rename is enough
   // here; this intentionally does not fsync the directory for crash durability.
-  await writeFile(tempPath, buffer)
-  await rename(tempPath, filePath)
+  await writeFile(/* turbopackIgnore: true */ tempPath, buffer)
+  await rename(/* turbopackIgnore: true */ tempPath, /* turbopackIgnore: true */ filePath)
   return invoicePdfStoredPath(orderId)
 }
 

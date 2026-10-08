@@ -2,7 +2,8 @@
 
 ## Prerequisites
 
-- **Operating system**: Debian 11/12 or Ubuntu 22.04/24.04 (tested in LXC containers)
+- **Operating system**: Debian 11/12/13 or Ubuntu 22.04/24.04 (tested in LXC containers; Debian 13 was rehearsed end to end in a container). The installer accepts any Debian or Ubuntu release and only warns on another distribution.
+- **Memory for the build**: `next build` needs a Node heap well above Node's default (about 2 GB). A rehearsal on an 8 GB host aborted the TypeScript pass at 2 GB and at 3 GB and completed at 5 GB. `install.sh`, `update.sh` and `deploy.sh` therefore start the build step (and only that step) with `NODE_OPTIONS=--max-old-space-size=6144`. This is a ceiling, not a reservation: plan for roughly 5 GB of free memory (RAM plus swap) while the build runs, and add swap on a smaller host, because a host that cannot supply it fails the build -- before anything is stopped or migrated. Override the ceiling with `IMS_BUILD_MAX_OLD_SPACE_MB` (whole megabytes, 1000-999999; pass it through sudo with `sudo env IMS_BUILD_MAX_OLD_SPACE_MB=8192 bash ...`); without it, a `--max-old-space-size` you already put in `NODE_OPTIONS` is left alone. A malformed value is refused up front, before anything is changed.
 - **Node.js**: Version 22 (installed automatically by the install script)
 - **PostgreSQL**: Version 14 or later (installed automatically, or provide an external connection)
 - **nginx**: Used as the reverse proxy (installed automatically)
@@ -903,7 +904,7 @@ run, or the re-written `.env` will blank them.
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
-- **Default admin name/email/password** — optional bootstrap admin user for unattended installs
+- **Default admin name/email/password** — optional bootstrap admin user for unattended installs. Leave the email blank to skip creating one (the password is then not asked for and is ignored); the installer still seeds the public URL and any SMTP and WooCommerce settings you gave it.
 - **Notification email** — optional recipient for the bootstrap credentials email
 
 After installation, sign in and set the organisation base currency in **Settings > Company** before entering live transactional data. The base currency is intended to be set once for a new system. Changing it later requires a database reset.
@@ -975,6 +976,10 @@ the client sends.
 ### Xero (Optional)
 - Client ID and client secret
 - Can be configured later in Settings
+
+### Cloudflare Turnstile (Optional)
+- Site key and secret key for the login-page challenge (`NEXT_PUBLIC_TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`)
+- Leave both blank (the default, and what `--non-interactive` uses when they are not exported) to keep the challenge disabled; they are collected up front with the other prompts and written to `.env` either way
 
 ### Outbound Email (Optional)
 - SMTP host, port, username, password, transport security
@@ -4672,7 +4677,8 @@ Key variables in the `.env` file:
 | `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD` | When the WooCommerce pending-FX retry queue reaches this depth, notify active admins. Default `5`. The queue accumulates when WC orders arrive in a currency without a stored FX rate; it drains automatically after the next FX-rate refresh. |
 | `BD_GIT_HOOK` / `BEADS_HOOK_TIMEOUT` | Beads (bd) integration hook settings, used only when bd issue tracking is enabled in the working tree. Not required for runtime. |
 | `IMS_INSTANCE_ROLE` | What this deployment **is**: `production`, `stage`, `development` or `e2e`. `NODE_ENV` cannot answer this — it is set by the build, so `next start` reports `production` on a stage server, a second production-shaped copy and the end-to-end rig alike, and controls that exempt production therefore exempt all of them (o3d-l89a). Set it on **every** instance. Production preflight warns while it is absent and fails when it is present and says anything other than `production` (or when `E2E_TEST_MODE=1` contradicts it). Absence currently falls back to the old `NODE_ENV`/`E2E_TEST_MODE` reading; once production carries the line, absence becomes non-production everywhere. |
-| `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
+| `IMS_BUILD_MAX_OLD_SPACE_MB` | Installer/updater input (not read by the application): heap ceiling in megabytes handed to `next build` as `--max-old-space-size` by `install.sh`, `update.sh` and `deploy.sh`. Default `6144`; see *Memory for the build* under Prerequisites |
+| `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. `install.sh` writes `/var/lib/one-two-inventory/invoice-pdfs` and creates it owned by the application account with mode 750. Defaults locally to `./data/invoices`; required by production preflight (which refuses the default and requires the directory to exist and be writable). Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
