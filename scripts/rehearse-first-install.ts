@@ -90,7 +90,7 @@ import {
   redactSecrets,
   renderMarkdown,
 } from '../lib/ops/first-install-rehearsal.ts'
-import { type Cluster, currentUser, freePort, pgBinDir, startCluster } from '../tests/scripts/real-postgres-cluster.ts'
+import { type Cluster, currentUser, freePort, pgBinDir, startCluster, toolEnv } from '../tests/scripts/real-postgres-cluster.ts'
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const DEFAULT_PARENT = '/var/tmp'
@@ -163,7 +163,7 @@ type RunState = {
 
 /** The file-system type under a path, from `stat -f`. */
 function filesystemType(target: string): string {
-  return execFileSync('stat', ['-f', '-c', '%T', target], { encoding: 'utf8' }).trim()
+  return execFileSync('stat', ['-f', '-c', '%T', target], { encoding: 'utf8', env: toolEnv() }).trim()
 }
 
 const RAM_BACKED = new Set(['tmpfs', 'ramfs'])
@@ -586,7 +586,7 @@ function teardownRun(state: RunState): TeardownResult {
     state.betweenIdentityAndStop?.()
     if (pidFileStillNames(identity) && postmasterIsStillOurs(identity)) {
       try {
-        execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe' })
+        execFileSync(path.join(pgBinDir(), 'pg_ctl'), ['-D', identity.dataDir, '-m', 'immediate', '-w', 'stop'], { stdio: 'pipe', env: toolEnv() })
       } catch (error) {
         errors.push(`pg_ctl stop failed: ${error instanceof Error ? error.message : String(error)}`)
       }

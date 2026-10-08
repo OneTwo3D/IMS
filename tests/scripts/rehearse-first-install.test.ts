@@ -970,6 +970,57 @@ test('REPORT DIRECTORY identity: swapping the validated --report-dir for another
   assert.equal(outcome.report.verdict, 'RED')
 })
 
+test('SHELL STARTUP HOOKS: BASH_ENV, ENV, SHELLOPTS and PS4 exported by the caller never execute in ANY phase (discovery, startup, steps, teardown)', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const marks = { bashEnv: join(parent, 'mark-bash-env'), env: join(parent, 'mark-env'), ps4: join(parent, 'mark-ps4') }
+  const hookFile = (name: string, mark: string) => { const f = join(parent, name); writeFileSync(f, `echo ran >> ${mark}\n`); return f }
+  const planted = {
+    BASH_ENV: hookFile('bash-env.sh', marks.bashEnv),
+    ENV: hookFile('env.sh', marks.env),
+    SHELLOPTS: 'xtrace',
+    PS4: `$(echo ran >> ${marks.ps4}) +`,
+  }
+  const previous = Object.fromEntries(Object.keys(planted).map((k) => [k, process.env[k]]))
+  Object.assign(process.env, planted)
+  try {
+    // Positive control: a bash -c that inherits this environment DOES fire the canaries (the old discovery shape).
+    execFileSync('bash', ['-c', 'true'], { env: process.env, stdio: 'pipe' })
+    const fired = Object.entries(marks).filter(([, m]) => existsSync(m)).map(([k]) => k)
+    console.log(`# positive control: an inheriting bash -c fired ${JSON.stringify(fired)}`)
+    assert.ok(fired.includes('bashEnv') && fired.includes('ps4'), 'precondition: the canaries can fire')
+    for (const m of Object.values(marks)) rmSync(m, { force: true })
+    const outcome = await runRehearsal({
+      parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined,
+      only: new Set<StepId>([...LIGHT, 'invariant-preflight']),
+    })
+    assert.ok(outcome.report)
+    assert.deepEqual(outcome.report.steps.filter((x) => x.status !== 'passed').map((x) => `${x.id}: ${x.reason}`), [], 'precondition: every phase ran (cluster start, node/npm steps, dump/restore, teardown)')
+    assert.equal(outcome.exitCode, REHEARSAL_EXIT.OK)
+    const after = Object.entries(marks).filter(([, m]) => existsSync(m)).map(([k]) => k)
+    console.log(`# canaries fired during the whole rehearsal: ${JSON.stringify(after)}`)
+    assert.deepEqual(after, [])
+  } finally {
+    for (const [k, v] of Object.entries(previous)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test('spawn sweep: no shell and no inherited environment in the rehearsal or its cluster helper', () => {
+  const files = ['scripts/rehearse-first-install.ts', 'lib/ops/first-install-rehearsal.ts', 'scripts/lib/first-install-probe.ts', 'tests/scripts/real-postgres-cluster.ts']
+  const found: string[] = []
+  for (const file of files) {
+    const lines = readFileSync(join(REPO, file), 'utf8').split('\n')
+    lines.forEach((line, index) => {
+      if (/^\s*(\/\/|\*|\/\*)/.test(line)) return
+      if (/\b(execSync|spawnSync|exec)\(|shell:\s*true|['"]bash['"]|['"]sh['"]\s*,\s*\[/.test(line)) found.push(`${file}:${index + 1}: ${line.trim()}`)
+    })
+  }
+  console.log(`# shell-capable spawn sites found: ${found.length}`)
+  assert.deepEqual(found, [])
+})
+
 test('INTERRUPTION during the last, asynchronous step (no child to kill) still makes the report RED', { timeout: TIMEOUT }, async (t) => {
   const before = new Set(process.listeners('SIGTERM'))
   const outcome = await rehearse(t, {
