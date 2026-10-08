@@ -311,3 +311,14 @@ test('[o3d-j625 r6 H4] re-saving the order raises the SAME posting', async () =>
   assert.equal(refusedRun.outstanding.length, 1, 'PRECONDITION: the first save was refused and recorded')
   assert.deepEqual(accountingPostingKey(resaved.queued[0] as never), refusedRun.outstanding[0]!.posting)
 })
+
+test('[Codex r18] the claim-held log states only the known enqueue result and claim state, never an unverified ledger outcome', async () => {
+  const { deps, activity } = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true, answer: { queued: false, reason: 'hand-post-deferred', connector: 'xero' } as never })
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice(baseParams, deps)
+  const logged = activity.find((a) => (a as { action: string }).action === 'sales_invoice_update_not_queued') as { description: string }
+  assert.ok(logged, 'PRECONDITION: the claim-held decline is logged')
+  assert.doesNotMatch(logged.description, /shows neither|nor, yet, theirs/, 'no claim about what the accounting invoice shows')
+  assert.match(logged.description, /NOT known to IMS/, 'it says the ledger state is unknown')
+  assert.match(logged.description, /inspect its current version in the accounting system before deciding what remains owed/, 'and tells the operator to inspect the current ledger version')
+  assert.match(logged.description, /An operator has taken this posting to settle it BY HAND and still holds it/, 'the known claim state is stated')
+})

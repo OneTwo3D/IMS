@@ -1,5 +1,6 @@
 'use server'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
@@ -2678,9 +2679,9 @@ export async function recordRefundParkManually(
       return {
         success: false,
         error:
-          'This park does not carry the WooCommerce refund it came from, so the amount recorded here ' +
+          withLedgerCheck('This park does not carry the WooCommerce refund it came from, so the amount recorded here ' +
           'could not be checked against the refund it settles. Use Retry on this row first — that ' +
-          're-reads the refund from WooCommerce and stores it — then record it manually.',
+          're-reads the refund from WooCommerce and stores it — then record it manually.'),
       }
     }
     const parkedGross = toDecimal(parkedGrossText).abs()

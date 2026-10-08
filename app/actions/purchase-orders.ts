@@ -4154,8 +4154,8 @@ export async function markBillPaid(
         success: false,
         error: declined
           ? billPaymentEnqueueDeclinedMessage(declineReason)
-          : 'The payment could not be queued for the accounting connector, so the bill was not marked ' +
-            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
+          : withLedgerCheck('The payment could not be queued for the accounting connector, so the bill was not marked ' +
+            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.'),
       }
     }
 
@@ -4195,9 +4195,9 @@ export async function markBillPaid(
         tag: 'purchase',
         level: 'WARNING',
         description:
-          `Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
+          withLedgerCheck(`Bill ${invoice.invoiceNumber ?? '(no number)'} was marked PAID before it posted to the ` +
           `accounting connector, so no payment was queued. Once the bill posts, record the payment ` +
-          `again (or in the ledger directly) — posting the bill does not settle it.`,
+          `again (or in the ledger directly) — posting the bill does not settle it.`),
         metadata: { invoiceId: invoice.id, reference: invoice.po.reference, amountForeign: paymentAmount },
       }).catch(() => {})
     }
@@ -4486,9 +4486,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: it was `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: it was `
           + `prepared against ${creditNotePosting.chartConnector}'s chart of accounts and the active accounting `
-          + `connector is now ${creditNotePosting.activeConnector ?? 'none'}. The credit note is still a draft.`,
+          + `connector is now ${creditNotePosting.activeConnector ?? 'none'}. The credit note is still a draft.`),
         metadata: {
           creditNoteId: cn.id,
           reference: cn.po.reference,
@@ -4649,9 +4649,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         tag: 'accounting',
         level: 'ERROR',
         description:
-          `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: the `
+          withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} was NOT posted: the `
           + `accounting queue ${declined.reason === 'refused' ? 'REFUSED' : 'declined'} the ACCPAYCREDIT, so `
-          + `the credit note was left DRAFT rather than marked POSTED in IMS with nothing in the ledger.`,
+          + `the credit note was left DRAFT rather than marked POSTED in IMS with nothing in the ledger.`),
         metadata: {
           creditNoteId: cn.id,
           reference: cn.po.reference,

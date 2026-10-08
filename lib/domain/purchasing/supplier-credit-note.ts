@@ -205,13 +205,13 @@ export function proveSupplierCreditNoteNumberIsMinted(input: {
     return {
       ok: false,
       reason:
-        `NOTHING WAS SENT. Credit note number ${JSON.stringify(wanted)} was NOT minted by IMS for this credit `
+        withLedgerCheck(`NOTHING WAS SENT. Credit note number ${JSON.stringify(wanted)} was NOT minted by IMS for this credit `
         + `note — the number IMS mints for it is ${JSON.stringify(minted)}. A number that merely looks minted `
         + `(an operator-entered ${JSON.stringify(MINTED_CREDIT_NOTE_NUMBER_PREFIX)} reference, or a purchase `
         + `order's reference shared by every credit against it) is not unique by construction, so a document `
         + `found in the ledger under it need not be this credit note: adopting it would link the WRONG ledger `
         + `document, and refusing on it would block this one for ever. Re-record the credit note so it is queued `
-        + `under its own minted number.`,
+        + `under its own minted number.`),
     }
   }
 
@@ -408,10 +408,10 @@ export function decidePurchaseCreditNotePost(input: {
       action: 'refuse',
       retryable: false,
       reason:
-        `NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
+        withLedgerCheck(`NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
         + `(${lookup.claims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
         + `this credit note's primary key, so every one of them is a duplicate of THIS credit note and payables `
-        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`,
+        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`),
     }
   }
 

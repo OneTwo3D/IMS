@@ -404,12 +404,12 @@ export function decideInvoiceNumberPost(params: {
     code: 'NUMBER_HELD_BY_FOREIGN_DOCUMENT',
     retryable: false,
     reason:
-      `Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger ALREADY HOLDS that `
+      withLedgerCheck(`Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger ALREADY HOLDS that `
       + `number (${describeClaim(holder)}) and IMS does not own that document. The sales-invoice create is `
       + 'update-or-create on the invoice number, so this post would not duplicate — it would silently REPLACE '
       + 'that invoice. The expected cause during cutover is that the WooCommerce PDF/xeroom plugin already '
       + 'posted this order. If the existing document is the right one, leave it and cancel this sync row; if '
       + 'this order genuinely has no ledger document yet, link the correct one to the order (or void the wrong '
-      + `one in the accounting system) and re-queue.${attemptedNote}${describeAlsoHeldBy(dead)}`,
+      + `one in the accounting system) and re-queue.${attemptedNote}${describeAlsoHeldBy(dead)}`),
   }
 }

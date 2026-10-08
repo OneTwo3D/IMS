@@ -169,16 +169,16 @@ export function assertedJournalRemedy(params: {
   if (ob && params.withheldAmount !== null && params.withheldAmount > 0.005) {
     const credit = Math.min(params.withheldAmount, ob.open)
     return (
-      'WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
+      withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero, then raise the Allocated Inventory credit for the REFUNDED UNITS ONLY. ' +
       `Refunded units value £${params.withheldAmount.toFixed(2)}; ${balanceText}; credit the LESSER: DR Inventory / CR Allocated Inventory £${credit.toFixed(2)}. ` +
       "Do NOT credit more than the open balance and do NOT credit anything else: the rest of this order's A2 debit covers units the customer still holds and comes out when they are dispatched or refunded." +
-      DEDUCT + ' ' + tail
+      DEDUCT + ' ' + tail)
     )
   }
   return (
-    'WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
+    withLedgerCheck('WHAT TO DO TODAY: confirm the journal in Xero and reconcile the Allocated Inventory for the REFUNDED UNITS ONLY in Xero. ' +
     'The IMS could not establish the figure for this refund, so none is given: work it out from the refunded lines and the order\'s open A2 balance (recorded debit less relief already credited), credit the lesser, and do NOT credit the order\'s whole A2 debit ' +
-    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail
+    '(the rest covers units the customer still holds).' + DEDUCT + ' ' + tail)
   )
 }
 

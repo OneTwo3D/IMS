@@ -3811,10 +3811,10 @@ export async function createSalesOrderRefund(
       const rateByTaxType = buildTaxTypeRateIndex(salesTaxRates)
       const identityMoved = (target: string, was: string, now: string) => ({
         error:
-          `The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
+          withLedgerCheck(`The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
           `when the amount was converted and is ${now} now, so the credit note would not come to the ` +
           'figure that was reconciled. Nothing has been credited. Re-open the refund and record it ' +
-          'again against the tax settings that now apply.',
+          'again against the tax settings that now apply.'),
       } as const)
       for (const expected of input.expectedTaxIdentities) {
         const target = expected.lineKind === 'shipping'
@@ -3946,7 +3946,7 @@ export async function createSalesOrderRefund(
           }
         : {
             conflict: 'prior-chargeback',
-            conflictError: `Order was already charged back (credit note ${conflictRef}) — a second credit note would double-reverse it; reconcile this refund manually.`,
+            conflictError: withLedgerCheck(`Order was already charged back (credit note ${conflictRef}) — a second credit note would double-reverse it; reconcile this refund manually.`),
           }
       return conflictResult
     }
@@ -4038,9 +4038,9 @@ export async function createSalesOrderRefund(
     if (!allExistingRefundsNet) {
       return {
         error:
-          'This order has an earlier refund recorded on a legacy/unknown amount basis, which cannot be ' +
+          withLedgerCheck('This order has an earlier refund recorded on a legacy/unknown amount basis, which cannot be ' +
           'safely reconciled with a new refund automatically. Reconcile the order manually before creating ' +
-          'another refund.',
+          'another refund.'),
         quarantine: true as const,
       } as const
     }

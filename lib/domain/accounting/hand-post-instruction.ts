@@ -426,7 +426,7 @@ export function renderHandPostSettlementDoc(): string {
 
 /** An imperative to post, re-post, re-save, re-send, retry, reset, raise, enter or register something, or to do anything "by hand" / "yourself". */
 export const HAND_POST_INSTRUCTION_PATTERN =
-  /\b(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register)\b[^.]{0,80}\b(by hand|yourself|manually|again|in the ledger|in the accounting system|from (its|the) source document|in (Xero|QuickBooks))\b|\bpost (it|this|that|the current (version|payment)|its current version)\b|\byourself\b|\bre-?save\b|\bre-?post\b|\bresend\b|\bre-?raise\b/i
+  /\b(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register|record|book|apply|allocate|settle|reconcile|journal|credit|refund|void)\b[^.]{0,80}\b(by hand|yourself|manually|again|in the ledger|in the accounting system|from (its|the) source document|in (Xero|QuickBooks))\b|\bpost (it|this|that|the current (version|payment)|its current version)\b|\byourself\b|\bre-?save\b|\bre-?post\b|\bresend\b|\bre-?raise\b/i
 
 export const HAND_POST_SAFETY =
   'BEFORE any hand posting, re-post or re-save: take the posting for hand posting on this row and hold that claim (so IMS does not queue it while you work), '

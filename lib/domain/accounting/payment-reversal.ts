@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { db } from '@/lib/db'
@@ -887,11 +888,11 @@ export class BillPaymentEnqueueDeclined extends Error {
 }
 
 export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
-  'This bill has already been posted to the accounting connector, but the connector would not accept '
+  withLedgerCheck('This bill has already been posted to the accounting connector, but the connector would not accept '
   + 'a payment for it — accounting sync, or bill-payment posting specifically, is switched off. '
   + 'Marking the bill paid now would leave the ledger showing it outstanding with nothing queued to '
   + 'correct that, so nothing was changed. Turn bill-payment posting back on and try again, or record '
-  + 'the payment in the ledger by hand.'
+  + 'the payment in the ledger by hand.')
 
 /**
  * o3d-j625 r3 (Codex HIGH 2) — the message for a REFUSED bill payment, as opposed to an unconfigured

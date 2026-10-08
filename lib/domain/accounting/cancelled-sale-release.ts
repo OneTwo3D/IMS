@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import { syncTypeWritesBackReference } from './back-reference'
 import { isOperatorAssertedSettlement } from './sync-row-settlement'
@@ -146,18 +147,18 @@ export function describeCancelledSaleRelease(
   if (sale === 'CANCELLED') {
     return {
       release: false,
-      reason: 'The sales order is still CANCELLED. A document raised against a cancelled sale must not be revived — '
+      reason: withLedgerCheck('The sales order is still CANCELLED. A document raised against a cancelled sale must not be revived — '
         + `writing its id onto the order would enqueue that sale's PDF, email, storefront note and PAYMENT. The `
         + `document ${externalId} is real and is the only thing left to undo: void or credit-note it in the `
-        + 'accounting system. If the sale should be live, reinstate the order first and then release this row.',
+        + 'accounting system. If the sale should be live, reinstate the order first and then release this row.'),
     }
   }
 
   if (sale === 'MISSING') {
     return {
       release: false,
-      reason: 'The sales order this row belongs to no longer exists, so there is nothing for the document id to be '
-        + `written onto. The document ${externalId} is still real: void or credit-note it in the accounting system.`,
+      reason: withLedgerCheck('The sales order this row belongs to no longer exists, so there is nothing for the document id to be '
+        + `written onto. The document ${externalId} is still real: void or credit-note it in the accounting system.`),
     }
   }
 

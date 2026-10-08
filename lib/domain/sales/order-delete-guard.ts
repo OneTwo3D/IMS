@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { parseAllocationDebitPasses } from '@/lib/domain/accounting/allocation-debit-passes'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep'
@@ -261,9 +262,9 @@ export async function findSalesOrderDeleteBlocker(
     blockers.push({
       code: 'accounting_document_exists',
       message:
-        `Cannot delete an order with an accounting document already posted `
+        withLedgerCheck(`Cannot delete an order with an accounting document already posted `
         + `(invoice ${invoiced.accountingInvoiceId}). It needs an explicit reversal or credit note `
-        + `in the accounting system first — cancelling the order does NOT reverse a posted invoice.`,
+        + `in the accounting system first — cancelling the order does NOT reverse a posted invoice.`),
     })
   }
 
@@ -515,10 +516,10 @@ export async function findSalesOrderDeleteBlocker(
         // retires PENDING / FAILED / stale-PROCESSING rows and explicitly leaves SYNCED alone, because
         // a cancel-after-post needs an explicit reversal. Telling an operator to cancel a posted
         // document leaves a live receivable against a CANCELLED order.
-        ? `Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
+        ? withLedgerCheck(`Cannot delete an order whose ${liveDocument.connector} accounting document (${liveDocument.type}) `
           + `is already POSTED${named ? ` as ${named}` : ''}. `
           + 'It needs an explicit reversal or credit note in the accounting system — '
-          + 'cancelling the order does NOT reverse a posted document.'
+          + 'cancelling the order does NOT reverse a posted document.')
         : documentStanding === 'ASSERTED_POSTED'
           // o3d-anu8: SAY WHOSE CLAIM IT IS. "is already POSTED as X" is a statement about the ledger,
           // and on a settled row nobody has read the ledger: a human typed X in, IMS made no call and

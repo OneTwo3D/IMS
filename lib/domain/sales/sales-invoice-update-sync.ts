@@ -268,8 +268,8 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
       description: handPostDeferred
         ? `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `
           + 'IMS. An operator has taken this posting to settle it BY HAND and still holds it, so IMS did not '
-          + `queue this edit — and accounting invoice ${params.accountingInvoiceId} shows neither this version `
-          + 'nor, yet, theirs. This stays outstanding in the exception inbox while they hold it and after they '
+          + `queue this edit. What the accounting invoice ${params.accountingInvoiceId} holds now is NOT known to IMS: `
+          + 'inspect its current version in the accounting system before deciding what remains owed. This stays outstanding in the exception inbox while they hold it and after they '
           + 'finish; nothing requeues it on its own. ' + LEDGER_CHECK_FIRST
           + 're-save the order once the refused posting shows no claim.'
         : `NOTHING WAS QUEUED for the sales invoice update for ${params.orderNumber}, but the order is updated in `

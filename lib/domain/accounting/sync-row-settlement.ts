@@ -633,8 +633,8 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
       return {
         code: 'external_id_conflict',
         message:
-          `This row already carries external id ${existingExternalId}. Settling it as ${asserted} would `
-          + 'overwrite the only pointer IMS has at the existing document. Reconcile the two in the ledger first.',
+          withLedgerCheck(`This row already carries external id ${existingExternalId}. Settling it as ${asserted} would `
+          + 'overwrite the only pointer IMS has at the existing document. Reconcile the two in the ledger first.'),
       }
     }
     return null
@@ -649,8 +649,8 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
     return {
       code: 'contradicts_post_evidence',
       message:
-        `This row already carries external id ${existingExternalId}, which is evidence it DID post. `
-        + 'Settle it as POSTED, or reverse the document in the accounting system first.',
+        withLedgerCheck(`This row already carries external id ${existingExternalId}, which is evidence it DID post. `
+        + 'Settle it as POSTED, or reverse the document in the accounting system first.'),
     }
   }
   return null
@@ -936,14 +936,14 @@ export function refuseSettlementContradictedByMirror(
       return {
         code: 'contradicts_mirrored_document',
         message:
-          `The mirrored accounting event for this row already names document ${mirroredId}, ${basisClause}. `
+          withLedgerCheck(`The mirrored accounting event for this row already names document ${mirroredId}, ${basisClause}. `
           + 'Nothing was settled and nothing was changed. '
           + (provenance === 'confirmed'
             ? 'Settle this row as POSTED with that id, or reverse the document in the accounting system first and settle it afterwards.'
             // Not confirmed: the document may not exist, so "reverse it" is conditional on finding it.
             : 'Check that document in the accounting system. If it exists, settle this row as POSTED with that id (or, if it is the wrong '
               + 'document, reverse it there first and settle afterwards); otherwise there is nothing to undo - the mirror\'s '
-              + 'record is what is wrong.'),
+              + 'record is what is wrong.')),
       }
     }
     if (mirrored.status === 'POSTED') {

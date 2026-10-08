@@ -666,7 +666,7 @@ export async function guardInvoicePaymentCapacity(
           + `measured, and IMS will not guess with money. Nothing was sent. Open that payment in the ledger, `
           + `confirm what it actually settled, and register any balance genuinely owed there by hand.`)
       case 'SETTLED_ON_RETIRED_DOCUMENT':
-        return head
+        return withLedgerCheck(head
           + `this receipt is ALREADY REGISTERED in the accounting connector against a different document `
           + `(sync ${verdict.ambiguousIds.join(', ')}) — the invoice it settled was deleted and re-posted, `
           + `so this order now points somewhere else. That earlier payment was actually SENT, and nothing `
@@ -674,16 +674,16 @@ export async function guardInvoicePaymentCapacity(
           + `connectors a deleted invoice leaves its payment behind as an unapplied credit, and sending `
           + `this one would credit the customer twice. Nothing was sent. Open that payment in the `
           + `accounting system; if it is genuinely gone, cancel the earlier sync row and re-run this one, `
-          + `and if it is still there, apply it to the new invoice by hand.`
+          + `and if it is still there, apply it to the new invoice by hand.`)
       case 'AMBIGUOUS_FAILED_REGISTRATION':
-        return head
+        return withLedgerCheck(head
           + `an earlier registration against this same invoice FAILED `
           + `(sync ${verdict.ambiguousIds.join(', ')}), and a failed registration is NOT proof that `
           + `nothing reached the ledger — the payment may have been created and the response lost. IMS `
           + `therefore cannot tell how much of this invoice is already settled, and will not guess with `
           + `money. Nothing was sent. Open this invoice in the ledger: if the failed payment is not `
           + `there, resolve that sync entry and record the receipt again; if it IS there, the invoice `
-          + `is already settled by it and no further payment should be registered.`
+          + `is already settled by it and no further payment should be registered.`)
       case 'WOULD_OVERPAY':
         return withLedgerCheck(head
           + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed()} with `

@@ -25,6 +25,7 @@
  * post under the real number creates a SECOND invoice instead of replacing the first.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import type { WcFullOrder, WcMeta } from './types'
@@ -170,10 +171,10 @@ function commitmentToExistingNumber(params: {
   const under = params.storedInvoiceNumber ? ` under ${params.storedInvoiceNumber}` : ''
   if (accountingInvoiceId) {
     return (
-      `a ledger document (${accountingInvoiceId}) is already posted for this order${under}. The sales-invoice `
+      withLedgerCheck(`a ledger document (${accountingInvoiceId}) is already posted for this order${under}. The sales-invoice `
       + 'create is update-or-create on the invoice number, and the update sends the order\'s number against that '
       + 'document — so taking a different number now would either add a SECOND document or renumber a live one. '
-      + 'Reconcile the two by hand.'
+      + 'Reconcile the two by hand.')
     )
   }
   if (params.salesInvoiceSyncRowCount > 0) {

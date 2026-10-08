@@ -553,6 +553,27 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/products/bom-recipe.ts', prefix: 'An older BOM recipe for a different product', verdict: 'NON_ACCOUNTING', why: 'manufacturing BOM recipe' },
   { file: 'components/settings/backup-restore.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button', count: 2 },
   { file: 'components/settings/database-reset.tsx', prefix: 'Resend code', verdict: 'NON_ACCOUNTING', why: 'e-mail confirmation code button' },
+  { file: 'app/(dashboard)/sync/settle-sync-row-control.tsx', prefix: 'Settle this row — record what actually happened', verdict: 'DESCRIPTION', why: 'heading of the settle control: it records on the IMS row what the operator saw in the ledger and posts nothing' },
+  { file: 'app/actions/sales.ts', prefix: 'Reconcile the reservation manually', verdict: 'NON_ACCOUNTING', why: 'stock reservation release, no ledger posting' },
+  { file: 'lib/domain/sales/refund-reservation-release-outbox.ts', prefix: 'Reconcile the reservation manually', verdict: 'NON_ACCOUNTING', why: 'stock reservation release, no ledger posting' },
+  { file: 'lib/accounting-fx-revaluation.ts', prefix: 'Check the journal in the accounting system.', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check' },
+  { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'credit note(s) {} in the ledger', verdict: 'DESCRIPTION', why: 'states which credit notes the ledger holds' },
+  { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'no credit note of theirs recorded in the ledger', verdict: 'DESCRIPTION', why: 'states a fact about the ledger' },
+  { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'IMS records refund(s) {}', verdict: 'DESCRIPTION', why: 'states what IMS holds' },
+  { file: 'lib/connectors/woocommerce/sync/refund-sync.ts', prefix: 'This refund also returned {} unit(s)', verdict: 'DESCRIPTION', why: 'states a stock consequence; the instruction sentence is guarded' },
+  { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'ALLOCATED an existing supplier credit note', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
+  { file: 'lib/domain/accounting/allocation-debit-posting-proof.ts', prefix: 'the A2 journal this order was staged into is', verdict: 'DESCRIPTION', why: 'states why the proof failed' },
+  { file: 'lib/domain/accounting/ledger-settlement-evidence.ts', prefix: 'this row does not record the amount and date', verdict: 'DESCRIPTION', why: 'states why evidence cannot be matched' },
+  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The FX revaluation raises this journal only', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind' },
+  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The journal is queued once, with the stock movement', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
+  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The journal is queued once, with the receipt', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
+  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{} are NOT accounting documents', verdict: 'DESCRIPTION', why: 'states what the listed items are' },
+  { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'IMS could not establish whether credit note', verdict: 'DESCRIPTION', why: 'states why IMS refused' },
+  { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Credit note {} is already in the ledger as', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
 ]
 
 test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by construction or declared per sentence (verdict + justification), exactly (shrink-only)', () => {
@@ -598,4 +619,17 @@ test('[o3d-1e7sl Codex r17] the daily-batch diagnostics, rendered through the RE
     assert.match(before, /only if|If it does not exist|does not exist/i, `${name}: the instruction is conditional on the check`)
   }
   assert.doesNotMatch(dailyBatchUnprovedRefusal('X', 'r'), /Re-post it deliberately, or leave it/, 'the old unconditional advice is gone')
+})
+
+test('[o3d-1e7sl Codex r18] "record" and the other ledger verbs are instruction verbs; the bill-payment failure message is guarded by the ledger check', () => {
+  for (const text of ['Try again, or record the payment in the ledger by hand.', 'Enter the credit in the accounting system.', 'Reconcile the invoice manually.', 'Apply the credit note in the ledger.', 'Void it in the accounting system.', 'Settle it in the ledger by hand.', 'Allocate it in Xero.', 'Refund it again in the ledger.']) {
+    assert.match(text, HAND_POST_INSTRUCTION_PATTERN, `matched: ${text}`)
+    assert.ok(withLedgerCheck(text).startsWith(LEDGER_CHECK_PREAMBLE), `guarded: ${text}`)
+  }
+  // the markBillPaid failure that RETURNS the message to the operator (not just logs it)
+  const src = read('app/actions/purchase-orders.ts')
+  const m = src.match(/: withLedgerCheck\('The payment could not be queued for the accounting connector, so the bill was not marked ' \+\s*'paid\. Nothing was changed — try again, or record the payment in the ledger by hand\.'\)/)
+  assert.ok(m, 'the returned enqueue-failure error is wrapped in withLedgerCheck')
+  const rendered = withLedgerCheck('The payment could not be queued for the accounting connector, so the bill was not marked paid. Nothing was changed — try again, or record the payment in the ledger by hand.')
+  assert.ok(rendered.indexOf('check whether the current version is already in the accounting system') < rendered.indexOf('try again'), 'the check comes BEFORE either action')
 })

@@ -70,6 +70,7 @@
  * module, so a pre-existing row keeps deriving its token exactly as it did before.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import {
   accountingOriginRecordsMatch,
   carryAccountingOriginRecord,
@@ -523,12 +524,12 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     return {
       action: 'refuse',
       assertedNotPostedRowIds,
-      reason: `${assertedNotPostedRowIds.length} earlier ${input.type} row(s) for this reference and document are CANCELLED `
+      reason: withLedgerCheck(`${assertedNotPostedRowIds.length} earlier ${input.type} row(s) for this reference and document are CANCELLED `
         + 'because an OPERATOR settled them (as "not posted", or as posted against a cancelled sale). That is a person\'s word about a ledger IMS did not '
         + 'check, not proof - a lost response, a late webhook or a hand-posted payment would leave exactly the same '
         + 'row - so IMS will not send this money again on the strength of it. Open the document in the accounting '
         + 'system: if the payment is there, nothing more is owed (settle the row as POSTED with its id if you want '
-        + 'IMS to record it); if it is not, record the payment in the accounting system by hand.',
+        + 'IMS to record it); if it is not, record the payment in the accounting system by hand.'),
     }
   }
 
@@ -577,9 +578,9 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   if (candidateTokens.size > 1 && moneyMoving) {
     return {
       action: 'refuse',
-      reason: `${candidateTokens.size} different idempotency tokens have been used for ${input.type} against this `
+      reason: withLedgerCheck(`${candidateTokens.size} different idempotency tokens have been used for ${input.type} against this `
         + 'reference and document. Any one of them may have committed remotely, so an automatic retry could '
-        + 'duplicate it. Reconcile them in the ledger and resolve the rows manually.',
+        + 'duplicate it. Reconcile them in the ledger and resolve the rows manually.'),
     }
   }
 

@@ -30,6 +30,7 @@ export function unsafeInstructionSentences(text: string): string[] {
   const out: string[] = []
   sentences.forEach((sentence, i) => {
     if (!HAND_POST_INSTRUCTION_PATTERN.test(sentence) || PROHIBITION.test(sentence) || DESCRIPTION.test(sentence)) return
+    if (/^(Take this posting|Took a refused accounting posting) to settle it by hand\.?$/i.test(sentence.trim())) return // the CLAIM itself (the step that makes the later steps safe)
     const before = `${sentences.slice(Math.max(0, i - 3), i).join(' ')} ${sentence}`
     if (CLAIM_PHRASE.test(before) && LEDGER_CHECK_PHRASE.test(before)) return
     out.push(sentence.slice(0, 160))

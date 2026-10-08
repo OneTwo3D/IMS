@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
@@ -1287,13 +1288,13 @@ export async function enqueueFollowUpSyncLog(
   // refusals below (o3d-peh1).
   if (plan.action === 'skip') return FOLLOW_UPS_ENQUEUED
   if (plan.action === 'refuse') {
-    const message = `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: ${plan.reason} `
+    const message = withLedgerCheck(`Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: ${plan.reason} `
       + 'Nothing was queued and the FAILED rows are unchanged. '
       + 'A RETRY CANNOT CLEAR THIS: the manual retry applies the same rule and refuses for the same reason. Open the '
       + 'document in Xero and establish which attempt actually landed. If one did, record it with Settle on the '
       + 'accounting sync log (\'it posted, here is the id\'). If none did, record the payment in Xero by hand: '
       + 'settling a row as \'it did not post\' does NOT clear this any more, because that is an operator\'s word '
-      + 'about a ledger IMS did not check and IMS will not send money again on the strength of it.'
+      + 'about a ledger IMS did not check and IMS will not send money again on the strength of it.')
     await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_followup_enqueue_refused',
@@ -3591,7 +3592,7 @@ const POST_EFFECT_LEDGER_DOCUMENT = {
 } as const
 const POST_EFFECT_JOURNAL = {
   effect: 'POSTED a manual journal to the Xero ledger',
-  remedy: 'The journal is in the ledger: post a reversing journal there if it should not exist.',
+  remedy: withLedgerCheck('The journal is in the ledger: post a reversing journal there if it should not exist.'),
 } as const
 /**
  * o3d-e2mz r5 (Codex finding 2): A DRAFT JOURNAL'S REMEDY IS NOT A REVERSAL — IT IS A DELETION.
@@ -3695,9 +3696,9 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   MANUFACTURING_RECLASS: POST_EFFECT_JOURNAL,
   PURCHASE_CREDIT_NOTE_ALLOCATION: {
     effect: 'ALLOCATED an existing supplier credit note against a bill in Xero',
-    remedy: 'NO document was created — the allocation is a sub-resource of a credit note that already existed. '
+    remedy: withLedgerCheck('NO document was created — the allocation is a sub-resource of a credit note that already existed. '
       + 'Undo the allocation on that credit note in Xero if it should not stand; there is nothing to reverse or '
-      + 'credit-note.',
+      + 'credit-note.'),
   },
   BILL_ATTACHMENT: {
     effect: 'ATTACHED the supplier PDF to an existing Xero bill (a no-op when attachment upload is disabled)',
@@ -6898,7 +6899,7 @@ function describeMissingCreditNoteOrigin(
  * ledger, by the one party who can see which organisation they live in.
  */
 function creditNoteAllocationOriginRemedy(item: { creditNoteId: string; accountingInvoiceId: string }): string {
-  return 'WHAT TO DO: allocate it in the accounting system by hand — open credit note '
+  return withLedgerCheck('WHAT TO DO: allocate it in the accounting system by hand — open credit note '
     + `${item.creditNoteId} in the organisation that issued it and apply it to bill ${item.accountingInvoiceId}. `
     + 'That is exactly the effect this row would have had, decided by someone who can see which organisation '
     + 'the two documents live in, which nothing in this instance can. Do NOT retry or re-queue the row: it '
@@ -6909,7 +6910,7 @@ function creditNoteAllocationOriginRemedy(item: { creditNoteId: string; accounti
     + 'source document". For an allocation that is not a remedy, for the reason just given.) The row is '
     + 'inert meanwhile: it sends nothing, and once its retries are spent it sits FAILED in the sync log '
     + 'carrying the refusal, as a record rather than as outstanding work. Nothing else depends on it, and no '
-    + 'second one will be created.'
+    + 'second one will be created.')
 }
 
 /**

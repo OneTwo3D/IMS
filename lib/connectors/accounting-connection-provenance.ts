@@ -90,6 +90,7 @@
  * `match`, where two strings were compared and were equal.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { accountingIdProvenanceMatches } from './accounting-id-provenance'
 
 /** The payload key. Underscore-prefixed like `_postingMode`, so it cannot collide with a document field. */
@@ -602,14 +603,14 @@ export function accountingPayloadConnectionVerdict(params: {
 
   return refuse(
     'mismatch',
-    `Refused to post ${what}: it was queued for accounting connection ${stamp.provenance}, and this `
+    withLedgerCheck(`Refused to post ${what}: it was queued for accounting connection ${stamp.provenance}, and this `
     + `instance is now connected to ${active}. The external ids in this payload — the invoice or bill id, `
     + 'the bank account, the contact and item ids, the account codes and tax types — were all issued by, '
     + 'or only mean anything in, the organisation it was queued for. Posting it now would either be '
     + 'rejected outright or, worse, land on whatever unrelated document happens to hold the same id in '
     + 'the new organisation. Nothing was sent. If the reconnection was deliberate, this row belongs to '
     + 'the previous ledger: settle it there, or cancel it and re-queue the work from the source document '
-    + 'so the payload is rebuilt against the organisation that is connected now.',
+    + 'so the payload is rebuilt against the organisation that is connected now.'),
   )
 }
 
