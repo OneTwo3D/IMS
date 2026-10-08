@@ -334,14 +334,14 @@ function createAdapters(overrides: {
     now: () => FIXED_DATE,
     runPreflight: async () => overrides.preflight ?? createPreflight(),
     collectAdminHealth: async () => overrides.adminHealth ?? createAdminHealth(),
-    latestAccountingReconciliationRun: async () =>
-      overrides.latestAccountingReconciliationRun === undefined
+    accountingReconciliationSnapshot: async () => ({
+      latest: overrides.latestAccountingReconciliationRun === undefined
         ? createReconciliationRun()
         : overrides.latestAccountingReconciliationRun,
-    accountingReconciliationHistory: async () =>
-      typeof overrides.history === 'function'
-        ? overrides.history()
+      history: typeof overrides.history === 'function'
+        ? await overrides.history()
         : overrides.history ?? { runs: [], overflow: false, recordedBeforeNewest: false },
+    }),
   }
 }
 

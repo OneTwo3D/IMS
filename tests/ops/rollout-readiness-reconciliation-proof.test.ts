@@ -65,11 +65,10 @@ function adapters(latest: LatestAccountingReconciliationRun | null, history: Rec
     now: () => NOW,
     runPreflight: async () => ({ ok: true, checks: [{ id: 'node-env', name: 'NODE_ENV', status: 'pass', message: 'ok' }] }),
     collectAdminHealth: async () => cleanHealth(),
-    latestAccountingReconciliationRun: async () => latest,
-    accountingReconciliationHistory: async () => {
-      if (history instanceof Error) throw history
-      return history
-    },
+    accountingReconciliationSnapshot: async () => ({
+      latest,
+      history: history instanceof Error ? { unreadable: history.message } : history,
+    }),
   }
 }
 
@@ -389,7 +388,7 @@ function okLatest(lastStatus: string) {
 }
 
 test('[o3d-6e4v] an UNREADABLE newest-run read is a blocker, not "no run": allowWarnings cannot turn it green', async () => {
-  const failing = { ...adapters(newestRun(), noHistory), latestAccountingReconciliationRun: async () => { throw new Error('connection reset') } }
+  const failing = { ...adapters(newestRun(), noHistory), accountingReconciliationSnapshot: async () => { throw new Error('connection reset') } }
   const report = await collectRolloutReadiness(failing)
   assert.equal(report.status, 'blocked')
   assert.deepEqual(report.blockers.map((f) => f.id), ['readiness-adapter:accounting-reconciliation'])
@@ -397,4 +396,63 @@ test('[o3d-6e4v] an UNREADABLE newest-run read is a blocker, not "no run": allow
   const handler = createRolloutReadinessHandler({ authorize: async () => null, collect: () => collectRolloutReadiness(failing) })
   const response = await handler(new Request('https://ims.example/api/admin/rollout-readiness?allowWarnings=true'))
   assert.equal(response.status, 412)
+})
+
+// ---------------------------------------------------------------------------------------------------
+// A CLOSED TABLE over proof states: no not-proven state may read as ready.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] every not-proven proof state yields a blocker, except the one classified warning [mutation: unclassified fallback and newest-incomplete blocker removed]', async () => {
+  const { classifyReconciliationProof } = await import('../../lib/ops/rollout-readiness.ts')
+  const unresolved = { runId: 'old', createdAt: iso(5), fromDate: iso(95), toDate: iso(5), code: ROW_CAP }
+  const newestStates = ['complete', 'truncated', 'unreadable', 'not-recorded'] as const
+  let cases = 0
+  let warningOnly = 0
+  for (const newest of newestStates) {
+    for (const unresolvedCount of [0, 1]) {
+      for (const overflow of [false, true]) {
+        for (const notRecordedAfterRecording of [false, true]) {
+          // 'complete' with nothing unresolved, no overflow is the PROVEN shape; it is not a not-proven state.
+          if (newest === 'complete' && unresolvedCount === 0 && !overflow) continue
+          // notRecordedAfterRecording is only meaningful for a not-recorded newest run.
+          if (notRecordedAfterRecording && newest !== 'not-recorded') continue
+          const proof = { state: 'not-proven' as const, unresolved: unresolvedCount ? [unresolved] : [], overflow, newest, notRecordedAfterRecording }
+          const blockers: Parameters<typeof classifyReconciliationProof>[1] = []
+          const warnings: Parameters<typeof classifyReconciliationProof>[2] = []
+          classifyReconciliationProof(proof, blockers, warnings)
+          cases += 1
+          const onlyNotRecorded = newest === 'not-recorded' && unresolvedCount === 0 && !overflow && !notRecordedAfterRecording
+          if (onlyNotRecorded) {
+            warningOnly += 1
+            assert.deepEqual([blockers.length, warnings.map((w) => w.id)], [0, ['accounting-reconciliation:completeness-not-recorded']])
+          } else {
+            assert.ok(blockers.length > 0, `not-proven ${JSON.stringify({ newest, unresolvedCount, overflow, notRecordedAfterRecording })} must block`)
+          }
+        }
+      }
+    }
+  }
+  console.log(`precondition: ${cases} not-proven states classified; ${warningOnly} warning-only`)
+  assert.equal(warningOnly, 1)
+  // The shape that read as ready before: newest truncated, nothing unresolved (a later run covered it), no other finding.
+  const blockers: Parameters<typeof classifyReconciliationProof>[1] = []
+  classifyReconciliationProof({ state: 'not-proven', unresolved: [], overflow: false, newest: 'truncated', notRecordedAfterRecording: false }, blockers, [])
+  assert.deepEqual(blockers.map((b) => b.id), ['accounting-reconciliation:newest-run-incomplete'])
+  // A proven proof adds nothing.
+  const none: Parameters<typeof classifyReconciliationProof>[1] = []
+  classifyReconciliationProof({ state: 'proven' }, none, [])
+  assert.deepEqual(none, [])
+})
+
+test('[o3d-6e4v] the endpoint cannot be ready for a not-proven proof whose history covers its own truncated newest run', async () => {
+  // The interleaved read: the newest run T is truncated, and the history (read after a later complete run landed) covers T.
+  const truncatedNewest = newestRun({ id: 'T', truncations: [truncation(ROW_CAP)], warningCount: 1, totalCount: 1 })
+  const history: ReconciliationHistory = {
+    runs: [run('T', 1, 90, [truncation(ROW_CAP)]), run('C', 0, 200, [])],
+    overflow: false,
+    recordedBeforeNewest: true,
+  }
+  const { status, blockers } = await verdict(truncatedNewest, history)
+  assert.equal(status, 'blocked')
+  assert.deepEqual(blockers, ['accounting-reconciliation:newest-run-incomplete'])
 })

@@ -115,3 +115,48 @@ test('[o3d-6e4v] DB: with NO truncated run the reader returns nothing, and says 
   assert.deepEqual(before, { runs: [], overflow: false, recordedBeforeNewest: true })
   assert.deepEqual(first, { runs: [], overflow: false, recordedBeforeNewest: false })
 })
+
+// ---------------------------------------------------------------------------------------------------
+// THE SNAPSHOT: a reconciliation that lands between the two reads must not change what the proof sees.
+// ---------------------------------------------------------------------------------------------------
+
+test('[o3d-6e4v] DB: a complete run committed BETWEEN the newest-run read and the history read is NOT in the history (one REPEATABLE READ snapshot)', { skip }, async () => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  const { db } = await import('../../lib/db')
+  const { getAccountingReconciliationSnapshot, collectAccountingReconciliationReadiness } = await import('../../lib/ops/rollout-readiness')
+  const prefix = `rrsnap-${Date.now().toString(36)}-`
+  const insert = (id: string, createdAt: string, from: string, to: string, truncations: string) => db.$executeRawUnsafe(
+    `INSERT INTO "accounting_reconciliation_runs"
+       ("id", "fromDate", "toDate", "status", "totalCount", "warningCount", "criticalCount", "createdAt", "truncations")
+     VALUES ($1, $2::timestamp, $3::timestamp, 'COMPLETED', 0, 0, 0, $4::timestamp, $5::jsonb)`,
+    id, from, to, createdAt, truncations,
+  )
+  try {
+    // Dates in 2099 so these two are the newest rows whatever else the shared database holds.
+    await insert(`${prefix}T`, '2099-03-01T00:00:00', '2098-12-01T00:00:00', '2099-03-01T00:00:00', TRUNCATED)
+    let injected = false
+    const snapshot = await getAccountingReconciliationSnapshot({
+      afterLatestRead: async () => {
+        // A DIFFERENT connection commits a later complete run whose window contains T's.
+        await insert(`${prefix}C`, '2099-03-02T00:00:00', '2098-11-01T00:00:00', '2099-03-02T00:00:00', '[]')
+        injected = true
+      },
+    })
+    assert.equal(injected, true, 'precondition: the interleaving ran between the two reads')
+    assert.equal(snapshot.latest?.id, `${prefix}T`, 'precondition: T was the newest run when it was read')
+    const committed = await db.$queryRawUnsafe<Array<{ id: string }>>(`SELECT "id" FROM "accounting_reconciliation_runs" WHERE "id" = $1`, `${prefix}C`)
+    assert.equal(committed.length, 1, 'precondition: C really is committed and visible to a new reader')
+    assert.ok(!('unreadable' in snapshot.history), 'the history was readable')
+    const ids = 'runs' in snapshot.history ? snapshot.history.runs.map((r) => r.id) : []
+    console.log(`precondition: snapshot history ids ${JSON.stringify(ids.filter((id) => id.startsWith(prefix)))}`)
+    assert.equal(ids.includes(`${prefix}C`), false, 'C was committed after the snapshot began, so the history must not contain it')
+    assert.equal(ids.includes(`${prefix}T`), true)
+
+    // And through the readiness evaluation: T is still an UNRESOLVED truncation in that snapshot, so it blocks and says why.
+    const readiness = await collectAccountingReconciliationReadiness({ accountingReconciliationSnapshot: async () => snapshot }, new Date('2099-03-03T00:00:00Z'))
+    assert.ok(readiness.blockers.some((b) => b.id === 'accounting-reconciliation:truncation-unresolved'), 'blocked by the unresolved truncation')
+  } finally {
+    await db.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" LIKE $1`, `${prefix}%`)
+  }
+})

@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
   HEALTH_NO_STORE_HEADERS,
@@ -121,12 +122,12 @@ export type RolloutReadinessAdapters = {
   now: () => Date
   runPreflight: () => Promise<PreflightResult>
   collectAdminHealth: () => Promise<AdminHealthResponse>
-  latestAccountingReconciliationRun: () => Promise<LatestAccountingReconciliationRun | null>
   /**
-   * o3d-6e4v: the run history the completeness proof needs — every recorded run from the oldest
-   * unresolved truncation onward (see ReconciliationHistory). Asked only when a newest run exists.
+   * o3d-6e4v: the newest run AND the history its completeness proof quantifies over, read in ONE consistent snapshot
+   * (see getAccountingReconciliationSnapshot). Two separate reads let a reconciliation that lands between them
+   * cover the run the first read called newest, which then reads as proven-incomplete with nothing to say why.
    */
-  accountingReconciliationHistory: (newest: LatestAccountingReconciliationRun) => Promise<ReconciliationHistory>
+  accountingReconciliationSnapshot: () => Promise<AccountingReconciliationSnapshot>
 }
 
 export type CollectRolloutReadinessOptions = {
@@ -146,8 +147,7 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     now: () => new Date(),
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
-    latestAccountingReconciliationRun: getLatestAccountingReconciliationRun,
-    accountingReconciliationHistory: (newest) => getAccountingReconciliationHistory(newest),
+    accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot(),
   }
 }
 
@@ -244,6 +244,12 @@ export async function collectRolloutReadiness(
   })
 }
 
+export type AccountingReconciliationSnapshot = {
+  latest: LatestAccountingReconciliationRun | null
+  /** The history read in the SAME snapshot as `latest`, or why it could not be read. */
+  history: ReconciliationHistory | { unreadable: string }
+}
+
 export type AccountingReconciliationReadiness = {
   latest: LatestAccountingReconciliationRun | null
   proof: ReconciliationProof | null
@@ -263,44 +269,39 @@ export type AccountingReconciliationReadiness = {
  * converts to HTTP 200.)
  */
 export async function collectAccountingReconciliationReadiness(
-  adapters: Pick<RolloutReadinessAdapters, 'latestAccountingReconciliationRun' | 'accountingReconciliationHistory'>,
+  adapters: Pick<RolloutReadinessAdapters, 'accountingReconciliationSnapshot'>,
   now: Date,
   timeoutMs: number = DEFAULT_READINESS_TIMEOUT_MS,
 ): Promise<AccountingReconciliationReadiness> {
   const blockers: RolloutReadinessFinding[] = []
   const warnings: RolloutReadinessFinding[] = []
-  const latestResult = await settleReadinessAdapter('accounting-reconciliation', adapters.latestAccountingReconciliationRun(), timeoutMs)
-  if (!latestResult.ok) {
+  const snapshotResult = await settleReadinessAdapter('accounting-reconciliation', adapters.accountingReconciliationSnapshot(), timeoutMs)
+  if (!snapshotResult.ok) {
     blockers.push({
       id: 'readiness-adapter:accounting-reconciliation',
       severity: 'blocker',
       source: 'rollout-readiness',
       message: 'Accounting reconciliation readiness check failed or timed out, so whether the reconciliation is complete was not established.',
-      details: { error: summarizeReadinessError(latestResult.error) },
+      details: { error: summarizeReadinessError(snapshotResult.error) },
     })
     return { latest: null, proof: null, blockers, warnings }
   }
-  const latest = latestResult.value
+  const { latest, history } = snapshotResult.value
   classifyAccountingReconciliation(latest, blockers, warnings)
 
   let proof: ReconciliationProof | null = null
   if (latest) {
-    const historyResult = await settleReadinessAdapter(
-      'accounting-reconciliation-history',
-      adapters.accountingReconciliationHistory(latest),
-      timeoutMs,
-    )
-    if (historyResult.ok) {
-      proof = evaluateReconciliationProof(latest, historyResult.value)
-      classifyReconciliationProof(proof, blockers, warnings)
-    } else {
+    if ('unreadable' in history) {
       blockers.push({
         id: 'accounting-reconciliation:completeness-unevaluated',
         severity: 'blocker',
         source: 'accounting-reconciliation',
         message: 'Whether the accounting reconciliation is complete could not be established: its run history could not be read.',
-        details: { error: summarizeReadinessError(historyResult.error) },
+        details: { error: history.unreadable },
       })
+    } else {
+      proof = evaluateReconciliationProof(latest, history)
+      classifyReconciliationProof(proof, blockers, warnings)
     }
     classifyReconciliationAge(latest, now, warnings)
   }
@@ -328,8 +329,10 @@ export function createRolloutReadinessHandler({
   }
 }
 
-async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingReconciliationRun | null> {
-  const latest = await db.accountingReconciliationRun.findFirst({
+type ReconciliationRunReader = Pick<typeof db, 'accountingReconciliationRun'>
+
+async function readLatestAccountingReconciliationRun(client: ReconciliationRunReader): Promise<LatestAccountingReconciliationRun | null> {
+  const latest = await client.accountingReconciliationRun.findFirst({
     where: {
       status: {
         in: [...TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES],
@@ -358,6 +361,29 @@ async function getLatestAccountingReconciliationRun(): Promise<LatestAccountingR
     toDate: latest.toDate?.toISOString() ?? null,
     truncations: latest.truncations,
   }
+}
+
+/**
+ * o3d-6e4v: THE NEWEST RUN AND ITS HISTORY IN ONE SNAPSHOT. A single REPEATABLE READ transaction whose first statement
+ * reads the newest run, so the history is read from the same point in time. Read separately, a reconciliation that
+ * completes between the two reads can cover the run the first read called newest: the proof then says "not proven,
+ * newest run truncated" with no unresolved entry, and (before every not-proven state became a blocker) no finding.
+ * `afterLatestRead` is a seam for the interleaving test: it runs between the two reads.
+ */
+export async function getAccountingReconciliationSnapshot(
+  options: { afterLatestRead?: () => Promise<void>; client?: { $transaction: typeof db.$transaction } } = {},
+): Promise<AccountingReconciliationSnapshot> {
+  const client = options.client ?? db
+  return client.$transaction(async (tx) => {
+    const latest = await readLatestAccountingReconciliationRun(tx)
+    await options.afterLatestRead?.()
+    if (!latest) return { latest: null, history: { runs: [], overflow: false, recordedBeforeNewest: false } }
+    try {
+      return { latest, history: await getAccountingReconciliationHistory(latest, tx) }
+    } catch (error) {
+      return { latest, history: { unreadable: summarizeReadinessError(error) } }
+    }
+  }, { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead, maxWait: 10_000, timeout: 30_000 })
 }
 
 /**
@@ -950,12 +976,13 @@ function classifyAccountingReconciliation(
  * state has the severity it has; in short, the two that are the data's own statement of loss (truncated,
  * unreadable) are blockers, because `?allowWarnings=true` makes any warning HTTP 200 without a record.
  */
-function classifyReconciliationProof(
+export function classifyReconciliationProof(
   proof: ReconciliationProof,
   blockers: RolloutReadinessFinding[],
   warnings: RolloutReadinessFinding[],
 ): void {
   if (proof.state === 'proven') return
+  const blockersBefore = blockers.length
   const shown = proof.unresolved.slice(0, 20).map((entry) => ({
     runId: entry.runId,
     createdAt: entry.createdAt,
@@ -1010,6 +1037,29 @@ function classifyReconciliationProof(
           + 'is unknown. Run reconciliation again on this build.',
     }
     ;(proof.notRecordedAfterRecording ? blockers : warnings).push(finding)
+  }
+  // The newest run's OWN record says it omitted findings (or cannot be read) and nothing above named it, so say so.
+  if ((proof.newest === 'truncated' || proof.newest === 'unreadable') && proof.unresolved.length === 0) {
+    blockers.push({
+      id: 'accounting-reconciliation:newest-run-incomplete',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: `The newest accounting reconciliation run recorded that its report is ${proof.newest === 'truncated' ? 'truncated' : 'unreadable'}, so it does not prove the reconciliation complete.`,
+    })
+  }
+  // CLOSED TABLE. A not-proven proof is acceptable WITHOUT a blocker in exactly one shape: the newest run predates
+  // completeness recording and nothing else is wrong (a warning, above). Every other not-proven state that has not
+  // already produced a blocker in this call is itself a blocker, so a state this function does not know how to explain
+  // can never read as ready.
+  const onlyNotRecorded = proof.newest === 'not-recorded' && proof.unresolved.length === 0 && !proof.overflow && !proof.notRecordedAfterRecording
+  if (!onlyNotRecorded && blockers.length === blockersBefore) {
+    blockers.push({
+      id: 'accounting-reconciliation:completeness-unclassified',
+      severity: 'blocker',
+      source: 'accounting-reconciliation',
+      message: 'The accounting reconciliation is not proven complete, for a reason this check does not classify. It is treated as a blocker.',
+      details: { newest: proof.newest, unresolved: proof.unresolved.length, overflow: proof.overflow, notRecordedAfterRecording: proof.notRecordedAfterRecording },
+    })
   }
 }
 
