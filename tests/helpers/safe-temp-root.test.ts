@@ -73,3 +73,25 @@ test('dispose refuses after the directory was swapped for a symlink to the repo 
     assert.ok(existsSync(join(w.repo, 'precious.txt')))
   } finally { rmSync(w.world, { recursive: true, force: true }) }
 })
+
+test('isolating cases: each remaining rule refuses on its own (the other rules would allow it)', () => {
+  const world = realpathSync(mkdtempSync(join(tmpdir(), 'safe-root-iso-')))
+  try {
+    const tmpBase = join(world, 'tmp')
+    const repo = join(world, 'elsewhere', 'repo') // the stand-in repo is OUTSIDE the stand-in tmp dir
+    const insideRepo = join(repo, 'sub')
+    const otherUnderTmp = join(tmpBase, 'other-scratch')
+    for (const dir of [tmpBase, insideRepo, otherUnderTmp]) mkdirSync(dir, { recursive: true })
+    const options = { tmpBase, repoRoot: repo }
+    const scratch = makeScratchRoot('probe-', options)
+    console.log('precondition (isolating): stand-in repo outside the stand-in tmp dir; targets that only ONE rule forbids')
+    assert.throws(() => assertSafeToDelete(tmpBase, tmpBase, options), /strictly under/, 'the temp dir itself (not an ancestor of the repo here)')
+    assert.throws(() => assertSafeToDelete(otherUnderTmp, scratch.root, options), /exact path/, 'a safe-looking directory that is not the one created')
+    assert.throws(() => assertSafeToDelete(insideRepo, insideRepo, options), /not strictly under|inside the repository/, 'a directory inside the repo')
+    // inside the repo AND under tmp (the repo placed under tmp), so only the "inside the repository" rule can refuse
+    const repo2 = join(tmpBase, 'repo2')
+    mkdirSync(join(repo2, 'sub'), { recursive: true })
+    assert.throws(() => assertSafeToDelete(join(repo2, 'sub'), join(repo2, 'sub'), { tmpBase, repoRoot: repo2 }), /inside the repository/)
+    scratch.dispose()
+  } finally { rmSync(world, { recursive: true, force: true }) }
+})
