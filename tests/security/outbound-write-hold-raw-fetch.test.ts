@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
+
+import { makeScratchRoot } from '../helpers/safe-temp-root'
 import ts from 'typescript'
 
 /**
@@ -119,7 +120,8 @@ test('every non-GET raw fetch under scripts/ and e2e/ goes through guardedExtern
 
 test('the scanner can fail: it flags an alias, a member call, a spread, a quoted method key, an unknown shape and a raw http request', () => {
   // A PRIVATE temp dir outside the source tree: tests that scan the tree run in parallel with this one.
-  const dir = mkdtempSync(join(tmpdir(), 'rawfetch-probe-'))
+  const scratch = makeScratchRoot('rawfetch-probe-')
+  const dir = scratch.root
   const cases: Record<string, string> = {
     alias: "const f = fetch\nawait f('https://api.xero.com/x', { method: 'POST' })",
     member: "await globalThis.fetch('https://shop.example.com/x', { method: 'DELETE' })",
@@ -140,7 +142,7 @@ test('the scanner can fail: it flags an alias, a member call, a spread, a quoted
     writeFileSync(clean, "await fetch('https://shop.example.com/x', { headers: {} })\nawait fetch(`${baseUrl}/api/cron/x`, { method: 'POST' })")
     assert.equal(scan(clean).findings.length, 0, 'the control: a literal GET and a local-app POST are not findings')
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    scratch.dispose()
   }
   console.log(`precondition (scanner): ${flagged}/${Object.keys(cases).length} evasion shapes flagged`)
   assert.equal(flagged, Object.keys(cases).length)

@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
+
+import { makeScratchRoot } from '../helpers/safe-temp-root'
 import ts from 'typescript'
 
 /**
@@ -199,7 +200,8 @@ test('a NEW file with a failing writer is found by the whole-tree scan (it does 
   // The probe tree is PRIVATE and outside the repo: tests that scan the real tree run in parallel with this one,
   // so nothing here may create or remove a file inside lib/, app/ or tests/. The same scanner is pointed at a
   // temp root that mimics lib/.
-  const root = mkdtempSync(join(tmpdir(), 'census-probe-'))
+  const scratch = makeScratchRoot('census-probe-')
+  const root = scratch.root
   const realBefore = listFiles()
   try {
     mkdirSync(join(root, 'lib', 'zz-text-census-probe'), { recursive: true })
@@ -211,7 +213,7 @@ test('a NEW file with a failing writer is found by the whole-tree scan (it does 
     assert.ok(findings.some((f) => f.where.startsWith('lib/zz-text-census-probe/writer.ts')), 'and flags it')
     console.log('precondition (new file): a fresh file in a private temp root mimicking lib/ was listed and flagged')
   } finally {
-    rmSync(root, { recursive: true, force: true })
+    scratch.dispose()
   }
   assert.deepEqual(listFiles(), realBefore, 'the real scanned tree is byte-for-byte the same file list before and after: the probe never touched it')
 })
