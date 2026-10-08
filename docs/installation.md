@@ -897,7 +897,9 @@ The **database password** is preserved on the same terms, with one extra conditi
 Supplying a different one asks for a deliberate rotation, which happens inside the stopped, fenced
 window — see *The database password is preserved, and a rotation waits for the fence* above.
 
-Prompts NOT preserved across a re-run: the WooCommerce, Xero, Turnstile and SMTP values, and the
+The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: Enter keeps the pair already in `.env` (type `none`, or export `none`, to clear one -- a blank answer does not clear it), and an existing `INVOICE_PDF_STORAGE_DIR` is kept as is (it must be absolute; outside `/var/lib/one-two-inventory` it must already exist, be a real directory and be writable by the application account, or the run stops before `.env` is written).
+
+Prompts NOT preserved across a re-run: the WooCommerce, Xero and SMTP values, and the
 database host, port, name and user. Supply them again (or as environment variables) on an upgrade
 run, or the re-written `.env` will blank them.
 
@@ -979,7 +981,7 @@ the client sends.
 
 ### Cloudflare Turnstile (Optional)
 - Site key and secret key for the login-page challenge (`NEXT_PUBLIC_TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`)
-- Leave both blank (the default, and what `--non-interactive` uses when they are not exported) to keep the challenge disabled; they are collected up front with the other prompts and written to `.env` either way
+- On a first install, leave both blank (the default, and what `--non-interactive` uses when they are not exported) to keep the challenge disabled; on a re-run the existing pair is the default and `none` clears it; they are collected up front with the other prompts and written to `.env` either way
 
 ### Outbound Email (Optional)
 - SMTP host, port, username, password, transport security
