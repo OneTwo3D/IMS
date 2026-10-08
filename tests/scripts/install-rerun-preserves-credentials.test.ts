@@ -221,7 +221,7 @@ async function runInstallerCapturing(
     APP_DOMAIN=ims.example.com
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory
     ${UNRELATED_VARS.map((name) => `${name}=''`).join('\n    ')}
-    ${hasEnvTable ? 'declare -A EXISTING_ENV=()' : ''}
+    ${hasEnvTable ? 'declare -A EXISTING_ENV=(); declare -A EXISTING_ENV_LINENO=(); declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=()' : ''}
     ${captureTerminatorAssignment(source)}
     ${sliceOptionalBlock(source, 'capture() {') ?? ''}
     ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
@@ -229,6 +229,7 @@ async function runInstallerCapturing(
     ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
     ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
     ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
+    ${sliceOptionalBlock(source, 'env_value_closes_quote() {') ?? ''}
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
     ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
@@ -553,7 +554,7 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       warn() { echo "WARN: $*" >&2; }
       die() { echo "DIE: $*" >&2; exit 9; }
       APP_DIR=${JSON.stringify(appDir)}
-      ${source.includes('declare -A EXISTING_ENV=()') ? 'declare -A EXISTING_ENV=()' : ''}
+      ${source.includes('declare -A EXISTING_ENV=()') ? 'declare -A EXISTING_ENV=(); declare -A EXISTING_ENV_LINENO=(); declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=()' : ''}
       ${captureTerminatorAssignment(source)}
       ${sliceOptionalBlock(source, 'capture() {') ?? ''}
       ${sliceOptionalBlock(source, 'urlencode() {') ?? ''}
@@ -561,7 +562,8 @@ test('a preserved credential is never echoed as a prompt default', async () => {
       ${sliceOptionalBlock(source, 'mask_secret() {') ?? ''}
       ${sliceOptionalBlock(source, 'redact_url_credentials() {') ?? ''}
       ${sliceOptionalBlock(source, 'redis_url_credential_state() {') ?? ''}
-      ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
+      ${sliceOptionalBlock(source, 'env_value_closes_quote() {') ?? ''}
+    ${sliceOptionalBlock(source, 'load_existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}
       ${sliceOptionalBlock(source, 'prompt() {') ?? ''}
@@ -605,7 +607,8 @@ async function loadEnvState(
     warn() { echo "WARN: $*" >&2; }
     die() { echo "DIE: $*" >&2; exit 9; }
     APP_DIR=${JSON.stringify(appDir)}
-    declare -A EXISTING_ENV=()
+    declare -A EXISTING_ENV=(); declare -A EXISTING_ENV_LINENO=(); declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=()
+    ${sliceOptionalBlock(source, 'env_value_closes_quote() {') ?? ''}
     ${sliceOptionalBlock(source, 'load_existing_env() {') ?? 'load_existing_env() { :; }'}
     ${sliceOptionalBlock(source, 'unquote_env_value() {') ?? ''}
     ${sliceOptionalBlock(source, 'existing_env() {') ?? ''}

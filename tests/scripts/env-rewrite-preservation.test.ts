@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 
@@ -50,11 +50,15 @@ const LIB = [
   'die() { echo "DIE: $*"; exit 9; }',
   'APP_DIR=/opt/app; APP_USER=app; DB_ADMIN_CREDENTIAL_FILE=/etc/ims-db-admin/deploy-admin.env',
   'declare -A EXISTING_ENV=()',
-  'declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=()',
+  'declare -a EXISTING_ENV_RAW=() EXISTING_ENV_UNCLASSIFIED=() ENV_REFUSED_KEYS=()',
+  'declare -A EXISTING_ENV_LINENO=()',
+  'ENV_REFUSAL_REASON=""',
   'ENV_FILE_STATE=absent',
   'ENV_BACKUP_FILE=""; ENV_KEPT_KEYS=(); ENV_PRESERVED_BLOCK=""',
   shippedFunction(INSTALL, 'existing_env'),
+  shippedFunction(INSTALL, 'env_value_closes_quote'),
   shippedFunction(INSTALL, 'load_existing_env'),
+  shippedFunction(INSTALL, 'env_key_carry_check'),
   shippedFunction(INSTALL, 'env_key_is_admin_credential'),
   shippedFunction(INSTALL, 'render_preserved_env_keys'),
   shippedFunction(INSTALL, 'write_env_backup'),
@@ -96,24 +100,53 @@ test('re-run: a deploy admin credential left in the application .env is REFUSED,
 
 test('re-run: a timestamped mode-600 backup of the old file is written from what was read, before anything is replaced', async () => {
   await withTempDir('ims-env-bak-', async (dir) => {
-    const old = join(dir, '.env')
+    const old = join(dir, '.env.src')
     writeFileSync(old, OLD_ENV)
+    const appDir = join(dir, 'app')
+    mkdirSync(appDir)
     const target = join(dir, 'captured')
     const r = bash([LIB, 'date() { echo 20261008T120000Z; }',
       // publish_durable_file replaced by a recorder: arguments + stdin.
       `publish_durable_file() { echo "PUBLISH $1 $2 $3" > '${target}.args'; cat > '${target}.body'; }`,
-      `load_existing_env '${old}'`, 'APP_DIR=/opt/app', 'write_env_backup; echo "RC=$?"', 'echo "FILE=${ENV_BACKUP_FILE}"'].join('\n'))
+      `load_existing_env '${old}'`, `APP_DIR='${appDir}'`, 'write_env_backup; echo "RC=$?"', 'echo "FILE=${ENV_BACKUP_FILE}"'].join('\n'))
     const args = readFileSync(`${target}.args`, 'utf8').trim()
-    console.log(`  backup: ${args}`)
+    console.log(`  backup: ${args.replace(dir, '<tmp>')}`)
     assert.match(r.out, /RC=0/)
-    assert.equal(args, 'PUBLISH /opt/app/.env.bak-20261008T120000Z app:app 600')
+    assert.match(args, new RegExp(`^PUBLISH ${appDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.env\\.bak-20261008T120000Z-\\d+-0 app:app 600$`))
     assert.equal(readFileSync(`${target}.body`, 'utf8'), OLD_ENV, 'the backup is the old file byte for byte')
     // First install: nothing to back up, nothing published.
     const first = bash([LIB, 'publish_durable_file() { echo CALLED; }', 'write_env_backup; echo "RC=$? FILE=[${ENV_BACKUP_FILE}]"'].join('\n'))
     assert.match(first.out, /RC=0 FILE=\[\]/)
     assert.doesNotMatch(first.out, /CALLED/)
-    assert.deepEqual(readdirSync(dir).filter((f) => f.startsWith('.env.bak')), [], 'precondition: the rig itself wrote no real backup')
-    void statSync
+  })
+})
+
+test('re-run: two backups in the same second get different names, and a planted name is skipped, never replaced', async () => {
+  await withTempDir('ims-env-bak2-', async (dir) => {
+    const old = join(dir, '.env.src')
+    writeFileSync(old, OLD_ENV)
+    const appDir = join(dir, 'app')
+    mkdirSync(appDir)
+    const program = (extra: string) => [LIB, 'date() { echo 20261008T120000Z; }',
+      // The recorder publishes for real into the reserved name, as publish_durable_file renames over it.
+      'publish_durable_file() { cat > "$1"; }',
+      `load_existing_env '${old}'`, `APP_DIR='${appDir}'`, extra,
+      'write_env_backup; echo "FIRST=${ENV_BACKUP_FILE##*/}"', 'write_env_backup; echo "SECOND=${ENV_BACKUP_FILE##*/}"'].join('\n')
+    const r = bash(program(''))
+    const first = /FIRST=(\S+)/.exec(r.out)?.[1]
+    const second = /SECOND=(\S+)/.exec(r.out)?.[1]
+    console.log(`  same-second names: ${first} / ${second}`)
+    assert.ok(first && second && first !== second, 'precondition: two names were handed out')
+    assert.equal(readFileSync(join(appDir, first), 'utf8'), OLD_ENV, 'and the first backup is still there, intact')
+    assert.equal(readFileSync(join(appDir, second), 'utf8'), OLD_ENV)
+    // A name already taken (here a symlink planted at the first candidate) is skipped, not followed.
+    const victim = join(dir, 'victim')
+    writeFileSync(victim, 'DO NOT TOUCH\n')
+    const planted = bash(program(`ln -s '${victim}' "${appDir}/.env.bak-20261008T120000Z-$$-0"`))
+    const pf = /FIRST=(\S+)/.exec(planted.out)?.[1]
+    console.log(`  with a planted symlink at -0: ${pf}; victim intact: ${readFileSync(victim, 'utf8') === 'DO NOT TOUCH\n'}`)
+    assert.match(pf ?? '', /-1$/, 'the planted name was skipped')
+    assert.equal(readFileSync(victim, 'utf8'), 'DO NOT TOUCH\n', 'and what it pointed at was not written through')
   })
 })
 
@@ -133,14 +166,122 @@ test('re-run: the summary names what was kept, changed and added, and never prin
   })
 })
 
-test('re-run: lines that are not plain KEY=VALUE are counted and pointed at the backup, not silently dropped', async () => {
-  await withTempDir('ims-env-uncl-', async (dir) => {
+test('re-run: export/spaced forms and multi-line quoted values are read whole; anything else is unclassified', async () => {
+  await withTempDir('ims-env-ml-', async (dir) => {
     const old = join(dir, '.env')
-    writeFileSync(old, 'A=1\nexport B=2\nC = 3\n# comment\n\nD=4\n')
-    const r = bash([LIB, `load_existing_env '${old}'`, 'ENV_BACKUP_FILE=/b', 'print_env_rewrite_summary "A=1"'].join('\n'))
-    console.log(`  unclassified: ${JSON.stringify(r.out.split('\n').filter((l) => /WARN/.test(l)).map((l) => l.slice(0, 120)))}`)
-    assert.match(r.out, /WARN:   2 line\(s\) .*line numbers: 2 3\) and were NOT carried over; they are in the backup/)
+    writeFileSync(old, [
+      'A=1',
+      'export B=2',
+      'C = 3',
+      'KEY="-----BEGIN PRIVATE KEY-----',
+      'line two with = and #',
+      '-----END PRIVATE KEY-----"',
+      "SQ='one",
+      "two'",
+      'D="a \\"quoted\\" word"',
+      'not a key value line',
+      'E="never closed',
+      'F=6',
+      '',
+    ].join('\n'))
+    const r = bash([LIB, `load_existing_env '${old}'`,
+      'echo "UNCLASSIFIED=${EXISTING_ENV_UNCLASSIFIED[*]}"',
+      'for k in A B C KEY SQ D F; do printf "%s|%s|line %s\\n" "$k" "${EXISTING_ENV[$k]-<unset>}" "${EXISTING_ENV_LINENO[$k]-?}"; done'].join('\n'))
+    console.log(`  loader: ${JSON.stringify(r.out.split('\n').slice(0, 14))}`)
+    assert.match(r.out, /UNCLASSIFIED=10 11\b/, 'the prose line (10) and the quoted value that never closes (11) are the only unclassified lines')
+    assert.match(r.out, /^B\|2\|line 2$/m, '`export KEY=v` is read as KEY=v')
+    assert.match(r.out, /^C\| 3\|line 3$/m, '`KEY = v` is read as KEY with that value')
+    assert.match(r.out, /^KEY\|"-----BEGIN PRIVATE KEY-----$/m, 'a multi-line quoted value starts at its first line...')
+    assert.match(r.out, /^-----END PRIVATE KEY-----"\|line 4$/m, '...and ends with its closing line (one value; the middle lines are not keys of their own)')
+    assert.match(r.out, /^D\|"a \\"quoted\\" word"\|line 9$/m, 'an escaped quote does not close a double-quoted value')
+    assert.match(r.out, /^F\|6\|line 12$/m, 'and reading resumes after an unclosed value')
+    // The caller refuses the rewrite before anything has changed.
+    const lines = INSTALL.split('\n')
+    const start = lines.findIndex((l) => l === 'if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then')
+    const end = lines.findIndex((l, i) => i > start && l === 'fi')
+    assert.ok(start > 0 && end > start, 'precondition: the refusal block exists')
+    const gate = lines.slice(start, end + 1).join('\n')
+    const refused = bash([LIB, 'APP_DIR=/opt/app', `load_existing_env '${old}'`, gate, 'echo "CONTINUED"'].join('\n'))
+    console.log(`  caller: ${JSON.stringify(refused.out.split('\n').filter((l) => /DIE|CONTINUED/.test(l)).map((l) => l.slice(0, 150)))}`)
+    assert.equal(refused.status, 9)
+    assert.match(refused.out, /DIE: .*2 line\(s\).*\(line numbers: 10 11\).*Nothing has been changed\./)
+    assert.doesNotMatch(refused.out, /CONTINUED/)
+    const clean = join(dir, 'clean.env')
+    writeFileSync(clean, 'A=1\nexport B=2\nQ="x\ny"\n')
+    const ok = bash([LIB, 'APP_DIR=/opt/app', `load_existing_env '${clean}'`, gate, 'echo "CONTINUED"'].join('\n'))
+    assert.match(ok.out, /CONTINUED/, 'a file it can reproduce goes through')
   })
+})
+
+test('re-run: a multi-line value is carried across whole', async () => {
+  await withTempDir('ims-env-mlc-', async (dir) => {
+    const old = join(dir, '.env')
+    writeFileSync(old, 'APP_PORT=3000\nCERT_PEM="-----BEGIN\nMIIB=\n-----END"\nTAIL=1\n')
+    const r = bash([LIB, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'", 'render_preserved_env_keys "${rendered}"; printf "BLOCK<<%s>>" "${ENV_PRESERVED_BLOCK}"'].join('\n'))
+    console.log(`  multi-line carried: ${JSON.stringify(r.out.slice(-80))}`)
+    assert.match(r.out, /CERT_PEM="-----BEGIN\nMIIB=\n-----END"\nTAIL=1\n>>/)
+  })
+})
+
+const CARRY_ADMIN = 'postgresql://deployadmin:Adm1nPassw0rd@127.0.0.1:5432/db'
+
+test('re-run: a database-connection-like key or value is NOT carried into the application .env; the reason is listed, the value never printed', async () => {
+  await withTempDir('ims-env-carry-', async (dir) => {
+    const old = join(dir, '.env')
+    writeFileSync(old, [
+      'APP_PORT=3000',
+      `DIRECT_URL=${CARRY_ADMIN}`,
+      `MIGRATION_DATABASE_URL=${CARRY_ADMIN}`,
+      'PGPASSWORD=Adm1nPassw0rd',
+      'PGUSER=deployadmin',
+      `direct_url=${CARRY_ADMIN}`,
+      `export SHADOW_DATABASE_URL=${CARRY_ADMIN}`,
+      'REPORTING_CONN=postgres://reader:readerpw@db.example.test/reports',
+      'PROXYISH=http://user:secretpw@proxy.example.test:3128',
+      'INNOCUOUS_NOTE=copied from the admin file: Adm1nPassw0rd',
+      'ROLE_NOTE=connect as deployadmin: postgres://deployadmin@h/db',
+      'TRUSTED_PROXY_IPS=10.0.0.1',
+      'XERO_ALLOWED_TENANT_IDS=tenant-a',
+      '',
+    ].join('\n'))
+    const r = bash([LIB, `DEPLOY_ADMIN_DATABASE_URL='${CARRY_ADMIN}'`, `load_existing_env '${old}'`, "rendered='APP_PORT=3000'",
+      'render_preserved_env_keys "${rendered}"; echo "RC=$?"', 'printf "BLOCK<<%s>>\\n" "${ENV_PRESERVED_BLOCK}"',
+      'ENV_BACKUP_FILE=/b; print_env_rewrite_summary "${rendered}"'].join('\n'))
+    console.log(`  carried block: ${JSON.stringify(/BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1])}`)
+    console.log(`  refused: ${JSON.stringify(r.out.split('\n').filter((l) => /^WARN:     /.test(l)).map((l) => l.slice(0, 110)))}`)
+    assert.match(r.out, /RC=0/)
+    const block = /BLOCK<<([\s\S]*?)>>/.exec(r.out)?.[1] ?? ''
+    assert.match(block, /^TRUSTED_PROXY_IPS=10\.0\.0\.1$/m, 'precondition: ordinary hand-added keys are still carried')
+    assert.match(block, /^XERO_ALLOWED_TENANT_IDS=tenant-a$/m)
+    for (const gone of ['DIRECT_URL', 'MIGRATION_DATABASE_URL', 'PGPASSWORD', 'PGUSER', 'direct_url', 'SHADOW_DATABASE_URL', 'REPORTING_CONN', 'PROXYISH', 'INNOCUOUS_NOTE', 'ROLE_NOTE']) {
+      assert.doesNotMatch(block, new RegExp(`^${gone}=`, 'm'), `${gone} must not be carried`)
+      assert.match(r.out, new RegExp(`WARN:     ${gone} \\(line \\d+\\): `), `${gone} must be listed with its line and a reason`)
+    }
+    assert.match(r.out, /WARN:     INNOCUOUS_NOTE \(line \d+\): the value contains the deploy admin's password/, 'a value-only match under an innocuous name is caught')
+    assert.match(r.out, /WARN:     ROLE_NOTE .*PostgreSQL connection URL/)
+    assert.match(r.out, /WARN:     PROXYISH .*URL with a password/)
+    for (const secret of ['Adm1nPassw0rd', 'readerpw', 'secretpw']) assert.doesNotMatch(r.out, new RegExp(secret), `${secret} must never be printed`)
+  })
+})
+
+test('re-run: the admin-material checks need the admin credential to be known, and ordinary keys pass without it', async () => {
+  const check = (key: string, value: string, admin: string) => bash([LIB, admin ? `DEPLOY_ADMIN_DATABASE_URL='${admin}'` : 'DEPLOY_ADMIN_DATABASE_URL=""',
+    `env_key_carry_check '${key}' '${value}'; echo "RC=$? REASON=[$ENV_REFUSAL_REASON]"`].join('\n')).out.trim().split('\n').pop()
+  const rows: Array<[string, string, string, string]> = [
+    ['TRUSTED_PROXY_IPS', '10.0.0.1', CARRY_ADMIN, 'RC=0 REASON=[]'],
+    ['NOTE', 'has Adm1nPassw0rd inside', CARRY_ADMIN, "RC=1 REASON=[the value contains the deploy admin's password]"],
+    ['NOTE', 'has Adm1nPassw0rd inside', '', 'RC=0 REASON=[]'],
+    ['NOTE', 'x@deployadmin:y', CARRY_ADMIN, 'RC=0 REASON=[]'],
+    ['NOTE', 'ssh://deployadmin@host/x', CARRY_ADMIN, 'RC=1 REASON=[the value names the deploy admin role as a connection user]'],
+    ['PGSSLMODE', 'require', '', 'RC=1 REASON=[the name looks like a database connection setting]'],
+    ['SUPERUSER_FLAG', '1', '', 'RC=1 REASON=[the name looks like a database connection setting]'],
+    ['FEATURE_X', 'on', '', 'RC=0 REASON=[]'],
+  ]
+  for (const [key, value, admin, want] of rows) {
+    const got = check(key, value, admin)
+    console.log(`  ${key}=${value.slice(0, 22)} admin=${admin ? 'known' : 'unknown'} -> ${got}`)
+    assert.equal(got, want)
+  }
 })
 
 /** A block of shipped lines from `first` through `last` inclusive. */

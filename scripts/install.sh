@@ -394,6 +394,7 @@ declare -A EXISTING_ENV=()
 # those are not carried into the new file, and the summary says how many there were.
 declare -a EXISTING_ENV_RAW=()
 declare -a EXISTING_ENV_UNCLASSIFIED=()
+declare -A EXISTING_ENV_LINENO=()
 
 # o3d-l89a r4 (Codex r3 finding 2) — A FILE WE CANNOT READ IS NOT A FILE WITH NO SECRETS.
 #
@@ -410,6 +411,17 @@ declare -a EXISTING_ENV_UNCLASSIFIED=()
 #   read   — the file was opened and read to the end, and EXISTING_ENV is what it held.
 #   (the third is not a value: an unreadable path REFUSES, because there is nothing safe to assume.)
 ENV_FILE_STATE=absent
+
+# Does this text contain the quote that closes a quoted dotenv value opened with ${2}? A double quote
+# closes at the first one not escaped by a backslash; a single quote at the first one.
+env_value_closes_quote() {
+  if [[ "$2" == '"' ]]; then
+    local re='^([^"\\]|\\.)*"'
+    [[ "$1" =~ $re ]]
+  else
+    [[ "$1" == *"'"* ]]
+  fi
+}
 
 load_existing_env() {
   local file="$1" line key value
@@ -434,19 +446,46 @@ load_existing_env() {
     die "${file} could not be read to the end, so the secrets a previous install committed to are unknown. Refusing to continue rather than minting new ones over a live database."
   fi
 
-  local lineno=0
+  # KEY=VALUE, also `export KEY=VALUE` and `KEY = VALUE` (dotenv reads all three the same way), and a
+  # quoted value that runs over several lines is ONE value: its continuation lines are part of it and
+  # are not parsed as keys of their own. A line that is none of these, or a quoted value that never
+  # closes, is recorded and the run refuses before anything is changed (see the caller).
+  local lineno=0 n=${#lines[@]} i=0 lead quote j closed
   EXISTING_ENV_RAW=("${lines[@]}")
   EXISTING_ENV_UNCLASSIFIED=()
-  for line in "${lines[@]}"; do
-    lineno=$((lineno + 1))
+  EXISTING_ENV_LINENO=()
+  while ((i < n)); do
+    line="${lines[i]}"
+    lineno=$((i + 1))
+    i=$((i + 1))
     [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
-    key="${line%%=*}"
-    value="${line#*=}"
-    if [[ "${line}" != *=* || ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    if [[ ! "${line}" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
       EXISTING_ENV_UNCLASSIFIED+=("${lineno}")
       continue
     fi
+    key="${BASH_REMATCH[2]}"
+    value="${BASH_REMATCH[3]}"
+    lead="${value#"${value%%[![:space:]]*}"}"
+    quote="${lead:0:1}"
+    if [[ ("${quote}" == '"' || "${quote}" == "'") ]] && ! env_value_closes_quote "${lead:1}" "${quote}"; then
+      closed=false
+      j=${i}
+      while ((j < n)); do
+        value+=$'\n'"${lines[j]}"
+        j=$((j + 1))
+        if env_value_closes_quote "${lines[j - 1]}" "${quote}"; then
+          closed=true
+          break
+        fi
+      done
+      if ! ${closed}; then
+        EXISTING_ENV_UNCLASSIFIED+=("${lineno}")
+        continue
+      fi
+      i=${j}
+    fi
     EXISTING_ENV["${key}"]="${value}"
+    EXISTING_ENV_LINENO["${key}"]="${lineno}"
   done
   ENV_FILE_STATE="read"
 }
@@ -7681,6 +7720,13 @@ header "Configuration"
 # permanently undecryptable.
 load_existing_env "${APP_DIR}/.env"
 
+# A FILE THIS RUN CANNOT REPRODUCE IS NOT REWRITTEN. The rewrite carries every key across, so a line
+# it cannot read as KEY=VALUE (or a quoted value that never closes) would be silently lost; stopping
+# here, before a package, account, directory or file has been touched, costs a re-run.
+if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
+  die "${APP_DIR}/.env has ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) this installer cannot carry across to the file it is about to write (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}): not KEY=VALUE, or a quoted value that is never closed. Rewrite them as KEY=VALUE (a quoted value may span lines if it closes), or remove them, and re-run. Nothing has been changed."
+fi
+
 # THE INVOICE PDF DIRECTORY IS WHERE THE PREVIOUS RUN PUT IT. The default assigned among the other
 # path defaults is only the answer for a host with no .env: a re-run that rewrote .env with that
 # default would silently repoint a live installation away from the PDFs it has already stored.
@@ -9019,11 +9065,56 @@ EOF
 env_key_is_admin_credential() {
   [[ "$1" == DEPLOY_ADMIN* || "$1" == *ADMIN_DATABASE_URL* ]]
 }
+
+# WHICH UNOWNED KEYS MAY BE CARRIED INTO THE APPLICATION'S .env AT ALL (review of the re-run preservation).
+# Naming the deploy admin variable was not enough: a hand-added DIRECT_URL, MIGRATION_DATABASE_URL or
+# PGPASSWORD holding the admin connection would have gone through. The rule is generic and errs toward
+# not carrying: a key whose NAME looks like a database connection, or whose VALUE is a PostgreSQL URL, a
+# URL with a password in it, or contains the deploy admin's password or role, is NOT carried over. That
+# is reported by key name, line number and reason (never the value) and the old file is in the backup, so
+# the cost of a false positive is one line copied back by hand. Sets ENV_REFUSAL_REASON; returns 0 when
+# the key may be carried.
+ENV_REFUSAL_REASON=""
+env_key_carry_check() {
+  local key="$1" value="$2" upper admin_user="" admin_pass="" url="${DEPLOY_ADMIN_DATABASE_URL:-}"
+  upper="${key^^}"
+  ENV_REFUSAL_REASON=""
+  case "${upper}" in
+    DIRECT_URL | *DATABASE*URL* | *DB_URL* | *_DB_*URL* | *MIGRATION* | *ADMIN* | *SUPERUSER* | *POSTGRES* | PG*)
+      ENV_REFUSAL_REASON="the name looks like a database connection setting"
+      return 1
+      ;;
+  esac
+  if [[ "${value,,}" == *postgres://* || "${value,,}" == *postgresql://* ]]; then
+    ENV_REFUSAL_REASON="the value is a PostgreSQL connection URL"
+    return 1
+  fi
+  if [[ "${value}" =~ ://[^/@[:space:]]*:[^/@[:space:]]+@ ]]; then
+    ENV_REFUSAL_REASON="the value is a URL with a password in it"
+    return 1
+  fi
+  if [[ "${url}" =~ ^[A-Za-z][A-Za-z0-9+.-]*://([^:@/]+):([^@]+)@ ]]; then
+    admin_user="${BASH_REMATCH[1]}"
+    admin_pass="${BASH_REMATCH[2]}"
+    if [[ ${#admin_pass} -ge 4 && "${value}" == *"${admin_pass}"* ]]; then
+      ENV_REFUSAL_REASON="the value contains the deploy admin's password"
+      return 1
+    fi
+    if [[ "${value}" == *"://${admin_user}:"* || "${value}" == *"://${admin_user}@"* ]]; then
+      ENV_REFUSAL_REASON="the value names the deploy admin role as a connection user"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+ENV_REFUSED_KEYS=()
 render_preserved_env_keys() {
   local rendered="$1" key line i j
   local -A owned=()
   local -a kept=()
   ENV_KEPT_KEYS=()
+  ENV_REFUSED_KEYS=()
   ENV_PRESERVED_BLOCK=""
   while IFS= read -r line; do
     [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && owned["${BASH_REMATCH[1]}"]=1
@@ -9033,6 +9124,10 @@ render_preserved_env_keys() {
     if env_key_is_admin_credential "${key}"; then
       error "${APP_DIR}/.env defines ${key}. That file belongs to the application account and must never hold the deploy admin credential, so it is not carried into the new file; move it to ${DB_ADMIN_CREDENTIAL_FILE}."
       return 1
+    fi
+    if ! env_key_carry_check "${key}" "${EXISTING_ENV[${key}]}"; then
+      ENV_REFUSED_KEYS+=("${key} (line ${EXISTING_ENV_LINENO[${key}]:-?}): ${ENV_REFUSAL_REASON}")
+      continue
     fi
     kept+=("${key}")
   done
@@ -9057,18 +9152,32 @@ render_preserved_env_keys() {
 # at the start (not re-read from a path the application account can swap). Same publication
 # primitive and owner as .env itself. Never pruned by this script: they hold secrets, and deleting
 # an operator's backup is not the installer's call.
+#
+# THE NAME IS RESERVED BEFORE ANYTHING IS PUBLISHED TO IT. Second-resolution names collided inside one
+# second (two runs, or a retry) and the second publication replaced the first run's backup. The
+# candidate carries the second, this process id and a counter, and is created exclusively (noclobber is
+# O_EXCL: it also refuses a symlink planted at the name); the first name that is free is the backup.
 ENV_BACKUP_FILE=""
 write_env_backup() {
   [[ "${ENV_FILE_STATE}" == "read" && "${#EXISTING_ENV_RAW[@]}" -gt 0 ]] || return 0
-  local stamp
+  local stamp candidate n=0
   stamp="$(date -u +%Y%m%dT%H%M%SZ)" || return 1
-  ENV_BACKUP_FILE="${APP_DIR}/.env.bak-${stamp}"
+  ENV_BACKUP_FILE=""
+  while ((n < 1000)); do
+    candidate="${APP_DIR}/.env.bak-${stamp}-$$-${n}"
+    if (set -o noclobber; : > "${candidate}") 2> /dev/null; then
+      ENV_BACKUP_FILE="${candidate}"
+      break
+    fi
+    n=$((n + 1))
+  done
+  [[ -n "${ENV_BACKUP_FILE}" ]] || return 1
   printf '%s\n' "${EXISTING_ENV_RAW[@]}" | publish_durable_file "${ENV_BACKUP_FILE}" "${APP_USER}:${APP_USER}" 600 || { ENV_BACKUP_FILE=""; return 1; }
 }
 
 # WHAT THE REWRITE KEPT AND CHANGED, by NAME ONLY: a value can be a secret.
 print_env_rewrite_summary() {
-  local rendered="$1" line key
+  local rendered="$1" line key entry
   local -a changed=() added=()
   [[ "${ENV_FILE_STATE}" == "read" ]] || return 0
   while IFS= read -r line; do
@@ -9084,6 +9193,12 @@ print_env_rewrite_summary() {
   info "  kept as it was, not set by the installer (${#ENV_KEPT_KEYS[@]}): ${ENV_KEPT_KEYS[*]:-none}"
   info "  values this run changed (${#changed[@]}): ${changed[*]:-none}"
   info "  keys this run added (${#added[@]}): ${added[*]:-none}"
+  if ((${#ENV_REFUSED_KEYS[@]} > 0)); then
+    warn "  ${#ENV_REFUSED_KEYS[@]} key(s) were NOT carried over because they look like database connection settings; they are in the backup (values are never printed):"
+    for entry in "${ENV_REFUSED_KEYS[@]}"; do
+      warn "    ${entry}"
+    done
+  fi
   if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
     warn "  ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) of the previous file are not plain KEY=VALUE (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}) and were NOT carried over; they are in the backup."
   fi

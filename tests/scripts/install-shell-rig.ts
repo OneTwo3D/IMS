@@ -69,7 +69,9 @@ export const SHIPPED = [
   'pg_endpoint_psql',
   'unquote_env_value',
   'existing_env',
+  'env_value_closes_quote',
   'load_existing_env',
+  'env_key_carry_check',
   'mask_secret',
   'prompt',
   // r39 (Codex HIGH): the two grammars the one password travels through, and the composer both
@@ -392,6 +394,10 @@ on_route() {
   return "\${status}"
 }
 declare -A EXISTING_ENV=()
+declare -A EXISTING_ENV_LINENO=()
+declare -a EXISTING_ENV_UNCLASSIFIED=()
+declare -a ENV_REFUSED_KEYS=()
+ENV_REFUSAL_REASON=''
 ${assignments}
 # r39: the interrupted-rotation journal, resolved AFTER the caller's assignments because it hangs
 # off APP_DIR. In the shipped script it lives under /etc/ims-cutover — root-owned and 0700, because
@@ -676,8 +682,11 @@ export function writeInstalledEnv(appDir: string, port: number, password: string
     // an unanchored match rewrites that connection too.
     // (A hand-added reporting connection. It was DEPLOY_ADMIN_DATABASE_URL until a re-run began to refuse
     // that key outright -- an application .env may never carry the admin credential -- and a
-    // re-run now carries unowned keys across, so this is also a key the rewrite must leave alone.)
+    // re-run now carries unowned keys across, so it is the trap for an unanchored match, and the re-run refuses to CARRY it (its name looks like a
+    // database connection) -- the rotation tests prove the one line that moves; the carry-over has its own.)
     `ANALYTICS_DATABASE_URL=postgresql://reporting:report-password@127.0.0.1:${port}/one_two_inventory`,
+    // And an ordinary hand-added key, which the re-run carries across.
+    'REPORTING_TIMEOUT_MS=5000',
     'NEXT_PUBLIC_APP_URL=https://ims.example.test',
     '',
   ].join('\n')

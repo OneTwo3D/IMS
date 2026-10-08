@@ -415,9 +415,10 @@ test('r39: .env is published by rename, so the previous file is never truncated'
     // failing producer died; this compares the whole file against the whole render.
     const rendered = Buffer.from(readVar(run.output, 'RENDERED_B64'), 'base64').toString('utf8')
     // ...followed by the keys the previous file had and the template does not own (the re-run
-    // preservation; here the hand-added ANALYTICS_DATABASE_URL), which is the only addition.
+    // preservation; here the hand-added REPORTING_TIMEOUT_MS), which is the only addition.
     const preserved = Buffer.from(readVar(run.output, 'PRESERVED_B64'), 'base64').toString('utf8')
-    assert.match(preserved, /^ANALYTICS_DATABASE_URL=/m, 'precondition: the unowned key is in the preserved block')
+    assert.match(preserved, /^REPORTING_TIMEOUT_MS=5000$/m, 'precondition: the ordinary unowned key is in the preserved block')
+    assert.doesNotMatch(preserved, /ANALYTICS_DATABASE_URL/, 'and the connection-looking one is NOT carried')
     assert.equal(readFileSync(join(root, '.env'), 'utf8'), rendered + preserved, 'the published file must be exactly the rendered content plus the preserved block')
   } finally {
     cluster?.stop()

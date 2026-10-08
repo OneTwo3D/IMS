@@ -6706,8 +6706,8 @@ const MENTION_SHAPES: ReadonlyArray<{ why: string; match: RegExp }> = (
     // (write_env_backup()), handed to the same publisher with the same owner and mode, and the path is
     // never opened by this script. Spelled out whole-line so a different destination is not covered.
     {
-      why: 'the name of the timestamped backup written beside the file install.sh owns',
-      match: 'ENV_BACKUP_FILE="\\$\\{APP_DIR\\}/\\.env\\.bak-\\$\\{stamp\\}"',
+      why: 'the candidate name of the timestamped backup written beside the file install.sh owns (reserved exclusively before use)',
+      match: 'candidate="\\$\\{APP_DIR\\}/\\.env\\.bak-\\$\\{stamp\\}-\\$\\$-\\$\\{n\\}"',
     },
     // The rotation journal write, which mentions the environment file only in the sentence it
     // refuses with. Its arguments are TWO PASSWORDS AND A DATABASE NAME, all BY VALUE — no path is

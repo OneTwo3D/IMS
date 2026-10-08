@@ -901,24 +901,36 @@ The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: 
 
 **What a re-run does to `.env`.** The file is rewritten, but nothing in it is discarded silently:
 
-* **Preserved by default** (Enter keeps them; type `none`, or export `none`, to clear one -- a blank is
-  not a request to clear): the domain (from `NEXT_PUBLIC_APP_URL`) and port, the WooCommerce store URL,
-  consumer key, consumer secret and **webhook secret** (a fresh webhook secret would break the signature
-  check of every webhook WooCommerce is already sending), the Turnstile pair, `INVOICE_PDF_STORAGE_DIR`,
-  and the upload-scanner settings (`FILE_SCAN_*`).
+* **Defaults come from the installed file** (Enter keeps them): the domain (from `NEXT_PUBLIC_APP_URL`), the
+  port, the WooCommerce store URL, consumer key, consumer secret and **webhook secret** (a fresh webhook secret
+  would break the signature check of every webhook WooCommerce is already sending), the Turnstile pair, and
+  `INVOICE_PDF_STORAGE_DIR`. Typing a value changes it. **Only the WooCommerce four and the Turnstile pair can be
+  cleared at the prompt**, by typing `none` (or exporting `none` for `--non-interactive`); a blank answer or blank
+  export keeps the existing value. The domain and port are required, so they have no clearing form. The upload
+  scanner settings (`FILE_SCAN_*`) and `INVOICE_PDF_STORAGE_DIR` are not prompted: the installer keeps what is in
+  the file, and you change them by editing `.env` and restarting the service.
 * **Every other key already in the file is carried over verbatim** into a `# Kept from the previous .env`
   block at the end -- hand-added variables such as `TRUSTED_PROXY_IPS`, `REQUIRE_TRUSTED_PROXY_CONFIG` or
-  `XERO_ALLOWED_TENANT_IDS`.
-* **A deploy admin credential is never carried.** A `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` key left in
-  the application `.env` is refused before anything is changed (it belongs in
-  `/etc/ims-db-admin/deploy-admin.env`), and the copy step refuses it again as a second lock.
-* **A backup is written first**: `${APP_DIR}/.env.bak-<UTC timestamp>`, mode 600, owned by the application
-  account, made from the lines the run read at its start (not re-read), kept by the source sync
-  (`rsync --delete` excludes `.env.bak*`) and never pruned by the installer: they hold secrets, so delete old
-  ones yourself.
+  `XERO_ALLOWED_TENANT_IDS`. `export KEY=value`, `KEY = value` and quoted values that span several lines are read
+  as the single entries they are.
+* **Database connection settings are never carried, because the application's `.env` is not where they may
+  come from.** A key whose *name* looks like a database connection (`DIRECT_URL`, anything with `DATABASE`..`URL`,
+  `DB_URL`, `MIGRATION`, `ADMIN`, `SUPERUSER`, `POSTGRES`, or a `PG...` variable such as `PGPASSWORD`), or whose
+  *value* is a PostgreSQL URL, a URL with a password in it, or contains the deploy admin's password or names the
+  deploy admin role as a connection user, is **not** copied to the new file. The summary lists it by key name, line
+  number and reason (never the value) and the old file is in the backup, so a false positive costs one line copied
+  back by hand. A `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` key is refused outright, before anything is changed
+  (it belongs in `/etc/ims-db-admin/deploy-admin.env`).
+* **A file the installer cannot reproduce is not rewritten.** A line that is not `KEY=VALUE` (in one of the forms
+  above), or a quoted value that is never closed, stops the run in the configuration phase, before any package,
+  account or file is touched, naming the line numbers.
+* **A backup is written first**: `${APP_DIR}/.env.bak-<UTC timestamp>-<pid>-<n>`, mode 600, owned by the
+  application account, made from the lines the run read at its start (not re-read). The name is created
+  exclusively, so two runs in the same second cannot replace each other's backup and a name planted by another
+  account is skipped, never written through. The source sync (`rsync --delete`) excludes `.env.bak*`, and the
+  installer never prunes backups: they hold secrets, so delete old ones yourself.
 * **It says what it did**, by key name only (never a value): the backup path, the keys kept, the values this
-  run changed, the keys it added, and the line numbers of any line that is not plain `KEY=VALUE`
-  (`export KEY=v`, `KEY = v`), which is **not** carried over and is in the backup.
+  run changed, the keys it added, and any key that was not carried over and why.
 
 Not preserved across a re-run, because they are not in `.env`: the SMTP values (they seed the settings
 table once) and the database host, port, name and user (supply them again, or as environment variables).
