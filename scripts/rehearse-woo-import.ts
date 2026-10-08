@@ -479,11 +479,6 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
           from shopping_order_links l join sales_orders so on so.id = l."orderId" where l.connector = 'woocommerce'`)
         .then((r) => new Map(r.rows.map((row) => [Number(row.externalOrderId), { imsStatus: String(row.imsStatus), orderNumber: String(row.orderNumber), noProductLines: num(row.noProductLines), shortLines: num(row.shortLines), shortQty: Math.round(num(row.shortQty) * 10_000) / 10_000 }])))
 
-    /** Orders the import refused for a reason that leaves a durable retry row (the pending-FX queue). */
-    const readRetryRecorded = (client: pg.Client): Promise<Set<number>> =>
-      client.query(`select "externalId" from shopping_sync_logs where connector = 'woocommerce' and status = 'PENDING' and "entityType" = 'SalesOrder' and "entityId" is null and payload->>'reason' = 'missing_fx_rate'`)
-        .then((r) => new Set(r.rows.map((row) => Number(row.externalId))))
-
     const runStep = async (def: WooStepDefinition, body: () => Promise<StepOutcome>): Promise<boolean> => {
       if (!included(def)) return true
       const began = Date.now()
@@ -581,7 +576,10 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       },
       'no-stamp-on-rehearsal': async () => verdictOf(assessNoStampAfterRehearsal({ before: firstPass!.stampBefore, after: firstPass!.stampAfter, stampedFlag: firstPass!.stamped }), { before: firstPass!.stampBefore, after: firstPass!.stampAfter }),
       'r9-orders': async () => {
-        const [allocation, retry] = await db(async (client) => [await readAllocation(client), await readRetryRecorded(client)] as const)
+        const allocation = await db(readAllocation)
+        const retryRun = await driver('r9-orders', 'retry-rows')
+        if (retryRun.payload === null) return { status: 'failed', reason: `the driver did not report the retry rows (exit ${retryRun.run.exitCode}). ${outputTail(retryRun.run)}` }
+        const retry = new Set<number>(retryRun.payload.externalOrderIds as number[])
         allocationAtImport = allocation
         r9 = assessR9({ store: storeFacts, imported: importedFacts, selectedStatuses: firstPass!.statuses, allocation, retryRecorded: retry })
         abortedRows = r9.rows

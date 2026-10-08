@@ -11,6 +11,7 @@
  *   import         run the REAL initial-import pass (`runInitialImport`), as a rehearsal (no stamp) or as the
  *                  real thing (stamp)
  *   try-start      call the button's own entry point (`startInitialImport`) and say whether it ran
+ *   retry-rows     list the orders the import refused that have a durable retry row (the pending-FX queue)
  *   land-stock     put stock into IMS AFTER the import, then trigger allocation by the routes production uses
  *
  * It never contacts anything but the fake store: the connector reads its URL and credentials from the
@@ -148,6 +149,13 @@ async function tryStart(): Promise<void> {
   emit({ phase: 'try-start', progressBefore: before.status, progressAfter: after.status, threw, stamp: await readStamp() })
 }
 
+/** Orders the import refused for a reason that leaves a durable retry row: the pending-FX queue, by the application's own predicate. */
+async function retryRows(): Promise<void> {
+  const { pendingFxQueueWhere } = await import('@/lib/connectors/woocommerce/sync/order-import')
+  const rows = await db.shoppingSyncLog.findMany({ where: pendingFxQueueWhere(), select: { externalId: true } })
+  emit({ phase: 'retry-rows', externalOrderIds: rows.map((row) => Number(row.externalId)) })
+}
+
 async function landStock(): Promise<void> {
   const landing = JSON.parse(requireEnv('REHEARSAL_LANDING')) as Array<{ sku: string; qty: number; unitCost: number }>
   const warehouse = await db.warehouse.findFirstOrThrow({ where: { isDefault: true } })
@@ -200,6 +208,7 @@ async function main(): Promise<void> {
     else if (phase === 'import-rehearsal') await importPhase('rehearsal')
     else if (phase === 'import-real') await importPhase('real')
     else if (phase === 'try-start') await tryStart()
+    else if (phase === 'retry-rows') await retryRows()
     else if (phase === 'land-stock') await landStock()
     else throw new Error(`unknown phase ${phase ?? '(none)'}`)
   } finally {
