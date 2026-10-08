@@ -180,6 +180,9 @@ function parseLayoutKeys(
       supplied.add('warehouseCode')
       const totals = stringRecord(w.totals ?? {}, `${where}.wide.totals`, problems)
       if (Object.keys(totals).length === 0) problems.push(`${where}.wide.totals is required: name the report's all-warehouses total header for each block column, so every row can be reconciled`)
+      for (const column of Object.keys(blockColumns)) {
+        if (!(column in totals)) problems.push(`${where}.wide.totals: block column "${column}" has no total header; every column read from the blocks must be reconciled to the report's total (omitting one would let a changed warehouse cell pass)`)
+      }
       for (const [column, header] of Object.entries(totals)) {
         if (!(column in blockColumns)) problems.push(`${where}.wide.totals: "${column}" is not one of wide.blockColumns`)
         if (header.trim() === '') problems.push(`${where}.wide.totals.${column}: the total header is empty`)
@@ -376,6 +379,11 @@ export interface IngestedDataset {
    * They are records read, and the transform books each as EXCLUDED, so the accounting still reconciles.
    */
   superseded: Array<{ line: number; key: string; reason: string }>
+  /**
+   * Wide files only: the per-row key (canonical column) and every source row's key with its line, including rows that were later rejected.
+   * mergeIngested uses it to refuse a key that appears in more than one file.
+   */
+  wideKey: { column: string; keys: Array<{ key: string; line: number }> } | null
   /** One entry per file read into this dataset (several when a manifest lists the dataset more than once). */
   parts: Array<{ file: string; sha256: string; bytes: number }>
 }
@@ -449,6 +457,39 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     kept[index] = rows
     for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))
   })
+  // A wide report is one row per key ACROSS FILES too: a key present in more than one file refuses every source row that carries it, in every file.
+  const crossRejected: IngestRejection[] = []
+  let removedRecords = 0
+  const keyColumn = parts.find((part) => part.wideKey)?.wideKey?.column
+  if (keyColumn) {
+    const where = new Map<string, Array<{ part: number; line: number }>>()
+    parts.forEach((part, index) => {
+      for (const entry of part.wideKey?.keys ?? []) where.set(entry.key, [...(where.get(entry.key) ?? []), { part: index, line: entry.line }])
+    })
+    const spread = new Map([...where].filter(([, list]) => new Set(list.map((entry) => entry.part)).size > 1))
+    if (spread.size > 0) {
+      parts.forEach((part, index) => {
+        const bySource = new Map<number, CanonRow[]>()
+        const stay: CanonRow[] = []
+        for (const row of kept[index]) {
+          const key = (row.values[keyColumn] ?? '').toUpperCase()
+          if (part.wideKey && spread.has(key)) bySource.set(Math.floor(row.line), [...(bySource.get(Math.floor(row.line)) ?? []), row])
+          else stay.push(row)
+        }
+        for (const [line, removed] of bySource) {
+          const key = (removed[0].values[keyColumn] ?? '').toUpperCase()
+          const others = spread.get(key)!.filter((entry) => entry.part !== index).map((entry) => `${parts[entry.part].file} line ${entry.line}`)
+          removedRecords += removed.length
+          crossRejected.push({
+            line: at(line, index),
+            code: 'DUPLICATE_SOURCE_ROW',
+            reason: `${keyColumn} ${JSON.stringify(removed[0].values[keyColumn])} is also on ${others.join(', ')}; a one-row-per-key report must not repeat a key across files, and warehouse quantities of two rows are never added together. Fix it in the source`,
+          })
+        }
+        kept[index] = stay
+      })
+    }
+  }
   const rowsSkipped: Record<string, number> = {}
   const unmapped: string[] = []
   for (const part of parts) {
@@ -465,10 +506,11 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     hadBom: parts.some((part) => part.hadBom),
     blankRows: parts.reduce((total, part) => total + part.blankRows, 0),
     rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
-    rejected: [...parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts],
+    rejected: [...parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts, ...crossRejected],
     unmappedHeaders: unmapped,
-    recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0),
+    recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0) - removedRecords + crossRejected.length,
     superseded,
+    wideKey: null,
     rowsSkipped,
     parts: parts.flatMap((part) => part.parts),
   }
@@ -674,14 +716,19 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   // A wide file is one row per key: every row that shares its key with another row is refused, whatever else it says, because the
   // warehouse quantities of two rows are never to be added together (the report cannot say whether it repeated a row or listed a second one).
   const repeated = new Set<string>()
+  let wideKeys: Array<{ key: string; line: number }> | null = null
   if (mapping?.wide) {
     const keyAt = indexOf.get(mapping.wide.uniqueBy)
     const seen = new Map<string, number>()
+    wideKeys = []
     if (keyAt !== undefined) {
       for (const record of records) {
         if (record.cells.length !== header.length) continue
         const key = clean(record.cells[keyAt]).toUpperCase()
-        if (key !== '') seen.set(key, (seen.get(key) ?? 0) + 1)
+        if (key !== '') {
+          seen.set(key, (seen.get(key) ?? 0) + 1)
+          wideKeys.push({ key, line: record.line })
+        }
       }
       for (const [key, count] of seen) if (count > 1) repeated.add(key)
     }
@@ -811,6 +858,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     unmappedHeaders,
     recordsRead: rows.length + rejected.length,
     superseded: [],
+    wideKey: mapping?.wide && wideKeys ? { column: mapping.wide.uniqueBy, keys: wideKeys } : null,
     rowsSkipped,
     parts: [{ file, sha256, bytes: bytes.length }],
   }

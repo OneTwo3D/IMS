@@ -501,3 +501,41 @@ test('opening cost: zero cost with stock WARNS, a blank cost with stock is rejec
   assert.equal(countOf(report, 'stock-lots', 'MISSING_UNIT_COST'), 1, 'only the SKU that holds stock')
   assert.ok(!report.findings.some((f) => f.code === 'ZERO_COST_OPENING_STOCK' && f.keys?.some((k) => k.startsWith('SYN-8001'))))
 })
+
+test('wide blocks across files: a key in two stock files refuses every row carrying it in BOTH files; one SKU in several blocks of one row is not a duplicate', async (t) => {
+  const fileA = [['A1', '7', '3', 'y', '4', 'z'], ['B1', '5', '5', 'y', '0', 'z']]
+  const fileB = [['a1', '9', '2', 'y', '7', 'z'], ['C1', '2', '1', 'y', '1', 'z']] // A1 again, asymmetric quantities
+  const a = wideRead(LABELS, HEADER, WIDE, fileA)
+  const b = wideRead(LABELS, HEADER, WIDE, fileB)
+  const merged = mergeIngested([a, b])
+  precondition(t, 'records across both files', merged.recordsRead)
+  assert.deepEqual([...new Set(merged.rows.map((row) => row.values.sku))].sort(), ['B1', 'C1'], 'A1 is in neither file\'s accepted rows')
+  assert.deepEqual(merged.rejected.map((r) => [r.line, r.code]).sort(), [[1_000_000 + 3, 'DUPLICATE_SOURCE_ROW'], [3, 'DUPLICATE_SOURCE_ROW']])
+  assert.match(merged.rejected[0].reason, /is also on/)
+  assert.equal(merged.rows.length + merged.rejected.length, merged.recordsRead, 'every record has one place')
+  // Controls: B1 holds stock in two blocks of one row (not a duplicate), and distinct keys across files merge untouched.
+  assert.equal(merged.rows.filter((row) => row.values.sku === 'B1').length, 2)
+  const clean = mergeIngested([a, wideRead(LABELS, HEADER, WIDE, [['D1', '2', '1', 'y', '1', 'z']])])
+  assert.equal(clean.rejected.length, 0)
+  assert.equal(clean.recordsRead, 6)
+  // Through the command line: the same SKU in two stock-lots files with different quantities never reaches opening stock.
+  const dir = copyNative()
+  const second = readFileSync(path.join(dir, 'stock-on-hand.csv'), 'utf8').replace('"15.000000","0.000000","15.000000","0.000000","0.000000","0.000000","False","10.000000"', '"21.000000","0.000000","21.000000","0.000000","0.000000","0.000000","False","16.000000"')
+  writeFileSync(path.join(dir, 'stock-on-hand-2.csv'), second)
+  const manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+  manifest.inputs.push({ dataset: 'stock-lots', file: 'stock-on-hand-2.csv', columnMap: 'maps/qoblex-stock-on-hand.map.json' })
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
+  const out = fresh('twofiles')
+  const run = await cli(['--manifest', path.join(dir, 'manifest.json'), '--out', out])
+  const report = reportOf(out)
+  assert.equal(run.code, EXIT_CODES.BLOCKING_FINDINGS)
+  assert.ok(countOf(report, 'stock-lots', 'DUPLICATE_SOURCE_ROW') >= 2 * 7, 'every row of both files that shares a SKU is refused')
+  assert.ok(report.accounting.every((row) => row.unaccounted === 0))
+})
+
+test('wide map: every block column needs a report total (omitting qty is refused at validation)', (t) => {
+  const two = { ...WIDE, blockColumns: { qty: 'Quantity', unitCost: 'Other' }, totals: { unitCost: 'Total Quantity' } }
+  precondition(t, 'maps', 2)
+  assert.throws(() => parseColumnMap(wideMapText(two), 'm.json'), (e) => e instanceof InputError && /block column "qty" has no total header/.test(e.message))
+  assert.doesNotThrow(() => parseColumnMap(wideMapText({ ...two, totals: { qty: 'Total Quantity', unitCost: 'Total Quantity' } }), 'm.json'))
+})
