@@ -45,7 +45,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -60,7 +59,6 @@ import type pg from 'pg'
 import {
   type Assessment,
   type StepResult,
-  type TeardownResult,
   RehearsalGuardError,
   assertNoConnectorEnv,
   assertThrowawayDatabaseUrl,
@@ -181,6 +179,29 @@ export type WooRehearsalOutcome = {
   runRoot?: string
 }
 
+/** What a driver phase prints on its REHEARSAL_DRIVER line (scripts/lib/woo-import-driver.ts); every field optional because each phase prints its own. */
+type DriverPayload = {
+  outcome?: string
+  stamped?: boolean
+  statuses?: string[]
+  unrecordedRefusals?: number
+  progress?: { activeOrdersImported?: number; activeOrdersSkipped?: number; errors?: string[] }
+  stampBefore?: StampFacts
+  stampAfter?: StampFacts
+  openingStock?: unknown
+  externalOrderIds?: number[]
+  beforeLanding?: string[]
+  afterLandingBeforeTrigger?: string[]
+  afterBackorderAllocator?: string[]
+  afterSweep?: string[]
+  statusByOrder?: Record<string, string>
+  backorders?: { allocated?: number; skipped?: number; errors?: number }
+  sweep?: unknown
+  threw?: string | null
+  progressBefore?: string
+  progressAfter?: string
+}
+
 type StepOutcome = { status: 'passed' | 'failed'; reason?: string; detail?: Record<string, unknown>; required?: boolean; skipped?: boolean }
 
 function refuse(message: string): WooRehearsalOutcome {
@@ -188,6 +209,12 @@ function refuse(message: string): WooRehearsalOutcome {
 }
 
 const num = (value: unknown): number => Number(value ?? 0)
+
+/** A field a driver phase must have printed: its absence is a failure of the step (it throws), never a default. */
+function need<T>(value: T | undefined | null, name: string): T {
+  if (value === undefined || value === null) throw new Error(`the driver did not report ${name}`)
+  return value
+}
 
 export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): Promise<WooRehearsalOutcome> {
   const repoRoot = options.repoRoot ?? REPO_ROOT
@@ -426,16 +453,16 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       assertThrowawayDatabaseUrl(sourceUrl, target)
       return withClient(sourceUrl, fn)
     }
-    const driver = async (id: WooStepId, phase: string): Promise<{ run: ChildResult; payload: Record<string, any> | null }> => {
+    const driver = async (id: WooStepId, phase: string): Promise<{ run: ChildResult; payload: DriverPayload | null }> => {
       const run = await childIn(id, bin('tsx'), [DRIVER, phase])
       const line = run.stdout.split('\n').find((candidate) => candidate.startsWith('REHEARSAL_DRIVER '))
-      let payload: Record<string, any> | null = null
+      let payload: DriverPayload | null = null
       if (line) {
         try { payload = JSON.parse(line.slice('REHEARSAL_DRIVER '.length)) } catch { payload = null }
       }
       return { run, payload }
     }
-    const asPass = (payload: Record<string, any>): PassFacts => ({
+    const asPass = (payload: DriverPayload): PassFacts => ({
       outcome: String(payload.outcome),
       imported: num(payload.progress?.activeOrdersImported),
       skipped: num(payload.progress?.activeOrdersSkipped),
@@ -536,7 +563,8 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       'rehearsal-import': async () => {
         const { run, payload } = await driver('rehearsal-import', 'import-rehearsal')
         if (run.exitCode !== 0 || payload === null) return { status: 'failed', reason: `the driver did not report (exit ${run.exitCode}). ${outputTail(run)}` }
-        firstPass = { ...asPass(payload), stampBefore: payload.stampBefore, stampAfter: payload.stampAfter, stamped: payload.stamped === true }
+        const parsed = { ...asPass(payload), stampBefore: need(payload.stampBefore, 'stampBefore'), stampAfter: need(payload.stampAfter, 'stampAfter'), stamped: payload.stamped === true }
+        firstPass = parsed
         await db(async (client) => {
           await hooks.afterFirstPass?.(client)
           importedFacts = await readImported(client)
@@ -561,7 +589,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         })
         fetchedFirstPass = fake!.requests.filter((r) => r.path.endsWith('/orders')).reduce((sum, r) => sum + (r.returned ?? 0), 0)
         const dbOrders = importedFacts.length
-        return { status: 'passed', detail: { outcome: firstPass.outcome, imported: firstPass.imported, skipped: firstPass.skipped, errors: firstPass.errors.length, ordersInIms: dbOrders, requestsSoFar: fake!.requests.length } }
+        return { status: 'passed', detail: { outcome: parsed.outcome, imported: parsed.imported, skipped: parsed.skipped, errors: parsed.errors.length, ordersInIms: dbOrders, requestsSoFar: fake!.requests.length } }
       },
       'status-selection': async () => verdictOf(assessStatusSelection(firstPass?.statuses ?? []), { resolved: firstPass?.statuses ?? [] }),
       'pass-complete': async () => {
@@ -625,10 +653,11 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       'stock-lands-later': async () => {
         const { run, payload } = await driver('stock-lands-later', 'land-stock')
         if (run.exitCode !== 0 || payload === null) return { status: 'failed', reason: `the driver did not report (exit ${run.exitCode}). ${outputTail(run)}` }
-        landing = { beforeLanding: payload.beforeLanding, afterLandingBeforeTrigger: payload.afterLandingBeforeTrigger, afterBackorderAllocator: payload.afterBackorderAllocator, afterSweep: payload.afterSweep, statusByOrder: payload.statusByOrder }
+        const facts: LandingFacts = { beforeLanding: need(payload.beforeLanding, 'beforeLanding'), afterLandingBeforeTrigger: need(payload.afterLandingBeforeTrigger, 'afterLandingBeforeTrigger'), afterBackorderAllocator: need(payload.afterBackorderAllocator, 'afterBackorderAllocator'), afterSweep: need(payload.afterSweep, 'afterSweep'), statusByOrder: need(payload.statusByOrder, 'statusByOrder') }
+        landing = facts
         const after = await db(async (client) => ({ stock: await readStockRows(client), allocation: await readAllocation(client) }))
         r4AfterLanding = assessR4(after.stock)
-        const landed = assessLanding(landing)
+        const landed = assessLanding(facts)
         const failures = [...landed.assessment.failures, ...r4AfterLanding.assessment.failures.map((f) => `R4 after landing: ${f}`)]
         unallocatable = unallocatable.map((row) => {
           const now = after.allocation.get(row.externalOrderId)
@@ -646,18 +675,20 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         if (withoutProduct.length > 0) {
           findings.push({ code: 'lines-without-product-are-never-allocatable', text: `${withoutProduct.length} imported order(s) carry a line with no product link (a SKU IMS does not hold, a line with no SKU, or a fee). No stock landing allocates such a line; the SKU must exist in IMS (and the line be re-linked) before it can.`, orders: withoutProduct.map((r) => String(r.externalOrderId)) })
         }
-        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { waitingBefore: landing.beforeLanding.length, afterBareLanding: landing.afterLandingBeforeTrigger.length, afterBackorderAllocator: landing.afterBackorderAllocator.length, afterSweep: landing.afterSweep.length, pickedUp: landed.pickedUp.length, notPickedUp: landed.notPickedUp, backorders: { allocated: payload.backorders?.allocated, skipped: payload.backorders?.skipped, errors: payload.backorders?.errors }, sweep: payload.sweep } }
+        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { waitingBefore: facts.beforeLanding.length, afterBareLanding: facts.afterLandingBeforeTrigger.length, afterBackorderAllocator: facts.afterBackorderAllocator.length, afterSweep: facts.afterSweep.length, pickedUp: landed.pickedUp.length, notPickedUp: landed.notPickedUp, backorders: { allocated: payload.backorders?.allocated, skipped: payload.backorders?.skipped, errors: payload.backorders?.errors }, sweep: payload.sweep } }
       },
       'real-pass-stamps': async () => {
         const { run, payload } = await driver('real-pass-stamps', 'import-real')
         if (run.exitCode !== 0 || payload === null) return { status: 'failed', reason: `the driver did not report (exit ${run.exitCode}). ${outputTail(run)}` }
         const pass = asPass(payload)
-        stampAfterRealPass = payload.stampAfter
-        const stamp = assessRealStamp({ before: payload.stampBefore, after: payload.stampAfter, stampedFlag: payload.stamped === true, outcome: pass.outcome })
+        const stampBefore = need(payload.stampBefore, 'stampBefore')
+        const stampAfter = need(payload.stampAfter, 'stampAfter')
+        stampAfterRealPass = stampAfter
+        const stamp = assessRealStamp({ before: stampBefore, after: stampAfter, stampedFlag: payload.stamped === true, outcome: pass.outcome })
         const failures = [...stamp.failures]
         // The real pass runs on top of the imported set: it must create no order.
         if (pass.imported !== 0) failures.push(`the real pass imported ${pass.imported} order(s) on top of an already imported set`)
-        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { stampBefore: payload.stampBefore, stampAfter: payload.stampAfter, outcome: pass.outcome } }
+        return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { stampBefore, stampAfter, outcome: pass.outcome } }
       },
       'start-declines-after-stamp': async () => {
         const { run, payload } = await driver('start-declines-after-stamp', 'try-start')

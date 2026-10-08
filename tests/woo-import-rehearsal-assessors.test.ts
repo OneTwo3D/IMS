@@ -22,7 +22,6 @@ import {
   assessRealStamp,
   assessStatusSelection,
   wooImportExitCode,
-  type AllocationFact,
   type ImportedOrderFact,
   type PassFacts,
   type StoreOrderFact,

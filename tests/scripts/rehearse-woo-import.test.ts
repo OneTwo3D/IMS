@@ -17,10 +17,8 @@ import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
  * comment above it; the change was made, the arm went red, and the change was reverted (md5-verified).
  */
 
-const REPO = process.cwd()
 const SCRATCH_PARENT = '/var/tmp'
 const TIMEOUT = 15 * 60 * 1000
-const ALL: ReadonlySet<WooStepId> = new Set(WOO_STEP_CATALOGUE.map((s) => s.id))
 const PREREQS: WooStepId[] = ['migrate-deploy', 'seed', 'prepare']
 
 function scratchParent(t: TestContext): string {

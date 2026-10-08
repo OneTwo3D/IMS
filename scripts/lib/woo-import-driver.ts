@@ -165,14 +165,14 @@ async function landStock(): Promise<void> {
 
   // Orders with a PRODUCT line whose allocation is short of the quantity ordered: the ones waiting for stock.
   const snapshot = async () => {
-    const rows = await db.$queryRawUnsafe<Array<{ orderNumber: string; status: string }>>(`
+    const rows = await db.$queryRaw<Array<{ orderNumber: string; status: string }>>`
       select so."externalOrderNumber" as "orderNumber", so.status::text as status
         from sales_orders so
        where exists (
          select 1 from sales_order_lines sol
           where sol."orderId" = so.id and sol."productId" is not null
             and sol.qty > coalesce((select sum(oa.qty) from order_allocations oa where oa."lineId" = sol.id), 0) + 0.0001)
-       order by so."externalOrderNumber"`)
+       order by so."externalOrderNumber"`
     return rows
   }
 
