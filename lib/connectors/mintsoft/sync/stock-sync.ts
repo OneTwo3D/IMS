@@ -71,8 +71,11 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
-  computeGrossUnitCostBaseByLine,
+  computeLandedCostForPendingLines,
 } from '@/lib/domain/purchasing/landed-cost-service'
+import { unabsorbedBaseForQty, type LandedAllocationFloor } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
+import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 
 /**
@@ -1317,8 +1320,10 @@ type AlignmentPurchaseLineCost = {
   productId: string
   /** Goods `unitCostBase` alone, kept only so the fallback below can be seen to be a fallback. */
   goodsUnitCostBase: number
-  /** THE value: goods plus this line's freight share. Movement, layer and journal all use it. */
-  grossUnitCostBase: number
+  /** THE value: goods plus this line's freight share, floored at zero. Movement, layer and journal all use it. */
+  grossUnitCostBase: Prisma.Decimal
+  /** Set when a negative landed cost was larger than the goods cost and the floor held this line at zero. */
+  floor: LandedAllocationFloor | null
 }
 
 /**
@@ -1374,7 +1379,7 @@ async function loadAlignmentPurchaseLineCost(
             },
           },
           freightCostLines: {
-            select: { amountBase: true, distributionMethod: true },
+            select: { id: true, amountBase: true, distributionMethod: true },
           },
           landedCostLinks: {
             // o3d-6nd55 r2 (Codex round-2 HIGH-1): a CANCELLED freight order must NOT contribute.
@@ -1391,7 +1396,7 @@ async function loadAlignmentPurchaseLineCost(
               freightPO: {
                 select: {
                   freightCostLines: {
-                    select: { amountBase: true, distributionMethod: true },
+                    select: { id: true, amountBase: true, distributionMethod: true },
                   },
                 },
               },
@@ -1405,7 +1410,7 @@ async function loadAlignmentPurchaseLineCost(
     throw new Error(`Purchase order line ${poLineId} is missing for alignment.`)
   }
 
-  const grossByLine = computeGrossUnitCostBaseByLine({
+  const landedAllocation = computeLandedCostForPendingLines({
     lines: poLine.po.lines.map((line) => ({
       id: line.id,
       qty: line.qty,
@@ -1415,16 +1420,20 @@ async function loadAlignmentPurchaseLineCost(
       weight: line.product?.weight ?? null,
     })),
     directCostLines: poLine.po.freightCostLines.map((costLine) => ({
+      id: costLine.id,
       amountBase: costLine.amountBase,
       distributionMethod: costLine.distributionMethod,
     })),
     linkedCostLines: poLine.po.landedCostLinks.flatMap((link) => (
       link.freightPO.freightCostLines.map((costLine) => ({
+        id: costLine.id,
         amountBase: costLine.amountBase,
         distributionMethod: costLine.distributionMethod,
       }))
     )),
   })
+  const grossByLine = landedAllocation.grossUnitCostBaseByLine
+  const floorByLine = new Map(landedAllocation.floors.map((floor) => [floor.lineId, floor]))
 
   // Every line of the order is cached, not just the one asked for: the helper computed them all,
   // and a sibling allocation in this same sweep would otherwise re-read the order to get a number
@@ -1439,7 +1448,8 @@ async function loadAlignmentPurchaseLineCost(
       // The fallback is the GOODS cost, reached only when the helper declined the line — it skips a
       // line whose `qty` is not greater than zero, and such a line cannot be the subject of an
       // alignment allocation of positive quantity. It is deliberately NOT `landedUnitCostBase`.
-      grossUnitCostBase: grossByLine.get(line.id) ?? Number(line.unitCostBase),
+      grossUnitCostBase: grossByLine.get(line.id) ?? new Prisma.Decimal(line.unitCostBase),
+      floor: floorByLine.get(line.id) ?? null,
     }
     cache.set(line.id, entry)
     if (line.id === poLine.id) requested = entry
@@ -1820,6 +1830,8 @@ export async function applyMintsoftAlignmentForProduct(params: {
     //     `grossUnitCostBaseByLine` for the whole order before its receipt loop).
     // It also fails EARLY: a missing purchase-order line aborts before any stock has been credited.
     const purchaseLineCostCache = new Map<string, AlignmentPurchaseLineCost>()
+    // Per PO line, what the zero floor could not absorb over the units this alignment layers.
+    const creditFloorByPoLine = new Map<string, { poId: string; poReference: string; entry: FlooredLandedCreditEntry }>()
     const costByAsnLineMapId = new Map<string, AlignmentPurchaseLineCost>()
     for (const allocation of plan.allocations) {
       const candidate = candidateById.get(allocation.asnLineMapId)
@@ -1902,6 +1914,21 @@ export async function applyMintsoftAlignmentForProduct(params: {
           )
         }
         const unitCostBase = purchaseCost.grossUnitCostBase
+        if (purchaseCost.floor) {
+          // The floor held this line at zero: what it could not absorb over THIS allocation's units. Reported
+          // after the commit (see the end of this function), never from inside the transaction.
+          const previous = creditFloorByPoLine.get(candidate.sourceLineId)
+          const unabsorbedBase = unabsorbedBaseForQty(purchaseCost.floor.unflooredGrossUnitCostBase, allocation.qty)
+          creditFloorByPoLine.set(candidate.sourceLineId, {
+            poId: purchaseCost.poId,
+            poReference: purchaseCost.poReference,
+            entry: {
+              label: params.sku,
+              unabsorbedBase: previous ? previous.entry.unabsorbedBase.add(unabsorbedBase) : unabsorbedBase,
+              unflooredGrossUnitCostBase: purchaseCost.floor.unflooredGrossUnitCostBase,
+            },
+          })
+        }
         await tx.stockMovement.update({
           where: { id: movement.id },
           data: buildStockMovementValueFields({ qty: allocation.qty, unitCostBase }),
@@ -2191,6 +2218,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
     return {
       kind: 'applied' as const,
+      creditFloorReports: [...creditFloorByPoLine.values()],
       correctedQty: params.delta,
       allocationCount: plan.allocations.length,
       reason: `Aligned ${formatQuantity(params.delta)} from Mintsoft to ${plan.allocations.length} open ASN line${plan.allocations.length === 1 ? '' : 's'}.`,
@@ -2214,6 +2242,21 @@ export async function applyMintsoftAlignmentForProduct(params: {
   }, { maxWait: 5000, timeout: 30000 })
 
   if (outcome.kind === 'applied') {
+    // A negative landed cost larger than the goods cost was held at zero for some of these layers: the
+    // durable WARNING is written now, AFTER the commit, one entry per purchase order.
+    const floorReportsByPo = new Map<string, { poReference: string; entries: FlooredLandedCreditEntry[] }>()
+    for (const report of outcome.creditFloorReports) {
+      const group = floorReportsByPo.get(report.poId) ?? { poReference: report.poReference, entries: [] }
+      group.entries.push(report.entry)
+      floorReportsByPo.set(report.poId, group)
+    }
+    for (const [poId, group] of floorReportsByPo) {
+      await logFlooredLandedCredit({
+        purchaseOrderId: poId,
+        context: `PO ${group.poReference} Mintsoft alignment for ${params.sku}`,
+        entries: group.entries,
+      })
+    }
     const reservedExceedsAvailable = outcome.reservedQty > outcome.quantityAfter
     await logActivity({
       entityType: 'SYNC',

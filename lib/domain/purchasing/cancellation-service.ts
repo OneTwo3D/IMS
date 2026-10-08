@@ -18,6 +18,7 @@ import {
 import {
   recalculateLandedCosts,
   queueLandedCostAdjustmentJournals,
+  logLandedCostCreditFloorActivities,
   type LandedCostRecalcResult,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
@@ -338,6 +339,8 @@ export async function cancelPurchaseOrderService(
     // Isolated from the success path — the cancellation already committed.
     const landedCostRecalc = cancellation.landedCostRecalc
     if (landedCostRecalc) {
+      // Cancelling freight can move a floored layer too; the durable WARNING is written after the commit.
+      await logLandedCostCreditFloorActivities(landedCostRecalc)
       try {
         await deps.queueLandedCostAdjustmentJournals(landedCostRecalc)
       } catch (journalError) {

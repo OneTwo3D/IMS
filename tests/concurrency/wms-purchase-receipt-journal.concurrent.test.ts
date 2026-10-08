@@ -2016,3 +2016,48 @@ test('o3d-ln2df: a DECLINED receipt journal is reported with what the book-in co
   assert.equal(okRefusals.length, 0, 'and raise NO refusal — otherwise the arm above would pass for an implementation that refuses everything')
   assert.equal(okReports.length, 0, 'and no not-queued report')
 })
+
+/**
+ * ARM 14 — THE LANDED-COST ZERO FLOOR AT THE WMS BOOK-IN (o3d-gj68).
+ *
+ * The book-in is one of the three writers of a PO-derived cost layer, and it reaches the ONE allocation
+ * through `computeLandedCostForPendingLines`. A credit cost line larger than a line's goods cost must lay a
+ * ZERO layer (never a negative one, which would throw at the movement builder and roll the whole book-in
+ * back), queue NO STOCK_RECEIPT (nothing of value entered stock) and write ONE durable WARNING after the
+ * commit that names the amount the floor could not absorb.
+ *
+ * The credit line is written DIRECTLY on the goods PO: `createPurchaseOrder` filters credits out of
+ * additional costs, and that is exactly why the fixture cannot go through it.
+ *
+ * WHAT WOULD STILL PASS THIS ARM: a fix that floors the layer but writes the warning inside the
+ * transaction (it would still be there here; the manual-receipt arm in
+ * landed-cost-receipt-recalc-agreement pins the after-commit half for that path).
+ */
+test('o3d-gj68: a credit larger than the goods cost lays a ZERO layer at the WMS book-in and warns once', SKIP, async () => {
+  loadEnv()
+  const { db } = await import('@/lib/db')
+  await enableStockReceiptPosting()
+  const QTY = 2
+  const GOODS_UNIT = 5
+  const seeded = await seedPurchaseBackedAsnViaRealCreate('LF', QTY, GOODS_UNIT)
+  await db.freightCostLine.create({
+    data: { poId: seeded.poId, description: 'direct credit', amountForeign: '-13.0000', amountBase: '-13.0000', vatable: false, distributionMethod: 'BY_VALUE', sortOrder: 0 },
+  })
+  // 5 + (-13 / 2) = -1.5 per unit: floored to 0, so 1.5 x 2 = 3.00 could not be absorbed.
+
+  const { status } = await runBookedIn(seeded, seeded.poLineId)
+  assert.equal(status, 'processed', 'a negative layer would have rolled the whole book-in back')
+
+  const layer = await db.costLayer.findFirstOrThrow({ where: { poLineId: seeded.poLineId }, select: { unitCostBase: true, receivedQty: true } })
+  const movement = await db.stockMovement.findFirstOrThrow({ where: { type: 'PURCHASE_RECEIPT', productId: seeded.productId }, select: { unitCostBase: true, totalValueBase: true } })
+  const logs = await stockReceiptLogsFor(seeded.poId)
+  const activity = await db.activityLog.findMany({ where: { entityType: 'PURCHASE_ORDER', entityId: seeded.poId, action: 'landed_cost_credit_floored' }, select: { level: true, description: true } })
+  console.log(`[arm14] unfloored unit cost would be ${GOODS_UNIT + -13 / QTY}; layer=${layer.unitCostBase}, movement=${movement.unitCostBase}/${movement.totalValueBase}, STOCK_RECEIPT rows=${logs.length}, floor activity=${activity.length}`)
+  assert.equal(layer.unitCostBase.toString(), '0')
+  assert.equal(Number(movement.totalValueBase), 0)
+  assert.equal(logs.length, 0, 'nothing of value entered stock, so no STOCK_RECEIPT is queued')
+  assert.equal(activity.length, 1, 'exactly one durable WARNING')
+  assert.equal(activity[0]!.level, 'WARNING')
+  assert.match(activity[0]!.description, /Mintsoft book-in/)
+  assert.match(activity[0]!.description, /could not absorb 3\.00 of it into stock/)
+})
