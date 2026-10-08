@@ -389,6 +389,11 @@ mask_secret() {
 # is written by an UNQUOTED heredoc, so `KEY=VALUE` to end of line is exactly what a
 # previous run wrote and reading it back the same way round-trips byte for byte.
 declare -A EXISTING_ENV=()
+# The previous .env verbatim (for the backup written before it is replaced) and the 1-based numbers
+# of its non-comment lines this reader could not classify as KEY=VALUE (`export KEY=v`, `KEY = v`):
+# those are not carried into the new file, and the summary says how many there were.
+declare -a EXISTING_ENV_RAW=()
+declare -a EXISTING_ENV_UNCLASSIFIED=()
 
 # o3d-l89a r4 (Codex r3 finding 2) — A FILE WE CANNOT READ IS NOT A FILE WITH NO SECRETS.
 #
@@ -429,12 +434,18 @@ load_existing_env() {
     die "${file} could not be read to the end, so the secrets a previous install committed to are unknown. Refusing to continue rather than minting new ones over a live database."
   fi
 
+  local lineno=0
+  EXISTING_ENV_RAW=("${lines[@]}")
+  EXISTING_ENV_UNCLASSIFIED=()
   for line in "${lines[@]}"; do
+    lineno=$((lineno + 1))
     [[ "${line}" =~ ^[[:space:]]*(#|$) ]] && continue
-    [[ "${line}" == *=* ]] || continue
     key="${line%%=*}"
     value="${line#*=}"
-    [[ "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ "${line}" != *=* || ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      EXISTING_ENV_UNCLASSIFIED+=("${lineno}")
+      continue
+    fi
     EXISTING_ENV["${key}"]="${value}"
   done
   ENV_FILE_STATE="read"
@@ -7744,8 +7755,13 @@ fi
 
 echo ""
 info "--- Application ---"
-prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "ims.localhost"
-prompt APP_PORT        "Internal port the app listens on"       "3000"
+# A re-run's defaults are what the installed .env already says: the public URL's host and the port.
+# Defaulting to the factory values would repoint a live installation on the first Enter.
+EXISTING_APP_DOMAIN="$(existing_env NEXT_PUBLIC_APP_URL)"
+EXISTING_APP_DOMAIN="${EXISTING_APP_DOMAIN#*://}"
+EXISTING_APP_DOMAIN="${EXISTING_APP_DOMAIN%%/*}"
+prompt APP_DOMAIN      "Domain name (e.g. ims.yourdomain.com)" "${EXISTING_APP_DOMAIN:-ims.localhost}"
+prompt APP_PORT        "Internal port the app listens on"       "$(existing_env APP_PORT 3000)"
 # The same shape check update.sh applies to the value it reads back out of .env (o3d-2sm1.5 r26,
 # Codex HIGH). Here it is not a parsing question — the value came from a prompt or, under
 # --non-interactive, from the invocation's own environment — but it lands in exactly the same
@@ -8149,10 +8165,19 @@ fi
 
 echo ""
 info "--- WooCommerce (optional — can be configured later in Settings) ---"
-prompt WC_STORE_URL       "WooCommerce store URL"      ""
-prompt WC_CONSUMER_KEY    "WooCommerce consumer key"   ""
-prompt WC_CONSUMER_SECRET "WooCommerce consumer secret" "" "secret"
-prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret"  "$(openssl rand -hex 16)" "secret"
+# A re-run keeps what the previous .env had (Enter accepts it); clearing a value is an explicit
+# choice -- type `none` (or export `none` for --non-interactive) -- because a blank answer used to
+# be indistinguishable from "I did not notice this question" and silently blanked a working
+# WooCommerce connection. The webhook secret is the sharper case: a fresh random one breaks the
+# signature check of every webhook WooCommerce is already sending with the old one.
+prompt WC_STORE_URL       "WooCommerce store URL (type none to clear)"      "$(existing_env WC_STORE_URL)"
+prompt WC_CONSUMER_KEY    "WooCommerce consumer key (type none to clear)"   "$(existing_env WC_CONSUMER_KEY)"
+prompt WC_CONSUMER_SECRET "WooCommerce consumer secret (type none to clear)" "$(existing_env WC_CONSUMER_SECRET)" "secret" "$([[ -n "$(existing_env WC_CONSUMER_SECRET)" ]] && printf 'kept from the existing .env' || true)"
+prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret (type none to clear)"  "$(existing_env WC_WEBHOOK_SECRET "$(openssl rand -hex 16)")" "secret" "$([[ -n "$(existing_env WC_WEBHOOK_SECRET)" ]] && printf 'kept from the existing .env' || printf 'generated')"
+for _wc_name in WC_STORE_URL WC_CONSUMER_KEY WC_CONSUMER_SECRET WC_WEBHOOK_SECRET; do
+  [[ "${!_wc_name}" != "none" ]] || printf -v "${_wc_name}" '%s' ""
+done
+unset _wc_name
 
 # Xero is configured entirely in the app: the client id/secret are stored in the
 # settings table and connecting requires the interactive OAuth consent round
@@ -8749,6 +8774,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
       --exclude='.deploy-meta' \
       --exclude='.env' \
       --exclude='.env.local' \
+      --exclude='.env.bak*' \
       --exclude='backups' \
       --exclude='uploads' \
       --exclude='public/uploads' \
@@ -8776,6 +8802,7 @@ else
     --exclude='.next' \
     --exclude='.env' \
     --exclude='.env.local' \
+    --exclude='.env.bak*' \
     --exclude='backups' \
     --exclude='uploads' \
     --exclude='public/uploads' \
@@ -8897,6 +8924,15 @@ ENV_FILE_GENERATED_AT="$(date -u +"%Y-%m-%d %H:%M:%S UTC")"
 # reach the publication at all — a pipeline would have renamed whatever bytes it had received
 # before the producer died. Command substitution strips trailing newlines and `printf '%s\n'`
 # restores the single one the heredoc ends with, so the published bytes are the rendered bytes.
+# The upload scanner settings are written as constants by a first install and are the operator's to
+# tune afterwards (a re-run used to put them all back to `disabled`).
+FILE_SCAN_MODE="$(existing_env FILE_SCAN_MODE disabled)"
+FILE_SCAN_COMMAND_ARGV="$(existing_env FILE_SCAN_COMMAND_ARGV)"
+FILE_SCAN_COMMAND="$(existing_env FILE_SCAN_COMMAND)"
+FILE_SCAN_NAME="$(existing_env FILE_SCAN_NAME)"
+FILE_SCAN_ENV_ALLOWLIST="$(existing_env FILE_SCAN_ENV_ALLOWLIST PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL)"
+FILE_SCAN_TIMEOUT_MS="$(existing_env FILE_SCAN_TIMEOUT_MS 30000)"
+
 render_app_env_file() {
 cat <<EOF
 # One Two Inventory — generated by install.sh on ${ENV_FILE_GENERATED_AT}
@@ -8954,12 +8990,12 @@ BACKUP_DIR=${BACKUP_DIR}
 UPLOAD_STORAGE_DIR=${UPLOAD_STORAGE_DIR}
 PUBLIC_UPLOAD_STORAGE_DIR=${PUBLIC_UPLOAD_STORAGE_DIR}
 INVOICE_PDF_STORAGE_DIR=${INVOICE_PDF_STORAGE_DIR}
-FILE_SCAN_MODE=disabled
-FILE_SCAN_COMMAND_ARGV=
-FILE_SCAN_COMMAND=
-FILE_SCAN_NAME=
-FILE_SCAN_ENV_ALLOWLIST=PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL
-FILE_SCAN_TIMEOUT_MS=30000
+FILE_SCAN_MODE=${FILE_SCAN_MODE}
+FILE_SCAN_COMMAND_ARGV=${FILE_SCAN_COMMAND_ARGV}
+FILE_SCAN_COMMAND=${FILE_SCAN_COMMAND}
+FILE_SCAN_NAME=${FILE_SCAN_NAME}
+FILE_SCAN_ENV_ALLOWLIST=${FILE_SCAN_ENV_ALLOWLIST}
+FILE_SCAN_TIMEOUT_MS=${FILE_SCAN_TIMEOUT_MS}
 EOF
 }
 
@@ -8971,16 +9007,105 @@ EOF
 # under `set -e` aborted the script from wherever it stood, and the `chown` and `chmod` after it
 # were not checked at all, so a refused chown left the trap claiming the file agreed with the
 # server.
+# EVERY KEY THE PREVIOUS .env HAD AND THIS TEMPLATE DOES NOT OWN IS CARRIED OVER (D4 re-run).
+# The file used to be rewritten from the template alone, so a hand-added TRUSTED_PROXY_IPS (which
+# preflight:production asks for) or XERO_ALLOWED_TENANT_IDS vanished on the next re-run with no
+# word said. Prints, for the keys the rendered text does not set, `KEY=value` exactly as read.
+#
+# THE ADMIN CREDENTIAL IS THE ONE THING THAT IS NEVER CARRIED. db_admin_credential_load() already
+# refuses a run whose application .env defines DEPLOY_ADMIN_DATABASE_URL, long before this point;
+# this is the second lock on the same door, so a future change to that load cannot turn the
+# preservation into a way of copying the credential forward.
+env_key_is_admin_credential() {
+  [[ "$1" == DEPLOY_ADMIN* || "$1" == *ADMIN_DATABASE_URL* ]]
+}
+render_preserved_env_keys() {
+  local rendered="$1" key line i j
+  local -A owned=()
+  local -a kept=()
+  ENV_KEPT_KEYS=()
+  ENV_PRESERVED_BLOCK=""
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]] && owned["${BASH_REMATCH[1]}"]=1
+  done <<< "${rendered}"
+  for key in "${!EXISTING_ENV[@]}"; do
+    [[ -z "${owned[${key}]-}" ]] || continue
+    if env_key_is_admin_credential "${key}"; then
+      error "${APP_DIR}/.env defines ${key}. That file belongs to the application account and must never hold the deploy admin credential, so it is not carried into the new file; move it to ${DB_ADMIN_CREDENTIAL_FILE}."
+      return 1
+    fi
+    kept+=("${key}")
+  done
+  ((${#kept[@]} == 0)) && return 0
+  # Sorted in bash itself (insertion sort over a handful of names): no subprocess whose failure this
+  # errexit-suspended body could not see.
+  for ((i = 0; i < ${#kept[@]}; i++)); do
+    key="${kept[i]}"
+    for ((j = i - 1; j >= 0; j--)); do
+      [[ "${ENV_KEPT_KEYS[j]}" > "${key}" ]] || break
+      ENV_KEPT_KEYS[j + 1]="${ENV_KEPT_KEYS[j]}"
+    done
+    ENV_KEPT_KEYS[j + 1]="${key}"
+  done
+  ENV_PRESERVED_BLOCK=$'\n# Kept from the previous .env by install.sh (not set by the installer)\n'
+  for key in "${ENV_KEPT_KEYS[@]}"; do
+    ENV_PRESERVED_BLOCK+="${key}=${EXISTING_ENV[${key}]}"$'\n'
+  done
+}
+
+# A TIMESTAMPED, MODE-600 COPY OF WHAT IS ABOUT TO BE REPLACED, written from the lines this run read
+# at the start (not re-read from a path the application account can swap). Same publication
+# primitive and owner as .env itself. Never pruned by this script: they hold secrets, and deleting
+# an operator's backup is not the installer's call.
+ENV_BACKUP_FILE=""
+write_env_backup() {
+  [[ "${ENV_FILE_STATE}" == "read" && "${#EXISTING_ENV_RAW[@]}" -gt 0 ]] || return 0
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)" || return 1
+  ENV_BACKUP_FILE="${APP_DIR}/.env.bak-${stamp}"
+  printf '%s\n' "${EXISTING_ENV_RAW[@]}" | publish_durable_file "${ENV_BACKUP_FILE}" "${APP_USER}:${APP_USER}" 600 || { ENV_BACKUP_FILE=""; return 1; }
+}
+
+# WHAT THE REWRITE KEPT AND CHANGED, by NAME ONLY: a value can be a secret.
+print_env_rewrite_summary() {
+  local rendered="$1" line key
+  local -a changed=() added=()
+  [[ "${ENV_FILE_STATE}" == "read" ]] || return 0
+  while IFS= read -r line; do
+    [[ "${line}" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    if [[ -z "${EXISTING_ENV[${key}]+x}" ]]; then
+      added+=("${key}")
+    elif [[ "${EXISTING_ENV[${key}]}" != "${BASH_REMATCH[2]}" ]]; then
+      changed+=("${key}")
+    fi
+  done <<< "${rendered}"
+  info "The previous ${APP_DIR}/.env was replaced. Backup (mode 600): ${ENV_BACKUP_FILE:-<none>}"
+  info "  kept as it was, not set by the installer (${#ENV_KEPT_KEYS[@]}): ${ENV_KEPT_KEYS[*]:-none}"
+  info "  values this run changed (${#changed[@]}): ${changed[*]:-none}"
+  info "  keys this run added (${#added[@]}): ${added[*]:-none}"
+  if ((${#EXISTING_ENV_UNCLASSIFIED[@]} > 0)); then
+    warn "  ${#EXISTING_ENV_UNCLASSIFIED[@]} line(s) of the previous file are not plain KEY=VALUE (line numbers: ${EXISTING_ENV_UNCLASSIFIED[*]}) and were NOT carried over; they are in the backup."
+  fi
+}
+
+ENV_KEPT_KEYS=()
+ENV_PRESERVED_BLOCK=""
+ENV_LAST_RENDERED=""
 write_app_env_file() {
   local rendered
   rendered="$(render_app_env_file)" || return 1
   [[ -n "${rendered}" ]] || return 1
-  printf '%s\n' "${rendered}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  render_preserved_env_keys "${rendered}" || return 1
+  write_env_backup || return 1
+  printf '%s\n%s' "${rendered}" "${ENV_PRESERVED_BLOCK}" | publish_durable_file "${APP_DIR}/.env" "${APP_USER}:${APP_USER}" 600 || return 1
+  ENV_LAST_RENDERED="${rendered}"
   return 0
 }
 
 write_app_env_file || die "${APP_DIR}/.env could not be written. Nothing has been stopped and nothing has been migrated; the file at that path is whatever the previous run left there, complete and unchanged — it is published by rename, so there is no half-written state to clean up."
 success ".env written to ${APP_DIR}/.env"
+print_env_rewrite_summary "${ENV_LAST_RENDERED}"
 write_admin_credential_file || die "${DB_ADMIN_CREDENTIAL_FILE} could not be written. Nothing has been stopped and nothing has been migrated; the admin credential stays where it was, with root."
 # The publication the interrupted-rotation journal was waiting for has now happened, and it named
 # DB_PASSWORD_EFFECTIVE — which reconcile_interrupted_role_rotation() has already set to the

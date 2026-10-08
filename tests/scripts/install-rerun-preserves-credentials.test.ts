@@ -211,6 +211,12 @@ async function runInstallerCapturing(
     UPLOAD_STORAGE_DIR="\${DATA_DIR}/uploads"
     PUBLIC_UPLOAD_STORAGE_DIR="\${DATA_DIR}/public-uploads"
     INVOICE_PDF_STORAGE_DIR="\${DATA_DIR}/invoice-pdfs"
+    FILE_SCAN_MODE=disabled
+    FILE_SCAN_COMMAND_ARGV=''
+    FILE_SCAN_COMMAND=''
+    FILE_SCAN_NAME=''
+    FILE_SCAN_ENV_ALLOWLIST=PATH
+    FILE_SCAN_TIMEOUT_MS=30000
     APP_PORT=3000
     APP_DOMAIN=ims.example.com
     DATABASE_URL=postgresql://imsuser:pw@localhost:5432/one_two_inventory

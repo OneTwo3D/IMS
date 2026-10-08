@@ -899,9 +899,29 @@ window — see *The database password is preserved, and a rotation waits for the
 
 The Turnstile site and secret keys and `INVOICE_PDF_STORAGE_DIR` are preserved: Enter keeps the pair already in `.env` (type `none`, or export `none`, to clear one -- a blank answer does not clear it), and an existing `INVOICE_PDF_STORAGE_DIR` is kept as is (it must be absolute; outside `/var/lib/one-two-inventory` it must already exist, be a real directory and be writable by the application account, or the run stops before `.env` is written).
 
-Prompts NOT preserved across a re-run: the WooCommerce, Xero and SMTP values, and the
-database host, port, name and user. Supply them again (or as environment variables) on an upgrade
-run, or the re-written `.env` will blank them.
+**What a re-run does to `.env`.** The file is rewritten, but nothing in it is discarded silently:
+
+* **Preserved by default** (Enter keeps them; type `none`, or export `none`, to clear one -- a blank is
+  not a request to clear): the domain (from `NEXT_PUBLIC_APP_URL`) and port, the WooCommerce store URL,
+  consumer key, consumer secret and **webhook secret** (a fresh webhook secret would break the signature
+  check of every webhook WooCommerce is already sending), the Turnstile pair, `INVOICE_PDF_STORAGE_DIR`,
+  and the upload-scanner settings (`FILE_SCAN_*`).
+* **Every other key already in the file is carried over verbatim** into a `# Kept from the previous .env`
+  block at the end -- hand-added variables such as `TRUSTED_PROXY_IPS`, `REQUIRE_TRUSTED_PROXY_CONFIG` or
+  `XERO_ALLOWED_TENANT_IDS`.
+* **A deploy admin credential is never carried.** A `DEPLOY_ADMIN_*` / `*ADMIN_DATABASE_URL` key left in
+  the application `.env` is refused before anything is changed (it belongs in
+  `/etc/ims-db-admin/deploy-admin.env`), and the copy step refuses it again as a second lock.
+* **A backup is written first**: `${APP_DIR}/.env.bak-<UTC timestamp>`, mode 600, owned by the application
+  account, made from the lines the run read at its start (not re-read), kept by the source sync
+  (`rsync --delete` excludes `.env.bak*`) and never pruned by the installer: they hold secrets, so delete old
+  ones yourself.
+* **It says what it did**, by key name only (never a value): the backup path, the keys kept, the values this
+  run changed, the keys it added, and the line numbers of any line that is not plain `KEY=VALUE`
+  (`export KEY=v`, `KEY = v`), which is **not** carried over and is in the backup.
+
+Not preserved across a re-run, because they are not in `.env`: the SMTP values (they seed the settings
+table once) and the database host, port, name and user (supply them again, or as environment variables).
 
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)

@@ -398,6 +398,7 @@ test('r39: .env is published by rename, so the previous file is never truncated'
     const run = runShipped(installVars(cluster, root), `
       ${REINSTALL_BODY}
       echo "RENDERED_B64=$(render_app_env_file | base64 | tr -d '\\n')"
+      echo "PRESERVED_B64=$(printf '%s' "\${ENV_PRESERVED_BLOCK}" | base64 | tr -d '\\n')"
     `)
     assert.equal(run.status, 0, run.output)
 
@@ -413,7 +414,11 @@ test('r39: .env is published by rename, so the previous file is never truncated'
     // publish split honest. A pipeline would have published whatever it had received before a
     // failing producer died; this compares the whole file against the whole render.
     const rendered = Buffer.from(readVar(run.output, 'RENDERED_B64'), 'base64').toString('utf8')
-    assert.equal(readFileSync(join(root, '.env'), 'utf8'), rendered, 'the published file must be exactly the rendered content')
+    // ...followed by the keys the previous file had and the template does not own (the re-run
+    // preservation; here the hand-added ANALYTICS_DATABASE_URL), which is the only addition.
+    const preserved = Buffer.from(readVar(run.output, 'PRESERVED_B64'), 'base64').toString('utf8')
+    assert.match(preserved, /^ANALYTICS_DATABASE_URL=/m, 'precondition: the unowned key is in the preserved block')
+    assert.equal(readFileSync(join(root, '.env'), 'utf8'), rendered + preserved, 'the published file must be exactly the rendered content plus the preserved block')
   } finally {
     cluster?.stop()
     rmSync(root, { recursive: true, force: true })

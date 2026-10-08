@@ -172,6 +172,10 @@ export const SHIPPED = [
   'classify_database_credential_rotation',
   'provision_database_role_and_privileges',
   'render_app_env_file',
+  // The re-run preservation (backup, kept keys) that write_app_env_file() now calls.
+  'env_key_is_admin_credential',
+  'render_preserved_env_keys',
+  'write_env_backup',
   'write_app_env_file',
   'rotate_database_password_in_fenced_window',
 ]
@@ -245,6 +249,15 @@ export const ENV_HEREDOC_DEFAULTS = [
   ),
 ]
   .map((name) => `${name}="\${${name}-}"`)
+  .concat([
+    // What write_app_env_file() reads that is not part of the heredoc: the re-run bookkeeping.
+    'ENV_BACKUP_FILE="${ENV_BACKUP_FILE-}"',
+    'ENV_PRESERVED_BLOCK="${ENV_PRESERVED_BLOCK-}"',
+    'ENV_LAST_RENDERED="${ENV_LAST_RENDERED-}"',
+    'DB_ADMIN_CREDENTIAL_FILE="${DB_ADMIN_CREDENTIAL_FILE-}"',
+    '[[ -v ENV_KEPT_KEYS ]] || declare -a ENV_KEPT_KEYS=()',
+    '[[ -v EXISTING_ENV_RAW ]] || declare -a EXISTING_ENV_RAW=()',
+  ])
   .join('\n')
 
 export interface Run {
@@ -660,9 +673,11 @@ export function writeInstalledEnv(appDir: string, port: number, password: string
     '',
     `DATABASE_URL=postgresql://imsuser:${password}@127.0.0.1:${port}/one_two_inventory`,
     // IN THE SAME FILE ON PURPOSE. It ends in the same fourteen characters as the line above, so
-    // an unanchored match rewrites the deploy admin's credential too — and that is the connection
-    // the fence itself is held with.
-    `DEPLOY_ADMIN_DATABASE_URL=postgresql://deployadmin:admin-password@127.0.0.1:${port}/one_two_inventory`,
+    // an unanchored match rewrites that connection too.
+    // (A hand-added reporting connection. It was DEPLOY_ADMIN_DATABASE_URL until a re-run began to refuse
+    // that key outright -- an application .env may never carry the admin credential -- and a
+    // re-run now carries unowned keys across, so this is also a key the rewrite must leave alone.)
+    `ANALYTICS_DATABASE_URL=postgresql://reporting:report-password@127.0.0.1:${port}/one_two_inventory`,
     'NEXT_PUBLIC_APP_URL=https://ims.example.test',
     '',
   ].join('\n')
@@ -701,7 +716,7 @@ export const REINSTALL_BODY = `
   ensure_database_role_exists
   classify_database_credential_rotation
   provision_database_role_and_privileges
-  write_app_env_file
+  write_app_env_file || exit 9
   echo "COMPOSED_URL=\${DATABASE_URL}"
   echo "ROLE_PREEXISTED=\${DB_ROLE_PREEXISTED}"
   echo "ROTATION_PENDING=\${DB_PASSWORD_ROTATION_PENDING}"
