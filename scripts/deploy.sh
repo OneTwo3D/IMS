@@ -2214,7 +2214,7 @@ write_fence_marker() {
     # What the operator reading this file is actually looking at. Printing "held" from a
     # SCHEMA_TOUCHED branch that had already released it is how a fence that does not
     # exist gets read as one (Codex r3 HIGH).
-    echo "db_connect_fence=$($DB_FENCE_UP && echo held || echo released)"
+    echo "db_connect_fence=$(db_connect_fence_claim)"
     echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
     # THE LAST LINE, AND IT IS THE POINT OF IT (o3d-2sm1.5, Codex r9 HIGH). A marker that
     # does not end here was never published by publish_durable_file(), so every fact above
@@ -3880,6 +3880,24 @@ on_exit() {
   local status=$?
   $DEPLOY_OK && exit 0
 
+  # A DRY RUN CHANGED NOTHING, SO NOTHING IT PRINTS MAY DESCRIBE A CHANGED HOST (D4 rehearsal).
+  # FENCE_ARMED is raised in a dry run too, because the plan walks the same statements, and the
+  # branches below read it as "something was stopped": a failing check late in a dry run printed
+  # UPDATE FAILED AFTER THE STOP, claimed the service was stopped and the cron fenced, and told the
+  # operator the old version would not be restarted -- none of which had happened. The one thing a
+  # dry run can say about a failure is which step it reached and that the host is as it was.
+  if $DRY_RUN; then
+    echo ""
+    echo -e "${RED}${BOLD}=======================================================================${RESET}"
+    echo -e "${RED}${BOLD} DRY RUN FAILED — NOTHING WAS CHANGED${RESET}"
+    echo -e "${RED}${BOLD}=======================================================================${RESET}"
+    echo -e "  failed step : ${CURRENT_STEP}"
+    echo -e "  exit status : ${status}"
+    echo -e "  host        : untouched. Nothing was stopped, fenced, migrated or written; the service"
+    echo -e "                and the crontab are exactly as they were. A real run would stop at this step."
+    exit "${status}"
+  fi
+
   # THE POINT OF NO RETURN (o3d-2sm1.5, Codex r4 HIGH).
   #
   # DEPLOY_OK was only set after the cron restore and the marker removal, so under `set -e` a
@@ -5060,8 +5078,16 @@ remove_reboot_fence
 # hand: the die reaches on_exit() with SCHEMA_TOUCHED true and DB_FENCE_UP false, which is
 # exactly the branch that re-establishes the connection fence through refence_db_connections()
 # and re-installs the reboot fence, and then says which of the two it actually managed.
-require_start_identity_bound || die \
-  "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and \`systemctl start\` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
+if $DRY_RUN; then
+  # A dry run publishes no environment snapshot and reloads nothing, so there is no loaded unit
+  # configuration for this check to read: run for real it fails on every healthy host, and the
+  # refusal it prints describes a stop that did not happen. It is a check of what this run
+  # CHANGED, and a dry run changed nothing.
+  echo -e "${YELLOW}[DRY]${RESET}   would verify that the loaded unit configuration binds the service to this run's database snapshot"
+else
+  require_start_identity_bound || die \
+    "THE APPLICATION IS NOT BEING STARTED, AND BOTH FENCES ARE BEING PUT BACK: ${DB_IDENTITY_DRIFT_REASON}. This was checked after the final daemon-reload, so it is the loaded unit configuration and the current file contents that disagree with the identity this run fenced and migrated. It is also the check that proves the environment snapshot this run published is in that loaded configuration, loaded last and loaded mandatorily — the binding that makes the answer independent of anything that happens between this line and the exec. NOTHING BETWEEN HERE AND THE START RUNS A UNIT-FILE COMMAND AT ALL: the unmask moved above the final reload in r24 because it reloads implicitly, and every command left in the window is a timestamp, a shell test, a loop, an echo and \`systemctl start\` itself, which acts on the loaded configuration and does not re-read unit files. So the list of environment files systemd will read is now fixed. The connection fence was released a moment ago for the start and is being re-established below; the banner that follows says whether that succeeded and what is standing. Restore ${APP_DIR_REAL}/.env and the unit to the identity above and re-run this script, which adopts the fence. Do NOT start the service by hand first."
+fi
 
 # The instant the restart was issued. The responder proof below requires the process on the
 # port to post-date it: anything older survived the stop and is not what this run started.

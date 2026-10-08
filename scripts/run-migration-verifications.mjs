@@ -69,7 +69,7 @@
 // and that is deploy.sh's job, not this file's. This hook is the second line.
 // =============================================================================
 
-import { readFileSync, readdirSync, existsSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -380,7 +380,19 @@ async function main() {
   process.exitCode = 1
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+// process.argv[1] is the path the command was TYPED with, and import.meta.url is the path Node
+// RESOLVED (symlinks followed). Invoked through a symlink -- the documented
+// /etc/ims-cutover-recovery/app/... path is one -- the two differed, main() never ran and the command
+// exited 0 having done nothing. Compare like with like.
+function isMainModule() {
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1] ?? '')).href
+  } catch {
+    return false
+  }
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(`Migration verification hook crashed: ${error instanceof Error ? error.message : String(error)}`)
     console.error('Treating that as a failed verification — the new build must not be started.')

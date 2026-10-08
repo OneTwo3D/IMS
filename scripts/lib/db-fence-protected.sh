@@ -5621,3 +5621,42 @@ db_fence_report_candidate_digest() {
   db_fence_probe_report || rc=1
   return "${rc}"
 }
+
+# WHAT A CUTOVER MARKER MAY SAY ABOUT THE CONNECTION FENCE -- ONE DEFINITION, THREE WRITERS.
+#
+# THE DEFECT (D4 rehearsal, kill -9 in the middle of the migration window). Every writer printed
+# `db_connect_fence=$($DB_FENCE_UP && echo held || echo released)`. DB_FENCE_UP is a variable in this
+# shell's memory that is false BEFORE the fence is raised as well as AFTER it is released, so the
+# marker published at the start of the stop phase -- before the fence existed, and never rewritten
+# when it was raised -- said `released` for the whole of a window in which CONNECT was revoked and
+# the migration login was open. A person reading the marker after a SIGKILL was told the fence was
+# down. "Not held" was being reported as "released".
+#
+# THE RULE. The marker is a claim about the moment it was written, so it may only claim what this run
+# KNOWS at that moment, and it may not claim a thing it has not seen happen:
+#
+#   held        this run's fence is standing (raised or adopted and not since lowered)
+#   released    this run raised, or adopted, a fence and has since lowered it (the release was verified
+#               by the database before DB_FENCE_UP was cleared)
+#   not-raised  nothing has been stopped yet, or this is a first install that takes no fence at all:
+#               there is no fence to be standing
+#   unknown     the stop has been requested but this run has not seen a fence raised: a fence may be
+#               raised at any instant after this line is written, and the marker cannot be rewritten
+#               by a process that is killed. The DATABASE says which (datacl, db-connect-fence.json,
+#               release-db-fence), never this file.
+#
+# Every recovery path already decides from the database and the standing record; the marker's own
+# word is only ever printed to a person. This keeps that word from being the wrong one to print.
+db_connect_fence_claim() {
+  if ${DB_FENCE_UP:-false}; then
+    echo held
+  elif ${DB_FENCE_RAISED:-false}; then
+    echo released
+  elif ${FIRST_INSTALL_NO_CREDENTIALED_FENCE:-false}; then
+    echo not-raised
+  elif ${FENCE_ARMED:-false}; then
+    echo unknown
+  else
+    echo not-raised
+  fi
+}

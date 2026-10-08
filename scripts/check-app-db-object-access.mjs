@@ -71,7 +71,7 @@
 // objects the admin just created is the defect, restated as a passing check.
 // =============================================================================
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, realpathSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 import { config as loadDotenv } from 'dotenv'
@@ -445,7 +445,19 @@ async function main() {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+// process.argv[1] is the path the command was TYPED with, and import.meta.url is the path Node
+// RESOLVED (symlinks followed). Invoked through a symlink -- the documented
+// /etc/ims-cutover-recovery/app/... path is one -- the two differed, main() never ran and the command
+// exited 0 having done nothing. Compare like with like.
+function isMainModule() {
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1] ?? '')).href
+  } catch {
+    return false
+  }
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(`Failed to check what the application role can use: ${error instanceof Error ? error.message : String(error)}`)
     console.error('Treating that as "not proven usable" — the new build must not be started.')

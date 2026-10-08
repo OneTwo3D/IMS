@@ -5630,7 +5630,7 @@ write_cutover_marker() {
     # What the operator reading this file is actually looking at. A SCHEMA_TOUCHED branch
     # printing "held" about a fence the start step had already released is how a fence that
     # does not exist gets read as one (Codex r3 HIGH).
-    echo "db_connect_fence=$(${DB_FENCE_UP} && echo held || echo released)"
+    echo "db_connect_fence=$(db_connect_fence_claim)"
     echo "release_db_connect_fence=${DB_FENCE_RELEASE_CMD}"
     # THE LAST LINE, AND IT IS THE POINT OF IT (o3d-2sm1.5, Codex r9 HIGH). A marker that
     # does not end here was never published by publish_durable_file(), so every fact above

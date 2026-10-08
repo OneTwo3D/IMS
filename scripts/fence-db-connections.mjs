@@ -170,7 +170,7 @@
 // =============================================================================
 
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from 'node:crypto'
-import { lstatSync, readFileSync } from 'node:fs'
+import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -3205,7 +3205,36 @@ export function assessUnrecordedRelease({
     // the application's own URL reaching it. When the two disagree, the disagreement is the
     // finding, and it is fatal: the caller is about to start an application on the strength of
     // the weaker of the two answers.
-    if (!appConnection || !appConnection.connected) {
+    // THE SECOND QUESTION WAS NOT ASKED, WHICH IS NOT THE SAME AS ITS ANSWER BEING "NO" (D4
+    // rehearsal). The operator wrappers run as root with the admin credential only -- by design they
+    // read nothing out of the application's .env -- so a record-less release run through one has no
+    // DATABASE_URL to connect with. The branch below would then report two ANSWERS that DISAGREE, and
+    // that DATABASE_URL "CANNOT CONNECT", about a connection nobody attempted, to an operator who had
+    // come only to close the migration login that update.sh's refusal told them to close. It is still
+    // a refusal (nothing here can certify the application can get in, and a privilege read alone is
+    // not that proof), but it says what is actually the case.
+    if (!appConnection || appConnection.attempted === false) {
+      return {
+        exitCode: EXIT_ERROR,
+        fenceProvenAbsent: false,
+        appRoleConnects: false,
+        lines: [
+          `No usable connection-fence record (${what}) at ${where}.`,
+          `The connection this run opened${connectedDatabase ? ` (attached to "${connectedDatabase}")` : ''} says ${appRole} holds CONNECT.`,
+          'This run could not ALSO connect as the application: no DATABASE_URL reached it (the operator wrappers',
+          'run as root with the admin credential only, and read nothing from the application\'s .env). That is not',
+          'a disagreement between two answers; the second question was not asked, so this is not a verdict on',
+          'DATABASE_URL and it is not evidence that a fence is standing.',
+          'It is still not a release: with no record there is no baseline of who held CONNECT, so a privilege read',
+          'alone cannot certify the database is open. Anything printed above about the migration login stands',
+          'on its own (it was closed or it was not). To certify the application can connect, re-run from',
+          'update.sh or install.sh (which hold DATABASE_URL), or connect as the application yourself; to audit',
+          'the grants:',
+          '  SELECT datacl FROM pg_database WHERE datname = current_database();',
+        ],
+      }
+    }
+    if (!appConnection.connected) {
       return {
         exitCode: EXIT_ERROR,
         fenceProvenAbsent: false,
@@ -4344,7 +4373,19 @@ async function main() {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+// process.argv[1] is the path the command was TYPED with, and import.meta.url is the path Node
+// RESOLVED (symlinks followed). Invoked through a symlink -- the documented
+// /etc/ims-cutover-recovery/app/... path is one -- the two differed, main() never ran and the command
+// exited 0 having done nothing. Compare like with like.
+function isMainModule() {
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1] ?? '')).href
+  } catch {
+    return false
+  }
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(`Connection fence failed: ${error instanceof Error ? error.message : String(error)}`)
     process.exit(EXIT_ERROR)
