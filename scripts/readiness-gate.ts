@@ -214,7 +214,7 @@ export async function runReadinessGate(options: GateRunOptions): Promise<number>
     if ('refused' in accepted) return refused(accepted.refused)
 
     const deps = options.deps ?? defaultDeps(env)
-    stderr(`Readiness gate for ${args.phase}: collecting checks (validate:db can take several minutes).`)
+    stderr(`Readiness gate for ${args.phase}: collecting checks (the schema commands can take a minute).`)
     const { results, notes } = await collectGateResults({ phase: args.phase, expectGranted: args.expectGranted, rehearsalDir: path.resolve(args.rehearsalDir) }, deps)
     const now = deps.now()
     const verdict = decideVerdict({ phase: args.phase, results, acceptances: accepted.file, now })
