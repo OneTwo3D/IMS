@@ -39,12 +39,12 @@ export function shippedFunction(source: string, name: string): string {
  * these tools starts a shell (pg_ctl and initdb both do).
  */
 export function toolEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {}
+  const env = {} as Record<string, string>
   for (const name of ['PATH', 'HOME', 'LANG', 'LC_ALL', 'TZ', 'TMPDIR']) {
     const value = process.env[name]
     if (value !== undefined) env[name] = value
   }
-  return env
+  return env as unknown as NodeJS.ProcessEnv
 }
 
 /** The server binaries, wherever this distribution keeps them. No shell is involved in finding them. */
