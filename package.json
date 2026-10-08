@@ -34,6 +34,7 @@
     "invariant-check:preflight": "tsx scripts/invariant-check-preflight.ts",
     "rehearse:first-install": "tsx scripts/rehearse-first-install.ts",
     "outbound:status": "tsx scripts/outbound-status.ts",
+    "readiness:gate": "tsx scripts/readiness-gate.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
     "wc:coupon-discount:backfill": "tsx scripts/backfill-wc-coupon-order-discount.ts",

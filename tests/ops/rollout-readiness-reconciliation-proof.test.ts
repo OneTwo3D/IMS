@@ -387,3 +387,14 @@ function okLatest(lastStatus: string) {
     reference: 'ok-ref',
   }
 }
+
+test('[o3d-6e4v] an UNREADABLE newest-run read is a blocker, not "no run": allowWarnings cannot turn it green', async () => {
+  const failing = { ...adapters(newestRun(), noHistory), latestAccountingReconciliationRun: async () => { throw new Error('connection reset') } }
+  const report = await collectRolloutReadiness(failing)
+  assert.equal(report.status, 'blocked')
+  assert.deepEqual(report.blockers.map((f) => f.id), ['readiness-adapter:accounting-reconciliation'])
+  assert.deepEqual(report.warnings.map((f) => f.id), [])
+  const handler = createRolloutReadinessHandler({ authorize: async () => null, collect: () => collectRolloutReadiness(failing) })
+  const response = await handler(new Request('https://ims.example/api/admin/rollout-readiness?allowWarnings=true'))
+  assert.equal(response.status, 412)
+})
