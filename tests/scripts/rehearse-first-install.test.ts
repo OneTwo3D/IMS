@@ -279,6 +279,11 @@ test('shredFile refuses a symlink, a different regular file and a FIFO at the na
   execFileSync('mkfifo', [join(dir, 'fifo')])
   assert.equal(shredFile(join(dir, 'fifo'), id).ok, false, 'a FIFO is refused without blocking')
   assert.equal(shredFile(mine, null).ok, false, 'no recorded identity means nothing may be overwritten')
+  // Inode numbers are reused after a delete (this is what made the CI run overwrite a decoy): same dev and
+  // ino with another creation time is a different file.
+  const born = statSync(mine).birthtimeMs
+  assert.ok(born > 0, 'precondition: this file system reports a creation time')
+  assert.equal(shredFile(mine, { ...id, birthtimeMs: born + 5000 }).ok, false, 'same device and inode, different creation time: not ours')
   console.log(`# victim after four refusals: ${JSON.stringify(readFileSync(victim, 'utf8'))}; mine: ${JSON.stringify(readFileSync(mine, 'utf8'))}`)
   assert.equal(readFileSync(victim, 'utf8'), 'precious')
   assert.equal(readFileSync(mine, 'utf8'), 'created by the run')
@@ -919,13 +924,12 @@ for (const mode of ['symlink', 'different file'] as const) {
         betweenIdentityAndStop: () => {
           const run = readdirSync(parent).find((name) => name.startsWith('ims-rehearsal-') && name !== 'reports')!
           envFile = join(parent, run, 'rehearsal.env')
+          // The decoy is created BEFORE the env file is removed, so it cannot be handed the same inode number.
+          writeFileSync(join(parent, 'decoy-keep'), 'decoy contents')
           rmSync(envFile)
+          // A hard link, so the decoy outlives the run directory and its content can be read afterwards.
           if (mode === 'symlink') symlinkSync(victim, envFile)
-          else {
-            // A hard link, so the decoy outlives the run directory and its content can be read afterwards.
-            writeFileSync(join(parent, 'decoy-keep'), 'decoy contents')
-            linkSync(join(parent, 'decoy-keep'), envFile)
-          }
+          else linkSync(join(parent, 'decoy-keep'), envFile)
         },
       },
     })

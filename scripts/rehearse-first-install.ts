@@ -472,7 +472,13 @@ export function checkAncestors(target: string, label: string): string | null {
 
 class DirectoryReplacedError extends Error {}
 
-export type FileIdentity = { dev: number; ino: number }
+/** `birthtimeMs` is recorded where the file system reports one: an inode NUMBER can be reused after a delete, its creation time cannot match by accident. */
+export type FileIdentity = { dev: number; ino: number; birthtimeMs?: number }
+
+function sameFile(info: { dev: number; ino: number; birthtimeMs: number }, expected: FileIdentity): boolean {
+  if (info.dev !== expected.dev || info.ino !== expected.ino) return false
+  return expected.birthtimeMs === undefined || expected.birthtimeMs === 0 || info.birthtimeMs === 0 || info.birthtimeMs === expected.birthtimeMs
+}
 
 /**
  * Overwrite and remove a file THIS run created, and nothing else. The file is opened with O_NOFOLLOW
@@ -494,8 +500,8 @@ export function shredFile(file: string, expected: FileIdentity | null): { ok: bo
   }
   try {
     const info = fstatSync(fd)
-    if (expected === null || !info.isFile() || info.dev !== expected.dev || info.ino !== expected.ino) {
-      return { ok: false, reason: `${file} is not the file this run created (device/inode differ or it is not a regular file), so it was neither overwritten nor removed` }
+    if (expected === null || !info.isFile() || !sameFile(info, expected)) {
+      return { ok: false, reason: `${file} is not the file this run created (device, inode or creation time differ, or it is not a regular file), so it was neither overwritten nor removed` }
     }
     writeSync(fd, randomBytes(Math.max(info.size, 1)))
     fsyncSync(fd)
@@ -504,7 +510,7 @@ export function shredFile(file: string, expected: FileIdentity | null): { ok: bo
   }
   try {
     const now = lstatSync(file)
-    if (now.isSymbolicLink() || now.dev !== expected.dev || now.ino !== expected.ino) return { ok: false, reason: `${file} changed after it was overwritten, so it was not removed` }
+    if (now.isSymbolicLink() || !sameFile(now, expected)) return { ok: false, reason: `${file} changed after it was overwritten, so it was not removed` }
     unlinkSync(file)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return { ok: false, reason: `${file} could not be removed: ${error instanceof Error ? error.message : String(error)}` }
@@ -810,7 +816,7 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
         fsyncSync(fd)
         const info = fstatSync(fd)
         if ((info.mode & 0o777) !== 0o600) throw new Error('the env file is not mode 600')
-        state.envFileId = { dev: info.dev, ino: info.ino }
+        state.envFileId = { dev: info.dev, ino: info.ino, birthtimeMs: info.birthtimeMs }
       } finally {
         closeSync(fd)
       }
