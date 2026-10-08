@@ -73,6 +73,7 @@ export type WooStepId =
   | 'outbound-held-before'
   | 'rehearsal-import'
   | 'status-selection'
+  | 'deployment-statuses'
   | 'pass-complete'
   | 'no-stamp-on-rehearsal'
   | 'r9-orders'
@@ -81,6 +82,7 @@ export type WooStepId =
   | 'unallocatable-list'
   | 'idempotent-second-pass'
   | 'stock-lands-later'
+  | 'short-after-landing'
   | 'real-pass-stamps'
   | 'start-declines-after-stamp'
   | 'read-only-proof'
@@ -94,7 +96,8 @@ export const WOO_STEP_CATALOGUE: readonly WooStepDefinition[] = [
   { id: 'prepare', title: 'IMS-side fixtures: products, opening stock, tax mappings, FX rate, store settings', prerequisite: true },
   { id: 'outbound-held-before', title: 'No outbound-write grant exists: outbound:status reports every connector held', prerequisite: false },
   { id: 'rehearsal-import', title: 'The real initial-import pass runs as a rehearsal (no stamp)', prerequisite: true },
-  { id: 'status-selection', title: 'The resolved status list equals the owner decision', prerequisite: false },
+  { id: 'status-selection', title: 'SIMULATED configuration check: the status list the rehearsal itself configured resolves to the owner decision', prerequisite: false },
+  { id: 'deployment-statuses', title: 'Deployment: the target installation\'s wc_sync_order_statuses resolves to the owner decision (NOT CHECKED unless --check-deployment-statuses is given)', prerequisite: false },
   { id: 'pass-complete', title: 'The pass judges itself COMPLETE on its own terms (no unread page, no truncated read, no unrecorded refusal)', prerequisite: false },
   { id: 'no-stamp-on-rehearsal', title: 'A rehearsal wrote neither the completion stamp nor the sync cursor', prerequisite: false },
   { id: 'r9-orders', title: 'R9: exact order count in the selected statuses; value within tolerance per order', prerequisite: false },
@@ -102,7 +105,8 @@ export const WOO_STEP_CATALOGUE: readonly WooStepDefinition[] = [
   { id: 'allocations-derived', title: 'Every allocation row was derived by the allocation service (none seeded by hand)', prerequisite: false },
   { id: 'unallocatable-list', title: 'Orders and lines that imported but could not be allocated are listed', prerequisite: false },
   { id: 'idempotent-second-pass', title: 'A second pass imports nothing new', prerequisite: false },
-  { id: 'stock-lands-later', title: 'OD-4: orders that could not be allocated are allocated when stock lands', prerequisite: false },
+  { id: 'stock-lands-later', title: 'OD-4 (PROCESSING and ALLOCATED orders only): every such order that was waiting before stock landed is allocated after the backorder allocator and the sweep', prerequisite: false },
+  { id: 'short-after-landing', title: 'Every order still short after stock landed is listed by status; none of a status expected to allocate remains short; ON_HOLD and PENDING_PAYMENT are named as not expected to allocate', prerequisite: false },
   { id: 'real-pass-stamps', title: 'A real pass stamps completion and the sync cursor (once)', prerequisite: false },
   { id: 'start-declines-after-stamp', title: 'After the stamp the import button declines to run again', prerequisite: false },
   { id: 'read-only-proof', title: 'Read-only: no request other than GET reached the store, none was unmodelled, the hold refused nothing', prerequisite: false },
@@ -123,7 +127,7 @@ export type StoreOrderFact = {
   /** The GBP rate the rehearsal seeded for the order's currency (1 GBP = x currency); 1 for GBP. */
   fxPerGbp: number
   /** What the fixture says should happen. */
-  expectation: 'imports' | 'imports-with-unallocatable-lines' | 'fails-to-import' | 'abandoned-by-status'
+  expectation: 'imports' | 'imports-with-unallocatable-lines' | 'abandoned-by-status'
 }
 
 /** One order as IMS holds it after the import. Null fields mean "no such order". */
@@ -181,13 +185,12 @@ export type R9Result = {
   assessment: Assessment
   /** Orders the store holds in the selected statuses: the exact count the import must reach. */
   expectedCount: number
-  /** Of those, the ones a fixture declares known to fail (expected NOT to import). */
-  knownBadCount: number
   importedCount: number
-  /** Orders in the selected statuses that did not import and were not declared known-bad. */
+  /** Orders in a selected status that are not in IMS. ANY is a failure: a real pass would stamp completion over them. */
   missing: number[]
-  /** Declared known-bad orders that imported anyway (the probe would then prove nothing). */
-  knownBadThatImported: number[]
+  /** Of those, the ones with a durable retry row. A RECOVERY FACT, reported beside the failure; it never excuses it. */
+  missingWithRetryRow: number[]
+  missingWithoutRetryRow: number[]
   /** Orders in a status that was not selected that IMS nevertheless holds. */
   importedFromAbandonedStatus: number[]
   overTolerance: number[]
@@ -219,11 +222,12 @@ export function assessR9(input: {
   const byId = new Map(input.imported.map((fact) => [fact.externalOrderId, fact]))
   const selected = input.store.filter((order) => input.selectedStatuses.includes(order.status))
   const selectedIds = new Set(selected.map((order) => order.id))
-  const knownBad = selected.filter((order) => order.expectation === 'fails-to-import')
-  const mustImport = selected.filter((order) => order.expectation !== 'fails-to-import')
 
-  const missing = mustImport.filter((order) => !byId.has(order.id)).map((order) => order.id)
-  const knownBadThatImported = knownBad.filter((order) => byId.has(order.id)).map((order) => order.id)
+  // THE REQUIRED COUNT IS EVERY ORDER IN A SELECTED STATUS. No order is excused from it: one that is not in
+  // IMS fails R9 whether or not a retry row exists, because the stamp moves the cursor past it regardless.
+  const missing = selected.filter((order) => !byId.has(order.id)).map((order) => order.id)
+  const missingWithRetryRow = missing.filter((id) => input.retryRecorded?.has(id) ?? false)
+  const missingWithoutRetryRow = missing.filter((id) => !(input.retryRecorded?.has(id) ?? false))
   const importedFromAbandonedStatus = input.imported.filter((fact) => !selectedIds.has(fact.externalOrderId)).map((fact) => fact.externalOrderId)
 
   const rows: OrderRow[] = []
@@ -255,9 +259,7 @@ export function assessR9(input: {
         retryRecorded: input.selectedStatuses.includes(order.status) ? (input.retryRecorded?.has(order.id) ?? false) : null,
         reason: !input.selectedStatuses.includes(order.status)
           ? `status ${order.status} is not selected: abandoned by decision, never asked for`
-          : order.expectation === 'fails-to-import'
-            ? `declared known to fail (probe); ${input.retryRecorded?.has(order.id) ? 'a durable retry row is recorded, so the stamp does not strand it' : 'NO durable retry row: the stamp would strand it'}`
-            : 'MISSING',
+          : `MISSING from IMS; recovery fact: ${input.retryRecorded?.has(order.id) ? 'a durable retry row is recorded (the pending-FX queue), which does NOT make the count right' : 'NO durable retry row: nothing would bring it back after the stamp'}`,
       })
       continue
     }
@@ -291,21 +293,18 @@ export function assessR9(input: {
     })
   }
 
-  if (missing.length > 0) failures.push(`${missing.length} order(s) in the selected statuses are not in IMS: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', ...' : ''}`)
-  if (knownBadThatImported.length > 0) failures.push(`${knownBadThatImported.length} order(s) declared known to fail imported anyway (the probe proves nothing): ${knownBadThatImported.join(', ')}`)
+  if (missing.length > 0) failures.push(`${missing.length} order(s) in the selected statuses are not in IMS: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', ...' : ''} (durable retry row recorded for ${missingWithRetryRow.length}, none for ${missingWithoutRetryRow.length}; a real pass would stamp completion over them)`)
   if (importedFromAbandonedStatus.length > 0) failures.push(`${importedFromAbandonedStatus.length} order(s) outside the selected statuses are in IMS: ${importedFromAbandonedStatus.join(', ')}`)
-  const stranded = knownBad.filter((order) => !byId.has(order.id) && !(input.retryRecorded?.has(order.id) ?? false)).map((order) => order.id)
-  if (stranded.length > 0) failures.push(`${stranded.length} order(s) that did not import have no durable retry row, so the stamp would strand them for good: ${stranded.join(', ')}`)
   if (overTolerance.length > 0) failures.push(`${overTolerance.length} order(s) differ from WooCommerce by more than ${tolerance}: ${overTolerance.slice(0, 10).join(', ')}`)
   if (selected.length === 0) failures.push('the store holds no order in any selected status, so the count proves nothing')
 
   return {
     assessment: { ok: failures.length === 0, failures },
     expectedCount: selected.length,
-    knownBadCount: knownBad.length,
     importedCount: input.imported.length,
     missing,
-    knownBadThatImported,
+    missingWithRetryRow,
+    missingWithoutRetryRow,
     importedFromAbandonedStatus,
     overTolerance,
     maxValueDiffForeign: maxForeign,
@@ -402,27 +401,24 @@ export type PassFacts = {
   statuses: string[]
 }
 
-/** The pass must call itself complete, and any per-order error must be a known-bad probe. */
-export function assessPassComplete(pass: PassFacts, knownBadIds: readonly number[]): Assessment {
+/** The pass must call itself complete, with no unrecorded refusal and no per-order error: an error is an order that did not import. */
+export function assessPassComplete(pass: PassFacts): Assessment {
   const failures: string[] = []
   if (pass.outcome !== 'complete') failures.push(`the pass ended ${pass.outcome}, not complete`)
   if (pass.unrecordedRefusals > 0) failures.push(`${pass.unrecordedRefusals} refusal(s) could not be recorded`)
-  const unexpected = pass.errors.filter((message) => !knownBadIds.some((id) => message.includes(`#${id}:`)))
-  if (unexpected.length > 0) failures.push(`${unexpected.length} error(s) the fixtures did not declare: ${unexpected.slice(0, 3).join(' | ')}`)
+  if (pass.errors.length > 0) failures.push(`${pass.errors.length} per-order error(s): ${pass.errors.slice(0, 3).join(' | ')}`)
   return { ok: failures.length === 0, failures }
 }
 
 /** The second pass imports nothing and creates nothing. */
-export function assessIdempotency(input: { first: PassFacts; second: PassFacts; ordersAfterFirst: number; ordersAfterSecond: number; linesAfterFirst: number; linesAfterSecond: number; knownBadCount: number }): Assessment {
+export function assessIdempotency(input: { first: PassFacts; second: PassFacts; ordersAfterFirst: number; ordersAfterSecond: number; linesAfterFirst: number; linesAfterSecond: number }): Assessment {
   const failures: string[] = []
   if (input.first.imported <= 0) failures.push('precondition failed: the first pass imported nothing, so a second pass importing nothing proves nothing')
   if (input.second.imported !== 0) failures.push(`the second pass imported ${input.second.imported} order(s); it must import none`)
   if (input.ordersAfterSecond !== input.ordersAfterFirst) failures.push(`sales orders went from ${input.ordersAfterFirst} to ${input.ordersAfterSecond}`)
   if (input.linesAfterSecond !== input.linesAfterFirst) failures.push(`sales order lines went from ${input.linesAfterFirst} to ${input.linesAfterSecond}`)
-  // The second pass re-reads everything: the orders already in IMS are skipped, and the known-bad probes are retried (and fail again).
   if (input.second.skipped < input.first.imported) failures.push(`the second pass skipped ${input.second.skipped} order(s) as already imported but the first imported ${input.first.imported}`)
-  const secondErrors = input.second.errors.length
-  if (secondErrors !== input.knownBadCount) failures.push(`the second pass reported ${secondErrors} error(s); only the ${input.knownBadCount} declared known-bad order(s) may fail again`)
+  if (input.second.errors.length > 0) failures.push(`the second pass reported ${input.second.errors.length} error(s): ${input.second.errors.slice(0, 3).join(' | ')}`)
   return { ok: failures.length === 0, failures }
 }
 
@@ -478,6 +474,60 @@ export function assessLanding(input: LandingFacts): LandingAssessment {
   return { assessment: { ok: failures.length === 0, failures }, notPickedUp, pickedUp }
 }
 
+/** Statuses whose short orders the backorder allocator and the sweep allocate when stock lands. */
+export const EXPECTED_TO_ALLOCATE_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
+/** Statuses that are NOT allocated when stock lands, by the product's current design (o3d-zjsb5.36 tracks whether that is right). */
+export const NOT_EXPECTED_TO_ALLOCATE_STATUSES = ['ON_HOLD', 'PENDING_PAYMENT'] as const
+export const NOT_EXPECTED_TO_ALLOCATE_LABEL = 'not expected to allocate (o3d-zjsb5.36)'
+
+export type StillShortRow = { externalOrderId: number; orderNumber: string; imsStatus: string; shortLines: number; shortQty: number }
+
+export type StillShortResult = {
+  assessment: Assessment
+  ordersExamined: number
+  expectedToAllocateStillShort: StillShortRow[]
+  notExpectedToAllocate: StillShortRow[]
+  unclassified: StillShortRow[]
+}
+
+/**
+ * AFTER stock landed and both mechanisms ran: every imported order that still has a product line short of
+ * stock, by status. Fails if one of a status that IS expected to allocate remains short, or if a short order
+ * has a status nobody classified; the ON_HOLD / PENDING_PAYMENT ones are returned as their own named group so
+ * a report can never read as if they allocated.
+ */
+export function assessStillShort(input: { ordersExamined: number; short: readonly StillShortRow[] }): StillShortResult {
+  const expected = (EXPECTED_TO_ALLOCATE_STATUSES as readonly string[])
+  const notExpected = (NOT_EXPECTED_TO_ALLOCATE_STATUSES as readonly string[])
+  const expectedToAllocateStillShort = input.short.filter((row) => expected.includes(row.imsStatus))
+  const notExpectedToAllocate = input.short.filter((row) => notExpected.includes(row.imsStatus))
+  const unclassified = input.short.filter((row) => !expected.includes(row.imsStatus) && !notExpected.includes(row.imsStatus))
+  const failures: string[] = []
+  if (input.ordersExamined === 0) failures.push('no imported order was examined, so "none remains short" proves nothing')
+  if (expectedToAllocateStillShort.length > 0) failures.push(`${expectedToAllocateStillShort.length} order(s) of a status expected to allocate are still short after stock landed: ${expectedToAllocateStillShort.slice(0, 8).map((r) => `${r.externalOrderId} (${r.imsStatus})`).join(', ')}`)
+  if (unclassified.length > 0) failures.push(`${unclassified.length} short order(s) have a status nobody classified as expected or not expected to allocate: ${unclassified.slice(0, 8).map((r) => `${r.externalOrderId} (${r.imsStatus})`).join(', ')}`)
+  return { assessment: { ok: failures.length === 0, failures }, ordersExamined: input.ordersExamined, expectedToAllocateStillShort, notExpectedToAllocate, unclassified }
+}
+
+export type DeploymentStatusCheck = { state: 'not-checked' | 'passed' | 'failed'; resolved: string[] | null; reason: string }
+
+/** The reason printed when the deployment's setting was not read. Never a pass. */
+export const DEPLOYMENT_STATUSES_NOT_CHECKED_REASON =
+  'NOT CHECKED: a fresh install defaults to "processing" only, so the intended deployment\'s wc_sync_order_statuses must be checked before D7 is considered satisfied. Re-run with --check-deployment-statuses <env file naming DATABASE_URL> for a read-only check of the actual setting.'
+
+/** The deployment's actual `wc_sync_order_statuses` value (null when the row is absent) judged against the owner decision. */
+export function assessDeploymentStatuses(raw: string | null, parse: (raw: string | null | undefined) => string[]): DeploymentStatusCheck {
+  const resolved = parse(raw)
+  const verdict = assessStatusSelection(resolved)
+  return {
+    state: verdict.ok ? 'passed' : 'failed',
+    resolved,
+    reason: verdict.ok
+      ? `the deployment's setting resolves to ${resolved.join(', ')}`
+      : `${raw === null ? 'no wc_sync_order_statuses row exists, so the default applies: ' : ''}${verdict.failures.join('; ')}`,
+  }
+}
+
 // ---------------------------------------------------------------------------------------------
 // The report.
 // ---------------------------------------------------------------------------------------------
@@ -517,9 +567,8 @@ export type WooImportReport = {
     importedSecondPass: number | null
     ordersInIms: number | null
     abandonedByStatus: number | null
-    knownBadProbes: number | null
   }
-  r9: { expectedCount: number; importedCount: number; knownBadCount: number; missing: number[]; maxValueDiffForeign: number; maxValueDiffBase: number; maxComponentsDiff: number; tolerance: number } | null
+  r9: { expectedCount: number; importedCount: number; missing: number[]; missingWithRetryRow: number[]; maxValueDiffForeign: number; maxValueDiffBase: number; maxComponentsDiff: number; tolerance: number } | null
   r4: { rowsChecked: number; rowsWithReservations: number; worstDiff: number; tolerance: number; afterLanding: { rowsChecked: number; worstDiff: number } | null } | null
   orders: OrderRow[]
   skippedWithReason: Array<{ externalOrderId: number; reason: string }>
@@ -537,6 +586,10 @@ export type WooImportReport = {
   sideEffects: SideEffects | null
   /** Things the owner must read that do not make the run RED. */
   findings: Array<{ code: string; text: string; orders: string[] }>
+  /** After stock landed and both mechanisms ran: orders still short, by status. */
+  stillShortAfterLanding: { ordersExamined: number; expectedToAllocate: StillShortRow[]; notExpectedToAllocate: StillShortRow[]; unclassified: StillShortRow[] } | null
+  /** The deployment's actual status selection. `not-checked` is never a pass. */
+  deployment: DeploymentStatusCheck
   landing: LandingFacts | null
   stamp: { afterRehearsal: StampFacts | null; afterRealPass: StampFacts | null }
   readOnly: { totalRequests: number; byRoute: Record<string, number>; nonGetRequests: number; unmodelledRequests: number; holdRefusals: Record<string, number | null> } | null
@@ -584,8 +637,11 @@ export function renderWooImportMarkdown(report: WooImportReport): string {
   lines.push('')
   lines.push('## Status selection')
   lines.push('')
-  lines.push(`Resolved list (what the Sync page prints before the button): ${report.statuses.resolved.join(', ') || '(none)'}.`)
+  lines.push(`Resolved list (SIMULATED: the rehearsal configured it itself; this is not your deployment's setting): ${report.statuses.resolved.join(', ') || '(none)'}.`)
   lines.push(`Owner decision: ${report.statuses.decided.join(', ')}. Abandoned on purpose: ${report.statuses.abandoned.join(', ')}.`)
+  lines.push('')
+  lines.push(`Status selection check 1 (SIMULATED: the rehearsal configured this list itself): ${report.statuses.resolved.join(', ') || '(none)'}.`)
+  lines.push(`Status selection check 2 (the deployment's actual setting): **${report.deployment.state === 'not-checked' ? 'NOT CHECKED' : report.deployment.state.toUpperCase()}**. ${report.deployment.reason}`)
   lines.push('')
   lines.push('## Tallies')
   lines.push('')
@@ -596,7 +652,7 @@ export function renderWooImportMarkdown(report: WooImportReport): string {
   if (report.r9) {
     lines.push('## R9: orders')
     lines.push('')
-    lines.push(`Expected in the selected statuses: ${report.r9.expectedCount}; imported: ${report.r9.importedCount}; declared known to fail: ${report.r9.knownBadCount}; missing: ${report.r9.missing.length}.`)
+    lines.push(`Expected in the selected statuses: ${report.r9.expectedCount}; imported: ${report.r9.importedCount}; missing: ${report.r9.missing.length} (of which a durable retry row is recorded for ${report.r9.missingWithRetryRow.length}; a retry row is a recovery fact and does not satisfy the count).`)
     lines.push(`Worst difference to WooCommerce: ${report.r9.maxValueDiffForeign} (order currency), ${report.r9.maxValueDiffBase} (GBP), ${report.r9.maxComponentsDiff} (parts vs total); tolerance ${report.r9.tolerance}.`)
     lines.push('')
   }
@@ -632,8 +688,24 @@ export function renderWooImportMarkdown(report: WooImportReport): string {
     for (const finding of report.findings) lines.push(`- **${finding.code}**: ${cell(finding.text)}${finding.orders.length > 0 ? ` Orders: ${finding.orders.slice(0, 20).join(', ')}${finding.orders.length > 20 ? ', ...' : ''}.` : ''}`)
     lines.push('')
   }
+  if (report.stillShortAfterLanding) {
+    const sh = report.stillShortAfterLanding
+    lines.push('## Still short after stock landed')
+    lines.push('')
+    lines.push(`${sh.ordersExamined} imported order(s) examined. Of a status expected to allocate and still short: ${sh.expectedToAllocate.length}. Unclassified: ${sh.unclassified.length}.`)
+    lines.push('')
+    lines.push(`**${NOT_EXPECTED_TO_ALLOCATE_LABEL}: ${sh.notExpectedToAllocate.length} order(s), still unallocated and NOT allocated by the stock landing:**`)
+    lines.push('')
+    if (sh.notExpectedToAllocate.length === 0) lines.push('None.')
+    else {
+      lines.push('| Order | IMS status | Lines short | Quantity short |')
+      lines.push('| --- | --- | --- | --- |')
+      for (const row of sh.notExpectedToAllocate) lines.push(`| ${row.externalOrderId} | ${row.imsStatus} | ${row.shortLines} | ${row.shortQty} |`)
+    }
+    lines.push('')
+  }
   if (report.landing) {
-    lines.push('## OD-4: stock lands after the import')
+    lines.push('## OD-4 (PROCESSING and ALLOCATED orders only): stock lands after the import')
     lines.push('')
     lines.push(`Waiting before stock landed: ${report.landing.beforeLanding.length}. After stock landed, before anything was triggered: ${report.landing.afterLandingBeforeTrigger.length}. After the backorder allocator: ${report.landing.afterBackorderAllocator.length}. After the cron sweep: ${report.landing.afterSweep.length}.`)
     lines.push('')

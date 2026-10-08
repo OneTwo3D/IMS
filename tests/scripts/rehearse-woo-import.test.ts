@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { freePort, startCluster } from './real-postgres-cluster'
 import { type TestContext, test } from 'node:test'
 
 import { WOO_IMPORT_EXIT, WOO_STEP_CATALOGUE, type WooStepId } from '@/lib/ops/woo-import-rehearsal'
 import { processIsAlive, processesNaming, verifyPublishedReport } from '@/scripts/rehearse-first-install'
-import { parseWooImportArgs, runWooImportRehearsal, type WooRehearsalHooks, type WooRehearsalOptions } from '@/scripts/rehearse-woo-import'
+import { parseWooImportArgs, readDeploymentStatusSetting, runWooImportRehearsal, type WooRehearsalHooks, type WooRehearsalOptions } from '@/scripts/rehearse-woo-import'
 import { wooFixtureOrders, BULK_PROCESSING_ORDERS } from '@/tests/fixtures/woo-import/orders'
 import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
 
@@ -18,6 +19,7 @@ import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
  */
 
 const SCRATCH_PARENT = '/var/tmp'
+const REPO_CWD = process.cwd()
 const TIMEOUT = 15 * 60 * 1000
 const PREREQS: WooStepId[] = ['migrate-deploy', 'seed', 'prepare']
 
@@ -29,14 +31,14 @@ function scratchParent(t: TestContext): string {
 
 const runDirsIn = (parent: string): string[] => readdirSync(parent).filter((name) => name.startsWith('ims-rehearsal-'))
 
-async function rehearse(t: TestContext, options: { only?: ReadonlySet<WooStepId>; hooks?: WooRehearsalHooks; storeFaults?: WooRehearsalOptions['storeFaults'] } = {}) {
+async function rehearse(t: TestContext, options: { only?: ReadonlySet<WooStepId>; hooks?: WooRehearsalHooks; storeFaults?: WooRehearsalOptions['storeFaults']; seedUsdRate?: boolean; deploymentStatuses?: WooRehearsalOptions['deploymentStatuses'] } = {}) {
   const parent = scratchParent(t)
   const outcome = await runWooImportRehearsal({ parentDir: parent, reportDir: join(parent, 'reports'), log: () => undefined, ...options })
   assert.ok(outcome.report, `the rehearsal produced a report (refusal: ${outcome.refusal})`)
   return { parent, outcome, report: outcome.report }
 }
 
-function step(report: { steps: Array<{ id: unknown; status: string; reason?: string; detail: Record<string, unknown> }> }, id: WooStepId) {
+function step(report: { steps: Array<{ id: unknown; required: boolean; status: string; reason?: string; detail: Record<string, unknown> }> }, id: WooStepId) {
   const found = report.steps.find((candidate) => candidate.id === id)
   assert.ok(found, `step ${id} is in the report`)
   return found
@@ -112,19 +114,17 @@ test('GREEN: every step passes; counts are exact; the stamp appears only on the 
   // R9 count and value, with the numbers the fixtures dictate.
   const fixtures = wooFixtureOrders()
   const selected = fixtures.filter((f) => ['processing', 'pending', 'on-hold'].includes(f.order.status))
-  const knownBad = selected.filter((f) => f.expectation === 'fails-to-import')
-  const expectedImported = selected.length - knownBad.length
-  console.log(`# store: ${fixtures.length} orders, ${selected.length} in the selected statuses, ${knownBad.length} declared known-bad, ${expectedImported} expected to import (bulk ${BULK_PROCESSING_ORDERS})`)
+  const expectedImported = selected.length
+  console.log(`# store: ${fixtures.length} orders, ${selected.length} in the selected statuses, ${expectedImported} expected to import (bulk ${BULK_PROCESSING_ORDERS})`)
   assert.ok(selected.length > 100, 'precondition: more than one page of 100 in the selected statuses')
   assert.equal(report.r9!.expectedCount, selected.length)
   assert.equal(report.r9!.importedCount, expectedImported)
-  assert.equal(report.r9!.knownBadCount, knownBad.length)
   assert.deepEqual(report.r9!.missing, [])
   assert.equal(report.r9!.maxValueDiffForeign, 0)
   assert.equal(report.r9!.maxValueDiffBase, 0)
   assert.equal(report.tallies.fetchedFromStore, selected.length, 'the first pass fetched exactly the orders in the selected statuses and no other')
   assert.equal(report.tallies.importedFirstPass, expectedImported)
-  assert.equal(report.tallies.errorsFirstPass, knownBad.length)
+  assert.equal(report.tallies.errorsFirstPass, 0)
   assert.equal(report.tallies.importedSecondPass, 0)
   assert.equal(report.tallies.abandonedByStatus, fixtures.length - selected.length)
   assert.deepEqual(report.statuses.resolved.slice().sort(), ['on-hold', 'pending', 'processing'])
@@ -159,8 +159,20 @@ test('GREEN: every step passes; counts are exact; the stamp appears only on the 
   assert.deepEqual(findings, [
     'imported-short-orders-outside-processing-are-not-allocated-when-stock-lands',
     'lines-without-product-are-never-allocatable',
-    'pass-complete-with-orders-that-did-not-import',
   ])
+  // The review findings: nothing is excused from the count, and the not-allocated orders are named, not implied to allocate.
+  assert.equal(step(report, 'short-after-landing').status, 'passed')
+  assert.deepEqual(report.stillShortAfterLanding!.notExpectedToAllocate.map((r) => `${r.externalOrderId}:${r.imsStatus}`), ['5003:ON_HOLD', '5015:PENDING_PAYMENT'])
+  assert.deepEqual(report.stillShortAfterLanding!.expectedToAllocate, [])
+  assert.match(readFileSync(outcome.reportPaths!.markdown, 'utf8'), /not expected to allocate \(o3d-zjsb5\.36\): 2 order\(s\), still unallocated and NOT allocated by the stock landing/)
+  const deployStep = step(report, 'deployment-statuses')
+  assert.equal(deployStep.status, 'skipped')
+  assert.equal(deployStep.required, false)
+  assert.match(deployStep.reason ?? '', /^NOT CHECKED:/)
+  assert.equal(report.deployment.state, 'not-checked')
+  assert.match(readFileSync(outcome.reportPaths!.markdown, 'utf8'), /the deployment's actual setting\): \*\*NOT CHECKED\*\*/)
+  assert.match(readFileSync(outcome.reportPaths!.markdown, 'utf8'), /SIMULATED: the rehearsal configured it itself/)
+
   const waiting = report.unallocatable.find((o) => o.externalOrderId === 5003)!
   assert.equal(waiting.imsStatus, 'ON_HOLD')
   assert.equal(waiting.afterLanding, 'still-waiting')
@@ -353,4 +365,105 @@ test('parseWooImportArgs', () => {
   assert.deepEqual(parseWooImportArgs(['--help']), { help: true })
   assert.deepEqual(parseWooImportArgs(['--root']), { error: '--root needs a value' })
   assert.deepEqual(parseWooImportArgs(['--bogus']), { error: 'unknown argument --bogus' })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Review round 1.
+// ---------------------------------------------------------------------------------------------
+
+// FAILING-FIRST (finding 1). MUTATION: put the old carve-out back (exclude an order that has a retry row from `missing` in assessR9) and this goes green.
+test('ARM (no USD rate): the USD order cannot import, R9 is RED for the missing order, the retry row is reported as a recovery fact, and the verdict is RED', { timeout: TIMEOUT }, async (t) => {
+  const { outcome, report } = await rehearse(t, {
+    only: new Set<WooStepId>([...PREREQS, 'rehearsal-import', 'pass-complete', 'r9-orders']),
+    seedUsdRate: false,
+  })
+  console.log(`precondition: pass errors=${JSON.stringify(report.tallies.errorsFirstPass)} missing=${JSON.stringify(report.r9!.missing)} withRetryRow=${JSON.stringify(report.r9!.missingWithRetryRow)}`)
+  assert.deepEqual(report.r9!.missing, [5010])
+  assert.deepEqual(report.r9!.missingWithRetryRow, [5010], 'the recovery fact: a durable retry row exists')
+  assert.deepEqual(redSteps(report), ['pass-complete', 'r9-orders'])
+  assert.match(step(report, 'r9-orders').reason ?? '', /not in IMS: 5010 \(durable retry row recorded for 1, none for 0; a real pass would stamp completion over them\)/)
+  assert.equal(report.orders.find((o) => o.externalOrderId === 5010)!.retryRecorded, true)
+  assert.ok(report.findings.some((f) => f.code === 'pass-complete-with-orders-that-did-not-import'))
+  assert.equal(report.verdict, 'RED')
+  assert.equal(outcome.exitCode, WOO_IMPORT_EXIT.RED)
+})
+
+// MUTATION (finding 2): drop the `expectedToAllocateStillShort` failure in assessStillShort, or let short-after-landing look only at ON_HOLD.
+test('ARM (PROCESSING order left short): an order of an allocating status that stays short after the stock landed is RED in short-after-landing', { timeout: TIMEOUT }, async (t) => {
+  const { report } = await rehearse(t, {
+    only: new Set<WooStepId>([...PREREQS, 'rehearsal-import', 'short-after-landing']),
+  })
+  // Without the landing step nothing has been topped up, so the bulk PROCESSING orders are still short: the step must say so.
+  assert.deepEqual(redSteps(report), ['short-after-landing'])
+  const reason = step(report, 'short-after-landing').reason ?? ''
+  console.log(`precondition: ${reason.slice(0, 160)}`)
+  assert.match(reason, /order\(s\) of a status expected to allocate are still short after stock landed: .*\(PROCESSING\)/)
+  assert.ok(report.stillShortAfterLanding!.expectedToAllocate.length > 20)
+})
+
+// MUTATION (medium): make the deployment step return passed when no reader is given.
+test('DEPLOYMENT STATUSES: not given is NOT CHECKED (never a pass); given and equal to the decision passes; given and the default or absent fails the run', { timeout: TIMEOUT }, async (t) => {
+  const only = new Set<WooStepId>([...PREREQS, 'deployment-statuses'])
+  const none = await rehearse(t, { only })
+  assert.equal(step(none.report, 'deployment-statuses').status, 'skipped')
+  assert.equal(none.report.deployment.state, 'not-checked')
+  assert.deepEqual(redSteps(none.report), [], 'not checked does not make the run red, and it is not a pass')
+
+  const good = await rehearse(t, { only, deploymentStatuses: { read: async () => JSON.stringify(['processing', 'pending', 'on-hold']) } })
+  assert.equal(step(good.report, 'deployment-statuses').status, 'passed')
+  assert.equal(good.report.deployment.state, 'passed')
+
+  for (const raw of [null, JSON.stringify(['processing'])]) {
+    const bad = await rehearse(t, { only, deploymentStatuses: { read: async () => raw } })
+    console.log(`precondition: deployment setting ${JSON.stringify(raw)} -> ${bad.report.deployment.state}: ${bad.report.deployment.reason.slice(0, 100)}`)
+    assert.deepEqual(redSteps(bad.report), ['deployment-statuses'])
+    assert.equal(bad.report.deployment.state, 'failed')
+    assert.deepEqual(bad.report.deployment.resolved, ['processing'])
+  }
+})
+
+test('readDeploymentStatusSetting reads the one settings row over a real connection (value, and null when absent) and writes nothing', { timeout: TIMEOUT }, async (t) => {
+  const parent = scratchParent(t)
+  const port = await freePort()
+  const cluster = startCluster(parent, 'dep', port, '127.0.0.1')
+  t.after(() => cluster.stop())
+  cluster.psql(['-c', "create role depr login password 'dep-pass-1'"])
+  cluster.psql(['-c', 'create database depdb owner depr'])
+  const url = `postgresql://depr:dep-pass-1@127.0.0.1:${port}/depdb`
+  cluster.psql(['-c', 'create table settings (key text primary key, value text not null)'], { database: 'depdb' })
+  cluster.psql(['-c', 'alter table settings owner to depr'], { database: 'depdb' })
+  assert.equal(await readDeploymentStatusSetting(url), null, 'absent row')
+  cluster.psql(['-c', `insert into settings values ('wc_sync_order_statuses', '["processing","pending"]'), ('other', 'x')`], { database: 'depdb' })
+  const before = cluster.psql(['-c', 'select count(*) || md5(string_agg(key || value, \',\' order by key)) from settings'], { database: 'depdb' })
+  assert.equal(await readDeploymentStatusSetting(url), '["processing","pending"]')
+  const after = cluster.psql(['-c', 'select count(*) || md5(string_agg(key || value, \',\' order by key)) from settings'], { database: 'depdb' })
+  assert.equal(after, before, 'the table is unchanged')
+})
+
+test('--check-deployment-statuses is parsed, and an unreadable or group-readable env file is refused (exit 2) before a cluster is created', () => {
+  assert.deepEqual(parseWooImportArgs(['--check-deployment-statuses', '/x/f.env']), { help: false, checkDeploymentStatuses: '/x/f.env' })
+  assert.deepEqual(parseWooImportArgs(['--check-deployment-statuses']), { error: '--check-deployment-statuses needs a value' })
+  const dir = mkdtempSync(join(SCRATCH_PARENT, 'ims-woo-cli-'))
+  try {
+    const loose = join(dir, 'loose.env')
+    writeFileSync(loose, 'DATABASE_URL=postgresql://x:y@127.0.0.1:1/z\n', { mode: 0o644 })
+    chmodSync(loose, 0o644)
+    const before = readdirSync(SCRATCH_PARENT).filter((n) => n.startsWith('ims-rehearsal-woo-'))
+    for (const file of [loose, join(dir, 'missing.env')]) {
+      let code = 0
+      let stderr = ''
+      try {
+        execFileSync('npx', ['tsx', 'scripts/rehearse-woo-import.ts', '--check-deployment-statuses', file], { cwd: REPO_CWD, encoding: 'utf8', stdio: 'pipe', env: { PATH: process.env.PATH ?? '', HOME: dir } as unknown as NodeJS.ProcessEnv })
+      } catch (error) {
+        const e = error as { status?: number; stderr?: string }
+        code = e.status ?? -1
+        stderr = e.stderr ?? ''
+      }
+      assert.equal(code, WOO_IMPORT_EXIT.REFUSED, file)
+      assert.match(stderr, /Refused: --check-deployment-statuses/)
+    }
+    assert.deepEqual(readdirSync(SCRATCH_PARENT).filter((n) => n.startsWith('ims-rehearsal-woo-')), before, 'no run directory was created')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

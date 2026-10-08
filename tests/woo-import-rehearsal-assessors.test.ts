@@ -14,6 +14,10 @@ import {
   WOO_STEP_CATALOGUE,
   assessIdempotency,
   assessLanding,
+  assessStillShort,
+  assessDeploymentStatuses,
+  DEPLOYMENT_STATUSES_NOT_CHECKED_REASON,
+  NOT_EXPECTED_TO_ALLOCATE_LABEL,
   assessNoStampAfterRehearsal,
   assessPassComplete,
   assessR4,
@@ -36,7 +40,7 @@ const REPO = process.cwd()
 const store = (): StoreOrderFact[] => [
   { id: 1, status: 'processing', currency: 'GBP', total: '60.00', fxPerGbp: 1, expectation: 'imports' },
   { id: 2, status: 'on-hold', currency: 'EUR', total: '75.00', fxPerGbp: 1.25, expectation: 'imports' },
-  { id: 3, status: 'processing', currency: 'USD', total: '20.00', fxPerGbp: 1, expectation: 'fails-to-import' },
+  { id: 3, status: 'processing', currency: 'USD', total: '26.00', fxPerGbp: 1.3, expectation: 'imports' },
   { id: 9, status: 'cancelled', currency: 'GBP', total: '12.00', fxPerGbp: 1, expectation: 'abandoned-by-status' },
 ]
 
@@ -59,11 +63,14 @@ const imported = (over: Partial<ImportedOrderFact> & { externalOrderId: number }
 
 const goodImported = (): ImportedOrderFact[] => [
   imported({ externalOrderId: 1 }),
+  // USD 26.00 at 1.30 per GBP is GBP 20.00; parts: 20 + 4 + 2 = 26 at the order's own scale
+  imported({ externalOrderId: 3, currency: 'USD', totalForeign: 26, totalBase: 20, subtotalForeign: 19.5, taxForeign: 4, shippingForeign: 2.5, lineTotalForeignSum: 19.5 }),
   // EUR 75.00 at 1.25 per GBP is GBP 60.00; parts: 56.25 + 11.25 + 7.5 - 0 = 75
   imported({ externalOrderId: 2, currency: 'EUR', totalForeign: 75, totalBase: 60, subtotalForeign: 56.25, taxForeign: 11.25, shippingForeign: 7.5, lineTotalForeignSum: 56.25 }),
 ]
 
 const retry = new Set([3])
+const sortedImported = (xs: ImportedOrderFact[]) => xs.sort((a, b) => a.externalOrderId - b.externalOrderId)
 const run = (over: Partial<Parameters<typeof assessR9>[0]> = {}) =>
   assessR9({ store: store(), imported: goodImported(), selectedStatuses: ['processing', 'on-hold', 'pending'], retryRecorded: retry, ...over })
 
@@ -73,22 +80,38 @@ const run = (over: Partial<Parameters<typeof assessR9>[0]> = {}) =>
 
 test('R9: the control passes, and the precondition it examined is printed', () => {
   const result = run()
-  console.log(`precondition: expected=${result.expectedCount} imported=${result.importedCount} knownBad=${result.knownBadCount} rows=${result.rows.length}`)
+  console.log(`precondition: expected=${result.expectedCount} imported=${result.importedCount} missing=${result.missing.length} rows=${result.rows.length}`)
   assert.equal(result.assessment.ok, true, result.assessment.failures.join('; '))
-  assert.equal(result.expectedCount, 3, 'three orders sit in the selected statuses (one of them a declared known-bad probe)')
-  assert.equal(result.importedCount, 2)
-  assert.equal(result.knownBadCount, 1)
+  assert.equal(result.expectedCount, 3, 'three orders sit in the selected statuses')
+  assert.equal(result.importedCount, 3)
 })
 
 test('R9 COUNT is exact: one order missing from IMS is RED and is named', () => {
-  const result = run({ imported: goodImported().slice(0, 1) })
+  const result = run({ imported: goodImported().filter((o) => o.externalOrderId !== 2) })
   assert.equal(result.assessment.ok, false)
   assert.deepEqual(result.missing, [2])
   assert.match(result.assessment.failures.join(' '), /not in IMS: 2/)
 })
 
+// FAILING-FIRST for the review finding: a selected order missing from IMS must fail R9 EVEN WHEN a durable retry row exists.
+// MUTATION: exclude the order from `selected`/`missing` again (the old known-bad carve-out) and the isolating arm below goes green.
+test('R9 COUNT (isolating): a selected order that is missing is RED even though a durable retry row exists for it; the retry row is a separate recovery fact', () => {
+  const imported3missing = goodImported().filter((o) => o.externalOrderId !== 3)
+  const withRetry = run({ imported: imported3missing, retryRecorded: new Set([3]) })
+  const withoutRetry = run({ imported: imported3missing, retryRecorded: new Set() })
+  console.log(`precondition: missing=${JSON.stringify(withRetry.missing)} withRetryRow=${JSON.stringify(withRetry.missingWithRetryRow)} withoutRetryRow=${JSON.stringify(withoutRetry.missingWithoutRetryRow)}`)
+  assert.equal(withRetry.assessment.ok, false, 'a retry row does not satisfy the count')
+  assert.deepEqual(withRetry.missingWithRetryRow, [3])
+  assert.deepEqual(withRetry.missingWithoutRetryRow, [])
+  assert.match(withRetry.assessment.failures.join(' '), /not in IMS: 3 \(durable retry row recorded for 1, none for 0/)
+  assert.equal(withRetry.rows.find((r) => r.externalOrderId === 3)!.retryRecorded, true)
+  assert.match(withRetry.rows.find((r) => r.externalOrderId === 3)!.reason ?? '', /MISSING from IMS; recovery fact: a durable retry row is recorded/)
+  assert.equal(withoutRetry.assessment.ok, false)
+  assert.deepEqual(withoutRetry.missingWithoutRetryRow, [3])
+})
+
 test('R9 VALUE: the tolerance is a boundary, per order, in the order currency AND in GBP AND between the order\'s parts', () => {
-  const at = (over: Partial<ImportedOrderFact>) => run({ imported: [imported({ externalOrderId: 1, ...over }), goodImported()[1]!] })
+  const at = (over: Partial<ImportedOrderFact>) => run({ imported: sortedImported([imported({ externalOrderId: 1, ...over }), ...goodImported().filter((o) => o.externalOrderId !== 1)]) })
   assert.equal(at({ totalForeign: 60.01, taxForeign: 9.01 }).assessment.ok, true, 'exactly one hundredth out (and consistent parts) is ON the boundary and inside the tolerance')
   assert.equal(at({ totalForeign: 60.01 }).assessment.ok, true, 'one hundredth out with parts one hundredth out of step is also on the boundary')
   assert.equal(at({ totalForeign: 60.02, taxForeign: 9.02 }).assessment.ok, false, 'two hundredths is outside it')
@@ -98,15 +121,13 @@ test('R9 VALUE: the tolerance is a boundary, per order, in the order currency AN
 })
 
 test('R9 VALUE: widening the tolerance is what lets a wrong total through (the tolerance is live)', () => {
-  const wrong = [imported({ externalOrderId: 1, totalForeign: 61, totalBase: 61, taxForeign: 10 }), goodImported()[1]!]
+  const wrong = [imported({ externalOrderId: 1, totalForeign: 61, totalBase: 61, taxForeign: 10 }), ...goodImported().filter((o) => o.externalOrderId !== 1)]
   assert.equal(run({ imported: wrong }).assessment.ok, false)
   assert.equal(run({ imported: wrong, tolerance: 5 }).assessment.ok, true, 'with a tolerance of 5 the same wrong total passes: this is the arm the mutation of R9_VALUE_TOLERANCE turns red')
 })
 
-test('R9: a known-bad probe that imported anyway, an order outside the selected statuses, a probe with no retry row, and an empty store are each RED', () => {
-  assert.match(run({ imported: [...goodImported(), imported({ externalOrderId: 3 })] }).assessment.failures.join(' '), /known to fail imported anyway/)
+test('R9: an order outside the selected statuses that IMS holds, and an empty store, are each RED', () => {
   assert.match(run({ imported: [...goodImported(), imported({ externalOrderId: 9 })] }).assessment.failures.join(' '), /outside the selected statuses are in IMS: 9/)
-  assert.match(run({ retryRecorded: new Set() }).assessment.failures.join(' '), /no durable retry row.*3/)
   assert.match(run({ store: [], imported: [] }).assessment.failures.join(' '), /proves nothing/)
 })
 
@@ -196,22 +217,21 @@ test('STAMP: a real pass must end complete, report the stamp, and leave "true" a
 
 const pass = (over: Partial<PassFacts> = {}): PassFacts => ({ outcome: 'complete', imported: 125, skipped: 0, errors: [], unrecordedRefusals: 0, statuses: ['on-hold', 'pending', 'processing'], ...over })
 
-test('PASS: complete with no error passes; a failed pass, an unrecorded refusal, or an error the fixtures did not declare is RED', () => {
-  assert.equal(assessPassComplete(pass(), []).ok, true)
-  assert.equal(assessPassComplete(pass({ errors: ['Order #5010: Missing GBP FX rate'] }), [5010]).ok, true, 'a declared probe may fail')
-  assert.equal(assessPassComplete(pass({ errors: ['Order #5011: boom'] }), [5010]).ok, false)
-  assert.equal(assessPassComplete(pass({ outcome: 'failed' }), []).ok, false)
-  assert.equal(assessPassComplete(pass({ unrecordedRefusals: 1 }), []).ok, false)
+test('PASS: complete with no error passes; a failed pass, an unrecorded refusal, or ANY per-order error is RED', () => {
+  assert.equal(assessPassComplete(pass()).ok, true)
+  assert.equal(assessPassComplete(pass({ errors: ['Order #5010: Missing GBP FX rate'] })).ok, false, 'an order that did not import is not a pass, declared or not')
+  assert.equal(assessPassComplete(pass({ outcome: 'failed' })).ok, false)
+  assert.equal(assessPassComplete(pass({ unrecordedRefusals: 1 })).ok, false)
 })
 
 test('IDEMPOTENCY: a second pass that imports nothing and creates nothing passes; each deviation is RED', () => {
-  const base = { first: pass(), second: pass({ imported: 0, skipped: 125, errors: ['Order #5010: x'] }), ordersAfterFirst: 125, ordersAfterSecond: 125, linesAfterFirst: 140, linesAfterSecond: 140, knownBadCount: 1 }
+  const base = { first: pass(), second: pass({ imported: 0, skipped: 125 }), ordersAfterFirst: 125, ordersAfterSecond: 125, linesAfterFirst: 140, linesAfterSecond: 140 }
   assert.equal(assessIdempotency(base).ok, true)
-  assert.equal(assessIdempotency({ ...base, second: pass({ imported: 3, skipped: 122, errors: ['Order #5010: x'] }) }).ok, false, 'a second pass that imports')
+  assert.equal(assessIdempotency({ ...base, second: pass({ imported: 3, skipped: 122 }) }).ok, false, 'a second pass that imports')
   assert.equal(assessIdempotency({ ...base, ordersAfterSecond: 126 }).ok, false, 'an order created')
   assert.equal(assessIdempotency({ ...base, linesAfterSecond: 141 }).ok, false, 'a line created')
   assert.equal(assessIdempotency({ ...base, first: pass({ imported: 0 }) }).ok, false, 'nothing to be idempotent about')
-  assert.equal(assessIdempotency({ ...base, second: pass({ imported: 0, skipped: 10, errors: ['Order #5010: x'] }) }).ok, false, 'the second pass did not skip what the first imported')
+  assert.equal(assessIdempotency({ ...base, second: pass({ imported: 0, skipped: 10 }) }).ok, false, 'the second pass did not skip what the first imported')
 })
 
 test('STATUS SELECTION: exactly the owner decision passes; a missing, extra or abandoned status is RED', () => {
@@ -238,6 +258,43 @@ test('LANDING (OD-4): eligible orders allocated by the mechanisms pass; stock al
   assert.equal(assessLanding({ ...facts, afterSweep: ['10', '12'] }).assessment.ok, false, 'an eligible order still waiting')
   assert.equal(assessLanding({ ...facts, afterLandingBeforeTrigger: ['11', '12'] }).assessment.ok, false, 'stock alone allocated order 10: the later stages would prove nothing')
   assert.equal(assessLanding({ ...facts, beforeLanding: ['12'], afterLandingBeforeTrigger: ['12'], afterBackorderAllocator: ['12'], afterSweep: ['12'] }).assessment.ok, false, 'no eligible order waited: nothing was proved')
+})
+
+// FAILING-FIRST for the review finding: the landing step must not let a short order of an allocating status hide.
+// MUTATION: drop the `expectedToAllocateStillShort` failure in assessStillShort and the first assertion below goes green.
+test('STILL SHORT AFTER LANDING: a PROCESSING/ALLOCATED order still short is RED; ON_HOLD and PENDING_PAYMENT are listed under their own named group, not failed and not hidden; an unclassified status is RED', () => {
+  const row = (externalOrderId: number, imsStatus: string) => ({ externalOrderId, orderNumber: String(externalOrderId), imsStatus, shortLines: 1, shortQty: 2 })
+  const clean = assessStillShort({ ordersExamined: 126, short: [row(5003, 'ON_HOLD'), row(5015, 'PENDING_PAYMENT')] })
+  console.log(`precondition: examined=${clean.ordersExamined} notExpected=${clean.notExpectedToAllocate.map((r) => `${r.externalOrderId}:${r.imsStatus}`)} label="${NOT_EXPECTED_TO_ALLOCATE_LABEL}"`)
+  assert.equal(clean.assessment.ok, true, clean.assessment.failures.join('; '))
+  assert.deepEqual(clean.notExpectedToAllocate.map((r) => r.imsStatus), ['ON_HOLD', 'PENDING_PAYMENT'])
+  assert.match(NOT_EXPECTED_TO_ALLOCATE_LABEL, /not expected to allocate \(o3d-zjsb5\.36\)/)
+  for (const status of ['PROCESSING', 'ALLOCATED']) {
+    const bad = assessStillShort({ ordersExamined: 126, short: [row(7090, status), row(5003, 'ON_HOLD')] })
+    assert.equal(bad.assessment.ok, false, status)
+    assert.match(bad.assessment.failures.join(' '), new RegExp(`7090 \\(${status}\\)`))
+  }
+  assert.equal(assessStillShort({ ordersExamined: 126, short: [row(1, 'PICKING')] }).assessment.ok, false, 'a status nobody classified')
+  assert.equal(assessStillShort({ ordersExamined: 0, short: [] }).assessment.ok, false, 'examining nothing proves nothing')
+  assert.equal(assessStillShort({ ordersExamined: 126, short: [] }).assessment.ok, true)
+})
+
+const parseStatuses = (raw: string | null | undefined): string[] => {
+  if (raw === null || raw === undefined || raw.trim() === '') return ['processing']
+  return JSON.parse(raw) as string[]
+}
+
+test('DEPLOYMENT STATUSES: the actual setting is judged against the decision; an absent row is the default (processing only) and FAILS; not reading it is NOT a pass', () => {
+  assert.equal(assessDeploymentStatuses(JSON.stringify(['processing', 'pending', 'on-hold']), parseStatuses).state, 'passed')
+  const absent = assessDeploymentStatuses(null, parseStatuses)
+  console.log(`precondition: absent row resolves to [${absent.resolved}] state=${absent.state}`)
+  assert.equal(absent.state, 'failed')
+  assert.deepEqual(absent.resolved, ['processing'])
+  assert.match(absent.reason, /no wc_sync_order_statuses row exists, so the default applies/)
+  assert.equal(assessDeploymentStatuses(JSON.stringify(['processing']), parseStatuses).state, 'failed')
+  assert.equal(assessDeploymentStatuses(JSON.stringify(['processing', 'pending', 'on-hold', 'completed']), parseStatuses).state, 'failed')
+  assert.match(DEPLOYMENT_STATUSES_NOT_CHECKED_REASON, /^NOT CHECKED: a fresh install defaults to "processing" only/)
+  assert.doesNotMatch(DEPLOYMENT_STATUSES_NOT_CHECKED_REASON, /\bPASS/i)
 })
 
 // ---------------------------------------------------------------------------------------------

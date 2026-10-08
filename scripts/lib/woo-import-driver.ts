@@ -86,8 +86,11 @@ async function prepare(): Promise<void> {
     })
   }
 
-  // 1 GBP = 1.25 EUR, dated before every fixture order.
+  // 1 GBP = 1.25 EUR and 1.30 USD, dated before every fixture order. The USD rate can be left out (a dedicated arm models an installation without it).
   await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'EUR', rate: '1.25', fetchedAt: new Date('2026-08-01T00:00:00Z'), source: 'manual', manualOverride: true } })
+  if (process.env.REHEARSAL_SEED_USD_RATE !== '0') {
+    await db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.30', fetchedAt: new Date('2026-08-01T00:00:00Z'), source: 'manual', manualOverride: true } })
+  }
 
   await upsertSetting('wc_url', url)
   await upsertSetting('wc_consumer_key', key)

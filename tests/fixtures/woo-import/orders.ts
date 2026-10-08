@@ -28,6 +28,8 @@ const RATE_LABEL: Record<number, string> = { [WC_RATE_STANDARD]: 'GB-VAT-1', [WC
 
 /** The GBP value of one unit of foreign currency's inverse: 1 GBP = this many EUR. The rehearsal seeds it. */
 export const FX_GBP_TO_EUR = 1.25
+/** 1 GBP = this many USD. Seeded by default; the rehearsal can leave it out to model an installation with no USD rate. */
+export const FX_GBP_TO_USD = 1.3
 
 export type FixtureExpectation =
   /** In the selected statuses and expected to import cleanly. */
@@ -35,7 +37,6 @@ export type FixtureExpectation =
   /** In the selected statuses; expected to import, and expected to have at least one line IMS cannot allocate. */
   | 'imports-with-unallocatable-lines'
   /** In the selected statuses but expected to FAIL to import (reason in `note`). */
-  | 'fails-to-import'
   /** In a status the owner decision abandons (completed, cancelled, refunded, failed): never fetched. */
   | 'abandoned-by-status'
 
@@ -262,7 +263,7 @@ function named(): FixtureOrder[] {
     o({ id: 5007, status: 'processing', currency: 'EUR', createdOffsetMinutes: 7, customerId: 82, lines: [{ sku: SKU_PLENTY, qty: 2, unitMinor: 2400 }], shipping: { title: 'International', minor: 1200 } }, 'imports', 'Euro order: totals are converted at the GBP rate IMS holds for the order date.'),
     o({ id: 5008, status: 'processing', createdOffsetMinutes: 8, customerId: 83, lines: [{ sku: SKU_ABSENT, qty: 1, unitMinor: 4000 }, { sku: SKU_PLENTY, qty: 1, unitMinor: 1000 }] }, 'imports-with-unallocatable-lines', 'One line is for a SKU that does not exist in IMS: the order imports, that line carries no product and cannot be allocated.'),
     o({ id: 5009, status: 'processing', createdOffsetMinutes: 9, customerId: 84, lines: [{ sku: '', qty: 1, unitMinor: 900, name: 'Custom engraving' }, { sku: SKU_PLENTY, qty: 1, unitMinor: 1000 }] }, 'imports-with-unallocatable-lines', 'A WooCommerce line with no SKU at all (custom product): imports as wc-<product id>, no product link.'),
-    o({ id: 5010, status: 'processing', currency: 'USD', createdOffsetMinutes: 10, customerId: 85, lines: [{ sku: SKU_PLENTY, qty: 1, unitMinor: 1300 }], shipping: { title: 'International', minor: 900 } }, 'fails-to-import', 'A currency IMS holds no GBP rate for: the import cannot convert it, queues it for retry after the next FX-rate refresh, and the pass still ends COMPLETE.'),
+    o({ id: 5010, status: 'processing', currency: 'USD', createdOffsetMinutes: 10, customerId: 85, lines: [{ sku: SKU_PLENTY, qty: 1, unitMinor: 1300 }], shipping: { title: 'International', minor: 900 } }, 'imports', 'A US-dollar order. IMS holds a GBP-to-USD rate for it in a normal run; with the rate left out (a dedicated arm) the import cannot convert it, queues it for retry after the next FX-rate refresh, and the pass still ends COMPLETE.'),
     o({ id: 5011, status: 'processing', createdOffsetMinutes: 11, customerId: 86, pricesIncludeTax: true, lines: [{ sku: SKU_PLENTY, qty: 3, unitMinor: 1667 }], shipping: { title: 'Flat rate', minor: 499 } }, 'imports', 'Store that enters prices inclusive of tax (prices_include_tax true).'),
     o({ id: 5012, status: 'processing', createdOffsetMinutes: 12, customerId: 87, lines: [{ sku: SKU_STOCKED, qty: 50, unitMinor: 1000 }] }, 'imports-with-unallocatable-lines', 'Bigger than the stock IMS holds for the SKU: imports, cannot be fully allocated.'),
     o({ id: 5013, status: 'processing', createdOffsetMinutes: 13, lines: [{ sku: SKU_PLENTY, qty: 1, unitMinor: 1000 }], noTaxOnLines: true, customerNote: 'Zero-rated export, no VAT lines' }, 'imports', 'Guest order with no tax lines at all.'),

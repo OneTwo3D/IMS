@@ -56,6 +56,8 @@ import { pathToFileURL } from 'node:url'
 
 import type pg from 'pg'
 
+import { parseWcSyncOrderStatuses } from '../lib/connectors/woocommerce/order-status-filter.ts'
+
 import {
   type Assessment,
   type StepResult,
@@ -74,6 +76,10 @@ import {
   WOO_IMPORT_EXIT_MEANING,
   WOO_STEP_CATALOGUE,
   type AllocationFact,
+  type DeploymentStatusCheck,
+  type StillShortResult,
+  DEPLOYMENT_STATUSES_NOT_CHECKED_REASON,
+  NOT_EXPECTED_TO_ALLOCATE_LABEL,
   type ImportedOrderFact,
   type LandingFacts,
   type OrderRow,
@@ -87,7 +93,9 @@ import {
   type WooImportReport,
   type WooStepDefinition,
   type WooStepId,
+  assessDeploymentStatuses,
   assessIdempotency,
+  assessStillShort,
   assessLanding,
   assessNoStampAfterRehearsal,
   assessPassComplete,
@@ -163,6 +171,10 @@ export type WooRehearsalOptions = {
   /** The store's orders. Default: the synthetic fixtures. */
   orders?: readonly FixtureOrder[]
   /** Fake-store fault injection (a test models a store that fails a page). */
+  /** Seed a GBP-to-USD rate (default true). A dedicated arm leaves it out: the USD order then cannot import. */
+  seedUsdRate?: boolean
+  /** A read-only check of a DEPLOYMENT's actual `wc_sync_order_statuses`. Absent: the step reports NOT CHECKED. */
+  deploymentStatuses?: { read: () => Promise<string | null> }
   storeFaults?: { failPages?: readonly number[]; pastEnd?: 'empty' | 'error'; omitPaginationHeaders?: boolean }
   /** Run only these steps (tests); the rest are omitted from the report. */
   only?: ReadonlySet<WooStepId>
@@ -297,10 +309,9 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
     status: order.status,
     currency: order.currency,
     total: order.total,
-    fxPerGbp: order.currency === 'EUR' ? 1.25 : 1,
+    fxPerGbp: order.currency === 'EUR' ? 1.25 : order.currency === 'USD' ? 1.3 : 1,
     expectation,
   }))
-  const knownBadIds = storeFacts.filter((o) => o.expectation === 'fails-to-import' && (DECIDED_IMPORT_STATUSES as readonly string[]).includes(o.status)).map((o) => o.id)
   let firstPass = null as (PassFacts & { stampBefore: StampFacts; stampAfter: StampFacts; stamped: boolean }) | null
   let secondPass = null as PassFacts | null
   let importedFacts: ImportedOrderFact[] = []
@@ -316,6 +327,8 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
   let counts = { ordersFirst: 0, linesFirst: 0 }
   let fetchedFirstPass = null as number | null
   let sideEffects = null as SideEffects | null
+  let stillShort = null as StillShortResult | null
+  let deployment: DeploymentStatusCheck = { state: 'not-checked', resolved: null, reason: DEPLOYMENT_STATUSES_NOT_CHECKED_REASON }
   let abortedRows: OrderRow[] = []
 
   let interrupted: string | null = null
@@ -408,6 +421,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       REHEARSAL_STORE_SECRET: storeSecret,
       REHEARSAL_STORE_STATUSES: JSON.stringify([...DECIDED_IMPORT_STATUSES]),
       REHEARSAL_LANDING: JSON.stringify(LANDING),
+      REHEARSAL_SEED_USD_RATE: options.seedUsdRate === false ? '0' : '1',
     }
     writeFileSync(path.join(root, 'empty.env'), '', { flag: 'wx' })
     {
@@ -591,16 +605,24 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         const dbOrders = importedFacts.length
         return { status: 'passed', detail: { outcome: parsed.outcome, imported: parsed.imported, skipped: parsed.skipped, errors: parsed.errors.length, ordersInIms: dbOrders, requestsSoFar: fake!.requests.length } }
       },
-      'status-selection': async () => verdictOf(assessStatusSelection(firstPass?.statuses ?? []), { resolved: firstPass?.statuses ?? [] }),
+      'status-selection': async () => verdictOf(assessStatusSelection(firstPass?.statuses ?? []), { simulated: true, resolved: firstPass?.statuses ?? [] }),
+      'deployment-statuses': async () => {
+        if (!options.deploymentStatuses) {
+          // NEVER a pass: nothing was read. Optional (does not make the report RED) and said out loud.
+          return { status: 'failed', skipped: true, required: false, reason: DEPLOYMENT_STATUSES_NOT_CHECKED_REASON, detail: { state: 'not-checked' } }
+        }
+        deployment = assessDeploymentStatuses(await options.deploymentStatuses.read(), parseWcSyncOrderStatuses)
+        return { status: deployment.state === 'passed' ? 'passed' : 'failed', reason: deployment.state === 'passed' ? undefined : deployment.reason, detail: { state: deployment.state, resolved: deployment.resolved } }
+      },
       'pass-complete': async () => {
         if (firstPass!.outcome === 'complete' && firstPass!.errors.length > 0) {
           findings.push({
             code: 'pass-complete-with-orders-that-did-not-import',
             text: `The pass ended COMPLETE although ${firstPass!.errors.length} order(s) did not import (${firstPass!.errors.map((e) => tail(e, 160)).join(' | ')}). A real pass would stamp completion and move the sync cursor past them; only an order with a durable retry row (the pending-FX queue) is recoverable afterwards. R9 checks that each such order has one.`,
-            orders: knownBadIds.map(String),
+            orders: firstPass!.errors.map((e) => /#(\d+):/.exec(e)?.[1] ?? '').filter(Boolean),
           })
         }
-        return verdictOf(assessPassComplete(firstPass!, knownBadIds), { outcome: firstPass!.outcome, errors: firstPass!.errors.map((e) => tail(e, 300)) })
+        return verdictOf(assessPassComplete(firstPass!), { outcome: firstPass!.outcome, errors: firstPass!.errors.map((e) => tail(e, 300)) })
       },
       'no-stamp-on-rehearsal': async () => verdictOf(assessNoStampAfterRehearsal({ before: firstPass!.stampBefore, after: firstPass!.stampAfter, stampedFlag: firstPass!.stamped }), { before: firstPass!.stampBefore, after: firstPass!.stampAfter }),
       'r9-orders': async () => {
@@ -611,7 +633,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         allocationAtImport = allocation
         r9 = assessR9({ store: storeFacts, imported: importedFacts, selectedStatuses: firstPass!.statuses, allocation, retryRecorded: retry })
         abortedRows = r9.rows
-        return verdictOf(r9.assessment, { expected: r9.expectedCount, imported: r9.importedCount, knownBad: r9.knownBadCount, maxValueDiffForeign: r9.maxValueDiffForeign, maxValueDiffBase: r9.maxValueDiffBase, maxComponentsDiff: r9.maxComponentsDiff, tolerance: R9_VALUE_TOLERANCE })
+        return verdictOf(r9.assessment, { expected: r9.expectedCount, imported: r9.importedCount, missingWithRetryRow: r9.missingWithRetryRow.length, maxValueDiffForeign: r9.maxValueDiffForeign, maxValueDiffBase: r9.maxValueDiffBase, maxComponentsDiff: r9.maxComponentsDiff, tolerance: R9_VALUE_TOLERANCE })
       },
       'r4-reservations': async () => {
         r4 = assessR4(await db(readStockRows))
@@ -648,7 +670,7 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
         if (run.exitCode !== 0 || payload === null) return { status: 'failed', reason: `the driver did not report (exit ${run.exitCode}). ${outputTail(run)}` }
         secondPass = asPass(payload)
         const after = await db(countOrders)
-        return verdictOf(assessIdempotency({ first: firstPass!, second: secondPass, ordersAfterFirst: counts.ordersFirst, ordersAfterSecond: after.orders, linesAfterFirst: counts.linesFirst, linesAfterSecond: after.lines, knownBadCount: knownBadIds.length }), { secondImported: secondPass.imported, secondSkipped: secondPass.skipped, secondErrors: secondPass.errors.length, ordersAfterSecond: after.orders })
+        return verdictOf(assessIdempotency({ first: firstPass!, second: secondPass, ordersAfterFirst: counts.ordersFirst, ordersAfterSecond: after.orders, linesAfterFirst: counts.linesFirst, linesAfterSecond: after.lines }), { secondImported: secondPass.imported, secondSkipped: secondPass.skipped, secondErrors: secondPass.errors.length, ordersAfterSecond: after.orders })
       },
       'stock-lands-later': async () => {
         const { run, payload } = await driver('stock-lands-later', 'land-stock')
@@ -676,6 +698,13 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
           findings.push({ code: 'lines-without-product-are-never-allocatable', text: `${withoutProduct.length} imported order(s) carry a line with no product link (a SKU IMS does not hold, a line with no SKU, or a fee). No stock landing allocates such a line; the SKU must exist in IMS (and the line be re-linked) before it can.`, orders: withoutProduct.map((r) => String(r.externalOrderId)) })
         }
         return { status: failures.length === 0 ? 'passed' : 'failed', reason: failures.length === 0 ? undefined : failures.join('; '), detail: { waitingBefore: facts.beforeLanding.length, afterBareLanding: facts.afterLandingBeforeTrigger.length, afterBackorderAllocator: facts.afterBackorderAllocator.length, afterSweep: facts.afterSweep.length, pickedUp: landed.pickedUp.length, notPickedUp: landed.notPickedUp, backorders: { allocated: payload.backorders?.allocated, skipped: payload.backorders?.skipped, errors: payload.backorders?.errors }, sweep: payload.sweep } }
+      },
+      'short-after-landing': async () => {
+        const rows = await db(readAllocation)
+        const short = [...rows.entries()].filter(([, fact]) => fact.shortLines > 0).sort(([x], [y]) => x - y)
+          .map(([externalOrderId, fact]) => ({ externalOrderId, orderNumber: fact.orderNumber, imsStatus: fact.imsStatus, shortLines: fact.shortLines, shortQty: fact.shortQty }))
+        stillShort = assessStillShort({ ordersExamined: rows.size, short })
+        return verdictOf(stillShort.assessment, { ordersExamined: rows.size, stillShortTotal: short.length, expectedToAllocateStillShort: stillShort.expectedToAllocateStillShort.length, [NOT_EXPECTED_TO_ALLOCATE_LABEL]: stillShort.notExpectedToAllocate.map((r) => `${r.externalOrderId}:${r.imsStatus}`), unclassified: stillShort.unclassified.length })
       },
       'real-pass-stamps': async () => {
         const { run, payload } = await driver('real-pass-stamps', 'import-real')
@@ -791,15 +820,16 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
       importedSecondPass: secondPass?.imported ?? null,
       ordersInIms: r9Final ? r9Final.importedCount : null,
       abandonedByStatus: storeFacts.filter((o) => !(DECIDED_IMPORT_STATUSES as readonly string[]).includes(o.status)).length,
-      knownBadProbes: knownBadIds.length,
     },
-    r9: r9Final ? { expectedCount: r9Final.expectedCount, importedCount: r9Final.importedCount, knownBadCount: r9Final.knownBadCount, missing: r9Final.missing, maxValueDiffForeign: r9Final.maxValueDiffForeign, maxValueDiffBase: r9Final.maxValueDiffBase, maxComponentsDiff: r9Final.maxComponentsDiff, tolerance: R9_VALUE_TOLERANCE } : null,
+    r9: r9Final ? { expectedCount: r9Final.expectedCount, importedCount: r9Final.importedCount, missing: r9Final.missing, missingWithRetryRow: r9Final.missingWithRetryRow, maxValueDiffForeign: r9Final.maxValueDiffForeign, maxValueDiffBase: r9Final.maxValueDiffBase, maxComponentsDiff: r9Final.maxComponentsDiff, tolerance: R9_VALUE_TOLERANCE } : null,
     r4: r4Final ? { rowsChecked: r4Final.rowsChecked, rowsWithReservations: r4Final.rowsWithReservations, worstDiff: r4Final.worstDiff, tolerance: R4_QUANTITY_TOLERANCE, afterLanding: r4AfterLanding ? { rowsChecked: r4AfterLanding.rowsChecked, worstDiff: r4AfterLanding.worstDiff } : null } : null,
     orders: r9Final ? r9Final.rows : abortedRows,
     skippedWithReason: (r9Final ? r9Final.rows : []).filter((row) => row.outcome === 'not-imported').map((row) => ({ externalOrderId: row.externalOrderId, reason: row.reason ?? '' })),
     unallocatable,
     sideEffects,
     findings,
+    stillShortAfterLanding: stillShort ? { ordersExamined: stillShort.ordersExamined, expectedToAllocate: stillShort.expectedToAllocateStillShort, notExpectedToAllocate: stillShort.notExpectedToAllocate, unclassified: stillShort.unclassified } : null,
+    deployment,
     landing,
     stamp: { afterRehearsal: stampAfterRehearsal, afterRealPass: stampAfterRealPass },
     readOnly: readOnlyFinal ? { totalRequests: readOnlyFinal.totalRequests, byRoute: readOnlyFinal.byRoute, nonGetRequests: readOnlyFinal.nonGet.length, unmodelledRequests: readOnlyFinal.unmodelled.length, holdRefusals: readOnlyFinal.holdRefusals } : null,
@@ -876,22 +906,43 @@ export async function runWooImportRehearsal(options: WooRehearsalOptions = {}): 
 // Command line.
 // ---------------------------------------------------------------------------------------------
 
-export const WOO_IMPORT_USAGE = `Usage: npm run rehearse:woo-import -- [--root <dir>] [--report-dir <dir>]
+export const WOO_IMPORT_USAGE = `Usage: npm run rehearse:woo-import -- [--root <dir>] [--report-dir <dir>] [--check-deployment-statuses <env file>]
+
+  --check-deployment-statuses <env file>  a mode-600 file holding DATABASE_URL=... of the DEPLOYMENT to check. Its
+                      wc_sync_order_statuses is READ (one read-only transaction, nothing written) and judged against the
+                      owner decision. Without it the report says NOT CHECKED; it is never a pass.
 
 Exit codes:
 ${Object.entries(WOO_IMPORT_EXIT_MEANING).map(([code, meaning]) => `  ${code}  ${meaning}`).join('\n')}
 `
 
-export function parseWooImportArgs(argv: readonly string[]): { root?: string; reportDir?: string; help: boolean } | { error: string } {
-  const out: { root?: string; reportDir?: string; help: boolean } = { help: false }
+/**
+ * A DEPLOYMENT's actual `wc_sync_order_statuses`, read in ONE read-only transaction (null when the row is
+ * absent). Reads one settings row and writes nothing; the URL is never logged.
+ */
+export async function readDeploymentStatusSetting(databaseUrl: string): Promise<string | null> {
+  return withClient(databaseUrl, async (client) => {
+    await client.query('begin read only')
+    try {
+      const result = await client.query<{ value: string }>('select value from settings where key = $1', ['wc_sync_order_statuses'])
+      return result.rows[0]?.value ?? null
+    } finally {
+      await client.query('rollback')
+    }
+  })
+}
+
+export function parseWooImportArgs(argv: readonly string[]): { root?: string; reportDir?: string; checkDeploymentStatuses?: string; help: boolean } | { error: string } {
+  const out: { root?: string; reportDir?: string; checkDeploymentStatuses?: string; help: boolean } = { help: false }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
     if (arg === '--help' || arg === '-h') out.help = true
-    else if (arg === '--root' || arg === '--report-dir') {
+    else if (arg === '--root' || arg === '--report-dir' || arg === '--check-deployment-statuses') {
       const value = argv[i + 1]
       if (!value || value.startsWith('--')) return { error: `${arg} needs a value` }
       if (arg === '--root') out.root = value
-      else out.reportDir = value
+      else if (arg === '--report-dir') out.reportDir = value
+      else out.checkDeploymentStatuses = value
       i += 1
     } else return { error: `unknown argument ${arg}` }
   }
@@ -908,7 +959,22 @@ async function main(): Promise<number> {
     console.log(WOO_IMPORT_USAGE)
     return WOO_IMPORT_EXIT.OK
   }
-  const outcome = await runWooImportRehearsal({ parentDir: parsed.root, reportDir: parsed.reportDir })
+  let deploymentStatuses: WooRehearsalOptions['deploymentStatuses']
+  if (parsed.checkDeploymentStatuses !== undefined) {
+    const file = path.resolve(parsed.checkDeploymentStatuses)
+    let url: string | undefined
+    try {
+      const info = statSync(file)
+      if (!info.isFile() || (info.mode & 0o077) !== 0) throw new Error('it must be a regular file readable by this account only (mode 600)')
+      url = parseEnvFile(file).DATABASE_URL
+      if (!url) throw new Error('it has no DATABASE_URL line')
+    } catch (error) {
+      console.error(`Refused: --check-deployment-statuses ${file}: ${error instanceof Error ? error.message : String(error)}`)
+      return WOO_IMPORT_EXIT.REFUSED
+    }
+    deploymentStatuses = { read: () => readDeploymentStatusSetting(url!) }
+  }
+  const outcome = await runWooImportRehearsal({ parentDir: parsed.root, reportDir: parsed.reportDir, deploymentStatuses })
   if (outcome.report === null) {
     console.error(`Refused: ${outcome.refusal}`)
     return outcome.exitCode
