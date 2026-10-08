@@ -13,7 +13,7 @@ import { config } from 'dotenv'
  * as an `unreadable` result carrying that text.
  *
  * Three preconditions are asserted first, because a test that examined nothing would pass anyway:
- *   1. the connection really is read-only (SHOW says on);
+ *   1. the connection really is read-only (current_setting says on);
  *   2. a write through the very same client is REFUSED (the rig can fail);
  *   3. the collectors really ran and returned a result of the shape the verdict reads.
  *
@@ -49,7 +49,7 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
   const db = await readOnlyDb()
 
   // Precondition 1: the connection is read-only.
-  const [setting] = await db.$queryRawUnsafe<Array<{ ro: string }>>(`SHOW default_transaction_read_only`)
+  const [setting] = await db.$queryRawUnsafe<Array<{ ro: string }>>(`SELECT current_setting('default_transaction_read_only') AS ro`)
   assert.equal(setting!.ro, 'on', 'precondition: the session is read-only')
   const [identity] = await db.$queryRawUnsafe<Array<{ db: string }>>(`SELECT current_database() AS db`)
   console.log(`precondition: connected to ${identity!.db} with default_transaction_read_only=${setting!.ro}`)
