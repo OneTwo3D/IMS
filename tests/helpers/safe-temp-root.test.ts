@@ -168,6 +168,13 @@ test('the checkout root is the TOPMOST marker, so a nested package.json cannot n
     const nestedHelperDir = join(checkout, 'tests', 'helpers')
     console.log('precondition (nested package): stand-in checkout with .git, lib/, and a package.json nested under tests/')
     assert.equal(findRepoRoot(nestedHelperDir), realpathSync(checkout), 'the topmost marker wins, not the nearest package.json')
+    // isolating the two rules: an OUTER package.json without .git (above the checkout) must not widen it, and a
+    // nested package that has its own .git (a submodule) must not narrow it
+    writeFileSync(join(scratch.root, 'package.json'), '{}')
+    mkdirSync(join(checkout, 'tests', 'pkg'))
+    writeFileSync(join(checkout, 'tests', 'pkg', 'package.json'), '{}')
+    writeFileSync(join(checkout, 'tests', 'pkg', '.git'), 'gitdir: nested')
+    assert.equal(findRepoRoot(join(checkout, 'tests', 'pkg')), realpathSync(checkout), 'a nested package with its own .git does not narrow it; an outer package.json without .git does not widen it')
     // TMPDIR at the sibling lib/ is refused because the repo root is the checkout, not tests/
     assert.throws(() => makeScratchRoot('probe-', { tmpBase: join(checkout, 'lib'), repoRoot: findRepoRoot(nestedHelperDir) }), /refusing to create a scratch root/)
     assert.deepEqual(readdirSync(join(checkout, 'lib')), [])
