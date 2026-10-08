@@ -350,7 +350,7 @@ const rsAll = () => REQUIRED_READ_SYNC_STREAMS.map((stream) => rsEntry(stream))
 const counts = (entries: Array<{ state: unknown }>) => ({ fresh: entries.filter((e) => e.state === 'fresh').length, stale: entries.filter((e) => e.state === 'stale').length, never: entries.filter((e) => e.state === 'never').length, off: entries.filter((e) => e.state === 'off').length })
 const rsOut = (over: Record<string, unknown> = {}) => {
   const entries = (over.entries as Array<{ state: unknown }> | undefined) ?? rsAll()
-  return JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), counts: counts(entries), entries, scheduler: { examined: true, unreadable: null, unscheduled: [] }, ...over })
+  return JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), counts: counts(entries), entries, scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: [] }, ...over })
 }
 
 test('read-sync status: strict contract; every required stream fresh WITH a valid recent last success [mutation: fresh without timestamp passes / catalogue not compared]', () => {
@@ -375,6 +375,8 @@ test('read-sync status: strict contract; every required stream fresh WITH a vali
     ['scheduler not examined', rsOut({ scheduler: { examined: false, unreadable: null, unscheduled: [] } }), 'fail'],
     ['job unscheduled', rsOut({ scheduler: { examined: true, unreadable: null, unscheduled: ['wc-reconcile'] } }), 'fail'],
     ['crontab unreadable', rsOut({ scheduler: { examined: true, unreadable: 'EACCES', unscheduled: [] } }), 'fail'],
+    ['crontab block problem (WP8 e6eb79b2 field)', rsOut({ scheduler: { examined: true, unreadable: null, blockProblem: 'block is incomplete', unscheduled: [], disabled: [] } }), 'fail'],
+    ['a job disabled in the crontab (WP8 e6eb79b2 field)', rsOut({ scheduler: { examined: true, unreadable: null, blockProblem: null, unscheduled: [], disabled: ['wc-reconcile'] } }), 'fail'],
     ['no scheduler object', JSON.stringify({ schemaVersion: 1, generatedAt: RS_NOW.toISOString(), counts: counts(rsAll()), entries: rsAll() }), 'fail'],
     ['no schemaVersion (a producer that does not declare its contract)', JSON.stringify(noVersion), 'unreadable'],
     ['a different schemaVersion', rsOut({ schemaVersion: 2 }), 'unreadable'],

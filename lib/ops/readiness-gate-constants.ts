@@ -74,7 +74,7 @@ export const ACCEPTANCES_DEFAULT_FILE = 'ops/readiness-warning-acceptances.json'
 /** The package.json script the read-sync liveness check runs once it exists (see READ_SYNC_CONTRACT). */
 export const READ_SYNC_STATUS_SCRIPT = 'read-sync:status'
 export const READ_SYNC_SCHEMA_VERSION = 1
-export const READ_SYNC_CONTRACT_VERSION = 'read-sync status schemaVersion 1 (the WP8 producer at 4e7df144 does not emit schemaVersion yet and is being asked to add it; until it does this check fails closed against it; UNPROVEN until that merges)'
+export const READ_SYNC_CONTRACT_VERSION = 'read-sync status schemaVersion 1, matched against the WP8 producer at commit e6eb79b2 (PR 744, not yet merged: UNPROVEN until it merges, and the reading changes with it if its JSON changes)'
 /** The streams that must all be reported, each fresh. Mirrors that status API's stream list. */
 export const REQUIRED_READ_SYNC_STREAMS = [
   'woocommerce-order-sweep',

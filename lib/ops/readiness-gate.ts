@@ -574,6 +574,9 @@ export function assessReadSyncStatus(run: { exitCode: number | null; stdout: str
   else {
     if (scheduler.unreadable !== null && scheduler.unreadable !== undefined) problems.push('the read-sync scheduler check could not read the crontab')
     if (!Array.isArray(scheduler.unscheduled) || scheduler.unscheduled.length > 0) problems.push('a job behind a read-sync stream has no managed crontab entry')
+    const extra = scheduler as { blockProblem?: unknown; disabled?: unknown }
+    if (extra.blockProblem !== null && extra.blockProblem !== undefined) problems.push('the managed crontab block has a problem, so the scheduled jobs may not run')
+    if (Array.isArray(extra.disabled) && extra.disabled.length > 0) problems.push('a job behind a read-sync stream is disabled in the crontab')
   }
   const detail = { streams: [...streams].sort(), entries: seen.size }
   return problems.length === 0 ? pass(`${seen.size} entries across ${streams.size} required streams, each fresh with a valid last success`, detail) : fail(problems, detail)
