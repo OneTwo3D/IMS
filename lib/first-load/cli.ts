@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type IngestedDataset } from './ingest'
+import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
@@ -170,10 +170,13 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   const layouts = new Map<DatasetName, Set<string>>()
   const maps = new Map<string, ColumnMap>()
   const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
+  const problems: string[] = []
   try {
-    const problems: string[] = []
+    // Pass 1: resolve every column map and check the manifest as a whole BEFORE any dataset file is read, so a missing or malformed data
+    // file cannot turn a manifest error (exit 2) into an input error (exit 3).
+    const resolved: Array<{ input: (typeof manifest.inputs)[number]; mapping: DatasetMapping | null }> = []
     for (const input of manifest.inputs) {
-      let mapping = null
+      let mapping: DatasetMapping | null = null
       if (input.columnMap !== null) {
         const mapPath = resolve(input.columnMap)
         let map = maps.get(mapPath)
@@ -203,6 +206,16 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         }
       }
       layouts.set(input.dataset, (layouts.get(input.dataset) ?? new Set()).add(mapping?.wide ? 'wide' : 'canonical-or-long'))
+      resolved.push({ input, mapping })
+    }
+    for (const [name, kinds] of layouts) {
+      if (kinds.size > 1) {
+        io.stderr(`first-load-prepare: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together. Nothing was read.\n\n${usageText()}`)
+        return EXIT_CODES.USAGE
+      }
+    }
+    // Pass 2: read the files.
+    for (const { input, mapping } of resolved) {
       let bytes: Buffer
       try {
         bytes = readFileSync(resolve(input.file))
@@ -218,12 +231,6 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
       }
     }
     if (problems.length > 0) throw new InputError(problems)
-    for (const [name, kinds] of layouts) {
-      if (kinds.size > 1) {
-        io.stderr(`first-load-prepare: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together\n\n${usageText()}`)
-        return EXIT_CODES.USAGE
-      }
-    }
     for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!.map((part) => part.ingested), parts[name]!.map((part) => part.supersedes))
   } catch (error) {
     if (error instanceof InputError) {

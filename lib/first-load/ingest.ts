@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto'
 import { CsvFormatError, parseCsvStrict } from './csv'
 import { dateFormatProblem, parseDateByFormat } from './dates'
 import { D, parseDecimal } from './money'
+import { idToken } from './validate'
 import { DATASETS, SOURCES, type DatasetName, type SourceName } from './spec'
 
 export class InputError extends Error {
@@ -105,6 +106,17 @@ function stringRecord(value: unknown, where: string, problems: string[]): Record
   return out
 }
 
+/**
+ * The key of a source row of a wide file: the CANONICAL value of the key column (after the map's valueMaps) normalised like the loader's
+ * identifiers (NFKC, no spaces, control or zero-width characters, upper-case). Two source values that become the same canonical SKU are one key.
+ */
+function wideKeyOf(mapping: DatasetMapping, cell: string): string {
+  let value = clean(cell)
+  const valueMap = mapping.valueMaps[mapping.wide!.uniqueBy]
+  if (valueMap && Object.prototype.hasOwnProperty.call(valueMap, value)) value = clean(valueMap[value])
+  return idToken(value)
+}
+
 const WIDE_KEYS = new Set(['blockStart', 'warehouses', 'blockColumns', 'totals', 'uniqueBy'])
 const ROW_SELECT_KEYS = new Set(['column', 'keep', 'skip'])
 const PARENT_FROM_KEYS = new Set(['column', 'parentValues', 'skuColumn', 'into'])
@@ -187,6 +199,8 @@ function parseLayoutKeys(
         if (!(column in blockColumns)) problems.push(`${where}.wide.totals: "${column}" is not one of wide.blockColumns`)
         if (header.trim() === '') problems.push(`${where}.wide.totals.${column}: the total header is empty`)
       }
+      if (w.uniqueBy !== 'sku') problems.push(`${where}.wide.uniqueBy must be "sku": the key of a wide file is the column mapped to the canonical sku, because that is what makes two rows the same stock (any other column would let two rows of one SKU through)`)
+      else if (!('sku' in columns)) problems.push(`${where}.wide.uniqueBy is "sku", so sku must be mapped to a source column`)
       if (typeof w.uniqueBy !== 'string' || !(w.uniqueBy in columns)) problems.push(`${where}.wide.uniqueBy must name a mapped per-row canonical column (for example sku): a wide file is one row per key`)
       if ((w.blockStart === 'after-label' || w.blockStart === 'at-label') && Object.keys(warehouses).length > 0) {
         wide = { blockStart: w.blockStart, warehouses, blockColumns, totals, uniqueBy: typeof w.uniqueBy === 'string' ? w.uniqueBy : '' }
@@ -476,7 +490,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
         const accepted = new Map<number, CanonRow[]>()
         const stay: CanonRow[] = []
         for (const row of kept[index]) {
-          if (spread.has((row.values[keyColumn] ?? '').toUpperCase())) accepted.set(Math.floor(row.line), [...(accepted.get(Math.floor(row.line)) ?? []), row])
+          if (spread.has(idToken(row.values[keyColumn] ?? ''))) accepted.set(Math.floor(row.line), [...(accepted.get(Math.floor(row.line)) ?? []), row])
           else stay.push(row)
         }
         const seenLines = new Set<number>()
@@ -739,7 +753,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         // A row the map deliberately SKIPS is not part of this dataset, so its key is not a key of the dataset (rows that are kept, or refused
         // later, still count: a refused row is still a row that said something about that key).
         if (mapping.rowSelect && selectIndex >= 0 && mapping.rowSelect.skip.includes(clean(record.cells[selectIndex]))) continue
-        const key = clean(record.cells[keyAt]).toUpperCase()
+        const key = wideKeyOf(mapping, record.cells[keyAt])
         if (key !== '') {
           seen.set(key, (seen.get(key) ?? 0) + 1)
           wideKeys.push({ key, line: record.line })
@@ -766,7 +780,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     if (mapping?.wide) {
       const keyAt = indexOf.get(mapping.wide.uniqueBy)!
       const key = clean(record.cells[keyAt])
-      if (repeated.has(key.toUpperCase())) {
+      if (repeated.has(wideKeyOf(mapping, record.cells[keyAt]))) {
         rejected.push({
           line: record.line,
           code: 'DUPLICATE_SOURCE_ROW',

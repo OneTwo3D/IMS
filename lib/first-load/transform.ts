@@ -923,13 +923,18 @@ function loadStock(run: Run): void {
   const byGroup = new Map<string, Lot[]>()
   for (const lot of lots) if (!refused.has(lot)) byGroup.set(stockGroupKey(lot.key, lot.warehouse), [...(byGroup.get(stockGroupKey(lot.key, lot.warehouse)) ?? []), lot])
   for (const list of byGroup.values()) {
+    if (list.length < 2) continue
     const partsSeen = new Set(list.map((lot) => Math.floor(lot.row.line / PART_LINE_STRIDE)))
-    if (partsSeen.size < 2) continue
+    // A row of a wide report has a fractional line number (L.0B): such a report states ONE balance per SKU and warehouse, so a second row for
+    // the same SKU and warehouse (two source spellings of one SKU, the loader's own normalisation catching what the reader's did not) is a repeat.
+    const wideRows = list.some((lot) => !Number.isInteger(lot.row.line))
+    if (partsSeen.size < 2 && !wideRows) continue
     const tokens = list.map((lot) => idToken(lot.lotRef))
     if (tokens.every((token) => token !== '') && new Set(tokens).size === tokens.length) continue
     for (const lot of list) {
       refused.add(lot)
-      run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'STOCK_FROM_SEVERAL_FILES', `${lot.sku} in ${lot.warehouse} is stocked by rows from ${partsSeen.size} different input files and they do not all carry their own lot reference; they could be the same stock exported twice, so they are not added together. Give each lot a reference or supply the stock in one file`)
+      if (partsSeen.size >= 2) run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'STOCK_FROM_SEVERAL_FILES', `${lot.sku} in ${lot.warehouse} is stocked by rows from ${partsSeen.size} different input files and they do not all carry their own lot reference; they could be the same stock exported twice, so they are not added together. Give each lot a reference or supply the stock in one file`)
+      else run.add('stock-lots', lot.row.line, lot.sku, 'REJECTED', 'REPEATED_WIDE_STOCK_ROW', `${list.length} rows of a one-row-per-SKU report state ${lot.sku} in ${lot.warehouse} (two spellings of one SKU?) and they have no lot references to tell them apart; they are not added together. Fix the source`)
     }
   }
   const groups = new Map<string, Lot[]>()

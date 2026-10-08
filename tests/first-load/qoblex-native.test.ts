@@ -618,3 +618,70 @@ test('cross-file duplicates name every offending source row: rows already refuse
   assert.match(text(1_000_000 + 4), /a\.csv line 5/, 'B M1 names the A row')
   assert.equal(merged.rejected.filter((r) => r.line === 3).length, 1, 'still one rejection per source row')
 })
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 4: ONE canonical SKU per source row, mixed-layout check before any read
+// ---------------------------------------------------------------------------------------------------------------------
+
+test('wide map: the key must be the canonical sku (any other key column is refused at map validation)', (t) => {
+  precondition(t, 'maps', 3)
+  for (const bad of ['unitCost', 'currency', 'warehouseCode']) {
+    assert.throws(
+      () => parseColumnMap(wideMapText({ ...WIDE, uniqueBy: bad }, { columns: { sku: 'Sku', unitCost: 'Other', currency: 'Other2' } }), 'm.json'),
+      (e) => e instanceof InputError && /uniqueBy must be "sku"/.test(e.message),
+      bad,
+    )
+  }
+  assert.doesNotThrow(() => parseColumnMap(wideMapText(WIDE), 'm.json'))
+})
+
+test('wide keys are CANONICAL: two source SKU values that map or normalise to one SKU are one key, within a file and across files', (t) => {
+  const mapText = wideMapText(WIDE, { valueMaps: { sku: { 'A-1': 'X1', 'A_1': 'X1', B1: 'B1', 'b 1': 'B1' } } })
+  const mapping = parseColumnMap(mapText, 'm.json').datasets['stock-lots']!
+  const read = (file: string, rows: string[][]) => ingestDataset('stock-lots', wideFile(LABELS, HEADER, rows), file, mapping)
+  // One file: two spellings that the map sends to X1, with asymmetric quantities.
+  const one = read('a.csv', [['A-1', '7', '3', 'y', '4', 'z'], ['A_1', '9', '5', 'y', '4', 'z'], ['B1', '7', '3', 'y', '4', 'z'], ['b 1', '5', '1', 'y', '4', 'z']])
+  precondition(t, 'source rows', 4)
+  assert.deepEqual(one.rejected.map((r) => [r.line, r.code]), [[3, 'DUPLICATE_SOURCE_ROW'], [4, 'DUPLICATE_SOURCE_ROW'], [5, 'DUPLICATE_SOURCE_ROW'], [6, 'DUPLICATE_SOURCE_ROW']])
+  assert.equal(one.rows.length, 0)
+  // Two files: the same canonical SKU through different spellings, and a spelling that only differs in case/space (no map entry needed).
+  const plain = parseColumnMap(wideMapText(WIDE), 'm.json').datasets['stock-lots']!
+  const a = ingestDataset('stock-lots', wideFile(LABELS, HEADER, [['AB1', '7', '3', 'y', '4', 'z']]), 'a.csv', plain)
+  const b = ingestDataset('stock-lots', wideFile(LABELS, HEADER, [['ab 1', '9', '5', 'y', '4', 'z']]), 'b.csv', plain)
+  const merged = mergeIngested([a, b])
+  assert.equal(merged.rows.length, 0, 'neither spelling reaches opening stock')
+  assert.deepEqual(merged.rejected.map((r) => r.code), ['DUPLICATE_SOURCE_ROW', 'DUPLICATE_SOURCE_ROW'])
+  // Control: genuinely different SKUs are untouched.
+  const fine = read('c.csv', [['A-1', '7', '3', 'y', '4', 'z'], ['B1', '7', '3', 'y', '4', 'z']])
+  assert.equal(fine.rejected.length, 0)
+})
+
+test('the loader refuses two wide rows for one SKU and warehouse that the reader did not catch; a long (non-wide) multi-lot SKU still collapses', (t) => {
+  const products = ds('products', [product('S1')])
+  const wideRows = ds('stock-lots', [lot('S1', '10', '1.5'), lot('s1', '4', '9.25')])
+  // Make them look like records of a wide report: line 3.01 and 4.01.
+  const wide = { ...wideRows, rows: wideRows.rows.map((row, i) => ({ ...row, line: 3.01 + i })) }
+  const refused = run({ products, 'stock-lots': wide })
+  precondition(t, 'stock records', wide.rows.length)
+  assert.deepEqual(refused.report.accountingByCode.filter((row) => row.dataset === 'stock-lots').map((row) => [row.code, row.count]), [['REPEATED_WIDE_STOCK_ROW', 2]])
+  assert.equal(rowsOf(refused, 'opening-stock').length, 0)
+  const longRows = run({ products, 'stock-lots': wideRows })
+  assert.equal(rowsOf(longRows, 'opening-stock')[0].qty, '14', 'the multi-lot weighted average for other sources is unchanged')
+})
+
+test('a mixed-layout manifest is a usage error (exit 2) even when a data file is missing: the manifest is checked before any file is read', async (t) => {
+  const dir = copyNative()
+  const manifest = JSON.parse(readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+  manifest.inputs.push({ dataset: 'stock-lots', file: 'does-not-exist.csv' })
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
+  const run1 = await cli(['--manifest', path.join(dir, 'manifest.json'), '--dry-run'])
+  precondition(t, 'stderr bytes', run1.stderr.length)
+  assert.equal(run1.code, EXIT_CODES.USAGE)
+  assert.match(run1.stderr, /Nothing was read/)
+  assert.ok(!/cannot read does-not-exist/.test(run1.stderr), 'the missing file was never opened')
+  // Control: a missing file in an otherwise consistent manifest is still an input error (exit 3).
+  manifest.inputs.pop()
+  manifest.inputs.push({ dataset: 'stock-lots', file: 'does-not-exist.csv', columnMap: 'maps/qoblex-stock-on-hand.map.json' })
+  writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify(manifest))
+  assert.equal((await cli(['--manifest', path.join(dir, 'manifest.json'), '--dry-run'])).code, EXIT_CODES.INPUT_UNUSABLE)
+})
