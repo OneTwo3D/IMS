@@ -4,6 +4,7 @@ import { resolveEnabledWmsConnector, wmsResolutionSkipReason } from '@/lib/conne
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 import { shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
+import { WMS_ORDER_STATUS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
 
 /**
  * Connector-agnostic WMS order-status sweep. Refreshes the cached snapshot for
@@ -276,6 +277,21 @@ export async function runWmsOrderStatusSweep(
         })
         .catch(() => {})
     }
+  }
+
+  // The LAST-SUCCESS stamp (read-sync liveness). Reached only by a run that resolved a connector and a
+  // lookup source (every skip above returned before here) and read every order it selected without an
+  // error: `failed` counts a lookup or snapshot write that threw. A run that selected no orders because
+  // none were stale counts - that is a sweep that legitimately found nothing to refresh. A run with any
+  // failure does not, so one order that keeps failing keeps the stamp from advancing, which is the
+  // honest reading: the cache is not being kept current for it.
+  if (failed === 0) {
+    const stampedAt = new Date().toISOString()
+    await db.setting.upsert({
+      where: { key: WMS_ORDER_STATUS_LAST_SUCCESS_SETTING },
+      create: { key: WMS_ORDER_STATUS_LAST_SUCCESS_SETTING, value: stampedAt },
+      update: { value: stampedAt },
+    })
   }
 
   return { scanned: orders.length, updated, failed }

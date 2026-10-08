@@ -4773,6 +4773,44 @@ A refused login after an HTTP 401 is a pure hold only when that 401 came straigh
 | 5 | failed | the report could not be produced because of an unexpected error |
 <!-- /outbound-write-hold:status-command -->
 
+### Keeping IMS current during a parallel run: read-sync liveness
+
+<!-- read-sync-liveness:overview -->
+During a parallel run IMS only reads from WooCommerce, Mintsoft and Xero, and a feed that has stopped looks exactly like a feed that has nothing new to say. So every read feed records the time of its last SUCCESSFUL run, separately from the time of its last attempt (an attempt that failed does not move it, and a run that legitimately found nothing new does), and a feed whose last success is older than its limit is reported as stale. A stale feed means the data IMS holds from that source may be old; it does not show that any record is wrong.
+
+The `read-sync-liveness` scheduled job (hourly, on by default) raises an admin notification and a WARNING activity entry once per breach for every feed except the Mintsoft stock sync, whose alert is raised by the existing `wms-watchdog` job. A feed that has never recorded a success is only alarmed once its limit has passed since the job first ran, so a fresh deployment does not alarm for a feed that has not yet had its first scheduled run.
+<!-- /read-sync-liveness:overview -->
+
+The feeds, when each is expected to complete, what counts as a success and when it is stale:
+
+<!-- read-sync-liveness:streams -->
+| Feed | Expected cadence | Counts as a success when | Stale after | Alarm raised by |
+|---|---|---|---|---|
+| WooCommerce order sweep | daily (the wc-reconcile job; while webhooks are primary the reconcile only runs when 24 hours have passed since the last one, so a daily job completes it every one to two days) | the sweep read WooCommerce to an empty page, imported or skipped every order it returned without an error, and advanced its cursor; a sweep that found no new orders counts | 3 days (two days is the longest healthy gap (a daily job whose 24 hour check lands just short of a day skips one run), and a third day is the first one that is not explained by that) | read-sync-liveness job |
+| Mintsoft stock sync | each binding's own sync frequency (default hourly) | the sync read the warehouse stock for the binding and finished its checks (a run with some per-line errors counts as completed, a run that could not read the warehouse does not) | 3 sync intervals, at least 60 minutes (3 of the binding's own intervals and never less than 1 hour, the rule the WMS watchdog has always applied) | WMS watchdog |
+| Mintsoft despatch poll | every 15 minutes, as the installation guide lists it (the mintsoft-dispatch-sync endpoint). It is neither a registered scheduled job nor in the installer's bootstrap crontab, so confirm that your own scheduler calls it | the poll finished with job status SUCCEEDED, which excludes a poll that degraded (a failed delta read, unresolved orders, an unreadable withdrawal screen); a poll with nothing to check counts | 2 hours (eight missed 15 minute polls, long enough to ride out a short Mintsoft outage and short enough to matter on a day of trading) | read-sync-liveness job |
+| Mintsoft order-status refresh | every 15 minutes (the wms-order-status job; off by default) | the refresh resolved a connector and a lookup source and read every order it selected without an error; a refresh with no stale orders to read counts, a refresh that was skipped does not | 2 hours (eight missed 15 minute runs, the same reasoning as the despatch poll) | read-sync-liveness job |
+| Xero balance-snapshot pull | daily at 01:00 (the account-balance-snapshot job) | the scheduled pull read the Xero trial balance and stored a snapshot for every configured account without an error; an on-demand refresh for one date or one account does not count | 36 hours (a day and a half: one missed daily run is the first thing that is not explained by the schedule) | read-sync-liveness job |
+| Xero tax-rate read | hourly (the xero-tax-rate-drift job) | the sweep read the Xero tax rates (or found no IMS tax rates to compare) and stored its result; a sweep that found no drift counts | 6 hours (six missed hourly runs, long enough to ride out a Xero outage or rate-limit window) | read-sync-liveness job |
+<!-- /read-sync-liveness:streams -->
+
+To check them:
+
+<!-- read-sync-liveness:status-command -->
+`npm run read-sync:status` prints every feed with its state (fresh, stale, never succeeded, or off), the time of its last recorded success, its age and its limit. It reads the database only, makes no network call and writes nothing. Pass `--json` for a machine-readable report. A feed is "off" when its plugin or scheduled job is disabled, the connector is not connected, or there is no active binding; an off feed is not keeping IMS current, so it is reported rather than hidden.
+
+| Exit code | Name | Meaning |
+|---|---|---|
+| 0 | ok | every stream is switched on and last succeeded within its limit |
+| 1 | stale | at least one stream that is switched on last succeeded longer ago than its limit (or has a last-success time in the future, which is not believed) |
+| 2 | never | at least one stream that is switched on has no successful run recorded; no stream is stale |
+| 3 | usage | an unknown argument was given; nothing was evaluated |
+| 4 | off | at least one stream is switched off or cannot run (plugin disabled, scheduled job disabled, not connected, no active binding), so it is not keeping IMS current; no stream that is switched on is stale or without a success |
+| 5 | failed | the report could not be produced because of an unexpected error; no stream was evaluated |
+<!-- /read-sync-liveness:status-command -->
+
+Runbook. If a feed is reported stale, first find out which side stopped: look at the scheduled job's last run under Settings > System > Scheduler (or in `cron_runs`), then at the connector's connection and credentials. A feed that is "off" or has "never" succeeded after its limit has passed is not keeping IMS current until that is fixed; any reconciliation or comparison taken meanwhile may be measuring old data, so note the gap alongside its result. The status command and the alarm only read IMS's own database and never contact WooCommerce, Mintsoft or Xero. The `read-sync-liveness` job is a registered scheduled job, so it reaches the crontab through the in-app scheduler sync (Settings > System > Scheduler), not through the installer's bootstrap list; confirm it is scheduled before relying on its alerts. The `/api/cron/mintsoft-dispatch-sync` endpoint listed under Cron Jobs above is in neither place, so the despatch poll appears as stale or never-succeeded until your own scheduler calls it. This feature adds no environment variables.
+
 
 ### Connection pooling in front of `DATABASE_URL` is not supported
 

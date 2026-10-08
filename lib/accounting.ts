@@ -2005,6 +2005,8 @@ export async function syncAccountingAccountBalanceSnapshots(options?: {
   balanceDate?: Date | string
   accountCodes?: string[]
   syncRunId?: string
+  /** Set only by the scheduled pull: record the read-sync last-success stamp with the snapshots. */
+  recordScheduledPullSuccess?: boolean
 }): Promise<AccountBalanceSnapshotSyncResult> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return { fetched: 0, persisted: 0, skipped: 0, errors: ['No active accounting connector'] }
