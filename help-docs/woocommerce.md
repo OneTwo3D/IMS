@@ -88,6 +88,8 @@ order that has no record anywhere — no webhook will resend a historical order,
 retry row for the fifteen-minute recheck to find. Press **Import Active Orders** again once the
 cause is resolved; orders that already imported are skipped, so a retry costs nothing.
 
+**Rehearse before the real import.** `npm run rehearse:woo-import` (operators' guide: *Installation → WooCommerce initial-import rehearsal*) runs this same import against a local fake store in a throwaway database. It never contacts WooCommerce, never writes, and never sets the completion stamp, so it can be run as often as needed. Its report lists the orders fetched, imported and skipped, the orders that imported but could not be allocated, and whether the totals agree. It uses synthetic orders, so it does not replace a look at the status list the Sync page prints before you press the button.
+
 ### Ongoing Order Sync
 
 With the initial import complete, new and updated WooCommerce orders are imported automatically.
