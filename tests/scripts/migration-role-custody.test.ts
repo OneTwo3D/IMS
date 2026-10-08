@@ -12,6 +12,7 @@ import {
   MIGRATION_URL_SAFE_PARAMETERS,
   assessMigrationRoleAttributes,
   classifyFenceState,
+  sameServerBinding,
   retireMigrationLogin,
   buildMigrationLoginUrl,
   planConnectionFence,
@@ -1096,4 +1097,47 @@ test('[o3d-1bgr] MUTATION pg_authid-unconditional: reading the password in the m
     assert.notEqual(run.status, 0, 'the unconditional read is refused by the server')
     assert.match(run.stderr, /permission denied/)
   }, () => {}, 'owner')
+})
+
+test('[o3d-1bgr] sameServerBinding: an empty reading never matches, the system identifier included (Codex round 5)', () => {
+  const full = { systemIdentifier: '7000', postmaster: 'p1', databaseOid: '16384' }
+  const cases: Array<[string, unknown, unknown, boolean]> = [
+    ['identical, all readings present', full, { ...full }, true],
+    ['both system identifiers unreadable', { ...full, systemIdentifier: '' }, { ...full, systemIdentifier: '' }, false],
+    ['one system identifier unreadable', full, { ...full, systemIdentifier: '' }, false],
+    ['different postmaster', full, { ...full, postmaster: 'p2' }, false],
+    ['different database OID', full, { ...full, databaseOid: '5' }, false],
+    ['no baseline', null, full, false],
+  ]
+  for (const [label, a, b, want] of cases) {
+    console.log(`${label}: ${sameServerBinding(a as never, b as never)}`)
+    assert.equal(sameServerBinding(a as never, b as never), want, label)
+  }
+})
+
+test('[o3d-1bgr] a failed release whose system identifier is unreadable on BOTH connections reports unknown, not restored/held (real cluster; Codex round 5)', async () => {
+  await withRig(async (rig) => {
+    const { stateFile } = fenceUp(rig)
+    const unreadable = (label: string, extra = false) => {
+      const script = mutatedHelper(rig, 'return { systemIdentifier: cluster.systemIdentifier, postmaster:', "return { systemIdentifier: '', postmaster:", label)
+      let text = readFileSync(script, 'utf8').replace("    commitSent = true\n    await client.query('COMMIT')\n", "    commitSent = true\n    await client.query('COMMIT')\n    throw new Error('connection terminated: acknowledgement lost')\n")
+      if (extra) {
+        const lax = text.replace(' || !a.systemIdentifier || !b.systemIdentifier) return false', ') return false')
+        assert.notEqual(lax, text, 'precondition: the second mutation applies')
+        text = lax
+      }
+      writeFileSync(script, text)
+      return script
+    }
+    // both readings are empty (the identifier is "unreadable" on the release connection and on the probe)
+    const run = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: unreadable('unreadable-both') })
+    console.log(`identifier unreadable on both: ${stateLine(run.stdout)}`)
+    assert.equal(stateLine(run.stdout), 'FENCE_STATE=unknown')
+
+    // MUTATION empty-equals-empty: the old rule trusted postmaster + OID alone and reported restored.
+    rig.cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+    const bad = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: unreadable('empty-equals-empty', true) })
+    console.log(`mutated (empty equals empty): ${stateLine(bad.stdout)}`)
+    assert.notEqual(stateLine(bad.stdout), 'FENCE_STATE=unknown', 'the mutated rule trusts a probe the identifier could not bind')
+  })
 })

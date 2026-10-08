@@ -4008,7 +4008,19 @@ migration login that is **already open** (`LOGIN`, or a stored password) with th
 `pg_authid` (a database-owner admin with `CREATEROLE` may not: then only `LOGIN` decides). The fresh
 `FENCE_STATE` read is **bound to the server the release ran on** (postmaster start time, database OID and, where
 readable, the system identifier, compared with the ones the release connection reported before it granted
-anything); a connection that lands anywhere else prints `FENCE_STATE=unknown`. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
+anything); a connection that lands anywhere else prints `FENCE_STATE=unknown`. An unreadable system identifier
+never matches: where it cannot be read on both connections the state is `unknown` after a failed release, and the
+entrypoint re-fences, which is the safe direction.
+
+**One cutover host per database.** The cutover lock that serialises fence, migration and release is a file on the
+host running the entrypoint. It does not exclude a cutover started from a second host against the same database:
+both can pass the ACL check, both fence (the second revoke is a no-op) and both enter a window, and the first
+release then restores `CONNECT` under the other's migration. IMS is a single-application-host install, so this is
+an operator-error case, but it is not detected. Never run two cutovers against one database. If a second cutover is
+suspected, stop both, run `SELECT datacl FROM pg_database WHERE datname = current_database();` and
+`SELECT pid, usename, application_name, backend_start FROM pg_stat_activity WHERE datname = current_database();` to
+see what is attached, re-run a single `update.sh` from one host (it re-fences from the record), and check the
+migration with `prisma migrate status`. A database-wide lease is tracked as a follow-up. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
 as the application role, or it is not printed and the login is closed again. A window that is
 **interrupted** leaves a password nobody holds; the next window mints another.
 

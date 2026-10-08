@@ -2844,6 +2844,16 @@ export async function doBindMigration(client, options) {
   return EXIT_OK
 }
 
+/*
+ * SINGLE CUTOVER HOST (Codex round 5, HIGH, accepted and documented). The cutover lock that serialises
+ * fence/migrate/release is a file on THIS host. Two hosts cutting over the SAME database at once can both pass the
+ * ACL check, both REVOKE (the second is a no-op), both enter a window, and the first release then restores CONNECT
+ * under the other's migration. Nothing in the database holds the window: the only long-lived admin session is the
+ * optional witness (another database, absent in the supported degraded mode, started per run by root), so a lock
+ * taken there would be an exclusion that is sometimes missing, not a guarantee, and release has no session of its
+ * own that spans the window. IMS is a single-application-host install; the assumption is "one cutover host per
+ * database", documented in docs/installation.md. A database-wide lease is the real fix and is filed separately.
+ */
 /**
  * The database a witness attaches to, given the connection string the fence would use.
  *
@@ -4090,10 +4100,16 @@ export async function captureServerBinding(client) {
   return { systemIdentifier: cluster.systemIdentifier, postmaster: String(rows[0]?.postmaster ?? ''), databaseOid: String(rows[0]?.database_oid ?? '') }
 }
 
-/** Pure: the same server, or not shown to be. An empty postmaster or OID is never a match. */
+/**
+ * Pure: the same server, or not shown to be. An empty reading is never a match, and that includes the system
+ * identifier: where pg_control_system() is refused (a database-owner admin) both readings are empty, and "empty
+ * equals empty" would leave the postmaster start time and the OID, which a lookalike can coincide on, as the
+ * whole proof (Codex round 5). The cost is stated: such an admin gets FENCE_STATE=unknown after a failed
+ * release, which the callers answer by re-fencing (the safe direction).
+ */
 export function sameServerBinding(a, b) {
   if (!a || !b) return false
-  if (!a.postmaster || !b.postmaster || !a.databaseOid || !b.databaseOid) return false
+  if (!a.postmaster || !b.postmaster || !a.databaseOid || !b.databaseOid || !a.systemIdentifier || !b.systemIdentifier) return false
   return a.postmaster === b.postmaster && a.databaseOid === b.databaseOid && a.systemIdentifier === b.systemIdentifier
 }
 
