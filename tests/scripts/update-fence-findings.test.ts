@@ -103,23 +103,28 @@ for (const [name, source] of [['update.sh', UPDATE], ['deploy.sh', DEPLOY]] as c
 
 const CLAIM_FN = shippedFunction(FENCE_LIB, 'db_connect_fence_claim')
 
-test('marker: db_connect_fence_claim never says "released" for a fence it has not seen lowered', () => {
+test('marker: db_connect_fence_claim says "released" only for a release the database confirmed (every combination)', () => {
   const ask = (vars: string): string => bash(`${CLAIM_FN}\n${vars}\ndb_connect_fence_claim`).out.trim()
-  const table: Array<[string, string, string]> = [
-    ['standing', 'DB_FENCE_UP=true; DB_FENCE_RAISED=true; FENCE_ARMED=true', 'held'],
-    ['raised then lowered', 'DB_FENCE_UP=false; DB_FENCE_RAISED=true; FENCE_ARMED=true', 'released'],
-    // THE D4 STATE: phase=stopping written, the fence not yet raised, then SIGKILL.
-    ['stop requested, fence not yet raised', 'DB_FENCE_UP=false; DB_FENCE_RAISED=false; FENCE_ARMED=true', 'unknown'],
-    ['before the stop', 'DB_FENCE_UP=false; DB_FENCE_RAISED=false; FENCE_ARMED=false', 'not-raised'],
-    ['first install (no fence by policy)', 'DB_FENCE_UP=false; DB_FENCE_RAISED=false; FENCE_ARMED=true; FIRST_INSTALL_NO_CREDENTIALED_FENCE=true', 'not-raised'],
-  ]
-  for (const [label, vars, want] of table) {
+  // The oracle is written independently of the function, as a precedence table.
+  const oracle = (up: boolean, verified: boolean, raised: boolean, armed: boolean, first: boolean): string =>
+    up ? 'held' : verified ? 'released' : raised ? 'unknown' : first ? 'not-raised' : armed ? 'unknown' : 'not-raised'
+  let checked = 0
+  const seen = new Map<string, number>()
+  for (let bits = 0; bits < 32; bits++) {
+    const [up, verified, raised, armed, first] = [0, 1, 2, 3, 4].map((i) => Boolean(bits & (1 << i)))
+    const vars = `DB_FENCE_UP=${up}; DB_FENCE_RELEASE_VERIFIED=${verified}; DB_FENCE_RAISED=${raised}; FENCE_ARMED=${armed}; FIRST_INSTALL_NO_CREDENTIALED_FENCE=${first}`
     const got = ask(vars)
-    console.log(`  marker claim: ${label} -> ${got}`)
-    assert.equal(got, want, label)
+    assert.equal(got, oracle(up, verified, raised, armed, first), vars)
+    seen.set(got, (seen.get(got) ?? 0) + 1)
+    checked++
   }
-  // Under `set -u` with none of the variables defined it still answers (the install path defines
-  // only some of them at the moment it writes).
+  console.log(`  claim: ${checked} combinations of up/verified/raised/armed/first-install checked; outcomes ${JSON.stringify([...seen])}`)
+  assert.equal(checked, 32)
+  assert.ok(['held', 'released', 'unknown', 'not-raised'].every((k) => seen.has(k)), 'precondition: every outcome is reachable')
+  // The D4 state, and the two the review named: a lost record and a failed re-fence are NOT "released".
+  assert.equal(ask('DB_FENCE_UP=false; DB_FENCE_RELEASE_VERIFIED=false; DB_FENCE_RAISED=false; FENCE_ARMED=true'), 'unknown')
+  assert.equal(ask('DB_FENCE_UP=false; DB_FENCE_RELEASE_VERIFIED=false; DB_FENCE_RAISED=true; FENCE_ARMED=true'), 'unknown')
+  // Under `set -u` with none of the variables defined it still answers.
   assert.equal(bash(`set -u\n${CLAIM_FN}\ndb_connect_fence_claim`).out.trim(), 'not-raised')
 })
 
@@ -301,3 +306,59 @@ test('dry run: the pull step of a checkout WITHOUT .git performs no write of any
   console.log(`  dry run with the guard cut: ${JSON.stringify(verbs(cut.calls))}`)
   assert.ok(cut.calls.length > 0, 'without the guard the dry run writes (this is the defect)')
 })
+
+// ---------------------------------------------------------------------------
+// marker -- the verified-release state is set only by a release the database confirmed
+// ---------------------------------------------------------------------------
+
+function releaseRig(source: string, helperRc: number, fenceState: string, afterRelease = ''): string {
+  return [
+    'set -uo pipefail',
+    'exec 2>&1',
+    'RED=""; BOLD=""; RESET=""; YELLOW=""; GREEN=""',
+    'info() { :; }; warn() { :; }; error() { echo "ERR: $*"; }; success() { :; }; die() { echo "DIE: $*"; exit 9; }',
+    'APP_USER=app; FIRST_INSTALL_NO_CREDENTIALED_FENCE=false; DRY_RUN=false; DB_FENCE_UP=true; DB_FENCE_RAISED=true; DB_FENCE_RELEASE_VERIFIED=false; FENCE_ARMED=true',
+    'DB_FENCE_STATE=/nonexistent/state; DB_FENCE_RELEASE_CMD=rel; DB_FENCE_KEEP_RECORD=0; DB_FENCE_IDENTITY_ARGS=(); DATABASE_URL=u; MIGRATION_DATABASE_URL=m',
+    'resolve_fence_script() { echo /fake/helper; }',
+    'db_fence_witness_nonce() { return 1; }; db_fence_witness_challenge() { return 1; }; db_fence_witness_stop() { :; }',
+    `db_fence_helper() { echo "FAKE_MACHINE_LINE"; return ${helperRc}; }`,
+    `db_fence_state_after_release() { echo ${fenceState}; }`,
+    'db_fence_machine_verdict() { echo ""; }; db_fence_clear_authority() { return 0; }',
+    shippedFunction(source, 'release_db_connections'),
+    shippedFunction(FENCE_LIB, 'db_connect_fence_claim'),
+    'release_db_connections; echo "RELEASE_RC=$?"',
+    afterRelease,
+    'echo "CLAIM=$(db_connect_fence_claim) UP=${DB_FENCE_UP} VERIFIED=${DB_FENCE_RELEASE_VERIFIED}"',
+  ].join('\n')
+}
+
+const claimOf = (out: string): string => out.match(/CLAIM=\S+ UP=\S+ VERIFIED=\S+/)?.[0] ?? `NO CLAIM LINE: ${out.slice(-400)}`
+
+for (const [name, source] of [['install.sh', INSTALL], ['update.sh', UPDATE], ['deploy.sh', DEPLOY]] as const) {
+  test(`marker: ${name} reaches "released" only through a release the helper confirmed (exit 0)`, () => {
+    const results = {
+      confirmed: claimOf(bash(releaseRig(source, 0, 'restored')).out),
+      lostRecord: claimOf(bash(releaseRig(source, 4, 'restored')).out),
+      failedNotHeld: claimOf(bash(releaseRig(source, 1, 'restored')).out),
+      failedStillHeld: claimOf(bash(releaseRig(source, 1, 'held')).out),
+    }
+    console.log(`  ${name}: ${JSON.stringify(results)}`)
+    assert.equal(results.confirmed, 'CLAIM=released UP=false VERIFIED=true', 'precondition: a confirmed release is "released"')
+    assert.equal(results.lostRecord, 'CLAIM=unknown UP=false VERIFIED=false', 'a lost record (exit 4) lowers the fence flag but proves nothing about the grants')
+    assert.equal(results.failedNotHeld, 'CLAIM=unknown UP=false VERIFIED=false', 'a failed release whose ACL does not show the fence is not a verified release either')
+    assert.equal(results.failedStillHeld, 'CLAIM=held UP=true VERIFIED=false')
+  })
+
+  test(`marker: ${name} clears the verified state whenever it starts to raise a fence again`, () => {
+    const lines = source.split('\n')
+    const raises = lines.map((l, i) => [l, i] as const).filter(([l]) => /^\s*db_fence_raise "/.test(l))
+    assert.ok(raises.length >= 2, 'precondition: both the first raise and the re-fence are present')
+    for (const [, i] of raises) {
+      const window = lines.slice(Math.max(0, i - 4), i).join('\n')
+      console.log(`  ${name}: db_fence_raise at line ${i + 1} preceded by ${JSON.stringify(lines[i - 1].trim())}`)
+      assert.match(window, /DB_FENCE_RELEASE_VERIFIED=false/, `${name}: line ${i + 1}`)
+    }
+    const trues = lines.filter((l) => /DB_FENCE_RELEASE_VERIFIED=true/.test(l) && !/^\s*#/.test(l))
+    assert.equal(trues.length, 1, `${name}: exactly one statement can set the verified state`)
+  })
+}

@@ -875,6 +875,11 @@ SCHEMA_TOUCHED=false
 # start step releases the fence while SCHEMA_TOUCHED stays true, so a failure to start must
 # not report a fence that is no longer there (Codex r3 HIGH).
 DB_FENCE_UP=false
+# Has THIS run seen the database confirm a release of a fence it raised or adopted (the helper's exit 0)?
+# DB_FENCE_UP=false does not say so: it is also cleared by a release that lost its record (exit 4) and by one
+# that failed with the ACL not showing the fence, neither of which proves the revoked grants came back.
+# Only db_connect_fence_claim() reads this, and only to decide whether a marker may say `released`.
+DB_FENCE_RELEASE_VERIFIED=false
 # DID THIS RUN EVER RAISE A CONNECTION FENCE (o3d-2sm1.5, Codex r12 HIGH). DB_FENCE_UP is
 # lowered again by every release, so it cannot answer "was there a fence to release at all".
 # This one is raised once and never lowered: if it is true and the release then reports it has
@@ -6705,6 +6710,9 @@ fence_db_connections() {
   # ${APP_USER} -- so the account being defended against chose what a later release would
   # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
   # durable publication in between; see lib/db-fence-protected.sh.
+  # An attempt to raise a fence invalidates any earlier verified release: if this one fails part-way, the database
+  # is in a state nothing here has seen, and the marker must not go on saying `released`.
+  DB_FENCE_RELEASE_VERIFIED=false
   db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
 
   case "${rc}" in
@@ -6724,6 +6732,7 @@ fence_db_connections() {
       # front of it. The re-fence path has had this order since r13 (see refence_db_connections);
       # this is that order on the path the ordinary cutover takes.
       DB_FENCE_UP=true
+      DB_FENCE_RELEASE_VERIFIED=false
       DB_FENCE_RAISED=true
       # THE MIGRATION CONNECTS AS THE MIGRATION ROLE (it was the admin until owner decision C3) AND RUNS AS THE APPLICATION ROLE (o3d-2sm1.5,
       # Codex r4 CRITICAL). This installer makes the APPLICATION role the database owner, and
@@ -6778,6 +6787,7 @@ fence_db_connections() {
       # fatal after one. This arm aborts like exit 3 does, but it says the opposite thing about
       # the database: exit 3 revoked nothing, this revoked and is holding.
       DB_FENCE_UP=true
+      DB_FENCE_RELEASE_VERIFIED=false
       DB_FENCE_RAISED=true
       die "THE FENCE MAY BE STANDING AND CANNOT BE CALLED GOOD (exit 5): the REVOKEs were COMMITTED, or were issued to a COMMIT whose acknowledgement was lost — the reason this run will not call the database fenced is printed above. CONNECT may currently be denied to every grantee it took it from, which may include PUBLIC, monitoring, backup, BI and a second application, so this is NOT a run that changed nothing. Nothing has been migrated. Release it before starting anything: ${DB_FENCE_RELEASE_CMD}"
       ;;
@@ -6881,6 +6891,7 @@ release_db_connections() {
   if [[ "${rc}" -eq 0 ]]; then
     MIGRATION_DATABASE_URL="${DATABASE_URL}"
     DB_FENCE_UP=false
+    DB_FENCE_RELEASE_VERIFIED=true
     # AND ROOT CLEARS THE RECORD, BECAUSE THE HELPER CANNOT (o3d-secops r23). The authority lives
     # in a directory only this account may write, so the unlink is this account own. It happens
     # AFTER the release has been verified: until then the record is the only account of what was
@@ -7052,6 +7063,9 @@ refence_db_connections() {
   # ${APP_USER} -- so the account being defended against chose what a later release would
   # GRANT CONNECT to. db_fence_raise() runs the helper twice with a privileged validation and a
   # durable publication in between; see lib/db-fence-protected.sh.
+  # An attempt to raise a fence invalidates any earlier verified release: if this one fails part-way, the database
+  # is in a state nothing here has seen, and the marker must not go on saying `released`.
+  DB_FENCE_RELEASE_VERIFIED=false
   db_fence_raise "${fence_script}" "${DB_FENCE_STATE}" "${DB_FENCE_IDENTITY_ARGS[@]:-}" || rc=$?
   # EVERY POST-COMMIT RESULT RAISES THE STICKY FLAG (o3d-2sm1.5, Codex r13 HIGH). Exit 5 says
   # the REVOKEs are COMMITTED and standing: this call could not call the database fenced, but it
@@ -7060,6 +7074,7 @@ refence_db_connections() {
   # past. Raised here, that release becomes the refusal it should always have been.
   if [[ "${rc}" -eq 5 ]]; then
     DB_FENCE_UP=true
+    DB_FENCE_RELEASE_VERIFIED=false
     DB_FENCE_RAISED=true
     warn "THE RE-FENCE COMMITTED ITS REVOKES AND COULD NOT CALL THE DATABASE FENCED (exit 5)."
     warn "CONNECT is denied to the grantees it was taken from and nothing here has given it back,"
@@ -7072,6 +7087,7 @@ refence_db_connections() {
   fi
   [[ "${rc}" -eq 0 ]] || return 1
   DB_FENCE_UP=true
+  DB_FENCE_RELEASE_VERIFIED=false
   DB_FENCE_RAISED=true
   # DO NOT SUBSTITUTE THE ADMIN URL WHEN THE COMPOSER REFUSES (o3d-2sm1.5, r6).
   # `--print-migration-url` throws precisely so that a migration can never run AS THE ADMIN

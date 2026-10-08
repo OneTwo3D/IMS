@@ -5636,11 +5636,12 @@ db_fence_report_candidate_digest() {
 # KNOWS at that moment, and it may not claim a thing it has not seen happen:
 #
 #   held        this run's fence is standing (raised or adopted and not since lowered)
-#   released    this run raised, or adopted, a fence and has since lowered it (the release was verified
-#               by the database before DB_FENCE_UP was cleared)
+#   released    this run raised, or adopted, a fence and the DATABASE CONFIRMED its release (the helper's exit 0),
+#               with no later attempt to raise one: DB_FENCE_RELEASE_VERIFIED, which nothing else sets
 #   not-raised  nothing has been stopped yet, or this is a first install that takes no fence at all:
 #               there is no fence to be standing
-#   unknown     the stop has been requested but this run has not seen a fence raised: a fence may be
+#   unknown     a fence was raised and its release was never confirmed (lost record, indeterminate release,
+#               failed re-fence), or the stop has been requested but this run has not seen a fence raised: a fence may be
 #               raised at any instant after this line is written, and the marker cannot be rewritten
 #               by a process that is killed. The DATABASE says which (datacl, db-connect-fence.json,
 #               release-db-fence), never this file.
@@ -5650,8 +5651,16 @@ db_fence_report_candidate_digest() {
 db_connect_fence_claim() {
   if ${DB_FENCE_UP:-false}; then
     echo held
-  elif ${DB_FENCE_RAISED:-false}; then
+  elif ${DB_FENCE_RELEASE_VERIFIED:-false}; then
+    # The database confirmed a release of a fence this run raised or adopted (the helper's exit 0), and no
+    # later attempt to raise one has started.
     echo released
+  elif ${DB_FENCE_RAISED:-false}; then
+    # Raised, and not standing as far as this run knows -- but never seen RELEASED: the record was lost
+    # (exit 4), the release failed with the ACL not showing the fence, or a re-fence failed part-way. None of
+    # those proves the revoked grants came back, and "released" would be the one word that is wrong in the
+    # direction that matters.
+    echo unknown
   elif ${FIRST_INSTALL_NO_CREDENTIALED_FENCE:-false}; then
     echo not-raised
   elif ${FENCE_ARMED:-false}; then
