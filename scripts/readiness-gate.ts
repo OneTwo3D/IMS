@@ -49,6 +49,7 @@ import {
   runNpmScript,
   type GateDeps,
 } from '../lib/ops/readiness-gate-collect.ts'
+import { readBuildIdentity } from '../lib/ops/build-identity.ts'
 import { publishGateReport } from '../lib/ops/readiness-gate-publish.ts'
 import { checkAncestors, verifyPublishedReport } from '../lib/ops/published-report.ts'
 import { OUTBOUND_CONNECTORS } from '../lib/security/outbound-write-hold-constants.ts'
@@ -110,11 +111,25 @@ export function parseGateArgs(argv: readonly string[]): GateCliArgs | { error: s
   return out
 }
 
+/**
+ * The acceptance file is a DECISION, so who could have written it matters. It is used only if it is a regular
+ * file (opened O_NOFOLLOW) owned by root or the running account and not writable by group or others, and its
+ * directory and every ancestor pass the gate's own ancestor policy (lib/ops/published-report.ts). Otherwise
+ * the whole file is rejected and accepts nothing: a file another account can edit could turn a blocking
+ * warning into a GO.
+ */
+export class UntrustedAcceptanceFile extends Error {}
+
 function readAcceptanceText(file: string): string {
   const fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
   try {
     const info = fstatSync(fd)
-    if (!info.isFile()) throw new Error(`${file} is not a regular file`)
+    if (!info.isFile()) throw new UntrustedAcceptanceFile(`${file} is not a regular file`)
+    const me = typeof process.getuid === 'function' ? process.getuid() : 0
+    if (info.uid !== 0 && info.uid !== me) throw new UntrustedAcceptanceFile(`${file} is owned by uid ${info.uid}, neither root nor the running account`)
+    if ((info.mode & 0o022) !== 0) throw new UntrustedAcceptanceFile(`${file} is writable by group or others`)
+    const ancestors = checkAncestors(path.dirname(file), 'acceptance file directory')
+    if (ancestors) throw new UntrustedAcceptanceFile(ancestors)
     if (info.size > MAX_ACCEPTANCE_BYTES) throw new Error(`${file} is larger than ${MAX_ACCEPTANCE_BYTES} bytes`)
     const buffer = Buffer.alloc(info.size)
     let read = 0
@@ -136,6 +151,7 @@ export function loadAcceptances(args: Pick<GateCliArgs, 'acceptances'>, repoRoot
   try {
     return { file: parseAcceptanceFile(readAcceptanceText(file)), path: file }
   } catch (error) {
+    if (error instanceof UntrustedAcceptanceFile) return { file: { status: 'rejected', problems: [`the acceptance file was not used: ${error.message}`], entries: [] }, path: file }
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT' && !explicit) return { file: parseAcceptanceFile(null), path: null }
     if (explicit) return { refused: `the acceptance file ${file} could not be read (${code ?? (error as Error).message})` }
@@ -152,6 +168,7 @@ function defaultDeps(env: Record<string, string | undefined>): GateDeps {
     readReconciliation: defaultReadReconciliation,
     runScript: runNpmScript,
     readPackageScripts: () => readPackageScriptsFrom(REPO_ROOT),
+    readBuildIdentity: () => readBuildIdentity(REPO_ROOT),
     readNewestRehearsal: (dir) => readNewestRehearsal(dir, verifyPublishedReport),
     env,
     repoRoot: REPO_ROOT,

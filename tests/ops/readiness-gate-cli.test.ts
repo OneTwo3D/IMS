@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import test, { after } from 'node:test'
 
@@ -8,7 +8,7 @@ import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import { READINESS_GATE_EXIT_CODES } from '../../lib/ops/readiness-gate-constants.ts'
 import type { GateDeps } from '../../lib/ops/readiness-gate-collect.ts'
 import { parseGateArgs, runReadinessGate } from '../../scripts/readiness-gate.ts'
-import { NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
+import { GATE_BUILD, NOW, acceptanceText, cleanInvariant, cleanOutbound, greenRehearsal, validAcceptance } from '../helpers/readiness-gate-fixtures.ts'
 
 const ROOT = process.cwd()
 
@@ -32,6 +32,7 @@ function deps(overrides: Partial<GateDeps> = {}): GateDeps {
     readReconciliation: async () => ({ latest: { id: 'r', status: 'COMPLETED', totalCount: 0, warningCount: 0, criticalCount: 0, createdAt: NOW.toISOString() }, proof: { state: 'proven' }, blockers: [], warnings: [] }),
     runScript: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
     readPackageScripts: () => ({}),
+    readBuildIdentity: () => GATE_BUILD,
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r' }),
     env: URL_ENV,
     repoRoot: ROOT,
@@ -211,4 +212,45 @@ test('the real command line: no arguments exits 2 and prints the exit-code table
   const noUrl = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/readiness-gate.ts', '--phase', 'P0'], { cwd: ROOT, env, encoding: 'utf8' })
   assert.equal(noUrl.status, 2)
   assert.match(noUrl.stderr, /DATABASE_URL is not set/)
+})
+
+test('an acceptance file another account could have written is NOT used [mutation: ownership/permission check removed]', async () => {
+  const warned = cleanInvariant({ inventory: [{ severity: 'warning', code: 'stock_movement_value_mismatch', productId: 'p1', warehouseId: 'w1', message: 'm' }] })
+  const id = 'invariant:inventory:stock_movement_value_mismatch:product=p1,warehouse=w1'
+  const attempt = async (prepare: (dir: string, file: string) => string): Promise<{ code: number; record: { acceptanceFile: { status: string; problems: string[] } } | null }> => {
+    const base = scratchBase('ims-gate-trust-')
+    const file = path.join(base, 'acceptances.json')
+    writeFileSync(file, acceptanceText([validAcceptance(id)]), { mode: 0o600 })
+    chmodSync(file, 0o600)
+    const target = prepare(base, file)
+    const reportDir = path.join(scratchBase('ims-gate-trustrep-'), 'reports')
+    const code = await runReadinessGate({ argv: ['--phase', 'P0', '--acceptances', target, '--report-dir', reportDir], env: URL_ENV, deps: deps({ runInvariant: async () => warned }), stdout: () => undefined, stderr: () => undefined, disconnect: async () => undefined })
+    const [runId] = existsSync(reportDir) ? readdirSync(reportDir) : []
+    const record = runId ? JSON.parse(readFileSync(path.join(reportDir, runId, 'readiness-gate.json'), 'utf8')) : null
+    return { code, record }
+  }
+  // Control: the identical file, owned by us, mode 600, in a private directory, IS used (exit 10).
+  const control = await attempt((_dir, file) => file)
+  assert.equal(control.code, 10, 'control: a trusted acceptance file is honoured')
+  console.log('precondition: the control file was honoured; now planting writable shapes')
+
+  const shapes: Array<[string, (dir: string, file: string) => string, RegExp]> = [
+    ['group-writable file', (_d, f) => { chmodSync(f, 0o660); return f }, /writable by group or others/],
+    ['world-writable file', (_d, f) => { chmodSync(f, 0o666); return f }, /writable by group or others/],
+    ['group-writable directory', (d, f) => { chmodSync(d, 0o770); return f }, /acceptance file directory/],
+    ['world-writable directory', (d, f) => { chmodSync(d, 0o777); return f }, /acceptance file directory/],
+  ]
+  for (const [label, prepare, message] of shapes) {
+    const result = await attempt(prepare)
+    assert.equal(result.code, 1, `${label}: the warning stays unaccepted (NO-GO)`)
+    assert.equal(result.record?.acceptanceFile.status, 'rejected', label)
+    assert.match(result.record!.acceptanceFile.problems.join(' '), message, label)
+  }
+  // A symlink at the acceptance path is never followed: with an explicit path that is a refusal.
+  const linked = await attempt((d, f) => { const l = path.join(d, 'link.json'); symlinkSync(f, l); return l })
+  assert.equal(linked.code, 2, 'a symlinked acceptance file is refused, not followed')
+  // A directory where the file should be.
+  const dir = await attempt((d) => { mkdirSync(path.join(d, 'asdir'), { mode: 0o700 }); return path.join(d, 'asdir') })
+  assert.equal(dir.code, 1, 'a directory is not a regular file: the file is rejected and the warning stays unaccepted')
+  assert.equal(dir.record?.acceptanceFile.status, 'rejected')
 })

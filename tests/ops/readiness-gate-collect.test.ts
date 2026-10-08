@@ -17,10 +17,10 @@ import {
   type GateDeps,
 } from '../../lib/ops/readiness-gate-collect.ts'
 import { FORBIDDEN_ENV_PATTERNS } from '../../lib/ops/first-install-rehearsal.ts'
-import { READ_SYNC_STATUS_SCRIPT } from '../../lib/ops/readiness-gate-constants.ts'
+import { READ_SYNC_STATUS_SCRIPT, REQUIRED_READ_SYNC_STREAMS } from '../../lib/ops/readiness-gate-constants.ts'
 import { decideVerdict } from '../../lib/ops/readiness-gate.ts'
 import type { AccountingReconciliationReadiness } from '../../lib/ops/rollout-readiness.ts'
-import { DAY, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
+import { DAY, GATE_BUILD, NOW, NO_ACCEPTANCES, cleanInvariant, cleanOutbound, greenRehearsal } from '../helpers/readiness-gate-fixtures.ts'
 
 /**
  * COLLECTION: every dependency failing is `unreadable`, never silence; the child environment is a
@@ -49,6 +49,7 @@ function deps(overrides: Partial<GateDeps> = {}, scripts: Record<string, string>
     readReconciliation: async () => goodReconciliation(),
     runScript: async (spec) => { spawned.push(spec); return { exitCode: 0, stdout: 'SKIPPED: npm run test:concurrency', stderr: '', timedOut: false } },
     readPackageScripts: () => scripts,
+    readBuildIdentity: () => GATE_BUILD,
     readNewestRehearsal: () => ({ digest: { ok: true }, parsed: greenRehearsal(), location: '/r/readiness-report.json' }),
     env: { PATH: '/usr/bin', HOME: '/home/x', DATABASE_URL: 'postgresql://u:p@127.0.0.1:5432/db', SMTP_PASSWORD: 'secret', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example', MINTSOFT_API_KEY: 'k', NODE_OPTIONS: '--require /evil.js', IMS_CONCURRENCY_SCRATCH_DB: 'x' },
     repoRoot: ROOT,
@@ -100,14 +101,16 @@ test('an unreadable invariant report also makes R3, R4 and R15 unreadable (they 
 test('read-sync liveness is optional until the script exists, then required and strictly read', async () => {
   const absent = deps()
   assert.equal((await collectGateResults(OPTIONS, absent)).results['read-sync-liveness']!.kind, 'not-available')
-  const stdout = JSON.stringify({ streams: [{ stream: 'wc', state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00Z' }] })
+  const entry = (stream: string, over: object = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00Z', ageMs: 3600000, maxAgeMs: 259200000, ...over })
+  const stdout = JSON.stringify({ entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name)), scheduler: { examined: true, unreadable: null, unscheduled: [] } })
   const present = deps({}, { [READ_SYNC_STATUS_SCRIPT]: 'tsx scripts/read-sync-status.ts' })
   present.runScript = async (spec) => { present.spawned.push(spec); return { exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? stdout : '', stderr: '', timedOut: false } }
   assert.equal((await collectGateResults(OPTIONS, present)).results['read-sync-liveness']!.kind, 'pass')
-  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ streams: [{ stream: 'wc', state: 'stale' }] }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
+  const stale = deps({ runScript: async (spec) => ({ exitCode: 0, stdout: spec.script === READ_SYNC_STATUS_SCRIPT ? JSON.stringify({ entries: REQUIRED_READ_SYNC_STREAMS.map((name) => entry(name, { state: 'stale' })), scheduler: { examined: true, unreadable: null, unscheduled: [] } }) : '', stderr: '', timedOut: false }) }, { [READ_SYNC_STATUS_SCRIPT]: 'x' })
   assert.equal((await collectGateResults(OPTIONS, stale)).results['read-sync-liveness']!.kind, 'fail')
   const spawnedPresent = present.spawned.map((spec) => `${spec.script}:${spec.silent}`)
   assert.deepEqual(spawnedPresent, ['validate:db:false', `${READ_SYNC_STATUS_SCRIPT}:true`])
+  assert.deepEqual(present.spawned[1]!.args, ['--json'], 'the status script is asked for its JSON form')
 })
 
 test('children get a whitelisted environment: no credential, no grant, no SMTP, no NODE_OPTIONS, no scratch-DB switch', async () => {
@@ -123,7 +126,7 @@ test('children get a whitelisted environment: no credential, no grant, no SMTP, 
   for (const name of CHILD_ENV_WHITELIST) assert.ok(!FORBIDDEN_ENV_PATTERNS.some((pattern) => pattern.test(name)) || name === 'DATABASE_URL', name)
   assert.equal(Object.keys(buildChildEnv({ PATH: '', HOME: undefined })).includes('PATH'), false, 'an empty value is not passed on')
   // No secret on a command line: the spec carries only a fixed script name.
-  assert.deepEqual(Object.keys(d.spawned[0]!).sort(), ['cwd', 'env', 'script', 'silent', 'timeoutMs'])
+  assert.deepEqual(Object.keys(d.spawned[0]!).sort(), ['cwd', 'env', 'script', 'silent', 'timeoutMs'], 'no argument carries anything but fixed words')
   assert.equal(/postgres/.test(d.spawned[0]!.script), false)
 })
 

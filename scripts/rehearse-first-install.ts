@@ -60,6 +60,8 @@ import { pathToFileURL } from 'node:url'
 
 import pg from 'pg'
 
+import { readBuildIdentity, type BuildIdentity } from '../lib/ops/build-identity.ts'
+
 import {
   ancestorProblem,
   checkAncestors,
@@ -127,6 +129,8 @@ export type RehearsalHooks = {
   clusterStarter?: typeof startCluster
   afterProvision?: (client: pg.Client) => Promise<void>
   afterRestore?: (client: pg.Client) => Promise<void>
+  /** Replaces reading the checkout's build identity from git. */
+  buildIdentity?: () => BuildIdentity | null
   tamperStepEnv?: (id: StepId, env: Record<string, string>) => void
 }
 
@@ -1075,8 +1079,15 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
 
   const order = new Map(STEP_CATALOGUE.map((definition, index) => [definition.id, index]))
   results.sort((a, b) => order.get(a.id)! - order.get(b.id)!)
+  let build: BuildIdentity | null = null
+  try {
+    build = hooks.buildIdentity ? hooks.buildIdentity() : readBuildIdentity(repoRoot)
+  } catch (error) {
+    notes.push(`The build identity of ${repoRoot} could not be read (${error instanceof Error ? error.message : String(error)}); the readiness gate will refuse this report.`)
+  }
   const report = buildReport({
     runId,
+    build,
     startedAt: startedAt.toISOString(),
     finishedAt: new Date().toISOString(),
     host: { node: process.version, postgresServer },

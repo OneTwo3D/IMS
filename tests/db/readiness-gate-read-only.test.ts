@@ -82,6 +82,7 @@ test('[readiness gate] DB: the default collectors complete over a READ-ONLY conn
       readReconciliation: defaultReadReconciliation,
       runScript: async () => ({ exitCode: 0, stdout: '', stderr: '', timedOut: false }),
       readPackageScripts: () => ({}),
+      readBuildIdentity: () => ({ commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true }),
       readNewestRehearsal: () => ({ none: 'not under test' }),
       env: { PATH: process.env.PATH, DATABASE_URL: process.env.DATABASE_URL },
       repoRoot: process.cwd(),

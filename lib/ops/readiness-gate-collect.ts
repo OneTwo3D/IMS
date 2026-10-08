@@ -45,6 +45,7 @@ import {
   type OutboundEvidence,
   type RehearsalEvidence,
 } from '@/lib/ops/readiness-gate'
+import type { BuildIdentity } from '@/lib/ops/build-identity'
 import type { AccountingReconciliationReadiness } from '@/lib/ops/rollout-readiness'
 
 export type ChildResult = { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean }
@@ -53,6 +54,8 @@ export type ChildSpec = {
   /** The npm script name. The command is always `npm run <script>`; no other program is ever run. */
   script: string
   silent: boolean
+  /** Fixed arguments after `--` (never a credential). */
+  args?: readonly string[]
   env: Record<string, string>
   cwd: string
   timeoutMs: number
@@ -65,6 +68,8 @@ export type GateDeps = {
   readReconciliation: (now: Date) => Promise<AccountingReconciliationReadiness>
   runScript: (spec: ChildSpec) => Promise<ChildResult>
   readPackageScripts: () => Record<string, string>
+  /** The commit and tree of the checkout the gate runs from. Throws when git cannot say. */
+  readBuildIdentity: () => BuildIdentity
   /** The newest rehearsal report in `dir`, or a reason there is none. Throws when the directory cannot be read. */
   readNewestRehearsal: (dir: string, now: Date) => RehearsalEvidence | { none: string }
   /** The environment of this process, read only by name. */
@@ -124,7 +129,7 @@ function tail(text: string): string {
 /** `npm run [--silent] <script>` with no shell. The child leads its own process group so a timeout stops what it started. */
 export function runNpmScript(spec: ChildSpec): Promise<ChildResult> {
   return new Promise((resolve) => {
-    const args = ['run', ...(spec.silent ? ['--silent'] : []), spec.script]
+    const args = ['run', ...(spec.silent ? ['--silent'] : []), spec.script, ...(spec.args && spec.args.length > 0 ? ['--', ...spec.args] : [])]
     const child = spawn('npm', args, { cwd: spec.cwd, env: spec.env as NodeJS.ProcessEnv, stdio: ['ignore', 'pipe', 'pipe'], detached: true, shell: false })
     let stdout = ''
     let stderr = ''
@@ -298,9 +303,15 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
 
   // 4. Rehearsal.
   results['first-install-rehearsal'] = await guarded('the rehearsal report', () => {
+    let gateBuild: BuildIdentity | { unreadable: string }
+    try {
+      gateBuild = deps.readBuildIdentity()
+    } catch (error) {
+      gateBuild = { unreadable: describe(error) }
+    }
     const found = deps.readNewestRehearsal(options.rehearsalDir, now)
     if ('none' in found) return { kind: 'fail', reasons: [found.none] } as CheckResult
-    return assessRehearsalReport(found, now)
+    return assessRehearsalReport(found, now, gateBuild)
   })
 
   // 5. Reconciliation completeness.
@@ -313,9 +324,9 @@ export async function collectGateResults(options: CollectOptions, deps: GateDeps
     if (typeof script !== 'string' || script.trim() === '') {
       return { kind: 'not-available', reason: `package.json has no ${READ_SYNC_STATUS_SCRIPT} script on this tree, so read-sync liveness is not checked; it becomes required the moment the script exists` } as CheckResult
     }
-    const run = await deps.runScript({ script: READ_SYNC_STATUS_SCRIPT, silent: true, env: childEnv, cwd: deps.repoRoot, timeoutMs: READ_SYNC_TIMEOUT_MS })
+    const run = await deps.runScript({ script: READ_SYNC_STATUS_SCRIPT, silent: true, args: ['--json'], env: childEnv, cwd: deps.repoRoot, timeoutMs: READ_SYNC_TIMEOUT_MS })
     if (run.timedOut || run.exitCode === null) return { kind: 'unreadable', reason: `${READ_SYNC_STATUS_SCRIPT} did not complete` } as CheckResult
-    return assessReadSyncStatus(run)
+    return assessReadSyncStatus(run, now)
   })
 
   // 7. The reconciliation pack, as slots.

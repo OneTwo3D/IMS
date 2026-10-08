@@ -73,7 +73,17 @@ export const ACCEPTANCES_DEFAULT_FILE = 'ops/readiness-warning-acceptances.json'
 
 /** The package.json script the read-sync liveness check runs once it exists (see READ_SYNC_CONTRACT). */
 export const READ_SYNC_STATUS_SCRIPT = 'read-sync:status'
-export const READ_SYNC_CONTRACT = 'the script prints exactly one JSON object {"streams":[{"stream":"<name>","state":"fresh"|"stale"|"never-succeeded"|"unknown","lastSuccessAt":"<ISO time>"|null}]} with at least one stream, and exits 0'
+export const READ_SYNC_CONTRACT_VERSION = 'read-sync status v1 (as built in the WP8 branch at 4e7df144; UNPROVEN until that merges: if its JSON changes, this and assessReadSyncStatus change with it)'
+/** The streams that must all be reported, each fresh. Mirrors that status API's stream list. */
+export const REQUIRED_READ_SYNC_STREAMS = [
+  'woocommerce-order-sweep',
+  'mintsoft-stock-sync',
+  'mintsoft-dispatch-poll',
+  'mintsoft-order-status',
+  'xero-balance-snapshots',
+  'xero-tax-rates',
+] as const
+export const READ_SYNC_CONTRACT = `${READ_SYNC_CONTRACT_VERSION}: \`npm run --silent read-sync:status\` exits 0 and prints one JSON object with an \`entries\` list (one per stream, or per binding for the stock sync) carrying \`stream\`, \`state\` (must be fresh), \`lastSuccessAt\` (a valid ISO time, not in the future), \`maxAgeMs\` and \`ageMs\`, covering all of ${REQUIRED_READ_SYNC_STREAMS.join(', ')}, and a \`scheduler\` object that was examined, readable, with nothing unscheduled`
 
 export const DEFAULT_REPORT_DIR = '/var/tmp/ims-readiness-gate-reports'
 export const DEFAULT_REHEARSAL_DIR = '/var/tmp/ims-rehearsal-reports'
@@ -161,7 +171,7 @@ export const CHECK_CATALOGUE: readonly CheckDefinition[] = [
     id: 'first-install-rehearsal',
     title: 'Latest first-install rehearsal is present, GREEN and fresh',
     requirement: ALL_PHASES('required'),
-    expectation: ALL_PHASES(`The newest report in the rehearsal directory has an intact digest pair, is GREEN with every step required and passed (outbound status included), a clean teardown, and finished within ${REHEARSAL_MAX_AGE_DAYS} days.`),
+    expectation: ALL_PHASES(`The newest report in the rehearsal directory has an intact digest pair, was made for the same commit and source tree as the checkout the gate runs from (both must have no uncommitted changes; an older report format that records no build is refused), is GREEN with every step required and passed (outbound status included), a clean teardown, and finished within ${REHEARSAL_MAX_AGE_DAYS} days.`),
   },
   {
     id: 'reconciliation-completeness',
@@ -229,7 +239,7 @@ export const READINESS_GATE_DOC_BLOCKS: Record<ReadinessGateDocBlockId, string> 
     renderChecksTable(),
   ].join('\n'),
   acceptances: [
-    'A warning is not a failure, and it is not a pass either: it must be accepted in writing, one warning at a time, or the verdict is NO-GO. The acceptance file is JSON with `schemaVersion` 1 and an `acceptances` list. Every entry names exactly one warning by its `warningId` (no patterns, no wildcards) and carries `acceptedBy` (who), `acceptedAt` (when, an ISO time not in the future), `reason` (why, at least 15 characters), `expiresAt` (an ISO time after `acceptedAt`, no more than 90 days later) and `phases` (the phases it applies to, a non-empty list of P0, P1, P2). An entry that has expired, that is not yet in effect, that does not list the phase being asked about, or that is malformed does not accept anything; a file that cannot be read, has an unknown field, or names the same warning twice is rejected as a whole and nothing is accepted. A failure is never acceptable: only findings the report labels as warnings can be covered. An acceptance for a warning that no longer occurs is listed as unused and does no harm.',
+    'A warning is not a failure, and it is not a pass either: it must be accepted in writing, one warning at a time, or the verdict is NO-GO. The acceptance file is JSON with `schemaVersion` 1 and an `acceptances` list. Every entry names exactly one warning by its `warningId` (no patterns, no wildcards) and carries `acceptedBy` (who), `acceptedAt` (when, an ISO time not in the future), `reason` (why, at least 15 characters), `expiresAt` (an ISO time after `acceptedAt`, no more than 90 days later) and `phases` (the phases it applies to, a non-empty list of P0, P1, P2). An entry that has expired, that is not yet in effect, that does not list the phase being asked about, or that is malformed does not accept anything; a file that cannot be read, has an unknown field, or names the same warning twice is rejected as a whole and nothing is accepted. A failure is never acceptable: only findings the report labels as warnings can be covered. An acceptance for a warning that no longer occurs is listed as unused and does no harm. Because an acceptance is a decision, the file is used only if it is a regular file (a symlink is never followed) owned by root or the account running the gate, not writable by group or others, in a directory whose every ancestor only root or that account can modify; otherwise the whole file is rejected, the report says why, and nothing is accepted.',
   ].join('\n'),
   'exit-codes': renderReadinessGateExitCodeTable(),
 }

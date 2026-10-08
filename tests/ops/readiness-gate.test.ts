@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { compareBuildIdentity, readBuildIdentity, type BuildIdentity } from '../../lib/ops/build-identity.ts'
 import { verifyPublishedReport } from '../../lib/ops/published-report.ts'
 import {
   ACCEPTANCE_MAX_DAYS,
@@ -8,6 +9,7 @@ import {
   PACK_ITEMS,
   READINESS_GATE_EXIT_CODES,
   REHEARSAL_MAX_AGE_DAYS,
+  REQUIRED_READ_SYNC_STREAMS,
   readinessGateExitCode,
   type ReadinessPhase,
 } from '../../lib/ops/readiness-gate-constants.ts'
@@ -27,6 +29,7 @@ import {
 } from '../../lib/ops/readiness-gate.ts'
 import {
   DAY,
+  GATE_BUILD,
   NOW,
   NO_ACCEPTANCES,
   PASS,
@@ -149,27 +152,27 @@ test('there is no way to GO with a RED rehearsal: every red shape of the report,
     ['no teardown', greenRehearsal({ teardown: null }), { ok: true }],
     ['interrupted', greenRehearsal({ interrupted: 'SIGTERM' }), { ok: true }],
     ['wrong tool', greenRehearsal({ tool: 'something-else' as never }), { ok: true }],
-    ['wrong schema', greenRehearsal({ schemaVersion: 2 as never }), { ok: true }],
+    ['wrong schema', greenRehearsal({ schemaVersion: 3 as never }), { ok: true }],
     ['stale by one day', greenRehearsal({ finishedAt: new Date(NOW.getTime() - (REHEARSAL_MAX_AGE_DAYS + 1) * DAY).toISOString() }), { ok: true }],
     ['finished in the future', greenRehearsal({ finishedAt: new Date(NOW.getTime() + 3600_000).toISOString() }), { ok: true }],
     ['no finishedAt', greenRehearsal({ finishedAt: undefined as never }), { ok: true }],
     ['digest does not verify', greenRehearsal(), { ok: false, reason: 'the Markdown does not match' }],
   ]
   for (const [label, report, digest] of redShapes) {
-    const result = assessRehearsalReport({ digest, parsed: report, location: '/x/readiness-report.json' }, NOW)
+    const result = assessRehearsalReport({ digest, parsed: report, location: '/x/readiness-report.json' }, NOW, GATE_BUILD)
     assert.notEqual(result.kind, 'pass', `${label}: the assessor must not pass it`)
     const verdict = verdictOf('P0', { ...allPassing(), 'first-install-rehearsal': result })
     assert.equal(verdict.verdict, 'NO-GO', label)
   }
-  const green = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal(), location: '/x' }, NOW)
+  const green = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal(), location: '/x' }, NOW, GATE_BUILD)
   assert.equal(green.kind, 'pass', 'control: the same assessor passes a GREEN, fresh, complete report')
-  const edge = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal({ finishedAt: new Date(NOW.getTime() - REHEARSAL_MAX_AGE_DAYS * DAY + 1000).toISOString() }), location: '/x' }, NOW)
+  const edge = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal({ finishedAt: new Date(NOW.getTime() - REHEARSAL_MAX_AGE_DAYS * DAY + 1000).toISOString() }), location: '/x' }, NOW, GATE_BUILD)
   assert.equal(edge.kind, 'pass', 'control: just inside the age limit passes')
   console.log(`precondition: ${redShapes.length} red shapes examined, plus two controls`)
 })
 
 test('a rehearsal report that is not an object is unreadable', () => {
-  assert.equal(assessRehearsalReport({ digest: { ok: true }, parsed: null, location: '/x' }, NOW).kind, 'unreadable')
+  assert.equal(assessRehearsalReport({ digest: { ok: true }, parsed: null, location: '/x' }, NOW, GATE_BUILD).kind, 'unreadable')
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -339,22 +342,44 @@ test('pack items R3, R4 and R15 are read from the same invariant report', () => 
   assert.equal(derivePackItemFromInvariant('R3', truncated, assessInvariantReport(truncated)).kind, 'unreadable', 'a truncated report cannot establish R3')
 })
 
-test('read-sync status: strict contract; empty or malformed is unreadable, a stale stream fails', () => {
-  const run = (stdout: string, exitCode: number | null = 0) => assessReadSyncStatus({ exitCode, stdout })
-  const fresh = (name: string) => ({ stream: name, state: 'fresh', lastSuccessAt: '2026-10-08T11:00:00Z' })
-  assert.equal(run(JSON.stringify({ streams: [fresh('wc'), fresh('xero')] })).kind, 'pass')
-  assert.equal(run(JSON.stringify({ streams: [fresh('wc'), { stream: 'xero', state: 'stale', lastSuccessAt: null }] })).kind, 'fail')
-  for (const [label, out, code] of [
-    ['empty streams', JSON.stringify({ streams: [] }), 0],
-    ['not json', 'banner\n{}', 0],
-    ['no streams key', '{}', 0],
-    ['exit 1', JSON.stringify({ streams: [fresh('wc')] }), 1],
-    ['exit null', JSON.stringify({ streams: [fresh('wc')] }), null],
-    ['duplicate stream', JSON.stringify({ streams: [fresh('wc'), fresh('wc')] }), 0],
-    ['unnamed stream', JSON.stringify({ streams: [{ state: 'fresh' }] }), 0],
-  ] as const) {
-    assert.equal(run(out, code).kind, 'unreadable', label)
-  }
+const RS_NOW = NOW
+const rsEntry = (stream: string, over: Record<string, unknown> = {}) => ({ stream, instance: null, state: 'fresh', lastSuccessAt: new Date(RS_NOW.getTime() - 3600_000).toISOString(), ageMs: 3600_000, maxAgeMs: 72 * 3600_000, ...over })
+const rsAll = () => REQUIRED_READ_SYNC_STREAMS.map((stream) => rsEntry(stream))
+const rsOut = (over: Record<string, unknown> = {}) => JSON.stringify({ entries: rsAll(), scheduler: { examined: true, unreadable: null, unscheduled: [] }, ...over })
+
+test('read-sync status: strict contract; every required stream fresh WITH a valid recent last success [mutation: fresh without timestamp passes / catalogue not compared]', () => {
+  const run = (stdout: string, exitCode: number | null = 0) => assessReadSyncStatus({ exitCode, stdout }, RS_NOW)
+  assert.equal(run(rsOut()).kind, 'pass', 'control: the full catalogue, all fresh, passes')
+  const with_ = (mut: (e: ReturnType<typeof rsAll>) => unknown[]) => rsOut({ entries: mut(rsAll()) })
+  const cases: Array<[string, string, 'fail' | 'unreadable']> = [
+    ['one fresh stream with null timestamp (the reported false GO)', rsOut({ entries: [rsEntry('woocommerce-order-sweep', { lastSuccessAt: null })] }), 'fail'],
+    ['one fresh stream only: the rest of the catalogue missing', rsOut({ entries: [rsEntry('woocommerce-order-sweep')] }), 'fail'],
+    ['a required stream missing', with_((e) => e.slice(1)), 'fail'],
+    ['fresh with a null last success', with_((e) => [{ ...e[0], lastSuccessAt: null }, ...e.slice(1)]), 'fail'],
+    ['fresh with an unparseable last success', with_((e) => [{ ...e[0], lastSuccessAt: 'yesterday' }, ...e.slice(1)]), 'fail'],
+    ['last success in the future', with_((e) => [{ ...e[0], lastSuccessAt: new Date(RS_NOW.getTime() + 3600_000).toISOString() }, ...e.slice(1)]), 'fail'],
+    ['older than its own limit while labelled fresh', with_((e) => [{ ...e[0], lastSuccessAt: new Date(RS_NOW.getTime() - 100 * 3600_000).toISOString() }, ...e.slice(1)]), 'fail'],
+    ['no age limit reported', with_((e) => [{ ...e[0], maxAgeMs: null }, ...e.slice(1)]), 'fail'],
+    ['stale stream', with_((e) => [{ ...e[0], state: 'stale' }, ...e.slice(1)]), 'fail'],
+    ['never succeeded', with_((e) => [{ ...e[0], state: 'never', lastSuccessAt: null }, ...e.slice(1)]), 'fail'],
+    ['switched off', with_((e) => [{ ...e[0], state: 'off' }, ...e.slice(1)]), 'fail'],
+    ['unknown stream name', with_((e) => [...e, rsEntry('surprise')]), 'fail'],
+    ['scheduler not examined', rsOut({ scheduler: { examined: false, unreadable: null, unscheduled: [] } }), 'fail'],
+    ['job unscheduled', rsOut({ scheduler: { examined: true, unreadable: null, unscheduled: ['wc-reconcile'] } }), 'fail'],
+    ['crontab unreadable', rsOut({ scheduler: { examined: true, unreadable: 'EACCES', unscheduled: [] } }), 'fail'],
+    ['no scheduler object', JSON.stringify({ entries: rsAll() }), 'fail'],
+    ['empty entries', rsOut({ entries: [] }), 'unreadable'],
+    ['not json', 'banner\n{}', 'unreadable'],
+    ['old streams-shaped output', JSON.stringify({ streams: [{ stream: 'wc', state: 'fresh' }] }), 'unreadable'],
+    ['duplicate instance', with_((e) => [...e, e[0]]), 'unreadable'],
+    ['unnamed entry', with_((e) => [{ state: 'fresh' }, ...e]), 'unreadable'],
+  ]
+  for (const [label, out, want] of cases) assert.equal(run(out).kind, want, label)
+  assert.equal(run(rsOut(), 1).kind, 'unreadable', 'non-zero exit')
+  assert.equal(run(rsOut(), null).kind, 'unreadable', 'no exit code')
+  // Several bindings of one stream are fine.
+  assert.equal(run(with_((e) => [...e, { ...e[1], instance: 'WH2' }])).kind, 'pass')
+  console.log(`precondition: ${cases.length + 3} read-sync shapes examined`)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -384,4 +409,55 @@ test('the report states what a GO does and does not cover, and lists NOT YET AVA
   // The word GO must not describe a NO-GO report.
   assert.doesNotMatch(noGo.split('\n').slice(0, 3).join('\n'), /: GO/)
   void verifyPublishedReport
+})
+
+test('the rehearsal must be about THIS build: match / mismatch / absent / malformed / older schema / dirty [mutation: build comparison removed]', () => {
+  const other = { commit: 'c'.repeat(40), tree: 'b'.repeat(40), clean: true }
+  const otherTree = { commit: 'a'.repeat(40), tree: 'd'.repeat(40), clean: true }
+  const cases: Array<[string, unknown, BuildIdentity | { unreadable: string }, 'pass' | 'fail' | 'unreadable', RegExp | null]> = [
+    ['match', { ...GATE_BUILD }, GATE_BUILD, 'pass', null],
+    ['different commit', other, GATE_BUILD, 'fail', /run on commit c+, not on this build/],
+    ['same commit, different tree', otherTree, GATE_BUILD, 'fail', /source tree/],
+    ['absent', undefined, GATE_BUILD, 'fail', /carries no build identifier/],
+    ['null (git could not say)', null, GATE_BUILD, 'fail', /carries no build identifier/],
+    ['malformed commit', { ...GATE_BUILD, commit: 'abc' }, GATE_BUILD, 'fail', /build identifier this gate cannot read/],
+    ['malformed clean flag', { ...GATE_BUILD, clean: 'yes' }, GATE_BUILD, 'fail', /cannot read/],
+    ['rehearsed a dirty checkout', { ...GATE_BUILD, clean: false }, GATE_BUILD, 'fail', /uncommitted changes/],
+    ['the gate checkout is dirty', { ...GATE_BUILD }, { ...GATE_BUILD, clean: false }, 'fail', /this checkout has uncommitted changes/],
+    ['gate build unreadable', { ...GATE_BUILD }, { unreadable: 'not a git repository' }, 'unreadable', /could not be read/],
+  ]
+  for (const [label, build, gate, want, message] of cases) {
+    const result = assessRehearsalReport({ digest: { ok: true }, parsed: greenRehearsal({ build: build as never }), location: '/x' }, NOW, gate)
+    assert.equal(result.kind, want, label)
+    if (message) assert.match(JSON.stringify(result), message, label)
+    if (want !== 'pass') assert.equal(verdictOf('P0', { ...allPassing(), 'first-install-rehearsal': result }).verdict, 'NO-GO', label)
+  }
+  // An older-schema report (no build identifier at all) is refused with the 'no build identifier' text, even if everything else is GREEN and fresh.
+  const v1 = { ...greenRehearsal(), schemaVersion: 1 } as Record<string, unknown>
+  delete v1.build
+  const old = assessRehearsalReport({ digest: { ok: true }, parsed: v1, location: '/x' }, NOW, GATE_BUILD)
+  assert.equal(old.kind, 'fail')
+  assert.match(JSON.stringify(old), /carries no build identifier/)
+  console.log(`precondition: ${cases.length + 1} build-identity cases examined`)
+})
+
+test('build identity: reading git, and the pure comparison', () => {
+  const answers: Record<string, string> = { 'rev-parse HEAD': `${'a'.repeat(40)}\n`, 'rev-parse HEAD^{tree}': `${'b'.repeat(40)}\n`, 'status --porcelain': '' }
+  assert.deepEqual(readBuildIdentity('/x', (args) => answers[args.join(' ')]!), GATE_BUILD)
+  assert.equal(readBuildIdentity('/x', (args) => (args[0] === 'status' ? ' M lib/a.ts\n' : answers[args.join(' ')]!)).clean, false)
+  assert.throws(() => readBuildIdentity('/x', () => 'not an id'), /commit and tree/)
+  assert.throws(() => readBuildIdentity('/x', () => { throw new Error('not a git repository') }), /not a git repository/)
+  assert.equal(compareBuildIdentity(GATE_BUILD, GATE_BUILD).ok, true)
+})
+
+test('the rehearsal report format records the build it rehearsed (schema 2) and renders it', async () => {
+  const { buildReport, renderMarkdown } = await import('../../lib/ops/first-install-rehearsal.ts')
+  const base = greenRehearsal()
+  const { schemaVersion, tool, verdict, exitCode, durationMs, ...input } = base
+  void schemaVersion; void tool; void verdict; void exitCode; void durationMs
+  const report = buildReport({ ...input, build: GATE_BUILD })
+  assert.equal(report.schemaVersion, 2)
+  assert.deepEqual(report.build, GATE_BUILD)
+  assert.match(renderMarkdown(report), new RegExp(`commit ${'a'.repeat(40)}, source tree ${'b'.repeat(40)}, clean checkout`))
+  assert.match(renderMarkdown({ ...report, build: null }), /not identified/)
 })

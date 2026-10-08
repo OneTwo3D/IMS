@@ -26,6 +26,7 @@ import {
   CHECK_CATALOGUE,
   READINESS_GATE_EXIT_CODES,
   READINESS_PHASES,
+  REQUIRED_READ_SYNC_STREAMS,
   REHEARSAL_CLOCK_SKEW_MS,
   REHEARSAL_MAX_AGE_DAYS,
   readinessGateExitCode,
@@ -34,6 +35,7 @@ import {
   type ReadinessVerdict,
   type Requirement,
 } from '@/lib/ops/readiness-gate-constants'
+import { BUILD_IDENTITY_TEXT, compareBuildIdentity, type BuildIdentity } from '@/lib/ops/build-identity'
 import { STEP_CATALOGUE, teardownIncomplete, type RehearsalReport } from '@/lib/ops/first-install-rehearsal'
 import { OUTBOUND_CONNECTORS } from '@/lib/security/outbound-write-hold-constants'
 
@@ -447,13 +449,21 @@ export function derivePackItemFromInvariant(item: 'R3' | 'R4' | 'R15', evidence:
 /** A rehearsal report as found on disk. `digest` is the outcome of verifyPublishedReport. */
 export type RehearsalEvidence = { digest: { ok: true } | { ok: false; reason: string }; parsed: unknown; location: string }
 
-export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date): CheckResult {
+export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date, gateBuild: BuildIdentity | { unreadable: string }): CheckResult {
+  if ('unreadable' in gateBuild) return unreadable(`${BUILD_IDENTITY_TEXT.gateUnreadable}: ${gateBuild.unreadable}`)
   if (!evidence.digest.ok) return fail([`the newest rehearsal report ${evidence.location} does not verify: ${evidence.digest.reason}`], { location: evidence.location })
   const failures: string[] = []
   const report = evidence.parsed as Partial<RehearsalReport> | null
   if (report === null || typeof report !== 'object') return unreadable(`the newest rehearsal report ${evidence.location} is not a JSON object`)
   if (report.tool !== 'rehearse-first-install') failures.push(`the report's tool is ${JSON.stringify(report.tool)}, not rehearse-first-install`)
-  if (report.schemaVersion !== 1) failures.push(`the report's schemaVersion is ${JSON.stringify(report.schemaVersion)}, not 1`)
+  const version = report.schemaVersion as unknown
+  if (version === 1) failures.push(BUILD_IDENTITY_TEXT.absent)
+  else if (version !== 2) failures.push(`the report's schemaVersion is ${JSON.stringify(version)}, not 2`)
+  // THE REPORT MUST BE ABOUT THIS BUILD. A GREEN rehearsal of another commit says nothing about this one.
+  if (version === 2) {
+    const build = compareBuildIdentity((report as { build?: unknown }).build, gateBuild)
+    if (!build.ok) failures.push(build.message)
+  }
   if (report.verdict !== 'GREEN') failures.push(`the rehearsal verdict is ${JSON.stringify(report.verdict)}, not GREEN`)
   if (report.exitCode !== 0) failures.push(`the rehearsal exit code is ${JSON.stringify(report.exitCode)}, not 0`)
   if (report.interrupted !== null && report.interrupted !== undefined) failures.push(`the rehearsal was interrupted (${String(report.interrupted)})`)
@@ -493,7 +503,17 @@ export function assessRehearsalReport(evidence: RehearsalEvidence, now: Date): C
 
 // ---- read-sync liveness ------------------------------------------------------------------------
 
-export function assessReadSyncStatus(run: { exitCode: number | null; stdout: string }): CheckResult {
+/** How far ahead of the gate's clock a recorded success may be before it is not believed (clock skew). */
+export const READ_SYNC_FUTURE_TOLERANCE_MS = 5 * 60_000
+
+/**
+ * Strict reading of `npm run --silent read-sync:status` under READ_SYNC_CONTRACT_VERSION. A stream passes only
+ * with a valid, parseable, not-future `lastSuccessAt`, state `fresh`, and an age inside the `maxAgeMs` it
+ * reports; every stream of the REQUIRED catalogue must appear (a stream missing from the output is
+ * not "fine", it is unproven); an unknown stream name, a duplicate instance, a scheduler that was not
+ * examined or has unscheduled jobs, or any other state ("stale", "never", "off") fails.
+ */
+export function assessReadSyncStatus(run: { exitCode: number | null; stdout: string }, now: Date): CheckResult {
   if (run.exitCode !== 0) return unreadable(`the read-sync status command exited ${run.exitCode}`)
   let parsed: unknown
   try {
@@ -501,23 +521,40 @@ export function assessReadSyncStatus(run: { exitCode: number | null; stdout: str
   } catch {
     return unreadable('the read-sync status output is not one JSON object')
   }
-  const streams = (parsed as { streams?: unknown } | null)?.streams
-  if (parsed === null || typeof parsed !== 'object' || !Array.isArray(streams) || streams.length === 0) {
-    return unreadable('the read-sync status output has no streams list, or it is empty (an empty list proves nothing is fresh)')
+  const root = parsed as { entries?: unknown; scheduler?: { examined?: unknown; unreadable?: unknown; unscheduled?: unknown } } | null
+  if (root === null || typeof root !== 'object' || !Array.isArray(root.entries) || root.entries.length === 0) {
+    return unreadable('the read-sync status output has no entries list, or it is empty (an empty list proves nothing is fresh)')
   }
   const problems: string[] = []
-  const names = new Set<string>()
-  for (const [index, stream] of streams.entries()) {
-    const entry = stream as { stream?: unknown; state?: unknown } | null
-    if (entry === null || typeof entry !== 'object' || typeof entry.stream !== 'string' || entry.stream === '') {
-      return unreadable(`read-sync stream #${index} has no name`)
-    }
-    if (names.has(entry.stream)) return unreadable(`read-sync stream ${entry.stream} is listed twice`)
-    names.add(entry.stream)
-    if (entry.state !== 'fresh') problems.push(`stream ${entry.stream} is ${JSON.stringify(entry.state)}, not fresh`)
+  const seen = new Set<string>()
+  const streams = new Set<string>()
+  for (const [index, raw] of root.entries.entries()) {
+    const entry = raw as { stream?: unknown; instance?: unknown; state?: unknown; lastSuccessAt?: unknown; ageMs?: unknown; maxAgeMs?: unknown } | null
+    if (entry === null || typeof entry !== 'object' || typeof entry.stream !== 'string' || entry.stream === '') return unreadable(`read-sync entry #${index} has no stream name`)
+    const name = entry.stream
+    if (!(REQUIRED_READ_SYNC_STREAMS as readonly string[]).includes(name)) { problems.push(`read-sync reports a stream ${name} that is not in the required catalogue`); continue }
+    const key = `${name}/${typeof entry.instance === 'string' ? entry.instance : ''}`
+    if (seen.has(key)) return unreadable(`read-sync entry ${key} is listed twice`)
+    seen.add(key)
+    streams.add(name)
+    if (entry.state !== 'fresh') { problems.push(`stream ${key} is ${JSON.stringify(entry.state)}, not fresh`); continue }
+    const at = typeof entry.lastSuccessAt === 'string' && ISO_RE.test(entry.lastSuccessAt) ? Date.parse(entry.lastSuccessAt) : Number.NaN
+    if (!Number.isFinite(at)) { problems.push(`stream ${key} is marked fresh but has no valid lastSuccessAt`); continue }
+    if (at > now.getTime() + READ_SYNC_FUTURE_TOLERANCE_MS) { problems.push(`stream ${key} has a lastSuccessAt in the future (${entry.lastSuccessAt})`); continue }
+    if (typeof entry.maxAgeMs !== 'number' || !(entry.maxAgeMs > 0)) { problems.push(`stream ${key} reports no age limit`); continue }
+    if (now.getTime() - at >= entry.maxAgeMs) problems.push(`stream ${key} last succeeded at ${entry.lastSuccessAt}, older than its limit`)
   }
-  const detail = { streams: [...names] }
-  return problems.length === 0 ? pass(`${names.size} stream(s) fresh`, detail) : fail(problems, detail)
+  for (const required of REQUIRED_READ_SYNC_STREAMS) {
+    if (!streams.has(required)) problems.push(`required stream ${required} is missing from the read-sync status output`)
+  }
+  const scheduler = root.scheduler
+  if (!scheduler || scheduler.examined !== true) problems.push('the read-sync status did not examine the scheduler')
+  else {
+    if (scheduler.unreadable !== null && scheduler.unreadable !== undefined) problems.push('the read-sync scheduler check could not read the crontab')
+    if (!Array.isArray(scheduler.unscheduled) || scheduler.unscheduled.length > 0) problems.push('a job behind a read-sync stream has no managed crontab entry')
+  }
+  const detail = { streams: [...streams].sort(), entries: seen.size }
+  return problems.length === 0 ? pass(`${seen.size} entries across ${streams.size} required streams, each fresh with a valid last success`, detail) : fail(problems, detail)
 }
 
 // ---------------------------------------------------------------------------------------------

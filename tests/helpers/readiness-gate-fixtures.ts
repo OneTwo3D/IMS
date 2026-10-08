@@ -3,6 +3,7 @@ import {
   CHECK_CATALOGUE,
   type ReadinessPhase,
 } from '../../lib/ops/readiness-gate-constants.ts'
+import type { BuildIdentity } from '../../lib/ops/build-identity.ts'
 import {
   type AcceptanceFile,
   type CheckResult,
@@ -13,6 +14,8 @@ import {
 export const NOW = new Date('2026-10-08T12:00:00.000Z')
 export const DAY = 24 * 60 * 60 * 1000
 export const NO_ACCEPTANCES: AcceptanceFile = { status: 'absent', problems: [], entries: [] }
+
+export const GATE_BUILD: BuildIdentity = { commit: 'a'.repeat(40), tree: 'b'.repeat(40), clean: true }
 
 export const PASS: CheckResult = { kind: 'pass', summary: 'ok' }
 
@@ -91,8 +94,9 @@ export function cleanTeardown(): TeardownResult {
 export function greenRehearsal(overrides: Partial<RehearsalReport> = {}): RehearsalReport {
   const finished = new Date(NOW.getTime() - 2 * DAY)
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     tool: 'rehearse-first-install',
+    build: { ...GATE_BUILD },
     runId: 'run-1',
     verdict: 'GREEN',
     exitCode: 0,
