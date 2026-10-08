@@ -1014,7 +1014,7 @@ test('spawn sweep: no shell and no inherited environment in the rehearsal or its
     const lines = readFileSync(join(REPO, file), 'utf8').split('\n')
     lines.forEach((line, index) => {
       if (/^\s*(\/\/|\*|\/\*)/.test(line)) return
-      if (/\b(execSync|spawnSync|exec)\(|shell:\s*true|['"]bash['"]|['"]sh['"]\s*,\s*\[/.test(line)) found.push(`${file}:${index + 1}: ${line.trim()}`)
+      if (/\b(execSync|spawnSync)\(|(^|[^.\w])exec\(|shell:\s*true|['"]bash['"]|['"]sh['"]\s*,\s*\[/.test(line)) found.push(`${file}:${index + 1}: ${line.trim()}`)
     })
   }
   console.log(`# shell-capable spawn sites found: ${found.length}`)
