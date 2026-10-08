@@ -52,7 +52,7 @@ function randomSecret(label: string): string {
   return `${label}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`
 }
 
-async function withRig(body: (rig: Rig) => Promise<void>, setup: (rig: Rig) => void = () => {}) {
+async function withRig(body: (rig: Rig) => Promise<void>, setup: (rig: Rig) => void = () => {}, adminKind: 'superuser' | 'owner' = 'superuser') {
   const root = mkdtempSync(join(tmpdir(), 'ims-migrole-'))
   const port = await freePort()
   let cluster: Cluster | undefined
@@ -63,13 +63,24 @@ async function withRig(body: (rig: Rig) => Promise<void>, setup: (rig: Rig) => v
     cluster.psql(['-c', `CREATE ROLE deployadmin SUPERUSER LOGIN PASSWORD '${adminPassword}'`])
     cluster.psql(['-c', `CREATE ROLE imsapp LOGIN PASSWORD '${appPassword}'`])
     cluster.psql(['-c', 'CREATE DATABASE imsdb OWNER imsapp'])
+    // THE DOCUMENTED NON-SUPERUSER ADMIN: CREATEROLE, a member of the application role 
+    // with ADMIN/SET/INHERIT, the OWNER of the database, and no privilege on pg_authid or on anything else of the cluster's.
+    let adminLogin = 'deployadmin'
+    let adminSecret = adminPassword
+    if (adminKind === 'owner') {
+      adminLogin = 'dbadmin'
+      adminSecret = randomSecret('dba')
+      cluster.psql(['-c', `CREATE ROLE dbadmin LOGIN CREATEROLE PASSWORD '${adminSecret}'`])
+      cluster.psql(['-c', 'GRANT imsapp TO dbadmin WITH ADMIN OPTION, INHERIT TRUE, SET TRUE'])
+      cluster.psql(['-c', 'ALTER DATABASE imsdb OWNER TO dbadmin'])
+    }
     const rig: Rig = {
       cluster,
       root,
       port,
       adminPassword,
       appPassword,
-      adminUrl: `postgresql://deployadmin:${adminPassword}@127.0.0.1:${port}/imsdb`,
+      adminUrl: `postgresql://${adminLogin}:${adminSecret}@127.0.0.1:${port}/imsdb`,
       identity: ['--app-host=127.0.0.1', `--app-port=${port}`, '--app-user=imsapp', '--app-database=imsdb'],
     }
     setup(rig)
@@ -991,4 +1002,98 @@ test('[o3d-1bgr] MUTATIONS login-open checks: each is the only thing refusing an
     console.log(`fence with neither check: exit ${passes.status}\n${passes.stderr}`)
     assert.equal(passes.status, 0, 'with both gone the fence completes over an open login: the defect')
   })
+})
+
+test('[o3d-1bgr] the fresh FENCE_STATE probe is bound to the server the release ran on: a fenced lookalike behind the same endpoint reads unknown (Codex round 4)', async () => {
+  await withRig(async (rig) => {
+    const { stateFile, appCanConnect } = fenceUp(rig)
+    // A SECOND CLUSTER standing where the fresh connection lands: same database name, same roles, fenced shape.
+    const otherRoot = mkdtempSync(join(tmpdir(), 'ims-migrole-other-'))
+    const otherPort = await freePort()
+    const other = startCluster(otherRoot, 'oth', otherPort, '127.0.0.1')
+    try {
+      other.psql(['-c', `CREATE ROLE deployadmin SUPERUSER LOGIN PASSWORD 'x'`])
+      other.psql(['-c', 'CREATE ROLE imsapp LOGIN'])
+      other.psql(['-c', 'CREATE DATABASE imsdb OWNER imsapp'])
+      other.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM PUBLIC, imsapp'])
+      const lookalike = `postgresql://deployadmin:x@127.0.0.1:${otherPort}/imsdb`
+      console.log(`precondition: the lookalike cluster (port ${otherPort}) answers has_database_privilege(imsapp, imsdb, CONNECT) = ${other.psql(['-Atc', "SELECT has_database_privilege('imsapp','imsdb','CONNECT')"])}`)
+      const lostAck = (label: string, extraFind = '', extraReplace = '') => {
+        const script = mutatedHelper(rig, "const fresh = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-state' })", `const fresh = new pg.Client({ connectionString: ${JSON.stringify(lookalike)}, application_name: 'ims-deploy-fence-state' })`, label)
+        let text = readFileSync(script, 'utf8').replace("    commitSent = true\n    await client.query('COMMIT')\n", "    commitSent = true\n    await client.query('COMMIT')\n    throw new Error('connection terminated: acknowledgement lost')\n")
+        if (extraFind) {
+          assert.ok(text.includes(extraFind), 'precondition: the second mutation applies')
+          text = text.replace(extraFind, extraReplace)
+        }
+        writeFileSync(script, text)
+        return script
+      }
+      const bound = lostAck('probe-moves')
+      const run = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: bound })
+      console.log(`probe moved to another server: exit ${run.status}, ${stateLine(run.stdout)}; application can connect on the real server = ${await appCanConnect()}`)
+      assert.equal(await appCanConnect(), true, 'the real server IS open')
+      assert.equal(stateLine(run.stdout), 'FENCE_STATE=unknown', 'and the lookalike fenced ACL is not taken for it')
+
+      // MUTATION no-binding: without the comparison the lookalike's fenced ACL reads held although the real server is open.
+      rig.cluster.psql(['-c', 'REVOKE CONNECT ON DATABASE imsdb FROM imsapp'])
+      const unbound = lostAck('no-binding', 'if (!sameServerBinding(options.releaseBinding, freshBinding)) {', 'if (false) {')
+      const bad = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`], { script: unbound })
+      console.log(`mutated (no binding): ${stateLine(bad.stdout)}`)
+      assert.equal(stateLine(bad.stdout), 'FENCE_STATE=held', 'the defect: a fenced copy is reported as the fence standing')
+    } finally {
+      other.stop()
+      rmSync(otherRoot, { recursive: true, force: true })
+    }
+  })
+})
+
+test('[o3d-1bgr] the documented NON-SUPERUSER admin (CREATEROLE, no pg_authid privilege): ensure, preflight, plan, fence, window, release all work; an open LOGIN is refused', async () => {
+  await withRig(async (rig) => {
+    console.log(`precondition: ${rig.cluster.psql(['-Atc', "SELECT rolname || ' super=' || rolsuper || ' createrole=' || rolcreaterole || ' authid-select=' || has_table_privilege(rolname, 'pg_authid', 'SELECT') FROM pg_roles WHERE rolname = 'dbadmin'"])}`)
+    assert.equal(rig.cluster.psql(['-Atc', "SELECT has_table_privilege('dbadmin', 'pg_authid', 'SELECT')"]), 'f', 'precondition: the admin cannot read pg_authid')
+    const ensured = helper(rig, ['--ensure-migration-role'])
+    assert.equal(ensured.status, 0, `ensure as the limited admin:\n${ensured.stderr}`)
+    const pre = helper(rig, ['--preflight'])
+    assert.equal(pre.status, 0, `preflight as the limited admin:\n${pre.stderr}`)
+
+    // an open LOGIN is refused although the password state cannot be read (rolcanlogin decides)
+    rig.cluster.psql(['-c', "ALTER ROLE imsapp_migrator LOGIN PASSWORD 'left-open'"])
+    const open = helper(rig, ['--preflight'])
+    console.log(`open LOGIN role, limited admin: preflight exit ${open.status}`)
+    assert.equal(open.status, 3, open.stderr)
+    assert.match(open.stderr, /ALREADY OPEN/)
+    rig.cluster.psql(['-c', 'ALTER ROLE imsapp_migrator NOLOGIN PASSWORD NULL'])
+
+    const stateFile = join(rig.root, 'state.json')
+    const plan = helper(rig, ['--plan', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+    assert.equal(plan.status, 0, `plan as the limited admin:\n${plan.stderr}`)
+    publishPlan(JSON.parse(plan.stdout.trim()), stateFile)
+    // an application session is attached while the limited admin fences: it must be drained (pg_terminate_backend on a role the admin is a member of)
+    const attached = new pg.Client({ connectionString: `postgresql://imsapp:${rig.appPassword}@127.0.0.1:${rig.port}/imsdb` })
+    attached.on('error', () => {})
+    await attached.connect()
+    console.log(`precondition: ${rig.cluster.psql(['-Atc', "SELECT count(*) FROM pg_stat_activity WHERE datname = 'imsdb' AND usename = 'imsapp'"])} application backend(s) attached before the fence`)
+    const fenced = helper(rig, ['--fence', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+    assert.equal(fenced.status, 0, `fence as the limited admin:\n${fenced.stderr}`)
+    assert.equal(rig.cluster.psql(['-Atc', "SELECT count(*) FROM pg_stat_activity WHERE datname = 'imsdb' AND usename = 'imsapp'"]), '0', 'the application backend was drained by the limited admin')
+    await attached.end().catch(() => {})
+    const url = printUrl(rig)
+    await session(url, async (client) => { await client.query('SELECT 1') })
+    const released = helper(rig, ['--release', `--state-file=${stateFile}`, `--state-owner=${OWNER()}`])
+    console.log(`release as the limited admin: exit ${released.status}`)
+    assert.equal(released.status, 0, released.stderr)
+    await assert.rejects(session(url, async (client) => { await client.query('SELECT 1') }), 'the minted login is closed again')
+  }, () => {}, 'owner')
+})
+
+test('[o3d-1bgr] MUTATION pg_authid-unconditional: reading the password in the main role query fails the limited admin (the new arm would be red)', async () => {
+  await withRig(async (rig) => {
+    const script = mutatedHelper(rig, "    const mayRead = (await client.query(`SELECT has_table_privilege(current_user, 'pg_catalog.pg_authid', 'SELECT') AS may_read`)).rows[0]?.may_read === true", "    const mayRead = true", 'authid-unconditional')
+    const ensured = helper(rig, ['--ensure-migration-role'])
+    assert.equal(ensured.status, 0, ensured.stderr)
+    const run = helper(rig, ['--preflight'], { script })
+    console.log(`limited admin, pg_authid queried unconditionally: preflight exit ${run.status}: ${run.stderr.split('\n').find((l) => /permission denied/.test(l)) ?? run.stderr.slice(0, 200)}`)
+    assert.notEqual(run.status, 0, 'the unconditional read is refused by the server')
+    assert.match(run.stderr, /permission denied/)
+  }, () => {}, 'owner')
 })

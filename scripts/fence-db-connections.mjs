@@ -2054,12 +2054,11 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
                          AND d.objid = (SELECT oid FROM pg_database WHERE datname = current_database()))) AS direct_dependencies,
             (SELECT count(*)::int FROM pg_db_role_setting s WHERE s.setrole = r.oid) AS role_settings,
             -- IS THE LOGIN OPEN. Outside a window the role is NOLOGIN with no password (D1); a role left
-            -- LOGIN, or still holding the password of an earlier window, is a login somebody may hold. The
-            -- password column is readable only where the admin may read pg_authid: unreadable is null, and
-            -- null is "not known" (rolcanlogin is the check that does not depend on it).
+            -- LOGIN is a login somebody may hold (pg_roles, readable by anyone). The stored password is
+            -- read in a statement of its own below, because PostgreSQL checks relation privileges for the
+            -- WHOLE statement: a CASE around pg_authid does not stop a non-superuser admin being refused.
             r.rolcanlogin,
-            CASE WHEN has_table_privilege(current_user, 'pg_catalog.pg_authid', 'SELECT')
-                 THEN (SELECT x.rolpassword IS NOT NULL FROM pg_authid x WHERE x.oid = r.oid) END AS has_stored_password,
+
             -- ON THIS DATABASE the role may hold CONNECT and nothing else, and not with grant option. The
             -- shared-dependency count above deliberately skips this database's ACL entry (one dependency
             -- per grantee, not per privilege), so the entry is read here, privilege by privilege.
@@ -2090,6 +2089,15 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
     [migrationRole, appRole, MIGRATION_ROLE_MARKER],
   )
   const row = rows[0]
+  // The stored password, only where the admin may read pg_authid (asked first, in its own statement).
+  // Where it may not, the state is recorded as unknown (null) and rolcanlogin still decides.
+  let hasStoredPassword = null
+  if (row) {
+    const mayRead = (await client.query(`SELECT has_table_privilege(current_user, 'pg_catalog.pg_authid', 'SELECT') AS may_read`)).rows[0]?.may_read === true
+    if (mayRead) {
+      hasStoredPassword = (await client.query('SELECT rolpassword IS NOT NULL AS stored FROM pg_authid WHERE rolname = $1', [migrationRole])).rows[0]?.stored === true
+    }
+  }
   const serverVersionNum = Number((await client.query(`SELECT current_setting('server_version_num')::int AS v`)).rows[0]?.v ?? 0)
   const base = { migrationRole, appRole, database: facts.database, adminRole: facts.admin_role, serverVersionNum }
   if (!row) return { ...base, exists: false }
@@ -2102,7 +2110,7 @@ async function readMigrationRoleFacts(client, appRole, migrationRole, facts) {
     otherMemberships: Number(row.other_memberships ?? 0),
     roleSettings: Number(row.role_settings ?? 0),
     canLogin: row.rolcanlogin === true,
-    hasStoredPassword: row.has_stored_password === true ? true : row.has_stored_password === false ? false : null,
+    hasStoredPassword,
     rolsuper: row.rolsuper === true,
     rolcreaterole: row.rolcreaterole === true,
     rolcreatedb: row.rolcreatedb === true,
@@ -4068,6 +4076,27 @@ export async function retireMigrationLogin(client, migrationRole) {
  * The callers never infer the fence from an exit status or a flag: `restored` and `unknown` both mean "not
  * up" to them, and only `held` leaves it standing.
  */
+/**
+ * WHICH SERVER IS THIS CONNECTION ON: the three readings a second connection can be compared by. The system
+ * identifier is asked in a query of its own (it may be refused), and the postmaster start time and the
+ * database OID are readable by anyone. A pooler or a failover that moves a new connection to another server
+ * changes at least the postmaster start time; a clone changes it too.
+ */
+export async function captureServerBinding(client) {
+  const cluster = await readClusterIdentity(client)
+  const { rows } = await client.query(
+    'SELECT pg_postmaster_start_time()::text AS postmaster, (SELECT oid::text FROM pg_database WHERE datname = current_database()) AS database_oid',
+  )
+  return { systemIdentifier: cluster.systemIdentifier, postmaster: String(rows[0]?.postmaster ?? ''), databaseOid: String(rows[0]?.database_oid ?? '') }
+}
+
+/** Pure: the same server, or not shown to be. An empty postmaster or OID is never a match. */
+export function sameServerBinding(a, b) {
+  if (!a || !b) return false
+  if (!a.postmaster || !b.postmaster || !a.databaseOid || !b.databaseOid) return false
+  return a.postmaster === b.postmaster && a.databaseOid === b.databaseOid && a.systemIdentifier === b.systemIdentifier
+}
+
 export function classifyFenceState({ appConnects, recordedHolding, answered }) {
   if (!answered) return 'unknown'
   if (appConnects) return 'restored'
@@ -4079,6 +4108,13 @@ async function reportFenceState(connectionString, options) {
   const fresh = new pg.Client({ connectionString, application_name: 'ims-deploy-fence-state' })
   try {
     await fresh.connect()
+    // BOUND TO THE SERVER THAT RECEIVED THE GRANTS (Codex round 4, HIGH). A pooler or a failover can put this
+    // connection on another server, whose ACL says nothing about the one the release ran on.
+    const freshBinding = await captureServerBinding(fresh)
+    if (!sameServerBinding(options.releaseBinding, freshBinding)) {
+      console.error(`The fresh connection is not shown to be on the server the release ran on (release: ${JSON.stringify(options.releaseBinding ?? null)}, now: ${JSON.stringify(freshBinding)}), so its ACL is not evidence.`)
+      throw new Error('server binding differs or could not be established')
+    }
     const database = options.releaseRecord?.database || options.appDatabase
     const appRole = options.appRole || options.appUser
     const { rows } = await fresh.query(
@@ -4277,6 +4313,8 @@ async function main() {
     else if (options.mode === 'ensure-migration-role') process.exitCode = await doEnsureMigrationRole(client, options)
     else {
       let releaseCode = EXIT_ERROR
+      // The identity of the server the release connection is on, taken BEFORE anything is granted.
+      try { options.releaseBinding = await captureServerBinding(client) } catch { options.releaseBinding = null }
       try {
         releaseCode = await doRelease(client, options)
       } catch (error) {

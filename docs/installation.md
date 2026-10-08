@@ -4004,7 +4004,11 @@ wrapper treat only `held` as a fence that is still standing (a failed release ca
 verification read failed, or the `COMMIT` acknowledgement was lost), so on `restored` or `unknown` the entrypoint
 clears its own "fence is up" flag, says so, and re-fences on the way out. `--preflight` and `--fence` also refuse a
 migration login that is **already open** (`LOGIN`, or a stored password) with the statement that closes it, and
-`--fence` asks again at the end of the drain. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
+`--fence` asks again at the end of the drain. The stored password is read only where the admin may read
+`pg_authid` (a database-owner admin with `CREATEROLE` may not: then only `LOGIN` decides). The fresh
+`FENCE_STATE` read is **bound to the server the release ran on** (postmaster start time, database OID and, where
+readable, the system identifier, compared with the ones the release connection reported before it granted
+anything); a connection that lands anywhere else prints `FENCE_STATE=unknown`. The URL is also **opened once when it is minted** and must authenticate as the migration role and run
 as the application role, or it is not printed and the login is closed again. A window that is
 **interrupted** leaves a password nobody holds; the next window mints another.
 
