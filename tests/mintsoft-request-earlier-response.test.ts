@@ -34,6 +34,7 @@ mock.module('@/lib/security/connector-fetch', {
 
 let baseUrl = ''
 let tokenCalls = 0
+let refreshSucceeds = false
 
 function heldError(): OutboundWriteHeldError {
   const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: 'https://api.mintsoft.co.uk/api/Auth', writeScopeId: '89', env: {} })
@@ -48,7 +49,7 @@ mock.module('@/lib/connectors/mintsoft/api/auth', {
     }),
     getMintsoftAccessToken: async (options?: { forceRefresh?: boolean }) => {
       tokenCalls += 1
-      if (options?.forceRefresh) throw heldError() // the key refresh after a 401 is held
+      if (options?.forceRefresh && !refreshSucceeds) throw heldError() // the key refresh after a 401 is held
       return 'k'
     },
     invalidateMintsoftAccessToken: async () => undefined,
@@ -187,6 +188,43 @@ test('table (settled rule): a 401 is proof of non-processing ONLY with zero foll
     }
   } finally {
     hideProvenance = false
+    delete process.env.MINTSOFT_WRITE_ALLOWED
+    delete process.env.E2E_TEST_MODE
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
+test('unproven 401 + a refresh that WOULD succeed: a mutating request is never replayed; zero-hop 401 and reads are', async () => {
+  const received: string[] = []
+  let redirectFirst = false
+  const server = createServer((req, res) => {
+    received.push(`${req.method} ${req.url}`)
+    if (redirectFirst && (req.url === '/api/Order' || req.url === '/api/Order/5')) { res.writeHead(307, { location: `/moved${req.url}` }); res.end(); return }
+    res.writeHead(received.filter((r) => r.endsWith(req.url ?? '')).length > 1 ? 200 : 401, { 'content-type': 'application/json' }); res.end('{}')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  baseUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+  process.env.E2E_TEST_MODE = '1'
+  process.env.MINTSOFT_WRITE_ALLOWED = `${baseUrl}|89`
+  refreshSucceeds = true
+  try {
+    const { mintsoftRequest } = await import('../lib/connectors/mintsoft/api/client')
+    console.log('precondition (no replay): login IS granted and the refresh would succeed in every case')
+    redirectFirst = true; received.length = 0
+    const put = await mintsoftRequest('/api/Order', { method: 'PUT', body: '{"ClientId":89}' })
+    assert.deepEqual(received, ['PUT /api/Order', 'PUT /moved/api/Order'], 'redirected PUT then 401: exactly the two hops of ONE request, no refresh-and-replay')
+    assert.equal(isOutboundMaybeSentRefusalText(put.error), true, 'maybe-sent')
+    assert.equal(put.held, undefined)
+    redirectFirst = false; received.length = 0
+    const zero = await mintsoftRequest('/api/Order', { method: 'PUT', body: '{"ClientId":89}' })
+    assert.deepEqual(received, ['PUT /api/Order', 'PUT /api/Order'], 'proven zero-hop 401: refreshed and replayed once')
+    assert.equal(zero.status, 200)
+    redirectFirst = true; received.length = 0
+    const get = await mintsoftRequest('/api/Order/5')
+    assert.equal(received.length >= 3, true, 'a READ is replayed after refresh even when the 401 followed a redirect')
+    assert.equal(get.status, 200)
+  } finally {
+    refreshSucceeds = false
     delete process.env.MINTSOFT_WRITE_ALLOWED
     delete process.env.E2E_TEST_MODE
     await new Promise<void>((resolve) => server.close(() => resolve()))

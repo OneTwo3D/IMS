@@ -8,6 +8,7 @@ import {
 } from './asn-creation-rule'
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
+import { classifyMintsoftRequest } from './read-allowlist'
 import * as connectorTransport from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { outboundTextAfterEarlierSend } from '@/lib/security/outbound-write-hold-constants'
@@ -157,6 +158,22 @@ export async function mintsoftRequest<T>(
           ?? 'Mintsoft rejected the fixed API key (401). Not re-authenticating: that would '
             + 'regenerate the tenant API key and break the other Mintsoft integrations. '
             + 'Check that the configured key is current.',
+      }
+    }
+
+    // AN UNPROVEN 401 ON A MUTATING REQUEST IS NEVER REFRESHED-AND-REPLAYED. If the 401 came after a followed
+    // redirect (or with an unknown hop count) the original request may already have taken effect at an earlier
+    // hop; replaying the same PUT/POST could duplicate it. Stop and report a maybe-sent outcome so the caller
+    // parks/reconciles. A proven zero-hop 401 (nothing processed) may refresh and replay, and a READ (the
+    // allow-list) may always refresh and replay, since repeating a read cannot duplicate anything.
+    if (earlierResponseUnproven && classifyMintsoftRequest(init?.method ?? 'GET', path.split('?')[0] ?? path).class === 'write') {
+      return {
+        data: null,
+        error: outboundTextAfterEarlierSend(
+          'refusal (Mintsoft): the response was a 401 that came after a followed redirect or with unknown provenance, so it does not prove the request was not processed; IMS did not refresh the key and replay it.',
+          'Mintsoft',
+        ),
+        status: 500,
       }
     }
 
