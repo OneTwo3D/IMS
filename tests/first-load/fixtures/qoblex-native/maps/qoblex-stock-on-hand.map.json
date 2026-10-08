@@ -164,7 +164,11 @@
         },
         "blockColumns": {
           "qty": "Quantity"
-        }
+        },
+        "totals": {
+          "qty": "Quantity"
+        },
+        "uniqueBy": "sku"
       }
     }
   }

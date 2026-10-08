@@ -92,7 +92,7 @@ test('wide blocks: the aggregate group before the first label is never read as a
 })
 
 /** Build a tiny wide file: a label row, a header row and data rows. */
-function wideFile(labels: string[], header: string[], rows: string[][] = [['A1', 'x', '3', 'y', '4', 'z']]): Uint8Array {
+function wideFile(labels: string[], header: string[], rows: string[][] = [['A1', '7', '3', 'y', '4', 'z']]): Uint8Array {
   const line = (cells: string[]) => cells.map((cell) => JSON.stringify(cell)).join(',')
   return enc([line(labels), line(header), ...rows.map(line)].join('\n') + '\n')
 }
@@ -104,8 +104,8 @@ const wideMapText = (wide: Record<string, unknown>, extra: Record<string, unknow
     datasets: { 'stock-lots': { rowsAboveHeader: 1, columns: { sku: 'Sku' }, constants: { currency: 'GBP' }, wide, ...extra } },
   })
 
-const WIDE = { blockStart: 'after-label', warehouses: { 'W one': 'ONE', 'W two': 'TWO' }, blockColumns: { qty: 'Quantity' } }
-const HEADER = ['Sku', 'Filler', 'Quantity', 'Other', 'Quantity', 'Other']
+const WIDE = { blockStart: 'after-label', warehouses: { 'W one': 'ONE', 'W two': 'TWO' }, blockColumns: { qty: 'Quantity' }, totals: { qty: 'Total Quantity' }, uniqueBy: 'sku' }
+const HEADER = ['Sku', 'Total Quantity', 'Quantity', 'Other', 'Quantity', 'Other']
 // A label sits above the LAST column of the previous block; a block starts in the column after its label.
 const LABELS = ['', 'W one', '', 'W two', '', '']
 const wideRead = (labels: string[], header: string[], wide: Record<string, unknown> = WIDE, rows?: string[][]) =>
@@ -368,7 +368,7 @@ test('two bundle groups for one product with the same component are refused as a
     dir,
     'bundles.csv',
     '"Synthetic part one","SYN-3001","5","100.000000","","100.000000","1.0","0","Part"',
-    '"Synthetic part one","SYN-3001","5","100.000000","","100.000000","1.0","0","Part"\r\n"Synthetic made item","SYN-5001","","12.000000","","12.000000","1.0","0","BillOfMaterial"\r\n"Synthetic part one","SYN-3001","6","100.000000","","100.000000","1.0","0","Part"',
+    '"Synthetic part one","SYN-3001","5","100.000000","","100.000000","1.0","0","Part"\r\n"Synthetic bom item","SYN-5001","","12.000000","","12.000000","1.0","0","BillOfMaterial"\r\n"Synthetic part one","SYN-3001","6","100.000000","","100.000000","1.0","0","Part"',
   )
   const out = fresh('dupbom')
   await cli(['--manifest', path.join(dir, 'manifest.json'), '--out', out])
@@ -376,4 +376,118 @@ test('two bundle groups for one product with the same component are refused as a
   precondition(t, 'duplicate recipe lines', countOf(report, 'recipe-lines', 'DUPLICATE_RECIPE_LINE'))
   assert.equal(countOf(report, 'recipe-lines', 'DUPLICATE_RECIPE_LINE'), 2)
   assert.ok(report.findings.some((f) => f.code === 'NO_RECIPE_LINES' && f.keys?.includes('SYN-5001')))
+})
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review round 1: duplicate rows, totals, superseding merges, cost rules
+// ---------------------------------------------------------------------------------------------------------------------
+
+test('wide blocks: a SKU on more than one row refuses EVERY row that carries it, whatever the quantities say (never summed)', (t) => {
+  const rows = [['A1', '7', '3', 'y', '4', 'z'], ['a1', '9', '5', 'y', '4', 'z'], ['B1', '7', '3', 'y', '4', 'z'], ['', '7', '3', 'y', '4', 'z'], ['', '7', '3', 'y', '4', 'z']]
+  const result = wideRead(LABELS, HEADER, WIDE, rows)
+  precondition(t, 'source rows', rows.length)
+  assert.deepEqual(result.rejected.map((r) => [r.line, r.code]), [[3, 'DUPLICATE_SOURCE_ROW'], [4, 'DUPLICATE_SOURCE_ROW']])
+  assert.deepEqual([...new Set(result.rows.map((row) => row.values.sku))], ['B1', ''], 'unequal duplicates are both gone; blank SKUs are the transform\'s problem, not a duplicate group')
+  // Control: with the second row's SKU changed, nothing is refused and the units are the rows' own.
+  const control = wideRead(LABELS, HEADER, WIDE, [rows[0], ['A2', ...rows[1].slice(1)]])
+  assert.equal(control.rejected.length, 0)
+})
+
+test('wide blocks: the report total must equal the exact sum of the warehouse blocks (missing, edited, blank and negative cells)', (t) => {
+  const cases: Array<[string, string[], string | null]> = [
+    ['balanced', ['A1', '7', '3', 'y', '4', 'z'], null],
+    ['balanced with a negative block', ['A1', '2', '6', 'y', '-4', 'z'], null],
+    ['one block cell lowered', ['A1', '7', '3', 'y', '3', 'z'], 'up to 6'],
+    ['total raised', ['A1', '8', '3', 'y', '4', 'z'], 'is 8 but'],
+    ['blank block cell', ['A1', '7', '3', 'y', '', 'z'], 'blank or not a plain number'],
+    ['blank total', ['A1', '', '3', 'y', '4', 'z'], 'blank or not a plain number'],
+    ['quantity shifted into the next column (asymmetric)', ['A1', '7', 'y', '3', 'z', '4'], 'blank or not a plain number'],
+    ['negative hidden by a zero total', ['A1', '0', '0', 'y', '-5', 'z'], 'up to -5'],
+  ]
+  precondition(t, 'cases', cases.length)
+  for (const [name, row, expected] of cases) {
+    const result = wideRead(LABELS, HEADER, WIDE, [row])
+    if (expected === null) assert.equal(result.rejected.length, 0, name)
+    else {
+      assert.deepEqual(result.rejected.map((r) => r.code), ['WIDE_TOTAL_MISMATCH'], name)
+      assert.ok(result.rejected[0].reason.includes(expected), `${name}: ${result.rejected[0].reason}`)
+      assert.equal(result.rows.length, 0, `${name}: no block record of a mismatched row is emitted`)
+    }
+  }
+  // The total header must exist exactly once before the first block.
+  assert.throws(() => wideRead(LABELS, ['Sku', 'Totl', 'Quantity', 'Other', 'Quantity', 'Other']), (e) => e instanceof InputError && /total header "Total Quantity".*appears 0 time/.test(e.message))
+  assert.throws(() => parseColumnMap(wideMapText({ ...WIDE, totals: undefined }), 'm.json'), (e) => e instanceof InputError && /wide\.totals is required/.test(e.message))
+  assert.throws(() => parseColumnMap(wideMapText({ ...WIDE, uniqueBy: undefined }), 'm.json'), (e) => e instanceof InputError && /uniqueBy must name/.test(e.message))
+})
+
+test('the shipped fixture: a changed warehouse cell and a repeated SKU in the real-shape report are refused, not loaded', async (t) => {
+  const dir = copyNative()
+  // SYN-1001 MIL1 quantity 10 -> 11 while its total stays 15.
+  editFile(dir, 'stock-on-hand.csv', '"15.000000","0.000000","15.000000","0.000000","0.000000","0.000000","False","10.000000"', '"15.000000","0.000000","15.000000","0.000000","0.000000","0.000000","False","11.000000"')
+  const result = ingestDataset('stock-lots', readFileSync(path.join(dir, 'stock-on-hand.csv')), 'stock-on-hand.csv', stockMap().datasets['stock-lots']!)
+  precondition(t, 'rejections', result.rejected.length)
+  assert.ok(result.rejected.some((r) => r.code === 'WIDE_TOTAL_MISMATCH' && r.line === 3), 'line 3 is SYN-1001')
+  assert.equal(result.rows.filter((row) => row.values.sku === 'SYN-1001').length, 0)
+  // A repeated SKU with different quantity and cost (the real report has five of these).
+  const dup = copyNative()
+  const text = readFileSync(path.join(dup, 'stock-on-hand.csv'), 'utf8')
+  const twin = text.split('\r\n').find((line) => line.includes('"SYN-6001"'))!.replace('"Unknown","Active"', '"simple","Active"').replace('"Synthetic twin"', '"Synthetic twin again"').replace(/"SYN-6001","Unknown"/, '"SYN-3001","Unknown"')
+  assert.ok(twin.includes('"SYN-3001"'), 'precondition: the twin row names SYN-3001')
+  writeFileSync(path.join(dup, 'stock-on-hand.csv'), text.replace('"Synthetic part one"', `${twin.replace(/^"[^"]*"/, '"Synthetic part one twin"')}\r\n"Synthetic part one"`))
+  const second = ingestDataset('stock-lots', readFileSync(path.join(dup, 'stock-on-hand.csv')), 'stock-on-hand.csv', stockMap().datasets['stock-lots']!)
+  assert.ok(second.rejected.filter((r) => r.code === 'DUPLICATE_SOURCE_ROW').length >= 2)
+  assert.equal(second.rows.filter((row) => row.values.sku === 'SYN-3001').length, 0, 'neither the real row nor its twin reaches opening stock')
+})
+
+test('superseding: a later file fills what it lacks from the earlier row (barcode), never blanks it, and a disagreeing identity field rejects the row', (t) => {
+  const stock = ingestDataset('products', read('stock-on-hand.csv'), 'stock-on-hand.csv', stockMap().datasets.products!)
+  const bundles = ingestDataset('products', read('bundles.csv'), 'bundles.csv', bundlesMap().datasets.products!)
+  const merged = mergeIngested([stock, bundles], [false, true])
+  const made = merged.rows.find((row) => row.values.sku === 'SYN-5001')!
+  precondition(t, 'merged rows', merged.rows.length)
+  assert.equal(made.values.barcode, '5012345678900', 'the barcode only the stock report reads survives')
+  assert.equal(made.values.active, 'TRUE')
+  assert.equal(made.values.type, 'BOM')
+  assert.equal(made.values.weight, '0', 'the later file fills a field the earlier one did not read')
+  assert.match(merged.superseded[0].reason, /kept from this row: .*barcode/)
+  // Conflicts: a different name, then a type change that is not SIMPLE -> KIT/BOM.
+  const renamed = { ...bundles, rows: bundles.rows.map((row) => (row.values.sku === 'SYN-5001' ? { ...row, values: { ...row.values, name: 'A different name' } } : row)) }
+  const clash = mergeIngested([stock, renamed], [false, true])
+  assert.deepEqual(clash.rejected.filter((r) => r.code === 'SUPERSEDE_CONFLICT').map((r) => r.line), [1_000_000 + 5])
+  assert.ok(clash.rejected.find((r) => r.code === 'SUPERSEDE_CONFLICT')!.reason.includes('name differs'))
+  assert.equal(clash.rows.filter((row) => row.values.sku === 'SYN-5001').length, 0)
+  const retyped = { ...stock, rows: stock.rows.map((row) => (row.values.sku === 'SYN-5001' ? { ...row, values: { ...row.values, type: 'VARIANT' } } : row)) }
+  const bad = mergeIngested([retyped, bundles], [false, true])
+  assert.ok(bad.rejected.some((r) => r.code === 'SUPERSEDE_CONFLICT' && /only SIMPLE -> KIT or BOM/.test(r.reason)))
+  assert.equal(clash.recordsRead, stock.recordsRead + bundles.recordsRead, 'a conflict moves a row from rows to rejected; nothing is lost from the count')
+})
+
+test('opening cost: zero cost with stock WARNS, a blank cost with stock is rejected (MISSING_UNIT_COST), a blank cost with no stock is just zero on hand', async (t) => {
+  const dir = copyNative()
+  dropLinesWith(dir, 'stock-on-hand.csv', ['"SYN-6001"', '"SYN-7001"', '"SYN-2000-01"'])
+  const text = readFileSync(path.join(dir, 'stock-on-hand.csv'), 'utf8')
+  // Blank the moving average cost of SYN-8001 (9 units in MIL1, cost "0" today) and of SYN-1003 (no stock).
+  const blank = (sku: string, source: string) =>
+    source
+      .split('\r\n')
+      .map((line) => {
+        if (!line.includes(`"${sku}"`)) return line
+        const cells = line.match(/"(?:[^"]|"")*"/g)!
+        cells[8] = '""' // Moving Average Cost
+        return cells.join(',')
+      })
+      .join('\r\n')
+  const warnOut = fresh('zerocost')
+  const warn = await cli(['--manifest', path.join(dir, 'manifest.json'), '--out', warnOut])
+  precondition(t, 'report bytes', warn.stdout.length)
+  assert.equal(warn.code, EXIT_CODES.OK)
+  assert.ok(reportOf(warnOut).findings.some((f) => f.severity === 'WARNING' && f.code === 'ZERO_COST_OPENING_STOCK' && f.keys?.some((k) => k.startsWith('SYN-8001'))))
+  writeFileSync(path.join(dir, 'stock-on-hand.csv'), blank('SYN-1003', blank('SYN-8001', text)))
+  assert.notEqual(readFileSync(path.join(dir, 'stock-on-hand.csv'), 'utf8'), text)
+  const out = fresh('blankcost')
+  const run = await cli(['--manifest', path.join(dir, 'manifest.json'), '--out', out])
+  const report = reportOf(out)
+  assert.equal(run.code, EXIT_CODES.BLOCKING_FINDINGS)
+  assert.equal(countOf(report, 'stock-lots', 'MISSING_UNIT_COST'), 1, 'only the SKU that holds stock')
+  assert.ok(!report.findings.some((f) => f.code === 'ZERO_COST_OPENING_STOCK' && f.keys?.some((k) => k.startsWith('SYN-8001'))))
 })

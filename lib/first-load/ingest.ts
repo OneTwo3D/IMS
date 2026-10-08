@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto'
 import { CsvFormatError, parseCsvStrict } from './csv'
 import { dateFormatProblem, parseDateByFormat } from './dates'
+import { D, parseDecimal } from './money'
 import { DATASETS, SOURCES, type DatasetName, type SourceName } from './spec'
 
 export class InputError extends Error {
@@ -55,6 +56,14 @@ export interface WideLayout {
   warehouses: Record<string, string>
   /** canonical column -> header that must appear exactly once in every block */
   blockColumns: Record<string, string>
+  /**
+   * canonical column (one of blockColumns) -> header of the report's all-warehouses total for it, which must appear exactly once before the
+   * first block. Every source row must have the total equal to the exact sum of its blocks, or the row is rejected (a misaligned, missing or
+   * edited warehouse cell cannot pass).
+   */
+  totals: Record<string, string>
+  /** canonical column that must be unique across the source rows: a wide file is ONE row per key, and a repeated key rejects every row that carries it (rows are never summed). */
+  uniqueBy: string
 }
 
 export interface RowSelect {
@@ -96,7 +105,7 @@ function stringRecord(value: unknown, where: string, problems: string[]): Record
   return out
 }
 
-const WIDE_KEYS = new Set(['blockStart', 'warehouses', 'blockColumns'])
+const WIDE_KEYS = new Set(['blockStart', 'warehouses', 'blockColumns', 'totals', 'uniqueBy'])
 const ROW_SELECT_KEYS = new Set(['column', 'keep', 'skip'])
 const PARENT_FROM_KEYS = new Set(['column', 'parentValues', 'skuColumn', 'into'])
 
@@ -169,8 +178,15 @@ function parseLayoutKeys(
         if (column in columns || column in constants || column in valueMaps) problems.push(`${where}: warehouseCode is set by the wide layout's labels and cannot also be mapped, given a constant or value-mapped`)
       }
       supplied.add('warehouseCode')
+      const totals = stringRecord(w.totals ?? {}, `${where}.wide.totals`, problems)
+      if (Object.keys(totals).length === 0) problems.push(`${where}.wide.totals is required: name the report's all-warehouses total header for each block column, so every row can be reconciled`)
+      for (const [column, header] of Object.entries(totals)) {
+        if (!(column in blockColumns)) problems.push(`${where}.wide.totals: "${column}" is not one of wide.blockColumns`)
+        if (header.trim() === '') problems.push(`${where}.wide.totals.${column}: the total header is empty`)
+      }
+      if (typeof w.uniqueBy !== 'string' || !(w.uniqueBy in columns)) problems.push(`${where}.wide.uniqueBy must name a mapped per-row canonical column (for example sku): a wide file is one row per key`)
       if ((w.blockStart === 'after-label' || w.blockStart === 'at-label') && Object.keys(warehouses).length > 0) {
-        wide = { blockStart: w.blockStart, warehouses, blockColumns }
+        wide = { blockStart: w.blockStart, warehouses, blockColumns, totals, uniqueBy: typeof w.uniqueBy === 'string' ? w.uniqueBy : '' }
       }
     }
   }
@@ -375,19 +391,61 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
   if (parts.length === 1 && !supersedes[0]) return parts[0]
   const first = parts[0]
   const superseded: IngestedDataset['superseded'] = parts.flatMap((part, index) => part.superseded.map((entry) => ({ ...entry, line: Number((entry.line + index * PART_LINE_STRIDE).toFixed(2)) })))
-  const kept: CanonRow[][] = parts.map((part) => part.rows)
+  const kept: CanonRow[][] = parts.map((part) => [...part.rows])
+  const conflicts: IngestRejection[] = []
+  const at = (line: number, index: number) => Number((line + index * PART_LINE_STRIDE).toFixed(2))
   parts.forEach((part, index) => {
     if (!supersedes[index]) return
-    const keys = new Set(part.rows.map((row) => row.values.sku.toUpperCase()).filter((key) => key !== ''))
+    // Earlier rows with the same SKU are MERGED into the later row, never just dropped: a field the later file does not read (or leaves blank)
+    // keeps the earlier value; a non-blank field that disagrees rejects the later row; the type may only change SIMPLE -> KIT/BOM.
+    const matches = new Map<string, Array<{ row: CanonRow; part: number }>>()
     for (let earlier = 0; earlier < index; earlier++) {
-      const stay: CanonRow[] = []
       for (const row of kept[earlier]) {
         const key = row.values.sku.toUpperCase()
-        if (keys.has(key)) superseded.push({ line: Number((row.line + earlier * PART_LINE_STRIDE).toFixed(2)), key: row.values.sku, reason: `replaced by the row for the same SKU in ${part.file} (the manifest says that file supersedes earlier ones)` })
-        else stay.push(row)
+        if (key !== '') matches.set(key, [...(matches.get(key) ?? []), { row, part: earlier }])
       }
-      kept[earlier] = stay
     }
+    const replaced = new Set<CanonRow>()
+    const rows: CanonRow[] = []
+    for (const row of kept[index]) {
+      const list = matches.get(row.values.sku.toUpperCase())
+      if (!list) {
+        rows.push(row)
+        continue
+      }
+      const values = { ...row.values }
+      const filled: string[] = []
+      const problems: string[] = []
+      for (const column of Object.keys(values)) {
+        const earlierValues = [...new Set(list.map((match) => match.row.values[column] ?? '').filter((value) => value !== ''))]
+        if (column === 'type') {
+          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')))
+          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE -> KIT or BOM may change)`)
+          continue
+        }
+        const all = [...new Set([...earlierValues, ...(values[column] !== '' ? [values[column]] : [])])]
+        if (all.length > 1) problems.push(`${column} differs (${all.map((value) => JSON.stringify(value)).join(' vs ')})`)
+        else if (values[column] === '' && all.length === 1) {
+          values[column] = all[0]
+          filled.push(column)
+        }
+      }
+      for (const match of list) {
+        replaced.add(match.row)
+        superseded.push({
+          line: at(match.row.line, match.part),
+          key: match.row.values.sku,
+          reason: problems.length > 0
+            ? `replaced by the row for the same SKU in ${part.file}, which was then rejected for a conflict`
+            : `replaced by the row for the same SKU in ${part.file} (the manifest says that file supersedes earlier ones)${filled.length > 0 ? `; kept from this row: ${filled.join(', ')}` : ''}`,
+        })
+      }
+      if (problems.length > 0) {
+        conflicts.push({ line: at(row.line, index), code: 'SUPERSEDE_CONFLICT', reason: `the earlier row(s) for this SKU disagree with this one: ${problems.join('; ')}. Nothing is overwritten silently; fix the data or make the exports agree` })
+      } else rows.push({ line: row.line, values })
+    }
+    kept[index] = rows
+    for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))
   })
   const rowsSkipped: Record<string, number> = {}
   const unmapped: string[] = []
@@ -405,7 +463,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     hadBom: parts.some((part) => part.hadBom),
     blankRows: parts.reduce((total, part) => total + part.blankRows, 0),
     rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
-    rejected: parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))),
+    rejected: [...parts.flatMap((part, index) => part.rejected.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts],
     unmappedHeaders: unmapped,
     recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0),
     superseded,
@@ -535,6 +593,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const indexOf = new Map<string, number>()
   const readIndexes = new Set<number>()
   let blocks: Block[] = []
+  const totalIndex = new Map<string, number>()
   let selectIndex = -1
   let parentKindIndex = -1
   let parentSkuIndex = -1
@@ -592,6 +651,15 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
           if (at >= blocks[0].start) problems.push(`${file}: column ${JSON.stringify(header[at])} (for ${column}) lies inside a warehouse block (it starts at column ${blocks[0].start + 1}); a per-row column must come before the first block`)
         }
         for (const block of blocks) for (const at of block.index.values()) readIndexes.add(at)
+        for (const [column, wanted] of Object.entries(mapping.wide.totals)) {
+          const at: number[] = []
+          for (let i = 0; i < blocks[0].start; i++) if (header[i] === wanted) at.push(i)
+          if (at.length !== 1) problems.push(`${file}: the total header ${JSON.stringify(wanted)} (for ${column}) appears ${at.length} time(s) before the first warehouse block; it must appear exactly once, or the rows cannot be reconciled`)
+          else {
+            totalIndex.set(column, at[0])
+            readIndexes.add(at[0])
+          }
+        }
       }
     }
   }
@@ -601,6 +669,21 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const rejected: IngestRejection[] = []
   const rowsSkipped: Record<string, number> = {}
   const emissions = blocks.length > 0 ? blocks : [null]
+  // A wide file is one row per key: every row that shares its key with another row is refused, whatever else it says, because the
+  // warehouse quantities of two rows are never to be added together (the report cannot say whether it repeated a row or listed a second one).
+  const repeated = new Set<string>()
+  if (mapping?.wide) {
+    const keyAt = indexOf.get(mapping.wide.uniqueBy)
+    const seen = new Map<string, number>()
+    if (keyAt !== undefined) {
+      for (const record of records) {
+        if (record.cells.length !== header.length) continue
+        const key = clean(record.cells[keyAt]).toUpperCase()
+        if (key !== '') seen.set(key, (seen.get(key) ?? 0) + 1)
+      }
+      for (const [key, count] of seen) if (count > 1) repeated.add(key)
+    }
+  }
   // The SKU of the latest parent row. null = unknown (nothing seen yet, or the latest parent row was unreadable): children are refused.
   let parent: string | null = null
   const dateFormats = mapping?.dateFormats ?? {}
@@ -615,6 +698,37 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       })
       if (mapping?.parentFrom) parent = null
       continue
+    }
+    if (mapping?.wide) {
+      const keyAt = indexOf.get(mapping.wide.uniqueBy)!
+      const key = clean(record.cells[keyAt])
+      if (repeated.has(key.toUpperCase())) {
+        rejected.push({
+          line: record.line,
+          code: 'DUPLICATE_SOURCE_ROW',
+          reason: `${mapping.wide.uniqueBy} ${JSON.stringify(key)} appears on more than one row of this one-row-per-key report; every row carrying it is refused because their warehouse quantities must never be added together. Fix it in the source`,
+        })
+        if (mapping.parentFrom) parent = null
+        continue
+      }
+      let mismatch: string | null = null
+      for (const [column, totalAt] of totalIndex) {
+        const total = parseDecimal(clean(record.cells[totalAt]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+        let blockSum = new D(0)
+        let readable = total.ok
+        for (const block of blocks) {
+          const cell = parseDecimal(clean(record.cells[block.index.get(column)!]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+          if (cell.ok) blockSum = blockSum.plus(cell.value)
+          else readable = false
+        }
+        if (!readable) mismatch = `the all-warehouses ${column} or a warehouse ${column} cell is blank or not a plain number, so the row cannot be reconciled`
+        else if (total.ok && !total.value.eq(blockSum)) mismatch = `the all-warehouses ${column} is ${total.value.toFixed()} but the warehouse blocks add up to ${blockSum.toFixed()}; a warehouse cell is missing, changed or misaligned (negative balances count)`
+      }
+      if (mismatch !== null) {
+        rejected.push({ line: record.line, code: 'WIDE_TOTAL_MISMATCH', reason: mismatch })
+        if (mapping.parentFrom) parent = null
+        continue
+      }
     }
     if (mapping?.parentFrom && parentKindIndex >= 0 && mapping.parentFrom.parentValues.includes(clean(record.cells[parentKindIndex]))) {
       const sku = clean(record.cells[parentSkuIndex])
