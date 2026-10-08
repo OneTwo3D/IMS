@@ -340,6 +340,10 @@ const ALLOWLIST = [
   'lib/security/outbound-write-grant.ts',
   'lib/security/outbound-write-hold-constants.ts',
   'lib/ops/outbound-status.ts',
+  // The readiness gate's operator text and its reconciliation-pack titles (R1 against Mintsoft, R9 against
+  // WooCommerce, ...) name the systems the checks compare, exactly as the outbound registry does. Constants and
+  // text only: no connector flow, import or call lives in this file.
+  'lib/ops/readiness-gate-constants.ts',
   'lib/integration-plugins.ts',
   // The plugin setting keys, split out of lib/integration-plugins.ts so the full-chain quiesce
   // harness can name them without importing Prisma (o3d-osl8 round 6). Same registry, same reason
