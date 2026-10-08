@@ -51,6 +51,10 @@ export function matchesWhere(row: Record<string, unknown>, where: WhereNode): bo
       for (const [operator, operand] of Object.entries(condition as Record<string, unknown>)) {
         if (operator === 'in') {
           if (!(operand as unknown[]).includes(value)) return false
+        } else if (operator === 'notIn') {
+          // o3d-1e7sl: `ASSERTED_POSTED_WHERE` excludes the unfinished statuses with `status: { notIn }`. SQL-faithful
+          // for the non-nullable columns it is used on: a value in the list fails, anything else passes.
+          if ((operand as unknown[]).includes(value)) return false
         } else if (operator === 'startsWith') {
           if (typeof value !== 'string' || !value.startsWith(operand as string)) return false
         } else if (operator === 'not') {

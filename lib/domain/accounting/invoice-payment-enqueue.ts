@@ -8,6 +8,7 @@
  * endpoint worth exposing — so the shared logic lives here and app/actions/sales.ts imports it.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
@@ -687,8 +688,8 @@ export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string
       + 'undoable. Read the document, record what is actually there, and ESCALATE.'
   }
   if (redrive.redrive === 'none') {
-    return 'Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
-      + 'genuinely owed.'
+    return withLedgerCheck('Nothing will come back for this receipt, so register it in the accounting connector by hand if it is '
+      + 'genuinely owed.')
   }
   if (redrive.redrive === 'invoice-post') {
     return 'HAND SETTLEMENT IS REFUSED HERE: this receipt has no sync row of its own, which is exactly what the '
@@ -1001,7 +1002,7 @@ export function describeInvoicePaymentRefusal(params: {
         description:
           `Recorded ${amount} against ${params.orderReference}, but a payment already registered against this `
           + `invoice (${refused.detail ?? 'unnamed'}) was recorded on an OPERATOR'S ASSERTION rather than confirmed by `
-          + `the accounting connector — IMS never made that call and never read the document, so the amount it holds `
+          + `the accounting connector — IMS did not verify that settlement against the ledger and read no document, so the amount it holds `
           + `for it is what it MEANT to send, not what the ledger recorded. How much of the invoice is still `
           + `outstanding therefore cannot be computed, and this receipt was not sent. Open that payment in the `
           + `accounting system and confirm what it actually settled. ${remedy}`,

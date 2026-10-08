@@ -1,6 +1,13 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { provenCauseOf } from '@/lib/domain/accounting/ledger-standing-display'
 import { accountingPostingKeyForRow, postingKeyIsReusedAcrossPostings } from '@/lib/accounting/posting-key'
-import { isPostableAccountingSyncStatus } from '@/lib/domain/accounting/postable-sync-statuses'
+import {
+  accountingSyncRowCanPostOrHasPosted,
+  isPostableAccountingSyncStatus,
+  retiredUnprovenRows,
+} from '@/lib/domain/accounting/postable-sync-statuses'
+import { describeEarlierPostings, describeRetiredUnproven, handPostStepFor, OTHER_OPERATOR_CLAIM_OUTCOME, type EarlierPosting } from '@/lib/domain/accounting/hand-post-instruction'
+import { ledgerStanding, type LedgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { SOURCE_CANCELLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { POSTING_REFUSAL_KINDS, postingRefusalMarkable, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
@@ -51,6 +58,8 @@ export type MarkHandledClient = PostingSuppressionClient & {
     findMany(args: { where: Record<string, unknown>; select: Record<string, true> }): Promise<Array<{
       id: string; connector: string; status: string; attemptRevision: number | null
       externalTransactionId: string | null; payload: unknown
+      /** o3d-1e7sl: the two columns `ledgerStanding` needs beside status + id. */
+      settlementBasis: string | null; abandonedBeforeRemoteCall: boolean | null
     }>>
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
   }
@@ -130,14 +139,16 @@ export class MarkHandledRaceError extends Error {
  * mark cancels it) or "settle the sync log first" (the mark will refuse), and two spellings of that rule
  * would eventually disagree about which instruction an operator is given.
  */
-export function accountingSyncRowIsProvablyUnsent(sync: {
-  status: string
+export function accountingSyncRowIsProvablyUnsent(sync: LedgerStandingRow & {
   attemptRevision: number | null
-  externalTransactionId: string | null
 }): boolean {
+  // o3d-1e7sl: `LIVE_WORK` is the ledger-standing module's "PENDING or PROCESSING, no document id, no
+  // assertion" (row 12), so the id half of this test is the module's and not a second spelling of it. A
+  // PENDING row carrying a document id (CONFIRMED_POSTED), an operator's basis (UNKNOWN: no writer) or an
+  // unrecognised basis is therefore NOT provably unsent - the direction that cannot post twice.
   return sync.status === 'PENDING'
     && sync.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
-    && !sync.externalTransactionId
+    && ledgerStanding(sync) === 'LIVE_WORK'
 }
 
 /**
@@ -184,10 +195,20 @@ type PostingKeyRows = {
   cancellable: PostingKeyRow[]
   /** Completed postings of an EARLIER posting on a reused key. Neither blocking nor cancellable — reported. */
   earlier: PostingKeyRow[]
+  /**
+   * o3d-1e7sl (C1): RETIRED rows (CANCELLED) that are NOT proven never to have reached the ledger - an
+   * operator's NOT_POSTED settlement, a cancellation that recorded no pre-call proof, a cancelled row
+   * still naming a document. They can never post again, so they do not block the mark (the remedy for an
+   * asserted-not-posted or unresolved attempt IS to hand-post and mark handled, D1), but they are not
+   * "nothing": the operator is told to check the ledger first, because hand-posting a document the ledger
+   * already holds posts it twice. Reported, never dropped in silence.
+   */
+  retiredUnproven: PostingKeyRow[]
 }
 type PostingKeyRow = {
   id: string; connector: string; status: string; attemptRevision: number | null
   externalTransactionId: string | null; payload: unknown
+  settlementBasis: string | null; abandonedBeforeRemoteCall: boolean | null
 }
 
 /**
@@ -196,25 +217,81 @@ type PostingKeyRow = {
  * claim, the mark and the inbox's own instruction must not be able to disagree about which rows matter.
  */
 async function postingKeyRows(tx: MarkHandledClient, key: { type: string; referenceType: string; referenceId: string; scope: string }): Promise<PostingKeyRows> {
-  const candidates = (await tx.accountingSyncLog.findMany({
-    where: { type: key.type, referenceType: key.referenceType, referenceId: key.referenceId, status: { not: 'CANCELLED' } },
-    select: { id: true, connector: true, status: true, attemptRevision: true, externalTransactionId: true, payload: true },
+  // EVERY row for the key, whatever its status (o3d-1e7sl): the split below, in TypeScript and through the
+  // ledger-standing module, decides which are candidates and which are RETIRED-and-unproven, instead of a
+  // `status: { not: 'CANCELLED' }` that dropped the second group without a trace.
+  const everyRow = (await tx.accountingSyncLog.findMany({
+    where: { type: key.type, referenceType: key.referenceType, referenceId: key.referenceId },
+    select: {
+      id: true, connector: true, status: true, attemptRevision: true, externalTransactionId: true, payload: true,
+      settlementBasis: true, abandonedBeforeRemoteCall: true,
+    },
   })).filter((sync) => accountingPostingKeyForRow({ ...key, payload: sync.payload }).scope === key.scope)
+  const candidates = everyRow.filter(accountingSyncRowCanPostOrHasPosted)
   const earlier = candidates.filter((sync) => accountingSyncRowPostedAnEarlierPosting({ type: key.type, status: sync.status }))
   const couldPost = candidates.filter((sync) => !earlier.includes(sync))
   return {
     earlier,
     blocking: couldPost.filter((sync) => !accountingSyncRowIsProvablyUnsent(sync)),
     cancellable: couldPost.filter((sync) => accountingSyncRowIsProvablyUnsent(sync)),
+    retiredUnproven: retiredUnprovenRows(everyRow),
+  }
+}
+
+/**
+ * WHAT A BLOCKING ROW IS, in the ledger-standing module's terms (o3d-1e7sl). `row X is SYNCED with document Y`
+ * read as a fact about the ledger on a row where an operator typed Y in; say whose word it is.
+ */
+export function describeSyncRowStanding(sync: LedgerStandingRow): string {
+  const id = sync.externalTransactionId?.trim() ?? ''
+  switch (ledgerStanding(sync)) {
+    case 'CONFIRMED_POSTED':
+      return `${sync.status}${id ? ` with document ${id}` : ''} (confirmed by the connector)`
+    case 'ASSERTED_POSTED':
+      return `${sync.status} with document ${id}, TYPED IN BY AN OPERATOR (an assertion; IMS did not verify it against the ledger)`
+    case 'ASSERTED_NOT_POSTED':
+      return `${sync.status}, settled by an operator as NOT posted (an assertion, not proof that it did not post)`
+    case 'PROVEN_NOT_POSTED':
+      // Only a RECORDED PRE-CALL proof is "never sent"; a verified reversal may have been posted first (Codex r1).
+      return provenCauseOf(sync) === 'VERIFIED_REVERSAL'
+        ? `${sync.status}, verified reversed in the ledger (it may have been posted earlier)`
+        : provenCauseOf(sync) === 'REJECTED_BEFORE_POSTING'
+          ? `${sync.status}, rejected before posting`
+          : `${sync.status}, never sent (recorded before the remote call)`
+    case 'LIVE_WORK':
+      return `${sync.status} (queued or in flight)`
+    default:
+      return `${sync.status}, and nothing on the row says whether it reached the ledger`
   }
 }
 
 /** The one sentence both the claim and the mark refuse with, so an operator cannot read two accounts of it. */
 function mayBePostedMessage(rows: PostingKeyRows): string {
   return 'IMS may already have posted this, or be posting it now — accounting sync '
-    + `${rows.blocking.map((sync) => `row ${sync.id} is ${sync.status}${sync.externalTransactionId ? ` with document ${sync.externalTransactionId}` : ''}`).join('; ')}. `
+    + `${rows.blocking.map((sync) => `row ${sync.id} is ${describeSyncRowStanding(sync)}`).join('; ')}. `
     + 'Check the ledger and settle that row in the accounting sync log first; marking this handled now could '
     + 'post it twice.'
+}
+
+/** One line per retired-and-unproven row, each naming whose word its standing rests on (o3d-1e7sl). */
+export function retiredUnprovenNotes(rows: ReadonlyArray<LedgerStandingRow & { id: string }>): string[] {
+  return rows.map((sync) => `row ${sync.id} (${describeSyncRowStanding(sync)})`)
+}
+
+/**
+ * The notes as an operator-facing sentence, or '' when there are none (o3d-1e7sl). Never says the ledger is
+ * clear: the point of the sentence is that IMS cannot say.
+ */
+/**
+ * Codex round 6: a completed posting of an EARLIER edit, WITH ITS STANDING. Reducing the row to an id dropped the one fact
+ * the operator needs: whether the ledger CONFIRMED that document or an operator merely typed its id in (an asserted SYNCED
+ * row is an "earlier posting" on a reused key too). The ref is for display; the standing decides the wording.
+ */
+
+export { describeEarlierPostings, describeRetiredUnproven, type EarlierPosting }
+
+export function earlierPostingOf(row: LedgerStandingRow & { id?: string }): EarlierPosting {
+  return { ref: row.externalTransactionId ?? `${row.status} row`, standing: ledgerStanding(row) }
 }
 
 /**
@@ -306,8 +383,7 @@ function claimedByOther(row: LoadedRefusal): Extract<MarkHandledResult, { ok: fa
     message:
       'Another operator is settling this posting by hand — they took it '
       + `${row.handPostClaimedAt ? `at ${row.handPostClaimedAt.toISOString()}` : 'already'}. `
-      + 'Do not post it as well: while they hold it IMS will not queue it, and when they confirm it the row '
-      + 'closes. If they are not going to, release their claim first.',
+      + `Do not post it as well. ${OTHER_OPERATOR_CLAIM_OUTCOME}`,
   }
 }
 
@@ -361,7 +437,7 @@ function claimedByOther(row: LoadedRefusal): Extract<MarkHandledResult, { ok: fa
  * interval and can be given back; a mark cannot.
  */
 export type HandPostClaimResult =
-  | { ok: true; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[] }
+  | { ok: true; type: string; cancelledSyncRows: string[]; claimedAt: Date; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
   | Extract<MarkHandledResult, { ok: false }>
 
 export async function claimPostingForHandPosting(
@@ -375,7 +451,19 @@ export async function claimPostingForHandPosting(
   if (row.handPostClaimedAt) {
     // Idempotent for the holder: pressing it twice must not read as somebody else's claim.
     if (row.handPostClaimedBy === params.userId) {
-      return { ok: true, cancelledSyncRows: [], claimedAt: row.handPostClaimedAt, earlierPostings: [] }
+      // Codex round 9: a repeated Take RELOADS the posting key's rows and returns their standing - the caller writes an operator-facing
+      // log entry from this, and empty arrays here would have logged the plain "post it now" instruction over an asserted earlier
+      // posting or an unproven retired attempt. ONE code path for claim and re-claim: nothing is cancelled on a re-claim.
+      const held = await postingKeyRows(tx, key)
+      return {
+        ok: true,
+        type: key.type,
+        cancelledSyncRows: [],
+        claimedAt: row.handPostClaimedAt,
+        earlierPostings: held.earlier.map((sync) => sync.externalTransactionId ?? sync.id),
+        earlierPostingDetails: held.earlier.map(earlierPostingOf),
+        retiredUnproven: retiredUnprovenNotes(held.retiredUnproven),
+      }
     }
     return claimedByOther(row)
   }
@@ -406,9 +494,12 @@ export async function claimPostingForHandPosting(
   if (claimed.count === 0) throw new MarkHandledRaceError()
   return {
     ok: true,
+    type: key.type,
     cancelledSyncRows,
     claimedAt: now,
     earlierPostings: rows.earlier.map((sync) => sync.externalTransactionId ?? sync.id),
+    earlierPostingDetails: rows.earlier.map(earlierPostingOf),
+    retiredUnproven: retiredUnprovenNotes(rows.retiredUnproven),
   }
 }
 
@@ -519,7 +610,7 @@ export async function markPostingHandled(
       message:
         'Take this posting for hand posting FIRST — that is what stops IMS queueing it while you are in the '
         + 'ledger. Press "Take for hand posting" (it cancels any queued row that nothing has picked up, and '
-        + 'refuses if one may already have been sent), then post it, then mark it handled. If you have '
+        + `refuses if one may already have been sent), then ${handPostStepFor(row.type)}, then mark it handled. If you have `
         + 'already posted it, take it now and check the accounting sync log for a row IMS queued meanwhile.',
     }
   }

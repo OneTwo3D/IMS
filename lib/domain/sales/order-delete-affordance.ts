@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 /**
  * o3d-0zy — WHY THE DELETE BUTTON GOES QUIET ON A NON-DRAFT ORDER.
  *
@@ -43,8 +44,8 @@ export function resolveSalesOrderDeleteBlock(input: {
   if (input.accountingInvoiceId) {
     return {
       remedy: 'finance',
-      reason: 'An accounting invoice has already been posted for this order, so it can no longer be deleted. '
-        + 'Cancelling would not reverse it either — finance has to raise a credit note or reversal in the accounting system.',
+      reason: withLedgerCheck('An accounting invoice has already been posted for this order, so it can no longer be deleted. '
+        + 'Cancelling would not reverse it either — finance has to raise a credit note or reversal in the accounting system.'),
     }
   }
 

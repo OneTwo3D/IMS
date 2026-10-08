@@ -1,5 +1,6 @@
 'use server'
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
@@ -37,6 +38,7 @@ import {
 } from '@/lib/domain/accounting/follow-up-obligation-registry'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { accountingSyncRowCanPostOrHasPosted, retiredUnprovenRows } from '@/lib/domain/accounting/postable-sync-statuses'
 import { POSTING_REFUSAL_KINDS, POSTING_REFUSAL_NOTE_MAX_LENGTH, postingRefusalClearing, type PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import {
   countUnreconciledProvisionalPostingRefusals,
@@ -52,6 +54,11 @@ import {
   accountingSyncRowIsProvablyUnsent,
   accountingSyncRowPostedAnEarlierPosting,
   claimPostingForHandPosting,
+  describeEarlierPostings,
+  describeRetiredUnproven,
+  earlierPostingOf,
+  type EarlierPosting,
+  retiredUnprovenNotes,
   markPostingHandled,
   MarkHandledRaceError,
   releasePostingHandPostClaim,
@@ -60,6 +67,7 @@ import {
   type MarkHandledClient,
   type MarkHandledResult,
 } from '@/lib/domain/accounting/posting-mark-handled'
+import { claimLogDescription, handPostInstruction, handPostOrderFor, markLogDescription, markNotice, releaseLogDescription, releaseNotice, withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
@@ -550,6 +558,8 @@ export type AccountingFollowUpObligationRow = {
   referenceType: string
   referenceId: string
   externalTransactionId: string | null
+  /** Codex round 6: null for a confirmed or queued row; set when the id rests on an operator (asserted) or nothing proves it (unproven). */
+  standingLabel: string | null
   owedSince: string | null
   blockedBy: string
   operatorRemedy: string
@@ -621,6 +631,20 @@ export type AccountingPostingRefusalRow = {
    * hand REPLACES it rather than joining it.
    */
   earlierPostings: string[]
+  /** Codex round 6: each earlier posting WITH ITS STANDING (confirmed by the connector, or an id an operator typed in). */
+  earlierPostingDetails: EarlierPosting[]
+  /** Codex round 9: 'loaded' only when the server read the posting key's rows; a dialog reads anything else as not loaded. */
+  handPostState: 'loaded' | 'not-loaded'
+  /**
+   * o3d-1e7sl (C1) — EARLIER ATTEMPTS IMS RETIRED WITHOUT PROOF THAT THEY NEVER REACHED THE LEDGER.
+   *
+   * One line per CANCELLED row for this posting key that is not PROVEN_NOT_POSTED (an operator's
+   * NOT_POSTED settlement, a cancellation that recorded no pre-call proof, a cancelled row still naming a
+   * document), each saying whose word its standing rests on. They never block the mark - they cannot post
+   * again, and hand-posting is the remedy for them - but the operator is told to look in the ledger before
+   * posting by hand, because a retired row is not evidence that nothing was posted.
+   */
+  retiredUnproven: string[]
   /**
    * o3d-j625 r16 (Codex round 15, HIGH 1) — WHO IS SETTLING THIS BY HAND, if anybody.
    *
@@ -1252,6 +1276,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         referenceType: true,
         referenceId: true,
         externalTransactionId: true,
+        settlementBasis: true,
+        abandonedBeforeRemoteCall: true,
         backReferenceFollowUpsPendingAt: true,
         // r8: the AGE columns, and both are stamped by the DATABASE. `owedSince` is the claim's own
         // clock_timestamp() stamp, else createdAt (a database now() default). NOT the marker, which
@@ -1623,6 +1649,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
           )
           const queuedRow = classified?.queuedRow ?? null
           const earlierPostings = classified?.earlierPostings ?? []
+          const earlierPostingDetails = classified?.earlierPostingDetails ?? []
+          const retiredUnproven = classified?.retiredUnproven ?? []
           const handPostClaim = row.handPostClaimedAt
             ? {
                 at: row.handPostClaimedAt.toISOString(),
@@ -1640,6 +1668,11 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             unconfirmed: false,
             queuedRow,
             earlierPostings,
+            earlierPostingDetails,
+            // Codex round 9: the server's positive statement that it loaded this posting key's rows (classifyQueuedRowsForRefusals reads
+            // EVERY row for every refusal, so no entry for a key means none exist). Anything else reads as not loaded.
+            handPostState: 'loaded' as const,
+            retiredUnproven,
             handPostClaim,
             handPostDeferredEdits: row.handPostDeferredCount,
             /**
@@ -1654,10 +1687,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             handPostDeclineUnaccounted: row.handPostDeclineUncountedAt !== null,
             // o3d-j625 r16: the site's own remedy, VERBATIM, in every case — round 12's property with the
             // exception r14 introduced removed again. What to do FIRST is its own field.
-            remedy: row.remedy,
+            // Codex round 17: GUARDED ON READ too. A row persisted before the sink guard existed still holds its raw remedy; the guard is idempotent,
+            // so a row that already carries the preamble is returned as it is.
+            remedy: withHandPostSafety(row.remedy),
             handPostOrder: clearing === null || clearing === 'auto'
               ? null
-              : handPostOrderFor({ queuedRow, earlierPostings, claim: handPostClaim }),
+              : handPostOrderFor({ queuedRow, state: 'loaded', earlierPostingDetails, retiredUnproven, type: row.type, claim: handPostClaim }),
           }
         })
       })(),
@@ -1736,6 +1771,10 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
     // claim (a provisional claim is not yet known to be owed, so it may not be settled by hand at all), and
     // therefore no order of operations. Its own remedy is the whole of what it can say.
     earlierPostings: [],
+    earlierPostingDetails: [],
+    retiredUnproven: [],
+    // Codex round 9: NOT loaded - a provisional row has no established posting key, so these empty arrays are not a statement.
+    handPostState: 'not-loaded' as const,
     handPostClaim: null,
     handPostOrder: null,
     // o3d-j625 r18: an unconfirmed claim has no established posting key and cannot be taken for hand posting
@@ -1772,16 +1811,18 @@ async function loadUnconfirmedPostingRefusals(): Promise<AccountingPostingRefusa
  * the same function the row-creating primitive keys its clear on — decides whether a row belongs to this
  * refusal's posting or to a different one sharing the reference.
  */
-type QueuedRowClassification = { queuedRow: 'unsent' | 'may-be-sent' | null; earlierPostings: string[] }
+type QueuedRowClassification = { queuedRow: 'unsent' | 'may-be-sent' | null; earlierPostings: string[]; earlierPostingDetails: EarlierPosting[]; retiredUnproven: string[] }
 
 async function classifyQueuedRowsForRefusals(
   refusals: Array<{ type: string; referenceType: string; referenceId: string; scope: string }>,
 ): Promise<Map<string, QueuedRowClassification>> {
   const classification = new Map<string, QueuedRowClassification>()
   if (refusals.length === 0) return classification
-  const live = await db.accountingSyncLog.findMany({
+  // EVERY row for these postings, whatever its status (o3d-1e7sl): the split below goes through the
+  // ledger-standing module, so a CANCELLED row is neither dropped by a `status: { not: 'CANCELLED' }` nor
+  // read as "nothing was posted" - it is REPORTED as retired-and-unproven unless it proved otherwise.
+  const everyRow = await db.accountingSyncLog.findMany({
     where: {
-      status: { not: 'CANCELLED' },
       OR: refusals.map((refusal) => ({
         type: refusal.type as never,
         referenceType: refusal.referenceType,
@@ -1789,14 +1830,24 @@ async function classifyQueuedRowsForRefusals(
       })),
     },
     select: {
-      type: true, referenceType: true, referenceId: true, payload: true,
+      id: true, type: true, referenceType: true, referenceId: true, payload: true,
       status: true, attemptRevision: true, externalTransactionId: true,
+      settlementBasis: true, abandonedBeforeRemoteCall: true,
     },
   })
+  const live = everyRow.filter(accountingSyncRowCanPostOrHasPosted)
+  const retiredUnproven = retiredUnprovenRows(everyRow)
+  for (const row of retiredUnproven) {
+    const key = accountingPostingKeyForRow(row)
+    const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
+    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
+    classification.set(id, at)
+    at.retiredUnproven.push(...retiredUnprovenNotes([row]))
+  }
   for (const row of live) {
     const key = accountingPostingKeyForRow(row)
     const id = `${key.type}\u0000${key.referenceType}\u0000${key.referenceId}\u0000${key.scope}`
-    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [] }
+    const at = classification.get(id) ?? { queuedRow: null, earlierPostings: [], earlierPostingDetails: [], retiredUnproven: [] }
     classification.set(id, at)
     /**
      * o3d-j625 r16 (Codex round 15, HIGH 2) — A COMPLETED POSTING OF AN EARLIER EDIT IS NOT A ROW THAT
@@ -1813,6 +1864,7 @@ async function classifyQueuedRowsForRefusals(
      */
     if (accountingSyncRowPostedAnEarlierPosting(row)) {
       at.earlierPostings.push(row.externalTransactionId ?? `${row.status} row`)
+      at.earlierPostingDetails.push(earlierPostingOf(row))
       continue
     }
     // 'may-be-sent' WINS over 'unsent' when a key has both: the instruction has to be safe for the worst
@@ -1821,57 +1873,6 @@ async function classifyQueuedRowsForRefusals(
     at.queuedRow = accountingSyncRowIsProvablyUnsent(row) ? 'unsent' : 'may-be-sent'
   }
   return classification
-}
-
-/**
- * ── o3d-j625 r16 — WHAT TO DO *FIRST*, for a refusal a person can close by hand ──
- *
- * The refusing site's own remedy is rendered verbatim beside this, always; this is the ORDER, and it exists
- * because the order is the whole of the safety argument. r14 wrote it by rewriting the site's remedy, which
- * cost round 12's property its exactness for no gain — the two sentences answer different questions and are
- * now two fields.
- *
- * Every branch names an ACT, not a caution, because the act is what closes the interval: taking the posting
- * for hand posting is a transaction that cancels the unsent rows and stops IMS queueing it, so an operator
- * who takes it and then spends twenty minutes in the ledger cannot be overtaken.
- */
-function handPostOrderFor(state: {
-  queuedRow: 'unsent' | 'may-be-sent' | null
-  earlierPostings: string[]
-  claim: { at: string; byName: string | null; mine: boolean } | null
-}): string {
-  const earlier = state.earlierPostings.length > 0
-    ? ' The ledger ALREADY holds '
-      + `${state.earlierPostings.join(', ')} for this obligation, from an earlier version of this document — `
-      + 'your hand posting REPLACES that document; do not raise a second one.'
-    : ''
-  if (state.claim?.mine) {
-    return 'YOU are settling this by hand. IMS will not queue this posting while you hold it, so take your '
-      + 'time: post it in the ledger now, then press "Mark as handled" to confirm it and close this row. If '
-      + 'you are not going to post it, press "Release" — IMS may then queue it again.'
-      + earlier
-  }
-  if (state.claim) {
-    return `${state.claim.byName ?? 'Another operator'} is settling this by hand (taken ${state.claim.at}). `
-      + 'Do NOT post it as well. IMS will not queue it while they hold it, and the row closes when they '
-      + 'confirm. If they are not going to finish, release their claim first.'
-      + earlier
-  }
-  if (state.queuedRow === 'may-be-sent') {
-    return 'DO NOT POST THIS BY HAND. IMS may ALREADY have posted this — its accounting sync row is in '
-      + 'flight, has been claimed by a processor, or carries a document id — so posting it now is how the '
-      + 'ledger gets it twice. Find this posting in the accounting sync log and settle THAT row first; '
-      + 'taking it for hand posting will refuse until you do.'
-      + earlier
-  }
-  return 'DO NOT POST THIS BY HAND YET. Press "Take for hand posting" FIRST. That is one transaction which '
-    + (state.queuedRow === 'unsent'
-      ? 'cancels the queued row IMS is holding for this posting (nothing has picked it up yet), refuses if '
-        + 'any row may already have been sent, '
-      : 'refuses if any row for this posting may already have been sent, cancels any that provably has not, ')
-    + 'and stops IMS queueing this posting at all while you hold it — so nothing can post it behind you '
-    + 'while you are in the ledger. Then post it, then press "Mark as handled".'
-    + earlier
 }
 
 /**
@@ -2171,20 +2172,18 @@ export async function claimAccountingPostingRefusalForHandPostingAction(id: stri
       tag: 'accounting',
       action: 'accounting_posting_refusal_claimed_for_hand_posting',
       level: 'INFO',
-      description:
-        'Took a refused accounting posting to settle it by hand. IMS will refuse to queue this posting while '
-        + 'the claim is held, so it cannot be posted twice while the operator is in the ledger'
-        + (result.cancelledSyncRows.length > 0
-          ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.`
-          : '.')
-        + (result.earlierPostings.length > 0
-          ? ` The ledger already holds ${result.earlierPostings.join(', ')} for this obligation from an earlier `
-            + 'version of the document; the hand posting replaces it.'
-          : ''),
+      description: claimLogDescription({
+        cancelledCount: result.cancelledSyncRows.length,
+        earlier: describeEarlierPostings(result.earlierPostingDetails),
+        retired: describeRetiredUnproven(result.retiredUnproven),
+        step: handPostInstruction({ type: result.type }).step,
+      }),
       metadata: {
         refusalId: id, userId: session.user.id,
         cancelledSyncRows: result.cancelledSyncRows,
         earlierPostings: result.earlierPostings,
+        earlierPostingDetails: result.earlierPostingDetails,
+        retiredUnproven: result.retiredUnproven,
         claimedAt: result.claimedAt.toISOString(),
       },
       resolveUser: false,
@@ -2227,30 +2226,7 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
       tag: 'accounting',
       action: 'accounting_posting_refusal_hand_post_claim_released',
       level: 'WARNING',
-      description:
-        'Released the hand-posting claim on a refused accounting posting. IMS may queue and post it again '
-        + 'from now on — if it was already posted by hand and not confirmed here, the ledger can get it '
-        + 'twice. The refusal is still outstanding in the exception inbox.'
-        // o3d-j625 r18 (Codex round 17, HIGH 1): and what IMS declined to queue while the claim was held is
-        // named, because nothing requeues those postings on its own — the outstanding row is the record and
-        // re-saving the document is what queues the CURRENT version.
-        /**
-         * o3d-j625 r36 (Codex round 35, HIGH 1) — THE UNACCOUNTED CASE FIRST, BECAUSE THE COUNT IS ZERO IN IT.
-         *
-         * r34 gave the stamp the job of holding a reused key's debt when the count could not be written, and
-         * taught the MARK to say so. This path still read `deferredEdits` alone, which is structurally 0 there —
-         * so releasing a stamped claim logged and announced a ROUTINE release while an uncounted posting was
-         * still owed. Same trap as the mark's, on a surface I had not swept.
-         */
-        + (result.declineUnaccounted
-          ? ' While it was held, IMS declined AT LEAST ONE posting for this key and COULD NOT RECORD HOW MANY, '
-            + 'so this refusal\'s history is incomplete. It stays outstanding. Nothing requeues it by itself — '
-            + 'compare the document with the ledger, then re-save it to queue its current version.'
-          : result.deferredEdits > 0
-            ? ` While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for this key; they `
-              + 'have been added to the refusal\'s count and it stays outstanding. Nothing requeues them by '
-              + 'itself — re-save the document to queue its current version.'
-            : ''),
+      description: releaseLogDescription({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits }),
       metadata: {
         refusalId: id, releasedBy: session.user.id,
         heldBy: result.releasedFrom, heldSince: result.heldSince.toISOString(),
@@ -2263,20 +2239,10 @@ export async function releaseAccountingPostingRefusalHandPostClaimAction(id: str
     revalidatePath('/sync/exceptions')
     return {
       success: true,
-      // o3d-j625 r36: and the operator is told at the moment of releasing, not left with a routine "Released".
-      ...(result.declineUnaccounted
-        ? {
-            notice: 'Released — but this refusal\'s history is INCOMPLETE: while it was held IMS declined at '
-              + 'least one posting for this key and could not record how many. It stays outstanding. Compare the '
-              + 'document with the ledger, then re-save it to queue the current version.',
-          }
-        : result.deferredEdits > 0
-          ? {
-              notice: `Released. While it was held, IMS declined to queue ${result.deferredEdits} posting(s) for `
-                + 'this key; they are counted on the refusal, which stays outstanding. Nothing requeues them by '
-                + 'itself — re-save the document to queue its current version.',
-            }
-          : {}),
+      // The operator is told at the moment of releasing what IMS declined while the claim was held (a fact), then to check afterwards.
+      ...(releaseNotice({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits })
+        ? { notice: releaseNotice({ unaccounted: Boolean(result.declineUnaccounted), deferredEdits: result.deferredEdits }) as string }
+        : {}),
     }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
@@ -2325,46 +2291,13 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
       tag: 'accounting',
       action: 'accounting_posting_refusal_marked_handled',
       level: 'INFO',
-      description:
-        `Marked a refused ${result.kind} posting as handled — posted by hand in the ledger. `
-        // o3d-j625 r13 (independent review, HIGH) — SAY WHICH OF THE TWO THIS WAS.
-        //
-        // "IMS will not post it" was written for a suppression that covers ONE posting for ever, and it
-        // was the only sentence an operator ever saw. On a REUSED posting key (an invoice or bill update,
-        // a bill payment) it was also false about the future: the same sentence covered every LATER edit
-        // of that document, silently. Those kinds no longer suppress at all, so the copy now states which
-        // of the two happened rather than implying the stronger one.
-        + (result.suppressed
-          ? 'IMS will not post this posting again'
-          : 'IMS will not re-post this edit, and a LATER edit of this document will be queued as usual — '
-            + 'this posting key is one successive edits share')
-        + (result.cancelledSyncRows.length > 0 ? `; ${result.cancelledSyncRows.length} unsent queued row(s) for it were cancelled.` : '.')
-        /**
-         * o3d-j625 r18 (Codex round 17, HIGH 1) — AND WHETHER THE DEBT IS ACTUALLY DISCHARGED.
-         *
-         * On a reused posting key, a posting IMS declined to queue while the claim was held may be a LATER
-         * version of the same document. The operator posted the version they had; the ledger still does not
-         * hold the current one. The row therefore stays OUTSTANDING and the record says so — it is not a
-         * refusal of their mark (the ledger write they made is real and is recorded here), it is a refusal of
-         * the claim that the obligation is met.
-         */
-        /**
-         * o3d-j625 r34 (Codex round 33, HIGH): and the UNACCOUNTED case gets its own sentence. When the debt is
-         * kept by the stamp rather than by the count, `deferredEdits` is 0 — "IMS was asked to post 0 later
-         * version(s)" is the one thing this must never say, because the truth is "at least one, and IMS could
-         * not count it". The operator meets that at the moment of clicking, which is the requirement: a
-         * residual they would have had to read a log line for earlier is not a mitigation.
-         */
-        + (result.stillOutstanding
-          ? (result.unaccountedDecline
-            ? ' This row STAYS OUTSTANDING: while the claim was held IMS declined at least one posting of this '
-              + 'document and COULD NOT RECORD HOW MANY, so its history here is incomplete. Treat the ledger as '
-              + 'possibly behind: check the document against the ledger, then re-save it to queue the current '
-              + 'version, or post that version by hand and mark it again.'
-            : ` This row STAYS OUTSTANDING: while the claim was held, IMS was asked to post ${result.deferredEdits} `
-              + 'later version(s) of this document and declined, so the ledger does not hold the current one. '
-              + 'Re-save the document to queue it, or post the current version by hand and mark it again.')
-          : ''),
+      description: markLogDescription({
+        kind: result.kind,
+        cancelledCount: result.cancelledSyncRows.length,
+        stillOutstanding: result.stillOutstanding,
+        unaccounted: Boolean(result.unaccountedDecline),
+        deferredEdits: result.deferredEdits,
+      }),
       metadata: {
         refusalId: id, kind: result.kind, userId: session.user.id, note: trimmed === '' ? null : trimmed,
         cancelledSyncRows: result.cancelledSyncRows,
@@ -2385,17 +2318,7 @@ export async function markAccountingPostingRefusalHandledAction(id: string, note
     return {
       success: true,
       ...(result.stillOutstanding
-        ? {
-            notice: result.unaccountedDecline
-              ? 'Your hand posting is recorded, but this row STAYS OUTSTANDING: while you held it IMS declined '
-                + 'at least one posting of this document and could not record how many, so its history here is '
-                + 'INCOMPLETE. Check this document against the ledger, then re-save it to queue the current '
-                + 'version, or post that version by hand and mark it again.'
-              : 'Your hand posting is recorded, but this row STAYS OUTSTANDING: IMS was asked to post '
-                + `${result.deferredEdits} later version(s) of this document while you held it and declined, so `
-                + 'the ledger does not hold the current one. Re-save the document to queue it, or post the '
-                + 'current version by hand and mark it again.',
-          }
+        ? { notice: markNotice({ unaccounted: Boolean(result.unaccountedDecline), deferredEdits: result.deferredEdits }) }
         : {}),
     }
   } catch (error) {
@@ -2756,9 +2679,9 @@ export async function recordRefundParkManually(
       return {
         success: false,
         error:
-          'This park does not carry the WooCommerce refund it came from, so the amount recorded here ' +
+          withLedgerCheck('This park does not carry the WooCommerce refund it came from, so the amount recorded here ' +
           'could not be checked against the refund it settles. Use Retry on this row first — that ' +
-          're-reads the refund from WooCommerce and stores it — then record it manually.',
+          're-reads the refund from WooCommerce and stores it — then record it manually.'),
       }
     }
     const parkedGross = toDecimal(parkedGrossText).abs()

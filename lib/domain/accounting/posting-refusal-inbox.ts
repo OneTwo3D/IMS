@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { withSavepoint } from '@/lib/db/savepoint'
 import type { PostingRefusalKind } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
+import { accountingSyncRowCanPostOrHasPosted } from '@/lib/domain/accounting/postable-sync-statuses'
 import { recordHandPostDeferral, runUnderPostingKeyLock, type PostingKeyLockClient, type PostingSuppressionClient } from '@/lib/domain/accounting/posting-suppression'
 import { enqueueProvisionalPostingRefusal } from '@/lib/domain/accounting/posting-refusal-provisional'
 import type { IntegrationOutboxClient } from '@/lib/domain/integrations/outbox'
@@ -118,8 +120,14 @@ export type PostingRefusalClient = {
 type SyncLogReader = {
   findMany?(args: {
     where: Record<string, unknown>
-    select: { id: true; payload: true }
-  }): Promise<Array<{ id: string; payload: unknown }>>
+    select: { id: true; payload: true; status: true; settlementBasis: true; externalTransactionId: true; abandonedBeforeRemoteCall: true }
+  }): Promise<Array<{
+    id: string; payload: unknown
+    // o3d-1e7sl: the columns the ledger-standing module needs to say whether a row is a posting that
+    // can still post / has posted (`live`) or a retired one.
+    status: string; settlementBasis: string | null; externalTransactionId: string | null
+    abandonedBeforeRemoteCall: boolean | null
+  }>>
 }
 
 /** The key of the posting a row is about — produced by `accountingPostingKey` in lib/accounting.ts. */
@@ -368,13 +376,14 @@ async function readPostingRowIdsForKey(
       type: key.type,
       referenceType: key.referenceType,
       referenceId: key.referenceId,
-      // A CANCELLED row is not a queued posting — and it IS part of a baseline, because it can be put
-      // back in front of the connector under the same id.
-      ...(statuses === 'live' ? { status: { not: 'CANCELLED' } } : {}),
     },
-    select: { id: true, payload: true },
+    // EVERY row is read and `live` is decided in TypeScript through `accountingSyncRowCanPostOrHasPosted`
+    // (o3d-1e7sl), not by `status: { not: 'CANCELLED' }`: a CANCELLED row is not a queued posting - and it
+    // IS part of a baseline, because it can be put back in front of the connector under the same id.
+    select: { id: true, payload: true, status: true, settlementBasis: true, externalTransactionId: true, abandonedBeforeRemoteCall: true },
   })
   return rows
+    .filter((row) => statuses === 'every' || accountingSyncRowCanPostOrHasPosted(row))
     .filter((row) => accountingPostingKeyForRow({ ...key, payload: row.payload }).scope === key.scope)
     .filter((row) => typeof row.id === 'string')
     .map((row) => row.id)
@@ -406,11 +415,11 @@ async function seesEveryCommittedRow(client: PostingKeyLockClient): Promise<bool
 }
 
 /** The postings that are queued or posted for this key right now. */
-const readLiveQueuedPostings = (client: PostingRefusalClient, key: PostingRefusalKey) =>
+export const readLiveQueuedPostings = (client: PostingRefusalClient, key: PostingRefusalKey) =>
   readPostingRowIdsForKey(client, key, 'live')
 
 /** Every row this key has, whatever its status — what a baseline must know about. */
-const readEveryPostingRowForKey = (client: PostingRefusalClient, key: PostingRefusalKey) =>
+export const readEveryPostingRowForKey = (client: PostingRefusalClient, key: PostingRefusalKey) =>
   readPostingRowIdsForKey(client, key, 'every')
 
 /**
@@ -554,9 +563,12 @@ async function postingSupersedesThisRefusal(
 export async function recordAccountingPostingRefusal(
   client: PostingRefusalClient,
   key: PostingRefusalKey,
-  record: AccountingPostingRefusalRecord,
+  rawRecord: AccountingPostingRefusalRecord,
   options?: RecordRefusalOptions,
 ): Promise<RefusalRecordOutcome> {
+  // Codex round 16: THE SINK GUARD. Every refusing site's remedy passes through here, so a hand-post / re-post / re-save instruction never reaches the
+  // exception inbox without the claim-and-ledger-check preamble in front of it.
+  const record: AccountingPostingRefusalRecord = { ...rawRecord, remedy: withHandPostSafety(rawRecord.remedy) }
   const now = new Date()
   const decidedAt = options?.decidedAt ?? now
   // A holder rather than a plain `let`: the assignment happens inside a callback, and TypeScript would
@@ -767,8 +779,8 @@ export async function recordAccountingPostingRefusal(
       tag: 'accounting',
       level: 'INFO',
       description:
-        `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled — `
-        + `posted by hand — on ${outcome.at.toISOString()}. Nothing is owed and nothing was recorded.`,
+        `${key.type} for ${key.referenceType} ${key.referenceId} was refused again, but it was marked handled (an operator confirmed it) `
+        + `on ${outcome.at.toISOString()}. Nothing was recorded.`,
       metadata: { ...key, reason: record.reason },
     }).catch(() => { /* nothing else to try */ })
     return outcome
@@ -1196,16 +1208,13 @@ async function reportClearDeclinedForHandPostClaim(
     description:
       `A queued ${key.type} for ${key.referenceType} ${key.referenceId} did NOT close its refused-posting row: `
       + `an operator took it to settle by hand at ${claimedAt.toISOString()} and still holds it, which cancelled `
-      + 'the queued row this clear was about. The refusal stays OUTSTANDING and the claim stays theirs — '
-      + 'clearing it would hide a posting nobody could then release or mark handled, while its claim went on '
-      + 'stopping IMS queueing it.'
+      + 'the queued row this clear was about. The refusal is OUTSTANDING and the claim is theirs.'
       // o3d-j625 r34: which of the two durable signals this decline left behind. The signal itself is what
       // stops the mark resolving the row; this line only describes it, and is no longer the mechanism.
       + (counted
         ? ' The postponement is COUNTED against the claim.'
         : ' The postponement could NOT be counted, so the refusal is stamped as carrying an UNACCOUNTED decline '
-          + 'instead — written in this same transaction, under this same lock, so it commits with this decline or '
-          + 'not at all. Marking the claim handled will keep the refusal outstanding either way.'),
+          + 'instead, written in this same transaction under this same lock.'),
     metadata: { ...key, handPostClaimedAt: claimedAt.toISOString(), handPostClaimedBy: claimedBy, postponementCounted: counted },
   }).catch(() => { /* an audit line that cannot be written must not fail the enqueue it describes */ })
 }

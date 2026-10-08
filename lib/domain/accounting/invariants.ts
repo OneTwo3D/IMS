@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
+import { ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
@@ -183,6 +184,12 @@ type AccountingSyncLogRow = {
   retryCount: number
   createdAt: Date | string
   syncedAt: Date | string | null
+  /**
+   * o3d-1e7sl (D5): the two columns `ledgerStanding` / `workSlotStanding` need beside status + id.
+   * REQUIRED: a collector that forgot them would read every operator-typed SYNCED row as the connector's.
+   */
+  settlementBasis: string | null
+  abandonedBeforeRemoteCall: boolean | null
 }
 
 export type AccountingInvariantRows = {
@@ -227,7 +234,10 @@ type AccountingInvariantClient = {
   }
 }
 
-const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
+// o3d-1e7sl (D5): WHAT COUNTS AS A "LIVE" SYNC ROW is the work slot (ledger-standing.ts: PENDING / PROCESSING
+// / SYNCED, the unique indexes' own predicate), asked of the module through `rowHoldsWorkSlot` below instead of
+// a status set restated here. It is an EXISTENCE reading (D2): an operator-typed SYNCED row still counts as
+// the posting being there - and is reported (`accounting_sync_evidence_operator_asserted`), never silently.
 const IDEMPOTENCY_REQUIRED_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'])
 const DAILY_BATCH_TYPES = new Set([
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -305,6 +315,10 @@ function buildSummary(findings: AccountingInvariantFinding[]): AccountingInvaria
   )
 }
 
+function rowHoldsWorkSlot(log: AccountingSyncLogRow): boolean {
+  return workSlotStanding(log).slot === 'OCCUPIED'
+}
+
 function liveSyncLogIndexKey(type: string, referenceId: string, referenceType: string): string {
   return `${type}\u0000${referenceType}\u0000${referenceId}`
 }
@@ -340,7 +354,7 @@ function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): LiveSyncLogInd
   const exact = new Set<string>()
   const digestBridged = new Set<string>()
   for (const log of syncLogs) {
-    if (!LIVE_SYNC_STATUSES.has(log.status)) continue
+    if (!rowHoldsWorkSlot(log)) continue
     const key = liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType)
     exact.add(key)
     digestBridged.add(key)
@@ -487,7 +501,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // A posted (or to-be-posted) journal must balance: total debits == total
     // credits. The suite previously only checked that evidence existed, never the
     // amounts, so an unbalanced journal could reach the GL undetected (scjz.38).
-    if (LIVE_SYNC_STATUSES.has(log.status)) {
+    if (rowHoldsWorkSlot(log)) {
       const totals = journalLineTotals(log.payload)
       if (totals && Math.abs(totals.debit - totals.credit) > 0.005) {
         findings.push({
@@ -506,6 +520,27 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
           },
         })
       }
+    }
+
+    // o3d-1e7sl (D5, D2): A POSTING THAT IS "THERE" ONLY ON AN OPERATOR'S WORD IS SAID TO BE. The row counts as
+    // evidence (so the "no sync evidence" findings stay quiet, as they did), but nothing about it was read
+    // from the ledger: the document id is what somebody typed in. One finding per such row.
+    if (rowHoldsWorkSlot(log) && workSlotStanding(log).asserted) {
+      findings.push({
+        severity: 'info',
+        code: 'accounting_sync_evidence_operator_asserted',
+        syncLogId: log.id,
+        message: `Accounting sync log ${log.id} counts as evidence of a posting only on an operator's assertion `
+          + `(document ${log.externalTransactionId?.trim() || 'id not recorded'} was typed in; IMS did not verify it against the ledger)`,
+        details: {
+          connector: log.connector,
+          type: log.type,
+          referenceType: log.referenceType,
+          referenceId: log.referenceId,
+          status: log.status,
+          standing: ledgerStanding(log),
+        },
+      })
     }
 
     if (
@@ -1126,6 +1161,10 @@ export async function collectAccountingInvariantRows(
         retryCount: true,
         createdAt: true,
         syncedAt: true,
+        // o3d-1e7sl (D5): asked for EXPLICITLY - a select is not a `*`, and dropping these makes every
+        // operator-typed row read as the connector's.
+        settlementBasis: true,
+        abandonedBeforeRemoteCall: true,
       },
     }),
     // o3d-o97 r4 — THE REFUSALS, AND DELIBERATELY OUTSIDE EVERY FILTER ABOVE.

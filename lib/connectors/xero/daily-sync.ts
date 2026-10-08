@@ -13,6 +13,7 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
 import { createHash } from 'node:crypto'
 
@@ -67,6 +68,7 @@ import {
   allocationDebitForeignLedgerReports,
   buildAllocationDebitOrderUpdate,
   foldA2RecreateOrder,
+  foreignJournalStateOf,
   newA2RecreateSummary,
   repointAllocationDebitPassesToRecreatedJournal,
   type A2RecreateSummary,
@@ -97,7 +99,7 @@ import {
   unearnedReversalStandingReport,
   type UnearnedReversalSyncRow,
 } from '@/lib/domain/accounting/deferred-trueup'
-import { LEDGER_STANDING_SELECT } from '@/lib/domain/accounting/ledger-standing'
+import { LEDGER_STANDING_SELECT, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
@@ -710,6 +712,30 @@ export function takeDailyBatchWindow<T>(
  */
 type DailyBatchRecreateVerdict = { blocked: boolean; refusal: string | null }
 
+/** Codex round 17: the refusal for a daily batch whose cancelled/failed row was settled BY HAND as posted. Pure, so the operator wording is rendered by the tests. */
+export function dailyBatchAssertedRefusal(type: string, describeAsserted: string): string {
+  return withLedgerCheck(`Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
+        '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
+        'system; IMS did not verify the document, which organisation holds it or its lines.' +
+        ' The batch is deliberately NOT recreated, because if the journal really is ' +
+        'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
+        'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
+        'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +
+        'the row\'s own lines and correct the id.')
+}
+
+/** Codex round 17: the refusal for a daily batch with cancelled/failed rows that do not prove the journal never reached the ledger. Pure, so the tests render it. */
+export function dailyBatchUnprovedRefusal(type: string, describe: string): string {
+  return withLedgerCheck(
+    `Daily batch ${type} not recreated: ${describe} — ` +
+      'a cancelled or failed row does not establish that its journal never reached the ledger ' +
+      '(the processor posts before it persists SYNCED), so re-raising it could post the same ' +
+      'journal twice. Check the accounting system for a journal covering this batch first: if one is there, settle the row with its id; ' +
+      'only if none is there, re-post it deliberately. Or leave it: the orders/shipments keep their stamps ' +
+      'and the standing accounting invariants keep reporting them.',
+  )
+}
+
 async function dailyBatchRecreateVerdict(
   type: DailyBatchLogType,
   refs: string | DailyBatchLiveRefs,
@@ -766,14 +792,7 @@ async function dailyBatchRecreateVerdict(
     return {
       blocked: true,
       refusal:
-        `Daily batch ${type} not recreated: ${describeAsserted} — that row was settled BY HAND as ` +
-        '"it DID post". The document id on it is what an operator typed after looking in the accounting ' +
-        'system; IMS never read the document, never checked which organisation holds it and never ' +
-        'compared its lines. The batch is deliberately NOT recreated, because if the journal really is ' +
-        'there a rebuild posts it twice — but nothing has confirmed that it is. Open that document in ' +
-        'the accounting system and check it covers this batch. If it does not exist, this batch\'s ' +
-        'value is missing from the accounts and no sweep will ever raise it again: post it there from ' +
-        'the row\'s own lines and correct the id.',
+        dailyBatchAssertedRefusal(type, describeAsserted),
     }
   }
   // Read from the SHARED rule, not restated (o3d-nepa). Retention's delete predicate asks the same
@@ -794,11 +813,7 @@ async function dailyBatchRecreateVerdict(
   return {
     blocked: true,
     refusal:
-      `Daily batch ${type} not recreated: ${describe} — ` +
-      'a cancelled or failed row does not establish that its journal never reached the ledger ' +
-      '(the processor posts before it persists SYNCED), so re-raising it could post the same ' +
-      'journal twice. Re-post it deliberately, or leave it: the orders/shipments keep their stamps ' +
-      'and the standing accounting invariants keep reporting them.',
+      dailyBatchUnprovedRefusal(type, describe),
   }
 }
 
@@ -969,7 +984,7 @@ export async function recreateMissingDailyBatchLogs(
   // like a deleted one and the report told an operator the journal was not on record and to post it
   // by hand. Neither status establishes that nothing reached the remote ledger, so that advice can
   // duplicate a posting. The status is carried instead, and the report distinguishes the two.
-  const foreignJournalStatusById = new Map<string, string>()
+  const foreignJournalRowById = new Map<string, LedgerStandingRow>()
   let scheduledSweepConnector: string | null = null
   if (foreignPasses.length > 0) {
     scheduledSweepConnector = (await resolveScheduledDailyBatchSweep()).connector
@@ -977,17 +992,17 @@ export async function recreateMissingDailyBatchLogs(
     if (foreignJournalIds.length > 0) {
       const rows = await db.accountingSyncLog.findMany({
         where: { id: { in: foreignJournalIds } },
-        select: { id: true, status: true },
+        // o3d-1e7sl (G15): the standing columns, because an operator-typed SYNCED journal is `asserted`, not
+        // `live` - it still counts as existing (D2) but is reported.
+        select: { id: true, ...LEDGER_STANDING_SELECT },
       })
-      for (const row of rows) foreignJournalStatusById.set(row.id, row.status)
+      for (const row of rows) foreignJournalRowById.set(row.id, row)
     }
   }
   const foreignJournalState = (syncLogId: string | null): ForeignJournalState => {
     // A pass that named no journal raised none: unambiguously nothing in the other ledger.
     if (syncLogId == null) return 'absent'
-    const status = foreignJournalStatusById.get(syncLogId)
-    if (status === undefined) return 'absent'
-    return (LIVE_DAILY_BATCH_STATUSES as readonly string[]).includes(status) ? 'live' : 'unsettled'
+    return foreignJournalStateOf(foreignJournalRowById.get(syncLogId))
   }
 
   for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {

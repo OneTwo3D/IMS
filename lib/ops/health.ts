@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { getAllCronJobs } from '@/lib/cron-jobs'
+import { ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import type { CronJobDef } from '@/lib/cron-registry'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { checkFileScanHealth } from '@/lib/security/file-scan'
@@ -876,6 +877,17 @@ async function getLatestBackup(now: Date = new Date()): Promise<LatestOperationH
   }
 }
 
+/**
+ * The status the health page shows for the latest accounting batch row (o3d-1e7sl, D8). `SYNCED` is 'ok' to
+ * `LATEST_OPERATION_OK_STATUSES`, and an operator-typed SYNCED row (ASSERTED_POSTED) is not the connector's
+ * answer, so it is re-labelled with whose word it is and therefore stops matching the ok set: the page then
+ * shows a warning instead of a green batch nobody checked. Every other status is shown as it is - its own
+ * word (FAILED, CANCELLED, PENDING) already is not 'ok'.
+ */
+export function latestBatchStatusLabel(status: string, standing: LedgerStanding): string {
+  return standing === 'ASSERTED_POSTED' ? `${status} (asserted by an operator, not confirmed)` : status
+}
+
 async function getLatestAccountingBatch(now: Date = new Date()): Promise<LatestOperationHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
@@ -888,16 +900,22 @@ async function getLatestAccountingBatch(now: Date = new Date()): Promise<LatestO
         status: true,
         createdAt: true,
         syncedAt: true,
+        // o3d-1e7sl (D8): the standing columns. A batch journal an operator typed an id into reads SYNCED to
+        // the page and was 'ok'; it is now a warning that says whose word it is (see latestBatchStatusLabel).
+        externalTransactionId: true,
+        settlementBasis: true,
+        abandonedBeforeRemoteCall: true,
       },
     })
 
     if (!latest) return warningLatest('No accounting batch sync log found', now)
 
+    const standing = ledgerStanding(latest)
     return latestOperation({
       lastRunAt: latest.syncedAt ?? latest.createdAt,
-      lastStatus: latest.status,
+      lastStatus: latestBatchStatusLabel(latest.status, standing),
       reference: latest.type,
-      details: { connector: latest.connector },
+      details: { connector: latest.connector, standing },
       now,
     })
   } catch (error) {

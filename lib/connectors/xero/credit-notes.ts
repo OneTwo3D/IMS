@@ -2,6 +2,7 @@
  * Push credit notes to Xero.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
 import { xeroGet, xeroPost, xeroPut } from './api'
 import { findOrCreateContact } from './contacts'
@@ -609,9 +610,9 @@ export async function allocatePurchaseCreditNote(
     success: false,
     allocatedAmount: allocateAmount,
     partial,
-    error: `PARTIAL allocation: ${allocateAmount.toFixed(2)} was allocated to this bill just now (${partial.totalAllocatedToThisBill.toFixed(2)} of the `
+    error: withLedgerCheck(`PARTIAL allocation: ${allocateAmount.toFixed(2)} was allocated to this bill just now (${partial.totalAllocatedToThisBill.toFixed(2)} of the `
       + `${requested.toFixed(2)} requested is now allocated; ${partial.shortfall.toFixed(2)} is still outstanding) because the credit note's remaining credit `
       + `(${remainingCredit.toFixed(2)}) or the bill's amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
-      + 'then retry: a retry sends only the remainder.',
+      + 'then retry: a retry sends only the remainder.'),
   }
 }

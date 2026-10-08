@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import {
   readPostedInvoiceOrderDiscount,
   type PostedInvoiceEventClient,
@@ -1506,14 +1507,14 @@ export function wcCouponNetClaimSteps(position: WcCouponNetPosition): string[] {
         nettedAgainst: position.nettedAgainst,
         whatIsVoid: 'this conclusion',
       }),
-      'THE TWO ERRORS CANCEL, PROVIDED THOSE CREDIT NOTES STILL STAND: the credit note reversed ' +
+      withLedgerCheck('THE TWO ERRORS CANCEL, PROVIDED THOSE CREDIT NOTES STILL STAND: the credit note reversed ' +
         'the same mis-stated discount the invoice charged, so on the documents IMS can see this ' +
         'customer is square, and there is NO ACCOUNTING ACTION for this order — this run only ' +
         'removed the duplicate from IMS. If any of the credit notes named above has been voided ' +
         'or edited by hand, or turns out to sit in a different organisation from the invoice, ' +
         `then that reversal did not happen: ${position.documentRef} stands at its full posted ` +
         'value and this order is NOT settled. Re-derive it with `--reprint <allowlist>` and ' +
-        'escalate rather than acting on this line.',
+        'escalate rather than acting on this line.'),
     ]
   }
   return [

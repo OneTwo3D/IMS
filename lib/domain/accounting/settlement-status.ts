@@ -332,10 +332,27 @@ export function settlementStatus(input: {
             (p.externalTransactionId ? ` (payment ${p.externalTransactionId})` : '') +
             (asserted
               ? '. That is an OPERATOR ASSERTION, not something the ledger confirmed — nobody has checked the '
-                + 'document or its amount. Verify it in the accounting system, then reverse the payment there or '
+                + 'document or its amount. Verify it in the accounting system. If it exists there, reverse the payment there or '
                 + 'restore the receipt here.'
               : '. The ledger shows it settled while IMS does not — reverse the payment there, or restore it here.'),
           basis: asserted ? 'OPERATOR_ASSERTION' : 'LEDGER_CONFIRMED',
+        }
+      }
+      // o3d-1e7sl (D9, C1): THE ASSERTED NOT-POSTED SETTLEMENT HAS ITS OWN SENTENCE HERE TOO. The paid-locally
+      // CANCELLED branch below has said so since 1a; this not-paid-locally branch kept the FAILED-attempt
+      // wording ("ATTEMPTED in the ledger but the outcome was never recorded", basis NONE) for the very same
+      // row, which is a different and false account of it: nobody attempted anything on the record - a person
+      // SAID nothing posted. Same standing, same words, and the basis names whose word it is.
+      if (standing === 'UNDECIDED' && asserted && !hasPostEvidence(p)) {
+        return {
+          status: 'LEDGER_UNDECIDED',
+          discrepancy: true,
+          basis: 'OPERATOR_ASSERTION',
+          detail:
+            'This is NOT marked as paid in IMS, and an operator settled the payment attempt for it as NOT posted. '
+            + 'That is a person\'s word about a ledger IMS did not check, not proof: a lost response or a payment made by '
+            + 'hand would leave exactly the same row. Open the invoice in the accounting system and check whether a '
+            + 'payment is on it before recording or registering anything else against it.',
         }
       }
       if (standing === 'UNDECIDED') {
@@ -437,7 +454,7 @@ export function settlementStatus(input: {
           basis: 'OPERATOR_ASSERTION',
           detail:
             `An operator recorded this as paid in the ledger (payment ${p.externalTransactionId}) on their own ` +
-            `assertion — IMS never made the call, never read the document and never compared the amount. The ` +
+            `assertion — IMS did not verify that settlement against the ledger: it read no document and compared no amount. The ` +
             `figure shown here (${syncRowSettledAmount(p)?.toFixed() ?? 'unknown'}) is what IMS meant to send, ` +
             `not what the ledger recorded, so a part payment against this invoice would look identical. Open ` +
             `payment ${p.externalTransactionId} in the accounting system and confirm its amount against the ` +
@@ -594,7 +611,7 @@ export function settlementStatus(input: {
           basis: 'OPERATOR_ASSERTION',
           detail:
             'An operator settled this payment attempt as NOT posted and the row was then retired. That is a '
-            + 'person\'s word about a ledger IMS never read: a lost response or a payment made by hand would leave '
+            + 'person\'s word about a ledger IMS did not check: a lost response or a payment made by hand would leave '
             + 'exactly the same row, so IMS does not treat it as proof that nothing posted. Open the invoice in the '
             + 'accounting system and check whether a payment is on it before recording or registering anything '
             + 'else against this document.',
@@ -612,8 +629,8 @@ export function settlementStatus(input: {
             basis: 'OPERATOR_ASSERTION',
             detail:
               `An operator recorded this as posted in the ledger (payment ${p.externalTransactionId}) and the row was ` +
-              'then retired, so nothing here will chase it. IMS never made the call, never read the document and never ' +
-              'compared the amount. Open that payment in the accounting system and confirm it before registering ' +
+              'then retired, so nothing here will chase it. IMS did not verify that settlement against the ledger: it read no document and ' +
+              'compared no amount. Open that payment in the accounting system and confirm it before registering ' +
               'anything else against this document.',
           }
         }
@@ -633,18 +650,17 @@ export function settlementStatus(input: {
             + `it before registering anything else against this document.`,
         }
       }
+      // Only a standing the classifier calls NOTHING reaches this line (PROVEN_NOT_POSTED, or the documented
+      // unflagged-CANCELLED divergence), and neither is an operator's assertion: an asserted NOT_POSTED reads
+      // UNDECIDED above (C1). The sentence used to carry an "it was an OPERATOR'S ASSERTION" clause for a row
+      // that could not arrive here; it is gone rather than left to describe a state that no longer exists.
       return {
         status: 'NOT_SENT',
         discrepancy: true,
         detail:
           'The payment sync was cancelled, so the ledger was never told about this settlement and still ' +
-          'shows the amount outstanding.' +
-          // The NOT_POSTED settlement: the same conclusion, reached from a human's word rather than
-          // from IMS's own record. Named, because a reader acting on it deserves to know which.
-          (assertedPost
-            ? ' That cancellation was an OPERATOR\'S ASSERTION that nothing posted, not something IMS established.'
-            : ''),
-        basis: assertedPost ? 'OPERATOR_ASSERTION' : 'NONE',
+          'shows the amount outstanding.',
+        basis: 'NONE',
       }
     }
   }

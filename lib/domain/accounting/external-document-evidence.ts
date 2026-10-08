@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { ASSERTED_POSTED_WHERE, CLAIMS_TO_HAVE_POSTED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 
 // ---------------------------------------------------------------------------
 // o3d-v7sy — THE ROW THAT IS THE ONLY LOCAL RECORD OF AN EXTERNAL ACCOUNTING DOCUMENT.
@@ -85,27 +86,34 @@ export const EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES = [
 ] as const
 
 /**
- * The statuses that say a document may stand in the ledger AND that retention would otherwise
- * delete. POSTABLE rows are already exempt (see the header); this is the remainder.
- */
-export const EXTERNAL_DOCUMENT_EVIDENCE_STATUS = 'SYNCED'
-
-/**
  * THE RECORD RETENTION MUST NOT DELETE: a row that is the only local evidence that an external
  * accounting document stands against a sales order, a shipment of one, or a daily batch one was
- * staged into.
+ * staged into - and (o3d-1e7sl, D5) every row an OPERATOR claims posted, whatever it is keyed to.
  *
  * Deleting it does not make a reader fail. It makes two readers answer "nothing was posted" — one
  * of which then permits an irreversible hard delete, and one of which then posts the journal again.
+ *
+ * TWO ARMS, both stated through the ledger-standing module (the statuses and the id test are its):
+ *
+ *   1. `CLAIMS_TO_HAVE_POSTED_WHERE` over the three reference types the delete guard and the batch
+ *      verdict read: the row is SYNCED or names a document, whoever's claim that is. Unchanged in
+ *      what it selects (it was `status = SYNCED OR id IS NOT NULL`); now it is the module's wording,
+ *      so a new standing cannot be added to the table without this arm being asked about it.
+ *
+ *   2. `ASSERTED_POSTED_WHERE` over ANY reference type (D5). An operator-typed document id is the ONLY
+ *      local record of a document IMS never saw: the back-reference sweep refuses to write an asserted
+ *      id onto the document it belongs to, so for a credit note, a bill, a supplier credit note or an
+ *      allocation the holder column stays empty and the sync row is the whole of the record. Arm 1 did
+ *      not reach those reference types, so such a row aged out of `accounting_sync_logs` and the
+ *      claim disappeared with it. It is now retained and COMPACTED, never deleted: the payload (names,
+ *      addresses, line text) still expires on the schedule the settings UI promises, and what survives
+ *      is the columns - connector, type, reference, status, id, basis - which is what every reader of
+ *      the claim reads. BILL_PAYMENT, INVOICE_PAYMENT and PCN_ALLOCATION are never deleted at all
+ *      (remote-money-evidence.ts), so this arm is what covers the document types.
  */
 export const EXTERNAL_DOCUMENT_EVIDENCE_WHERE: Prisma.AccountingSyncLogWhereInput = {
-  referenceType: { in: [...EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES] },
   OR: [
-    // The processor's own writeback said the ledger answered.
-    { status: EXTERNAL_DOCUMENT_EVIDENCE_STATUS },
-    // ...or the row names a document, whatever its status now says. A posted row can be reverted to
-    // PENDING by a failed follow-up and cancelled from there, KEEPING the id — see the delete
-    // guard's own note on why the status filter cannot come first.
-    { externalTransactionId: { not: null } },
+    { AND: [{ referenceType: { in: [...EXTERNAL_DOCUMENT_EVIDENCE_REFERENCE_TYPES] } }, CLAIMS_TO_HAVE_POSTED_WHERE] },
+    ASSERTED_POSTED_WHERE,
   ],
 }

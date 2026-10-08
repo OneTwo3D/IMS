@@ -2,6 +2,7 @@
  * WooCommerce → IMS refund sync.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -1064,7 +1065,7 @@ export async function syncWcRefund(
           // A quantity-bearing refund may owe an inventory movement nothing else will make,
           // so it needs action rather than a note. A monetary-only suppression owes nothing.
           level: refundedUnits > 0 ? 'ERROR' : 'WARNING',
-          description: `WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`.trim(),
+          description: withLedgerCheck(`WooCommerce refund ${wcRefund.id} on order #${so.externalOrderNumber} was not recorded — the order was already charged back by the payment poller, and a second credit note would double-reverse it. Reconcile the Woo refund manually.${returnedNote} ${result.error ?? ''}`).trim(),
           metadata: {
             externalRefundId: wcRefund.id,
             parentOrderId: externalOrderId,

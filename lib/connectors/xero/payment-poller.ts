@@ -27,6 +27,7 @@
  * notices. See drainInvoicesModifiedSince for the boundary rules that keep chunking lossless.
  */
 
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
@@ -99,14 +100,14 @@ async function notifyReversalAdmins(
   const paidAtClause =
     'IMS is clearing its paid flag to match (if the order still shows as paid, this poll did not ' +
     'finish and the next one repeats the whole reversal)'
-  const message = (chargebackManualReason
+  const message = withLedgerCheck((chargebackManualReason
     ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). ${paidAtClause}, but the revenue unwind was REFUSED and NO credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the payment poller.`
     : wcHandled
       ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and ${paidAtClause} — verify the refund fully covers the reversal and whether the order status should revert.`
       : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). ${paidAtClause} and revenue unwound where applicable — review whether the order status should revert.`)
     + (registeredPaymentGone
       ? ` The payment IMS registered is gone from the invoice but ANOTHER payment (or an amount Xero did not state) remains, so revenue was NOT unwound automatically — decide the credit note by hand.`
-      : '')
+      : ''))
   const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
   await Promise.all(
     admins.map((admin) =>
@@ -232,7 +233,7 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     // with both numbers, because the operator's question is "part of what?" and the answer decides
     // whether they go to the ledger or to the order.
     case 'PART_COVERED_OFF_LEDGER':
-      return ` The payment registration(s) IMS raised for this order (${verdict.paymentIds.join(', ') || 'none readable'}) `
+      return withLedgerCheck(` The payment registration(s) IMS raised for this order (${verdict.paymentIds.join(', ') || 'none readable'}) `
         + `${verdict.registeredTotal == null
           ? 'do not record how much they sent'
           : `cover only ${verdict.registeredTotal} of its ${verdict.documentTotal} total`}, and the order is `
@@ -240,7 +241,7 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
         + `account of PART of this balance, and the remainder was never in any ledger to have been removed `
         + `from. Reversing the whole order here would raise a chargeback credit note over money nobody took `
         + `back. Record the remaining receipt against the order, or reverse it by hand if the payment really `
-        + `is gone.`
+        + `is gone.`)
     // o3d-psrx r8 (Codex HIGH 2): NOT REACHABLE FROM XERO, and the reason is this poller's own
     // structure rather than luck. This verdict says "the ledger has not been shown to hold nothing on
     // this document" — a precondition every admitting arm of `zeroPaidIsProvenReversal` assumes — and
@@ -511,17 +512,17 @@ type WithheldOrderDoc = {
 function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, reason: WithheldAmountReason): string {
   switch (reason) {
     case 'part-payment':
-      return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
+      return withLedgerCheck(`Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
         + `still holds a payment of ${ledgerAmountText(invoice, 'AmountPaid')} against it with `
         + `${ledgerAmountText(invoice, 'AmountDue')} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set: clearing it would re-arm Mark Paid over a supplier payment that has `
         + `already been made, and pressing it again would pay the supplier twice. Settle the balance in `
-        + `Xero, or correct the bill total in IMS.`
+        + `Xero, or correct the bill total in IMS.`)
     case 'amount-not-stated':
-      return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
+      return withLedgerCheck(`Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
         + `payload did not state how much has been paid, so IMS cannot tell a part payment from a `
         + `removed one. paidAt was left set rather than guessed — clearing it would re-arm Mark Paid and `
-        + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`
+        + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`)
     case 'zero-paid-unproven':
       return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero with NOTHING paid against it, `
         + `which normally means the payment was removed. paidAt was LEFT SET anyway: IMS holds a payment `
@@ -593,7 +594,7 @@ function salesWithheldDescription(
   // do not add up to the order, and no later poll changes that. Stating it as an in-flight
   // registration would send an operator to /sync to wait for something that has already happened.
   if (verdict.verdict === 'PART_COVERED_OFF_LEDGER') {
-    return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
+    return withLedgerCheck(`Invoice for order ${ref} is ${invoice.Status} in Xero showing `
       + `${ledgerAmountText(invoice, 'AmountPaid')} paid, which normally means a payment was removed. `
       + `paidAt was LEFT SET and NO chargeback credit note was raised: the payment registration(s) IMS `
       + `raised for this order `
@@ -603,7 +604,7 @@ function salesWithheldDescription(
       + `still held as paid on evidence the ledger was never given. The ledger's figure is therefore an `
       + `account of PART of this balance; the rest of it was never in any ledger to be taken away. `
       + `Record the remaining receipt against the order, or unwind the order by hand if the payment is `
-      + `genuinely gone.`
+      + `genuinely gone.`)
   }
   if (verdict.verdict === 'RECEIPT_NOT_REGISTERED') {
     return `Invoice for order ${ref} is ${invoice.Status} in Xero showing `
@@ -615,17 +616,17 @@ function salesWithheldDescription(
   }
   switch (reason) {
     case 'part-payment':
-      return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
+      return withLedgerCheck(`Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
         + `holds a payment of ${ledgerAmountText(invoice, 'AmountPaid')} against it with `
         + `${ledgerAmountText(invoice, 'AmountDue')} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set and NO chargeback credit note was raised — unwinding revenue against a `
         + `payment the ledger is still holding would be wrong. Settle the balance in Xero, or correct `
-        + `the order total in IMS.`
+        + `the order total in IMS.`)
     case 'amount-not-stated':
-      return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
+      return withLedgerCheck(`Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
         + `did not state how much has been paid, so IMS cannot tell a part payment from a removed one. `
         + `paidAt was left set and NO chargeback credit note was raised. Check the invoice in Xero and `
-        + `reconcile it by hand.`
+        + `reconcile it by hand.`)
     case 'zero-paid-unproven':
       // The sales side of the same race: an INVOICE_PAYMENT registered and not yet posted reads as a
       // zero, and a chargeback raised there reverses recognised revenue against a payment about to land.
@@ -1033,14 +1034,14 @@ async function processDeltaChunk(
             // order from the poller's window — so it states the clear as the step that follows, not as
             // one that already happened. An entry with no matching clear is a run that did not finish,
             // and the next poll repeats the whole decision.
-            description: (chargebackManualReason
+            description: withLedgerCheck((chargebackManualReason
               ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
               : wcHandled
                 ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); clearing paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
                 : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt. Review whether the order status should revert.`)
               + (registeredPaymentGone
                 ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
-                : ''),
+                : '')),
             resolveUser: false,
           }),
         })

@@ -94,7 +94,7 @@ test('[o3d-f709 / o3d-kj718] a CANCELLED row frees the key ONLY when its standin
 test('[o3d-f709 M11, C1] a CANCELLED row an operator settled NOT_POSTED BLOCKS the slot - it is not a free one', () => {
   // THE FLIP. The test above used to carry "...for a row an operator has settled as NOT_POSTED" as its
   // reason for treating CANCELLED as free: that settlement WAS the way to re-queue. An operator's word
-  // about a ledger IMS never read is not proof, so the enqueue now refuses (D1) instead of raising a
+  // about a ledger IMS did not check is not proof, so the enqueue now refuses (D1) instead of raising a
   // second document.
   const settled = row({ id: 'log_settled', status: 'CANCELLED', settlementBasis: 'OPERATOR_ASSERTION' })
   console.log(`# precondition M11 blocked: ${JSON.stringify(settled)}`)

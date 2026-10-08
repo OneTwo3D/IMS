@@ -3519,7 +3519,7 @@ test('o3d-xlk7: a rebuild that adds quantity to a row RECORDING NOTHING keeps th
   assert.equal((activityLogs[0] as { action: string }).action, 'allocation_accounting_stage_retained')
   assert.match(
     String((activityLogs[0] as { description: string }).description),
-    /NO allocation row records what A2 already accounted, so handing this order back would re-value and re-post every unit/,
+    /NO allocation row records what A2 already accounted, so handing this order back would cause every unit on it to be re-valued and re-posted/,
   )
 })
 

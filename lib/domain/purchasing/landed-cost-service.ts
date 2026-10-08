@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -1100,7 +1101,7 @@ export async function queueLandedCostAdjustmentJournals(
         remedy:
           'Inventory and goods-in-transit in the ledger no longer match IMS for this order. The landed-cost '
           + 'journal outbox retries it once the accounting connector selection has settled; if it has given up, '
-          + 'post the reclass by hand and mark this row handled, which stops IMS posting it too.',
+          + 'post the reclass by hand and mark this row handled. ' + MARK_REMEDY_TAIL,
         outcome: postingOutcome.outcome,
         metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
       })
@@ -1192,8 +1193,8 @@ export async function queueLandedCostAdjustmentJournals(
         remedy:
           'COGS in the ledger does not reflect this landed-cost change and the freight liability will not drain '
           + 'out of goods-in-transit. The landed-cost journal outbox retries it once the accounting connector '
-          + 'selection has settled; if it has given up, post the adjustment by hand and mark this row handled, '
-          + 'which stops IMS posting it too.',
+          + 'selection has settled; if it has given up, post the adjustment by hand and mark this row handled. '
+          + MARK_REMEDY_TAIL,
         outcome: cogsPostingOutcome.outcome,
         metadata: { primaryPoRef: adj.primaryPoRef, chartConnector: settings.connector },
       })

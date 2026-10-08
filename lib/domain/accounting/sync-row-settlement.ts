@@ -1,3 +1,4 @@
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { isUniqueConstraintViolation, uniqueConstraintFields } from '@/lib/db/prisma-unique-violation'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
@@ -6,6 +7,7 @@ import type { MirroredEventWriteGuard } from '@/lib/domain/accounting/accounting
 // From the LEAF module, not from accounting-event-mirror: this file is imported by suites that
 // replace that module with a partial mock, under which a value import of it would be `undefined`.
 import { ATTEMPT_SETTLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
+import { CONFIRMED_POST_BASES, OPERATOR_ASSERTION_POST_BASIS } from '@/lib/domain/accounting/accounting-event-post-basis'
 
 /**
  * o3d-nf9i + o3d-osl8 item 2 — OPERATOR SETTLEMENT of an AccountingSyncLog row the system cannot
@@ -53,8 +55,9 @@ import { ATTEMPT_SETTLED_VOID_BASIS } from '@/lib/domain/accounting/accounting-e
  *   lib/domain/sales/order-delete-guard.ts, where a row with an id ranks as "already POSTED" ahead
  *   of any status test. So the two possible endings are:
  *
- *     • nothing posted  -> the row stays CANCELLED and the order becomes deletable, which is what
- *       the operator asserted and what they wanted; or
+ *     • nothing posted  -> the row stays CANCELLED with no id. Since o3d-1e7sl (C1) that does NOT make
+ *       the order deletable: the delete guard reads an operator's NOT_POSTED as ASSERTED_NOT_POSTED, a
+ *       claim and not proof, and keeps blocking (cancel the order instead); or
  *     • something posted -> the connector stamps the document id onto the CANCELLED row and raises
  *       an ERROR naming it, the order stays undeletable, and the operator's assertion is visibly
  *       contradicted by evidence rather than silently believed.
@@ -217,10 +220,11 @@ export function settleableSettlementOutcomes(type: string): readonly SettlementO
  * skipping it silently; and the order delete guard still refuses the delete but under its own blocker
  * code, with a message that does not claim the document exists.
  *
- * Written on BOTH outcomes, not only POSTED. A CANCELLED row is read as "nothing posted" by the
- * delete guard and by the follow-up ambiguity set, and "nothing posted because a human looked" is a
- * weaker fact than "nothing posted because the connector never got a document id" in exactly the
- * same way.
+ * Written on BOTH outcomes, not only POSTED. "Nothing posted because a human looked" is a weaker fact
+ * than "nothing posted because the connector never got a document id", and since o3d-1e7sl no reader
+ * treats the two alike: the delete guard, the enqueue's work slot, the follow-up ambiguity set and
+ * retention all read the NOT_POSTED settlement as ASSERTED_NOT_POSTED (ledger-standing.ts), i.e. it may
+ * have reached the ledger.
  *
  * NULL is the connector's own writeback and needs no marker: absence of an assertion IS the
  * confirmation case, and back-filling every historical row to say so would be a write with no
@@ -371,7 +375,7 @@ const PENDING_REFUSAL_MESSAGE =
   + 'processed, retried, or retired by the ordinary sweeps.'
 
 function describeDailyBatchRefusal(type: string): string {
-  return `${type} is a DAILY BATCH row and cannot be settled as NOT POSTED. A batch row is keyed by `
+  return withLedgerCheck(`${type} is a DAILY BATCH row and cannot be settled as NOT POSTED. A batch row is keyed by `
     + 'the batch, not by one order, and CANCELLED reads as "never posted" BOTH to the batch recreators '
     + 'and to the order delete guard. Settling it that way would let an order be hard-deleted while a '
     + 'recreate is already building a journal that still contains that order\'s value. What you CAN do '
@@ -381,7 +385,7 @@ function describeDailyBatchRefusal(type: string): string {
     + 'reporting the batch until the journal is confirmed. If the journal is genuinely not in the '
     + 'accounting system, post it there from this '
     + 'row\'s own lines and record that id here — a batch is a finance-level correction, and there is '
-    + 'no per-row cancel for one.'
+    + 'no per-row cancel for one.')
 }
 
 /**
@@ -629,8 +633,8 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
       return {
         code: 'external_id_conflict',
         message:
-          `This row already carries external id ${existingExternalId}. Settling it as ${asserted} would `
-          + 'overwrite the only pointer IMS has at the existing document. Reconcile the two in the ledger first.',
+          withLedgerCheck(`This row already carries external id ${existingExternalId}. Settling it as ${asserted} would `
+          + 'overwrite the only pointer IMS has at the existing document. Reconcile the two in the ledger first.'),
       }
     }
     return null
@@ -645,8 +649,8 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
     return {
       code: 'contradicts_post_evidence',
       message:
-        `This row already carries external id ${existingExternalId}, which is evidence it DID post. `
-        + 'Settle it as POSTED, or reverse the document in the accounting system first.',
+        withLedgerCheck(`This row already carries external id ${existingExternalId}, which is evidence it DID post. `
+        + 'Settle it as POSTED, or reverse the document in the accounting system first.'),
     }
   }
   return null
@@ -677,7 +681,7 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
  * gathers, which turned a `refuse` into a `create`/`reuse` for a money-moving type, and it freed the
  * work slot so the same posting could be queued again. That was the settlement action's stated
  * purpose, and its premise was that the assertion was evidence. It is not: a person said "nothing
- * posted" about a ledger IMS never read, and a lost response, a late webhook and a hand-post all
+ * posted" about a ledger IMS did not check, and a lost response, a late webhook and a hand-post all
  * leave the same row. So:
  *
  *   - `planFollowUpEnqueue` REFUSES a money follow-up while a settled-NOT_POSTED row for the same
@@ -688,9 +692,10 @@ export function refuseSettlement(row: SettlementRowView, assertion: SettlementAs
  *     ledger fact, and retention keeps it.
  *
  * What the assertion still does: it records, against the operator's name, that they looked and
- * believed nothing posted - which is useful evidence for the next person - and it releases the
- * ORDER (the delete guard's own status reading is a separate, later conversion). The operator's way
- * to re-post is now to hand-post in the accounting system and mark the posting handled.
+ * believed nothing posted - which is useful evidence for the next person - and it retires the row so
+ * nothing keeps retrying it. It does NOT release the order for a hard delete any more (o3d-1e7sl: the
+ * delete guard reads ASSERTED_NOT_POSTED as may-have-reached-the-ledger and keeps blocking). The
+ * operator's way to re-post is to hand-post in the accounting system and mark the posting handled.
  * ------------------------------------------------------------------------------------------------
  */
 export function buildSettlementData(
@@ -725,14 +730,15 @@ export function buildSettlementData(
     // or credit note" whatever its status, and a CANCELLED row that still carries one STILL BLOCKS
     // the hard delete. So the NOT_POSTED branch must never WRITE an external id — and equally must
     // never CLEAR one, which would destroy real post evidence. refuseSettlement() has already
-    // established that this row carries none, so leaving the column untouched leaves it NULL, which
-    // is what makes the order deletable again. It also leaves the column free for the connector's
-    // own fence-loss evidence write to fill in if the call turns out to have landed.
+    // established that this row carries none, so leaving the column untouched leaves it NULL - which
+    // is what `ledgerStanding` reads as ASSERTED_NOT_POSTED together with the basis below (it no longer
+    // frees the order: o3d-1e7sl). It also leaves the column free for the connector's own fence-loss
+    // evidence write to fill in if the call turns out to have landed.
     errorMessage: settlementNote(assertion),
     processingStartedAt: null,
     // Written on the NOT_POSTED branch too. "Nothing posted, a human looked" is a weaker fact than
-    // "nothing posted, the connector never got an id", and the delete guard and the follow-up
-    // ambiguity set both act on this row as though it were the latter.
+    // "nothing posted, the connector never got an id", and it is the basis `ledgerStanding` reads to
+    // call this row ASSERTED_NOT_POSTED instead of letting it pass as the latter.
     settlementBasis: OPERATOR_ASSERTION_SETTLEMENT_BASIS,
   }
 }
@@ -787,7 +793,10 @@ export function settlementNote(assertion: SettlementAssertion): string {
     return `Settled by operator: verified POSTED as ${assertion.externalTransactionId.trim()}.`
   }
   const reason = trimmed(assertion.reason)
-  return `Settled by operator: verified NOT POSTED — nothing reached the accounting system.${reason ? ` ${reason}` : ''}`
+  // C1 (o3d-1e7sl): a person's NOT_POSTED is an assertion, not proof. The note is what the operator reads
+  // beside the row for ever, so it must not say "nothing reached the accounting system" in IMS's voice.
+  return 'Settled by operator: recorded as NOT POSTED - an operator\'s assertion; IMS did not check the accounting '
+    + `system, so whether anything reached it is UNPROVEN.${reason ? ` ${reason}` : ''}`
 }
 
 /**
@@ -887,7 +896,24 @@ export function settlementMirrorGuard(): MirroredEventWriteGuard {
  * Returns null when the settlement may proceed, so the caller's `if (refusal) rollback` reads the
  * same way as every other refusal in this module.
  */
-export type MirroredDocumentView = { status: string; externalId: string | null }
+export type MirroredDocumentView = {
+  status: string
+  externalId: string | null
+  /**
+   * o3d-1e7sl (AE4): HOW the mirror came to be POSTED. OPTIONAL so a caller that cannot say reads as
+   * UNRECORDED - the sentence then claims nothing about whose word the mirror rests on. It exists so a
+   * mirror an operator's typed id made POSTED is not called evidence, or "a posting IMS has written
+   * down": IMS wrote down what a person told it.
+   */
+  postBasis?: string | null
+}
+
+/** Whose word a mirrored POSTED event rests on, for the sentences below. */
+function mirrorProvenance(mirrored: MirroredDocumentView): 'confirmed' | 'asserted' | 'unrecorded' {
+  if ((CONFIRMED_POST_BASES as readonly string[]).includes(mirrored.postBasis ?? '')) return 'confirmed'
+  if (mirrored.postBasis === OPERATOR_ASSERTION_POST_BASIS) return 'asserted'
+  return 'unrecorded'
+}
 
 export function refuseSettlementContradictedByMirror(
   assertion: SettlementAssertion,
@@ -896,23 +922,42 @@ export function refuseSettlementContradictedByMirror(
   const mirroredId = trimmed(mirrored.externalId)
 
   if (assertion.outcome === 'NOT_POSTED') {
+    const provenance = mirrorProvenance(mirrored)
+    // WHOSE WORD (AE4). "evidence it DID post" and "a posting IMS has already written down" are true of a
+    // mirror the connector wrote after the ledger answered. They are not true of one an OPERATOR'S typed
+    // id made POSTED, whose lines are enqueue-time intent: that is an earlier claim, still unchecked. It
+    // still refuses the opposite claim (the two assertions cannot both stand) but says so.
+    const basisClause = provenance === 'confirmed'
+      ? 'which is evidence it DID post'
+      : provenance === 'asserted'
+        ? 'which an OPERATOR earlier recorded as posted (an assertion IMS did not verify against the ledger, not a confirmation)'
+        : 'whose basis was never recorded (IMS cannot say whether the connector or a person made it POSTED)'
     if (mirroredId) {
       return {
         code: 'contradicts_mirrored_document',
         message:
-          `The mirrored accounting event for this row already names document ${mirroredId}, which is evidence `
-          + 'it DID post. Nothing was settled and nothing was changed. Settle this row as POSTED with that id, '
-          + 'or reverse the document in the accounting system first and settle it afterwards.',
+          withLedgerCheck(`The mirrored accounting event for this row already names document ${mirroredId}, ${basisClause}. `
+          + 'Nothing was settled and nothing was changed. '
+          + (provenance === 'confirmed'
+            ? 'Settle this row as POSTED with that id, or reverse the document in the accounting system first and settle it afterwards.'
+            // Not confirmed: the document may not exist, so "reverse it" is conditional on finding it.
+            : 'Check that document in the accounting system. If it exists, settle this row as POSTED with that id (or, if it is the wrong '
+              + 'document, reverse it there first and settle afterwards); otherwise there is nothing to undo - the mirror\'s '
+              + 'record is what is wrong.')),
       }
     }
     if (mirrored.status === 'POSTED') {
       return {
         code: 'contradicts_mirrored_document',
         message:
-          'The mirrored accounting event for this row is already recorded as POSTED, so asserting that nothing '
-          + 'posted contradicts a posting IMS has already written down. Nothing was settled and nothing was '
-          + 'changed. Find the document in the accounting system and settle this row as POSTED with its id, or '
-          + 'reverse it there first.',
+          'The mirrored accounting event for this row is already recorded as POSTED'
+          + `${provenance === 'asserted' ? ' on an operator\'s earlier assertion' : provenance === 'unrecorded' ? ' (how it came to be posted was never recorded)' : ''}, `
+          + 'so asserting that nothing posted contradicts that record. Nothing was settled and nothing was '
+          + 'changed. '
+          + (provenance === 'confirmed'
+            ? 'Find the document in the accounting system and settle this row as POSTED with its id, or reverse it there first.'
+            : 'Look for the document in the accounting system. If it exists, settle this row as POSTED with its id (or reverse it there '
+              + 'first if it is wrong); if there is none, there is nothing to undo - the mirror\'s record is what is wrong.'),
       }
     }
     return null
@@ -926,8 +971,8 @@ export function refuseSettlementContradictedByMirror(
         `The mirrored accounting event for this row already names document ${mirroredId}, and this settlement `
         + `asserts ${asserted}. Two different documents cannot both be this posting, so nothing was settled and `
         + 'nothing was changed — the row still names whatever it named before. Check BOTH ids in the accounting '
-        + `system: if ${mirroredId} is the real one there is nothing to settle, and if it is not, reverse it there `
-        + 'before recording the other.',
+        + `system. If ${mirroredId} is the real one there is nothing to settle. Reverse it there ONLY if it exists and is the wrong `
+        + 'document, before recording the other.',
     }
   }
   return null
@@ -984,13 +1029,24 @@ export function isSaleScopedSettlementRow(referenceType: string): boolean {
  * writes safe in either order — but it is no longer the only thing standing between a live
  * replacement and a VOIDed mirror.
  */
-export const MIRROR_OWNING_SYNC_STATUSES = ['PENDING', 'PROCESSING', 'SYNCED'] as const
+// o3d-1e7sl: WHICH ROWS OWN A MIRROR is `ownsMirroredEvent` in lib/domain/accounting/ledger-standing.ts
+// (work slot OR names a document), asked by the caller. This module is the settlement LEAF and must not
+// import the standing module (it imports THIS one for its basis constants), so the candidate carries the
+// answer rather than the columns it is derived from.
 
 /** Another sync row that may map onto the same mirrored accounting event. */
 export type MirrorClaimCandidate = {
   id: string
   status: string
-  externalTransactionId: string | null
+  /** `ownsMirroredEvent(row)`, computed by the caller from the ledger-standing module. */
+  ownsMirror: boolean
+  /** `namesADocument(row)`: whether the other row carries post evidence of its own. */
+  posted: boolean
+  /**
+   * o3d-1e7sl (D11): the caller's `ledgerStanding(row) === 'ASSERTED_POSTED'` - the document the other row names
+   * was TYPED IN by an operator, not verified against the ledger. Optional: absent reads false (the connector's own).
+   */
+  assertedDocument?: boolean
   /** Every idempotency key the mirror updater would try for that row. */
   mirrorKeys: readonly string[]
 }
@@ -1000,15 +1056,17 @@ export type MirrorOwnershipConflict = {
   status: string
   /** Whether the other row is merely live, or carries post evidence of its own. */
   posted: boolean
+  /** Whether that post evidence is an operator's typed id (D11) rather than the connector's own. */
+  assertedDocument: boolean
   sharedKey: string
 }
 
 /**
  * The other row that owns this mirrored event, or null when nothing else claims it.
  *
- * "Owns" = shares a mirror key AND is either LIVE (still able to post: PENDING / PROCESSING /
- * SYNCED) or already POSTED (carries an externalTransactionId, whatever its status — a FAILED row
- * with an id is a document that exists, per o3d-ju8t).
+ * "Owns" = shares a mirror key AND `ownsMirror` (the caller's `ownsMirroredEvent`: holds the work slot -
+ * PENDING / PROCESSING / SYNCED - or names a document in any status; a FAILED row with an id is a
+ * document that exists, per o3d-ju8t, and an operator-typed id is a claim that one does).
  */
 export function findMirrorOwnershipConflict(
   selfMirrorKeys: readonly string[],
@@ -1017,11 +1075,14 @@ export function findMirrorOwnershipConflict(
   if (selfMirrorKeys.length === 0) return null
   const mine = new Set(selfMirrorKeys)
   for (const candidate of candidates) {
-    const live = (MIRROR_OWNING_SYNC_STATUSES as readonly string[]).includes(candidate.status)
-    const posted = trimmed(candidate.externalTransactionId).length > 0
-    if (!live && !posted) continue
+    if (!candidate.ownsMirror) continue
     const sharedKey = candidate.mirrorKeys.find((key) => mine.has(key))
-    if (sharedKey) return { syncLogId: candidate.id, status: candidate.status, posted, sharedKey }
+    if (sharedKey) {
+      return {
+        syncLogId: candidate.id, status: candidate.status, posted: candidate.posted,
+        assertedDocument: candidate.assertedDocument === true, sharedKey,
+      }
+    }
   }
   return null
 }
@@ -1029,7 +1090,13 @@ export function findMirrorOwnershipConflict(
 /** The note recorded on the audit row when the mirror write is skipped. */
 export function describeMirrorOwnershipSkip(conflict: MirrorOwnershipConflict): string {
   return `Mirrored accounting event left untouched: sync row ${conflict.syncLogId} (${conflict.status}`
-    + `${conflict.posted ? ', carries post evidence' : ''}) maps to the same mirrored event and still owns it. `
+    // o3d-1e7sl (D11): "carries post evidence" is true of an id the connector issued. An operator-typed one is
+    // a claim that a document exists, not evidence anyone read - say which.
+    + `${conflict.posted
+      ? (conflict.assertedDocument
+        ? ', names a document an operator typed in - an assertion, not verified against the ledger'
+        : ', carries post evidence')
+      : ''}) maps to the same mirrored event and still owns it. `
     + 'Settling this row does not terminalise a document another attempt is responsible for.'
 }
 

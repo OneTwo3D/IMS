@@ -711,3 +711,27 @@ function createHealthAdapters(overrides: Partial<HealthAdapters> = {}): HealthAd
     ...overrides,
   }
 }
+
+test('[o3d-1e7sl D8] the latest accounting batch is only "SYNCED" (ok) on the CONNECTOR\'s word - one case per standing', async () => {
+  const { latestBatchStatusLabel } = await import('@/lib/ops/health')
+  const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  const cases: Array<{ name: string; row: { status: string; externalTransactionId: string | null; settlementBasis: string | null; abandonedBeforeRemoteCall: boolean | null }; standing: string; label: string }> = [
+    { name: 'CONFIRMED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'J-1', settlementBasis: null, abandonedBeforeRemoteCall: null }, standing: 'CONFIRMED_POSTED', label: 'SYNCED' },
+    { name: 'ASSERTED_POSTED', row: { status: 'SYNCED', externalTransactionId: 'J-T', settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null }, standing: 'ASSERTED_POSTED', label: 'SYNCED (asserted by an operator, not confirmed)' },
+    { name: 'LIVE_WORK', row: { status: 'PENDING', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null }, standing: 'LIVE_WORK', label: 'PENDING' },
+    { name: 'UNKNOWN (FAILED)', row: { status: 'FAILED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null }, standing: 'UNKNOWN', label: 'FAILED' },
+    { name: 'ASSERTED_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: 'OPERATOR_ASSERTION', abandonedBeforeRemoteCall: null }, standing: 'ASSERTED_NOT_POSTED', label: 'CANCELLED' },
+    { name: 'PROVEN_NOT_POSTED', row: { status: 'CANCELLED', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: true }, standing: 'PROVEN_NOT_POSTED', label: 'CANCELLED' },
+  ]
+  let relabelled = 0
+  for (const c of cases) {
+    const standing = ledgerStanding(c.row)
+    console.log(`# D8 precondition: ${c.name}: standing ${standing}`)
+    assert.equal(standing, c.standing, `fixture is not the standing it names: ${c.name}`)
+    const label = latestBatchStatusLabel(c.row.status, standing)
+    assert.equal(label, c.label, c.name)
+    if (label !== c.row.status) relabelled += 1
+  }
+  console.log(`# D8 cases: ${cases.length}; relabelled: ${relabelled}`)
+  assert.equal(relabelled, 1, 'only the operator-typed SYNCED row is relabelled')
+})
